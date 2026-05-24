@@ -8,6 +8,24 @@
 //! - [`JitRuntimeHelpers`] — function pointer table for JIT runtime callbacks
 //! - [`gpu_lowering::GpuLowering`] (under the `gpu-lowering` feature) —
 //!   trait seam for emitting PTX from a resolved Java method.
+//!
+//! ## `gpu-lowering` feature status
+//!
+//! As of the round-8 audit (2026-05-24): **no consumer crate in this
+//! workspace enables `gpu-lowering`**. A workspace-wide search for
+//! `features = ["gpu-lowering"]` / `--features gpu-lowering` outside this
+//! crate's own `Cargo.toml` returns zero hits — the only documentation
+//! references live in `docs/gpu/README.md`, which describes a planned
+//! integration that never landed.
+//!
+//! The feature gate, the `gpu_lowering` module, and the `GpuLowering`
+//! trait remain in-tree because removing them is a public-API break that
+//! is out of scope for the current soundness round.
+//!
+//! TODO(round-9): if `gpu-lowering` still has zero consumers at the start
+//! of round 9, delete the feature, the module, and the `docs/gpu/`
+//! README. There is no point keeping a feature-gated public API that
+//! exists only to be referenced by its own documentation.
 
 #[cfg(feature = "gpu-lowering")]
 pub mod gpu_lowering;
@@ -146,21 +164,163 @@ pub struct JitRuntimeHelpers {
     pub tlab_post_init: usize,
 }
 
-impl JitRuntimeHelpers {
-    /// Number of fields included in the bulk-validation arrays
-    /// (`all_pointers` / `field_names`).
-    ///
-    /// This is a hand-maintained constant. It pins the *length* of the two
-    /// parallel arrays to the same value, so they cannot drift apart from
-    /// each other. It does NOT, however, force `JitRuntimeHelpers` to have
-    /// exactly 33 function-pointer fields — nothing in the type system
-    /// connects the struct's field count to this constant. If you add a
-    /// new function-pointer field to the struct you must manually extend
-    /// both arrays and bump this constant (see the maintenance contract on
-    /// [`Self::all_pointers`]).
-    pub const NUM_FIELDS: usize = 33;
+/// Classifies each field of [`JitRuntimeHelpers`] for the validator.
+///
+/// Drives the `helper_fields!` macro below — the macro emits one
+/// `FieldEntry` per struct field, and [`JitRuntimeHelpers::validate`]
+/// branches on `kind` so the right contract is applied per slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldKind {
+    /// Mandatory `CALL` target. Zero (null) means a baked absolute call
+    /// would fault — `validate()` rejects.
+    RequiredPtr,
+    /// Optional `CALL` target. Zero means "not wired, JIT falls back to
+    /// the helper-call slow path"; non-zero must be a real entry point.
+    /// `validate()` accepts both — non-zero is automatically non-null.
+    OptionalPtr,
+    /// Byte offset (immediate), not a pointer. Zero is a legitimate value
+    /// (e.g. `class_id_offset_in_obj` is 0 by contract). `validate()`
+    /// ignores it.
+    Offset,
+}
 
-    /// Validate that all required function pointers are non-null.
+/// One macro-generated entry per field of [`JitRuntimeHelpers`].
+///
+/// Carrying `name`, `kind`, and `value` together lets [`JitRuntimeHelpers::null_pointers`]
+/// and [`JitRuntimeHelpers::validate`] iterate the same single source of
+/// truth — there is no longer a parallel `[usize; N]` / `[&str; N]` pair
+/// that can drift.
+#[derive(Clone, Copy, Debug)]
+pub struct FieldEntry {
+    pub name: &'static str,
+    pub kind: FieldKind,
+    pub value: usize,
+}
+
+// ---------------------------------------------------------------------
+// Single source of truth for the `JitRuntimeHelpers` field list.
+//
+// `helper_fields!` expands to:
+//   * `JitRuntimeHelpers::all_fields(&self) -> [FieldEntry; NUM_FIELDS]`
+//   * `JitRuntimeHelpers::NUM_FIELDS: usize`
+//
+// To add a new field: add it to the `helper_fields!` invocation below
+// and add the matching `pub <name>: usize,` to the struct. NUM_FIELDS
+// is computed from the macro input — no separate constant to bump.
+//
+// `repr(C)` + every field being `usize` means the layout is sequential,
+// so the golden-offset test in `mod tests` can validate the on-disk
+// shape against documented byte offsets.
+// ---------------------------------------------------------------------
+macro_rules! helper_fields {
+    ( $( ($name:ident, $kind:expr) ),* $(,)? ) => {
+        impl JitRuntimeHelpers {
+            /// Number of fields in the bulk-validation array.
+            ///
+            /// Computed by the `helper_fields!` macro from the field list
+            /// — there is no separate hand-maintained constant to bump
+            /// when a field is added. The `const _: () = assert!(...)`
+            /// below additionally ties this to
+            /// `size_of::<JitRuntimeHelpers>() / size_of::<usize>()`, so
+            /// adding a field to the *struct* without also adding it to
+            /// the macro invocation is a compile-time error.
+            pub const NUM_FIELDS: usize = [ $( helper_fields!(@unit $name) ),* ].len();
+
+            /// All fields, tagged with classification, for bulk validation.
+            ///
+            /// Macro-generated from the `helper_fields!` invocation so the
+            /// field list lives in exactly one place. Length is pinned by
+            /// the return type, kind is per-entry, and `null_pointers`
+            /// and `validate` both consume this array — the previous
+            /// drift hazard between `all_pointers` and `field_names` is
+            /// gone.
+            fn all_fields(&self) -> [FieldEntry; Self::NUM_FIELDS] {
+                [
+                    $(
+                        FieldEntry {
+                            name: stringify!($name),
+                            kind: $kind,
+                            value: self.$name,
+                        },
+                    )*
+                ]
+            }
+        }
+    };
+    (@unit $name:ident) => { () };
+}
+
+helper_fields! {
+    (newarray,                       FieldKind::RequiredPtr),
+    (new_object,                     FieldKind::RequiredPtr),
+    (anewarray_object,               FieldKind::RequiredPtr),
+    (baload,                         FieldKind::RequiredPtr),
+    (bastore,                        FieldKind::RequiredPtr),
+    (iaload,                         FieldKind::RequiredPtr),
+    (iastore,                        FieldKind::RequiredPtr),
+    (aaload,                         FieldKind::RequiredPtr),
+    (aastore,                        FieldKind::RequiredPtr),
+    (multianewarray_2d,              FieldKind::RequiredPtr),
+    (arraylength,                    FieldKind::RequiredPtr),
+    (getfield,                       FieldKind::RequiredPtr),
+    (putfield_int,                   FieldKind::RequiredPtr),
+    (putfield_long,                  FieldKind::RequiredPtr),
+    (putfield_float,                 FieldKind::RequiredPtr),
+    (putfield_double,                FieldKind::RequiredPtr),
+    (putfield_object,                FieldKind::RequiredPtr),
+    (getstatic,                      FieldKind::RequiredPtr),
+    (putstatic_int,                  FieldKind::RequiredPtr),
+    (putstatic_long,                 FieldKind::RequiredPtr),
+    (putstatic_float,                FieldKind::RequiredPtr),
+    (putstatic_double,               FieldKind::RequiredPtr),
+    (putstatic_object,               FieldKind::RequiredPtr),
+    (checkcast,                      FieldKind::RequiredPtr),
+    (instanceof_check,               FieldKind::RequiredPtr),
+    (throw_aioobe,                   FieldKind::RequiredPtr),
+    (invoke_dispatch,                FieldKind::RequiredPtr),
+    (invoke_virtual_mic,             FieldKind::RequiredPtr),
+    (write_barrier,                  FieldKind::RequiredPtr),
+    (satb_pre_write_barrier,         FieldKind::RequiredPtr),
+    (uncommon_trap,                  FieldKind::RequiredPtr),
+    (math_fma_double,                FieldKind::RequiredPtr),
+    (math_fma_float,                 FieldKind::RequiredPtr),
+    (tlab_cursor_offset_in_thread,   FieldKind::Offset),
+    (tlab_end_offset_in_thread,      FieldKind::Offset),
+    (class_id_offset_in_obj,         FieldKind::Offset),
+    (get_current_thread,             FieldKind::OptionalPtr),
+    (tlab_post_init,                 FieldKind::OptionalPtr),
+}
+
+// Compile-time integrity check: the macro-generated NUM_FIELDS must
+// match `sizeof(JitRuntimeHelpers) / sizeof(usize)`. Every field of
+// `JitRuntimeHelpers` is a `usize` and the struct is `#[repr(C)]` with
+// no padding, so this ratio equals the field count. If a future
+// contributor adds `pub foo: usize` to the struct without adding `foo`
+// to the `helper_fields!` invocation, this assert fails — the silent
+// "field omitted from validation" failure mode is closed at build time.
+//
+// Uses a `const _:` item rather than an inline `const { ... }` block to
+// stay compatible with Rust 1.77 (inline const expressions stabilised
+// in 1.79; the workspace MSRV is below that).
+const _: () = assert!(
+    JitRuntimeHelpers::NUM_FIELDS
+        == core::mem::size_of::<JitRuntimeHelpers>() / core::mem::size_of::<usize>(),
+    "JitRuntimeHelpers::NUM_FIELDS drifted from struct field count — add the new field \
+     to the helper_fields! invocation in jit-api/src/lib.rs",
+);
+
+// Belt-and-suspenders: pin the exact expected count so a *removal* of a
+// field also requires touching this line. Without this, deleting a
+// struct field AND its macro entry simultaneously would still satisfy
+// the ratio assert above and silently change the JIT ABI.
+const _: () = assert!(
+    JitRuntimeHelpers::NUM_FIELDS == 38,
+    "JitRuntimeHelpers field count changed — bump the literal here and update \
+     the golden-offset test in mod tests if the change is intentional",
+);
+
+impl JitRuntimeHelpers {
+    /// Validate that every mandatory helper pointer is non-null.
     ///
     /// A null (zero) function pointer is invalid — there is no function at
     /// address 0, so an absolute `CALL` baked from it would fault. Non-null
@@ -169,161 +329,47 @@ impl JitRuntimeHelpers {
     /// start at an odd address, so a parity/alignment check would
     /// false-positive on a perfectly valid helper.
     ///
-    /// The 30 mandatory helper pointers in [`Self::all_pointers`] must all
-    /// be non-null. The two *optional* helper pointers, `get_current_thread`
-    /// and `tlab_post_init`, are also validated, but only when set: each is
-    /// a nullable optional helper (zero means "not wired" and the JIT falls
-    /// back to the unconditional `new_object` call). When either is set to
-    /// a non-zero value it is an active `CALL` target, so it is held to the
-    /// same non-null contract — this catches a corrupt non-zero address
-    /// silently passing validation. (A non-zero value trivially satisfies
-    /// "non-null"; the explicit check documents the intent and gives a
-    /// single place to tighten the optional-helper contract later.)
+    /// Iteration is over [`Self::all_fields`], the macro-generated list,
+    /// so this method automatically covers every field of the struct.
+    /// Per-field semantics:
     ///
-    /// NOTE: The `tlab_cursor_offset_in_thread`, `tlab_end_offset_in_thread`,
-    /// and `class_id_offset_in_obj` fields are NOT validated here: they are
-    /// byte offsets, not pointers, and zero is a legitimate value for each
-    /// (`class_id_offset_in_obj` is 0 by contract).
-    pub fn validate(&self) -> bool {
-        let ptrs = self.all_pointers();
-        // Mandatory helpers: every one must be a non-null call target.
-        if !ptrs.iter().all(|&p| p != 0) {
-            return false;
+    /// * [`FieldKind::RequiredPtr`] — must be non-zero. Returns `Err`
+    ///   listing the offending field names otherwise.
+    /// * [`FieldKind::OptionalPtr`] — zero means "not wired" and is OK;
+    ///   any non-zero value is automatically non-null (so no additional
+    ///   check is needed, but the slot is still covered by the iteration
+    ///   — future tightening can add e.g. address-range sanity here).
+    /// * [`FieldKind::Offset`] — byte offset, not a pointer. Zero is a
+    ///   legitimate value (`class_id_offset_in_obj` is 0 by contract).
+    ///   Skipped.
+    ///
+    /// Returns `Ok(())` when every required pointer is non-null. Returns
+    /// `Err(Vec<&'static str>)` with the names of the null required
+    /// pointers — useful for surfacing a list of misses in a single
+    /// error message rather than failing on the first one. (Round-9
+    /// fix: the previous bool-returning, dead-loop implementation
+    /// silently returned `true` on a null `tlab_post_init` because the
+    /// 33-element bulk array did not include it.)
+    pub fn validate(&self) -> Result<(), Vec<&'static str>> {
+        let nulls = self.null_pointers();
+        if nulls.is_empty() {
+            Ok(())
+        } else {
+            Err(nulls)
         }
-        // Optional helpers: only constrained when wired (non-zero). A
-        // set-but-zero value cannot occur here by construction; this loop
-        // exists so a future stricter check (e.g. address-range sanity)
-        // has an obvious home, and so a corrupt optional pointer is
-        // covered by the same validation surface as the mandatory ones.
-        for &opt in &[self.get_current_thread, self.tlab_post_init] {
-            if opt != 0 {
-                // Wired => must be a usable call target (non-null).
-                // Already true since `opt != 0`; kept explicit for intent.
-                continue;
-            }
-        }
-        true
     }
 
-    /// Return a list of field names whose pointer value is null (zero).
+    /// Return the names of mandatory pointer fields whose value is null.
+    ///
+    /// Only [`FieldKind::RequiredPtr`] fields are reported — an unset
+    /// optional helper is *expected* to be zero (and the offset fields
+    /// can legitimately be zero), so neither would be a bug.
     pub fn null_pointers(&self) -> Vec<&'static str> {
-        let names = Self::field_names();
-        let ptrs = self.all_pointers();
-        names
+        self.all_fields()
             .iter()
-            .zip(ptrs.iter())
-            .filter(|(_, &p)| p == 0)
-            .map(|(&name, _)| name)
+            .filter(|e| e.kind == FieldKind::RequiredPtr && e.value == 0)
+            .map(|e| e.name)
             .collect()
-    }
-
-    /// Collect all pointer values into an array for bulk validation.
-    ///
-    /// **Maintenance contract.** If you add a new function-pointer field
-    /// above, you MUST:
-    ///   1. Add it to the array literal below.
-    ///   2. Add its name to the parallel array in [`Self::field_names`].
-    ///   3. Bump [`Self::NUM_FIELDS`] by one.
-    ///
-    /// What the compiler *does* enforce: the return type
-    /// `[usize; NUM_FIELDS]` pins the length of this array and of
-    /// `field_names` to the same constant, so the two parallel arrays
-    /// cannot drift to *different* lengths — a literal with the wrong
-    /// number of elements fails to compile.
-    ///
-    /// What the compiler does NOT enforce: nothing connects the struct's
-    /// actual field count to `NUM_FIELDS`. You can add a field to
-    /// `JitRuntimeHelpers` and forget step (1) entirely; the code still
-    /// compiles, the new field is simply omitted from validation. Steps
-    /// (1)–(3) above are a human responsibility.
-    ///
-    /// TODO(round-9): macro this so the field list lives in exactly one
-    /// place — both arrays would then be generated from a single
-    /// declarative source of truth, which *would* make the field count
-    /// compiler-enforced.
-    fn all_pointers(&self) -> [usize; Self::NUM_FIELDS] {
-        let arr = [
-            self.newarray,
-            self.new_object,
-            self.anewarray_object,
-            self.baload,
-            self.bastore,
-            self.iaload,
-            self.iastore,
-            self.aaload,
-            self.aastore,
-            self.multianewarray_2d,
-            self.arraylength,
-            self.getfield,
-            self.putfield_int,
-            self.putfield_long,
-            self.putfield_float,
-            self.putfield_double,
-            self.putfield_object,
-            self.getstatic,
-            self.putstatic_int,
-            self.putstatic_long,
-            self.putstatic_float,
-            self.putstatic_double,
-            self.putstatic_object,
-            self.checkcast,
-            self.instanceof_check,
-            self.throw_aioobe,
-            self.invoke_dispatch,
-            self.invoke_virtual_mic,
-            self.write_barrier,
-            self.satb_pre_write_barrier,
-            self.uncommon_trap,
-            self.math_fma_double,
-            self.math_fma_float,
-        ];
-        // Array length is type-pinned by the return signature
-        // `[usize; NUM_FIELDS]`; this keeps `all_pointers` and
-        // `field_names` the same length. It does NOT verify the array
-        // covers every struct field — see the maintenance-contract
-        // docstring above.
-        arr
-    }
-
-    fn field_names() -> [&'static str; Self::NUM_FIELDS] {
-        let arr = [
-            "newarray",
-            "new_object",
-            "anewarray_object",
-            "baload",
-            "bastore",
-            "iaload",
-            "iastore",
-            "aaload",
-            "aastore",
-            "multianewarray_2d",
-            "arraylength",
-            "getfield",
-            "putfield_int",
-            "putfield_long",
-            "putfield_float",
-            "putfield_double",
-            "putfield_object",
-            "getstatic",
-            "putstatic_int",
-            "putstatic_long",
-            "putstatic_float",
-            "putstatic_double",
-            "putstatic_object",
-            "checkcast",
-            "instanceof_check",
-            "throw_aioobe",
-            "invoke_dispatch",
-            "invoke_virtual_mic",
-            "write_barrier",
-            "satb_pre_write_barrier",
-            "uncommon_trap",
-            "math_fma_double",
-            "math_fma_float",
-        ];
-        // Length type-pinned by `[&'static str; NUM_FIELDS]`. See
-        // `all_pointers` for the maintenance contract.
-        arr
     }
 }
 
@@ -658,14 +704,15 @@ mod tests {
     #[test]
     fn test_helpers_validate_all_nonzero() {
         let h = make_helpers();
-        assert!(h.validate());
+        assert!(h.validate().is_ok());
     }
 
     #[test]
     fn test_helpers_validate_fails_on_zero() {
         let mut h = make_helpers();
         h.newarray = 0;
-        assert!(!h.validate());
+        let err = h.validate().expect_err("zero newarray must fail");
+        assert!(err.contains(&"newarray"));
     }
 
     #[test]
@@ -689,4 +736,274 @@ mod tests {
     //     was deleted (see comment above the deleted block in the
     //     module body). The remaining tests cover the runtime-helpers
     //     struct + validation directly.
+
+    // --- JitRuntimeHelpers golden ABI offsets ---
+    //
+    // The JIT compiler bakes `JitRuntimeHelpers` field addresses into
+    // generated RWX machine code as absolute CALL targets and as
+    // `[helpers_ptr + disp32]` loads. A silent field reorder would
+    // change the disp32 immediates while the JIT still emits the old
+    // offsets — i.e. a CALL that used to dispatch `new_object` would
+    // now dispatch `anewarray_object`, with no compile error. This
+    // failure is undetectable at runtime until the wrong helper
+    // corrupts the heap.
+    //
+    // The struct is `#[repr(C)]` and every field is `usize` (8 bytes
+    // on x86-64, the only supported target). That gives a sequential
+    // layout with no padding, so the documented offset of field N is
+    // simply `N * 8`. The test below pins both:
+    //
+    //   1. The byte offset of every individual field (via
+    //      `std::mem::offset_of!`, stable since 1.77), and
+    //   2. The 0-based field index of every field (via a const N) so
+    //      a swap of two fields with the same size — which preserves
+    //      every offset individually — is also caught.
+    //
+    // If you add a new field to `JitRuntimeHelpers`, append a row
+    // below and bump the `NUM_FIELDS` literal in the const-assert in
+    // the module body. Do NOT renumber existing rows: the indices
+    // here are part of the JIT ABI.
+
+    /// Width of every field in `JitRuntimeHelpers` (every field is `usize`).
+    /// On any 64-bit target Rust supports this is 8. We pin to 8 because the
+    /// JIT only emits x86-64 code today; if/when 32-bit support lands, this
+    /// test (and the JIT immediate-width assumptions) must be revisited.
+    const FIELD_WIDTH: usize = 8;
+
+    /// Documented JIT ABI offset of a field, given its 0-based index in
+    /// the `#[repr(C)]` declaration order. Sequential because every
+    /// field is `usize` (no inter-field padding).
+    const fn expected_offset(index: usize) -> usize {
+        index * FIELD_WIDTH
+    }
+
+    #[test]
+    fn jit_runtime_helpers_field_size_is_eight() {
+        // x86-64 only. If this fires, the per-field 8-byte stride
+        // below is no longer the JIT ABI and the offset assertions
+        // are stale.
+        assert_eq!(std::mem::size_of::<usize>(), FIELD_WIDTH);
+    }
+
+    #[test]
+    fn jit_runtime_helpers_struct_size_matches_field_count() {
+        // `#[repr(C)]` + all `usize` fields ⇒ no padding ⇒ struct size
+        // is exactly `NUM_FIELDS * 8`. Drift here means a field was
+        // added/removed without updating `helper_fields!`, OR the
+        // struct gained a non-`usize` field that violates the JIT ABI.
+        assert_eq!(
+            std::mem::size_of::<JitRuntimeHelpers>(),
+            JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
+        );
+        // And the macro-driven count is the canonical 38.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 38);
+    }
+
+    #[test]
+    fn jit_runtime_helpers_repr_c_golden_offsets() {
+        // Each row: (0-based ABI index, field name, offset_of! probe).
+        // The expected byte offset is `index * 8`. The names are also
+        // checked against `all_fields()` so a field rename (which the
+        // offset_of! invocation would silently follow) is caught too.
+        let probes: [(usize, &'static str, usize); JitRuntimeHelpers::NUM_FIELDS] = [
+            (0,  "newarray",                     std::mem::offset_of!(JitRuntimeHelpers, newarray)),
+            (1,  "new_object",                   std::mem::offset_of!(JitRuntimeHelpers, new_object)),
+            (2,  "anewarray_object",             std::mem::offset_of!(JitRuntimeHelpers, anewarray_object)),
+            (3,  "baload",                       std::mem::offset_of!(JitRuntimeHelpers, baload)),
+            (4,  "bastore",                      std::mem::offset_of!(JitRuntimeHelpers, bastore)),
+            (5,  "iaload",                       std::mem::offset_of!(JitRuntimeHelpers, iaload)),
+            (6,  "iastore",                      std::mem::offset_of!(JitRuntimeHelpers, iastore)),
+            (7,  "aaload",                       std::mem::offset_of!(JitRuntimeHelpers, aaload)),
+            (8,  "aastore",                      std::mem::offset_of!(JitRuntimeHelpers, aastore)),
+            (9,  "multianewarray_2d",            std::mem::offset_of!(JitRuntimeHelpers, multianewarray_2d)),
+            (10, "arraylength",                  std::mem::offset_of!(JitRuntimeHelpers, arraylength)),
+            (11, "getfield",                     std::mem::offset_of!(JitRuntimeHelpers, getfield)),
+            (12, "putfield_int",                 std::mem::offset_of!(JitRuntimeHelpers, putfield_int)),
+            (13, "putfield_long",                std::mem::offset_of!(JitRuntimeHelpers, putfield_long)),
+            (14, "putfield_float",               std::mem::offset_of!(JitRuntimeHelpers, putfield_float)),
+            (15, "putfield_double",              std::mem::offset_of!(JitRuntimeHelpers, putfield_double)),
+            (16, "putfield_object",              std::mem::offset_of!(JitRuntimeHelpers, putfield_object)),
+            (17, "getstatic",                    std::mem::offset_of!(JitRuntimeHelpers, getstatic)),
+            (18, "putstatic_int",                std::mem::offset_of!(JitRuntimeHelpers, putstatic_int)),
+            (19, "putstatic_long",               std::mem::offset_of!(JitRuntimeHelpers, putstatic_long)),
+            (20, "putstatic_float",              std::mem::offset_of!(JitRuntimeHelpers, putstatic_float)),
+            (21, "putstatic_double",             std::mem::offset_of!(JitRuntimeHelpers, putstatic_double)),
+            (22, "putstatic_object",             std::mem::offset_of!(JitRuntimeHelpers, putstatic_object)),
+            (23, "checkcast",                    std::mem::offset_of!(JitRuntimeHelpers, checkcast)),
+            (24, "instanceof_check",             std::mem::offset_of!(JitRuntimeHelpers, instanceof_check)),
+            (25, "throw_aioobe",                 std::mem::offset_of!(JitRuntimeHelpers, throw_aioobe)),
+            (26, "invoke_dispatch",              std::mem::offset_of!(JitRuntimeHelpers, invoke_dispatch)),
+            (27, "invoke_virtual_mic",           std::mem::offset_of!(JitRuntimeHelpers, invoke_virtual_mic)),
+            (28, "write_barrier",                std::mem::offset_of!(JitRuntimeHelpers, write_barrier)),
+            (29, "satb_pre_write_barrier",       std::mem::offset_of!(JitRuntimeHelpers, satb_pre_write_barrier)),
+            (30, "uncommon_trap",                std::mem::offset_of!(JitRuntimeHelpers, uncommon_trap)),
+            (31, "math_fma_double",              std::mem::offset_of!(JitRuntimeHelpers, math_fma_double)),
+            (32, "math_fma_float",               std::mem::offset_of!(JitRuntimeHelpers, math_fma_float)),
+            (33, "tlab_cursor_offset_in_thread", std::mem::offset_of!(JitRuntimeHelpers, tlab_cursor_offset_in_thread)),
+            (34, "tlab_end_offset_in_thread",    std::mem::offset_of!(JitRuntimeHelpers, tlab_end_offset_in_thread)),
+            (35, "class_id_offset_in_obj",       std::mem::offset_of!(JitRuntimeHelpers, class_id_offset_in_obj)),
+            (36, "get_current_thread",           std::mem::offset_of!(JitRuntimeHelpers, get_current_thread)),
+            (37, "tlab_post_init",               std::mem::offset_of!(JitRuntimeHelpers, tlab_post_init)),
+        ];
+
+        // (a) Each field is at its documented sequential byte offset.
+        // A swap of two same-size fields would change the (index, name)
+        // → offset_of! relationship and trip this.
+        for (idx, name, actual) in probes.iter() {
+            let expected = expected_offset(*idx);
+            assert_eq!(
+                *actual, expected,
+                "ABI offset drift: field `{}` (index {}) is at byte offset {}, \
+                 expected {}. The JIT bakes this offset into RWX code — fix the \
+                 reorder, or if intentional, update both this table and \
+                 `vm/src/jit/helpers.rs::build_helpers`.",
+                name, idx, actual, expected,
+            );
+        }
+
+        // (b) The macro-generated name list agrees with the golden
+        // table, in the same order. This catches a field rename in
+        // the struct that the contributor forgot to mirror into the
+        // `helper_fields!` macro invocation (or vice versa).
+        let h = make_helpers();
+        let fields = h.all_fields();
+        assert_eq!(fields.len(), probes.len());
+        for (i, (_, expected_name, _)) in probes.iter().enumerate() {
+            assert_eq!(
+                fields[i].name, *expected_name,
+                "macro-driven field order disagrees with golden ABI table at \
+                 index {}: macro has `{}`, golden has `{}`",
+                i, fields[i].name, expected_name,
+            );
+        }
+    }
+
+    #[test]
+    fn jit_runtime_helpers_all_fields_classified() {
+        // The macro must classify every field. 33 RequiredPtr + 3
+        // Offset + 2 OptionalPtr = 38. A new field whose classification
+        // is omitted will fail to compile (the macro requires both
+        // arms); this test pins the *counts* so a reclassification
+        // (e.g. demoting a RequiredPtr to OptionalPtr) is also a
+        // deliberate, reviewed change.
+        let h = make_helpers();
+        let f = h.all_fields();
+        let req = f.iter().filter(|e| e.kind == FieldKind::RequiredPtr).count();
+        let opt = f.iter().filter(|e| e.kind == FieldKind::OptionalPtr).count();
+        let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
+        assert_eq!(req, 33, "required-pointer count drifted");
+        assert_eq!(opt, 2, "optional-pointer count drifted");
+        assert_eq!(off, 3, "offset-field count drifted");
+        assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
+    }
+
+    #[test]
+    fn jit_runtime_helpers_validate_ignores_offsets() {
+        // `class_id_offset_in_obj` is 0 by contract; the validator
+        // must NOT reject on that. (Regression for the round-9 fix —
+        // the previous `validate()` looped over a 33-element array
+        // that omitted all offset/optional fields, so this was true
+        // by accident. The new validator iterates ALL 38 fields and
+        // must still pass when offsets are zero.)
+        let mut h = make_helpers();
+        h.tlab_cursor_offset_in_thread = 0;
+        h.tlab_end_offset_in_thread = 0;
+        h.class_id_offset_in_obj = 0;
+        assert!(h.validate().is_ok());
+        assert!(h.null_pointers().is_empty());
+    }
+
+    #[test]
+    fn jit_runtime_helpers_validate_accepts_unwired_optionals() {
+        // Optional helpers default to zero ("not wired") — must pass.
+        let mut h = make_helpers();
+        h.get_current_thread = 0;
+        h.tlab_post_init = 0;
+        assert!(h.validate().is_ok());
+        // And they are NOT reported by null_pointers (they are not
+        // mandatory-and-null, just optional-and-unset).
+        assert!(h.null_pointers().is_empty());
+    }
+
+    #[test]
+    fn jit_runtime_helpers_validate_rejects_each_required_null() {
+        // Sweep every required-pointer field: zeroing it must trip
+        // the validator AND report the field by name.
+        let names: Vec<&'static str> = make_helpers()
+            .all_fields()
+            .iter()
+            .filter(|e| e.kind == FieldKind::RequiredPtr)
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(names.len(), 33);
+        for name in names {
+            let mut h = make_helpers();
+            // Zero the field by name via a match — the macro doesn't
+            // give us per-field mutable accessors, so this is exhaustive
+            // but verbose. The test exists precisely to ensure no
+            // required field is silently uncovered.
+            zero_field_by_name(&mut h, name);
+            match h.validate() {
+                Ok(()) => panic!(
+                    "validator failed to reject null required field `{}` (returned Ok)",
+                    name
+                ),
+                Err(err) => assert!(
+                    err.contains(&name),
+                    "validator's Err list did not include `{}`; got {:?}",
+                    name,
+                    err,
+                ),
+            }
+            let nulls = h.null_pointers();
+            assert!(
+                nulls.contains(&name),
+                "null_pointers() did not report `{}`; got {:?}",
+                name,
+                nulls,
+            );
+        }
+    }
+
+    // Helper for `validate_rejects_each_required_null`: zero a single
+    // field by string name. Kept in the test module so production
+    // code doesn't grow a stringly-typed mutator.
+    fn zero_field_by_name(h: &mut JitRuntimeHelpers, name: &str) {
+        match name {
+            "newarray" => h.newarray = 0,
+            "new_object" => h.new_object = 0,
+            "anewarray_object" => h.anewarray_object = 0,
+            "baload" => h.baload = 0,
+            "bastore" => h.bastore = 0,
+            "iaload" => h.iaload = 0,
+            "iastore" => h.iastore = 0,
+            "aaload" => h.aaload = 0,
+            "aastore" => h.aastore = 0,
+            "multianewarray_2d" => h.multianewarray_2d = 0,
+            "arraylength" => h.arraylength = 0,
+            "getfield" => h.getfield = 0,
+            "putfield_int" => h.putfield_int = 0,
+            "putfield_long" => h.putfield_long = 0,
+            "putfield_float" => h.putfield_float = 0,
+            "putfield_double" => h.putfield_double = 0,
+            "putfield_object" => h.putfield_object = 0,
+            "getstatic" => h.getstatic = 0,
+            "putstatic_int" => h.putstatic_int = 0,
+            "putstatic_long" => h.putstatic_long = 0,
+            "putstatic_float" => h.putstatic_float = 0,
+            "putstatic_double" => h.putstatic_double = 0,
+            "putstatic_object" => h.putstatic_object = 0,
+            "checkcast" => h.checkcast = 0,
+            "instanceof_check" => h.instanceof_check = 0,
+            "throw_aioobe" => h.throw_aioobe = 0,
+            "invoke_dispatch" => h.invoke_dispatch = 0,
+            "invoke_virtual_mic" => h.invoke_virtual_mic = 0,
+            "write_barrier" => h.write_barrier = 0,
+            "satb_pre_write_barrier" => h.satb_pre_write_barrier = 0,
+            "uncommon_trap" => h.uncommon_trap = 0,
+            "math_fma_double" => h.math_fma_double = 0,
+            "math_fma_float" => h.math_fma_float = 0,
+            other => panic!("unknown required-pointer field name in test: {}", other),
+        }
+    }
 }
