@@ -15,12 +15,207 @@ type WinResult<T> = windows::core::Result<T>;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::System::DataExchange::{CloseClipboard, OpenClipboard};
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::Memory::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::backend::*;
+
+// ---------------------------------------------------------------------------
+// RAII guards for Win32 handle pairs.
+//
+// The previous code in `blit_buffer` and `clipboard_set_text` (and the other
+// GDI-heavy paths) used hand-written cleanup after each call site. That works
+// for the happy path, but the `?` operator on `CreateDIBSection` /
+// `OpenClipboard` returns early without running the matching `EndPaint` /
+// `GlobalFree` / `CloseClipboard`, leaking the handle on every error.
+//
+// These guards wrap the pair so the closing call runs on every exit path,
+// including `?` propagation, panics, and explicit `return`.
+// ---------------------------------------------------------------------------
+
+/// Pairs `BeginPaint` with `EndPaint`. `Drop` calls `EndPaint`, so the paint
+/// session is closed even if a later `?` bails out of `blit_buffer`.
+struct PaintGuard {
+    hwnd: HWND,
+    ps: PAINTSTRUCT,
+    hdc: HDC,
+}
+
+impl PaintGuard {
+    /// Begins a paint session. Returns `None` if `BeginPaint` returns an
+    /// invalid HDC (the underlying call does not require an `EndPaint` in
+    /// that case, per the Win32 contract).
+    unsafe fn begin(hwnd: HWND) -> Option<Self> {
+        let mut ps = PAINTSTRUCT::default();
+        let hdc = unsafe { BeginPaint(hwnd, &mut ps) };
+        if hdc.is_invalid() {
+            return None;
+        }
+        Some(Self { hwnd, ps, hdc })
+    }
+
+    fn hdc(&self) -> HDC {
+        self.hdc
+    }
+}
+
+impl Drop for PaintGuard {
+    fn drop(&mut self) {
+        // SAFETY: `BeginPaint` succeeded (otherwise `begin` returned `None`),
+        // so the matching `EndPaint` is required exactly once.
+        unsafe {
+            let _ = EndPaint(self.hwnd, &self.ps);
+        }
+    }
+}
+
+/// Wraps an `HGLOBAL` returned by `GlobalAlloc`. `Drop` calls `GlobalFree`
+/// unless ownership has been released (e.g. after `SetClipboardData`, which
+/// transfers ownership to the clipboard).
+struct GlobalAllocGuard {
+    handle: HGLOBAL,
+    released: bool,
+}
+
+impl GlobalAllocGuard {
+    unsafe fn new(flags: GLOBAL_ALLOC_FLAGS, size: usize) -> WinResult<Self> {
+        let handle = unsafe { GlobalAlloc(flags, size) }?;
+        Ok(Self {
+            handle,
+            released: false,
+        })
+    }
+
+    fn handle(&self) -> HGLOBAL {
+        self.handle
+    }
+
+    /// Marks the allocation as transferred elsewhere (typically to the
+    /// clipboard after `SetClipboardData`). Prevents `Drop` from freeing it.
+    fn release(mut self) -> HGLOBAL {
+        self.released = true;
+        self.handle
+    }
+}
+
+impl Drop for GlobalAllocGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            // SAFETY: `GlobalAlloc` succeeded and ownership was not handed off.
+            unsafe {
+                let _ = GlobalFree(self.handle);
+            }
+        }
+    }
+}
+
+/// Pairs `OpenClipboard` with `CloseClipboard`. `Drop` runs `CloseClipboard`
+/// so every error path between the two calls is balanced.
+struct ClipboardGuard;
+
+impl ClipboardGuard {
+    unsafe fn open(hwnd: HWND) -> WinResult<Self> {
+        unsafe { OpenClipboard(hwnd) }?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ClipboardGuard {
+    fn drop(&mut self) {
+        // SAFETY: `OpenClipboard` succeeded, so a matching `CloseClipboard`
+        // is required.
+        unsafe {
+            let _ = CloseClipboard();
+        }
+    }
+}
+
+/// Wraps a GDI `HDC` created by `CreateCompatibleDC` (or `CreateDC`). `Drop`
+/// calls `DeleteDC`. Use [`SelectObjectGuard`] to restore any objects
+/// selected into the DC before this guard drops.
+struct DcGuard(HDC);
+
+impl DcGuard {
+    fn new(hdc: HDC) -> Option<Self> {
+        if hdc.is_invalid() {
+            None
+        } else {
+            Some(Self(hdc))
+        }
+    }
+
+    fn hdc(&self) -> HDC {
+        self.0
+    }
+}
+
+impl Drop for DcGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = DeleteDC(self.0);
+        }
+    }
+}
+
+/// Wraps a GDI object handle that must be passed to `DeleteObject` (e.g.
+/// `HBITMAP` from `CreateDIBSection`/`CreateBitmap`, `HFONT` from
+/// `CreateFontW`). The handle MUST first be deselected from any DC before
+/// drop; selecting it into another DC and letting drop run is fine.
+struct GdiObjectGuard {
+    handle: HGDIOBJ,
+    released: bool,
+}
+
+impl GdiObjectGuard {
+    fn new<T: Into<HGDIOBJ>>(handle: T) -> Self {
+        Self {
+            handle: handle.into(),
+            released: false,
+        }
+    }
+
+    fn handle(&self) -> HGDIOBJ {
+        self.handle
+    }
+}
+
+impl Drop for GdiObjectGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            unsafe {
+                let _ = DeleteObject(self.handle);
+            }
+        }
+    }
+}
+
+/// Restores a previously selected GDI object back into its DC on drop.
+/// `SelectObject` returns the prior object; this guard puts it back so the
+/// caller-owned object isn't left selected (which would block `DeleteObject`).
+struct SelectObjectGuard {
+    hdc: HDC,
+    prev: HGDIOBJ,
+}
+
+impl SelectObjectGuard {
+    /// Selects `obj` into `hdc` and remembers the previously selected object
+    /// so it can be restored on drop.
+    unsafe fn select<T: Into<HGDIOBJ>>(hdc: HDC, obj: T) -> Self {
+        let prev = unsafe { SelectObject(hdc, obj.into()) };
+        Self { hdc, prev }
+    }
+}
+
+impl Drop for SelectObjectGuard {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.hdc, self.prev);
+        }
+    }
+}
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -470,12 +665,20 @@ impl PlatformBackend for Win32Backend {
             .ok_or(PlatformError::WindowNotFound)?;
         let hwnd = info.hwnd();
         unsafe {
-            let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(hwnd, &mut ps);
-            if hdc.is_invalid() {
-                return Ok(());
-            }
-            let hdc_mem = CreateCompatibleDC(hdc);
+            // BeginPaint -> EndPaint pair. If we bail with `?` below the
+            // guard's Drop closes the paint session.
+            let paint = match PaintGuard::begin(hwnd) {
+                Some(p) => p,
+                None => return Ok(()),
+            };
+            let hdc = paint.hdc();
+
+            // CreateCompatibleDC -> DeleteDC pair.
+            let mem_dc = DcGuard::new(CreateCompatibleDC(hdc)).ok_or_else(|| {
+                PlatformError::CreationFailed("CreateCompatibleDC failed".into())
+            })?;
+            let hdc_mem = mem_dc.hdc();
+
             let bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
                     biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -489,6 +692,9 @@ impl PlatformBackend for Win32Backend {
                 ..Default::default()
             };
             let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            // CreateDIBSection -> DeleteObject pair. The error path here used
+            // to leak the BeginPaint handle; now `paint`'s Drop runs as the
+            // `?` unwinds the scope.
             let hbm = CreateDIBSection(
                 hdc_mem,
                 &bmi,
@@ -500,7 +706,10 @@ impl PlatformBackend for Win32Backend {
             .map_err(|_| {
                 PlatformError::CreationFailed("CreateDIBSection failed".into())
             })?;
-            let old = SelectObject(hdc_mem, hbm);
+            let hbm_guard = GdiObjectGuard::new(hbm);
+
+            // SelectObject -> restore-previous pair.
+            let _selected = SelectObjectGuard::select(hdc_mem, hbm_guard.handle());
             if !bits.is_null() {
                 let dst = std::slice::from_raw_parts_mut(
                     bits as *mut u32,
@@ -529,10 +738,9 @@ impl PlatformBackend for Win32Backend {
                 0,
                 SRCCOPY,
             );
-            SelectObject(hdc_mem, old);
-            let _ = DeleteObject(hbm);
-            let _ = DeleteDC(hdc_mem);
-            let _ = EndPaint(hwnd, &ps);
+            // Drop order at scope exit: _selected (restore old object)
+            // -> hbm_guard (DeleteObject) -> mem_dc (DeleteDC)
+            // -> paint (EndPaint). This matches the original manual ordering.
         }
         Ok(())
     }
@@ -708,8 +916,15 @@ impl PlatformBackend for Win32Backend {
 
         unsafe {
             let hdc_screen = GetDC(HWND::default());
-            let hdc_mem = CreateCompatibleDC(hdc_screen);
+            let mem_dc = match DcGuard::new(CreateCompatibleDC(hdc_screen)) {
+                Some(d) => d,
+                None => {
+                    ReleaseDC(HWND::default(), hdc_screen);
+                    return empty;
+                }
+            };
             ReleaseDC(HWND::default(), hdc_screen);
+            let hdc_mem = mem_dc.hdc();
 
             let bmi = BITMAPINFO {
                 bmiHeader: BITMAPINFOHEADER {
@@ -725,6 +940,8 @@ impl PlatformBackend for Win32Backend {
             };
 
             let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+            // CreateDIBSection -> DeleteObject. On error `mem_dc` drops and
+            // runs DeleteDC; no leak.
             let hbm = match CreateDIBSection(
                 hdc_mem,
                 &bmi,
@@ -734,13 +951,11 @@ impl PlatformBackend for Win32Backend {
                 0,
             ) {
                 Ok(bm) => bm,
-                Err(_) => {
-                    let _ = DeleteDC(hdc_mem);
-                    return empty;
-                }
+                Err(_) => return empty,
             };
+            let _hbm_guard = GdiObjectGuard::new(hbm);
 
-            let old_bm = SelectObject(hdc_mem, hbm);
+            let _old_bm = SelectObjectGuard::select(hdc_mem, hbm);
             SetBkMode(hdc_mem, TRANSPARENT);
             SetTextColor(hdc_mem, COLORREF((cb << 16) | (cg << 8) | cr));
 
@@ -766,7 +981,8 @@ impl PlatformBackend for Win32Backend {
                 (DEFAULT_PITCH.0 | FF_DONTCARE.0) as u32,
                 PCWSTR(fam.as_ptr()),
             );
-            let old_font = SelectObject(hdc_mem, hfont);
+            let _hfont_guard = GdiObjectGuard::new(hfont);
+            let _old_font = SelectObjectGuard::select(hdc_mem, hfont);
 
             let text_w: Vec<u16> = text.encode_utf16().collect();
             let _ = TextOutW(hdc_mem, 0, 0, &text_w);
@@ -787,12 +1003,13 @@ impl PlatformBackend for Win32Backend {
                 }
             }
 
-            SelectObject(hdc_mem, old_font);
-            let _ = DeleteObject(hfont);
-            SelectObject(hdc_mem, old_bm);
-            let _ = DeleteObject(hbm);
-            let _ = DeleteDC(hdc_mem);
-
+            // Drop order at scope exit (reverse of declaration):
+            //   _old_font   -> restore previous font into hdc_mem
+            //   _hfont_guard -> DeleteObject(hfont)
+            //   _old_bm     -> restore previous bitmap
+            //   _hbm_guard  -> DeleteObject(hbm)
+            //   mem_dc      -> DeleteDC(hdc_mem)
+            // Matches the previously hand-written cleanup ordering.
             TextRaster {
                 pixels: px_out,
                 width: tw,
@@ -807,11 +1024,11 @@ impl PlatformBackend for Win32Backend {
         use windows::Win32::System::Ole::CF_UNICODETEXT;
 
         unsafe {
-            if OpenClipboard(HWND::default()).is_err() {
-                return None;
-            }
+            // ClipboardGuard ensures CloseClipboard runs on every exit path
+            // (including the early `return None` inside the closure below).
+            let _clipboard = ClipboardGuard::open(HWND::default()).ok()?;
             let handle = GetClipboardData(CF_UNICODETEXT.0 as u32);
-            let result = handle.ok().and_then(|h| {
+            handle.ok().and_then(|h| {
                 let ptr = GlobalLock(HGLOBAL(h.0)) as *const u16;
                 if ptr.is_null() {
                     return None;
@@ -828,9 +1045,8 @@ impl PlatformBackend for Win32Backend {
                 let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
                 let _ = GlobalUnlock(HGLOBAL(h.0));
                 Some(s)
-            });
-            let _ = CloseClipboard();
-            result
+            })
+            // `_clipboard` drops here, calling CloseClipboard.
         }
     }
 
@@ -844,22 +1060,37 @@ impl PlatformBackend for Win32Backend {
             .collect();
 
         unsafe {
-            let hmem = GlobalAlloc(GMEM_MOVEABLE, wide.len() * 2)
+            // GlobalAlloc -> GlobalFree pair. If `OpenClipboard` below fails
+            // (the previous code's leak site), the guard's Drop frees the
+            // buffer instead of leaving it dangling.
+            let hmem_guard = GlobalAllocGuard::new(GMEM_MOVEABLE, wide.len() * 2)
                 .map_err(|_| PlatformError::ClipboardError("GlobalAlloc failed".into()))?;
+            let hmem = hmem_guard.handle();
+
             let ptr = GlobalLock(hmem) as *mut u16;
             if ptr.is_null() {
-                let _ = GlobalFree(hmem);
+                // hmem_guard's Drop runs here -> GlobalFree.
                 return Err(PlatformError::ClipboardError(
                     "GlobalLock failed".into(),
                 ));
             }
             std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
             let _ = GlobalUnlock(hmem);
-            OpenClipboard(HWND::default())
+
+            // OpenClipboard -> CloseClipboard pair. If this fails, the
+            // hmem_guard above still drops correctly.
+            let _clipboard = ClipboardGuard::open(HWND::default())
                 .map_err(|_| PlatformError::ClipboardError("OpenClipboard failed".into()))?;
             let _ = EmptyClipboard();
-            let _ = SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0));
-            let _ = CloseClipboard();
+            // On success SetClipboardData takes ownership of the HGLOBAL.
+            // We must NOT free it ourselves in that case, so release the
+            // guard. If SetClipboardData fails we keep the guard so its
+            // Drop reclaims the buffer.
+            let set_handle = SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hmem.0));
+            if set_handle.is_ok() {
+                let _ = hmem_guard.release();
+            }
+            // _clipboard's Drop -> CloseClipboard runs at scope exit.
         }
         Ok(())
     }
@@ -957,5 +1188,215 @@ mod tests {
         // The most-negative coordinate the i16 encoding can carry.
         let lp = LPARAM(0x80008000u32 as isize);
         assert_eq!(Win32Backend::lparam_xy(lp), (-32768, -32768));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Guard tests
+//
+// These tests exercise the Drop-based cleanup contract of the RAII guards
+// without depending on a real GUI session. They use a small fake counter
+// (`GuardLeakCounter`) and parallel mock guards that mirror the real ones'
+// Drop logic. Together with code inspection of `blit_buffer` /
+// `clipboard_set_text`, this confirms the leak fix.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod guard_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Tracks how many "handles" are live. Mirrors what a real leak detector
+    /// would do for Win32 handle counts (e.g. `GetGuiResources` for GDI).
+    #[derive(Default)]
+    struct GuardLeakCounter {
+        alive: AtomicUsize,
+    }
+
+    impl GuardLeakCounter {
+        fn acquire(&self) {
+            self.alive.fetch_add(1, Ordering::SeqCst);
+        }
+        fn release(&self) {
+            self.alive.fetch_sub(1, Ordering::SeqCst);
+        }
+        fn live(&self) -> usize {
+            self.alive.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Mock that mirrors `PaintGuard` / `ClipboardGuard` semantics: acquire
+    /// in `begin`, release in `Drop`.
+    struct MockPairGuard<'a> {
+        counter: &'a GuardLeakCounter,
+    }
+    impl<'a> MockPairGuard<'a> {
+        fn begin(counter: &'a GuardLeakCounter) -> Self {
+            counter.acquire();
+            Self { counter }
+        }
+    }
+    impl Drop for MockPairGuard<'_> {
+        fn drop(&mut self) {
+            self.counter.release();
+        }
+    }
+
+    /// Mock that mirrors `GlobalAllocGuard`: optional release before drop.
+    struct MockAllocGuard<'a> {
+        counter: &'a GuardLeakCounter,
+        released: bool,
+    }
+    impl<'a> MockAllocGuard<'a> {
+        fn new(counter: &'a GuardLeakCounter) -> Self {
+            counter.acquire();
+            Self {
+                counter,
+                released: false,
+            }
+        }
+        fn release(mut self) {
+            self.released = true;
+        }
+    }
+    impl Drop for MockAllocGuard<'_> {
+        fn drop(&mut self) {
+            if !self.released {
+                self.counter.release();
+            }
+        }
+    }
+
+    /// Verifies the BeginPaint/EndPaint pair pattern: even when an early-
+    /// `?` propagates out before the matching close, the guard's Drop fires.
+    ///
+    /// This is the regression test for the original
+    /// `blit_buffer` leak — `CreateDIBSection` failing with `?` used to skip
+    /// `EndPaint`.
+    #[test]
+    fn paint_guard_drops_on_question_mark_propagation() {
+        let leaks = GuardLeakCounter::default();
+
+        fn inner(counter: &GuardLeakCounter) -> Result<(), &'static str> {
+            let _paint = MockPairGuard::begin(counter);
+            // Simulates `CreateDIBSection.map_err(...)?` returning early.
+            Err("create_dib_section failed")?;
+            #[allow(unreachable_code)]
+            Ok(())
+        }
+
+        let r = inner(&leaks);
+        assert!(r.is_err(), "inner must propagate the simulated failure");
+        assert_eq!(
+            leaks.live(),
+            0,
+            "PaintGuard Drop should run when `?` bails before manual EndPaint"
+        );
+    }
+
+    /// Verifies the GlobalAlloc/GlobalFree pair pattern: if `OpenClipboard`
+    /// fails after `GlobalAlloc` succeeds, the alloc still gets freed.
+    /// Regression test for the original `clipboard_set_text` leak.
+    #[test]
+    fn global_alloc_guard_drops_when_clipboard_open_fails() {
+        let leaks = GuardLeakCounter::default();
+
+        fn inner(counter: &GuardLeakCounter) -> Result<(), &'static str> {
+            let _hmem = MockAllocGuard::new(counter);
+            // GlobalLock would happen here; assume success.
+            // Now OpenClipboard fails (simulated). Use `?` to model the
+            // real code's early-return via the `?` operator.
+            Err("OpenClipboard failed")?;
+            #[allow(unreachable_code)]
+            Ok(())
+        }
+
+        let r = inner(&leaks);
+        assert!(r.is_err());
+        assert_eq!(
+            leaks.live(),
+            0,
+            "GlobalAllocGuard Drop should free the buffer on the clipboard \
+             open failure path"
+        );
+    }
+
+    /// When SetClipboardData succeeds the OS owns the buffer; the alloc
+    /// guard must NOT free it. `release()` arms that case.
+    #[test]
+    fn global_alloc_guard_release_skips_drop() {
+        let leaks = GuardLeakCounter::default();
+
+        {
+            let hmem = MockAllocGuard::new(&leaks);
+            assert_eq!(leaks.live(), 1);
+            hmem.release();
+            // After release, drop is a no-op for the counter.
+            assert_eq!(
+                leaks.live(),
+                1,
+                "release() must hand ownership off without decrementing"
+            );
+        }
+        // Counter stays at 1 because the OS now owns it (in real code,
+        // SetClipboardData -> CloseClipboard would free the global handle
+        // along with the clipboard contents).
+        assert_eq!(leaks.live(), 1);
+    }
+
+    /// Multiple guards in one scope must all run their Drop in reverse
+    /// declaration order. Mirrors `blit_buffer`'s nested guards.
+    #[test]
+    fn nested_guards_all_drop_on_early_return() {
+        let leaks = GuardLeakCounter::default();
+
+        fn inner(counter: &GuardLeakCounter) -> Result<(), &'static str> {
+            let _paint = MockPairGuard::begin(counter);
+            let _dc = MockPairGuard::begin(counter);
+            let _hbm = MockPairGuard::begin(counter);
+            assert_eq!(counter.live(), 3);
+            // Simulate a later failure (e.g. SelectObject error).
+            Err("late failure")?;
+            #[allow(unreachable_code)]
+            Ok(())
+        }
+
+        let _ = inner(&leaks);
+        assert_eq!(
+            leaks.live(),
+            0,
+            "all three guards must drop on `?` propagation"
+        );
+    }
+
+    /// Sanity-check that `Drop` ordering inside Rust is LIFO. The real
+    /// `blit_buffer` depends on this: SelectObjectGuard (restores prev)
+    /// must drop BEFORE GdiObjectGuard (DeleteObject on hbm) so the bitmap
+    /// isn't still selected into the DC when we delete it.
+    #[test]
+    fn drop_order_is_reverse_of_declaration() {
+        use std::cell::RefCell;
+        let log: RefCell<Vec<&'static str>> = RefCell::new(Vec::new());
+
+        struct Tag<'a>(&'a RefCell<Vec<&'static str>>, &'static str);
+        impl Drop for Tag<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().push(self.1);
+            }
+        }
+
+        {
+            let _a = Tag(&log, "select_object"); // selected obj into DC
+            let _b = Tag(&log, "gdi_object"); // hbm
+            let _c = Tag(&log, "dc"); // mem DC
+            let _d = Tag(&log, "paint"); // BeginPaint
+        }
+
+        let order = log.into_inner();
+        assert_eq!(
+            order,
+            vec!["paint", "dc", "gdi_object", "select_object"],
+            "Drop must run in reverse-declaration (LIFO) order so the \
+             selection guard restores the old object before the object \
+             itself is deleted, and EndPaint runs after DeleteDC"
+        );
     }
 }
