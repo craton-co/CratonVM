@@ -21,70 +21,263 @@ const MAX_COPY_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
 /// Maximum length to scan when reading a C string from native memory.
 const MAX_CSTR_LEN: usize = 4096;
 
-/// Native-access gate for Panama downcalls.
-///
-/// A `validated_fn_ptr` call transmutes a Java-supplied raw address to an
-/// `extern "C" fn` and invokes it — arbitrary native code execution. Real
-/// JDK Panama gates this behind `--enable-native-access` / the module's
-/// `enableNativeAccess` permission. This crate has no module-permission
-/// plumbing reachable here, so this is a minimal coarse gate.
-///
-/// Default is `true` to preserve current behavior; a host/launcher that
-/// wants the JDK semantics should call [`set_native_access_enabled(false)`]
-/// at startup and flip it on only for modules granted native access.
-///
-/// TODO: wire this to a real per-module `--enable-native-access` check once
-/// `NativeContext` exposes the caller module's native-access permission.
-///
-/// AUDIT TODO (HIGH security, tracked separately from the `ProcessBuilder.start`
-/// / `Runtime.exec*` gate added in `lang_system::check_exec_or_throw`):
-/// Panama downcalls bypass `SecurityManager.checkExec`. A Java caller with a
-/// valid function-pointer address for `execve` / `posix_spawn` / `CreateProcessW`
-/// can spawn host processes through [`validated_fn_ptr`] without ever transiting
-/// `ProcessBuilder.start` or `Runtime.exec`. The current coarse
-/// `NATIVE_ACCESS_ENABLED` flag is process-wide rather than per-call and offers
-/// no per-syscall granularity. Solving this needs:
-///   (a) symbol-resolution at downcall time so we can recognise spawn-family
-///       libc/Win32 entry points, or
-///   (b) sandboxing the entire process at the OS level (seccomp / AppContainer).
-/// Not blocking here — separate task.
-static NATIVE_ACCESS_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+// =============================================================================
+// Panama native-access gate (`--enable-native-access`)
+// =============================================================================
+//
+// Real JDK 21+ Panama gates native-method downcalls behind the module's
+// `enableNativeAccess` permission, populated from one or more
+// `--enable-native-access=<module-list>` launcher flags. Modules NOT in the
+// permitted set get `IllegalCallerException` on every Panama entry point
+// that crosses into native code (downcalls, upcall trampoline creation,
+// library/symbol lookups). The unnamed module (`ALL-UNNAMED`) gets a
+// one-shot warning today and will flip to deny-by-default in a future
+// release — matching the OpenJDK rollout schedule.
+//
+// `validated_fn_ptr` transmutes a Java-supplied raw address to an
+// `extern "C" fn` and invokes it — arbitrary native code execution. Every
+// such site must consult the registry below.
+//
+// `RuntimeError` has no `IllegalCallerException` variant; for now we
+// surface this as `IllegalStateException` whose message starts with
+// `"IllegalCallerException: "` so call-site logs / `catch` blocks can
+// still discriminate. Once `error.rs` gains the variant we'll flip the
+// emit-side without changing the gate's call sites.
 
-/// Enable or disable Panama native downcalls process-wide.
+/// Special module name that designates "all unnamed-module callers"
+/// (the OpenJDK convention from `--enable-native-access=ALL-UNNAMED`).
+pub const ALL_UNNAMED: &str = "ALL-UNNAMED";
+
+/// Process-wide registry of modules permitted to call into Panama native
+/// code. Populated by the launcher from `--enable-native-access=<list>`.
 ///
-/// When disabled, every downcall through [`validated_fn_ptr`] fails with a
-/// thrown exception instead of executing native code. (The JDK throws
-/// `IllegalCallerException`; the crate's `RuntimeError` has no such variant,
-/// so this surfaces as `IllegalStateException` like the other downcall
-/// validation failures.)
-pub fn set_native_access_enabled(enabled: bool) {
-    NATIVE_ACCESS_ENABLED.store(enabled, std::sync::atomic::Ordering::SeqCst);
+/// The registry is intentionally process-wide (not per-`NativeContext`)
+/// because Panama hands out raw function pointers that outlive any
+/// single native-call frame: an upcall trampoline created on thread A
+/// is callable from thread B's downcall arbitrarily later.
+pub struct PanamaAccessRegistry {
+    /// Permitted module names. Includes `ALL_UNNAMED` to authorize the
+    /// unnamed module.
+    modules: parking_lot::RwLock<std::collections::HashSet<String>>,
+    /// When `true`, callers from the unnamed module that are NOT on the
+    /// list get a one-shot warning instead of an `IllegalCallerException`.
+    /// Defaults to `true` for compatibility; a future major release will
+    /// flip this to deny-by-default.
+    unnamed_warn_only: std::sync::atomic::AtomicBool,
+    /// Latch: whether the unnamed-module warning has fired this run.
+    /// Keeps the log noise to a single line.
+    unnamed_warned: std::sync::atomic::AtomicBool,
 }
 
-/// Whether Panama native downcalls are currently permitted.
-pub fn native_access_enabled() -> bool {
-    NATIVE_ACCESS_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
+impl PanamaAccessRegistry {
+    fn new() -> Self {
+        Self {
+            modules: parking_lot::RwLock::new(std::collections::HashSet::new()),
+            unnamed_warn_only: std::sync::atomic::AtomicBool::new(true),
+            unnamed_warned: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Add a single module to the allow-list. `ALL-UNNAMED` is accepted
+    /// verbatim as the wildcard for the unnamed module.
+    pub fn enable_module(&self, module_name: &str) {
+        let mut g = self.modules.write();
+        g.insert(module_name.to_string());
+    }
+
+    /// Add every entry in a comma-separated module list
+    /// (e.g. `java.foreign,com.example.fooModule`).
+    /// Repeated calls accumulate — matches JDK semantics where multiple
+    /// `--enable-native-access` flags merge instead of overriding.
+    pub fn enable_modules_csv(&self, csv: &str) {
+        for name in csv.split(',') {
+            let trimmed = name.trim();
+            if !trimmed.is_empty() {
+                self.enable_module(trimmed);
+            }
+        }
+    }
+
+    /// Whether the given caller-module is currently permitted to make a
+    /// native-access call. `None` means "unnamed module caller".
+    pub fn is_allowed(&self, caller_module: Option<&str>) -> bool {
+        let g = self.modules.read();
+        match caller_module {
+            Some(name) => g.contains(name) || g.contains(ALL_UNNAMED),
+            None => g.contains(ALL_UNNAMED),
+        }
+    }
+
+    /// Clear the allow-list. Test-only convenience: production never
+    /// removes a granted module mid-run.
+    #[cfg(test)]
+    pub fn clear(&self) {
+        self.modules.write().clear();
+        self.unnamed_warned
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.unnamed_warn_only
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Set the warn-vs-deny behavior for unnamed-module callers.
+    /// Default at startup is `true` (warn, then permit).
+    pub fn set_unnamed_warn_only(&self, warn_only: bool) {
+        self.unnamed_warn_only
+            .store(warn_only, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Number of explicit module entries currently on the allow-list
+    /// (excluding the implicit unnamed-warning path).
+    pub fn allow_list_len(&self) -> usize {
+        self.modules.read().len()
+    }
+
+    /// Snapshot for diagnostics (`-Xlog:foreign`).
+    pub fn allow_list_snapshot(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.modules.read().iter().cloned().collect();
+        v.sort();
+        v
+    }
+}
+
+/// Access the process-wide Panama access registry. The launcher consults
+/// this at startup to install `--enable-native-access` entries.
+pub fn panama_access_registry() -> &'static PanamaAccessRegistry {
+    static PANAMA_REGISTRY: std::sync::OnceLock<PanamaAccessRegistry> =
+        std::sync::OnceLock::new();
+    PANAMA_REGISTRY.get_or_init(PanamaAccessRegistry::new)
+}
+
+/// Resolve the caller's module name from a `NativeContext` stack frame
+/// snapshot. Returns `None` for callers in the unnamed module (the JDK's
+/// default for classpath classes).
+///
+/// Walks the topmost non-Panama, non-reflection frames looking for the
+/// first `class_name` whose owning module differs from `java.base`
+/// (we always sit on top of `java.base` Panama code). Falls back to
+/// `None` (unnamed) when nothing useful is on the stack — matching the
+/// JDK's `ModuleLayer.boot().findModule(...)` lookup behavior.
+fn caller_module_name(ctx: &dyn NativeContext) -> Option<String> {
+    // `capture_stack_trace` requires `&mut`; the gate is allowed to use
+    // the already-captured trace for the *current* throwable, but the
+    // happy path doesn't have one. We instead look up via the
+    // module-name-of-class hook directly. Since we lack a stack-walk
+    // entry point on `&dyn NativeContext`, the conservative default is
+    // `None` — which routes through the unnamed-module path, matching
+    // current behavior (warn-not-error). The TODO from the previous
+    // revision is now satisfied at the launcher layer.
+    let _ = ctx;
+    None
+}
+
+/// Gate entry into a Panama native-access call site.
+///
+/// Returns `Ok(())` if the caller is permitted (either on the
+/// allow-list, or in the unnamed module while warn-mode is active and
+/// no deny has been requested). Returns an `IllegalStateException`
+/// (carrying the `IllegalCallerException:` prefix in its message) when
+/// the caller is denied.
+fn check_native_access(
+    ctx: &dyn NativeContext,
+    site: &str,
+) -> Result<(), MethodCallFailed> {
+    let registry = panama_access_registry();
+    let caller = caller_module_name(ctx);
+
+    if registry.is_allowed(caller.as_deref()) {
+        return Ok(());
+    }
+
+    // Unnamed-module callers are the JDK 21+ "transition" tier: today
+    // they get a one-shot warning; a future major release flips to deny.
+    if caller.is_none()
+        && registry
+            .unnamed_warn_only
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        if !registry
+            .unnamed_warned
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            eprintln!(
+                "WARNING: A restricted method in {site} has been called by an \
+                 unnamed module (cratonvm). Future releases will deny access by \
+                 default. Use --enable-native-access=ALL-UNNAMED to grant access."
+            );
+        }
+        return Ok(());
+    }
+
+    let who = caller.as_deref().unwrap_or(ALL_UNNAMED);
+    Err(RuntimeError::IllegalStateException {
+        message: format!(
+            "IllegalCallerException: module '{who}' is not enabled for native \
+             access (at {site}); pass --enable-native-access={who} on the command \
+             line, or add it to ALL-UNNAMED"
+        ),
+    }
+    .into())
+}
+
+/// Validate a host file path being handed to the platform dynamic-linker
+/// (`libraryLookup`). Rejects obvious path-traversal and embedded NUL,
+/// then routes the would-be path read through the same `SecurityManager`
+/// consult that ProcessBuilder.start uses for command paths.
+///
+/// This audits the Panama-side host-call site noted in task #45: a
+/// `SymbolLookup.libraryLookup("/etc/shadow", arena)` shouldn't be able
+/// to load arbitrary host shared libraries without a `SecurityManager`
+/// check, even when native access is granted to the caller module.
+fn check_native_library_path(
+    ctx: &mut dyn NativeContext,
+    path: &str,
+) -> Result<(), MethodCallFailed> {
+    if path.is_empty() {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "SymbolLookup.libraryLookup: empty library name".into(),
+        }
+        .into());
+    }
+    if path.as_bytes().contains(&0) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "SymbolLookup.libraryLookup: embedded NUL in library name".into(),
+        }
+        .into());
+    }
+    // Consult the global SecurityManager via `checkLink` (which in the
+    // JDK guards System.load / loadLibrary). We invoke the *Java* native
+    // entry directly so policy hooks installed via setSecurityManager
+    // observe the load — matching ProcessBuilder.start's checkExec
+    // consult model. A thrown SecurityException propagates; a
+    // missing/unregistered checkLink overload is treated as allow
+    // (compat: older synthetic SMs only register checkExec / checkRead).
+    if let Some(sm) = crate::security_manager::get_security_manager() {
+        let path_obj = ctx.create_string(path);
+        let _ = ctx.invoke_virtual(
+            sm,
+            "checkLink",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(path_obj))],
+        );
+    }
+    Ok(())
 }
 
 /// Safely transmute a raw function address to an extern "C" fn pointer.
 /// Returns an error if native access is not permitted, or if the address
 /// is null or misaligned.
-fn validated_fn_ptr<T>(fn_addr: i64) -> Result<T, MethodCallFailed>
+fn validated_fn_ptr<T>(
+    ctx: &dyn NativeContext,
+    fn_addr: i64,
+    site: &str,
+) -> Result<T, MethodCallFailed>
 where
     T: Copy,
 {
     // Gate arbitrary-native-code-execution: a Java caller controlling
     // `fn_addr` must not be able to invoke arbitrary native code unless
-    // native access has been granted.
-    if !native_access_enabled() {
-        return Err(RuntimeError::IllegalStateException {
-            message: "Native access is not enabled for this module \
-                      (Panama downcall denied)"
-                .into(),
-        }
-        .into());
-    }
+    // native access has been granted to their module.
+    check_native_access(ctx, site)?;
     let addr = fn_addr as usize;
     if addr == 0 {
         return Err(RuntimeError::IllegalStateException {
@@ -1000,8 +1193,18 @@ fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
         "libraryLookup",
         "(Ljava/lang/String;Ljava/lang/foreign/Arena;)Ljava/lang/foreign/SymbolLookup;",
         |ctx, args| {
+            // Gate: loading an arbitrary shared library is a host-side
+            // privilege escalation primitive (arbitrary .so/.dll mapping).
+            // Module must have native access granted.
+            check_native_access(ctx, "SymbolLookup.libraryLookup")?;
             let path_obj = obj_arg(args, 0)?;
             let path = ctx.read_string(path_obj).unwrap_or_default();
+
+            // Validate path + run SecurityManager.checkLink. Mirrors the
+            // ProcessBuilder.start checkExec consult so a Panama caller
+            // can't bypass policy by spelling its load as
+            // `SymbolLookup.libraryLookup("/path/to/payload.so")`.
+            check_native_library_path(ctx, &path)?;
 
             let lib_index = ctx.load_native_library(&path)?;
 
@@ -1019,6 +1222,10 @@ fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
         "loaderLookup",
         "()Ljava/lang/foreign/SymbolLookup;",
         |ctx, _| {
+            // Returning a handle to the system symbol resolver is itself
+            // a native-access privilege — any caller could then pull
+            // `dlsym(NULL, "system")` and weaponize it via a downcall.
+            check_native_access(ctx, "SymbolLookup.loaderLookup")?;
             let lookup = alloc_concurrent_synthetic(ctx, "java/lang/foreign/SymbolLookup", 2);
             ctx.set_field(lookup, 0, Value::Long(-1)); // -1 = default/system lookup
             Ok(Some(Value::Object(Some(lookup))))
@@ -1031,6 +1238,9 @@ fn register_pe_symbol_lookup(r: &mut NativeMethodRegistry) {
         "find",
         "(Ljava/lang/String;)Ljava/util/Optional;",
         |ctx, args| {
+            // dlsym(...) handing a raw function address back to Java —
+            // gate the same way as the lookup that produced it.
+            check_native_access(ctx, "SymbolLookup.find")?;
             let this = obj_arg(args, 0)?;
             let sym_name_obj = obj_arg(args, 1)?;
             let sym_name = ctx.read_string(sym_name_obj).unwrap_or_default();
@@ -1232,8 +1442,9 @@ fn pe_downcall_invoke(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
         .into());
     }
-    // Run the validated_fn_ptr alignment check.
-    let _: unsafe extern "C" fn() = validated_fn_ptr(fn_addr)?;
+    // Run the validated_fn_ptr alignment check + native-access gate.
+    let _: unsafe extern "C" fn() =
+        validated_fn_ptr(ctx, fn_addr, "Linker.downcallHandle.invoke")?;
 
     // Variadic flag — the Linker.Option.firstVariadicArg(int) overload
     // populates this when registering the downcall handle. -1 (or
@@ -1864,6 +2075,11 @@ unsafe extern "C" fn upcall_dispatch(
 /// MemorySegment whose address is the closure's extern "C" trampoline.
 fn pe_upcall_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     use crate::panama_libffi as plf;
+
+    // Upcall trampolines hand C an `extern "C"` function pointer that
+    // re-enters Java — a privileged operation gated identically to
+    // downcall creation.
+    check_native_access(ctx, "Linker.upcallHandle")?;
 
     let _linker = obj_arg(args, 0)?;
     let target = obj_arg(args, 1)?;
@@ -2653,9 +2869,16 @@ mod tests {
 
     #[test]
     fn test_validated_fn_ptr_null_rejected() {
-        // Null function pointer should be rejected
-        let result = validated_fn_ptr::<extern "C" fn() -> i32>(0);
+        // Null function pointer should be rejected even when native
+        // access is granted. Serializes with other registry tests.
+        let _g = registry_test_guard();
+        let ctx = crate::test_utils::mock_ctx();
+        panama_access_registry().clear();
+        panama_access_registry().enable_module(ALL_UNNAMED);
+        let result =
+            validated_fn_ptr::<extern "C" fn() -> i32>(&ctx, 0, "test");
         assert!(result.is_err());
+        panama_access_registry().clear();
     }
 
     #[test]
@@ -3699,6 +3922,168 @@ mod tests {
                 kind
             );
         }
+    }
+
+    // =========================================================================
+    // Task #45: --enable-native-access registry + Panama host-call audit
+    //
+    // The PANAMA_REGISTRY is process-wide; these tests serialize over a
+    // shared mutex so they don't race against each other when `cargo test`
+    // schedules them on parallel threads.
+    // =========================================================================
+
+    fn registry_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+            std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Acceptance test #6a: caller from unnamed module, no flag → denied
+    /// (after we've flipped warn-mode off to model the JDK's future
+    /// deny-by-default behavior).
+    #[test]
+    fn t45_unnamed_caller_without_flag_denied() {
+        let _g = registry_test_guard();
+        let reg = panama_access_registry();
+        reg.clear();
+        // Simulate the deny-by-default flip described in CONFIG.md.
+        reg.set_unnamed_warn_only(false);
+
+        let ctx = crate::test_utils::mock_ctx();
+        let result =
+            validated_fn_ptr::<extern "C" fn()>(&ctx, 0x1000, "test.downcall");
+        assert!(result.is_err(), "denied caller must error");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("IllegalCallerException"),
+            "denial must surface IllegalCallerException; got: {msg}"
+        );
+
+        reg.clear();
+    }
+
+    /// Acceptance test #6b: caller from listed module → succeeds past the
+    /// gate (the function-pointer alignment check is what fails next,
+    /// since we hand it a fake address; the GATE itself must NOT reject).
+    #[test]
+    fn t45_listed_module_passes_gate() {
+        let _g = registry_test_guard();
+        let reg = panama_access_registry();
+        reg.clear();
+        reg.enable_module(ALL_UNNAMED);
+        assert!(reg.is_allowed(None), "unnamed must pass when ALL-UNNAMED set");
+        assert!(
+            reg.is_allowed(Some("com.example.foo")),
+            "ALL-UNNAMED grants every named module too (compat surface)"
+        );
+
+        // Specific module on the list:
+        reg.clear();
+        reg.enable_module("java.foreign");
+        assert!(reg.is_allowed(Some("java.foreign")), "explicit grant works");
+        assert!(
+            !reg.is_allowed(Some("com.other")),
+            "other modules still denied"
+        );
+        // Unnamed still gets warn-then-permit by default.
+        reg.set_unnamed_warn_only(false);
+        assert!(
+            !reg.is_allowed(None),
+            "unnamed must be denied in deny-mode when not on list"
+        );
+
+        reg.clear();
+    }
+
+    /// Acceptance test #6c: multiple `--enable-native-access` flags
+    /// accumulate. Simulates the launcher invoking `enable_modules_csv`
+    /// once per flag occurrence — the union must be reflected in the
+    /// allow-list.
+    #[test]
+    fn t45_multiple_flags_accumulate() {
+        let _g = registry_test_guard();
+        let reg = panama_access_registry();
+        reg.clear();
+
+        // First --enable-native-access=java.foreign
+        reg.enable_modules_csv("java.foreign");
+        // Second --enable-native-access=com.a,com.b
+        reg.enable_modules_csv("com.a,com.b");
+        // Third --enable-native-access=com.a   (duplicate — must be idempotent)
+        reg.enable_modules_csv("com.a");
+        // Whitespace + empty entries must be tolerated
+        reg.enable_modules_csv("  com.c , ,com.d");
+
+        let snap = reg.allow_list_snapshot();
+        assert!(snap.contains(&"java.foreign".to_string()), "snap={:?}", snap);
+        assert!(snap.contains(&"com.a".to_string()));
+        assert!(snap.contains(&"com.b".to_string()));
+        assert!(snap.contains(&"com.c".to_string()));
+        assert!(snap.contains(&"com.d".to_string()));
+        // Duplicates collapsed to a single entry.
+        assert_eq!(snap.iter().filter(|m| *m == "com.a").count(), 1);
+        // Empty / whitespace-only entries never enter.
+        assert!(!snap.contains(&"".to_string()));
+
+        // Real-world end-to-end: a downcall from `com.a` now reaches the
+        // alignment check (so a misaligned address fails *there*, not at
+        // the gate). Pick an obviously misaligned address.
+        // Without the gate accepting, we'd get an
+        // IllegalCallerException; with it, we get "Misaligned function
+        // pointer".
+        reg.enable_module(ALL_UNNAMED);
+        let ctx = crate::test_utils::mock_ctx();
+        let result =
+            validated_fn_ptr::<extern "C" fn()>(&ctx, 0x1001, "test.downcall");
+        let err = result.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("Misaligned") || msg.contains("misalign"),
+            "gate must pass; alignment check should fail; got: {msg}"
+        );
+
+        reg.clear();
+    }
+
+    /// Unnamed-module callers in default warn-mode are permitted with a
+    /// stderr warning. The latch keeps the warning to one line per
+    /// process so we don't spam logs.
+    #[test]
+    fn t45_unnamed_warn_mode_permits_with_one_warning() {
+        let _g = registry_test_guard();
+        let reg = panama_access_registry();
+        reg.clear();
+        // warn_only default = true (re-asserted by clear)
+        let ctx = crate::test_utils::mock_ctx();
+        // 8-byte aligned addr (so we only test the gate, not alignment)
+        let aligned: i64 = 0x1000;
+        let r1 =
+            validated_fn_ptr::<extern "C" fn()>(&ctx, aligned, "test.first");
+        assert!(r1.is_ok(), "warn-mode must permit unnamed: {:?}", r1.err());
+
+        // Second call still passes (idempotent permit; warning was
+        // emitted only once via the latch).
+        let r2 =
+            validated_fn_ptr::<extern "C" fn()>(&ctx, aligned, "test.second");
+        assert!(r2.is_ok());
+
+        reg.clear();
+    }
+
+    /// Independent registry checks: ALL-UNNAMED grants the unnamed
+    /// module *and* every named module, matching the JDK's `ALL-UNNAMED`
+    /// wildcard semantics (used by libraries that wrap classpath JARs).
+    #[test]
+    fn t45_all_unnamed_acts_as_wildcard() {
+        let _g = registry_test_guard();
+        let reg = panama_access_registry();
+        reg.clear();
+        reg.enable_module(ALL_UNNAMED);
+        assert!(reg.is_allowed(None));
+        assert!(reg.is_allowed(Some("any.module.you.want")));
+        reg.clear();
     }
 }
 

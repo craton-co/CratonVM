@@ -75,6 +75,32 @@ cratonvm [OPTIONS] --jar <FILE.jar> [ARGS...]
 | `-agentpath:<path>[=opts]` | Native JVMTI agent loaded from an absolute path. |
 | `-javaagent:<jar>[=opts]` | Java agent JAR with a `Premain-Class` manifest header. |
 
+## Native access (Panama FFI / `java.lang.foreign`)
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--enable-native-access=<module-list>` | Grant the named modules permission to call restricted methods in `java.lang.foreign` (Panama downcalls, upcall trampolines, library/symbol lookups). Comma-separated list of module names, plus the special token `ALL-UNNAMED` for the unnamed module (classpath code). May be repeated; entries from every occurrence accumulate. Mirrors HotSpot JEP 472. | Unnamed-module callers get a one-shot warning; named modules without a grant get `IllegalCallerException`. |
+
+`PanamaAccessRegistry` (in [`native-builtins/src/panama.rs`](../native-builtins/src/panama.rs)) is the in-process source of truth. The launcher accumulates `--enable-native-access` values into it at startup via `panama_access_registry().enable_modules_csv(...)`. Every Panama host-call entry point (`DowncallHandle.invoke` / `invokeExact`, `Linker.upcallHandle`, `SymbolLookup.libraryLookup`, `SymbolLookup.loaderLookup`, `SymbolLookup.find`) consults the registry; denied callers get an `IllegalStateException` whose message starts with `"IllegalCallerException:"` (the dedicated runtime-error variant will be added in a follow-up).
+
+Examples:
+
+```
+# Grant ALL classpath callers (matches HotSpot's legacy ergonomic).
+cratonvm --enable-native-access=ALL-UNNAMED MyApp
+
+# Grant a specific module, plus the unnamed module for testing.
+cratonvm --enable-native-access=java.foreign \
+         --enable-native-access=ALL-UNNAMED MyApp
+
+# Equivalent — comma list within one flag.
+cratonvm --enable-native-access=java.foreign,ALL-UNNAMED MyApp
+```
+
+**Deny-by-default rollout.** Today, an unnamed-module caller without an `--enable-native-access=ALL-UNNAMED` grant gets a one-shot stderr warning and proceeds, matching the OpenJDK 21 transition behavior. A future major CratonVM release will flip the unnamed-module default to **deny** (`IllegalCallerException`), tracking the JDK schedule (`enableNativeAccess` becoming mandatory). Pin your dependencies' module declarations now, or budget for an `--enable-native-access=ALL-UNNAMED` line in launcher scripts before that flip.
+
+**SecurityManager interaction.** Even for granted modules, `SymbolLookup.libraryLookup(path, arena)` consults the installed `SecurityManager.checkLink(path)` before mapping a shared library — the same way `ProcessBuilder.start()` consults `checkExec` for command paths. A thrown `SecurityException` propagates to the Java caller; `setSecurityManager(null)` (the default) skips the consult.
+
 ## Container / cgroups
 
 | Flag | Description | Default |

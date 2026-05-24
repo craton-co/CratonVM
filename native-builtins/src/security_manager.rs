@@ -48,10 +48,13 @@ fn dbg_dopriv_enabled() -> bool {
 
 static SECURITY_MANAGER: Mutex<Option<ObjectRef>> = Mutex::new(None);
 
-/// Read the currently-installed `java.lang.SecurityManager` reference, if
-/// any. Exposed at crate scope so security-sensitive native entry points
-/// (e.g. `ProcessBuilder.start`, `Runtime.exec*`) can consult it before
-/// invoking the underlying host syscall — see `lang_system::check_exec_or_throw`.
+/// Return the currently-installed `java.lang.SecurityManager` reference,
+/// or `None` if `System.setSecurityManager(null)` is in effect (the default).
+///
+/// `pub(crate)` so security-sensitive native entry points can consult the same
+/// singleton: `ProcessBuilder.start` / `Runtime.exec*` via
+/// `lang_system::check_exec_or_throw`, and the Panama host-call gate via
+/// `panama::check_native_access`.
 pub(crate) fn get_security_manager() -> Option<ObjectRef> {
     *SECURITY_MANAGER.lock().unwrap_or_else(|e| e.into_inner())
 }
