@@ -95,6 +95,10 @@ while IFS=$'\t' read -r name app probe_class probe_dir cp_glob args max_seconds 
     [ -z "$name" ] && continue
     [[ "$name" =~ ^# ]] && continue
     [ "$name" = "name" ] && continue  # header row
+    # Strip trailing CR — pool.tsv may be checked out with CRLF line endings on
+    # Windows, which leaves \r on the last field. Without this, every probe
+    # reports NO_BASE because $baseline_file points at "<name>.txt\r".
+    baseline_file="${baseline_file%$'\r'}"
     if [ -n "$ONLY_NAME" ] && [ "$name" != "$ONLY_NAME" ]; then
         continue
     fi

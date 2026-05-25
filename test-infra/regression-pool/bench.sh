@@ -75,6 +75,7 @@ while IFS=$'\t' read -r name app probe_class probe_dir cp_glob args max_seconds 
     [ -z "$name" ] && continue
     [[ "$name" =~ ^# ]] && continue
     [ "$name" = "name" ] && continue  # header row
+    baseline_file="${baseline_file%$'\r'}"  # strip CR from CRLF-mode checkout
     [ -n "$ONLY" ] && [ "$name" != "$ONLY" ] && continue
 
     PROBE_DIR_ABS="$REPO_ROOT/$probe_dir"
