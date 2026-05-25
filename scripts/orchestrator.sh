@@ -639,6 +639,65 @@ run_smoke() {
         class_load_test jedit "$APPS/jedit5.7.0install.jar" installer.Install
         probes_present=1
     }
+    # ---- Wave 4: more master-list apps via ClassLoadProbe.
+    [ -f "$APPS/glassfish/glassfish-api.jar" ] && {
+        class_load_test glassfish "$APPS/glassfish/glassfish-api.jar" \
+            com.sun.appserv.server.LifecycleEvent
+        probes_present=1
+    }
+    [ -f "$APPS/jenkins/jenkins-core.jar" ] && {
+        class_load_test jenkins "$APPS/jenkins/jenkins-core.jar" \
+            jenkins.ClassLoaderReflectionToolkit
+        probes_present=1
+    }
+    [ -f "$APPS/cas/cas-api.jar" ] && {
+        class_load_test cas "$APPS/cas/cas-api.jar" \
+            org.apereo.cas.authentication.principal.PrincipalProvisioner
+        probes_present=1
+    }
+    [ -f "$APPS/jhipster/jhipster-framework.jar" ] && {
+        class_load_test jhipster "$APPS/jhipster/jhipster-framework.jar" \
+            tech.jhipster.config.JHipsterDefaults
+        probes_present=1
+    }
+    [ -f "$APPS/josm/josm.jar" ] && {
+        class_load_test josm "$APPS/josm/josm.jar" \
+            org.openstreetmap.josm.command.SequenceCommand
+        probes_present=1
+    }
+    [ -f "$APPS/minecraft/minecraft_server.jar" ] && {
+        # Minecraft Java Edition server. Uses the bundler-Main entry that
+        # in turn launches the real net.minecraft.server.MinecraftServer
+        # inside a custom classloader (similar shape to DaCapo's Harness).
+        # ClassLoadProbe on net.minecraft.bundler.Main verifies the
+        # bundler stage class-loads cleanly on this JVM.
+        class_load_test minecraft "$APPS/minecraft/minecraft_server.jar" \
+            net.minecraft.bundler.Main
+        probes_present=1
+    }
+    [ -f "$APPS/mindustry/mindustry.jar" ] && {
+        class_load_test mindustry "$APPS/mindustry/mindustry.jar" \
+            mindustry.server.ServerLauncher
+        probes_present=1
+    }
+    [ -f "$APPS/imagej/imagej.jar" ] && {
+        class_load_test imagej "$APPS/imagej/imagej.jar" ij.IJ
+        probes_present=1
+    }
+    [ -f "$APPS/libgdx/gdx.jar" ] && {
+        class_load_test libgdx "$APPS/libgdx/gdx.jar" com.badlogic.gdx.Gdx
+        probes_present=1
+    }
+    [ -f "$APPS/liberty/com.ibm.ws.kernel.boot_1.0.91.jar" ] && {
+        class_load_test liberty "$APPS/liberty/com.ibm.ws.kernel.boot_1.0.91.jar" \
+            com.ibm.ws.kernel.boot.LaunchArguments
+        probes_present=1
+    }
+    [ -f "$APPS/payara/payara-api.jar" ] && {
+        class_load_test payara "$APPS/payara/payara-api.jar" \
+            fish.payara.cdi.auth.roles.RolesPermitted
+        probes_present=1
+    }
 
     # Spring Boot probe: constructs a SpringApplication with banner-mode
     # OFF and WebApplicationType.NONE, prints the main app class, and
