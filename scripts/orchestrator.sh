@@ -339,8 +339,13 @@ run_oneshot() {
 
     local t0 t1
     t0=$(date +%s)
+    # Always close stdin so interactive REPL launchers (felix Gogo, kafka
+    # Scala REPL, kc26 picocli interactive prompt, ...) see EOF and exit
+    # cleanly instead of blocking until the per-app timeout fires. Apps
+    # that need real stdin from the test harness aren't part of this
+    # bring-up suite.
     timeout --foreground -k 5 "$t" "$@" \
-        > "$LOGDIR/$name.out" 2> "$LOGDIR/$name.err"
+        < /dev/null > "$LOGDIR/$name.out" 2> "$LOGDIR/$name.err"
     local rc=$?
     t1=$(date +%s)
     local elapsed=$((t1 - t0))
@@ -451,9 +456,16 @@ run_smoke() {
         --jar "$APPS/jenkins.war" -- --version --enable-future-java
 
     if [ -d "$APPS/jetty-home-11.0.20" ]; then
+        # Use jetty-home as its own jetty.base for the smoke probe;
+        # --list-config needs a valid base to discover modules. Without
+        # this jetty errors out with "No enabled jetty modules found!"
+        # because the CWD isn't a jetty base directory.
         run_oneshot jetty "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            --jar "$APPS/jetty-home-11.0.20/start.jar" -- --list-config
+            --jar "$APPS/jetty-home-11.0.20/start.jar" \
+            -- "jetty.home=$APPS/jetty-home-11.0.20" \
+               "jetty.base=$APPS/jetty-home-11.0.20" \
+               --help
     fi
 
     if [ -d "$APPS/wlp" ]; then
@@ -539,6 +551,9 @@ run_smoke() {
             -c "$cp" org.neo4j.server.startup.Neo4jBoot -- version
     fi
 
+    # Felix smoke: verify the launcher boots. Felix's Gogo shell waits
+    # for stdin; run_oneshot closes stdin globally so EOF triggers a
+    # clean exit (rc=0) within the smoke window.
     [ -d "$APPS/felix-framework-7.0.5" ] && run_oneshot felix "$TIMEOUT_S" \
         "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
         --jar "$APPS/felix-framework-7.0.5/bin/felix.jar"
