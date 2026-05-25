@@ -5113,6 +5113,29 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // DirectoryStream is an interface — iterator()/close() are abstract on
+    // it. Jetty start.jar (BaseHome.<init> → JettyBaseConfigSource) and
+    // Spring Boot's path scanning both walk newDirectoryStream(...) via
+    // for-each, which compiles to invokeinterface DirectoryStream.iterator.
+    // Without these natives every such walk throws
+    // `AbstractMethodError: DirectoryStream.iterator()V has no Code attribute`.
+    let ds = "java/nio/file/DirectoryStream";
+    r.register(ds, "iterator", "()Ljava/util/Iterator;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let arr = match ctx.get_field(this, 0) {
+            Value::Object(Some(a)) => a,
+            _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
+        };
+        let len = ctx.array_length(arr);
+        cratonvm_native_collections::make_iterator_from_array(ctx, arr, len)
+    });
+    r.register(ds, "close", "()V", |_ctx, _args| Ok(None));
+    r.register(ds, "spliterator", "()Ljava/util/Spliterator;", |_ctx, _args| {
+        // Spliterator API is rarely walked for DirectoryStream; return null
+        // so callers that probe it fall back to iterator().
+        Ok(Some(Value::Object(None)))
+    });
+
     // newFileChannel(Path, Set<? extends OpenOption>, FileAttribute[]) -> FileChannel
     // Real JDK delegates to WindowsFileSystemProvider.newFileChannel which
     // overrides this abstract method. We provide a synthetic FileChannel

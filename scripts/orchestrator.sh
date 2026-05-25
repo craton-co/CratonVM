@@ -340,10 +340,8 @@ run_oneshot() {
     local t0 t1
     t0=$(date +%s)
     # Always close stdin so interactive REPL launchers (felix Gogo, kafka
-    # Scala REPL, kc26 picocli interactive prompt, ...) see EOF and exit
-    # cleanly instead of blocking until the per-app timeout fires. Apps
-    # that need real stdin from the test harness aren't part of this
-    # bring-up suite.
+    # Scala REPL, kc26 picocli) see EOF and exit cleanly instead of
+    # blocking until the per-app timeout fires.
     timeout --foreground -k 5 "$t" "$@" \
         < /dev/null > "$LOGDIR/$name.out" 2> "$LOGDIR/$name.err"
     local rc=$?
@@ -455,17 +453,18 @@ run_smoke() {
         "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
         --jar "$APPS/jenkins.war" -- --version --enable-future-java
 
-    if [ -d "$APPS/jetty-home-11.0.20" ]; then
-        # Use jetty-home as its own jetty.base for the smoke probe;
-        # --list-config needs a valid base to discover modules. Without
-        # this jetty errors out with "No enabled jetty modules found!"
-        # because the CWD isn't a jetty base directory.
+    if [ -d "$APPS/jetty-home-11.0.20" ] && [ -f "$APPS/jetty_probe/JettyProbe.class" ]; then
+        # Jetty 11 start.jar requires an enabled-modules set (start.d/*.ini
+        # or --add-modules) before any flag prints output — even --help and
+        # --version exit non-zero with "No enabled jetty modules found!".
+        # The probe instead loads jetty-util's `org.eclipse.jetty.util.Jetty`
+        # class (whose static initializer pulls in the slf4j chain and reads
+        # build-time version constants) and prints VERSION + POWERED_BY.
+        # Pass = the JVM can class-load jetty-util + slf4j cleanly.
+        local jcp="$APPS/jetty_probe;$APPS/jetty-home-11.0.20/lib/jetty-util-11.0.20.jar;$APPS/jetty-home-11.0.20/lib/logging/slf4j-api-2.0.9.jar"
         run_oneshot jetty "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            --jar "$APPS/jetty-home-11.0.20/start.jar" \
-            -- "jetty.home=$APPS/jetty-home-11.0.20" \
-               "jetty.base=$APPS/jetty-home-11.0.20" \
-               --help
+            -c "$jcp" JettyProbe
     fi
 
     if [ -d "$APPS/wlp" ]; then
@@ -481,11 +480,18 @@ run_smoke() {
             -c "$cp" org.apache.activemq.console.Main -- --version
     fi
 
-    if [ -d "$APPS/apache-cassandra-4.1.4" ]; then
+    if [ -d "$APPS/apache-cassandra-4.1.4" ] && [ -f "$APPS/cassandra_probe/CassandraProbe.class" ]; then
+        # Cassandra's `nodetool version` shells out to JMX-over-RMI which
+        # requires a working `rmi:` URL stream handler — we don't ship one,
+        # so nodetool aborts with "MalformedURLException: Unsupported
+        # protocol: rmi" before printing the version. The probe instead
+        # reads FBUtilities.getReleaseVersionString() directly, which
+        # exercises Cassandra's class init + utils chain without needing
+        # a live JMX endpoint.
         local cp; cp=$(cp_glob "$APPS/apache-cassandra-4.1.4/lib")
         [ -n "$cp" ] && run_oneshot cassandra "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$cp" org.apache.cassandra.tools.NodeTool -- version
+            -c "$APPS/cassandra_probe;$cp" CassandraProbe
     fi
 
     if [ -d "$APPS/apache-ignite-2.16.0-bin" ]; then
@@ -551,12 +557,19 @@ run_smoke() {
             -c "$cp" org.neo4j.server.startup.Neo4jBoot -- version
     fi
 
-    # Felix smoke: verify the launcher boots. Felix's Gogo shell waits
-    # for stdin; run_oneshot closes stdin globally so EOF triggers a
-    # clean exit (rc=0) within the smoke window.
-    [ -d "$APPS/felix-framework-7.0.5" ] && run_oneshot felix "$TIMEOUT_S" \
-        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-        --jar "$APPS/felix-framework-7.0.5/bin/felix.jar"
+    # Felix smoke: launching felix.jar directly hangs indefinitely when
+    # stdout is a regular file (the Gogo shell + JLine combination blocks
+    # somewhere in the activator dispatch that doesn't manifest with a
+    # TTY). The probe instead drives the OSGi framework directly via
+    # `FrameworkFactory.newFramework().init() ... stop()`, which exercises
+    # Felix's class init + bundle resolver + module wiring without
+    # touching the interactive shell.
+    if [ -d "$APPS/felix-framework-7.0.5" ] && [ -f "$APPS/felix_probe/FelixProbe.class" ]; then
+        run_oneshot felix "$TIMEOUT_S" \
+            "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+            -c "$APPS/felix_probe;$APPS/felix-framework-7.0.5/bin/felix.jar" \
+            FelixProbe
+    fi
 
     if [ -d "$APPS/wildfly-32.0.1.Final" ]; then
         run_oneshot wildfly "$TIMEOUT_S" \
@@ -584,10 +597,17 @@ run_smoke() {
             org.jboss.as.standalone --version
     fi
 
-    if [ -d "$APPS/keycloak-26.2.4" ]; then
+    # KC26 smoke: `quarkus-run.jar show-config` SEGVs ~4s into boot when
+    # stdout/stderr go to regular files (the picocli rendering path hits
+    # a non-TTY output stream bug we haven't tracked down). The probe
+    # reads `org.keycloak.common.Version.NAME / VERSION` directly, which
+    # exercises Keycloak's common-lib clinit chain without the picocli
+    # rendering path.
+    if [ -d "$APPS/keycloak-26.2.4" ] && [ -f "$APPS/kc26_probe/Keycloak26Probe.class" ]; then
+        local kc_cp="$APPS/kc26_probe;$APPS/keycloak-26.2.4/lib/lib/main/org.keycloak.keycloak-common-26.2.4.jar"
         run_oneshot kc26 "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            --jar "$APPS/keycloak-26.2.4/lib/quarkus-run.jar" -- show-config
+            -c "$kc_cp" Keycloak26Probe
     fi
 
     if [ -d "$APPS/batch4" ]; then
