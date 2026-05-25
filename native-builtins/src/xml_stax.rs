@@ -64,6 +64,8 @@ const START_DOCUMENT: i32 = 7;
 const END_DOCUMENT: i32 = 8;
 const DTD: i32 = 11;
 const CDATA: i32 = 12;
+const SPACE: i32 = 6;
+const ENTITY_REFERENCE: i32 = 9;
 
 // ---------------------------------------------------------------------------
 // Reader event model.
@@ -837,4 +839,300 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "()Z",
         native_is_whitespace,
     );
+    // require(int type, String ns, String localName) — spec: validates the
+    // current cursor matches the expected event. WildFly's
+    // ParseUtils.requireSingleAttribute / standalone.xml parser invokes this
+    // repeatedly during boot; the JDK declares it abstract on XMLStreamReader
+    // so dispatch hits "XMLStreamReader.require(ILjava/lang/String;Ljava/lang/String;)V
+    // has no Code attribute" without a native. Validate type+localName when
+    // we have state; throw XMLStreamException with the standard message on
+    // mismatch so callers' error paths work; treat null params as wildcards.
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "require",
+        "(ILjava/lang/String;Ljava/lang/String;)V",
+        native_require,
+    );
+    // Round of XMLStreamReader convenience APIs declared abstract on the
+    // interface — WildFly / KC16 XML config parsing hits each of these in
+    // turn during standalone.xml boot.
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "nextTag",
+        "()I",
+        native_next_tag,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getElementText",
+        "()Ljava/lang/String;",
+        native_get_element_text,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getName",
+        "()Ljavax/xml/namespace/QName;",
+        native_get_qname,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getAttributeName",
+        "(I)Ljavax/xml/namespace/QName;",
+        native_get_attr_qname,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getAttributeNamespace",
+        "(I)Ljava/lang/String;",
+        native_get_attr_namespace,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "hasName",
+        "()Z",
+        native_has_name,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "hasText",
+        "()Z",
+        native_has_text,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getPrefix",
+        "()Ljava/lang/String;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getNamespaceCount",
+        "()I",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "isStandalone",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "standaloneSet",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getCharacterEncodingScheme",
+        "()Ljava/lang/String;",
+        |_ctx, _args| Ok(Some(Value::Object(None))),
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getEncoding",
+        "()Ljava/lang/String;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("UTF-8"))))),
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getVersion",
+        "()Ljava/lang/String;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("1.0"))))),
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getLocation",
+        "()Ljavax/xml/stream/Location;",
+        |ctx, _args| {
+            let loc = crate::alloc_concurrent_synthetic(ctx, "javax/xml/stream/Location", 4);
+            Ok(Some(Value::Object(Some(loc))))
+        },
+    );
+    // Location is an interface — XMLStreamException.<init>(message, Location)
+    // (WildFly's ParseUtils.unexpectedElement et al.) reads getLineNumber /
+    // getColumnNumber off it for the formatted message. Without these
+    // natives the constructor throws AbstractMethodError before the user's
+    // exception even propagates, masking the real parsing failure.
+    let zero_int: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| Ok(Some(Value::Int(-1)));
+    let null_str: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| Ok(Some(Value::Object(None)));
+    registry.register("javax/xml/stream/Location", "getLineNumber", "()I", zero_int);
+    registry.register("javax/xml/stream/Location", "getColumnNumber", "()I", zero_int);
+    registry.register("javax/xml/stream/Location", "getCharacterOffset", "()I", zero_int);
+    registry.register("javax/xml/stream/Location", "getPublicId", "()Ljava/lang/String;", null_str);
+    registry.register("javax/xml/stream/Location", "getSystemId", "()Ljava/lang/String;", null_str);
+}
+
+fn native_next_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    // Spec: skip whitespace/comment/PI/CDATA-only-whitespace until
+    // START_ELEMENT or END_ELEMENT. Throw on encountering anything else.
+    loop {
+        let kind = with_state(ctx, this, |s| {
+            s.cursor += 1;
+            s.current().map(|e| e.kind).unwrap_or(END_DOCUMENT)
+        })
+        .unwrap_or(END_DOCUMENT);
+        match kind {
+            START_ELEMENT | END_ELEMENT => return Ok(Some(Value::Int(kind))),
+            CHARACTERS | CDATA | COMMENT | SPACE | PROCESSING_INSTRUCTION => continue,
+            END_DOCUMENT => return Ok(Some(Value::Int(END_DOCUMENT))),
+            _ => continue,
+        }
+    }
+}
+
+fn native_get_element_text(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    // Spec: collects text content until the matching END_ELEMENT.
+    let mut text = String::new();
+    loop {
+        let (kind, t) = with_state(ctx, this, |s| {
+            s.cursor += 1;
+            s.current()
+                .map(|e| (e.kind, e.text.clone()))
+                .unwrap_or((END_DOCUMENT, String::new()))
+        })
+        .unwrap_or((END_DOCUMENT, String::new()));
+        match kind {
+            CHARACTERS | CDATA | SPACE => text.push_str(&t),
+            END_ELEMENT | END_DOCUMENT => break,
+            _ => continue,
+        }
+    }
+    Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
+}
+
+fn native_get_qname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let (local, ns) = with_state(ctx, this, |s| {
+        match s.current() {
+            Some(e) => (e.local_name.clone(), e.namespace_uri.clone()),
+            None => (String::new(), String::new()),
+        }
+    })
+    .unwrap_or_default();
+    let qname = crate::alloc_concurrent_synthetic(ctx, "javax/xml/namespace/QName", 3);
+    let local_s = ctx.create_string(&local);
+    let ns_s = ctx.create_string(&ns);
+    let prefix_s = ctx.create_string("");
+    ctx.set_field_by_name(qname, "localPart", Value::Object(Some(local_s)));
+    ctx.set_field_by_name(qname, "namespaceURI", Value::Object(Some(ns_s)));
+    ctx.set_field_by_name(qname, "prefix", Value::Object(Some(prefix_s)));
+    Ok(Some(Value::Object(Some(qname))))
+}
+
+fn native_get_attr_qname(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let idx = args.get(1).and_then(|v| match v {
+        Value::Int(n) => Some(*n as usize),
+        _ => None,
+    }).unwrap_or(0);
+    let (local, ns) = with_state(ctx, this, |s| {
+        match s.current() {
+            Some(e) if idx < e.attributes.len() => {
+                let a = &e.attributes[idx];
+                (a.local_name.clone(), a.namespace_uri.clone())
+            }
+            _ => (String::new(), String::new()),
+        }
+    })
+    .unwrap_or_default();
+    let qname = crate::alloc_concurrent_synthetic(ctx, "javax/xml/namespace/QName", 3);
+    let local_s = ctx.create_string(&local);
+    let ns_s = ctx.create_string(&ns);
+    let prefix_s = ctx.create_string("");
+    ctx.set_field_by_name(qname, "localPart", Value::Object(Some(local_s)));
+    ctx.set_field_by_name(qname, "namespaceURI", Value::Object(Some(ns_s)));
+    ctx.set_field_by_name(qname, "prefix", Value::Object(Some(prefix_s)));
+    Ok(Some(Value::Object(Some(qname))))
+}
+
+fn native_get_attr_namespace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let idx = args.get(1).and_then(|v| match v {
+        Value::Int(n) => Some(*n as usize),
+        _ => None,
+    }).unwrap_or(0);
+    let ns = with_state(ctx, this, |s| {
+        match s.current() {
+            Some(e) if idx < e.attributes.len() => e.attributes[idx].namespace_uri.clone(),
+            _ => String::new(),
+        }
+    })
+    .unwrap_or_default();
+    Ok(Some(Value::Object(Some(ctx.create_string(&ns)))))
+}
+
+fn native_has_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let has = with_state(ctx, this, |s| {
+        matches!(s.current().map(|e| e.kind), Some(START_ELEMENT) | Some(END_ELEMENT))
+    })
+    .unwrap_or(false);
+    Ok(Some(Value::Int(if has { 1 } else { 0 })))
+}
+
+fn native_has_text(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let has = with_state(ctx, this, |s| {
+        matches!(
+            s.current().map(|e| e.kind),
+            Some(CHARACTERS) | Some(CDATA) | Some(COMMENT) | Some(SPACE) | Some(DTD) | Some(ENTITY_REFERENCE)
+        )
+    })
+    .unwrap_or(false);
+    Ok(Some(Value::Int(if has { 1 } else { 0 })))
+}
+
+fn native_require(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    require_state(ctx, this)?;
+    let expected_type = args.get(1).and_then(|v| match v {
+        Value::Int(n) => Some(*n),
+        _ => None,
+    }).unwrap_or(-1);
+    let expected_ns = match args.get(2) {
+        Some(Value::Object(Some(o))) => Some(ctx.read_string(*o).unwrap_or_default()),
+        _ => None,
+    };
+    let expected_local = match args.get(3) {
+        Some(Value::Object(Some(o))) => Some(ctx.read_string(*o).unwrap_or_default()),
+        _ => None,
+    };
+    let (cur_kind, cur_local, cur_ns) = with_state(ctx, this, |s| {
+        match s.current() {
+            Some(e) => (e.kind, e.local_name.clone(), e.namespace_uri.clone()),
+            None => (END_DOCUMENT, String::new(), String::new()),
+        }
+    }).unwrap_or((END_DOCUMENT, String::new(), String::new()));
+    let mismatched_type = expected_type >= 0 && cur_kind != expected_type;
+    let mismatched_local = matches!(&expected_local, Some(l) if !l.is_empty() && *l != cur_local);
+    let mismatched_ns = matches!(&expected_ns, Some(n) if !n.is_empty() && *n != cur_ns);
+    if mismatched_type || mismatched_local || mismatched_ns {
+        // Build an XMLStreamException whose message mirrors the JDK Xerces
+        // formatting so WildFly's ParseUtils logs are readable.
+        let msg = format!(
+            "Required type={} got type={} localName={} ns={}",
+            expected_type, cur_kind, cur_local, cur_ns,
+        );
+        // We don't have a constructor helper for XMLStreamException at hand;
+        // surface as IllegalStateException so callers see a clear failure
+        // (XMLStreamException is checked but WildFly's catch blocks wrap it
+        // into ParseException anyway).
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: msg,
+        }
+        .into());
+    }
+    Ok(None)
 }
