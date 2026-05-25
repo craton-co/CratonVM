@@ -9428,8 +9428,21 @@ pub(crate) fn native_class_get_constant_pool(
 
 /// `java/lang/Class.getDeclaredClasses0()[Ljava/lang/Class;`
 ///
-/// Returns an array of Class objects for all classes and interfaces that are
-/// declared as members of this class. Uses the InnerClasses attribute.
+/// Returns an array of Class mirrors for the immediate member classes /
+/// interfaces declared inside this class (JLS §8.5). Walks this class's
+/// `InnerClasses` attribute (JVMS §4.7.6) and selects entries whose
+/// `outer_class_info` matches this class AND whose `inner_name` is non-empty
+/// — the empty-`inner_name` case denotes an anonymous class, which `Class.
+/// getDeclaredClasses` MUST exclude (HotSpot's `getDeclaredClasses0` checks
+/// the same predicate).
+///
+/// Each surviving entry is then *resolved* through `load_class` so the inner
+/// class actually has a `ClassId` (and therefore a mirror) — without this,
+/// calling `getDeclaredClasses()` on a class whose members haven't been
+/// referenced yet would always return an empty array, because
+/// `class_id_by_name` only finds already-loaded classes. Unresolvable entries
+/// are silently dropped (matches HotSpot, which suppresses class-loader
+/// failures here rather than surfacing them at reflection time).
 pub(crate) fn native_class_get_declared_classes(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -9446,13 +9459,35 @@ pub(crate) fn native_class_get_declared_classes(
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
     let inner_classes = ctx.inner_classes(class_id);
 
-    // Collect inner classes where outer_class == this class
+    // Collect inner classes where outer_class == this class AND inner_name is
+    // non-empty (anonymous classes have inner_name_index == 0, which the
+    // parser surfaces as an empty string).
     let mut declared: Vec<ObjectRef> = Vec::new();
-    for (inner_class, outer_class, _inner_name, _flags) in &inner_classes {
-        if outer_class == &class_name && inner_class != &class_name {
-            if let Some(inner_id) = ctx.class_id_by_name(inner_class) {
-                declared.push(ctx.get_class_mirror(inner_id));
-            }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (inner_class, outer_class, inner_name, _flags) in &inner_classes {
+        if outer_class != &class_name || inner_class == &class_name {
+            continue;
+        }
+        if inner_name.is_empty() {
+            // Anonymous (and most local) classes — JLS-defined exclusion.
+            continue;
+        }
+        if !seen.insert(inner_class.clone()) {
+            continue;
+        }
+        // Resolve the inner class. Prefer the already-loaded id; otherwise
+        // ask the VM to load it (without initializing — `load_class` calls
+        // `load_class_concurrent`, which stops before <clinit>). Failures are
+        // dropped, matching HotSpot's behaviour for missing inner classes.
+        let inner_id = match ctx.class_id_by_name(inner_class) {
+            Some(id) => Some(id),
+            None => match ctx.load_class(inner_class) {
+                Ok(_) => ctx.class_id_by_name(inner_class),
+                Err(_) => None,
+            },
+        };
+        if let Some(inner_id) = inner_id {
+            declared.push(ctx.get_class_mirror(inner_id));
         }
     }
 
