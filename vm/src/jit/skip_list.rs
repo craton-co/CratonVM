@@ -943,6 +943,54 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
+
+        // PIC.1 (Session 118, 2026-05-25) — provisional blanket ban for the
+        // shadowed picocli copy that JUnit Platform ships in its console
+        // standalone jar. `junit-platform-console-standalone-1.10.2.jar
+        // -- --help` SEGFAULTs (rc=139) right after the BigInteger
+        // post-clinit fixup line and before any picocli help-banner output.
+        // `CRATONVM_DBG_JIT_ENTRY=1` shows the last methods JIT-entered before
+        // the crash are
+        // `org/junit/platform/console/shadow/picocli/CommandLine$Model$OptionSpec.equals`,
+        // `CommandLine$Assert.equals`, `CommandLine$Model$ArgSpec.equalsImpl`,
+        // and `CommandLine$Model$CaseAwareLinkedMap.entrySet/values`. With
+        // `CRATONVM_JIT_BISECT_ONLY=java/,sun/` (i.e. picocli not JIT-eligible)
+        // the SEGFAULT vanishes and the run progresses to a clean
+        // `BreakIteratorProviderImpl.getBreakInstance` NPE — a separate
+        // downstream JDK-locale gap, not a JIT issue. Classic
+        // JIT-miscompile signature.
+        //
+        // `OptionSpec.equals` is the canonical allocate-then-putfield
+        // archetype that bites W2-CHM / RBC.1 / SPB.*. The hot path:
+        //   - call `ArgSpec.equalsImpl` (a comparator chain of getfields),
+        //   - allocate two fresh `java.util.HashSet`s wrapping `Arrays.asList`
+        //     over the `names:[Ljava/lang/String;` field of each side,
+        //   - call `HashSet.equals` to compare the two name sets.
+        // Each `new HashSet(Collection)` ctor stores `table`/`size`/
+        // `loadFactor` slots immediately after allocation; `Arrays.asList`
+        // wraps the array via putfield into a fresh `Arrays$ArrayList`. The
+        // bisect also showed `CommandLine$Assert.equals` (a static
+        // `Object.equals(Object,Object)` helper with two null checks)
+        // appearing on the crash path when allowed alone — picocli's
+        // dispatch into the JIT-compiled `Assert.equals` PIC slot was
+        // already documented as a Keycloak-26 SEGFAULT site (see
+        // `x64.rs:3800` and the SPB.* cascade).
+        //
+        // Coarse-grained safety net so JUnit Platform's `--help` reaches at
+        // least the same point the interpreter does. Lifted by
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/junit/platform/console/shadow/picocli/`.
+        // The unshaded picocli copy (`info/picocli/`) is rare in this
+        // project and intentionally left JIT-eligible. Track for a real
+        // fix once the underlying allocate-then-putfield / PIC dispatch
+        // miscompile is root-caused.
+        if class_name.starts_with("org/junit/platform/console/shadow/picocli/")
+            && !package_allowed(
+                "org/junit/platform/console/shadow/picocli/",
+                allow_packages,
+            )
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
     }
 
     None

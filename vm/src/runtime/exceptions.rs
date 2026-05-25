@@ -213,6 +213,29 @@ pub fn throw_runtime_error(
     // when the CLI uncaught-exception renderer later prints zero frames.
     // The env-var read is a single cached atomic load, so the no-debug
     // path is free; it is intentionally NOT gated behind `tracing::enabled!`.
+    if std::env::var_os("CRATONVM_DBG_AIOOBE").is_some() {
+        if let RuntimeError::ArrayIndexOutOfBoundsException { index } = &error {
+            eprintln!(
+                "[AIOOBE-THROW] index={index} — full live Java thread stack ({} frames, deepest first):",
+                thread.frames.len()
+            );
+            for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
+                let cn = shared
+                    .class_manager
+                    .read()
+                    .get_class(f.class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                eprintln!(
+                    "[AIOOBE-STK {i}] {}.{}{} pc={}",
+                    cn,
+                    f.method_name(),
+                    f.method_descriptor(),
+                    f.pc
+                );
+            }
+        }
+    }
     if crate::runtime::env_cache::charset_dbg() {
         if let RuntimeError::NullPointerException { message: Some(m) } = &error {
             if m == "charset" {

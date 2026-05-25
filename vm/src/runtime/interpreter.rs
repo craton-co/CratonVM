@@ -5398,6 +5398,13 @@ fn execute_instruction(
                 .heap
                 .get_array_element(array_ref, index as usize) // Widening: index conversion
                 .map_err(|i| {
+                    if std::env::var("CRATONVM_DBG_AIOOBE").is_ok() {
+                        let cls = thread.frames[frame_idx].class_name().to_string();
+                        let mth = thread.frames[frame_idx].method_name().to_string();
+                        let pc = thread.frames[frame_idx].pc;
+                        let alen = shared.heap.array_length(array_ref);
+                        eprintln!("AIOOBE-LOAD class={cls} method={mth} pc={pc} idx={i} len={alen}");
+                    }
                     RuntimeError::ArrayIndexOutOfBoundsException { index: i }
                 })?;
             thread.frames[frame_idx].stack.push(value)?;
@@ -5456,6 +5463,10 @@ fn execute_instruction(
                 .heap
                 .set_array_element(array_ref, index as usize, value) // Widening: index conversion
                 .map_err(|i| {
+                    if std::env::var("CRATONVM_DBG_AIOOBE").is_ok() {
+                        let alen = shared.heap.array_length(array_ref);
+                        eprintln!("AIOOBE-AASTORE class={_diag_class} method={_diag_method} pc={_diag_pc} idx={i} len={alen}");
+                    }
                     RuntimeError::ArrayIndexOutOfBoundsException { index: i }
                 })?;
             // write_barrier fires automatically inside set_array_element
@@ -5474,7 +5485,13 @@ fn execute_instruction(
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, value) // Widening: index conversion
-                .map_err(|i| RuntimeError::ArrayIndexOutOfBoundsException { index: i })?;
+                .map_err(|i| {
+                    if std::env::var("CRATONVM_DBG_AIOOBE").is_ok() {
+                        let alen = shared.heap.array_length(array_ref);
+                        eprintln!("AIOOBE-XASTORE class={_diag_class} method={_diag_method} pc={_diag_pc} idx={i} len={alen}");
+                    }
+                    RuntimeError::ArrayIndexOutOfBoundsException { index: i }
+                })?;
         }
         // WP4.3 fix: long[] / double[] store must use typed pop so that the
         // CompactValue type-erasure (raw long bits decoding as Value::Double via
@@ -6269,6 +6286,23 @@ fn execute_instruction(
                 ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
+            if std::env::var("CRATON_HASHTABLEOFINT_TRACE").is_ok() {
+                let cname = thread.frames[frame_idx].class_name();
+                let mname = thread.frames[frame_idx].method_name();
+                if cname.contains("HashtableOfInt") {
+                    let v = shared.heap.get_field(obj_ref, field.field_index);
+                    let nf = shared.class_manager.read().get_class(field.declaring_class_id)
+                        .map(|c| c.num_total_fields).unwrap_or(0);
+                    eprintln!(
+                        "[HTI-GET] {cname}.{mname} cp#{idx} fld={field_name:?} declaring={decl:?} field_index={fi} is_ref={ir} num_total_fields={nf} obj_ptr={op:p} value={v:?}",
+                        idx = *index,
+                        decl = field.declaring_class_id,
+                        fi = field.field_index,
+                        ir = field.is_reference,
+                        op = obj_ref.as_ptr(),
+                    );
+                }
+            }
             if crate::runtime::env_cache::bd_debug() {
                 let mname = thread.frames[frame_idx].method_name().to_string();
                 let cname = thread.frames[frame_idx].class_name().to_string();
@@ -6481,6 +6515,24 @@ fn execute_instruction(
                 ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
+            if std::env::var("CRATON_HASHTABLEOFINT_TRACE").is_ok() {
+                let cname = thread.frames[frame_idx].class_name();
+                let mname = thread.frames[frame_idx].method_name();
+                if cname.contains("HashtableOfInt") {
+                    let nf = shared.class_manager.read().get_class(field.declaring_class_id)
+                        .map(|c| c.num_total_fields).unwrap_or(0);
+                    eprintln!(
+                        "[HTI-PUT] {cname}.{mname} cp#{idx} fld={fn2:?} declaring={decl:?} field_index={fi} is_ref={ir} num_total_fields={nf} obj_ptr={op:p} value={v:?}",
+                        idx = *index,
+                        fn2 = field_name,
+                        decl = field.declaring_class_id,
+                        fi = field.field_index,
+                        ir = field.is_reference,
+                        op = obj_ref.as_ptr(),
+                        v = value,
+                    );
+                }
+            }
             // T17.Δ.4 — JVMTI FieldModification watchpoint.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);
@@ -6725,8 +6777,12 @@ fn execute_instruction(
             }
             sizes.reverse();
 
-            // Resolve the leaf element type from the array class descriptor
-            let leaf_et = {
+            // Resolve the leaf element type AND total array depth from the
+            // array class descriptor. The `dimensions` operand may be less
+            // than the total `[` count, in which case the unspecified inner
+            // dimensions stay null and the deepest *allocated* array must
+            // hold references (not the leaf type) — see `alloc_multi_array`.
+            let (leaf_et, total_array_depth) = {
                 let current_class_id = thread.frames[frame_idx].class_id;
                 let cm = shared.class_manager.read();
                 let class = cm
@@ -6740,9 +6796,15 @@ fn execute_instruction(
                             message: format!("invalid class ref at cp#{index}"),
                         }
                     })?;
-                // Strip leading '[' to find the leaf type descriptor
-                let leaf = array_class_name.trim_start_matches('[');
-                match leaf.as_bytes().first() {
+                // Strip leading '[' to find the leaf type descriptor; the
+                // count of stripped `[`s is the total array depth.
+                let total_depth = array_class_name
+                    .as_bytes()
+                    .iter()
+                    .take_while(|&&b| b == b'[')
+                    .count();
+                let leaf = &array_class_name.as_bytes()[total_depth..];
+                let et = match leaf.first() {
                     Some(b'I') => ArrayElementType::Int,
                     Some(b'J') => ArrayElementType::Long,
                     Some(b'F') => ArrayElementType::Float,
@@ -6752,10 +6814,11 @@ fn execute_instruction(
                     Some(b'S') => ArrayElementType::Short,
                     Some(b'Z') => ArrayElementType::Boolean,
                     _ => ArrayElementType::Reference,
-                }
+                };
+                (et, total_depth)
             };
 
-            let arr = alloc_multi_array(shared, &sizes, 0, leaf_et)?;
+            let arr = alloc_multi_array(shared, &sizes, 0, leaf_et, total_array_depth)?;
             thread.frames[frame_idx]
                 .stack
                 .push(Value::Object(Some(arr)))?;
@@ -11934,6 +11997,38 @@ fn try_osr(
             }
         }
 
+        // Resolve instance fields for getfield/putfield. Without this, the
+        // OSR-compiled method had no `field_info` and every getfield/putfield
+        // fell back to the `(pc, 0, b'I')` default in `compile_op_getfield` /
+        // `compile_op_putfield` — silently routing every instance-field write
+        // through `jit_putfield_int` into slot 0 with the wrong type tag.
+        // Manifested in `org/eclipse/jdt/internal/compiler/util/HashtableOfInt`
+        // (Eclipse JDT BatchCompiler boot): the OSR-compiled `rehash()`
+        // stored the new `int[]` into `keyTable`'s slot tagged as
+        // `Value::Int(low32_of_ptr)`, and the next `put()` then read back the
+        // bogus tag and crashed at `arraylength` with
+        //   `expected object reference, got int(N)`.
+        // Mirrors the field_info collection in the first-call JIT compile
+        // path (this file, ~line 1915) and `resolve_inline_site` (~line 13367).
+        let mut field_info: Vec<(usize, usize, u8)> = Vec::new();
+        if !scan.field_ops.is_empty() {
+            for &(pc, cp_idx) in &scan.field_ops {
+                let field = resolve_field_ref(shared, class_id, cp_idx).ok()?;
+                let cm_lock = shared.class_manager.read();
+                let class = cm_lock.get_class(class_id)?;
+                let nat_idx = match class.constant_pool.get(cp_idx) {
+                    Some(ConstantPoolEntry::FieldReference {
+                        name_and_type_index,
+                        ..
+                    }) => *name_and_type_index,
+                    _ => return None,
+                };
+                let (_, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
+                let type_tag = *descriptor.as_bytes().first()?;
+                field_info.push((pc, field.field_index, type_tag));
+            }
+        }
+
         // Resolve invokes — collect info under lock, then compile callees after release
         let mut invoke_info: Vec<(usize, *const crate::jit::JitInvokeInfo)> = Vec::new();
         let mut owned_jit_invoke_infos2: Vec<Box<crate::jit::JitInvokeInfo>> = Vec::new();
@@ -12181,7 +12276,7 @@ fn try_osr(
             thread.frames[frame_idx].max_locals as usize, // Widening: u16 to usize
             scan.needs_heap,
             mna_info,
-            Vec::new(),
+            field_info,
             typecheck_info,
             static_field_info,
             new_info2,
@@ -13734,6 +13829,24 @@ fn execute_jit_call(
     if result == i64::MIN {
         // Check for pending AIOOBE from JIT bounds check
         if let Some((index, _length)) = crate::jit::helpers::take_jit_pending_aioobe() {
+            if std::env::var_os("CRATONVM_DBG_AIOOBE").is_some() {
+                eprintln!("[AIOOBE-JIT] idx={index} len={_length} — JIT-compiled bounds check failed");
+                for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
+                    let cn = shared
+                        .class_manager
+                        .read()
+                        .get_class(f.class_id)
+                        .map(|c| c.name.to_string())
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[AIOOBE-JIT-STK {i}] {}.{}{} pc={}",
+                        cn,
+                        f.method_name(),
+                        f.method_descriptor(),
+                        f.pc
+                    );
+                }
+            }
             return Err(MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::ArrayIndexOutOfBoundsException {
                     index: index as i32, // Cast: bounds-check index
@@ -14256,6 +14369,24 @@ fn execute_invokevirtual_cached(
         Some(t) => t.clone(),
         None => return Ok(CachedCallResult::CacheMiss),
     };
+    // [PB-DIAG] one-shot dump for InfoCmp.getInfoCmp at pc 38
+    if std::env::var_os("CRATONVM_DBG_PBSTART").is_some() {
+        let cn = thread.frames[frame_idx].class_name();
+        let mn = thread.frames[frame_idx].method_name();
+        if cn.ends_with("/InfoCmp") && mn == "getInfoCmp" && site_pc == 38 {
+            let tname = match &target {
+                CachedInvokeTarget::VirtualBytecode { receiver_class_id, cached, .. } =>
+                    format!("VirtualBytecode rc={} class={} {}{}", receiver_class_id.as_u32(), cached.class_name, cached.method_name, cached.method_descriptor),
+                CachedInvokeTarget::VirtualNative { receiver_class_id, .. } =>
+                    format!("VirtualNative rc={}", receiver_class_id.as_u32()),
+                CachedInvokeTarget::Native { .. } => "Native".to_string(),
+                CachedInvokeTarget::Intrinsic { .. } => "Intrinsic".to_string(),
+                CachedInvokeTarget::Bytecode { cached, .. } => format!("Bytecode class={} {}{}", cached.class_name, cached.method_name, cached.method_descriptor),
+                _ => format!("{:?}", target),
+            };
+            eprintln!("[PB-DIAG-INVOKE] caller={}.{} pc={} cp_idx={} is_special={} target={}", cn, mn, site_pc, cp_index, is_special, tname);
+        }
+    }
 
     match target {
         CachedInvokeTarget::VirtualBytecode {
@@ -15485,6 +15616,7 @@ fn alloc_multi_array(
     sizes: &[usize],
     depth: usize,
     leaf_et: ArrayElementType,
+    total_array_depth: usize,
 ) -> Result<ObjectRef, MethodCallFailed> {
     if depth >= MAX_MULTI_ARRAY_DEPTH {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
@@ -15500,8 +15632,25 @@ fn alloc_multi_array(
     let length = sizes[depth];
 
     if depth == sizes.len() - 1 {
-        // Innermost dimension: use the leaf element type (Int, Byte, etc.)
-        let arr = shared.heap.try_alloc_array(ClassId::new(0), leaf_et, length)
+        // Innermost SPECIFIED dimension. Per JVM spec for multianewarray, the
+        // array type descriptor can have more leading `[` than the `dimensions`
+        // operand; unspecified inner dimensions are left null/uninitialized.
+        // So the last-allocated array's element type is the descriptor's leaf
+        // type ONLY when `sizes.len() == total_array_depth`. Otherwise the
+        // element type must be Reference (each slot would hold an array-of-
+        // arrays-of-...-of-leaf that we are NOT instantiating here).
+        //
+        // Example: `multianewarray [[[[C, 3` (descriptor depth=4, sizes.len()=3)
+        // → outer Ref[N], mid Ref[N], inner Ref[N] (null slots). Using `Char`
+        // here would build a `char[N]` leaf and crash on the subsequent
+        // `aaload`/`aastore` that walks the unallocated 4th dim
+        // (e.g. Eclipse ecj `CharDeduplication.charArray_length`).
+        let element_type = if sizes.len() == total_array_depth {
+            leaf_et
+        } else {
+            ArrayElementType::Reference
+        };
+        let arr = shared.heap.try_alloc_array(ClassId::new(0), element_type, length)
             .ok_or_else(|| MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::OutOfMemoryError {
                     message: format!("Java heap space (multianewarray leaf dim, length={})", length),
@@ -15519,7 +15668,8 @@ fn alloc_multi_array(
                 },
             )))?;
         for i in 0..length {
-            let sub_array = alloc_multi_array(shared, sizes, depth + 1, leaf_et)?;
+            let sub_array =
+                alloc_multi_array(shared, sizes, depth + 1, leaf_et, total_array_depth)?;
             shared
                 .heap
                 .set_array_element(arr, i, Value::Object(Some(sub_array)))
@@ -15804,7 +15954,7 @@ mod tests {
         let vm = Vm::new(config);
 
         let sizes = vec![3, 4];
-        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference).unwrap();
+        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference, sizes.len()).unwrap();
 
         assert_eq!(vm.shared.heap.array_length(outer), 3);
 
@@ -15828,7 +15978,7 @@ mod tests {
         let vm = Vm::new(config);
 
         let sizes = vec![0, 5];
-        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference).unwrap();
+        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference, sizes.len()).unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 0);
     }
 
@@ -15841,7 +15991,7 @@ mod tests {
         let vm = Vm::new(config);
 
         let sizes = vec![7];
-        let arr = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference).unwrap();
+        let arr = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference, sizes.len()).unwrap();
         assert_eq!(vm.shared.heap.array_length(arr), 7);
     }
 
@@ -15854,7 +16004,7 @@ mod tests {
         let vm = Vm::new(config);
 
         let sizes = vec![2, 3, 4];
-        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference).unwrap();
+        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference, sizes.len()).unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 2);
 
         let mid_val = vm.shared.heap.get_array_element(outer, 0).unwrap();
@@ -16247,7 +16397,7 @@ mod tests {
 
         // 2D array with int leaves: int[3][4]
         let sizes = vec![3, 4];
-        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Int).unwrap();
+        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Int, sizes.len()).unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 3);
 
         let inner_val = vm.shared.heap.get_array_element(outer, 0).unwrap();
@@ -16272,7 +16422,7 @@ mod tests {
 
         // 4D: [2][2][2][2]
         let sizes = vec![2, 2, 2, 2];
-        let d0 = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference).unwrap();
+        let d0 = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference, sizes.len()).unwrap();
         assert_eq!(vm.shared.heap.array_length(d0), 2);
 
         // Walk down to depth 3
@@ -16299,6 +16449,47 @@ mod tests {
     }
 
     #[test]
+    fn alloc_multi_array_partial_dims_leaves_inner_as_references() {
+        // Regression: Eclipse ecj CharDeduplication does
+        //   new char[5][30][6][];   //  multianewarray [[[[C, 3
+        // The descriptor `[[[[C` has 4 array dims but only 3 are specified.
+        // The deepest allocated array must be Reference[N] (null slots, to be
+        // filled in later by user code with char[]), NOT char[N]. Without this
+        // fix the subsequent `init()` walked the array with aaload/aastore and
+        // crashed with AIOOBE because each "slot" was 2-byte char storage and
+        // bounds were wrong.
+        use crate::config::VmConfig;
+        use crate::vm::Vm;
+
+        let config = VmConfig::new();
+        let vm = Vm::new(config);
+
+        // sizes.len()=3, total_array_depth=4, leaf_et=Char
+        let sizes = vec![5, 30, 6];
+        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Char, 4).unwrap();
+        assert_eq!(vm.shared.heap.array_length(outer), 5);
+
+        // Walk to the inner (3rd) dim and verify it's a reference array of
+        // length 6, not a char array.
+        let mid = match vm.shared.heap.get_array_element(outer, 0).unwrap() {
+            Value::Object(Some(r)) => r,
+            other => panic!("expected mid array, got {other:?}"),
+        };
+        assert_eq!(vm.shared.heap.array_length(mid), 30);
+        let inner = match vm.shared.heap.get_array_element(mid, 0).unwrap() {
+            Value::Object(Some(r)) => r,
+            other => panic!("expected inner array, got {other:?}"),
+        };
+        assert_eq!(vm.shared.heap.array_length(inner), 6);
+
+        // The element type of the inner array must be Reference (so the user
+        // can store char[] references into it via aastore). All slots start
+        // as null Object refs.
+        let slot = vm.shared.heap.get_array_element(inner, 5).unwrap();
+        assert!(matches!(slot, Value::Object(None)), "inner slot must be null Object, got {slot:?}");
+    }
+
+    #[test]
     fn alloc_multi_array_single_element() {
         use crate::config::VmConfig;
         use crate::vm::Vm;
@@ -16308,7 +16499,7 @@ mod tests {
 
         // [1][1] — minimal non-zero multi-array
         let sizes = vec![1, 1];
-        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference).unwrap();
+        let outer = alloc_multi_array(&vm.shared, &sizes, 0, ArrayElementType::Reference, sizes.len()).unwrap();
         assert_eq!(vm.shared.heap.array_length(outer), 1);
 
         let inner_val = vm.shared.heap.get_array_element(outer, 0).unwrap();

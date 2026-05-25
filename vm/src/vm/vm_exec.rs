@@ -1349,20 +1349,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .thread
                 .frames
                 .last()
-                .map(|f| format!("{}.{}{}", f.class_name(), f.method_name(), f.method_descriptor()))
+                .map(|f| format!("{}.{}{} pc={}", f.class_name(), f.method_name(), f.method_descriptor(), f.pc))
                 .unwrap_or_else(|| "<no-frame>".to_string());
             eprintln!(
-                "[ARRAY-LEN-GUARD] non-array object class={} kind={:?} caller={}",
-                class_name, kind, top
+                "[ARRAY-LEN-GUARD] non-array object class={} kind={:?} caller={} obj={:?}",
+                class_name, kind, top, obj
             );
             for (i, f) in self.thread.frames.iter().enumerate().rev().take(8) {
                 eprintln!(
-                    "[ARRAY-LEN-GUARD]   stack[{i}] {}.{}{}",
+                    "[ARRAY-LEN-GUARD]   stack[{i}] {}.{}{} pc={}",
                     f.class_name(),
                     f.method_name(),
-                    f.method_descriptor()
+                    f.method_descriptor(),
+                    f.pc,
                 );
             }
+            // Print Rust backtrace to identify the source native.
+            let bt = std::backtrace::Backtrace::force_capture();
+            eprintln!("[ARRAY-LEN-GUARD] rust-bt:\n{}", bt);
             return 0;
         }
         self.shared.heap.array_length(obj)

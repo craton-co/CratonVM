@@ -1393,6 +1393,7 @@ pub(crate) fn native_pb_command(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    eprintln!("[PB-START-OLD] called! args.len={}", args.len());
     // SECURITY: this is the "simplified" ProcessBuilder.start stub that
     // never actually spawns — it returns a dummy Process with exit_code=0.
     // The real spawning path is `phases_late::register_phase57_process`,

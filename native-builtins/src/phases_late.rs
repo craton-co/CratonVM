@@ -5028,6 +5028,35 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // FileSystemProvider.newOutputStream — JDK's default impl at
+    // `FileSystemProvider.java:426` calls `newByteChannel(path, opts)` which
+    // our minimal `newByteChannel` registration handles as READ-ONLY via
+    // `std::fs::read(&p)`. For a NEW file (the whole point of an output
+    // stream) `std::fs::read` ENOENTs, the channel allocation fails, and the
+    // caller sees `IOException: file not found`. This breaks any code that
+    // uses `Files.newOutputStream` / `Files.write(Path, byte[])` to *create*
+    // a file — most prominently Felix's `BundleArchive.writeBundleInfo`,
+    // which is invoked once per installed bundle. Without it the entire
+    // Felix auto-deploy directory fails to install (every `installBundle`
+    // throws `BundleException: Unable to cache bundle`), no Gogo shell
+    // bundles activate, no shell-reader thread spawns, and `felix.jar` hangs
+    // forever in `Felix.waitForStop(0)` because nothing ever calls
+    // `framework.stop()`.
+    //
+    // The fix: register `newOutputStream` directly so we never fall through
+    // to the JDK default. We open the path for writing through `fd_table`
+    // (honouring APPEND/CREATE/etc. via `open_options_*` helpers below) and
+    // hand back a real `java.io.FileOutputStream` instance with the fd
+    // wired onto its `FileDescriptor` — that way every downstream
+    // `write`/`flush`/`close` native (already registered against
+    // `java/io/FileOutputStream`) just works without any new shim type.
+    r.register(
+        fsp,
+        "newOutputStream",
+        "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/io/OutputStream;",
+        |ctx, args| fsp_new_output_stream(ctx, args),
+    );
+
     r.register(
         fsp,
         "checkAccess",
@@ -6289,6 +6318,118 @@ fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     obj
 }
 
+/// Inspect a `Set<OpenOption>` or `OpenOption[]` for APPEND/CREATE-NEW.
+///
+/// `Files.newOutputStream(path, opts...)` packages varargs as an OpenOption[]
+/// before dispatching to the provider; the provider's default impl converts
+/// the array to a `HashSet<OpenOption>` and then forwards to `newByteChannel`.
+/// We need to honour APPEND (open-for-append vs truncate-on-open) and
+/// CREATE_NEW (fail-if-exists, per spec) regardless of which container the
+/// caller passes us. CREATE/WRITE are implied for an output stream and need
+/// no flag.
+fn fsp_scan_open_options(
+    ctx: &mut dyn NativeContext,
+    container: Option<Value>,
+) -> (bool /*append*/, bool /*create_new*/) {
+    let (mut append, mut create_new) = (false, false);
+    let obj = match container {
+        Some(Value::Object(Some(o))) => o,
+        _ => return (append, create_new),
+    };
+    // Try as array first: array_length returns 0 for non-array objects.
+    let arr_len = ctx.array_length(obj);
+    if arr_len > 0 {
+        for i in 0..arr_len {
+            let opt = match ctx.get_array_element(obj, i) {
+                Value::Object(Some(o)) => o,
+                _ => continue,
+            };
+            // Enum.name() lives in instance field 0 on synthetic enums.
+            let mut name: Option<String> = None;
+            if let Value::Object(Some(ns)) = ctx.get_field(opt, 0) {
+                name = ctx.read_string(ns);
+            }
+            // Fallback: invoke toString() on the option.
+            if name.is_none() {
+                if let Ok(Some(Value::Object(Some(s)))) =
+                    ctx.invoke_virtual(opt, "toString", "()Ljava/lang/String;", &[])
+                {
+                    name = ctx.read_string(s);
+                }
+            }
+            if let Some(n) = name {
+                if n.eq_ignore_ascii_case("APPEND") {
+                    append = true;
+                }
+                if n.eq_ignore_ascii_case("CREATE_NEW") {
+                    create_new = true;
+                }
+            }
+        }
+        return (append, create_new);
+    }
+    // Set: rely on toString() — `HashSet.toString()` yields `[APPEND, WRITE]`
+    // etc. Substring match is robust enough and avoids invoking iterator().
+    if let Ok(Some(Value::Object(Some(s)))) =
+        ctx.invoke_virtual(obj, "toString", "()Ljava/lang/String;", &[])
+    {
+        if let Some(n) = ctx.read_string(s) {
+            if n.to_ascii_uppercase().contains("APPEND") {
+                append = true;
+            }
+            if n.to_ascii_uppercase().contains("CREATE_NEW") {
+                create_new = true;
+            }
+        }
+    }
+    (append, create_new)
+}
+
+/// FileSystemProvider.newOutputStream — opens `path` for writing via
+/// `fd_table` and returns a `java.io.FileOutputStream` whose `FileDescriptor`
+/// carries the fd. See the registration site (above, near `fsp` block) for
+/// the rationale; this helper does the actual work and is split out so the
+/// closure stays tight enough for the registry macro.
+fn fsp_new_output_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let path_obj = obj_arg(args, 1)?;
+    let p = p57_read_path(ctx, path_obj);
+    if p.is_empty() {
+        return Err(RuntimeError::IOException {
+            message: "newOutputStream: null path".to_string(),
+        }
+        .into());
+    }
+    let (append, create_new) = fsp_scan_open_options(ctx, args.get(2).copied());
+    if create_new && std::path::Path::new(&p).exists() {
+        // CREATE_NEW + existing file ⇒ FileAlreadyExistsException
+        let exc = alloc_concurrent_synthetic(ctx, "java/nio/file/FileAlreadyExistsException", 4);
+        let file_str = ctx.create_string(&p);
+        ctx.set_field_by_name(exc, "file", Value::Object(Some(file_str)));
+        return Err(MethodCallFailed::ExceptionThrown(exc));
+    }
+    let fd = ctx
+        .fd_table()
+        .open_write(&p, append)
+        .map_err(|e| RuntimeError::IOException {
+            message: format!("newOutputStream({}): {}", p, e),
+        })?;
+    // Allocate a real FileOutputStream and wire the fd onto its
+    // FileDescriptor — the existing FOS native overrides (write/flush/close,
+    // registered in native-io::lib.rs) recover the fd via the same
+    // `fd`/`handle` fields on the FileDescriptor object.
+    let fos = alloc_concurrent_synthetic(ctx, "java/io/FileOutputStream", 4);
+    let fd_obj = alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 4);
+    ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
+    ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
+    ctx.set_field_by_name(fos, "fd", Value::Object(Some(fd_obj)));
+    // Belt-and-braces for legacy callers that read instance slot 0 directly.
+    ctx.set_field(fos, 0, Value::Object(Some(fd_obj)));
+    Ok(Some(Value::Object(Some(fos))))
+}
+
 /// Build a *typed* `java.nio.file.NoSuchFileException` for `path` and return it
 /// wrapped as a thrown Java exception.
 ///
@@ -6636,6 +6777,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
     // ProcessBuilder.start() — real process execution via std::process::Command
     r.register(pb, "start", "()Ljava/lang/Process;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        eprintln!("[PB-START-ENTRY] this={:?}", this);
 
         // --- Extract command strings from the `command` field ---
         // Three cases are possible:
@@ -6705,11 +6847,22 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
                     }
                 };
                 if let Some(data) = data_arr {
-                    let len = ctx.array_length(data);
-                    let n = (size as usize).min(len);
-                    for i in 0..n {
-                        if let Value::Object(Some(s)) = ctx.get_array_element(data, i) {
-                            cmd_strings.push(ctx.read_string(s).unwrap_or_default());
+                    // Diag: classify `data` before reading it as an array.
+                    use cratonvm_types::ObjectKind;
+                    if ctx.heap_kind_of(data) != ObjectKind::Array {
+                        let cid = ctx.class_id_of_object(data);
+                        let cname = ctx.class_name_of_id(cid).unwrap_or_else(|| "<?>".into());
+                        let cmd_cid = ctx.class_id_of_object(cmd_obj);
+                        let cmd_cname = ctx.class_name_of_id(cmd_cid).unwrap_or_else(|| "<?>".into());
+                        eprintln!("[PB-DIAG] data field is not an array: data_class={} cmd_class={} cmd_obj={:?} data={:?} size_by_name={:?}", cname, cmd_cname, cmd_obj, data, size_by_name);
+                        // Skip the array_length call to avoid noisy guard print.
+                    } else {
+                        let len = ctx.array_length(data);
+                        let n = (size as usize).min(len);
+                        for i in 0..n {
+                            if let Value::Object(Some(s)) = ctx.get_array_element(data, i) {
+                                cmd_strings.push(ctx.read_string(s).unwrap_or_default());
+                            }
                         }
                     }
                 }

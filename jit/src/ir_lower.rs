@@ -50,11 +50,16 @@ impl<'a> Lowerer<'a> {
         max_nodes: usize,
     ) -> Self {
         // Frame layout: [RBP-8] = first slot, etc.
-        // Reserve slots for locals + max_nodes spill slots + shadow space
+        // Reserve slots for locals + max_nodes spill slots + shadow space.
+        // The 16-byte tail above the shadow region holds in-frame stack args
+        // for any helper called without `emit_stack_arg_setup`; see the
+        // matching comment in `x64.rs` (Compiler::new) for the worst-case
+        // 6-arg `jit_invoke_virtual_mic` site that motivates 16 (not 8).
         let locals_size = (num_locals as i32) * 8;
         let spill_size = (max_nodes as i32) * 8;
         let shadow = 32i32;
-        let total = locals_size + spill_size + shadow + 8;
+        let stack_arg_reserve = 16i32;
+        let total = locals_size + spill_size + shadow + stack_arg_reserve;
         let frame_size = (total + 15) & !15;
 
         Lowerer {
