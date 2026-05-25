@@ -54,6 +54,13 @@ bench/ejbca-deploy/ejbca_ce_*.zip
 # Temp files
 *.tmp
 
+# Per-developer scratch dirs + Felix OSGi runtime cache + stray bench cache + server logs.
+# These accumulated under `de387c1 save 25.05`; now ignored so they don't slip in again.
+scratch/
+felix-cache/
+.bench-cache/
+server.log
+
 # Windows artifacts
 nul
 
