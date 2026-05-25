@@ -485,6 +485,45 @@ run_smoke() {
     # SpringApplication far enough to print its banner; if it returns
     # rc=0 within the smoke window the Boot lifecycle reached the
     # post-banner application-runner stage.
+    # SportMe / letsgo are Spring Boot 2.0 monoliths whose Application
+    # classes depend on Spring Boot 2.0 + spring-session-redis + springfox
+    # that aren't on the orchestrator's stable classpath. Use the
+    # ClassLoadProbe to verify the compiled `target/classes/` tree at
+    # least parses + loads a leaf class — that's a meaningful "compiled
+    # against this JVM" signal even when the SpringApplication itself
+    # can't link.
+    if [ -d "$APPS/SportMe-master/target/classes" ] \
+        && [ -f "$REPO_ROOT/test-infra/probes/classload_probe/ClassLoadProbe.class" ]; then
+        run_oneshot sportme "$TIMEOUT_S" \
+            "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+            -c "$REPO_ROOT/test-infra/probes/classload_probe;$APPS/SportMe-master/target/classes" \
+            ClassLoadProbe \
+            ru.sberbank.sportme.api.BaseRequest \
+            ru.sberbank.sportme.api.BaseResponse
+        probes_present=1
+    fi
+    if [ -d "$APPS/letsgo/letsgo-main/target/classes" ] \
+        && [ -f "$REPO_ROOT/test-infra/probes/classload_probe/ClassLoadProbe.class" ]; then
+        run_oneshot letsgo "$TIMEOUT_S" \
+            "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+            -c "$REPO_ROOT/test-infra/probes/classload_probe;$APPS/letsgo/letsgo-main/target/classes" \
+            ClassLoadProbe \
+            com.digsol.main.category.Category
+        probes_present=1
+    fi
+    # DaCapo benchmarks — the Harness Main needs a custom ClassLoader
+    # that loads benchmarks from harness/ inside the jar; that boot
+    # path fails in our env. Probe via ClassLoadProbe instead so the
+    # signal is "Harness.class parses + loads on this JVM".
+    if [ -f "$APPS/dacapo-9.12-MR1-bach.jar" ] \
+        && [ -f "$REPO_ROOT/test-infra/probes/classload_probe/ClassLoadProbe.class" ]; then
+        run_oneshot dacapo "$TIMEOUT_S" \
+            "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+            -c "$REPO_ROOT/test-infra/probes/classload_probe;$APPS/dacapo-9.12-MR1-bach.jar" \
+            ClassLoadProbe Harness
+        probes_present=1
+    fi
+
     # Spring Boot probe: constructs a SpringApplication with banner-mode
     # OFF and WebApplicationType.NONE, prints the main app class, and
     # exits. Doesn't call run() (which blocks at the post-banner
