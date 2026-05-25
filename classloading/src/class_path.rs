@@ -607,6 +607,42 @@ pub(crate) fn is_safe_entry_name(name: &str) -> bool {
     true
 }
 
+/// Parse a `<jar-path>!/<prefix>/` specification of the form produced by
+/// stripping `file:`/`jar:` off a `jar:file:/.../foo.jar!/some/dir/` URL.
+/// Returns `Some((jar_path, prefix_with_trailing_slash))` if the input
+/// matches; `None` otherwise. The prefix is guaranteed to end with `/`,
+/// matching the convention used by [`ClassPathEntry::NestedDirectory`].
+///
+/// Examples:
+///   "C:/dacapo.jar!/harness/" -> Some(("C:/dacapo.jar", "harness/"))
+///   "/lib/foo.jar!/META-INF/"  -> Some(("/lib/foo.jar", "META-INF/"))
+///   "C:/x.jar"                 -> None  (no `!/` separator)
+///   "C:/x.jar!/"               -> None  (empty prefix → equivalent to root)
+fn parse_jar_subdir_spec(spec: &str) -> Option<(String, String)> {
+    let idx = spec.find("!/")?;
+    let jar_part = &spec[..idx];
+    let prefix_part = &spec[idx + 2..];
+    if jar_part.is_empty() || prefix_part.is_empty() {
+        return None;
+    }
+    // Only accept `.jar` / `.zip` outer archives so a `findResource`
+    // miss-with-colon (e.g. "https:") never trips this branch.
+    let lower = jar_part.to_ascii_lowercase();
+    if !(lower.ends_with(".jar") || lower.ends_with(".zip")) {
+        return None;
+    }
+    let prefix = if prefix_part.ends_with('/') {
+        prefix_part.to_string()
+    } else {
+        format!("{prefix_part}/")
+    };
+    // Defence-in-depth: prefix must be a sane forward-slash-only path.
+    if prefix.contains('\\') || prefix.contains('\0') || prefix.contains("..") {
+        return None;
+    }
+    Some((jar_part.to_string(), prefix))
+}
+
 impl ClassPath {
     /// Round 5 audit fix (MED): cached [`fs::canonicalize`] wrapper.
     ///
@@ -1178,6 +1214,52 @@ impl ClassPath {
     /// the directory instead of silently dropping the entry.
     pub fn add_path(&mut self, path: &str) {
         for expanded in Self::expand_classpath_wildcard(path) {
+            // DaCapo-style URL handoff: a URL of the form
+            // `jar:file:/<jar>!/<prefix>/` extracted by URLClassLoader will
+            // arrive here as `<jar>!/<prefix>/` (the `file:` and `jar:`
+            // prefixes are stripped by the URLClassLoader native before
+            // `add_path` is called). Treat the outer JAR as the resource
+            // root, but virtualised at the prefix — so a `findClass` for
+            // `Foo` looks inside the JAR at `<prefix>Foo.class` instead of
+            // `Foo.class`. This mirrors the JDK's `URLClassLoader` over a
+            // `jar:` URL pointing at a subdirectory inside a JAR, which is
+            // exactly what DaCapo 9.12-MR1's Harness does at startup
+            // (`cl.getResource("harness/")` → URLClassLoader → loadClass
+            // `org.dacapo.harness.TestHarness`).
+            if let Some((jar_part, prefix)) = parse_jar_subdir_spec(&expanded) {
+                let pb = std::path::PathBuf::from(jar_part);
+                if pb.exists() {
+                    match read_file_for_classpath(&pb) {
+                        Ok(data) => {
+                            match Self::build_nested_directory_from_jar(
+                                &pb, data, &prefix,
+                            ) {
+                                Some(entry) => {
+                                    debug!(
+                                        "Dynamic classpath: adding nested-dir {}!/{}",
+                                        pb.display(), prefix
+                                    );
+                                    self.entries.push(entry);
+                                }
+                                None => debug!(
+                                    "Dynamic classpath: nested-dir {}!/{} \
+                                     yielded no entries (skipping)",
+                                    pb.display(), prefix
+                                ),
+                            }
+                        }
+                        Err(e) => debug!(
+                            "Dynamic classpath: failed to read {}: {e}", pb.display()
+                        ),
+                    }
+                    continue;
+                }
+                debug!(
+                    "Dynamic classpath: nested-dir spec {} references missing JAR",
+                    expanded
+                );
+                continue;
+            }
             let pb = std::path::PathBuf::from(&expanded);
             if pb.is_dir() {
                 debug!("Dynamic classpath: adding directory {expanded}");
@@ -1206,6 +1288,63 @@ impl ClassPath {
                 debug!("Dynamic classpath: skipping non-existent entry {expanded}");
             }
         }
+    }
+
+    /// Build a [`ClassPathEntry::NestedDirectory`] by extracting every entry
+    /// in `archive` whose name begins with `prefix` (which itself must end
+    /// with `/`, mirroring how `BOOT-INF/classes/` is structured). Returns
+    /// `None` if the archive cannot be opened or no entries match.
+    ///
+    /// Used by `add_path` for the DaCapo-style `<jar>!/<prefix>/` URL form.
+    fn build_nested_directory_from_jar(
+        path: &Path,
+        data: Vec<u8>,
+        prefix: &str,
+    ) -> Option<ClassPathEntry> {
+        let cursor = Cursor::new(data);
+        let mut archive = match ZipArchive::new(cursor) {
+            Ok(a) => a,
+            Err(e) => {
+                debug!("Failed to open JAR for nested-dir {}: {e}", path.display());
+                return None;
+            }
+        };
+        let mut entries_cache: HashMap<String, Vec<u8>> = HashMap::new();
+        let total = archive.len();
+        for i in 0..total {
+            let name = match archive.by_index_raw(i) {
+                Ok(entry) => entry.name().to_string(),
+                Err(_) => continue,
+            };
+            if !is_safe_entry_name(&name) {
+                continue;
+            }
+            if !name.starts_with(prefix) || name.len() <= prefix.len() {
+                continue;
+            }
+            let relative = &name[prefix.len()..];
+            if relative.is_empty() || relative.ends_with('/') {
+                // Skip the directory marker itself and any subdirectories.
+                continue;
+            }
+            if !is_safe_entry_name(relative) {
+                continue;
+            }
+            if let Ok(mut entry) = archive.by_name(&name) {
+                let mut bytes = Vec::with_capacity(safe_with_capacity(entry.size()));
+                if entry.read_to_end(&mut bytes).is_ok() {
+                    entries_cache.insert(relative.to_string(), bytes);
+                }
+            }
+        }
+        if entries_cache.is_empty() {
+            return None;
+        }
+        Some(ClassPathEntry::NestedDirectory {
+            parent_jar: path.to_path_buf(),
+            prefix: prefix.to_string(),
+            entries_cache,
+        })
     }
 
     /// Find and read a class file by its binary name (e.g., `java/lang/Object`).
@@ -1779,6 +1918,23 @@ impl ClassPath {
                         debug!("Found resource {name} in JAR");
                         return Some(data);
                     }
+                    // Slash-tolerant retry: HotSpot resolves a `cnf` request
+                    // against a `cnf/` directory entry inside a JAR. Mirror
+                    // that so `getResource(name)` is non-null for known
+                    // archive subdirectories (DaCapo's bench loader does
+                    // `getResource("cnf").getProtocol()` with no null check).
+                    if !name.ends_with('/') {
+                        let alt = format!("{name}/");
+                        let alt_found = if *multi_release {
+                            Self::find_in_multi_release_archive(archive, versions_cache, &alt)
+                        } else {
+                            Self::find_in_archive(archive, &alt)
+                        };
+                        if let Some(data) = alt_found {
+                            debug!("Found resource {alt} in JAR (slash-tolerant)");
+                            return Some(data);
+                        }
+                    }
                 }
                 ClassPathEntry::NestedDirectory { entries_cache, .. } => {
                     if let Some(data) = entries_cache.get(name) {
@@ -2034,11 +2190,28 @@ impl ClassPath {
                     }
                 }
                 ClassPathEntry::JarFile { archive, multi_release, versions_cache, path } => {
-                    let found = if *multi_release {
+                    let direct = if *multi_release {
                         Self::find_in_multi_release_archive(archive, versions_cache, name).is_some()
                     } else {
                         Self::find_in_archive(archive, name).is_some()
                     };
+                    // HotSpot's URLClassLoader matches a request for `cnf` against
+                    // a `cnf/` directory entry inside a JAR. Without the slash-
+                    // tolerant retry, `getResource("cnf")` returned null even when
+                    // the JAR clearly contains the directory, breaking DaCapo's
+                    // `extractBenchmarkSet` (which dereferences the URL's
+                    // protocol without a null check).
+                    let with_slash = if !direct && !name.ends_with('/') {
+                        let alt = format!("{name}/");
+                        if *multi_release {
+                            Self::find_in_multi_release_archive(archive, versions_cache, &alt).is_some()
+                        } else {
+                            Self::find_in_archive(archive, &alt).is_some()
+                        }
+                    } else {
+                        false
+                    };
+                    let found = direct || with_slash;
                     if dbg {
                         eprintln!(
                             "[GRES-DBG]   jar {} mr={} -> {}",
@@ -2055,7 +2228,12 @@ impl ClassPath {
                         // Strip UNC prefix \\?\ that canonicalize produces on Windows.
                         let p = p.strip_prefix("//?/").unwrap_or(&p);
                         let p = p.trim_start_matches('/');
-                        urls.push(format!("jar:file:/{p}!/{name}"));
+                        let suffix = if with_slash {
+                            format!("{name}/")
+                        } else {
+                            name.to_string()
+                        };
+                        urls.push(format!("jar:file:/{p}!/{suffix}"));
                     }
                 }
                 ClassPathEntry::NestedDirectory { parent_jar, prefix, entries_cache } => {

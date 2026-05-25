@@ -2289,34 +2289,66 @@ fn cl_is_registered_as_parallel_capable(ctx: &mut dyn NativeContext, args: &[Val
 // ---------------------------------------------------------------------------
 
 /// Extract filesystem path from a URL object (tries field 3 = path, field 5 = full string).
+///
+/// Returns one of two shapes depending on the URL form:
+///   * `file:/X/foo.jar`            → `X/foo.jar`            (plain JAR / directory)
+///   * `jar:file:/X/foo.jar!/sub/`  → `X/foo.jar!/sub/`      (JAR with internal prefix)
+///
+/// The `!/<prefix>/` form is preserved so `ClassPath::add_path` can build a
+/// `NestedDirectory` entry pointing at the right place inside the outer JAR.
+/// Without this, DaCapo's `Harness` (which builds a URLClassLoader rooted at
+/// `harness/` inside the launcher JAR) silently dropped the entry from the
+/// dynamic classpath and every subsequent `loadClass` returned CNFE.
 fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<String> {
-    let raw = if let Value::Object(Some(path_ref)) = ctx.get_field(url_obj, 3) {
-        ctx.read_string(path_ref)
-    } else if let Value::Object(Some(full_ref)) = ctx.get_field(url_obj, 5) {
+    // For `jar:` URLs, the synthetic-URL builder puts the full
+    // `file:/.../foo.jar!/sub/` (without the `jar:` prefix) into both
+    // the `file` and `path` named fields. For plain `file:` URLs, slot 3
+    // (path) is just `/X/foo.jar` (or on Windows `/C:/X/foo.jar`). To
+    // distinguish the two cases we consult the FULL spec (slot 5) first
+    // when present, so we know whether to keep the JAR-internal suffix.
+    let full_spec = if let Value::Object(Some(full_ref)) = ctx.get_field(url_obj, 5) {
         ctx.read_string(full_ref)
     } else {
-        ctx.read_string(url_obj)
+        None
     };
-    raw.map(|p| {
-        let p = p.strip_prefix("file:").unwrap_or(&p).to_string();
-        let p = p.strip_prefix("//").unwrap_or(&p).to_string();
-        // Windows: `File.toURI().toURL()` yields `file:/C:/dir/...`, so the
-        // extracted path is `/C:/dir/...` — a leading slash *before* the
-        // drive letter. `PathBuf::from("/C:/...")` does not resolve on
-        // Windows (`is_dir()` / `exists()` both fail), which made every
-        // directory/jar URL silently skipped by `ClassPath::add_path`.
-        // Strip the spurious leading slash when followed by a drive letter.
-        let bytes = p.as_bytes();
-        if bytes.len() >= 3
-            && bytes[0] == b'/'
-            && bytes[1].is_ascii_alphabetic()
-            && bytes[2] == b':'
-        {
-            p[1..].to_string()
-        } else {
-            p
-        }
-    })
+    let path_field = if let Value::Object(Some(path_ref)) = ctx.get_field(url_obj, 3) {
+        ctx.read_string(path_ref)
+    } else {
+        None
+    };
+
+    // Pick the most descriptive string: if the path field encodes the
+    // `!/<prefix>/` shape (which `build_synthetic_url` does — see
+    // jboss_module_loader::build_synthetic_url where field "path" is
+    // set to the post-`jar:` remainder), prefer it; otherwise fall back
+    // to the full spec; otherwise the raw string read off the object.
+    let raw = path_field
+        .or(full_spec)
+        .or_else(|| ctx.read_string(url_obj))?;
+
+    // Normalise: strip a leading `jar:` (so `jar:file:/X!/sub/` collapses
+    // to `file:/X!/sub/`), then strip the `file:` scheme. We keep the
+    // `!/<prefix>/` suffix intact for `ClassPath::add_path` to interpret.
+    let p = raw.strip_prefix("jar:").unwrap_or(&raw).to_string();
+    let p = p.strip_prefix("file:").unwrap_or(&p).to_string();
+    let p = p.strip_prefix("//").unwrap_or(&p).to_string();
+    // Windows: `File.toURI().toURL()` yields `file:/C:/dir/...`, so the
+    // extracted path is `/C:/dir/...` — a leading slash *before* the
+    // drive letter. `PathBuf::from("/C:/...")` does not resolve on
+    // Windows (`is_dir()` / `exists()` both fail), which made every
+    // directory/jar URL silently skipped by `ClassPath::add_path`.
+    // Strip the spurious leading slash when followed by a drive letter.
+    let bytes = p.as_bytes();
+    let p = if bytes.len() >= 3
+        && bytes[0] == b'/'
+        && bytes[1].is_ascii_alphabetic()
+        && bytes[2] == b':'
+    {
+        p[1..].to_string()
+    } else {
+        p
+    };
+    Some(p)
 }
 
 /// Initialize a URLClassLoader: store the URL array, extract paths, register with classpath.
