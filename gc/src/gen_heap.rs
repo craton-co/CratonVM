@@ -75,6 +75,15 @@ const MAX_HEAP_EXPANSION_FACTOR: usize = 4;
 /// If GC reclaims less than this fraction of young gen, expand the heap.
 const GC_EXPANSION_THRESHOLD_PERCENT: usize = 25;
 
+/// If GC reclaims less than this fraction of young gen, arm the
+/// "promote-on-pressure" flag so the NEXT minor GC promotes ALL
+/// survivors to old gen regardless of age. Mirrors HotSpot's
+/// "premature promotion" / "always tenure" behaviour for high-survival
+/// cycles: when the survival rate is this high (>75%) the working set
+/// is effectively long-lived, and another semi→semi copy would just
+/// repeat the same problem on the next cycle.
+const GC_PROMOTE_PRESSURE_PERCENT: usize = 25;
+
 // ---------------------------------------------------------------------------
 // GenerationalHeap
 // ---------------------------------------------------------------------------
@@ -221,6 +230,20 @@ pub struct GenerationalHeap {
     numa_num_nodes: usize,
     /// Phase H (RH.1) statistics — updated during every minor/major GC.
     stats: HeapStats,
+    /// Promote-on-pressure flag: when the previous minor GC reclaimed
+    /// less than [`GC_PROMOTE_PRESSURE_PERCENT`]% of young from-space
+    /// (i.e. survival rate was very high), the NEXT minor GC promotes
+    /// every survivor to old gen regardless of its age. This breaks the
+    /// "semispace death spiral" that occurs with long-lived heap shapes
+    /// like the classic binary-trees benchmark — a single ~tens-of-MB
+    /// tree that's kept live for the entire run would otherwise be
+    /// copied semi→semi on every minor GC forever, eventually OOM'ing
+    /// when the long-lived data plus the young allocations no longer
+    /// fit in a single semi-space.
+    ///
+    /// `AtomicBool` so the flag can be read/written without going
+    /// through the per-arena mutex.
+    force_promote_all: std::sync::atomic::AtomicBool,
 }
 
 // SAFETY: Same reasoning as Heap — raw pointers are to internally owned
@@ -284,6 +307,7 @@ impl GenerationalHeap {
             numa_node_hint,
             numa_num_nodes,
             stats: HeapStats::default(),
+            force_promote_all: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1538,6 +1562,15 @@ impl GenerationalHeap {
 
         let bytes_before = young_from.used();
         let mut objects_copied: usize = 0;
+        // Read & clear the promote-on-pressure flag set by the previous
+        // minor GC. When true, every survivor of THIS cycle is promoted
+        // to old gen regardless of age, breaking the long-lived-tree
+        // semispace death spiral. Single AtomicBool::swap so the flag
+        // doesn't latch across multiple consecutive cycles unless the
+        // pressure persists.
+        let force_promote_all = self
+            .force_promote_all
+            .swap(false, Ordering::Relaxed);
         // CRIT-P2 fix: use FxHashMap to avoid SipHash overhead on every
         // forwarded pointer (N hash ops per GC for N live objects).
         // Converted back to std HashMap at the end for public-API
@@ -1569,6 +1602,7 @@ impl GenerationalHeap {
                 &mut objects_copied,
                 &mut pointer_map,
                 &mut promoted_worklist,
+                force_promote_all,
             );
             // SAFETY: `new_ptr` was returned by `forward_object`, which allocated
             // space in young_to or old_gen and copied a valid object there.
@@ -1606,6 +1640,7 @@ impl GenerationalHeap {
                             &mut objects_copied,
                             &mut pointer_map,
                             &mut promoted_worklist,
+                            force_promote_all,
                         );
                         // SAFETY: Writing the forwarded pointer back to the same valid slot.
                         unsafe { std::ptr::write(slot_ptr as *mut u64, new_ptr as u64) };
@@ -1628,6 +1663,7 @@ impl GenerationalHeap {
                             &mut objects_copied,
                             &mut pointer_map,
                             &mut promoted_worklist,
+                            force_promote_all,
                         );
                         // SAFETY: `new_ptr` is a valid forwarded allocation.
                         let new_value =
@@ -1693,6 +1729,7 @@ impl GenerationalHeap {
                                         &mut objects_copied,
                                         &mut pointer_map,
                                         &mut promoted_worklist,
+                                        force_promote_all,
                                     );
                                     // SAFETY: Writing forwarded pointer back to the same valid slot.
                                     unsafe {
@@ -1720,6 +1757,7 @@ impl GenerationalHeap {
                                     &mut objects_copied,
                                     &mut pointer_map,
                                     &mut promoted_worklist,
+                                    force_promote_all,
                                 );
                                 // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
                                 let new_value = Value::Object(Some(unsafe {
@@ -1779,6 +1817,7 @@ impl GenerationalHeap {
                                         &mut objects_copied,
                                         &mut pointer_map,
                                         &mut promoted_worklist,
+                                        force_promote_all,
                                     );
                                     // SAFETY: Writing forwarded pointer back to the same valid slot.
                                     unsafe {
@@ -1810,6 +1849,7 @@ impl GenerationalHeap {
                                     &mut objects_copied,
                                     &mut pointer_map,
                                     &mut promoted_worklist,
+                                    force_promote_all,
                                 );
                                 // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
                                 let new_value = Value::Object(Some(unsafe {
@@ -1853,6 +1893,7 @@ impl GenerationalHeap {
                 &mut objects_copied,
                 &mut pointer_map,
                 &mut promoted_worklist,
+                force_promote_all,
             );
             dead_finalizers.push(new_ptr as usize);
         }
@@ -1879,6 +1920,7 @@ impl GenerationalHeap {
                                         let new_ref_ptr = Self::forward_object(
                                             &young_from, &mut young_to, &mut old_gen,
                                             ref_ptr, &mut objects_copied, &mut pointer_map, &mut promoted_worklist,
+                                            force_promote_all,
                                         );
                                         // SAFETY: Writing forwarded pointer back to the same valid ref-array slot.
                                         unsafe { std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64); }
@@ -1897,6 +1939,7 @@ impl GenerationalHeap {
                                     let new_ref_ptr = Self::forward_object(
                                         &young_from, &mut young_to, &mut old_gen,
                                         ref_ptr, &mut objects_copied, &mut pointer_map, &mut promoted_worklist,
+                                        force_promote_all,
                                     );
                                     // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
                                     let new_value = Value::Object(Some(unsafe {
@@ -1931,6 +1974,7 @@ impl GenerationalHeap {
                                         let new_ref_ptr = Self::forward_object(
                                             &young_from, &mut young_to, &mut old_gen,
                                             ref_ptr, &mut objects_copied, &mut pointer_map, &mut promoted_worklist,
+                                            force_promote_all,
                                         );
                                         // SAFETY: Writing forwarded pointer back to the same valid ref-array slot.
                                         unsafe { std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64); }
@@ -1952,6 +1996,7 @@ impl GenerationalHeap {
                                     let new_ref_ptr = Self::forward_object(
                                         &young_from, &mut young_to, &mut old_gen,
                                         ref_ptr, &mut objects_copied, &mut pointer_map, &mut promoted_worklist,
+                                        force_promote_all,
                                     );
                                     // SAFETY: `new_ref_ptr` is a valid forwarded allocation.
                                     let new_value = Value::Object(Some(unsafe {
@@ -2090,6 +2135,34 @@ impl GenerationalHeap {
         } else {
             100
         };
+        // Promote-on-pressure: if survival was very high this cycle,
+        // arm the flag so the NEXT minor GC promotes ALL survivors to
+        // old gen regardless of age. Otherwise a long-lived working set
+        // gets copied semi→semi forever (binary-trees death spiral).
+        //
+        // Only arm when the *from* itself is at high occupancy. The
+        // freed_percent metric measures young_to.used vs young_from.used,
+        // but a low percentage when bytes_before is tiny (e.g. a partial-
+        // allocation cycle) doesn't indicate real pressure. Gating on
+        // bytes_before >= 1/2 of the from capacity rules out those
+        // false-positives. force_promote_all was already consumed (and
+        // cleared) at the top of this function via `swap`; setting it
+        // here arms the *next* cycle.
+        // `young_to` post-swap is the arena we just *collected* — its
+        // capacity is what `bytes_before` was measured against.
+        let from_cap_before = young_to.capacity();
+        let high_survival = freed_percent < GC_PROMOTE_PRESSURE_PERCENT
+            && bytes_before >= from_cap_before / 2;
+        if high_survival {
+            tracing::debug!(
+                "GC: high survival ({}% freed of {} bytes) — \
+                 arming promote-on-pressure for next minor GC",
+                freed_percent,
+                bytes_before,
+            );
+            self.force_promote_all.store(true, Ordering::Relaxed);
+        }
+
         if freed_percent < GC_EXPANSION_THRESHOLD_PERCENT {
             let current_cap = young_to.capacity();
             let new_cap = (current_cap * 2).min(self.max_young_semi_size);
@@ -2773,6 +2846,11 @@ impl GenerationalHeap {
     /// If the object has been forwarded already, returns the existing address.
     /// If the object has survived enough GCs (age >= PROMOTION_AGE), promotes
     /// it to old gen. Otherwise copies to young to-space with incremented age.
+    ///
+    /// When `force_promote_all` is true (set by the previous minor GC after
+    /// observing a high survival rate, see [`GC_PROMOTE_PRESSURE_PERCENT`]),
+    /// every survivor is promoted regardless of age. This breaks the
+    /// long-lived-tree semispace death spiral.
     fn forward_object(
         young_from: &Arena,
         young_to: &mut Arena,
@@ -2781,6 +2859,7 @@ impl GenerationalHeap {
         objects_copied: &mut usize,
         pointer_map: &mut FxHashMap<usize, usize>,
         promoted_worklist: &mut Vec<*mut u8>,
+        force_promote_all: bool,
     ) -> *mut u8 {
         // SAFETY: `old_ptr` points to a live young-gen object; its header is
         // valid. Build an owned *copy* of the header rather than holding a
@@ -2916,10 +2995,15 @@ impl GenerationalHeap {
             );
             return old_ptr; // Leave unmoved — likely not a real object
         }
-        // Promote if this GC survival would reach or exceed the promotion age.
+        // Promote if this GC survival would reach or exceed the promotion age,
+        // OR if the previous minor GC observed high survival pressure and
+        // armed the force-promote-all flag. The latter breaks the death
+        // spiral where a long-lived object is repeatedly copied semi→semi
+        // because its age hasn't yet reached PROMOTION_AGE.
+        //
         // E.g., with PROMOTION_AGE=3: an object at age 2, surviving this GC,
         // would become age 3 → promote instead.
-        let should_promote = header.gc_age + 1 >= PROMOTION_AGE;
+        let should_promote = force_promote_all || header.gc_age + 1 >= PROMOTION_AGE;
 
         let new_ptr = if should_promote {
             // Promote to old gen
