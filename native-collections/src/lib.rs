@@ -6300,6 +6300,20 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
         native_stream_to_array_gen,
     );
+    // close() — BaseStream.close is abstract; synthetic Stream objects
+    // (class `java/util/stream/Stream`) dispatch directly to the abstract
+    // interface declaration and throw AbstractMethodError. Register a
+    // no-op so try-with-resources and explicit s.close() succeed.
+    // Without this, jboss-modules / WildFly / Keycloak boot hits
+    // "BaseStream.close()V has no Code attribute" inside lambda/stream-based
+    // utility methods during MBean / module wiring.
+    let close_noop: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
+        |_ctx, _args| Ok(None);
+    r.register(c, "close", "()V", close_noop);
+    r.register("java/util/stream/BaseStream", "close", "()V", close_noop);
+    r.register("java/util/stream/IntStream", "close", "()V", close_noop);
+    r.register("java/util/stream/LongStream", "close", "()V", close_noop);
+    r.register("java/util/stream/DoubleStream", "close", "()V", close_noop);
     r.register(
         c,
         "findFirst",
