@@ -513,7 +513,7 @@ run_smoke() {
         local cp; cp=$(cp_glob "$APPS/kafka_2.13-3.7.0/libs")
         [ -n "$cp" ] && run_oneshot kafka "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$cp" kafka.Kafka
+            -c "$cp" kafka.Kafka --version
     fi
 
     if [ -d "$APPS/gradle-8.10.2" ]; then

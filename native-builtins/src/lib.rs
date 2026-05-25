@@ -7146,6 +7146,23 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     registry.register(acl_log, "isInfoEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
     registry.register(acl_log, "isWarnEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
     registry.register(acl_log, "isErrorEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    // Complete the Log interface so ActiveMQ/Kafka (jcl-over-slf4j users) don't hit
+    // `AbstractMethodError: ...isTraceEnabled()Z has no Code attribute` on the
+    // synthetic Log object manufactured by `LogFactory.getLog(...)` above.
+    registry.register(acl_log, "isTraceEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(acl_log, "isFatalEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(acl_log, "trace", "(Ljava/lang/Object;)V", crate::native_noop_with_this);
+    registry.register(acl_log, "trace", "(Ljava/lang/Object;Ljava/lang/Throwable;)V", crate::native_noop_with_this);
+    registry.register(acl_log, "fatal", "(Ljava/lang/Object;)V", |ctx, args| {
+        if let Some(Value::Object(Some(msg))) = args.get(1) {
+            if let Some(s) = ctx.read_string(*msg) { ctx.record_printed_line(format!("[ACL FATAL] {}", s)); }
+        }
+        Ok(None)
+    });
+    registry.register(acl_log, "fatal", "(Ljava/lang/Object;Ljava/lang/Throwable;)V", crate::native_noop_with_this);
+    registry.register(acl_log, "info", "(Ljava/lang/Object;Ljava/lang/Throwable;)V", crate::native_noop_with_this);
+    registry.register(acl_log, "debug", "(Ljava/lang/Object;Ljava/lang/Throwable;)V", crate::native_noop_with_this);
+    registry.register(acl_log, "error", "(Ljava/lang/Object;Ljava/lang/Throwable;)V", crate::native_noop_with_this);
 
     // Spring Boot 3 `JarFileArchive.<clinit>` calls `PosixFilePermissions.asFileAttribute`;
     // real `java.base` bytecode from `--java-home` provides the anonymous
@@ -27759,6 +27776,17 @@ pub fn register_slf4j_binder_stubs_pub(registry: &mut NativeMethodRegistry) {
     registry.register("org/slf4j/Logger", "isInfoEnabled", "()Z", slf4j_false);
     registry.register("org/slf4j/Logger", "isWarnEnabled", "()Z", slf4j_false);
     registry.register("org/slf4j/Logger", "isErrorEnabled", "()Z", slf4j_false);
+    // Marker-aware variants: SLF4J `Logger` interface declares
+    // `is{Trace,Debug,Info,Warn,Error}Enabled(Marker)`. Kafka (kafka.Kafka via
+    // Scala) routes log calls through these overloads on first startup; the
+    // synthetic Log objects returned by our `LoggerFactory.getLogger` natives
+    // otherwise dispatch to the abstract interface decl and throw
+    // `AbstractMethodError: org/slf4j/Logger.isErrorEnabled(Lorg/slf4j/Marker;)Z`.
+    registry.register("org/slf4j/Logger", "isTraceEnabled", "(Lorg/slf4j/Marker;)Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isDebugEnabled", "(Lorg/slf4j/Marker;)Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isInfoEnabled", "(Lorg/slf4j/Marker;)Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isWarnEnabled", "(Lorg/slf4j/Marker;)Z", slf4j_false);
+    registry.register("org/slf4j/Logger", "isErrorEnabled", "(Lorg/slf4j/Marker;)Z", slf4j_false);
 
     // Round 63: Keycloak — KerberosJdkProvider.isKerberosAvailable() probes the
     // JCE provider list via java.security.Provider.checkInitialized, which
@@ -28500,6 +28528,23 @@ fn register_slf4j_natives(registry: &mut NativeMethodRegistry) {
     registry.register(acl_log, "isInfoEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
     registry.register(acl_log, "isWarnEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
     registry.register(acl_log, "isErrorEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    // Complete the Log interface so ActiveMQ/Kafka (jcl-over-slf4j users) don't hit
+    // `AbstractMethodError: ...isTraceEnabled()Z has no Code attribute` on the
+    // synthetic Log object manufactured by `LogFactory.getLog(...)` above.
+    registry.register(acl_log, "isTraceEnabled", "()Z", |_, _| Ok(Some(Value::Int(0))));
+    registry.register(acl_log, "isFatalEnabled", "()Z", |_, _| Ok(Some(Value::Int(1))));
+    registry.register(acl_log, "trace", "(Ljava/lang/Object;)V", crate::native_noop_with_this);
+    registry.register(acl_log, "trace", "(Ljava/lang/Object;Ljava/lang/Throwable;)V", crate::native_noop_with_this);
+    registry.register(acl_log, "fatal", "(Ljava/lang/Object;)V", |ctx, args| {
+        if let Some(Value::Object(Some(msg))) = args.get(1) {
+            if let Some(s) = ctx.read_string(*msg) { ctx.record_printed_line(format!("[ACL FATAL] {}", s)); }
+        }
+        Ok(None)
+    });
+    registry.register(acl_log, "fatal", "(Ljava/lang/Object;Ljava/lang/Throwable;)V", crate::native_noop_with_this);
+    registry.register(acl_log, "info", "(Ljava/lang/Object;Ljava/lang/Throwable;)V", crate::native_noop_with_this);
+    registry.register(acl_log, "debug", "(Ljava/lang/Object;Ljava/lang/Throwable;)V", crate::native_noop_with_this);
+    registry.register(acl_log, "error", "(Ljava/lang/Object;Ljava/lang/Throwable;)V", crate::native_noop_with_this);
 
     // --- Log4j2 (org.apache.logging.log4j) ---
     let log4j_lm = "org/apache/logging/log4j/LogManager";
