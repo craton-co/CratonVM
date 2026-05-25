@@ -69,6 +69,27 @@ const PROMOTION_AGE: u8 = 3;
 /// GC threshold: trigger minor GC when young from-space usage exceeds this %.
 const YOUNG_GC_THRESHOLD_PERCENT: usize = 75;
 
+/// "Humongous" object threshold as a percentage of the young semi-space
+/// capacity.  Allocations whose total in-memory footprint
+/// (`HEADER_SIZE + array_data_size`) exceeds this fraction of one young
+/// semi-space are routed directly to the old generation, bypassing
+/// the young from-space entirely (G1-style humongous handling).
+///
+/// Without this routing, a single large array of size `A` would force
+/// the user to size `--Xmx` to at least `4 * A` just so the array can
+/// fit in *one* young semi-space (each semi is `Xmx / 4` —
+/// see [`with_capacity`]).  A 2 GiB int[] at `--Xmx 16g` (4 GiB
+/// semi) fits; at `--Xmx 12g` (3 GiB semi) it would not, even though
+/// the heap has 12 GiB free.  HotSpot avoids the same trap by
+/// sending oversized arrays straight to old gen / a humongous region.
+///
+/// Threshold chosen at 50%: large enough that small surviving sets
+/// in young can still copy without colliding with a humongous tail
+/// (Cheney needs to be able to fit copies into to-space), small enough
+/// that any single array bigger than half the young semi-space takes
+/// the humongous path instead of guaranteeing a copying-collector OOM.
+const HUMONGOUS_YOUNG_FRACTION_PERCENT: usize = 50;
+
 /// Maximum allowed heap expansion factor (4x the initial size).
 const MAX_HEAP_EXPANSION_FACTOR: usize = 4;
 
@@ -475,6 +496,14 @@ impl GenerationalHeap {
     ///
     /// Arrays use compact element sizes: 1 byte for boolean/byte, 2 for char/short,
     /// 4 for int/float, 8 for long/double/reference.
+    ///
+    /// **Humongous routing** (see [`HUMONGOUS_YOUNG_FRACTION_PERCENT`]):
+    /// when `HEADER_SIZE + array_data_size` exceeds half of one young
+    /// semi-space, the array is allocated directly in the old generation
+    /// instead of young.  This mirrors HotSpot G1's humongous handling and
+    /// unblocks the case where a single huge array would force the user
+    /// to over-size `--Xmx` to ≥ 4× the array size just to make it fit in
+    /// one young semi-space.
     pub fn alloc_array(
         &self,
         class_id: ClassId,
@@ -500,6 +529,18 @@ impl GenerationalHeap {
             );
             std::process::abort();
         });
+
+        // Humongous path: skip young, allocate straight into old gen.
+        if self.is_humongous(total_size) {
+            if let Some(obj) = self.try_alloc_array_humongous(class_id, element_type, length_u32) {
+                return obj;
+            }
+            // Old gen was full — fall through to the young-gen path so the
+            // standard OOM diagnostic fires (`alloc_young` aborts hard with
+            // a young-gen-exhaustion message; a future humongous-OOM
+            // diagnostic would live here).
+        }
+
         let ptr = self.alloc_young(total_size);
 
         let header = ObjectHeader::new(
@@ -544,7 +585,15 @@ impl GenerationalHeap {
         }
     }
 
-    /// Try to allocate a Java array. Returns `None` if young gen is exhausted.
+    /// Try to allocate a Java array. Returns `None` if young gen (or, for
+    /// humongous arrays, the old gen) is exhausted.
+    ///
+    /// **Humongous routing** (see [`HUMONGOUS_YOUNG_FRACTION_PERCENT`]):
+    /// when `HEADER_SIZE + array_data_size` exceeds half of one young
+    /// semi-space, the array is allocated directly in the old generation
+    /// (G1-style humongous handling).  Without this routing a single
+    /// huge array would have to fit in one young semi (each is `Xmx / 4`),
+    /// forcing the user to size `--Xmx` to at least `4 * array_size`.
     pub fn try_alloc_array(
         &self,
         class_id: ClassId,
@@ -553,14 +602,32 @@ impl GenerationalHeap {
     ) -> Option<ObjectRef> {
         let data_size = array_data_size(length, element_type).ok()?;
         let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let length_u32 = u32::try_from(length).ok()?;
+
+        // Humongous path: route straight to old gen so a single array
+        // larger than half of one young semi-space doesn't force the
+        // caller to over-size `--Xmx`.  See module docs on
+        // `HUMONGOUS_YOUNG_FRACTION_PERCENT` for the rationale.
+        if self.is_humongous(total_size) {
+            if let Some(obj) =
+                self.try_alloc_array_humongous(class_id, element_type, length_u32)
+            {
+                return Some(obj);
+            }
+            // Old gen full — fall through to the young path. If young is
+            // also too small, the caller (`gc_alloc_array`) will trigger
+            // a GC and retry, which may free old-gen space; if that still
+            // can't satisfy the request, the standard OOM fires.
+        }
+
         let ptr = self.try_alloc_young(total_size)?;
         let header = ObjectHeader::new(
             class_id,
             ObjectKind::Array,
             element_type,
             self.next_hash(),
-            u32::try_from(length).ok()?,
-            u32::try_from(length).ok()?,
+            length_u32,
+            length_u32,
         );
         // SAFETY: `ptr` was bump-allocated from the young arena with sufficient size
         // for the array header + data and 8-byte alignment. The pointer is exclusively
@@ -569,6 +636,75 @@ impl GenerationalHeap {
             std::ptr::write(ptr as *mut ObjectHeader, header);
             Some(ObjectRef::from_raw(ptr))
         }
+    }
+
+    /// Returns `true` if a `total_size`-byte allocation should bypass
+    /// young-gen and go straight to the old generation.
+    ///
+    /// Threshold = [`HUMONGOUS_YOUNG_FRACTION_PERCENT`] of one young
+    /// semi-space capacity.  Computed from a live read of the
+    /// `young_from` arena so the cap correctly tracks any in-flight
+    /// expansion (see `collect_garbage_inner`'s adaptive growth path).
+    #[inline]
+    fn is_humongous(&self, total_size: usize) -> bool {
+        let semi = self.young_from.lock().capacity();
+        // Saturating arithmetic: a tiny semi-space (e.g. 1 KiB test heap)
+        // can produce a 0-byte threshold under integer truncation — clamp
+        // up to at least one allocation so the humongous path doesn't fire
+        // on every small allocation in pathological cases.
+        let threshold = (semi / 100).saturating_mul(HUMONGOUS_YOUNG_FRACTION_PERCENT);
+        total_size > threshold.max(HEADER_SIZE)
+    }
+
+    /// Allocate a humongous array directly in the old generation.
+    ///
+    /// The returned object has `GC_FLAG_OLD_GEN` already set on its
+    /// header, so the next minor GC will not try to copy it as if it
+    /// lived in young from-space.  Returns `None` if old gen is full.
+    fn try_alloc_array_humongous(
+        &self,
+        class_id: ClassId,
+        element_type: ArrayElementType,
+        length_u32: u32,
+    ) -> Option<ObjectRef> {
+        // Recompute total_size from the (already-validated) length —
+        // callers have all run `array_data_size(length, ..)?` upstream so
+        // a fresh `array_data_size` cannot overflow here either, but use
+        // checked arithmetic just in case the validated path is ever
+        // narrowed in a future refactor.
+        let data_size =
+            array_data_size(length_u32 as usize, element_type).ok()?;
+        let total_size = HEADER_SIZE.checked_add(data_size)?;
+
+        let ptr = {
+            let mut og = self.old_gen.lock();
+            og.alloc(total_size, 8)?
+        };
+
+        let mut header = ObjectHeader::new(
+            class_id,
+            ObjectKind::Array,
+            element_type,
+            self.next_hash(),
+            length_u32,
+            length_u32,
+        );
+        // Mark as already-promoted so minor GC's `forward_object` does not
+        // try to relocate this object — it lives in old gen, not the
+        // young from-space arena that gets reset every minor cycle.
+        // `OldGen::alloc` zeroed the data region; the header overwrite
+        // below initializes the rest of the bookkeeping.
+        header.gc_flags |= GC_FLAG_OLD_GEN;
+
+        // SAFETY: `OldGen::alloc` returned a pointer to `total_size` bytes
+        // of zeroed, 8-byte-aligned memory exclusive to this allocation.
+        // Writing the header is in-bounds and the resulting `ObjectRef`
+        // wraps a fully-initialized header.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+        }
+        self.stats.old_allocations.fetch_add(1, Ordering::Relaxed);
+        Some(unsafe { ObjectRef::from_raw(ptr) })
     }
 
     // ----- Header access -----------------------------------------------------
@@ -3586,6 +3722,87 @@ mod tests {
         assert!(heap.is_in_young(arr.as_ptr()));
         assert_eq!(heap.array_length(arr), 5);
         assert_eq!(heap.kind_of(arr), ObjectKind::Array);
+    }
+
+    /// Humongous-routing regression: an array whose footprint exceeds
+    /// `HUMONGOUS_YOUNG_FRACTION_PERCENT` of one young semi-space must
+    /// be allocated directly in the old generation, NOT in young.
+    ///
+    /// Before the humongous path landed, a single allocation larger
+    /// than one young semi-space (`Xmx / 4`) would fail with
+    /// `OutOfMemoryError: Java heap space (alloc_array length N)` even
+    /// when old gen had tens of GiB free.  The acceptance case from
+    /// the bug report: a 2 GiB int[] at `--Xmx 16g` (4 GiB young semi,
+    /// 8 GiB old).
+    ///
+    /// We stage the same shape at test scale (1 MiB young semi / 4 MiB
+    /// old gen) so the test does not commit a real multi-GiB heap.
+    #[test]
+    fn humongous_array_routes_to_old_gen() {
+        // 1 MiB young semi → humongous threshold = 512 KiB.
+        // Old gen has 4 MiB so a 1 MiB array fits comfortably.
+        let heap = GenerationalHeap::with_sizes(1024 * 1024, 4 * 1024 * 1024);
+        // 256 K ints * 4 bytes/int = 1 MiB array payload; > 512 KiB threshold.
+        let big = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 256 * 1024);
+        assert!(
+            heap.is_in_old(big.as_ptr()),
+            "humongous array must land in old gen, not young from-space",
+        );
+        assert!(
+            !heap.is_in_young(big.as_ptr()),
+            "humongous array must NOT be in young from-space",
+        );
+        assert_eq!(heap.array_length(big), 256 * 1024);
+        assert_eq!(heap.kind_of(big), ObjectKind::Array);
+        // The humongous header MUST have GC_FLAG_OLD_GEN set so the next
+        // minor GC's `forward_object` does not try to relocate it from
+        // (non-existent) young from-space.
+        assert_ne!(
+            heap.get_header(big).gc_flags & GC_FLAG_OLD_GEN,
+            0,
+            "humongous array header must carry GC_FLAG_OLD_GEN",
+        );
+    }
+
+    /// Small arrays must still allocate in the young generation; the
+    /// humongous routing must not steal the fast path for normal-sized
+    /// allocations.
+    #[test]
+    fn small_array_still_in_young() {
+        let heap = GenerationalHeap::with_sizes(1024 * 1024, 4 * 1024 * 1024);
+        // 16 ints * 4 bytes = 64 bytes payload, well below the 512 KiB
+        // humongous threshold.
+        let small = heap.alloc_array(ClassId::new(0), ArrayElementType::Int, 16);
+        assert!(
+            heap.is_in_young(small.as_ptr()),
+            "small array must still allocate in young from-space",
+        );
+        assert_eq!(
+            heap.get_header(small).gc_flags & GC_FLAG_OLD_GEN,
+            0,
+            "small young-gen array must not be flagged as old-gen resident",
+        );
+    }
+
+    /// Fallible `try_alloc_array` must take the humongous path as well —
+    /// the interpreter's `gc_alloc_array` calls `try_alloc_array` first
+    /// and only falls back to the panicking `alloc_array` via the OOM
+    /// formatter, so the routing must work on the fallible path too.
+    #[test]
+    fn humongous_routing_applies_to_try_alloc_array() {
+        let heap = GenerationalHeap::with_sizes(1024 * 1024, 4 * 1024 * 1024);
+        let big = heap
+            .try_alloc_array(ClassId::new(0), ArrayElementType::Int, 256 * 1024)
+            .expect("humongous try_alloc_array must succeed when old gen has room");
+        assert!(
+            heap.is_in_old(big.as_ptr()),
+            "try_alloc_array humongous must land in old gen",
+        );
+        assert_ne!(
+            heap.get_header(big).gc_flags & GC_FLAG_OLD_GEN,
+            0,
+            "humongous try_alloc_array header must carry GC_FLAG_OLD_GEN",
+        );
     }
 
     #[test]
