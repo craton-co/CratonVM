@@ -2133,6 +2133,18 @@ pub fn execute(
                 let mut jit_args = [0i64; 6];
                 let mut jit_count = 0;
                 for arg in args {
+                    // Bail out before writing past the end of `jit_args`. The
+                    // post-loop guard further narrows to MAX_JIT_ARGS, but
+                    // that check fires too late on its own: a Java method with
+                    // 7+ args (common in libraries like Lucene) would panic
+                    // here with "index out of bounds: the len is 6 but the
+                    // index is 6" on `jit_args[6]` before the post-loop guard
+                    // ever runs. Bail with the existing usize::MAX sentinel
+                    // so the interpreter handles the call instead.
+                    if jit_count >= jit_args.len() {
+                        jit_count = usize::MAX;
+                        break;
+                    }
                     match arg {
                         Value::Int(v) => {
                             jit_args[jit_count] = *v as i64; // Cast: JIT ABI -- i64 register convention
