@@ -12449,7 +12449,7 @@ impl Compiler {
                         self.emit_load_local(RAX, field_off);
                         self.push_from_rax();
                         pc += 3;
-                    } else if let Some(&info_idx) = self.field_info_idx.get(&pc) {
+                    } else if let Some(&info_idx) = self.field_info_idx.get(&pc).filter(|_| std::env::var_os("DISABLE_INLINE_GETFIELD").is_none()) {
                         // Inline field load — the field index and type tag are
                         // statically resolved (`field_info` was built from
                         // `resolve_field_ref` in lib.rs), so we can emit a raw

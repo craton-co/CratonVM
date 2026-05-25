@@ -2553,6 +2553,13 @@ impl GenerationalHeap {
         let mut cursor: usize = 0;
         let used = young_from.used();
         let mut free_iter = existing_free.iter().peekable();
+        // Debug diag: keep a short ring buffer of (offset, size, class_id, kind,
+        // num_slots, array_length) for the last 6 objects walked. When the
+        // implausible-header break fires we dump it so we can pin down which
+        // PRIOR object had an undersized/oversized header that mis-aligned the
+        // walker into a payload region. Cheap (a Vec push per object) and only
+        // logged once per sweep on the abort path.
+        let mut walked: Vec<(usize, usize, u32, ObjectKind, u32, u32)> = Vec::new();
         while cursor < used {
             // If `cursor` is the start of a known free block, skip it.
             if let Some(&&(off, sz)) = free_iter.peek() {
@@ -2572,15 +2579,63 @@ impl GenerationalHeap {
             if total_size < HEADER_SIZE || cursor + total_size > used {
                 tracing::warn!(
                     "non-moving sweep: stopping walk at offset {} — implausible \
-                     object size {} (kind={:?}, num_slots={}, array_len={})",
+                     object size {} (kind={:?}, num_slots={}, array_len={}, class_id={})",
                     cursor,
                     total_size,
                     header.kind,
                     header.num_slots,
                     header.array_length,
+                    header.class_id.as_u32(),
                 );
+                tracing::warn!(
+                    "  total walked={} objects, used={} from_base={:#x}",
+                    walked.len(), used, from_base,
+                );
+                // Find the FIRST cursor where the all-zero-header pattern
+                // started (num_slots == 0 && class_id == 0 && kind == Object).
+                let first_zero = walked.iter().position(|(_, _, cid, k, ns, _)| {
+                    *ns == 0 && *cid == 0 && matches!(k, ObjectKind::Object)
+                });
+                if let Some(idx) = first_zero {
+                    let start = idx.saturating_sub(15);
+                    for i in start..=idx {
+                        let (off, sz, cid, kind, ns, al) = walked[i];
+                        tracing::warn!(
+                            "  PRE-corruption idx {} @off={} size={} class_id={} kind={:?} num_slots={} array_length={}",
+                            i, off, sz, cid, kind, ns, al,
+                        );
+                    }
+                }
+                let recent: Vec<_> = walked.iter().rev().take(8).rev().cloned().collect();
+                for (off, sz, cid, kind, ns, al) in &recent {
+                    tracing::warn!(
+                        "  prior obj @off={} size={} class_id={} kind={:?} num_slots={} array_length={}",
+                        off, sz, cid, kind, ns, al,
+                    );
+                }
+                // Dump 64 bytes of context starting 16 bytes before the bad
+                // header so we can see the tail of the previous object's payload.
+                let start = cursor.saturating_sub(16);
+                let end = (cursor + 48).min(used);
+                let mut hex = String::new();
+                for i in start..end {
+                    // SAFETY: i < used, region mapped.
+                    let b = unsafe { *((from_base + i) as *const u8) };
+                    hex.push_str(&format!("{:02x} ", b));
+                    if (i - start + 1) % 16 == 0 { hex.push('\n'); }
+                }
+                tracing::warn!("  bytes around bad header (start_off={}):\n{}", start, hex);
                 break;
             }
+
+            walked.push((
+                cursor,
+                total_size,
+                header.class_id.as_u32(),
+                header.kind,
+                header.num_slots,
+                header.array_length,
+            ));
 
             if header.gc_flags & GC_FLAG_MARKED != 0 {
                 // Survivor: clear the mark, keep in place.

@@ -1140,6 +1140,14 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
     if obj_ptr == 0 { return; }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
+    if std::env::var_os("CRATON_JIT_PFI_TRACE").is_some() {
+        // Read existing value to see if we're overwriting a ref with an int
+        let existing = std::ptr::read(ptr as *const Value);
+        let cid_off = obj_ptr as *const u8;
+        let cid: u32 = std::ptr::read(cid_off as *const u32);
+        eprintln!("[JIT-PFI] obj=0x{:x} class_id={} field_index={} val=0x{:x} (val_as_i32={}) prev_value={:?}",
+            obj_ptr as usize, cid, field_index, val as u64, val as i32, existing);
+    }
     std::ptr::write(ptr as *mut Value, Value::Int(val as i32));
 }
 
@@ -1202,6 +1210,28 @@ pub unsafe extern "C" fn jit_putfield_object(
         let num_slots = heap.num_fields(obj_ref);
         if field_index < 0 || field_index as usize >= num_slots {
             return;
+        }
+    }
+    if std::env::var_os("CRATON_JIT_PFO_TRACE").is_some() {
+        let cid_off = obj_ptr as *const u8;
+        let cid: u32 = std::ptr::read(cid_off as *const u32);
+        if cid == 394 {
+            // Check the value's class_id if it's an object
+            let val_class_id = if val != 0 {
+                let v_cid_ptr = val as *const u8;
+                std::ptr::read(v_cid_ptr as *const u32)
+            } else { 0 };
+            // Check kind byte of value
+            let val_kind = if val != 0 {
+                let v_kind_ptr = (val as *const u8).add(4);
+                std::ptr::read(v_kind_ptr)
+            } else { 0 };
+            let val_arrlen = if val != 0 {
+                let len_ptr = (val as *const u8).add(12);
+                std::ptr::read(len_ptr as *const u32)
+            } else { 0 };
+            eprintln!("[JIT-PFO] obj=0x{:x} class_id=394 field_index={} val=0x{:x} val_cid={} val_kind={} val_arrlen={}",
+                obj_ptr as usize, field_index, val as u64, val_class_id, val_kind, val_arrlen);
         }
     }
     let ptr = obj_ref
