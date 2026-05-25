@@ -2533,11 +2533,21 @@ fn main() {
     }));
 
     // The interpreter uses recursive Rust calls for Java method invocations.
-    // Deep Java call stacks (e.g. Quarkus bootstrap) can exceed the default
-    // 8 MB Rust stack.  Spawn the real entry point on a thread with 64 MB.
+    // Deep Java call stacks (e.g. Quarkus bootstrap, binary-trees-style
+    // recursion under JIT dispatch) can exceed the default 8 MB Rust stack.
+    // 64 MB cleared every workload up to and including QuickBenchLong's
+    // first four kernels but `binaryTrees(18)` (~524 k recursive
+    // invocations through `jit_invoke_dispatch` / interpreter fallback
+    // helpers, each adding one Rust frame) drove the main-vm thread past
+    // it on some platforms — manifesting as `thread 'main-vm' has
+    // overflowed its stack` (rc=139 on Linux) before reaching the GC
+    // safepoint that would have triggered an OOME. Bump to 128 MB so
+    // even the deepest recursive workloads have headroom; the upper
+    // bound is virtual-address-space-only on 64-bit OSes (no commit
+    // until the page is touched), so the practical cost is zero.
     let builder = std::thread::Builder::new()
         .name("main-vm".into())
-        .stack_size(64 * 1024 * 1024);
+        .stack_size(128 * 1024 * 1024);
     let handler = builder.spawn(|| {
         if let Err(e) = run() {
             eprintln!("{e:#}");
