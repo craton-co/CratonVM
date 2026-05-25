@@ -422,19 +422,95 @@ print_summary() {
 run_smoke() {
     local probes_present=0
 
-    if [ -f "$APPS/bytebuddy_probe/ByteBuddyProbe.class" ]; then
-        local cp="$APPS/bytebuddy_probe;$APPS/bytebuddy_probe/byte-buddy-1.14.18.jar"
-        run_oneshot bytebuddy_probe "$TIMEOUT_S" \
+    # ------------------------------------------------------------------
+    # In-pool probe-style apps (live under apps/<name>/). These ship
+    # pre-compiled probe classes and exercise a focused chunk of the
+    # JVM (crypto, cleaners, signatures, enums, NIO, etc.).
+    # ------------------------------------------------------------------
+    if [ -f "$APPS/enumtest/EnumTest.class" ]; then
+        run_oneshot enumtest "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$cp" ByteBuddyProbe
+            -c "$APPS/enumtest" EnumTest
         probes_present=1
     fi
-
-    if [ -f "$APPS/cglib_probe/CglibProbe.class" ]; then
-        local cp="$APPS/cglib_probe;$APPS/cglib_probe/cglib-3.3.0.jar;$APPS/cglib_probe/asm-9.5.jar"
+    if [ -f "$APPS/cipher_probe/CipherProbe.class" ]; then
+        run_oneshot cipher_probe "$TIMEOUT_S" \
+            "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+            -c "$APPS/cipher_probe" CipherProbe
+        probes_present=1
+    fi
+    if [ -f "$APPS/cleaner_probe/classes/CleanerProbe.class" ]; then
+        run_oneshot cleaner_probe "$TIMEOUT_S" \
+            "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+            -c "$APPS/cleaner_probe/classes" CleanerProbe
+        probes_present=1
+    fi
+    if [ -f "$APPS/sig_probe/classes/SigProbe.class" ]; then
+        run_oneshot sig_probe "$TIMEOUT_S" \
+            "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+            -c "$APPS/sig_probe/classes" SigProbe
+        probes_present=1
+    fi
+    if [ -f "$APPS/cglib_probe/classes/CglibProbe.class" ]; then
         run_oneshot cglib_probe "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$cp" CglibProbe
+            -c "$APPS/cglib_probe/classes" CglibProbe
+        probes_present=1
+    fi
+    if [ -f "$APPS/slf4j/LogTest.class" ]; then
+        # LogTest links org.slf4j.Logger; pull the slf4j-api jar from
+        # ejbca-ce's lib/ext/ if present (it's the only in-pool source
+        # of slf4j-api at the moment).
+        local slf4j_jar="$APPS/ejbca-ce/lib/ext/slf4j-api-2.0.16.jar"
+        if [ -f "$slf4j_jar" ]; then
+            run_oneshot slf4j_log "$TIMEOUT_S" \
+                "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+                -c "$APPS/slf4j;$slf4j_jar" LogTest
+            probes_present=1
+        fi
+    fi
+    if [ -f "$APPS/netty/NioProbe.class" ]; then
+        run_oneshot netty_nio "$TIMEOUT_S" \
+            "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+            -c "$APPS/netty" NioProbe
+        probes_present=1
+    fi
+    if [ -f "$APPS/gpu-bench/classes/CpuOnlyBench.class" ]; then
+        run_oneshot gpu_bench "$TIMEOUT_S" \
+            "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+            -c "$APPS/gpu-bench/classes" CpuOnlyBench
+        probes_present=1
+    fi
+    # Spring Boot launchers — `--jar target/<app>.jar` boots the
+    # SpringApplication far enough to print its banner; if it returns
+    # rc=0 within the smoke window the Boot lifecycle reached the
+    # post-banner application-runner stage.
+    # NOTE: Spring Boot launchers (demo, insurance-backend) currently
+    # hang at the banner stage when stdout is a regular file (the same
+    # non-TTY behaviour that affected felix.jar / kc26 quarkus-run.jar
+    # before we wrote probe-based replacements). The Boot launcher
+    # reaches `SpringApplication.run()` → banner → context refresh, then
+    # blocks somewhere in the post-banner ApplicationRunner path. The
+    # banner-only outcome isn't a meaningful smoke signal so we don't
+    # wire these into the suite yet. TODO: write a SpringBootProbe that
+    // boots a SpringApplication subclass with `setBannerMode(OFF)` and
+    # exits immediately after refresh().
+    # Tomcat — out-of-tree probe lives under test-infra/probes/tomcat_probe/
+    if [ -d "$APPS/apache-tomcat-10.1.31" ] \
+        && [ -f "$REPO_ROOT/test-infra/probes/tomcat_probe/TomcatProbe.class" ]; then
+        local tcp=$(find "$APPS/apache-tomcat-10.1.31" -name '*.jar' | tr '\n' ';' | sed 's/;$//')
+        run_oneshot tomcat "$TIMEOUT_S" \
+            "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+            -c "$REPO_ROOT/test-infra/probes/tomcat_probe;$tcp" TomcatProbe
+        probes_present=1
+    fi
+    # EJBCA — out-of-tree probe drives BouncyCastle key generation + DN parsing
+    if [ -d "$APPS/ejbca-ce" ] \
+        && [ -f "$REPO_ROOT/test-infra/probes/ejbca_probe/EjbcaProbe.class" ]; then
+        local ecp=$(find "$APPS/ejbca-ce/lib" -maxdepth 2 -name '*.jar' | tr '\n' ';' | sed 's/;$//')
+        run_oneshot ejbca "$TIMEOUT_S" \
+            "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+            -c "$REPO_ROOT/test-infra/probes/ejbca_probe;$ecp" EjbcaProbe
         probes_present=1
     fi
 
