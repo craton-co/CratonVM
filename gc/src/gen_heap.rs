@@ -2021,8 +2021,8 @@ impl GenerationalHeap {
         // compared to N SipHash operations across the Cheney scan.
         let mut pointer_map: HashMap<usize, usize> = pointer_map.into_iter().collect();
 
-        // Phase 4: Remap monitors and swap young spaces
-        monitors.remap_after_gc(&pointer_map);
+        // Phase 4: Swap young spaces (monitor remap deferred until after a
+        // possible major GC so we can pass the composed pointer_map).
         std::mem::swap(&mut *young_from, &mut *young_to);
 
         // Phase 5: Check if old gen is getting full — trigger major GC (mark-compact)
@@ -2033,6 +2033,28 @@ impl GenerationalHeap {
             );
             let old_used_before = old_gen.used();
             let compact_map = Self::major_gc(roots, &young_from, &mut old_gen);
+            // CRITICAL FIX (heavy binary-trees GC corruption):
+            //
+            // Compose `pointer_map` with `compact_map` BEFORE merging. If a
+            // minor-GC entry says `young_addr → promoted_addr` AND the major
+            // GC compacted `promoted_addr → compacted_addr`, a naive merge
+            // leaves the minor entry pointing at the now-stale `promoted_addr`.
+            // `update_all_roots` does a single-step lookup per slot — so a
+            // frame local that originally held `young_addr` would be rewritten
+            // to `promoted_addr`, dereferencing freed/overwritten memory on
+            // the next field read (the visible symptom: Node objects come back
+            // as `java/lang/Object class_id=0 num_slots=0`).
+            //
+            // Walk all existing entries and chain any value that appears as a
+            // compact_map key through to its final destination, THEN merge the
+            // raw compact_map so external roots (statics, JNI, etc.) that
+            // pointed directly at an uncompacted old-gen object also get the
+            // correct post-compaction target.
+            for new_addr in pointer_map.values_mut() {
+                if let Some(&final_addr) = compact_map.get(new_addr) {
+                    *new_addr = final_addr;
+                }
+            }
             // Merge old-gen compaction relocations into the overall pointer map
             // so the VM can update external roots (statics, JNI, string pool, etc.)
             pointer_map.extend(compact_map);
@@ -2046,6 +2068,12 @@ impl GenerationalHeap {
         } else {
             false
         };
+
+        // Phase 4b (moved): remap monitors with the FINAL composed pointer_map.
+        // Doing this after a possible major GC ensures monitor keys for
+        // promoted-then-compacted objects are remapped to their final
+        // post-compaction addresses, not the intermediate post-promotion ones.
+        monitors.remap_after_gc(&pointer_map);
 
         let bytes_freed = bytes_before.saturating_sub(bytes_copied);
 

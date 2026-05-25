@@ -257,6 +257,22 @@ fn verify_no_stale_refs(
     // pointer at an address inside the just-reset young-from semispace.
     let heavy = std::env::var("CRATONVM_GC_VERIFY_STALE").ok().as_deref() == Some("1");
 
+    // Build the set of "stale destination addresses" — addresses that appear
+    // as VALUES in pointer_map but ALSO as KEYS. These are intermediate
+    // forwarding points: minor GC promoted an object to addr A, then major
+    // GC compacted A to B. A slot still pointing at A is silently stale —
+    // the header check above might NOT trigger (A could be overwritten by
+    // a slid object's data), but the slot is wrong.
+    let stale_destinations: std::collections::HashSet<usize> = if heavy {
+        pointer_map
+            .values()
+            .filter(|v| pointer_map.contains_key(v))
+            .copied()
+            .collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
     for (fi, frame) in thread.frames.iter().enumerate() {
         let cname = frame.class_name();
         let mname = frame.method_name();
@@ -266,7 +282,7 @@ fn verify_no_stale_refs(
             if let Value::Object(Some(obj_ref)) = val {
                 let addr = obj_ref.as_ptr() as usize;
                 if pointer_map.contains_key(&addr) {
-                    tracing::error!(
+                    eprintln!(
                         "POST-GC STALE LOCAL: frame[{}] {}.{} local[{}] still points to \
                          relocated addr 0x{:x} (should be 0x{:x})",
                         fi, cname, mname, li,
@@ -274,6 +290,14 @@ fn verify_no_stale_refs(
                     );
                 }
                 if heavy && addr != 0 {
+                    if stale_destinations.contains(&addr) {
+                        eprintln!(
+                            "POST-GC STALE-DEST LOCAL: frame[{}] {}.{} local[{}] pc={} \
+                             points to intermediate addr 0x{:x} which was further relocated to 0x{:x}",
+                            fi, cname, mname, li, frame.pc,
+                            addr, pointer_map[&addr],
+                        );
+                    }
                     // SAFETY: read-only probe of an aligned address; if the
                     // slot is corrupt we'll see it in the diagnostic. This is
                     // an opt-in debug path.
@@ -283,7 +307,7 @@ fn verify_no_stale_refs(
                         && h.num_slots == 0
                         && h.array_length == 0
                     {
-                        tracing::error!(
+                        eprintln!(
                             "POST-GC ZERO-HEADER LOCAL: frame[{}] {}.{} local[{}] pc={} \
                              points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
                             fi, cname, mname, li, frame.pc,
@@ -299,7 +323,7 @@ fn verify_no_stale_refs(
             if let Value::Object(Some(obj_ref)) = val {
                 let addr = obj_ref.as_ptr() as usize;
                 if pointer_map.contains_key(&addr) {
-                    tracing::error!(
+                    eprintln!(
                         "POST-GC STALE STACK: frame[{}] {}.{} stack[{}] still points to \
                          relocated addr 0x{:x} (should be 0x{:x})",
                         fi, cname, mname, si,
@@ -307,6 +331,14 @@ fn verify_no_stale_refs(
                     );
                 }
                 if heavy && addr != 0 {
+                    if stale_destinations.contains(&addr) {
+                        eprintln!(
+                            "POST-GC STALE-DEST STACK: frame[{}] {}.{} stack[{}] pc={} \
+                             points to intermediate addr 0x{:x} which was further relocated to 0x{:x}",
+                            fi, cname, mname, si, frame.pc,
+                            addr, pointer_map[&addr],
+                        );
+                    }
                     // SAFETY: see locals comment above.
                     let h = unsafe { &*(addr as *const ObjectHeader) };
                     if h.class_id.as_u32() == 0
@@ -314,7 +346,7 @@ fn verify_no_stale_refs(
                         && h.num_slots == 0
                         && h.array_length == 0
                     {
-                        tracing::error!(
+                        eprintln!(
                             "POST-GC ZERO-HEADER STACK: frame[{}] {}.{} stack[{}] pc={} \
                              points to ZEROED header at 0x{:x} (kind={:?}, gc_flags=0x{:x})",
                             fi, cname, mname, si, frame.pc,
