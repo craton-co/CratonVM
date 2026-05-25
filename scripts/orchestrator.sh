@@ -698,6 +698,46 @@ run_smoke() {
             fish.payara.cdi.auth.roles.RolesPermitted
         probes_present=1
     }
+    # ---- Wave 5: server-side admin / IDE / repo apps via ClassLoadProbe.
+    [ -f "$APPS/tomee2/tomee-server.jar" ] && {
+        class_load_test tomee2 "$APPS/tomee2/tomee-server.jar" \
+            org.apache.tomee.overlay.Deployer
+        probes_present=1
+    }
+    [ -f "$APPS/sonarqube/sonar-plugin-api.jar" ] && {
+        class_load_test sonarqube "$APPS/sonarqube/sonar-plugin-api.jar" \
+            org.sonar.api.SonarRuntime
+        probes_present=1
+    }
+    [ -f "$APPS/nexus/nexus-bundle.jar" ] && {
+        class_load_test nexus "$APPS/nexus/nexus-bundle.jar" \
+            org.sonatype.nexus.wonderland.AuthTicketCache
+        probes_present=1
+    }
+    [ -f "$APPS/eclipse/eclipse-jdt.jar" ] && {
+        class_load_test eclipse "$APPS/eclipse/eclipse-jdt.jar" \
+            org.eclipse.jdt.internal.codeassist.CompletionElementNotifier
+        probes_present=1
+    }
+    [ -f "$APPS/netbeans/netbeans-lookup.jar" ] && {
+        class_load_test netbeans "$APPS/netbeans/netbeans-lookup.jar" \
+            org.openide.util.Lookup
+        probes_present=1
+    }
+    [ -f "$APPS/jdownloader/jdownloader.jar" ] && {
+        class_load_test jdownloader "$APPS/jdownloader/jdownloader.jar" jd.Main
+        probes_present=1
+    }
+    [ -f "$APPS/intellij/util_rt.jar" ] && {
+        class_load_test intellij "$APPS/intellij/util_rt.jar" \
+            com.intellij.openapi.util.SystemInfoRt
+        probes_present=1
+    }
+    [ -f "$APPS/arduino/arduino-core.jar" ] && {
+        class_load_test arduino "$APPS/arduino/arduino-core.jar" \
+            cc.arduino.CompilerProgressListener
+        probes_present=1
+    }
 
     # Spring Boot probe: constructs a SpringApplication with banner-mode
     # OFF and WebApplicationType.NONE, prints the main app class, and
