@@ -6168,6 +6168,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
 
+    // CharBuffer.toString / toString(II) — abstract on CharBuffer, our
+    // subSequence and wrap natives return synthetic `java/nio/CharBuffer`
+    // instances. In real-JDK mode the full `register_p62_char_buffer`
+    // (which lives in phases_late) isn't called, so the toString natives
+    // never get installed. Without them, ICU normalization data load
+    // (`ICUBinary.getString` -> `CharBuffer.subSequence().toString()`)
+    // throws AbstractMethodError and cascades into the Jetty
+    // `Main.processCommandLine` NPE. Wire the essentials here so the
+    // real-JDK path picks them up too.
+    crate::phases_late::register_p62_char_buffer(registry);
+
     let after = registry.len();
     tracing::info!(count = after - before, "Registered essential natives");
 }

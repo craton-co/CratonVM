@@ -17478,6 +17478,98 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             _ => Ok(Some(Value::Int(0))),
         }
     });
+    // toString(II) / toString() — abstract on CharBuffer; subSequence and
+    // wrap return synthetic instances with class `java/nio/CharBuffer`
+    // itself, so the default `toString()` body (which calls
+    // `toString(position(), limit())` on this) hits an abstract method
+    // and throws AbstractMethodError. ICUBinary.getString uses exactly
+    // this pattern (`bytes.asCharBuffer().subSequence(0,len).toString()`)
+    // during ICU normalization data load, which blocks ICU clinit and
+    // cascades into Jetty `Main.processCommandLine` NPE.
+    fn cb_to_string_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let start = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+        let end = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        let arr = match cb_read_hb(ctx, this) {
+            Some(a) => a,
+            None => return Ok(Some(Value::Object(Some(ctx.create_string(""))))),
+        };
+        let cur_pos = match ctx.get_field_by_name(this, "position") {
+            Value::Int(v) => v,
+            _ => match ctx.get_field(this, CB_FIELD_POS) {
+                Value::Int(v) => v,
+                _ => 0,
+            },
+        };
+        let cur_off = match ctx.get_field_by_name(this, "offset") {
+            Value::Int(v) => v,
+            _ => 0,
+        };
+        // CharBuffer.toString(int start, int end) reads start..end (exclusive)
+        // RELATIVE to the current position — see HeapCharBuffer.toString.
+        let abs_start = cur_off + cur_pos + start;
+        let abs_end = cur_off + cur_pos + end;
+        let arr_len = ctx.array_length(arr) as i32;
+        let s_lo = abs_start.max(0).min(arr_len);
+        let s_hi = abs_end.max(s_lo).min(arr_len);
+        let mut chars: Vec<u16> = Vec::with_capacity((s_hi - s_lo) as usize);
+        for i in s_lo..s_hi {
+            if let Value::Int(v) = ctx.get_array_element(arr, i as usize) {
+                chars.push(v as u16);
+            }
+        }
+        let s: String = String::from_utf16_lossy(&chars);
+        Ok(Some(Value::Object(Some(ctx.create_string(&s)))))
+    }
+    r.register(cb, "toString", "(II)Ljava/lang/String;", cb_to_string_range);
+    // Concrete CharBuffer subclasses inherit our toString(II) only when the
+    // VM's vtable-lookup walks the super-class native registry. The
+    // ByteBufferAs*CharBuffer family and HeapCharBuffer are what
+    // `ByteBuffer.asCharBuffer()` returns in real-JDK mode, so registering
+    // directly on each ensures dispatch hits us regardless of how vtable
+    // resolution handles abstract-in-base + native-on-base.
+    for subclass in [
+        "java/nio/ByteBufferAsCharBufferB",
+        "java/nio/ByteBufferAsCharBufferL",
+        "java/nio/ByteBufferAsCharBufferRB",
+        "java/nio/ByteBufferAsCharBufferRL",
+        "java/nio/HeapCharBuffer",
+        "java/nio/HeapCharBufferR",
+        "java/nio/StringCharBuffer",
+    ] {
+        r.register(subclass, "toString", "(II)Ljava/lang/String;", cb_to_string_range);
+    }
+    r.register(cb, "toString", "()Ljava/lang/String;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let pos = match ctx.get_field_by_name(this, "position") {
+            Value::Int(v) => v,
+            _ => match ctx.get_field(this, CB_FIELD_POS) {
+                Value::Int(v) => v,
+                _ => 0,
+            },
+        };
+        let lim = match ctx.get_field_by_name(this, "limit") {
+            Value::Int(v) => v,
+            _ => match ctx.get_field(this, CB_FIELD_LIMIT) {
+                Value::Int(v) => v,
+                _ => pos,
+            },
+        };
+        // toString() is documented as toString(position(), limit())
+        // where start/end are RELATIVE — pass 0 and (lim-pos).
+        let args2 = [
+            Value::Object(Some(this)),
+            Value::Int(0),
+            Value::Int(lim - pos),
+        ];
+        cb_to_string_range(ctx, &args2)
+    });
     // subSequence(II)Ljava/nio/CharBuffer; — abstract on CharBuffer, so
     // an unbacked synthetic instance would AbstractMethodError. Allocate
     // a fresh CharBuffer with the same backing array and adjusted
