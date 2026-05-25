@@ -1,18 +1,24 @@
-import org.springframework.boot.SpringApplication;
+import org.springframework.boot.Banner;
+import org.springframework.boot.WebApplicationType;
+import org.springframework.boot.builder.SpringApplicationBuilder;
+import org.springframework.context.ConfigurableApplicationContext;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+
 public class SpringBootProbe {
     @Configuration
-    static class Cfg {}
+    static class Cfg {
+        @Bean public String probeMessage() { return "hello from probe"; }
+    }
     public static void main(String[] args) throws Exception {
-        // Verify Spring Boot core class loads (exercises the
-        // ConditionalOn* + AutoConfigurationImportSelector clinit chain)
-        SpringApplication app = new SpringApplication(Cfg.class);
-        app.setBannerMode(org.springframework.boot.Banner.Mode.OFF);
-        app.setWebApplicationType(org.springframework.boot.WebApplicationType.NONE);
-        System.out.println("SpringApplication: " + app.getClass().getName());
-        System.out.println("MainAppClass: " + app.getMainApplicationClass());
-        // Don't actually run() — the post-banner phase hangs on non-TTY
-        // stdout. Construction alone exercises ConfigClassParser etc.
+        ConfigurableApplicationContext ctx = new SpringApplicationBuilder(Cfg.class)
+            .web(WebApplicationType.NONE)
+            .bannerMode(Banner.Mode.OFF)
+            .registerShutdownHook(false)
+            .run(args);
+        String msg = ctx.getBean(String.class);
+        System.out.println("Bean: " + msg);
+        ctx.close();
         System.out.println("OK");
         System.exit(0);
     }

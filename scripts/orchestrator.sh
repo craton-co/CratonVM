@@ -21,6 +21,13 @@
 #                 probe, kill the daemon. Goes past the smoke layer and
 #                 surfaces application-level errors. ~21 hand-wired apps.
 #
+#                 Daemon-style apps (wildfly, kafka, activemq, felix,
+#                 kc16, kc26, springboot) use launch_daemon → endpoint
+#                 probe → kill. Library-only apps (cassandra utils,
+#                 hazelcast config, jetty Server(0), solr SolrInputDoc)
+#                 stay on probe-based oneshots — those have no daemon
+#                 shape.
+#
 #   recursive     Walk apps/ recursively; for every JAR/WAR whose
 #                 MANIFEST.MF declares Main-Class, run it under
 #                 CratonVM with a configurable timeout. Emits a CSV
@@ -65,6 +72,14 @@
 #   --verbose         Tee each app's stdout/stderr to the console as
 #                     well as the per-app log files.
 #   --no-summary      Skip the final summary block.
+#   --daemon-only     [functional] Run ONLY the daemon-style tests
+#                     (launch_daemon + endpoint probe). Skips probe-
+#                     based oneshots that exercise library code without
+#                     a real daemon. Use this to verify the daemon-level
+#                     retirement criterion documented in
+#                     apps/TARGET_APPS.md ("Daemon/server apps: real
+#                     daemon launch + endpoint probe pass = retire.
+#                     Library-level probe pass alone is NOT enough.").
 #   -h, --help        Print help.
 #
 # OUTPUT
@@ -111,6 +126,7 @@ DO_BUILD=0
 STRICT=0
 VERBOSE=0
 NO_SUMMARY=0
+DAEMON_ONLY=0
 
 # ----- Help -----------------------------------------------------------------
 
@@ -159,6 +175,7 @@ while [ $# -gt 0 ]; do
         --strict)      STRICT=1;         shift ;;
         --verbose)     VERBOSE=1;        shift ;;
         --no-summary)  NO_SUMMARY=1;     shift ;;
+        --daemon-only) DAEMON_ONLY=1;    shift ;;
         -h|--help)     print_help; exit 0 ;;
         *)
             echo "ERROR: unknown option '$1' (run '$0 help' for usage)" >&2
@@ -265,8 +282,14 @@ first_err_line() {
 # launch_daemon NAME READY_PATTERN TIMEOUT_S CMD...
 #
 # Background-launches CMD; greps merged out+err for READY_PATTERN until
-# match or timeout. Records PID for later kill_daemon. Returns 0 ready,
-# 2 daemon died, 3 timeout.
+# match or timeout. Records PID for later kill_daemon. Returns:
+#   0  daemon ready (pattern matched)
+#   2  daemon died before ready (DAEMON_DIED)
+#   3  timed out without ready (TIMEOUT_NO_READY)
+#
+# On non-success returns, this also emits a one-liner identical in shape
+# to run_oneshot's and appends a row to the CSV so summary tooling treats
+# daemon failures the same as oneshot failures.
 launch_daemon() {
     local name="$1"; shift
     local ready_re="$1"; shift
@@ -274,16 +297,35 @@ launch_daemon() {
     local out="$LOGDIR/$name.out"
     local err="$LOGDIR/$name.err"
 
-    "$@" > "$out" 2> "$err" &
+    local t0 t1 elapsed
+    t0=$(date +%s)
+
+    # Close stdin so daemons that read EOF and exit (felix Gogo, kc26
+    # picocli) don't sit forever waiting for keyboard input.
+    # Disable job-control before backgrounding so bash doesn't print
+    # "Segmentation fault" notices when the daemon dies — we already
+    # capture the exit status via kill -0 and report DAEMON_DIED.
+    set +m
+    "$@" < /dev/null > "$out" 2> "$err" &
     local pid=$!
+    disown $pid 2>/dev/null
     echo "$pid" > "$LOGDIR/$name.pid"
 
-    local elapsed=0
+    elapsed=0
     while [ "$elapsed" -lt "$t" ]; do
         if ! kill -0 "$pid" 2>/dev/null; then
-            local first_err
+            t1=$(date +%s); elapsed=$((t1 - t0))
+            local first_err cls line err_csv
             first_err=$(first_err_line "$err")
-            echo "$name | DAEMON_DIED | $first_err"
+            cls="DAEMON_DIED"
+            line=$(printf "%-30.30s | rc=%-3s | %5ds | %-13s | %s" \
+                "$name" "2" "$elapsed" "$cls" "$first_err")
+            echo "$line"
+            echo "$line" >> "$RUN_LOG"
+            if [ -n "$CSV" ]; then
+                err_csv=$(echo "$first_err" | tr -d '"' | tr ',' ' ' | head -c 200)
+                echo "$name,,,2,$elapsed,$cls,$err_csv" >> "$CSV"
+            fi
             return 2
         fi
         if grep -qE "$ready_re" "$out" "$err" 2>/dev/null; then
@@ -293,7 +335,18 @@ launch_daemon() {
         elapsed=$((elapsed + 1))
     done
 
-    echo "$name | TIMEOUT_NO_READY (${t}s)"
+    t1=$(date +%s); elapsed=$((t1 - t0))
+    local first_err cls line err_csv
+    first_err=$(first_err_line "$err")
+    cls="TIMEOUT_NO_READY"
+    line=$(printf "%-30.30s | rc=%-3s | %5ds | %-13s | %s" \
+        "$name" "3" "$elapsed" "$cls" "$first_err")
+    echo "$line"
+    echo "$line" >> "$RUN_LOG"
+    if [ -n "$CSV" ]; then
+        err_csv=$(echo "$first_err" | tr -d '"' | tr ',' ' ' | head -c 200)
+        echo "$name,,,3,$elapsed,$cls,$err_csv" >> "$CSV"
+    fi
     return 3
 }
 
@@ -739,16 +792,19 @@ run_smoke() {
         probes_present=1
     }
 
-    # Spring Boot probe: constructs a SpringApplication with banner-mode
-    # OFF and WebApplicationType.NONE, prints the main app class, and
-    # exits. Doesn't call run() (which blocks at the post-banner
-    # ApplicationRunner stage on non-TTY stdout). Compiled once against
-    # Spring Boot 4.0; runs unchanged on 3.x because the SpringApplication
-    # constructor + Banner.Mode + WebApplicationType APIs are stable.
+    # Spring Boot probe: builds a non-web SpringApplication via
+    # SpringApplicationBuilder and calls .run(), prints a bean it
+    # registered, then closes the context. Requires the full Spring
+    # framework stack including spring-aop (proxy/AOT-proxy code paths
+    # reach AopProxyUtils during context refresh) and spring-expression
+    # (StandardBeanExpressionResolver in prepareBeanFactory). Compiled once against
+    # Spring Boot 4.0; runs unchanged on 3.x because the
+    # SpringApplicationBuilder + Banner.Mode + WebApplicationType APIs
+    # are stable.
     if [ -f "$REPO_ROOT/test-infra/probes/springboot_probe/SpringBootProbe.class" ] \
         && [ -f "$REPO_ROOT/test-infra/spring-libs/spring-boot-4.0.6.jar" ]; then
         if [ -f "$APPS/demo/target/demo-0.0.1-SNAPSHOT.jar" ]; then
-            local sbcp="$REPO_ROOT/test-infra/probes/springboot_probe;$REPO_ROOT/test-infra/spring-libs/spring-boot-4.0.6.jar;$REPO_ROOT/test-infra/spring-libs/spring-context-7.0.7.jar;$REPO_ROOT/test-infra/spring-libs/spring-core-7.0.7.jar;$REPO_ROOT/test-infra/spring-libs/spring-beans-7.0.7.jar;$REPO_ROOT/test-infra/spring-libs/jspecify-1.0.0.jar"
+            local sbcp="$REPO_ROOT/test-infra/probes/springboot_probe;$REPO_ROOT/test-infra/spring-libs/spring-boot-4.0.6.jar;$REPO_ROOT/test-infra/spring-libs/spring-context-7.0.7.jar;$REPO_ROOT/test-infra/spring-libs/spring-core-7.0.7.jar;$REPO_ROOT/test-infra/spring-libs/spring-beans-7.0.7.jar;$REPO_ROOT/test-infra/spring-libs/spring-aop-7.0.7.jar;$REPO_ROOT/test-infra/spring-libs/spring-expression-7.0.7.jar;$REPO_ROOT/test-infra/spring-libs/jspecify-1.0.0.jar"
             run_oneshot springboot_demo "$TIMEOUT_S" \
                 "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
                 -c "$sbcp" SpringBootProbe
@@ -756,7 +812,7 @@ run_smoke() {
         fi
         if [ -f "$APPS/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar" ] \
             && [ -f "$REPO_ROOT/test-infra/spring-libs/spring-boot-3.2.0.jar" ]; then
-            local sbcp="$REPO_ROOT/test-infra/probes/springboot_probe;$REPO_ROOT/test-infra/spring-libs/spring-boot-3.2.0.jar;$REPO_ROOT/test-infra/spring-libs/spring-context-6.1.1.jar;$REPO_ROOT/test-infra/spring-libs/spring-core-6.1.1.jar;$REPO_ROOT/test-infra/spring-libs/spring-beans-6.1.1.jar;$REPO_ROOT/test-infra/spring-libs/jspecify-1.0.0.jar"
+            local sbcp="$REPO_ROOT/test-infra/probes/springboot_probe;$REPO_ROOT/test-infra/spring-libs/spring-boot-3.2.0.jar;$REPO_ROOT/test-infra/spring-libs/spring-context-6.1.1.jar;$REPO_ROOT/test-infra/spring-libs/spring-core-6.1.1.jar;$REPO_ROOT/test-infra/spring-libs/spring-beans-6.1.1.jar;$REPO_ROOT/test-infra/spring-libs/spring-aop-6.1.1.jar;$REPO_ROOT/test-infra/spring-libs/spring-expression-6.1.1.jar;$REPO_ROOT/test-infra/spring-libs/jspecify-1.0.0.jar"
             run_oneshot insurance "$TIMEOUT_S" \
                 "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
                 -c "$sbcp" SpringBootProbe
@@ -998,16 +1054,52 @@ run_smoke() {
 # Daemon + endpoint probe. Each helper launches the app, waits for a
 # service-ready log line, runs a single functional probe, then kills.
 
+# --------------------------------------------------------------------------
+# Daemon-style helpers (func_*) — these are the canonical retirement gate
+# for server/broker/app-server apps. Each launches the real upstream
+# daemon, waits for its canonical "ready" log line, probes the canonical
+# endpoint, and kills the daemon. A pass here means "the daemon actually
+# runs on CratonVM" — not "library code links cleanly".
+#
+# Library-only probe helpers (probe_*) are kept below as a fallback for
+# the non-daemon mode; they exercise library code paths without a live
+# daemon. --daemon-only skips them so the retirement gate is strict.
+# --------------------------------------------------------------------------
+
 func_activemq() {
     local name=activemq
     in_filter "$name" || return 0
-    # Real broker startup (`console.Main start xbean:file:...activemq.xml`)
-    # currently fails inside Spring's BeanDefinitionParser long before the
-    # broker would have been listening. The probe instead builds an
-    # OpenWire ProducerId/MessageId/ActiveMQTextMessage, round-trips it
-    # through the OpenWireFormat marshaller, and verifies the recovered
-    # message text — exercising ActiveMQ's command + serialization layer
-    # without touching the broker lifecycle.
+    [ -d "$APPS/apache-activemq-5.18.3" ] || return 0
+    local cp; cp=$(cp_glob "$APPS/apache-activemq-5.18.3/lib")
+    [ -z "$cp" ] && return 0
+    # Real broker start. Last seen failure: XBean → Spring
+    # BeanDefinitionParsingException on activemq.xml well before any
+    # port-bind. DAEMON_DIED expected on current CratonVM.
+    launch_daemon "$name" 'Apache ActiveMQ.*started|Listening for connections' "$TIMEOUT_S" \
+        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+        -c "$cp" \
+        "-Dactivemq.base=$APPS/apache-activemq-5.18.3" \
+        "-Dactivemq.home=$APPS/apache-activemq-5.18.3" \
+        "-Dactivemq.conf=$APPS/apache-activemq-5.18.3/conf" \
+        "-Dactivemq.data=$APPS/apache-activemq-5.18.3/data" \
+        org.apache.activemq.console.Main start \
+        xbean:file:"$APPS/apache-activemq-5.18.3/conf/activemq.xml"
+    if [ $? -eq 0 ]; then
+        if probe_http http://localhost:8161/admin/ 5; then
+            echo "$name | rc=0 | broker up, /admin OK"
+        else
+            echo "$name | rc=1 | broker up, /admin probe failed"
+        fi
+    fi
+    kill_daemon "$name"
+}
+
+# Library-only probe (exercises OpenWire marshaller without a broker).
+# Kept for non-daemon-only runs as a sanity check on the serialization
+# layer. NOT a substitute for daemon pass.
+probe_activemq() {
+    local name=activemq_probe
+    in_filter "$name" || return 0
     if [ -d "$APPS/apache-activemq-5.18.3" ] && [ -f "$REPO_ROOT/test-infra/probes/activemq_probe/ActiveMQProbe.class" ]; then
         local cp; cp=$(cp_glob "$APPS/apache-activemq-5.18.3/lib")
         run_oneshot "$name" "$TIMEOUT_S" \
@@ -1035,26 +1127,81 @@ func_jenkins() {
 func_wildfly() {
     local name=wildfly
     in_filter "$name" || return 0
-    # Full standalone-mode boot (jboss-modules + standalone.xml + the
-    # service container) makes it past the launcher but currently stalls
-    # well before WFLYSRV0025. The probe instead constructs a real
-    # LocalModuleLoader rooted at wildfly's modules/ and loads
-    # `org.jboss.logging` — exercising the jboss-modules class loader,
-    # the .mod parser, and the JDK module finder integration.
-    if [ -d "$APPS/wildfly-40.0.0.Final" ] && [ -f "$REPO_ROOT/test-infra/probes/wildfly_probe/WildflyProbe.class" ]; then
-        run_oneshot "$name" "$TIMEOUT_S" \
-            "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$REPO_ROOT/test-infra/probes/wildfly_probe;$APPS/wildfly-40.0.0.Final/jboss-modules.jar" \
-            WildflyProbe "$APPS/wildfly-40.0.0.Final"
+    # Try wildfly-32 first (re-staged daemon-blocked app), fall back to
+    # wildfly-40 if only the newer dist is on disk. Either way this is
+    # the real standalone-mode boot — last seen failure: boots through
+    # standalone.xml parse, then stalls in service-container wiring
+    # well before WFLYSRV0025.
+    local home=""
+    for cand in wildfly-32.0.1.Final wildfly-40.0.0.Final; do
+        if [ -d "$APPS/$cand" ] && [ -f "$APPS/$cand/jboss-modules.jar" ]; then
+            home="$APPS/$cand"
+            break
+        fi
+    done
+    [ -z "$home" ] && return 0
+    launch_daemon "$name" 'WFLYSRV0025|WildFly.*started in' "$TIMEOUT_S" \
+        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+        "-Djboss.home.dir=$home" \
+        --jar "$home/jboss-modules.jar" \
+        -- -mp "$home/modules" \
+        org.jboss.as.standalone
+    if [ $? -eq 0 ]; then
+        if probe_http http://localhost:9990/management 5; then
+            echo "$name | rc=0 | wildfly up, /management OK"
+        else
+            echo "$name | rc=1 | wildfly up, /management probe failed"
+        fi
     fi
+    kill_daemon "$name"
+}
+
+# Library-only probe (jboss-modules LocalModuleLoader → org.jboss.logging).
+# Useful as a smoke-of-the-modulesystem; NOT a substitute for daemon pass.
+probe_wildfly() {
+    local name=wildfly_probe
+    in_filter "$name" || return 0
+    local home=""
+    for cand in wildfly-32.0.1.Final wildfly-40.0.0.Final; do
+        [ -d "$APPS/$cand" ] && [ -f "$APPS/$cand/jboss-modules.jar" ] && {
+            home="$APPS/$cand"; break;
+        }
+    done
+    [ -z "$home" ] && return 0
+    [ -f "$REPO_ROOT/test-infra/probes/wildfly_probe/WildflyProbe.class" ] || return 0
+    run_oneshot "$name" "$TIMEOUT_S" \
+        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+        -c "$REPO_ROOT/test-infra/probes/wildfly_probe;$home/jboss-modules.jar" \
+        WildflyProbe "$home"
 }
 
 func_kc16() {
     local name=kc16
     in_filter "$name" || return 0
-    # KC16 ships as a WildFly distribution; the daemon stalls in the same
-    # service-container path as wildfly. Same probe shape: load
-    # `org.keycloak.keycloak-services` via jboss-modules.
+    [ -d "$APPS/keycloak-16.1.1" ] || return 0
+    # KC16 ships as a WildFly distribution; same daemon shape, same
+    # failure mode as wildfly-32 (stalls in service-container wiring
+    # before WFLYSRV0025 / Keycloak's own ready line).
+    launch_daemon "$name" 'WFLYSRV0025|Keycloak.*started|Started @' "$TIMEOUT_S" \
+        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+        "-Djboss.home.dir=$APPS/keycloak-16.1.1" \
+        --jar "$APPS/keycloak-16.1.1/jboss-modules.jar" \
+        -- -mp "$APPS/keycloak-16.1.1/modules" \
+        org.jboss.as.standalone
+    if [ $? -eq 0 ]; then
+        if probe_http http://localhost:8080/ 5; then
+            echo "$name | rc=0 | kc16 up, :8080 OK"
+        else
+            echo "$name | rc=1 | kc16 up, :8080 probe failed"
+        fi
+    fi
+    kill_daemon "$name"
+}
+
+# Library-only probe (jboss-modules → org.keycloak.keycloak-services).
+probe_kc16() {
+    local name=kc16_probe
+    in_filter "$name" || return 0
     if [ -d "$APPS/keycloak-16.1.1" ] && [ -f "$REPO_ROOT/test-infra/probes/kc16_probe/Keycloak16Probe.class" ]; then
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
@@ -1095,11 +1242,27 @@ func_bytebuddy_probe() {
 func_kafka() {
     local name=kafka
     in_filter "$name" || return 0
-    # `kafka.Kafka server.properties` starts ZK/KRaft + listeners; we
-    # don't have a working sockets/networking shape under the orchestrator.
-    # The probe reads AppInfoParser version, round-trips a
-    # StringSerializer/Deserializer pair, and validates a producer-style
-    # ConfigDef — the same code paths every Kafka client touches.
+    [ -d "$APPS/kafka_2.13-3.7.0" ] || return 0
+    local cp; cp=$(cp_glob "$APPS/kafka_2.13-3.7.0/libs")
+    [ -z "$cp" ] && return 0
+    local props="$APPS/kafka_2.13-3.7.0/config/kraft/server.properties"
+    [ -f "$props" ] || props="$APPS/kafka_2.13-3.7.0/config/server.properties"
+    [ -f "$props" ] || return 0
+    # `kafka.Kafka <props>` boots KRaft single-node. Last seen failure:
+    # silent rc=1 after BigInteger fixup, no Kafka Server started.
+    launch_daemon "$name" 'Kafka Server started|Awaiting socket connections' "$TIMEOUT_S" \
+        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+        -c "$cp" kafka.Kafka "$props"
+    if [ $? -eq 0 ]; then
+        echo "$name | rc=0 | kafka announced ready"
+    fi
+    kill_daemon "$name"
+}
+
+# Library-only probe (AppInfoParser + Serializer + ConfigDef).
+probe_kafka() {
+    local name=kafka_probe
+    in_filter "$name" || return 0
     if [ -d "$APPS/kafka_2.13-3.7.0" ] && [ -f "$REPO_ROOT/test-infra/probes/kafka_probe/KafkaProbe.class" ]; then
         local cp; cp=$(cp_glob "$APPS/kafka_2.13-3.7.0/libs")
         run_oneshot "$name" "$TIMEOUT_S" \
@@ -1130,12 +1293,32 @@ func_elasticsearch() {
 func_jetty() {
     local name=jetty
     in_filter "$name" || return 0
-    # start.jar's daemon flow requires a configured jetty.base + working
-    # ServerSocketChannel.bind(). The probe instead instantiates a
-    # `Server(0)` (port 0), wires an AbstractHandler, calls start(),
-    # checks isStarted, then stops — exercising Jetty's lifecycle
-    # machinery (Server, Handlers, NetworkConnector) with a graceful
-    # `Server channel not bound` soft-fail on the actual bind.
+    [ -d "$APPS/jetty-home-11.0.20" ] || return 0
+    [ -f "$APPS/jetty-home-11.0.20/start.jar" ] || return 0
+    # Real start.jar daemon. Requires a configured jetty.base. Last seen:
+    # boots through arg parse, then stalls at module enable. Expected
+    # outcome on current CratonVM: TIMEOUT_NO_READY.
+    launch_daemon "$name" 'Started @|oejs.Server.*Started|Server.*Started' "$TIMEOUT_S" \
+        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+        --jar "$APPS/jetty-home-11.0.20/start.jar" \
+        -- "jetty.home=$APPS/jetty-home-11.0.20" \
+           "jetty.base=$APPS/jetty-home-11.0.20" \
+           --modules=http,deploy,resources \
+           jetty.http.port=18080
+    if [ $? -eq 0 ]; then
+        if probe_http http://localhost:18080/ 5; then
+            echo "$name | rc=0 | jetty up, :18080 OK"
+        else
+            echo "$name | rc=1 | jetty up, :18080 probe failed"
+        fi
+    fi
+    kill_daemon "$name"
+}
+
+# Library-only probe (Server(0) + AbstractHandler lifecycle).
+probe_jetty() {
+    local name=jetty_probe
+    in_filter "$name" || return 0
     if [ -d "$APPS/jetty-home-11.0.20" ] && [ -f "$REPO_ROOT/test-infra/probes/jetty_probe/JettyFuncProbe.class" ]; then
         local L="$APPS/jetty-home-11.0.20/lib"
         local jcp="$REPO_ROOT/test-infra/probes/jetty_probe;$L/jetty-server-11.0.20.jar;$L/jetty-http-11.0.20.jar;$L/jetty-io-11.0.20.jar;$L/jetty-util-11.0.20.jar;$L/logging/slf4j-api-2.0.9.jar;$L/jetty-jakarta-servlet-api-5.0.2.jar"
@@ -1148,11 +1331,26 @@ func_jetty() {
 func_cassandra() {
     local name=cassandra
     in_filter "$name" || return 0
-    # CassandraDaemon needs a full SSTable storage tree + JMX listener +
-    # logback config. The probe instead reads
-    # FBUtilities.getReleaseVersionString(), round-trips a UUID via
-    # UUIDGen, and round-trips a string via ByteBufferUtil — the same
-    # utils chain the daemon constructs on every read/write.
+    [ -d "$APPS/apache-cassandra-4.1.4" ] || return 0
+    local cp; cp=$(cp_glob "$APPS/apache-cassandra-4.1.4/lib")
+    [ -z "$cp" ] && return 0
+    launch_daemon "$name" 'Listening for native transport|Starting listening for CQL' "$TIMEOUT_S" \
+        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+        -c "$cp" \
+        "-Dcassandra.config=file:$APPS/apache-cassandra-4.1.4/conf/cassandra.yaml" \
+        "-Dcassandra.storagedir=$APPS/apache-cassandra-4.1.4/data" \
+        "-Dlogback.configurationFile=$APPS/apache-cassandra-4.1.4/conf/logback.xml" \
+        org.apache.cassandra.service.CassandraDaemon
+    if [ $? -eq 0 ]; then
+        echo "$name | rc=0 | cassandra listening for CQL"
+    fi
+    kill_daemon "$name"
+}
+
+# Library-only probe (FBUtilities / UUIDGen / ByteBufferUtil round-trip).
+probe_cassandra() {
+    local name=cassandra_probe
+    in_filter "$name" || return 0
     if [ -d "$APPS/apache-cassandra-4.1.4" ] && [ -f "$REPO_ROOT/test-infra/probes/cassandra_probe/CassandraFuncProbe.class" ]; then
         local cp; cp=$(cp_glob "$APPS/apache-cassandra-4.1.4/lib")
         run_oneshot "$name" "$TIMEOUT_S" \
@@ -1181,11 +1379,22 @@ func_neo4j() {
 func_felix() {
     local name=felix
     in_filter "$name" || return 0
-    # felix.jar's Gogo shell hangs forever when stdout is a regular file.
-    # The probe instead drives `FrameworkFactory.newFramework().init().
-    # start() ... stop()` end-to-end, verifying the system bundle is
-    # ACTIVE between init and stop — that's an OSGi-spec lifecycle test
-    # without needing the interactive shell.
+    [ -d "$APPS/felix-framework-7.0.5" ] || return 0
+    # Real Gogo shell launch. Last seen failure: hangs on non-TTY stdout
+    # (kill_daemon will reap; expected outcome is TIMEOUT_NO_READY).
+    launch_daemon "$name" 'g!|Welcome to Apache Felix Gogo|Felix.*started' "$TIMEOUT_S" \
+        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+        --jar "$APPS/felix-framework-7.0.5/bin/felix.jar"
+    if [ $? -eq 0 ]; then
+        echo "$name | rc=0 | felix Gogo prompt reached"
+    fi
+    kill_daemon "$name"
+}
+
+# Library-only probe (FrameworkFactory init/start/stop lifecycle).
+probe_felix() {
+    local name=felix_probe
+    in_filter "$name" || return 0
     if [ -d "$APPS/felix-framework-7.0.5" ] && [ -f "$REPO_ROOT/test-infra/probes/felix_probe/FelixFuncProbe.class" ]; then
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
@@ -1197,9 +1406,22 @@ func_felix() {
 func_hazelcast() {
     local name=hazelcast
     in_filter "$name" || return 0
-    # A real Hazelcast member needs cluster discovery + listener sockets.
-    # The probe instead reads BuildInfoProvider's version + build, then
-    # constructs a Config + NetworkConfig + UuidUtil-generated UUID.
+    [ -f "$APPS/hazelcast.jar" ] || { [ -d "$APPS/hazelcast-5.4.0" ] || return 0; }
+    local jar="$APPS/hazelcast.jar"
+    [ -f "$jar" ] || return 0
+    launch_daemon "$name" 'STARTED|Members \{size:1|is STARTED' "$TIMEOUT_S" \
+        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+        --jar "$jar"
+    if [ $? -eq 0 ]; then
+        echo "$name | rc=0 | hazelcast member STARTED"
+    fi
+    kill_daemon "$name"
+}
+
+# Library-only probe (BuildInfoProvider + Config/NetworkConfig).
+probe_hazelcast() {
+    local name=hazelcast_probe
+    in_filter "$name" || return 0
     if [ -d "$APPS/hazelcast-5.4.0" ] && [ -f "$REPO_ROOT/test-infra/probes/hazelcast_probe/HazelcastProbe.class" ]; then
         local cp; cp=$(cp_glob "$APPS/hazelcast-5.4.0/lib")
         run_oneshot "$name" "$TIMEOUT_S" \
@@ -1243,17 +1465,60 @@ func_payara() {
 func_kc26() {
     local name=kc26
     in_filter "$name" || return 0
-    # `quarkus-run.jar start-dev` SEGVs on non-TTY stdout (same as smoke).
-    # The probe instead enumerates the Profile.Feature catalogue and
-    # verifies well-known features (ACCOUNT_API / AUTHORIZATION) are
-    # present — exercises the keycloak-common clinit chain + the
-    # annotation-driven feature registry.
+    [ -d "$APPS/keycloak-26.2.4" ] || return 0
+    local jar="$APPS/keycloak-26.2.4/lib/quarkus-run.jar"
+    [ -f "$jar" ] || return 0
+    # `quarkus-run.jar start-dev` SEGVs ~4s into boot on non-TTY stdout.
+    # That manifests as DAEMON_DIED before any "Listening on:" line.
+    launch_daemon "$name" 'Listening on:|Profile dev activated|Keycloak.*started' "$TIMEOUT_S" \
+        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+        --jar "$jar" -- start-dev
+    if [ $? -eq 0 ]; then
+        if probe_http http://localhost:8080/ 5; then
+            echo "$name | rc=0 | kc26 up, :8080 OK"
+        else
+            echo "$name | rc=1 | kc26 up, :8080 probe failed"
+        fi
+    fi
+    kill_daemon "$name"
+}
+
+# Library-only probe (Profile.Feature enumeration; no quarkus runtime).
+probe_kc26() {
+    local name=kc26_probe
+    in_filter "$name" || return 0
     if [ -d "$APPS/keycloak-26.2.4" ] && [ -f "$REPO_ROOT/test-infra/probes/kc26_probe/Keycloak26FuncProbe.class" ]; then
         local kc_cp="$REPO_ROOT/test-infra/probes/kc26_probe;$APPS/keycloak-26.2.4/lib/lib/main/org.keycloak.keycloak-common-26.2.4.jar"
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
             -c "$kc_cp" Keycloak26FuncProbe
     fi
+}
+
+# Spring Boot daemon attempt — banner-only on non-TTY stdout (same root
+# cause as kc26: another agent's non-TTY SEGV/hang fix unblocks this).
+# Targets a tiny Boot 4.0 hello-world under apps/demo/ if present.
+func_springboot() {
+    local name=springboot
+    in_filter "$name" || return 0
+    local jar=""
+    for cand in \
+        "$APPS/demo/target/demo-0.0.1-SNAPSHOT.jar" \
+        "$APPS/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar"; do
+        [ -f "$cand" ] && { jar="$cand"; break; }
+    done
+    [ -z "$jar" ] && return 0
+    launch_daemon "$name" 'Started .* in .* seconds|Tomcat started on|Netty started on' "$TIMEOUT_S" \
+        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+        --jar "$jar"
+    if [ $? -eq 0 ]; then
+        if probe_http http://localhost:8080/ 5; then
+            echo "$name | rc=0 | springboot up, :8080 OK"
+        else
+            echo "$name | rc=1 | springboot up, :8080 probe failed"
+        fi
+    fi
+    kill_daemon "$name"
 }
 
 func_flink() {
@@ -1296,14 +1561,15 @@ func_gradle() {
         -c "$cp" org.gradle.launcher.GradleMain -- --version
 }
 
-func_solr() {
-    local name=solr
+# Library-only probe (SolrInputDocument + DocumentObjectBinder).
+# Solr's real `bin/solr start` forks Jetty as a subprocess and doesn't
+# have a single-jar daemon entry — so the daemon-only criterion isn't
+# applicable here. Library-probe pass is the strongest signal we have
+# until we either (a) wire start-solr via Jetty embedded or (b) fix the
+# spawn path the bin/solr shell uses.
+probe_solr() {
+    local name=solr_probe
     in_filter "$name" || return 0
-    # `SolrCLI version` is identical to the smoke test. The probe does
-    # something more meaningful: build a SolrInputDocument with multiple
-    # fields, verify field-name enumeration, and construct a
-    # DocumentObjectBinder (reflection-based bean → SolrInputDocument
-    # serialization). That's the same code path every Solr client uses.
     if [ -d "$APPS/solr-9.5.0" ] && [ -f "$REPO_ROOT/test-infra/probes/solr_probe/SolrProbe.class" ]; then
         local cp; cp=$(cp_glob \
             "$APPS/solr-9.5.0/server/solr-webapp/webapp/WEB-INF/lib" \
@@ -1315,26 +1581,38 @@ func_solr() {
 }
 
 run_functional() {
-    # Each func_* helper is now probe-based: it short-circuits when the
-    # app isn't installed (no DAEMON_DIED noise for absent apps) and runs
-    # a focused workload that exercises the app's core library code
-    # without needing a live daemon. The probes that ship today:
-    #   activemq, cassandra, felix, hazelcast, jetty, kafka, kc16, kc26,
-    #   solr, wildfly.
-    # The legacy launch_daemon helpers (jenkins, ignite, elasticsearch,
-    # neo4j, liberty, payara, flink, spark, gradle, cglib_probe,
-    # bytebuddy_probe) intentionally aren't called: those apps either
-    # aren't installed or their probe targets don't exist on disk.
-    func_solr
+    # Daemon-style helpers (func_*): real upstream daemon → ready log →
+    # endpoint probe → kill. These are the canonical retirement gate
+    # for daemon/server apps per apps/TARGET_APPS.md. Expected outcome
+    # on current CratonVM: DAEMON_DIED / TIMEOUT_NO_READY for the
+    # apps on the "Daemon-blocked apps" list in TARGET_APPS.md.
     func_activemq
-    func_kafka
+    func_cassandra
+    func_felix
+    func_hazelcast
     func_jetty
-    func_wildfly
+    func_kafka
     func_kc16
     func_kc26
-    func_hazelcast
-    func_felix
-    func_cassandra
+    func_springboot
+    func_wildfly
+
+    # Library-only probes (probe_*): exercise the app's library code
+    # paths without a live daemon. NOT a substitute for daemon pass —
+    # use --daemon-only to skip these and assert the strict criterion.
+    # Also runs solr_probe (no daemon shape — see comment on probe_solr).
+    if [ "$DAEMON_ONLY" -eq 0 ]; then
+        probe_activemq
+        probe_cassandra
+        probe_felix
+        probe_hazelcast
+        probe_jetty
+        probe_kafka
+        probe_kc16
+        probe_kc26
+        probe_solr
+        probe_wildfly
+    fi
 }
 
 # ----- RECURSIVE -----------------------------------------------------------

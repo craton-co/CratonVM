@@ -29,6 +29,10 @@ apps/**/*.tar.gz
 # jboss-modules class loader, etc.) — see docstring on run_smoke /
 # run_functional in scripts/orchestrator.sh.
 !test-infra/probes/**/*.class
+# Spring Framework jars used by the springboot probe. Checked in so the
+# probe can compile + run without a network fetch at smoke time.
+# See test-infra/spring-libs/ and func_springboot in scripts/orchestrator.sh.
+!test-infra/spring-libs/**/*.jar
 
 # JAR files (benchmark dependencies — download separately)
 bench/*.jar
