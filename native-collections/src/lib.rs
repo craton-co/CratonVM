@@ -588,6 +588,23 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // unwrap that `map_state` already performs for unmodifiable maps.
     let this = unwrap_unmod(ctx, this);
     let (data_slot, size_slot, _) = al_slots(ctx);
+    // Receiver-layout guard. `al_state` is reached through `Collection`-
+    // and `List`-interface natives (`size`, `forEach`, `stream`, …) whose
+    // bytecode dispatcher can target *any* object — including non-list
+    // receivers funnelled through reflection, lambda metafactory, or a
+    // misresolved vtable.  In real-JDK mode `al_slots` returns
+    // `(elementData=4, size=6)` (matching the inherited AbstractList /
+    // AbstractCollection field layout); on a 3-slot receiver such as
+    // `java/nio/charset/Charset` the unguarded `get_field` issues an
+    // out-of-bounds slot read which the GC guard catches and the JUnit
+    // bootstrap eventually segfaults on downstream.  Returning the
+    // "empty list" sentinel matches the documented contract of
+    // `collection_elements_generic` and lets the caller fall back to a
+    // virtual-dispatch path.
+    let n_fields = ctx.object_num_fields(this);
+    if n_fields <= data_slot || n_fields <= size_slot {
+        return (None, 0);
+    }
     let data = match ctx.get_field(this, data_slot) {
         Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => Some(arr),
         _ => None,
@@ -638,12 +655,21 @@ fn collection_elements_generic(
 #[inline]
 fn al_set_data(ctx: &mut dyn NativeContext, this: ObjectRef, buf: ObjectRef) {
     let (data_slot, _, _) = al_slots(ctx);
+    // Receiver-layout guard — see `al_state` for rationale. Skip the write
+    // entirely on a wrong-class receiver to avoid the out-of-bounds GC guard
+    // warning that pairs with the read-side fix above.
+    if data_slot >= ctx.object_num_fields(this) {
+        return;
+    }
     ctx.set_field(this, data_slot, Value::Object(Some(buf)));
 }
 
 #[inline]
 fn al_set_size(ctx: &mut dyn NativeContext, this: ObjectRef, size: i32) {
     let (_, size_slot, _) = al_slots(ctx);
+    if size_slot >= ctx.object_num_fields(this) {
+        return;
+    }
     ctx.set_field(this, size_slot, Value::Int(size));
 }
 
@@ -13743,6 +13769,20 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
         }
     }
+    // KC-Charset fix (2026-05-25): receiver-layout guard for the speculative
+    // probe sequence below. `collect_collection_elements` is invoked through
+    // generic Collection-interface natives (`addAll`, `retainAll`, `HashSet`
+    // ctors, …) whose receiver type is statically `Collection` but at runtime
+    // may be ANY object — e.g. the JUnit `--help` bootstrap funnels a
+    // `java/nio/charset/Charset` (3 fields) through a generic-collection
+    // call site during charset registration, and the blind
+    // `ctx.get_field(coll, data_slot)` reads issued below hit slot indices 4
+    // and 6 on the 3-slot Charset.  Without the guard the GC fires hundreds
+    // of `gen_heap::get_field: out-of-bounds field read dropped` warnings,
+    // each probe returns a benign null, and a downstream invariant eventually
+    // segfaults the VM.  We compute `n_fields` once and use it to short-circuit
+    // any layout probe whose required slot is past the receiver's actual layout.
+    let n_fields = ctx.object_num_fields(coll);
     // S111r-bug-fix (peaceful-sammet): Try ArrayList layout via the
     // field-index resolver so we honour the real-JDK layout
     // (`modCount`/`elementData`/`size` slots from AbstractList/ArrayList) —
@@ -13753,24 +13793,36 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     // and surfaces as the `@AliasFor ... is not meta-present` chain.
     {
         let (data_slot, size_slot, _) = al_slots(ctx);
-        let f_data = ctx.get_field(coll, data_slot);
-        let f_size = ctx.get_field(coll, size_slot);
-        if let (Value::Object(Some(arr)), Value::Int(size)) = (f_data, f_size) {
-            if ctx.heap_kind_of(arr) == ObjectKind::Array {
-                let len = ctx.array_length(arr);
-                if size >= 0 && len >= size as usize {
-                    let mut elems = Vec::with_capacity(size as usize);
-                    for i in 0..(size as usize) {
-                        elems.push(ctx.get_array_element(arr, i));
+        if data_slot < n_fields && size_slot < n_fields {
+            let f_data = ctx.get_field(coll, data_slot);
+            let f_size = ctx.get_field(coll, size_slot);
+            if let (Value::Object(Some(arr)), Value::Int(size)) = (f_data, f_size) {
+                if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                    let len = ctx.array_length(arr);
+                    if size >= 0 && len >= size as usize {
+                        let mut elems = Vec::with_capacity(size as usize);
+                        for i in 0..(size as usize) {
+                            elems.push(ctx.get_array_element(arr, i));
+                        }
+                        return elems;
                     }
-                    return elems;
                 }
             }
         }
     }
-    // Legacy/synthetic ArrayList layout (field 0 = Object[], field 1 = Int size)
-    let f0 = ctx.get_field(coll, 0);
-    let f1 = ctx.get_field(coll, 1);
+    // Legacy/synthetic ArrayList layout (field 0 = Object[], field 1 = Int size).
+    // Skip entirely when the receiver doesn't even have 2 slots — common for
+    // 0-field marker classes (cglib's `MethodInterceptorGenerator`, etc.).
+    let f0 = if n_fields >= 1 {
+        ctx.get_field(coll, 0)
+    } else {
+        Value::Object(None)
+    };
+    let f1 = if n_fields >= 2 {
+        ctx.get_field(coll, 1)
+    } else {
+        Value::Object(None)
+    };
     if let (Value::Object(Some(arr)), Value::Int(size)) = (f0, f1) {
         if ctx.heap_kind_of(arr) == ObjectKind::Array {
             let len = ctx.array_length(arr);
@@ -13799,26 +13851,42 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             return elems;
         }
     }
-    // Try LinkedList layout (field 0 = head Node, field 2 = Int size)
-    if let Value::Int(size) = ctx.get_field(coll, LL_FIELD_SIZE) {
-        if size > 0 {
-            let mut elems = Vec::with_capacity(size as usize);
-            let mut cur = ctx.get_field(coll, LL_FIELD_HEAD);
-            while let Value::Object(Some(node)) = cur {
-                elems.push(ctx.get_field(node, LL_NODE_ELEM));
-                cur = ctx.get_field(node, LL_NODE_NEXT);
+    // Try LinkedList layout (field 0 = head Node, field 2 = Int size).
+    // Guarded so a 1- or 2-slot non-LL receiver doesn't trigger an OOB probe
+    // on slot 2.
+    if LL_FIELD_SIZE < n_fields {
+        if let Value::Int(size) = ctx.get_field(coll, LL_FIELD_SIZE) {
+            if size > 0 && LL_FIELD_HEAD < n_fields {
+                let mut elems = Vec::with_capacity(size as usize);
+                let mut cur = ctx.get_field(coll, LL_FIELD_HEAD);
+                while let Value::Object(Some(node)) = cur {
+                    // Per-node guard: a real LL node has 3 slots
+                    // (prev/next/elem). A non-node reached here (e.g. via the
+                    // false-positive size match above) would OOB-probe on
+                    // slot 2 / slot 1.
+                    let node_fields = ctx.object_num_fields(node);
+                    if LL_NODE_ELEM >= node_fields || LL_NODE_NEXT >= node_fields {
+                        break;
+                    }
+                    elems.push(ctx.get_field(node, LL_NODE_ELEM));
+                    cur = ctx.get_field(node, LL_NODE_NEXT);
+                }
+                return elems;
             }
-            return elems;
         }
     }
     // S111r28: HashSet / LinkedHashSet — field 0 = backing HashMap.
     // Walk the backing map's bucket nodes and collect keys.
-    if let Value::Object(Some(backing)) = ctx.get_field(coll, HS_FIELD_MAP) {
-        // Verify it actually is a HashMap-like (slot 0 = bucket array).
-        let s0 = ctx.get_field(backing, MAP_FIELD_BUCKETS);
-        if let Value::Object(Some(arr)) = s0 {
-            if ctx.heap_kind_of(arr) == ObjectKind::Array {
-                return map_collect_keys(ctx, backing);
+    if HS_FIELD_MAP < n_fields {
+        if let Value::Object(Some(backing)) = ctx.get_field(coll, HS_FIELD_MAP) {
+            // Verify it actually is a HashMap-like (slot 0 = bucket array).
+            if MAP_FIELD_BUCKETS < ctx.object_num_fields(backing) {
+                let s0 = ctx.get_field(backing, MAP_FIELD_BUCKETS);
+                if let Value::Object(Some(arr)) = s0 {
+                    if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                        return map_collect_keys(ctx, backing);
+                    }
+                }
             }
         }
     }
