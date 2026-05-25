@@ -466,12 +466,20 @@ fn _unused_aet() -> ArrayElementType {
 // rather than the externally-visible "value" (which is the bit-complement).
 //
 // Reference: java.util.zip.CRC32.updateBytes (JDK 25) — calls
-// `updateBytes0(crc, b, off, len)` with `crc` already complemented; returns
-// `~updated`.
+// `updateBytes0(crc, b, off, len)` where `crc` is the *public* CRC value
+// (initial 0, never complemented in the Java wrapper) and the native is
+// expected to return the new public CRC value. zlib's `crc32` implements
+// this contract by complementing the running state on entry and exit; the
+// inner reflected-shift loop runs on the complemented form. We mirror that
+// exactly here — getting this wrong by treating `crc` as the *running*
+// state breaks `ZipInputStream` (CRC of inflated entry mismatches the entry
+// header's stored CRC) on every benchmark that extracts data from a ZIP,
+// including DaCapo's `Benchmark.unpackZipStream` (avrora).
 
-/// CRC-32/IEEE update (reflected poly 0xEDB88320). The `crc` argument is the
-/// "running" (uncomplemented) state — the JDK Java wrapper has already
-/// inverted the public value before handing it to the native.
+/// Inner reflected CRC-32/IEEE shift (poly 0xEDB88320). Takes the running
+/// state (complemented form — i.e. `~public_crc`), returns the updated
+/// running state. Callers must complement on entry/exit; see
+/// `crc32_update_public` for the boundary-correct wrapper.
 fn crc32_step(mut crc: u32, data: &[u8]) -> u32 {
     for &b in data {
         crc ^= b as u32;
@@ -483,11 +491,17 @@ fn crc32_step(mut crc: u32, data: &[u8]) -> u32 {
     crc
 }
 
+/// CRC-32/IEEE update matching the JDK `CRC32` contract: `crc` is the
+/// public value (initial 0), output is the new public value.
+fn crc32_update_public(public_crc: u32, data: &[u8]) -> u32 {
+    !crc32_step(!public_crc, data)
+}
+
 fn crc32_update(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // static native int update(int crc, int b)
     let crc = arg_int(args, 0) as u32;
     let b = (arg_int(args, 1) & 0xFF) as u8;
-    Ok(Some(Value::Int(crc32_step(crc, &[b]) as i32)))
+    Ok(Some(Value::Int(crc32_update_public(crc, &[b]) as i32)))
 }
 
 fn crc32_update_bytes_0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -500,7 +514,7 @@ fn crc32_update_bytes_0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(a) => read_byte_array(ctx, a, off, len),
         None => Vec::new(),
     };
-    let new_crc = crc32_step(crc, &bytes);
+    let new_crc = crc32_update_public(crc, &bytes);
     Ok(Some(Value::Int(new_crc as i32)))
 }
 
@@ -608,9 +622,9 @@ mod tests {
 
     #[test]
     fn crc32_matches_known_vectors() {
-        // Empty input — running state starts at 0xFFFFFFFF (the JDK passes
-        // ~crc=0xFFFFFFFF in for a fresh CRC32), no bytes processed, result
-        // equals the input.
+        // Empty input — running state starts at 0xFFFFFFFF (the inner step
+        // takes the complemented form), no bytes processed, result equals
+        // the input.
         assert_eq!(crc32_step(0xFFFF_FFFF, b""), 0xFFFF_FFFF);
 
         // "123456789" — classic CRC-32/IEEE check vector is 0xCBF43926
@@ -622,6 +636,28 @@ mod tests {
         // "abc" — CRC-32/IEEE = 0x352441C2.
         let running = crc32_step(0xFFFF_FFFF, b"abc");
         assert_eq!(!running, 0x3524_41C2);
+    }
+
+    /// `crc32_update_public` matches the JDK `CRC32.update*` contract:
+    /// public CRC in, public CRC out (initial state 0, no caller-side
+    /// complementation). Regression guard for the DaCapo `avrora`
+    /// "invalid entry CRC" crash where the native was treating the
+    /// JDK-public `int crc` field as the complemented running state.
+    #[test]
+    fn crc32_public_contract_matches_jdk() {
+        // Fresh CRC32 starts at 0; getValue() must return 0 (matches real JDK).
+        assert_eq!(crc32_update_public(0, b""), 0);
+
+        // "123456789" → 0xCBF43926 (canonical IEEE check vector, also what
+        // real JDK 25 java.util.zip.CRC32 returns).
+        assert_eq!(crc32_update_public(0, b"123456789"), 0xCBF4_3926);
+
+        // "abc" → 0x352441C2.
+        assert_eq!(crc32_update_public(0, b"abc"), 0x3524_41C2);
+
+        // Chained call must equal one-shot.
+        let half = crc32_update_public(0, b"1234");
+        assert_eq!(crc32_update_public(half, b"56789"), 0xCBF4_3926);
     }
 
     #[test]
