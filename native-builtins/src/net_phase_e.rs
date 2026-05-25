@@ -2802,10 +2802,49 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             buf
         } else if let Some(rest) = url_str.strip_prefix("file:") {
             let path = rest.trim_start_matches('/');
-            // Retry with a leading slash for POSIX absolute paths.
-            std::fs::read(path)
-                .or_else(|_| std::fs::read(rest))
-                .map_err(|e| ioex(format!("URL.openStream: read file {path}: {e}")))?
+            // On Windows, MSYS/Cygwin-style `/c/...` (URL `file:/c/...`)
+            // needs the drive-letter colon reinjected: `c/foo` → `c:/foo`.
+            // ActiveMQ's XBeanBrokerFactory builds the activemq.xml URL
+            // from `-Dactivemq.conf=/c/.../conf`; without this rewrite the
+            // broker start fails with "Системе не удается найти указанный
+            // путь" (cannot find the specified path) at config load.
+            #[cfg(windows)]
+            let win_path = {
+                let bytes = path.as_bytes();
+                if bytes.len() >= 2
+                    && bytes[0].is_ascii_alphabetic()
+                    && (bytes[1] == b'/' || bytes[1] == b'\\')
+                {
+                    let mut s = String::with_capacity(path.len() + 1);
+                    s.push(bytes[0] as char);
+                    s.push(':');
+                    s.push_str(&path[1..]);
+                    Some(s)
+                } else {
+                    None
+                }
+            };
+            #[cfg(not(windows))]
+            let win_path: Option<String> = None;
+            let try_paths: Vec<String> = match &win_path {
+                Some(w) => vec![w.clone(), path.to_string(), rest.to_string()],
+                None => vec![path.to_string(), rest.to_string()],
+            };
+            let mut last_err: Option<std::io::Error> = None;
+            let mut result: Option<Vec<u8>> = None;
+            for p in &try_paths {
+                match std::fs::read(p) {
+                    Ok(b) => { result = Some(b); break; }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            match result {
+                Some(b) => b,
+                None => {
+                    let e = last_err.unwrap_or_else(|| std::io::Error::other("no path tried"));
+                    return Err(ioex(format!("URL.openStream: read file {path}: {e}")));
+                }
+            }
         } else if let Some(name) = url_str.strip_prefix("classpath:") {
             let name = name.trim_start_matches('/');
             ctx.find_resource(name)
