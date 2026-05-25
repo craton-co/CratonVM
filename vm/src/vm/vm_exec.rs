@@ -8324,7 +8324,38 @@ fn invoke_on_class_shared_inner(
                         // yields a non-null UTF-8 Charset.
                         || (class_name == "java/io/PrintStream"
                             && method_name == "charset"
-                            && descriptor == "()Ljava/nio/charset/Charset;");
+                            && descriptor == "()Ljava/nio/charset/Charset;")
+                        // BREAKITER: `java.text.BreakIterator.getWordInstance` /
+                        // `getLineInstance` / `getSentenceInstance` / `getCharacterInstance`
+                        // are concrete static factories whose JDK 25 bytecode walks
+                        // `LocaleProviderAdapter.forJRE().getBreakIteratorProvider()`,
+                        // then `BreakIteratorProviderImpl.getBreakInstance(...)` which
+                        // reads `LocaleResources.getBreakIteratorInfo("BreakIteratorClasses")`.
+                        // That cache lookup returns null in our partial locale-data
+                        // bootstrap (jdk.localedata's class-based resource bundles are
+                        // not surfaced through our jimage path), producing
+                        //   "Cannot load from null array"
+                        // at `BreakIteratorProviderImpl.getBreakInstance pc=21`.
+                        // Tripwire: JUnit Platform's `--help` formatter uses
+                        // `BreakIterator.getLineInstance(Locale.US)` for text wrapping
+                        // and aborts on the NPE under `CRATONVM_DISABLE_JIT=1`.
+                        //
+                        // Fix: pin our native overrides (registered in
+                        // `phases_late.rs::register_p66_break_iterator`) ahead of the
+                        // JDK bytecode. The natives return a synthetic
+                        // `java/text/BreakIterator` whose instance methods
+                        // (`setText`/`first`/`next`/`previous`/`last`) are abstract on
+                        // the real class — those route via the `method.is_abstract()`
+                        // branch automatically, so only the static factories need an
+                        // allow-list entry here.
+                        || (class_name == "java/text/BreakIterator"
+                            && matches!(
+                                method_name,
+                                "getWordInstance"
+                                | "getLineInstance"
+                                | "getSentenceInstance"
+                                | "getCharacterInstance"
+                            ));
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
