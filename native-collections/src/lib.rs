@@ -6437,6 +6437,133 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // flatMapToInt — Stream<T>.flatMapToInt(T -> IntStream) -> IntStream.
+    // Lucene's UnicodeUtil clinit uses this; without a native the
+    // abstract method on `Stream` is called and the clinit aborts with
+    // AbstractMethodError.
+    r.register(
+        c,
+        "flatMapToInt",
+        "(Ljava/util/function/Function;)Ljava/util/stream/IntStream;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let mapper = match args.get(1) {
+                Some(Value::Object(Some(f))) => *f,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let elements = stream_elements_mut(ctx, this);
+            let mut flat: Vec<Value> = Vec::new();
+            for e in elements {
+                let sub = ctx
+                    .invoke_virtual(mapper, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[e])
+                    .ok()
+                    .flatten();
+                if let Some(Value::Object(Some(sub_stream))) = sub {
+                    let sub_arr = match ctx.invoke_virtual(sub_stream, "toArray", "()[I", &[]) {
+                        Ok(Some(Value::Object(Some(a)))) => a,
+                        _ => continue,
+                    };
+                    let len = ctx.array_length(sub_arr);
+                    for i in 0..len {
+                        flat.push(ctx.get_array_element(sub_arr, i));
+                    }
+                }
+            }
+            let stream = alloc_synthetic(ctx, "java/util/stream/IntStream", 1);
+            let arr = alloc_ref_array(ctx, flat.len());
+            for (i, v) in flat.iter().enumerate() {
+                ctx.set_array_element(arr, i, *v);
+            }
+            ctx.set_field(stream, 0, Value::Object(Some(arr)));
+            Ok(Some(Value::Object(Some(stream))))
+        },
+    );
+    // flatMapToLong — same shape returning a LongStream.
+    r.register(
+        c,
+        "flatMapToLong",
+        "(Ljava/util/function/Function;)Ljava/util/stream/LongStream;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let mapper = match args.get(1) {
+                Some(Value::Object(Some(f))) => *f,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let elements = stream_elements_mut(ctx, this);
+            let mut flat: Vec<Value> = Vec::new();
+            for e in elements {
+                let sub = ctx
+                    .invoke_virtual(mapper, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[e])
+                    .ok()
+                    .flatten();
+                if let Some(Value::Object(Some(sub_stream))) = sub {
+                    let sub_arr = match ctx.invoke_virtual(sub_stream, "toArray", "()[J", &[]) {
+                        Ok(Some(Value::Object(Some(a)))) => a,
+                        _ => continue,
+                    };
+                    let len = ctx.array_length(sub_arr);
+                    for i in 0..len {
+                        flat.push(ctx.get_array_element(sub_arr, i));
+                    }
+                }
+            }
+            let stream = alloc_synthetic(ctx, "java/util/stream/LongStream", 1);
+            let arr = alloc_ref_array(ctx, flat.len());
+            for (i, v) in flat.iter().enumerate() {
+                ctx.set_array_element(arr, i, *v);
+            }
+            ctx.set_field(stream, 0, Value::Object(Some(arr)));
+            Ok(Some(Value::Object(Some(stream))))
+        },
+    );
+    // flatMapToDouble — same shape returning a DoubleStream.
+    r.register(
+        c,
+        "flatMapToDouble",
+        "(Ljava/util/function/Function;)Ljava/util/stream/DoubleStream;",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let mapper = match args.get(1) {
+                Some(Value::Object(Some(f))) => *f,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let elements = stream_elements_mut(ctx, this);
+            let mut flat: Vec<Value> = Vec::new();
+            for e in elements {
+                let sub = ctx
+                    .invoke_virtual(mapper, "apply", "(Ljava/lang/Object;)Ljava/lang/Object;", &[e])
+                    .ok()
+                    .flatten();
+                if let Some(Value::Object(Some(sub_stream))) = sub {
+                    let sub_arr = match ctx.invoke_virtual(sub_stream, "toArray", "()[D", &[]) {
+                        Ok(Some(Value::Object(Some(a)))) => a,
+                        _ => continue,
+                    };
+                    let len = ctx.array_length(sub_arr);
+                    for i in 0..len {
+                        flat.push(ctx.get_array_element(sub_arr, i));
+                    }
+                }
+            }
+            let stream = alloc_synthetic(ctx, "java/util/stream/DoubleStream", 1);
+            let arr = alloc_ref_array(ctx, flat.len());
+            for (i, v) in flat.iter().enumerate() {
+                ctx.set_array_element(arr, i, *v);
+            }
+            ctx.set_field(stream, 0, Value::Object(Some(arr)));
+            Ok(Some(Value::Object(Some(stream))))
+        },
+    );
+
     // mapToDouble
     r.register(
         c,

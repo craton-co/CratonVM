@@ -419,6 +419,22 @@ print_summary() {
 # argument parser. Counts the JDK boot path + classpath resolution as
 # implicit coverage.
 
+## class_load_test NAME JAR CLASS [CLASS...]
+##   Run the generic ClassLoadProbe against $JAR (or path glob) verifying
+##   each $CLASS parses + loads on CratonVM. Pass = every class loads.
+##   Used for Java-library apps where the upstream entry point needs
+##   transitive deps the orchestrator doesn't ship (slf4j, jboss-logging,
+##   ManagedChannelProvider SPI, etc.).
+class_load_test() {
+    local name="$1"; shift
+    local cp="$1"; shift
+    [ -f "$REPO_ROOT/test-infra/probes/classload_probe/ClassLoadProbe.class" ] || return 0
+    run_oneshot "$name" "$TIMEOUT_S" \
+        "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+        -c "$REPO_ROOT/test-infra/probes/classload_probe;$cp" \
+        ClassLoadProbe "$@"
+}
+
 run_smoke() {
     local probes_present=0
 
@@ -515,14 +531,114 @@ run_smoke() {
     # that loads benchmarks from harness/ inside the jar; that boot
     # path fails in our env. Probe via ClassLoadProbe instead so the
     # signal is "Harness.class parses + loads on this JVM".
-    if [ -f "$APPS/dacapo-9.12-MR1-bach.jar" ] \
-        && [ -f "$REPO_ROOT/test-infra/probes/classload_probe/ClassLoadProbe.class" ]; then
-        run_oneshot dacapo "$TIMEOUT_S" \
+    [ -f "$APPS/dacapo-9.12-MR1-bach.jar" ] && {
+        class_load_test dacapo "$APPS/dacapo-9.12-MR1-bach.jar" Harness; probes_present=1; }
+
+    # ---- Wave 3: Apache + Java-ecosystem libraries via ClassLoadProbe.
+    # Each app ships as a maven-central jar (or jar set) under its own
+    # apps/<name>/ directory; the probe verifies a representative class
+    # from the library's public surface parses + loads on CratonVM.
+    [ -f "$APPS/maven-3.9.9/lib/maven-core-3.9.9.jar" ] && {
+        # Maven gets a richer probe (model + version) since it's a
+        # tool whose API surface we exercise directly elsewhere.
+        if [ -f "$REPO_ROOT/test-infra/probes/maven_probe/MavenProbe.class" ]; then
+            local mvncp=$(find "$APPS/maven-3.9.9/lib" -name '*.jar' | tr '\n' ';' | sed 's/;$//')
+            run_oneshot maven "$TIMEOUT_S" \
+                "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+                -c "$REPO_ROOT/test-infra/probes/maven_probe;$mvncp" MavenProbe
+            probes_present=1
+        fi
+    }
+    [ -d "$APPS/lucene-9.10.0/modules" ] && {
+        class_load_test lucene "$APPS/lucene-9.10.0/modules/lucene-core-9.10.0.jar" \
+            org.apache.lucene.util.UnicodeUtil org.apache.lucene.document.Document
+        probes_present=1
+    }
+    if [ -f "$APPS/spring-framework-6/spring-context.jar" ] \
+        && [ -f "$REPO_ROOT/test-infra/probes/springfwk_probe/SpringFrameworkProbe.class" ]; then
+        local sfcp="$APPS/spring-framework-6/spring-context.jar;$APPS/spring-framework-6/spring-core.jar;$APPS/spring-framework-6/spring-beans.jar;$APPS/spring-framework-6/spring-aop.jar;$APPS/spring-framework-6/spring-expression.jar;$REPO_ROOT/test-infra/spring-libs/jspecify-1.0.0.jar"
+        run_oneshot spring_framework "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$REPO_ROOT/test-infra/probes/classload_probe;$APPS/dacapo-9.12-MR1-bach.jar" \
-            ClassLoadProbe Harness
+            -c "$REPO_ROOT/test-infra/probes/springfwk_probe;$sfcp" SpringFrameworkProbe
         probes_present=1
     fi
+    [ -f "$APPS/hibernate-6/hibernate-core-6.6.0.Final.jar" ] && {
+        class_load_test hibernate "$APPS/hibernate-6/hibernate-core-6.6.0.Final.jar" \
+            org.hibernate.Version org.hibernate.dialect.H2Dialect
+        probes_present=1
+    }
+    [ -f "$APPS/rabbitmq-client/amqp-client.jar" ] && {
+        class_load_test rabbitmq "$APPS/rabbitmq-client/amqp-client.jar" \
+            com.rabbitmq.client.Connection com.rabbitmq.client.AMQP\$BasicProperties
+        probes_present=1
+    }
+    [ -f "$APPS/grpc-java/grpc-api.jar" ] && {
+        class_load_test grpc "$APPS/grpc-java/grpc-api.jar;$APPS/grpc-java/grpc-core.jar" \
+            io.grpc.Status io.grpc.ManagedChannel
+        probes_present=1
+    }
+    [ -f "$APPS/flink/flink-core.jar" ] && {
+        class_load_test flink "$APPS/flink/flink-core.jar" \
+            org.apache.flink.api.common.JobID org.apache.flink.api.common.ExecutionConfig
+        probes_present=1
+    }
+    [ -f "$APPS/spark/spark-core.jar" ] && {
+        class_load_test spark "$APPS/spark/spark-core.jar" \
+            org.apache.spark.api.java.JavaSparkContext
+        probes_present=1
+    }
+    [ -f "$APPS/camel/camel-api.jar" ] && {
+        # DefaultCamelContext needs transitive deps not on our classpath;
+        # the CamelContext interface alone proves the JVM parses the
+        # camel-api jar's bytecode + annotation chain.
+        class_load_test camel "$APPS/camel/camel-api.jar;$APPS/camel/camel-core.jar" \
+            org.apache.camel.CamelContext
+        probes_present=1
+    }
+    [ -f "$APPS/tomee/openejb-core.jar" ] && {
+        class_load_test tomee "$APPS/tomee/openejb-core.jar" \
+            org.apache.openejb.OpenEJB
+        probes_present=1
+    }
+    [ -f "$APPS/quarkus/quarkus-core.jar" ] && {
+        class_load_test quarkus "$APPS/quarkus/quarkus-core.jar" \
+            io.quarkus.runtime.Quarkus
+        probes_present=1
+    }
+    [ -f "$APPS/micronaut/micronaut-core.jar" ] && {
+        class_load_test micronaut "$APPS/micronaut/micronaut-core.jar" \
+            io.micronaut.core.version.VersionUtils
+        probes_present=1
+    }
+    [ -f "$APPS/ignite/ignite-core.jar" ] && {
+        class_load_test ignite "$APPS/ignite/ignite-core.jar" \
+            org.apache.ignite.IgniteSystemProperties
+        probes_present=1
+    }
+    [ -f "$APPS/hbase/hbase-common.jar" ] && {
+        class_load_test hbase "$APPS/hbase/hbase-common.jar" \
+            org.apache.hadoop.hbase.HConstants
+        probes_present=1
+    }
+    [ -f "$APPS/neo4j/neo4j-driver.jar" ] && {
+        class_load_test neo4j "$APPS/neo4j/neo4j-driver.jar" \
+            org.neo4j.driver.GraphDatabase
+        probes_present=1
+    }
+    [ -f "$APPS/elasticsearch/elasticsearch-java.jar" ] && {
+        class_load_test elasticsearch "$APPS/elasticsearch/elasticsearch-java.jar" \
+            co.elastic.clients.elasticsearch.ElasticsearchClient
+        probes_present=1
+    }
+    [ -f "$APPS/hadoop/hadoop-common.jar" ] && {
+        class_load_test hadoop "$APPS/hadoop/hadoop-common.jar" \
+            org.apache.hadoop.fs.Path
+        probes_present=1
+    }
+    [ -f "$APPS/jedit5.7.0install.jar" ] && {
+        class_load_test jedit "$APPS/jedit5.7.0install.jar" installer.Install
+        probes_present=1
+    }
 
     # Spring Boot probe: constructs a SpringApplication with banner-mode
     # OFF and WebApplicationType.NONE, prints the main app class, and
