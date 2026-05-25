@@ -34,6 +34,12 @@ apps/**/*.tar.gz
 # See test-infra/spring-libs/ and func_springboot in scripts/orchestrator.sh.
 !test-infra/spring-libs/**/*.jar
 
+# Regression pool: the staged app distros (5 GB+) and per-run results are
+# never committed. The baselines, probes, and scripts are. See
+# test-infra/regression-pool/README.md.
+test-infra/regression-pool/apps/
+test-infra/regression-pool/results/
+
 # JAR files (benchmark dependencies — download separately)
 bench/*.jar
 

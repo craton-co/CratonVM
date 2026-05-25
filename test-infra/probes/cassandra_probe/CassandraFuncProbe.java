@@ -14,7 +14,7 @@ public class CassandraFuncProbe {
             System.out.println("FAIL: UUID round-trip mismatch: " + u1 + " -> " + u2);
             System.exit(1);
         }
-        System.out.println("UUID round-trip OK: " + u1);
+        System.out.println("UUID round-trip OK");  // don't print the UUID — baselines must be deterministic
         ByteBuffer sbb = ByteBufferUtil.bytes("cassandra-probe-payload");
         String s = ByteBufferUtil.string(sbb);
         if (!"cassandra-probe-payload".equals(s)) {

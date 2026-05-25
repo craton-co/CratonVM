@@ -1,0 +1,6 @@
+After init: state=8
+After start: state=32
+System bundle: org.apache.felix.framework
+Installed bundle count: 1
+Framework stopped, final state=4
+OK
