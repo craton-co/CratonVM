@@ -453,7 +453,7 @@ run_smoke() {
         "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
         --jar "$APPS/jenkins.war" -- --version --enable-future-java
 
-    if [ -d "$APPS/jetty-home-11.0.20" ] && [ -f "$APPS/jetty_probe/JettyProbe.class" ]; then
+    if [ -d "$APPS/jetty-home-11.0.20" ] && [ -f "$REPO_ROOT/test-infra/probes/jetty_probe/JettyProbe.class" ]; then
         # Jetty 11 start.jar requires an enabled-modules set (start.d/*.ini
         # or --add-modules) before any flag prints output — even --help and
         # --version exit non-zero with "No enabled jetty modules found!".
@@ -461,7 +461,7 @@ run_smoke() {
         # class (whose static initializer pulls in the slf4j chain and reads
         # build-time version constants) and prints VERSION + POWERED_BY.
         # Pass = the JVM can class-load jetty-util + slf4j cleanly.
-        local jcp="$APPS/jetty_probe;$APPS/jetty-home-11.0.20/lib/jetty-util-11.0.20.jar;$APPS/jetty-home-11.0.20/lib/logging/slf4j-api-2.0.9.jar"
+        local jcp="$REPO_ROOT/test-infra/probes/jetty_probe;$APPS/jetty-home-11.0.20/lib/jetty-util-11.0.20.jar;$APPS/jetty-home-11.0.20/lib/logging/slf4j-api-2.0.9.jar"
         run_oneshot jetty "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
             -c "$jcp" JettyProbe
@@ -480,7 +480,7 @@ run_smoke() {
             -c "$cp" org.apache.activemq.console.Main -- --version
     fi
 
-    if [ -d "$APPS/apache-cassandra-4.1.4" ] && [ -f "$APPS/cassandra_probe/CassandraProbe.class" ]; then
+    if [ -d "$APPS/apache-cassandra-4.1.4" ] && [ -f "$REPO_ROOT/test-infra/probes/cassandra_probe/CassandraProbe.class" ]; then
         # Cassandra's `nodetool version` shells out to JMX-over-RMI which
         # requires a working `rmi:` URL stream handler — we don't ship one,
         # so nodetool aborts with "MalformedURLException: Unsupported
@@ -491,7 +491,7 @@ run_smoke() {
         local cp; cp=$(cp_glob "$APPS/apache-cassandra-4.1.4/lib")
         [ -n "$cp" ] && run_oneshot cassandra "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$APPS/cassandra_probe;$cp" CassandraProbe
+            -c "$REPO_ROOT/test-infra/probes/cassandra_probe;$cp" CassandraProbe
     fi
 
     if [ -d "$APPS/apache-ignite-2.16.0-bin" ]; then
@@ -564,10 +564,10 @@ run_smoke() {
     # `FrameworkFactory.newFramework().init() ... stop()`, which exercises
     # Felix's class init + bundle resolver + module wiring without
     # touching the interactive shell.
-    if [ -d "$APPS/felix-framework-7.0.5" ] && [ -f "$APPS/felix_probe/FelixProbe.class" ]; then
+    if [ -d "$APPS/felix-framework-7.0.5" ] && [ -f "$REPO_ROOT/test-infra/probes/felix_probe/FelixProbe.class" ]; then
         run_oneshot felix "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$APPS/felix_probe;$APPS/felix-framework-7.0.5/bin/felix.jar" \
+            -c "$REPO_ROOT/test-infra/probes/felix_probe;$APPS/felix-framework-7.0.5/bin/felix.jar" \
             FelixProbe
     fi
 
@@ -603,8 +603,8 @@ run_smoke() {
     # reads `org.keycloak.common.Version.NAME / VERSION` directly, which
     # exercises Keycloak's common-lib clinit chain without the picocli
     # rendering path.
-    if [ -d "$APPS/keycloak-26.2.4" ] && [ -f "$APPS/kc26_probe/Keycloak26Probe.class" ]; then
-        local kc_cp="$APPS/kc26_probe;$APPS/keycloak-26.2.4/lib/lib/main/org.keycloak.keycloak-common-26.2.4.jar"
+    if [ -d "$APPS/keycloak-26.2.4" ] && [ -f "$REPO_ROOT/test-infra/probes/kc26_probe/Keycloak26Probe.class" ]; then
+        local kc_cp="$REPO_ROOT/test-infra/probes/kc26_probe;$APPS/keycloak-26.2.4/lib/lib/main/org.keycloak.keycloak-common-26.2.4.jar"
         run_oneshot kc26 "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
             -c "$kc_cp" Keycloak26Probe
@@ -660,11 +660,11 @@ func_activemq() {
     # through the OpenWireFormat marshaller, and verifies the recovered
     # message text — exercising ActiveMQ's command + serialization layer
     # without touching the broker lifecycle.
-    if [ -d "$APPS/apache-activemq-5.18.3" ] && [ -f "$APPS/activemq_probe/ActiveMQProbe.class" ]; then
+    if [ -d "$APPS/apache-activemq-5.18.3" ] && [ -f "$REPO_ROOT/test-infra/probes/activemq_probe/ActiveMQProbe.class" ]; then
         local cp; cp=$(cp_glob "$APPS/apache-activemq-5.18.3/lib")
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$APPS/activemq_probe;$cp" ActiveMQProbe
+            -c "$REPO_ROOT/test-infra/probes/activemq_probe;$cp" ActiveMQProbe
     fi
 }
 
@@ -693,10 +693,10 @@ func_wildfly() {
     # LocalModuleLoader rooted at wildfly's modules/ and loads
     # `org.jboss.logging` — exercising the jboss-modules class loader,
     # the .mod parser, and the JDK module finder integration.
-    if [ -d "$APPS/wildfly-32.0.1.Final" ] && [ -f "$APPS/wildfly_probe/WildflyProbe.class" ]; then
+    if [ -d "$APPS/wildfly-32.0.1.Final" ] && [ -f "$REPO_ROOT/test-infra/probes/wildfly_probe/WildflyProbe.class" ]; then
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$APPS/wildfly_probe;$APPS/wildfly-32.0.1.Final/jboss-modules.jar" \
+            -c "$REPO_ROOT/test-infra/probes/wildfly_probe;$APPS/wildfly-32.0.1.Final/jboss-modules.jar" \
             WildflyProbe "$APPS/wildfly-32.0.1.Final"
     fi
 }
@@ -707,10 +707,10 @@ func_kc16() {
     # KC16 ships as a WildFly distribution; the daemon stalls in the same
     # service-container path as wildfly. Same probe shape: load
     # `org.keycloak.keycloak-services` via jboss-modules.
-    if [ -d "$APPS/keycloak-16.1.1" ] && [ -f "$APPS/kc16_probe/Keycloak16Probe.class" ]; then
+    if [ -d "$APPS/keycloak-16.1.1" ] && [ -f "$REPO_ROOT/test-infra/probes/kc16_probe/Keycloak16Probe.class" ]; then
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$APPS/kc16_probe;$APPS/keycloak-16.1.1/jboss-modules.jar" \
+            -c "$REPO_ROOT/test-infra/probes/kc16_probe;$APPS/keycloak-16.1.1/jboss-modules.jar" \
             Keycloak16Probe "$APPS/keycloak-16.1.1"
     fi
 }
@@ -752,11 +752,11 @@ func_kafka() {
     # The probe reads AppInfoParser version, round-trips a
     # StringSerializer/Deserializer pair, and validates a producer-style
     # ConfigDef — the same code paths every Kafka client touches.
-    if [ -d "$APPS/kafka_2.13-3.7.0" ] && [ -f "$APPS/kafka_probe/KafkaProbe.class" ]; then
+    if [ -d "$APPS/kafka_2.13-3.7.0" ] && [ -f "$REPO_ROOT/test-infra/probes/kafka_probe/KafkaProbe.class" ]; then
         local cp; cp=$(cp_glob "$APPS/kafka_2.13-3.7.0/libs")
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$APPS/kafka_probe;$cp" KafkaProbe
+            -c "$REPO_ROOT/test-infra/probes/kafka_probe;$cp" KafkaProbe
     fi
 }
 
@@ -788,9 +788,9 @@ func_jetty() {
     # checks isStarted, then stops — exercising Jetty's lifecycle
     # machinery (Server, Handlers, NetworkConnector) with a graceful
     # `Server channel not bound` soft-fail on the actual bind.
-    if [ -d "$APPS/jetty-home-11.0.20" ] && [ -f "$APPS/jetty_probe/JettyFuncProbe.class" ]; then
+    if [ -d "$APPS/jetty-home-11.0.20" ] && [ -f "$REPO_ROOT/test-infra/probes/jetty_probe/JettyFuncProbe.class" ]; then
         local L="$APPS/jetty-home-11.0.20/lib"
-        local jcp="$APPS/jetty_probe;$L/jetty-server-11.0.20.jar;$L/jetty-http-11.0.20.jar;$L/jetty-io-11.0.20.jar;$L/jetty-util-11.0.20.jar;$L/logging/slf4j-api-2.0.9.jar;$L/jetty-jakarta-servlet-api-5.0.2.jar"
+        local jcp="$REPO_ROOT/test-infra/probes/jetty_probe;$L/jetty-server-11.0.20.jar;$L/jetty-http-11.0.20.jar;$L/jetty-io-11.0.20.jar;$L/jetty-util-11.0.20.jar;$L/logging/slf4j-api-2.0.9.jar;$L/jetty-jakarta-servlet-api-5.0.2.jar"
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
             -c "$jcp" JettyFuncProbe
@@ -805,11 +805,11 @@ func_cassandra() {
     # FBUtilities.getReleaseVersionString(), round-trips a UUID via
     # UUIDGen, and round-trips a string via ByteBufferUtil — the same
     # utils chain the daemon constructs on every read/write.
-    if [ -d "$APPS/apache-cassandra-4.1.4" ] && [ -f "$APPS/cassandra_probe/CassandraFuncProbe.class" ]; then
+    if [ -d "$APPS/apache-cassandra-4.1.4" ] && [ -f "$REPO_ROOT/test-infra/probes/cassandra_probe/CassandraFuncProbe.class" ]; then
         local cp; cp=$(cp_glob "$APPS/apache-cassandra-4.1.4/lib")
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$APPS/cassandra_probe;$cp" CassandraFuncProbe
+            -c "$REPO_ROOT/test-infra/probes/cassandra_probe;$cp" CassandraFuncProbe
     fi
 }
 
@@ -838,10 +838,10 @@ func_felix() {
     # start() ... stop()` end-to-end, verifying the system bundle is
     # ACTIVE between init and stop — that's an OSGi-spec lifecycle test
     # without needing the interactive shell.
-    if [ -d "$APPS/felix-framework-7.0.5" ] && [ -f "$APPS/felix_probe/FelixFuncProbe.class" ]; then
+    if [ -d "$APPS/felix-framework-7.0.5" ] && [ -f "$REPO_ROOT/test-infra/probes/felix_probe/FelixFuncProbe.class" ]; then
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$APPS/felix_probe;$APPS/felix-framework-7.0.5/bin/felix.jar" \
+            -c "$REPO_ROOT/test-infra/probes/felix_probe;$APPS/felix-framework-7.0.5/bin/felix.jar" \
             FelixFuncProbe
     fi
 }
@@ -852,11 +852,11 @@ func_hazelcast() {
     # A real Hazelcast member needs cluster discovery + listener sockets.
     # The probe instead reads BuildInfoProvider's version + build, then
     # constructs a Config + NetworkConfig + UuidUtil-generated UUID.
-    if [ -d "$APPS/hazelcast-5.4.0" ] && [ -f "$APPS/hazelcast_probe/HazelcastProbe.class" ]; then
+    if [ -d "$APPS/hazelcast-5.4.0" ] && [ -f "$REPO_ROOT/test-infra/probes/hazelcast_probe/HazelcastProbe.class" ]; then
         local cp; cp=$(cp_glob "$APPS/hazelcast-5.4.0/lib")
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$APPS/hazelcast_probe;$cp" HazelcastProbe
+            -c "$REPO_ROOT/test-infra/probes/hazelcast_probe;$cp" HazelcastProbe
     fi
 }
 
@@ -900,8 +900,8 @@ func_kc26() {
     # verifies well-known features (ACCOUNT_API / AUTHORIZATION) are
     # present — exercises the keycloak-common clinit chain + the
     # annotation-driven feature registry.
-    if [ -d "$APPS/keycloak-26.2.4" ] && [ -f "$APPS/kc26_probe/Keycloak26FuncProbe.class" ]; then
-        local kc_cp="$APPS/kc26_probe;$APPS/keycloak-26.2.4/lib/lib/main/org.keycloak.keycloak-common-26.2.4.jar"
+    if [ -d "$APPS/keycloak-26.2.4" ] && [ -f "$REPO_ROOT/test-infra/probes/kc26_probe/Keycloak26FuncProbe.class" ]; then
+        local kc_cp="$REPO_ROOT/test-infra/probes/kc26_probe;$APPS/keycloak-26.2.4/lib/lib/main/org.keycloak.keycloak-common-26.2.4.jar"
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
             -c "$kc_cp" Keycloak26FuncProbe
@@ -956,13 +956,13 @@ func_solr() {
     # fields, verify field-name enumeration, and construct a
     # DocumentObjectBinder (reflection-based bean → SolrInputDocument
     # serialization). That's the same code path every Solr client uses.
-    if [ -d "$APPS/solr-9.5.0" ] && [ -f "$APPS/solr_probe/SolrProbe.class" ]; then
+    if [ -d "$APPS/solr-9.5.0" ] && [ -f "$REPO_ROOT/test-infra/probes/solr_probe/SolrProbe.class" ]; then
         local cp; cp=$(cp_glob \
             "$APPS/solr-9.5.0/server/solr-webapp/webapp/WEB-INF/lib" \
             "$APPS/solr-9.5.0/server/lib/ext")
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$APPS/solr_probe;$cp" SolrProbe
+            -c "$REPO_ROOT/test-infra/probes/solr_probe;$cp" SolrProbe
     fi
 }
 

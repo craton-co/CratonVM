@@ -11,21 +11,6 @@ apps/
 !apps/letsgo/
 !apps/SportMe-master/
 !apps/demo/
-# Lightweight smoke probes shipped with the orchestrator — exercise an app's
-# core class init / utils chain when the upstream launcher entrypoint is
-# unsuitable as a smoke test (e.g. jetty start.jar wants a configured
-# jetty.base, cassandra nodetool requires JMX-over-RMI, felix Gogo hangs
-# when stdout is a file, kc26 quarkus-run.jar SEGVs on non-TTY output).
-!apps/jetty_probe/
-!apps/cassandra_probe/
-!apps/felix_probe/
-!apps/kc26_probe/
-!apps/wildfly_probe/
-!apps/kc16_probe/
-!apps/activemq_probe/
-!apps/kafka_probe/
-!apps/hazelcast_probe/
-!apps/solr_probe/
 .smoke-cache/
 **/*.jar
 **/*.tar.gz
