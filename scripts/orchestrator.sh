@@ -485,16 +485,30 @@ run_smoke() {
     # SpringApplication far enough to print its banner; if it returns
     # rc=0 within the smoke window the Boot lifecycle reached the
     # post-banner application-runner stage.
-    # NOTE: Spring Boot launchers (demo, insurance-backend) currently
-    # hang at the banner stage when stdout is a regular file (the same
-    # non-TTY behaviour that affected felix.jar / kc26 quarkus-run.jar
-    # before we wrote probe-based replacements). The Boot launcher
-    # reaches `SpringApplication.run()` → banner → context refresh, then
-    # blocks somewhere in the post-banner ApplicationRunner path. The
-    # banner-only outcome isn't a meaningful smoke signal so we don't
-    # wire these into the suite yet. TODO: write a SpringBootProbe that
-    // boots a SpringApplication subclass with `setBannerMode(OFF)` and
-    # exits immediately after refresh().
+    # Spring Boot probe: constructs a SpringApplication with banner-mode
+    # OFF and WebApplicationType.NONE, prints the main app class, and
+    # exits. Doesn't call run() (which blocks at the post-banner
+    # ApplicationRunner stage on non-TTY stdout). Compiled once against
+    # Spring Boot 4.0; runs unchanged on 3.x because the SpringApplication
+    # constructor + Banner.Mode + WebApplicationType APIs are stable.
+    if [ -f "$REPO_ROOT/test-infra/probes/springboot_probe/SpringBootProbe.class" ] \
+        && [ -f "$REPO_ROOT/test-infra/spring-libs/spring-boot-4.0.6.jar" ]; then
+        if [ -f "$APPS/demo/target/demo-0.0.1-SNAPSHOT.jar" ]; then
+            local sbcp="$REPO_ROOT/test-infra/probes/springboot_probe;$REPO_ROOT/test-infra/spring-libs/spring-boot-4.0.6.jar;$REPO_ROOT/test-infra/spring-libs/spring-context-7.0.7.jar;$REPO_ROOT/test-infra/spring-libs/spring-core-7.0.7.jar;$REPO_ROOT/test-infra/spring-libs/spring-beans-7.0.7.jar;$REPO_ROOT/test-infra/spring-libs/jspecify-1.0.0.jar"
+            run_oneshot springboot_demo "$TIMEOUT_S" \
+                "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+                -c "$sbcp" SpringBootProbe
+            probes_present=1
+        fi
+        if [ -f "$APPS/insurance-backend/target/insurance-0.0.1-SNAPSHOT.jar" ] \
+            && [ -f "$REPO_ROOT/test-infra/spring-libs/spring-boot-3.2.0.jar" ]; then
+            local sbcp="$REPO_ROOT/test-infra/probes/springboot_probe;$REPO_ROOT/test-infra/spring-libs/spring-boot-3.2.0.jar;$REPO_ROOT/test-infra/spring-libs/spring-context-6.1.1.jar;$REPO_ROOT/test-infra/spring-libs/spring-core-6.1.1.jar;$REPO_ROOT/test-infra/spring-libs/spring-beans-6.1.1.jar;$REPO_ROOT/test-infra/spring-libs/jspecify-1.0.0.jar"
+            run_oneshot insurance "$TIMEOUT_S" \
+                "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
+                -c "$sbcp" SpringBootProbe
+            probes_present=1
+        fi
+    fi
     # Tomcat — out-of-tree probe lives under test-infra/probes/tomcat_probe/
     if [ -d "$APPS/apache-tomcat-10.1.31" ] \
         && [ -f "$REPO_ROOT/test-infra/probes/tomcat_probe/TomcatProbe.class" ]; then
