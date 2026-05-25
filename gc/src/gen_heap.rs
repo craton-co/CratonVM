@@ -90,27 +90,6 @@ const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 /// the humongous path instead of guaranteeing a copying-collector OOM.
 const HUMONGOUS_YOUNG_FRACTION_PERCENT: usize = 50;
 
-/// "Humongous" object threshold as a percentage of the young semi-space
-/// capacity.  Allocations whose total in-memory footprint
-/// (`HEADER_SIZE + array_data_size`) exceeds this fraction of one young
-/// semi-space are routed directly to the old generation, bypassing
-/// the young from-space entirely (G1-style humongous handling).
-///
-/// Without this routing, a single large array of size `A` would force
-/// the user to size `--Xmx` to at least `4 * A` just so the array can
-/// fit in *one* young semi-space (each semi is `Xmx / 4` —
-/// see [`with_capacity`]).  A 2 GiB int[] at `--Xmx 16g` (4 GiB
-/// semi) fits; at `--Xmx 12g` (3 GiB semi) it would not, even though
-/// the heap has 12 GiB free.  HotSpot avoids the same trap by
-/// sending oversized arrays straight to old gen / a humongous region.
-///
-/// Threshold chosen at 50%: large enough that small surviving sets
-/// in young can still copy without colliding with a humongous tail
-/// (Cheney needs to be able to fit copies into to-space), small enough
-/// that any single array bigger than half the young semi-space takes
-/// the humongous path instead of guaranteeing a copying-collector OOM.
-const HUMONGOUS_YOUNG_FRACTION_PERCENT: usize = 50;
-
 /// Maximum allowed heap expansion factor (4x the initial size).
 const MAX_HEAP_EXPANSION_FACTOR: usize = 4;
 
