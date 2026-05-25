@@ -67,7 +67,7 @@ const DEFAULT_OLD_GEN_SIZE: usize = 128 * 1024 * 1024;
 const PROMOTION_AGE: u8 = 3;
 
 /// GC threshold: trigger minor GC when young from-space usage exceeds this %.
-const YOUNG_GC_THRESHOLD_PERCENT: usize = 75;
+const YOUNG_GC_THRESHOLD_PERCENT: usize = 50;
 
 /// "Humongous" object threshold as a percentage of the young semi-space
 /// capacity.  Allocations whose total in-memory footprint

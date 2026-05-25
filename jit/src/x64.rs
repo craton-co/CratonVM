@@ -3785,6 +3785,23 @@ impl Compiler {
         let locals_size = (total_locals.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let spill_size = (max_stack.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let shadow_space = 32i32; // Windows x64 shadow space for helper calls
+        // Reserved bytes ABOVE the shadow region for in-frame stack args to
+        // any helper called without `emit_stack_arg_setup` (which would
+        // bump RSP itself). The worst-case site is the PIC/MIC slow path
+        // that invokes `jit_invoke_virtual_mic` with 6 args: on Windows
+        // args 5..=6 are written by the JIT to `[RSP+32]` and `[RSP+40]`
+        // BEFORE the CALL (see the `MOV [RSP+0x28], RAX` emission in the
+        // invokevirtual slow-path). Reserving only 8 bytes (one slot) made
+        // the `[RSP+40]` write corrupt either a saved callee-saved GPR or
+        // the saved XMM region, which surfaced as a delayed STATUS_ACCESS_
+        // VIOLATION (rc=139) on Windows once the corrupted register was
+        // restored after the helper returned — observed in Keycloak 26
+        // `quarkus-run.jar start-dev` SEGFAULTing inside the JIT-compiled
+        // `picocli/CommandLine$Assert.hashCode(Object)` PIC dispatch and
+        // recurring across the W2-CHM / RBC.1 / SPB.* cascade documented
+        // in `vm/src/jit/skip_list.rs`. Reserve 16 bytes (two slots) so
+        // the 6th stack arg slot lands inside the allocated frame.
+        let stack_arg_reserve: i32 = 16;
 
         // Use graph-coloring allocator results
         let local_assignments = alloc_result.assignments;
@@ -3803,8 +3820,10 @@ impl Compiler {
         // XMM save slots follow GPR save slots
         let xmm_saved_base = callee_saved_base + callee_saved_size;
 
-        // Total frame = locals + spill + callee-saved GPRs + callee-saved XMMs + shadow + margin
-        let total = locals_size + spill_size + callee_saved_size + xmm_saved_size + shadow_space + 8;
+        // Total frame = locals + spill + callee-saved GPRs + callee-saved XMMs
+        //             + shadow space + room for in-frame stack args.
+        let total =
+            locals_size + spill_size + callee_saved_size + xmm_saved_size + shadow_space + stack_arg_reserve;
 
         // After CALL entry: RSP ≡ 8 mod 16 (return addr).
         // After PUSH RBP: RSP ≡ 0 mod 16.
@@ -7277,46 +7296,63 @@ impl Compiler {
         // Commit the bump: [R10 + cursor_off] = RAX.
         self.emit_mov_mem_disp32_r64(R10, RAX, cursor_off);
 
-        // Write class_id (4 bytes) at obj_ptr + class_id_off.
-        // The remaining header bytes are correctly zero from TLAB refill;
-        // post_tlab_init writes only identity_hash_code + num_slots.
+        // Write class_id (4 bytes) at obj_ptr + class_id_off and num_slots
+        // (4 bytes) at offset 16 IMMEDIATELY after the bump-commit. Both
+        // writes must happen before any subsequent safepoint poll or GC
+        // trigger, so the heap walker sees a fully-typed Object header:
+        //
+        //   class_id  → identifies the object's class
+        //   num_slots → tells the walker how to advance to the next object
+        //               (size = HEADER_SIZE + num_slots * SLOT_SIZE)
+        //
+        // CRIT (jit/gc audit, 2026-05): a previous incarnation deferred the
+        // num_slots write into the `jit_post_tlab_init` helper. Between the
+        // bump-commit and the helper call, num_slots was 0 (TLAB-zeroed),
+        // which made the walker treat every in-flight object as a 40-byte
+        // empty header and step into the middle of the very next real
+        // object's payload — decoding String char[] bytes as a header and
+        // tripping the "implausible object size" abort during a JIT-
+        // triggered minor GC. Writing num_slots inline closes that race.
+        //
+        // identity_hash_code (offset 8) stays 0 (TLAB-zeroed); the lazy-
+        // mint contract in `System.identityHashCode()` handles it on
+        // demand. The helper call below still runs for the
+        // primitive-init / finalizer paths but the header is already
+        // walker-coherent when GC runs inside that helper.
         self.emit_mov_dword_mem_disp32_imm32(
             R11,
             class_id_off,
             class_id_raw as i32, // Cast: ClassId immediate fits in 32 bits
         );
+        // Layout reminder (from `types/src/heap_types.rs`):
+        //   off 16: num_slots (u32) — Object kind only; arrays use
+        //   array_length at offset 12, but `new` only allocates Objects.
+        self.emit_mov_dword_mem_disp32_imm32(
+            R11,
+            16,
+            num_fields as i32, // Cast: x86-64 immediate encoding
+        );
 
         if skip_post_init_helper {
             // CRIT-2 fast path — no primitive defaults to apply and no
-            // finalizer to register. Inline the only remaining
-            // header-completion work that `jit_post_tlab_init` would
-            // perform: writing `num_slots` at offset 16.
-            //
-            // `identity_hash_code` (offset 8) is left at the TLAB-zeroed
-            // value (0). The contract is lazy mint: `System.
-            // identityHashCode()` and the mark-word lock path detect
-            // hash == 0 and atomically mint a fresh non-zero value on
-            // demand. This matches HotSpot's "displaced hash" treatment
-            // and avoids a `vm.heap.next_identity_hash()` call here that
-            // would touch the global hash counter on every allocation.
+            // finalizer to register. With class_id + num_slots already
+            // written inline above, the header is complete enough for
+            // both the GC walker and the runtime; no helper call needed.
             //
             // All other header fields (kind=0/Object,
             // element_type=0/Reference, padding, array_length=0, gc_age=0,
             // gc_flags=0, forwarding_ptr=null, mark_word=MARK_NEUTRAL)
             // are already the correct values from the TLAB-zeroed refill.
             //
-            // Layout reminder (from `types/src/heap_types.rs`):
-            //   off 16: num_slots (u32)
-            self.emit_mov_dword_mem_disp32_imm32(
-                R11,
-                16,
-                num_fields as i32, // Cast: x86-64 immediate encoding
-            );
             // RAX = obj_ptr — both arms converge with RAX holding the
             // freshly-allocated object pointer.
             self.emit_mov_r64_r64(RAX, R11);
         } else {
             // Hand off to post-init: tlab_post_init(vm_ptr, obj_ptr, cid, nf).
+            // The helper now only does the cold work (identity-hash mint,
+            // primitive-typed default values, finalizer registration); the
+            // walker-coherent header bits (class_id + num_slots) are
+            // already in place from the inline writes above.
             self.emit_load_local(ARG_REGS[0], self.heap_local_offset);
             self.emit_mov_r64_r64(ARG_REGS[1], R11);
             self.emit_mov_imm32_sx(ARG_REGS[2], class_id_raw as i32); // Cast: ClassId fits in 32 bits

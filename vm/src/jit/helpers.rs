@@ -620,7 +620,17 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     let total_size = cratonvm_types::HEADER_SIZE + data_size;
     if heap.try_alloc_young_probe(total_size).is_none() {
         // Young gen full — trigger GC through the orchestrated STW path.
+        // CRIT (jit/gc audit, 2026-05): MUST retire the calling thread's
+        // TLAB before kicking off GC. The retire installs a synthetic
+        // `int[]` filler at the cursor so the heap walker can stride over
+        // the unused TLAB tail in O(1); without it, the walker
+        // mis-decodes the tail's zeroed bytes (or a half-init JIT object)
+        // and aborts with "implausible object size" / corrupts old gen
+        // when promote-on-pressure copies stale pointers. Mirrors
+        // `alloc_object_shared` in the interpreter (runtime/interpreter.rs
+        // line ~782).
         if let Some((thread, _guard)) = jit_thread_mut() {
+            thread.tlab.retire();
             // Route allocation-failure GC through the interpreter's
             // orchestrated STW path (`maybe_gc_forced` -> `gc_barrier.request_stw()`
             // + `wait_for_all()`), so other mutator threads are parked
@@ -724,6 +734,31 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
     let vm = &*(vm_ptr as *const SharedVm);
     let heap = &vm.heap;
     let class_id = ClassId::new(class_id_raw as u32);
+
+    // CRIT (jit/gc audit, 2026-05): probe young-gen capacity BEFORE
+    // allocating. If young gen would overflow, retire the calling
+    // thread's TLAB and trigger an orchestrated STW GC so the next
+    // allocation has room — mirrors `alloc_object_shared` in
+    // `runtime/interpreter.rs:782`. The TLAB retire is critical: it
+    // installs a synthetic `int[]` filler at the cursor so the heap
+    // walker can stride over the unused tail in O(1) without
+    // mis-decoding it.
+    //
+    // This is the slow-path entry — we're here because the inline-TLAB
+    // bump in `emit_inline_tlab_new` failed (TLAB full / null thread)
+    // OR because the caller went straight to the helper for an
+    // over-sized object. In all cases the inline bump did not commit a
+    // half-initialized object: the TLAB cursor in memory is the
+    // last-allocated-object's end, so `retire()` here is safe.
+    let total_size = cratonvm_types::HEADER_SIZE
+        + (num_fields as usize).saturating_mul(cratonvm_types::SLOT_SIZE);
+    if heap.try_alloc_young_probe(total_size).is_none() {
+        if let Some((thread, _guard)) = jit_thread_mut() {
+            thread.tlab.retire();
+            crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+        }
+    }
+
     let obj_ref = heap.alloc_object(class_id, num_fields as usize);
     // Initialize primitive-typed fields to proper JVM default values.
     // Zero memory reads as Object(None) which is wrong for int/long/float/double fields.
@@ -795,8 +830,27 @@ pub unsafe extern "C" fn jit_anewarray_object(
     if vm_ptr == 0 {
         return 0;
     }
-    let heap = heap_from_vm(vm_ptr);
+    // SAFETY: vm_ptr is a valid SharedVm pointer per the caller contract.
+    let vm = &*(vm_ptr as *const SharedVm);
+    let heap = &vm.heap;
     let class_id = ClassId::new(component_class_id_raw as u32);
+
+    // CRIT (jit/gc audit, 2026-05): probe young-gen capacity and retire
+    // the calling thread's TLAB before triggering GC. See
+    // `jit_new_object` / `jit_newarray` for the full rationale —
+    // without the retire, the heap walker steps into TLAB tail bytes
+    // and mis-decodes them as object headers when GC fires from this
+    // slow path.
+    let data_size = cratonvm_types::array_data_size(length as usize, ArrayElementType::Reference)
+        .unwrap_or(0);
+    let total_size = cratonvm_types::HEADER_SIZE + data_size;
+    if heap.try_alloc_young_probe(total_size).is_none() {
+        if let Some((thread, _guard)) = jit_thread_mut() {
+            thread.tlab.retire();
+            crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+        }
+    }
+
     let arr = heap.alloc_array(class_id, ArrayElementType::Reference, length as usize);
     arr.as_ptr() as i64
 }
