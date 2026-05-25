@@ -20,6 +20,12 @@ apps/
 !apps/cassandra_probe/
 !apps/felix_probe/
 !apps/kc26_probe/
+!apps/wildfly_probe/
+!apps/kc16_probe/
+!apps/activemq_probe/
+!apps/kafka_probe/
+!apps/hazelcast_probe/
+!apps/solr_probe/
 .smoke-cache/
 **/*.jar
 **/*.tar.gz

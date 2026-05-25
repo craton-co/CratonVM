@@ -959,6 +959,38 @@ fn register_aifu(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;II)Z",
         native_aifu_compare_and_set,
     );
+    // Also register accessors on the abstract base AtomicIntegerFieldUpdater
+    // so generic-typed callers dispatch correctly without the impl class in scope.
+    r.register(
+        CLS_INT_FIELD_UPDATER,
+        "set",
+        "(Ljava/lang/Object;I)V",
+        native_aifu_set,
+    );
+    r.register(
+        CLS_INT_FIELD_UPDATER,
+        "lazySet",
+        "(Ljava/lang/Object;I)V",
+        native_aifu_set,
+    );
+    r.register(
+        CLS_INT_FIELD_UPDATER,
+        "get",
+        "(Ljava/lang/Object;)I",
+        native_aifu_get,
+    );
+    r.register(
+        CLS_INT_FIELD_UPDATER,
+        "compareAndSet",
+        "(Ljava/lang/Object;II)Z",
+        native_aifu_compare_and_set,
+    );
+    r.register(
+        CLS_INT_FIELD_UPDATER,
+        "getAndSet",
+        "(Ljava/lang/Object;I)I",
+        native_aifu_get_and_set,
+    );
 }
 
 fn register_alfu(r: &mut NativeMethodRegistry) {
@@ -1015,6 +1047,43 @@ fn register_alfu(r: &mut NativeMethodRegistry) {
         "compareAndSet",
         "(Ljava/lang/Object;JJ)Z",
         native_alfu_compare_and_set,
+    );
+    // Also register accessors on the abstract base class so virtual
+    // dispatch from generic code that holds an AtomicLongFieldUpdater
+    // reference (e.g. ActiveMQ's LongSequenceGenerator.setLastSequenceId)
+    // still finds an implementation. Mirrors the ARFU layout above —
+    // without these, every AtomicLongFieldUpdater.set/get call from a
+    // user library throws AbstractMethodError before the Impl class is
+    // ever consulted.
+    r.register(
+        CLS_LONG_FIELD_UPDATER,
+        "set",
+        "(Ljava/lang/Object;J)V",
+        native_alfu_set,
+    );
+    r.register(
+        CLS_LONG_FIELD_UPDATER,
+        "lazySet",
+        "(Ljava/lang/Object;J)V",
+        native_alfu_set,
+    );
+    r.register(
+        CLS_LONG_FIELD_UPDATER,
+        "get",
+        "(Ljava/lang/Object;)J",
+        native_alfu_get,
+    );
+    r.register(
+        CLS_LONG_FIELD_UPDATER,
+        "getAndSet",
+        "(Ljava/lang/Object;J)J",
+        native_alfu_get_and_set,
+    );
+    r.register(
+        CLS_LONG_FIELD_UPDATER,
+        "getAndAdd",
+        "(Ljava/lang/Object;J)J",
+        native_alfu_get_and_add,
     );
 }
 
