@@ -23,6 +23,12 @@ apps/**/*.tar.gz
 !test_classes/**/*.class
 !demo/**/*.class
 !vm-cli/tests/resources/**/*.class
+# Smoke / functional probes shipped with the orchestrator. Each probe
+# is a tiny single-class workload that drives a meaningful chunk of an
+# app's library code (OpenWire round-trip, OSGi framework lifecycle,
+# jboss-modules class loader, etc.) — see docstring on run_smoke /
+# run_functional in scripts/orchestrator.sh.
+!test-infra/probes/**/*.class
 
 # JAR files (benchmark dependencies — download separately)
 bench/*.jar

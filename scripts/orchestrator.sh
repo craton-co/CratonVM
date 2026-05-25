@@ -647,13 +647,17 @@ run_smoke() {
             FelixProbe
     fi
 
-    if [ -d "$APPS/wildfly-32.0.1.Final" ]; then
+    # WildFly smoke: route through the wildfly_probe (LocalModuleLoader
+    # rooted at modules/, loadModule("org.jboss.logging")) instead of
+    # the standalone launcher. The launcher works in smoke for older
+    # wildfly releases but the new wildfly-40 distribution stalls past
+    # the launcher's --version arg parse in our environment.
+    if [ -d "$APPS/wildfly-40.0.0.Final" ] \
+        && [ -f "$REPO_ROOT/test-infra/probes/wildfly_probe/WildflyProbe.class" ]; then
         run_oneshot wildfly "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            "-Djboss.home.dir=$APPS/wildfly-32.0.1.Final" \
-            --jar "$APPS/wildfly-32.0.1.Final/jboss-modules.jar" \
-            -- -mp "$APPS/wildfly-32.0.1.Final/modules" \
-            org.jboss.as.standalone --version
+            -c "$REPO_ROOT/test-infra/probes/wildfly_probe;$APPS/wildfly-40.0.0.Final/jboss-modules.jar" \
+            WildflyProbe "$APPS/wildfly-40.0.0.Final"
     fi
 
     if [ -d "$APPS/payara6" ]; then
@@ -769,11 +773,11 @@ func_wildfly() {
     # LocalModuleLoader rooted at wildfly's modules/ and loads
     # `org.jboss.logging` — exercising the jboss-modules class loader,
     # the .mod parser, and the JDK module finder integration.
-    if [ -d "$APPS/wildfly-32.0.1.Final" ] && [ -f "$REPO_ROOT/test-infra/probes/wildfly_probe/WildflyProbe.class" ]; then
+    if [ -d "$APPS/wildfly-40.0.0.Final" ] && [ -f "$REPO_ROOT/test-infra/probes/wildfly_probe/WildflyProbe.class" ]; then
         run_oneshot "$name" "$TIMEOUT_S" \
             "$RJVM" --java-home "$JDK" --stack-dump-on-timeout 0 --Xmx "$XMX" \
-            -c "$REPO_ROOT/test-infra/probes/wildfly_probe;$APPS/wildfly-32.0.1.Final/jboss-modules.jar" \
-            WildflyProbe "$APPS/wildfly-32.0.1.Final"
+            -c "$REPO_ROOT/test-infra/probes/wildfly_probe;$APPS/wildfly-40.0.0.Final/jboss-modules.jar" \
+            WildflyProbe "$APPS/wildfly-40.0.0.Final"
     fi
 }
 
