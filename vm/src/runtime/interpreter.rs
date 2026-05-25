@@ -10479,6 +10479,26 @@ fn force_native_over_real_jdk_bytecode(
                 "dynamicInvoker",
                 "()Ljava/lang/invoke/MethodHandle;",
             )
+            // `JMXConnectorFactory.newJMXConnector(JMXServiceURL, Map)` —
+            // the real-JDK bytecode chain `connect -> newJMXConnector ->
+            // ServiceLoader.load(JMXConnectorProvider)` finds zero
+            // providers because the RMI client provider is declared via
+            // `module-info: provides ... with com.sun.jmx.remote.protocol.
+            // rmi.ClientProvider`, not via a `META-INF/services/...`
+            // descriptor, and our ServiceLoader (service_loader.rs) only
+            // reads the classpath descriptor form. The factory then
+            // throws `MalformedURLException("Unsupported protocol: rmi")`,
+            // surfaced by Cassandra's nodetool as the misleading
+            // "Failed to connect … - MalformedURLException: 'Unsupported
+            // protocol: rmi'.". The registered native in jmx.rs
+            // (`register_jmx_connector_factory`) instead raises a plain
+            // `IOException("JMX over RMI is not implemented …")` so the
+            // client's catch handler reports a connection-layer error.
+            | (
+                "javax/management/remote/JMXConnectorFactory",
+                "newJMXConnector",
+                "(Ljavax/management/remote/JMXServiceURL;Ljava/util/Map;)Ljavax/management/remote/JMXConnector;",
+            )
     ) || (class_name == "java/net/URL"
         && matches!(method_name, "getAuthority" | "getHostAddress"))
         || (matches!(

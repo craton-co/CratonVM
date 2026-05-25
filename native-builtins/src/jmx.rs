@@ -5,13 +5,19 @@
 //! Provides MBeanServer and platform MXBeans for runtime monitoring.
 
 use cratonvm_types::ClassId;
-use cratonvm_types::error::MethodCallResult;
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::{ObjectRef, Value};
 use std::time::Instant;
 use std::sync::OnceLock;
 
 use crate::{native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
+
+/// Construct a Java `IOException` with the given message — the standard
+/// way to surface a connection-style failure to JDK callers.
+fn jmx_ioex<S: Into<String>>(message: S) -> MethodCallFailed {
+    RuntimeError::IOException { message: message.into() }.into()
+}
 
 /// VM start time – initialised once on first access.
 static VM_START: OnceLock<Instant> = OnceLock::new();
@@ -398,6 +404,80 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
             ctx.set_field_by_name(list, "elementData", Value::Object(Some(backing)));
             ctx.set_field_by_name(list, "size", Value::Int(beans.len() as i32));
             Ok(Some(Value::Object(Some(list))))
+        },
+    );
+
+    register_jmx_connector_factory(r);
+}
+
+// ---------------------------------------------------------------------------
+// javax.management.remote.JMXConnectorFactory
+//
+// Cassandra's `nodetool version` (and any JMX client) calls
+// `JMXConnectorFactory.connect(serviceURL)` which delegates to
+// `newJMXConnector(serviceURL, env)`. That static method uses
+// `ServiceLoader.load(JMXConnectorProvider.class)` to find a per-protocol
+// provider. For the `rmi` protocol the provider class
+// `com.sun.jmx.remote.protocol.rmi.ClientProvider` is declared in the
+// `java.management.rmi` module via `module-info: provides ... with ...`
+// — **not** via a `META-INF/services/...` descriptor. CratonVM's
+// `ServiceLoader` (native-builtins/src/service_loader.rs) only reads the
+// classpath `META-INF/services/` form and therefore returns zero
+// providers for `JMXConnectorProvider`. `JMXConnectorFactory` then
+// throws `MalformedURLException("Unsupported protocol: rmi")`, which
+// nodetool surfaces verbatim:
+//
+//     nodetool: Failed to connect to '127.0.0.1:7199' \
+//         - MalformedURLException: 'Unsupported protocol: rmi'.
+//
+// Implementing the full RMI stack (RMIConnector, JRMP, stub/skeleton,
+// remote method dispatch) is out of scope; we don't have an RMI runtime.
+// Instead, override `newJMXConnector` natively to raise an `IOException`
+// directly — the same class of exception a JMX client gets when the
+// remote host is unreachable. nodetool's existing catch-and-print path
+// then reports:
+//
+//     nodetool: Failed to connect to '127.0.0.1:7199' \
+//         - IOException: 'JMX over RMI is not implemented in CratonVM …'.
+//
+// which is the correct connection-layer outcome for "cannot reach this
+// JMX broker", and lets the launcher exit rc=1 cleanly instead of
+// short-circuiting at URL/provider resolution. Bonus: this also unblocks
+// any other JMX-using Java app from tripping over the same "Unsupported
+// protocol: rmi" error during boot.
+// ---------------------------------------------------------------------------
+fn register_jmx_connector_factory(r: &mut NativeMethodRegistry) {
+    // Static `newJMXConnector(JMXServiceURL, Map) -> JMXConnector` — the
+    // private chain `connect -> newJMXConnector -> ServiceLoader` ends
+    // here on the real JDK. Overriding the public factory method shorts
+    // out the provider lookup that we can't satisfy without parsing
+    // module-info SPI declarations.
+    r.register(
+        "javax/management/remote/JMXConnectorFactory",
+        "newJMXConnector",
+        "(Ljavax/management/remote/JMXServiceURL;Ljava/util/Map;)Ljavax/management/remote/JMXConnector;",
+        |ctx, args| {
+            // Reconstruct the service URL for the error message. JMXServiceURL
+            // is a real-JDK class; its `toString` returns
+            // `service:jmx:<protocol>://<host>:<port><path>`. If the call fails
+            // (e.g. argument is null) we still raise a meaningful IOException
+            // so the caller's catch surfaces the right error class.
+            let url_str = match args.first() {
+                Some(Value::Object(Some(u))) => ctx
+                    .invoke_virtual(*u, "toString", "()Ljava/lang/String;", &[])
+                    .ok()
+                    .and_then(|v| v)
+                    .and_then(|v| match v {
+                        Value::Object(Some(s)) => ctx.read_string(s),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| String::from("<unknown JMX URL>")),
+                _ => String::from("<null JMX URL>"),
+            };
+            Err(jmx_ioex(format!(
+                "JMX over RMI is not implemented in CratonVM \
+                 (cannot establish RMI connection to {url_str})"
+            )))
         },
     );
 }
