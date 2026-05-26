@@ -963,18 +963,38 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
     );
 
     // getGarbageCollectorMXBeans() -> List<GarbageCollectorMXBean>
+    //
+    // Construct a real `java.util.ArrayList` via its `<init>()` + `add()` so
+    // the returned List has the JDK's exact field layout (elementData, size,
+    // modCount inherited from AbstractList). Writing fields by raw slot to a
+    // synthetic ArrayList shadow made callers see `size() == 0` because the
+    // synthetic class only had 2 declared slots while the real ArrayList's
+    // `size` field lives at a different layout offset — H2's
+    // `Utils.getGarbageCollectionCount()` then iterated an apparently-empty
+    // list and returned 0, leaving `collectGarbage()`'s
+    // `while(count == getCount())` loop spinning indefinitely.
     r.register(
         cls,
         "getGarbageCollectorMXBeans",
         "()Ljava/util/List;",
         |ctx, _args| {
-            // Return an ArrayList with one GC bean
-            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-            let backing = ctx.new_ref_array(ClassId::new(0), 1);
+            let list = match ctx.new_object("java/util/ArrayList")? {
+                Some(Value::Object(Some(o))) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let _ = ctx.invoke(
+                "java/util/ArrayList",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(list))],
+            );
             let gc = alloc_gc_mxbean(ctx);
-            ctx.set_array_element(backing, 0, Value::Object(Some(gc)));
-            ctx.set_field(list, 0, Value::Object(Some(backing))); // elementData
-            ctx.set_field(list, 1, Value::Int(1)); // size
+            let _ = ctx.invoke(
+                "java/util/ArrayList",
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(list)), Value::Object(Some(gc))],
+            );
             Ok(Some(Value::Object(Some(list))))
         },
     );
@@ -1592,13 +1612,18 @@ fn register_gc_mxbean(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 0)))
         },
     );
-    r.register(cls, "getCollectionCount", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+    // H2's Utils.collectGarbage() spins until getCollectionTime() increments
+    // (src/main/org/h2/util/Utils.java:288-294). If these return frozen
+    // synthetic fields, the loop is infinite — observed as a > 1 hour hang
+    // on H2 TestAll boot. Bridge to the real heap counter so each GC bumps
+    // the value. getCollectionTime returns the same count for now; H2 only
+    // cares about deltas, and proper wall-clock GC time accounting can be
+    // a follow-up.
+    r.register(cls, "getCollectionCount", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(ctx.gc_collection_count() as i64)))
     });
-    r.register(cls, "getCollectionTime", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
+    r.register(cls, "getCollectionTime", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(ctx.gc_collection_count() as i64)))
     });
     r.register(
         cls,

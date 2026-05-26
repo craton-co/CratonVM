@@ -10562,6 +10562,20 @@ fn force_native_over_real_jdk_bytecode(
                 "newJMXConnector",
                 "(Ljavax/management/remote/JMXServiceURL;Ljava/util/Map;)Ljavax/management/remote/JMXConnector;",
             )
+            // `ManagementFactory.getGarbageCollectorMXBeans()` —
+            // real-JDK bytecode delegates to `ManagementFactoryHelper`
+            // which iterates platform GCs via natives we don't ship,
+            // returning an empty list. H2 `Utils.collectGarbage()` loops
+            // until `getCollectionTime()` ticks (`Utils.java:288-294`);
+            // an empty bean list makes the loop infinite (>1h hang on
+            // TestAll boot before any test runs). Force our synthetic
+            // single-bean list (jmx.rs:966-980) backed by the real heap
+            // GC counter so `collectGarbage()` exits after one cycle.
+            | (
+                "java/lang/management/ManagementFactory",
+                "getGarbageCollectorMXBeans",
+                "()Ljava/util/List;",
+            )
     ) || (class_name == "java/net/URL"
         && matches!(method_name, "getAuthority" | "getHostAddress"))
         || (matches!(

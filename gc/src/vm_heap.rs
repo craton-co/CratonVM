@@ -729,9 +729,19 @@ impl VmHeap {
     }
 
     /// Return the total number of GC collections performed so far.
+    ///
+    /// For the generational heap, this is the sum of minor + major cycle
+    /// counts (sampled with `Relaxed` ordering — see `HeapStats::snapshot`).
+    /// Used by the JMX `GarbageCollectorMXBean.getCollectionCount/Time`
+    /// natives; H2's `Utils.collectGarbage()` polls this in a
+    /// `while(prev == cur) { System.gc(); }` loop, so a constant `0` here
+    /// hangs the H2 test runner indefinitely.
     pub fn collection_count(&self) -> u64 {
         match self {
-            VmHeap::Generational(_) => 0, // generational heap doesn't track this
+            VmHeap::Generational(h) => {
+                let s = h.stats().snapshot();
+                s.minor_gc_count + s.major_gc_count
+            }
             VmHeap::G1(h) => h.collection_count(),
         }
     }
