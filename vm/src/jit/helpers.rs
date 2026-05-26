@@ -705,6 +705,17 @@ pub unsafe extern "C" fn jit_post_tlab_init(
     //   off 20: gc_age + gc_flags + _gc_reserved — already zero
     //   off 24: forwarding_ptr (8)       — already zero
     //   off 32: mark_word (8)            — already zero == MARK_NEUTRAL
+    // CRIT (#23, BinTrees-18): the documented assumption "TLAB-refill
+    // leaves everything zeroed" is empirically violated on long runs.
+    // Defensively zero the four header bytes at offset 4 (kind=Object=0,
+    // elem=Reference=0, padding=0) and the array_length at offset 12.
+    // Without this, a kind=Object header can ship with a non-zero
+    // array_length (observed: 0x01010101 from prior byte[] data), which
+    // causes the GC walker to mis-decode the object as an array and step
+    // into the next object's payload — surfacing as ECJ's
+    // HashtableOfInt.put `/by zero` on a zero-length keyTable.
+    *(raw_ptr.add(4) as *mut u32) = 0;
+    *(raw_ptr.add(12) as *mut u32) = 0;
     let hash = vm.heap.next_identity_hash();
     *(raw_ptr.add(8) as *mut i32) = hash;
     *(raw_ptr.add(16) as *mut u32) = num_fields as u32;

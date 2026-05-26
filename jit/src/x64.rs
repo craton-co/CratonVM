@@ -7324,6 +7324,18 @@ impl Compiler {
             class_id_off,
             class_id_raw as i32, // Cast: ClassId immediate fits in 32 bits
         );
+        // Defensively zero offset 4 (kind=Object=0, elem=Reference=0, pad=0)
+        // and offset 12 (array_length=0). The historical assumption "TLAB
+        // refill zeroes the region" was empirically violated on long runs
+        // (BinTrees-18, ECJ HashtableOfInt /by-zero #23): the GC-ARRAY-GUARD
+        // observed `kind=Object && array_length=0x01010101` on freshly-
+        // bumped slots. The defensive walker in `bcd70d0` catches that
+        // pattern as corruption, but the right place to enforce the
+        // invariant is at the *allocator* — write the four header bytes
+        // (and the four array_length bytes) explicitly. Two extra dwords
+        // per `new` is negligible vs. the safety guarantee.
+        self.emit_mov_dword_mem_disp32_imm32(R11, 4, 0);
+        self.emit_mov_dword_mem_disp32_imm32(R11, 12, 0);
         // Layout reminder (from `types/src/heap_types.rs`):
         //   off 16: num_slots (u32) — Object kind only; arrays use
         //   array_length at offset 12, but `new` only allocates Objects.
