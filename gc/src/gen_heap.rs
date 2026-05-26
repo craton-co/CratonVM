@@ -3630,6 +3630,49 @@ fn gen_object_total_size(header: &ObjectHeader) -> usize {
             }
         }
     } else {
+        // Header-coherence sanity check: a correctly-allocated `kind = Object`
+        // header always has `array_length = 0` (see `try_alloc_object` / the
+        // ObjectHeader::new contract — only `alloc_array` writes a non-zero
+        // array_length, and it sets `kind = Array` together with it).
+        //
+        // The binary-trees workload exposed a JIT inline-allocation path that
+        // writes `array_length` into the header but leaves `kind` at its
+        // TLAB-zeroed default of `Object`. The walker, trusting `kind`, would
+        // then compute size = HEADER_SIZE + num_slots * SLOT_SIZE (using
+        // whatever garbage `num_slots` happened to be — e.g. 55, yielding 920
+        // bytes) and overshoot into the next object's payload, eventually
+        // reading String char-array bytes as a header (the `"Data"` /
+        // `0x61746144` signature observed in the diag dumps).
+        //
+        // Return 0 here to flag the inconsistency. The non-moving sweep
+        // walker (line ~2579) interprets `total_size < HEADER_SIZE` as
+        // corruption and falls through to its re-sync path, which finds the
+        // next plausible header and resumes walking — losing only the
+        // skipped region (recovered by the next major-GC compaction)
+        // instead of aborting the whole arena sweep.
+        if header.array_length != 0 {
+            tracing::warn!(
+                "GC: inconsistent header — kind=Object but array_length={} (num_slots={}, \
+                 class_id={}); inline-alloc forgot to set kind=Array. Treating as corrupt \
+                 so the walker can re-sync.",
+                header.array_length,
+                header.num_slots,
+                header.class_id.as_u32(),
+            );
+            return 0;
+        }
+        // Defensive cap on num_slots: no real class has 1<<24 fields, and a
+        // value above this is almost certainly garbage from an uninitialised
+        // region.  Same fallthrough — walker re-syncs.
+        if header.num_slots > (1 << 24) {
+            tracing::warn!(
+                "GC: implausible num_slots {} on kind=Object header (class_id={}); \
+                 treating as corrupt so the walker can re-sync.",
+                header.num_slots,
+                header.class_id.as_u32(),
+            );
+            return 0;
+        }
         HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
     }
 }
