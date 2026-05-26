@@ -6416,6 +6416,32 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
         native_stream_collect,
     );
 
+    // 3-arg collect — `<R> R collect(Supplier<R>, BiConsumer<R,? super T>, BiConsumer<R,R>)`.
+    // In real JDK 25 this is an ABSTRACT method on `Stream` (the body lives in
+    // `ReferencePipeline`), so when our synthetic Stream (class =
+    // `java/util/stream/Stream` interface) is the receiver, invokeinterface
+    // resolves to the abstract declaration and throws
+    // "AbstractMethodError: Stream.collect(...) has no Code attribute".
+    // H2's `FilePathDisk.newDirectoryStream` hits this on every directory
+    // listing because `Files.list(Path)` -> `StreamSupport.stream(spliterator, false)`
+    // is intercepted by our native and returns a synthetic Stream.
+    //
+    // Semantics: `R c = supplier.get(); for elem in stream: accumulator.accept(c, elem);
+    // return c;`. The combiner is parallel-only and we are sequential-only,
+    // so it is ignored (matches JDK behaviour for non-parallel streams).
+    r.register(
+        c,
+        "collect",
+        "(Ljava/util/function/Supplier;Ljava/util/function/BiConsumer;Ljava/util/function/BiConsumer;)Ljava/lang/Object;",
+        native_stream_collect_3arg,
+    );
+    r.register(
+        "java/util/stream/ReferencePipeline",
+        "collect",
+        "(Ljava/util/function/Supplier;Ljava/util/function/BiConsumer;Ljava/util/function/BiConsumer;)Ljava/lang/Object;",
+        native_stream_collect_3arg,
+    );
+
     // mapToInt
     r.register(
         c,
@@ -7723,6 +7749,60 @@ fn collect_via_collector_protocol(
         )?
         .unwrap_or(Value::Object(None));
     Ok(Some(result))
+}
+
+/// `Stream.collect(Supplier<R>, BiConsumer<R,? super T>, BiConsumer<R,R>)`
+/// — the 3-arg mutable-reduction terminal operation.
+///
+/// In real JDK this is abstract on `Stream` (body lives in `ReferencePipeline`),
+/// so when our synthetic Stream — or any receiver whose runtime class is the
+/// `Stream` interface itself — is the receiver, the abstract declaration has
+/// no Code attribute and the VM throws AbstractMethodError. H2's
+/// `FilePathDisk.newDirectoryStream` is the canonical tripwire.
+///
+/// Sequential semantics (no parallel split):
+///   `R c = supplier.get();`
+///   `for each t in stream: accumulator.accept(c, t);`
+///   `return c;`
+/// The combiner is parallel-only and intentionally ignored.
+fn native_stream_collect_3arg(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let supplier = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let accumulator = match args.get(2) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    // args.get(3) is the combiner — ignored in sequential mode.
+    let elements = stream_elements_mut(ctx, this);
+    let container = match ctx.invoke_virtual(
+        supplier,
+        "get",
+        "()Ljava/lang/Object;",
+        &[],
+    )? {
+        Some(Value::Object(Some(c))) => Value::Object(Some(c)),
+        // Null supplier result is unusual but permitted; pass through to
+        // the accumulator just like JDK would.
+        other => other.unwrap_or(Value::Object(None)),
+    };
+    for elem in &elements {
+        let _ = ctx.invoke_virtual(
+            accumulator,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[container, *elem],
+        )?;
+    }
+    Ok(Some(container))
 }
 
 fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

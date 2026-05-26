@@ -641,7 +641,17 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
         }
     }
     let obj_ref = heap.alloc_array(ClassId::new(0), elem_type, length as usize);
-    obj_ref.as_ptr() as i64
+    let raw = obj_ref.as_ptr();
+    if std::env::var_os("CRATON_JIT_NEWARRAY_TRACE").is_some() {
+        let class_id_raw = std::ptr::read(raw as *const u32);
+        let kind_byte = *raw.add(4);
+        let elem_byte = *raw.add(5);
+        let stored_len = std::ptr::read(raw.add(12) as *const u32);
+        let num_slots = std::ptr::read(raw.add(16) as *const u32);
+        eprintln!("[JIT-NA] ptr={:p} atype={} len={} cid={} kind={} elem={} arrlen={} num_slots={}",
+            raw, atype, length, class_id_raw, kind_byte, elem_byte, stored_len, num_slots);
+    }
+    raw as i64
 }
 
 /// JIT inline-TLAB completion helper.
