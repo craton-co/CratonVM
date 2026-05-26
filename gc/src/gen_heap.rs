@@ -2625,7 +2625,54 @@ impl GenerationalHeap {
                     if (i - start + 1) % 16 == 0 { hex.push('\n'); }
                 }
                 tracing::warn!("  bytes around bad header (start_off={}):\n{}", start, hex);
-                break;
+
+                // Defensive recovery: instead of `break` (which abandons
+                // the rest of the arena and leaves dead objects unreclaimed
+                // → young exhaust → OOM/SIGSEGV downstream), scan forward
+                // in 8-byte (slot) increments looking for the next
+                // plausible-looking header. This re-syncs the walker past
+                // the corrupted region so the remainder of the arena can
+                // still contribute free spans. The skipped region is left
+                // out of `existing_free` — conservatively treated as live —
+                // and will be recovered by the next major-GC compaction.
+                const MAX_RESYNC_SKIP: usize = 1 << 20; // 1 MiB scan budget
+                const MAX_PLAUSIBLE_OBJ_BYTES: usize = 1 << 28; // 256 MiB sanity ceiling
+                let mut probe = cursor + 8;
+                let mut found = false;
+                while probe + HEADER_SIZE <= used && probe - cursor <= MAX_RESYNC_SKIP {
+                    // SAFETY: probe + HEADER_SIZE <= used, region mapped.
+                    let probe_hdr = unsafe { &*((from_base + probe) as *const ObjectHeader) };
+                    let probe_size = gen_object_total_size(probe_hdr);
+                    let kind_byte = probe_hdr.kind as u8;
+                    if kind_byte <= 1
+                        && probe_size >= HEADER_SIZE
+                        && probe_size <= MAX_PLAUSIBLE_OBJ_BYTES
+                        && probe + probe_size <= used
+                        && probe_hdr.num_slots <= (1 << 24)
+                        && probe_hdr.array_length <= i32::MAX as u32
+                    {
+                        tracing::warn!(
+                            "non-moving sweep: RE-SYNCED at offset {} (skipped {} bytes) — \
+                             class_id={} kind={:?} size={}; abandoned region treated as live, \
+                             will be recovered by next major GC",
+                            probe, probe - cursor,
+                            probe_hdr.class_id.as_u32(), probe_hdr.kind, probe_size,
+                        );
+                        cursor = probe;
+                        found = true;
+                        break;
+                    }
+                    probe += 8;
+                }
+                if !found {
+                    tracing::warn!(
+                        "non-moving sweep: no re-sync within {} bytes from offset {} — \
+                         abandoning rest of arena ({} bytes opaque)",
+                        MAX_RESYNC_SKIP, cursor, used - cursor,
+                    );
+                    break;
+                }
+                continue;
             }
 
             walked.push((
