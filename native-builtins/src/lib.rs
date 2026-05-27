@@ -2146,29 +2146,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // See `classloader_value_sidetable.rs`.
     crate::classloader_value_sidetable::register_classloader_value_sidetable(registry);
 
-    // S111r11 SB3: `jdk.internal.module.ModuleBootstrap.<clinit>` calls
-    // `getAndRemoveProperty(key) = (String) System.getProperties().remove(key)`
-    // for `jdk.module.path`, `jdk.module.upgrade.path`, `jdk.module.main.class`,
-    // etc. (see ModuleBootstrap.java:976). Our synthetic `System.getProperties()`
-    // is a `Properties` object whose private `ConcurrentHashMap<Object,Object> map`
-    // field is null, so JDK 25's `Properties.remove(Object)` (Properties.java:1348:
-    // `return map.remove(key);`) NPEs. The NPE bubbles up through `<clinit>`,
-    // wrecks the module-bootstrap state, and cascades to
-    // `PathMatchingResourcePatternResolver.<clinit>` later (Spring core touches
-    // the same module subsystem to walk the boot ModuleLayer).
-    //
-    // Override `Properties.remove(Object) Object` to return null. This matches
-    // the semantics of "key not present" — which is correct for our empty
-    // synthetic Properties (none of the jdk.module.* keys are set) and lets
-    // ModuleBootstrap's `getAndRemoveProperty` return null cleanly. The
-    // side-table-backed Properties used by setProperty/getProperty don't go
-    // through this path in our current bootstrap, so this is a safe stub.
-    registry.register(
-        "java/util/Properties",
-        "remove",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
+    // NOTE: `Properties.remove(Object)` is now registered by
+    // `register_properties_sidetable` as a side-table-aware native that
+    // returns the previous value (or null) — see properties_sidetable.rs.
+    // Earlier this was an always-null stub here, which broke any caller
+    // that legitimately removed an entry it had just `put` (e.g. H2's
+    // `ConnectionInfo.removeProperty("USER", "")` left USER in the
+    // property map, so every H2 JDBC connect failed with
+    // "Unsupported connection setting USER" when Engine.openSession
+    // iterated the keys).
 
     // JDK 25 additional System natives:
     registry.register("java/lang/System", "setIn0", "(Ljava/io/InputStream;)V", |ctx, args| {

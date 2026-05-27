@@ -412,6 +412,16 @@ fn get_kv(obj: ObjectRef, key: &str) -> Option<String> {
     table().lock().get(&key_for(obj))?.get(key).cloned()
 }
 
+/// Remove a key from the side-table.  Returns the previous value if it
+/// was present, or `None` if either the object isn't tracked or the key
+/// was absent.  Used by `native_properties_remove` to back the JDK
+/// `Properties.remove(Object) Object` semantics.
+fn remove_kv(obj: ObjectRef, key: &str) -> Option<String> {
+    let mut t = table().lock();
+    let entry = t.get_mut(&key_for(obj))?;
+    entry.remove(key)
+}
+
 /// Cross-module read access for callers that receive a `Properties` object
 /// behind an erased `Map` type (e.g. surefire `PropertiesWrapper`).
 pub(crate) fn get_property_from_sidetable(obj: ObjectRef, key: &str) -> Option<String> {
@@ -809,6 +819,43 @@ fn native_properties_put(
         }
     }
     Ok(Some(Value::Object(None)))
+}
+
+/// Native `Properties.remove(Object) Object` — symmetric with `put` /
+/// `setProperty`.  JDK 25's `Properties.remove` (Properties.java:1348)
+/// delegates to `map.remove(key)` where `map` is the private
+/// `ConcurrentHashMap` field; our synthetic Properties has a null `map`,
+/// so the JDK bytecode NPEs.  Route the remove through the side-table
+/// (where `put`/`setProperty` actually stored the entry) and return the
+/// previous value to honour the Map.remove contract.
+///
+/// Callers in the wild that need this semantics include H2's
+/// `org.h2.engine.ConnectionInfo` (`removeProperty("USER", "")` strips
+/// the JDBC USER setting before the engine iterates connection keys —
+/// every H2 JDBC connect failed without it) and ModuleBootstrap's
+/// `getAndRemoveProperty` (which previously got the same null-return
+/// behaviour via the no-op stub this replaces — empty side-table for
+/// jdk.module.* keys keeps that path unchanged).
+fn native_properties_remove(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key_obj = match args.get(1) {
+        Some(Value::Object(Some(k))) => *k,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let key = ctx.read_string(key_obj).unwrap_or_default();
+    if key.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    match remove_kv(this, &key) {
+        Some(prev) => Ok(Some(Value::Object(Some(ctx.create_string(&prev))))),
+        None => Ok(Some(Value::Object(None))),
+    }
 }
 
 /// Native `Properties.containsKey(Object)` — consults the side-table.
@@ -1224,6 +1271,24 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "containsKey",
         "(Ljava/lang/Object;)Z",
         native_properties_contains_key,
+    );
+    // S111r11 SB3 (formerly a no-op stub registered in lib.rs):
+    // ModuleBootstrap.<clinit> calls `getAndRemoveProperty(key)` which is
+    // `(String) System.getProperties().remove(key)`; H2's ConnectionInfo
+    // calls `prop.remove("USER")` to strip the JDBC USER setting before
+    // Engine.openSession iterates connection keys.  JDK 25's
+    // `Properties.remove(Object)` (Properties.java:1348) reads a private
+    // `ConcurrentHashMap<Object,Object> map` field that's null on our
+    // synthetic Properties, so the JDK bytecode NPEs.  Side-table-aware
+    // remove returns the previous value (or null if absent) — H2's
+    // ConnectionInfo.removeProperty now actually removes USER, and
+    // ModuleBootstrap's getAndRemoveProperty still gets null for keys
+    // that were never set.
+    registry.register(
+        "java/util/Properties",
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        native_properties_remove,
     );
     // Spring's PropertySourcesPropertyResolver reads through the
     // Hashtable.get(Object) interface rather than getProperty(String),
