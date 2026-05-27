@@ -23897,14 +23897,133 @@ fn native_bi_to_string_radix(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(result))))
 }
 
+/// Read the low `n_words` magnitude words of a BigInteger as an unsigned
+/// little-endian u128 (least-significant word first). Returns `(signum, lo)`
+/// where `lo` packs the lowest `n_words * 32` bits of the absolute value.
+///
+/// `n_words` must be `<= 4`. For real-JDK layout (`mag:[I` big-endian, base
+/// 2^32) the lowest word lives at `mag[mag.length - 1]`. For the synthetic
+/// fallback layout we go through `bi_read` and decimal-parse — slow, but only
+/// hit in synthetic-jdk mode.
+fn bi_low_bits(ctx: &dyn NativeContext, this: ObjectRef, n_words: usize) -> (i32, u128) {
+    debug_assert!(n_words <= 4);
+    if let Some((sig_i, mag_i)) = bi_layout(ctx) {
+        let signum = match ctx.get_field(this, sig_i) {
+            Value::Int(s) => s,
+            _ => 0,
+        };
+        if signum == 0 {
+            return (0, 0);
+        }
+        let mag = match ctx.get_field(this, mag_i) {
+            Value::Object(Some(o)) => o,
+            _ => return (signum, 0),
+        };
+        let len = ctx.array_length(mag);
+        if len == 0 {
+            return (signum, 0);
+        }
+        // mag[] is big-endian base 2^32, so mag[len-1-k] is the k'th word
+        // (counting from the LSB). Pack up to `n_words` low words into u128.
+        let mut lo: u128 = 0;
+        for k in 0..n_words {
+            if k >= len {
+                break;
+            }
+            let idx = len - 1 - k;
+            let w = match ctx.get_array_element(mag, idx) {
+                Value::Int(v) => v as u32,
+                _ => 0,
+            };
+            lo |= (w as u128) << (32 * k);
+        }
+        (signum, lo)
+    } else {
+        // Synthetic-stub layout: fall back to decimal-string parse.
+        let a = bi_read(ctx, this);
+        let (neg, abs) = bi_parse_sign(&a);
+        // Repeatedly mod by 2^(n_words*32) via decimal arithmetic — we only
+        // need the low bits. For small magnitudes the string itself parses;
+        // for big ones reduce step-by-step.
+        let modulus_bits = n_words * 32;
+        let mut decimal = abs.to_string();
+        let mut lo: u128 = 0;
+        // Build lo by extracting low 32 bits at a time.
+        for k in 0..n_words {
+            if decimal == "0" {
+                break;
+            }
+            // word = decimal mod 2^32
+            let mut word: u64 = 0;
+            for ch in decimal.chars() {
+                let d = ch.to_digit(10).unwrap_or(0) as u64;
+                word = (word * 10 + d) & 0xFFFF_FFFF;
+            }
+            lo |= (word as u128) << (32 * k);
+            // decimal = decimal / 2^32 (32 shift-rights via /2)
+            for _ in 0..32 {
+                decimal = bi_div_unsigned(&decimal, "2");
+                if decimal == "0" {
+                    break;
+                }
+            }
+        }
+        let _ = modulus_bits;
+        let signum = if abs == "0" {
+            0
+        } else if neg {
+            -1
+        } else {
+            1
+        };
+        (signum, lo)
+    }
+}
+
+/// Compute the low `bits` two's-complement bits of a BigInteger.
+/// For positive values: return the low `bits` bits of the magnitude.
+/// For negative values: return the low `bits` bits of `~(mag-1) + 1` — i.e.
+/// negate the magnitude as if it were an infinite-precision two's-complement
+/// integer, then truncate. `bits` must be 32, 64, or 128.
+fn bi_low_twos_complement(ctx: &dyn NativeContext, this: ObjectRef, bits: u32) -> u128 {
+    debug_assert!(bits == 32 || bits == 64 || bits == 128);
+    let n_words = (bits / 32) as usize;
+    let (signum, mag_lo) = bi_low_bits(ctx, this, n_words);
+    let mask: u128 = if bits == 128 {
+        u128::MAX
+    } else {
+        (1u128 << bits) - 1
+    };
+    if signum >= 0 {
+        mag_lo & mask
+    } else {
+        // Two's-complement negation of the magnitude, but we only kept the
+        // low words. The high (truncated) magnitude words affect the result
+        // only if they were nonzero AND we'd be propagating a borrow into
+        // the kept range. Equivalent: if mag_lo == 0 across all kept words,
+        // any nonzero high word makes the truncated two's-complement still 0
+        // (since negating 2^k gives ...1110...0, low k bits all zero).
+        // Otherwise the kept range's two's-complement is `(~mag_lo + 1) & mask`.
+        // Note: for the case where mag has more words than we kept and
+        // mag_lo != 0, the high-word contribution to the borrow is already
+        // captured by working modulo 2^bits.
+        ((!mag_lo).wrapping_add(1)) & mask
+    }
+}
+
 fn native_bi_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let a = bi_read(ctx, this);
-    let val: i32 = a.parse().unwrap_or(0);
-    Ok(Some(Value::Int(val)))
+    // BigInteger.intValue() returns the low 32 bits as a signed int — i.e.
+    // truncate the two's-complement representation to 32 bits. The old
+    // implementation went through `bi_read` + `i32::parse` which silently
+    // returned 0 for any value outside `[i32::MIN, i32::MAX]`, breaking
+    // every caller that pulls 32-bit chunks out of a wide BigInteger (e.g.
+    // BouncyCastle's `Nat.fromBigInteger`).
+    let low = bi_low_twos_complement(ctx, this, 32) as u32;
+    Ok(Some(Value::Int(low as i32)))
 }
 
 fn native_bi_long_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -23912,9 +24031,9 @@ fn native_bi_long_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let a = bi_read(ctx, this);
-    let val: i64 = a.parse().unwrap_or(0);
-    Ok(Some(Value::Long(val)))
+    // Same fix as `intValue` — return the low 64 two's-complement bits.
+    let low = bi_low_twos_complement(ctx, this, 64) as u64;
+    Ok(Some(Value::Long(low as i64)))
 }
 
 fn native_bi_double_value(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
