@@ -4,7 +4,7 @@
 //! Utility functions: class initialization, preparation, descriptor helpers,
 //! and the ClassStoreHierarchy adapter for the bytecode verifier.
 
-use crate::classloading::{Class, ClassId, ClassState, ClassStore};
+use crate::classloading::{find_field_recursive, Class, ClassId, ClassState, ClassStore};
 use crate::error::{LinkageError, MethodCallFailed, RuntimeError, VmError};
 use crate::threading::jvm_thread::JvmThread;
 use crate::types::Value;
@@ -19,6 +19,20 @@ use super::SharedVm;
 /// `Channels.newBufferedChannel(System.in)` during `ForkedBooter.setupBooter`
 /// **before** `System.initPhase1` has run far enough for the static field to
 /// be populated. `GETSTATIC System.in` must therefore never observe null.
+///
+/// BC-shim BCJ-1 (2026-05-27): set the `fd` `FileDescriptor` object on the
+/// synthetic FIS so the `native_fis_read` / `native_fis_read_bytes` natives
+/// can recover fd 0 via the standard `fis_fd_object` path. The earlier
+/// scheme of stuffing `fd+1` into instance slot 1 was a leftover from the
+/// pre-real-JDK layout: in the JDK 25 `FileInputStream` field layout slot 1
+/// is `path: String`, so `get_field(this, 1)` no longer yields the
+/// `Value::Int(1)` we wrote (type-mismatched writes to a reference slot get
+/// reinterpreted as `Value::Object(None)` at read time), `fis_get_fd`
+/// returns `None`, and `System.in.read()` always returned -1. This breaks
+/// any caller that reads stdin through `System.in` — including Gradle's
+/// `GradleWorkerMain` which pulls a binary protocol from stdin before
+/// running tests (reproduced 2026-05-27 against bc-java :core:test;
+/// `NegativeArraySizeException` from `anewarray URL[-1]`).
 pub fn ensure_system_stdin_object(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -39,8 +53,51 @@ pub fn ensure_system_stdin_object(
             .unwrap_or(2)
     };
     let in_obj = shared.heap.alloc_object(fis_class_id, num_fields);
-    // Slot 1 holds fd+1 encoding (see `native_system_init_phase1` S110 comment).
-    shared.heap.set_field(in_obj, 1, Value::Int(1));
+
+    // Build a real `FileDescriptor` carrying fd=0 and pin it to the FIS's
+    // `fd` slot. The `native_fis_read*` path resolves the fd via
+    // `fis_fd_object` -> `FileDescriptor.fd`, so the descriptor's int `fd`
+    // field carries the kernel handle.
+    let fd_class_id = shared.load_class_concurrent("java/io/FileDescriptor")?;
+    ensure_class_initialized_shared(shared, thread, fd_class_id)?;
+    let fd_num_fields = {
+        let cm = shared.class_manager.read();
+        cm.get_class(fd_class_id)
+            .map(|c| c.num_total_fields.max(2))
+            .unwrap_or(2)
+    };
+    let fd_obj = shared.heap.alloc_object(fd_class_id, fd_num_fields);
+    // Find the `fd` / `handle` field indices by name so we don't depend on
+    // a hardcoded slot order. `fd` is an int (kernel fd, used on POSIX and
+    // mirrored on Windows); `handle` is a long (Windows HANDLE), match the
+    // real JDK layout. Setting both keeps `fis_get_fd` happy on either
+    // platform.
+    let (fd_field_idx, handle_field_idx) = {
+        let cm = shared.class_manager.read();
+        let fd_idx = find_field_recursive(fd_class_id, "fd", &cm.class_store).map(|(i, _, _)| i);
+        let h_idx =
+            find_field_recursive(fd_class_id, "handle", &cm.class_store).map(|(i, _, _)| i);
+        (fd_idx, h_idx)
+    };
+    if let Some(idx) = fd_field_idx {
+        shared.heap.set_field(fd_obj, idx, Value::Int(0));
+    }
+    if let Some(idx) = handle_field_idx {
+        shared.heap.set_field(fd_obj, idx, Value::Long(0));
+    }
+
+    // Pin the FileDescriptor object on the FIS's `fd` slot.
+    let fis_fd_slot = {
+        let cm = shared.class_manager.read();
+        find_field_recursive(fis_class_id, "fd", &cm.class_store).map(|(i, _, _)| i)
+    };
+    if let Some(idx) = fis_fd_slot {
+        shared.heap.set_field(in_obj, idx, Value::Object(Some(fd_obj)));
+    } else {
+        // Fall back to the legacy slot-1 encoding if reflection fails.
+        shared.heap.set_field(in_obj, 1, Value::Int(1));
+    }
+
     *guard = Some(in_obj);
     Ok(in_obj)
 }
