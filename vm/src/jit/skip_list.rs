@@ -1634,6 +1634,33 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
             "io/smallrye/config/ConfigValueConfigSource$ConfigValueProperties",
             "load0",
         )
+        // BC-ASN1.1 (current session) — `apps/_test-suites/bc-java`'s
+        // `org.bouncycastle.asn1.test.RegressionTest` SEGFAULTs (rc=139) on
+        // Windows after ~20 tests pass, with the last successful output line
+        // being `String: DERT61String.getString() result incorrect`. With
+        // `CRATONVM_DISABLE_JIT=1` (or `--nojit`) the full 58-test suite
+        // completes cleanly (RC=0). Bisection via `CRATONVM_JIT_BISECT_ONLY=
+        // java/util/Calendar` plus `CRATONVM_JIT_BISECT_SKIP` pinpointed
+        // `java/util/Calendar.isFieldSet(II)Z` as the single offending JIT
+        // entry: with just that one method skipped, the suite completes
+        // cleanly and 38/58 tests pass (vs. 20/58 before the SEGFAULT under
+        // JIT — the remaining failures are pre-existing data-correctness
+        // gaps in BC's String / OID / X509 paths, not JIT crashes).
+        //
+        // `isFieldSet` is a tiny static helper used internally by Calendar
+        // field-mask logic: `(fieldMask & (1 << fieldIndex)) != 0`. Bytecode
+        // is `iload_0; iconst_1; iload_1; ishl; iand; ifeq …; iconst_1/0;
+        // ireturn` — a four-op bit test. The JIT'd version produces an
+        // incorrect boolean for at least one (mask, field) input, which
+        // mis-routes a downstream `selectFields` / `computeFields` branch
+        // in `GregorianCalendar` and ultimately surfaces as a raw native
+        // SEGFAULT (Windows STATUS_ACCESS_VIOLATION) when a corrupt index
+        // is fed back into an `int[]` slot. Same archetype as NETTY.1's
+        // `Arrays.fill` counted-loop miscompile, but on a much smaller
+        // bytecode shape — likely a regalloc / x64 codegen bug for the
+        // `ishl` / `iand` / `ifeq` short basic block. Liftable via
+        // `CRATONVM_JIT_ALLOW_PACKAGES=java/util/`.
+        | ("java/util/Calendar", "isFieldSet")
     )
 }
 
