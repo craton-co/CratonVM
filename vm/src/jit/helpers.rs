@@ -1235,24 +1235,25 @@ pub unsafe extern "C" fn jit_putfield_object(
     }
     if std::env::var_os("CRATON_JIT_PFO_TRACE").is_some() {
         let cid_off = obj_ptr as *const u8;
-        let cid: u32 = std::ptr::read(cid_off as *const u32);
-        if cid == 394 {
-            // Check the value's class_id if it's an object
-            let val_class_id = if val != 0 {
-                let v_cid_ptr = val as *const u8;
-                std::ptr::read(v_cid_ptr as *const u32)
-            } else { 0 };
-            // Check kind byte of value
-            let val_kind = if val != 0 {
-                let v_kind_ptr = (val as *const u8).add(4);
-                std::ptr::read(v_kind_ptr)
-            } else { 0 };
-            let val_arrlen = if val != 0 {
-                let len_ptr = (val as *const u8).add(12);
-                std::ptr::read(len_ptr as *const u32)
-            } else { 0 };
-            eprintln!("[JIT-PFO] obj=0x{:x} class_id=394 field_index={} val=0x{:x} val_cid={} val_kind={} val_arrlen={}",
-                obj_ptr as usize, field_index, val as u64, val_class_id, val_kind, val_arrlen);
+        let obj_cid: u32 = std::ptr::read(cid_off as *const u32);
+        // Surface only the suspect bit-patterns: invalid kind byte or
+        // implausibly-large array_length. Real refs to live objects pass
+        // through silently.
+        let val_class_id = if val != 0 {
+            let v_cid_ptr = val as *const u8;
+            std::ptr::read(v_cid_ptr as *const u32)
+        } else { 0 };
+        let val_kind = if val != 0 {
+            let v_kind_ptr = (val as *const u8).add(4);
+            std::ptr::read(v_kind_ptr)
+        } else { 0 };
+        let val_arrlen = if val != 0 {
+            let len_ptr = (val as *const u8).add(12);
+            std::ptr::read(len_ptr as *const u32)
+        } else { 0 };
+        if val != 0 && (val_kind > 1 || val_arrlen > 1_000_000) {
+            eprintln!("[JIT-PFO] obj=0x{:x} obj_cid={} field_index={} val=0x{:x} val_cid={} val_kind={} val_arrlen=0x{:x}",
+                obj_ptr as usize, obj_cid, field_index, val as u64, val_class_id, val_kind, val_arrlen);
         }
     }
     let ptr = obj_ref

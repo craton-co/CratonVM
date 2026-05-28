@@ -1661,6 +1661,32 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // `ishl` / `iand` / `ifeq` short basic block. Liftable via
         // `CRATONVM_JIT_ALLOW_PACKAGES=java/util/`.
         | ("java/util/Calendar", "isFieldSet")
+        // ECJ Eclipse-JDT issue #23 (BC SM2 followup, 2026-05-28) — the
+        // JIT-compiled `org/eclipse/jdt/internal/compiler/util/HashtableOfInt.rehash`
+        // produces a `keyTable` whose backing int[] header is corrupted
+        // (`val_cid=0 val_kind=0 val_arrlen=0x01010101` in the JIT-PFO
+        // trace), causing the next `HashtableOfInt.put` to divide by
+        // zero. Bisected via `CRATONVM_JIT_BISECT_SKIP`:
+        // `org/eclipse/jdt/internal/compiler/util/HashtableOfInt.rehash`
+        // closes the bug. `--nojit` and disabling the inline-TLAB
+        // `new` codegen path BOTH still fail, so the miscompile is
+        // somewhere in the rehash() method's other JIT-emitted code
+        // (loop iteration over the old keyTable, the three trailing
+        // putfield_object stores that copy the new instance's fields,
+        // or the JIT's tracking of stack slots across the dup/new/
+        // invokespecial sequence). The deeper investigation needs a
+        // Windows-side debugger watchpoint on the int[]'s header bytes.
+        // Pre-emptively include the sibling Hashtable* classes — they
+        // share the same `rehash` shape (allocate `new HashtableOfX`,
+        // iterate, replace fields) and would surface the same bug if
+        // the JIT ever crosses their per-method threshold.
+        | ("org/eclipse/jdt/internal/compiler/util/HashtableOfInt", "rehash")
+        | ("org/eclipse/jdt/internal/compiler/util/HashtableOfLong", "rehash")
+        | ("org/eclipse/jdt/internal/compiler/util/HashtableOfObject", "rehash")
+        | ("org/eclipse/jdt/internal/compiler/util/HashtableOfObjectToInt", "rehash")
+        | ("org/eclipse/jdt/internal/compiler/util/HashtableOfPackage", "rehash")
+        | ("org/eclipse/jdt/internal/compiler/util/HashtableOfType", "rehash")
+        | ("org/eclipse/jdt/internal/compiler/util/HashtableOfModule", "rehash")
     )
 }
 
