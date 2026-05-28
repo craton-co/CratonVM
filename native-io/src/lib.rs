@@ -2584,6 +2584,24 @@ fn native_baos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    // Registered on the base `java/io/OutputStream` class as a fallback for
+    // synthetic streams with the BAOS layout. For non-BAOS receivers,
+    // `baos_ensure_capacity` below would allocate a fresh byte[] and write
+    // it to slot 0 — clobbering whatever the subclass stored there. Guard
+    // with a class-name check; for non-BAOS receivers we'd need to dispatch
+    // to the subclass's overridden `write(I)V`, but that's recursive (this
+    // is the InputStream-registered native, called by `invoke_virtual` on
+    // the receiver). Empirically subclass-specific `write(I)V` natives
+    // (e.g. `FileOutputStream.write(I)V` -> `native_fos_write_byte`) win
+    // dispatch over this base-class fallback, so reaching here on a
+    // non-BAOS receiver indicates a subclass with no `write(I)V`
+    // implementation — the safe answer is a no-op, NOT corrupting slot 0.
+    let cls_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    if cls_name != "java/io/ByteArrayOutputStream" {
+        return Ok(None);
+    }
     let count = match ctx.get_field(this, BAOS_FIELD_COUNT) {
         Value::Int(v) => v as usize,
         _ => 0,
@@ -2611,6 +2629,37 @@ fn native_baos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
+    // This native is registered on the base `java/io/OutputStream` class as
+    // a fallback for synthetic streams that have the
+    // ByteArrayOutputStream layout in slots 0..1 (`data:[B`, `count:int`).
+    // For genuine subclasses that override `write([BII)V` to do something
+    // OTHER than accumulate into a byte[] (e.g. a FilterOutputStream that
+    // wraps a write-to-disk stream, or any non-BAOS sink), writing into
+    // slots 0/1 either no-ops (wrong slot for `count`) or silently
+    // corrupts the subclass's own fields. Reproducer family: BC's
+    // `IndefiniteLengthInputStream.read([BII)` (already fixed via
+    // `native_bais_read_bytes`); DaCapo's BufferedOutputStream chain
+    // (fixed by the `native_bos_*` slot-resolution).
+    //
+    // Guard with a class-name check: only use the BAOS fast path for the
+    // exact class `java/io/ByteArrayOutputStream`. For everything else,
+    // fall back to the JDK `OutputStream.write(byte[], int, int)` default
+    // impl — loop over `write(b[off+i])` via `invoke_virtual` so the
+    // subclass's overridden `write(int)` runs. Matches the parallel guard
+    // in `native_bais_read_bytes` (committed in 840160d).
+    let cls_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    if cls_name != "java/io/ByteArrayOutputStream" {
+        for i in 0..len {
+            let v = match ctx.get_array_element(buf, off + i) {
+                Value::Int(b) => b & 0xFF,
+                _ => 0,
+            };
+            ctx.invoke_virtual(this, "write", "(I)V", &[Value::Int(v)])?;
+        }
+        return Ok(None);
+    }
     let count = match ctx.get_field(this, BAOS_FIELD_COUNT) {
         Value::Int(v) => v as usize,
         _ => 0,
