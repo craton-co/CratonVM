@@ -277,8 +277,30 @@ fn read_java_string_inner(heap: &VmHeap, obj_ref: ObjectRef, _compact_override: 
     let elem_type = heap.array_element_type(value_array);
     let coder = match elem_type {
         Some(ArrayElementType::Byte) => match heap.get_field(obj_ref, 1) {
-            Value::Int(c) => c,
-            _ => CODER_LATIN1,
+            // Slot 1 of a real-JDK 9+ String is `coder:byte` (stored as Int
+            // on the JVM stack/field) and is ALWAYS 0 (LATIN1) or 1 (UTF16).
+            // Anything else means this receiver is NOT a String. Two common
+            // collisions we MUST reject here:
+            //
+            //   • `ASN1ObjectIdentifier` (`contents:[B` + `identifier:String`)
+            //     — slot 1 is a reference, falls through to the catch-all.
+            //
+            //   • `ASN1ObjectIdentifier$OidHandle` and similar
+            //     byte-array-payload key classes (`contents:[B` +
+            //     `contentsLength:I` + `key:I`) — slot 1 is an Int but its
+            //     value is the array length, not a coder. Without this guard
+            //     we feed `contentsLength` to `decode_java_string_value_array`
+            //     and read the byte[] as UTF-16-LE (any non-zero coder falls
+            //     into the UTF-16 branch). Every OID whose contents share
+            //     bytes 0..2 — i.e. every `2.5.4.x` OID, all of BCStyle's
+            //     X.500 attribute identifiers — then collapses to the same
+            //     decoded char, the same `map_hash_key`, and the same
+            //     `map_keys_equal`, so `BCStyle.DefaultLookUp` ends up with
+            //     one entry holding the LAST OID interned. Result: every
+            //     `attrNameToOID("cn"/"o"/"cn"/...)` returns the same wrong
+            //     instance, and `getId()` reports e.g. "2.5.4.6" for `CN`.
+            Value::Int(c) if c == CODER_LATIN1 || c == CODER_UTF16 => c,
+            _ => return None,
         },
         _ => CODER_LATIN1,
     };

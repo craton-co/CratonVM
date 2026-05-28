@@ -7314,6 +7314,18 @@ fn invoke_on_class_shared_inner(
                                 | "isEmpty"
                                 | "clear"
                                 | "putAll"
+                                // `Hashtable.keys()` / `elements()` — legacy
+                                // pre-1.2 Enumeration accessors. Real-JDK
+                                // body walks `this.table[]`; our side-store
+                                // makes that empty. See companion entries
+                                // in `interpreter.rs::force_native_over_real_jdk_bytecode`
+                                // and the matching natives in
+                                // `native-collections::lib.rs`. BC's
+                                // `AbstractX500NameStyle.copyHashTable` is
+                                // the canonical victim — without this,
+                                // every `BCStyle.attrNameToOID("cn"/...)`
+                                // fails with "Unknown object id".
+                                | "keys" | "elements"
                                 // S111r14: copy-constructor `<init>(Ljava/util/Map;)V`
                                 // — DateTimeFormatter.<clinit> hits this via
                                 // `new LinkedHashMap<>(map)`. Override only

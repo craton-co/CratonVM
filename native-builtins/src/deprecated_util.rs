@@ -658,17 +658,31 @@ fn native_properties_save(
 
 /// Walk the HashMap-backed Hashtable buckets and emit (key, value) pairs.
 /// Mirrors `native-collections::map_collect_*` since those are private.
+///
+/// Layout from native-collections: slot 0 = buckets (Object[]).
+///
+/// Historical bug: this used to read slot 2 as "capacity" to bound the walk,
+/// but slot 2 is `threshold:int` on a real-JDK Hashtable. When
+/// `native_map_init` writes buckets to the real-JDK `table` slot (via
+/// `resolve_field_index("java/util/HashMap", "table")`) it sometimes lands
+/// on Hashtable's slot 2 (because HashMap's table-field slot index doesn't
+/// match Hashtable's layout — Hashtable's `table` is at slot 0, not at
+/// HashMap's table slot). Slot 2 then holds a pointer that this function
+/// would read as `Value::Object`, mismatch the `Value::Int(c)` pattern, and
+/// return an empty Vec. That collapsed `Hashtable.keys()` / `elements()` to
+/// empty Enumerations, which cascaded into BC's
+/// `AbstractX500NameStyle.copyHashTable(BCStyle.DefaultLookUp)` producing an
+/// empty per-instance `defaultLookUp` and surfaced as every
+/// `BCStyle.attrNameToOID("cn"/"o"/"CN"/...)` throwing "Unknown object id".
+///
+/// Fix: derive the cap from `buckets.length` directly. That's authoritative
+/// (the bucket array IS the capacity) and immune to any slot-2 corruption.
 fn collect_hashtable(ctx: &dyn NativeContext, this: ObjectRef, want_keys: bool) -> Vec<Value> {
-    // Map field layout from native-collections (private constants
-    // duplicated here): buckets=0, size=1, capacity=2.
     let buckets = match ctx.get_field(this, 0) {
         Value::Object(Some(arr)) => arr,
         _ => return Vec::new(),
     };
-    let cap = match ctx.get_field(this, 2) {
-        Value::Int(c) if c > 0 => c as usize,
-        _ => return Vec::new(),
-    };
+    let cap = ctx.array_length(buckets);
     let mut out = Vec::new();
     for i in 0..cap {
         let mut node_val = ctx.get_array_element(buckets, i);

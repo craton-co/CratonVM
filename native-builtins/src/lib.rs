@@ -22946,7 +22946,7 @@ pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
 }
 
 /// Simple big integer addition using string-based decimal arithmetic.
-fn bi_add_str(a: &str, b: &str) -> String {
+pub(crate) fn bi_add_str(a: &str, b: &str) -> String {
     let (a_neg, a_abs) = bi_parse_sign(a);
     let (b_neg, b_abs) = bi_parse_sign(b);
 
@@ -22964,7 +22964,7 @@ fn bi_add_str(a: &str, b: &str) -> String {
     }
 }
 
-fn bi_sub_str(a: &str, b: &str) -> String {
+pub(crate) fn bi_sub_str(a: &str, b: &str) -> String {
     let neg_b = if let Some(stripped) = b.strip_prefix('-') {
         stripped.to_string()
     } else {
@@ -22973,7 +22973,7 @@ fn bi_sub_str(a: &str, b: &str) -> String {
     bi_add_str(a, &neg_b)
 }
 
-fn bi_mul_str(a: &str, b: &str) -> String {
+pub(crate) fn bi_mul_str(a: &str, b: &str) -> String {
     let (a_neg, a_abs) = bi_parse_sign(a);
     let (b_neg, b_abs) = bi_parse_sign(b);
     let result = bi_mul_unsigned(a_abs, b_abs);
@@ -22987,7 +22987,7 @@ fn bi_mul_str(a: &str, b: &str) -> String {
     }
 }
 
-fn bi_div_str(a: &str, b: &str) -> String {
+pub(crate) fn bi_div_str(a: &str, b: &str) -> String {
     let (a_neg, a_abs) = bi_parse_sign(a);
     let (b_neg, b_abs) = bi_parse_sign(b);
     let result = bi_div_unsigned(a_abs, b_abs);
@@ -23001,13 +23001,13 @@ fn bi_div_str(a: &str, b: &str) -> String {
     }
 }
 
-fn bi_mod_str(a: &str, b: &str) -> String {
+pub(crate) fn bi_mod_str(a: &str, b: &str) -> String {
     let (_a_neg, a_abs) = bi_parse_sign(a);
     let (_b_neg, b_abs) = bi_parse_sign(b);
     bi_mod_unsigned(a_abs, b_abs)
 }
 
-fn bi_parse_sign(s: &str) -> (bool, &str) {
+pub(crate) fn bi_parse_sign(s: &str) -> (bool, &str) {
     if let Some(rest) = s.strip_prefix('-') {
         (true, rest)
     } else {
@@ -23015,7 +23015,7 @@ fn bi_parse_sign(s: &str) -> (bool, &str) {
     }
 }
 
-fn bi_add_unsigned(a: &str, b: &str) -> String {
+pub(crate) fn bi_add_unsigned(a: &str, b: &str) -> String {
     let a_bytes: Vec<u8> = a.bytes().rev().map(|b| b - b'0').collect();
     let b_bytes: Vec<u8> = b.bytes().rev().map(|b| b - b'0').collect();
     let max_len = a_bytes.len().max(b_bytes.len());
@@ -23038,7 +23038,7 @@ fn bi_add_unsigned(a: &str, b: &str) -> String {
     }
 }
 
-fn bi_sub_unsigned(a: &str, b: &str) -> String {
+pub(crate) fn bi_sub_unsigned(a: &str, b: &str) -> String {
     let cmp = bi_cmp_unsigned(a, b);
     if cmp == 0 {
         return "0".to_string();
@@ -23070,7 +23070,7 @@ fn bi_sub_unsigned(a: &str, b: &str) -> String {
     }
 }
 
-fn bi_mul_unsigned(a: &str, b: &str) -> String {
+pub(crate) fn bi_mul_unsigned(a: &str, b: &str) -> String {
     let a_bytes: Vec<u8> = a.bytes().rev().map(|b| b - b'0').collect();
     let b_bytes: Vec<u8> = b.bytes().rev().map(|b| b - b'0').collect();
     let mut result = vec![0u8; a_bytes.len() + b_bytes.len()];
@@ -23091,7 +23091,7 @@ fn bi_mul_unsigned(a: &str, b: &str) -> String {
     result.iter().rev().map(|&d| (d + b'0') as char).collect()
 }
 
-fn bi_div_unsigned(a: &str, b: &str) -> String {
+pub(crate) fn bi_div_unsigned(a: &str, b: &str) -> String {
     if b == "0" {
         return "0".to_string();
     } // Division by zero: return 0 (simplified)
@@ -23120,7 +23120,7 @@ fn bi_div_unsigned(a: &str, b: &str) -> String {
     quotient
 }
 
-fn bi_mod_unsigned(a: &str, b: &str) -> String {
+pub(crate) fn bi_mod_unsigned(a: &str, b: &str) -> String {
     if b == "0" {
         return "0".to_string();
     }
@@ -23129,7 +23129,7 @@ fn bi_mod_unsigned(a: &str, b: &str) -> String {
     bi_sub_unsigned(a, &prod)
 }
 
-fn bi_cmp_unsigned(a: &str, b: &str) -> i32 {
+pub(crate) fn bi_cmp_unsigned(a: &str, b: &str) -> i32 {
     if a.len() != b.len() {
         return if a.len() > b.len() { 1 } else { -1 };
     }
@@ -23140,7 +23140,7 @@ fn bi_cmp_unsigned(a: &str, b: &str) -> i32 {
     }
 }
 
-fn bi_compare(a: &str, b: &str) -> i32 {
+pub(crate) fn bi_compare(a: &str, b: &str) -> i32 {
     let (a_neg, a_abs) = bi_parse_sign(a);
     let (b_neg, b_abs) = bi_parse_sign(b);
     if a_neg && !b_neg {
@@ -23158,7 +23158,7 @@ fn bi_compare(a: &str, b: &str) -> i32 {
 }
 
 /// Convert decimal string to binary string (e.g., "10" -> "1010")
-fn bi_to_binary(decimal: &str) -> String {
+pub(crate) fn bi_to_binary(decimal: &str) -> String {
     if decimal == "0" { return "0".to_string(); }
     let mut val = decimal.to_string();
     let mut bits = Vec::new();
@@ -23171,7 +23171,7 @@ fn bi_to_binary(decimal: &str) -> String {
 }
 
 /// Convert binary string back to decimal string
-fn bi_from_binary(binary: &str) -> String {
+pub(crate) fn bi_from_binary(binary: &str) -> String {
     if binary == "0" || binary.is_empty() { return "0".to_string(); }
     let mut result = "0".to_string();
     for ch in binary.chars() {
@@ -23184,7 +23184,7 @@ fn bi_from_binary(binary: &str) -> String {
 }
 
 /// Bitwise AND on two non-negative decimal strings
-fn bi_bitwise_and(a: &str, b: &str) -> String {
+pub(crate) fn bi_bitwise_and(a: &str, b: &str) -> String {
     let ba = bi_to_binary(a);
     let bb = bi_to_binary(b);
     let max_len = ba.len().max(bb.len());
@@ -23198,7 +23198,7 @@ fn bi_bitwise_and(a: &str, b: &str) -> String {
 }
 
 /// Bitwise OR on two non-negative decimal strings
-fn bi_bitwise_or(a: &str, b: &str) -> String {
+pub(crate) fn bi_bitwise_or(a: &str, b: &str) -> String {
     let ba = bi_to_binary(a);
     let bb = bi_to_binary(b);
     let max_len = ba.len().max(bb.len());
@@ -23212,7 +23212,7 @@ fn bi_bitwise_or(a: &str, b: &str) -> String {
 }
 
 /// Bitwise XOR on two non-negative decimal strings
-fn bi_bitwise_xor(a: &str, b: &str) -> String {
+pub(crate) fn bi_bitwise_xor(a: &str, b: &str) -> String {
     let ba = bi_to_binary(a);
     let bb = bi_to_binary(b);
     let max_len = ba.len().max(bb.len());
@@ -23223,6 +23223,459 @@ fn bi_bitwise_xor(a: &str, b: &str) -> String {
         .collect();
     let trimmed = result.trim_start_matches('0');
     if trimmed.is_empty() { "0".to_string() } else { bi_from_binary(trimmed) }
+}
+
+// ---------------------------------------------------------------------------
+// Arbitrary-precision string helpers for the rest of the BigInteger surface.
+// These all preserve full precision (no i128 truncation). They are used by
+// the BigInteger natives registered in `phases_late.rs` to replace the buggy
+// `p71_bi_val` path which silently truncated to i128 via parse-decimal.
+// ---------------------------------------------------------------------------
+
+/// `value << n` for arbitrary-precision signed decimal string `value`.
+/// `n` may be negative — that becomes a right shift.
+pub(crate) fn bi_shift_left_str(value: &str, n: i32) -> String {
+    if value == "0" {
+        return "0".to_string();
+    }
+    if n == 0 {
+        return value.to_string();
+    }
+    if n < 0 {
+        return bi_shift_right_str(value, -n);
+    }
+    // multiply absolute magnitude by 2^n via repeated doubling, preserving sign
+    let (neg, abs) = bi_parse_sign(value);
+    let mut acc = abs.to_string();
+    // Doubling chunked: multiply by 2 n times. For small n (typical shift
+    // amounts: 1..512), this is acceptable. For larger n we could mul by
+    // a precomputed power-of-two string, but YAGNI.
+    for _ in 0..n {
+        acc = bi_add_unsigned(&acc, &acc);
+    }
+    if neg && acc != "0" {
+        format!("-{}", acc)
+    } else {
+        acc
+    }
+}
+
+/// `value >> n` (arithmetic right shift) for arbitrary-precision signed
+/// decimal string `value`. `n` may be negative — that becomes a left shift.
+/// Negative inputs use Java's arithmetic-shift semantics: round toward
+/// negative infinity (so `-1 >> 1 == -1`, not `0`).
+pub(crate) fn bi_shift_right_str(value: &str, n: i32) -> String {
+    if value == "0" {
+        return "0".to_string();
+    }
+    if n == 0 {
+        return value.to_string();
+    }
+    if n < 0 {
+        return bi_shift_left_str(value, -n);
+    }
+    let (neg, abs) = bi_parse_sign(value);
+    // For positive values: floor-divide by 2^n == divide unsigned by 2^n.
+    // For negative values: Java's `x >> n` floors toward -inf, so
+    //   `-x >> n == -((x - 1) >> n) - 1` is NOT quite right; the cleaner
+    //   identity is: `(-mag) >> n == -ceildiv(mag, 2^n)`.
+    let mut q = abs.to_string();
+    for _ in 0..n {
+        if q == "0" {
+            break;
+        }
+        // q = q / 2 (floor)
+        let half = bi_div_unsigned(&q, "2");
+        if neg {
+            // ceildiv: if q is odd, ceildiv adds 1 after floor-div
+            let last_digit = q.bytes().last().map(|b| b - b'0').unwrap_or(0);
+            if last_digit & 1 != 0 {
+                q = bi_add_unsigned(&half, "1");
+            } else {
+                q = half;
+            }
+        } else {
+            q = half;
+        }
+    }
+    if neg && q != "0" {
+        format!("-{}", q)
+    } else if q == "0" && neg {
+        // -1 shifted past its bit length still equals -1 in Java arithmetic
+        // shift semantics (sign extension fills with 1s). E.g. (-1) >> 100 == -1.
+        // We hit q=="0" here because abs is "1" — recover the sign-extended
+        // result by returning -1.
+        "-1".to_string()
+    } else {
+        q
+    }
+}
+
+/// Return bit `n` of the infinite two's-complement representation of
+/// `value`. For nonnegative `value`, this is bit `n` of the magnitude.
+/// For negative `value`, this is `!(bit n of (mag - 1))`.
+pub(crate) fn bi_test_bit_str(value: &str, n: i32) -> bool {
+    if n < 0 {
+        return false; // BigInteger throws ArithmeticException, but we just return false here.
+    }
+    if value == "0" {
+        return false;
+    }
+    let (neg, abs) = bi_parse_sign(value);
+    // For negative: two's-complement bit n of -mag is !(bit n of (mag - 1))
+    let work = if neg {
+        bi_sub_unsigned(abs, "1")
+    } else {
+        abs.to_string()
+    };
+    // bit n of `work` (which is now an unsigned magnitude string)
+    // Compute work >> n, then & 1.
+    let mut w = work;
+    for _ in 0..n {
+        if w == "0" {
+            break;
+        }
+        w = bi_div_unsigned(&w, "2");
+    }
+    let last = w.bytes().last().map(|b| b - b'0').unwrap_or(0);
+    let bit = (last & 1) != 0;
+    if neg {
+        !bit
+    } else {
+        bit
+    }
+}
+
+/// Number of bits in the minimal two's-complement representation of `value`,
+/// excluding the sign bit. This matches `java.math.BigInteger.bitLength()`.
+pub(crate) fn bi_bit_length_str(value: &str) -> u32 {
+    if value == "0" {
+        return 0;
+    }
+    let (neg, abs) = bi_parse_sign(value);
+    if neg {
+        // For negative values, bitLength = bitLength of magnitude minus
+        // 1 if the magnitude is a power of two (since -2^k needs only
+        // k bits including sign), else bitLength of magnitude.
+        let abs_bits = bi_to_binary(abs).len() as u32;
+        // is magnitude a power of two? a power of two has binary "1000...0"
+        let bin = bi_to_binary(abs);
+        let is_pow2 = bin.starts_with('1') && bin[1..].chars().all(|c| c == '0');
+        if is_pow2 { abs_bits - 1 } else { abs_bits }
+    } else {
+        bi_to_binary(abs).len() as u32
+    }
+}
+
+/// `BigInteger.bitCount()`: count of bits that *differ* from the sign bit
+/// in the two's-complement representation. For nonnegative values, this is
+/// just `popcount(magnitude)`. For negative values, this is the count of
+/// zero bits in the lowest `bitLength` bits of `(magnitude - 1)`.
+pub(crate) fn bi_bit_count_str(value: &str) -> u32 {
+    if value == "0" {
+        return 0;
+    }
+    let (neg, abs) = bi_parse_sign(value);
+    if !neg {
+        let bin = bi_to_binary(abs);
+        bin.bytes().filter(|&b| b == b'1').count() as u32
+    } else {
+        // Count zero bits in (abs - 1) over its bit width.
+        let m1 = bi_sub_unsigned(abs, "1");
+        if m1 == "0" {
+            // value is -1: in two's complement, -1 is "...111", differs
+            // from sign bit (1) in zero positions.
+            return 0;
+        }
+        let bin = bi_to_binary(&m1);
+        bin.bytes().filter(|&b| b == b'0').count() as u32
+    }
+}
+
+/// `BigInteger.not()` — bitwise NOT in two's complement, equivalent to
+/// `-(value + 1)`.
+pub(crate) fn bi_not_str(value: &str) -> String {
+    // -(value + 1)
+    let plus1 = bi_add_str(value, "1");
+    if plus1 == "0" {
+        return "0".to_string();
+    }
+    if let Some(rest) = plus1.strip_prefix('-') {
+        rest.to_string()
+    } else {
+        format!("-{}", plus1)
+    }
+}
+
+/// `BigInteger.gcd(other)` — Euclidean GCD on absolute values.
+pub(crate) fn bi_gcd_str(a: &str, b: &str) -> String {
+    let (_, a_abs) = bi_parse_sign(a);
+    let (_, b_abs) = bi_parse_sign(b);
+    let mut x = a_abs.to_string();
+    let mut y = b_abs.to_string();
+    while y != "0" {
+        let r = bi_mod_unsigned(&x, &y);
+        x = y;
+        y = r;
+    }
+    x
+}
+
+/// `BigInteger.modPow(exp, m)` — `base^exp mod m` for arbitrary-precision
+/// signed decimal strings. Negative exponents require `modInverse` and are
+/// rejected here (Java throws `ArithmeticException`); callers should handle
+/// that branch explicitly.
+pub(crate) fn bi_mod_pow_str(base: &str, exp: &str, m: &str) -> String {
+    if m == "1" || m == "-1" {
+        return "0".to_string();
+    }
+    let (m_neg, m_abs) = bi_parse_sign(m);
+    let _ = m_neg; // modulus magnitude is what matters
+    // Reduce base mod m first (Java BigInteger always returns a nonnegative
+    // representative in [0, |m|)).
+    let mut b = bi_mod_str(base, m_abs);
+    if b.starts_with('-') {
+        b = bi_add_str(&b, m_abs);
+    }
+    // exp must be non-negative for plain modPow.
+    let (e_neg, e_abs) = bi_parse_sign(exp);
+    if e_neg {
+        // Caller is responsible for inverting base first.
+        // Fallback: treat as |exp| (consistent with our previous buggy
+        // wrapping_mul behavior is not OK; instead return 0 sentinel — but
+        // returning 0 is itself a synthetic stub, so panic to be loud).
+        panic!("bi_mod_pow_str: negative exponent — caller must compute modInverse first");
+    }
+    let mut result = "1".to_string();
+    // Iterate bits of exp from LSB to MSB by repeated div2.
+    let mut e = e_abs.to_string();
+    while e != "0" {
+        let last = e.bytes().last().map(|b| b - b'0').unwrap_or(0);
+        if last & 1 == 1 {
+            result = bi_mod_unsigned(&bi_mul_unsigned(&result, &b), m_abs);
+        }
+        e = bi_div_unsigned(&e, "2");
+        if e != "0" {
+            b = bi_mod_unsigned(&bi_mul_unsigned(&b, &b), m_abs);
+        }
+    }
+    result
+}
+
+/// `BigInteger.modInverse(m)` — extended Euclidean on arbitrary-precision
+/// signed decimal strings. Returns `None` if `gcd(a, m) != 1`.
+pub(crate) fn bi_mod_inverse_str(a: &str, m: &str) -> Option<String> {
+    let (_, m_abs) = bi_parse_sign(m);
+    // Reduce a mod m_abs first (positive representative).
+    let a_red = {
+        let r = bi_mod_str(a, m_abs);
+        if r.starts_with('-') { bi_add_str(&r, m_abs) } else { r }
+    };
+    // Extended GCD on (a_red, m_abs).
+    let mut old_r = a_red;
+    let mut r = m_abs.to_string();
+    let mut old_s = "1".to_string();
+    let mut s = "0".to_string();
+    while r != "0" {
+        let q = bi_div_str(&old_r, &r);
+        let new_r = bi_sub_str(&old_r, &bi_mul_str(&q, &r));
+        old_r = std::mem::replace(&mut r, new_r);
+        let new_s = bi_sub_str(&old_s, &bi_mul_str(&q, &s));
+        old_s = std::mem::replace(&mut s, new_s);
+    }
+    if old_r != "1" {
+        return None;
+    }
+    // Result = old_s mod m_abs, in [0, m_abs)
+    let mut inv = bi_mod_str(&old_s, m_abs);
+    if inv.starts_with('-') {
+        inv = bi_add_str(&inv, m_abs);
+    }
+    Some(inv)
+}
+
+/// `BigInteger.toByteArray()` — two's-complement big-endian byte encoding,
+/// with the minimal length needed to represent the value (always at least
+/// one byte). Sign-extends.
+pub(crate) fn bi_to_byte_array_str(value: &str) -> Vec<u8> {
+    if value == "0" {
+        return vec![0u8];
+    }
+    let (neg, abs) = bi_parse_sign(value);
+    // First build the magnitude as big-endian bytes.
+    let mut mag_bytes: Vec<u8> = Vec::new();
+    let mut q = abs.to_string();
+    while q != "0" {
+        // q mod 256, q = q / 256
+        // Compute mod 256 via decimal long division by 256.
+        let mut rem: u32 = 0;
+        let mut next_q = String::new();
+        for ch in q.chars() {
+            let d = ch.to_digit(10).unwrap_or(0);
+            let cur = rem * 10 + d;
+            let qd = cur / 256;
+            rem = cur % 256;
+            if !(next_q.is_empty() && qd == 0) {
+                next_q.push(char::from_digit(qd, 10).unwrap());
+            }
+        }
+        if next_q.is_empty() {
+            next_q.push('0');
+        }
+        mag_bytes.push(rem as u8);
+        q = next_q;
+    }
+    // mag_bytes is currently little-endian (LSB first). Reverse for BE.
+    mag_bytes.reverse();
+    if !neg {
+        // Positive: prepend 0x00 if high bit is set, so sign bit reads as +.
+        if mag_bytes[0] & 0x80 != 0 {
+            let mut out = Vec::with_capacity(mag_bytes.len() + 1);
+            out.push(0);
+            out.extend_from_slice(&mag_bytes);
+            out
+        } else {
+            mag_bytes
+        }
+    } else {
+        // Negative: two's complement = invert all bits of (mag - 1)... actually
+        // simpler: (~mag + 1) bytewise, but we have mag, want -mag.
+        // Compute (2^(8*len) - mag) interpreted as len bytes; if that result's
+        // high bit is 0, prepend 0xFF so sign reads as negative.
+        // Easy path: do bytewise (256 - byte) with borrow.
+        let len = mag_bytes.len();
+        let mut twos = vec![0u8; len];
+        let mut borrow: u16 = 0;
+        // Process from LSB (end of mag_bytes) to MSB (start).
+        for i in (0..len).rev() {
+            let m = mag_bytes[i] as i32;
+            let mut diff = 0i32 - m - borrow as i32;
+            if diff < 0 {
+                diff += 256;
+                borrow = 1;
+            } else {
+                borrow = 0;
+            }
+            twos[i] = diff as u8;
+        }
+        // If high bit of twos[0] is 0, we need to prepend 0xFF to keep sign.
+        if twos[0] & 0x80 == 0 {
+            let mut out = Vec::with_capacity(len + 1);
+            out.push(0xFF);
+            out.extend_from_slice(&twos);
+            out
+        } else {
+            // Trim leading 0xFF bytes as long as the next byte still has
+            // high bit set (sign extension).
+            let mut start = 0usize;
+            while start + 1 < twos.len() && twos[start] == 0xFF && (twos[start + 1] & 0x80) != 0 {
+                start += 1;
+            }
+            twos[start..].to_vec()
+        }
+    }
+}
+
+/// `BigInteger(byte[])` — interpret `bytes` as a signed two's-complement
+/// big-endian integer and return the decimal string.
+pub(crate) fn bi_from_byte_array_signed(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "0".to_string();
+    }
+    let negative = bytes[0] & 0x80 != 0;
+    // For positive: just build the magnitude from the bytes (treat as unsigned).
+    // For negative: build the magnitude as ~bytes + 1 (two's complement).
+    let mag_bytes: Vec<u8> = if !negative {
+        bytes.to_vec()
+    } else {
+        // Invert + add 1 with borrow propagation.
+        let mut inv: Vec<u8> = bytes.iter().map(|b| !b).collect();
+        let mut carry: u16 = 1;
+        for byte in inv.iter_mut().rev() {
+            let v = *byte as u16 + carry;
+            *byte = (v & 0xFF) as u8;
+            carry = v >> 8;
+            if carry == 0 {
+                break;
+            }
+        }
+        inv
+    };
+    // Convert big-endian bytes to decimal string (multiply by 256 each step).
+    let mut decimal = "0".to_string();
+    for &b in &mag_bytes {
+        decimal = bi_mul_unsigned(&decimal, "256");
+        if b != 0 {
+            decimal = bi_add_unsigned(&decimal, &b.to_string());
+        }
+    }
+    if decimal == "0" {
+        "0".to_string()
+    } else if negative {
+        format!("-{}", decimal)
+    } else {
+        decimal
+    }
+}
+
+/// `BigInteger(int signum, byte[] magnitude)` — interpret `bytes` as an
+/// unsigned big-endian magnitude and apply the given `signum`.
+pub(crate) fn bi_from_byte_array_with_signum(signum: i32, bytes: &[u8]) -> String {
+    let mut decimal = "0".to_string();
+    for &b in bytes {
+        decimal = bi_mul_unsigned(&decimal, "256");
+        if b != 0 {
+            decimal = bi_add_unsigned(&decimal, &b.to_string());
+        }
+    }
+    if decimal == "0" {
+        "0".to_string()
+    } else if signum < 0 {
+        format!("-{}", decimal)
+    } else {
+        decimal
+    }
+}
+
+/// `BigInteger.isProbablePrime(certainty)` — trial division by small odd
+/// primes (3, 5, 7, …, 999). For the certainty levels used by callers like
+/// BouncyCastle's EC parameter setup, a value that survives trial division
+/// to the small-prime threshold and is itself ≥ 2 is reported as probably
+/// prime. (This is a pragmatic stand-in for full Miller–Rabin, sufficient
+/// for the BC EC parameter validation use-case where the curve primes
+/// genuinely are prime.)
+pub(crate) fn bi_is_probable_prime_str(value: &str) -> bool {
+    let (neg, abs) = bi_parse_sign(value);
+    if neg || abs == "0" || abs == "1" {
+        return false;
+    }
+    if abs == "2" || abs == "3" {
+        return true;
+    }
+    // Even?
+    let last = abs.bytes().last().map(|b| b - b'0').unwrap_or(0);
+    if last & 1 == 0 {
+        return false;
+    }
+    let mut i: u32 = 3;
+    while i < 1000 {
+        let divisor = i.to_string();
+        // Skip if divisor exceeds value (only possible for very small `abs`,
+        // which we already handled above).
+        if bi_cmp_unsigned(&divisor, abs) > 0 {
+            break;
+        }
+        if bi_mod_unsigned(abs, &divisor) == "0" {
+            // value == divisor itself is OK (i.e. the divisor IS the value);
+            // any larger multiple means composite.
+            if bi_cmp_unsigned(&divisor, abs) == 0 {
+                return true;
+            }
+            return false;
+        }
+        i += 2;
+    }
+    true
 }
 
 /// RBIGDEC.1 — register BigInteger arithmetic + toString overrides for

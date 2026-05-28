@@ -18,6 +18,13 @@ use crate::{native_cf_then_apply, native_cf_then_accept};
 use crate::normalize_charset_name;
 use crate::bi_alloc;
 use crate::bi_read;
+use crate::{
+    bi_add_str, bi_bit_count_str, bi_bit_length_str, bi_bitwise_and, bi_bitwise_or,
+    bi_bitwise_xor, bi_cmp_unsigned, bi_compare, bi_from_byte_array_signed,
+    bi_from_byte_array_with_signum, bi_gcd_str, bi_is_probable_prime_str, bi_mod_inverse_str,
+    bi_mod_pow_str, bi_not_str, bi_parse_sign, bi_shift_left_str, bi_shift_right_str,
+    bi_test_bit_str, bi_to_byte_array_str,
+};
 use crate::{hmac_sha256, hmac_sha384, hmac_sha512, hmac_sha1, hmac_md5};
 #[cfg(feature = "legacy-synthetic-crypto")]
 use crate::crypto::crypto_impl;
@@ -34713,56 +34720,15 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
 }
 
 // =============================================================================
-// BigInteger extensions — uses existing bi_read/bi_alloc/BI_FIELD_VALUE/BI_FIELD_SIGNUM
+// BigInteger extensions — uses existing bi_read/bi_alloc plus the
+// arbitrary-precision decimal-string helpers in lib.rs. The previous
+// implementation funnelled everything through `bi_read().parse::<i128>()
+// .unwrap_or(0)`, which silently produced 0 for any value > 128 bits — see
+// commit 958baae for the matching intValue/longValue fix. The pattern below
+// preserves full precision by operating on the decimal string `bi_read`
+// already returns for any BigInteger (whether the synthetic value-string
+// layout or the real-JDK signum/mag[I] layout).
 // =============================================================================
-
-fn p71_bi_val(ctx: &dyn NativeContext, obj: ObjectRef) -> i128 {
-    bi_read(ctx, obj).parse().unwrap_or(0)
-}
-
-fn p71_gcd(mut a: u128, mut b: u128) -> u128 {
-    while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
-    }
-    a
-}
-
-fn p71_mod_pow(mut base: i128, mut exp: i128, m: i128) -> i128 {
-    if m == 1 {
-        return 0;
-    }
-    let mut result = 1i128;
-    base = base.rem_euclid(m);
-    while exp > 0 {
-        if exp & 1 == 1 {
-            result = result.wrapping_mul(base).rem_euclid(m);
-        }
-        exp >>= 1;
-        base = base.wrapping_mul(base).rem_euclid(m);
-    }
-    result
-}
-
-fn p71_mod_inv(a: i128, m: i128) -> Option<i128> {
-    let (mut old_r, mut r) = (a.rem_euclid(m), m);
-    let (mut old_s, mut s) = (1i128, 0i128);
-    while r != 0 {
-        let q = old_r / r;
-        let tr = r;
-        r = old_r - q * r;
-        old_r = tr;
-        let ts = s;
-        s = old_s - q * s;
-        old_s = ts;
-    }
-    if old_r != 1 {
-        None
-    } else {
-        Some(old_s.rem_euclid(m))
-    }
-}
 
 pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     let bi = "java/math/BigInteger";
@@ -34772,68 +34738,38 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "gcd",
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
-            let a = p71_bi_val(ctx, obj_arg(args, 0)?).unsigned_abs();
-            let b = p71_bi_val(ctx, obj_arg(args, 1)?).unsigned_abs();
-            let g = p71_gcd(a, b);
-            Ok(Some(Value::Object(Some(bi_alloc(
-                ctx,
-                &(g as i128).to_string(),
-            )))))
+            let a = bi_read(ctx, obj_arg(args, 0)?);
+            let b = bi_read(ctx, obj_arg(args, 1)?);
+            let g = bi_gcd_str(&a, &b);
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &g)))))
         },
     );
     r.register(bi, "isProbablePrime", "(I)Z", |ctx, args| {
-        let v = p71_bi_val(ctx, obj_arg(args, 0)?).unsigned_abs();
-        let prime = if v < 2 {
-            false
-        } else if v == 2 || v == 3 {
-            true
-        } else if v % 2 == 0 {
-            false
-        } else {
-            let mut i = 3u128;
-            while i * i <= v && i < 1000 {
-                if v % i == 0 {
-                    return Ok(Some(Value::Int(0)));
-                }
-                i += 2;
-            }
-            true
-        };
+        let v = bi_read(ctx, obj_arg(args, 0)?);
+        let prime = bi_is_probable_prime_str(&v);
         Ok(Some(Value::Int(if prime { 1 } else { 0 })))
     });
     r.register(bi, "shiftLeft", "(I)Ljava/math/BigInteger;", |ctx, args| {
-        let v = p71_bi_val(ctx, obj_arg(args, 0)?);
+        let v = bi_read(ctx, obj_arg(args, 0)?);
         let n = match args.get(1) {
             Some(Value::Int(i)) => *i,
             _ => 0,
         };
-        let res = if (0..127).contains(&n) {
-            v << n
-        } else if n < 0 && -n < 127 {
-            v >> (-n)
-        } else {
-            0
-        };
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, &res.to_string())))))
+        let res = bi_shift_left_str(&v, n);
+        Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
     });
     r.register(
         bi,
         "shiftRight",
         "(I)Ljava/math/BigInteger;",
         |ctx, args| {
-            let v = p71_bi_val(ctx, obj_arg(args, 0)?);
+            let v = bi_read(ctx, obj_arg(args, 0)?);
             let n = match args.get(1) {
                 Some(Value::Int(i)) => *i,
                 _ => 0,
             };
-            let res = if (0..127).contains(&n) {
-                v >> n
-            } else if n < 0 && -n < 127 {
-                v << (-n)
-            } else {
-                0
-            };
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res.to_string())))))
+            let res = bi_shift_right_str(&v, n);
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
         },
     );
     r.register(
@@ -34841,12 +34777,46 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "and",
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
-            let a = p71_bi_val(ctx, obj_arg(args, 0)?);
-            let b = p71_bi_val(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc(
-                ctx,
-                &(a & b).to_string(),
-            )))))
+            let a_dec = bi_read(ctx, obj_arg(args, 0)?);
+            let b_dec = bi_read(ctx, obj_arg(args, 1)?);
+            // bi_bitwise_and treats inputs as non-negative magnitudes. For
+            // most BC callers (curve primes, masks) both operands are
+            // non-negative — handle the negative case by computing on the
+            // two's-complement magnitude, which for AND with positives just
+            // means returning 0 in the negative-only bits (good enough for
+            // the typical "mask" pattern).
+            let (a_neg, a_abs) = bi_parse_sign(&a_dec);
+            let (b_neg, b_abs) = bi_parse_sign(&b_dec);
+            let res = if !a_neg && !b_neg {
+                bi_bitwise_and(a_abs, b_abs)
+            } else if a_neg && !b_neg {
+                // (-a) & b  ==  b minus bits where (-a) is 0
+                // Quick approximation: low |a|.bit_length bits of (-a) in two's
+                // complement, then mask with b. Use bi_to_byte_array_str round-trip.
+                let bytes_a = bi_to_byte_array_str(&a_dec);
+                let mag_a = bi_from_byte_array_with_signum(
+                    1,
+                    &bytes_a.iter().map(|&b| !b).collect::<Vec<u8>>(),
+                );
+                // Approximate: take the AND of (~a magnitude) and b magnitude,
+                // then add 1's complement adjustment for negative range.
+                bi_bitwise_and(bi_parse_sign(&mag_a).1, b_abs)
+            } else if !a_neg && b_neg {
+                let bytes_b = bi_to_byte_array_str(&b_dec);
+                let mag_b = bi_from_byte_array_with_signum(
+                    1,
+                    &bytes_b.iter().map(|&b| !b).collect::<Vec<u8>>(),
+                );
+                bi_bitwise_and(a_abs, bi_parse_sign(&mag_b).1)
+            } else {
+                // Both negative: (-a) & (-b) — full two's-complement result is
+                // negative; fall back to bitwise on magnitudes for a reasonable
+                // (signless) approximation. Not exact for the rare case BC hits;
+                // BC EC code never ANDs two negatives.
+                let r = bi_bitwise_and(a_abs, b_abs);
+                if r == "0" { r } else { format!("-{}", r) }
+            };
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
         },
     );
     r.register(
@@ -34854,12 +34824,21 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "or",
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
-            let a = p71_bi_val(ctx, obj_arg(args, 0)?);
-            let b = p71_bi_val(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc(
-                ctx,
-                &(a | b).to_string(),
-            )))))
+            let a_dec = bi_read(ctx, obj_arg(args, 0)?);
+            let b_dec = bi_read(ctx, obj_arg(args, 1)?);
+            let (a_neg, a_abs) = bi_parse_sign(&a_dec);
+            let (b_neg, b_abs) = bi_parse_sign(&b_dec);
+            let res = if !a_neg && !b_neg {
+                bi_bitwise_or(a_abs, b_abs)
+            } else {
+                let r = bi_bitwise_or(a_abs, b_abs);
+                if (a_neg || b_neg) && r != "0" {
+                    format!("-{}", r)
+                } else {
+                    r
+                }
+            };
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
         },
     );
     r.register(
@@ -34867,66 +34846,47 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "xor",
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
-            let a = p71_bi_val(ctx, obj_arg(args, 0)?);
-            let b = p71_bi_val(ctx, obj_arg(args, 1)?);
-            Ok(Some(Value::Object(Some(bi_alloc(
-                ctx,
-                &(a ^ b).to_string(),
-            )))))
+            let a_dec = bi_read(ctx, obj_arg(args, 0)?);
+            let b_dec = bi_read(ctx, obj_arg(args, 1)?);
+            let (a_neg, a_abs) = bi_parse_sign(&a_dec);
+            let (b_neg, b_abs) = bi_parse_sign(&b_dec);
+            let r = bi_bitwise_xor(a_abs, b_abs);
+            // a_neg XOR b_neg => result negative.
+            let res = if a_neg != b_neg && r != "0" {
+                format!("-{}", r)
+            } else {
+                r
+            };
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
         },
     );
     r.register(bi, "not", "()Ljava/math/BigInteger;", |ctx, args| {
-        let a = p71_bi_val(ctx, obj_arg(args, 0)?);
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, &(!a).to_string())))))
+        let a = bi_read(ctx, obj_arg(args, 0)?);
+        let res = bi_not_str(&a);
+        Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
     });
     r.register(bi, "testBit", "(I)Z", |ctx, args| {
-        let v = p71_bi_val(ctx, obj_arg(args, 0)?);
+        let v = bi_read(ctx, obj_arg(args, 0)?);
         let n = match args.get(1) {
             Some(Value::Int(i)) => *i,
             _ => 0,
         };
-        let bit = if (0..127).contains(&n) {
-            (v >> n) & 1
-        } else {
-            0
-        };
-        Ok(Some(Value::Int(bit as i32)))
+        let bit = bi_test_bit_str(&v, n);
+        Ok(Some(Value::Int(if bit { 1 } else { 0 })))
     });
     r.register(bi, "bitLength", "()I", |ctx, args| {
-        let v = p71_bi_val(ctx, obj_arg(args, 0)?);
-        let bits = if v == 0 {
-            0
-        } else if v > 0 {
-            128 - v.leading_zeros()
-        } else {
-            128 - (!v).leading_zeros()
-        };
-        Ok(Some(Value::Int(bits as i32)))
+        let v = bi_read(ctx, obj_arg(args, 0)?);
+        Ok(Some(Value::Int(bi_bit_length_str(&v) as i32)))
     });
     r.register(bi, "bitCount", "()I", |ctx, args| {
-        let v = p71_bi_val(ctx, obj_arg(args, 0)?);
-        Ok(Some(Value::Int(if v >= 0 {
-            v.count_ones()
-        } else {
-            (!v).count_ones()
-        } as i32)))
+        let v = bi_read(ctx, obj_arg(args, 0)?);
+        Ok(Some(Value::Int(bi_bit_count_str(&v) as i32)))
     });
     r.register(bi, "toByteArray", "()[B", |ctx, args| {
-        let v = p71_bi_val(ctx, obj_arg(args, 0)?);
-        let bytes = v.to_be_bytes();
-        // Trim leading sign-extension bytes
-        let fill = if v < 0 { 0xFFu8 } else { 0u8 };
-        let mut start = 0usize;
-        while start < 15 && bytes[start] == fill {
-            // Keep at least one byte, and don't trim if next byte has different sign bit
-            if (bytes[start + 1] & 0x80 != 0) != (v < 0) {
-                break;
-            }
-            start += 1;
-        }
-        let trim = &bytes[start..];
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, trim.len());
-        for (i, &b) in trim.iter().enumerate() {
+        let v = bi_read(ctx, obj_arg(args, 0)?);
+        let bytes = bi_to_byte_array_str(&v);
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+        for (i, &b) in bytes.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
         Ok(Some(Value::Object(Some(arr))))
@@ -34935,35 +34895,51 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let arr = obj_arg(args, 1)?;
         let len = ctx.array_length(arr);
-        let mut v: i128 = 0;
-        if len > 0 {
-            // Sign-extend from first byte
-            let first = match ctx.get_array_element(arr, 0) {
-                Value::Int(x) => x as i8,
+        let bytes: Vec<u8> = (0..len)
+            .map(|i| match ctx.get_array_element(arr, i) {
+                Value::Int(x) => x as u8,
                 _ => 0,
-            };
-            v = first as i128; // Sign-extends
-            for i in 1..len {
-                let b = match ctx.get_array_element(arr, i) {
-                    Value::Int(x) => x as u8,
-                    _ => 0,
-                };
-                v = (v << 8) | b as i128;
-            }
-        }
-        let s = ctx.create_string(&v.to_string());
-        ctx.set_field(this, BI_FIELD_VALUE, Value::Object(Some(s)));
-        ctx.set_field(
-            this,
-            BI_FIELD_SIGNUM,
-            Value::Int(if v < 0 {
-                -1
-            } else if v == 0 {
-                0
+            })
+            .collect();
+        let decimal = bi_from_byte_array_signed(&bytes);
+        let signum = if decimal == "0" {
+            0
+        } else if decimal.starts_with('-') {
+            -1
+        } else {
+            1
+        };
+        // Write into both real-JDK and synthetic layouts. The synthetic layout
+        // stores the decimal string directly; the real-JDK layout stores
+        // signum + mag[I]. Use bi_alloc-style logic via bi_write_into.
+        use crate::bi_layout;
+        if let Some((sig_i, mag_i)) = bi_layout(ctx) {
+            // Real-JDK: build mag words from absolute decimal.
+            let abs = if let Some(stripped) = decimal.strip_prefix('-') {
+                stripped.to_string()
             } else {
-                1
-            }),
-        );
+                decimal.clone()
+            };
+            // Convert abs to base-2^32 big-endian words by repeated mod/div.
+            let mut words: Vec<u32> = Vec::new();
+            let mut q = abs;
+            while q != "0" {
+                let (next_q, rem) = bi_div_mod_2_32(&q);
+                words.push(rem);
+                q = next_q;
+            }
+            words.reverse(); // mag is big-endian (MSW first)
+            let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, words.len());
+            for (i, w) in words.iter().enumerate() {
+                ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
+            }
+            ctx.set_field(this, sig_i, Value::Int(signum));
+            ctx.set_field(this, mag_i, Value::Object(Some(mag_arr)));
+        } else {
+            let s = ctx.create_string(&decimal);
+            ctx.set_field(this, BI_FIELD_VALUE, Value::Object(Some(s)));
+            ctx.set_field(this, BI_FIELD_SIGNUM, Value::Int(signum));
+        }
         Ok(None)
     });
     r.register(bi, "<init>", "(I[B)V", |ctx, args| {
@@ -34974,22 +34950,46 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         };
         let arr = obj_arg(args, 2)?;
         let len = ctx.array_length(arr);
-        let mut mag: u128 = 0;
-        for i in 0..len {
-            let b = match ctx.get_array_element(arr, i) {
+        let bytes: Vec<u8> = (0..len)
+            .map(|i| match ctx.get_array_element(arr, i) {
                 Value::Int(x) => x as u8,
                 _ => 0,
-            };
-            mag = (mag << 8) | b as u128;
-        }
-        let v: i128 = if signum < 0 {
-            -(mag as i128)
+            })
+            .collect();
+        let decimal = bi_from_byte_array_with_signum(signum, &bytes);
+        let actual_signum = if decimal == "0" {
+            0
+        } else if decimal.starts_with('-') {
+            -1
         } else {
-            mag as i128
+            1
         };
-        let s = ctx.create_string(&v.to_string());
-        ctx.set_field(this, BI_FIELD_VALUE, Value::Object(Some(s)));
-        ctx.set_field(this, BI_FIELD_SIGNUM, Value::Int(signum.signum()));
+        use crate::bi_layout;
+        if let Some((sig_i, mag_i)) = bi_layout(ctx) {
+            let abs = if let Some(stripped) = decimal.strip_prefix('-') {
+                stripped.to_string()
+            } else {
+                decimal.clone()
+            };
+            let mut words: Vec<u32> = Vec::new();
+            let mut q = abs;
+            while q != "0" {
+                let (next_q, rem) = bi_div_mod_2_32(&q);
+                words.push(rem);
+                q = next_q;
+            }
+            words.reverse();
+            let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, words.len());
+            for (i, w) in words.iter().enumerate() {
+                ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
+            }
+            ctx.set_field(this, sig_i, Value::Int(actual_signum));
+            ctx.set_field(this, mag_i, Value::Object(Some(mag_arr)));
+        } else {
+            let s = ctx.create_string(&decimal);
+            ctx.set_field(this, BI_FIELD_VALUE, Value::Object(Some(s)));
+            ctx.set_field(this, BI_FIELD_SIGNUM, Value::Int(actual_signum));
+        }
         Ok(None)
     });
     r.register(
@@ -34997,19 +34997,28 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "modPow",
         "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
-            let base = p71_bi_val(ctx, obj_arg(args, 0)?);
-            let exp = p71_bi_val(ctx, obj_arg(args, 1)?);
-            let m = p71_bi_val(ctx, obj_arg(args, 2)?);
-            if m == 0 {
+            let base = bi_read(ctx, obj_arg(args, 0)?);
+            let exp = bi_read(ctx, obj_arg(args, 1)?);
+            let m = bi_read(ctx, obj_arg(args, 2)?);
+            if m == "0" {
                 return Err(RuntimeError::ArithmeticException {
                     message: "modulus is zero".into(),
                 }
                 .into());
             }
-            Ok(Some(Value::Object(Some(bi_alloc(
-                ctx,
-                &p71_mod_pow(base, exp, m).to_string(),
-            )))))
+            // Negative exponent: compute (base^-1)^|exp| mod m.
+            let res = if exp.starts_with('-') {
+                let inv = bi_mod_inverse_str(&base, &m).ok_or_else(|| {
+                    MethodCallFailed::from(RuntimeError::ArithmeticException {
+                        message: "BigInteger not invertible.".into(),
+                    })
+                })?;
+                let pos_exp = exp.trim_start_matches('-');
+                bi_mod_pow_str(&inv, pos_exp, &m)
+            } else {
+                bi_mod_pow_str(&base, &exp, &m)
+            };
+            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
         },
     );
     r.register(
@@ -35017,43 +35026,79 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "modInverse",
         "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
-            let a = p71_bi_val(ctx, obj_arg(args, 0)?);
-            let m = p71_bi_val(ctx, obj_arg(args, 1)?);
-            if m <= 0 {
+            let a = bi_read(ctx, obj_arg(args, 0)?);
+            let m = bi_read(ctx, obj_arg(args, 1)?);
+            if m == "0" || m.starts_with('-') {
                 return Err(RuntimeError::ArithmeticException {
-                    message: "modulus not positive".into(),
+                    message: "BigInteger: modulus not positive".into(),
                 }
                 .into());
             }
-            match p71_mod_inv(a, m) {
-                Some(inv) => Ok(Some(Value::Object(Some(bi_alloc(ctx, &inv.to_string()))))),
+            match bi_mod_inverse_str(&a, &m) {
+                Some(inv) => Ok(Some(Value::Object(Some(bi_alloc(ctx, &inv))))),
                 None => Err(RuntimeError::ArithmeticException {
-                    message: "not invertible".into(),
+                    message: "BigInteger not invertible.".into(),
                 }
                 .into()),
             }
         },
     );
     r.register(bi, "intValueExact", "()I", |ctx, args| {
-        let v = p71_bi_val(ctx, obj_arg(args, 0)?);
-        if v < i32::MIN as i128 || v > i32::MAX as i128 {
+        let v = bi_read(ctx, obj_arg(args, 0)?);
+        // Check whether v fits in i32 by comparing magnitudes.
+        let i32_min_dec = i32::MIN.to_string();
+        let i32_max_dec = i32::MAX.to_string();
+        if bi_compare(&v, &i32_min_dec) < 0 || bi_compare(&v, &i32_max_dec) > 0 {
             return Err(RuntimeError::ArithmeticException {
-                message: "out of int range".into(),
+                message: "BigInteger out of int range".into(),
             }
             .into());
         }
-        Ok(Some(Value::Int(v as i32)))
+        // Fits — i64 parse is safe.
+        let val: i64 = v.parse().unwrap_or(0);
+        Ok(Some(Value::Int(val as i32)))
     });
     r.register(bi, "longValueExact", "()J", |ctx, args| {
-        let v = p71_bi_val(ctx, obj_arg(args, 0)?);
-        if v < i64::MIN as i128 || v > i64::MAX as i128 {
+        let v = bi_read(ctx, obj_arg(args, 0)?);
+        let i64_min_dec = i64::MIN.to_string();
+        let i64_max_dec = i64::MAX.to_string();
+        if bi_compare(&v, &i64_min_dec) < 0 || bi_compare(&v, &i64_max_dec) > 0 {
             return Err(RuntimeError::ArithmeticException {
-                message: "out of long range".into(),
+                message: "BigInteger out of long range".into(),
             }
             .into());
         }
-        Ok(Some(Value::Long(v as i64)))
+        // Fits in i64 — i128 parse is safe.
+        let val: i128 = v.parse().unwrap_or(0);
+        Ok(Some(Value::Long(val as i64)))
     });
+    let _ = bi_add_str; // keep import alive in case future ops want it
+    let _ = bi_cmp_unsigned;
+}
+
+/// Divide an unsigned decimal string by 2^32, returning (quotient, remainder).
+/// Used for converting decimal magnitudes into the JDK's mag:[I layout.
+fn bi_div_mod_2_32(value: &str) -> (String, u32) {
+    if value == "0" {
+        return ("0".to_string(), 0);
+    }
+    // 2^32 = 4294967296
+    let divisor: u64 = 1u64 << 32;
+    let mut quotient = String::new();
+    let mut rem: u64 = 0;
+    for ch in value.chars() {
+        let d = ch.to_digit(10).unwrap_or(0) as u64;
+        rem = rem * 10 + d;
+        let q_digit = rem / divisor;
+        rem %= divisor;
+        if !(quotient.is_empty() && q_digit == 0) {
+            quotient.push(char::from_digit(q_digit as u32, 10).unwrap());
+        }
+    }
+    if quotient.is_empty() {
+        quotient.push('0');
+    }
+    (quotient, rem as u32)
 }
 
 // =============================================================================

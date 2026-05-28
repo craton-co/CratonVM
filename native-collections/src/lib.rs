@@ -2859,6 +2859,9 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             .into());
         }
         let node_key_field = get_node_key(ctx, node);
+        if std::env::var("CRATONVM_DBG_HMPUT").is_ok() {
+            eprintln!("[HMPUT] walk node_key_field={:?} key_ref={:?} hash_arg={} is_null={}", node_key_field, key_ref, hash, is_null_key);
+        }
         if is_null_key {
             // Looking for a null-key node
             if matches!(node_key_field, Value::Object(None)) {
@@ -2871,7 +2874,11 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 return Ok(Some(old_value));
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
-            if map_keys_equal(ctx, node_key, key_ref.unwrap())? {
+            let eq = map_keys_equal(ctx, node_key, key_ref.unwrap())?;
+            if std::env::var("CRATONVM_DBG_HMPUT").is_ok() {
+                eprintln!("[HMPUT] map_keys_equal(node_key={:?}, key={:?}) = {}", node_key, key_ref.unwrap(), eq);
+            }
+            if eq {
                 let old_value = get_node_value(ctx, node);
                 match ctx.get_field(node, 0) {
                     Value::Object(_) => ctx.set_field(node, NODE_FIELD_VALUE, value), // legacy slot 1
@@ -18387,6 +18394,17 @@ fn register_properties_natives(registry: &mut NativeMethodRegistry) {
     registry.register(ht, "entrySet", "()Ljava/util/Set;", native_map_entry_set);
     registry.register(ht, "toString", "()Ljava/lang/String;", native_map_to_string);
     registry.register(ht, "putAll", "(Ljava/util/Map;)V", native_map_put_all);
+    // Note: `keys()` / `elements()` are registered by
+    // `cratonvm-native-builtins::deprecated_io_util::register_*_natives`,
+    // which runs AFTER us in `vm_init`'s real-JDK arm. The force-native
+    // override in `interpreter.rs::force_native_over_real_jdk_bytecode`
+    // routes dispatch to that registration instead of the real-JDK
+    // Hashtable.keys() body (which walks Hashtable's own internal
+    // `table[]` — empty in our impl because `put` writes to a side-store).
+    // Without the force-native entry, BC's
+    // `AbstractX500NameStyle.copyHashTable(BCStyle.DefaultLookUp)` produced
+    // an empty per-instance `defaultLookUp` and every
+    // `BCStyle.attrNameToOID("cn"/...)` threw "Unknown object id".
 }
 
 fn native_props_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

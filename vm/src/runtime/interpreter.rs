@@ -10576,6 +10576,28 @@ fn force_native_over_real_jdk_bytecode(
                 "getGarbageCollectorMXBeans",
                 "()Ljava/util/List;",
             )
+            // `Hashtable.keys()` / `elements()` — the legacy pre-1.2
+            // Enumeration accessors. We native-override put/get/size onto
+            // our own side-store (`native_map_put` etc.), so the real-JDK
+            // bytecode body (`return this.getEnumeration(KEYS)`) walks an
+            // EMPTY internal `Hashtable.table[]` and returns an empty
+            // Enumeration. Sound-but-different contract: real JDK is
+            // correct for its own table, but our backing store is in a
+            // different place. BC's `AbstractX500NameStyle.copyHashTable`
+            // depends on `keys()` to populate the per-instance
+            // `defaultLookUp`; without this override, every
+            // `attrNameToOID("cn"/"o"/"CN"/...)` returns null and the
+            // X.500 RDN parser throws "Unknown object id".
+            | (
+                "java/util/Hashtable",
+                "keys",
+                "()Ljava/util/Enumeration;",
+            )
+            | (
+                "java/util/Hashtable",
+                "elements",
+                "()Ljava/util/Enumeration;",
+            )
     ) || (class_name == "java/net/URL"
         && matches!(method_name, "getAuthority" | "getHostAddress"))
         || (matches!(
@@ -15085,6 +15107,11 @@ fn populate_virtual_invoke_cache(
             | "containsKey" | "containsValue"
             | "size" | "isEmpty" | "clear"
             | "<init>"
+            // `Hashtable.keys()` / `elements()` — legacy pre-1.2 Enumeration
+            // accessors. Real-JDK body walks `this.table[]`; our overrides
+            // store data in a side-store, so the JDK bytecode sees an empty
+            // table. See companion entry in `force_native_over_real_jdk_bytecode`.
+            | "keys" | "elements"
         ));
         if force {
             if let Some(callback) =

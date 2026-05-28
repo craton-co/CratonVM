@@ -734,14 +734,30 @@ fn register_hashtable_enumerations(r: &mut NativeMethodRegistry) {
     // enumeration without needing per-class natives on a
     // `HashtableEnumerator`.
     fn snapshot(ctx: &dyn NativeContext, this: ObjectRef, want_keys: bool) -> Vec<Value> {
+        // Layout from native-collections: slot 0 = buckets (Object[]).
+        //
+        // Historical bug: this used to read slot 2 as "capacity" to bound the
+        // walk, but slot 2 is `threshold:int` on a real-JDK Hashtable, and
+        // `native_map_init`'s S111r29 path (which writes buckets to the JDK
+        // `table` slot) ends up clobbering Hashtable's slot 2 with a pointer
+        // (HashMap's table slot index doesn't match Hashtable's layout —
+        // Hashtable's `table` is at slot 0). Slot 2 then holds a `Value::Object`
+        // that mismatches the `Value::Int(c)` pattern below, so this function
+        // returned an empty Vec. `keys()` / `elements()` collapsed to empty
+        // Enumerations, BC's `AbstractX500NameStyle.copyHashTable(
+        // BCStyle.DefaultLookUp)` produced an empty per-instance
+        // `defaultLookUp`, and every `BCStyle.attrNameToOID("cn"/"o"/"CN"/...)`
+        // threw "Unknown object id".
+        //
+        // Fix: derive the cap from `buckets.length` directly — that's
+        // authoritative (the bucket array IS the capacity) and immune to any
+        // slot-2 corruption. Matches the parallel fix in
+        // `deprecated_util::collect_hashtable`.
         let buckets = match ctx.get_field(this, 0) {
             Value::Object(Some(arr)) => arr,
             _ => return Vec::new(),
         };
-        let cap = match ctx.get_field(this, 2) {
-            Value::Int(c) if c > 0 => c as usize,
-            _ => return Vec::new(),
-        };
+        let cap = ctx.array_length(buckets);
         let mut out = Vec::new();
         for i in 0..cap {
             let mut node_val = ctx.get_array_element(buckets, i);
