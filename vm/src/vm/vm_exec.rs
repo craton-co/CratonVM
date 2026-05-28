@@ -688,7 +688,7 @@ impl<'a> NativeContextImpl<'a> {
         let mut snapshot = self.thread.root_snapshot.lock();
         snapshot.clear();
         for frame in &self.thread.frames {
-            frame.scan_local_objects(&mut snapshot);
+            frame.scan_local_objects(&mut snapshot, &self.shared.heap);
             let before = snapshot.len();
             frame.stack.scan_object_refs(&mut snapshot, &self.shared.heap);
             if snapshot.len() > before {
@@ -724,7 +724,7 @@ impl<'a> NativeContextImpl<'a> {
                 .arrive_and_wait(self.thread.thread_id);
             if !pointer_map.is_empty() {
                 for frame in &mut self.thread.frames {
-                    frame.update_local_refs(&pointer_map);
+                    frame.update_local_refs(&pointer_map, &self.shared.heap);
                     frame.stack.update_object_refs(&pointer_map, &self.shared.heap);
                 }
                 for val in &mut self.thread.printed {

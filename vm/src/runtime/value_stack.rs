@@ -635,43 +635,23 @@ impl ValueStack {
         let idx = self.len - 1;
         let cv = self.slots[idx];
         match cv.tag() {
-            // KC26 K1: Long values stored via `CompactValue::long(v)` are raw
-            // i64 bits.  For "normal" values the bit pattern is untagged, so
-            // `tag()` returns `Double`.  But for values whose high bits happen
-            // to collide with the NaN-tag pattern (e.g. `-1_i64`, `i64::MIN`),
-            // `tag()` returns `Long` (SUB_LONG_LO/HI). Both cases are simply
-            // raw i64 storage — reinterpret the bits.
-            CompactTag::Double | CompactTag::Long => {
-                self.len -= 1;
-                Ok(cv.as_long_unchecked())
-            }
+            // BC SM2 fix (2026-05-28): `CompactValue::long` stores bits
+            // verbatim, so a long whose natural sub-tag is
+            // `Int`/`Float`/`Object`/`Null`/`Uninit`/`ReturnAddress`/`Long-Lo`/`Long-Hi`
+            // *also* arrives here as a long. The verifier guarantees this slot
+            // is a Long, so reinterpret the raw bits regardless of which sub-tag
+            // `tag()` reports. Only `Int` is special — the JVM accidentally-int-
+            // on-the-stack widening behaviour predates the verbatim long encoding
+            // and is preserved for compatibility with synthetic bytecode that
+            // leaves an int where a long is expected.
             CompactTag::Int => {
                 self.len -= 1;
                 // Sign-extend int → long.
                 Ok(cv.as_int().unwrap_or(0) as i64)
             }
             _ => {
-                // Slow path: defer to the full pop() + value coercion.
-                // Capture the raw slot before decode so the diagnostic sees
-                // the exact bit pattern the interpreter produced.
-                let raw_cv = cv;
-                let v = self.pop()?;
-                match v {
-                    Value::Long(l) => Ok(l),
-                    Value::Int(i) => Ok(i as i64),
-                    // K1-family null/uninit-coercion: a primitive long field
-                    // whose default-zero hasn't been written produces null or
-                    // Uninitialized at slot read.  Standard JDK semantics is
-                    // to read 0L from such slots.
-                    Value::Object(None) => Ok(0),
-                    Value::Uninitialized => Ok(0),
-                    other => {
-                        log_tag_mismatch("long", raw_cv, self.len + 1);
-                        Err(RuntimeError::NotImplemented {
-                            feature: format!("expected long on stack, got {other}"),
-                        })
-                    }
-                }
+                self.len -= 1;
+                Ok(cv.as_long_unchecked())
             }
         }
     }
@@ -767,9 +747,16 @@ impl ValueStack {
             let cv = self.slots[i];
             if cv.is_object() {
                 if let Some(ptr) = cv.as_object_ptr() {
-                    if ptr != 0 {
-                        // SAFETY: ptr was stored by CompactValue::object from a
-                        // valid ObjectRef.
+                    // Filter long-bit-pattern false positives: with the
+                    // bit-exact `CompactValue::long` encoding (BC SM2 fix,
+                    // 2026-05-28) a long whose natural sub-tag is SUB_OBJECT
+                    // satisfies `is_object()`. Drop the slot from the root
+                    // set unless its payload is a live heap address.
+                    if ptr != 0 && heap.is_heap_addr(ptr as usize).is_some() {
+                        // SAFETY: ptr was either stored by
+                        // `CompactValue::object` from a valid ObjectRef, or
+                        // it's a JNI-smuggled jobject whose address has been
+                        // heap-validated above.
                         roots.push(unsafe { ObjectRef::from_raw(ptr as *mut u8) });
                     }
                 }
@@ -806,6 +793,16 @@ impl ValueStack {
             let cv = self.slots[i];
             if cv.is_object() {
                 if let Some(old_ptr) = cv.as_object_ptr() {
+                    // Filter long-bit-pattern false positives (BC SM2 fix,
+                    // 2026-05-28): the bit-exact `CompactValue::long`
+                    // encoding lets longs with sub=SUB_OBJECT through
+                    // `is_object()`. Rewriting such a slot via the pointer
+                    // map would corrupt the primitive long value. Require
+                    // the address to be a live heap object before treating
+                    // it as a real reference.
+                    if heap.is_heap_addr(old_ptr as usize).is_none() {
+                        continue;
+                    }
                     if let Some(&new_addr) = pointer_map.get(&(old_ptr as usize)) {
                         // SAFETY: `new_addr` comes from a `HashMap<usize,
                         // usize>` of live-heap pointers populated by the GC

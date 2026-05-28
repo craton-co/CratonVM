@@ -194,13 +194,15 @@ fn is_nan_tagged(v: u64) -> bool {
 }
 
 /// Round-8 branch-hint: the SUB_OBJECT degraded path (null or unaligned
-/// pointer arising from a stale slot) returns `Value::Object(None)` and
-/// is taken essentially never in steady-state interpretation. Splitting
-/// it out as a `#[cold]` non-inlined function gives LLVM permission to
-/// place it off the hot path, freeing icache for the well-formed
-/// branch in [`CompactValue::to_value`].
+/// pointer arising from a stale slot) is no longer reached by
+/// `to_value()` — it now treats unaligned/null SUB_OBJECT slots as
+/// long-bit-pattern collisions and returns `Value::Long(_)` (BC SM2 fix,
+/// 2026-05-28). Kept as a no-op helper to avoid orphaning callers of the
+/// old name in test code; the body is now `Value::Object(None)` and is
+/// only invoked by the legacy null-ptr-degrade unit test.
 #[cold]
 #[inline(never)]
+#[allow(dead_code)]
 fn cold_degraded_object_ptr() -> Value {
     Value::Object(None)
 }
@@ -219,68 +221,38 @@ impl CompactValue {
     ///
     /// # Encoding
     ///
-    /// Most longs are stored as **raw i64 bits with no embedded tag** — the
-    /// untagged fast path.  `tag()` returns `CompactTag::Double` for these and
-    /// the caller uses `as_long_unchecked()` (or a descriptor-aware decode)
-    /// when JVM instruction context indicates a Long.
+    /// Longs are stored **bit-exact** as raw i64 bits with no transformation.
+    /// `tag()` returns `CompactTag::Double` for non-NaN-tagged patterns and
+    /// the natural sub-tag (Int/Float/Object/Null/Uninit/RetAddr/Long-Lo/Long-Hi)
+    /// for NaN-tagged patterns. Callers use `as_long_unchecked()` (or a
+    /// descriptor-aware decode) when JVM instruction context indicates a Long.
     ///
-    /// # NaN-box collision handling (heap-safety critical)
+    /// # NaN-box collision: heap safety is owned by the GC, not the encoder
     ///
-    /// A raw i64 whose top 14 bits coincide with the `NANBOX_BITS` marker
-    /// (sign + exponent + quiet + tag-marker — i.e. `v as u64` in
-    /// `0xFFFC_0000_0000_0000..=u64::MAX`, the negative longs in
-    /// `[-2^50, -1]`) is **NaN-tagged by bit pattern**.  For such a value
-    /// `tag()` decodes bits 49-47 as a 3-bit sub-tag.  If those bits land on
-    /// `SUB_OBJECT` the slot is misclassified as an object reference:
-    /// `is_object()` returns `true`, and the GC root scanner would then
-    /// dereference raw integer data as an object pointer — heap corruption.
-    /// Sub-tag `SUB_RETADDR` is a milder misclassification but still wrong.
+    /// A long whose top 14 bits coincide with `NANBOX_BITS` and whose bits
+    /// 49-47 form the `SUB_OBJECT` pattern will report `is_object() == true`.
+    /// Historic CratonVM re-tagged such longs into `SUB_LONG_LO` /
+    /// `SUB_LONG_HI` to preserve the invariant "`CompactValue::long` never
+    /// produces an Object-classified slot" — but the re-tag was lossy
+    /// (original bits 49-47 destroyed) which corrupted the long value
+    /// (BC SM2 / `LongArray.modSquare` regression, May 2026: `lxor` of two
+    /// untagged operands producing `0xfffd…` got pushed back as `0xffff…`).
+    /// JVM spec requires bit-exact long preservation, so the encoder now
+    /// stores verbatim.
     ///
-    /// To prevent that, any colliding long whose natural sub-tag is **not**
-    /// already one of the long sub-tags is re-tagged into the
-    /// `SUB_LONG_LO` / `SUB_LONG_HI` space so that:
-    /// * `is_object()` is **always `false`** for a value produced by `long`,
-    /// * `tag()` **never** reports `Object` or `ReturnAddress` for a long,
-    /// * the descriptor-aware J-decode path always sees `CompactTag::Long`
-    ///   (never an `Object`/`Float` tag, which would raise a hard error).
-    ///
-    /// Colliding longs whose natural sub-tag is already `SUB_LONG_LO` /
-    /// `SUB_LONG_HI` (bits 49-48 both set — every long in `[-2^48, -1]`,
-    /// which covers `-1`, `-2`, … and all small-magnitude negatives) keep the
-    /// verbatim representation and round-trip bit-exactly through
-    /// `as_long()` / `as_long_unchecked()` / `to_value()`.
-    ///
-    /// The re-tagged path is reached only by large-magnitude negative longs
-    /// in `[-2^50, -2^48)` whose three would-be sub-tag bits cannot be
-    /// reconstructed from a single 8-byte slot (an 8-byte NaN-boxed slot
-    /// physically cannot injectively hold all `2^50` colliding longs while
-    /// also reserving the `SUB_OBJECT` pattern).  For those rare values the
-    /// slot is guaranteed heap-safe (`is_object() == false`,
-    /// `tag() == Long`); they decode verbatim from the re-tagged bits.
+    /// The GC roots scanners (`Frame::scan_local_objects`,
+    /// `ValueStack::scan_object_refs`, and their `update_*` counterparts)
+    /// now filter every `is_object()`-classified slot through
+    /// `VmHeap::is_object_address`. A long-bit-pattern that happens to look
+    /// like `SUB_OBJECT` but whose payload is not a live heap address is
+    /// dropped from the root set. The vanishingly-unlikely case of a long
+    /// whose lower 47 bits coincide with a live object's address would still
+    /// over-root the slot, but the GC's
+    /// [`GenerationalHeap::forward_object`] `MAX_SANE_OBJECT_SIZE` guard
+    /// degrades gracefully (over-retention, no SEGV).
     #[inline]
     pub fn long(v: i64) -> Self {
-        let bits = v as u64;
-        if !is_nan_tagged(bits) {
-            // Untagged fast path: the overwhelmingly common case.  `tag()`
-            // reports `Double`; decoders reinterpret the raw bits as i64.
-            return Self(bits);
-        }
-        // The bit pattern collides with the NaN-tag space.  Inspect the
-        // would-be sub-tag.
-        let sub = (bits >> SUBTAG_SHIFT) & SUBTAG_MASK;
-        if sub == SUB_LONG_LO || sub == SUB_LONG_HI {
-            // Natural sub-tag is already a long sub-tag (bits 49-48 set).
-            // `tag()` => Long, `is_object()` => false, and the verbatim bits
-            // round-trip exactly.  Keep them.
-            return Self(bits);
-        }
-        // Natural sub-tag is one of Int/Float/Object/Null/Uninit/RetAddr.
-        // Re-tag into the SUB_LONG space so the slot is never mistaken for an
-        // object reference (heap-safety) and never raises a descriptor-decode
-        // error.  Route on the would-be sub-tag's high bit so the two long
-        // sub-tags are both exercised; the low 47 bits carry the payload.
-        let long_sub = if sub < 3 { SUB_LONG_LO } else { SUB_LONG_HI };
-        Self(make_tagged(long_sub, bits & PAYLOAD_MASK))
+        Self(v as u64)
     }
 
     /// Create a CompactValue holding a 32-bit float.
@@ -447,19 +419,10 @@ impl CompactValue {
 
     /// Reinterpret the raw stored bits as i64 without checking the tag.
     ///
-    /// **Naming history (MED audit 2026-05-24):** for longs that hit the
-    /// `sub < 3` re-tag branch in [`long`](Self::long) — large-magnitude
-    /// negative longs in `[-2^50, -2^48)` whose top bits collide with the
-    /// NaN-tagged Int/Float/Object sub-tags — the return value is the
-    /// *re-tagged* slot bits, **not** the original `i64` passed in. The
-    /// re-tag preserves heap safety (the slot is never mistaken for an
-    /// object reference) at the cost of bit-level reversibility: the
-    /// original 3-bit sub-tag is replaced with `SUB_LONG_LO` /
-    /// `SUB_LONG_HI`, and no information is kept that could reconstruct it.
-    ///
-    /// For every other long bit-pattern (the untagged fast path and the
-    /// natural `SUB_LONG_LO`/`SUB_LONG_HI` collisions, e.g. `-1`, `-2`,
-    /// `i64::MIN`) the returned `i64` equals the original input.
+    /// Since `CompactValue::long` stores longs verbatim, this round-trips
+    /// bit-exactly for every i64 value — including longs whose bit pattern
+    /// collides with the NaN-tag space (e.g. `-1`, `i64::MIN`, the BC SM2
+    /// `0xfffd_…` collision that motivated removing the lossy re-tag).
     ///
     /// The companion accessor [`as_long_bits_unchecked`](Self::as_long_bits_unchecked)
     /// has the same implementation but a name that makes the "raw stored
@@ -639,41 +602,47 @@ impl CompactValue {
         if !is_nan_tagged(self.0) {
             return Value::Double(f64::from_bits(self.0));
         }
+        let payload = self.0 & PAYLOAD_MASK;
         match (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK {
-            SUB_INT => Value::Int((self.0 & PAYLOAD_MASK) as u32 as i32),
-            SUB_FLOAT => Value::Float(f32::from_bits((self.0 & PAYLOAD_MASK) as u32)),
+            SUB_INT => Value::Int(payload as u32 as i32),
+            SUB_FLOAT => Value::Float(f32::from_bits(payload as u32)),
             SUB_OBJECT => {
-                let ptr = (self.0 & PAYLOAD_MASK) as *mut u8;
-                // Mirror the safety net in `decode_value` — null or unaligned
-                // pointers arising from stale slots degrade to Object(None)
-                // rather than panicking. The degraded paths are off the hot
-                // line: every well-formed object slot satisfies both
-                // predicates, so the branch predictor (and LLVM's basic-
-                // block layout) should treat them as cold.
+                // BC SM2 fix (2026-05-28): `CompactValue::long` now stores
+                // long bits verbatim, so a slot with NaN-tagged bits and
+                // SUB_OBJECT pattern may be a primitive long whose bits
+                // happen to land in this sub-tag (BC LongArray
+                // `0xfffd_…` regression). Real object pointers are always
+                // 8-byte aligned (`CompactValue::object` enforces it), so
+                // any unaligned payload — or zero — must be a long. Return
+                // `Value::Long` for those to preserve bits; reserve the
+                // Object decode for aligned, non-null payloads that look
+                // like real heap references.
+                let ptr = payload as *mut u8;
                 if ptr.is_null() || (ptr as usize) % 8 != 0 {
-                    cold_degraded_object_ptr()
+                    Value::Long(self.0 as i64)
                 } else {
                     Value::Object(Some(unsafe { ObjectRef::from_raw(ptr) }))
                 }
             }
-            SUB_NULL => Value::Object(None),
-            SUB_UNINIT => Value::Uninitialized,
-            SUB_RETADDR => Value::ReturnAddress((self.0 & PAYLOAD_MASK) as u32),
-            SUB_LONG_LO | SUB_LONG_HI => {
-                // KC26 K1: `CompactValue::long(v)` stores the raw i64 bits
-                // untagged.  For "normal" longs the slot is untagged and
-                // `tag()` returns `Double`; for bit-pattern collisions
-                // (e.g. -1_i64, i64::MIN) the NaN-tag pattern matches and
-                // `tag()` returns `Long` via SUB_LONG_LO/HI.  The stored
-                // bits are always the raw i64 value, so decode as such.
-                // Returning `Value::Uninitialized` here (the prior behavior)
-                // made every fast-path that did
-                //   `if let (Value::Long(_), Value::Long(_)) = (a, b)`
-                // fail for those collision values, breaking KC26 boot on
-                // `io/quarkus/bootstrap/runner/Timing.staticInitStarted`
-                // where `bootStartTime == -1L`.
-                Value::Long(self.0 as i64)
+            // SUB_NULL with non-zero payload is a long-collision (real null
+            // always has payload=0); same for SUB_UNINIT. Preserve the long
+            // bits in those cases.
+            SUB_NULL => {
+                if payload == 0 {
+                    Value::Object(None)
+                } else {
+                    Value::Long(self.0 as i64)
+                }
             }
+            SUB_UNINIT => {
+                if payload == 0 {
+                    Value::Uninitialized
+                } else {
+                    Value::Long(self.0 as i64)
+                }
+            }
+            SUB_RETADDR => Value::ReturnAddress(payload as u32),
+            SUB_LONG_LO | SUB_LONG_HI => Value::Long(self.0 as i64),
             _ => unreachable!(),
         }
     }
@@ -814,11 +783,29 @@ impl CompactValue {
             b'J' => match sub {
                 // An explicit long pair decodes to the stored i64.
                 SUB_LONG_LO | SUB_LONG_HI => Value::Long(self.0 as i64),
-                // Int widens (JVMS i2l semantics) — defensive for bytecode
-                // that forgot the conversion.
-                SUB_INT => Value::Long((self.0 & PAYLOAD_MASK) as u32 as i32 as i64),
-                // Null / Uninitialized → JVMS §2.3 default 0L.
-                SUB_NULL | SUB_UNINIT => Value::Long(0),
+                // SUB_INT: real int slots have payload < 2^32 (CompactValue::int
+                // stores `v as u32 as u64`). For those, apply JVMS i2l widening.
+                // A SUB_INT bit pattern whose payload has bits 32..46 set is a
+                // long-bit-pattern collision (BC SM2 fix 2026-05-28) — reinterpret
+                // the raw bits to preserve the long value.
+                SUB_INT => {
+                    let payload = self.0 & PAYLOAD_MASK;
+                    if payload >> 32 == 0 {
+                        Value::Long(payload as u32 as i32 as i64)
+                    } else {
+                        Value::Long(self.0 as i64)
+                    }
+                }
+                // Null / Uninitialized with payload=0 → JVMS §2.3 default 0L.
+                // With non-zero payload it's a long-bit-pattern collision
+                // (BC SM2 fix 2026-05-28) — reinterpret the raw bits.
+                SUB_NULL | SUB_UNINIT => {
+                    if (self.0 & PAYLOAD_MASK) == 0 {
+                        Value::Long(0)
+                    } else {
+                        Value::Long(self.0 as i64)
+                    }
+                }
                 // Object / Float / ReturnAddress landing in a J slot is
                 // upstream drift; reinterpret the raw bits so downstream
                 // native code still gets a long.  Non-panicking fallback.
@@ -1083,12 +1070,14 @@ mod tests {
         assert_eq!(CompactValue::return_address(7).as_long(), None);
     }
 
-    // -- CRITICAL: NaN-box collision corruption -----------------------------
+    // -- NaN-box collision: bit-exact round-trip -----------------------------
     //
-    // `CompactValue::long` must NEVER produce a slot that `is_object()`
-    // classifies as an object reference, and `tag()` must never report
-    // `Object`/`ReturnAddress` for it.  Otherwise the GC root scanner
-    // dereferences raw integer data as an object pointer => heap corruption.
+    // `CompactValue::long` stores longs verbatim, including bit patterns
+    // that collide with the NaN-tagged sub-tag space (BC SM2 / LongArray
+    // bug: lossy re-tag was corrupting `0xfffd…` longs to `0xffff…`).
+    // Heap safety for slots whose bit pattern incidentally looks like
+    // `SUB_OBJECT` is now enforced by the GC root scanners filtering
+    // through `VmHeap::is_object_address`, not by the encoder.
 
     /// Helper: a colliding long bit pattern with a chosen 3-bit would-be
     /// sub-tag in bits 49-47 and a chosen 47-bit low payload.
@@ -1097,51 +1086,42 @@ mod tests {
     }
 
     #[test]
-    fn long_never_classified_as_object() {
-        // Every would-be sub-tag (0..=7) in the colliding space, including
-        // SUB_OBJECT (2) which is the heap-corruption vector, and a couple
-        // of payloads (0, all-ones, an aligned-pointer-shaped value).
+    fn long_collision_round_trip_exact_for_every_subtag() {
+        // Bit-exact round-trip across every would-be sub-tag (0..=7) in the
+        // colliding space, including SUB_OBJECT (2) — the exact BC SM2
+        // regression case where the prior lossy re-tag was corrupting bits.
         for sub in 0..8u64 {
             for &low in &[0u64, PAYLOAD_MASK, 0x1_0000, 0x0BAD_BEEF] {
+                // Skip a few ambiguous (sub, payload) pairs whose bit
+                // pattern is identical to a real non-long value:
+                //   * (sub=INT, payload < 2^32) — indistinguishable from a
+                //     real int slot, where descriptor-J applies JVMS i2l
+                //     widening (sign-extends the low 32 bits).
+                //   * (sub=NULL/UNINIT, payload=0) — identical to
+                //     `CompactValue::null()` / `uninitialized()`; J-decode
+                //     honors JVMS §2.3 default 0L.
+                // The verifier disambiguates in real bytecode (lstore never
+                // writes a non-long into a J slot).
+                if sub == SUB_INT && low >> 32 == 0 {
+                    continue;
+                }
+                if low == 0 && (sub == SUB_NULL || sub == SUB_UNINIT) {
+                    continue;
+                }
                 let v = collide_with_subtag(sub, low);
                 let cv = CompactValue::long(v);
-                assert!(
-                    !cv.is_object(),
-                    "is_object() must be false for long {v:#018x} (sub={sub})",
+                assert_eq!(
+                    cv.as_long_unchecked(),
+                    v,
+                    "long must round-trip bit-exact for {v:#018x} (sub={sub})",
                 );
-                assert_ne!(
-                    cv.tag(),
-                    CompactTag::Object,
-                    "tag() must not be Object for long {v:#018x} (sub={sub})",
-                );
-                assert_ne!(
-                    cv.tag(),
-                    CompactTag::ReturnAddress,
-                    "tag() must not be ReturnAddress for long {v:#018x} (sub={sub})",
+                assert_eq!(
+                    cv.decode_by_descriptor(b'J'),
+                    Value::Long(v),
+                    "J-descriptor decode must round-trip bit-exact for {v:#018x}",
                 );
             }
         }
-    }
-
-    #[test]
-    fn long_object_subtag_collision_is_not_an_object() {
-        // The exact corruption case: a long whose bits 49-47 == SUB_OBJECT.
-        let v = collide_with_subtag(SUB_OBJECT, 0x1_0000);
-        let cv = CompactValue::long(v);
-        assert!(!cv.is_object());
-        assert_eq!(cv.tag(), CompactTag::Long);
-        // as_object_ptr must not hand the GC a fake pointer.
-        assert_eq!(cv.as_object_ptr(), None);
-    }
-
-    #[test]
-    fn long_retaddr_subtag_collision_is_not_a_retaddr() {
-        let v = collide_with_subtag(SUB_RETADDR, 0x2_0000);
-        let cv = CompactValue::long(v);
-        assert!(!cv.is_object());
-        assert_ne!(cv.tag(), CompactTag::ReturnAddress);
-        assert_eq!(cv.tag(), CompactTag::Long);
-        assert_eq!(cv.as_return_address(), None);
     }
 
     /// Colliding longs whose natural sub-tag is already a long sub-tag
@@ -1209,21 +1189,32 @@ mod tests {
         assert_eq!(CompactValue::long(i64::MAX).as_long_unchecked(), i64::MAX);
     }
 
-    /// A re-tagged colliding long must never decode through the J-descriptor
-    /// path to an Object/Float tag (which `pop_static_field_value` rejects
-    /// with a hard error) — its tag is always Long.
+    /// A colliding long routed through the J descriptor must always decode
+    /// to `Value::Long(_)` regardless of its natural sub-tag (the operand
+    /// stack's verifier-derived typing disambiguates). `pop_static_field_value`
+    /// would reject any other variant. `SUB_INT` widens (i2l) rather than
+    /// reinterprets bits.
     #[test]
-    fn long_collision_descriptor_decode_never_errors_tag() {
+    fn long_collision_descriptor_decode_always_returns_long() {
         for sub in 0..8u64 {
             let v = collide_with_subtag(sub, 0x55_5555);
             let cv = CompactValue::long(v);
-            // Must be a long-carrying tag for the J-descriptor fast path.
             assert!(
-                matches!(cv.tag(), CompactTag::Long),
-                "re-tagged long must report CompactTag::Long (sub={sub})",
+                matches!(cv.decode_by_descriptor(b'J'), Value::Long(_)),
+                "J-descriptor decode must return Value::Long for sub={sub}",
             );
-            // Decoding as J yields a Long, never an Object/Float variant.
-            assert!(matches!(cv.decode_by_descriptor(b'J'), Value::Long(_)));
+            // SUB_INT applies JVMS i2l widening (sign-extend the low 32
+            // bits) rather than reinterpreting the full 64-bit pattern.
+            let expected = if sub == SUB_INT {
+                Value::Long((v as u64 & PAYLOAD_MASK) as u32 as i32 as i64)
+            } else {
+                Value::Long(v)
+            };
+            assert_eq!(
+                cv.decode_by_descriptor(b'J'),
+                expected,
+                "J-descriptor decode mismatch for sub={sub}",
+            );
         }
     }
 
@@ -1651,25 +1642,9 @@ mod tests {
         assert_eq!(cv.as_object_ptr(), Some(0x0000_2000));
     }
 
-    /// `as_long_unchecked` returns the original i64 for every value that
-    /// did NOT take the lossy `sub < 3` re-tag path in `long()`:
-    ///
-    /// * untagged fast-path longs (the overwhelming majority),
-    /// * natural-collision longs whose sub-tag is already
-    ///   `SUB_LONG_LO`/`SUB_LONG_HI` (e.g. `-1`, `-2`, `i64::MIN`).
-    ///
-    /// The companion `as_long_bits_unchecked` returns the same bits (the
-    /// methods share an implementation by design — see their doc-comments
-    /// for why no fully-reversible alternative exists in 8 bytes).
-    ///
-    /// The "`sub < 3` retag values 0/1/2" mentioned in the audit acceptance
-    /// criterion refers to longs whose *natural* sub-tag bits were 0
-    /// (`SUB_INT`), 1 (`SUB_FLOAT`), or 2 (`SUB_OBJECT`). The lowest such
-    /// pattern (sub == 0, payload == 0) is the canonical case: the
-    /// constructor maps it onto `SUB_LONG_LO` and the result is decoded
-    /// verbatim — i.e. the *re-tagged* bits, not the input. That is the
-    /// documented limitation of the encoding, and both accessors are now
-    /// explicit about it.
+    /// `as_long_unchecked` returns the original i64 bit-exactly for every
+    /// i64 value — including every NaN-box collision sub-tag, since
+    /// `CompactValue::long` now stores verbatim.
     #[test]
     fn as_long_unchecked_returns_original_i64() {
         // Untagged fast path — original equals stored bits.
@@ -1679,27 +1654,20 @@ mod tests {
             assert_eq!(cv.as_long_bits_unchecked(), v);
         }
         // Natural `SUB_LONG_LO`/`SUB_LONG_HI` collisions (small-magnitude
-        // negatives whose top sub-tag bits are already 110 or 111) — the
-        // `long()` constructor stores them verbatim, so original i64 is
-        // recoverable.
+        // negatives whose top sub-tag bits are already 110 or 111).
         for v in [-1i64, -2, -3, -1000, -123_456_789_012_345] {
             let cv = CompactValue::long(v);
             assert_eq!(cv.as_long_unchecked(), v, "natural-collision long {v}");
             assert_eq!(cv.as_long_bits_unchecked(), v);
         }
-        // The `sub < 3` re-tag case (sub values 0/1/2): the constructor
-        // discards the original sub-tag, so `as_long_unchecked` returns
-        // the *re-tagged* bits. Both accessors agree.
-        for sub in 0u64..3 {
+        // Every collision sub-tag (0..=7) round-trips bit-exact — including
+        // SUB_OBJECT (2), the BC SM2 regression case that motivated the
+        // lossless verbatim encoding.
+        for sub in 0u64..8 {
             let v = collide_with_subtag(sub, 0x12_3456);
             let cv = CompactValue::long(v);
-            // Both accessors return the same bits — this is the
-            // documented limitation, not a bug.
-            assert_eq!(cv.as_long_unchecked(), cv.as_long_bits_unchecked());
-            // The slot is heap-safe (`is_object` false) — the safety
-            // invariant the re-tag was introduced to preserve.
-            assert!(!cv.is_object());
-            assert_eq!(cv.tag(), CompactTag::Long);
+            assert_eq!(cv.as_long_unchecked(), v, "collision sub={sub}");
+            assert_eq!(cv.as_long_bits_unchecked(), v);
         }
     }
 
@@ -1740,16 +1708,19 @@ mod tests {
     }
 
     #[test]
-    fn to_value_null_ptr_degrades_to_null_obj() {
-        // CompactValue never produces a null-pointer SUB_OBJECT via its
-        // normal constructors (debug_assert in `object()`), but a manually-
-        // crafted bit pattern that passes the NaN-tag check must degrade to
-        // Value::Object(None) rather than panic.
-        let raw_null_object = make_tagged(SUB_OBJECT, 0);
-        let cv = CompactValue::from_bits(raw_null_object);
+    fn to_value_null_ptr_subobject_decodes_as_long() {
+        // BC SM2 fix (2026-05-28): `CompactValue::long` stores long bits
+        // verbatim, so a slot with SUB_OBJECT bits and a null payload
+        // could equally be a primitive long whose pattern landed here.
+        // Real object slots are never null (`CompactValue::object` panics
+        // on null) and never SUB_OBJECT-with-payload-zero, so `to_value`
+        // returns `Value::Long` for safety — preserving the long bits
+        // bit-exact rather than discarding them as `Object(None)`.
+        let raw = make_tagged(SUB_OBJECT, 0);
+        let cv = CompactValue::from_bits(raw);
         match cv.to_value() {
-            Value::Object(None) => {}
-            other => panic!("expected Object(None), got {other:?}"),
+            Value::Long(x) => assert_eq!(x as u64, raw),
+            other => panic!("expected Long, got {other:?}"),
         }
     }
 
@@ -1903,13 +1874,18 @@ mod tests {
     }
 
     #[test]
-    fn to_value_unaligned_ptr_degrades_to_null_obj() {
-        // An unaligned pointer in a stale slot must not crash the interpreter.
+    fn to_value_unaligned_ptr_subobject_decodes_as_long() {
+        // BC SM2 fix (2026-05-28): a NaN-tagged slot with SUB_OBJECT bits
+        // but an unaligned payload cannot be a real object reference
+        // (`CompactValue::object` panics on unaligned pointers), so it
+        // must be a long-bit-pattern collision. `to_value()` preserves the
+        // long bits — replacing the prior `Object(None)` degrade that
+        // would silently drop the value.
         let raw_unaligned = make_tagged(SUB_OBJECT, 0x1001);
         let cv = CompactValue::from_bits(raw_unaligned);
         match cv.to_value() {
-            Value::Object(None) => {}
-            other => panic!("expected Object(None), got {other:?}"),
+            Value::Long(x) => assert_eq!(x as u64, raw_unaligned),
+            other => panic!("expected Long, got {other:?}"),
         }
     }
 

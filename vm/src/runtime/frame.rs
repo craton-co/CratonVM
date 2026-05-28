@@ -1065,27 +1065,19 @@ impl Frame {
     /// `astore`/`lstore` and `coerce_value_for_return` already promotes any
     /// smuggled jobject to `VTAG_OBJECT` before it reaches a local slot.
     ///
-    /// In `enhanceConfigurationClasses` (Spring 5.3.27) the frame has 15 locals
-    /// where some primitive `long` slots carried bit patterns that look like
-    /// aligned heap pointers (low 3 bits = 0, value < 1<<48). The next safepoint
-    /// (backward `goto 401`) would call this function, push the bogus pointer
-    /// into the root set, and the GC then dereferenced garbage → `0xC0000005`
-    /// SEGV. Removing the `VTAG_LONG` arm eliminates this entire class of false
-    /// positives. See `applogs/letsgo-segv-diagnosis.md` for full evidence.
-    pub fn scan_local_objects(&self, roots: &mut Vec<ObjectRef>) {
+    /// **BC SM2 fix (2026-05-28):** `CompactValue::long` now stores longs
+    /// bit-exact (no lossy re-tag), so a long whose natural sub-tag bits
+    /// happen to be `SUB_OBJECT` (bits 49-47 = 010, e.g. the BC LongArray
+    /// `0xfffd_…` regression) will satisfy `is_object()`. The
+    /// `heap.is_object_address` filter below drops those spurious roots
+    /// before they reach the GC's mark phase. Real object slots pass the
+    /// filter unchanged; long-bit-patterns whose lower 47 bits don't point
+    /// at a live heap object are correctly excluded.
+    pub fn scan_local_objects(&self, roots: &mut Vec<ObjectRef>, heap: &crate::memory::VmHeap) {
         for cv in &self.locals {
-            // Only Object-tagged slots are heap references — same policy as
-            // the prior `is_object_tag(VTAG_OBJECT)` check. Long / Null /
-            // Int / Float / Double / ReturnAddress / Uninitialized are never
-            // roots. `is_object()` returns false for null slots (which carry
-            // `SUB_NULL`, not `SUB_OBJECT`), matching the prior behavior
-            // where `bits != 0` filtered null-pointer slots.
             if cv.is_object() {
                 if let Some(ptr) = cv.as_object_ptr() {
-                    // Belt-and-suspenders: SUB_OBJECT is never constructed
-                    // with a zero pointer (CompactValue::object panics on
-                    // null), but defend against bit-corrupted slots.
-                    if ptr != 0 {
+                    if ptr != 0 && heap.is_object_address(ptr as usize).is_some() {
                         roots.push(unsafe { ObjectRef::from_raw(ptr as *mut u8) });
                     }
                 }
@@ -1095,12 +1087,18 @@ impl Frame {
 
     /// Update Object references in locals after GC using the pointer map.
     ///
-    /// Symmetric with [`Self::scan_local_objects`]: only `VTAG_OBJECT` slots are
-    /// heap references. `VTAG_LONG` slots are primitive `long`s by spec and must
-    /// never be remapped by GC — doing so would corrupt a primitive value whose
-    /// bits happened to look like a moved pointer (Spring Boot SEGV root cause,
-    /// see `applogs/letsgo-segv-diagnosis.md`).
-    pub fn update_local_refs(&mut self, pointer_map: &HashMap<usize, usize>) {
+    /// Symmetric with [`Self::scan_local_objects`]: only verified heap-resident
+    /// slots are remapped. `VTAG_LONG` slots are primitive `long`s by spec and
+    /// must never be remapped by GC — even when a long's bit pattern
+    /// coincidentally looks like `SUB_OBJECT` after the lossless verbatim
+    /// encoding (BC SM2 fix, 2026-05-28). The `heap.is_object_address` check
+    /// rejects long bit patterns whose lower 47 bits don't point at a live
+    /// heap object, leaving the long value intact.
+    pub fn update_local_refs(
+        &mut self,
+        pointer_map: &HashMap<usize, usize>,
+        heap: &crate::memory::VmHeap,
+    ) {
         for cv in self.locals.iter_mut() {
             if !cv.is_object() {
                 continue;
@@ -1108,11 +1106,13 @@ impl Frame {
             let Some(old_ptr) = cv.as_object_ptr() else {
                 continue;
             };
+            // Filter long-bit-pattern false positives: only treat this slot
+            // as a real Object reference if old_ptr points at a live heap
+            // object pre-relocation.
+            if heap.is_object_address(old_ptr as usize).is_none() {
+                continue;
+            }
             if let Some(&new_addr) = pointer_map.get(&(old_ptr as usize)) {
-                // Rebuild the Object CompactValue with the relocated pointer.
-                // `CompactValue::object` panics on null or out-of-range, so
-                // route through `try_from_pointer` to degrade safely if the
-                // GC handed back an unexpected address (e.g. 0 = freed).
                 *cv = CompactValue::try_from_pointer(new_addr as u64)
                     .unwrap_or_else(CompactValue::null);
             }
@@ -1283,6 +1283,8 @@ mod tests {
     /// Boot SEGV regression where pointer-shaped long bits were mis-rooted.
     #[test]
     fn scan_local_objects_does_not_root_long_with_pointer_shaped_bits() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
         let mut frame = Frame::new(
             ClassId::new(0),
             "T".to_string(),
@@ -1298,13 +1300,16 @@ mod tests {
         let fake = 0x1000usize as i64;
         frame.set_local_unchecked(0, Value::Long(fake));
 
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
         let mut roots = Vec::new();
-        frame.scan_local_objects(&mut roots);
+        frame.scan_local_objects(&mut roots, &heap);
         assert!(roots.is_empty(), "VTAG_LONG must never produce a root");
     }
 
     #[test]
     fn scan_local_objects_skips_long_that_is_not_aligned_object_pattern() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
         let mut frame = Frame::new(
             ClassId::new(0),
             "T".to_string(),
@@ -1319,8 +1324,9 @@ mod tests {
         );
         frame.set_local_unchecked(0, Value::Long(7));
 
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
         let mut roots = Vec::new();
-        frame.scan_local_objects(&mut roots);
+        frame.scan_local_objects(&mut roots, &heap);
         assert!(roots.is_empty());
     }
 
@@ -1328,6 +1334,8 @@ mod tests {
     /// GC must NOT remap them even if their bits look like a moved pointer.
     #[test]
     fn update_local_refs_does_not_touch_long_with_pointer_shaped_bits() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
         use std::collections::HashMap;
 
         let mut frame = Frame::new(
@@ -1347,7 +1355,8 @@ mod tests {
 
         let mut map = HashMap::new();
         map.insert(0x2000usize, 0x3000usize);
-        frame.update_local_refs(&map);
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        frame.update_local_refs(&map, &heap);
 
         // Long primitive must be preserved verbatim. Use the compact
         // accessor (CompactValue's Long/Double tag ambiguity is resolved

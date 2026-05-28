@@ -34,7 +34,7 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // jboss-modules token) can no longer poison the root set and cause a
     // `0xC0000005` SEGV when the GC later dereferences the bogus pointer.
     for frame in thread.frames.iter() {
-        frame.scan_local_objects(&mut roots);
+        frame.scan_local_objects(&mut roots, &shared.heap);
         let before = roots.len();
         frame.stack.scan_object_refs(&mut roots, &shared.heap);
         if roots.len() > before {

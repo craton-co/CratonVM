@@ -32,7 +32,7 @@ pub fn update_all_roots(
 
     // 1. Thread frames — locals and operand stacks (SoA layout)
     for frame in &mut thread.frames {
-        frame.update_local_refs(pointer_map);
+        frame.update_local_refs(pointer_map, &shared.heap);
         frame.stack.update_object_refs(pointer_map, &shared.heap);
     }
 
@@ -510,7 +510,7 @@ mod tests {
         let mut roots = vec![obj, obj, obj];
         let result = heap.collect_garbage(&stw(), &mut roots, &monitor_table);
 
-        thread.frames[0].update_local_refs(&result.pointer_map);
+        thread.frames[0].update_local_refs(&result.pointer_map, &vm_heap);
         thread.frames[0]
             .stack
             .update_object_refs(&result.pointer_map, &vm_heap);

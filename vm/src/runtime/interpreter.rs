@@ -877,7 +877,7 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
     let mut snapshot = thread.root_snapshot.lock();
     snapshot.clear();
     for frame in &thread.frames {
-        frame.scan_local_objects(&mut snapshot);
+        frame.scan_local_objects(&mut snapshot, &shared.heap);
         let before = snapshot.len();
         frame.stack.scan_object_refs(&mut snapshot, &shared.heap);
         // Validate every operand-stack-sourced root against the heap.
@@ -969,7 +969,7 @@ pub(crate) fn apply_pointer_map_to_thread(
     heap: &crate::memory::VmHeap,
 ) {
     for frame in &mut thread.frames {
-        frame.update_local_refs(pointer_map);
+        frame.update_local_refs(pointer_map, heap);
         frame.stack.update_object_refs(pointer_map, heap);
     }
     // Also update printed values and java_thread_obj
@@ -8669,20 +8669,28 @@ fn pop_coerced_invoke_args_virtual(
     let (_class_name, _method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, caller_class_id, cp_index)?;
     let (param_descs, _) = split_method_descriptor(&method_descriptor);
-    let mut tmp: Vec<Value> = Vec::with_capacity(num_params + 1);
+    // BC SM2 fix (2026-05-28): use raw CompactValue + descriptor-aware
+    // decode so a Long-collision-with-SUB_OBJECT bit pattern doesn't
+    // round-trip through Value::Object and lose bits.
+    let mut tmp_cv: Vec<CompactValue> = Vec::with_capacity(num_params + 1);
     for _ in 0..num_params {
-        tmp.push(thread.frames[frame_idx].stack.pop()?);
+        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_checked()?);
     }
-    tmp.push(thread.frames[frame_idx].stack.pop()?);
-    tmp.reverse();
+    tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_checked()?);
+    tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params + 1);
-    args.push(coerce_invoke_arg_for_descriptor("Ljava/lang/Object;", tmp[0]));
+    args.push(coerce_invoke_arg_for_descriptor(
+        "Ljava/lang/Object;",
+        tmp_cv[0].decode_by_descriptor(b'L'),
+    ));
     for i in 0..num_params {
         let pd = param_descs
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or("Ljava/lang/Object;");
-        args.push(coerce_invoke_arg_for_descriptor(pd, tmp[i + 1]));
+        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let v = tmp_cv[i + 1].decode_by_descriptor(pd_byte);
+        args.push(coerce_invoke_arg_for_descriptor(pd, v));
     }
     Ok((args, method_descriptor))
 }
@@ -8698,17 +8706,23 @@ fn pop_coerced_invoke_args_static(
     let (_class_name, _method_name, method_descriptor, num_params) =
         resolve_method_ref(shared, caller_class_id, cp_index)?;
     let (param_descs, _) = split_method_descriptor(&method_descriptor);
-    let mut tmp: Vec<Value> = Vec::with_capacity(num_params);
+    // BC SM2 fix (2026-05-28): pop slots as raw CompactValue and decode
+    // with the parameter descriptor. `CompactValue::to_value()` would
+    // mis-decode a Long whose bits collide with SUB_OBJECT as
+    // Value::Object — the descriptor-aware decode keeps the long bits.
+    let mut tmp_cv: Vec<CompactValue> = Vec::with_capacity(num_params);
     for _ in 0..num_params {
-        tmp.push(thread.frames[frame_idx].stack.pop()?);
+        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_checked()?);
     }
-    tmp.reverse();
+    tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
-    for (i, v) in tmp.into_iter().enumerate() {
+    for (i, cv) in tmp_cv.into_iter().enumerate() {
         let pd = param_descs
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or("Ljava/lang/Object;");
+        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let v = cv.decode_by_descriptor(pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
     }
     Ok((args, method_descriptor))
@@ -11197,17 +11211,24 @@ fn execute_invokestatic(
     }
 
     let (param_descs, _) = split_method_descriptor(&method_descriptor);
-    let mut tmp: Vec<Value> = Vec::with_capacity(num_params);
+    // BC SM2 fix (2026-05-28): pop slots as raw CompactValue and decode
+    // with the parameter descriptor so a Long whose bit pattern collides
+    // with the NaN-tagged SUB_OBJECT space is not silently coerced to 0L
+    // by `to_value() -> Value::Object`. The descriptor-aware decode
+    // path (`decode_by_descriptor(b'J')`) reinterprets the raw bits.
+    let mut tmp_cv: Vec<CompactValue> = Vec::with_capacity(num_params);
     for _ in 0..num_params {
-        tmp.push(thread.frames[frame_idx].stack.pop()?);
+        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_checked()?);
     }
-    tmp.reverse();
+    tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
-    for (i, v) in tmp.into_iter().enumerate() {
+    for (i, cv) in tmp_cv.into_iter().enumerate() {
         let pd = param_descs
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or("Ljava/lang/Object;");
+        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let v = cv.decode_by_descriptor(pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
     }
 
@@ -11376,12 +11397,21 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
 ) -> Result<&'b [Value], MethodCallFailed> {
     let total = num_params + with_receiver as usize;
     debug_assert!(total <= MAX_INTRINSIC_ARGS);
-    // The operand-stack top is the last argument: fill the buffer back-to-front.
+    // BC SM2 fix (2026-05-28): pop raw CompactValue slots and decode each
+    // with the corresponding parameter descriptor so a Long bit pattern
+    // colliding with SUB_OBJECT survives intact (instead of being
+    // converted to `Value::Object(None)` by `to_value()` and then
+    // coerced to 0L).
+    let mut cv_buf: [CompactValue; MAX_INTRINSIC_ARGS] =
+        [CompactValue::uninitialized(); MAX_INTRINSIC_ARGS];
     for i in (0..total).rev() {
-        buf[i] = thread.frames[frame_idx].stack.pop()?;
+        cv_buf[i] = thread.frames[frame_idx].stack.pop_compact_checked()?;
     }
     let base = if with_receiver {
-        buf[0] = coerce_invoke_arg_for_descriptor("Ljava/lang/Object;", buf[0]);
+        buf[0] = coerce_invoke_arg_for_descriptor(
+            "Ljava/lang/Object;",
+            cv_buf[0].decode_by_descriptor(b'L'),
+        );
         1
     } else {
         0
@@ -11391,7 +11421,11 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
             .get(i)
             .map(|s| &**s)
             .unwrap_or("Ljava/lang/Object;");
-        buf[base + i] = coerce_invoke_arg_for_descriptor(pd, buf[base + i]);
+        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        buf[base + i] = coerce_invoke_arg_for_descriptor(
+            pd,
+            cv_buf[base + i].decode_by_descriptor(pd_byte),
+        );
     }
     Ok(&buf[..total])
 }
