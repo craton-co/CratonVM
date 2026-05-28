@@ -3861,6 +3861,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/io/FileDescriptor", "getAppend", "(I)Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+    // FileDescriptor.sync0()V — fsync. We rely on the host OS's buffer
+    // cache for write durability; a true fsync would require the VM to
+    // expose `RWFile::sync_all` through `fd_table`, which is not yet
+    // wired. Treating it as a no-op matches what Lucene's
+    // `FSDirectory.sync` needs (a successful return from the FileDescriptor
+    // sync path so the IndexWriter commit completes), and is consistent
+    // with how the synthetic stream natives have always handled `flush`.
+    registry.register("java/io/FileDescriptor", "sync0", "()V", native_noop);
 
     // --- jdk/internal/misc/VM (needed by IntegerCache, LongCache, etc.) ---
     registry.register("jdk/internal/misc/VM", "initialize", "()V", native_noop);

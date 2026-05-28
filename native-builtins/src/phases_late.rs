@@ -7227,6 +7227,68 @@ fn df_parse_pattern(pattern: &str) -> (bool, usize, usize) {
 // mode: 0=read-only, 1=read-write
 // ---------------------------------------------------------------------------
 
+/// Resolve the real-JDK `fd` FileDescriptor object on a RandomAccessFile, if
+/// the loaded class declares the field. Returns `None` for the synthetic
+/// 2-slot layout (where slot 0 is the raw `Int` fd_id).
+fn raf_fd_object(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    match ctx.get_field_by_name(this, "fd") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// Store an open RAF fd id. Mirrors `fos_set_fd`: when the real-JDK
+/// `FileDescriptor` field is present on the receiver we stash the id on the
+/// `FileDescriptor` itself (so the JDK `getFD()` bytecode returns a non-null
+/// FD), allocating a fresh `FileDescriptor` when the JDK ctor did not run.
+/// On the synthetic 2-slot layout we keep the legacy slot-0 placement.
+fn raf_set_fd(ctx: &mut dyn NativeContext, this: ObjectRef, fd: u32) {
+    // Real-JDK path: there's an `fd` Object field — make sure it points at a
+    // live `FileDescriptor` and write the id there.
+    let cid = ctx.class_id_of_object(this);
+    let class_name = ctx.class_name_of_id(cid).unwrap_or_default();
+    let has_fd_field = ctx.resolve_field_index(&class_name, "fd").is_some();
+    if has_fd_field {
+        let fd_obj = match raf_fd_object(ctx, this) {
+            Some(existing) => existing,
+            None => {
+                // JDK ctor did not initialise `this.fd`; allocate one so the
+                // `getFD()` bytecode (`return this.fd;`) returns a non-null
+                // FileDescriptor. `FSDirectory.sync` does exactly this:
+                // `new RandomAccessFile(...).getFD().sync()`. Without this,
+                // sync() is dispatched on a null receiver and the Lucene
+                // commit path fails with InvocationTargetException.
+                let new_fd = alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 1);
+                ctx.set_field_by_name(this, "fd", Value::Object(Some(new_fd)));
+                new_fd
+            }
+        };
+        ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd as i32));
+        ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd as i64));
+        return;
+    }
+    ctx.set_field(this, 0, Value::Int(fd as i32));
+}
+
+/// Recover the open RAF fd id. Tries the real-JDK `fd.fd`/`fd.handle` pair
+/// first, then falls back to slot 0 for the synthetic 2-slot layout.
+fn raf_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<u32> {
+    if let Some(fd_obj) = raf_fd_object(ctx, this) {
+        match ctx.get_field_by_name(fd_obj, "fd") {
+            Value::Int(v) if v >= 0 => return Some(v as u32),
+            _ => {}
+        }
+        match ctx.get_field_by_name(fd_obj, "handle") {
+            Value::Long(v) if v >= 0 => return Some(v as u32),
+            _ => {}
+        }
+    }
+    match ctx.get_field(this, 0) {
+        Value::Int(v) if v >= 0 => return Some(v as u32),
+        _ => None,
+    }
+}
+
 pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) {
     let raf = "java/io/RandomAccessFile";
 
@@ -7252,12 +7314,12 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
                     ctx.fd_table().open_read(&path).map(|id| id)
                 })
                 .map_err(|e| RuntimeError::IOException { message: format!("Cannot open {}: {}", path, e) })?;
-            ctx.set_field(this, 0, Value::Int(fd_id as i32));
+            raf_set_fd(ctx, this, fd_id);
             ctx.set_field(this, 1, Value::Int(0)); // read-only
         } else {
             let fd_id = ctx.fd_table().open_read_write(&path, create)
                 .map_err(|e| RuntimeError::IOException { message: format!("Cannot open {}: {}", path, e) })?;
-            ctx.set_field(this, 0, Value::Int(fd_id as i32));
+            raf_set_fd(ctx, this, fd_id);
             ctx.set_field(this, 1, Value::Int(1)); // read-write
         }
         Ok(None)
@@ -7280,7 +7342,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let writable = mode_str.contains('w');
         let fd_id = ctx.fd_table().open_read_write(&path, writable)
             .map_err(|e| RuntimeError::IOException { message: format!("Cannot open {}: {}", path, e) })?;
-        ctx.set_field(this, 0, Value::Int(fd_id as i32));
+        raf_set_fd(ctx, this, fd_id);
         ctx.set_field(this, 1, Value::Int(if writable { 1 } else { 0 }));
         Ok(None)
     });
@@ -7288,7 +7350,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // read() -> int (single byte, -1 on EOF)
     r.register(raf, "read", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         if fd_id < 0 { return Ok(Some(Value::Int(-1))); }
         let mut buf = [0u8; 1];
         match ctx.fd_table().rw_read(fd_id as u32, &mut buf) {
@@ -7301,7 +7363,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // read(byte[], int off, int len) -> int
     r.register(raf, "read", "([BII)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         if fd_id < 0 { return Ok(Some(Value::Int(-1))); }
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
@@ -7325,7 +7387,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // read(byte[]) -> int
     r.register(raf, "read", "([B)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         if fd_id < 0 { return Ok(Some(Value::Int(-1))); }
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
@@ -7348,7 +7410,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // readFully(byte[])
     r.register(raf, "readFully", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
             _ => return Err(RuntimeError::IOException { message: "null buffer".into() }.into()),
@@ -7372,7 +7434,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // readFully(byte[], int off, int len)
     r.register(raf, "readFully", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
             _ => return Err(RuntimeError::IOException { message: "null buffer".into() }.into()),
@@ -7397,7 +7459,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // write(int)
     r.register(raf, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
         ctx.fd_table().rw_write(fd_id as u32, &[b])
             .map_err(|e| RuntimeError::IOException { message: e.to_string() })?;
@@ -7407,7 +7469,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // write(byte[], int off, int len)
     r.register(raf, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(None),
@@ -7428,7 +7490,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // write(byte[])
     r.register(raf, "write", "([B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(None),
@@ -7448,7 +7510,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // seek(long pos)
     r.register(raf, "seek", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         // RKC23B: J-typed args may arrive tagged as Double across some
         // native dispatch paths; reinterpret bits to recover the long.
         let pos = match args.get(1) {
@@ -7464,7 +7526,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // getFilePointer() -> long
     r.register(raf, "getFilePointer", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let pos = ctx.fd_table().rw_position(fd_id as u32).unwrap_or(0);
         Ok(Some(Value::Long(pos as i64)))
     });
@@ -7472,7 +7534,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // length() -> long
     r.register(raf, "length", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let size = ctx.fd_table().file_size(fd_id as u32).unwrap_or(0);
         Ok(Some(Value::Long(size as i64)))
     });
@@ -7480,7 +7542,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // setLength(long newLength)
     r.register(raf, "setLength", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let new_len = match args.get(1) {
             Some(Value::Long(v)) => *v as u64,
             Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()) as u64,
@@ -7494,10 +7556,18 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // close()
     r.register(raf, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         if fd_id >= 0 {
             let _ = ctx.fd_table().close(fd_id as u32);
-            ctx.set_field(this, 0, Value::Int(-1));
+            // Clear via the same path `<init>` used so a real-JDK receiver's
+            // `FileDescriptor` is updated rather than its `fd` Object slot
+            // being stomped with an `Int`.
+            if let Some(fd_obj) = raf_fd_object(ctx, this) {
+                ctx.set_field_by_name(fd_obj, "fd", Value::Int(-1));
+                ctx.set_field_by_name(fd_obj, "handle", Value::Long(-1));
+            } else {
+                ctx.set_field(this, 0, Value::Int(-1));
+            }
         }
         Ok(None)
     });
@@ -7505,77 +7575,77 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // --- DataInput interface methods ---
     r.register(raf, "readInt", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let mut buf = [0u8; 4];
         raf_read_fully(ctx, fd_id, &mut buf)?;
         Ok(Some(Value::Int(i32::from_be_bytes(buf))))
     });
     r.register(raf, "readLong", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let mut buf = [0u8; 8];
         raf_read_fully(ctx, fd_id, &mut buf)?;
         Ok(Some(Value::Long(i64::from_be_bytes(buf))))
     });
     r.register(raf, "readShort", "()S", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let mut buf = [0u8; 2];
         raf_read_fully(ctx, fd_id, &mut buf)?;
         Ok(Some(Value::Int(i16::from_be_bytes(buf) as i32)))
     });
     r.register(raf, "readChar", "()C", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let mut buf = [0u8; 2];
         raf_read_fully(ctx, fd_id, &mut buf)?;
         Ok(Some(Value::Int(u16::from_be_bytes(buf) as i32)))
     });
     r.register(raf, "readByte", "()B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let mut buf = [0u8; 1];
         raf_read_fully(ctx, fd_id, &mut buf)?;
         Ok(Some(Value::Int(buf[0] as i8 as i32)))
     });
     r.register(raf, "readUnsignedByte", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let mut buf = [0u8; 1];
         raf_read_fully(ctx, fd_id, &mut buf)?;
         Ok(Some(Value::Int(buf[0] as i32)))
     });
     r.register(raf, "readUnsignedShort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let mut buf = [0u8; 2];
         raf_read_fully(ctx, fd_id, &mut buf)?;
         Ok(Some(Value::Int(u16::from_be_bytes(buf) as i32)))
     });
     r.register(raf, "readBoolean", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let mut buf = [0u8; 1];
         raf_read_fully(ctx, fd_id, &mut buf)?;
         Ok(Some(Value::Int(if buf[0] != 0 { 1 } else { 0 })))
     });
     r.register(raf, "readFloat", "()F", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let mut buf = [0u8; 4];
         raf_read_fully(ctx, fd_id, &mut buf)?;
         Ok(Some(Value::Float(f32::from_be_bytes(buf))))
     });
     r.register(raf, "readDouble", "()D", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let mut buf = [0u8; 8];
         raf_read_fully(ctx, fd_id, &mut buf)?;
         Ok(Some(Value::Double(f64::from_be_bytes(buf))))
     });
     r.register(raf, "readUTF", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let mut len_buf = [0u8; 2];
         raf_read_fully(ctx, fd_id, &mut len_buf)?;
         let len = u16::from_be_bytes(len_buf) as usize;
@@ -7587,7 +7657,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     });
     r.register(raf, "readLine", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let mut line = Vec::new();
         let mut buf = [0u8; 1];
         loop {
@@ -7612,63 +7682,63 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // --- DataOutput interface methods ---
     r.register(raf, "writeInt", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
         Ok(None)
     });
     r.register(raf, "writeLong", "(J)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = match args.get(1) { Some(Value::Long(l)) => *l, _ => 0 };
         let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
         Ok(None)
     });
     r.register(raf, "writeShort", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i16;
         let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
         Ok(None)
     });
     r.register(raf, "writeChar", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u16;
         let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
         Ok(None)
     });
     r.register(raf, "writeByte", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
         let _ = ctx.fd_table().rw_write(fd_id as u32, &[v]);
         Ok(None)
     });
     r.register(raf, "writeBoolean", "(Z)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let _ = ctx.fd_table().rw_write(fd_id as u32, &[if v != 0 { 1 } else { 0 }]);
         Ok(None)
     });
     r.register(raf, "writeFloat", "(F)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = match args.get(1) { Some(Value::Float(f)) => *f, _ => 0.0 };
         let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
         Ok(None)
     });
     r.register(raf, "writeDouble", "(D)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let v = match args.get(1) { Some(Value::Double(d)) => *d, _ => 0.0 };
         let _ = ctx.fd_table().rw_write(fd_id as u32, &v.to_be_bytes());
         Ok(None)
     });
     r.register(raf, "writeUTF", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let s = match args.get(1) {
             Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
             _ => String::new(),
@@ -7681,7 +7751,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     });
     r.register(raf, "writeBytes", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let s = match args.get(1) {
             Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
             _ => String::new(),
@@ -7691,7 +7761,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     });
     r.register(raf, "writeChars", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let s = match args.get(1) {
             Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
             _ => String::new(),
@@ -7703,6 +7773,17 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     });
     r.register(raf, "getFD", "()Ljava/io/FileDescriptor;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Prefer the receiver's real-JDK `fd` field when it exists (and is
+        // non-null) — Lucene's `FSDirectory.sync` immediately calls
+        // `getFD().sync()`, so a freshly-allocated wrapper that does NOT
+        // carry the open fd into a `FileDescriptor.sync()` capable shape
+        // would NPE the bytecode caller. The `<init>` natives now ensure
+        // `this.fd` is populated for real-JDK receivers.
+        if let Some(existing) = raf_fd_object(ctx, this) {
+            return Ok(Some(Value::Object(Some(existing))));
+        }
+        // Synthetic 2-slot layout fallback: allocate a FileDescriptor and
+        // copy the fd id across so legacy callers continue to work.
         let fd = alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 1);
         ctx.set_field(fd, 0, ctx.get_field(this, 0));
         Ok(Some(Value::Object(Some(fd))))
@@ -7715,7 +7796,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     });
     r.register(raf, "skipBytes", "(I)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
+        let fd_id = raf_get_fd(ctx, this).map(|v| v as i32).unwrap_or(-1);
         let n = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if n <= 0 { return Ok(Some(Value::Int(0))); }
         let pos = ctx.fd_table().rw_position(fd_id as u32).unwrap_or(0);
