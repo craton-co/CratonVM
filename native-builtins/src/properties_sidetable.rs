@@ -796,6 +796,27 @@ fn native_properties_set_property(
 /// finds it.  The bytecode `Hashtable.put` continues to run, so
 /// the JDK's internal table is also populated (for any caller that
 /// reads via `Properties.get`).
+///
+/// Also mirror to the VM's system-property store, matching what
+/// `Properties.setProperty` does. The JDK-semantic behaviour: real
+/// `System.getProperties()` returns the `System.props` singleton, so
+/// any `put(k,v)` on it is immediately visible via
+/// `System.getProperty(k)`. CratonVM's `System.getProperties()` (see
+/// `lib.rs` essential registration) returns a FRESH snapshot
+/// Properties each call — so receiver-identity against `System.props`
+/// would always fail, and constraining the mirror to such a check
+/// would silently break the pattern.
+///
+/// Mirror unconditionally. The cost is that a `Properties` instance
+/// used as a plain map pollutes the VM system-property store with its
+/// (String,String) entries, which is harmless to readers that query
+/// specific keys.
+///
+/// Reproducer: BC's `ASN1IntegerTest.testLooseValidEncoding_*` flips
+/// `false → true` via `System.getProperties().put(...)` and then
+/// `ASN1Integer`'s `Properties.isOverrideSet(...)` reads back stale
+/// `false`, so the loose-validation bypass never engages and
+/// "malformed integer" throws on inputs the test expects to accept.
 fn native_properties_put(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -814,6 +835,11 @@ fn native_properties_put(
     if !ks.is_empty() {
         let prev = get_kv(this, &ks);
         put_kv(this, &ks, &vs);
+        // Mirror to the VM system-property store so subsequent
+        // System.getProperty(ks) observes the write. Symmetric with
+        // native_properties_set_property; see fn-level docs above for
+        // the System.getProperties()-singleton rationale.
+        let _ = ctx.set_system_property(&ks, &vs);
         if let Some(p) = prev {
             return Ok(Some(Value::Object(Some(ctx.create_string(&p)))));
         }
