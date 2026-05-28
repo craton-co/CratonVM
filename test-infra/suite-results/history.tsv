@@ -2,3 +2,20 @@ iso_date	suite	variant	rc	pass	total	wall_s	notes
 2026-05-28T11:50:00Z	bc-asn1-regression	cratonvm	0	58	58	141.86	post-NaN-box-fix; SUB_OBJECT/NULL/UNINIT/RETADDR collisions decode as Long when payload disambiguates
 2026-05-28T11:50:00Z	bc-asn1-regression	hotspot	0	58	58	0.91	JDK 25
 2026-05-28T11:50:00Z	bc-asn1-regression	tornadovm	0	58	58	3.38	Graal + PTX argfile
+2026-05-28T11:52:00Z	h2-driver-probe	cratonvm	0	1	1	6.39	H2 2.4.249-SNAPSHOT; CREATE+INSERT+SELECT count(*) round-trip
+2026-05-28T11:52:00Z	h2-driver-probe	hotspot	0	1	1	0.97	JDK 25
+2026-05-28T11:52:00Z	h2-driver-probe	tornadovm	0	1	1	1.48	Graal + PTX argfile
+2026-05-28T11:53:00Z	eclipse-ecj-start	cratonvm-nojit	0	1	1	1.62	BatchCompiler reaches compile(); ok=false due to missing JRT FS provider (separate issue, unrelated to startup)
+2026-05-28T11:53:00Z	eclipse-ecj-start	cratonvm	1	0	1	2.55	ArithmeticException /by zero in HashtableOfInt.put due to JIT-corrupted array header (issue #23, upstream JIT bug — not in HashtableOfInt itself)
+2026-05-28T11:53:00Z	eclipse-ecj-start	hotspot	0	1	1	1.15	ok=true; real compile
+2026-05-28T11:53:00Z	eclipse-ecj-start	tornadovm	0	1	1	1.49	ok=true
+2026-05-28T11:55:00Z	dacapo-lucene	cratonvm	139	0	1	18.40	bench-only; SEGV in inline-alloc header init (issue #23 family)
+2026-05-28T11:55:00Z	dacapo-lucene	cratonvm-nojit	127	0	1	18.80	bench-only; reflective LuIndex.iterate dispatches on speculative collection-layout probe -> System.exit(-1)
+2026-05-28T11:55:00Z	dacapo-lucene	hotspot	0	1	1	23.48	PASSED in 20478 msec
+2026-05-28T11:55:00Z	dacapo-lucene	tornadovm	0	1	1	16.92	PASSED in 14128 msec; bare JDK (TornadoVM module path can't load unnamed-package dacapo.jar)
+2026-05-28T11:57:00Z	commons-math	cratonvm	0	3204	3204	154.00	2:34min; 30 skipped; 9 flakes (auto-retried, all eventually green)
+2026-05-28T11:57:00Z	commons-math	hotspot	0	3204	3204	96.00	1:36min; 30 skipped; 3 flakes
+2026-05-28T11:58:00Z	bc-math-ec	cratonvm	139	0	14	33.09	SEGV in inline-alloc header init (kind=Object but array_length=54) - same JIT family as DaCapo (issue #23/#6)
+2026-05-28T11:58:00Z	bc-math-ec	cratonvm-nojit	1	7	14	360.00	progresses without JIT crash but 7 tests fail with "BigInteger not invertible" / "Inverse does not exist" - modular-inverse data-correctness gap
+2026-05-28T11:58:00Z	bc-math-ec	hotspot	0	14	14	31.27	OK (14 tests)
+2026-05-28T11:58:00Z	bc-math-ec	tornadovm	0	14	14	52.00	OK (14 tests)

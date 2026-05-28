@@ -23039,9 +23039,22 @@ pub(crate) fn bi_div_str(a: &str, b: &str) -> String {
 }
 
 pub(crate) fn bi_mod_str(a: &str, b: &str) -> String {
-    let (_a_neg, a_abs) = bi_parse_sign(a);
+    // Mirror Java's `BigInteger.remainder` semantics: the sign of the result
+    // matches the sign of the dividend (C-style truncated division).
+    // `bi_mod_str` is the building block for `bi_mod_inverse_str`, whose
+    // extended-Euclidean loop relies on this signed-remainder contract to
+    // produce the correct sign of the Bezout coefficient (BC SM2 fix
+    // 2026-05-28: BC's `modInverse(p192)` was returning `-x^-1 mod p`
+    // because the dropped-sign behaviour collapsed `a_red = (-3) mod 11`
+    // from `8` to `3`, off-by-(p-1) in every subsequent step).
+    let (a_neg, a_abs) = bi_parse_sign(a);
     let (_b_neg, b_abs) = bi_parse_sign(b);
-    bi_mod_unsigned(a_abs, b_abs)
+    let r = bi_mod_unsigned(a_abs, b_abs);
+    if a_neg && r != "0" {
+        format!("-{r}")
+    } else {
+        r
+    }
 }
 
 pub(crate) fn bi_parse_sign(s: &str) -> (bool, &str) {
