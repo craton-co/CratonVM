@@ -15,7 +15,9 @@ iso_date	suite	variant	rc	pass	total	wall_s	notes
 2026-05-28T11:55:00Z	dacapo-lucene	tornadovm	0	1	1	16.92	PASSED in 14128 msec; bare JDK (TornadoVM module path can't load unnamed-package dacapo.jar)
 2026-05-28T11:57:00Z	commons-math	cratonvm	0	3204	3204	154.00	2:34min; 30 skipped; 9 flakes (auto-retried, all eventually green)
 2026-05-28T11:57:00Z	commons-math	hotspot	0	3204	3204	96.00	1:36min; 30 skipped; 3 flakes
+2026-05-28T12:07:00Z	commons-math	tornadovm	0	3204	3204	118.00	1:58min; 30 skipped; 4 flakes
 2026-05-28T11:58:00Z	bc-math-ec	cratonvm	139	0	14	33.09	SEGV in inline-alloc header init (kind=Object but array_length=54) - same JIT family as DaCapo (issue #23/#6)
 2026-05-28T11:58:00Z	bc-math-ec	cratonvm-nojit	1	7	14	360.00	progresses without JIT crash but 7 tests fail with "BigInteger not invertible" / "Inverse does not exist" - modular-inverse data-correctness gap
 2026-05-28T11:58:00Z	bc-math-ec	hotspot	0	14	14	31.27	OK (14 tests)
 2026-05-28T11:58:00Z	bc-math-ec	tornadovm	0	14	14	52.00	OK (14 tests)
+2026-05-28T12:20:00Z	bc-math-ec	cratonvm-nojit	1	7	14	491.44	post-bi_mod_str sign fix: 7/14 pass (was same count); residual 6 errors + 1 failure trace into deeper EC arithmetic gaps (testFixedPointMultiplier mismatched standard-curve coords; ECAlgorithmsTest sums of multiplies)
