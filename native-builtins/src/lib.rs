@@ -826,6 +826,31 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // never touched at runtime.
     register_biginteger_arithmetic_overrides(registry);
     register_bigdecimal_arithmetic_overrides(registry);
+    // `Long.parseLong(String)J` / `Integer.parseInt(String)I` — in real-JDK
+    // mode, these fall through to JDK bytecode whose loop multiplies-and-adds
+    // digit-by-digit (`result = result * 10 + digit`). Bounds-check arithmetic
+    // for values above ~2^54 trips a wrong overflow path in our interpreter
+    // (Long.parseLong("35747322042253312") returned 1970324836974592 = 7·2^48,
+    // dropping the high 0x78 bits of the 0x7F top byte; Long.parseLong(
+    // "9151314442816847872") returned 2114440025050447872, similar pattern).
+    // Cascading impact: ASN1RelativeOID.writeField takes the long branch for
+    // arc components of length ≤ 18 chars and encodes the wrong value, so the
+    // BC ASN.1 OID/RelativeOID round-trip tests on the canonical wide-arc OID
+    // `1.1.127.32512.…35747322042253312.9151314442816847872` decode back to
+    // …1970324836974592… instead. Route through our Rust `text.parse::<i64>()`
+    // so the parse is unconditionally correct.
+    registry.register(
+        "java/lang/Long",
+        "parseLong",
+        "(Ljava/lang/String;)J",
+        crate::lang_math::native_long_parse_long,
+    );
+    registry.register(
+        "java/lang/Integer",
+        "parseInt",
+        "(Ljava/lang/String;)I",
+        crate::lang_math::native_integer_parse_int,
+    );
     // The "extras" pack — `gcd`, `shiftLeft/Right`, `and/or/xor/not`,
     // `testBit`, `bitLength/bitCount`, `toByteArray`, `<init>([B)V`,
     // `<init>(I[B)V`, `modPow`, `modInverse`, `intValueExact`,
