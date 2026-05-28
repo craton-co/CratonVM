@@ -8712,11 +8712,31 @@ const BIS_FIELD_POS: usize = 2;
 const BIS_FIELD_COUNT: usize = 3;
 const _BIS_NUM_FIELDS: usize = 4;
 
-// BufferedOutputStream: 3-field synthetic (out=0, buf=1 byte[], count=2)
+// BufferedOutputStream: 3-field synthetic (out=0, buf=1 byte[], count=2).
+// Real-JDK BufferedOutputStream extends FilterOutputStream which has an
+// extra `closed:boolean` field at slot 1, pushing `buf` to slot 2 and
+// `count` to slot 3 in the real layout. Use bos_slots() at runtime to
+// pick the right slot indices; falls back to the legacy 0/1/2 when the
+// class isn't resolvable (synthetic-stub mode).
 const BOS_FIELD_OUT: usize = 0;
 const BOS_FIELD_BUF: usize = 1;
 const BOS_FIELD_COUNT: usize = 2;
 const _BOS_NUM_FIELDS: usize = 3;
+
+/// Resolve BufferedOutputStream's `buf` and `count` slot indices via the
+/// real-JDK class metadata, falling back to the legacy synthetic layout
+/// when the class isn't loaded as a real-JDK class. The `out` slot is
+/// always at absolute index 0 (FilterOutputStream's first instance field
+/// inherits to slot 0 of any subclass) so we don't bother resolving it.
+fn bos_slots(ctx: &dyn NativeContext) -> (usize, usize) {
+    let buf = ctx
+        .resolve_field_index("java/io/BufferedOutputStream", "buf")
+        .unwrap_or(BOS_FIELD_BUF);
+    let count = ctx
+        .resolve_field_index("java/io/BufferedOutputStream", "count")
+        .unwrap_or(BOS_FIELD_COUNT);
+    (buf, count)
+}
 
 fn register_buffered_stream_natives(registry: &mut NativeMethodRegistry) {
     // BufferedInputStream — Wave2 H2 fix:
@@ -8749,7 +8769,7 @@ fn register_buffered_stream_natives(registry: &mut NativeMethodRegistry) {
     registry.register(bos, "write", "(I)V", native_bos_write);
     registry.register(bos, "write", "([BII)V", native_bos_write_bulk);
     registry.register(bos, "flush", "()V", native_bos_flush);
-    registry.register(bos, "close", "()V", native_bos_flush);
+    registry.register(bos, "close", "()V", native_bos_close);
 
     // PipedInputStream/PipedOutputStream — simplified as ByteArrayI/O pair
     let pis = "java/io/PipedInputStream";
@@ -9031,6 +9051,19 @@ fn native_bis_mark_supported(_ctx: &mut dyn NativeContext, _args: &[Value]) -> M
 }
 
 // BufferedOutputStream
+//
+// All natives use `bos_slots()` to resolve `buf` and `count` at runtime
+// rather than the legacy hardcoded slots. Real-JDK BufferedOutputStream
+// extends FilterOutputStream which puts `closed:boolean` at slot 1,
+// shifting `buf` to slot 2 and `count` to slot 3 — using BOS_FIELD_BUF=1
+// and BOS_FIELD_COUNT=2 unconditionally wrote `buf` into `closed` and
+// stored the would-be count in `buf`, so the `buf` field stayed null and
+// every flush iterated 0 elements. DaCapo's `Benchmark.extractFileResource`
+// (which uses BufferedOutputStream around FileOutputStream to copy
+// embedded jars from dacapo.jar to scratch/jar/) wrote 0 bytes for every
+// benchmark, leaving DacapoClassLoader unable to find the benchmark class
+// and surfacing as a cryptic `InvocationTargetException` in
+// `TestHarness.runBenchmark`. Resolving the slots by name fixes the write.
 fn native_bos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -9038,9 +9071,10 @@ fn native_bos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let inner = args.get(1).cloned().unwrap_or(Value::Object(None));
     let buf = ctx.new_array(ArrayElementType::Byte, 8192);
+    let (buf_slot, count_slot) = bos_slots(ctx);
     ctx.set_field(this, BOS_FIELD_OUT, inner);
-    ctx.set_field(this, BOS_FIELD_BUF, Value::Object(Some(buf)));
-    ctx.set_field(this, BOS_FIELD_COUNT, Value::Int(0));
+    ctx.set_field(this, buf_slot, Value::Object(Some(buf)));
+    ctx.set_field(this, count_slot, Value::Int(0));
     Ok(None)
 }
 
@@ -9055,9 +9089,10 @@ fn native_bos_init_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => 8192,
     };
     let buf = ctx.new_array(ArrayElementType::Byte, size.max(1) as usize);
+    let (buf_slot, count_slot) = bos_slots(ctx);
     ctx.set_field(this, BOS_FIELD_OUT, inner);
-    ctx.set_field(this, BOS_FIELD_BUF, Value::Object(Some(buf)));
-    ctx.set_field(this, BOS_FIELD_COUNT, Value::Int(0));
+    ctx.set_field(this, buf_slot, Value::Object(Some(buf)));
+    ctx.set_field(this, count_slot, Value::Int(0));
     Ok(None)
 }
 
@@ -9070,11 +9105,12 @@ fn native_bos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let count = match ctx.get_field(this, BOS_FIELD_COUNT) {
+    let (buf_slot, count_slot) = bos_slots(ctx);
+    let count = match ctx.get_field(this, count_slot) {
         Value::Int(v) => v,
         _ => 0,
     };
-    let buf = match ctx.get_field(this, BOS_FIELD_BUF) {
+    let buf = match ctx.get_field(this, buf_slot) {
         Value::Object(Some(b)) => b,
         _ => return Ok(None),
     };
@@ -9089,7 +9125,7 @@ fn native_bos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         ctx.invoke_virtual(inner, "write", "(I)V", &[Value::Int(byte_val)])?;
     } else {
         ctx.set_array_element(buf, count as usize, Value::Int(byte_val & 0xFF));
-        ctx.set_field(this, BOS_FIELD_COUNT, Value::Int(count + 1));
+        ctx.set_field(this, count_slot, Value::Int(count + 1));
     }
     Ok(None)
 }
@@ -9123,12 +9159,13 @@ fn native_bos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let count = match ctx.get_field(this, BOS_FIELD_COUNT) {
+    let (buf_slot, count_slot) = bos_slots(ctx);
+    let count = match ctx.get_field(this, count_slot) {
         Value::Int(v) => v,
         _ => 0,
     };
     if count > 0 {
-        let buf = match ctx.get_field(this, BOS_FIELD_BUF) {
+        let buf = match ctx.get_field(this, buf_slot) {
             Value::Object(Some(b)) => b,
             _ => return Ok(None),
         };
@@ -9140,7 +9177,36 @@ fn native_bos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             let b = ctx.get_array_element(buf, i);
             ctx.invoke_virtual(inner, "write", "(I)V", &[b])?;
         }
-        ctx.set_field(this, BOS_FIELD_COUNT, Value::Int(0));
+        ctx.set_field(this, count_slot, Value::Int(0));
+    }
+    Ok(None)
+}
+
+/// Real `BufferedOutputStream.close`: flush buffered bytes to the inner
+/// stream, then close the inner stream so its underlying writer (BufWriter
+/// around File in fd_table) actually pushes to disk.
+///
+/// Previously `close` was registered as `native_bos_flush`, which left the
+/// inner FileOutputStream (and its `fd_table` BufWriter) open. For small
+/// writes (< BufWriter capacity, default 8 KB) the bytes never reached disk
+/// — observed as every BufferedOutputStream-wrapped writer producing a
+/// 0-byte file. DaCapo's `Benchmark.extractFileResource` uses exactly this
+/// pattern to copy embedded jars from dacapo.jar to scratch/jar/, so every
+/// benchmark jar ended up 0 bytes and `DacapoClassLoader` couldn't find the
+/// benchmark class — `TestHarness.runBenchmark` then surfaced as a cryptic
+/// `InvocationTargetException` whose root cause was
+/// `ClassNotFoundException: org.dacapo.<bench>.<Main>`.
+fn native_bos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    // 1) Flush the buffered bytes.
+    native_bos_flush(ctx, args)?;
+    // 2) Close the inner stream (matches the JDK
+    //    `try (out) {}` block in BufferedOutputStream.close).
+    if let Value::Object(Some(inner)) = ctx.get_field(this, BOS_FIELD_OUT) {
+        ctx.invoke_virtual(inner, "close", "()V", &[])?;
     }
     Ok(None)
 }
