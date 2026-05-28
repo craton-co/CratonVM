@@ -9370,6 +9370,14 @@ fn execute_invoke_kind(
                             );
                         }
                     }
+                    if std::env::var_os("CRATONVM_DBG_NPE_STACK").is_some() {
+                        let cm = shared.class_manager.read();
+                        eprintln!("[CRATONVM_DBG_NPE_STACK] NPE invoke {}.{}{} — stack:", &*method_class_name, &*method_name, &*method_descriptor);
+                        for (i, f) in thread.frames.iter().enumerate().rev().take(30) {
+                            let cn = cm.get_class(f.class_id).map(|c| c.name.to_string()).unwrap_or_default();
+                            eprintln!("  [{i}] {}.{}{} pc={}", cn, f.method_name(), f.method_descriptor(), f.pc);
+                        }
+                    }
                     return Err(RuntimeError::NullPointerException {
                         message: Some(format!("Cannot invoke {method_name} on null")),
                     }
