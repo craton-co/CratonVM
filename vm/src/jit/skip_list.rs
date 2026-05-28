@@ -1687,6 +1687,32 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("org/eclipse/jdt/internal/compiler/util/HashtableOfPackage", "rehash")
         | ("org/eclipse/jdt/internal/compiler/util/HashtableOfType", "rehash")
         | ("org/eclipse/jdt/internal/compiler/util/HashtableOfModule", "rehash")
+        // bc-math-ec JUnit-3 AllTests SEGV (BC SM2 followup, 2026-05-28)
+        // — when the JIT compiles `junit/textui/TestRunner.main`, the
+        // `new TestRunner; dup; invokespecial <init>; astore_1; aload_1;
+        // invokevirtual start(args)` sequence miscompiles and the next
+        // minor GC walker finds object headers reading byte[] data
+        // (`class_id=36 array_length=54 num_slots=60` in the trace).
+        // Same dup/new/invokespecial/astore pattern that bites
+        // `HashtableOfInt.rehash` above; the regalloc / stack-slot
+        // tracking across the invokespecial likely drops the dup'd
+        // reference. Bisection via
+        // `CRATONVM_JIT_BISECT_ONLY=...,junit/textui/TestRunner` +
+        // `BISECT_SKIP=junit/textui/TestRunner.main` closes the bug.
+        // `--nojit` works; disabling inline-TLAB `new` doesn't.
+        | ("junit/textui/TestRunner", "main")
+        // dacapo-lucene + H2 TestAll SEGV (BC SM2 followup, 2026-05-28)
+        // — bisected via `CRATONVM_JIT_BISECT_ONLY` per-`jdk/internal/`
+        // subpackage: only `jdk/internal/ref/` triggers the SEGV, and
+        // within it the single offending method is `CleanerImpl.run`.
+        // JIT-compiling CleanerImpl.run produces code whose effect at
+        // GC time leaves the walker reading random byte[] data as
+        // object headers (`class_id=1785409400 = 0x6A617661 = "java"`
+        // ASCII signature in the diagnostic dump). CleanerImpl.run is
+        // the Cleaner thread's main loop — it pulls phantom-cleanable
+        // refs off the queue and invokes their thunks. The bug also
+        // fires under H2 TestAll (same root cause, different witness).
+        | ("jdk/internal/ref/CleanerImpl", "run")
     )
 }
 

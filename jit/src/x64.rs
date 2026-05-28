@@ -16258,7 +16258,8 @@ impl Compiler {
                             && self.helpers.tlab_post_init != 0
                             && self.helpers.new_object != 0
                             && total_size <= 256
-                            && self.needs_heap; // need vm_ptr in heap_local slot
+                            && self.needs_heap // need vm_ptr in heap_local slot
+                            && std::env::var_os("CRATONVM_JIT_DISABLE_INLINE_NEW").is_none();
 
                         // Round-8 wave-3: defensive callee-saved spill
                         // before the `new` safepoint (both inline TLAB
