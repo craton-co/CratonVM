@@ -3930,27 +3930,14 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         start_child_noop,
     );
 
-    // Round 60 cont. — Connector.startInternal() fails with NPE in
-    // Thread.priority because our synthetic Thread/TaskThread layout
-    // doesn't wire up the `holder.group` field. Skip the protocol-handler
-    // start; the demo doesn't actually serve requests under CratonVM.
-    fn connector_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        Ok(None)
-    }
-    r.register(
-        "org/apache/catalina/connector/Connector",
-        "startInternal",
-        "()V",
-        connector_noop,
-    );
-    // Same problem path through protocol handler/endpoint — short-circuit
-    // both layers so the LifecycleBase wrapper completes state transitions.
-    r.register(
-        "org/apache/coyote/AbstractProtocol",
-        "start",
-        "()V",
-        connector_noop,
-    );
+    // 2026-05-28 — REMOVED synthetic Connector.startInternal / AbstractProtocol.start
+    // no-op stubs that violated the no-synthetic-stubs policy
+    // (`memory/feedback_no_synthetic_stubs.md`). The previous shims returned
+    // Ok(None) without advancing the lifecycle state, which then caused
+    // LifecycleBase.start() to throw "invalid Lifecycle transition [after_start]
+    // ... in state [STARTING_PREP]" — the exact symptom we were trying to mask.
+    //
+    // The real Tomcat bytecode must run; bugs are fixed at their root in the VM.
 
     // Round 60 cont. — short-circuit TomcatWebServer.start() entirely.
     // We've already constructed the TomcatWebServer in getWebServer(), and
