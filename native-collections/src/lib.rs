@@ -17420,10 +17420,21 @@ fn chm_seg_get(
         Value::Object(Some(arr)) if ctx.heap_kind_of(arr) == ObjectKind::Array => arr,
         _ => return Ok(None),
     };
-    let cap = match ctx.get_field(seg, MAP_FIELD_CAPACITY) {
-        Value::Int(c) => c,
-        _ => return Ok(None),
-    };
+    // Derive cap from the bucket array's length — that's authoritative and
+    // immune to the slot-aliasing problem below. Previously this read
+    // `get_field(seg, MAP_FIELD_CAPACITY)` (= slot 2), which was correct
+    // before the first segment-resize but stale afterwards: `map_resize`
+    // resolves `java/util/HashMap.table` via the real-JDK class metadata —
+    // which puts `table` at absolute slot 2 (after AbstractMap.keySet@0 and
+    // AbstractMap.values@1) — and `set_field_volatile`s the new bucket
+    // array into that slot. Slot 2 then holds `Value::Object(Some(arr))`,
+    // not `Value::Int(cap)`, and this match's `_` arm returned `Ok(None)`
+    // for every subsequent `get` on that segment — silently making every
+    // CHM lookup miss after the first growth (10000-key probe: 0/10000
+    // hits; reproduces BC's `ObjectIdentifier.intern()` "Should be taken
+    // from cache" failure where the pool grows past the resize threshold
+    // and subsequent intern lookups can't find their predecessor).
+    let cap = ctx.array_length(buckets) as i32;
     if cap <= 0 {
         return Ok(None);
     }
