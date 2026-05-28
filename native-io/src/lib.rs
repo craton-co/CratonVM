@@ -2352,6 +2352,52 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Int(v)) => *v as usize,
         _ => 0,
     };
+    // This native is registered on the base `java/io/InputStream` class as a
+    // fallback for synthetic streams (URL.openStream, getResourceAsStream)
+    // that materialise as bare InputStream-typed receivers but actually have
+    // the ByteArrayInputStream layout in slots 0..3. When the receiver is a
+    // genuine InputStream SUBCLASS (e.g. `IndefiniteLengthInputStream`,
+    // `LimitedInputStream`) that overrides `read()` for lookahead /
+    // bookkeeping, the BAIS fast path below misinterprets the subclass's
+    // own slots (slot 0 = wrapped InputStream ref, slot 1/2 = byte
+    // lookahead ints) as data/pos/count and returns -1 — observed as BC's
+    // PKCS12 parser throwing "DEF length 1 object truncated by 1" when
+    // the indefinite-length BER sequence dispatches `read([BII)` on its
+    // 2-byte-lookahead wrapper.
+    //
+    // Guard with a class-name check: if `this` is exactly
+    // `java/io/ByteArrayInputStream` (or one of our synthetic stub
+    // ByteArrayInputStream descendants used by URL/Resource streams), use
+    // the BAIS fast path. Otherwise reproduce `InputStream.read(byte[],
+    // int, int)`'s JDK default impl by looping over the subclass's
+    // overridden `read()I` via virtual dispatch — which is what real-JDK
+    // bytecode would do.
+    let cls_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .unwrap_or_default();
+    let is_bais = cls_name == "java/io/ByteArrayInputStream";
+    if !is_bais {
+        // Match InputStream.read(byte[],int,int) default impl: one read()
+        // call per byte, stop on -1, return count read (or -1 if none).
+        if len == 0 {
+            return Ok(Some(Value::Int(0)));
+        }
+        let mut i: usize = 0;
+        while i < len {
+            match ctx.invoke_virtual(this, "read", "()I", &[])? {
+                Some(Value::Int(-1)) => break,
+                Some(Value::Int(b)) => {
+                    ctx.set_array_element(buf, off + i, Value::Int(b & 0xFF));
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+        if i == 0 {
+            return Ok(Some(Value::Int(-1)));
+        }
+        return Ok(Some(Value::Int(i as i32)));
+    }
     let data = match ctx.get_field(this, BAIS_FIELD_DATA) {
         Value::Object(Some(arr)) => arr,
         _ => return Ok(Some(Value::Int(-1))),
