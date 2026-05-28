@@ -23742,7 +23742,40 @@ fn register_biginteger_arithmetic_overrides(registry: &mut NativeMethodRegistry)
     registry.register(bi, "toString", "()Ljava/lang/String;", native_bi_to_string);
     registry.register(bi, "intValue", "()I", native_bi_int_value);
     registry.register(bi, "longValue", "()J", native_bi_long_value);
+    // `compareTo` — the JDK 25 bytecode walks `mag:[I` word-by-word and uses
+    // `Integer.compareUnsigned`. Our `mag:[I` is populated by `bi_alloc` for
+    // values constructed via Rust natives, but BigIntegers that originate from
+    // JDK bytecode (constants, `valueOf`, hex-string ctor) may take a different
+    // initialization path whose mag-layout disagrees with the unsigned-compare
+    // walk — BC's `ECCurve.Fp.fromBigInteger` then sees `compareTo(q) == 0`
+    // for every value near q and throws "x value invalid for Fp field element"
+    // on every X9 curve point. Route through `bi_compare` (signed decimal
+    // compare via `bi_cmp_unsigned`) which works regardless of mag layout.
+    registry.register(
+        bi,
+        "compareTo",
+        "(Ljava/math/BigInteger;)I",
+        native_bi_compare_to,
+    );
+    // Erased Comparable<BigInteger>.compareTo(Object) bridge.
+    registry.register(
+        bi,
+        "compareTo",
+        "(Ljava/lang/Object;)I",
+        native_bi_compare_to,
+    );
+    registry.register(
+        bi,
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        native_bi_equals,
+    );
 }
+
+// `native_bi_compare_to` and `native_bi_equals` are defined further down in
+// this file (~line 24386 / 24400) inside the synthetic-mode BigInteger
+// register block. They handle the real-JDK `signum`+`mag` layout transparently
+// via `bi_read`, so the same implementations work in both modes.
 
 /// RBIGDEC.1 — register BigDecimal arithmetic + toString overrides for
 /// real-JDK mode.  Same rationale as `register_biginteger_arithmetic_overrides`.
