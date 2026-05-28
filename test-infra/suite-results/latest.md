@@ -10,11 +10,13 @@ Generated 2026-05-28. Times in seconds, wall-clock.
 | h2-driver-probe      | 1/1 — 6.4 s          | 1/1 — 1.0 s          | 1/1 — 1.5 s          |
 | commons-math         | 3204/3204 — 154 s    | 3204/3204 — 96 s     | 3204/3204 — 118 s    |
 | spring-boot-probe    | 1/1 — 2.6 s          | 1/1 — 1.4 s          | 0/1 — 0.9 s †‡       |
-| bc-math-ec           | 7/14 — 491 s †       | 14/14 — 31.3 s       | 14/14 — 52.0 s       |
+| bc-math-ec           | 6/14 — 455 s †       | 14/14 — 57 s         | 14/14 — 52.0 s       |
 | h2-testall           | 0/1 — 122.1 s †§     | 0/1 — 212.1 s §      | (not tested)         |
 | regression-pool      | 14/14 — ~20 s        | n/a                  | n/a                  |
 
-† CratonVM `--nojit` required where noted.
+† JIT enabled. The 6/14 failures are residual EC arithmetic gaps in BC's
+hand-rolled `Mod.modOddInverse` (int[]-based modular inverse) — not the
+JIT bug, which is now skip-listed (`TestRunner.main`).
 ‡ TornadoVM fails on `IncompatibleClassChangeError` in log4j2 lambda — Graal-specific quirk, not CratonVM.
 § Both CratonVM and HotSpot fail H2 TestAll: CratonVM hits the issue #23 JIT family;
 HotSpot has 4 upstream JDK 25 incompat tests (TestFunctions / TestPreparedStatement /
@@ -53,34 +55,47 @@ collection-layout probe).
 - spring-boot-probe 1/1 (1.9× slower)
 
 **CratonVM partial** (suite-specific limitations):
-- bc-math-ec 7/14 (`--nojit`, residual EC arithmetic gaps)
+- bc-math-ec 6/14 (JIT enabled; residual EC arithmetic gaps —
+  `Mod.modOddInverse` int[]-based modular inverse)
 - tomcat-bootstrap (engine starts, HTTP Connector fails)
+- dacapo-lucene (SEGV fixed; now hits a separate reflection issue)
+- h2-testall (SEGV fixed; runs but times out due to large suite size)
 
-**CratonVM red** (JIT issue #23 family):
-- dacapo-lucene (benchmark)
-- bc-math-ec (with JIT)
-- h2-testall
-
-**Recently fixed**:
-- eclipse-ecj-start (with JIT) — was red, now green via
-  `HashtableOfInt.rehash` skip-list (this session).
+**Recently fixed** (this session, JIT corruption family):
+- eclipse-ecj-start (with JIT) → green via `HashtableOfInt.rehash`
+  skip-list
+- bc-math-ec → no more SEGV with JIT, via `TestRunner.main` skip-list
+- dacapo-lucene → no more SEGV, via `CleanerImpl.run` skip-list
+- h2-testall → no more SEGV, via `CleanerImpl.run` skip-list (same
+  underlying bug as dacapo)
 
 ## Open issues per suite
 
-- **eclipse-ecj-start (with JIT)** — **partially fixed** (this session) via
-  targeted skip-list of `HashtableOfInt.rehash` and its Hashtable*
-  siblings. JIT now successfully completes ECJ startup. Root cause of
-  the miscompile inside `rehash`'s body remains unlocated
-  (`--nojit` works; disabling inline-TLAB-`new` still fails; defensive
-  header zero-init still fails) — needs a Windows-side debugger
-  watchpoint on the int[] header bytes between rehash's two field
-  accesses.
-- **dacapo-lucene** / **bc-math-ec** / **h2-testall** — same JIT
-  corruption *family* as #23 but different signatures (class_id /
-  array_length values differ from the ECJ case), suggesting independent
-  trigger sites. Each needs its own bisection. Defensive headers +
-  skip-list bandaids don't help — the corruption happens upstream of
-  the failure site.
+- **eclipse-ecj-start (with JIT)** / **bc-math-ec** / **dacapo-lucene** /
+  **h2-testall** — all **JIT-corruption-fixed** this session via
+  targeted skip-list of three offending methods, bisected via
+  `CRATONVM_JIT_BISECT_ONLY`/`SKIP`:
+  - `org/eclipse/jdt/internal/compiler/util/HashtableOfInt.rehash`
+    (and 6 sibling `HashtableOf*` classes that share the same shape)
+  - `junit/textui/TestRunner.main`
+  - `jdk/internal/ref/CleanerImpl.run`
+  Root-cause investigation is ongoing — all three follow the same
+  pattern (`new X; dup; invokespecial X.<init>` or hot iteration
+  loops), pointing at regalloc / stack-slot tracking across the
+  invokespecial as the underlying defect. Closing that defect would
+  let the skip-listed methods rejoin JIT eligibility.
+- **bc-math-ec (residual 6/14 failures with JIT enabled)** — the
+  remaining test errors are EC arithmetic gaps in BC's hand-rolled
+  `org.bouncycastle.math.raw.Mod.modOddInverse` (int[]-based modular
+  inverse, bypasses BigInteger). Identical to the `--nojit` run from
+  the prior session; unrelated to the JIT family.
+- **dacapo-lucene (residual rc=127)** — after the SEGV fix, a separate
+  reflection issue surfaces: "speculative collection-layout probe
+  dispatched on a non-matching receiver type" during
+  `Luindex.iterate`'s reflective `Method.invoke`. Independent bug.
+- **tomcat-bootstrap** — HTTP Connector startInternal throws something
+  that gets swallowed. Catalina engine itself works. Needs bytecode-
+  level trace of NIO selector / SocketChannel plumbing.
 - **bc-math-ec (`--nojit`)** — even with JIT off, BC's `Mod.modOddInverse`
   (hand-rolled int[]-based modular inverse, bypasses BigInteger) produces
   wrong results for standard NIST curves. `bi_mod_str` sign-preservation

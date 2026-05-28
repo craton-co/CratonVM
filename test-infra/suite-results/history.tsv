@@ -9,6 +9,11 @@ iso_date	suite	variant	rc	pass	total	wall_s	notes
 2026-05-28T11:53:00Z	eclipse-ecj-start	cratonvm	1	0	1	2.55	ArithmeticException /by zero in HashtableOfInt.put due to JIT-corrupted array header (issue #23, upstream JIT bug)
 2026-05-28T14:18:00Z	eclipse-ecj-start	cratonvm	0	1	1	1.88	post-rehash skip-list (issue #23 ECJ fix): BatchCompiler reaches compile(); ok=false from missing JRT FS (separate issue)
 2026-05-28T14:21:00Z	bc-asn1-regression	cratonvm	0	58	58	98.51	post-rehash skip-list; faster after BigInteger fixes settled
+2026-05-28T17:43:00Z	bc-math-ec	cratonvm	1	6	14	454.89	post-TestRunner.main + CleanerImpl.run skip-list: JIT-enabled, NO SEGV (was rc=139 33 s); residual 6 errors + 2 failures are EC arithmetic gaps in BC's hand-rolled Mod.modOddInverse, not JIT
+2026-05-28T17:45:00Z	bc-math-ec	hotspot	0	14	14	56.83	JDK 25 re-baseline after the skip-list landed
+2026-05-28T17:46:00Z	dacapo-lucene	cratonvm	127	0	1	17.06	post-CleanerImpl.run skip: SEGV fixed (was rc=139); now fails on a separate "speculative collection-layout probe" reflection issue at Luindex.iterate
+2026-05-28T17:48:00Z	h2-testall	cratonvm	124	0	1	120.25	post-CleanerImpl.run skip: SEGV fixed (was rc=1 at 122 s with JIT corruption); now times out cleanly during the multi-hundred test run (HotSpot baseline 212 s)
+2026-05-28T17:48:00Z	bc-asn1-regression	cratonvm	0	58	58	153.51	post-CleanerImpl.run skip; bc-asn1 stays green
 2026-05-28T11:53:00Z	eclipse-ecj-start	hotspot	0	1	1	1.15	ok=true; real compile
 2026-05-28T11:53:00Z	eclipse-ecj-start	tornadovm	0	1	1	1.49	ok=true
 2026-05-28T11:55:00Z	dacapo-lucene	cratonvm	139	0	1	18.40	bench-only; SEGV in inline-alloc header init (issue #23 family)
