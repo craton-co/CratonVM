@@ -279,7 +279,7 @@ fn read_java_string_inner(heap: &VmHeap, obj_ref: ObjectRef, _compact_override: 
         Some(ArrayElementType::Byte) => match heap.get_field(obj_ref, 1) {
             // Slot 1 of a real-JDK 9+ String is `coder:byte` (stored as Int
             // on the JVM stack/field) and is ALWAYS 0 (LATIN1) or 1 (UTF16).
-            // Anything else means this receiver is NOT a String. Two common
+            // Anything else means this receiver is NOT a String. Three common
             // collisions we MUST reject here:
             //
             //   • `ASN1ObjectIdentifier` (`contents:[B` + `identifier:String`)
@@ -288,18 +288,23 @@ fn read_java_string_inner(heap: &VmHeap, obj_ref: ObjectRef, _compact_override: 
             //   • `ASN1ObjectIdentifier$OidHandle` and similar
             //     byte-array-payload key classes (`contents:[B` +
             //     `contentsLength:I` + `key:I`) — slot 1 is an Int but its
-            //     value is the array length, not a coder. Without this guard
-            //     we feed `contentsLength` to `decode_java_string_value_array`
-            //     and read the byte[] as UTF-16-LE (any non-zero coder falls
-            //     into the UTF-16 branch). Every OID whose contents share
-            //     bytes 0..2 — i.e. every `2.5.4.x` OID, all of BCStyle's
-            //     X.500 attribute identifiers — then collapses to the same
-            //     decoded char, the same `map_hash_key`, and the same
-            //     `map_keys_equal`, so `BCStyle.DefaultLookUp` ends up with
-            //     one entry holding the LAST OID interned. Result: every
-            //     `attrNameToOID("cn"/"o"/"cn"/...)` returns the same wrong
-            //     instance, and `getId()` reports e.g. "2.5.4.6" for `CN`.
-            Value::Int(c) if c == CODER_LATIN1 || c == CODER_UTF16 => c,
+            //     value is the array length, not a coder.
+            //
+            //   • `ASN1Integer` (`bytes:[B` + `start:I` where `start==0`
+            //     for any small value) — coder check alone passes (0 ==
+            //     LATIN1). The additional `num_fields >= 4` test below
+            //     rejects it: real-JDK 9+ String has exactly 4 fields
+            //     (value, coder, hash, hashIsZero) and ASN1Integer has 2.
+            //
+            // Without these guards, ASN1Integer's `toString()` for value 9
+            // returned the tab character "\t" (Latin-1 decode of byte[9]),
+            // surfacing in BC ASN.1's DLExternalTest as a mismatch between
+            // the printed "\t" and the expected "9".
+            Value::Int(c) if (c == CODER_LATIN1 || c == CODER_UTF16)
+                && heap.num_fields(obj_ref) >= 4 =>
+            {
+                c
+            }
             _ => return None,
         },
         _ => CODER_LATIN1,
