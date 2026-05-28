@@ -414,6 +414,30 @@ fn string_from_bytes_utf8(
     Ok(None)
 }
 
+/// Build a JVM String from `bytes` decoded with the named charset and copy
+/// its layout onto `this`.
+///
+/// Routes through the same `engine::decode_bytes_lossy` path that
+/// `CharsetDecoder.decode` uses, so ISO-8859-1 / Latin-1 / windows-12xx etc.
+/// produce the spec-correct chars instead of UTF-8-substituted U+FFFD.
+///
+/// Empty/unrecognised charset names fall back to UTF-8 (matching the
+/// `normalize_charset_name` → `decode_str_named` empty-name fallback).
+fn string_from_bytes_with_charset(
+    ctx: &mut dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    bytes: &[u8],
+    charset_name: &str,
+) -> MethodCallResult {
+    let text = crate::charset::decode_str_named(charset_name, bytes);
+    let str_obj = ctx.create_string(&text);
+    let value = ctx.get_field(str_obj, 0);
+    let coder = ctx.get_field(str_obj, 1);
+    ctx.set_field(this, 0, value);
+    ctx.set_field(this, 1, coder);
+    Ok(None)
+}
+
 /// `<init>([B)V` — `new String(byte[])`.
 fn native_string_init_bytes(
     ctx: &mut dyn NativeContext,
@@ -470,7 +494,8 @@ fn native_string_init_bytes_charset_name(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let arr = obj_arg(args, 1)?;
-    // args[2] = charset name String — ignored per docstring above.
+    let charset_obj = obj_arg(args, 2)?;
+    let charset_name = ctx.read_string(charset_obj).unwrap_or_default();
     let len = ctx.array_length(arr);
     let mut bytes = Vec::with_capacity(len);
     for i in 0..len {
@@ -478,7 +503,7 @@ fn native_string_init_bytes_charset_name(
             bytes.push(b as u8);
         }
     }
-    string_from_bytes_utf8(ctx, this, &bytes)
+    string_from_bytes_with_charset(ctx, this, &bytes, &charset_name)
 }
 
 /// `<init>([BIILjava/lang/String;)V` — `new String(byte[], int offset,
@@ -491,7 +516,8 @@ fn native_string_init_bytes_off_len_charset_name(
     let arr = obj_arg(args, 1)?;
     let offset = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
     let count = match args.get(3) { Some(Value::Int(v)) => *v as usize, _ => 0 };
-    // args[4] = charset name String — ignored (UTF-8 lossy).
+    let charset_obj = obj_arg(args, 4)?;
+    let charset_name = ctx.read_string(charset_obj).unwrap_or_default();
     let arr_len = ctx.array_length(arr);
     if offset + count > arr_len {
         return Err(RuntimeError::ArrayIndexOutOfBoundsException {
@@ -505,7 +531,7 @@ fn native_string_init_bytes_off_len_charset_name(
             bytes.push(b as u8);
         }
     }
-    string_from_bytes_utf8(ctx, this, &bytes)
+    string_from_bytes_with_charset(ctx, this, &bytes, &charset_name)
 }
 
 /// `<init>([BLjava/nio/charset/Charset;)V` — `new String(byte[], Charset)`.
@@ -515,6 +541,11 @@ fn native_string_init_bytes_charset(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let arr = obj_arg(args, 1)?;
+    let cs_obj = obj_arg(args, 2)?;
+    let charset_name = match ctx.get_field(cs_obj, crate::CHARSET_FIELD_NAME) {
+        Value::Object(Some(name_obj)) => ctx.read_string(name_obj).unwrap_or_default(),
+        _ => String::new(),
+    };
     let len = ctx.array_length(arr);
     let mut bytes = Vec::with_capacity(len);
     for i in 0..len {
@@ -522,7 +553,7 @@ fn native_string_init_bytes_charset(
             bytes.push(b as u8);
         }
     }
-    string_from_bytes_utf8(ctx, this, &bytes)
+    string_from_bytes_with_charset(ctx, this, &bytes, &charset_name)
 }
 
 /// `<init>([BIILjava/nio/charset/Charset;)V` — `new String(byte[], int
@@ -535,6 +566,11 @@ fn native_string_init_bytes_off_len_charset(
     let arr = obj_arg(args, 1)?;
     let offset = match args.get(2) { Some(Value::Int(v)) => *v as usize, _ => 0 };
     let count = match args.get(3) { Some(Value::Int(v)) => *v as usize, _ => 0 };
+    let cs_obj = obj_arg(args, 4)?;
+    let charset_name = match ctx.get_field(cs_obj, crate::CHARSET_FIELD_NAME) {
+        Value::Object(Some(name_obj)) => ctx.read_string(name_obj).unwrap_or_default(),
+        _ => String::new(),
+    };
     let arr_len = ctx.array_length(arr);
     if offset + count > arr_len {
         return Err(RuntimeError::ArrayIndexOutOfBoundsException {
@@ -548,7 +584,7 @@ fn native_string_init_bytes_off_len_charset(
             bytes.push(b as u8);
         }
     }
-    string_from_bytes_utf8(ctx, this, &bytes)
+    string_from_bytes_with_charset(ctx, this, &bytes, &charset_name)
 }
 
 // ---------------------------------------------------------------------------
