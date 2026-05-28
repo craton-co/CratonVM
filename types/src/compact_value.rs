@@ -641,7 +641,18 @@ impl CompactValue {
                     Value::Long(self.0 as i64)
                 }
             }
-            SUB_RETADDR => Value::ReturnAddress(payload as u32),
+            SUB_RETADDR => {
+                // Real return addresses fit in u32 (`CompactValue::return_address`
+                // stores `pc as u64` from a u32 pc, so payload bits 32-46 are
+                // always 0). A SUB_RETADDR bit pattern with payload bits 32-46
+                // set is a long-bit-pattern collision (BC SM2 fix 2026-05-28)
+                // — preserve the long bits rather than truncating to u32.
+                if payload >> 32 == 0 {
+                    Value::ReturnAddress(payload as u32)
+                } else {
+                    Value::Long(self.0 as i64)
+                }
+            }
             SUB_LONG_LO | SUB_LONG_HI => Value::Long(self.0 as i64),
             _ => unreachable!(),
         }

@@ -1,0 +1,4 @@
+iso_date	suite	variant	rc	pass	total	wall_s	notes
+2026-05-28T11:50:00Z	bc-asn1-regression	cratonvm	0	58	58	141.86	post-NaN-box-fix; SUB_OBJECT/NULL/UNINIT/RETADDR collisions decode as Long when payload disambiguates
+2026-05-28T11:50:00Z	bc-asn1-regression	hotspot	0	58	58	0.91	JDK 25
+2026-05-28T11:50:00Z	bc-asn1-regression	tornadovm	0	58	58	3.38	Graal + PTX argfile
