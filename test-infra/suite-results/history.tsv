@@ -6,7 +6,7 @@ iso_date	suite	variant	rc	pass	total	wall_s	notes
 2026-05-28T11:52:00Z	h2-driver-probe	hotspot	0	1	1	0.97	JDK 25
 2026-05-28T11:52:00Z	h2-driver-probe	tornadovm	0	1	1	1.48	Graal + PTX argfile
 2026-05-28T11:53:00Z	eclipse-ecj-start	cratonvm-nojit	0	1	1	1.62	BatchCompiler reaches compile(); ok=false due to missing JRT FS provider (separate issue, unrelated to startup)
-2026-05-28T11:53:00Z	eclipse-ecj-start	cratonvm	1	0	1	2.55	ArithmeticException /by zero in HashtableOfInt.put due to JIT-corrupted array header (issue #23, upstream JIT bug — not in HashtableOfInt itself)
+2026-05-28T11:53:00Z	eclipse-ecj-start	cratonvm	1	0	1	2.55	ArithmeticException /by zero in HashtableOfInt.put due to JIT-corrupted array header (issue #23, upstream JIT bug)
 2026-05-28T11:53:00Z	eclipse-ecj-start	hotspot	0	1	1	1.15	ok=true; real compile
 2026-05-28T11:53:00Z	eclipse-ecj-start	tornadovm	0	1	1	1.49	ok=true
 2026-05-28T11:55:00Z	dacapo-lucene	cratonvm	139	0	1	18.40	bench-only; SEGV in inline-alloc header init (issue #23 family)
@@ -17,7 +17,15 @@ iso_date	suite	variant	rc	pass	total	wall_s	notes
 2026-05-28T11:57:00Z	commons-math	hotspot	0	3204	3204	96.00	1:36min; 30 skipped; 3 flakes
 2026-05-28T12:07:00Z	commons-math	tornadovm	0	3204	3204	118.00	1:58min; 30 skipped; 4 flakes
 2026-05-28T11:58:00Z	bc-math-ec	cratonvm	139	0	14	33.09	SEGV in inline-alloc header init (kind=Object but array_length=54) - same JIT family as DaCapo (issue #23/#6)
-2026-05-28T11:58:00Z	bc-math-ec	cratonvm-nojit	1	7	14	360.00	progresses without JIT crash but 7 tests fail with "BigInteger not invertible" / "Inverse does not exist" - modular-inverse data-correctness gap
+2026-05-28T11:58:00Z	bc-math-ec	cratonvm-nojit	1	7	14	360.00	7 tests fail with "BigInteger not invertible" / "Inverse does not exist" - modular-inverse data-correctness gap
 2026-05-28T11:58:00Z	bc-math-ec	hotspot	0	14	14	31.27	OK (14 tests)
 2026-05-28T11:58:00Z	bc-math-ec	tornadovm	0	14	14	52.00	OK (14 tests)
-2026-05-28T12:20:00Z	bc-math-ec	cratonvm-nojit	1	7	14	491.44	post-bi_mod_str sign fix: 7/14 pass (was same count); residual 6 errors + 1 failure trace into deeper EC arithmetic gaps (testFixedPointMultiplier mismatched standard-curve coords; ECAlgorithmsTest sums of multiplies)
+2026-05-28T12:20:00Z	bc-math-ec	cratonvm-nojit	1	7	14	491.44	post-bi_mod_str sign fix; residual 6 errors + 1 failure trace into deeper EC arithmetic gaps (BC's hand-rolled Mod.modOddInverse on int[], not BigInteger.modPow)
+2026-05-28T12:30:00Z	h2-testall	cratonvm	1	0	1	122.10	JIT corruption family (issue #23): stale receiver pointer, all-zero headers, NPE in TestAll.main
+2026-05-28T12:30:00Z	h2-testall	hotspot	1	0	1	212.09	4 upstream FAILs (TestFunctions/TestPreparedStatement/TestCrashAPI/TestOutOfMemory) — known H2/JDK25 incompats
+2026-05-28T12:35:00Z	tomcat-bootstrap	cratonvm	124	0	1	30.21	server engine starts in 252ms but HTTP Connector ["http-nio-8080"] fails: LifecycleException "invalid Lifecycle transition [after_start] for component in state [STARTING_PREP]" — startInternal threw and was swallowed
+2026-05-28T12:35:00Z	tomcat-bootstrap	hotspot	124	1	1	15.22	Server startup in [1368] milliseconds — clean start; rc=124 only because we timed out on the running server
+2026-05-28T12:35:00Z	tomcat-bootstrap	tornadovm	124	1	1	30.22	Server startup in [8530] milliseconds — clean start (slow Graal warmup); rc=124 only because we timed out on running server
+2026-05-28T12:40:00Z	spring-boot-probe	cratonvm	0	1	1	2.63	commons-logging on cp (real jar from hadoop) — SpringApplicationBuilder + @Configuration + bean retrieval round-trip
+2026-05-28T12:40:00Z	spring-boot-probe	hotspot	0	1	1	1.35	commons-logging on cp
+2026-05-28T12:40:00Z	spring-boot-probe	tornadovm	1	0	1	0.90	IncompatibleClassChangeError on log4j2 PropertiesUtil lambda: Graal lambda-impl-class doesn't match BiConsumer — TornadoVM-specific issue, not CratonVM-related
