@@ -826,6 +826,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // never touched at runtime.
     register_biginteger_arithmetic_overrides(registry);
     register_bigdecimal_arithmetic_overrides(registry);
+    // The "extras" pack — `gcd`, `shiftLeft/Right`, `and/or/xor/not`,
+    // `testBit`, `bitLength/bitCount`, `toByteArray`, `<init>([B)V`,
+    // `<init>(I[B)V`, `modPow`, `modInverse`, `intValueExact`,
+    // `longValueExact`, `isProbablePrime`. Previously only registered in
+    // synthetic-JDK mode via `register_builtins`. In real-JDK mode the
+    // JDK bytecode bodies for these methods depend on intrinsics / DRBG
+    // plumbing we don't fully model — `isProbablePrime` returns false for
+    // every prime ≥ ~63 bits (Miller-Rabin path), which surfaces as
+    // BC's `ECCurve.Fp.<init>` throwing "Fp q value not prime" for SM2
+    // and X9 curves. Our string-decimal helpers (sweep landed alongside
+    // this commit, follow-up to 958baae) preserve full precision.
+    crate::phases_late::register_p71_biginteger_extras(registry);
 
     // Spring Boot loader in real-JDK mode can resolve Pattern natives through
     // synthetic-stub dispatch paths before/without usable JDK bytecode
