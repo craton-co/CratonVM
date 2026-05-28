@@ -24,10 +24,12 @@ TestCrashAPI / TestOutOfMemory — known per `continue_prompt.md`).
 
 | Suite                | CratonVM (rc, time)  | HotSpot (time)       | TornadoVM (time)     |
 |----------------------|----------------------|----------------------|----------------------|
-| eclipse-ecj-start    | starts† — 1.6 s      | ok=true — 1.2 s      | ok=true — 1.5 s      |
+| eclipse-ecj-start    | starts — 1.9 s †     | ok=true — 1.2 s      | ok=true — 1.5 s      |
 | tomcat-bootstrap     | partial‡ — 30 s      | clean — 1.4 s        | clean — 8.5 s        |
 
-† `--nojit` required. With JIT, issue #23 fires inside `HashtableOfInt.put`.
+† **JIT now enabled** — `HashtableOfInt.rehash` and siblings are skip-listed
+(issue #23 partial fix). BatchCompiler reaches `compile(...)`; `ok=false`
+because JRT FileSystem provider isn't wired (separate issue).
 ‡ Catalina engine starts in 252 ms but HTTP Connector fails:
 `LifecycleException: invalid Lifecycle transition [after_start] in state [STARTING_PREP]`
 — `startInternal` threw and was swallowed before the state advanced.
@@ -52,24 +54,33 @@ collection-layout probe).
 
 **CratonVM partial** (suite-specific limitations):
 - bc-math-ec 7/14 (`--nojit`, residual EC arithmetic gaps)
-- eclipse-ecj-start (`--nojit`)
 - tomcat-bootstrap (engine starts, HTTP Connector fails)
 
 **CratonVM red** (JIT issue #23 family):
 - dacapo-lucene (benchmark)
 - bc-math-ec (with JIT)
-- eclipse-ecj-start (with JIT)
 - h2-testall
+
+**Recently fixed**:
+- eclipse-ecj-start (with JIT) — was red, now green via
+  `HashtableOfInt.rehash` skip-list (this session).
 
 ## Open issues per suite
 
-- **eclipse-ecj-start (with JIT)** / **dacapo-lucene** / **bc-math-ec** /
-  **h2-testall** — all hit the same JIT inline-allocate-then-putfield
-  miscompile family documented in `continue_prompt.md` issue #23 / #6.
-  Manifests as `kind=Object && array_length=<garbage>` walker corruption;
-  needs a Windows-side debugger watchpoint (lldb/windbg) to localise the
-  responsible codegen path. Defensive headers + skip-list bandaids don't
-  help — the corruption happens upstream of the failure site.
+- **eclipse-ecj-start (with JIT)** — **partially fixed** (this session) via
+  targeted skip-list of `HashtableOfInt.rehash` and its Hashtable*
+  siblings. JIT now successfully completes ECJ startup. Root cause of
+  the miscompile inside `rehash`'s body remains unlocated
+  (`--nojit` works; disabling inline-TLAB-`new` still fails; defensive
+  header zero-init still fails) — needs a Windows-side debugger
+  watchpoint on the int[] header bytes between rehash's two field
+  accesses.
+- **dacapo-lucene** / **bc-math-ec** / **h2-testall** — same JIT
+  corruption *family* as #23 but different signatures (class_id /
+  array_length values differ from the ECJ case), suggesting independent
+  trigger sites. Each needs its own bisection. Defensive headers +
+  skip-list bandaids don't help — the corruption happens upstream of
+  the failure site.
 - **bc-math-ec (`--nojit`)** — even with JIT off, BC's `Mod.modOddInverse`
   (hand-rolled int[]-based modular inverse, bypasses BigInteger) produces
   wrong results for standard NIST curves. `bi_mod_str` sign-preservation
