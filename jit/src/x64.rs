@@ -17294,8 +17294,32 @@ pub fn compile_with_param_slots(
         return None;
     }
 
-    // Build the CompiledMethod with OSR metadata
+    // Build the CompiledMethod with OSR metadata.
+    //
+    // `has_dispatch` gates the interpreter's compiled-entry fast path
+    // (`interpreter.rs`: `if !compiled.has_dispatch { ... }`), which skips
+    // `set_jit_thread`. That TLS pointer is what the dispatch helpers
+    // (`jit_invoke_dispatch` / `jit_invoke_virtual_mic`) read via
+    // `jit_thread_mut()`; when it is null they short-circuit and return 0.
+    //
+    // A method with `direct_calls` makes machine-level `CALL`s into other
+    // compiled callees WITHOUT crossing a Rust boundary that could set the
+    // TLS. Those callees inherit whatever `JIT_THREAD` the caller was
+    // entered with, and may themselves dispatch (or transitively call a
+    // method that does). So a method whose only inter-method calls are
+    // direct calls must STILL be entered through the slow path that sets
+    // `JIT_THREAD` — otherwise the callee's dispatch helper sees a null
+    // thread and silently returns 0.
+    //
+    // This was the `Character.getType(char)` miscompile: its sole call,
+    // `invokestatic Character.getType(int)`, resolved to a `direct_call`,
+    // leaving `invoke_info` empty. The fast path skipped `set_jit_thread`,
+    // so the directly-called `getType(int)` ran with a null thread and its
+    // `CharacterData.of(...)` / `getType(...)` dispatches returned 0 →
+    // `Character.getType` returned UNASSIGNED for every Latin-1 letter once
+    // JIT-compiled.
     let has_dispatch = !compiler.invoke_info.is_empty()
+        || !compiler.direct_calls.is_empty()
         || !compiler.bounds_check_stubs.is_empty()
         || !compiler.null_check_store_stubs.is_empty();
     let mut cm = if needs_heap {
