@@ -17,8 +17,8 @@ JDK="C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot"
 # few common spots; if absent, those suites are skipped (reported rc=SKIP).
 JUNIT=""
 for cand in \
-  "$ROOT"/apps/_test-suites/**/junit*.jar \
-  "$ROOT"/apps/**/junit-3*.jar \
+  "$ROOT/apps/_test-suites/junit-3.8.2.jar" \
+  "$ROOT/apps/_test-suites/bc-java/libs/junit-4.13.2.jar" \
   "$HOME"/.m2/repository/junit/junit/3.8.2/junit-3.8.2.jar \
   "$TEMP"/junit-3.8.2.jar \
   /c/Users/*/AppData/Local/Temp/junit-3.8.2.jar ; do
