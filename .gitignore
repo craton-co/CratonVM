@@ -77,9 +77,6 @@ Thumbs.db
 # Claude Code
 .claude/
 
-# Internal-only docs (not for OSS distribution)
-docs/internal/
-
 # Application logs
 applogs/
 
