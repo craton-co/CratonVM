@@ -331,6 +331,69 @@ fn validate_class_name(name: &str) -> Result<()> {
 /// Returns a new classpath list with the substitutions applied.  A warning is
 /// emitted to stderr when a substitution occurs so the user knows what
 /// happened.
+/// Cheap sniff for whether `jar_path` looks like a Quarkus fast-jar /
+/// runner packaging, used to decide whether the expensive multi-dir
+/// classpath walk (the `app/quarkus/lib/...` probe in `run()`) is worth
+/// running. A real Quarkus app always ships one of these signature
+/// artifacts next to the runner jar:
+///
+///   * `quarkus-run.jar` — the canonical fast-jar launcher;
+///   * `quarkus-app/` — the fast-jar output directory;
+///   * a `quarkus/` subdir — holds `quarkus-application.dat` +
+///     `generated-bytecode.jar`;
+///   * `quarkus-application.dat` — the serialized bootstrap metadata.
+///
+/// We check the jar's own directory AND its parent (Keycloak puts the
+/// runner one level deep in `lib/`), mirroring the two `roots` the walk
+/// itself probes. Each check is a single `Path::exists()` stat — far
+/// cheaper than the `canonicalize` + `read_dir` of ~10 candidate dirs the
+/// walk performs. For a trivial non-Quarkus HelloWorld jar this returns
+/// `false` after at most a handful of stats, skipping the walk entirely.
+///
+/// Conservative by design: any false positive merely re-enables the same
+/// walk that previously always ran, so real Quarkus behaviour is never
+/// degraded.
+fn quarkus_signature_present(jar_path: &std::path::Path) -> bool {
+    // Signature file/dir names looked for in each candidate directory.
+    const SIGNATURES: &[&str] = &[
+        "quarkus-run.jar",
+        "quarkus-app",
+        "quarkus",
+        "quarkus-application.dat",
+    ];
+
+    // The runner jar's own dir, plus its parent (one-level-deep packagings
+    // such as Keycloak's `lib/quarkus-run.jar`). No canonicalisation: a
+    // relative `jar_path` still has a usable parent chain for `.join()`,
+    // and `exists()` resolves relative paths against the cwd just fine.
+    let mut dirs: Vec<&std::path::Path> = Vec::with_capacity(2);
+    if let Some(d) = jar_path.parent() {
+        // `Path::parent()` of a bare basename is `Some("")`; treat the
+        // empty path as "current directory" so the stats still hit.
+        dirs.push(if d.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            d
+        });
+        if let Some(pp) = d.parent() {
+            if !pp.as_os_str().is_empty() {
+                dirs.push(pp);
+            }
+        }
+    } else {
+        dirs.push(std::path::Path::new("."));
+    }
+
+    for dir in dirs {
+        for sig in SIGNATURES {
+            if dir.join(sig).exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn expand_aggregate_jars(entries: Vec<String>) -> Vec<String> {
     // (aggregate_file_name, split_prefix) pairs.  The split prefix is
     // matched case-insensitively against sibling file names.
@@ -1123,7 +1186,18 @@ fn run() -> Result<()> {
         // its parent. Probe BOTH the jar's own dir AND its parent, since
         // Keycloak packaging puts quarkus-run.jar in lib/ (one level deep),
         // whereas the canonical Quarkus packaging puts it at the project root.
-        {
+        //
+        // PERF: the multi-dir `canonicalize` + `read_dir` walk below is
+        // only meaningful for Quarkus packagings, but it used to run on
+        // EVERY `-jar` startup — ~10 stat/read_dir syscalls even for a
+        // trivial HelloWorld jar. Gate it behind a cheap "is this actually
+        // a Quarkus app" sniff so non-Quarkus jars skip the walk entirely.
+        // The sniff is a handful of `Path::exists()` stats next to the jar
+        // (and one dir-parent up), which is far cheaper than canonicalising
+        // and reading 5 candidate dirs across 2 roots. Real Quarkus apps
+        // always ship one of these signature artifacts, so their behaviour
+        // is unchanged.
+        if quarkus_signature_present(jar_path) {
             let canon_jar = std::fs::canonicalize(jar_path)
                 .unwrap_or_else(|_| jar_path.to_path_buf());
             let jar_dir = canon_jar.parent().map(|p| p.to_path_buf());
@@ -1454,6 +1528,29 @@ fn run() -> Result<()> {
     // `--stack-dump-on-timeout=N` (with N suitably large) or set
     // `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1` — the same way they pass
     // explicit `-Xmx` instead of relying on heap defaults.
+    // PERF: the native-call ring + dispatch-trace ring record on EVERY
+    // native-method entry while enabled (a relaxed AtomicBool load on the
+    // hot path, plus a parking_lot::Mutex + timestamp when on). They used
+    // to be armed whenever ANY watchdog was active — which, since the
+    // default 120s watchdog is armed for every run, meant every short-lived
+    // CLI invocation paid the per-native-call recording cost even though
+    // the rings are only ever *read* by the watchdog's "0 Java threads
+    // dumped" native-hang fallback.
+    //
+    // Gate the ring recording behind an EXPLICIT diagnostic request:
+    //   * `--stack-dump-on-timeout=N` (N>0) supplied on the CLI, or
+    //   * `CRATONVM_ENABLE_NATIVE_RING=1` for callers who want the rings
+    //     under the implicit default watchdog without changing the timeout.
+    //
+    // The implicit default watchdog keeps its core function intact: it
+    // still aborts the process and still triggers `request_stack_dump`
+    // (the Java-frame dump path is wholly independent of the rings). Only
+    // the deeper "all threads parked in native Rust" ring detail is opt-in
+    // now — and that fallback already prints the PID, the watchdog's own
+    // native backtrace, and an attach-a-debugger hint regardless.
+    let explicit_watchdog = matches!(args.stack_dump_on_timeout, Some(s) if s > 0);
+    let ring_recording_requested = explicit_watchdog
+        || std::env::var("CRATONVM_ENABLE_NATIVE_RING").ok().as_deref() == Some("1");
     let effective_watchdog = match args.stack_dump_on_timeout {
         Some(s) if s > 0 => Some(s),
         Some(_) => None, // explicit `--stack-dump-on-timeout=0` disables
@@ -1486,15 +1583,20 @@ fn run() -> Result<()> {
         // `dump_to_stderr` reports "recording disabled" and a hang in
         // pure Rust runtime code has no actionable diagnostic.
         // Recording cost (single relaxed AtomicBool load on entry, plus
-        // a parking_lot::Mutex when set) is negligible compared to the
-        // value of identifying the hang site on intermittent hangs.
-        cratonvm_native_api::native_ring::enable(true);
-        // T19.H1 — also enable the dispatch-trace ring. The native-call
-        // ring records only opaque fn-pointers from two dispatch sites;
-        // the dispatch trace records *named* class.method.desc for every
-        // bytecode-method entry and every `safe_native_call`, which is
-        // the actionable diagnostic for "main thread is in native code".
-        cratonvm_vm::dispatch_trace::enable();
+        // a parking_lot::Mutex when set) is negligible per call but adds
+        // up across a full run, so we only arm it when a diagnostic was
+        // EXPLICITLY requested (see `ring_recording_requested` above). The
+        // implicit default watchdog still aborts + dumps Java frames; the
+        // ring detail is reserved for runs that asked for it.
+        if ring_recording_requested {
+            cratonvm_native_api::native_ring::enable(true);
+            // T19.H1 — also enable the dispatch-trace ring. The native-call
+            // ring records only opaque fn-pointers from two dispatch sites;
+            // the dispatch trace records *named* class.method.desc for every
+            // bytecode-method entry and every `safe_native_call`, which is
+            // the actionable diagnostic for "main thread is in native code".
+            cratonvm_vm::dispatch_trace::enable();
+        }
         let shared_for_watchdog = std::sync::Arc::clone(&vm.shared);
         // RKC16N.5 — capture the audit-dump paths into the watchdog
         // thread so a hung run still produces a missing-natives
@@ -1575,6 +1677,20 @@ fn run() -> Result<()> {
                          thread; FYI only) ---\n{bt}\n--- end native \
                          backtrace ---"
                     );
+                    // PERF: ring recording is opt-in now (see
+                    // `ring_recording_requested`). If it wasn't requested,
+                    // the ring dumps below will say "recording disabled";
+                    // tell the operator how to capture them next time so
+                    // the diagnostic isn't a dead end.
+                    if !ring_recording_requested {
+                        eprintln!(
+                            "=== T19.H1 watchdog: native-call/dispatch \
+                             rings were not recording (opt-in). Re-run with \
+                             `--stack-dump-on-timeout=N` or \
+                             `CRATONVM_ENABLE_NATIVE_RING=1` to capture the \
+                             last native methods leading up to the hang. ==="
+                        );
+                    }
                     // KC-watchdog-native: dump the native-call ring
                     // buffer. The last entry with `STILL-IN-NATIVE`
                     // marks the hang site.
@@ -3031,6 +3147,69 @@ mod tests {
         let entry = aggregate.to_string_lossy().into_owned();
         let expanded = expand_aggregate_jars(vec![entry.clone()]);
         assert_eq!(expanded, vec![entry]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // -----------------------------------------------------------------------
+    // quarkus_signature_present tests — PERF gate for the multi-dir
+    // classpath walk. A plain jar must NOT trip the sniff; the canonical
+    // Quarkus signature artifacts (and the Keycloak one-level-deep layout)
+    // MUST.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quarkus_sniff_false_for_plain_jar() {
+        let dir = unique_temp_dir("qsniff-plain");
+        let jar = dir.join("hello.jar");
+        std::fs::write(&jar, b"pk").unwrap();
+        assert!(
+            !quarkus_signature_present(&jar),
+            "a plain jar with no Quarkus artifacts must skip the walk"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quarkus_sniff_true_for_quarkus_run_jar_sibling() {
+        let dir = unique_temp_dir("qsniff-run");
+        let jar = dir.join("app.jar");
+        std::fs::write(&jar, b"pk").unwrap();
+        std::fs::write(dir.join("quarkus-run.jar"), b"pk").unwrap();
+        assert!(
+            quarkus_signature_present(&jar),
+            "quarkus-run.jar next to the jar must enable the walk"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quarkus_sniff_true_for_quarkus_subdir() {
+        let dir = unique_temp_dir("qsniff-subdir");
+        let jar = dir.join("app.jar");
+        std::fs::write(&jar, b"pk").unwrap();
+        std::fs::create_dir_all(dir.join("quarkus")).unwrap();
+        assert!(
+            quarkus_signature_present(&jar),
+            "a quarkus/ subdir must enable the walk"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quarkus_sniff_true_for_parent_dir_signature() {
+        // Keycloak packaging puts quarkus-run.jar one level up from the
+        // runner jar (which lives in lib/). The sniff probes the parent.
+        let dir = unique_temp_dir("qsniff-parent");
+        let lib = dir.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        let jar = lib.join("quarkus-run.jar");
+        std::fs::write(&jar, b"pk").unwrap();
+        // Signature artifact lives in the PARENT (dir), not lib/.
+        std::fs::write(dir.join("quarkus-application.dat"), b"x").unwrap();
+        assert!(
+            quarkus_signature_present(&jar),
+            "a signature in the jar's parent dir must enable the walk"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

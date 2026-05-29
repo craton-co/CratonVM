@@ -66,6 +66,13 @@ fn dbg_kcbool() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_KCBOOL").is_some())
 }
 
+/// `true` iff `CRATONVM_DBG_HMPUT` is set (HashMap put node-walk tracing).
+/// Cached to avoid a syscall-backed env probe per node on the hot put path.
+fn dbg_hmput() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_DBG_HMPUT").is_some())
+}
+
 /// Diagnostic: on an enum-keyed `Map.get` miss, dump the lookup key's enum
 /// identity and every node's enum identity in the map. `nodes` is an iterator
 /// of `(node_key_ref)` for each entry currently in the map.
@@ -2859,7 +2866,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             .into());
         }
         let node_key_field = get_node_key(ctx, node);
-        if std::env::var("CRATONVM_DBG_HMPUT").is_ok() {
+        if dbg_hmput() {
             eprintln!("[HMPUT] walk node_key_field={:?} key_ref={:?} hash_arg={} is_null={}", node_key_field, key_ref, hash, is_null_key);
         }
         if is_null_key {
@@ -2875,7 +2882,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             }
         } else if let Value::Object(Some(node_key)) = node_key_field {
             let eq = map_keys_equal(ctx, node_key, key_ref.unwrap())?;
-            if std::env::var("CRATONVM_DBG_HMPUT").is_ok() {
+            if dbg_hmput() {
                 eprintln!("[HMPUT] map_keys_equal(node_key={:?}, key={:?}) = {}", node_key, key_ref.unwrap(), eq);
             }
             if eq {
@@ -23623,6 +23630,17 @@ mod tests {
 
     // Unit tests for helper functions only.
     // Integration tests are in vm.rs since they need the full VM.
+
+    #[test]
+    fn dbg_hmput_matches_env_presence() {
+        // The cached helper must report exactly "env var is set" — identical
+        // truthiness to the original `env::var(...).is_ok()` check.
+        use super::dbg_hmput;
+        let expected = std::env::var_os("CRATONVM_DBG_HMPUT").is_some();
+        assert_eq!(dbg_hmput(), expected);
+        // Cached: second call returns the same value.
+        assert_eq!(dbg_hmput(), expected);
+    }
 
     #[test]
     fn map_bucket_index_power_of_two() {

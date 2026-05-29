@@ -262,6 +262,12 @@ enum GfxTarget {
 struct GfxEntry {
     state: Graphics2DState,
     target: GfxTarget,
+    /// Set once `dispose()` has flushed this context's pixels back to its
+    /// target and freed its scratch renderer. A disposed entry holds only a
+    /// 1x1 placeholder buffer; it is kept solely so that `flush_image` can
+    /// reap any disposed contexts still associated with an image id without
+    /// racing a live (undisposed) context. See `dispose_gfx` / `flush_image`.
+    disposed: bool,
 }
 
 /// Each Graphics2D context is wrapped in its own `Arc<Mutex<...>>` so that
@@ -299,6 +305,7 @@ fn gfx_handle_for(ctx: &dyn NativeContext, receiver: ObjectRef) -> GfxHandle {
     let handle: GfxHandle = Arc::new(Mutex::new(GfxEntry {
         state: Graphics2DState::create(1, 1),
         target: GfxTarget::Detached,
+        disposed: false,
     }));
     reg.map.insert(hash, handle.clone());
     handle
@@ -335,6 +342,7 @@ fn register_gfx_for_image(ctx: &dyn NativeContext, gfx_obj: ObjectRef, image_id:
     let handle: GfxHandle = Arc::new(Mutex::new(GfxEntry {
         state: Graphics2DState::create(w.max(1), h.max(1)),
         target: GfxTarget::Image(image_id),
+        disposed: false,
     }));
     gfx_registry().lock().map.insert(hash, handle);
 }
@@ -351,27 +359,42 @@ fn register_gfx_for_peer(ctx: &dyn NativeContext, gfx_obj: ObjectRef, peer_id: P
     let handle: GfxHandle = Arc::new(Mutex::new(GfxEntry {
         state: Graphics2DState::create(w, h),
         target: GfxTarget::Peer(peer_id),
+        disposed: false,
     }));
     gfx_registry().lock().map.insert(hash, handle);
 }
 
 /// Flush Graphics2D pixel data back to its target (BufferedImage or peer)
 /// and remove the registry entry. Called from `dispose()`.
+///
+/// Memory note: the entry is `remove`d from the registry up front and the
+/// `GfxHandle` `Arc` is dropped at the end of this function, so the disposed
+/// context's full-size scratch renderer (≈ `w*h*4` bytes — ~8 MiB for a 1080p
+/// image) is reclaimed immediately on dispose rather than lingering until
+/// process exit.
 fn dispose_gfx(ctx: &dyn NativeContext, receiver: ObjectRef) {
     let hash = ctx.identity_hash_code(receiver);
     let handle = { gfx_registry().lock().map.remove(&hash) };
     let Some(handle) = handle else { return; };
     let mut entry = handle.lock();
     entry.state.dispose();
+    entry.disposed = true;
     match entry.target {
         GfxTarget::Image(image_id) => {
+            // Commit the rendered result back to the backing image. Borrow the
+            // gfx scratch buffer (`&[u32]` via `pixels()`) and the image buffer
+            // (`&mut [u32]` via `get_data_buffer_mut()`) simultaneously: they
+            // are distinct allocations behind distinct locks, so we can copy
+            // straight from one into the other without first cloning the gfx
+            // buffer into an intermediate `Vec` (the previous `to_vec()` was an
+            // ~8 MiB heap allocation + memcpy on every image-graphics dispose).
             let w = entry.state.width();
             let h = entry.state.height();
-            let pixels = entry.state.pixels().to_vec();
             let mut reg = image::image_registry();
             if let Some(img) = reg.get_mut(image_id) {
                 if img.width() == w && img.height() == h {
-                    img.get_data_buffer_mut().copy_from_slice(&pixels);
+                    img.get_data_buffer_mut()
+                        .copy_from_slice(entry.state.pixels());
                 }
             }
         }
@@ -385,6 +408,46 @@ fn dispose_gfx(ctx: &dyn NativeContext, receiver: ObjectRef) {
         }
         GfxTarget::Detached => {}
     }
+}
+
+/// Reclaim derived/cached native resources associated with a `BufferedImage`
+/// when Java explicitly calls `BufferedImage.flush()`.
+///
+/// IMPORTANT — what flush does and does NOT free:
+///
+/// `java.awt.Image.flush()` flushes *reconstructable* resources. A CratonVM
+/// `BufferedImage` is memory-backed: its authoritative ARGB raster lives in
+/// the `ImageRegistry` and is NOT reconstructable from a producer. The JDK
+/// contract is that such a raster survives `flush()` — code may legally do
+/// `g = img.createGraphics(); ...; g.dispose(); img.flush(); img.getRGB(..)`
+/// and still read the drawn pixels, and may re-`createGraphics()` afterwards.
+/// Therefore we deliberately do NOT `ImageRegistry::destroy()` the raster
+/// here: doing so would be a correctness bug (subsequent legal reads would
+/// silently return 0 / no-op). Reclaiming the raster is only safe at the
+/// image's true end-of-life, for which no native hook currently exists; this
+/// is the documented nuance for finding #1.
+///
+/// What we CAN safely reclaim is any *disposed* Graphics2D scratch context
+/// still associated with this image id. A disposed context has already
+/// committed its pixels back to the raster (see `dispose_gfx`) and the Java
+/// `Graphics2D` is, by contract, unusable, so its full-size scratch buffer is
+/// provably dead. `dispose_gfx` normally removes such entries immediately, but
+/// the lazy-fallback path in `gfx_handle_for` can mint untracked contexts that
+/// are later disposed; this reaper bounds their accumulation. We only touch
+/// entries flagged `disposed`, never a live one, so there is no risk of
+/// dropping a buffer that an in-flight render still holds.
+fn flush_image(image_id: ImageId) {
+    let mut reg = gfx_registry().lock();
+    reg.map.retain(|_hash, handle| {
+        // Only inspect handles we can lock without contention; a currently
+        // locked handle is in active use (a draw call holds it), so it is by
+        // definition not a dead disposed scratch buffer — keep it.
+        let Some(entry) = handle.try_lock() else { return true; };
+        let is_dead_scratch =
+            entry.disposed && matches!(entry.target, GfxTarget::Image(id) if id == image_id);
+        // Returning `false` drops the entry (and its `Arc`/scratch buffer).
+        !is_dead_scratch
+    });
 }
 
 /// Read an int[] array into a Vec<i32>.
@@ -1257,6 +1320,7 @@ fn register_graphics_natives(registry: &mut NativeMethodRegistry) {
                         let handle: GfxHandle = Arc::new(Mutex::new(GfxEntry {
                             state: Graphics2DState::create(1, 1),
                             target: GfxTarget::Detached,
+                            disposed: false,
                         }));
                         gfx_registry().lock().map.insert(hash, handle);
                     }
@@ -1421,7 +1485,20 @@ fn register_image_natives(registry: &mut NativeMethodRegistry) {
         }
         null_ok()
     });
-    registry.register("java/awt/image/BufferedImage", "flush", "()V", |_ctx, _args| void_ok());
+    // BufferedImage.flush() — release reconstructable/derived native resources.
+    // Per the JDK contract (and see `flush_image`), the memory-backed pixel
+    // raster is NOT reconstructable and must survive flush, so we reclaim only
+    // dead (disposed) Graphics2D scratch buffers tied to this image id. The
+    // raster itself is never freed here, so re-fetching pixels or re-creating
+    // graphics after flush still works.
+    registry.register("java/awt/image/BufferedImage", "flush", "()V", |ctx, args| {
+        if let Some(this) = get_obj(args, 0) {
+            if let Value::Long(id) = ctx.get_field_by_name(this, "imageId") {
+                flush_image(ImageId(id as u64));
+            }
+        }
+        void_ok()
+    });
 
     // Bulk getRGB: copy an w*h block of ARGB pixels into an int[].
     // Signature: getRGB(int startX, int startY, int w, int h,
@@ -2326,5 +2403,81 @@ mod tests {
         edt.stop();
         let evt = got.expect("must observe the posted event");
         assert_eq!(evt.id, event_id::WINDOW_OPENED);
+    }
+
+    // ── Image flush / dispose-graphics buffer reclamation ─────────────
+
+    /// Insert a `GfxEntry` directly into the process-wide registry under a
+    /// unique hash and return that hash. Test-only shortcut that bypasses the
+    /// `NativeContext`-dependent `register_gfx_for_image` path.
+    fn insert_gfx_entry(hash: i32, target: GfxTarget, disposed: bool) {
+        let handle: GfxHandle = Arc::new(Mutex::new(GfxEntry {
+            state: Graphics2DState::create(2, 2),
+            target,
+            disposed,
+        }));
+        gfx_registry().lock().map.insert(hash, handle);
+    }
+
+    fn gfx_contains(hash: i32) -> bool {
+        gfx_registry().lock().map.contains_key(&hash)
+    }
+
+    /// `flush_image` reaps a *disposed* Graphics2D scratch context tied to the
+    /// flushed image id, freeing its buffer.
+    #[test]
+    fn flush_image_reaps_disposed_scratch_for_that_image() {
+        let img = ImageId(0x5111_1000); // arbitrary unique id
+        let hash = 0x5111_0001u32 as i32;
+        insert_gfx_entry(hash, GfxTarget::Image(img), /*disposed=*/ true);
+        assert!(gfx_contains(hash));
+        flush_image(img);
+        assert!(!gfx_contains(hash), "disposed scratch for the image must be reclaimed");
+    }
+
+    /// `flush_image` must NOT touch a *live* (undisposed) context, even one
+    /// targeting the same image — dropping it would discard an in-progress
+    /// render's buffer (use-after-free of meaning, lost pixels).
+    #[test]
+    fn flush_image_keeps_live_context_for_that_image() {
+        let img = ImageId(0x5111_2000);
+        let hash = 0x5111_0002u32 as i32;
+        insert_gfx_entry(hash, GfxTarget::Image(img), /*disposed=*/ false);
+        flush_image(img);
+        assert!(gfx_contains(hash), "live context must survive flush");
+        // cleanup
+        gfx_registry().lock().map.remove(&hash);
+    }
+
+    /// `flush_image` is scoped to a single image id — a disposed context for a
+    /// *different* image is left alone.
+    #[test]
+    fn flush_image_ignores_other_images() {
+        let flushed = ImageId(0x5111_3000);
+        let other = ImageId(0x5111_3001);
+        let hash = 0x5111_0003u32 as i32;
+        insert_gfx_entry(hash, GfxTarget::Image(other), /*disposed=*/ true);
+        flush_image(flushed);
+        assert!(gfx_contains(hash), "other image's context must be untouched");
+        // cleanup
+        gfx_registry().lock().map.remove(&hash);
+    }
+
+    /// Flushing must NOT destroy the image's pixel raster: a memory-backed
+    /// `BufferedImage` is re-usable after `flush()` (legal `getRGB` afterwards).
+    #[test]
+    fn flush_image_preserves_pixel_raster() {
+        let id = image::image_registry()
+            .create(4, 4, ImageType::IntArgb)
+            .expect("create image");
+        image::image_registry()
+            .get_mut(id)
+            .unwrap()
+            .set_rgb(1, 1, 0xDEAD_BEEF);
+        flush_image(id);
+        // Raster still present and pixel intact.
+        let reg = image::image_registry();
+        let img = reg.get(id).expect("raster must survive flush");
+        assert_eq!(img.get_rgb(1, 1), 0xDEAD_BEEF);
     }
 }

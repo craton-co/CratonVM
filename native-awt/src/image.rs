@@ -294,12 +294,23 @@ impl Clone for BufferedImageData {
 /// `u64`s, so SipHash provides no security benefit here and FxHash is
 /// roughly 2-3x faster for integer keys on this lookup hot path.
 ///
-/// TODO(leak): no eviction is wired. `destroy()` exists but is never called
-/// from `natives.rs` — every `java.awt.image.BufferedImage` allocated by the
-/// JVM leaks its pixel buffer until process exit. Either:
-///   (a) hook `BufferedImage.flush()` / finalizer to call `destroy()`, or
-///   (b) bounded LRU, or
-///   (c) weak-ref tied to Java BufferedImage GC (cleanest).
+/// Lifetime / reclamation note:
+///
+/// Derived scratch buffers (the per-`Graphics2D` render surfaces backing an
+/// image) ARE reclaimed: `natives.rs::dispose_gfx` drops a Graphics2D
+/// context's full-size buffer the moment `Graphics2D.dispose()` runs, and
+/// `natives.rs::flush_image` (wired to `BufferedImage.flush()`) reaps any
+/// disposed scratch context still associated with an image id.
+///
+/// The authoritative pixel raster held here is intentionally NOT freed by
+/// `flush()`: a CratonVM `BufferedImage` is memory-backed and therefore not
+/// reconstructable, so the JDK contract requires its raster to survive
+/// `flush()` (callers may legally read or re-`createGraphics()` afterwards).
+/// `destroy()` below performs the actual reclamation and is only safe to call
+/// at the image's true end-of-life; no native end-of-life hook for
+/// `BufferedImage` exists yet (a finalizer/Cleaner or a bounded LRU keyed on
+/// idle time would be the next step), so it is currently exercised only by
+/// tests. Do NOT wire `destroy()` to anything that can race a live raster.
 pub struct ImageRegistry {
     images: FxHashMap<u64, BufferedImageData>,
     next_id: u64,

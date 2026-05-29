@@ -16,9 +16,11 @@
 //! CVE-2017-3289). The parser must reject all malformed frames cleanly;
 //! a panic on any input is a CVE-class defect.
 //!
-//! After a successful parse we also call `compute_absolute_offsets` —
-//! it does an additive walk over `offset_delta`s and is a candidate
-//! site for u16 overflow on adversarial input.
+//! After a successful parse we also call `StackMapTable::absolute_offsets`
+//! — it does an additive walk over `offset_delta`s and is a candidate
+//! site for u16 overflow on adversarial input. It must return an `Err`
+//! (`InvalidClassData`) rather than panic when the running absolute
+//! offset overshoots `u16::MAX`.
 //!
 //! Run with:
 //!   cargo +nightly fuzz run fuzz_stack_map
@@ -51,4 +53,10 @@ fuzz_target!(|data: &[u8]| {
         // bytecode offset) and surfaces any out-of-band data.
         let _ = format!("{:?}", frame);
     }
+
+    // Exercise the additive offset walk on every parsed table. This is
+    // the u16-overflow candidate site flagged in the module docstring:
+    // a malformed frame sequence whose running absolute offset exceeds
+    // `u16::MAX` must yield `Err(InvalidClassData)`, never a panic.
+    let _ = table.absolute_offsets();
 });

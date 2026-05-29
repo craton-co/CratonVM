@@ -14139,6 +14139,29 @@ pub(crate) fn unsafe_array_read_bytes(
     if start + n > total {
         return None;
     }
+    // Perf fast path: for byte/boolean arrays the element width is 1, so the
+    // raw byte offset `start` is exactly the element index and each element is
+    // a single byte in native (and Java) order. Route through the bulk
+    // `read_byte_array_into` NativeContext intrinsic, which the VM overrides
+    // with a single `ptr::copy_nonoverlapping`, avoiding a per-element
+    // `get_array_element` (Value box + dynamic dispatch) on the hot path.
+    // Bounds are already validated above (`start + n <= total == len`, and
+    // `width == 1` so `start <= len`); the intrinsic clamps independently as
+    // well, so this cannot read past the array.
+    if matches!(
+        et,
+        cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean
+    ) {
+        debug_assert_eq!(width, 1);
+        let mut out = vec![0u8; n];
+        let copied = ctx.read_byte_array_into(arr, start, &mut out);
+        // `start + n <= len` guarantees the intrinsic copies exactly `n`.
+        debug_assert_eq!(copied, n);
+        if copied != n {
+            return None;
+        }
+        return Some(out);
+    }
     let mut out = Vec::with_capacity(n);
     let mut produced = 0usize;
     let mut elem_idx = start / width;
@@ -14203,6 +14226,22 @@ pub(crate) fn unsafe_array_write_bytes(
     };
     if start + bytes.len() > total {
         return false;
+    }
+    // Perf fast path: for byte/boolean arrays width is 1, so `start` is the
+    // element index and there are no partial-element (read-modify-write)
+    // concerns — every touched byte is a whole element. Route through the bulk
+    // `write_byte_array_from` NativeContext intrinsic (VM override =
+    // `ptr::copy_nonoverlapping`), avoiding the per-element get/set Value
+    // boxing + dynamic dispatch. Bounds are already validated above
+    // (`start + bytes.len() <= total == len`, `width == 1`); the intrinsic
+    // re-checks `dst_off + src.len() <= array_length` and returns `false`
+    // without writing anything on mismatch, preserving the bounds contract.
+    if matches!(
+        et,
+        cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean
+    ) {
+        debug_assert_eq!(width, 1);
+        return ctx.write_byte_array_from(arr, start, bytes);
     }
     let mut consumed = 0usize;
     let mut elem_idx = start / width;

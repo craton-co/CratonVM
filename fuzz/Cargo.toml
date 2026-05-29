@@ -55,6 +55,18 @@ test = false
 doc = false
 
 [[bin]]
+name = "fuzz_instruction"
+path = "fuzz_targets/fuzz_instruction.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_descriptor"
+path = "fuzz_targets/fuzz_descriptor.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "fuzz_asn1"
 path = "fuzz_targets/fuzz_asn1.rs"
 test = false
