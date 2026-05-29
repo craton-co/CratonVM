@@ -154,9 +154,35 @@ fn log_tag_mismatch(_expected: &str, _cv: CompactValue, _stack_len: usize) {}
 /// implementation so the 500+ interpreter call sites are unaffected; the
 /// conversion `CompactValue::from_value` / `CompactValue::to_value` is
 /// `#[inline(always)]` and degrades to a handful of bit-ops per push / pop.
+// Per-slot "kind" marks (parallel to `ValueStack::slots`).
+//
+// The NaN-boxed `CompactValue` cannot self-describe a 64-bit `long` (or
+// `double`): both are stored as raw 64 bits and are distinguished only by
+// opcode context. When a long's raw bits land in the NaN-tag space (e.g. BC
+// safegcd / EC accumulators in `0xFFFC_0000_0000_xxxx`), the slot is
+// bit-identical to a tagged `Int`, and `pop_long`'s context-free decode would
+// sign-extend it, dropping the high bits and corrupting the value (the
+// `bc-ec-mod` / `Mod.modOddInverse` infinite-loop family; see
+// `docs/bc-ec-mod-mododdinverse-investigation.md`).
+//
+// `kinds[i]` records when slot `i` was pushed by a *genuine* long/double
+// producer, letting the typed pops read the bits verbatim. The design is
+// **safe by degradation**: a slot left `KIND_UNKNOWN` falls back to the exact
+// pre-existing decode (including the i2l/i2d widening crutch for synthetic
+// bytecode that leaves a narrower type), so a missed mark is never a
+// regression. The only unsafe direction is *over*-marking, which is avoided
+// by setting `KIND_LONG`/`KIND_DOUBLE` solely at real long/double push sites.
+const KIND_UNKNOWN: u8 = 0;
+const KIND_LONG: u8 = 1;
+const KIND_DOUBLE: u8 = 2;
+
 #[derive(Debug)]
 pub struct ValueStack {
     slots: Vec<CompactValue>,
+    /// Parallel kind marks (see [`KIND_UNKNOWN`]). `kinds[i]` is meaningful for
+    /// `i < len`; entries are (re)written by every push, so they cannot go
+    /// stale across frame reuse.
+    kinds: Vec<u8>,
     len: usize,
     max_size: usize,
 }
@@ -166,8 +192,31 @@ impl ValueStack {
         let slots = vec![CompactValue::zero(); max_size];
         Self {
             slots,
+            kinds: vec![KIND_UNKNOWN; max_size],
             len: 0,
             max_size,
+        }
+    }
+
+    /// Decode slot `idx` to a `Value`, honoring its kind mark so that a
+    /// genuine long/double whose raw bits collide with the NaN-tag space is
+    /// not mis-decoded. Unmarked slots use the exact legacy `to_value()` path.
+    #[inline(always)]
+    fn value_at(&self, idx: usize) -> Value {
+        match self.kinds[idx] {
+            KIND_LONG => Value::Long(self.slots[idx].as_long_unchecked()),
+            KIND_DOUBLE => Value::Double(f64::from_bits(self.slots[idx].to_bits())),
+            _ => self.slots[idx].to_value(),
+        }
+    }
+
+    /// Kind mark to record for a `Value` about to be stored.
+    #[inline(always)]
+    fn kind_of_value(v: &Value) -> u8 {
+        match v {
+            Value::Long(_) => KIND_LONG,
+            Value::Double(_) => KIND_DOUBLE,
+            _ => KIND_UNKNOWN,
         }
     }
 
@@ -177,14 +226,21 @@ impl ValueStack {
     /// The incoming `vals` is treated as a pool of raw u64 slots; the
     /// `tags` vec is ignored (tags are encoded inline via NaN-boxing) — the
     /// signature is preserved so existing pool callers stay unchanged.
-    pub fn from_pooled(vals: Vec<u64>, _tags: Vec<u8>, max_size: usize) -> Self {
+    pub fn from_pooled(vals: Vec<u64>, tags: Vec<u8>, max_size: usize) -> Self {
         // CompactValue is repr(transparent) over u64 — Vec<u64> can be
         // transmuted to Vec<CompactValue> without reallocation.
         let mut slots = u64_vec_to_compact(vals);
         slots.clear();
         slots.resize(max_size, CompactValue::zero());
+        // Reuse the pooled tag Vec as the `kinds` array. It MUST be cleared:
+        // stale marks from a prior frame would over-mark fresh slots (the one
+        // unsafe direction), so reset every entry to KIND_UNKNOWN.
+        let mut kinds = tags;
+        kinds.clear();
+        kinds.resize(max_size, KIND_UNKNOWN);
         Self {
             slots,
+            kinds,
             len: 0,
             max_size,
         }
@@ -196,7 +252,9 @@ impl ValueStack {
     /// type tag inline); callers that pool both halves will simply see a
     /// fresh empty allocation for the tag slot.
     pub fn into_inner(self) -> (Vec<u64>, Vec<u8>) {
-        (compact_vec_to_u64(self.slots), Vec::new())
+        // Return the `kinds` array as the tag half so the pool can recycle its
+        // allocation (it is re-cleared on the next `from_pooled`).
+        (compact_vec_to_u64(self.slots), self.kinds)
     }
 
     pub fn push(&mut self, value: Value) -> Result<(), RuntimeError> {
@@ -205,6 +263,7 @@ impl ValueStack {
                 feature: "operand stack overflow".to_string(),
             });
         }
+        self.kinds[self.len] = Self::kind_of_value(&value);
         self.slots[self.len] = CompactValue::from_value(value);
         self.len += 1;
         Ok(())
@@ -219,6 +278,7 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_unchecked(&mut self, value: Value) {
         debug_assert!(self.len < self.max_size, "stack overflow in push_unchecked");
+        self.kinds[self.len] = Self::kind_of_value(&value);
         self.slots[self.len] = CompactValue::from_value(value);
         self.len += 1;
     }
@@ -233,6 +293,7 @@ impl ValueStack {
                 message: "operand stack overflow".to_string(),
             });
         }
+        self.kinds[self.len] = Self::kind_of_value(&value);
         self.slots[self.len] = CompactValue::from_value(value);
         self.len += 1;
         Ok(())
@@ -247,8 +308,65 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_compact(&mut self, cv: CompactValue) {
         debug_assert!(self.len < self.max_size, "stack overflow in push_compact");
+        // Raw compact push: the bits alone cannot distinguish a collision-long
+        // from a tagged value, so mark UNKNOWN (safe fallback). Genuine long/
+        // double producers call push_long/push_double instead.
+        self.kinds[self.len] = KIND_UNKNOWN;
         self.slots[self.len] = cv;
         self.len += 1;
+    }
+
+    /// Push a raw `CompactValue` bit-exact AND mark the slot `KIND_LONG`.
+    ///
+    /// Used by `lload`/`lload_<n>` to forward a long from a local without the
+    /// lossy `to_value()`/`from_value()` round-trip, while still recording the
+    /// long kind so the eventual `pop_long` reads the bits verbatim instead of
+    /// sign-extending a NaN-tag-colliding `0xFFFC_…` value.
+    #[inline(always)]
+    pub fn push_compact_long(&mut self, cv: CompactValue) {
+        debug_assert!(self.len < self.max_size, "stack overflow in push_compact_long");
+        self.kinds[self.len] = KIND_LONG;
+        self.slots[self.len] = cv;
+        self.len += 1;
+    }
+
+    /// Push a raw `CompactValue` bit-exact AND mark the slot `KIND_DOUBLE`.
+    /// Double sibling of [`Self::push_compact_long`] (used by `dload`).
+    #[inline(always)]
+    pub fn push_compact_double(&mut self, cv: CompactValue) {
+        debug_assert!(self.len < self.max_size, "stack overflow in push_compact_double");
+        self.kinds[self.len] = KIND_DOUBLE;
+        self.slots[self.len] = cv;
+        self.len += 1;
+    }
+
+    /// Checked, `KIND_LONG`-marking compact push for the slow-path `Lload`
+    /// (which otherwise uses the unmarked `push_compact_checked`).
+    #[inline(always)]
+    pub fn push_compact_long_checked(&mut self, cv: CompactValue) -> Result<(), RuntimeError> {
+        if self.len >= self.max_size {
+            return Err(RuntimeError::IllegalStateException {
+                message: "operand stack overflow".to_string(),
+            });
+        }
+        self.kinds[self.len] = KIND_LONG;
+        self.slots[self.len] = cv;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Checked, `KIND_DOUBLE`-marking compact push for the slow-path `Dload`.
+    #[inline(always)]
+    pub fn push_compact_double_checked(&mut self, cv: CompactValue) -> Result<(), RuntimeError> {
+        if self.len >= self.max_size {
+            return Err(RuntimeError::IllegalStateException {
+                message: "operand stack overflow".to_string(),
+            });
+        }
+        self.kinds[self.len] = KIND_DOUBLE;
+        self.slots[self.len] = cv;
+        self.len += 1;
+        Ok(())
     }
 
     /// B12: checked sibling of [`Self::push_compact`]. Returns
@@ -260,6 +378,10 @@ impl ValueStack {
                 message: "operand stack overflow".to_string(),
             });
         }
+        // Raw compact push: the bits alone cannot distinguish a collision-long
+        // from a tagged value, so mark UNKNOWN (safe fallback). Genuine long/
+        // double producers call push_long/push_double instead.
+        self.kinds[self.len] = KIND_UNKNOWN;
         self.slots[self.len] = cv;
         self.len += 1;
         Ok(())
@@ -275,6 +397,7 @@ impl ValueStack {
                 feature: "operand stack overflow".to_string(),
             });
         }
+        self.kinds[self.len] = KIND_UNKNOWN;
         self.slots[self.len] = CompactValue::int(v);
         self.len += 1;
         Ok(())
@@ -288,6 +411,7 @@ impl ValueStack {
                 feature: "operand stack overflow".to_string(),
             });
         }
+        self.kinds[self.len] = KIND_LONG;
         self.slots[self.len] = CompactValue::long(v);
         self.len += 1;
         Ok(())
@@ -301,6 +425,7 @@ impl ValueStack {
                 feature: "operand stack overflow".to_string(),
             });
         }
+        self.kinds[self.len] = KIND_UNKNOWN;
         self.slots[self.len] = CompactValue::float(v);
         self.len += 1;
         Ok(())
@@ -314,6 +439,7 @@ impl ValueStack {
                 feature: "operand stack overflow".to_string(),
             });
         }
+        self.kinds[self.len] = KIND_DOUBLE;
         self.slots[self.len] = CompactValue::double(v);
         self.len += 1;
         Ok(())
@@ -327,6 +453,7 @@ impl ValueStack {
                 feature: "operand stack overflow".to_string(),
             });
         }
+        self.kinds[self.len] = KIND_UNKNOWN;
         self.slots[self.len] = CompactValue::null();
         self.len += 1;
         Ok(())
@@ -339,7 +466,7 @@ impl ValueStack {
             });
         }
         self.len -= 1;
-        Ok(self.slots[self.len].to_value())
+        Ok(self.value_at(self.len))
     }
 
     /// Pop without error wrapping. Used by the fast-path interpreter
@@ -351,7 +478,7 @@ impl ValueStack {
     pub fn pop_unchecked(&mut self) -> Value {
         debug_assert!(self.len > 0, "stack underflow in pop_unchecked");
         self.len -= 1;
-        self.slots[self.len].to_value()
+        self.value_at(self.len)
     }
 
     /// B12: checked sibling of [`Self::pop_unchecked`]. Returns
@@ -364,7 +491,7 @@ impl ValueStack {
             });
         }
         self.len -= 1;
-        Ok(self.slots[self.len].to_value())
+        Ok(self.value_at(self.len))
     }
 
     /// Pop a raw `CompactValue` slot without decoding to `Value`.
@@ -411,6 +538,7 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_int_unchecked(&mut self, v: i32) {
         debug_assert!(self.len < self.max_size, "stack overflow in push_int_unchecked");
+        self.kinds[self.len] = KIND_UNKNOWN;
         self.slots[self.len] = CompactValue::int(v);
         self.len += 1;
     }
@@ -444,6 +572,7 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_float_unchecked(&mut self, v: f32) {
         debug_assert!(self.len < self.max_size, "stack overflow in push_float_unchecked");
+        self.kinds[self.len] = KIND_UNKNOWN;
         self.slots[self.len] = CompactValue::float(v);
         self.len += 1;
     }
@@ -469,6 +598,7 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_double_unchecked(&mut self, v: f64) {
         debug_assert!(self.len < self.max_size, "stack overflow in push_double_unchecked");
+        self.kinds[self.len] = KIND_DOUBLE;
         self.slots[self.len] = CompactValue::double(v);
         self.len += 1;
     }
@@ -503,6 +633,7 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_long_unchecked(&mut self, v: i64) {
         debug_assert!(self.len < self.max_size, "stack overflow in push_long_unchecked");
+        self.kinds[self.len] = KIND_LONG;
         self.slots[self.len] = CompactValue::long(v);
         self.len += 1;
     }
@@ -552,7 +683,7 @@ impl ValueStack {
                 feature: "operand stack underflow".to_string(),
             });
         }
-        Ok(self.slots[self.len - 1].to_value())
+        Ok(self.value_at(self.len - 1))
     }
 
     /// Peek at the top value. Used by the fast-path interpreter.
@@ -562,7 +693,7 @@ impl ValueStack {
     #[inline(always)]
     pub fn peek(&self) -> Value {
         debug_assert!(self.len > 0, "stack underflow in peek");
-        self.slots[self.len - 1].to_value()
+        self.value_at(self.len - 1)
     }
 
     /// Peek the top slot as a raw `CompactValue` (zero-copy).
@@ -595,7 +726,7 @@ impl ValueStack {
     #[inline(always)]
     pub fn peek_at(&self, offset_from_top: usize) -> Value {
         debug_assert!(offset_from_top < self.len, "stack underflow in peek_at");
-        self.slots[self.len - 1 - offset_from_top].to_value()
+        self.value_at(self.len - 1 - offset_from_top)
     }
 
     pub fn pop_int(&mut self) -> Result<i32, RuntimeError> {
@@ -656,6 +787,15 @@ impl ValueStack {
         // docs/bc-ec-mod-mododdinverse-investigation.md.
         self.len -= 1;
         let cv = self.slots[self.len];
+        // Fast, bit-exact path: the slot was pushed by a genuine long producer
+        // (push_long / Value::Long). Read the raw 64 bits verbatim — this is
+        // what fixes the BC EC / safegcd collision-long corruption, since the
+        // tag-based decode below would sign-extend a `0xFFFC_…` long as if it
+        // were an Int. Unmarked slots fall through to the legacy decode, which
+        // preserves the i2l-widening crutch for synthetic int-where-long.
+        if self.kinds[self.len] == KIND_LONG {
+            return Ok(cv.as_long_unchecked());
+        }
         match cv.decode_by_descriptor(b'J') {
             Value::Long(v) => Ok(v),
             // `decode_by_descriptor(b'J')` is total over `Value::Long`; this
@@ -684,6 +824,13 @@ impl ValueStack {
         // without going through the full Value decode.
         let idx = self.len - 1;
         let cv = self.slots[idx];
+        // Bit-exact fast path for genuine double producers (push_double /
+        // Value::Double): read the raw f64 bits verbatim, immune to any
+        // NaN-tag collision (mirrors pop_long's KIND_LONG fast path).
+        if self.kinds[idx] == KIND_DOUBLE {
+            self.len -= 1;
+            return Ok(f64::from_bits(cv.to_bits()));
+        }
         match cv.tag() {
             // KC26 K1: mirror pop_long's handling — Long-tagged values
             // (SUB_LONG_LO/HI) also store raw bits untagged; they arise
@@ -862,9 +1009,15 @@ impl ValueStack {
     /// wire format (Vec<u64> + Vec<u8>) is preserved for continuation thaw.
     pub fn snapshot_raw(&self) -> (Vec<u64>, Vec<u8>) {
         let vals: Vec<u64> = self.slots[..self.len].iter().map(|cv| cv.to_bits()).collect();
-        let tags: Vec<u8> = self.slots[..self.len]
-            .iter()
-            .map(|cv| compact_tag_to_vtag(*cv))
+        // Honor the kind mark when emitting SoA tags: a genuine long/double
+        // whose raw bits collide with the NaN-tag space would otherwise be
+        // tagged Int/Double by `compact_tag_to_vtag` and mis-restored.
+        let tags: Vec<u8> = (0..self.len)
+            .map(|i| match self.kinds[i] {
+                KIND_LONG => crate::types::VTAG_LONG,
+                KIND_DOUBLE => crate::types::VTAG_DOUBLE,
+                _ => compact_tag_to_vtag(self.slots[i]),
+            })
             .collect();
         (vals, tags)
     }
@@ -877,20 +1030,31 @@ impl ValueStack {
     /// disambiguate Long vs Double.
     pub fn from_snapshot(vals: Vec<u64>, tags: Vec<u8>, max_size: usize) -> Self {
         let len = vals.len();
-        let mut slots: Vec<CompactValue> = Vec::with_capacity(max_size);
+        let cap = max_size.max(len);
+        let mut slots: Vec<CompactValue> = Vec::with_capacity(cap);
+        let mut kinds: Vec<u8> = Vec::with_capacity(cap);
         // If the tag vec is shorter (e.g. empty from into_inner), treat
         // missing entries as double so the raw u64 is preserved verbatim.
         for i in 0..len {
             let v = vals[i];
             let t = tags.get(i).copied().unwrap_or(crate::types::VTAG_DOUBLE);
             slots.push(vtag_to_compact(v, t));
+            // Derive the kind mark from the restored SoA tag so a long/double
+            // recovered from a snapshot pops bit-exact.
+            kinds.push(match t {
+                crate::types::VTAG_LONG => KIND_LONG,
+                crate::types::VTAG_DOUBLE => KIND_DOUBLE,
+                _ => KIND_UNKNOWN,
+            });
         }
-        // Extend to max_size so push operations have space.
-        slots.resize(max_size.max(len), CompactValue::zero());
+        // Extend to cap so push operations have space.
+        slots.resize(cap, CompactValue::zero());
+        kinds.resize(cap, KIND_UNKNOWN);
         Self {
             slots,
+            kinds,
             len,
-            max_size: max_size.max(len),
+            max_size: cap,
         }
     }
 
@@ -901,7 +1065,7 @@ impl ValueStack {
         if index >= self.len {
             return Value::Uninitialized;
         }
-        self.slots[index].to_value()
+        self.value_at(index)
     }
 
     /// Get a raw `CompactValue` at an index (cold path — for GC, freeze).

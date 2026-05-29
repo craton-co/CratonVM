@@ -3761,7 +3761,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     // boundary tagging drift on long slots.
                     frame
                         .stack
-                        .push_compact(CompactValue::long(i64::from(val)));
+                        .push_long_unchecked(i64::from(val));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -3777,7 +3777,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let vb = cvb.as_long_unchecked();
                     frame
                         .stack
-                        .push_compact(CompactValue::long(va.wrapping_add(vb)));
+                        .push_long_unchecked(va.wrapping_add(vb));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -3789,7 +3789,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let vb = cvb.as_long_unchecked();
                     frame
                         .stack
-                        .push_compact(CompactValue::long(va.wrapping_sub(vb)));
+                        .push_long_unchecked(va.wrapping_sub(vb));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -3801,7 +3801,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let vb = cvb.as_long_unchecked();
                     frame
                         .stack
-                        .push_compact(CompactValue::long(va.wrapping_mul(vb)));
+                        .push_long_unchecked(va.wrapping_mul(vb));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -3813,22 +3813,22 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // `Value::Int`, dropping bits 32-46 on re-encode. push_compact
                 // preserves every bit and skips the Value decode/encode.
                 0x1e => {
-                    frame.stack.push_compact(frame.get_local_compact_unchecked(0));
+                    frame.stack.push_compact_long(frame.get_local_compact_unchecked(0));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x1f => {
-                    frame.stack.push_compact(frame.get_local_compact_unchecked(1));
+                    frame.stack.push_compact_long(frame.get_local_compact_unchecked(1));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x20 => {
-                    frame.stack.push_compact(frame.get_local_compact_unchecked(2));
+                    frame.stack.push_compact_long(frame.get_local_compact_unchecked(2));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x21 => {
-                    frame.stack.push_compact(frame.get_local_compact_unchecked(3));
+                    frame.stack.push_compact_long(frame.get_local_compact_unchecked(3));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -3869,12 +3869,12 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 0x09 => {
                     // Direct CompactValue push — Long is an 8-byte slot on
                     // CompactValue so no category-2 double push is required.
-                    frame.stack.push_compact(CompactValue::long(0));
+                    frame.stack.push_long_unchecked(0);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x0a => {
-                    frame.stack.push_compact(CompactValue::long(1));
+                    frame.stack.push_long_unchecked(1);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -3958,7 +3958,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let v = cv.as_long_unchecked();
                     frame
                         .stack
-                        .push_compact(CompactValue::long(v.wrapping_neg()));
+                        .push_long_unchecked(v.wrapping_neg());
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -3968,7 +3968,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let cva = frame.stack.pop_compact();
                     let va = cva.as_long_unchecked();
                     let vb = cvb.as_long_unchecked();
-                    frame.stack.push_compact(CompactValue::long(va & vb));
+                    frame.stack.push_long_unchecked(va & vb);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -3978,7 +3978,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let cva = frame.stack.pop_compact();
                     let va = cva.as_long_unchecked();
                     let vb = cvb.as_long_unchecked();
-                    frame.stack.push_compact(CompactValue::long(va | vb));
+                    frame.stack.push_long_unchecked(va | vb);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -3988,7 +3988,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let cva = frame.stack.pop_compact();
                     let va = cva.as_long_unchecked();
                     let vb = cvb.as_long_unchecked();
-                    frame.stack.push_compact(CompactValue::long(va ^ vb));
+                    frame.stack.push_long_unchecked(va ^ vb);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -4001,7 +4001,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if vb != 0 {
                         frame
                             .stack
-                            .push_compact(CompactValue::long(va.wrapping_div(vb)));
+                            .push_long_unchecked(va.wrapping_div(vb));
                         frame.pc = saved_pc + 1;
                         continue;
                     }
@@ -4018,7 +4018,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     if vb != 0 {
                         frame
                             .stack
-                            .push_compact(CompactValue::long(va.wrapping_rem(vb)));
+                            .push_long_unchecked(va.wrapping_rem(vb));
                         frame.pc = saved_pc + 1;
                         continue;
                     }
@@ -4230,7 +4230,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     // tagged with the Double NaN-box encoding.
                     frame
                         .stack
-                        .push_compact(CompactValue::double(f64::from(val)));
+                        .push_double_unchecked(f64::from(val));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -4271,12 +4271,12 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // dconst_0, dconst_1 (0x0e-0x0f)
                 0x0e => {
                     // Direct CompactValue push — double is an 8-byte slot.
-                    frame.stack.push_compact(CompactValue::double(0.0));
+                    frame.stack.push_double_unchecked(0.0);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x0f => {
-                    frame.stack.push_compact(CompactValue::double(1.0));
+                    frame.stack.push_double_unchecked(1.0);
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -4332,9 +4332,14 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // collision-pattern longs (see lload_0..3 above).
                 // H7: bounds-guard `b1` (see iload/fload/aload above).
                 0x16 | 0x18 if (b1 as usize) < frame.max_locals as usize => {
-                    frame
-                        .stack
-                        .push_compact(frame.get_local_compact_unchecked(b1 as usize)); // Cast: bytecode operand decoding
+                    let cv = frame.get_local_compact_unchecked(b1 as usize); // Cast: bytecode operand decoding
+                    // Mark the slot's category so a NaN-tag-colliding long is
+                    // popped bit-exact (lload) rather than sign-extended.
+                    if opcode == 0x16 {
+                        frame.stack.push_compact_long(cv);
+                    } else {
+                        frame.stack.push_compact_double(cv);
+                    }
                     frame.pc = saved_pc + 2;
                     continue;
                 }
@@ -5522,7 +5527,8 @@ fn execute_instruction(
         }
         Instruction::Lload(idx) => {
             let cv = thread.frames[frame_idx].get_local_compact(*idx);
-            thread.frames[frame_idx].stack.push_compact_checked(cv)?;
+            // Mark KIND_LONG so a NaN-tag-colliding long pops bit-exact.
+            thread.frames[frame_idx].stack.push_compact_long_checked(cv)?;
         }
         Instruction::Fload(idx) => {
             let cv = thread.frames[frame_idx].get_local_compact(*idx);
@@ -5530,7 +5536,7 @@ fn execute_instruction(
         }
         Instruction::Dload(idx) => {
             let cv = thread.frames[frame_idx].get_local_compact(*idx);
-            thread.frames[frame_idx].stack.push_compact_checked(cv)?;
+            thread.frames[frame_idx].stack.push_compact_double_checked(cv)?;
         }
         Instruction::Aload(idx) => {
             // Mirror `Instruction::Astore` / fast-path `aload`: JNI may leave a
@@ -17252,9 +17258,9 @@ mod tests {
     #[test]
     fn t18_k5_lconst_0_round_trip() {
         use crate::runtime::ValueStack;
-        // Mirrors the fast-path 0x09 arm: push_compact(CompactValue::long(0)).
+        // Mirrors the fast-path 0x09 arm: push_long_unchecked(0).
         let mut stack = ValueStack::new(2);
-        stack.push_compact(CompactValue::long(0));
+        stack.push_long_unchecked(0);
         assert_eq!(stack.pop_long().expect("pop_long"), 0);
     }
 
@@ -17263,7 +17269,7 @@ mod tests {
         use crate::runtime::ValueStack;
         // Mirrors the fast-path 0x0a arm.
         let mut stack = ValueStack::new(2);
-        stack.push_compact(CompactValue::long(1));
+        stack.push_long_unchecked(1);
         assert_eq!(stack.pop_long().expect("pop_long"), 1);
     }
 
@@ -17271,7 +17277,7 @@ mod tests {
     fn t18_k5_dconst_0_round_trip() {
         use crate::runtime::ValueStack;
         let mut stack = ValueStack::new(2);
-        stack.push_compact(CompactValue::double(0.0));
+        stack.push_double_unchecked(0.0);
         assert_eq!(
             stack.pop_double().expect("pop_double").to_bits(),
             0f64.to_bits()
@@ -17282,7 +17288,7 @@ mod tests {
     fn t18_k5_dconst_1_round_trip() {
         use crate::runtime::ValueStack;
         let mut stack = ValueStack::new(2);
-        stack.push_compact(CompactValue::double(1.0));
+        stack.push_double_unchecked(1.0);
         assert_eq!(stack.pop_double().expect("pop_double"), 1.0);
     }
 
@@ -17694,7 +17700,7 @@ mod tests {
                 other => panic!("unexpected tag for long field: {other:?}"),
             };
             let mut stack = crate::runtime::ValueStack::new(2);
-            stack.push_compact(CompactValue::long(bits));
+            stack.push_long_unchecked(bits);
             let popped = stack.pop_long().expect("pop_long after K2 push");
             assert_eq!(popped, v, "long {v:#x} must round-trip through K2 getfield");
         }
@@ -17742,7 +17748,7 @@ mod tests {
                 Value::Object(None) | Value::Uninitialized => 0,
                 other => panic!("unexpected tag for long field: {other:?}"),
             };
-            stack.push_compact(CompactValue::long(bits));
+            stack.push_long_unchecked(bits);
             assert_eq!(
                 stack.pop_long().expect("pop_long"),
                 v,
@@ -17780,7 +17786,7 @@ mod tests {
                 other => panic!("unexpected tag for double field: {other:?}"),
             };
             let mut stack = crate::runtime::ValueStack::new(2);
-            stack.push_compact(CompactValue::double(d));
+            stack.push_double_unchecked(d);
             let popped = stack.pop_double().expect("pop_double");
             assert_eq!(
                 popped.to_bits(),
@@ -17827,7 +17833,7 @@ mod tests {
                 Value::Object(None) | Value::Uninitialized => 0.0,
                 other => panic!("unexpected tag for double field: {other:?}"),
             };
-            stack.push_compact(CompactValue::double(d));
+            stack.push_double_unchecked(d);
             assert_eq!(
                 stack.pop_double().expect("pop_double").to_bits(),
                 v.to_bits(),
