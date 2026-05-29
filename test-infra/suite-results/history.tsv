@@ -42,3 +42,13 @@ iso_date	suite	variant	rc	pass	total	wall_s	notes
 2026-05-29T01:31:00Z	bc-util-utiltest	cratonvm	0	1	1	2.09	dev tip 55ca37f; JUnit AllTests passes
 2026-05-29T01:23:00Z	bc-math-ec	cratonvm	124	0	14	120.15	dev tip 55ca37f; timeout (long-bit-collision family); fast repro is bc-math-raw
 2026-05-29T01:25:00Z	bc-math-raw	cratonvm	1	0	1	1.29	dev tip 55ca37f; FAST long-bit-collision repro — JUnit expected:<N> but was:<N> with identical-printing longs (pop_long int-widen drops bits)
+2026-05-29T23:22:28Z	bc-math-raw	cratonvm	0	4	4	3.39	dev d5b4c10; JUnit AllTests
+2026-05-29T23:24:06Z	bc-util-encoders	cratonvm	0	15	15	95.66	dev d5b4c10; JUnit AllTests
+2026-05-29T23:24:08Z	bc-util-utiltest	cratonvm	0	18	18	1.63	dev d5b4c10; JUnit AllTests
+2026-05-29T23:24:11Z	bc-crypto-threshold	cratonvm	0	5	5	2.07	dev d5b4c10; JUnit AllTests
+2026-05-29T23:27:27Z	commons-math	cratonvm	0	3640	3640	195.44	dev d5b4c10; mvn test (rat.skip); 31 skipped, 0 fail 0 err; log _cm-cratonvm-202411.log
+2026-05-29T23:28:45Z	bc-math-raw	hotspot	0	4	4	0.80	dev 98b18d4; JUnit AllTests
+2026-05-29T23:28:47Z	bc-util-encoders	hotspot	0	15	15	0.81	dev 98b18d4; JUnit AllTests
+2026-05-29T23:28:48Z	bc-util-utiltest	hotspot	0	18	18	0.38	dev 98b18d4; JUnit AllTests
+2026-05-29T23:28:49Z	bc-crypto-threshold	hotspot	0	5	5	0.51	dev 98b18d4; JUnit AllTests
+2026-05-29T23:32:22Z	commons-math	hotspot	0	3640	3640	213.35	dev 98b18d4; mvn test (rat.skip); 31 skipped, 0 fail 0 err; log _cm-hotspot-202849.log

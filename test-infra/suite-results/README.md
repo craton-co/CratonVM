@@ -3,6 +3,33 @@
 Persistent log of each gauntlet suite's runtime + pass/fail under CratonVM,
 HotSpot (JDK 25 baseline), and TornadoVM (Graal + PTX argfile).
 
+## Default regression suite — `test-infra/regression-suite.sh`
+
+The canonical regression gate for routine use. Runs two suites and appends one
+`history.tsv` row per suite per run, flagging any suite >=20% slower than its
+previous same-variant run (speed regression).
+
+```
+bash test-infra/regression-suite.sh                 # cratonvm (default)
+bash test-infra/regression-suite.sh --variant hotspot
+```
+
+1. **BouncyCastle core** (functional). Green set gated here: `bc-math-raw`,
+   `bc-util-encoders`, `bc-util-utiltest`, `bc-crypto-threshold` — all pass on
+   both CratonVM (JIT) and HotSpot. Broader/known-failing BC suites
+   (asn1-regression locale fails, crypto-prng HMacDRBG, crypto.test/math.ec/
+   math/pqc timeouts) stay in `run-bc-core-local.sh` until green.
+2. **Apache Commons Math** (numeric, full reactor via Surefire, ~3640 tests).
+   Run under CratonVM via a generated JVM shim (`-Djvm=`); under HotSpot
+   directly. NOTE: a few Commons Math 4.0-SNAPSHOT tests are tolerance/JDK-25
+   sensitive (auto-retried as Surefire flakes; FastSineTransformer fails on
+   HotSpot too) — so the bar is **CratonVM pass-count >= HotSpot pass-count**,
+   not 100% green.
+
+Needs `cargo build --release -p cratonvm-cli` first, and Maven (auto-detects the
+IntelliJ-bundled mvn; override with `$MVN`). First Commons Math run is online to
+warm `~/.m2` (incl. the Surefire provider); later runs reuse the cache.
+
 ## Files
 
 - `history.tsv` — append-only log; one row per run.
