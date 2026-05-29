@@ -6,6 +6,33 @@ reviewed in parallel by 18 crate-level agents).
 
 Today's date: 2026-05-24. Workspace version: 0.3.0.
 
+> ## Status update (as of 0.3.0)
+>
+> **This document is a historical snapshot** of an earlier OSS-readiness audit.
+> Several findings below have since been **RESOLVED** and the original text is
+> retained only for the record. Read the resolved list first; do not treat the
+> historical findings below as open issues without re-verifying.
+>
+> **Resolved since this audit:**
+>
+> - **MSRV is now uniformly 1.77** across `README.md`, `BUILD_GUIDE.md`,
+>   `CONTRIBUTING.md`, and `docs/INSTALL.md`. The earlier 1.75/1.77
+>   inconsistency (blocker #1 / finding 1) is gone.
+> - **Inter-crate dependencies now carry an explicit `version = "0.3.0"`**
+>   alongside their `path` (the crates.io prerequisite in blocker #4 /
+>   finding 4 of §4).
+> - **Governance/community files now exist:** `SUPPORT.md`, `GOVERNANCE.md`,
+>   `MAINTAINERS.md`, and `THIRD_PARTY_NOTICES.md` (the gaps in §2).
+> - **The release workflow `.github/workflows/release.yml` is active** (no
+>   longer disabled under `_disabled-workflows/`; blocker #5).
+> - **`SECURITY.md` "Supported Versions" table now lists 0.3.x as current**,
+>   with 0.2.x / 0.1.x end-of-life (blocker #3 / finding 3).
+>
+> **Deferred (not a defect):** crates.io publishing remains intentionally
+> gated by `publish = false` at the workspace level, by design — see
+> `RELEASING.md`. The §4 "crates.io readiness" notes below describe the
+> mechanics for when/if that gate is lifted, not an outstanding blocker.
+
 ## Summary
 
 **Overall verdict:** **needs fixes** before a public 0.3.0 release.

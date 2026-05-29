@@ -19,6 +19,17 @@ ships in `java.base` and resolves entirely through bytecode is *not* in this
 table. Methods are listed as `name(descriptor)` using JVMS internal form
 (e.g. `[B` = `byte[]`, `Ljava/lang/String;` = `String`).
 
+> **Note — scope of this count vs. the "3,100+" figure.** The entries in this
+> catalog are *only* the natives **formally registered through the
+> native-method registry** (the `r.register(...)` call sites). They are a
+> **subset** of CratonVM's total native coverage. The larger "3,100+ native
+> methods" figure cited in the README and CHANGELOG counts the full surface,
+> which *additionally* includes natives satisfied via bytecode/synthetic
+> implementations that are not emitted through `r.register(...)` and therefore
+> are not enumerated by this generated dump. The two numbers measure different
+> things and do not conflict: this file reports the formally-registered subset,
+> while "3,100+" reports the aggregate native surface.
+
 ---
 
 ## `java/beans/FeatureDescriptor`
@@ -422,3 +433,11 @@ table. Methods are listed as `name(descriptor)` using JVMS internal form
 
 **Totals (0.3.0)**: 53 distinct classes, 128 registered native methods
 (native-builtins: 121, native-collections: 4, native-io: 3, native-awt: 0).
+
+These totals count *only* the methods formally registered through the
+native-method registry (the `r.register(...)` call sites enumerated above) and
+are a **subset** of CratonVM's overall native coverage. The "3,100+ native
+methods" figure cited elsewhere (README/CHANGELOG) is larger because it also
+includes natives provided via bytecode/synthetic implementations, which are not
+emitted through `r.register(...)` and so are not enumerated here. The two
+figures are therefore consistent rather than contradictory.

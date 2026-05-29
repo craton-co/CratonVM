@@ -1,1 +1,0 @@
-No class name or --jar specified. Usage: rustjvm <class> or rustjvm --jar <file.jar>

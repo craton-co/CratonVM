@@ -71,7 +71,7 @@ $globRoots = @()
 if ($env:USERPROFILE) {
     $globRoots += (Join-Path $env:USERPROFILE '.m2\repository\net\bytebuddy\byte-buddy')
 }
-$globRoots += 'C:\Users\Victor\.m2\repository\net\bytebuddy\byte-buddy'
+$globRoots += "$env:USERPROFILE\.m2\repository\net\bytebuddy\byte-buddy"
 $globRoots += 'C:\craton\ejbca-ce\lib\hibernate'
 
 foreach ($root in $globRoots) {

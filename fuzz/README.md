@@ -89,9 +89,9 @@ Sketch of the files OSS-Fuzz wants under
 ```yaml
 homepage: "https://github.com/craton-co/cratonvm"
 language: rust
-primary_contact: "security@craton.software"
+primary_contact: "security@craton.co"
 auto_ccs:
-  - "security@craton.software"
+  - "security@craton.co"
 sanitizers:
   - address
   - memory

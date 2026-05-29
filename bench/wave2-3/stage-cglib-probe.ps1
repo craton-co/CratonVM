@@ -78,8 +78,8 @@ if ($env:USERPROFILE) {
     $globRoots += (Join-Path $env:USERPROFILE '.m2\repository\cglib\cglib-nodep')
     $globRoots += (Join-Path $env:USERPROFILE '.m2\repository\cglib\cglib')
 }
-$globRoots += 'C:\Users\Victor\.m2\repository\cglib\cglib-nodep'
-$globRoots += 'C:\Users\Victor\.m2\repository\cglib\cglib'
+$globRoots += "$env:USERPROFILE\.m2\repository\cglib\cglib-nodep"
+$globRoots += "$env:USERPROFILE\.m2\repository\cglib\cglib"
 $globRoots += 'C:\craton\ejbca-ce\lib'
 
 foreach ($root in $globRoots) {
@@ -133,7 +133,7 @@ if (-not $JarPath) {
 
 if (-not $JarPath) {
     Add-Content -Path $CompileLog -Value "stage-cglib-probe: SKIP cglib jar not found" -Encoding utf8
-    Add-Content -Path $CompileLog -Value "  searched: \$env:CGLIB_JAR, $env:USERPROFILE\.m2, C:\Users\Victor\.m2, C:\craton\ejbca-ce\lib, C:\craton\keycloak-*" -Encoding utf8
+    Add-Content -Path $CompileLog -Value "  searched: \$env:CGLIB_JAR, $env:USERPROFILE\.m2, %USERPROFILE%\.m2, C:\craton\ejbca-ce\lib, C:\craton\keycloak-*" -Encoding utf8
     Add-Content -Path $CompileLog -Value "  attempted: Maven Central (set NO_NET=1 to skip; \$env:MAVEN_CENTRAL_BASE to override mirror)" -Encoding utf8
     Set-Content -Path $SkipFlag -Value 'no-cglib-jar' -Encoding utf8
     Write-Output "stage-cglib-probe: SKIP cglib jar not found (set CGLIB_JAR to enable real-DSL probe)"

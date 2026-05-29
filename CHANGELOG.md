@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Unreleased (post-review-orchestrator)
-
 A cross-crate review-driven fix orchestrator landed 50+ commits across security, soundness, correctness, and OSS-distribution hygiene. Highlights:
 
 #### Security

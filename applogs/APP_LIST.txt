@@ -1,8 +1,0 @@
-﻿# CratonVM runnable-app inventory (absolute paths). Lines starting with # are notes.
-# JAR smoke under rustjvm (no pipe deadlock): bench/run-jar-under-rustjvm.ps1 - logs to applogs/run_<UTC>_<name>.*.
-# WildFly: bench/wildfly-boot/stage.ps1 downloads/extracts to bench/wildfly-boot/staged/wildfly.
-# This machine already has jboss-modules.jar under the apps path below - do not replace that directory with a junction to staged (would drop a real install). Use staged tree for bench/run-under-rustjvm.ps1.
-C:\craton\CratonVM\apps\wildfly\wildfly-32.0.1.Final
-C:\craton\CratonVM\apps\letsgo\letsgo-main\target\letsgo-main-0.0.1-SNAPSHOT.jar
-C:\craton\CratonVM\apps\SportMe-master\target\sportme-backend.jar
-C:\craton\CratonVM\apps\insurance-backend\target\insurance-0.0.1-SNAPSHOT.jar

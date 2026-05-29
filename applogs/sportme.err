@@ -1,5 +1,0 @@
-[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
-[2m2026-05-09T13:35:43.738878Z[0m [33m WARN[0m [2mrustjvm_vm::runtime::diagnostics[0m[2m:[0m B6: silent-swallow — error suppressed to keep VM running [3msite[0m[2m=[0m<clinit> [3mcategory[0m[2m=[0mnon-critical-exception [3mdetail[0m[2m=[0mclass=java/util/jar/JarFile exc=java/lang/NullPointerException: Cannot invoke intValue on null
-[LUC-DBG] LaunchedURLClassLoader.loadClass(1) called: ru.sberbank.sportme.SportMeApplication
-[2m2026-05-09T13:35:43.862358Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_exec[0m[2m:[0m NoSuchMethodError [3mmethod[0m[2m=[0m"java/util/Collections$EmptyIterator.hasMoreElements()Z"
-Error in thread "main" linkage error: no such method: java/util/Collections$EmptyIterator.hasMoreElements()Z

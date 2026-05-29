@@ -9,7 +9,7 @@ set +e
 ROOT="C:/craton/CratonVM"
 CRATONVM="$ROOT/target/release/cratonvm.exe"
 JDK="C:/Program Files/Java/jdk-25"
-JUNIT='C:\Users\Victor\AppData\Local\Temp\junit-3.8.2.jar'
+JUNIT="${JUNIT:-$TEMP/junit-3.8.2.jar}"
 
 TIMEOUT="${1:-180}"
 RESULTS="$ROOT/test-infra/suite-results/bc-dacapo-$(date +%Y%m%d-%H%M%S).tsv"

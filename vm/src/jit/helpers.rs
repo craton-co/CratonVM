@@ -2315,8 +2315,26 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         full_args.push(Value::Object(Some(receiver_ref)));
         full_args.extend_from_slice(&method_args);
 
-        // Try to compile callee for next time (populate cached_entry_ptr + needs_ctx)
-        if let Some((entry_ptr, needs_ctx)) = try_compile_callee(vm, info) {
+        // Try to compile callee for next time (populate cached_entry_ptr + needs_ctx).
+        //
+        // VIRTUAL DISPATCH FIX: resolve the callee from the RECEIVER's class
+        // (`class_name`, derived from `receiver_class_id` above), NOT from
+        // `info.class_name` (the *static* call-site type). When the receiver
+        // overrides a concrete superclass method — e.g. a `Long` reached
+        // through an `Object`-typed `equals(Object)Z` call site — the static
+        // type resolves to `Object.equals` (identity `==`) instead of
+        // `Long.equals` (value comparison). The MIC then cached that identity
+        // entry against the receiver's class id and invoked it on every
+        // monomorphic hit, so two distinct but equal-valued boxes compared
+        // unequal (bc-java InterleaveTest, junit assertEquals(Object,Object)).
+        // `find_method_recursive` (inside `try_jit_compile_callee`) walks up
+        // from the receiver class to the real override.
+        if let Some((entry_ptr, needs_ctx)) = crate::runtime::interpreter::try_jit_compile_callee(
+            vm,
+            &class_name,
+            info.method_name,
+            info.descriptor,
+        ) {
             mic.cached_entry_ptr
                 .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
             mic.cached_needs_context
@@ -2408,8 +2426,16 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             .unwrap_or_default()
     };
 
-    // Try to compile callee for cached entry
-    let (entry_ptr, needs_ctx) = match try_compile_callee(vm, info) {
+    // Try to compile callee for cached entry. Resolve by the RECEIVER's class
+    // (`class_name`), not the static `info.class_name` — see the matching
+    // VIRTUAL DISPATCH FIX in the cache-hit branch above. `class_name` here is
+    // an `Arc<str>`; deref to `&str` for the resolver.
+    let (entry_ptr, needs_ctx) = match crate::runtime::interpreter::try_jit_compile_callee(
+        vm,
+        &class_name,
+        info.method_name,
+        info.descriptor,
+    ) {
         Some((ptr, nc)) => (ptr as u64, nc),
         None => (0, false),
     };

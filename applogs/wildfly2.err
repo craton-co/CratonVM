@@ -1,8 +1,0 @@
-[rustjvm] stack-dump watchdog armed: will dump + abort after 45s
-[PROPS-GET] this=ObjectRef { ptr: 0x237e8a9e7b0 } key="java.lang.invoke.MethodHandle.DEBUG_NAMES" -> sidetable MISS, falling back to system
-[PROPS-GET] this=ObjectRef { ptr: 0x237e8a9e7b0 } key="java.lang.invoke.MethodHandle.TRACE_INTERPRETER" -> sidetable MISS, falling back to system
-[PROPS-GET] this=ObjectRef { ptr: 0x237e8a9e7b0 } key="java.lang.invoke.MethodHandle.TRACE_METHOD_LINKAGE" -> sidetable MISS, falling back to system
-[PROPS-GET] this=ObjectRef { ptr: 0x237e8a9e7b0 } key="java.lang.invoke.MethodHandle.TRACE_RESOLVE" -> sidetable MISS, falling back to system
-Exception in thread "main" java/lang/NullPointerException: Cannot invoke length on null
-	at org/jboss/modules/Main.main(Main.java:446)
-	at org/jboss/modules/Main.getServiceName(Main.java:634)

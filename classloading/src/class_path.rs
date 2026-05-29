@@ -3633,12 +3633,12 @@ mod tests {
 
     #[test]
     fn manifest_classpath_file_uri_windows_drive() {
-        let data = b"Class-Path: file:/C:/Users/Victor/.m2/repository/x/y.jar\n";
+        let data = b"Class-Path: file:/C:/Users/dev/.m2/repository/x/y.jar\n";
         let info = ManifestInfo::parse(data);
         let cp = info.resolve_class_path(Path::new("C:/tmp/booter.jar"));
         assert_eq!(cp.len(), 1);
         let norm = cp[0].replace('\\', "/");
-        assert_eq!(norm, "C:/Users/Victor/.m2/repository/x/y.jar");
+        assert_eq!(norm, "C:/Users/dev/.m2/repository/x/y.jar");
     }
 
     #[test]

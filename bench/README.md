@@ -67,3 +67,9 @@ still trips the gate.
 | 2    | Baseline file missing/corrupt and `--update-baseline` not given |
 | 3    | No criterion data found — run `cargo bench` first |
 | 4    | Invalid CLI arguments |
+
+## License
+
+Apache-2.0. See `../LICENSE` and `../NOTICE` at the workspace root.
+
+Copyright 2024-2026 Craton Software Company.

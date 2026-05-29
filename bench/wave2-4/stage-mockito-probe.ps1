@@ -72,7 +72,7 @@ function Find-FirstJar {
 
 $m2Roots = @()
 if ($env:USERPROFILE) { $m2Roots += (Join-Path $env:USERPROFILE '.m2\repository') }
-$m2Roots += 'C:\Users\Victor\.m2\repository'
+$m2Roots += "$env:USERPROFILE\.m2\repository"
 
 $MockitoJar = $env:MOCKITO_JAR
 if (-not $MockitoJar -or -not (Test-Path $MockitoJar)) {
@@ -151,7 +151,7 @@ if (-not $ObjJar)     { $missing += 'objenesis' }
 
 if ($missing.Count -gt 0) {
     Add-Content -Path $CompileLog -Value ("stage-mockito-probe: SKIP missing jars: " + ($missing -join ', ')) -Encoding utf8
-    Add-Content -Path $CompileLog -Value "  searched: ~/.m2/repository, C:\Users\Victor\.m2\repository" -Encoding utf8
+    Add-Content -Path $CompileLog -Value "  searched: ~/.m2/repository, %USERPROFILE%\.m2\repository" -Encoding utf8
     Add-Content -Path $CompileLog -Value "  attempted: Maven Central (set NO_NET=1 to skip; \$env:MAVEN_CENTRAL_BASE to override mirror)" -Encoding utf8
     Set-Content -Path $SkipFlag -Value ('missing: ' + ($missing -join ',')) -Encoding utf8
     # Compile the interface even when skipping so re-runs of the run script

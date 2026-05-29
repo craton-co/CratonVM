@@ -57,7 +57,7 @@ echo "stage-cglib-probe: using javac at $JAVAC" | tee -a "$COMPILE_LOG"
 #   1. $CGLIB_JAR (env override)
 #   2. local maven repo: ~/.m2/repository/cglib/cglib-nodep/*/cglib-nodep-*.jar
 #                        $USERPROFILE/.m2/...                        (Windows)
-#   3. C:/Users/Victor/.m2/repository/cglib/cglib-nodep/*/cglib-nodep-*.jar
+#   3. $HOME/.m2/repository/cglib/cglib-nodep/*/cglib-nodep-*.jar
 #   4. C:/craton/ejbca-ce/lib/cglib*.jar  (best-effort vendor location)
 #   5. C:/craton/keycloak-*/**/cglib*.jar
 # If none, we still stage the legacy synthetic probe (no jar needed) and
@@ -80,7 +80,7 @@ if [[ -n "${USERPROFILE:-}" ]]; then
     candidates+=( "$UP_BASH"/.m2/repository/cglib/cglib-nodep/*/cglib-nodep-*.jar )
     candidates+=( "$UP_BASH"/.m2/repository/cglib/cglib/*/cglib-*.jar )
 fi
-candidates+=( /c/Users/Victor/.m2/repository/cglib/cglib-nodep/*/cglib-nodep-*.jar )
+candidates+=( "$HOME"/.m2/repository/cglib/cglib-nodep/*/cglib-nodep-*.jar )
 candidates+=( /c/craton/ejbca-ce/lib/cglib*.jar )
 candidates+=( /c/craton/keycloak-*/modules/system/layers/base/cglib/*/main/cglib*.jar )
 candidates+=( /c/craton/keycloak-*/modules/system/layers/base/net/sf/cglib/main/cglib*.jar )
@@ -121,7 +121,7 @@ fi
 
 if [[ -z "$CGLIB_JAR_PATH" ]]; then
     echo "stage-cglib-probe: SKIP cglib-nodep jar not found" | tee -a "$COMPILE_LOG"
-    echo "  searched: \$CGLIB_JAR, ~/.m2/repository/cglib/, C:/Users/Victor/.m2, C:/craton/ejbca-ce/lib, C:/craton/keycloak-*" | tee -a "$COMPILE_LOG"
+    echo "  searched: \$CGLIB_JAR, ~/.m2/repository/cglib/, \$HOME/.m2, C:/craton/ejbca-ce/lib, C:/craton/keycloak-*" | tee -a "$COMPILE_LOG"
     echo "  attempted: Maven Central (set NO_NET=1 to skip; \$MAVEN_CENTRAL_BASE to override mirror)" | tee -a "$COMPILE_LOG"
     echo "  set CGLIB_JAR=/path/to/cglib-nodep-X.Y.jar to enable the real-DSL probe" | tee -a "$COMPILE_LOG"
     touch "$SKIP_FLAG"

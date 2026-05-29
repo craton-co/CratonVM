@@ -1,7 +1,0 @@
-﻿[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
-2026-05-13T22:58:22.118677Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER populated with empty AtomicReference
-WARNING: Failed to load the specified log manager class org.jboss.logmanager.LogManager
-2026-05-13T22:58:23.001766Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
-2026-05-13T22:58:27.597298Z  WARN rustjvm_vm::runtime::interpreter: Stale pointer detected in invokevirtual receiver (ptr=0x2550f920, all-zero header) тАФ falling back to CP class java/lang/ClassLoader
-2026-05-13T22:58:27.597348Z  WARN rustjvm_vm::runtime::interpreter: Stale pointer detected in invokevirtual receiver (ptr=0x2550f920, all-zero header) тАФ falling back to CP class java/lang/ClassLoader
-

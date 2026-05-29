@@ -1,4 +1,0 @@
-[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
-2026-05-14T17:06:51.862614Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/security/AccessController.checkPermission(Ljava/security/Permission;)V"
-2026-05-14T17:06:51.865765Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/util/concurrent/LinkedBlockingQueue.size()I"
-Error in thread "main" linkage error: no such method: java/util/concurrent/LinkedBlockingQueue.size()I

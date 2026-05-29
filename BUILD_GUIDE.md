@@ -135,7 +135,7 @@ java -cp bench QuickBench          # JDK C2 (full JIT) — baseline
 java -Xint -cp bench QuickBench    # JDK interpreter only
 ```
 
-**Expected results (vs HotSpot JDK 25 C2):**
+**Expected results (vs HotSpot JDK 25 C2), as of 2026-03-31:**
 
 | Benchmark | JDK 25 C2 | CratonVM | Ratio |
 |-----------|-----------|---------|-------|
@@ -146,6 +146,8 @@ java -Xint -cp bench QuickBench    # JDK interpreter only
 | **TOTAL** | **3,440 ms** | **5,161 ms** | **1.50x** |
 
 *Measured 2026-03-31 on Windows 11, JDK 25.0.1 LTS. Round 26 JIT: OSR, loop unrolling, speculative BCE, graph-coloring regalloc.*
+
+*These figures are a point-in-time snapshot and are indicative only — actual results vary by hardware, JDK build, and CratonVM build. For benchmark methodology and how to reproduce these measurements, see [`docs/PROFILING.md`](docs/PROFILING.md).*
 
 ---
 

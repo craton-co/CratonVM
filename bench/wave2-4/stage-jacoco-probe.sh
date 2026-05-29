@@ -60,7 +60,7 @@ if [[ -n "${USERPROFILE:-}" ]]; then
     UP_BASH="${UP_BASH//\\//}"
     candidates+=( "$UP_BASH"/.m2/repository/org/jacoco/org.jacoco.agent/*/org.jacoco.agent-*-runtime.jar )
 fi
-candidates+=( /c/Users/Victor/.m2/repository/org/jacoco/org.jacoco.agent/*/org.jacoco.agent-*-runtime.jar )
+candidates+=( "$HOME"/.m2/repository/org/jacoco/org.jacoco.agent/*/org.jacoco.agent-*-runtime.jar )
 shopt -u nullglob
 
 for cand in "${candidates[@]}"; do

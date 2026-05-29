@@ -15,23 +15,31 @@ The GitHub team `@craton-co/cratonvm-maintainers` referenced from
 
 ## Maintainers
 
-Individual maintainer slots will be populated as contributors meet the
-criteria described in [GOVERNANCE.md#becoming-a-maintainer](GOVERNANCE.md#becoming-a-maintainer).
-As of this writing, day-to-day maintenance is performed by Craton Software
-Company staff acting in the Steward role.
+CratonVM is currently developed and maintained under single-vendor
+stewardship: all maintainer responsibilities are held by **Craton Software
+Company** staff acting in the Steward role, and the
+`@craton-co/cratonvm-maintainers` team is composed of those staff. The project
+actively welcomes outside contributors, and individual maintainer slots will
+be added to the roster below as contributors meet the criteria described in
+[GOVERNANCE.md#becoming-a-maintainer](GOVERNANCE.md#becoming-a-maintainer).
 
 | Name | GitHub | Areas | Since |
 |------|--------|-------|-------|
-| _(initial roster pending; see Steward above)_ | — | — | — |
+| Craton Software Company staff (Steward) | `@craton-co/cratonvm-maintainers` | All | — |
 
 ## Reviewers
 
 Trusted reviewers without merge rights, scoped to specific subsystems.
 Reviewers can fast-track PRs in their area with a single Maintainer +1.
 
+Reviewer duties are presently covered by Craton Software Company staff under
+the Steward role. This role is open to community contributors who establish a
+track record per
+[GOVERNANCE.md#becoming-a-maintainer](GOVERNANCE.md#becoming-a-maintainer).
+
 | Name | GitHub | Areas | Since |
 |------|--------|-------|-------|
-| _(none yet)_ | — | — | — |
+| Craton Software Company staff (Steward) | `@craton-co/cratonvm-maintainers` | All | — |
 
 ## Emeritus
 

@@ -76,7 +76,7 @@ if [[ -n "${USERPROFILE:-}" ]]; then
     UP_BASH="${UP_BASH//\\//}"
     up_m2="$UP_BASH/.m2/repository"
 fi
-hard_m2="/c/Users/Victor/.m2/repository"
+hard_m2="$HOME/.m2/repository"
 
 MOCKITO_JAR=""
 BB_JAR=""

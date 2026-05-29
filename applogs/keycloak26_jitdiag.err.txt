@@ -1,2 +1,0 @@
-[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
-2026-05-13T18:08:28.195021Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)

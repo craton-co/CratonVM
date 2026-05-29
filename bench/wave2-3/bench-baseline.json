@@ -20,7 +20,7 @@
       "real_jar_search": [
         "$CGLIB_JAR (env)",
         "$USERPROFILE/.m2/repository/cglib/cglib-nodep/*/cglib-nodep-*.jar",
-        "C:/Users/Victor/.m2/repository/cglib/cglib-nodep/*/cglib-nodep-*.jar",
+        "<USER_HOME>/.m2/repository/cglib/cglib-nodep/*/cglib-nodep-*.jar",
         "C:/craton/ejbca-ce/lib/cglib*.jar",
         "C:/craton/keycloak-*/**/cglib*.jar"
       ],
@@ -49,7 +49,7 @@
       "real_jar_search": [
         "$BYTEBUDDY_JAR (env)",
         "$USERPROFILE/.m2/repository/net/bytebuddy/byte-buddy/*/byte-buddy-*.jar",
-        "C:/Users/Victor/.m2/repository/net/bytebuddy/byte-buddy/*/byte-buddy-*.jar",
+        "<USER_HOME>/.m2/repository/net/bytebuddy/byte-buddy/*/byte-buddy-*.jar",
         "C:/craton/ejbca-ce/lib/hibernate/byte-buddy-*.jar",
         "C:/craton/keycloak-*/modules/system/layers/base/net/bytebuddy/main/byte-buddy-*.jar"
       ],

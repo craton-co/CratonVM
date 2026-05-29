@@ -1,9 +1,0 @@
-﻿2026-05-13T21:44:10.272572Z  WARN rustjvm_vm::runtime::diagnostics: B6: silent-swallow тАФ error suppressed to keep VM running site=<clinit> category=non-critical-exception detail=class=org/jboss/modules/Module exc=java/lang/NullPointerException
-2026-05-13T21:44:10.272655Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 0] at org/jboss/modules/Main.main (Main.java:337) bci=1219
-2026-05-13T21:44:10.272666Z  WARN rustjvm_vm::vm::vm_util:   [SWALLOW-TRACE 1] at org/jboss/modules/Module.<clinit> (Module.java:77) bci=22
-2026-05-13T21:44:10.272682Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.systemPaths backfilled with empty String[]
-2026-05-13T21:44:10.272690Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.systemPackages backfilled with empty String[]
-Exception in thread "main" java/lang/NullPointerException
-	at org/jboss/modules/Main.main(Main.java:337)
-	at org/jboss/modules/Module.initBootModuleLoader(Module.java:586)
-

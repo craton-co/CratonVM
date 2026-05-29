@@ -1,8 +1,0 @@
---- STDOUT ---
-
---- STDERR ---
-[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
-2026-05-14T20:14:55.667602Z  WARN rustjvm_vm::vm::vm_exec: NoSuchMethodError method="java/nio/file/attribute/PosixFilePermissions.asFileAttribute(Ljava/util/Set;)Ljava/nio/file/attribute/FileAttribute;"
-Error in thread "main" linkage error: no such method: java/nio/file/attribute/PosixFilePermissions.asFileAttribute(Ljava/util/Set;)Ljava/nio/file/attribute/FileAttribute;
-
---- EXIT 1 ---

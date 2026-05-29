@@ -63,7 +63,7 @@ if ($env:JACOCO_AGENT_JAR -and (Test-Path $env:JACOCO_AGENT_JAR)) { $candidates 
 $candidates += 'C:\craton\ejbca-ce\lib\coverage\jacocoagent.jar'
 
 # Search local maven for org.jacoco.agent runtime jar.
-foreach ($base in @($env:USERPROFILE, 'C:\Users\Victor')) {
+foreach ($base in @($env:USERPROFILE)) {
     if (-not $base) { continue }
     $root = Join-Path $base '.m2\repository\org\jacoco\org.jacoco.agent'
     if (Test-Path $root) {

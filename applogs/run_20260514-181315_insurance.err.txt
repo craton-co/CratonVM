@@ -1,4 +1,0 @@
-[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
-Exception in thread "main" java/lang/ClassCastException
-	at org/springframework/boot/loader/launch/Launcher.launch(Launcher.java:50)
-	at org/springframework/boot/loader/launch/Launcher.createClassLoader(Launcher.java:71)

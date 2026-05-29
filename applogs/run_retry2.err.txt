@@ -1,7 +1,0 @@
-[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
-2026-05-14T23:16:34.518534Z  WARN rustjvm_vm::vm::vm_util: <clinit> failed вЂ” wrapping in ExceptionInInitializerError class=org/springframework/boot/SpringApplicationShutdownHook cause=java/lang/NullPointerException 
-2026-05-14T23:16:34.520142Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE 0] at org/springframework/boot/loader/MainMethodRunner.run (MainMethodRunner.java:49) bci=49
-2026-05-14T23:16:34.521377Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE 1] at com/digsol/main/MainServiceApplication.main (MainServiceApplication.java:12) bci=3
-2026-05-14T23:16:34.521806Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE 2] at org/springframework/boot/SpringApplication.<clinit> (SpringApplication.java:180) bci=8
-2026-05-14T23:16:34.521970Z  WARN rustjvm_vm::vm::vm_util:   [CLINIT-TRACE 3] at org/springframework/boot/SpringApplicationShutdownHook.<clinit> (SpringApplicationShutdownHook.java:52) bci=6
-Exception in thread "main" java/lang/reflect/InvocationTargetException

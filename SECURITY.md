@@ -90,8 +90,10 @@ For **non-sensitive** issues, open a
 [GitHub Issue](https://github.com/craton-co/cratonvm/issues) with the label `security`.
 
 For **sensitive** issues (exploitable vulnerabilities, crashes on untrusted input),
-please use [GitHub Security Advisories](https://github.com/craton-co/cratonvm/security/advisories/new)
-to report privately. This ensures the issue is not publicly visible until a fix is available.
+please report privately either via
+[GitHub Security Advisories](https://github.com/craton-co/cratonvm/security/advisories/new)
+(preferred) or by emailing `security@craton.co`. Either channel keeps the issue
+private and ensures it is not publicly visible until a fix is available.
 
 In your report, please include:
 - Description of the vulnerability

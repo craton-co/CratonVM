@@ -4,7 +4,7 @@
 # happens, the culprit is in that sub-package.
 
 set -u
-JUNIT='C:\Users\Victor\AppData\Local\Temp\junit-3.8.2.jar'
+JUNIT="${JUNIT:-$TEMP/junit-3.8.2.jar}"
 BC_CP='core/build/classes/java/main;core/build/classes/java/test;core/build/resources/main;core/build/resources/test'
 CMD="C:/craton/CratonVM/target/release/cratonvm.exe --java-home \"C:/Program Files/Java/jdk-25\" --stack-dump-on-timeout 0 -Xmx1g -cp \"${BC_CP};${JUNIT}\" junit.textui.TestRunner org.bouncycastle.math.ec.test.AllTests"
 

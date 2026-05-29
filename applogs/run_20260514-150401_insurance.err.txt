@@ -1,7 +1,0 @@
-[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
-Exception in thread "main" java/lang/NoSuchFieldError
-	at org/springframework/boot/loader/launch/JarLauncher.main(JarLauncher.java:58)
-	at org/springframework/boot/loader/launch/JarLauncher.<init>(JarLauncher.java:32)
-	at org/springframework/boot/loader/launch/ExecutableArchiveLauncher.<init>(ExecutableArchiveLauncher.java:53)
-	at org/springframework/boot/loader/launch/Archive.create(Archive.java:128)
-	at org/springframework/boot/loader/launch/JarFileArchive.<clinit>(JarFileArchive.java:55)

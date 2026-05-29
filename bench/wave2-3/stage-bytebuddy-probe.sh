@@ -58,7 +58,7 @@ if [[ -n "${USERPROFILE:-}" ]]; then
     UP_BASH="${UP_BASH//\\//}"
     candidates+=( "$UP_BASH"/.m2/repository/net/bytebuddy/byte-buddy/*/byte-buddy-*.jar )
 fi
-candidates+=( /c/Users/Victor/.m2/repository/net/bytebuddy/byte-buddy/*/byte-buddy-*.jar )
+candidates+=( "$HOME"/.m2/repository/net/bytebuddy/byte-buddy/*/byte-buddy-*.jar )
 candidates+=( /c/craton/ejbca-ce/lib/hibernate/byte-buddy-*.jar )
 candidates+=( /c/craton/keycloak-*/modules/system/layers/base/net/bytebuddy/main/byte-buddy-*.jar )
 shopt -u nullglob

@@ -92,3 +92,11 @@ applogs/
 /sf-desc.txt
 *.dis
 __pycache__/
+
+# Local dev scratch / log artifacts — must NOT ship in the public Apache-2.0
+# repo. These are per-developer run logs and internal session-handoff notes
+# that can contain personal filesystem paths and other local-only data.
+applogs/
+/continue_prompt.md
+/err_all.log
+test-infra/suite-results/*.tsv

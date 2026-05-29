@@ -3,7 +3,7 @@
 # Each entry is a Class.method pair (slash-class, dot-method).
 
 set -u
-JUNIT='C:\Users\Victor\AppData\Local\Temp\junit-3.8.2.jar'
+JUNIT="${JUNIT:-$TEMP/junit-3.8.2.jar}"
 BC_CP='core/build/classes/java/main;core/build/classes/java/test;core/build/resources/main;core/build/resources/test'
 
 cd C:/craton/CratonVM/apps/_test-suites/bc-java

@@ -21,3 +21,9 @@ cratonvm --classpath examples HelloWorld
 | `examples/StringTest.java` | String operations |
 
 Compile examples with `javac examples/*.java`, then run with `cratonvm --classpath examples <ClassName>`.
+
+## License
+
+Apache-2.0. See `../LICENSE` and `../NOTICE` at the workspace root.
+
+Copyright 2024-2026 Craton Software Company.

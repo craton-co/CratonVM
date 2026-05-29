@@ -1,4 +1,0 @@
-[rustjvm] stack-dump watchdog armed: will dump + abort after 120s
-2026-05-13T23:07:55.881454Z  WARN rustjvm_vm::vm::vm_util: Post-clinit fixup: org/jboss/modules/Module.BOOT_MODULE_LOADER populated with empty AtomicReference
-org.jboss.modules.ModuleNotFoundException: org.jboss.as.standalone
-[rustjvm] System.exit(1) called тАФ process terminating

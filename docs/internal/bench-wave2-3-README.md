@@ -77,8 +77,8 @@ type bench\wave2-3\summary.json
 
 ## Expected today (2026-04-25, pre-2.3-A/B/C)
 
-- `stage-cglib-probe`: rc=0; locates `C:/Users/Victor/.m2/repository/cglib/cglib-nodep/2.2/cglib-nodep-2.2.jar` on the dev workstation; compiles `CglibProbe2`.
-- `stage-bytebuddy-probe`: rc=0; locates `C:/Users/Victor/.m2/repository/net/bytebuddy/byte-buddy/1.14.19/byte-buddy-1.14.19.jar`; compiles `ByteBuddyProbe`.
+- `stage-cglib-probe`: rc=0; locates `C:/Users/<dev>/.m2/repository/cglib/cglib-nodep/2.2/cglib-nodep-2.2.jar` on the dev workstation; compiles `CglibProbe2`.
+- `stage-bytebuddy-probe`: rc=0; locates `C:/Users/<dev>/.m2/repository/net/bytebuddy/byte-buddy/1.14.19/byte-buddy-1.14.19.jar`; compiles `ByteBuddyProbe`.
 - `run-under-cratonvm`: each probe rc=1.
   - CGLIB synthetic mode: `NullPointerException: Cannot invoke getCodeSource on null` — the post-defineClass `getProtectionDomain()` chain returns `null`. WP2.3-C must add ProtectionDomain.
   - CGLIB real mode: deeper inside `Enhancer.create()`, CGLIB hits `Unsafe.defineClass` / `MethodHandles.Lookup.defineClass`, both stubs today (WP2.3-A + 2.3-B).

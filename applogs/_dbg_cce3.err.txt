@@ -1,4 +1,0 @@
-[CCE_DBG] checkcast fail: obj_cid=0 obj_class=java/util/Enumeration$Impl target=org/springframework/boot/loader/archive/Archive caller=org/springframework/boot/loader/ExecutableArchiveLauncher.createClassLoader(Ljava/util/Iterator;)Ljava/lang/ClassLoader;
-Exception in thread "main" java/lang/ClassCastException
-	at org/springframework/boot/loader/Launcher.launch(Launcher.java:55)
-	at org/springframework/boot/loader/ExecutableArchiveLauncher.createClassLoader(ExecutableArchiveLauncher.java:104)

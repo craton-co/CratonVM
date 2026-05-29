@@ -150,3 +150,9 @@ The op log captures one variant per enqueue or synchronization call:
 | `EventWait`     | event id the stream is gated on.                               |
 | `Synchronize`   | a host-side `stream.synchronize()` call.                       |
 
+## License
+
+Apache-2.0. See `../LICENSE` and `../NOTICE` at the workspace root.
+
+Copyright 2024-2026 Craton Software Company.
+
