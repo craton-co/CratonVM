@@ -36,3 +36,9 @@ iso_date	suite	variant	rc	pass	total	wall_s	notes
 2026-05-28T12:40:00Z	spring-boot-probe	cratonvm	0	1	1	2.63	commons-logging on cp (real jar from hadoop) — SpringApplicationBuilder + @Configuration + bean retrieval round-trip
 2026-05-28T12:40:00Z	spring-boot-probe	hotspot	0	1	1	1.35	commons-logging on cp
 2026-05-28T12:40:00Z	spring-boot-probe	tornadovm	1	0	1	0.90	IncompatibleClassChangeError on log4j2 PropertiesUtil lambda: Graal lambda-impl-class doesn't match BiConsumer — TornadoVM-specific issue, not CratonVM-related
+2026-05-29T01:50:00Z	commons-math	cratonvm	0	3204	3204	104.00	mvn -Drat.skip=true (RAT plugin trips on session vs-comparison .log files — not a CratonVM issue); 30 skipped, 3 flakes auto-retried green; down from 113s prior baseline
+2026-05-29T01:21:00Z	bc-asn1-regression	cratonvm	0	58	58	84.89	dev tip 55ca37f; SimpleTest main() run directly (NOT junit.textui.TestRunner)
+2026-05-29T01:28:00Z	bc-crypto-prng-regression	cratonvm	0	1	1	15.73	dev tip 55ca37f; RegressionTest main passes
+2026-05-29T01:31:00Z	bc-util-utiltest	cratonvm	0	1	1	2.09	dev tip 55ca37f; JUnit AllTests passes
+2026-05-29T01:23:00Z	bc-math-ec	cratonvm	124	0	14	120.15	dev tip 55ca37f; timeout (long-bit-collision family); fast repro is bc-math-raw
+2026-05-29T01:25:00Z	bc-math-raw	cratonvm	1	0	1	1.29	dev tip 55ca37f; FAST long-bit-collision repro — JUnit expected:<N> but was:<N> with identical-printing longs (pop_long int-widen drops bits)
