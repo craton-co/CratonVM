@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
@@ -373,10 +373,55 @@ fn read_string_field(
     }
 }
 
-/// Check a permission object. If a policy is loaded, the grant list is
-/// consulted using the currently-active privileged frame's code base (if
-/// any) to disambiguate `codeBase "..."` grants. With no policy loaded
-/// the result is allow-all (JDK default).
+/// Construct and throw a real `java.security.AccessControlException`
+/// (a subclass of `java.lang.SecurityException`) carrying `message`.
+///
+/// We build the genuine Java object rather than route through a
+/// `RuntimeError` variant because the shared `RuntimeError::SecurityException`
+/// maps to the bare `java.lang.SecurityException` class — JDK code that
+/// does `catch (AccessControlException e)` (the conventional catch around
+/// `checkPermission`) would miss a plain `SecurityException`. The
+/// AccessControlException(String) constructor exists on JDK 25.
+///
+/// If object construction fails (e.g. the class can't be resolved in a
+/// stripped runtime), fall back to the `RuntimeError::SecurityException`
+/// path so a denial is still surfaced as *some* SecurityException rather
+/// than silently allowed.
+fn throw_access_control_exception(
+    ctx: &mut dyn NativeContext,
+    message: String,
+) -> MethodCallFailed {
+    let cls = "java/security/AccessControlException";
+    // Allocate the exception object, then run its (String) constructor so
+    // the detail message is populated the same way the JDK would.
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object(cls) {
+        let msg_obj = ctx.create_string(&message);
+        let ctor = ctx.invoke(
+            cls,
+            "<init>",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(exc)), Value::Object(Some(msg_obj))],
+        );
+        if ctor.is_ok() {
+            return MethodCallFailed::ExceptionThrown(exc);
+        }
+    }
+    // Fallback: still a SecurityException, just the base class.
+    RuntimeError::SecurityException { message }.into()
+}
+
+/// Check a permission object. Enforcement only bites when the active
+/// policy actually denies the request; with no policy loaded the result
+/// is allow-all (the JDK default when a SecurityManager is installed
+/// programmatically without a `java.policy`), so apps that never
+/// configure a policy — including the BouncyCastle regression suite,
+/// which installs neither a SecurityManager nor a policy — are never
+/// affected.
+///
+/// If a policy is loaded, the grant list is consulted using the
+/// currently-active privileged frame's code base (if any) to disambiguate
+/// `codeBase "..."` grants. A denial throws
+/// `java.security.AccessControlException`.
 fn check_permission_impl(
     ctx: &mut dyn NativeContext,
     perm: ObjectRef,
@@ -421,11 +466,35 @@ fn check_permission_impl(
             code_base = ?code_base,
             "SecurityManager.checkPermission: DENY"
         );
-        Err(RuntimeError::SecurityException {
-            message: format!("access denied (\"{class_name}\" \"{target}\" \"{actions}\")"),
-        }
-        .into())
+        let message = format!("access denied (\"{class_name}\" \"{target}\" \"{actions}\")");
+        Err(throw_access_control_exception(ctx, message))
     }
+}
+
+/// Evaluate a Permission object against the currently-active parsed policy,
+/// using the active privileged frame's code base / signer digests for
+/// `codeBase "..."` / `signedBy "..."` matching. Returns `true` if the
+/// permission is implied (or if no policy is loaded — the allow-all
+/// default). This is the shared core used by both `SecurityManager`-style
+/// `checkPermission` and the `Policy.implies(...)` native so the two stay
+/// in lock-step.
+fn policy_implies_permission(ctx: &mut dyn NativeContext, perm: ObjectRef) -> bool {
+    let class_id = ctx.class_id_of_object(perm);
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
+    // Permission conventions: field 0 = name/target, field 1 = actions.
+    let target = read_string_field(ctx, perm, 0);
+    let actions = read_string_field(ctx, perm, 1);
+
+    let code_base = current_privileged_code_base_arc();
+    let cert_digests = current_privileged_cert_digests_arc();
+
+    policy_allows_full_generic(
+        &class_name,
+        &target,
+        &actions,
+        code_base.as_deref(),
+        &cert_digests,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,20 +1113,22 @@ fn register_access_control_context(r: &mut NativeMethodRegistry) {
 // `ModulesPolicy.install`. Throwing kills boot.
 //
 // cratonvm's lenient model accepts the installation: we store the reference
-// in a process-wide singleton and answer subsequent queries from it. We
-// do not enforce the installed Policy at runtime — `implies(...)` always
-// returns `true` because cratonvm has no permission-check choke points
-// (the `SecurityManager.checkPermission` flow above is policy-aware but
-// `policy_allows_full` short-circuits to `true` whenever no Rust-side
-// `Policy` (the parsed `java.policy` flavour) is installed).
+// in a process-wide singleton and answer subsequent queries from it.
 //
-// SECURITY POSTURE: this is a deliberate no-enforcement design, NOT a
-// regression. cratonvm operates in real-JDK-mode without the
-// SecurityManager call sites that would consult the Policy. Apps that
-// embed cratonvm and *do* require permission enforcement must layer that
-// on top — the OS sandbox, container limits, or a Java-side
-// `java.policy` are all viable. The `implies(...)`-returns-true contract
-// is documented here so the next agent doesn't mistake it for a bug.
+// ENFORCEMENT: `implies(...)` now delegates to the parsed `java.policy`
+// grant evaluation (`policy_implies_permission` → `policy_allows_full_generic`).
+// When a Rust-side `Policy` (the parsed `java.policy` flavour) is configured,
+// a permission not covered by any grant returns `false`; the
+// `SecurityManager.checkPermission` flow above shares the same evaluation
+// and throws `java.security.AccessControlException` on denial.
+//
+// SECURITY POSTURE: enforcement is policy-gated, not always-on. When no
+// `java.policy` is configured the evaluation short-circuits to allow-all
+// (the JDK default for a programmatically-installed SecurityManager with no
+// policy), so apps that install neither a SecurityManager nor a policy —
+// including the BouncyCastle regression suite — are entirely unaffected.
+// Enforcement only ever DENIES once a policy has been parsed and installed
+// via `set_active_policy` / `load_policy_file`.
 fn register_policy_natives(r: &mut NativeMethodRegistry) {
     let p = "java/security/Policy";
 
@@ -1136,13 +1207,32 @@ fn register_policy_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // implies(ProtectionDomain, Permission)Z — always true under the
-    // no-enforcement model. Documented above; not a regression.
+    // implies(ProtectionDomain, Permission)Z — delegate to the parsed
+    // `java.policy` grant evaluation. With no Rust-side policy installed
+    // this still returns `true` (allow-all default, matching the prior
+    // contract and the no-SecurityManager BouncyCastle path); once a
+    // policy IS configured, the answer reflects whether any grant covers
+    // the requested permission.
+    //
+    // The Permission is the final argument: under the real VM the args are
+    // `[this(Policy), protectionDomain, permission]`; some internal/test
+    // call paths omit the receiver, leaving `[protectionDomain, permission]`.
+    // In both shapes the Permission is `args.last()`, so we read it from
+    // there rather than a fixed index.
     r.register(
         p,
         "implies",
         "(Ljava/security/ProtectionDomain;Ljava/security/Permission;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
+        |ctx, args| {
+            let perm = match args.last() {
+                Some(Value::Object(Some(o))) => *o,
+                // No permission object to evaluate (e.g. null) — preserve
+                // the lenient default and allow.
+                _ => return Ok(Some(Value::Int(1))),
+            };
+            let allowed = policy_implies_permission(ctx, perm);
+            Ok(Some(Value::Int(if allowed { 1 } else { 0 })))
+        },
     );
 
     // refresh()V — no-op: cratonvm has no Policy provider to reload.
@@ -2580,6 +2670,94 @@ mod tests {
         );
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), Some(Value::Int(1)));
+
+        clear_policy_and_stack();
+    }
+
+    /// With a parsed policy installed, `Policy.implies(pd, perm)` must
+    /// return 0 for a permission no grant covers and 1 for one that is
+    /// covered — i.e. it genuinely delegates to the grant evaluation
+    /// instead of unconditionally returning 1.
+    #[test]
+    fn policy_implies_delegates_to_parsed_policy() {
+        let _guard = policy_test_lock();
+        clear_policy_and_stack();
+        let src = r#"
+            grant {
+                permission java.io.FilePermission "/tmp/*", "read";
+            };
+        "#;
+        set_active_policy(Some(Policy::parse(src).unwrap()));
+
+        let mut registry = NativeMethodRegistry::new();
+        register_security_manager_natives(&mut registry);
+
+        let implies = registry
+            .find(
+                "java/security/Policy",
+                "implies",
+                "(Ljava/security/ProtectionDomain;Ljava/security/Permission;)Z",
+            )
+            .expect("implies should be registered");
+
+        let mut ctx = MockNativeContext::new();
+        let pd = alloc_concurrent_synthetic(&mut ctx, "java/security/ProtectionDomain", 4);
+
+        // Not granted: a SocketPermission must be DENIED (implies -> 0).
+        let denied = alloc_concurrent_synthetic(&mut ctx, "java/net/SocketPermission", 2);
+        let host = ctx.create_string("example.com:443");
+        ctx.set_field(denied, 0, Value::Object(Some(host)));
+        let act = ctx.create_string("connect");
+        ctx.set_field(denied, 1, Value::Object(Some(act)));
+        let r = implies(
+            &mut ctx,
+            &[Value::Object(Some(pd)), Value::Object(Some(denied))],
+        )
+        .unwrap();
+        assert_eq!(r, Some(Value::Int(0)), "ungranted permission must imply 0");
+
+        // Granted: a FilePermission read on /tmp/* must be ALLOWED (-> 1).
+        let granted = alloc_concurrent_synthetic(&mut ctx, "java/io/FilePermission", 2);
+        let path = ctx.create_string("/tmp/foo.txt");
+        ctx.set_field(granted, 0, Value::Object(Some(path)));
+        let act2 = ctx.create_string("read");
+        ctx.set_field(granted, 1, Value::Object(Some(act2)));
+        let r = implies(
+            &mut ctx,
+            &[Value::Object(Some(pd)), Value::Object(Some(granted))],
+        )
+        .unwrap();
+        assert_eq!(r, Some(Value::Int(1)), "granted permission must imply 1");
+
+        clear_policy_and_stack();
+    }
+
+    /// Sanity: when NO policy is installed (the BouncyCastle / default case)
+    /// `Policy.implies` returns 1 (allow-all) for any permission.
+    #[test]
+    fn policy_implies_allows_all_with_no_policy() {
+        let _guard = policy_test_lock();
+        clear_policy_and_stack();
+        let mut registry = NativeMethodRegistry::new();
+        register_security_manager_natives(&mut registry);
+
+        let implies = registry
+            .find(
+                "java/security/Policy",
+                "implies",
+                "(Ljava/security/ProtectionDomain;Ljava/security/Permission;)Z",
+            )
+            .unwrap();
+
+        let mut ctx = MockNativeContext::new();
+        let pd = alloc_concurrent_synthetic(&mut ctx, "java/security/ProtectionDomain", 4);
+        let perm = alloc_concurrent_synthetic(&mut ctx, "java/net/SocketPermission", 2);
+        let r = implies(
+            &mut ctx,
+            &[Value::Object(Some(pd)), Value::Object(Some(perm))],
+        )
+        .unwrap();
+        assert_eq!(r, Some(Value::Int(1)));
 
         clear_policy_and_stack();
     }

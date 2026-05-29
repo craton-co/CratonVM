@@ -272,15 +272,351 @@ fn native_fd_isother0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
     Ok(Some(Value::Int(0)))
 }
 
-/// `lock0(FileDescriptor, boolean, long, long, boolean) -> int` — file
-/// locking. Return 0 (success) to let the JDK proceed.
-fn native_fd_lock0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
+/// `lock0(FileDescriptor fd, boolean blocking, long pos, long size, boolean shared) -> int`
+///
+/// Acquire a real OS advisory/byte-range lock on the file behind `fd`.
+/// This is the native that backs `FileChannel.lock(...)` /
+/// `FileChannel.tryLock(...)`.
+///
+/// JDK `sun.nio.ch.FileDispatcher` return convention (matched exactly):
+///        `NO_LOCK     = -1` (could not acquire — non-blocking tryLock
+///                            failed because the range is already held;
+///                            `FileChannelImpl.tryLock` maps this to a
+///                            `null` `FileLock`),
+///        `LOCKED      =  0` (acquired the lock exactly as requested),
+///        `RET_EX_LOCK =  1` (acquired an *exclusive* lock when a shared
+///                            one was asked for — a Unix quirk we never
+///                            return because `flock`/`LockFileEx` honor
+///                            the requested mode),
+///        `INTERRUPTED =  2` (blocking lock interrupted — N/A here).
+///   * A genuine OS error throws `IOException` (returned as `Err`).
+///
+/// We return `LOCKED (0)` on success and `NO_LOCK (-1)` when a
+/// non-blocking acquisition fails because the range is already held.
+/// (The previous no-op stub returned `0` unconditionally, which is why
+/// callers always "succeeded" — `0` is precisely `LOCKED`.)
+///
+/// Parameter mapping:
+///   * `pos`  — start byte offset of the range to lock.
+///   * `size` — length of the range. The JDK passes `Long.MAX_VALUE`
+///     for a whole-file lock; we treat `size <= 0 || pos + size`
+///     overflow as "to end of file" (whole range from `pos`).
+///   * `shared`  — true => shared (read) lock; false => exclusive.
+///   * `blocking == false` (i.e. `tryLock`) => fail immediately if the
+///     range is contended rather than waiting.
+fn native_fd_lock0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // JDK sun.nio.ch.FileDispatcher return codes.
+    const NO_LOCK: i32 = -1;
+    const LOCKED: i32 = 0;
+
+    let fd_obj = fd_arg(args, 0)?;
+    let blocking = int_arg(args, 1) != 0;
+    let pos = long_arg(args, 2);
+    let size = long_arg(args, 3);
+    let shared = int_arg(args, 4) != 0;
+
+    if pos < 0 {
+        return Err(io_error("lock0: negative position"));
+    }
+    let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
+        return Err(io_error("lock0: FileDescriptor has no open handle"));
+    };
+
+    // Obtain a handle/fd onto the same kernel file object. `clone_file`
+    // dups the underlying handle (Windows `DuplicateHandle` / Unix
+    // `dup`), so the lock placed through it is coherent with the file
+    // and survives this temporary clone being dropped (the original fd
+    // keeps the kernel file object / open file description alive).
+    let file = ctx
+        .fd_table()
+        .clone_file(fd)
+        .map_err(|e| io_error(format!("lock0: {e}")))?;
+
+    match os_lock::lock_range(&file, pos as u64, size, shared, blocking) {
+        Ok(true) => Ok(Some(Value::Int(LOCKED))),
+        Ok(false) => Ok(Some(Value::Int(NO_LOCK))),
+        Err(e) => Err(io_error(format!("lock0: {e}"))),
+    }
 }
 
-/// `release0(FileDescriptor, long, long)` — release lock.
-fn native_fd_release0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// `release0(FileDescriptor fd, long pos, long size)`
+///
+/// Release the byte-range lock previously taken by `lock0` over exactly
+/// `[pos, pos+size)`. The JDK always calls this with the same `pos`/
+/// `size` it passed to `lock0`, so we unlock the identical range.
+fn native_fd_release0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let fd_obj = fd_arg(args, 0)?;
+    let pos = long_arg(args, 1);
+    let size = long_arg(args, 2);
+
+    if pos < 0 {
+        return Err(io_error("release0: negative position"));
+    }
+    let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
+        // Nothing to release if the fd is already gone.
+        return Ok(None);
+    };
+    let file = ctx
+        .fd_table()
+        .clone_file(fd)
+        .map_err(|e| io_error(format!("release0: {e}")))?;
+
+    os_lock::unlock_range(&file, pos as u64, size).map_err(|e| io_error(format!("release0: {e}")))?;
     Ok(None)
+}
+
+/// Platform-specific byte-range file locking, declaring the Win32 /
+/// libc externs inline in the same style as the `WSAPoll` / `poll`
+/// blocks in `native-api/src/fd_table.rs`.
+mod os_lock {
+    use std::io;
+
+    /// Normalize the JDK `(pos, size)` pair into the byte range to lock.
+    /// The JDK uses `Long.MAX_VALUE` (and historically `0`) to mean
+    /// "the rest of the file / whole file". We clamp an overflowing or
+    /// non-positive `size` to "lock the maximum range from `pos`".
+    fn range_len(pos: u64, size: i64) -> u64 {
+        if size <= 0 {
+            // Whole file from `pos`: lock the largest range that does
+            // not overflow past u64::MAX when added to `pos`.
+            u64::MAX - pos
+        } else {
+            let size = size as u64;
+            // Clamp so `pos + size` never overflows.
+            size.min(u64::MAX - pos)
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Windows: LockFileEx / UnlockFileEx on the file HANDLE.
+    // -----------------------------------------------------------------
+    #[cfg(windows)]
+    pub fn lock_range(
+        file: &std::fs::File,
+        pos: u64,
+        size: i64,
+        shared: bool,
+        blocking: bool,
+    ) -> io::Result<bool> {
+        use std::os::windows::io::AsRawHandle;
+
+        // Flags for LockFileEx.
+        const LOCKFILE_FAIL_IMMEDIATELY: u32 = 0x0000_0001;
+        const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+        // GetLastError code returned when LOCKFILE_FAIL_IMMEDIATELY
+        // cannot acquire because the range is already locked.
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+        const ERROR_IO_PENDING: i32 = 997;
+
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            h_event: *mut core::ffi::c_void,
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn LockFileEx(
+                hfile: *mut core::ffi::c_void,
+                dwflags: u32,
+                dwreserved: u32,
+                nnumberofbytestolocklow: u32,
+                nnumberofbytestolockhigh: u32,
+                lpoverlapped: *mut Overlapped,
+            ) -> i32;
+        }
+
+        let len = range_len(pos, size);
+        let mut flags = 0u32;
+        if !shared {
+            flags |= LOCKFILE_EXCLUSIVE_LOCK;
+        }
+        if !blocking {
+            flags |= LOCKFILE_FAIL_IMMEDIATELY;
+        }
+
+        let mut ov = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: (pos & 0xFFFF_FFFF) as u32,
+            offset_high: (pos >> 32) as u32,
+            h_event: core::ptr::null_mut(),
+        };
+
+        // SAFETY: `hfile` is a live Win32 file HANDLE owned by `file`
+        // (kept alive for the duration of the call); `ov` is a fully
+        // initialised OVERLAPPED carrying the 64-bit offset; the byte
+        // count is split into its low/high 32-bit halves per the API.
+        let rc = unsafe {
+            LockFileEx(
+                file.as_raw_handle(),
+                flags,
+                0,
+                (len & 0xFFFF_FFFF) as u32,
+                (len >> 32) as u32,
+                &mut ov as *mut Overlapped,
+            )
+        };
+        if rc != 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            // tryLock contention — report "not acquired" rather than error.
+            Some(ERROR_LOCK_VIOLATION) | Some(ERROR_IO_PENDING) if !blocking => Ok(false),
+            _ => Err(err),
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn unlock_range(file: &std::fs::File, pos: u64, size: i64) -> io::Result<()> {
+        use std::os::windows::io::AsRawHandle;
+
+        #[repr(C)]
+        struct Overlapped {
+            internal: usize,
+            internal_high: usize,
+            offset: u32,
+            offset_high: u32,
+            h_event: *mut core::ffi::c_void,
+        }
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn UnlockFileEx(
+                hfile: *mut core::ffi::c_void,
+                dwreserved: u32,
+                nnumberofbytestounlocklow: u32,
+                nnumberofbytestounlockhigh: u32,
+                lpoverlapped: *mut Overlapped,
+            ) -> i32;
+        }
+
+        let len = range_len(pos, size);
+        let mut ov = Overlapped {
+            internal: 0,
+            internal_high: 0,
+            offset: (pos & 0xFFFF_FFFF) as u32,
+            offset_high: (pos >> 32) as u32,
+            h_event: core::ptr::null_mut(),
+        };
+        // SAFETY: same invariants as `lock_range`; unlocks the exact
+        // range that the matching `lock_range` call locked.
+        let rc = unsafe {
+            UnlockFileEx(
+                file.as_raw_handle(),
+                0,
+                (len & 0xFFFF_FFFF) as u32,
+                (len >> 32) as u32,
+                &mut ov as *mut Overlapped,
+            )
+        };
+        if rc != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Unix: flock on the file descriptor. POSIX `fcntl` locks are owned
+    // per (process, inode) and are dropped the moment ANY fd to that
+    // inode is closed — which would be unsafe here because we lock
+    // through a `dup`-ed clone. `flock` locks are instead tied to the
+    // open file description (shared across `dup`s) and survive the
+    // temporary clone being dropped, so we use `flock`. It honors the
+    // shared/exclusive and blocking/non-blocking dimensions; the byte
+    // range is whole-file (flock's documented granularity), which is a
+    // conservative superset of the requested `[pos, pos+size)`.
+    // -----------------------------------------------------------------
+    #[cfg(unix)]
+    pub fn lock_range(
+        file: &std::fs::File,
+        _pos: u64,
+        _size: i64,
+        shared: bool,
+        blocking: bool,
+    ) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+
+        const LOCK_SH: i32 = 1;
+        const LOCK_EX: i32 = 2;
+        const LOCK_NB: i32 = 4;
+        const EWOULDBLOCK: i32 = 11; // == EAGAIN on Linux
+
+        extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+
+        let mut op = if shared { LOCK_SH } else { LOCK_EX };
+        if !blocking {
+            op |= LOCK_NB;
+        }
+        // SAFETY: `fd` is a live file descriptor owned by `file` (kept
+        // alive across the call). `flock` only inspects kernel state for
+        // that descriptor.
+        let rc = unsafe { flock(file.as_raw_fd(), op) };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let err = io::Error::last_os_error();
+        match err.raw_os_error() {
+            // tryLock contention.
+            Some(EWOULDBLOCK) if !blocking => Ok(false),
+            _ => Err(err),
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn unlock_range(file: &std::fs::File, _pos: u64, _size: i64) -> io::Result<()> {
+        use std::os::fd::AsRawFd;
+
+        const LOCK_UN: i32 = 8;
+
+        extern "C" {
+            fn flock(fd: i32, operation: i32) -> i32;
+        }
+
+        // SAFETY: see `lock_range`.
+        let rc = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::range_len;
+
+        #[test]
+        fn whole_file_size_zero_locks_max_range() {
+            assert_eq!(range_len(0, 0), u64::MAX);
+            assert_eq!(range_len(10, 0), u64::MAX - 10);
+        }
+
+        #[test]
+        fn whole_file_long_max_size_does_not_overflow() {
+            // JDK passes Long.MAX_VALUE for a whole-file lock.
+            let r = range_len(100, i64::MAX);
+            assert!(r <= u64::MAX - 100);
+            assert_eq!(r, u64::MAX - 100);
+        }
+
+        #[test]
+        fn bounded_range_is_preserved() {
+            assert_eq!(range_len(5, 20), 20);
+        }
+
+        #[test]
+        fn negative_size_treated_as_whole_file() {
+            assert_eq!(range_len(0, -1), u64::MAX);
+        }
+    }
 }
 
 /// `duplicateHandle(long) -> long` — duplicate a Win32 HANDLE. We just

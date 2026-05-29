@@ -34,6 +34,20 @@ hashbrown = "0.14"
 # directly, so the mmap deref is a drop-in replacement everywhere the
 # bytes feed straight into `ZipArchive::new(Cursor::new(bytes))`.
 memmap2 = "0.9"
+# Task #1/#40 — real JAR signature + trust-store verification (jar_signer.rs).
+# Both crates are ALREADY in the workspace `Cargo.lock` (pulled in by
+# `native-builtins`): `sha2` 0.10.9 and `p12` 0.6.3. Declaring them here as
+# direct deps adds no new external fetch.
+#
+# `sha2` supplies the SHA-384 / SHA-512 digests used by modern jarsigner
+# `.SF` bindings and by RSA PKCS#1 v1.5 DigestInfo verification. SHA-1 /
+# SHA-256 remain the in-module implementations (kept for the legacy paths
+# already exercised by this file's tests).
+sha2 = "0.10"
+# `p12` parses PKCS#12 / PFX trust stores (CertBag extraction) so a
+# `*.p12` / `*.pfx` `javax.net.ssl.trustStore` yields real trust anchors.
+# JKS is hand-rolled in-module (the format is fully open).
+p12 = "0.6"
 
 [dev-dependencies]
 # Used by `tests/wp_security_robustness.rs` to materialise synthetic JARs

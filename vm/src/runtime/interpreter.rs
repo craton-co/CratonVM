@@ -2427,15 +2427,28 @@ pub fn execute(
     let frames_depth_before_push = thread.frames.len();
 
     // Create the frame.
-    // PERF (round-5 vm #9 fix): use `Frame::new_from_arcs` so that the
-    // bytecode is taken straight from `code_attr.code: ByteView` (deref
-    // to `&[u8]`) through `padded_bytecode(&[u8])` (one alloc for the +2
-    // zero-padding) instead of first cloning the bytes into an owned
-    // `Vec<u8>` (`.to_vec()`) and then copying *that* into the padded Arc
-    // inside `Frame::new` — two full bytecode mem-copies per method entry.
-    // The synthetic test frames keep the convenient `Frame::new` entry
-    // point that owns its `Vec<u8>`.
-    let frame = Frame::new_from_arcs(
+    // PERF (round-5 vm #9 fix): the bytecode is taken straight from
+    // `code_attr.code: ByteView` (deref to `&[u8]`) through
+    // `padded_bytecode(&[u8])` (one alloc for the +2 zero-padding) instead
+    // of first cloning the bytes into an owned `Vec<u8>` (`.to_vec()`) and
+    // then copying *that* into the padded Arc inside `Frame::new` — two full
+    // bytecode mem-copies per method entry. The synthetic test frames keep
+    // the convenient `Frame::new` entry point that owns its `Vec<u8>`.
+    //
+    // PERF (P4): this previously used `Frame::new_from_arcs`, which allocated
+    // fresh `locals`/`stack` Vecs on every (uncached) method entry. Mirror the
+    // cached fast path (`new_pooled_cached`) by refilling from the shared pools
+    // and reusing thread-local pooled Vecs via `Frame::new_pooled`. Frame Vecs
+    // returned to the pool on `recycle()` are now reused here too. The locals
+    // are fully re-initialized by `init_locals_pooled` and the stack reset by
+    // `ValueStack::from_pooled`, so no stale state can leak between frames.
+    thread.refill_pools_from_shared(
+        &shared.operand_stack_pool,
+        &shared.tag_pool,
+        code_attr.max_locals as usize,
+        (code_attr.max_stack as usize).max(16) + 8,
+    );
+    let frame = Frame::new_pooled(
         class_id,
         std::sync::Arc::from(class_name_str.as_str()),
         std::sync::Arc::from(method_name),
@@ -2446,6 +2459,8 @@ pub fn execute(
         code_attr.max_stack,
         code_attr.max_locals,
         args,
+        &mut thread.locals_pool,
+        &mut thread.stacks_pool,
     );
 
     // Push frame onto thread

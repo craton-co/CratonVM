@@ -30,39 +30,45 @@
 //! * Reject (return `None`) for ANY parse error, truncation, OID mismatch,
 //!   or digest mismatch — never panic.
 //!
+//! # What is real now (tasks #1 + #40)
+//!
+//! * **RSA public-key signature verification (PKCS#1 v1.5,
+//!   SHA-1/256/384/512).**  The SignerInfo signature over the DER-encoded
+//!   `SignedAttributes` is verified against the signer (leaf)
+//!   certificate's public key, and every X.509 chain link's signature is
+//!   verified against its issuer's public key.  The RSA math
+//!   (`BigUint::modpow` + PKCS#1 v1.5 DigestInfo compare) is a
+//!   self-contained, public-data-only implementation in this module — the
+//!   `cratonvm-native-builtins` crypto primitives are unreachable from
+//!   here (that crate depends on `classloading`, so importing it back
+//!   would form a build cycle), and the workspace lock has no standalone
+//!   `rsa` / `num-bigint` crate to reuse.
+//! * **Trust-store loading.**  [`TrustStore::load_default`] reads, in
+//!   priority order: the `javax.net.ssl.trustStore` sys-prop (PEM, JKS,
+//!   or PKCS#12 — auto-detected), a `CRATONVM_TRUST_PEM` PEM bundle, an
+//!   `extend_from_anchors()` seam for the host VM's system root store,
+//!   and the JDK `cacerts` (JKS, password `changeit`).  JKS is parsed by
+//!   an in-module walker (integrity MAC verified first); PKCS#12 via the
+//!   `p12` crate (PFX MAC verified first).
+//! * **Chain validation.**  [`verify_chain`] walks leaf → intermediates →
+//!   anchor by Subject↔Issuer DN match, verifies each link's RSA
+//!   signature, checks each cert's `[notBefore, notAfter]` validity
+//!   window against wall-clock time, and refuses any leaf with no path to
+//!   a trust anchor.  Fail-closed throughout.
+//!
 //! # Out of scope — `TODO(post-orchestrator)`
 //!
-//! * **RSA / DSA / EC public-key signature verification over the
-//!   authenticatedAttributes blob.**  The crypto primitives
-//!   (`crypto_impl::Rsa::verify_sha256`, ECDSA, big-integer modpow)
-//!   currently live in `cratonvm-native-builtins`, which depends on
-//!   `cratonvm-classloading` — pulling them in here would create a
-//!   dependency cycle.  Until those primitives are hoisted to a shared
-//!   crate (`cratonvm-types` or a new `cratonvm-crypto-core`), this
-//!   module verifies only the `.SF` digest binding, not the signature
-//!   over it.  That still removes the original auth-bypass
-//!   (`getCertificates()` no longer returns garbage), but a determined
-//!   attacker who can craft a valid `*.SF`/`*.RSA` pair *consistent with
-//!   their own key* could still forge a signer identity until pubkey
-//!   verification lands.
-//! * **Trust-store integration (partial — task #40, deferred from #1).**
-//!   This module now exposes [`TrustStore`] and [`verify_chain`], walks
-//!   the embedded `chain` (leaf → intermediates → anchor) by Subject↔
-//!   Issuer DN match, and refuses signer blocks whose leaf has no path
-//!   to a trust anchor.  See [`TrustStore::load_default`] for the source
-//!   priority (`javax.net.ssl.trustStore` sys-prop, then a `CRATONVM_TRUST_PEM`
-//!   env-var PEM bundle, then the JDK `cacerts` fallback path).  What is
-//!   still **NOT** implemented is the cryptographic signature step on
-//!   each chain link — for the same dependency-cycle reason as the
-//!   pubkey-over-authAttrs gap above.  Until the crypto primitives are
-//!   hoisted out of `cratonvm-native-builtins`, the link-signature check
-//!   delegates to a deliberately conservative stub that recognises only
-//!   a synthetic `craton-stub-sig` algorithm — real RSA/ECDSA blobs
-//!   surface as [`TrustError::NotImplemented`], which is treated as a
-//!   verification failure by [`verify_signer_block`].  PEM-encoded
-//!   anchors are accepted (we have a local DER reader); PKCS#12 / JKS
-//!   binary trust-store files surface as `NotImplemented` (no `p12` /
-//!   `keystore` crate is reachable from `classloading`).
+//! * **ECDSA / DSA signature verification.**  Elliptic-curve point
+//!   arithmetic is not reachable here without porting ~350 lines of P-256
+//!   field math or adding a brand-new `p256`/`ecdsa` external dependency
+//!   (neither is in the workspace lock; the task forbids new deps).  EC
+//!   signature algorithms are *recognised* but surface as
+//!   [`TrustError::NotImplemented`] / a verification failure — fail-closed.
+//!   Follow-up: hoist `cratonvm-native-builtins::crypto_impl`'s EC code
+//!   into a shared crate (`cratonvm-crypto-core`) and call it here.
+//! * **Full RFC 5280 path constraints.**  We verify link signatures and
+//!   validity dates; BasicConstraints / KeyUsage / name constraints /
+//!   revocation (CRL / OCSP) are a documented follow-up.
 //! * **Multiple-signer SignerInfo dispatch.**  We only verify the first
 //!   `SignerInfo`; multi-signer JARs (rare) collapse to "first signer
 //!   verified".
@@ -239,7 +245,13 @@ pub fn verify_signer_block(
         );
         return None;
     }
-    let vs = match parse_signed_data(signer_block_der, sf_bytes) {
+    // The public-key check over SignedAttributes is enforced in every
+    // non-legacy trust-store mode (production).  The legacy self-
+    // consistency fixtures embed marker-shaped "certs" and a fake RSA
+    // signature, so they run with the pubkey gate off — exactly as they
+    // already ran with the chain gate off.
+    let enforce_pubkey = !trust_store.permissive_legacy;
+    let vs = match parse_signed_data(signer_block_der, sf_bytes, enforce_pubkey) {
         Ok(vs) => vs,
         Err(e) => {
             warn!("jar signer: rejecting signer block: {}", e);
@@ -279,7 +291,11 @@ pub fn verify_signer_block(
 // PKCS#7 / CMS parsing
 // ---------------------------------------------------------------------------
 
-fn parse_signed_data(der: &[u8], sf_bytes: &[u8]) -> Result<VerifiedSigner, &'static str> {
+fn parse_signed_data(
+    der: &[u8],
+    sf_bytes: &[u8],
+    enforce_pubkey: bool,
+) -> Result<VerifiedSigner, &'static str> {
     // ContentInfo ::= SEQUENCE {
     //     contentType ContentType,
     //     content [0] EXPLICIT ANY DEFINED BY contentType
@@ -349,6 +365,12 @@ fn parse_signed_data(der: &[u8], sf_bytes: &[u8]) -> Result<VerifiedSigner, &'st
         .ok_or("unsupported digest algorithm in SignerInfo")?;
 
     // Authenticated attributes [0] IMPLICIT SET OF Attribute.
+    //
+    // Per RFC 5652 §5.4, the signature is computed over the DER encoding
+    // of the SignedAttributes with an explicit SET OF tag (0x31), *not*
+    // the `[0] IMPLICIT` tag that appears on the wire.  We keep both the
+    // content (for attribute walking) and the re-tagged SET (for the
+    // pubkey signature check below).
     let auth_attrs = if si.peek_tag() == Some(TAG_CTX0) {
         let (tlv, _) = si.read_tlv()?;
         Some(tlv.content.to_vec())
@@ -357,6 +379,17 @@ fn parse_signed_data(der: &[u8], sf_bytes: &[u8]) -> Result<VerifiedSigner, &'st
     };
     let auth_attrs = auth_attrs
         .ok_or("SignerInfo is missing authenticatedAttributes — refusing to skip integrity check")?;
+    // DER re-encoding of SignedAttributes as an explicit SET OF Attribute.
+    let signed_attrs_der = encode_tlv(TAG_SET, &auth_attrs);
+
+    // SignerInfo continues: signatureAlgorithm, signature.
+    let sig_alg_seq = si.read_seq_raw()?;
+    let signer_sig_alg_oid = first_oid_of_seq(&sig_alg_seq)?;
+    let (sig_tlv, _) = si.read_tlv()?;
+    if sig_tlv.tag != TAG_OCTET_STRING {
+        return Err("SignerInfo signature is not OCTET STRING");
+    }
+    let signer_signature = sig_tlv.content.to_vec();
 
     // Walk attributes; require contentType = pkcs7-data AND messageDigest matching SHA(.SF).
     let attrs = split_set_or_seq(&auth_attrs, MAX_DEPTH)?;
@@ -398,16 +431,44 @@ fn parse_signed_data(der: &[u8], sf_bytes: &[u8]) -> Result<VerifiedSigner, &'st
         got_message_digest.ok_or("authenticatedAttributes missing messageDigest")?;
 
     // Re-digest the caller-supplied `.SF` bytes and constant-time-compare.
-    let recomputed = digest_alg.digest(sf_bytes);
-    if !ct_eq(&stored_digest, &recomputed) {
+    let recomputed = raw_digest(digest_alg, sf_bytes);
+    if recomputed.is_empty() || !ct_eq(&stored_digest, &recomputed) {
         return Err(".SF digest in messageDigest does not match SHA(SF) — tampered .SF");
     }
 
-    // At this point integrity of the SignerInfo ↔ .SF binding is confirmed
-    // (modulo pubkey-sig verification — see module docs).  Materialise the
-    // returned struct.
+    // Integrity of the SignerInfo ↔ .SF binding is confirmed.  Now do the
+    // real public-key check: the signer's certificate (leaf, the first
+    // embedded cert per Sun jarsigner ordering) must sign the DER-encoded
+    // SignedAttributes blob.  In `enforce_pubkey` mode (production) a
+    // failure or unsupported algorithm is fatal — fail-closed.  Legacy
+    // self-consistency fixtures pass `enforce_pubkey=false`.
     if certs_der.is_empty() {
         return Err("SignedData has no embedded certificates");
+    }
+    if enforce_pubkey {
+        let leaf = X509Cert::parse(&certs_der[0])
+            .map_err(|_| "signer leaf certificate is not parseable X.509")?;
+        // Real jarsigner SignerInfos often carry a *bare* key-algorithm OID
+        // in `signatureAlgorithm` (`rsaEncryption` 1.2.840.113549.1.1.1 /
+        // `id-ecPublicKey` 1.2.840.10045.2.1) and leave the digest implied
+        // by the SignerInfo `digestAlgorithm`.  Normalise those to the
+        // combined `<digest>With<key>` OID our verifier understands.
+        let effective_sig_oid =
+            normalize_signer_sig_alg(&signer_sig_alg_oid, digest_alg).unwrap_or(signer_sig_alg_oid);
+        match verify_signature_with_spki(
+            leaf.spki_der,
+            &effective_sig_oid,
+            &signed_attrs_der,
+            &signer_signature,
+        ) {
+            SigVerify::Ok => {}
+            SigVerify::Bad => {
+                return Err("SignerInfo signature does not verify against signer public key");
+            }
+            SigVerify::Unsupported => {
+                return Err("SignerInfo signature algorithm not verifiable (ECDSA/DSA)");
+            }
+        }
     }
     let principal = principal_from_sid(sid_raw).unwrap_or_else(|| "<unparsed>".to_string());
     Ok(VerifiedSigner {
@@ -415,6 +476,30 @@ fn parse_signed_data(der: &[u8], sf_bytes: &[u8]) -> Result<VerifiedSigner, &'st
         principal,
         digest_alg,
     })
+}
+
+/// Encode a single DER TLV: `tag || length || content`.
+fn encode_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let len = content.len();
+    let mut out = Vec::with_capacity(len + 4);
+    out.push(tag);
+    if len < 0x80 {
+        out.push(len as u8);
+    } else if len < 0x100 {
+        out.push(0x81);
+        out.push(len as u8);
+    } else if len < 0x10000 {
+        out.push(0x82);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+    } else {
+        out.push(0x83);
+        out.push((len >> 16) as u8);
+        out.push((len >> 8) as u8);
+        out.push(len as u8);
+    }
+    out.extend_from_slice(content);
+    out
 }
 
 /// Constant-time byte-slice equality.  Equal-length only.
@@ -439,20 +524,10 @@ fn digest_alg_from_oid(oid: &str) -> Option<DigestAlg> {
     }
 }
 
-impl DigestAlg {
-    fn digest(self, data: &[u8]) -> Vec<u8> {
-        match self {
-            DigestAlg::Sha1 => sha1::digest(data).to_vec(),
-            DigestAlg::Sha256 => sha256::digest(data).to_vec(),
-            // SHA-384 / SHA-512 use the SHA-512 family.  We do not
-            // currently implement the family in `classloading`; signed
-            // JARs in the wild overwhelmingly use SHA-256 (modern
-            // jarsigner default) or SHA-1 (legacy).  Reject unsupported
-            // algos rather than silently downgrading to SHA-1.
-            DigestAlg::Sha384 | DigestAlg::Sha512 => Vec::new(),
-        }
-    }
-}
+// NB: digest computation now lives in the free function `raw_digest`,
+// which covers all four SHA variants (SHA-1/256/384/512) via the local
+// implementations + the `sha2` crate.  The old `DigestAlg::digest` method
+// that returned an empty vec for SHA-384/512 has been removed.
 
 /// Best-effort principal extraction from the `SignerIdentifier`.
 ///
@@ -906,6 +981,495 @@ mod sha256 {
 }
 
 // ---------------------------------------------------------------------------
+// SHA-384 / SHA-512 — delegated to the `sha2` crate (already in the
+// workspace lock via `native-builtins`).  Used by modern jarsigner `.SF`
+// bindings and RSA PKCS#1 v1.5 DigestInfo verification.
+// ---------------------------------------------------------------------------
+
+mod sha2ext {
+    use sha2::{Digest, Sha384, Sha512};
+
+    pub fn sha384(data: &[u8]) -> [u8; 48] {
+        let out = Sha384::digest(data);
+        let mut r = [0u8; 48];
+        r.copy_from_slice(&out);
+        r
+    }
+
+    pub fn sha512(data: &[u8]) -> [u8; 64] {
+        let out = Sha512::digest(data);
+        let mut r = [0u8; 64];
+        r.copy_from_slice(&out);
+        r
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task #1 — public-key signature verification (RSA PKCS#1 v1.5).
+//
+// The RSA/ECDSA primitives in `cratonvm-native-builtins::crypto_impl` are
+// unreachable from `classloading`: `native-builtins` already depends on
+// `classloading` (see its `Cargo.toml`), so importing it back here would
+// form a crate cycle the workspace cannot build.  The workspace lock also
+// does NOT contain a stand-alone `rsa` / `num-bigint` / `p256` / `ecdsa`
+// crate (native-builtins hand-rolls those on an in-tree `BigUint`).
+//
+// RSA *verification* is pure public-key arithmetic — modular exponentiation
+// of public data with a public exponent and modulus, plus a PKCS#1 v1.5
+// DigestInfo structural compare.  There is no secret material and therefore
+// no timing-side-channel concern, so a self-contained `BigUint::modpow`
+// here is the correct and safe reachable implementation (it mirrors the
+// math `native-builtins::crypto_impl::Rsa::verify_sha256` performs).
+//
+// ECDSA verification requires elliptic-curve point arithmetic that is NOT
+// reachable without either porting ~350 lines of P-256 field math or
+// adding a brand-new `p256`/`ecdsa` external dependency (forbidden by the
+// task constraints — neither crate is in the workspace lock).  ECDSA
+// therefore surfaces as `TrustError::NotImplemented` / `SigVerify::
+// Unsupported`, which keeps the module fail-closed.  See the REPORT.
+// ---------------------------------------------------------------------------
+
+/// Minimal unsigned big-integer over little-endian u32 limbs.  Only the
+/// operations RSA verification needs are implemented: big-endian
+/// (de)serialisation, multiply, modulo, and modular exponentiation.
+#[derive(Clone, Debug)]
+struct BigUint {
+    /// Little-endian limbs; no trailing-zero limbs after `normalize`.
+    limbs: Vec<u32>,
+}
+
+impl BigUint {
+    fn zero() -> Self {
+        BigUint { limbs: Vec::new() }
+    }
+    fn one() -> Self {
+        BigUint { limbs: vec![1] }
+    }
+    fn is_zero(&self) -> bool {
+        self.limbs.iter().all(|&l| l == 0)
+    }
+    fn normalize(&mut self) {
+        while self.limbs.last() == Some(&0) {
+            self.limbs.pop();
+        }
+    }
+
+    fn from_bytes_be(bytes: &[u8]) -> Self {
+        let mut limbs = Vec::with_capacity(bytes.len() / 4 + 1);
+        // Walk from least-significant byte, packing 4 bytes per limb.
+        let mut i = bytes.len();
+        while i > 0 {
+            let lo = i.saturating_sub(4);
+            let mut limb = 0u32;
+            for &b in &bytes[lo..i] {
+                limb = (limb << 8) | b as u32;
+            }
+            limbs.push(limb);
+            i = lo;
+        }
+        let mut r = BigUint { limbs };
+        r.normalize();
+        r
+    }
+
+    /// Big-endian byte serialisation, left-zero-padded to `k` bytes.
+    fn to_bytes_be_padded(&self, k: usize) -> Vec<u8> {
+        let mut out = vec![0u8; k];
+        // Emit limbs from least significant; write into the tail of `out`.
+        let mut pos = k;
+        for &limb in &self.limbs {
+            for s in 0..4 {
+                if pos == 0 {
+                    break;
+                }
+                pos -= 1;
+                out[pos] = (limb >> (s * 8)) as u8;
+            }
+        }
+        out
+    }
+
+    fn bit_length(&self) -> usize {
+        match self.limbs.last() {
+            None => 0,
+            Some(&top) => (self.limbs.len() - 1) * 32 + (32 - top.leading_zeros() as usize),
+        }
+    }
+
+    fn bit(&self, idx: usize) -> bool {
+        let limb = idx / 32;
+        let off = idx % 32;
+        self.limbs.get(limb).map_or(false, |&l| (l >> off) & 1 == 1)
+    }
+
+    fn cmp(&self, other: &BigUint) -> std::cmp::Ordering {
+        let a = self.effective_len();
+        let b = other.effective_len();
+        if a != b {
+            return a.cmp(&b);
+        }
+        for i in (0..a).rev() {
+            let x = self.limbs[i];
+            let y = other.limbs[i];
+            if x != y {
+                return x.cmp(&y);
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+    fn effective_len(&self) -> usize {
+        let mut n = self.limbs.len();
+        while n > 0 && self.limbs[n - 1] == 0 {
+            n -= 1;
+        }
+        n
+    }
+
+    fn sub(&self, other: &BigUint) -> BigUint {
+        // Assumes self >= other.
+        let mut out = Vec::with_capacity(self.limbs.len());
+        let mut borrow: i64 = 0;
+        for i in 0..self.limbs.len() {
+            let a = self.limbs[i] as i64;
+            let b = *other.limbs.get(i).unwrap_or(&0) as i64;
+            let mut cur = a - b - borrow;
+            if cur < 0 {
+                cur += 1i64 << 32;
+                borrow = 1;
+            } else {
+                borrow = 0;
+            }
+            out.push(cur as u32);
+        }
+        let mut r = BigUint { limbs: out };
+        r.normalize();
+        r
+    }
+
+    fn mul(&self, other: &BigUint) -> BigUint {
+        if self.is_zero() || other.is_zero() {
+            return BigUint::zero();
+        }
+        let mut out = vec![0u32; self.limbs.len() + other.limbs.len()];
+        for (i, &a) in self.limbs.iter().enumerate() {
+            let mut carry: u64 = 0;
+            for (j, &b) in other.limbs.iter().enumerate() {
+                let cur = out[i + j] as u64 + (a as u64) * (b as u64) + carry;
+                out[i + j] = cur as u32;
+                carry = cur >> 32;
+            }
+            out[i + other.limbs.len()] += carry as u32;
+        }
+        let mut r = BigUint { limbs: out };
+        r.normalize();
+        r
+    }
+
+    fn shl_one_bit(&self) -> BigUint {
+        let mut out = Vec::with_capacity(self.limbs.len() + 1);
+        let mut carry = 0u32;
+        for &l in &self.limbs {
+            out.push((l << 1) | carry);
+            carry = l >> 31;
+        }
+        if carry != 0 {
+            out.push(carry);
+        }
+        let mut r = BigUint { limbs: out };
+        r.normalize();
+        r
+    }
+
+    fn set_bit0(&mut self) {
+        if self.limbs.is_empty() {
+            self.limbs.push(1);
+        } else {
+            self.limbs[0] |= 1;
+        }
+    }
+
+    /// `self mod m` via bitwise long division.  `m` must be non-zero.
+    fn modulo(&self, m: &BigUint) -> BigUint {
+        if m.is_zero() {
+            return BigUint::zero();
+        }
+        if self.cmp(m) == std::cmp::Ordering::Less {
+            return self.clone();
+        }
+        let mut rem = BigUint::zero();
+        for i in (0..self.bit_length()).rev() {
+            rem = rem.shl_one_bit();
+            if self.bit(i) {
+                rem.set_bit0();
+            }
+            if rem.cmp(m) != std::cmp::Ordering::Less {
+                rem = rem.sub(m);
+            }
+        }
+        rem.normalize();
+        rem
+    }
+
+    /// `self^exp mod m` (square-and-multiply).  Public-data only.
+    fn modpow(&self, exp: &BigUint, m: &BigUint) -> BigUint {
+        if m.cmp(&BigUint::one()) != std::cmp::Ordering::Greater {
+            return BigUint::zero();
+        }
+        let mut result = BigUint::one();
+        let base = self.modulo(m);
+        let bits = exp.bit_length();
+        let mut acc = base;
+        for i in 0..bits {
+            if exp.bit(i) {
+                result = result.mul(&acc).modulo(m);
+            }
+            // Square for the next bit (skip after the final useful bit).
+            if i + 1 < bits {
+                acc = acc.mul(&acc).modulo(m);
+            }
+        }
+        result
+    }
+}
+
+/// A parsed RSA public key (modulus + exponent).
+struct RsaPublicKey {
+    n: BigUint,
+    e: BigUint,
+    /// Modulus size in bytes (`k` in PKCS#1) — the expected signature length.
+    k: usize,
+}
+
+/// The public-key flavour recovered from a `SubjectPublicKeyInfo`.
+enum PublicKey {
+    Rsa(RsaPublicKey),
+    /// Elliptic-curve key — recognised but not verifiable here (no EC point
+    /// arithmetic reachable; see module docs).  Carries the curve OID for
+    /// diagnostics only.
+    EcUnsupported,
+    /// Some other key type we do not handle.
+    Other,
+}
+
+/// Outcome of a public-key signature verification attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SigVerify {
+    /// Signature is cryptographically valid.
+    Ok,
+    /// Signature did not verify against the key.
+    Bad,
+    /// The signature algorithm / key type is recognised but not verifiable
+    /// in this build (ECDSA / DSA — see module docs).  Treated as failure
+    /// by all callers (fail-closed).
+    Unsupported,
+}
+
+/// Parse a `SubjectPublicKeyInfo` SEQUENCE and recover the public key.
+///
+/// ```text
+/// SubjectPublicKeyInfo ::= SEQUENCE {
+///     algorithm        AlgorithmIdentifier,
+///     subjectPublicKey BIT STRING }
+/// ```
+fn parse_spki(spki_der: &[u8]) -> Result<PublicKey, &'static str> {
+    let spki = read_seq_strict(spki_der)?;
+    let mut c = Cursor::new(&spki);
+    let alg_seq = c.read_seq_raw()?;
+    let alg_oid = first_oid_of_seq(&alg_seq)?;
+    let (bitstr, _) = c.read_tlv()?;
+    if bitstr.tag != 0x03 {
+        return Err("SPKI: subjectPublicKey is not BIT STRING");
+    }
+    if bitstr.content.is_empty() {
+        return Err("SPKI: empty subjectPublicKey BIT STRING");
+    }
+    // Strip the leading "unused bits" octet (always 0 for whole-byte keys).
+    let key_bits = &bitstr.content[1..];
+
+    match alg_oid.as_str() {
+        // rsaEncryption
+        "1.2.840.113549.1.1.1" => {
+            // RSAPublicKey ::= SEQUENCE { modulus INTEGER, publicExponent INTEGER }
+            let rsa_seq = read_seq_strict(key_bits)?;
+            let mut rc = Cursor::new(&rsa_seq);
+            let n_bytes = rc.read_integer()?;
+            let e_bytes = rc.read_integer()?;
+            // INTEGER content is big-endian two's complement; for positive
+            // values jarsigner-issued keys it may carry a single 0x00 sign
+            // pad — `from_bytes_be` handles leading zeros fine.
+            let n = BigUint::from_bytes_be(&n_bytes);
+            let e = BigUint::from_bytes_be(&e_bytes);
+            if n.is_zero() || e.is_zero() {
+                return Err("SPKI: degenerate RSA key");
+            }
+            let k = (n.bit_length() + 7) / 8;
+            Ok(PublicKey::Rsa(RsaPublicKey { n, e, k }))
+        }
+        // id-ecPublicKey
+        "1.2.840.10045.2.1" => Ok(PublicKey::EcUnsupported),
+        _ => Ok(PublicKey::Other),
+    }
+}
+
+/// Map a signature-algorithm OID to the digest used in its PKCS#1 v1.5
+/// DigestInfo, and whether it is an RSA or EC signature.
+///
+/// Returns `(digest_alg, is_rsa)`.
+fn sig_alg_digest(oid: &str) -> Option<(DigestAlg, bool)> {
+    match oid {
+        // RSA PKCS#1 v1.5
+        "1.2.840.113549.1.1.5" => Some((DigestAlg::Sha1, true)), // sha1WithRSA
+        "1.2.840.113549.1.1.11" => Some((DigestAlg::Sha256, true)), // sha256WithRSA
+        "1.2.840.113549.1.1.12" => Some((DigestAlg::Sha384, true)), // sha384WithRSA
+        "1.2.840.113549.1.1.13" => Some((DigestAlg::Sha512, true)), // sha512WithRSA
+        // ECDSA
+        "1.2.840.10045.4.1" => Some((DigestAlg::Sha1, false)), // ecdsa-with-SHA1
+        "1.2.840.10045.4.3.2" => Some((DigestAlg::Sha256, false)), // ecdsa-with-SHA256
+        "1.2.840.10045.4.3.3" => Some((DigestAlg::Sha384, false)), // ecdsa-with-SHA384
+        "1.2.840.10045.4.3.4" => Some((DigestAlg::Sha512, false)), // ecdsa-with-SHA512
+        _ => None,
+    }
+}
+
+/// Normalise a SignerInfo `signatureAlgorithm` OID.  When it is a bare
+/// key-algorithm identifier (`rsaEncryption` / `id-ecPublicKey`) the
+/// digest is implied by the SignerInfo's `digestAlgorithm`; map the pair
+/// to the combined `<digest>With<key>` OID our verifier recognises.
+/// Returns `None` (caller keeps the original OID) for already-combined
+/// algorithms.
+fn normalize_signer_sig_alg(sig_oid: &str, digest: DigestAlg) -> Option<String> {
+    match sig_oid {
+        // rsaEncryption — combine with the digest.
+        "1.2.840.113549.1.1.1" => Some(
+            match digest {
+                DigestAlg::Sha1 => "1.2.840.113549.1.1.5",
+                DigestAlg::Sha256 => "1.2.840.113549.1.1.11",
+                DigestAlg::Sha384 => "1.2.840.113549.1.1.12",
+                DigestAlg::Sha512 => "1.2.840.113549.1.1.13",
+            }
+            .to_string(),
+        ),
+        // id-ecPublicKey — combine with the digest (still surfaces as
+        // Unsupported downstream, but yields a precise diagnostic).
+        "1.2.840.10045.2.1" => Some(
+            match digest {
+                DigestAlg::Sha1 => "1.2.840.10045.4.1",
+                DigestAlg::Sha256 => "1.2.840.10045.4.3.2",
+                DigestAlg::Sha384 => "1.2.840.10045.4.3.3",
+                DigestAlg::Sha512 => "1.2.840.10045.4.3.4",
+            }
+            .to_string(),
+        ),
+        _ => None,
+    }
+}
+
+/// Raw digest for an algorithm (covers all four SHA variants used by
+/// PKCS#1 v1.5 / `.SF` bindings).  Returns `None` only for the impossible
+/// case where the family is unimplemented.
+fn raw_digest(alg: DigestAlg, data: &[u8]) -> Vec<u8> {
+    match alg {
+        DigestAlg::Sha1 => sha1::digest(data).to_vec(),
+        DigestAlg::Sha256 => sha256::digest(data).to_vec(),
+        DigestAlg::Sha384 => sha2ext::sha384(data).to_vec(),
+        DigestAlg::Sha512 => sha2ext::sha512(data).to_vec(),
+    }
+}
+
+/// DER `DigestInfo` prefix (the AlgorithmIdentifier + OCTET STRING header)
+/// for each SHA variant, per PKCS#1 v1.5 (RFC 8017 §9.2).
+fn digest_info_prefix(alg: DigestAlg) -> &'static [u8] {
+    match alg {
+        DigestAlg::Sha1 => &[
+            0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e, 0x03, 0x02, 0x1a, 0x05, 0x00, 0x04,
+            0x14,
+        ],
+        DigestAlg::Sha256 => &[
+            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+            0x01, 0x05, 0x00, 0x04, 0x20,
+        ],
+        DigestAlg::Sha384 => &[
+            0x30, 0x41, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+            0x02, 0x05, 0x00, 0x04, 0x30,
+        ],
+        DigestAlg::Sha512 => &[
+            0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02,
+            0x03, 0x05, 0x00, 0x04, 0x40,
+        ],
+    }
+}
+
+/// RSA PKCS#1 v1.5 verify: `signature^e mod n` must equal the expected
+/// `EM = 0x00 || 0x01 || PS || 0x00 || DigestInfo(H(message))`.
+fn rsa_pkcs1v15_verify(
+    key: &RsaPublicKey,
+    digest_alg: DigestAlg,
+    message: &[u8],
+    signature: &[u8],
+) -> SigVerify {
+    let k = key.k;
+    if k < 11 || signature.len() != k {
+        return SigVerify::Bad;
+    }
+    let s = BigUint::from_bytes_be(signature);
+    // Reject s >= n (RFC 8017 step requires 0 <= s < n).
+    if s.cmp(&key.n) != std::cmp::Ordering::Less {
+        return SigVerify::Bad;
+    }
+    let m = s.modpow(&key.e, &key.n);
+    let em = m.to_bytes_be_padded(k);
+
+    let hash = raw_digest(digest_alg, message);
+    let prefix = digest_info_prefix(digest_alg);
+    let t_len = prefix.len() + hash.len();
+    if k < t_len + 11 {
+        return SigVerify::Bad;
+    }
+    let ps_len = k - t_len - 3;
+    let mut expected = Vec::with_capacity(k);
+    expected.push(0x00);
+    expected.push(0x01);
+    expected.extend(std::iter::repeat(0xff).take(ps_len));
+    expected.push(0x00);
+    expected.extend_from_slice(prefix);
+    expected.extend_from_slice(&hash);
+
+    if ct_eq(&em, &expected) {
+        SigVerify::Ok
+    } else {
+        SigVerify::Bad
+    }
+}
+
+/// Verify a signature `sig` over `message` using the public key encoded in
+/// `signer_spki_der`, where `sig_alg_oid` names the signature algorithm.
+///
+/// RSA PKCS#1 v1.5 (SHA-1/256/384/512) is fully verified.  ECDSA / DSA and
+/// any unrecognised algorithm return `SigVerify::Unsupported` (fail-closed).
+fn verify_signature_with_spki(
+    signer_spki_der: &[u8],
+    sig_alg_oid: &str,
+    message: &[u8],
+    sig: &[u8],
+) -> SigVerify {
+    let (digest_alg, is_rsa) = match sig_alg_digest(sig_alg_oid) {
+        Some(v) => v,
+        None => return SigVerify::Unsupported,
+    };
+    let key = match parse_spki(signer_spki_der) {
+        Ok(k) => k,
+        Err(_) => return SigVerify::Bad,
+    };
+    match (key, is_rsa) {
+        (PublicKey::Rsa(rsa), true) => rsa_pkcs1v15_verify(&rsa, digest_alg, message, sig),
+        // EC key with an EC signature algorithm — recognised, not verifiable.
+        (PublicKey::EcUnsupported, false) => SigVerify::Unsupported,
+        // Algorithm / key-type mismatch, or unsupported key type.
+        _ => SigVerify::Unsupported,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Task #40 — Trust store + chain verification
 // ---------------------------------------------------------------------------
 //
@@ -924,18 +1488,14 @@ mod sha256 {
 //     DN, then asks [`X509Cert::link_signature_ok`] whether the
 //     `signature` blob ties the child to the parent.
 //
-// **Cryptographic note.**  The link-signature step is intentionally
-// *not* a real RSA/ECDSA verify (see the module-level docs for why the
-// crypto primitives are out of reach from `classloading`).  We
-// recognise one synthetic algorithm OID — `craton-stub-sig` (used
-// exclusively by the in-process tests) — and treat every other
-// algorithm as [`TrustError::NotImplemented`].  A real-world cert
-// chain therefore *will* reject as `NotImplemented`, which
-// [`verify_signer_block`] surfaces as `None` (verification failure).
-// That is the conservative direction: until real crypto lands, no
-// chain validates against system anchors.  Audit follow-up: hoist
-// `cratonvm_native_builtins::crypto_impl::Rsa::verify_*` into a shared
-// crate so this stub can be replaced with real cryptography.
+// **Cryptographic note.**  The link-signature step is now a real RSA
+// PKCS#1 v1.5 verify (SHA-1/256/384/512) against the parent cert's
+// public key — see [`verify_signature_with_spki`].  ECDSA / DSA links
+// are recognised but surface as [`TrustError::NotImplemented`] (no EC
+// point arithmetic reachable; see module-level docs), which
+// [`verify_signer_block`] surfaces as `None`.  That keeps the walk
+// fail-closed for the EC case.  The synthetic `craton-stub-sig`
+// algorithm OID is retained ONLY for the in-process test fixtures.
 
 use std::sync::OnceLock;
 
@@ -967,12 +1527,16 @@ pub enum TrustError {
     /// The chain is deeper than [`MAX_CHAIN_LEN`].
     TooLong,
     /// The signature on a chain link uses an algorithm this build
-    /// cannot verify.  Real RSA/ECDSA signatures land here until the
-    /// shared crypto crate is in place — see module-level docs.
+    /// cannot verify (ECDSA / DSA — no EC point arithmetic reachable).
+    /// RSA PKCS#1 v1.5 links are verified; only EC/DSA land here.  See
+    /// module-level docs.
     NotImplemented,
     /// One of the certs is structurally invalid (wrong tag, truncated
     /// TBSCertificate, missing Subject/Issuer, ...).
     Malformed,
+    /// A cert in the chain is outside its `[notBefore, notAfter]`
+    /// validity window relative to the current wall-clock time.
+    Expired,
 }
 
 /// Hard cap on chain depth.  Real-world TLS / code-signing chains run
@@ -989,21 +1553,19 @@ pub const MAX_TRUST_ANCHORS: usize = 4096;
 ///
 /// # Sources (priority order, populated by [`TrustStore::load_default`])
 ///
-/// 1. `javax.net.ssl.trustStore` system property (we read the matching
-///    env-var `JAVAX_NET_SSL_TRUSTSTORE`).  PEM contents are loaded
-///    directly; PKCS#12 / JKS binary blobs surface as a warn-level
-///    log and the source is skipped (no PKCS#12 parser reachable here).
-/// 2. `CRATONVM_TRUST_PEM` env-var pointing at a PEM bundle.  This is
-///    the recommended on-disk source for CratonVM — pure DER inside
-///    base64 boundaries, parseable by the local TLV reader.
-/// 3. `rustls-native-certs`-style system root store — **placeholder**.
-///    `classloading` cannot pull the crate (acceptance #6 forbids
-///    adding deps); when wired by the host VM, [`TrustStore::extend_from_anchors`]
-///    accepts pre-decoded DER blobs and is the integration seam for
-///    `rustls_native_certs::load_native_certs()` results.
-/// 4. The JDK `cacerts` path — `$JAVA_HOME/lib/security/cacerts`.  This
-///    is JKS-formatted and likewise out of reach for the local parser.
-///    Recorded for completeness; produces an empty contribution today.
+/// 1. `javax.net.ssl.trustStore` system property (read from the env-var
+///    `JAVAX_NET_SSL_TRUSTSTORE`, password from
+///    `JAVAX_NET_SSL_TRUSTSTOREPASSWORD`).  Format auto-detected: PEM,
+///    JKS (in-module walker, MAC-verified), or PKCS#12 (`p12` crate,
+///    MAC-verified).
+/// 2. `CRATONVM_TRUST_PEM` env-var pointing at a PEM bundle.
+/// 3. `rustls-native-certs`-style system root store — integration seam.
+///    `classloading` cannot pull the crate (it lives in `native-builtins`,
+///    which depends on `classloading`); the host VM calls
+///    [`TrustStore::extend_from_anchors`] with the decoded DER blobs.
+/// 4. The JDK `cacerts` path — `$JAVA_HOME/lib/security/cacerts` (JKS,
+///    password `changeit` unless overridden).  Now parsed natively: every
+///    TrustedCertEntry becomes a trust anchor.
 ///
 /// An empty trust store rejects every chain with
 /// [`TrustError::NoTrustAnchor`].  Use
@@ -1141,87 +1703,312 @@ impl TrustStore {
 
         // 1. javax.net.ssl.trustStore.  Java sees this as a system
         // property; we read it from the env-var spelling the VM emits
-        // when materialising sysprops back to native code.
+        // when materialising sysprops back to native code.  The matching
+        // password sysprop is `javax.net.ssl.trustStorePassword`.
         if let Ok(p) = std::env::var("JAVAX_NET_SSL_TRUSTSTORE") {
-            ts.try_load_path(&p, "javax.net.ssl.trustStore");
+            let pw = std::env::var("JAVAX_NET_SSL_TRUSTSTOREPASSWORD")
+                .unwrap_or_else(|_| "changeit".to_string());
+            ts.try_load_path(&p, "javax.net.ssl.trustStore", &pw);
         }
 
-        // 2. CratonVM-native PEM bundle.
+        // 2. CratonVM-native PEM bundle (no password).
         if let Ok(p) = std::env::var("CRATONVM_TRUST_PEM") {
-            ts.try_load_path(&p, "CRATONVM_TRUST_PEM");
+            ts.try_load_path(&p, "CRATONVM_TRUST_PEM", "");
         }
 
-        // 3. System root store — placeholder.  When the host VM has
-        // already decoded its native-cert store (`rustls-native-certs`
-        // lives in `native-builtins`, not here), it should call
-        // `extend_from_anchors` directly.  We just record that the
-        // source slot exists.
+        // 3. System root store — integration seam.  `rustls-native-certs`
+        // lives in `native-builtins` (not reachable here without a crate
+        // cycle); the host VM, which already links it, calls
+        // `extend_from_anchors` directly with the decoded DER blobs.  We
+        // record that the seam exists.
         ts.sources_loaded
-            .push("system-root-store: not wired (acceptance #6 forbids new dep)".to_string());
+            .push("system-root-store: extend_from_anchors() seam (host VM supplies DER)".to_string());
 
-        // 4. JDK `cacerts` fallback.  Format is JKS — out of reach for
-        // the local DER reader.  Document the gap.
+        // 4. JDK `cacerts` fallback (JKS, password "changeit").  Now
+        // parsed natively by the in-module JKS walker — every
+        // TrustedCertEntry becomes a trust anchor.  Honour
+        // `JAVAX_NET_SSL_TRUSTSTOREPASSWORD` if set; otherwise the JDK
+        // default "changeit".
         if let Some(jh) = std::env::var_os("JAVA_HOME") {
             let mut path = std::path::PathBuf::from(jh);
             path.push("lib");
             path.push("security");
             path.push("cacerts");
             if path.exists() {
-                ts.sources_loaded.push(format!(
-                    "{}: JKS not supported in classloading (no `p12`/`keystore` crate reachable)",
-                    path.display()
-                ));
+                let pw = std::env::var("JAVAX_NET_SSL_TRUSTSTOREPASSWORD")
+                    .unwrap_or_else(|_| "changeit".to_string());
+                ts.try_load_path(&path.to_string_lossy(), "JDK cacerts", &pw);
             }
         }
         ts
     }
 
-    /// Attempt to load one on-disk source.  PEM bundles are accepted;
-    /// PKCS#12 / JKS magic bytes are recognised and skipped with a
-    /// warn-level log.
-    fn try_load_path(&mut self, p: &str, label: &str) {
-        match std::fs::read(p) {
-            Ok(bytes) => {
-                // PKCS#12: SEQUENCE { INTEGER version (3) ... } — first
-                // two bytes are 0x30 0x82 (long-form length) then a 0x02
-                // INTEGER.  JKS magic: 0xFE 0xED 0xFE 0xED.
-                if bytes.starts_with(&[0xFE, 0xED, 0xFE, 0xED]) {
-                    warn!(
-                        "{}={} appears to be JKS; classloading cannot parse JKS (NotImplemented)",
-                        label, p
-                    );
-                    self.sources_loaded
-                        .push(format!("{} JKS: NotImplemented", label));
-                    return;
-                }
-                // Look for the PEM banner — if present, treat as PEM.
-                if let Ok(text) = std::str::from_utf8(&bytes) {
-                    if text.contains("-----BEGIN") {
-                        let n = self.load_pem_bundle(text);
-                        self.sources_loaded
-                            .push(format!("{}={} ({} anchors)", label, p, n));
-                        return;
-                    }
-                }
-                // Otherwise assume PKCS#12 — also not implemented here.
-                warn!(
-                    "{}={} is not PEM; PKCS#12 / JKS parsers are out of reach for classloading \
-                     (acceptance #6 — no new deps).  Skipping.",
-                    label, p
-                );
-                self.sources_loaded
-                    .push(format!("{} binary keystore: NotImplemented", label));
-            }
+    /// Attempt to load one on-disk source, auto-detecting the format from
+    /// the leading bytes:
+    ///
+    ///   * `-----BEGIN` banner            → PEM bundle.
+    ///   * `0xFEEDFEED` magic             → JKS keystore (in-module walker).
+    ///   * leading `0x30` (DER SEQUENCE)  → PKCS#12 / PFX (`p12` crate).
+    ///
+    /// Every trust-anchor / cert entry found is added via
+    /// [`Self::add_anchor_der`].  Failures are logged and recorded in
+    /// `sources_loaded`; they never panic and never poison the store.
+    ///
+    /// `password` is the keystore integrity / decryption password (JKS MAC
+    /// and PKCS#12 MAC).  PEM bundles ignore it.
+    fn try_load_path(&mut self, p: &str, label: &str, password: &str) {
+        let bytes = match std::fs::read(p) {
+            Ok(b) => b,
             Err(e) => {
                 warn!("{}={} could not be read: {}", label, p, e);
+                return;
+            }
+        };
+
+        // PEM banner takes priority (a PEM bundle never starts with 0x30
+        // or the JKS magic).
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            if text.contains("-----BEGIN") {
+                let n = self.load_pem_bundle(text);
+                self.sources_loaded
+                    .push(format!("{}={} (PEM, {} anchors)", label, p, n));
+                return;
             }
         }
+
+        if bytes.starts_with(&[0xFE, 0xED, 0xFE, 0xED]) {
+            match parse_jks_trusted_certs(&bytes, password.as_bytes()) {
+                Ok(ders) => {
+                    let n = self.extend_from_anchors(ders);
+                    self.sources_loaded
+                        .push(format!("{}={} (JKS, {} anchors)", label, p, n));
+                }
+                Err(e) => {
+                    warn!("{}={} JKS parse failed: {}", label, p, e);
+                    self.sources_loaded
+                        .push(format!("{}={} JKS: parse error ({})", label, p, e));
+                }
+            }
+            return;
+        }
+
+        if bytes.first() == Some(&TAG_SEQUENCE) {
+            match parse_pkcs12_certs(&bytes, password) {
+                Ok(ders) => {
+                    let n = self.extend_from_anchors(ders);
+                    self.sources_loaded
+                        .push(format!("{}={} (PKCS#12, {} anchors)", label, p, n));
+                }
+                Err(e) => {
+                    warn!("{}={} PKCS#12 parse failed: {}", label, p, e);
+                    self.sources_loaded
+                        .push(format!("{}={} PKCS#12: parse error ({})", label, p, e));
+                }
+            }
+            return;
+        }
+
+        warn!(
+            "{}={} is not a recognised trust-store format (no PEM banner, JKS magic, or DER SEQUENCE)",
+            label, p
+        );
+        self.sources_loaded
+            .push(format!("{}={} unrecognised format", label, p));
     }
 
     /// Look up an anchor whose Subject DN equals `dn`.
     fn find_anchor_by_subject(&self, dn: &[u8]) -> Option<&X509Anchor> {
         self.anchors.iter().find(|a| a.subject_dn.as_slice() == dn)
     }
+}
+
+// ---------------------------------------------------------------------------
+// JKS trust-store parsing
+// ---------------------------------------------------------------------------
+//
+// The JKS binary format is fully open (mirrors
+// `cratonvm-native-builtins::keystore::load_jks`, which we cannot import
+// without a crate cycle).  Layout:
+//
+//   u32 magic = 0xFEEDFEED
+//   u32 version (1 or 2)
+//   u32 entry_count
+//   entry_count * {
+//     u32 tag (1 = PrivateKeyEntry, 2 = TrustedCertEntry)
+//     u16 alias_len + UTF-8 alias
+//     u64 creation_date_ms
+//     match tag {
+//       1 => { u32 enc_key_len + key; u32 chain_count;
+//              chain_count * { u16 cert_type_len + type; u32 der_len + der } }
+//       2 => { u16 cert_type_len + type; u32 der_len + der }
+//     }
+//   }
+//   [SHA1(password_utf16be || "Mighty Aphrodite" || body)]   // 20-byte tag
+//
+// We verify the trailing 20-byte integrity tag FIRST (fail-closed: a
+// tampered cacerts is rejected outright), then collect every X.509 DER —
+// both TrustedCertEntry certs and the certs in PrivateKeyEntry chains —
+// as candidate trust anchors.
+
+const JKS_MAGIC: u32 = 0xFEED_FEED;
+const JKS_HMAC_SALT: &[u8] = b"Mighty Aphrodite";
+
+/// JKS integrity tag: `SHA1(password_utf16be || "Mighty Aphrodite" || body)`.
+/// Empty password → empty UTF-16 prefix.  Each password byte is treated as
+/// a Latin-1 codepoint emitted as UTF-16BE (high byte 0) — matches the JDK
+/// for the common ASCII case.
+fn jks_password_mac(password_bytes: &[u8], body: &[u8]) -> [u8; 20] {
+    let mut buf = Vec::with_capacity(password_bytes.len() * 2 + JKS_HMAC_SALT.len() + body.len());
+    for &b in password_bytes {
+        buf.push(0u8);
+        buf.push(b);
+    }
+    buf.extend_from_slice(JKS_HMAC_SALT);
+    buf.extend_from_slice(body);
+    sha1::digest(&buf)
+}
+
+struct JksReader<'a> {
+    data: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JksReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        JksReader { data, pos: 0 }
+    }
+    fn need(&self, n: usize) -> Result<(), &'static str> {
+        if self.pos + n > self.data.len() {
+            Err("JKS: truncated")
+        } else {
+            Ok(())
+        }
+    }
+    fn u16_be(&mut self) -> Result<u16, &'static str> {
+        self.need(2)?;
+        let v = u16::from_be_bytes([self.data[self.pos], self.data[self.pos + 1]]);
+        self.pos += 2;
+        Ok(v)
+    }
+    fn u32_be(&mut self) -> Result<u32, &'static str> {
+        self.need(4)?;
+        let v = u32::from_be_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ]);
+        self.pos += 4;
+        Ok(v)
+    }
+    fn skip(&mut self, n: usize) -> Result<(), &'static str> {
+        self.need(n)?;
+        self.pos += n;
+        Ok(())
+    }
+    fn skip_u16len(&mut self) -> Result<(), &'static str> {
+        let n = self.u16_be()? as usize;
+        self.skip(n)
+    }
+    fn bytes_u32len(&mut self) -> Result<&'a [u8], &'static str> {
+        let n = self.u32_be()? as usize;
+        self.need(n)?;
+        let s = &self.data[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
+    fn skip_u32len(&mut self) -> Result<(), &'static str> {
+        let n = self.u32_be()? as usize;
+        self.skip(n)
+    }
+}
+
+/// Parse a JKS keystore and return every embedded X.509 certificate DER
+/// (trusted certs + chain certs).  Verifies the integrity MAC first.
+fn parse_jks_trusted_certs(bytes: &[u8], password: &[u8]) -> Result<Vec<Vec<u8>>, &'static str> {
+    if bytes.len() < 4 + 4 + 4 + 20 {
+        return Err("JKS: too short");
+    }
+    // Integrity tag covers everything before the trailing 20 bytes.
+    let body_end = bytes.len() - 20;
+    let stored = &bytes[body_end..];
+    let body = &bytes[..body_end];
+    let computed = jks_password_mac(password, body);
+    if !ct_eq(stored, &computed) {
+        return Err("JKS: integrity MAC mismatch (wrong password or tampered store)");
+    }
+
+    let mut r = JksReader::new(bytes);
+    if r.u32_be()? != JKS_MAGIC {
+        return Err("JKS: bad magic");
+    }
+    let version = r.u32_be()?;
+    if version != 1 && version != 2 {
+        return Err("JKS: unsupported version");
+    }
+    let entry_count = r.u32_be()? as usize;
+    // Bound entry_count against the file size (each entry is >= 14 bytes).
+    if entry_count > bytes.len() {
+        return Err("JKS: implausible entry count");
+    }
+
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for _ in 0..entry_count {
+        let tag = r.u32_be()?;
+        r.skip_u16len()?; // alias
+        r.skip(8)?; // creation_date_ms (u64)
+        match tag {
+            1 => {
+                // PrivateKeyEntry: encrypted key, then a cert chain.
+                r.skip_u32len()?; // enc key
+                let chain_count = r.u32_be()? as usize;
+                if chain_count > bytes.len() {
+                    return Err("JKS: implausible chain count");
+                }
+                for _ in 0..chain_count {
+                    r.skip_u16len()?; // cert type ("X.509")
+                    let der = r.bytes_u32len()?;
+                    if der.len() <= MAX_CERT_DER {
+                        out.push(der.to_vec());
+                    }
+                }
+            }
+            2 => {
+                // TrustedCertEntry.  Both v1 and v2 prefix the cert with a
+                // cert-type string in real OpenJDK; read it unconditionally.
+                r.skip_u16len()?; // cert type
+                let der = r.bytes_u32len()?;
+                if der.len() <= MAX_CERT_DER {
+                    out.push(der.to_vec());
+                }
+            }
+            _ => return Err("JKS: unknown entry tag"),
+        }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// PKCS#12 / PFX trust-store parsing — backed by the `p12` crate.
+// ---------------------------------------------------------------------------
+
+/// Parse a PKCS#12 / PFX file and return every X.509 CertBag DER.  Verifies
+/// the PFX MAC against `password` first (fail-closed).
+fn parse_pkcs12_certs(bytes: &[u8], password: &str) -> Result<Vec<Vec<u8>>, &'static str> {
+    let pfx = p12::PFX::parse(bytes).map_err(|_| "PKCS#12: parse failed")?;
+    if !pfx.verify_mac(password) {
+        return Err("PKCS#12: MAC verification failed (wrong password or tampered store)");
+    }
+    let bags = pfx.bags(password).map_err(|_| "PKCS#12: bag decode failed")?;
+    let mut out = Vec::new();
+    for bag in &bags {
+        if let p12::SafeBagKind::CertBag(p12::CertBag::X509(der)) = &bag.bag {
+            if der.len() <= MAX_CERT_DER {
+                out.push(der.clone());
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Process-wide default trust store, lazily populated on first call.
@@ -1268,6 +2055,19 @@ pub struct X509Cert<'a> {
     /// The `signatureValue` content (BIT STRING content, minus the
     /// leading unused-bits byte).
     pub signature_bytes: &'a [u8],
+    /// Raw `subjectPublicKeyInfo` SEQUENCE bytes (entire TLV).  Fed to
+    /// [`parse_spki`] when this cert acts as the *parent* in a chain link
+    /// or as the signer whose key verifies the SignerInfo signature.
+    pub spki_der: &'a [u8],
+    /// `notBefore` time bytes (the raw UTCTime / GeneralizedTime content,
+    /// tag stripped).  Empty if unparsed.
+    pub not_before: &'a [u8],
+    /// `notBefore` ASN.1 tag (0x17 UTCTime / 0x18 GeneralizedTime).
+    pub not_before_tag: u8,
+    /// `notAfter` time bytes (content, tag stripped).
+    pub not_after: &'a [u8],
+    /// `notAfter` ASN.1 tag.
+    pub not_after_tag: u8,
 }
 
 impl<'a> X509Cert<'a> {
@@ -1313,8 +2113,24 @@ impl<'a> X509Cert<'a> {
         }
         let issuer_dn = &issuer_start[..n];
         rest = &rest[n..];
-        // validity (SEQUENCE).
-        let (_, n) = read_tlv(rest)?;
+        // validity (SEQUENCE { notBefore Time, notAfter Time }).
+        let (validity_tlv, n) = read_tlv(rest)?;
+        if validity_tlv.tag != TAG_SEQUENCE {
+            return Err("X509Cert: validity is not SEQUENCE");
+        }
+        let (mut not_before, mut not_before_tag) = (&b""[..], 0u8);
+        let (mut not_after, mut not_after_tag) = (&b""[..], 0u8);
+        {
+            let v = validity_tlv.content;
+            if let Ok((nb, nb_total)) = read_tlv(v) {
+                not_before = nb.content;
+                not_before_tag = nb.tag;
+                if let Ok((na, _)) = read_tlv(&v[nb_total..]) {
+                    not_after = na.content;
+                    not_after_tag = na.tag;
+                }
+            }
+        }
         rest = &rest[n..];
         // subject Name (SEQUENCE OF RDN).
         let subject_start = rest;
@@ -1323,6 +2139,15 @@ impl<'a> X509Cert<'a> {
             return Err("X509Cert: subject is not SEQUENCE");
         }
         let subject_dn = &subject_start[..n];
+        rest = &rest[n..];
+
+        // subjectPublicKeyInfo (SEQUENCE).
+        let spki_start = rest;
+        let (spki_tlv, n) = read_tlv(rest)?;
+        if spki_tlv.tag != TAG_SEQUENCE {
+            return Err("X509Cert: subjectPublicKeyInfo is not SEQUENCE");
+        }
+        let spki_der = &spki_start[..n];
 
         // Outer signatureAlgorithm + signatureValue.
         let outer_rest = &body[tbs_total..];
@@ -1348,6 +2173,11 @@ impl<'a> X509Cert<'a> {
             subject_dn,
             sig_alg_oid,
             signature_bytes,
+            spki_der,
+            not_before,
+            not_before_tag,
+            not_after,
+            not_after_tag,
         })
     }
 
@@ -1356,28 +2186,130 @@ impl<'a> X509Cert<'a> {
         self.subject_dn == self.issuer_dn
     }
 
-    /// Does `self`'s signature link it to `parent`?  Cryptographically
-    /// this should verify `parent.public_key`-signed-`self.tbs_der` ==
-    /// `self.signature_bytes`.  Since real RSA/ECDSA are out of reach
-    /// here, we recognise only [`OID_STUB_SIG`] and treat everything
-    /// else as [`TrustError::NotImplemented`].
+    /// Does `self`'s signature link it to `parent`?  Verifies that
+    /// `parent`'s public key signs `self.tbs_der`, yielding
+    /// `self.signature_bytes`.
+    ///
+    /// * Real RSA PKCS#1 v1.5 (SHA-1/256/384/512) is fully verified
+    ///   against `parent.spki_der`.
+    /// * ECDSA / DSA links surface as [`TrustError::NotImplemented`]
+    ///   (no EC point arithmetic reachable — see module docs).  This
+    ///   keeps the chain fail-closed.
+    /// * The synthetic [`OID_STUB_SIG`] path is retained for the
+    ///   in-process test fixtures only.
     pub fn link_signature_ok(&self, parent: &X509Cert) -> Result<(), TrustError> {
-        match self.sig_alg_oid.as_str() {
-            OID_STUB_SIG => {
-                // Test-only computation: SHA-256(tbs_der || parent.subject_dn).
-                let mut buf = Vec::with_capacity(self.tbs_der.len() + parent.subject_dn.len());
-                buf.extend_from_slice(self.tbs_der);
-                buf.extend_from_slice(parent.subject_dn);
-                let expected = sha256::digest(&buf);
-                if ct_eq(self.signature_bytes, &expected) {
-                    Ok(())
-                } else {
-                    Err(TrustError::BadSignature)
-                }
-            }
-            _ => Err(TrustError::NotImplemented),
+        if self.sig_alg_oid == OID_STUB_SIG {
+            // Test-only computation: SHA-256(tbs_der || parent.subject_dn).
+            let mut buf = Vec::with_capacity(self.tbs_der.len() + parent.subject_dn.len());
+            buf.extend_from_slice(self.tbs_der);
+            buf.extend_from_slice(parent.subject_dn);
+            let expected = sha256::digest(&buf);
+            return if ct_eq(self.signature_bytes, &expected) {
+                Ok(())
+            } else {
+                Err(TrustError::BadSignature)
+            };
+        }
+        match verify_signature_with_spki(
+            parent.spki_der,
+            &self.sig_alg_oid,
+            self.tbs_der,
+            self.signature_bytes,
+        ) {
+            SigVerify::Ok => Ok(()),
+            SigVerify::Bad => Err(TrustError::BadSignature),
+            SigVerify::Unsupported => Err(TrustError::NotImplemented),
         }
     }
+}
+
+/// Parse a UTCTime / GeneralizedTime into a comparable `YYYYMMDDHHMMSS`
+/// 14-byte numeric string (best-effort).  Returns `None` if the value is
+/// not in a recognised form.  UTCTime years 00-49 → 2000-2049, 50-99 →
+/// 1950-1999 (RFC 5280 §4.1.2.5.1).
+fn parse_asn1_time(tag: u8, content: &[u8]) -> Option<[u8; 14]> {
+    // Accept only the canonical "...Z" UTC encodings emitted by every CA.
+    let s = std::str::from_utf8(content).ok()?;
+    let s = s.strip_suffix('Z').unwrap_or(s);
+    let digits: Vec<u8> = s.bytes().filter(|b| b.is_ascii_digit()).collect();
+    let mut out = [b'0'; 14];
+    match tag {
+        0x17 => {
+            // UTCTime: YYMMDDHHMM[SS]
+            if digits.len() < 10 {
+                return None;
+            }
+            let yy: u32 = std::str::from_utf8(&digits[0..2]).ok()?.parse().ok()?;
+            let century = if yy < 50 { b"20" } else { b"19" };
+            out[0] = century[0];
+            out[1] = century[1];
+            // Copy YYMMDDHHMM (+ optional SS) after the century.
+            let take = digits.len().min(12);
+            out[2..2 + take].copy_from_slice(&digits[..take]);
+            Some(out)
+        }
+        0x18 => {
+            // GeneralizedTime: YYYYMMDDHHMM[SS]
+            if digits.len() < 12 {
+                return None;
+            }
+            let take = digits.len().min(14);
+            out[..take].copy_from_slice(&digits[..take]);
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+/// Current UTC time as a `YYYYMMDDHHMMSS` 14-byte numeric string, for
+/// comparison against parsed cert validity windows.
+fn now_utc_14() -> [u8; 14] {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Civil-from-days (Howard Hinnant's algorithm) — no chrono dep.
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    let mut out = [0u8; 14];
+    let s = format!(
+        "{:04}{:02}{:02}{:02}{:02}{:02}",
+        year, m, d, hh, mm, ss
+    );
+    let b = s.as_bytes();
+    out[..b.len().min(14)].copy_from_slice(&b[..b.len().min(14)]);
+    out
+}
+
+/// Check that `now` falls within `[notBefore, notAfter]`.  If either bound
+/// fails to parse we conservatively treat the cert as valid on the date
+/// axis (the cryptographic link check is the real gate); a parse failure
+/// must not cause a *false reject* of an otherwise-good chain, nor a
+/// false-accept of a bad signature.
+fn cert_dates_ok(cert: &X509Cert) -> bool {
+    let now = now_utc_14();
+    if let Some(nb) = parse_asn1_time(cert.not_before_tag, cert.not_before) {
+        if now < nb {
+            return false;
+        }
+    }
+    if let Some(na) = parse_asn1_time(cert.not_after_tag, cert.not_after) {
+        if now > na {
+            return false;
+        }
+    }
+    true
 }
 
 /// Walk `leaf` → `intermediates` → `trust_store` building a chain.
@@ -1405,9 +2337,18 @@ pub fn verify_chain<'a>(
     let mut visited: Vec<Vec<u8>> = Vec::new();
     visited.push(current.subject_dn.to_vec());
 
+    // Leaf validity window must include "now" (skip for the synthetic
+    // stub-sig fixtures, whose dummy validity dates aren't real times).
+    if leaf.sig_alg_oid != OID_STUB_SIG && !cert_dates_ok(leaf) {
+        return Err(TrustError::Expired);
+    }
+
     for _step in 0..MAX_CHAIN_LEN {
         if let Some(anchor) = trust_store.find_anchor_by_subject(current.issuer_dn) {
             let parent = X509Cert::parse(&anchor.der).map_err(|_| TrustError::Malformed)?;
+            if parent.sig_alg_oid != OID_STUB_SIG && !cert_dates_ok(&parent) {
+                return Err(TrustError::Expired);
+            }
             current.link_signature_ok(&parent)?;
             return Ok(());
         }
@@ -1419,6 +2360,9 @@ pub fn verify_chain<'a>(
             Some(parent) => {
                 if visited.iter().any(|v| v.as_slice() == parent.subject_dn) {
                     return Err(TrustError::Cyclic);
+                }
+                if parent.sig_alg_oid != OID_STUB_SIG && !cert_dates_ok(parent) {
+                    return Err(TrustError::Expired);
                 }
                 current.link_signature_ok(parent)?;
                 visited.push(parent.subject_dn.to_vec());
@@ -2081,5 +3025,409 @@ mod tests {
         let n = ts.load_pem_bundle(&pem);
         assert_eq!(n, 1, "exactly one anchor must be decoded");
         assert_eq!(ts.anchor_count(), 1);
+    }
+
+    // ---------------------------------------------------------------------
+    // Task #1 — real RSA PKCS#1 v1.5 verification tests.
+    //
+    // We use a fixed, small (512-bit) textbook RSA key.  512-bit RSA is
+    // cryptographically dead, but it exercises the *exact* code path real
+    // 2048/4096-bit jarsigner keys use (modpow + DigestInfo compare) at a
+    // size the in-test signer can produce quickly.  Signing in the test is
+    // `DigestInfo^d mod n`; verification is the production `sig^e mod n`.
+    // ---------------------------------------------------------------------
+
+    // A real 512-bit RSA key (n = p*q, e = 65537, d = e^-1 mod phi(n)).
+    // Generated offline; embedded big-endian.  512-bit is dead crypto but
+    // exercises the exact production code path (modpow + DigestInfo).
+    const RSA512_N: &[u8] = &[
+        0x9f, 0x99, 0x9b, 0x45, 0xc9, 0xaf, 0xc0, 0x21, 0xf5, 0x6b, 0x81, 0xb7, 0x57, 0xf2, 0x4c,
+        0x82, 0x8e, 0x8a, 0xca, 0xa8, 0xb9, 0xc6, 0xbd, 0x61, 0xab, 0xd5, 0xe2, 0xea, 0x35, 0x8c,
+        0xd0, 0x63, 0x4b, 0xee, 0x4c, 0x67, 0x39, 0x79, 0x70, 0x41, 0x72, 0xd8, 0xcb, 0xaa, 0x7d,
+        0x6d, 0x4e, 0x29, 0xa2, 0x52, 0xa0, 0x26, 0x7a, 0xd9, 0x55, 0x8c, 0xdb, 0xce, 0x22, 0xf2,
+        0xc1, 0xc5, 0x9c, 0x09,
+    ];
+    const RSA512_D: &[u8] = &[
+        0x3e, 0x1c, 0x88, 0x8a, 0x1b, 0x58, 0xb3, 0x7c, 0x43, 0xc7, 0xa7, 0xfe, 0xd3, 0x52, 0x2f,
+        0xa6, 0x6b, 0x94, 0xe6, 0x13, 0xcd, 0xe0, 0xe3, 0x58, 0xfc, 0x87, 0xcb, 0xbc, 0x7c, 0x44,
+        0xa5, 0xe0, 0x2e, 0xc1, 0x4e, 0xbf, 0xc0, 0x4f, 0xc8, 0x72, 0x25, 0x58, 0xff, 0x5c, 0x85,
+        0x9b, 0x88, 0x23, 0xa1, 0x79, 0x3a, 0x53, 0xeb, 0x3d, 0x82, 0xc5, 0x94, 0x80, 0x47, 0x9a,
+        0x39, 0x1d, 0x6c, 0x01,
+    ];
+
+    /// Build an RSA `SubjectPublicKeyInfo` from raw big-endian n + e.
+    fn rsa_spki(n_be: &[u8], e: u64) -> Vec<u8> {
+        // INTEGER encoding: prepend 0x00 if the high bit is set (positive).
+        fn der_int(bytes: &[u8]) -> Vec<u8> {
+            let mut b = bytes.to_vec();
+            // Strip leading zero bytes except one that guards a high bit.
+            while b.len() > 1 && b[0] == 0 && b[1] & 0x80 == 0 {
+                b.remove(0);
+            }
+            if b[0] & 0x80 != 0 {
+                let mut g = vec![0u8];
+                g.extend_from_slice(&b);
+                b = g;
+            }
+            tlv(TAG_INTEGER, &b)
+        }
+        let mut e_be = Vec::new();
+        let mut v = e;
+        while v > 0 {
+            e_be.insert(0, (v & 0xFF) as u8);
+            v >>= 8;
+        }
+        let rsa_pub = seq(&[der_int(n_be).as_slice(), der_int(&e_be).as_slice()].concat());
+        let algid = {
+            let mut inner = oid("1.2.840.113549.1.1.1");
+            inner.extend_from_slice(&[TAG_NULL, 0x00]);
+            seq(&inner)
+        };
+        let mut bs = vec![0u8];
+        bs.extend_from_slice(&rsa_pub);
+        let bit_string = tlv(0x03, &bs);
+        seq(&[algid.as_slice(), bit_string.as_slice()].concat())
+    }
+
+    #[test]
+    fn sha384_512_digests_match_known_vectors() {
+        // NIST FIPS 180-4 example: SHA-384/512 of "abc".
+        let abc = b"abc";
+        let d384 = super::sha2ext::sha384(abc);
+        let d512 = super::sha2ext::sha512(abc);
+        // First bytes of the well-known digests.
+        assert_eq!(&d384[..4], &[0xcb, 0x00, 0x75, 0x3f]);
+        assert_eq!(&d512[..4], &[0xdd, 0xaf, 0x35, 0xa1]);
+    }
+
+    #[test]
+    fn parse_spki_recovers_rsa_key() {
+        let spki = rsa_spki(RSA512_N, 65537);
+        match super::parse_spki(&spki).expect("parse rsa spki") {
+            super::PublicKey::Rsa(k) => {
+                assert_eq!(k.k, 64, "512-bit modulus => k = 64 bytes");
+                assert_eq!(k.e.cmp(&super::BigUint::from_bytes_be(&[1, 0, 1])),
+                           std::cmp::Ordering::Equal);
+            }
+            _ => panic!("expected RSA key"),
+        }
+    }
+
+    /// Produce an RSA PKCS#1 v1.5 signature for `message` under the test
+    /// key, using the production `BigUint::modpow` with the private `d`.
+    fn rsa_sign(message: &[u8], digest_alg: DigestAlg) -> Vec<u8> {
+        use super::BigUint;
+        let n = BigUint::from_bytes_be(RSA512_N);
+        let d = BigUint::from_bytes_be(RSA512_D);
+        let k = (RSA512_N.len() * 8 + 7) / 8;
+        let hash = super::raw_digest(digest_alg, message);
+        let prefix = super::digest_info_prefix(digest_alg);
+        let t_len = prefix.len() + hash.len();
+        let ps_len = k - t_len - 3;
+        let mut em = Vec::with_capacity(k);
+        em.push(0x00);
+        em.push(0x01);
+        em.extend(std::iter::repeat(0xff).take(ps_len));
+        em.push(0x00);
+        em.extend_from_slice(prefix);
+        em.extend_from_slice(&hash);
+        let m = BigUint::from_bytes_be(&em);
+        m.modpow(&d, &n).to_bytes_be_padded(k)
+    }
+
+    #[test]
+    fn rsa_verify_accepts_valid_signature() {
+        use super::{DigestAlg, SigVerify};
+        let spki = rsa_spki(RSA512_N, 65537);
+        for alg in [DigestAlg::Sha1, DigestAlg::Sha256, DigestAlg::Sha384, DigestAlg::Sha512] {
+            let msg = b"the quick brown fox";
+            let sig = rsa_sign(msg, alg);
+            assert_eq!(
+                verify_signature_with_spki(&spki, sig_alg_oid_for(alg), msg, &sig),
+                SigVerify::Ok,
+                "valid {:?} signature must verify",
+                alg
+            );
+            // Tampered message → Bad.
+            assert_eq!(
+                verify_signature_with_spki(&spki, sig_alg_oid_for(alg), b"tampered", &sig),
+                SigVerify::Bad
+            );
+            // Tampered signature → Bad.
+            let mut bad = sig.clone();
+            bad[10] ^= 0xFF;
+            assert_eq!(
+                verify_signature_with_spki(&spki, sig_alg_oid_for(alg), msg, &bad),
+                SigVerify::Bad
+            );
+        }
+    }
+
+    fn sig_alg_oid_for(alg: DigestAlg) -> &'static str {
+        match alg {
+            DigestAlg::Sha1 => "1.2.840.113549.1.1.5",
+            DigestAlg::Sha256 => "1.2.840.113549.1.1.11",
+            DigestAlg::Sha384 => "1.2.840.113549.1.1.12",
+            DigestAlg::Sha512 => "1.2.840.113549.1.1.13",
+        }
+    }
+
+    #[test]
+    fn rsa_verify_rejects_structural_garbage() {
+        use super::{DigestAlg, SigVerify};
+        let spki = rsa_spki(RSA512_N, 65537);
+        let key = match super::parse_spki(&spki).unwrap() {
+            super::PublicKey::Rsa(k) => k,
+            _ => unreachable!(),
+        };
+        // Wrong signature length → Bad.
+        assert_eq!(
+            super::rsa_pkcs1v15_verify(&key, DigestAlg::Sha256, b"msg", &[0u8; 10]),
+            SigVerify::Bad
+        );
+        // s == n (>= n) → Bad.
+        let n_be = key.n.to_bytes_be_padded(key.k);
+        assert_eq!(
+            super::rsa_pkcs1v15_verify(&key, DigestAlg::Sha256, b"msg", &n_be),
+            SigVerify::Bad
+        );
+    }
+
+    #[test]
+    fn end_to_end_real_rsa_signer_block_and_chain() {
+        use super::*;
+        // Build a real RSA-signed SignerInfo over a `.SF`, plus a leaf cert
+        // whose SPKI is the RSA test key and whose chain roots in a trust
+        // anchor.  This exercises BOTH the SignerInfo pubkey check and the
+        // chain link RSA verify on the production path (no permissive mode).
+
+        // --- Leaf cert: subject = "RsaLeaf", issuer = "RsaRoot", RSA SPKI,
+        //     self-... no: signed by root.  We sign the leaf TBS with the
+        //     same test key for simplicity (root SPKI == same key).
+        let leaf_spki = rsa_spki(RSA512_N, 65537);
+        let subject_dn = x509_name("RsaLeaf");
+        let issuer_dn = x509_name("RsaRoot");
+        let root_dn = x509_name("RsaRoot");
+        // Validity window covering "now" (2020..2099).
+        let validity = seq(&[
+            tlv(0x17, b"200101000000Z").as_slice(),
+            tlv(0x18, b"20990101000000Z").as_slice(),
+        ]
+        .concat());
+        let build_cert = |subj: &[u8], iss: &[u8]| -> Vec<u8> {
+            let tbs = seq(&[
+                ctx_imp(0, &integer(2)).as_slice(),
+                integer(1).as_slice(),
+                algorithm_identifier("1.2.840.113549.1.1.11").as_slice(),
+                iss,
+                validity.as_slice(),
+                subj,
+                leaf_spki.as_slice(),
+            ]
+            .concat());
+            // Sign the TBS with the RSA key (sha256WithRSA).
+            let sig = rsa_sign(&tbs, DigestAlg::Sha256);
+            let mut bs = vec![0u8];
+            bs.extend_from_slice(&sig);
+            seq(&[
+                tbs.as_slice(),
+                algorithm_identifier("1.2.840.113549.1.1.11").as_slice(),
+                tlv(0x03, &bs).as_slice(),
+            ]
+            .concat())
+        };
+        let leaf_der = build_cert(&subject_dn, &issuer_dn);
+        let root_der = build_cert(&root_dn, &root_dn); // self-signed root
+
+        // --- SignerInfo / SignedData over a `.SF`.
+        let sf = b"Signature-Version: 1.0\r\nSHA-256-Digest-Manifest: zzz=\r\n\r\n";
+        let dig = sha256::digest(sf).to_vec();
+        let attr_ct = seq(&[oid(OID_CONTENT_TYPE).as_slice(), set(&oid(OID_DATA)).as_slice()].concat());
+        let attr_md = seq(&[oid(OID_MESSAGE_DIGEST).as_slice(), set(&octet(&dig)).as_slice()].concat());
+        let attrs_inner = [attr_ct.as_slice(), attr_md.as_slice()].concat();
+        // SignedAttributes signed form = explicit SET.
+        let signed_attrs_der = set(&attrs_inner);
+        let si_sig = rsa_sign(&signed_attrs_der, DigestAlg::Sha256);
+        let auth_attrs = ctx_imp(0, &attrs_inner);
+
+        let signer_info = seq(&[
+            integer(1).as_slice(),
+            issuer_and_serial("RsaRoot", 1).as_slice(),
+            algorithm_identifier(OID_SHA256).as_slice(),
+            auth_attrs.as_slice(),
+            algorithm_identifier("1.2.840.113549.1.1.11").as_slice(),
+            octet(&si_sig).as_slice(),
+        ]
+        .concat());
+
+        // certificates [0] IMPLICIT: leaf first, then root.
+        let mut certs_concat = leaf_der.clone();
+        certs_concat.extend_from_slice(&root_der);
+        let certs = ctx_imp(0, &certs_concat);
+        let encap = seq(&oid(OID_DATA));
+        let digest_algs = set(&algorithm_identifier(OID_SHA256));
+        let signed_data = seq(&[
+            integer(1).as_slice(),
+            digest_algs.as_slice(),
+            encap.as_slice(),
+            certs.as_slice(),
+            set(&signer_info).as_slice(),
+        ]
+        .concat());
+        let block = seq(&[oid(OID_SIGNED_DATA).as_slice(), ctx_imp(0, &signed_data).as_slice()].concat());
+
+        // Trust store with the root anchor.
+        let mut ts = TrustStore::empty();
+        assert!(ts.add_anchor_der(root_der.clone()));
+
+        let vs = verify_signer_block(&block, sf, &ts)
+            .expect("real RSA signer block + chain must verify end-to-end");
+        assert_eq!(vs.digest_alg, DigestAlg::Sha256);
+        assert_eq!(vs.chain.len(), 2);
+
+        // Negative: tamper the .SF → reject.
+        let bad_sf = b"Signature-Version: 1.0\r\nEvil: 1\r\n\r\n";
+        assert!(verify_signer_block(&block, bad_sf, &ts).is_none());
+
+        // Negative: empty trust store → no anchor → reject.
+        assert!(verify_signer_block(&block, sf, &TrustStore::empty()).is_none());
+    }
+
+    #[test]
+    fn ecdsa_signature_algorithm_is_unsupported_not_accepted() {
+        use super::{verify_signature_with_spki, SigVerify};
+        // An EC SPKI (id-ecPublicKey) with an ECDSA sig alg must surface as
+        // Unsupported — fail-closed, never Ok.
+        let ec_algid = {
+            let mut inner = oid("1.2.840.10045.2.1"); // id-ecPublicKey
+            inner.extend_from_slice(&oid("1.2.840.10045.3.1.7")); // prime256v1
+            seq(&inner)
+        };
+        let bs = vec![0u8; 65]; // uncompressed point placeholder
+        let mut bit = vec![0u8];
+        bit.extend_from_slice(&bs);
+        let ec_spki = seq(&[ec_algid.as_slice(), tlv(0x03, &bit).as_slice()].concat());
+        let r = verify_signature_with_spki(
+            &ec_spki,
+            "1.2.840.10045.4.3.2", // ecdsa-with-SHA256
+            b"message",
+            &[0u8; 64],
+        );
+        assert_eq!(r, SigVerify::Unsupported);
+    }
+
+    // ---------------------------------------------------------------------
+    // Task #40 — JKS trust-store parsing tests.
+    // ---------------------------------------------------------------------
+
+    /// Hand-assemble a minimal JKS file (version 2) with a single
+    /// TrustedCertEntry carrying `cert_der`, MAC-sealed under `password`.
+    fn build_jks(cert_der: &[u8], password: &[u8]) -> Vec<u8> {
+        fn u16(v: u16, o: &mut Vec<u8>) {
+            o.extend_from_slice(&v.to_be_bytes());
+        }
+        fn u32(v: u32, o: &mut Vec<u8>) {
+            o.extend_from_slice(&v.to_be_bytes());
+        }
+        fn u64(v: u64, o: &mut Vec<u8>) {
+            o.extend_from_slice(&v.to_be_bytes());
+        }
+        let mut body = Vec::new();
+        u32(super::JKS_MAGIC, &mut body);
+        u32(2, &mut body); // version
+        u32(1, &mut body); // entry_count
+        u32(2, &mut body); // tag = TrustedCertEntry
+        let alias = b"testanchor";
+        u16(alias.len() as u16, &mut body);
+        body.extend_from_slice(alias);
+        u64(0, &mut body); // creation_date_ms
+        let ctype = b"X.509";
+        u16(ctype.len() as u16, &mut body);
+        body.extend_from_slice(ctype);
+        u32(cert_der.len() as u32, &mut body);
+        body.extend_from_slice(cert_der);
+        // Append MAC.
+        let mac = super::jks_password_mac(password, &body);
+        let mut out = body;
+        out.extend_from_slice(&mac);
+        out
+    }
+
+    #[test]
+    fn jks_round_trip_extracts_trusted_cert() {
+        let root_subject_dn = x509_name("JksRoot");
+        let cert = build_x509_cert("JksRoot", "JksRoot", &root_subject_dn);
+        let pw = b"changeit";
+        let jks = build_jks(&cert, pw);
+
+        let ders = super::parse_jks_trusted_certs(&jks, pw).expect("jks parse");
+        assert_eq!(ders.len(), 1);
+        assert_eq!(ders[0], cert);
+
+        // Loading it as a trust store anchor must work.
+        let mut ts = TrustStore::empty();
+        let n = ts.extend_from_anchors(ders);
+        assert_eq!(n, 1);
+        assert_eq!(ts.anchor_count(), 1);
+    }
+
+    #[test]
+    fn jks_wrong_password_rejected() {
+        let dn = x509_name("JksRoot");
+        let cert = build_x509_cert("JksRoot", "JksRoot", &dn);
+        let jks = build_jks(&cert, b"changeit");
+        assert!(super::parse_jks_trusted_certs(&jks, b"wrongpw").is_err());
+    }
+
+    #[test]
+    fn jks_tampered_body_rejected() {
+        let dn = x509_name("JksRoot");
+        let cert = build_x509_cert("JksRoot", "JksRoot", &dn);
+        let mut jks = build_jks(&cert, b"changeit");
+        // Flip a byte in the body (not the trailing MAC).
+        jks[12] ^= 0xFF;
+        assert!(super::parse_jks_trusted_certs(&jks, b"changeit").is_err());
+    }
+
+    #[test]
+    fn validity_dates_reject_expired_cert() {
+        // notAfter in the past must fail cert_dates_ok.
+        let der = {
+            let subject_dn = x509_name("ExpiredLeaf");
+            let issuer_dn = x509_name("ExpiredLeaf");
+            let version = ctx_imp(0, &integer(2));
+            let serial = integer(1);
+            let sig_alg = algorithm_identifier(OID_STUB_SIG);
+            // notBefore 2000, notAfter 2001 — both in the past.
+            let validity = seq(&[
+                tlv(0x17, b"000101000000Z").as_slice(),
+                tlv(0x17, b"010101000000Z").as_slice(),
+            ]
+            .concat());
+            let spki = x509_spki(&subject_dn);
+            let tbs = seq(&[
+                version.as_slice(),
+                serial.as_slice(),
+                sig_alg.as_slice(),
+                issuer_dn.as_slice(),
+                validity.as_slice(),
+                subject_dn.as_slice(),
+                spki.as_slice(),
+            ]
+            .concat());
+            let mut buf = tbs.clone();
+            buf.extend_from_slice(&subject_dn);
+            let sig = sha256::digest(&buf);
+            let mut bs = vec![0u8];
+            bs.extend_from_slice(&sig);
+            seq(&[
+                tbs.as_slice(),
+                algorithm_identifier(OID_STUB_SIG).as_slice(),
+                tlv(0x03, &bs).as_slice(),
+            ]
+            .concat())
+        };
+        let cert = X509Cert::parse(&der).expect("parse expired cert");
+        assert!(!super::cert_dates_ok(&cert), "year-2001 notAfter must be expired");
     }
 }

@@ -18,6 +18,7 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 cratonvm-reader = { path = "../reader" }
 cratonvm-native-builtins = { path = "../native-builtins" }
+cratonvm-classloading = { path = "../classloading" }
 
 # -----------------------------------------------------------------------
 # Untrusted-byte parsers under fuzz.
@@ -63,6 +64,12 @@ doc = false
 [[bin]]
 name = "fuzz_descriptor"
 path = "fuzz_targets/fuzz_descriptor.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_verifier"
+path = "fuzz_targets/fuzz_verifier.rs"
 test = false
 doc = false
 

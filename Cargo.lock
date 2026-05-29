@@ -429,8 +429,10 @@ dependencies = [
  "cratonvm-types",
  "hashbrown 0.14.5",
  "memmap2",
+ "p12",
  "parking_lot",
  "rustc-hash",
+ "sha2",
  "tempfile",
  "tracing",
  "zip",
@@ -457,6 +459,7 @@ dependencies = [
 name = "cratonvm-fuzz"
 version = "0.0.0"
 dependencies = [
+ "cratonvm-classloading",
  "cratonvm-native-builtins",
  "cratonvm-reader",
  "libfuzzer-sys",

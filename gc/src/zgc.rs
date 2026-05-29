@@ -2,10 +2,47 @@
 //!
 //! Implements colored pointers, load barriers, ZPages, concurrent GC phases,
 //! and a stub for Generational ZGC (JEP 439 / JDK 21+).
+//!
+//! # Real vs. simulated
+//!
+//! The original module ([`ZgcCollector`] / [`ZgcHeap`] / [`GenerationalZgc`])
+//! is a *metadata-only simulation*: its `ZPage`s carry synthetic `u64`
+//! virtual addresses with no backing storage, so it can model the colored-
+//! pointer / load-barrier / phase lifecycle but cannot hold real Java
+//! objects (see the long comment on [`ZgcCollector::concurrent_relocate`]).
+//!
+//! [`ZgcRealHeap`] (added below) is the **honest, functioning** collector:
+//! it backs every allocation with real owned memory (an [`crate::arena::Arena`]
+//! per page-tier), writes real [`ObjectHeader`]s, and implements the
+//! [`crate::collector::GarbageCollector`] trait with the same bounds-checked
+//! field/array semantics as [`crate::gen_heap::GenerationalHeap`] and
+//! [`crate::g1::G1Collector`]. Its [`ZgcRealHeap::collect_garbage`] performs a
+//! real stop-the-world **mark-sweep**: it traces the live object graph from
+//! the supplied roots, marks survivors in their header, and reclaims dead
+//! objects into a free list for reuse.
+//!
+//! What remains deferred (documented, not faked): the production ZGC
+//! invariants of *concurrent* marking/relocation, colored-pointer load
+//! barriers driving the trace, and *compaction* (the mark-sweep is
+//! non-moving, so it reclaims but does not defragment). The colored-pointer
+//! / phase machinery above is retained for that future work; the real heap
+//! is deliberately a clean, correct STW collector rather than a half-built
+//! concurrent one.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
+use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
+
+use crate::arena::Arena;
+use crate::collector::{GarbageCollector, MonitorCleanup, StopTheWorldToken};
+use crate::gc::{GcResult, GcStats};
+use crate::heap::{
+    array_data_size, read_prim_element, write_prim_element, ArrayElementType, ObjectHeader,
+    ObjectKind, GC_FLAG_MARKED, HEADER_SIZE, SLOT_SIZE,
+};
+use cratonvm_types::{ClassId, ObjectRef, Value};
 
 // ---------------------------------------------------------------------------
 // Colored pointer constants
@@ -1203,6 +1240,520 @@ impl GenerationalZgc {
 }
 
 // ---------------------------------------------------------------------------
+// ZgcRealHeap — a real, functioning ZGC-flavoured collector
+// ---------------------------------------------------------------------------
+//
+// Everything above this point is the colored-pointer / load-barrier / phase
+// *simulation* (no backing storage). `ZgcRealHeap` is the real thing: owned
+// memory, real object headers, a working mark-sweep collector, and the full
+// `GarbageCollector` trait. It is intentionally self-contained and does not
+// touch the simulation types.
+
+/// Default total heap size for a [`ZgcRealHeap`]: 64 MB.
+const ZGC_REAL_DEFAULT_HEAP: usize = 64 * 1024 * 1024;
+
+/// Trigger a collection once live+dead allocation crosses this fraction of
+/// total capacity.
+const ZGC_REAL_GC_THRESHOLD_PERCENT: usize = 75;
+
+/// Maximum array length, mirroring `heap.rs` / HotSpot's practical limit.
+const ZGC_REAL_MAX_ARRAY_LENGTH: usize = i32::MAX as usize;
+
+/// A real, memory-backed ZGC heap.
+///
+/// # Storage scheme
+///
+/// Objects live in a single bump-pointer [`Arena`] (the same allocator the
+/// semi-space `Heap` and the non-moving young-gen sweep use). Each allocation
+/// is laid out exactly like every other CratonVM heap:
+///
+/// ```text
+/// [ObjectHeader (HEADER_SIZE)] [field0 (SLOT_SIZE)] ... [fieldN]
+/// [ObjectHeader (HEADER_SIZE)] [elem0] [elem1] ...        (arrays, compact)
+/// ```
+///
+/// so `ObjectRef`s handed out by [`Self::alloc_object`] / [`Self::alloc_array`]
+/// are real `*mut u8` pointers into owned memory and are fully interoperable
+/// with the shared header/slot decoders in `heap.rs`.
+///
+/// A side **object registry** (`Vec` of base addresses) records every live
+/// allocation so the sweep can enumerate the heap without having to parse
+/// arena holes. Allocation appends; the sweep rebuilds it from the survivors.
+///
+/// # Collection algorithm
+///
+/// [`Self::collect_garbage`] is a **stop-the-world, non-moving mark-sweep**:
+///
+/// 1. **Mark.** Clear every object's mark bit, then trace transitively from
+///    `roots`: for each reachable object, set [`GC_FLAG_MARKED`] in its
+///    header and push its reference-typed fields / reference array elements
+///    onto a work stack (a real graph trace, not a page-level approximation).
+/// 2. **Sweep.** Walk the registry; objects without the mark bit are dead —
+///    their bytes are zeroed and handed back to the arena free list for
+///    reuse. Survivors keep their address (non-moving) and have their mark
+///    bit cleared for the next cycle.
+///
+/// Because it is non-moving, no `ObjectRef` ever changes — the returned
+/// [`GcResult::pointer_map`] is therefore empty (no remapping needed), which
+/// is exactly correct for a non-compacting collector.
+pub struct ZgcRealHeap {
+    /// Backing storage for all objects.
+    arena: Mutex<Arena>,
+    /// Base address of every live allocation, in allocation order. Rebuilt
+    /// (filtered to survivors) by each sweep.
+    registry: Mutex<Vec<usize>>,
+    /// Monotonic identity-hash-code source (matches `Heap::next_hash`).
+    next_hash_code: AtomicI32,
+    /// Bytes of live+dead object payload currently outstanding (drops on
+    /// sweep). Used by [`Self::needs_gc`] and [`Self::allocated_bytes`].
+    allocated: AtomicUsize,
+    /// Collection is triggered once `allocated` crosses this byte count.
+    gc_threshold: usize,
+    /// Lifetime collection counter (observability).
+    gc_count: AtomicUsize,
+}
+
+// SAFETY: identical argument to `Heap`/`G1Collector` (heap.rs:143). The only
+// non-Send/Sync state is the raw `*mut u8` arena pointers, which live behind
+// `Mutex<Arena>`; all allocation and collection serialize through that mutex,
+// and the moving... (there is no moving — this collector is non-moving) so
+// shared `&ZgcRealHeap` use across threads is sound under the same protocol
+// the other collectors document.
+unsafe impl Send for ZgcRealHeap {}
+unsafe impl Sync for ZgcRealHeap {}
+
+impl ZgcRealHeap {
+    /// Create a heap with the default capacity ([`ZGC_REAL_DEFAULT_HEAP`]).
+    pub fn new() -> Self {
+        Self::with_capacity(ZGC_REAL_DEFAULT_HEAP)
+    }
+
+    /// Create a heap with the given total capacity in bytes.
+    pub fn with_capacity(total_bytes: usize) -> Self {
+        let cap = total_bytes.max(4096);
+        Self {
+            arena: Mutex::new(Arena::new(cap)),
+            registry: Mutex::new(Vec::new()),
+            next_hash_code: AtomicI32::new(1),
+            allocated: AtomicUsize::new(0),
+            gc_threshold: cap * ZGC_REAL_GC_THRESHOLD_PERCENT / 100,
+            gc_count: AtomicUsize::new(0),
+        }
+    }
+
+    /// Number of collections performed so far.
+    pub fn gc_count(&self) -> usize {
+        self.gc_count.load(Ordering::Relaxed)
+    }
+
+    /// Next identity hash code (never zero; wraps avoiding 0).
+    fn next_hash(&self) -> i32 {
+        let h = self.next_hash_code.fetch_add(1, Ordering::Relaxed);
+        if h == 0 {
+            self.next_hash_code.fetch_add(1, Ordering::Relaxed)
+        } else {
+            h
+        }
+    }
+
+    /// Bump-allocate `size` zeroed bytes (8-byte aligned) and register the
+    /// base address. Returns `None` on OOM.
+    fn alloc_raw(&self, size: usize) -> Option<*mut u8> {
+        let ptr = {
+            let mut arena = self.arena.lock();
+            let ptr = arena.alloc(size, 8)?;
+            // The arena bump path hands out memory from a zeroed Vec, but a
+            // reused free-list block may contain stale bytes — zero it so a
+            // fresh header/fields start clean.
+            // SAFETY: `arena.alloc` guarantees `size` valid bytes at `ptr`.
+            unsafe { std::ptr::write_bytes(ptr, 0, size) };
+            ptr
+        };
+        self.registry.lock().push(ptr as usize);
+        self.allocated.fetch_add(size, Ordering::Relaxed);
+        Some(ptr)
+    }
+
+    /// Header accessor (shared with the trait impl).
+    #[inline]
+    fn header(&self, obj: ObjectRef) -> &ObjectHeader {
+        // SAFETY: `obj` points to a live allocation whose first HEADER_SIZE
+        // bytes are a valid `ObjectHeader` written at allocation time.
+        unsafe { &*(obj.as_ptr() as *const ObjectHeader) }
+    }
+
+    #[inline]
+    fn header_mut(&self, base: *mut u8) -> &mut ObjectHeader {
+        // SAFETY: `base` is a registered live allocation base; its first
+        // HEADER_SIZE bytes are a valid `ObjectHeader`.
+        unsafe { &mut *(base as *mut ObjectHeader) }
+    }
+
+    /// Total size in bytes of the allocation rooted at `header`.
+    fn alloc_size(header: &ObjectHeader) -> usize {
+        match header.kind {
+            ObjectKind::Object | ObjectKind::HumongousFiller => {
+                HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
+            }
+            ObjectKind::Array => {
+                let data = array_data_size(header.array_length as usize, header.element_type)
+                    .unwrap_or(0);
+                HEADER_SIZE + data
+            }
+        }
+    }
+
+    /// Push every reference-typed out-edge of the object at `base` onto
+    /// `work`. Mirrors how the semi-space collector enumerates an object's
+    /// oops, but reads them in place (non-moving).
+    fn enumerate_references(&self, base: *mut u8, work: &mut Vec<usize>) {
+        let header = self.header_mut(base);
+        match header.kind {
+            ObjectKind::Object => {
+                let n = header.num_slots as usize;
+                for i in 0..n {
+                    // SAFETY: i < num_slots so the slot is within the object.
+                    let slot = unsafe { base.add(HEADER_SIZE + i * SLOT_SIZE) };
+                    let val = unsafe { std::ptr::read(slot as *const Value) };
+                    if let Value::Object(Some(r)) = val {
+                        work.push(r.as_ptr() as usize);
+                    }
+                }
+            }
+            ObjectKind::Array => {
+                if header.element_type == ArrayElementType::Reference {
+                    let len = header.array_length as usize;
+                    // SAFETY: data area begins at base + HEADER_SIZE; each ref
+                    // element is REF_ELEMENT_SIZE and `i < len`.
+                    let data = unsafe { base.add(HEADER_SIZE) };
+                    for i in 0..len {
+                        let val = unsafe {
+                            read_prim_element(data, i, ArrayElementType::Reference)
+                        };
+                        if let Value::Object(Some(r)) = val {
+                            work.push(r.as_ptr() as usize);
+                        }
+                    }
+                }
+                // Primitive arrays have no out-edges.
+            }
+            ObjectKind::HumongousFiller => {}
+        }
+    }
+
+    /// Bounds-and-sanity check shared by `get_field`/`set_field`. Returns the
+    /// in-bounds slot count, or `None` (caller treats as no-op / null) when
+    /// the header is suspect or the index is out of range. Mirrors the guards
+    /// in `g1::get_field` / `gen_heap`.
+    fn check_field_index(&self, header: &ObjectHeader, index: usize) -> Option<usize> {
+        let num_slots = header.num_slots as usize;
+        if num_slots > (1 << 24) {
+            tracing::debug!(target: "zgc", index, num_slots, "zgc real: suspect header");
+            return None;
+        }
+        if index >= num_slots {
+            tracing::warn!(target: "zgc", index, num_slots, "zgc real: field index OOB");
+            return None;
+        }
+        Some(num_slots)
+    }
+}
+
+impl Default for ZgcRealHeap {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GarbageCollector for ZgcRealHeap {
+    fn alloc_object(&self, class_id: ClassId, num_fields: usize) -> ObjectRef {
+        let fields_size = num_fields
+            .checked_mul(SLOT_SIZE)
+            .expect("object field size overflow");
+        let total = HEADER_SIZE
+            .checked_add(fields_size)
+            .expect("object total size overflow");
+        let ptr = self.alloc_raw(total).unwrap_or_else(|| {
+            eprintln!("FATAL: ZGC(real): out of heap space for object ({total} bytes)");
+            std::process::abort();
+        });
+        let header = ObjectHeader::new(
+            class_id,
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            self.next_hash(),
+            0,
+            u32::try_from(num_fields).expect("field count exceeds u32::MAX"),
+        );
+        // SAFETY: `ptr` is a fresh zeroed allocation of `total >= HEADER_SIZE`.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            ObjectRef::from_raw(ptr)
+        }
+    }
+
+    fn alloc_array(
+        &self,
+        class_id: ClassId,
+        element_type: ArrayElementType,
+        length: usize,
+    ) -> ObjectRef {
+        assert!(
+            length <= ZGC_REAL_MAX_ARRAY_LENGTH,
+            "array length {length} exceeds maximum {ZGC_REAL_MAX_ARRAY_LENGTH}"
+        );
+        let data_size =
+            array_data_size(length, element_type).expect("array data size overflow");
+        let total = HEADER_SIZE
+            .checked_add(data_size)
+            .expect("array total size overflow");
+        let ptr = self.alloc_raw(total).unwrap_or_else(|| {
+            eprintln!("FATAL: ZGC(real): out of heap space for array ({total} bytes)");
+            std::process::abort();
+        });
+        let len_u32 = u32::try_from(length).expect("array length exceeds u32::MAX");
+        let header = ObjectHeader::new(
+            class_id,
+            ObjectKind::Array,
+            element_type,
+            self.next_hash(),
+            len_u32,
+            len_u32, // mirror length into num_slots, like Heap/G1/gen_heap
+        );
+        // SAFETY: fresh zeroed allocation of `total >= HEADER_SIZE`.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            ObjectRef::from_raw(ptr)
+        }
+    }
+
+    fn get_header(&self, obj: ObjectRef) -> &ObjectHeader {
+        self.header(obj)
+    }
+
+    fn class_id_of(&self, obj: ObjectRef) -> ClassId {
+        self.header(obj).class_id
+    }
+
+    fn kind_of(&self, obj: ObjectRef) -> ObjectKind {
+        self.header(obj).kind
+    }
+
+    fn element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
+        self.header(obj).element_type
+    }
+
+    fn identity_hash_code(&self, obj: ObjectRef) -> i32 {
+        self.header(obj).identity_hash_code
+    }
+
+    fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
+        let header = self.header(obj);
+        if self.check_field_index(header, index).is_none() {
+            return Value::Object(None);
+        }
+        // SAFETY: index validated < num_slots, so the slot is within bounds.
+        unsafe {
+            let ptr = obj.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE);
+            std::ptr::read(ptr as *const Value)
+        }
+    }
+
+    fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+        let header = self.header(obj);
+        if self.check_field_index(header, index).is_none() {
+            return;
+        }
+        // SAFETY: index validated < num_slots, so the slot is within bounds.
+        unsafe {
+            let ptr = obj.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE);
+            std::ptr::write(ptr as *mut Value, value);
+        }
+    }
+
+    fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value {
+        let _guard = crate::collector::volatile_stripe_lock(obj, index);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        let v = self.get_field(obj, index);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        v
+    }
+
+    fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value) {
+        let _guard = crate::collector::volatile_stripe_lock(obj, index);
+        std::sync::atomic::fence(Ordering::SeqCst);
+        self.set_field(obj, index, value);
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
+
+    fn array_length(&self, obj: ObjectRef) -> usize {
+        let header = self.header(obj);
+        debug_assert_eq!(header.kind, ObjectKind::Array, "not an array");
+        header.array_length as usize
+    }
+
+    fn get_array_element(&self, obj: ObjectRef, index: usize) -> Result<Value, i32> {
+        let header = self.header(obj);
+        if header.kind != ObjectKind::Array {
+            return Err(index as i32);
+        }
+        if index >= header.array_length as usize {
+            return Err(index as i32);
+        }
+        // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
+        let val = unsafe {
+            let base = obj.as_ptr().add(HEADER_SIZE);
+            read_prim_element(base, index, header.element_type)
+        };
+        Ok(val)
+    }
+
+    fn set_array_element(
+        &self,
+        obj: ObjectRef,
+        index: usize,
+        value: Value,
+    ) -> Result<(), i32> {
+        let header = self.header(obj);
+        if header.kind != ObjectKind::Array {
+            return Err(index as i32);
+        }
+        if index >= header.array_length as usize {
+            return Err(index as i32);
+        }
+        let element_type = header.element_type;
+        // SAFETY: bounds check passed; data area starts at base + HEADER_SIZE.
+        unsafe {
+            let base = obj.as_ptr().add(HEADER_SIZE);
+            if element_type == ArrayElementType::Reference {
+                match value {
+                    Value::Object(_) => {
+                        write_prim_element(base, index, element_type, value);
+                    }
+                    other => {
+                        // Auto-box non-Object values into a 1-field wrapper,
+                        // matching `Heap::set_array_element`.
+                        let wrapper =
+                            self.alloc_object(crate::heap::AUTOBOX_CLASS_ID, 1);
+                        self.set_field(wrapper, 0, other);
+                        // Re-fetch base: alloc_object cannot move existing
+                        // objects (non-moving heap), so `base` is still valid,
+                        // but reads are clearer with the explicit comment.
+                        write_prim_element(
+                            base,
+                            index,
+                            element_type,
+                            Value::Object(Some(wrapper)),
+                        );
+                    }
+                }
+            } else {
+                write_prim_element(base, index, element_type, value);
+            }
+        }
+        Ok(())
+    }
+
+    fn needs_gc(&self) -> bool {
+        self.allocated.load(Ordering::Relaxed) >= self.gc_threshold
+    }
+
+    fn collect_garbage(
+        &self,
+        _stw: &StopTheWorldToken,
+        roots: &mut [ObjectRef],
+        monitors: &dyn MonitorCleanup,
+    ) -> GcResult {
+        // ---- Mark phase --------------------------------------------------
+        // Snapshot the registry of all live-or-dead allocations under the
+        // lock, then release it: marking reads object bytes in place and
+        // does not allocate, so it needs no arena lock.
+        let all: Vec<usize> = self.registry.lock().clone();
+
+        // Clear all mark bits first (objects may carry a stale bit from a
+        // prior cycle's survivors).
+        for &base in &all {
+            self.header_mut(base as *mut u8).gc_flags &= !GC_FLAG_MARKED;
+        }
+
+        // Trace from roots. A work stack holds base addresses to visit.
+        let mut work: Vec<usize> = Vec::new();
+        for r in roots.iter() {
+            work.push(r.as_ptr() as usize);
+        }
+        while let Some(addr) = work.pop() {
+            if addr == 0 {
+                continue;
+            }
+            let header = self.header_mut(addr as *mut u8);
+            if header.gc_flags & GC_FLAG_MARKED != 0 {
+                continue; // already visited
+            }
+            header.gc_flags |= GC_FLAG_MARKED;
+            self.enumerate_references(addr as *mut u8, &mut work);
+        }
+
+        // ---- Sweep phase -------------------------------------------------
+        let mut survivors: Vec<usize> = Vec::with_capacity(all.len());
+        let mut bytes_copied = 0usize; // "retained" bytes (non-moving)
+        let mut bytes_freed = 0usize;
+        let mut objects_copied = 0usize;
+        {
+            let mut arena = self.arena.lock();
+            let arena_base = arena.base_ptr() as usize;
+            for &base in &all {
+                let header = self.header_mut(base as *mut u8);
+                let size = Self::alloc_size(header);
+                if header.gc_flags & GC_FLAG_MARKED != 0 {
+                    // Survivor: clear the mark bit for next cycle, keep it.
+                    header.gc_flags &= !GC_FLAG_MARKED;
+                    survivors.push(base);
+                    bytes_copied += size;
+                    objects_copied += 1;
+                } else {
+                    // Dead: zero the bytes (so a later scan can't see a stale
+                    // header) and return the span to the arena free list.
+                    // SAFETY: `base` is a registered allocation of `size`
+                    // bytes inside the arena.
+                    unsafe { std::ptr::write_bytes(base as *mut u8, 0, size) };
+                    if base >= arena_base {
+                        arena.add_free_block(base - arena_base, size);
+                    }
+                    bytes_freed += size;
+                }
+            }
+        }
+
+        // Publish the new registry and live-byte total.
+        *self.registry.lock() = survivors;
+        self.allocated.store(bytes_copied, Ordering::Relaxed);
+        self.gc_count.fetch_add(1, Ordering::Relaxed);
+
+        // Non-moving: no object changed address, so roots and external
+        // references need no fix-up and the pointer map is empty.
+        let pointer_map: HashMap<usize, usize> = HashMap::new();
+        monitors.remap_after_gc(&pointer_map);
+
+        GcResult {
+            stats: GcStats {
+                objects_copied,
+                bytes_copied,
+                bytes_freed,
+            },
+            pointer_map,
+        }
+    }
+
+    fn write_barrier(&self, _obj: ObjectRef, _stored_value: Value) {
+        // Non-generational, non-concurrent: nothing to record.
+    }
+
+    fn allocated_bytes(&self) -> usize {
+        self.allocated.load(Ordering::Relaxed)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1938,5 +2489,146 @@ mod tests {
         assert_eq!(s.promotions, 0);
         assert!(s.young_occupancy <= 1.0);
         assert!(s.old_occupancy <= 1.0);
+    }
+
+    // ------------------------------------------------------------------
+    // ZgcRealHeap — real, memory-backed collector tests
+    // ------------------------------------------------------------------
+    //
+    // `ClassId`, `StopTheWorldToken`, `MonitorCleanup`, `ObjectRef`,
+    // `Value`, `ArrayElementType`, `ObjectKind` are all already in scope
+    // via the `use super::*;` at the top of this module.
+
+    struct NoMonitors;
+    impl MonitorCleanup for NoMonitors {
+        fn remap_after_gc(&self, _: &HashMap<usize, usize>) {}
+    }
+
+    #[test]
+    fn real_alloc_object_roundtrips_fields() {
+        let heap = ZgcRealHeap::new();
+        let obj = heap.alloc_object(ClassId::new(7), 3);
+        assert_eq!(heap.class_id_of(obj), ClassId::new(7));
+        assert_eq!(heap.kind_of(obj), ObjectKind::Object);
+        heap.set_field(obj, 0, Value::Int(42));
+        heap.set_field(obj, 2, Value::Long(0x1_0000_0001));
+        assert_eq!(heap.get_field(obj, 0), Value::Int(42));
+        assert_eq!(heap.get_field(obj, 2), Value::Long(0x1_0000_0001));
+        // Unwritten reference slot reads as null.
+        assert_eq!(heap.get_field(obj, 1), Value::Object(None));
+    }
+
+    #[test]
+    fn real_field_oob_is_safe() {
+        let heap = ZgcRealHeap::new();
+        let obj = heap.alloc_object(ClassId::new(1), 1);
+        // Out-of-bounds read returns null and write is dropped (no UB / panic).
+        assert_eq!(heap.get_field(obj, 99), Value::Object(None));
+        heap.set_field(obj, 99, Value::Int(1));
+    }
+
+    #[test]
+    fn real_array_roundtrips_and_bounds() {
+        let heap = ZgcRealHeap::new();
+        let arr = heap.alloc_array(ClassId::new(2), ArrayElementType::Int, 4);
+        assert_eq!(heap.array_length(arr), 4);
+        heap.set_array_element(arr, 1, Value::Int(7)).unwrap();
+        assert_eq!(heap.get_array_element(arr, 1).unwrap(), Value::Int(7));
+        assert!(heap.get_array_element(arr, 4).is_err());
+        assert!(heap.set_array_element(arr, 4, Value::Int(0)).is_err());
+    }
+
+    #[test]
+    fn real_collect_reclaims_unreachable_and_keeps_reachable() {
+        let heap = ZgcRealHeap::new();
+        let live = heap.alloc_object(ClassId::new(1), 1);
+        let _dead = heap.alloc_object(ClassId::new(1), 1);
+        let before = heap.allocated_bytes();
+        assert!(before > 0);
+
+        let stw = StopTheWorldToken::new();
+        let mut roots = [live];
+        let result = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        // Exactly one object survives; the other is reclaimed.
+        assert_eq!(result.stats.objects_copied, 1);
+        assert!(result.stats.bytes_freed > 0);
+        assert!(heap.allocated_bytes() < before);
+        // The survivor is still usable and did not move (non-moving GC).
+        assert_eq!(roots[0].as_ptr(), live.as_ptr());
+        heap.set_field(live, 0, Value::Int(99));
+        assert_eq!(heap.get_field(live, 0), Value::Int(99));
+        assert_eq!(heap.gc_count(), 1);
+    }
+
+    #[test]
+    fn real_collect_traces_transitively() {
+        let heap = ZgcRealHeap::new();
+        // root -> a -> b  (b reachable only via a's field)
+        let b = heap.alloc_object(ClassId::new(3), 1);
+        let a = heap.alloc_object(ClassId::new(3), 1);
+        heap.set_field(a, 0, Value::Object(Some(b)));
+        let _garbage = heap.alloc_object(ClassId::new(3), 1);
+
+        let stw = StopTheWorldToken::new();
+        let mut roots = [a];
+        let result = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        // a and b survive; the unreferenced object is collected.
+        assert_eq!(result.stats.objects_copied, 2);
+        // b's address is still reachable through a after the cycle.
+        match heap.get_field(a, 0) {
+            Value::Object(Some(r)) => assert_eq!(r.as_ptr(), b.as_ptr()),
+            other => panic!("expected b reference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_array_reference_elements_are_traced() {
+        let heap = ZgcRealHeap::new();
+        let elem = heap.alloc_object(ClassId::new(4), 0);
+        let arr = heap.alloc_array(ClassId::new(5), ArrayElementType::Reference, 2);
+        heap.set_array_element(arr, 0, Value::Object(Some(elem))).unwrap();
+
+        let stw = StopTheWorldToken::new();
+        let mut roots = [arr];
+        let result = heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+
+        // array + element both survive.
+        assert_eq!(result.stats.objects_copied, 2);
+        match heap.get_array_element(arr, 0).unwrap() {
+            Value::Object(Some(r)) => assert_eq!(r.as_ptr(), elem.as_ptr()),
+            other => panic!("expected element reference, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_freed_memory_is_reused() {
+        // Small heap so reuse is observable: allocate, drop all roots, GC,
+        // then allocate again — the freed block should satisfy the request
+        // without growing past capacity.
+        let heap = ZgcRealHeap::with_capacity(64 * 1024);
+        for _ in 0..10 {
+            heap.alloc_object(ClassId::new(1), 4);
+        }
+        let stw = StopTheWorldToken::new();
+        let mut roots: [ObjectRef; 0] = [];
+        heap.collect_garbage(&stw, &mut roots, &NoMonitors);
+        assert_eq!(heap.allocated_bytes(), 0);
+        // Reallocate; must succeed from the reclaimed free list.
+        let obj = heap.alloc_object(ClassId::new(1), 4);
+        heap.set_field(obj, 0, Value::Int(123));
+        assert_eq!(heap.get_field(obj, 0), Value::Int(123));
+    }
+
+    #[test]
+    fn real_needs_gc_tracks_threshold() {
+        let heap = ZgcRealHeap::with_capacity(8 * 1024);
+        assert!(!heap.needs_gc());
+        // Fill past 75% of 8 KB.
+        while !heap.needs_gc() {
+            heap.alloc_object(ClassId::new(1), 8);
+        }
+        assert!(heap.needs_gc());
     }
 }
