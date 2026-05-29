@@ -2419,6 +2419,29 @@ impl G1Collector {
         Some((idx, payload_bytes))
     }
 
+    /// `true` iff `obj`'s start address names a `HumongousStart` region.
+    ///
+    /// A humongous object's payload is laid out across several
+    /// NON-contiguous region buffers (each with its own HEADER_SIZE prefix),
+    /// so it has no single valid contiguous data pointer. Callers that would
+    /// otherwise hand out `obj.as_ptr() + HEADER_SIZE` and walk a flat
+    /// `[base, base + len*stride)` range must instead route through the
+    /// region-aware per-element accessors (`get_array_element` /
+    /// `set_array_element`) when this returns `true`.
+    ///
+    /// This is the size-independent sibling of `humongous_span` (which also
+    /// needs the object's total size to compute the payload byte count).
+    /// Takes the `regions` lock briefly to inspect the region type — mirrors
+    /// the `lookup_region_for_addr` + `RegionType::HumongousStart` check in
+    /// `humongous_span`.
+    pub(crate) fn is_humongous(&self, obj: ObjectRef) -> bool {
+        let regions = self.regions.lock();
+        match self.lookup_region_for_addr(obj.as_ptr() as usize) {
+            Some(idx) => regions[idx].region_type == RegionType::HumongousStart,
+            None => false,
+        }
+    }
+
     /// Copy `len` bytes of a humongous object's payload, starting at logical
     /// payload offset `payload_off`, between the (region-fragmented) heap
     /// backing store and the caller-provided `buf`.
@@ -3617,6 +3640,25 @@ mod tests {
         // OOB index is rejected, not a wild write.
         assert!(gc.set_array_element(arr, n, Value::Int(1)).is_err());
         assert!(gc.get_array_element(arr, n).is_err());
+    }
+
+    // Residual humongous-OOB fix: `is_humongous` must distinguish a
+    // multi-region humongous array from an ordinary single-region one, so
+    // `VmHeap::array_data_ptr` can refuse to hand out a flat pointer for the
+    // former (whose payload is non-contiguous).
+    #[test]
+    fn is_humongous_detects_multi_region_arrays() {
+        let gc = make_collector();
+        // Small array fits in a single region → NOT humongous.
+        let small = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, 10);
+        assert!(!gc.is_humongous(small), "small array misclassified as humongous");
+        // Large array (~1.6 MB) spans multiple regions → humongous.
+        let large = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, 400_000);
+        assert!(gc.count_regions(RegionType::HumongousStart) >= 1);
+        assert!(gc.is_humongous(large), "humongous array not detected");
+        // A plain object is not humongous either.
+        let obj = gc.alloc_object(ClassId::new(1), 3);
+        assert!(!gc.is_humongous(obj), "small object misclassified as humongous");
     }
 
     // C2: long[] elements are 8 bytes; the per-region payload capacity

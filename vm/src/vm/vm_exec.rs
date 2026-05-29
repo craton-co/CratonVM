@@ -1429,9 +1429,26 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // by a Rust-side `&mut [u8]`). The destination range is
         // `[dst_off, dst_off + src.len())` which lies wholly within the
         // array's payload of `len` bytes.
-        unsafe {
-            let base = self.shared.heap.array_data_ptr(arr);
-            std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(dst_off), src.len());
+        match self.shared.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), base.add(dst_off), src.len());
+            },
+            // G1 humongous byte[]: payload is split across non-contiguous
+            // regions, so there is no flat base pointer. Store element-by-
+            // element through the region-aware accessor (bounds already
+            // verified, so every index lands inside the array).
+            None => {
+                for (i, &b) in src.iter().enumerate() {
+                    if self
+                        .shared
+                        .heap
+                        .set_array_element(arr, dst_off + i, Value::Int(b as i8 as i32))
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
         }
         true
     }
@@ -1457,9 +1474,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `n <= dst.len()`). Source pointer comes from `array_data_ptr`
         // (compact 1-byte-per-element payload). Destination is a caller-
         // owned `&mut [u8]` which cannot alias the heap arena.
-        unsafe {
-            let base = self.shared.heap.array_data_ptr(arr);
-            std::ptr::copy_nonoverlapping(base.add(src_off), dst.as_mut_ptr(), n);
+        match self.shared.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(base.add(src_off), dst.as_mut_ptr(), n);
+            },
+            // G1 humongous byte[]: region-safe per-element read. Byte slots
+            // decode to a sign-extended `Value::Int`; mask back to the raw
+            // 8-bit value.
+            None => {
+                for (i, slot) in dst.iter_mut().take(n).enumerate() {
+                    match self.shared.heap.get_array_element(arr, src_off + i) {
+                        Ok(Value::Int(x)) => *slot = x as u8,
+                        _ => return i,
+                    }
+                }
+            }
         }
         n
     }
@@ -1486,13 +1515,24 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // Same host-endian convention as `VmHeap::read_char_array_bulk`,
         // which already uses `copy_nonoverlapping` between this payload and
         // a host `[u16]`.
-        unsafe {
-            let base = self.shared.heap.array_data_ptr(arr);
-            std::ptr::copy_nonoverlapping(
-                base.add(src_off * 2),
-                dst.as_mut_ptr() as *mut u8,
-                n * 2,
-            );
+        match self.shared.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    base.add(src_off * 2),
+                    dst.as_mut_ptr() as *mut u8,
+                    n * 2,
+                );
+            },
+            // G1 humongous char[]: region-safe per-element read. Char slots
+            // decode to `Value::Int(u16 as i32)`; mask back to the code unit.
+            None => {
+                for (i, slot) in dst.iter_mut().take(n).enumerate() {
+                    match self.shared.heap.get_array_element(arr, src_off + i) {
+                        Ok(Value::Int(x)) => *slot = x as u16,
+                        _ => return i,
+                    }
+                }
+            }
         }
         n
     }
@@ -1520,13 +1560,28 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         // SAFETY: bounds checked above. Char arrays store 2 bytes per
         // element matching host-endian `u16` (see `read_char_array_into`).
-        unsafe {
-            let base = self.shared.heap.array_data_ptr(arr);
-            std::ptr::copy_nonoverlapping(
-                src.as_ptr() as *const u8,
-                base.add(dst_off * 2),
-                src.len() * 2,
-            );
+        match self.shared.heap.array_data_ptr(arr) {
+            Some(base) => unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.as_ptr() as *const u8,
+                    base.add(dst_off * 2),
+                    src.len() * 2,
+                );
+            },
+            // G1 humongous char[]: region-safe per-element store. Char slots
+            // store the low 16 bits of `Value::Int`.
+            None => {
+                for (i, &c) in src.iter().enumerate() {
+                    if self
+                        .shared
+                        .heap
+                        .set_array_element(arr, dst_off + i, Value::Int(c as i32))
+                        .is_err()
+                    {
+                        return false;
+                    }
+                }
+            }
         }
         true
     }
@@ -1580,10 +1635,61 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // distinct arrays the ranges cannot overlap (different heap
         // allocations) so `copy_nonoverlapping` is also valid, but `copy`
         // is fine in either case and lets us share one branch.
-        unsafe {
-            let src_ptr = self.shared.heap.array_data_ptr(src).add(src_off * stride);
-            let dst_ptr = self.shared.heap.array_data_ptr(dst).add(dst_off * stride);
-            std::ptr::copy(src_ptr, dst_ptr, len * stride);
+        //
+        // Either array may be a G1 humongous array, whose payload is split
+        // across non-contiguous regions and therefore has no flat base
+        // pointer. Only take the bulk-memcpy fast path when BOTH arrays
+        // expose a contiguous pointer; otherwise fall back to a region-safe
+        // per-element copy through `get_array_element` / `set_array_element`
+        // (both route humongous objects through `humongous_copy`).
+        match (
+            self.shared.heap.array_data_ptr(src),
+            self.shared.heap.array_data_ptr(dst),
+        ) {
+            (Some(src_base), Some(dst_base)) => unsafe {
+                let src_ptr = src_base.add(src_off * stride);
+                let dst_ptr = dst_base.add(dst_off * stride);
+                std::ptr::copy(src_ptr, dst_ptr, len * stride);
+            },
+            _ => {
+                // memmove semantics: when copying within the same array and the
+                // ranges overlap with `dst_off > src_off`, iterate backwards so
+                // a source element is read before it is overwritten.
+                let same_array = src.as_ptr() == dst.as_ptr();
+                if same_array && dst_off > src_off {
+                    for i in (0..len).rev() {
+                        match self.shared.heap.get_array_element(src, src_off + i) {
+                            Ok(v) => {
+                                if self
+                                    .shared
+                                    .heap
+                                    .set_array_element(dst, dst_off + i, v)
+                                    .is_err()
+                                {
+                                    return false;
+                                }
+                            }
+                            Err(_) => return false,
+                        }
+                    }
+                } else {
+                    for i in 0..len {
+                        match self.shared.heap.get_array_element(src, src_off + i) {
+                            Ok(v) => {
+                                if self
+                                    .shared
+                                    .heap
+                                    .set_array_element(dst, dst_off + i, v)
+                                    .is_err()
+                                {
+                                    return false;
+                                }
+                            }
+                            Err(_) => return false,
+                        }
+                    }
+                }
+            }
         }
         true
     }

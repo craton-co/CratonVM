@@ -632,45 +632,42 @@ impl VmHeap {
         }
     }
 
-    /// Raw pointer to array data region (after header).
+    /// Raw pointer to array data region (after header), or `None` when no
+    /// single contiguous pointer can describe the payload.
     ///
-    /// # UNSOUND for G1 humongous arrays — TODO(humongous-OOB)
+    /// For the generational heap and for ordinary (single-region) G1 arrays
+    /// the whole payload is contiguous after `obj.as_ptr() + HEADER_SIZE`, so
+    /// this returns `Some(ptr)` exactly as before.
     ///
-    /// This returns a SINGLE flat base pointer `obj.as_ptr() + HEADER_SIZE`
-    /// and assumes the whole payload is contiguous after it. That holds for
-    /// the generational heap and for ordinary (single-region) G1 arrays, but
-    /// it is fundamentally unsound for a G1 **humongous** array: such an array
-    /// is laid out across several NON-contiguous region buffers (each with its
-    /// own HEADER_SIZE prefix), so the returned pointer is only valid for the
-    /// first region's worth of payload. Any caller that walks
-    /// `[base, base + len * stride)` (gpu_marshal bulk copies, vm_exec
-    /// arraycopy/bulk char read, jni `GetPrimitiveArrayCritical`) reads/writes
-    /// out of bounds once the offset crosses the first region boundary.
+    /// For a G1 **humongous** array it returns `None`. Such an array is laid
+    /// out across several NON-contiguous region buffers (each with its own
+    /// HEADER_SIZE prefix), so a single flat base pointer is only valid for
+    /// the first region's worth of payload — any caller that walks
+    /// `[base, base + len * stride)` would read/write out of bounds once the
+    /// offset crosses the first region boundary. Callers MUST handle `None`
+    /// by falling back to the region-aware per-element accessors
+    /// (`get_array_element` / `set_array_element`, or `read_char_array_bulk`
+    /// for char[]), all of which route humongous objects through
+    /// `humongous_copy` and so can never escape the object's own backing
+    /// memory.
     ///
-    /// The correct contract is to REFUSE (return `None` / "no contiguous
-    /// pointer available") for G1 humongous objects so callers fall back to a
-    /// per-element / region-aware path. That fix is NOT applied here because it
-    /// cannot be completed inside `vm_heap.rs` alone:
-    ///   1. vm_heap has no reachable G1 API to detect a `HumongousStart`
-    ///      object. `g1.rs` would need to expose something like
-    ///      `pub(crate) fn G1Collector::is_humongous(&self, obj: ObjectRef) -> bool`
-    ///      (a thin wrapper over `lookup_region_for_addr` +
-    ///      `RegionType::HumongousStart`, all currently private).
-    ///   2. Changing this method's return type to `Option<*mut u8>` to signal
-    ///      refusal would break the external callers in
-    ///      `vm/src/runtime/gpu_marshal.rs`, `vm/src/vm/vm_exec.rs`, and
-    ///      `vm/src/native/jni.rs`, which consume the bare `*mut u8` — those
-    ///      files are outside this change's allowed edit scope and must be
-    ///      updated to handle `None` (fall back to the region-aware
-    ///      `get_array_element` / `read_char_array_bulk` path).
-    ///
-    /// SAFETY (current, single-region only): `obj` is a live `ObjectRef` in the
-    /// heap arena; `HEADER_SIZE` offset is the layout-documented start of the
-    /// array payload region. The returned pointer is valid for the lifetime of
-    /// the object (which the caller must not drop while holding the pointer)
-    /// AND only for offsets that stay within the object's first region.
-    pub fn array_data_ptr(&self, obj: ObjectRef) -> *mut u8 {
-        unsafe { obj.as_ptr().add(HEADER_SIZE) }
+    /// SAFETY (the `Some` case): `obj` is a live `ObjectRef` in the heap
+    /// arena; `HEADER_SIZE` offset is the layout-documented start of the array
+    /// payload region. The returned pointer is valid for the lifetime of the
+    /// object (which the caller must not drop while holding the pointer) and,
+    /// because `None` is returned for humongous arrays, for the full
+    /// `len * stride` payload span.
+    pub fn array_data_ptr(&self, obj: ObjectRef) -> Option<*mut u8> {
+        // A G1 humongous array has no valid contiguous data pointer: refuse
+        // so callers take the region-safe per-element fallback. All other
+        // cases (generational heap, single-region G1 arrays) keep the flat
+        // base pointer.
+        if let VmHeap::G1(h) = self {
+            if h.is_humongous(obj) {
+                return None;
+            }
+        }
+        Some(unsafe { obj.as_ptr().add(HEADER_SIZE) })
     }
 
     // =====================================================================
@@ -1368,5 +1365,29 @@ mod concurrent_mark_controller_tests {
         for i in 0..len {
             assert_eq!(out[i], (0x4100 + i) as u16);
         }
+    }
+
+    /// Residual humongous-OOB fix: `array_data_ptr` must REFUSE (return `None`)
+    /// for a G1 humongous array — its payload is split across non-contiguous
+    /// region buffers, so no single flat pointer is valid. For an ordinary
+    /// single-region G1 array it must still return `Some(obj + HEADER_SIZE)`.
+    #[test]
+    fn array_data_ptr_refuses_g1_humongous_but_allows_ordinary() {
+        let heap = make_g1_heap();
+
+        // Ordinary single-region int[]: contiguous pointer is returned and
+        // points just past the object header.
+        let small = heap.alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Int, 8);
+        let ptr = heap.array_data_ptr(small).expect("ordinary array must have a flat pointer");
+        let expected = unsafe { small.as_ptr().add(HEADER_SIZE) };
+        assert_eq!(ptr, expected, "flat pointer must be obj + HEADER_SIZE");
+
+        // Humongous int[] (~1.6 MB > 1 MiB region) spans multiple regions:
+        // no contiguous pointer, so `array_data_ptr` returns `None`.
+        let large = heap.alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Int, 400_000);
+        assert!(
+            heap.array_data_ptr(large).is_none(),
+            "humongous array must not expose a flat data pointer",
+        );
     }
 }

@@ -102,6 +102,16 @@ thread_local! {
     /// can reconstruct the correct `Vec` layout and deallocate safely.
     static JNI_STRING_BUFFERS: std::cell::RefCell<HashMap<usize, usize>> =
         std::cell::RefCell::new(HashMap::new());
+    /// Tracks temporary contiguous buffers handed out by
+    /// `GetPrimitiveArrayCritical` when the underlying array is a G1
+    /// **humongous** array (whose payload is split across non-contiguous
+    /// regions and therefore has no flat data pointer). The buffer is a
+    /// boxed `Vec<u8>` we materialised by copying every element in; the map
+    /// records the metadata `ReleasePrimitiveArrayCritical` needs to copy
+    /// the (possibly mutated) bytes back into the array and free the buffer.
+    /// Entries are keyed by the returned pointer (`buf.as_mut_ptr() as usize`).
+    static JNI_CRITICAL_COPIES: std::cell::RefCell<HashMap<usize, CriticalCopy>> =
+        std::cell::RefCell::new(HashMap::new());
     /// Thread-local cache for parsed method descriptors.
     /// Maps descriptor string → parsed parameter type tags, avoiding
     /// repeated parsing of the same descriptor in hot JNI call paths.
@@ -2626,6 +2636,108 @@ extern "C" fn jni_get_string_utf_region(
     });
 }
 
+/// Metadata for a temporary contiguous buffer handed out by
+/// `GetPrimitiveArrayCritical` for a G1 humongous array. See
+/// `JNI_CRITICAL_COPIES`.
+struct CriticalCopy {
+    /// The originating array handle, so release can copy back / free.
+    array: JArray,
+    /// Element type, so release re-packs each element correctly.
+    element_type: ArrayElementType,
+    /// Number of elements (== array length at Get time).
+    len: usize,
+    /// Bytes per element (the contiguous buffer is `len * stride` bytes).
+    stride: usize,
+}
+
+/// Bytes per stored element for a primitive array element type.
+fn critical_stride(et: ArrayElementType) -> usize {
+    match et {
+        ArrayElementType::Byte | ArrayElementType::Boolean => 1,
+        ArrayElementType::Char | ArrayElementType::Short => 2,
+        ArrayElementType::Int | ArrayElementType::Float => 4,
+        ArrayElementType::Long | ArrayElementType::Double => 8,
+        // Reference arrays are not valid for the primitive-critical API.
+        ArrayElementType::Reference => 0,
+    }
+}
+
+/// Write the host-endian bytes of array element `i` (read via the
+/// region-safe accessor) into `dst[i*stride .. (i+1)*stride]`.
+fn critical_encode_element(v: Value, et: ArrayElementType, dst: &mut [u8]) {
+    match et {
+        ArrayElementType::Byte | ArrayElementType::Boolean => {
+            let x = v.as_int().unwrap_or(0) as i8;
+            dst[0] = x as u8;
+        }
+        ArrayElementType::Short => {
+            let x = v.as_int().unwrap_or(0) as i16;
+            dst[..2].copy_from_slice(&x.to_ne_bytes());
+        }
+        ArrayElementType::Char => {
+            let x = v.as_int().unwrap_or(0) as u16;
+            dst[..2].copy_from_slice(&x.to_ne_bytes());
+        }
+        ArrayElementType::Int => {
+            let x = v.as_int().unwrap_or(0);
+            dst[..4].copy_from_slice(&x.to_ne_bytes());
+        }
+        ArrayElementType::Float => {
+            let x = match v {
+                Value::Float(f) => f,
+                _ => 0.0,
+            };
+            dst[..4].copy_from_slice(&x.to_ne_bytes());
+        }
+        ArrayElementType::Long => {
+            let x = match v {
+                Value::Long(l) => l,
+                _ => 0,
+            };
+            dst[..8].copy_from_slice(&x.to_ne_bytes());
+        }
+        ArrayElementType::Double => {
+            let x = match v {
+                Value::Double(d) => d,
+                _ => 0.0,
+            };
+            dst[..8].copy_from_slice(&x.to_ne_bytes());
+        }
+        ArrayElementType::Reference => {}
+    }
+}
+
+/// Decode element `i` from `src[i*stride .. (i+1)*stride]` (host-endian)
+/// back into a `Value` for store via the region-safe accessor.
+fn critical_decode_element(et: ArrayElementType, src: &[u8]) -> Value {
+    match et {
+        ArrayElementType::Byte | ArrayElementType::Boolean => {
+            Value::Int(src[0] as i8 as i32)
+        }
+        ArrayElementType::Short => {
+            let x = i16::from_ne_bytes([src[0], src[1]]);
+            Value::Int(x as i32)
+        }
+        ArrayElementType::Char => {
+            let x = u16::from_ne_bytes([src[0], src[1]]);
+            Value::Int(x as i32)
+        }
+        ArrayElementType::Int => {
+            Value::Int(i32::from_ne_bytes([src[0], src[1], src[2], src[3]]))
+        }
+        ArrayElementType::Float => {
+            Value::Float(f32::from_ne_bytes([src[0], src[1], src[2], src[3]]))
+        }
+        ArrayElementType::Long => Value::Long(i64::from_ne_bytes([
+            src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+        ])),
+        ArrayElementType::Double => Value::Double(f64::from_ne_bytes([
+            src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+        ])),
+        ArrayElementType::Reference => Value::Object(None),
+    }
+}
+
 // ---- Index 222: GetPrimitiveArrayCritical ----
 // Returns a direct pointer to the array data (no copy if possible).
 extern "C" fn jni_get_primitive_array_critical(
@@ -2638,11 +2750,52 @@ extern "C" fn jni_get_primitive_array_critical(
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(array)?;
-        let ptr = shared.heap.array_data_ptr(oref);
-        if !is_copy.is_null() {
-            unsafe { *is_copy = JNI_FALSE; } // Direct pointer, no copy
+        match shared.heap.array_data_ptr(oref) {
+            // Ordinary (single-region) array: hand out the live, contiguous
+            // payload pointer — no copy, release is a no-op.
+            Some(ptr) => {
+                if !is_copy.is_null() {
+                    unsafe { *is_copy = JNI_FALSE; } // Direct pointer, no copy
+                }
+                Some(ptr as *mut std::ffi::c_void)
+            }
+            // G1 humongous array: the payload spans non-contiguous regions, so
+            // the JNI contract's "direct pointer" cannot be honoured. Fall
+            // back to the same copy-out / copy-back scheme the non-critical
+            // `Get<Type>ArrayElements` path uses: materialise a contiguous
+            // buffer via the region-safe accessor, hand it out, and register
+            // it so `ReleasePrimitiveArrayCritical` copies any mutations back
+            // and frees it.
+            None => {
+                let element_type = shared.heap.array_element_type(oref)?;
+                let stride = critical_stride(element_type);
+                if stride == 0 {
+                    return None; // reference array — not a primitive critical
+                }
+                let len = shared.heap.array_length(oref);
+                let mut buf: Vec<u8> = vec![0u8; len * stride];
+                for i in 0..len {
+                    let v = match shared.heap.get_array_element(oref, i) {
+                        Ok(v) => v,
+                        Err(_) => break,
+                    };
+                    let off = i * stride;
+                    critical_encode_element(v, element_type, &mut buf[off..off + stride]);
+                }
+                let ptr = buf.as_mut_ptr();
+                std::mem::forget(buf); // OWNERSHIP: transferred to native caller, reclaimed by jni_release_primitive_array_critical
+                JNI_CRITICAL_COPIES.with(|c| {
+                    c.borrow_mut().insert(
+                        ptr as usize,
+                        CriticalCopy { array, element_type, len, stride },
+                    );
+                });
+                if !is_copy.is_null() {
+                    unsafe { *is_copy = JNI_TRUE; } // Copy, not a direct pointer
+                }
+                Some(ptr as *mut std::ffi::c_void)
+            }
         }
-        Some(ptr as *mut std::ffi::c_void)
     })
     .flatten()
     .unwrap_or(std::ptr::null_mut())
@@ -2652,10 +2805,55 @@ extern "C" fn jni_get_primitive_array_critical(
 extern "C" fn jni_release_primitive_array_critical(
     _env: JNIEnv,
     _array: JArray,
-    _carray: *mut std::ffi::c_void,
-    _mode: JInt,
+    carray: *mut std::ffi::c_void,
+    mode: JInt,
 ) {
-    // No-op: we returned a direct pointer, no copy to release.
+    if carray.is_null() {
+        return;
+    }
+    // Fast path: for ordinary arrays we handed out a direct pointer and
+    // recorded nothing, so there is nothing to copy back or free.
+    let copy = JNI_CRITICAL_COPIES.with(|c| c.borrow_mut().remove(&(carray as usize)));
+    let Some(copy) = copy else {
+        return;
+    };
+    // Humongous fallback buffer. mode 0 = copy back + free, JNI_COMMIT (1) =
+    // copy back, don't free, JNI_ABORT (2) = free without copy back.
+    if mode != 2 {
+        with_shared_vm(|shared| {
+            let oref = jobject_to_obj(copy.array)?;
+            for i in 0..copy.len {
+                let off = i * copy.stride;
+                // SAFETY: the buffer is `copy.len * copy.stride` bytes and we
+                // only read within it.
+                let src = unsafe {
+                    std::slice::from_raw_parts(
+                        (carray as *const u8).add(off),
+                        copy.stride,
+                    )
+                };
+                let v = critical_decode_element(copy.element_type, src);
+                let _ = shared.heap.set_array_element(oref, i, v);
+            }
+            Some(())
+        });
+    }
+    if mode != 1 {
+        // Reconstruct the `Vec<u8>` with its original layout and drop it.
+        let byte_len = copy.len * copy.stride;
+        // SAFETY: `carray` was produced by `Vec::<u8>::as_mut_ptr` +
+        // `mem::forget` in `jni_get_primitive_array_critical` with capacity
+        // == length == `byte_len`; we reconstruct the exact layout.
+        unsafe {
+            drop(Vec::from_raw_parts(carray as *mut u8, byte_len, byte_len));
+        }
+    } else {
+        // JNI_COMMIT: we kept the buffer alive but already removed it from the
+        // map; re-insert so a later release can still find it.
+        JNI_CRITICAL_COPIES.with(|c| {
+            c.borrow_mut().insert(carray as usize, copy);
+        });
+    }
 }
 
 // ---- Index 224: GetStringCritical ----
