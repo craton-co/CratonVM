@@ -417,6 +417,34 @@ impl CompactValue {
         }
     }
 
+    /// For a slot that `tag()`s as `Int`, return `Some(raw_i64)` when its
+    /// 47-bit payload has any bit at position 32..=46 set. A genuine
+    /// [`int`](Self::int) stores `n as u32` (payload `< 2^32`), so such a slot
+    /// cannot be a real int — it is a `long` whose bit pattern collides into
+    /// the `SUB_INT` sub-tag space (e.g. BC safegcd `0xFFFC_…` accumulators).
+    ///
+    /// Returns `None` for genuine ints (payload `< 2^32`, bit-identical to a
+    /// long with those exact bits and therefore unresolvable from a single
+    /// slot) and for every non-`Int` tag. Used by the JIT / OSR local-slot
+    /// transfer so a collision long in a local is handed to compiled code as
+    /// its true i64 value rather than truncated to the low 32 bits. Mirrors
+    /// the `SUB_INT` discrimination in
+    /// [`decode_by_descriptor`](Self::decode_by_descriptor).
+    #[inline]
+    pub fn int_tag_collision_long(&self) -> Option<i64> {
+        if !is_nan_tagged(self.0) {
+            return None;
+        }
+        if (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK != SUB_INT {
+            return None;
+        }
+        if (self.0 & PAYLOAD_MASK) >> 32 != 0 {
+            Some(self.0 as i64)
+        } else {
+            None
+        }
+    }
+
     /// Reinterpret the raw stored bits as i64 without checking the tag.
     ///
     /// Since `CompactValue::long` stores longs verbatim, this round-trips
@@ -1227,6 +1255,39 @@ mod tests {
                 "J-descriptor decode mismatch for sub={sub}",
             );
         }
+    }
+
+    /// `int_tag_collision_long` distinguishes a real int (payload < 2^32)
+    /// from a long whose bits collide into the SUB_INT space (payload bits
+    /// 32-46 set). Drives the JIT/OSR local-slot transfer fix.
+    #[test]
+    fn int_tag_collision_long_discriminates() {
+        const NANBOX: u64 = 0xFFFC_0000_0000_0000;
+        // Genuine ints: payload < 2^32 → None (kept as int).
+        for n in [0i32, 1, -1, 42, i32::MIN, i32::MAX] {
+            assert_eq!(CompactValue::int(n).int_tag_collision_long(), None, "int {n}");
+        }
+        // SUB_INT-pattern longs with payload bits 32-46 set → Some(raw bits).
+        for &bits in &[
+            NANBOX | (1u64 << 32),
+            NANBOX | 0x7FFF_FFFF_FFFF,
+            0xFFFC_0001_ABCD_1234u64,
+            0xFFFC_5555_5555_5555u64,
+        ] {
+            assert_eq!(
+                CompactValue::long(bits as i64).int_tag_collision_long(),
+                Some(bits as i64),
+                "collision long {bits:#018x}",
+            );
+        }
+        // Non-Int tags → None.
+        assert_eq!(CompactValue::long(-1).int_tag_collision_long(), None); // SUB_LONG_HI
+        assert_eq!(CompactValue::long(i64::MIN).int_tag_collision_long(), None); // untagged
+        assert_eq!(CompactValue::float(1.5).int_tag_collision_long(), None);
+        assert_eq!(CompactValue::null().int_tag_collision_long(), None);
+        // Residual ambiguous case: payload < 2^32 with SUB_INT pattern is
+        // indistinguishable from a real int → None (documented limitation).
+        assert_eq!(CompactValue::long(NANBOX as i64).int_tag_collision_long(), None);
     }
 
     // -- Float round-trips ---------------------------------------------------

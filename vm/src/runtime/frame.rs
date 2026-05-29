@@ -315,7 +315,21 @@ fn local_slot_to_compact(val: u64, tag: u8) -> CompactValue {
 #[inline(always)]
 fn compact_to_local_slot(cv: CompactValue) -> (u64, u8) {
     match cv.tag() {
-        CompactTag::Int => (cv.as_int().unwrap_or(0) as u32 as u64, VTAG_INT),
+        CompactTag::Int => {
+            // A `long` whose bit pattern collides into the SUB_INT sub-tag
+            // (e.g. BC safegcd `0xFFFC_…` accumulators) tags as `Int`. Handing
+            // it to the JIT/OSR via `as_int()` would truncate to the low 32
+            // bits — the residual long-bit loss that surfaced as JIT-only
+            // failures in bc-math-raw's InterleaveTest after the interpreter
+            // paths were fixed. Recover the full i64 when the payload proves
+            // it cannot be a real int. See
+            // docs/bc-ec-mod-mododdinverse-investigation.md.
+            if let Some(raw) = cv.int_tag_collision_long() {
+                (raw as u64, VTAG_LONG)
+            } else {
+                (cv.as_int().unwrap_or(0) as u32 as u64, VTAG_INT)
+            }
+        }
         CompactTag::Long => (cv.as_long_unchecked() as u64, VTAG_LONG),
         CompactTag::Float => (cv.as_float().unwrap_or(0.0).to_bits() as u64, VTAG_FLOAT),
         CompactTag::Double => {

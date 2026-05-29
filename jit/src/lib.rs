@@ -3448,8 +3448,18 @@ fn try_compile_inner(
 
     let scan = x64::jit_scan(code, code_len, &cached.method_descriptor)?;
 
-    // Try IR compilation for simple integer-only methods.
-    if ir::ir_compatible(&scan) {
+    // Try IR compilation for simple integer-only methods. The IR pipeline
+    // types every value as 32-bit `IrType::Int` and lays parameters out by
+    // JIT-argument index rather than JVM local slot, so it cannot represent
+    // 64-bit longs/doubles nor the two-slot category-2 parameter layout.
+    // Methods touching long/double fall through to the bytecode-x64 backend,
+    // which models them correctly. (Before this guard, a method like
+    // `boolean eq(long, long)` truncated the second long parameter — read
+    // from the never-populated `locals[2]` slot — and panicked with a
+    // `u32::MAX` slot index; bc-java InterleaveTest failed 2/4 under JIT.)
+    if ir::ir_compatible(&scan)
+        && !method_uses_category2(code, code_len, &cached.method_descriptor)
+    {
         // Includes the implicit `this` slot for instance methods — see
         // `prologue_param_slots` above.
         let num_params = prologue_param_slots;
@@ -3918,7 +3928,15 @@ fn try_compile_inner(
     // this method to the bail-list.
     *backend_attempted = true;
 
-    let mut compiled = x64::compile(
+    // Parameter → JVM-slot layout, so the prologue places long/double params
+    // (which span two JVM slots but arrive in one arg register) in the slots
+    // the body reads. `param_slots` above is the *argument count* (one per
+    // param, used for ABI register indexing); `param_slot_span` is the JVM
+    // slot span (category-2 counted as two).
+    let (param_jvm_slots, param_slot_span) =
+        compute_param_jvm_slots(&cached.method_descriptor, cached.is_static);
+
+    let mut compiled = x64::compile_with_param_slots(
         code,
         code_len,
         param_slots,
@@ -3942,6 +3960,8 @@ fn try_compile_inner(
         std::collections::HashSet::new(), // non_escaping_new — escape analysis done inside x64 too
         inline_sites,
         string_layout,
+        &param_jvm_slots,
+        param_slot_span,
     )?;
 
     compiled._jit_strings = owned_strings;
@@ -3954,6 +3974,150 @@ fn try_compile_inner(
 }
 
 /// Count the number of JVM stack slots consumed by parameters in a method descriptor.
+/// True if the method uses any category-2 (long/double) value — as a
+/// parameter, return type, or operand/result of a long/double bytecode.
+///
+/// The IR pipeline ([`ir::IrBuilder`]) types every value as 32-bit
+/// `IrType::Int` and lays parameters out by JIT-argument index rather than
+/// JVM local slot, so it can model neither 64-bit values nor the two-slot
+/// category-2 parameter layout. Such methods must use the single-pass
+/// bytecode-x64 backend instead. Note: a `long[]`/`double[]` parameter is a
+/// *reference* (category-1) and does NOT count here — only scalar J/D do.
+fn method_uses_category2(code: &[u8], code_len: usize, descriptor: &str) -> bool {
+    let b = descriptor.as_bytes();
+    // Scalar long/double parameter?
+    let mut i = 1;
+    while i < b.len() && b[i] != b')' {
+        match b[i] {
+            b'J' | b'D' => return true,
+            b'L' => {
+                i += 1;
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                // Skip the whole array type — arrays are references (cat-1),
+                // even `[J` / `[D`.
+                i += 1;
+                while i < b.len() && b[i] == b'[' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    i += 1;
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if i < b.len() {
+                    i += 1;
+                }
+            }
+            _ => i += 1, // I F B C S Z
+        }
+    }
+    // Long/double return type.
+    if let Some(rp) = b.iter().position(|&c| c == b')') {
+        if matches!(b.get(rp + 1), Some(b'J') | Some(b'D')) {
+            return true;
+        }
+    }
+    // Any long/double bytecode in the body.
+    let mut pc = 0;
+    while pc < code_len {
+        if is_category2_opcode(code[pc]) {
+            return true;
+        }
+        pc += crate::scev::bytecode_len(code, pc, code_len);
+    }
+    false
+}
+
+/// Compute, for each incoming JIT argument (in order: `this` for instance
+/// methods, then declared parameters), the JVM local slot it occupies, along
+/// with the total slot span the parameters consume. A category-2
+/// (long/double) parameter occupies TWO JVM local slots but is passed in a
+/// single JIT argument register, so its slot index diverges from its argument
+/// index — e.g. `static f(long a, long b)` puts `a` at slot 0 and `b` at slot
+/// 2, while the JIT passes them as args 0 and 1. The bytecode-x64 prologue
+/// uses this to deposit each argument in the slot the body reads. See
+/// [`x64::compile_with_param_slots`].
+fn compute_param_jvm_slots(descriptor: &str, is_static: bool) -> (Vec<usize>, usize) {
+    let mut slots = Vec::new();
+    let mut slot = 0usize;
+    if !is_static {
+        slots.push(slot);
+        slot += 1; // implicit `this`
+    }
+    let b = descriptor.as_bytes();
+    let mut i = 1;
+    while i < b.len() && b[i] != b')' {
+        slots.push(slot);
+        match b[i] {
+            b'J' | b'D' => {
+                slot += 2;
+                i += 1;
+            }
+            b'L' => {
+                slot += 1;
+                i += 1;
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                slot += 1;
+                i += 1;
+                while i < b.len() && b[i] == b'[' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    i += 1;
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if i < b.len() {
+                    i += 1;
+                }
+            }
+            _ => {
+                slot += 1;
+                i += 1;
+            }
+        }
+    }
+    (slots, slot)
+}
+
+/// Long/double bytecodes (category-2 operands or results). Used to keep such
+/// methods off the int-only IR pipeline.
+fn is_category2_opcode(op: u8) -> bool {
+    matches!(
+        op,
+        0x09 | 0x0a            // lconst_0, lconst_1
+        | 0x0e | 0x0f          // dconst_0, dconst_1
+        | 0x14                 // ldc2_w (long/double constant)
+        | 0x16 | 0x18          // lload, dload
+        | 0x1e..=0x21          // lload_0..3
+        | 0x26..=0x29          // dload_0..3
+        | 0x2f | 0x31          // laload, daload
+        | 0x37 | 0x39          // lstore, dstore
+        | 0x3f..=0x42          // lstore_0..3
+        | 0x47..=0x4a          // dstore_0..3
+        | 0x50 | 0x52          // lastore, dastore
+        | 0x61 | 0x63 | 0x65 | 0x67 | 0x69 | 0x6b | 0x6d | 0x6f | 0x71 | 0x73 // l/d add,sub,mul,div,rem
+        | 0x75 | 0x77          // lneg, dneg
+        | 0x79 | 0x7b | 0x7d   // lshl, lshr, lushr
+        | 0x7f | 0x81 | 0x83   // land, lor, lxor
+        | 0x85 | 0x87 | 0x88 | 0x89 | 0x8a | 0x8c | 0x8d | 0x8e | 0x8f | 0x90 // i2l,i2d,l2i,l2f,l2d,f2l,f2d,d2i,d2l,d2f
+        | 0x94 | 0x97 | 0x98   // lcmp, dcmpl, dcmpg
+        | 0xad | 0xaf          // lreturn, dreturn
+    )
+}
+
 pub fn count_param_slots(descriptor: &str) -> usize {
     let bytes = descriptor.as_bytes();
     if bytes.is_empty() || bytes[0] != b'(' {

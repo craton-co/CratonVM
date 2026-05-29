@@ -3380,16 +3380,33 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 }
                 // ireturn / lreturn / freturn / dreturn / areturn
                 0xac..=0xb0 => {
-                    let value = frame.stack.pop_unchecked();
+                    // Bit-exact return-value transfer. The prior
+                    // `pop_unchecked()` + `push_unchecked()` round-tripped the
+                    // slot through `to_value()`/`from_value()`, which decoded a
+                    // category-2 long whose NaN-box bit pattern collides with a
+                    // tagged sub-tag (e.g. `lreturn` of `0xFFFC_…`, a BC safegcd
+                    // `Mod.updateDE30`/`updateFG30` accumulator) as `Value::Int`,
+                    // dropping the high bits. Copy the raw CompactValue for
+                    // i/l/f/d-return; areturn still normalizes jobject-as-Long
+                    // handles via `coerce_value_for_return`. See
+                    // docs/bc-ec-mod-mododdinverse-investigation.md.
+                    let cv = frame.stack.pop_compact();
+                    let desc_byte = match opcode {
+                        0xad => b'J', // lreturn
+                        0xae => b'F', // freturn
+                        0xaf => b'D', // dreturn
+                        0xb0 => b'L', // areturn
+                        _ => b'I',    // ireturn (also B/C/S/Z)
+                    };
                     // areturn (0xb0): mirror slow-path `Instruction::Areturn` — JNI
                     // / bridges can leave a jobject as `Value::Long` on the stack;
                     // fast-path frames (non-JDK packages) must still normalize
                     // before pushing to the caller or returning from the outer VM.
                     let value = if opcode == 0xb0 {
                         let ret = crate::jit::return_type(frame.method_descriptor());
-                        coerce_value_for_return(value, ret)
+                        coerce_value_for_return(cv.to_value(), ret)
                     } else {
-                        value
+                        cv.decode_by_descriptor(desc_byte)
                     };
                     if crate::runtime::env_cache::trace_sb_filter() {
                         let cn = frame.class_name();
@@ -3445,10 +3462,17 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         }
                     }
                     if frame_idx > initial_frame_idx {
-                        // Stackless return: pop child frame, push value to parent
+                        // Stackless return: pop child frame, push value to parent.
                         pop_and_recycle_frame(shared, thread);
                         frame_idx -= 1;
-                        thread.frames[frame_idx].stack.push_unchecked(value);
+                        if opcode == 0xb0 {
+                            // areturn: push the normalized reference value.
+                            thread.frames[frame_idx].stack.push_unchecked(value);
+                        } else {
+                            // i/l/f/d-return: bit-exact raw slot copy preserves
+                            // collision-pattern longs (and doubles).
+                            thread.frames[frame_idx].stack.push_compact(cv);
+                        }
                         continue;
                     }
                     return Ok(Some(value));
@@ -3664,24 +3688,30 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.pc = saved_pc + 1;
                     continue;
                 }
-                // lload_0..3
+                // lload_0..3 — route raw CompactValue bits straight through
+                // (bit-exact, mirroring the slow-path `Lload` and fast-path
+                // `lstore_N`). The prior `get_local_unchecked().to_value()` +
+                // `push_unchecked()` round-trip decoded a collision-pattern
+                // long (e.g. `0xFFFC_….` whose NaN sub-tag reads as Int) to
+                // `Value::Int`, dropping bits 32-46 on re-encode. push_compact
+                // preserves every bit and skips the Value decode/encode.
                 0x1e => {
-                    frame.stack.push_unchecked(frame.get_local_unchecked(0));
+                    frame.stack.push_compact(frame.get_local_compact_unchecked(0));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x1f => {
-                    frame.stack.push_unchecked(frame.get_local_unchecked(1));
+                    frame.stack.push_compact(frame.get_local_compact_unchecked(1));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x20 => {
-                    frame.stack.push_unchecked(frame.get_local_unchecked(2));
+                    frame.stack.push_compact(frame.get_local_compact_unchecked(2));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
                 0x21 => {
-                    frame.stack.push_unchecked(frame.get_local_unchecked(3));
+                    frame.stack.push_compact(frame.get_local_compact_unchecked(3));
                     frame.pc = saved_pc + 1;
                     continue;
                 }
@@ -4168,11 +4198,15 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     frame.pc = saved_pc + 2;
                     continue;
                 }
-                // lload (0x16), dload (0x18)
+                // lload (0x16), dload (0x18) — bit-exact CompactValue pass
+                // through, matching the slow-path `Lload`/`Dload` arms
+                // (`get_local_compact` + `push_compact_checked`). Avoids the
+                // lossy `to_value()`/`from_value()` round-trip that dropped
+                // collision-pattern longs (see lload_0..3 above).
                 0x16 | 0x18 => {
                     frame
                         .stack
-                        .push_unchecked(frame.get_local_unchecked(b1 as usize)); // Cast: bytecode operand decoding
+                        .push_compact(frame.get_local_compact_unchecked(b1 as usize)); // Cast: bytecode operand decoding
                     frame.pc = saved_pc + 2;
                     continue;
                 }
@@ -8520,12 +8554,16 @@ fn pop_static_field_value(
                 // `CompactValue::long`/`CompactValue::double` (both
                 // untagged); reinterpret as i64.
                 CompactTag::Double => cv.raw_bits() as i64,
-                // Int widens to long (JVMS also allows iconst_0 → lstore
-                // via i2l, but a raw int tag on a J-slot indicates the
-                // JIT pushed an Int where a Long was expected).  Coerce
-                // rather than crash.
-                CompactTag::Int => match cv.to_value() {
-                    Value::Int(x) => x as i64,
+                // SUB_INT slot: disambiguate via the same logic as
+                // `decode_by_descriptor(b'J')` / `ValueStack::pop_long`. A real
+                // int has payload < 2^32 and widens (JVMS i2l); a SUB_INT
+                // pattern with payload bits 32-46 set is a collision long whose
+                // bits masquerade as Int (BC safegcd 0xFFFC_… accumulators) and
+                // must reinterpret bit-exact. The prior `to_value()` decode
+                // dropped the high bits of such longs. See
+                // docs/bc-ec-mod-mododdinverse-investigation.md.
+                CompactTag::Int => match cv.decode_by_descriptor(b'J') {
+                    Value::Long(x) => x,
                     _ => 0,
                 },
                 // Zero-initialized or uninitialized slot → 0L default.
@@ -8785,28 +8823,38 @@ fn execute_invoke_kind(
     let total_args = num_params + 1;
 
     let (param_descs, _) = split_method_descriptor(&method_descriptor);
-    let mut tmp: Vec<Value> = Vec::with_capacity(num_params + 1);
+    // Pop slots as raw CompactValue and decode with the parameter descriptor
+    // so a category-2 long whose NaN-box bit pattern collides with a tagged
+    // sub-tag survives bit-exact. The prior `pop()` → `to_value()` decoded
+    // such a long as `Value::Int`, which `coerce_invoke_arg_for_descriptor`
+    // then widened — corrupting `J` args to invokevirtual/special callees.
+    // Mirrors `pop_coerced_invoke_args_virtual`. See
+    // docs/bc-ec-mod-mododdinverse-investigation.md.
+    let mut tmp_cv: Vec<CompactValue> = Vec::with_capacity(num_params + 1);
     for _ in 0..num_params {
-        tmp.push(thread.frames[frame_idx].stack.pop()?);
+        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_checked()?);
     }
-    tmp.push(thread.frames[frame_idx].stack.pop()?); // receiver
-    tmp.reverse();
+    tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_checked()?); // receiver
+    tmp_cv.reverse();
+    let recv_val = tmp_cv[0].decode_by_descriptor(b'L');
     if std::env::var_os("CRATONVM_DBG_JETTY2").is_some()
         && &*method_name == "getClasspath"
     {
         eprintln!(
             "[jetty2-eik] execute_invoke_kind {}.{}{} receiver={:?}",
-            &*method_class_name, &*method_name, &*method_descriptor, tmp.first()
+            &*method_class_name, &*method_name, &*method_descriptor, recv_val
         );
     }
     let mut args = Vec::with_capacity(total_args);
-    args.push(coerce_invoke_arg_for_descriptor("Ljava/lang/Object;", tmp[0]));
+    args.push(coerce_invoke_arg_for_descriptor("Ljava/lang/Object;", recv_val));
     for i in 0..num_params {
         let pd = param_descs
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or("Ljava/lang/Object;");
-        args.push(coerce_invoke_arg_for_descriptor(pd, tmp[i + 1]));
+        let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let v = tmp_cv[i + 1].decode_by_descriptor(pd_byte);
+        args.push(coerce_invoke_arg_for_descriptor(pd, v));
     }
 
     // CRATONVM_DBG_JETTY — trace every invoke into the Jetty launcher
@@ -11846,22 +11894,37 @@ fn execute_invokestatic_cached(
                 )));
             }
 
-            // Pop args into stack-allocated buffer (avoids Vec allocation)
+            // Pop args into stack-allocated buffer (avoids Vec allocation).
+            // Decode each slot with its parameter descriptor (bit-exact): the
+            // prior `pop_unchecked()` → `to_value()` decoded a category-2 long
+            // arg whose NaN-box bit pattern collides with a tagged sub-tag
+            // (e.g. `0xFFFC_…`, a BC safegcd accumulator) as `Value::Int`,
+            // dropping the high bits before it reached the callee's locals.
+            // The non-cached `execute_invokestatic` path already decodes this
+            // way. See docs/bc-ec-mod-mododdinverse-investigation.md.
             const MAX_INLINE_ARGS: usize = 16;
             let num_params = cached.num_params as usize; // Widening: parameter count conversion
+            let (param_descs, _) = split_method_descriptor(&cached.method_descriptor);
+            let pd_byte = |i: usize| -> u8 {
+                param_descs
+                    .get(i)
+                    .and_then(|s| s.as_bytes().first().copied())
+                    .unwrap_or(b'L')
+            };
             let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
-            let mut args_vec = Vec::new();
+            let mut args_vec: Vec<Value> = Vec::new();
             let args_slice: &[Value] = if num_params <= MAX_INLINE_ARGS {
                 for i in (0..num_params).rev() {
-                    args_buf[i] = thread.frames[frame_idx].stack.pop_unchecked();
+                    let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                    args_buf[i] = cv.decode_by_descriptor(pd_byte(i));
                 }
                 &args_buf[..num_params]
             } else {
-                args_vec.reserve(num_params);
-                for _ in 0..num_params {
-                    args_vec.push(thread.frames[frame_idx].stack.pop_unchecked());
+                args_vec.resize(num_params, Value::Uninitialized);
+                for i in (0..num_params).rev() {
+                    let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                    args_vec[i] = cv.decode_by_descriptor(pd_byte(i));
                 }
-                args_vec.reverse();
                 &args_vec
             };
 
@@ -13760,25 +13823,41 @@ fn execute_jit_call(
         return Ok(CachedCallResult::CacheMiss);
     }
     let mut jit_args = [0i64; JIT_ABI_REG_SLOTS];
+    // The JIT calling convention expects raw primitive bits with no NaN-box
+    // tag (Int → sign-extended i64, Long → raw i64, Float → zero-extended u32
+    // bits, Double → raw f64 bits, Object → pointer). Decode each arg slot by
+    // its *parameter descriptor* (receiver slot = 'L' for instance methods):
+    //
+    //   * NaN-box leak (the original bugfix here): an `Int(11)` slot is encoded
+    //     0xFFFC_0000_0000_000B; `pop_raw().as_i64` would pass those tag bits
+    //     as the value, so a JIT'd `int n` arrived as 0xFFFC_..._000B instead
+    //     of 11 — forwarded to `alloc_array` it produced "young gen exhausted —
+    //     tried to allocate 18445618173802709003 bytes" (fannkuch n=11,
+    //     FullStackBench `new boolean[100000]`). `decode_by_descriptor(b'I')`
+    //     strips the tag → Int(11).
+    //   * Collision long: a `long` arg whose bit pattern collides with the
+    //     NaN-tag int space (BC safegcd 0xFFFC_… accumulator) was decoded by
+    //     the prior unconditional `to_value()` as `Value::Int`, truncating to
+    //     the low 32 bits. `decode_by_descriptor(b'J')` reinterprets the raw
+    //     i64 bit-exact. See docs/bc-ec-mod-mododdinverse-investigation.md.
+    let (param_descs, _) = split_method_descriptor(&cached.method_descriptor);
+    let is_static = cached.is_static;
     for i in (0..np).rev() {
-        // BUGFIX (CompactValue NaN-box leak into JIT): the operand stack stores
-        // values as NaN-boxed CompactValues, where Int(11) for example is encoded
-        // as 0xFFFC_0000_0000_000B. Using `pop_raw().as_i64` would pass those tag
-        // bits as the parameter value, so a JIT'd `int n` arrives as
-        // 0xFFFC_..._000B instead of 11. Downstream, the JIT loaded that bit
-        // pattern from a local frame slot and forwarded it to the GC's
-        // `alloc_array` length argument, producing the bogus
-        // "array data size overflow" / "young gen exhausted — tried to allocate
-        // 18445618173802709003 bytes" crash seen on fannkuch (n=11) and
-        // FullStackBench phase 5 (`new boolean[100000]`).
-        //
-        // The JIT calling convention expects raw primitive bits with no tag
-        // (Int → sign-extended i64, Long → raw i64, Float → zero-extended u32
-        // bits, Double → raw f64 bits, Object → pointer). Decode via
-        // CompactValue::to_value first, then encode for the JIT ABI exactly
-        // the way the eager-args path does at the other JIT entry point.
         let cv = thread.frames[frame_idx].stack.pop_compact();
-        let v = cv.to_value();
+        let desc_byte = if is_static {
+            param_descs
+                .get(i)
+                .and_then(|s| s.as_bytes().first().copied())
+                .unwrap_or(b'L')
+        } else if i == 0 {
+            b'L' // receiver
+        } else {
+            param_descs
+                .get(i - 1)
+                .and_then(|s| s.as_bytes().first().copied())
+                .unwrap_or(b'L')
+        };
+        let v = cv.decode_by_descriptor(desc_byte);
         jit_args[i] = match v {
             Value::Int(x) => x as i64,
             Value::Long(x) => x,
@@ -14301,19 +14380,36 @@ fn execute_invokevirtual_vtable_fast(
 
     let total_args = num_params + 1;
     const MAX_INLINE_ARGS: usize = 16;
+    // Decode args bit-exact via parameter descriptors (receiver slot = 'L').
+    // The prior pop_unchecked()/to_value() dropped the high bits of a
+    // category-2 long arg whose NaN-box bit pattern collides with a tagged
+    // sub-tag (BC safegcd 0xFFFC_… accumulators). See
+    // docs/bc-ec-mod-mododdinverse-investigation.md.
+    let (param_descs, _) = split_method_descriptor(&entry_cached.method_descriptor);
+    let arg_desc_byte = |i: usize| -> u8 {
+        if i == 0 {
+            b'L'
+        } else {
+            param_descs
+                .get(i - 1)
+                .and_then(|s| s.as_bytes().first().copied())
+                .unwrap_or(b'L')
+        }
+    };
     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
     let mut args_vec: Vec<Value> = Vec::new();
     let args_slice: &[Value] = if total_args <= MAX_INLINE_ARGS {
         for i in (0..total_args).rev() {
-            args_buf[i] = thread.frames[frame_idx].stack.pop_unchecked();
+            let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
+            args_buf[i] = cv.decode_by_descriptor(arg_desc_byte(i));
         }
         &args_buf[..total_args]
     } else {
-        args_vec.reserve(total_args);
-        for _ in 0..total_args {
-            args_vec.push(thread.frames[frame_idx].stack.pop_unchecked());
+        args_vec.resize(total_args, Value::Uninitialized);
+        for i in (0..total_args).rev() {
+            let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
+            args_vec[i] = cv.decode_by_descriptor(arg_desc_byte(i));
         }
-        args_vec.reverse();
         &args_vec
     };
 
@@ -14513,19 +14609,36 @@ fn execute_invokevirtual_cached(
 
                     let total_args = num_params + 1;
                     const MAX_INLINE_ARGS: usize = 16;
+                    // Decode args bit-exact via parameter descriptors (receiver
+                    // = 'L'); pop_unchecked()/to_value() dropped the high bits
+                    // of collision-pattern long args. See
+                    // docs/bc-ec-mod-mododdinverse-investigation.md.
+                    let (param_descs, _) =
+                        split_method_descriptor(&cached.method_descriptor);
+                    let arg_desc_byte = |i: usize| -> u8 {
+                        if i == 0 {
+                            b'L'
+                        } else {
+                            param_descs
+                                .get(i - 1)
+                                .and_then(|s| s.as_bytes().first().copied())
+                                .unwrap_or(b'L')
+                        }
+                    };
                     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
-                    let mut args_vec = Vec::new();
+                    let mut args_vec: Vec<Value> = Vec::new();
                     let args_slice: &[Value] = if total_args <= MAX_INLINE_ARGS {
                         for i in (0..total_args).rev() {
-                            args_buf[i] = thread.frames[frame_idx].stack.pop_unchecked();
+                            let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                            args_buf[i] = cv.decode_by_descriptor(arg_desc_byte(i));
                         }
                         &args_buf[..total_args]
                     } else {
-                        args_vec.reserve(total_args);
-                        for _ in 0..total_args {
-                            args_vec.push(thread.frames[frame_idx].stack.pop_unchecked());
+                        args_vec.resize(total_args, Value::Uninitialized);
+                        for i in (0..total_args).rev() {
+                            let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                            args_vec[i] = cv.decode_by_descriptor(arg_desc_byte(i));
                         }
-                        args_vec.reverse();
                         &args_vec
                     };
 
@@ -14772,19 +14885,34 @@ fn execute_invokevirtual_cached(
 
             let total_args = cached.num_params as usize + 1; // Widening: parameter count conversion
             const MAX_INLINE_ARGS: usize = 16;
+            // Decode args bit-exact via parameter descriptors (receiver = 'L');
+            // pop_unchecked()/to_value() dropped the high bits of collision-
+            // pattern long args. See docs/bc-ec-mod-mododdinverse-investigation.md.
+            let (param_descs, _) = split_method_descriptor(&cached.method_descriptor);
+            let arg_desc_byte = |i: usize| -> u8 {
+                if i == 0 {
+                    b'L'
+                } else {
+                    param_descs
+                        .get(i - 1)
+                        .and_then(|s| s.as_bytes().first().copied())
+                        .unwrap_or(b'L')
+                }
+            };
             let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
-            let mut args_vec = Vec::new();
+            let mut args_vec: Vec<Value> = Vec::new();
             let args_slice: &[Value] = if total_args <= MAX_INLINE_ARGS {
                 for i in (0..total_args).rev() {
-                    args_buf[i] = thread.frames[frame_idx].stack.pop_unchecked();
+                    let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                    args_buf[i] = cv.decode_by_descriptor(arg_desc_byte(i));
                 }
                 &args_buf[..total_args]
             } else {
-                args_vec.reserve(total_args);
-                for _ in 0..total_args {
-                    args_vec.push(thread.frames[frame_idx].stack.pop_unchecked());
+                args_vec.resize(total_args, Value::Uninitialized);
+                for i in (0..total_args).rev() {
+                    let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
+                    args_vec[i] = cv.decode_by_descriptor(arg_desc_byte(i));
                 }
-                args_vec.reverse();
                 &args_vec
             };
 

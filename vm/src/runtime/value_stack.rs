@@ -629,30 +629,38 @@ impl ValueStack {
                 feature: "operand stack underflow".to_string(),
             });
         }
-        // For a Long slot the raw 64-bit pattern IS the i64 value (CompactValue
-        // stores longs untagged).  Inspect the slot directly and widen ints
-        // that the bytecode may have left where a long was expected.
-        let idx = self.len - 1;
-        let cv = self.slots[idx];
-        match cv.tag() {
-            // BC SM2 fix (2026-05-28): `CompactValue::long` stores bits
-            // verbatim, so a long whose natural sub-tag is
-            // `Int`/`Float`/`Object`/`Null`/`Uninit`/`ReturnAddress`/`Long-Lo`/`Long-Hi`
-            // *also* arrives here as a long. The verifier guarantees this slot
-            // is a Long, so reinterpret the raw bits regardless of which sub-tag
-            // `tag()` reports. Only `Int` is special — the JVM accidentally-int-
-            // on-the-stack widening behaviour predates the verbatim long encoding
-            // and is preserved for compatibility with synthetic bytecode that
-            // leaves an int where a long is expected.
-            CompactTag::Int => {
-                self.len -= 1;
-                // Sign-extend int → long.
-                Ok(cv.as_int().unwrap_or(0) as i64)
-            }
-            _ => {
-                self.len -= 1;
-                Ok(cv.as_long_unchecked())
-            }
+        // A `pop_long` call site is a verified long-consumer (lstore / ladd /
+        // lcmp / l2i / lreturn / …), so the slot holds a Long. `CompactValue`
+        // stores longs verbatim, but a long whose top bits collide with the
+        // NaN-tag space reads back with a non-Long `tag()` — most importantly
+        // `SUB_INT`. Decode bit-exactly via the same discrimination as
+        // `CompactValue::decode_by_descriptor(b'J')`:
+        //
+        //   * any non-Int tag (incl. untagged, SUB_LONG_*, SUB_OBJECT/NULL/…)
+        //     → reinterpret the raw 64 bits as i64;
+        //   * `SUB_INT` with payload bits 32-46 set → a real int can never set
+        //     those (`CompactValue::int` stores `n as u32`), so the slot is a
+        //     long whose bit pattern collides into the int sub-tag (BC safegcd
+        //     `Mod.updateDE30` / `updateFG30` 0xFFFC_…/0xFFFE_… accumulators) —
+        //     reinterpret bit-exact;
+        //   * `SUB_INT` with payload < 2^32 → indistinguishable from a real
+        //     `Value::Int(n)`, so apply JVMS i2l sign-extension (preserves the
+        //     long-standing "native / synthetic bytecode left an int where a
+        //     long is expected" widening contract — see `pop_long_widens_int`).
+        //
+        // The previous code widened *every* `SUB_INT` slot, silently dropping
+        // the high bits of collision longs. The residual payload<2^32 SUB_INT
+        // ambiguity is unsalvageable from a single 8-byte slot (a real `Int(0)`
+        // and the long `0xFFFC_0000_0000_0000` are bit-identical) and needs a
+        // parallel stack type tag to close fully — see
+        // docs/bc-ec-mod-mododdinverse-investigation.md.
+        self.len -= 1;
+        let cv = self.slots[self.len];
+        match cv.decode_by_descriptor(b'J') {
+            Value::Long(v) => Ok(v),
+            // `decode_by_descriptor(b'J')` is total over `Value::Long`; this
+            // arm is unreachable but avoids an `unwrap`/panic on the hot path.
+            _ => Ok(cv.as_long_unchecked()),
         }
     }
 
@@ -1037,6 +1045,81 @@ mod tests {
         stack.push(Value::Int(99)).unwrap();
         assert_eq!(stack.peek().as_int(), Some(99));
         assert_eq!(stack.peek_at(1).as_int(), Some(42));
+    }
+
+    /// Regression: longs whose bit pattern collides with the NaN-tag int
+    /// space must survive `push_long` → `pop_long` bit-exactly *whenever the
+    /// collision is resolvable*. Before the 2026-05-28 fix `pop_long` widened
+    /// every `SUB_INT`-tagged slot via `as_int()`, dropping the upper bits of
+    /// every such long — including the BC safegcd `Mod.updateDE30`/`updateFG30`
+    /// accumulators (signed int*int products landing in the 0xFFFC_…/0xFFFE_…
+    /// band with nonzero magnitude). See
+    /// docs/bc-ec-mod-mododdinverse-investigation.md.
+    #[test]
+    fn pop_long_preserves_resolvable_nan_tag_collisions() {
+        // 0xFFFC_….: full NaN-box marker set; the 3-bit sub-tag (bits 49-47)
+        // selects which "non-double" tag the bits masquerade as. A real
+        // `CompactValue::int` stores `n as u32` (payload < 2^32), so a SUB_INT
+        // slot whose payload bits 32-46 are set CANNOT be a real int — it is a
+        // collision long and must reinterpret bit-exact.
+        const NANBOX: u64 = 0xFFFC_0000_0000_0000;
+        let resolvable: &[i64] = &[
+            (NANBOX | (1u64 << 32)) as i64,         // SUB_INT, payload bit 32 set
+            (NANBOX | 0x7FFF_FFFF_FFFF) as i64,     // SUB_INT, all 47 payload bits set
+            (NANBOX | (1u64 << 47)) as i64,         // SUB_FLOAT pattern (any tag → reinterpret)
+            (NANBOX | (2u64 << 47) | 0x55) as i64,  // SUB_OBJECT pattern, nonzero payload
+            (NANBOX | (5u64 << 47) | 0x1234) as i64,// SUB_RETADDR pattern, payload bits set
+            -1,                                     // natural SUB_LONG_HI
+            i64::MIN,                               // untagged fast path
+            i64::MAX,
+            123_456_789_012_345,
+        ];
+        for &v in resolvable {
+            let mut stack = ValueStack::new(2);
+            stack.push_long(v).unwrap();
+            assert_eq!(
+                stack.pop_long().unwrap(),
+                v,
+                "push_long/pop_long must round-trip {v:#018x} bit-exact",
+            );
+        }
+    }
+
+    /// Documented residual: a `SUB_INT` slot with payload < 2^32 is
+    /// bit-identical to a real `CompactValue::int`, so `pop_long` keeps the
+    /// JVMS i2l-widen contract there (it cannot tell the two apart from a
+    /// single 8-byte slot). Closing this fully needs a parallel stack type
+    /// tag — see docs/bc-ec-mod-mododdinverse-investigation.md. Pin the
+    /// behaviour so a future encoding change is a conscious decision.
+    #[test]
+    fn pop_long_widens_unresolvable_int_collision() {
+        const NANBOX: u64 = 0xFFFC_0000_0000_0000;
+        // payload 0 → widens to 0L; payload 0x1234 → widens to 0x1234L.
+        for &(bits, widened) in &[(NANBOX, 0i64), (NANBOX | 0x1234, 0x1234i64)] {
+            let mut stack = ValueStack::new(2);
+            stack.push_long(bits as i64).unwrap();
+            assert_eq!(stack.pop_long().unwrap(), widened);
+        }
+    }
+
+    /// Regression: the full `lload` → consume sequence the interpreter runs.
+    /// `lload_N` (fast path) now pushes the local's raw CompactValue bits via
+    /// `push_compact`; the consuming long opcode pops via `pop_long`. Both
+    /// stages must be bit-exact for resolvable collision-pattern longs.
+    #[test]
+    fn lload_then_pop_long_is_bit_exact_for_collisions() {
+        const NANBOX: u64 = 0xFFFC_0000_0000_0000;
+        for &v in &[
+            (NANBOX | 0x7FFF_FFFF_FFFF) as i64,    // SUB_INT, payload bits 32-46 set
+            (NANBOX | (2u64 << 47) | 0x55) as i64, // SUB_OBJECT pattern
+        ] {
+            // Simulate `lstore` writing the slot, then `lload` reading it: a
+            // local slot stores the long verbatim via CompactValue::long.
+            let local = crate::types::CompactValue::long(v);
+            let mut stack = ValueStack::new(2);
+            stack.push_compact(local); // lload_N
+            assert_eq!(stack.pop_long().unwrap(), v, "lload/pop {v:#018x}");
+        }
     }
 
     // B12: `*_unchecked` guards are now `debug_assert!`, so the panic only

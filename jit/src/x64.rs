@@ -3740,6 +3740,23 @@ struct Compiler {
     /// result is a pure function of the divisor, so caching is behavior-
     /// preserving.
     magic_div_memo: FxHashMap<i32, (i64, u32)>,
+
+    /// JVM local slot of each incoming JIT argument, in argument order
+    /// (`this` first for instance methods, then declared params). Because a
+    /// category-2 (long/double) parameter occupies TWO JVM local slots while
+    /// the JIT calling convention passes it in ONE argument register, an
+    /// argument's JVM slot can diverge from its argument index. The prologue
+    /// uses this to deposit each incoming argument register into the slot the
+    /// body actually reads (e.g. `lload_2` for the second `long` parameter).
+    /// Empty ⇒ legacy "argument index == slot" behavior (correct for
+    /// category-1-only methods); used by the many test call sites.
+    param_jvm_slots: Vec<usize>,
+
+    /// Total JVM local slots consumed by all parameters (category-2 counted
+    /// as 2, plus the implicit `this`). Used as the lower bound for prologue
+    /// zero-initialization so a `long`/`double` parameter's slot is never
+    /// clobbered. `0` ⇒ fall back to `num_params`.
+    param_slot_span: usize,
 }
 
 impl Compiler {
@@ -3941,6 +3958,10 @@ impl Compiler {
             ldc_info_idx: FxHashMap::default(),
             ldc2w_info_idx: FxHashMap::default(),
             magic_div_memo: FxHashMap::default(),
+            // Set by `compile_with_param_slots` after construction; empty/0
+            // here preserves legacy "arg index == slot" behavior.
+            param_jvm_slots: Vec::new(),
+            param_slot_span: 0,
         }
     }
 
@@ -6663,18 +6684,40 @@ impl Compiler {
         let reg_capacity = ARG_REGS.len() - ctx_offset;
         let reg_arg_count = self.num_params.min(reg_capacity);
 
+        // JVM local slots actually occupied by parameters, and the first slot
+        // past the parameter region. For category-1-only methods (and the
+        // test call sites that pass no slot map) `param_jvm_slots` is empty,
+        // so these reduce to the legacy "arg index == slot, span == count"
+        // behavior. For methods with long/double parameters they account for
+        // category-2 values spanning two JVM slots — the deposit slot below
+        // and the zero-init floor must skip the dead high-half slots so a
+        // long/double parameter is neither mis-placed nor clobbered.
+        let param_slots: Vec<usize> = if self.param_jvm_slots.is_empty() {
+            (0..self.num_params).collect()
+        } else {
+            self.param_jvm_slots.clone()
+        };
+        let zero_floor = if self.param_slot_span > 0 {
+            self.param_slot_span
+        } else {
+            self.num_params
+        };
+
         // Load register-passed Java params (java idx 0..reg_arg_count) from
         // ARG_REGS[ctx_offset + i] into the destination local slot.
         for i in 0..reg_arg_count {
             let reg = ARG_REGS[ctx_offset + i];
-            if let Some(xmm) = self.xmm_for_local(i) {
+            // Argument `i` is read from JVM slot `param_jvm_slots[i]` (identity
+            // when no slot map is supplied).
+            let slot = self.param_jvm_slots.get(i).copied().unwrap_or(i);
+            if let Some(xmm) = self.xmm_for_local(slot) {
                 // Float/double param: arg arrives as i64 bit pattern in GPR; move to XMM
                 self.emit_mov_reg_reg(RAX, reg);
                 self.emit_movq_xmm_from_rax(xmm);
-            } else if let Some(local_reg) = self.reg_for_local(i) {
+            } else if let Some(local_reg) = self.reg_for_local(slot) {
                 self.emit_mov_reg_reg(local_reg, reg);
             } else {
-                let offset = self.local_offset(i);
+                let offset = self.local_offset(slot);
                 self.emit_store_local(offset, reg);
             }
         }
@@ -6699,43 +6742,46 @@ impl Compiler {
             for i in reg_arg_count..self.num_params {
                 let stack_idx = i - reg_arg_count; // 0-based index among stack args
                 let positive_disp = stack_arg_base + (stack_idx as i32) * 8; // Cast: x86-64 immediate encoding
+                let slot = self.param_jvm_slots.get(i).copied().unwrap_or(i);
                 // Load via RAX scratch so XMM-mapped float/double params
                 // can still be moved through the existing GPR→XMM helper.
                 self.emit_load_caller_arg(RAX, positive_disp);
-                if let Some(xmm) = self.xmm_for_local(i) {
+                if let Some(xmm) = self.xmm_for_local(slot) {
                     self.emit_movq_xmm_from_rax(xmm);
-                } else if let Some(local_reg) = self.reg_for_local(i) {
+                } else if let Some(local_reg) = self.reg_for_local(slot) {
                     self.emit_mov_reg_reg(local_reg, RAX);
                 } else {
-                    let offset = self.local_offset(i);
+                    let offset = self.local_offset(slot);
                     self.emit_store_local(offset, RAX);
                 }
             }
         }
 
-        // Zero-initialize register-mapped GPR locals beyond params.
-        // Skip if a param local shares the same register (the register
-        // already holds the param value and zeroing it would corrupt it).
-        for i in self.num_params..self.num_locals {
+        // Zero-initialize register-mapped GPR locals beyond the parameter
+        // region. `zero_floor` skips the whole parameter span (including the
+        // dead high-half slots of category-2 params), and `param_slots`
+        // guards against zeroing a register a parameter was coalesced into.
+        for i in zero_floor..self.num_locals {
             if let Some(reg) = self.reg_for_local(i) {
-                let already_param = (0..self.num_params).any(|j| self.reg_for_local(j) == Some(reg));
+                let already_param = param_slots.iter().any(|&j| self.reg_for_local(j) == Some(reg));
                 if !already_param {
                     self.emit_xor_reg_self(reg);
                 }
             }
         }
-        // Zero-initialize XMM-mapped locals beyond params.
+        // Zero-initialize XMM-mapped locals beyond the parameter region.
         // Skip if the XMM register is already initialized for a param (shared live range).
-        for i in self.num_params..self.num_locals {
+        for i in zero_floor..self.num_locals {
             if let Some(xmm) = self.xmm_for_local(i) {
-                let already_param = (0..self.num_params).any(|j| self.xmm_for_local(j) == Some(xmm));
+                let already_param = param_slots.iter().any(|&j| self.xmm_for_local(j) == Some(xmm));
                 if !already_param {
                     self.emit_pxor_xmm_self(xmm);
                 }
             }
         }
-        // Zero-initialize frame-based locals beyond params (neither GPR nor XMM assigned)
-        for i in self.num_params..self.num_locals {
+        // Zero-initialize frame-based locals beyond the parameter region
+        // (neither GPR nor XMM assigned)
+        for i in zero_floor..self.num_locals {
             if self.reg_for_local(i).is_none() && self.xmm_for_local(i).is_none() {
                 let offset = self.local_offset(i);
                 self.emit_xor_reg_self(RAX);
@@ -16750,7 +16796,76 @@ impl Compiler {
 ///
 /// Returns `Some(CompiledMethod)` on success, `None` if compilation fails.
 #[allow(clippy::too_many_arguments)]
+/// Legacy entry point: assumes `arg index == JVM slot`, which is correct only
+/// for methods whose parameters are all category-1 (no long/double). Test
+/// call sites use this; the production path (`jit/src/lib.rs::try_compile`)
+/// calls [`compile_with_param_slots`] with the real parameter layout so
+/// long/double parameters land in the slots their body reads.
+#[allow(clippy::too_many_arguments)]
 pub fn compile(
+    code: &[u8],
+    code_len: usize,
+    num_params: usize,
+    max_locals: usize,
+    needs_heap: bool,
+    multianewarray_info: Vec<(usize, u8)>,
+    field_info: Vec<(usize, usize, u8)>,
+    typecheck_info: Vec<(usize, *const u8, usize)>,
+    static_field_info: Vec<(usize, u32, usize, u8, bool)>,
+    new_info: Vec<(usize, u32, usize, bool, bool)>,
+    anewarray_info: Vec<(usize, u32)>,
+    invoke_info: Vec<(usize, *const JitInvokeInfo)>,
+    direct_calls: Vec<(usize, super::JitDirectCall)>,
+    mic_slots: Vec<(usize, *const super::JitMICSlot)>,
+    pic_slots: Vec<(usize, *const super::JitPICSlot)>,
+    ldc_info: Vec<(usize, i64)>,
+    ldc2w_info: Vec<(usize, i64)>,
+    branch_hints: HashMap<usize, bool>,
+    loop_unroll_hints: HashMap<usize, usize>,
+    helpers: &JitRuntimeHelpers,
+    non_escaping_new: std::collections::HashSet<usize>,
+    inline_sites: HashMap<usize, crate::InlineSite>,
+    string_layout: Option<crate::StringFieldLayout>,
+) -> Option<CompiledMethod> {
+    compile_with_param_slots(
+        code,
+        code_len,
+        num_params,
+        max_locals,
+        needs_heap,
+        multianewarray_info,
+        field_info,
+        typecheck_info,
+        static_field_info,
+        new_info,
+        anewarray_info,
+        invoke_info,
+        direct_calls,
+        mic_slots,
+        pic_slots,
+        ldc_info,
+        ldc2w_info,
+        branch_hints,
+        loop_unroll_hints,
+        helpers,
+        non_escaping_new,
+        inline_sites,
+        string_layout,
+        &[],
+        0,
+    )
+}
+
+/// Compile a method to native code with an explicit parameter→JVM-slot map.
+///
+/// `param_jvm_slots[i]` is the JVM local slot of the i-th incoming JIT
+/// argument (`this` first for instance methods, then declared params), and
+/// `param_slot_span` is the total JVM slots the parameters occupy (category-2
+/// counted as 2). These let the prologue place long/double parameters in the
+/// slots the body actually reads. Pass `&[]` / `0` for the legacy
+/// "arg index == slot" behavior (see the [`compile`] wrapper).
+#[allow(clippy::too_many_arguments)]
+pub fn compile_with_param_slots(
     code: &[u8],
     code_len: usize,
     num_params: usize,
@@ -16793,6 +16908,8 @@ pub fn compile(
     // layout unavailable" — String-intrinsic codegen (added by a later
     // wave) treats it as a bail-to-dispatch. See `crate::StringFieldLayout`.
     string_layout: Option<crate::StringFieldLayout>,
+    param_jvm_slots: &[usize],
+    param_slot_span: usize,
 ) -> Option<CompiledMethod> {
     // Estimate buffer size: extra for invoke dispatch calls (~40 bytes each).
     // This is a heuristic only — see the `buf.overflowed()` bailout below for
@@ -17049,6 +17166,8 @@ pub fn compile(
         *helpers,
         num_scalar_slots,
     );
+    compiler.param_jvm_slots = param_jvm_slots.to_vec();
+    compiler.param_slot_span = param_slot_span;
     compiler.bounds_safe_pcs = bounds_safe_pcs;
     compiler.speculative_bce_guards = speculative_bce_guards;
     compiler.new_info = new_info;

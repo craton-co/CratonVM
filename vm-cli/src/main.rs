@@ -705,6 +705,29 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             // Default is on; nothing to emit.
             i += 1;
         }
+        // `-Xms<size>` (minimum/initial heap): CratonVM sizes the heap from
+        // `-Xmx` only, so the minimum-heap hint is accepted and ignored
+        // rather than rejected. A drop-in `java` must not abort on it —
+        // Maven Surefire forks pass `-Xms512m` unconditionally.
+        else if a.starts_with("-Xms") {
+            if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
+                eprintln!("[cratonvm] ignoring unimplemented HotSpot flag: {a}");
+            }
+            i += 1;
+        }
+        // Any other `-XX:...` flag is a HotSpot tuning knob CratonVM does not
+        // implement (`-XX:MetaspaceSize`, `-XX:MaxMetaspaceSize`,
+        // `-XX:+ExitOnOutOfMemoryError`, `-XX:+HeapDumpOnOutOfMemoryError`,
+        // GC selectors, …). Recognized `-XX:` flags are rewritten by the
+        // branches above; everything else is silently ignored so a Maven
+        // Surefire / Gradle fork — which passes these unconditionally —
+        // launches instead of clap aborting with "unexpected argument '-X'".
+        else if a.starts_with("-XX:") {
+            if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
+                eprintln!("[cratonvm] ignoring unimplemented HotSpot flag: {a}");
+            }
+            i += 1;
+        }
         else {
             out.push(args[i].clone());
             i += 1;
