@@ -25831,6 +25831,16 @@ mod tests {
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Int(7));
 
+        if std::env::var_os("CRATONVM_DUMP_CODE").is_some() {
+            let entry = compiled.entry_ptr() as usize;
+            let helper = stub_getfield as *const () as usize;
+            eprintln!("ENTRY={:#x} HELPER={:#x}", entry, helper);
+            let bytes = unsafe { std::slice::from_raw_parts(entry as *const u8, 400) };
+            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+            eprintln!("CODE={}", hex);
+            return;
+        }
+
         // n = 8 → loop trips 8 times. With a 4x unroll the body runs
         // a mix of original + copy bodies; correct dispatch from every
         // copy is required to land on stub_getfield → return 7.

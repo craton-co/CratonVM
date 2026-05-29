@@ -13872,6 +13872,20 @@ fn execute_jit_call(
     let args_slice = &jit_args[..np];
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
 
+    if std::env::var_os("CRATONVM_DBG_ASSERTEQ").is_some()
+        && cached.class_name.as_ref() == "junit/framework/Assert"
+        && cached.method_name.as_ref() == "assertEquals"
+    {
+        let mut buf = String::new();
+        for (i, a) in args_slice.iter().enumerate() {
+            buf.push_str(&format!(" a{}=0x{:x}", i, a));
+        }
+        eprintln!(
+            "[ASSERTEQ-ENTER] {}{} np={} needs_heap={}{}",
+            cached.method_name, cached.method_descriptor, np, needs_heap, buf
+        );
+    }
+
     // Fast path: dispatch-free methods skip catch_unwind + thread-local overhead
     // task #44: migrated from `call`/`call_with_context` (panicking shims) to
     // `try_call`/`try_call_with_context`. JIT runtime invocation failures
