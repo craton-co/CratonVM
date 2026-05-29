@@ -23,6 +23,123 @@ Build command: `cargo build --release -p cratonvm-cli` (≈5–10 min from cold,
 
 ---
 
+## Session 2026-05-28/29 — current knowledge base (READ FIRST)
+
+dev tip = `55ca37f`. Regression pool 14/14 PASS, ~19–31 s wall (high
+variance — concurrent builds skew it; anything in 18–45 s is noise).
+Build the binary before any test run.
+
+### THE SINGLE HIGHEST-LEVERAGE BUG: the dispatch-bypass family
+
+Three separately-reported failures share **one root cause**, so one fix
+closes all of them (plus ~8 DaCapo benchmarks):
+
+- **Tomcat NIO Selector** (`docs/tomcat-selector-investigation.md`)
+- **DaCapo Lucene `FSDirectory.sync` → RAF/FileDescriptor**
+  (`docs/bc-ec-mod-mododdinverse-investigation.md` is the *long-bit* doc;
+  the RAF angle is in commit `e2031a2`)
+- **8+ DaCapo benchmarks** firing the `gen_heap::get_field` "speculative
+  collection-layout probe dispatched on a non-matching receiver type"
+  warning (avrora, pmd, lusearch, fop, eclipse, tomcat, batik, …).
+
+**The mechanism.** We register natives for `Selector.open()`,
+`RandomAccessFile.<init>`, etc., but during these runs **the natives
+never fire** (proven with `CRATONVM_DBG_SEL=1` / `CRATONVM_DBG_RAF_GETFD=1`
+— zero trace lines across a full Tomcat / luindex boot). The app's
+bytecode reaches the real-JDK implementation instead:
+`Selector.open()` → `SelectorProvider.provider().openSelector()` →
+real-JDK `WindowsSelectorImpl`, whose platform natives (`poll0`,
+`setupPipe0`) we don't implement → the selector reports closed →
+continuous `ClosedSelectorException`. Same shape for RAF: a real-JDK
+`RandomAccessFile` is constructed whose `fd` field we never populate,
+so `getFD()` returns null and `.sync()` NPEs.
+
+**Why it surfaces as an OOBFIELD warning.** When the wrong (real-JDK)
+class is instantiated through a path we didn't intercept, a downstream
+reflective / collection-probe reads a slot index past the synthetic
+object's `num_slots`. The `gen_heap::get_field` guard catches it and
+returns `Value::Object(None)` (benign null) — but the null then NPEs or
+mis-dispatches one frame up.
+
+**Three fix paths, in increasing order of work** (full detail in
+`docs/tomcat-selector-investigation.md`):
+1. Intercept `SelectorProvider.provider()` / the relevant factory so our
+   synthetic implementation is returned (small, but must cover sibling
+   factory methods).
+2. **Debug *why* the registered `Selector.open()` static native is
+   bypassed** — add a trace to the native-dispatch table lookup itself
+   (not just the registered fn). Suspects: class-loader keying mismatch,
+   interpreter inlining the 1-line `open()` body, or an `<clinit>`-time
+   intercept that runs before our registration phase. **This is the
+   recommended starting point** — it's the cheapest way to learn whether
+   the bypass is general (affects every static native) or specific.
+3. Implement the real-JDK `WindowsSelectorImpl` / RAF native surface
+   (most correct, most work).
+
+### bc-math-raw — the FAST reproducer for the long-bit-collision bug
+
+`bc-math-raw` fails in **1.3 s** with JUnit
+`expected:<1158644549939187780> but was:<1158644549939187780>` — the two
+longs *print identically* but `equals()` says they differ. This is the
+exact symptom of the `CompactValue` long↔int NaN-box collision documented
+in `docs/bc-ec-mod-mododdinverse-investigation.md`: a `long` whose bits
+NaN-tag as `SUB_INT`/`SUB_UNINIT` survives `lstore`/`lload` but
+`pop_long` (`vm/src/runtime/value_stack.rs:626`) widens the int-tagged
+slot and drops the high bits.
+
+Use this as the iteration target — it's ~250× faster than the bc-math-ec
+SEGV (which is the same bug manifesting as a 5-min crash). The holistic
+fix needs BOTH stages bit-exact (slot→stack AND stack→consumer); patching
+only `lload` SEGVs (proven this session — see the doc's "rejected fix").
+Two viable approaches: parallel type-tags on the operand stack, or a
+collision-free long encoding. Repro:
+```sh
+cd C:/craton/CratonVM/apps/_test-suites/bc-java
+CP='core/build/classes/java/main;core/build/classes/java/test;core/build/resources/main;core/build/resources/test'
+JUNIT='C:\Users\Victor\AppData\Local\Temp\junit-3.8.2.jar'
+target/release/cratonvm.exe --java-home "C:/Program Files/Java/jdk-25" \
+  --stack-dump-on-timeout 0 -Xmx1g -cp "$CP;$JUNIT" \
+  junit.textui.TestRunner org.bouncycastle.math.raw.test.AllTests
+```
+
+### Two new DaCapo crash signatures (distinct from the dispatch family)
+
+- **`dacapo-batik` → rc=132 SIGILL** ("Illegal instruction"). The JIT is
+  emitting an x86 opcode the CPU rejects. Re-run with
+  `CRATONVM_DISABLE_JIT=1` to confirm it's JIT-only, then bisect with
+  `CRATONVM_JIT_BISECT_ONLY` to find the offending class. This is a real
+  codegen bug, NOT the OOBFIELD family.
+- **`dacapo-tradebeans` / `dacapo-tradesoap` → rc=139 SEGV at ~59 s.**
+  The consistent ~60 s timing across both points at a specific GC event
+  (likely the second major/old-gen collection) moving an object a
+  JIT frame still holds a stale pointer to — same family as #23.
+
+### Reverted-this-session (do NOT re-attempt without the prerequisite)
+
+- **3 JIT precision fixes** (dup oop-mark, inline-getfield L/[ mark, L/[
+  putfield safepoint bracket). #3 cost ~40 % on regression-pool; #1/#2
+  SEGV'd bc-math-ec via the documented `stack_oop_marks`
+  may-be-shorter-than-`stack` desync. Prereq + re-application criteria in
+  `docs/jit-safepoint-revert.md`. The marks/stack desync must be
+  eliminated first.
+- **Interpreter `lload`/`dload` bit-exact pass-through** — incomplete
+  (only fixes stage 2 of 3); see the long-bit doc.
+
+### Current BC + DaCapo snapshot
+
+`test-infra/run-bc-dacapo-suite.sh` runs the whole battery; latest TSV is
+`test-infra/suite-results/bc-dacapo-20260528-222154.tsv`.
+
+BC core **3/9 PASS**: ✅ asn1-regression (84.9 s), crypto-prng-regression
+(15.7 s), util-utiltest (2.1 s). ❌ math-raw (long-bit), crypto-regression
+(clinit IllegalStateException), util-encoders (`Unexpected encoded
+character`), math-ec / math / pqc-crypto (120 s timeout).
+
+DaCapo **0/15 PASS** — all blocked on the dispatch-bypass family or the
+two new crash signatures above.
+
+---
+
 ## Open issues (priority order)
 
 ### 1. #23 — ECJ JIT header-overwrite bug
@@ -251,7 +368,9 @@ phases_late.rs, rewrite each to use the `bi_low_bits` /
 |---|---:|---:|---|
 | Commons Math (3204 tests) | 113 s | 114 s | byte-identical; CratonVM-GPU 75 s |
 | Regression pool (14 probes) | ~20 s | n/a | committed baselines, must stay green |
-| BC ASN.1 RegressionTest | 38/58 | 58/58 | up from 20+SEGFAULT before `cbda1a0` |
+| BC ASN.1 RegressionTest | 58/58 | 58/58 | run `main` directly — NOT a JUnit class; do NOT use `junit.textui.TestRunner` (it reports "No tests found"). 84.9 s. |
+| BC crypto-prng RegressionTest | PASS | — | 15.7 s |
+| BC util-utiltest (JUnit) | PASS | — | 2.1 s |
 
 ### Setup needed before retrying
 | Suite | What's needed |
@@ -382,22 +501,28 @@ C:\craton\CratonVM\
 
 ---
 
-## Recent commits (last session, dev tip = `7f92446`)
+## Recent commits (dev tip = `55ca37f`)
 
 ```
-7f92446 test-infra: TornadoVM `java` shim for 4-way Surefire comparison
-cbda1a0 jit: skip-list Calendar.isFieldSet (BC ASN.1 RegressionTest SEGFAULT)
-958baae bigint: native intValue/longValue must return low 32/64 bits, not parse decimal
-7ce34a2 io: wire FileDescriptor on synthetic System.in so stdin reads work
-2045ff5 native-builtins: side-table-aware Properties.remove(Object)  (fixes every H2 JDBC connect)
-a417674 jit: defensive header zero-init in inline-new + tlab_post_init paths
-952b1c1 stream+diag: register Stream.collect 3-arg native + JIT_NEWARRAY_TRACE
-bcd70d0 GC: kind/array_length coherence invariant in walker size compute
-cc5efa4 jmx+gc: GarbageCollectorMXBean.getCollectionTime ticks on System.gc
-94f1f53 build-fix: dedup HUMONGOUS_YOUNG_FRACTION_PERCENT
-053ecac regression-pool: force LF line endings + strip CR from baseline_file
-bbcb908 reflection: getDeclaredClasses0 loads inner classes on demand
+55ca37f test-infra: BC core + DaCapo suite runner; first snapshot
+99796e5 docs+diag: Tomcat NIO Selector — natives bypassed at Selector.open dispatch
+e2031a2 native: RandomAccessFile.getFD mirrors fd_id into real-JDK fd/handle slots; ctor reads File.path by name
+cdcf159 native: handle real-JDK InetSocketAddress holder layout in NIO bind  (Tomcat reaches "Server startup")
+ac489f9 docs: capture reverted JIT precision fixes + BC EC long-bit-collision investigation
+3c288b0 native: remove synthetic Connector.startInternal / AbstractProtocol.start stubs
+9308959 native: RandomAccessFile real-JDK fd layout + FileDescriptor.sync0
+2504a29 suite-results: 3 more JIT-corruption-family suites unblocked
+19301f4 jit: skip-list TestRunner.main + CleanerImpl.run (issue #23 family expansion)
+7bce079 jit: skip-list HashtableOfInt.rehash (issue #23, ECJ /by-zero)
+0b5bcf5 bigint: bi_mod_str must preserve sign of dividend (modInverse negatives + large primes)
+003876c compact-value: SUB_RETADDR payload bits 32-46 set → decode as Long
+1cf7e96 compact-value: store longs verbatim — fixes BC SM2 F2m bit-49 corruption
 ```
+
+**Investigation docs added this session (read before re-attempting):**
+- `docs/tomcat-selector-investigation.md` — dispatch-bypass family + 3 fix paths
+- `docs/bc-ec-mod-mododdinverse-investigation.md` — long-bit-collision 3-stage loss model
+- `docs/jit-safepoint-revert.md` — reverted JIT precision fixes + re-application prereqs
 
 Pick the highest-impact open issue you can close in your session, fix
 the underlying bug (no synthetic stubs), commit & push to `dev`,
