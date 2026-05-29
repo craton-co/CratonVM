@@ -7328,13 +7328,27 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
     // <init>(File file, String mode)
     r.register(raf, "<init>", "(Ljava/io/File;Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // File.path / File.holder.path / synthetic slot-0 fallback chain.
         let path = match args.get(1) {
-            Some(Value::Object(Some(f))) => match ctx.get_field(*f, 0) {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            },
+            Some(Value::Object(Some(f))) => {
+                // Real-JDK `java.io.File` exposes the absolute path through
+                // the private `path` field (a `String`). Try that first; fall
+                // back to the synthetic slot-0 layout for the legacy probes.
+                let by_name = ctx.get_field_by_name(*f, "path");
+                let p = match by_name {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => match ctx.get_field(*f, 0) {
+                        Value::Object(Some(s)) => ctx.read_string(s),
+                        _ => None,
+                    },
+                };
+                p.unwrap_or_default()
+            }
             _ => String::new(),
         };
+        if std::env::var_os("CRATONVM_DBG_RAF_INIT").is_some() {
+            eprintln!("[RAF_INIT] file ctor path='{}'", path);
+        }
         let mode_str = match args.get(2) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => "r".into(),
@@ -7780,12 +7794,40 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         // would NPE the bytecode caller. The `<init>` natives now ensure
         // `this.fd` is populated for real-JDK receivers.
         if let Some(existing) = raf_fd_object(ctx, this) {
+            if std::env::var_os("CRATONVM_DBG_RAF_GETFD").is_some() {
+                eprintln!("[RAF_GETFD] existing fd_obj returned");
+            }
             return Ok(Some(Value::Object(Some(existing))));
         }
-        // Synthetic 2-slot layout fallback: allocate a FileDescriptor and
-        // copy the fd id across so legacy callers continue to work.
+        // Synthetic 2-slot layout fallback: allocate a FileDescriptor that
+        // carries the fd id in *both* the real-JDK-shaped name fields (`fd`
+        // / `handle`) and the legacy slot 0. Real-JDK `FileDescriptor.sync`
+        // bytecode reads `this.handle == -1L && this.fd == -1` before
+        // dispatching to `sync0()`; if those fields are missing the read
+        // is treated as out-of-bounds, falls back to null/0, and the sync
+        // bytecode still proceeds (sync0 is a no-op). The synthetic must
+        // also remain non-null on return — `Ok(Some(Value::Object(Some(fd))))`
+        // — or `file.getFD().sync()` NPEs at the next bytecode step.
+        let fd_id = ctx.get_field(this, 0);
         let fd = alloc_concurrent_synthetic(ctx, "java/io/FileDescriptor", 1);
-        ctx.set_field(fd, 0, ctx.get_field(this, 0));
+        ctx.set_field(fd, 0, fd_id);
+        // Mirror the id into the named real-JDK slots when present so that
+        // `FileDescriptor.valid()` / `.sync()` see a non-(-1) value.
+        let cid = ctx.class_id_of_object(fd);
+        let class_name = ctx.class_name_of_id(cid).unwrap_or_default();
+        if ctx.resolve_field_index(&class_name, "fd").is_some() {
+            ctx.set_field_by_name(fd, "fd", fd_id);
+        }
+        if ctx.resolve_field_index(&class_name, "handle").is_some() {
+            let id_long = match fd_id {
+                Value::Int(v) => Value::Long(v as i64),
+                v => v,
+            };
+            ctx.set_field_by_name(fd, "handle", id_long);
+        }
+        if std::env::var_os("CRATONVM_DBG_RAF_GETFD").is_some() {
+            eprintln!("[RAF_GETFD] synthetic fd_obj allocated, fd_id={:?}", fd_id);
+        }
         Ok(Some(Value::Object(Some(fd))))
     });
     r.register(raf, "getChannel", "()Ljava/nio/channels/FileChannel;", |ctx, args| {
