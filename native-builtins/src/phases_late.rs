@@ -10142,6 +10142,9 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     // Selector = 4-field synthetic (open=0, keys_arr=1, key_count=2, wakeup_flag=3)
     let sel = "java/nio/channels/Selector";
     r.register(sel, "open", "()Ljava/nio/channels/Selector;", |ctx, _args| {
+        if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
+            eprintln!("[SEL/p98] Selector.open()");
+        }
         let sel = alloc_concurrent_synthetic(ctx, "java/nio/channels/Selector", 4);
         ctx.set_field(sel, 0, Value::Int(1));
         let keys = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);

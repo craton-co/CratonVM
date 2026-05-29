@@ -3185,6 +3185,9 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
     let sel = "java/nio/channels/Selector";
 
     r.register(sel, "open", "()Ljava/nio/channels/Selector;", |ctx, _| {
+        if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
+            eprintln!("[SEL] Selector.open()");
+        }
         let s = alloc_concurrent_synthetic(ctx, "java/nio/channels/Selector", 3);
         ctx.set_field(s, S2SEL_OPEN,  Value::Int(1));
         ctx.set_field(s, S2SEL_KEYS,  Value::Object(None));
@@ -3197,6 +3200,11 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
     // "wait forever" sentinel.)
     r.register(sel, "select", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
+            let open = ctx.get_field(this, S2SEL_OPEN).as_int().unwrap_or(-1);
+            let nkeys = ctx.get_field(this, S2SEL_NKEYS).as_int().unwrap_or(-1);
+            eprintln!("[SEL] select() open={open} nkeys={nkeys}");
+        }
         let n = s2_selector_do_poll_with_timeout(ctx, this, -1);
         Ok(Some(Value::Int(n)))
     });
@@ -3249,7 +3257,14 @@ fn register_s2_selector(r: &mut NativeMethodRegistry) {
         signal_wakeup(this);
         Ok(Some(Value::Object(Some(this))))
     });
-    r.register(sel, "isOpen", "()Z", |ctx, args| Ok(Some(ctx.get_field(obj_arg(args,0)?, S2SEL_OPEN))));
+    r.register(sel, "isOpen", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let v = ctx.get_field(this, S2SEL_OPEN);
+        if std::env::var_os("CRATONVM_DBG_SEL").is_some() {
+            eprintln!("[SEL] isOpen() = {:?}", v);
+        }
+        Ok(Some(v))
+    });
     r.register(sel, "close",  "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, S2SEL_OPEN, Value::Int(0));
