@@ -116,15 +116,20 @@ fn verify_method(
     // Java 7+ (version >= 51) requires StackMapTable for verification
     let requires_stack_map = version.major >= ClassFileVersion::JAVA_7.major;
 
-    // M1: select strict branch-target verification per method. Strict is
-    // forced when the caller explicitly requested it (`verify_bytecode_strict`),
-    // and is otherwise enabled automatically for Java 7+ methods that ship a
-    // StackMapTable — those classfiles are required by JVMS §4.10.1 to declare
-    // a frame at every branch target, so a missing frame at a real branch
-    // target is a genuine VerifyError rather than a tolerated compiler quirk.
-    // Pre-Java-7 classfiles (no mandatory StackMapTable) remain lenient.
-    let effective_strict =
-        strict_verification || (requires_stack_map && stack_map_table.is_some());
+    // M1: strict branch-target verification is OPT-IN, not the default.
+    //
+    // JVMS §4.10.1 requires Java 7+ classfiles to declare a frame at every
+    // branch target, so in principle a missing frame is a VerifyError. In
+    // practice, javac edge cases and bytecode-rewriting frameworks (proguard,
+    // CGLIB/ByteBuddy, shaded jars) legitimately emit branch targets without a
+    // declared frame; defaulting to strict would turn previously-loadable
+    // real-world classes (e.g. heavily-processed BouncyCastle / Spring jars)
+    // into load-time VerifyErrors — a compatibility regression. Strict
+    // checking is therefore engaged only when the caller explicitly asks for
+    // it (`verify_bytecode_strict`, i.e. `-Xverify:all`). The remaining
+    // verifier passes (worklist type inference, unreachable-code rejection,
+    // operand-stack bounds) still apply in the default lenient mode.
+    let effective_strict = strict_verification;
 
     if requires_stack_map && stack_map_table.is_none() {
         // No StackMapTable — only valid if there are no branches/exception handlers.
@@ -1994,7 +1999,7 @@ mod tests {
     }
 
     #[test]
-    fn m1_java7plus_branch_target_without_frame_is_rejected_by_default() {
+    fn m1_java7plus_branch_target_without_frame_is_lenient_by_default() {
         let class = make_class_with_stackmap(
             ClassFileVersion::JAVA_8,
             "()V",
@@ -2003,11 +2008,14 @@ mod tests {
             m1_goto_code(),
             m1_stackmap_frame_at_5(),
         );
-        // Default entry point must now enforce strict checking for Java 7+.
+        // M1 is opt-in: the DEFAULT entry point stays lenient even for Java 7+
+        // (a missing frame at a branch target is tolerated to preserve
+        // compatibility with bytecode-rewritten jars). Strict rejection is
+        // only via `verify_bytecode_strict` — see `m1_explicit_strict_entry_*`.
         let res = verify_bytecode(&class, &MockHierarchy);
         assert!(
-            res.is_err(),
-            "Java 7+ branch target without a StackMapTable frame must be a VerifyError, got {res:?}"
+            res.is_ok(),
+            "Java 7+ branch target without a frame must be tolerated by the lenient default, got {res:?}"
         );
     }
 
