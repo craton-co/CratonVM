@@ -9945,19 +9945,75 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
         let addr_str = p98_extract_socket_addr(ctx, addr_obj);
-        if let Ok(fd) = ctx.fd_table().open_tcp_listener(&addr_str) {
-            ctx.set_field(this, 1, Value::Int(1));
-            ctx.set_field(this, 2, Value::Int(fd as i32));
-            // If a wrapper ServerSocket has been cached, mirror the actual local port
-            // so getLocalPort/getLocalSocketAddress return the OS-chosen port.
-            if let Value::Object(Some(s)) = ctx.get_field(this, 3) {
-                if let Ok(local) = ctx.fd_table().tcp_local_addr(fd) {
-                    let port = local.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
-                    ctx.set_field(s, 0, Value::Int(port)); // SS_PORT
+        if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+            eprintln!("[NIO_BIND] ssc.bind 1-arg addr='{}'", addr_str);
+        }
+        match ctx.fd_table().open_tcp_listener(&addr_str) {
+            Ok(fd) => {
+                ctx.set_field(this, 1, Value::Int(1));
+                ctx.set_field(this, 2, Value::Int(fd as i32));
+                if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                    eprintln!("[NIO_BIND] ssc.bind ok fd={fd}");
                 }
+                // If a wrapper ServerSocket has been cached, mirror the actual local port
+                // so getLocalPort/getLocalSocketAddress return the OS-chosen port.
+                if let Value::Object(Some(s)) = ctx.get_field(this, 3) {
+                    if let Ok(local) = ctx.fd_table().tcp_local_addr(fd) {
+                        let port = local.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
+                        ctx.set_field(s, 0, Value::Int(port)); // SS_PORT
+                    }
+                }
+                Ok(Some(Value::Object(Some(this))))
+            }
+            Err(e) => {
+                if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                    eprintln!("[NIO_BIND] ssc.bind FAILED addr='{}' err={}", addr_str, e);
+                }
+                Err(RuntimeError::IOException {
+                    message: format!("ServerSocketChannel.bind {}: {}", addr_str, e),
+                }
+                .into())
             }
         }
-        Ok(Some(Value::Object(Some(this))))
+    });
+    // 2-arg variant: `bind(SocketAddress, int backlog)`. NioEndpoint calls
+    // this one with `getAcceptCount()` as backlog. Without an explicit
+    // override the JDK default routes through the 1-arg version, but the
+    // real ServerSocketChannelImpl has a concrete 2-arg method that bypasses
+    // our 1-arg native — so register the same body for both signatures.
+    r.register(ssc, "bind", "(Ljava/net/SocketAddress;I)Ljava/nio/channels/ServerSocketChannel;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let addr_obj = args.get(1).copied().unwrap_or(Value::Object(None));
+        let addr_str = p98_extract_socket_addr(ctx, addr_obj);
+        if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+            let backlog = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+            eprintln!("[NIO_BIND] ssc.bind 2-arg addr='{}' backlog={}", addr_str, backlog);
+        }
+        match ctx.fd_table().open_tcp_listener(&addr_str) {
+            Ok(fd) => {
+                ctx.set_field(this, 1, Value::Int(1));
+                ctx.set_field(this, 2, Value::Int(fd as i32));
+                if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                    eprintln!("[NIO_BIND] ssc.bind 2-arg ok fd={fd}");
+                }
+                if let Value::Object(Some(s)) = ctx.get_field(this, 3) {
+                    if let Ok(local) = ctx.fd_table().tcp_local_addr(fd) {
+                        let port = local.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()).unwrap_or(0);
+                        ctx.set_field(s, 0, Value::Int(port));
+                    }
+                }
+                Ok(Some(Value::Object(Some(this))))
+            }
+            Err(e) => {
+                if std::env::var_os("CRATONVM_DBG_NIO_BIND").is_some() {
+                    eprintln!("[NIO_BIND] ssc.bind 2-arg FAILED addr='{}' err={}", addr_str, e);
+                }
+                Err(RuntimeError::IOException {
+                    message: format!("ServerSocketChannel.bind {}: {}", addr_str, e),
+                }
+                .into())
+            }
+        }
     });
     // ServerSocketChannel.socket() — return a wrapper ServerSocket linked to this channel.
     // Cached on first call. The wrapper's bind/getLocalPort delegate back to the channel.
@@ -10174,18 +10230,69 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     });
 }
 
-/// Extract host:port from a SocketAddress synthetic object
+/// Extract host:port from a SocketAddress synthetic object.
+///
+/// Handles three layouts:
+/// - **CratonVM synthetic 2-field** (legacy probes): field 0 = host string,
+///   field 1 = port int.
+/// - **Real-JDK 25 `InetSocketAddress`**: one `holder` field of type
+///   `InetSocketAddressHolder` with `{hostname, addr, port}`. We follow the
+///   `holder` chain and read `port` + `hostname` by name.
+/// - **Unknown / unresolved**: fall back to `"0.0.0.0:0"` so the listener
+///   binds to the wildcard ephemeral port (matches HotSpot behaviour for a
+///   `null` address). Returning `"127.0.0.1:0"` here was wrong — Tomcat's
+///   server connectors expect to bind on the all-interfaces wildcard, and a
+///   loopback-only listener fails the regression probe later when something
+///   tries to connect from outside.
 fn p98_extract_socket_addr(ctx: &mut dyn NativeContext, addr: Value) -> String {
-    if let Value::Object(Some(a)) = addr {
-        let host = match ctx.get_field(a, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".to_string()),
-            _ => "127.0.0.1".to_string(),
-        };
-        let port = ctx.get_field(a, 1).as_int().unwrap_or(0);
-        format!("{}:{}", host, port)
-    } else {
-        "127.0.0.1:0".to_string()
+    let a = match addr {
+        Value::Object(Some(a)) => a,
+        _ => return "0.0.0.0:0".to_string(),
+    };
+
+    // Real-JDK path first: probe for `holder` field by name. If present, the
+    // host + port live one level deeper via `holder.hostname` /
+    // `holder.addr.hostName` / `holder.port`. This is the layout JDK 25 ships
+    // and Tomcat / Netty / Jetty all hand us.
+    match ctx.get_field_by_name(a, "holder") {
+        Value::Object(Some(h)) => {
+            let port = match ctx.get_field_by_name(h, "port") {
+                Value::Int(p) => p,
+                _ => 0,
+            };
+            // Prefer holder.hostname when set; fall back to holder.addr's
+            // host string. If neither resolves, use the wildcard so the
+            // bind succeeds on all interfaces.
+            let host = match ctx.get_field_by_name(h, "hostname") {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let host = if !host.is_empty() {
+                host
+            } else if let Value::Object(Some(ia)) = ctx.get_field_by_name(h, "addr") {
+                // InetAddress.holder.hostName / InetAddress.holder.address fallback.
+                match ctx.get_field_by_name(ia, "holder") {
+                    Value::Object(Some(iah)) => match ctx.get_field_by_name(iah, "hostName") {
+                        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0.0.0.0".into()),
+                        _ => "0.0.0.0".into(),
+                    },
+                    _ => "0.0.0.0".into(),
+                }
+            } else {
+                "0.0.0.0".into()
+            };
+            return format!("{}:{}", host, port);
+        }
+        _ => {}
     }
+
+    // Synthetic 2-field fallback (the legacy probe layout).
+    let host = match ctx.get_field(a, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0.0.0.0".to_string()),
+        _ => "0.0.0.0".to_string(),
+    };
+    let port = ctx.get_field(a, 1).as_int().unwrap_or(0);
+    format!("{}:{}", host, port)
 }
 
 fn p98_selector_select(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

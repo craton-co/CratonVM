@@ -1365,6 +1365,42 @@ fn s2_bb_write8(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, val: i64) {
 // ---- Socket address helper -------------------------------------------------
 
 fn s2_parse_socket_addr(ctx: &dyn NativeContext, addr: ObjectRef) -> Option<(String, u16)> {
+    // Real-JDK 25 InetSocketAddress lays its host / port behind a `holder`
+    // chain: `InetSocketAddress.holder.{hostname, addr, port}`. The synthetic
+    // 2-field layout (host string at 0, port int at 1) is the legacy probe
+    // shape. Try the real-JDK shape first, then the synthetic.
+    if let Value::Object(Some(h)) = ctx.get_field_by_name(addr, "holder") {
+        let port = match ctx.get_field_by_name(h, "port") {
+            Value::Int(p) => p as u16,
+            _ => 0,
+        };
+        // hostname is set when the address was built via
+        // `InetSocketAddress(String, int)`; otherwise we fall back to the
+        // wildcard so a `bind(null, port)` matches HotSpot's behaviour of
+        // listening on all interfaces.
+        let host = match ctx.get_field_by_name(h, "hostname") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        let host = if !host.is_empty() {
+            host
+        } else if let Value::Object(Some(ia)) = ctx.get_field_by_name(h, "addr") {
+            // InetAddress.holder.hostName fallback for
+            // `InetSocketAddress(InetAddress, int)` callers.
+            match ctx.get_field_by_name(ia, "holder") {
+                Value::Object(Some(iah)) => match ctx.get_field_by_name(iah, "hostName") {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0.0.0.0".into()),
+                    _ => "0.0.0.0".into(),
+                },
+                _ => "0.0.0.0".into(),
+            }
+        } else {
+            "0.0.0.0".into()
+        };
+        return Some((host, port));
+    }
+
+    // Synthetic 2-field fallback.
     let host = match ctx.get_field(addr, 0) {
         Value::Object(Some(h)) => ctx.read_string(h)?,
         _ => return None,
