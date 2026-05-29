@@ -65,6 +65,15 @@ impl DeviceModule {
         args: KernelArgs,
         stream: &Stream,
     ) -> Result<()> {
+        // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary
+        // context to this thread before driving any CUDA handle
+        // (streams, events, the kernel launch). The `unsafe impl
+        // Send + Sync` blocks across the bridge are sound only when the
+        // driving thread has bound the device first; this prelude
+        // enforces it for the launch path. Cheap per-thread TLS check.
+        #[cfg(feature = "cuda")]
+        ctx.inner().bind_to_thread()?;
+
         // ── 1. Snapshot the device-ptr args' last_write slots BEFORE
         //       the launch consumes `args`. We need (a) the prior
         //       events to wait on and (b) the slot handles to write

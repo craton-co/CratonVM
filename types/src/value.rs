@@ -312,6 +312,12 @@ fn cold_decode_degraded_object_ptr(ptr: *mut u8) -> Value {
     // builds we panic via `debug_assert!(false, ...)` so tests catch the
     // underlying bug (writing non-reference bits through a reference
     // accessor) instead of silent degradation.
+    //
+    // HIGH long↔object audit: the debug_assert! below makes this invisible
+    // in release. Feed the shared degradation counter so this
+    // reclassification is countable via
+    // [`crate::compact_value::object_degradation_count`] even in release.
+    crate::compact_value::note_object_degradation();
     if ptr.is_null() {
         debug_assert!(
             false,
@@ -563,6 +569,27 @@ mod tests {
             decode_value(0x1001, VTAG_OBJECT),
             Value::Object(None)
         ));
+    }
+
+    /// HIGH long↔object audit: a `VTAG_OBJECT` slot whose pointer is null or
+    /// unaligned degrades to `Object(None)` and must bump the shared
+    /// degradation counter so the reclassification is countable in release.
+    /// Mirrors the precedent of `decode_value_rejects_null_object` /
+    /// `decode_value_rejects_unaligned_object`, which exercise the same
+    /// release-mode degrade path.
+    #[test]
+    fn decode_value_object_degrade_increments_counter() {
+        use crate::compact_value::{object_degradation_count, reset_object_degradation_count};
+        reset_object_degradation_count();
+        // Null pointer with VTAG_OBJECT → degrade.
+        assert!(matches!(decode_value(0, VTAG_OBJECT), Value::Object(None)));
+        // Unaligned non-null pointer with VTAG_OBJECT → degrade.
+        assert!(matches!(decode_value(0x1001, VTAG_OBJECT), Value::Object(None)));
+        assert!(
+            object_degradation_count() >= 2,
+            "expected at least 2 degradations recorded, got {}",
+            object_degradation_count()
+        );
     }
 
     #[test]

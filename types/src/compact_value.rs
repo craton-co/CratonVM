@@ -193,6 +193,74 @@ fn is_nan_tagged(v: u64) -> bool {
     (v & NANBOX_BITS) == NANBOX_BITS
 }
 
+// ---------------------------------------------------------------------------
+// Silent-degradation observability (HIGH NaN-box long↔object audit)
+// ---------------------------------------------------------------------------
+//
+// Several decode paths "degrade" a slot whose bit pattern *looks* like a
+// SUB_OBJECT reference but cannot be a real one (null payload, unaligned
+// payload, or — via the checked decoders — a payload that fails live-heap
+// validation) back to a primitive `Value::Long`. Historically those
+// degradations were guarded only by `debug_assert!`, so in release builds
+// they were completely invisible: a long whose bits collide with the
+// SUB_OBJECT tag space would silently be reclassified with no trace.
+//
+// To make the danger countable in release without adding a hot logging path,
+// every such degradation bumps this relaxed atomic counter. A `pub fn`
+// accessor lets the GC / diagnostics layer poll it (e.g. to assert the count
+// stays at zero in a fuzz corpus, or to surface "N long↔object collisions
+// degraded" in a crash report). A relaxed increment is a single `lock xadd`
+// with no ordering constraints — negligible on the cold degrade path and
+// never touched on the hot well-formed-reference path.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Process-wide count of NaN-box `SUB_OBJECT` slots that were degraded to a
+/// primitive `Value::Long` because their payload could not be a real heap
+/// reference (null, unaligned, or — for the `*_checked` decoders — not a live
+/// heap object). See [`object_degradation_count`].
+static OBJECT_DEGRADATION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Read the running count of degraded `SUB_OBJECT` slots.
+///
+/// This counter is incremented (relaxed) every time a decode path
+/// ([`CompactValue::to_value`], [`CompactValue::to_value_checked`],
+/// [`CompactValue::is_object_checked`], and the SoA [`crate::decode_value`])
+/// reclassifies a slot that carries the `SUB_OBJECT` NaN-box pattern but
+/// whose payload cannot be a live heap reference. In a correct run on
+/// verifier-checked bytecode this should stay at — or very near — zero; a
+/// non-zero value indicates long↔object bit-pattern collisions are reaching
+/// context-free decoders and is a useful signal for fuzzing and crash
+/// diagnostics.
+///
+/// Uses `Relaxed` ordering: the value is advisory and carries no
+/// happens-before relationship with the slot it counts.
+#[inline]
+pub fn object_degradation_count() -> u64 {
+    OBJECT_DEGRADATION_COUNT.load(Ordering::Relaxed)
+}
+
+/// Reset the degradation counter to zero, returning the previous value.
+///
+/// Intended for test harnesses and fuzzers that want to measure degradations
+/// over a bounded window. Not used on any hot path.
+#[inline]
+pub fn reset_object_degradation_count() -> u64 {
+    OBJECT_DEGRADATION_COUNT.swap(0, Ordering::Relaxed)
+}
+
+/// Record one degraded `SUB_OBJECT` slot. Cold: only reached when a slot that
+/// looks like an object reference is reclassified as a primitive long.
+///
+/// `pub(crate)` so the SoA decode path in `value.rs` (which performs the
+/// equivalent null/unaligned degrade for a `VTAG_OBJECT` slot) feeds the same
+/// process-wide counter exposed by [`object_degradation_count`].
+#[cold]
+#[inline]
+pub(crate) fn note_object_degradation() {
+    OBJECT_DEGRADATION_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Round-8 branch-hint: the SUB_OBJECT degraded path (null or unaligned
 /// pointer arising from a stale slot) is no longer reached by
 /// `to_value()` — it now treats unaligned/null SUB_OBJECT slots as
@@ -616,7 +684,7 @@ impl CompactValue {
 
     // -- Conversion to Value ------------------------------------------------
 
-    /// Convert back to the full `Value` enum.
+    /// Convert back to the full `Value` enum (UNCHECKED — see contract below).
     ///
     /// **Long vs Double ambiguity:** untagged values are decoded as `Double`.
     /// To decode as `Long`, use [`to_value_as_long`](Self::to_value_as_long).
@@ -625,6 +693,47 @@ impl CompactValue {
     /// pointer (not a full `ObjectRef`), conversion back to
     /// `Value::Object(Some(_))` requires reconstructing the `ObjectRef` via
     /// unsafe `from_raw`.
+    ///
+    /// # Safety / heap-validation contract (HIGH: NaN-box long↔object confusion)
+    ///
+    /// `CompactValue::long` stores i64 bits **verbatim** (see its docs). A
+    /// primitive long whose top bits coincide with `NANBOX_BITS`, whose
+    /// sub-tag field equals `SUB_OBJECT`, and whose 47-bit payload is
+    /// **non-zero and 8-byte aligned** is *indistinguishable from a real heap
+    /// reference at the bit level*. For such a slot this method returns
+    /// `Value::Object(Some(ObjectRef::from_raw(payload)))` — i.e. it will
+    /// fabricate a heap pointer out of a primitive long. Attacker-controlled
+    /// bytecode (`lxor`/`ladd` producing a chosen 64-bit pattern, then
+    /// `lstore` into a slot a context-free consumer reads) can drive this.
+    ///
+    /// `to_value` therefore makes **no guarantee** that an
+    /// `Value::Object(Some(_))` it returns points at a live heap object. The
+    /// only context-free safety net it applies is the "aligned & non-null"
+    /// filter (an unaligned or null `SUB_OBJECT` payload is treated as a long
+    /// collision and returned as `Value::Long`, bumping
+    /// [`object_degradation_count`]). That filter is necessary but **not
+    /// sufficient**: a long whose low 47 bits happen to form an aligned,
+    /// non-null address still decodes as an object here.
+    ///
+    /// Callers reading a slot that *may* hold a primitive long (operand-stack
+    /// slots, locals, GC roots — anything not provably a reference by JVM
+    /// type context) **MUST** do one of the following instead of trusting the
+    /// `SUB_OBJECT` result of `to_value`:
+    ///
+    /// * route the decode through [`decode_by_descriptor`](Self::decode_by_descriptor)
+    ///   when the declared JVM type is known — this is the type-safe path and
+    ///   never fabricates a reference from a primitive; or
+    /// * use [`to_value_checked`](Self::to_value_checked) (or
+    ///   [`is_object_checked`](Self::is_object_checked)) with a closure that
+    ///   validates the payload against the **live heap** (e.g.
+    ///   `VmHeap::is_object_address`), so a fabricated pointer degrades to
+    ///   `Value::Long` rather than being dereferenced or over-rooted.
+    ///
+    /// `to_value` is kept unchecked for backwards compatibility and for hot
+    /// paths where the caller has *already* established by type context that
+    /// the slot is a reference. Do not introduce new context-free
+    /// `to_value()`/`is_object()` reference consumers without one of the
+    /// guards above.
     #[inline(always)]
     pub fn to_value(&self) -> Value {
         if !is_nan_tagged(self.0) {
@@ -647,6 +756,10 @@ impl CompactValue {
                 // like real heap references.
                 let ptr = payload as *mut u8;
                 if ptr.is_null() || (ptr as usize) % 8 != 0 {
+                    // Provably-not-a-reference SUB_OBJECT slot: count the
+                    // degradation so the silent reclassification is visible in
+                    // release builds (HIGH long↔object audit).
+                    note_object_degradation();
                     Value::Long(self.0 as i64)
                 } else {
                     Value::Object(Some(unsafe { ObjectRef::from_raw(ptr) }))
@@ -686,13 +799,114 @@ impl CompactValue {
         }
     }
 
-    /// Returns `true` if this slot carries an object reference (non-null).
+    /// Returns `true` if this slot carries the `SUB_OBJECT` NaN-box pattern
+    /// (UNCHECKED — see contract below).
     ///
     /// Used by the GC scanner to find root set entries without decoding the
     /// full `Value` enum.
+    ///
+    /// # Safety / heap-validation contract (HIGH: NaN-box long↔object confusion)
+    ///
+    /// This is a **pure bit-pattern test**: it returns `true` for any slot
+    /// whose NaN-box sub-tag is `SUB_OBJECT`, regardless of whether the
+    /// payload is a live heap address. Because [`long`](Self::long) stores
+    /// i64 bits verbatim, a primitive long whose bits land in the
+    /// `SUB_OBJECT` space (e.g. an `lxor`/`ladd` result) reports
+    /// `is_object() == true` here. A consumer that then treats the payload as
+    /// a pointer (dereference, or adding it to the GC root set) is acting on a
+    /// fabricated reference.
+    ///
+    /// GC root scanners and any other context-free consumer **MUST** validate
+    /// the payload against the live heap before treating this slot as a
+    /// reference. Prefer [`is_object_checked`](Self::is_object_checked), which
+    /// folds the heap-validation closure in and returns `false` (counting the
+    /// degradation via [`object_degradation_count`]) for a non-live payload.
+    /// `is_object` is kept for callers that perform the heap check separately
+    /// (e.g. CratonVM's root scanners filter every `is_object()` slot through
+    /// `VmHeap::is_object_address`).
     #[inline(always)]
     pub fn is_object(&self) -> bool {
         is_nan_tagged(self.0) && (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK == SUB_OBJECT
+    }
+
+    /// Heap-validated counterpart to [`is_object`](Self::is_object).
+    ///
+    /// Returns `true` only when this slot carries the `SUB_OBJECT` pattern
+    /// **and** the closure `is_heap_object` confirms the payload is a live
+    /// heap address. For a `SUB_OBJECT` slot whose payload is *not* a live
+    /// heap object — i.e. a primitive long whose bits collided into the
+    /// object sub-tag — this returns `false` and bumps
+    /// [`object_degradation_count`] so the reclassification is observable.
+    ///
+    /// `is_heap_object` receives the **47-bit payload** (the candidate
+    /// pointer), exactly as it would be handed to `ObjectRef::from_raw`. It
+    /// should return `true` iff that address is a currently-live heap object
+    /// (e.g. `VmHeap::is_object_address`). This is the single correct check
+    /// callers should use instead of pairing a raw `is_object()` with an
+    /// open-coded heap lookup.
+    #[inline]
+    pub fn is_object_checked(&self, is_heap_object: impl Fn(u64) -> bool) -> bool {
+        if !self.is_object() {
+            return false;
+        }
+        let payload = self.0 & PAYLOAD_MASK;
+        if is_heap_object(payload) {
+            true
+        } else {
+            note_object_degradation();
+            false
+        }
+    }
+
+    /// Heap-validated counterpart to [`to_value`](Self::to_value).
+    ///
+    /// Behaves exactly like [`to_value`](Self::to_value) for every tag except
+    /// `SUB_OBJECT`. For a `SUB_OBJECT` slot that passes the context-free
+    /// "aligned & non-null" filter, it additionally calls `is_heap_object`
+    /// with the candidate pointer (the 47-bit payload). When that returns:
+    ///
+    /// * `true` — the payload is a live heap object, so this returns
+    ///   `Value::Object(Some(ObjectRef::from_raw(payload)))` exactly as
+    ///   `to_value` would; otherwise
+    /// * `false` — the slot is a primitive long whose bits merely *look* like
+    ///   a reference, so it degrades to `Value::Long(bits)` (bit-exact) and
+    ///   bumps [`object_degradation_count`].
+    ///
+    /// This gives callers a single, correct primitive: instead of taking the
+    /// unchecked `to_value()` result and re-validating the pointer themselves
+    /// (and risking that the slot was already dereferenced), they get the
+    /// heap-validated `Value` directly. Use this — or
+    /// [`decode_by_descriptor`](Self::decode_by_descriptor) when the declared
+    /// JVM type is known — for any slot that may hold a primitive long.
+    ///
+    /// `is_heap_object` should be a cheap, side-effect-free predicate such as
+    /// `VmHeap::is_object_address`.
+    #[inline]
+    pub fn to_value_checked(&self, is_heap_object: impl Fn(u64) -> bool) -> Value {
+        if !is_nan_tagged(self.0) {
+            return Value::Double(f64::from_bits(self.0));
+        }
+        if (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK != SUB_OBJECT {
+            // Non-object tags are unambiguous (or already long-collision
+            // aware inside `to_value`); reuse the existing decode.
+            return self.to_value();
+        }
+        // SUB_OBJECT: apply the context-free filter, then the heap check.
+        let payload = self.0 & PAYLOAD_MASK;
+        let ptr = payload as *mut u8;
+        if ptr.is_null() || (ptr as usize) % 8 != 0 {
+            note_object_degradation();
+            return Value::Long(self.0 as i64);
+        }
+        if is_heap_object(payload) {
+            Value::Object(Some(unsafe { ObjectRef::from_raw(ptr) }))
+        } else {
+            // Aligned, non-null, but not a live heap object: a long whose
+            // bits collided into the object sub-tag. Degrade to the bit-exact
+            // long and record the reclassification.
+            note_object_degradation();
+            Value::Long(self.0 as i64)
+        }
     }
 
     /// Replace the object-pointer payload if this slot holds an Object
@@ -2175,5 +2389,112 @@ mod tests {
         // yield null so native code doesn't see a bogus pointer.
         let cv = CompactValue::int(99);
         assert!(matches!(cv.decode_by_descriptor(b'L'), Value::Object(None)));
+    }
+
+    // ── HIGH: NaN-box long↔object type-confusion — checked decoders ──────
+
+    // The degradation counter is a process-wide static; serialize the tests
+    // that read/reset it so parallel `cargo test` runs don't interleave.
+    static DEGRADE_COUNTER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A primitive long whose bits land in the `SUB_OBJECT` space with an
+    /// aligned, non-null payload is decoded as a *fabricated* object by the
+    /// unchecked `to_value`. `to_value_checked` with a heap predicate that
+    /// rejects the address degrades it back to the bit-exact long and counts
+    /// the degradation. This is the core of the HIGH finding.
+    #[test]
+    fn to_value_checked_degrades_fabricated_pointer_to_long() {
+        let _guard = DEGRADE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Aligned (multiple of 8), non-null payload inside a SUB_OBJECT slot.
+        let aligned = 0x1234_5678_ABC0u64; // % 8 == 0, non-zero
+        let raw = make_tagged(SUB_OBJECT, aligned);
+        let cv = CompactValue::from_bits(raw);
+
+        // Unchecked path fabricates an object reference (the danger).
+        match cv.to_value() {
+            Value::Object(Some(o)) => assert_eq!(o.as_ptr() as u64, aligned),
+            other => panic!("unchecked to_value should fabricate object, got {other:?}"),
+        }
+
+        // Checked path with a heap that says "not a live object" degrades to
+        // the bit-exact long and records the reclassification.
+        reset_object_degradation_count();
+        match cv.to_value_checked(|_addr| false) {
+            Value::Long(x) => assert_eq!(x as u64, raw),
+            other => panic!("checked to_value should degrade to Long, got {other:?}"),
+        }
+        assert_eq!(object_degradation_count(), 1);
+    }
+
+    /// When the heap predicate confirms the address is live, the checked
+    /// decoder returns the same object reference as `to_value` and does NOT
+    /// count a degradation.
+    #[test]
+    fn to_value_checked_keeps_live_object() {
+        let _guard = DEGRADE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let aligned = 0x1234_5678_ABC0u64;
+        let cv = CompactValue::object(aligned);
+        reset_object_degradation_count();
+        match cv.to_value_checked(|addr| addr == aligned) {
+            Value::Object(Some(o)) => assert_eq!(o.as_ptr() as u64, aligned),
+            other => panic!("expected live Object, got {other:?}"),
+        }
+        assert_eq!(object_degradation_count(), 0);
+    }
+
+    /// `to_value_checked` is identical to `to_value` for every non-object
+    /// tag (and never invokes the heap closure for them).
+    #[test]
+    fn to_value_checked_matches_to_value_for_non_objects() {
+        let samples = [
+            CompactValue::int(-42),
+            CompactValue::float(1.5),
+            CompactValue::double(std::f64::consts::PI),
+            CompactValue::null(),
+            CompactValue::uninitialized(),
+            CompactValue::return_address(7),
+            CompactValue::long(5),       // untagged → Double
+            CompactValue::long(-1),      // SUB_LONG_HI collision
+            CompactValue::long(i64::MIN),
+        ];
+        for cv in samples {
+            // Closure must never be consulted for non-object slots.
+            let checked = cv.to_value_checked(|_| panic!("heap closure called for non-object"));
+            assert_eq!(checked, cv.to_value(), "mismatch for {cv:?}");
+        }
+    }
+
+    /// `is_object_checked` returns true only when the payload is live and
+    /// counts a degradation when a SUB_OBJECT slot fails heap validation.
+    #[test]
+    fn is_object_checked_validates_against_heap() {
+        let _guard = DEGRADE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let aligned = 0x4000u64;
+        let real = CompactValue::object(aligned);
+        assert!(real.is_object()); // unchecked pattern test
+        assert!(real.is_object_checked(|addr| addr == aligned));
+
+        reset_object_degradation_count();
+        // Same bit pattern, but the heap denies it → false + degradation.
+        assert!(!real.is_object_checked(|_| false));
+        assert_eq!(object_degradation_count(), 1);
+
+        // Non-object slots short-circuit without consulting the heap.
+        assert!(!CompactValue::int(1).is_object_checked(|_| panic!("called")));
+        assert!(!CompactValue::long(-1).is_object_checked(|_| panic!("called")));
+    }
+
+    /// The unchecked `to_value` SUB_OBJECT degrade (null / unaligned payload)
+    /// bumps the observability counter so release-mode reclassifications are
+    /// countable rather than invisible.
+    #[test]
+    fn to_value_unchecked_degrade_increments_counter() {
+        let _guard = DEGRADE_COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_object_degradation_count();
+        // Null payload SUB_OBJECT → Long, counted.
+        let _ = CompactValue::from_bits(make_tagged(SUB_OBJECT, 0)).to_value();
+        // Unaligned payload SUB_OBJECT → Long, counted.
+        let _ = CompactValue::from_bits(make_tagged(SUB_OBJECT, 0x1001)).to_value();
+        assert_eq!(object_degradation_count(), 2);
     }
 }

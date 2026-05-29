@@ -14250,6 +14250,12 @@ pub(crate) fn unsafe_array_write_bytes(
     true
 }
 
+/// Upper bound on a single `Unsafe.copyMemory` / `Unsafe.setMemory` request.
+/// Attacker-controlled `bytes` would otherwise drive an unbounded per-slot
+/// loop (`ctx.set_field`) for non-byte-exact targets. Mirrors the 256 MiB cap
+/// that `panama.rs` applies to `MemorySegment` copy/fill (finding M3).
+const MAX_UNSAFE_COPY_SIZE: usize = 256 * 1024 * 1024; // 256 MiB
+
 pub(crate) fn native_unsafe_copy_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args: [unsafe, srcObj, srcOffset, destObj, destOffset, bytes]
     let src_obj = unsafe_obj(args, 1);
@@ -14264,6 +14270,15 @@ pub(crate) fn native_unsafe_copy_memory(ctx: &mut dyn NativeContext, args: &[Val
     if bytes == 0 {
         return Ok(None);
     }
+    if bytes > MAX_UNSAFE_COPY_SIZE {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: format!(
+                "Unsafe.copyMemory size {} exceeds maximum of {} bytes",
+                bytes, MAX_UNSAFE_COPY_SIZE
+            ),
+        }
+        .into());
+    }
     if let (Some(src), Some(dst)) = (src_obj, dest_obj) {
         // Primitive-array → primitive-array: `copyMemory` is a raw byte copy
         // (the JDK's NIO buffer-view classes — ByteBufferAsCharBuffer,
@@ -14275,16 +14290,28 @@ pub(crate) fn native_unsafe_copy_memory(ctx: &mut dyn NativeContext, args: &[Val
             && ctx.heap_element_type_of(src) != cratonvm_types::ArrayElementType::Reference;
         let dst_is_array = ctx.heap_kind_of(dst) == cratonvm_types::ObjectKind::Array
             && ctx.heap_element_type_of(dst) != cratonvm_types::ArrayElementType::Reference;
-        if src_is_array && dst_is_array {
-            if let Some(buf) = unsafe_array_read_bytes(ctx, src, src_offset, bytes) {
-                if unsafe_array_write_bytes(ctx, dst, dest_offset, &buf) {
-                    return Ok(None);
+        if src_is_array || dst_is_array {
+            // At least one side is a primitive array: the only correct copy is
+            // the byte-exact array path, which is bounds-checked. If it cannot
+            // complete (out-of-bounds, or one side is not an array) we must NOT
+            // fall through to the unbounded slot loop — that would let an
+            // attacker-controlled `bytes`/offset drive `set_field` past the
+            // array's storage (finding M3). Throw IndexOutOfBoundsException
+            // (HotSpot's `Unsafe.copyMemory` behaviour on a bad range).
+            if src_is_array && dst_is_array {
+                if let Some(buf) = unsafe_array_read_bytes(ctx, src, src_offset, bytes) {
+                    if unsafe_array_write_bytes(ctx, dst, dest_offset, &buf) {
+                        return Ok(None);
+                    }
                 }
             }
-            // Fall through to the legacy element-copy if the byte-exact
-            // path could not run (shouldn't happen for in-bounds calls).
+            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: dest_offset as i32,
+            }
+            .into());
         }
-        // Legacy slot-by-slot copy for object-field / non-array targets.
+        // Legacy slot-by-slot copy for object-field (non-array) targets only.
+        // `bytes` is capped above by MAX_UNSAFE_COPY_SIZE.
         for i in 0..bytes {
             let val = ctx.get_field(src, src_offset + i);
             ctx.set_field(dst, dest_offset + i, val);
@@ -14313,8 +14340,25 @@ fn native_unsafe_set_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Int(v)) => *v as u8,
         _ => 0,
     };
+    if bytes == 0 {
+        return Ok(None);
+    }
+    if bytes > MAX_UNSAFE_COPY_SIZE {
+        return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: format!(
+                "Unsafe.setMemory size {} exceeds maximum of {} bytes",
+                bytes, MAX_UNSAFE_COPY_SIZE
+            ),
+        }
+        .into());
+    }
     if let Some(obj_ref) = obj {
-        // Primitive-array target: fill `bytes` raw bytes with `value`.
+        // Primitive-array target: fill `bytes` raw bytes with `value`. This is
+        // the only correct path for an array and it is bounds-checked. If it
+        // cannot complete (out-of-bounds) we must NOT fall through to the
+        // unbounded slot loop — doing so would let attacker-controlled
+        // `bytes`/`offset` drive `set_field` past the array storage, and for
+        // non-array objects the loop ran unconditionally (finding M3).
         if ctx.heap_kind_of(obj_ref) == cratonvm_types::ObjectKind::Array
             && ctx.heap_element_type_of(obj_ref) != cratonvm_types::ArrayElementType::Reference
         {
@@ -14322,7 +14366,13 @@ fn native_unsafe_set_memory(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             if unsafe_array_write_bytes(ctx, obj_ref, offset, &fill) {
                 return Ok(None);
             }
+            return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
+                index: offset as i32,
+            }
+            .into());
         }
+        // Object-field (non-array) target: bounded slot fill. `bytes` is capped
+        // above by MAX_UNSAFE_COPY_SIZE.
         let fill_value = Value::Int(value as i32);
         for i in 0..bytes {
             ctx.set_field(obj_ref, offset + i, fill_value);
@@ -36256,6 +36306,51 @@ mod concurrency_tests {
         assert_eq!(ctx.get_field(obj, 1), Value::Int(0x42));
         assert_eq!(ctx.get_field(obj, 2), Value::Int(0x42));
         assert_eq!(ctx.get_field(obj, 3), Value::Int(0x42));
+    }
+
+    // M3: oversized requests are rejected before any heap access, and array
+    // targets that fail the bounds-checked path no longer fall through to the
+    // unbounded slot loop.
+
+    #[test]
+    fn unsafe_set_memory_rejects_oversized_request() {
+        let mut ctx = make_ctx();
+        let obj = ctx.alloc_object(ClassId::new(0), 5);
+        let huge = (MAX_UNSAFE_COPY_SIZE + 1) as i64;
+        let res = native_unsafe_set_memory(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(obj)),
+                Value::Long(0),
+                Value::Long(huge),
+                Value::Int(0x42),
+            ],
+        );
+        assert!(res.is_err(), "oversized setMemory must be rejected");
+        // Nothing was written despite the huge byte count.
+        assert_eq!(ctx.get_field(obj, 0), Value::Int(0));
+    }
+
+    #[test]
+    fn unsafe_copy_memory_rejects_oversized_request() {
+        let mut ctx = make_ctx();
+        let src = ctx.alloc_object(ClassId::new(0), 4);
+        let dst = ctx.alloc_object(ClassId::new(0), 4);
+        let huge = (MAX_UNSAFE_COPY_SIZE + 1) as i64;
+        let res = native_unsafe_copy_memory(
+            &mut ctx,
+            &[
+                Value::Object(None),
+                Value::Object(Some(src)),
+                Value::Long(0),
+                Value::Object(Some(dst)),
+                Value::Long(0),
+                Value::Long(huge),
+            ],
+        );
+        assert!(res.is_err());
+        assert_eq!(ctx.get_field(dst, 0), Value::Int(0));
     }
 
     // ===================================================================

@@ -44,7 +44,7 @@ use crate::module::{
     ModuleRegistry,
 };
 use crate::vtype::ClassHierarchy;
-use cratonvm_types::error::{ClassFileError, LinkageError, VmError};
+use cratonvm_types::error::{ClassFileError, LinkageError, RuntimeError, VmError};
 
 /// Default soft cap for [`ClassManager::class_bytes_cache`]. 16 MiB.
 ///
@@ -110,6 +110,36 @@ fn loaded_classes_probe(
             *k_loader == loader_id && k_name.as_ref() == name
         })
         .map(|(_, &id)| id)
+}
+
+/// H5 (HIGH): return `true` if `internal_name` (a `/`-separated internal
+/// class name) lives in a runtime package that only the bootstrap loader
+/// is permitted to define classes into.
+///
+/// These are the JDK's protected namespaces: a non-bootstrap class loader
+/// that defines a class here is attempting to masquerade as platform code
+/// (privileged-package spoofing). HotSpot enforces the same set via
+/// `ClassLoader.checkName` / `SystemDictionary::resolve_class_from_stream`
+/// ("Prohibited package name: java.*") plus the package-access checks for
+/// `sun.*` and `jdk.internal.*`.
+///
+/// Matching is on package *boundaries* (`prefix` exactly, or `prefix/...`)
+/// so a benign top-level class such as `javax/Foo` or a user package like
+/// `javaland/Foo` is not falsely rejected.
+fn is_prohibited_package_name(internal_name: &str) -> bool {
+    const PROHIBITED_PREFIXES: [&str; 3] = ["java", "jdk/internal", "sun"];
+    for prefix in PROHIBITED_PREFIXES {
+        if let Some(rest) = internal_name.strip_prefix(prefix) {
+            // Exact prefix as a full package segment must be followed by a
+            // `/` (i.e. there is at least a class name after the package).
+            // `internal_name == prefix` (no `/`) is a default-package class
+            // literally *named* "java"/"sun" — not in the package, so allow.
+            if rest.starts_with('/') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Adapter implementing [`ClassHierarchy`] over the `ClassManager`'s
@@ -2142,6 +2172,47 @@ impl ClassManager {
                     name, name, class_file.this_class
                 ),
             }));
+        }
+
+        // H5 (HIGH): privileged-package spoofing guard.
+        //
+        // A user-defined class loader must not be allowed to define a
+        // class in a protected runtime package such as `java.*`. If it
+        // could, the spoofed class would share its package *name* with
+        // the genuine platform classes and (combined with same-loader
+        // runtime-package identity, were that ever relaxed) could gain
+        // access to package-private platform members; more concretely,
+        // it lets untrusted code masquerade as core-library code. This
+        // mirrors HotSpot's `ClassLoader.preDefineClass` /
+        // `SystemDictionary` check, which throws
+        // `SecurityException: Prohibited package name: java.*` for any
+        // non-bootstrap loader defining a `java/` class.
+        //
+        // Exemptions:
+        //   * The bootstrap loader (`ClassLoaderId::Bootstrap`) is the
+        //     legitimate definer of all `java/`, `jdk/internal/`, and
+        //     `sun/` classes.
+        //   * Hidden classes / `override_name` defines are JDK-internal,
+        //     trusted code-generation paths (`Lookup.defineHiddenClass`)
+        //     that deliberately register under a mangled name and are
+        //     gated by the trusted lookup that produced them; the real
+        //     JVM permits them to live in restricted packages.
+        if loader_id != ClassLoaderId::Bootstrap
+            && !options.hidden
+            && options.override_name.is_none()
+        {
+            let defined_name: &str = &class_file.this_class;
+            if is_prohibited_package_name(defined_name) {
+                return Err(VmError::Runtime(RuntimeError::SecurityException {
+                    message: format!(
+                        "Prohibited package name: {} \
+                         (non-bootstrap loader {} cannot define a class in a \
+                         protected platform package)",
+                        defined_name.replace('/', "."),
+                        loader_id
+                    ),
+                }));
+            }
         }
 
         // WP2.3: Duplicate-define rejection. Check before we mutate
@@ -7075,6 +7146,29 @@ mod tests {
             descriptor: cratonvm_types::intern_arc("I"),
             attributes: vec![],
         }
+    }
+
+    // --- H5: prohibited package-name guard ---
+
+    #[test]
+    fn prohibited_package_rejects_java_packages() {
+        assert!(is_prohibited_package_name("java/lang/Evil"));
+        assert!(is_prohibited_package_name("java/util/Spoof"));
+        assert!(is_prohibited_package_name("jdk/internal/misc/Unsafe"));
+        assert!(is_prohibited_package_name("sun/misc/Hack"));
+    }
+
+    #[test]
+    fn prohibited_package_allows_benign_names() {
+        // Lookalike top-level/package names must NOT be rejected.
+        assert!(!is_prohibited_package_name("javax/swing/JFrame"));
+        assert!(!is_prohibited_package_name("javaland/Foo"));
+        assert!(!is_prohibited_package_name("sundae/IceCream"));
+        assert!(!is_prohibited_package_name("jdk/jfr/Event")); // not jdk/internal
+        assert!(!is_prohibited_package_name("com/example/App"));
+        // Default-package classes literally named after a prefix are fine.
+        assert!(!is_prohibited_package_name("java"));
+        assert!(!is_prohibited_package_name("sun"));
     }
 
     #[test]

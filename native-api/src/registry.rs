@@ -310,11 +310,42 @@ pub trait NativeContext {
     fn get_stack_trace(&self, throwable_hash: i32) -> Option<&[StackTraceEntry]>;
 
     // -- Heap access methods (for native method implementations) --
+    //
+    // # Security contract (M4a — unvalidated slot indices)
+    //
+    // Every accessor in this section (and the volatile / CAS / static
+    // variants further down) takes a bare `usize` slot `index` with no type
+    // carried bound and returns an infallible `Value`. The `index` is NOT
+    // validated by the trait: it is the *caller's* obligation to pass a slot
+    // that is in range for `obj`'s class layout (for fields) or for the
+    // array's length (for elements). Callers typically derive the index from
+    // trusted reflection metadata (`FieldMetadata::slot_index`,
+    // `resolve_field_index`, `array_length`) and must NOT pass an index
+    // sourced from untrusted Java/native input without first bounds-checking
+    // it against `array_length` / the resolved field count.
+    //
+    // Implementations are the enforcement point: an implementation MUST
+    // bounds-check `index` and MUST NOT read or write memory outside the
+    // object's field block / the array's element range. On an out-of-range
+    // index an implementation must fail safe (e.g. return
+    // `Value::Object(None)` / a default for reads, no-op for writes, or
+    // raise a VM error) — it must NEVER perform an out-of-bounds heap access.
+    // The production `NativeContextImpl` in the `vm` crate performs this
+    // validation; mock/test impls that elide it must only ever be fed
+    // trusted indices.
 
     /// Read an object field by slot index.
+    ///
+    /// `index` is an absolute heap field slot (see [`FieldMetadata::slot_index`]).
+    /// The caller must ensure it is in range for `obj`'s class; the
+    /// implementation MUST bounds-check and MUST NOT read out of range (M4a).
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value;
 
     /// Write an object field by slot index.
+    ///
+    /// `index` is an absolute heap field slot (see [`FieldMetadata::slot_index`]).
+    /// The caller must ensure it is in range for `obj`'s class; the
+    /// implementation MUST bounds-check and MUST NOT write out of range (M4a).
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value);
 
     /// Read an object field by name. Resolves the field name to a slot index
@@ -344,9 +375,21 @@ pub trait NativeContext {
     fn array_length(&self, obj: ObjectRef) -> usize;
 
     /// Read an array element by index.
+    ///
+    /// `index` must be in `0..array_length(obj)`. The trait does NOT validate
+    /// it (M4a): the caller is responsible for range-checking against
+    /// [`array_length`](Self::array_length), and the implementation MUST
+    /// bounds-check and MUST NOT read out of range (fail safe — e.g. default
+    /// value or VM error — never an out-of-bounds heap read).
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value;
 
     /// Write an array element by index.
+    ///
+    /// `index` must be in `0..array_length(obj)`. The trait does NOT validate
+    /// it (M4a): the caller is responsible for range-checking against
+    /// [`array_length`](Self::array_length), and the implementation MUST
+    /// bounds-check and MUST NOT write out of range (fail safe — no-op or VM
+    /// error — never an out-of-bounds heap write).
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value);
 
     // -- Bulk primitive-array intrinsics (perf path) -----------------------
@@ -965,9 +1008,19 @@ pub trait NativeContext {
     fn class_access_flags(&self, class_id: ClassId) -> u16;
 
     /// Read a static field value by class and field index.
+    ///
+    /// `field_index` must be in range for `class_id`'s static field block
+    /// (typically resolved via [`static_field_index_by_name`](Self::static_field_index_by_name)).
+    /// The trait does NOT validate it (M4a): the implementation MUST
+    /// bounds-check and MUST NOT read out of range — fail safe on a bad index.
     fn get_static_field(&self, class_id: ClassId, field_index: usize) -> Value;
 
     /// Write a static field value by class and field index.
+    ///
+    /// `field_index` must be in range for `class_id`'s static field block
+    /// (typically resolved via [`static_field_index_by_name`](Self::static_field_index_by_name)).
+    /// The trait does NOT validate it (M4a): the implementation MUST
+    /// bounds-check and MUST NOT write out of range — fail safe on a bad index.
     fn set_static_field(&mut self, class_id: ClassId, field_index: usize, value: Value);
 
     /// Write a static field by class name and field name.
@@ -1027,15 +1080,34 @@ pub trait NativeContext {
     // -- Volatile field access (for sun.misc.Unsafe / Atomics) --
 
     /// Read an object field with volatile (sequentially consistent) semantics.
+    ///
+    /// Same slot-index contract as [`get_field`](Self::get_field): `index`
+    /// must be in range for `obj`'s class, the trait does NOT validate it
+    /// (M4a), and the implementation MUST bounds-check and MUST NOT read out
+    /// of range. Note `Unsafe` callers may pass an index derived from a
+    /// Java-supplied field *offset* — implementations must treat such input as
+    /// untrusted and validate it.
     fn get_field_volatile(&self, obj: ObjectRef, index: usize) -> Value;
 
     /// Write an object field with volatile (sequentially consistent) semantics.
+    ///
+    /// Same slot-index contract as [`set_field`](Self::set_field): `index`
+    /// must be in range for `obj`'s class, the trait does NOT validate it
+    /// (M4a), and the implementation MUST bounds-check and MUST NOT write out
+    /// of range. `Unsafe`-sourced offsets are untrusted and must be validated
+    /// by the implementation.
     fn set_field_volatile(&self, obj: ObjectRef, index: usize, value: Value);
 
     // -- Compare-and-swap --
 
     /// Compare-and-swap on an object field. Returns true if field contained
     /// `expected` and was updated to `new_val`.
+    ///
+    /// Same slot-index contract as [`set_field`](Self::set_field): `index`
+    /// must be in range for `obj`'s class, the trait does NOT validate it
+    /// (M4a), and the implementation MUST bounds-check and MUST NOT
+    /// read/write out of range. On an out-of-range index the implementation
+    /// must fail safe (return `false`), never touch out-of-bounds memory.
     fn compare_and_swap_field(
         &mut self,
         obj: ObjectRef,
@@ -1324,9 +1396,31 @@ pub trait NativeContext {
     // -- Panama FFI (JEP 454, Java 25) --
 
     /// Allocate off-heap memory. Returns (alloc_id, raw_pointer) or None on failure.
+    ///
+    /// # Security (M4b — raw pointer use-after-free)
+    ///
+    /// The returned `*mut u8` is a *bare base pointer* with no length and no
+    /// lifetime tie to `alloc_id`: a subsequent
+    /// [`free_native_memory`](Self::free_native_memory) of the same id frees
+    /// the block, leaving any retained copy of this pointer **dangling**.
+    /// Callers MUST NOT retain the bare pointer across any operation that
+    /// could free the allocation, and MUST bounds-check their own offset/len
+    /// before dereferencing. For validated access, resolve through the
+    /// implementation's [`NativeMemoryTable`](crate::ffi::NativeMemoryTable)
+    /// (`get_ptr_checked` / generation-tagged `get_ptr_checked_handle`) rather
+    /// than caching this pointer.
     fn allocate_native_memory(&mut self, size: usize, align: usize) -> Option<(i64, *mut u8)>;
 
     /// Free off-heap memory by allocation ID.
+    ///
+    /// # Security (M4b)
+    ///
+    /// After this call any `*mut u8` previously obtained for `alloc_id` via
+    /// [`allocate_native_memory`](Self::allocate_native_memory) is dangling;
+    /// dereferencing it is undefined behaviour. The backing
+    /// [`NativeMemoryTable`](crate::ffi::NativeMemoryTable) advances its
+    /// generation on free so a recycled id cannot be confused with this
+    /// freed allocation by a stale handle.
     fn free_native_memory(&mut self, alloc_id: i64);
 
     /// Load a native library. Returns library index or error.
@@ -1337,9 +1431,30 @@ pub trait NativeContext {
     fn find_native_symbol(&self, lib_index: i64, name: &str) -> Option<usize>;
 
     /// Register an upcall entry (Java callback for C). Returns the slot index.
+    ///
+    /// # Security (M4c — confused deputy via slot reuse)
+    ///
+    /// The returned bare slot index does NOT distinguish between successive
+    /// occupants of a reused slot: after the registration is dropped and the
+    /// slot re-registered, the same index resolves to a *different* Java
+    /// object. The backing
+    /// [`UpcallTable`](crate::ffi::UpcallTable) generation-tags every
+    /// registration; implementations that hand a trampoline index to native
+    /// code SHOULD carry the generation (see
+    /// `UpcallTable::register_handle` / `get_checked`) so a stale trampoline
+    /// fails closed rather than invoking the wrong callback.
     fn register_upcall(&mut self, entry: crate::ffi::UpcallEntry) -> usize;
 
     /// Get upcall info by slot index. Returns (target, param_kinds, return_kind).
+    ///
+    /// # Security (M4c)
+    ///
+    /// Resolving by bare `slot` cannot detect slot reuse. If the slot was
+    /// removed and re-registered since the trampoline was minted, this may
+    /// return info for a *different* callback (confused deputy). Where the
+    /// caller holds a generation-tagged handle, prefer resolving it through
+    /// the implementation's [`UpcallTable::get_checked`](crate::ffi::UpcallTable::get_checked)
+    /// so a stale handle fails closed.
     fn get_upcall_info(&self, slot: usize) -> Option<(ObjectRef, Vec<i32>, i32)>;
 
     // -- JPMS Module support (N3) --

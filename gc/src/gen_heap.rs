@@ -590,7 +590,9 @@ impl GenerationalHeap {
 
     /// Try to allocate a Java object. Returns `None` if young gen is exhausted.
     pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        let total_size = HEADER_SIZE + num_fields.checked_mul(SLOT_SIZE)?;
+        // M6 (round-12 gc): make the `+ HEADER_SIZE` add checked too, so a
+        // near-`usize::MAX` field count can't wrap past the checked multiply.
+        let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
         let ptr = self.try_alloc_young(total_size)?;
         let header = ObjectHeader::new(
             class_id,

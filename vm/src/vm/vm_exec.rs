@@ -2252,6 +2252,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .name(thread_name_for_builder)
             .stack_size(child_stack_size)
             .spawn(move || {
+            // H6: record this carrier's native stack size so the interpreter's
+            // re-entrant `execute` recursion guard derives a correct
+            // StackOverflowError ceiling for it. Worker carriers default to an
+            // 8 MiB native stack — far smaller than the 128 MiB main VM thread —
+            // so without this the guard (calibrated for the larger stack) would
+            // let deep re-entrant native dispatch overflow the 8 MiB stack and
+            // abort the whole process uncatchably before tripping.
+            crate::runtime::interpreter::init_thread_exec_depth_ceiling(child_stack_size);
             let mut jvm_thread = JvmThread::new(tid, &name);
             // Use the pre-created shared state
             jvm_thread.park_state = pre_park;

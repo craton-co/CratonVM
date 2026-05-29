@@ -371,7 +371,11 @@ impl Heap {
         );
         let data_size = array_data_size(length, element_type)
             .expect("array data size overflow in alloc_array");
-        let total_size = HEADER_SIZE + data_size;
+        // M6 (round-12 gc): make the `+ HEADER_SIZE` add checked too, matching
+        // `alloc_array_checked` (which uses `HEADER_SIZE.checked_add(data_size)?`).
+        let total_size = HEADER_SIZE
+            .checked_add(data_size)
+            .expect("array total size overflow in alloc_array");
         let ptr = self.alloc_zeroed(total_size);
 
         let header = ObjectHeader::new(

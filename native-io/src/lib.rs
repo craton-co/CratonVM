@@ -7842,7 +7842,7 @@ fn native_files_size(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 }
 
 fn native_files_delete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let s = files_path_str(ctx, args);
+    let s = validated_path(&files_path_str(ctx, args))?;
     let p = std::path::Path::new(&s);
     let result = if p.is_dir() {
         std::fs::remove_dir(&s)
@@ -7856,7 +7856,7 @@ fn native_files_delete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 fn native_files_delete_if_exists(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let s = files_path_str(ctx, args);
+    let s = validated_path(&files_path_str(ctx, args))?;
     let p = std::path::Path::new(&s);
     if !p.exists() {
         return Ok(Some(Value::Int(0)));
@@ -7870,7 +7870,7 @@ fn native_files_delete_if_exists(ctx: &mut dyn NativeContext, args: &[Value]) ->
 }
 
 fn native_files_create_file(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let s = files_path_str(ctx, args);
+    let s = validated_path(&files_path_str(ctx, args))?;
     if let Err(e) = std::fs::File::create(&s) {
         return Err(io_err(e));
     }
@@ -7882,7 +7882,7 @@ fn native_files_create_file(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_files_create_directory(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let s = files_path_str(ctx, args);
+    let s = validated_path(&files_path_str(ctx, args))?;
     if let Err(e) = std::fs::create_dir(&s) {
         return Err(io_err(e));
     }
@@ -7897,7 +7897,7 @@ fn native_files_create_directories(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s = files_path_str(ctx, args);
+    let s = validated_path(&files_path_str(ctx, args))?;
     if let Err(e) = std::fs::create_dir_all(&s) {
         return Err(io_err(e));
     }
@@ -7909,7 +7909,7 @@ fn native_files_create_directories(
 }
 
 fn native_files_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let s = files_path_str(ctx, args);
+    let s = validated_path(&files_path_str(ctx, args))?;
     let bytes = std::fs::read(&s).map_err(io_err)?;
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, &b) in bytes.iter().enumerate() {
@@ -7919,14 +7919,14 @@ fn native_files_read_all_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 fn native_files_read_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let s = files_path_str(ctx, args);
+    let s = validated_path(&files_path_str(ctx, args))?;
     let content = std::fs::read_to_string(&s).map_err(io_err)?;
     let result = ctx.create_string(&content);
     Ok(Some(Value::Object(Some(result))))
 }
 
 fn native_files_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let s = files_path_str(ctx, args);
+    let s = validated_path(&files_path_str(ctx, args))?;
     let arr = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(args.first().copied()),
@@ -7943,7 +7943,7 @@ fn native_files_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 }
 
 fn native_files_write_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let s = files_path_str(ctx, args);
+    let s = validated_path(&files_path_str(ctx, args))?;
     let content = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
@@ -7953,7 +7953,7 @@ fn native_files_write_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_files_read_all_lines(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let s = files_path_str(ctx, args);
+    let s = validated_path(&files_path_str(ctx, args))?;
     let content = std::fs::read_to_string(&s).map_err(io_err)?;
     let lines: Vec<&str> = content.lines().collect();
     // Return as ArrayList
@@ -7970,21 +7970,23 @@ fn native_files_read_all_lines(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 }
 
 fn native_files_copy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let src = files_path_str(ctx, args);
+    let src = validated_path(&files_path_str(ctx, args))?;
     let dst = match args.get(1) {
         Some(Value::Object(Some(o))) => read_path_str(ctx, *o),
         _ => String::new(),
     };
+    let dst = validated_path(&dst)?;
     std::fs::copy(&src, &dst).map_err(io_err)?;
     Ok(args.get(1).copied())
 }
 
 fn native_files_move(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let src = files_path_str(ctx, args);
+    let src = validated_path(&files_path_str(ctx, args))?;
     let dst = match args.get(1) {
         Some(Value::Object(Some(o))) => read_path_str(ctx, *o),
         _ => String::new(),
     };
+    let dst = validated_path(&dst)?;
     std::fs::rename(&src, &dst).map_err(io_err)?;
     Ok(args.get(1).copied())
 }
@@ -13688,6 +13690,57 @@ mod io_tests {
         let result = validate_path("/etc/passwd\0.txt");
         assert!(result.is_err(), "null byte accepted with validation off");
         set_path_validation_enabled(true);
+    }
+
+    // -----------------------------------------------------------------------
+    // NIO `java.nio.file.Files` path-validation regression tests
+    //
+    // AUDIT 2026-05-29 (HIGH): the `Files.*` natives previously passed the
+    // raw guest path straight to `std::fs`, bypassing `validated_path`
+    // entirely — skipping even the always-on null-byte and `..`-segment
+    // guards. Every `Files` native now routes its path(s) through
+    // `validated_path` (the same convenience wrapper the `File`/FIS/FOS/RAF
+    // natives use). These tests pin the contract of that shared wrapper so a
+    // future refactor that drops the call regresses loudly.
+    // -----------------------------------------------------------------------
+
+    /// `validated_path` (called by every `Files` native) must reject a
+    /// `..` *segment* via the always-on traversal guard, independent of
+    /// CWD confinement.
+    #[test]
+    fn files_validated_path_rejects_dotdot_segment() {
+        set_path_validation_enabled(true);
+        set_path_confine_to_cwd(false);
+        let result = validated_path("../../etc/passwd");
+        assert!(result.is_err(), "Files path with `..` segment accepted: {result:?}");
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(err.contains("Path traversal detected"), "err = {err}");
+    }
+
+    /// `validated_path` must reject an embedded null byte even when path
+    /// validation is otherwise disabled (the NUL truncates the host
+    /// C-string boundary).
+    #[test]
+    fn files_validated_path_rejects_null_byte_even_when_disabled() {
+        set_path_validation_enabled(false);
+        let result = validated_path("/tmp/evil\0.txt");
+        assert!(result.is_err(), "Files path with null byte accepted: {result:?}");
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(err.contains("null byte"), "err = {err}");
+        set_path_validation_enabled(true);
+    }
+
+    /// A not-yet-existing file inside the sandbox (e.g. the target of
+    /// `Files.createFile`/`writeString`) must still be accepted: legitimate
+    /// creation must not break. The parent (cwd) canonicalizes and the
+    /// result stays inside the sandbox root.
+    #[test]
+    fn files_validated_path_allows_nonexistent_in_sandbox() {
+        set_path_validation_enabled(true);
+        set_path_confine_to_cwd(true);
+        let result = validated_path("files_create_regression_target.txt");
+        assert!(result.is_ok(), "in-sandbox not-yet-existing path rejected: {result:?}");
+        set_path_confine_to_cwd(false);
     }
 
     // -----------------------------------------------------------------------

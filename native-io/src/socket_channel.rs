@@ -43,7 +43,7 @@ use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 use cratonvm_types::{ClassId, ObjectRef, Value};
 use std::collections::HashMap;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::Duration;
@@ -687,6 +687,53 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 // SocketChannel.connect / finishConnect
 // ---------------------------------------------------------------------------
 
+/// H3b: resolve a `host:port` target to one or more `SocketAddr`s and
+/// vet every resolved address against the outbound-host policy, mirroring
+/// `outbound_policy::policy_connect`'s resolution loop. The blocking path
+/// gets this for free via `policy_connect`; the non-blocking path calls
+/// this so its downstream dials (the fast-path connect and the background
+/// `connect_pool_worker`, both of which would otherwise re-run DNS) only
+/// ever target a vetted, already-resolved IP. This closes the DNS-rebind
+/// SSRF where a hostname resolves to a link-local cloud-metadata address.
+///
+/// We re-run `check_outbound` per resolved IP (formatting each as an
+/// `IP:port` literal so the default policy's literal-IP link-local check
+/// fires), reusing the public policy API rather than duplicating the
+/// link-local range logic. A denial maps to the same IOException the
+/// rest of the connect path uses.
+fn resolve_and_vet(target: &str) -> Result<Vec<SocketAddr>, MethodCallFailed> {
+    // First-pass policy check on the literal target — cheap, and rejects
+    // a direct link-local IP before we even resolve.
+    if let Err(reason) = crate::outbound_policy::check_outbound(target) {
+        return Err(ioex(format!("connect denied by outbound policy: {reason}")));
+    }
+
+    let addrs: Vec<SocketAddr> = match target.to_socket_addrs() {
+        Ok(it) => it.collect(),
+        Err(e) => return Err(map_err(target, e)),
+    };
+    if addrs.is_empty() {
+        return Err(ioex(format!("no addresses resolved for {target}")));
+    }
+
+    // Re-check the policy against every *resolved* address. A bracketed
+    // literal keeps IPv6 `host:port` parsing unambiguous, matching the
+    // policy's `host_part` expectations.
+    for addr in &addrs {
+        let literal = match addr {
+            SocketAddr::V4(_) => format!("{}:{}", addr.ip(), addr.port()),
+            SocketAddr::V6(_) => format!("[{}]:{}", addr.ip(), addr.port()),
+        };
+        if let Err(reason) = crate::outbound_policy::check_outbound(&literal) {
+            return Err(ioex(format!(
+                "connect denied by outbound policy: resolved address {} of {target} is blocked: {reason}",
+                addr.ip()
+            )));
+        }
+    }
+    Ok(addrs)
+}
+
 /// Inner connect routine. When `allow_block` is true (blocking mode), we
 /// wait for the connection to succeed/fail. In non-blocking mode we kick
 /// off the connect on a background thread and return false immediately;
@@ -741,23 +788,42 @@ fn sc_connect_inner(
         return Ok(true);
     }
 
-    // Task #16: policy gate also applies to non-blocking connects. We
-    // keep the existing 750 ms fast-path timeout here (deliberately
-    // shorter than the global 30 s cap — this is the Surefire IPC
-    // path, where localhost should answer in milliseconds), but a
-    // policy denial must still short-circuit the connect attempt.
-    if let Err(reason) = crate::outbound_policy::check_outbound(&target) {
-        return Err(ioex(format!(
-            "connect denied by outbound policy: {reason}"
-        )));
-    }
+    // Task #16 / H3b: policy gate also applies to non-blocking connects.
+    // The blocking branch above routes through `policy_connect`, which
+    // re-checks every *resolved* SocketAddr. The non-blocking branch must
+    // do the same: a `check_outbound(&target)` on the literal `host:port`
+    // string only blocks targets that *parse* as a link-local IP — it
+    // does NOT resolve DNS. Since the dials below (`TcpStream::connect`
+    // and the background `connect_pool_worker`) do their own resolution,
+    // a hostname that resolves to `169.254.169.254` would otherwise slip
+    // through (DNS-rebind SSRF). So we resolve here, vet every resolved
+    // IP against the outbound policy, and dial the *vetted* SocketAddr(s)
+    // directly — never re-resolving the original hostname downstream.
+    let vetted = resolve_and_vet(&target)?;
 
     // Non-blocking path fast-path: for localhost IPC (e.g., Surefire
     // master-fork channel), a short synchronous dial is more robust than
-    // deferring connect completion to a background thread.
-    let immediate = match target.parse::<SocketAddr>() {
-        Ok(addr) => TcpStream::connect_timeout(&addr, Duration::from_millis(750)),
-        Err(_) => TcpStream::connect(&target),
+    // deferring connect completion to a background thread. We try each
+    // vetted address with the existing 750 ms fast-path timeout
+    // (deliberately shorter than the global 30 s cap — localhost should
+    // answer in milliseconds).
+    let immediate = {
+        let mut last: Option<Result<TcpStream, std::io::Error>> = None;
+        for addr in &vetted {
+            match TcpStream::connect_timeout(addr, Duration::from_millis(750)) {
+                Ok(s) => {
+                    last = Some(Ok(s));
+                    break;
+                }
+                Err(e) => last = Some(Err(e)),
+            }
+        }
+        last.unwrap_or_else(|| {
+            Err(std::io::Error::new(
+                ErrorKind::AddrNotAvailable,
+                format!("no addresses resolved for {target}"),
+            ))
+        })
     };
     if let Ok(stream) = immediate {
         let _ = stream.set_nonblocking(true);
@@ -790,7 +856,15 @@ fn sc_connect_inner(
     let id = tcp_register(TcpHandle::Connecting(progress));
     tcp_blocking_state().write().insert(id, false);
 
-    connect_pool_submit(ConnectJob { id, target: target.clone() });
+    // H3b: hand the pool worker a *resolved, vetted* literal `IP:port`
+    // string (not the original hostname) so its `parse::<SocketAddr>()`
+    // branch succeeds and it never performs a second, unchecked DNS
+    // resolution that could land on a link-local address.
+    let job_target = vetted
+        .first()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| target.clone());
+    connect_pool_submit(ConnectJob { id, target: job_target });
 
     if ctx.object_num_fields(this) >= N_FIELDS {
         ctx.set_field(this, F_REG_ID, Value::Int(id));
@@ -1617,6 +1691,34 @@ mod tests {
                 "()Ljava/nio/channels/SocketChannel;"
             )
             .is_some());
+    }
+
+    #[test]
+    fn h3b_resolve_and_vet_blocks_link_local_literal() {
+        // Direct link-local IP must be denied before any dial.
+        crate::outbound_policy::reset_policy();
+        assert!(
+            resolve_and_vet("169.254.169.254:80").is_err(),
+            "expected AWS IMDS literal to be denied"
+        );
+        assert!(
+            resolve_and_vet("169.254.170.2:80").is_err(),
+            "expected 169.254.0.0/16 neighbour to be denied"
+        );
+        assert!(
+            resolve_and_vet("[fd00:ec2::254]:80").is_err(),
+            "expected IPv6 AWS metadata to be denied"
+        );
+    }
+
+    #[test]
+    fn h3b_resolve_and_vet_allows_and_resolves_loopback() {
+        // Loopback resolves and passes the policy; the returned addrs are
+        // concrete literals (no hostname left to re-resolve downstream).
+        crate::outbound_policy::reset_policy();
+        let addrs = resolve_and_vet("127.0.0.1:9").expect("loopback should be allowed");
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| a.ip().is_loopback()));
     }
 
     #[test]

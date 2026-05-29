@@ -35,10 +35,22 @@ use cratonvm_types::error::LinkageError;
 /// - Java 7+ (version >= 51) classes REQUIRE StackMapTable for non-trivial methods.
 /// - Pre-Java-7 classes use type inference verification (worklist dataflow).
 ///
-/// Uses lenient branch-target verification by default. Call
-/// [`verify_bytecode_strict`] to enforce strict StackMapTable frame checking
-/// at every branch target.
+/// Strictness selection (finding M1): strict branch-target / unreachable-code
+/// checking is enabled **automatically, per method**, for Java 7+ classes
+/// (`version.major >= JAVA_7`) whenever the method ships a `StackMapTable`.
+/// JVMS §4.10.1 requires such classes to declare a frame at every branch
+/// target, so enforcing strict checking does not reject legitimate Java-7+
+/// bytecode and closes the type-confusion hole that lenient mode left open
+/// (a branch target with no declared frame was previously accepted without
+/// confirming the incoming type-state was assignable to the target's
+/// expected state). Pre-Java-7 class files (`version.major < JAVA_7`, i.e.
+/// no mandatory StackMapTable) stay lenient and are handled by the worklist
+/// type-inference pass. [`verify_bytecode_strict`] forces strict mode
+/// unconditionally regardless of version.
 pub fn verify_bytecode(class: &Class, hierarchy: &dyn ClassHierarchy) -> Result<(), LinkageError> {
+    // `false` here means "do not *force* strict"; strict is still enabled
+    // automatically per method for Java 7+ classes carrying a StackMapTable
+    // (see `verify_method`'s `effective_strict`).
     verify_bytecode_inner(class, hierarchy, false)
 }
 
@@ -103,6 +115,16 @@ fn verify_method(
 
     // Java 7+ (version >= 51) requires StackMapTable for verification
     let requires_stack_map = version.major >= ClassFileVersion::JAVA_7.major;
+
+    // M1: select strict branch-target verification per method. Strict is
+    // forced when the caller explicitly requested it (`verify_bytecode_strict`),
+    // and is otherwise enabled automatically for Java 7+ methods that ship a
+    // StackMapTable — those classfiles are required by JVMS §4.10.1 to declare
+    // a frame at every branch target, so a missing frame at a real branch
+    // target is a genuine VerifyError rather than a tolerated compiler quirk.
+    // Pre-Java-7 classfiles (no mandatory StackMapTable) remain lenient.
+    let effective_strict =
+        strict_verification || (requires_stack_map && stack_map_table.is_some());
 
     if requires_stack_map && stack_map_table.is_none() {
         // No StackMapTable — only valid if there are no branches/exception handlers.
@@ -263,7 +285,7 @@ fn verify_method(
             // unreachable code silently (some older compilers emit
             // dead code after branches; rejecting them would break
             // backward compatibility).
-            if strict_verification {
+            if effective_strict {
                 return Err(LinkageError::VerifyError {
                     class_name: class_name.to_string(),
                     method_name: method.name.to_string(),
@@ -346,7 +368,7 @@ fn verify_method(
         // In strict mode (`verify_bytecode_strict`), the spec-compliant check
         // is enforced and missing frames are treated as verification errors.
         for &target in &result.branch_targets {
-            if strict_verification
+            if effective_strict
                 && requires_stack_map
                 && !declared_frames.contains_key(&target)
                 && parsed_table.is_some()
@@ -1912,6 +1934,116 @@ mod tests {
             "expected verification to succeed, got: {:?}",
             result
         );
+    }
+
+    // =======================================================================
+    // M1 — strict branch-target verification is the default for Java 7+
+    //
+    // A Java 7+ class that ships a StackMapTable but omits a frame at a
+    // real branch target must now be rejected by the *default*
+    // `verify_bytecode` entry point (previously only the never-called
+    // `verify_bytecode_strict` would catch it). Pre-Java-7 classfiles stay
+    // lenient.
+    // =======================================================================
+
+    /// Build a single-static-method class whose Code carries `code` and a
+    /// hand-rolled `StackMapTable` payload, at the given class file version.
+    fn make_class_with_stackmap(
+        version: ClassFileVersion,
+        descriptor: &str,
+        max_stack: u16,
+        max_locals: u16,
+        code: Vec<u8>,
+        stack_map_bytes: Vec<u8>,
+    ) -> Class {
+        let mut class = make_class(vec![ClassFileMethod {
+            access_flags: MethodAccessFlags::PUBLIC | MethodAccessFlags::STATIC,
+            name: Arc::from("m"),
+            descriptor: Arc::from(descriptor),
+            attributes: vec![LazyAttribute::new_decoded(Attribute::Code(CodeAttribute {
+                max_stack,
+                max_locals,
+                code: cratonvm_reader::ByteView::from_vec(code),
+                exception_table: vec![],
+                attributes: vec![Attribute::StackMapTable {
+                    entries: cratonvm_reader::ByteView::from_vec(stack_map_bytes),
+                }],
+            }))],
+        }]);
+        class.version = version;
+        class
+    }
+
+    /// Bytecode + StackMapTable shared by the strict/lenient M1 tests.
+    ///
+    ///   0: goto +6   (0xa7 0x00 0x06)  → branch target = offset 6
+    ///   3: nop        (0x00)
+    ///   4: nop        (0x00)
+    ///   5: nop        (0x00)
+    ///   6: return     (0xb1)           ← branch target, NO declared frame
+    ///
+    /// StackMapTable: one `same_frame` (frame_type=5 → absolute offset 5),
+    /// i.e. a frame is declared at offset 5 but NOT at the real branch
+    /// target (offset 6).
+    fn m1_goto_code() -> Vec<u8> {
+        vec![0xa7, 0x00, 0x06, 0x00, 0x00, 0x00, 0xb1]
+    }
+    fn m1_stackmap_frame_at_5() -> Vec<u8> {
+        // number_of_entries = 1, then same_frame(frame_type=5)
+        vec![0x00, 0x01, 0x05]
+    }
+
+    #[test]
+    fn m1_java7plus_branch_target_without_frame_is_rejected_by_default() {
+        let class = make_class_with_stackmap(
+            ClassFileVersion::JAVA_8,
+            "()V",
+            0,
+            1,
+            m1_goto_code(),
+            m1_stackmap_frame_at_5(),
+        );
+        // Default entry point must now enforce strict checking for Java 7+.
+        let res = verify_bytecode(&class, &MockHierarchy);
+        assert!(
+            res.is_err(),
+            "Java 7+ branch target without a StackMapTable frame must be a VerifyError, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn m1_pre_java7_same_bytecode_stays_lenient() {
+        // Identical shape but a pre-Java-7 (major < 51) version: strict
+        // checking must NOT be auto-enabled, so the missing frame at the
+        // branch target is tolerated.
+        let class = make_class_with_stackmap(
+            ClassFileVersion::JAVA_6,
+            "()V",
+            0,
+            1,
+            m1_goto_code(),
+            m1_stackmap_frame_at_5(),
+        );
+        let res = verify_bytecode(&class, &MockHierarchy);
+        assert!(
+            res.is_ok(),
+            "pre-Java-7 classfile must remain lenient, got {res:?}"
+        );
+    }
+
+    #[test]
+    fn m1_explicit_strict_entry_still_rejects() {
+        // `verify_bytecode_strict` keeps forcing strict mode regardless of
+        // version — including for the Java 7+ shape above.
+        let class = make_class_with_stackmap(
+            ClassFileVersion::JAVA_8,
+            "()V",
+            0,
+            1,
+            m1_goto_code(),
+            m1_stackmap_frame_at_5(),
+        );
+        assert!(verify_bytecode_strict(&class, &MockHierarchy).is_err());
     }
 }
 

@@ -105,6 +105,27 @@ struct Args {
     #[arg(long = "synthetic-jdk")]
     synthetic_jdk: bool,
 
+    /// Enable Panama FFI native access (mirrors JDK `--enable-native-access`).
+    ///
+    /// With native access disabled (the default after the security fix),
+    /// Panama downcalls, `MemorySegment.ofAddress`, and `reinterpret` throw
+    /// `IllegalCallerException`. Passing this flag opens the process-wide
+    /// gate so those restricted FFI operations are permitted.
+    ///
+    /// The optional value (`ALL-UNNAMED` or a module name) mirrors the JDK
+    /// spelling but is accepted-and-ignored: CratonVM's gate is a single
+    /// coarse process-wide toggle, not a per-module grant. The flag is also
+    /// accepted with no value at all (bare `--enable-native-access`). Because
+    /// clap accepts the long name directly, the JDK single-dash invocation
+    /// (`--enable-native-access=ALL-UNNAMED`) passes through unchanged.
+    #[arg(
+        long = "enable-native-access",
+        value_name = "MODULE",
+        num_args = 0..=1,
+        default_missing_value = "ALL-UNNAMED"
+    )]
+    enable_native_access: Option<String>,
+
     /// AOT compilation mode (-XX:AOTMode=off/training/production).
     #[arg(long = "XX:AOTMode", value_name = "MODE", default_value = "off")]
     aot_mode: String,
@@ -897,6 +918,22 @@ fn run() -> Result<()> {
     // (which is why it became unsafe in edition 2024) cannot fire here.
     if args.nojit {
         std::env::set_var("CRATONVM_DISABLE_JIT", "1");
+    }
+
+    // --enable-native-access: open the process-wide Panama FFI gate
+    // (`native-builtins/src/panama.rs::NATIVE_ACCESS_ENABLED`), which is
+    // default-CLOSED after the security fix. Mirrors the modern JDK
+    // `--enable-native-access` flag; the optional module value is
+    // accepted-and-ignored because the gate is a single coarse
+    // process-wide toggle rather than a per-module grant.
+    //
+    // Applied here, immediately after clap parsing and alongside the other
+    // global config toggles, so it runs on the main thread well before
+    // `Vm::new(config)` executes any bytecode — no Panama downcall,
+    // `MemorySegment.ofAddress`, or `reinterpret` can observe the closed
+    // gate once the user opted in.
+    if args.enable_native_access.is_some() {
+        cratonvm_native_builtins::panama::set_native_access_enabled(true);
     }
 
     // GPU handlers — only compiled when the `gpu` Cargo feature is on.

@@ -433,7 +433,15 @@ impl PlatformBackend for X11Backend {
         height: u32,
     ) -> Result<(), PlatformError> {
         let info = self.windows.get(&id).ok_or(PlatformError::WindowNotFound)?;
-        if (width * height) as usize > pixels.len() {
+        // `width * height` in `u32` wraps in release, so a hostile width/height
+        // could wrap the product down to a small value that passes this guard
+        // while the real area is enormous. Multiply in `usize` with overflow
+        // treated as "too big" so the buffer-too-small check can't be bypassed.
+        // Mirrors the cocoa backend's `blit_buffer` guard.
+        if (width as usize)
+            .checked_mul(height as usize)
+            .map_or(true, |n| n > pixels.len())
+        {
             return Err(PlatformError::CreationFailed("pixel buffer too small".into()));
         }
 
@@ -640,12 +648,36 @@ impl PlatformBackend for X11Backend {
             };
         }
 
+        // Clamp the metrics-derived dimensions to a sane maximum before they
+        // size the `vec![0u32; w*h]` allocation below. A pathological glyph
+        // run (huge font size or an extremely long string) could otherwise
+        // drive `w * h` to overflow a `u32`. The clamped dims keep the
+        // allocation, the `w`/`h` bounds checks in the blit loop, and the
+        // `py * w + px` index all mutually consistent.
+        const MAX_RASTER_DIM: u32 = 1 << 15; // 32768 px per side
+        let w = w.min(MAX_RASTER_DIM);
+        let h = h.min(MAX_RASTER_DIM);
+        // Pixel count via a checked `usize` multiply; bail to an empty raster
+        // on overflow (the clamp guarantees it fits, but never trust it to a
+        // wrapping `as usize`).
+        let raster_px = match (w as usize).checked_mul(h as usize) {
+            Some(n) => n,
+            None => {
+                return TextRaster {
+                    pixels: vec![],
+                    width: 0,
+                    height: 0,
+                    baseline: 0.0,
+                };
+            }
+        };
+
         let baseline = max_ascent as f32;
         let r = ((color >> 16) & 0xFF) as u32;
         let g = ((color >> 8) & 0xFF) as u32;
         let b = (color & 0xFF) as u32;
 
-        let mut pixels = vec![0u32; (w * h) as usize];
+        let mut pixels = vec![0u32; raster_px];
 
         // Second pass: blit each cached alpha mask into the destination buffer.
         for (glyph, x_offset) in &glyphs {

@@ -442,7 +442,33 @@ impl G1Collector {
         size: usize,
     ) -> Option<(*mut u8, usize)> {
         let region_size = self.config.region_size;
-        let regions_needed = size.div_ceil(region_size);
+
+        // CRIT (round-12 gc C2, humongous OOB R/W): a humongous object is laid
+        // out so that **every** region in the span carries a HEADER_SIZE prefix
+        // (the real ObjectHeader on the start region, a HumongousFiller sentinel
+        // on each continuation), and the object's payload lives in the
+        // `region_size - HEADER_SIZE` bytes AFTER that prefix. The previous
+        // layout returned `regions[start].base_ptr_mut()` and then accessed
+        // fields/elements via a single FLAT offset from that base — but each
+        // `G1Region.data` is a SEPARATE `vec![0u8; region_size]` allocation, so
+        // any logical offset past `region_size - HEADER_SIZE` landed outside
+        // region[start]'s Vec in unrelated heap memory (arbitrary OOB R/W).
+        //
+        // With the prefixed layout, every access is translated to the owning
+        // continuation region's own buffer (see `humongous_segment_for` /
+        // `humongous_payload_ptr` and the field/array accessors), so no access
+        // can ever escape the object's backing memory. The per-region prefix
+        // also lets us keep the HumongousFiller walker sentinel unchanged —
+        // walkers stay correct and continuation regions remain dark.
+        //
+        // `usable` is the payload capacity of one region; `payload_bytes` is the
+        // object size minus its single ObjectHeader.
+        let usable = region_size.checked_sub(HEADER_SIZE)?;
+        if usable == 0 {
+            return None;
+        }
+        let payload_bytes = size.saturating_sub(HEADER_SIZE);
+        let regions_needed = payload_bytes.div_ceil(usable).max(1);
 
         let start = find_contiguous_free(regions, regions_needed)?;
 
@@ -452,11 +478,12 @@ impl G1Collector {
             regions[start + i].region_type = RegionType::HumongousContinuation;
         }
 
-        // Allocate in the first region
-        regions[start].cursor = size.min(region_size);
-        for i in 1..regions_needed {
-            let remaining = size.saturating_sub(i * region_size);
-            regions[start + i].cursor = remaining.min(region_size);
+        // Per-region byte usage (`cursor`): each region stores its HEADER_SIZE
+        // prefix plus the payload chunk it owns. Chunk `i` covers payload bytes
+        // `[i*usable, (i+1)*usable)`.
+        for i in 0..regions_needed {
+            let chunk = payload_bytes.saturating_sub(i * usable).min(usable);
+            regions[start + i].cursor = HEADER_SIZE + chunk;
         }
 
         // CRIT (round-5 GC #1, heap walker UAF): zero the *entire* humongous
@@ -1566,14 +1593,49 @@ impl G1Collector {
             }
         };
 
+        // C2 (round-12 gc): humongous objects are region-fragmented — reading a
+        // ref slot at a flat offset from `obj_ptr` would read OOB past the
+        // start region for any slot beyond the first region's payload. Detect
+        // the humongous case once and read each ref slot through the same
+        // region-aware translation used by the field/array accessors.
+        let humongous_start: Option<(usize, usize)> = {
+            match self.lookup_region_for_addr(obj_ptr as usize) {
+                Some(idx) if regions[idx].region_type == RegionType::HumongousStart => {
+                    let total_size = object_total_size(header);
+                    Some((idx, total_size.saturating_sub(HEADER_SIZE)))
+                }
+                _ => None,
+            }
+        };
+        // Read an 8-byte ref word at logical payload offset `payload_off`.
+        let read_ref = |payload_off: usize| -> u64 {
+            if let Some((start, total_payload)) = humongous_start {
+                let mut buf = [0u8; 8];
+                if self.humongous_copy(
+                    regions,
+                    start,
+                    total_payload,
+                    payload_off,
+                    buf.as_mut_ptr(),
+                    8,
+                    false,
+                ) {
+                    u64::from_ne_bytes(buf)
+                } else {
+                    0
+                }
+            } else {
+                // SAFETY: caller guarantees the slot is within the object.
+                let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + payload_off) };
+                unsafe { std::ptr::read(slot_ptr as *const u64) }
+            }
+        };
+
         if header.kind == ObjectKind::Array {
             if header.element_type == ArrayElementType::Reference {
                 // Reference array: 8-byte compact slot per element.
                 for i in 0..header.array_length as usize {
-                    // SAFETY: i < array_length, within the allocated array.
-                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + i * 8) };
-                    // SAFETY: 8-byte aligned slot within the array data.
-                    let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                    let raw: u64 = read_ref(i * 8);
                     if raw == 0 {
                         continue;
                     }
@@ -1597,10 +1659,29 @@ impl G1Collector {
         } else {
             // Object: 16-byte Value slot per field.
             for slot_idx in 0..header.num_slots as usize {
-                // SAFETY: slot_idx < num_slots, within the allocated object.
-                let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
-                // SAFETY: slot_ptr is a properly aligned Value within the object.
-                let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
+                let payload_off = slot_idx * SLOT_SIZE;
+                let value = if let Some((start, total_payload)) = humongous_start {
+                    // Region-aware 16-byte read for humongous objects.
+                    let mut buf = [0u8; SLOT_SIZE];
+                    if !self.humongous_copy(
+                        regions,
+                        start,
+                        total_payload,
+                        payload_off,
+                        buf.as_mut_ptr(),
+                        SLOT_SIZE,
+                        false,
+                    ) {
+                        continue;
+                    }
+                    // SAFETY: `buf` holds an exact copy of the 16-byte Value slot.
+                    unsafe { std::ptr::read(buf.as_ptr() as *const Value) }
+                } else {
+                    // SAFETY: slot_idx < num_slots, within the allocated object.
+                    let slot_ptr = unsafe { obj_ptr.add(HEADER_SIZE + payload_off) };
+                    // SAFETY: slot_ptr is a properly aligned Value within the object.
+                    unsafe { std::ptr::read(slot_ptr as *const Value) }
+                };
                 if let Value::Object(Some(ref_obj)) = value {
                     let ref_ptr = ref_obj.as_ptr();
                     if let Some(idx) = region_for(ref_ptr) {
@@ -2000,7 +2081,9 @@ impl G1Collector {
     /// Try to allocate a Java object. Returns `None` when Eden is exhausted
     /// (caller should trigger GC and retry).
     pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
-        let total_size = HEADER_SIZE + num_fields.checked_mul(SLOT_SIZE)?;
+        // M6 (round-12 gc): checked `+ HEADER_SIZE` to match `try_alloc_array`
+        // and gen_heap; a near-`usize::MAX` field count must not wrap.
+        let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
         let (ptr, _region) = self.alloc_in_region(total_size)?;
 
         let header = ObjectHeader::new(
@@ -2301,6 +2384,128 @@ impl G1Collector {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Humongous object addressing (round-12 gc C2)
+    // -----------------------------------------------------------------------
+    //
+    // A humongous object spans several non-contiguous `G1Region.data`
+    // buffers. Each region carries a HEADER_SIZE prefix (real ObjectHeader on
+    // the start region, HumongousFiller sentinel on continuations) followed by
+    // `region_size - HEADER_SIZE` payload bytes. Logical payload byte `P`
+    // (0-based, i.e. measured from the end of the object's ObjectHeader)
+    // therefore lives in region `start + P / usable` at physical offset
+    // `HEADER_SIZE + (P % usable)`.
+    //
+    // The accessors below translate every field/array access through this map
+    // so a read/write can never fall outside the object's own backing memory.
+
+    /// If `obj`'s start address names a `HumongousStart` region, return the
+    /// start region index and the total payload byte count (object size minus
+    /// the single ObjectHeader). Returns `None` for ordinary (non-humongous)
+    /// objects, whose access uses the plain flat-offset path.
+    ///
+    /// Takes the already-held `regions` slice to avoid re-locking.
+    fn humongous_span(
+        &self,
+        regions: &[G1Region],
+        obj: ObjectRef,
+        total_object_size: usize,
+    ) -> Option<(usize, usize)> {
+        let idx = self.lookup_region_for_addr(obj.as_ptr() as usize)?;
+        if regions[idx].region_type != RegionType::HumongousStart {
+            return None;
+        }
+        let payload_bytes = total_object_size.saturating_sub(HEADER_SIZE);
+        Some((idx, payload_bytes))
+    }
+
+    /// Copy `len` bytes of a humongous object's payload, starting at logical
+    /// payload offset `payload_off`, between the (region-fragmented) heap
+    /// backing store and the caller-provided `buf`.
+    ///
+    /// `write == true` copies `buf -> heap`; otherwise `heap -> buf`. Every
+    /// byte is bounds-checked against the owning region's payload capacity and
+    /// against `total_payload`, so a straddling element (the per-region
+    /// payload capacity is not necessarily a multiple of the element/slot
+    /// size, since HEADER_SIZE is not a power-of-two divisor of region_size)
+    /// is handled correctly by splitting across the two regions. Returns
+    /// `false` if the access would exceed the object's payload (checked up
+    /// front, before any copy) — the caller turns that into a dropped access,
+    /// exactly as the `index >= len` bounds checks do. The per-region checks
+    /// inside the loop are defense-in-depth and are unreachable for a
+    /// well-formed humongous span (the allocator reserves
+    /// `payload_bytes.div_ceil(usable)` regions, so the region run always
+    /// covers `total_payload`).
+    ///
+    /// SAFETY: callers hold the `regions` lock for the duration, so the region
+    /// buffers are not concurrently reset/reallocated (the `Vec<G1Region>` is
+    /// never resized and each `data` Vec is never reallocated — only
+    /// zero-filled by `reset`). `start` must be a `HumongousStart` index with
+    /// `regions_needed` valid continuation regions following it.
+    fn humongous_copy(
+        &self,
+        regions: &[G1Region],
+        start: usize,
+        total_payload: usize,
+        payload_off: usize,
+        buf: *mut u8,
+        len: usize,
+        write: bool,
+    ) -> bool {
+        let region_size = self.config.region_size;
+        let usable = match region_size.checked_sub(HEADER_SIZE) {
+            Some(u) if u > 0 => u,
+            _ => return false,
+        };
+        // Reject any access whose end exceeds the object's payload.
+        let end = match payload_off.checked_add(len) {
+            Some(e) => e,
+            None => return false,
+        };
+        if end > total_payload {
+            return false;
+        }
+
+        let mut remaining = len;
+        let mut p = payload_off;
+        let mut buf_off = 0usize;
+        while remaining > 0 {
+            let region_slot = p / usable;
+            let within = p % usable;
+            let region_idx = start + region_slot;
+            if region_idx >= regions.len() {
+                return false;
+            }
+            let region = &regions[region_idx];
+            // Physical span actually backed by this region's payload.
+            let region_payload = region.cursor.saturating_sub(HEADER_SIZE);
+            if within >= region_payload {
+                return false;
+            }
+            let chunk = remaining.min(region_payload - within).min(usable - within);
+            if chunk == 0 {
+                return false;
+            }
+            // SAFETY: `within < region_payload <= usable` and
+            // `HEADER_SIZE + within + chunk <= cursor <= data.len()`, so the
+            // physical slice is fully inside this region's buffer. `buf` is a
+            // caller-owned buffer of at least `len` bytes.
+            unsafe {
+                let phys = region.data.as_ptr().add(HEADER_SIZE + within) as *mut u8;
+                let dst_src = buf.add(buf_off);
+                if write {
+                    std::ptr::copy_nonoverlapping(dst_src, phys, chunk);
+                } else {
+                    std::ptr::copy_nonoverlapping(phys, dst_src, chunk);
+                }
+            }
+            remaining -= chunk;
+            p += chunk;
+            buf_off += chunk;
+        }
+        true
+    }
+
     /// Conservative validity check for a *raw address* — see
     /// [`crate::gen_heap::GenerationalHeap::is_object_address`] for the
     /// contract. NEW-1.5 JIT frame root scanning calls this through
@@ -2498,14 +2703,157 @@ impl GarbageCollector for G1Collector {
     }
 
     fn get_field(&self, obj: ObjectRef, index: usize) -> Value {
-        let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE) };
+        // C2b (round-12 gc): runtime bounds + suspect-header guard, mirroring
+        // `GenerationalHeap::get_field` (gen_heap.rs). A corrupted/oversized
+        // header or an out-of-layout index must NOT dereference arbitrary
+        // memory — return a benign null read instead, matching gen_heap.
+        let header = self.get_header(obj);
+        let num_slots = header.num_slots as usize;
+        if num_slots > (1 << 24) {
+            tracing::debug!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "g1::get_field: suspect header (returning null)",
+            );
+            return Value::Object(None);
+        }
+        if index >= num_slots {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                "g1::get_field: out-of-bounds field read dropped (returning null)",
+            );
+            return Value::Object(None);
+        }
+
+        let total_size = HEADER_SIZE + num_slots * SLOT_SIZE;
+        let payload_off = index * SLOT_SIZE;
+
+        // C2 (round-12 gc): humongous objects are region-fragmented; translate
+        // the flat payload offset to the owning continuation region's buffer so
+        // the read can never escape the object's backing memory.
+        {
+            let regions = self.regions.lock();
+            if let Some((start, total_payload)) =
+                self.humongous_span(&regions, obj, total_size)
+            {
+                let mut tmp = [0u8; SLOT_SIZE];
+                if self.humongous_copy(
+                    &regions,
+                    start,
+                    total_payload,
+                    payload_off,
+                    tmp.as_mut_ptr(),
+                    SLOT_SIZE,
+                    false,
+                ) {
+                    // SAFETY: `tmp` holds an exact copy of the 16-byte `Value`
+                    // slot bit pattern that was stored by `set_field`.
+                    return unsafe { std::ptr::read(tmp.as_ptr() as *const Value) };
+                }
+                return Value::Object(None);
+            }
+        }
+
+        // SAFETY: `index < num_slots` (checked above) so the slot lies within
+        // the object's allocated, single-region backing store.
+        let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
         unsafe { std::ptr::read(ptr as *const Value) }
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
-        let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE) };
-        unsafe {
-            std::ptr::write(ptr as *mut Value, value);
+        // C2b (round-12 gc): runtime bounds + suspect-header guard. Drop
+        // out-of-layout writes rather than corrupting the neighboring object,
+        // mirroring `GenerationalHeap::set_field`.
+        let header = self.get_header(obj);
+        let num_slots = header.num_slots as usize;
+        if num_slots > (1 << 24) {
+            tracing::debug!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                value = ?value,
+                "g1::set_field: suspect header (dropping write)",
+            );
+            return;
+        }
+        if index >= num_slots {
+            tracing::warn!(
+                target: "cratonvm::gc::guard",
+                obj = ?obj.as_ptr(),
+                index,
+                num_slots,
+                class_id = ?header.class_id,
+                value = ?value,
+                "g1::set_field: out-of-bounds field write dropped",
+            );
+            return;
+        }
+
+        // C2c (round-12 gc): for reference stores, fire the SATB pre-barrier
+        // (log the OLD slot value before it is overwritten — only matters while
+        // concurrent marking is active) so the marker never loses an edge, and
+        // the RSet post-barrier (after the store) so cross-region roots are
+        // tracked. This mirrors how `GenerationalHeap::set_field` fires its
+        // barrier internally; callers do NOT need to call the barriers
+        // separately. Primitive stores skip both barriers.
+        let is_ref_store = matches!(value, Value::Object(_));
+        if is_ref_store && self.gc_state.is_marking_active() {
+            let old = self.get_field(obj, index);
+            if let Value::Object(Some(old_ref)) = old {
+                self.satb_pre_barrier(old_ref.as_ptr() as usize);
+            }
+        }
+
+        let total_size = HEADER_SIZE + num_slots * SLOT_SIZE;
+        let payload_off = index * SLOT_SIZE;
+
+        // C2 (round-12 gc): route humongous stores through the region-aware
+        // translation so the write can never escape the object's memory.
+        let stored = {
+            let regions = self.regions.lock();
+            if let Some((start, total_payload)) =
+                self.humongous_span(&regions, obj, total_size)
+            {
+                let mut tmp = [0u8; SLOT_SIZE];
+                // SAFETY: copy the 16-byte `Value` bit pattern into a byte buf.
+                unsafe {
+                    std::ptr::write(tmp.as_mut_ptr() as *mut Value, value);
+                }
+                self.humongous_copy(
+                    &regions,
+                    start,
+                    total_payload,
+                    payload_off,
+                    tmp.as_mut_ptr(),
+                    SLOT_SIZE,
+                    true,
+                )
+            } else {
+                // SAFETY: `index < num_slots`, so the slot is in-bounds of the
+                // object's single-region backing store.
+                let ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+                unsafe {
+                    std::ptr::write(ptr as *mut Value, value);
+                }
+                true
+            }
+        };
+
+        if stored && is_ref_store {
+            self.post_write_barrier_rset(obj, match value {
+                Value::Object(Some(r)) => r,
+                // Null store: nothing to record in the RSet.
+                _ => return,
+            });
         }
     }
 
@@ -2558,34 +2906,71 @@ impl GarbageCollector for G1Collector {
         if index >= len {
             return Err(index as i32);
         }
-        let elem_size = crate::heap::element_byte_size(header.element_type);
-        let slot_ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + index * elem_size) };
+        let element_type = header.element_type;
+        let elem_size = crate::heap::element_byte_size(element_type);
+        let payload_off = index * elem_size;
 
-        match header.element_type {
-            ArrayElementType::Int => Ok(Value::Int(unsafe { std::ptr::read(slot_ptr as *const i32) })),
-            ArrayElementType::Long => Ok(Value::Long(unsafe { std::ptr::read(slot_ptr as *const i64) })),
-            ArrayElementType::Float => Ok(Value::Float(unsafe { std::ptr::read(slot_ptr as *const f32) })),
-            ArrayElementType::Double => Ok(Value::Double(unsafe { std::ptr::read(slot_ptr as *const f64) })),
-            ArrayElementType::Byte | ArrayElementType::Boolean => {
-                Ok(Value::Int(unsafe { std::ptr::read(slot_ptr as *const i8) } as i32))
-            }
-            ArrayElementType::Short => {
-                Ok(Value::Int(unsafe { std::ptr::read(slot_ptr as *const i16) } as i32))
-            }
-            ArrayElementType::Char => {
-                Ok(Value::Int(unsafe { std::ptr::read(slot_ptr as *const u16) } as i32))
-            }
-            ArrayElementType::Reference => {
-                let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
-                if raw == 0 {
-                    Ok(Value::Object(None))
-                } else {
-                    Ok(Value::Object(Some(unsafe {
-                        ObjectRef::from_raw(raw as usize as *mut u8)
-                    })))
+        // Read the raw element bytes (`elem_size` of them) into a fixed buffer.
+        // The flat single-region path reads in place; the humongous path
+        // translates to the owning continuation region. Either way the read is
+        // bounds-confined to the object's own backing memory.
+        let mut raw = [0u8; 8]; // largest element is 8 bytes (long/double/ref)
+        {
+            let regions = self.regions.lock();
+            // C2: array data_size mirrors HEADER_SIZE + elements; recompute the
+            // total so the humongous span / payload bound is exact.
+            let total_size = HEADER_SIZE
+                + crate::heap::array_data_size(len, element_type).unwrap_or(0);
+            if let Some((start, total_payload)) =
+                self.humongous_span(&regions, obj, total_size)
+            {
+                if !self.humongous_copy(
+                    &regions,
+                    start,
+                    total_payload,
+                    payload_off,
+                    raw.as_mut_ptr(),
+                    elem_size,
+                    false,
+                ) {
+                    return Err(index as i32);
+                }
+            } else {
+                // SAFETY: `index < len` so `[payload_off, payload_off+elem_size)`
+                // is inside the array's single-region payload.
+                let slot_ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(slot_ptr, raw.as_mut_ptr(), elem_size);
                 }
             }
         }
+        let p = raw.as_ptr();
+        // SAFETY: `raw` holds `elem_size` valid bytes for `element_type`.
+        Ok(match element_type {
+            ArrayElementType::Int => Value::Int(unsafe { std::ptr::read(p as *const i32) }),
+            ArrayElementType::Long => Value::Long(unsafe { std::ptr::read(p as *const i64) }),
+            ArrayElementType::Float => Value::Float(unsafe { std::ptr::read(p as *const f32) }),
+            ArrayElementType::Double => Value::Double(unsafe { std::ptr::read(p as *const f64) }),
+            ArrayElementType::Byte | ArrayElementType::Boolean => {
+                Value::Int(unsafe { std::ptr::read(p as *const i8) } as i32)
+            }
+            ArrayElementType::Short => {
+                Value::Int(unsafe { std::ptr::read(p as *const i16) } as i32)
+            }
+            ArrayElementType::Char => {
+                Value::Int(unsafe { std::ptr::read(p as *const u16) } as i32)
+            }
+            ArrayElementType::Reference => {
+                let r: u64 = unsafe { std::ptr::read(p as *const u64) };
+                if r == 0 {
+                    Value::Object(None)
+                } else {
+                    Value::Object(Some(unsafe {
+                        ObjectRef::from_raw(r as usize as *mut u8)
+                    }))
+                }
+            }
+        })
     }
 
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) -> Result<(), i32> {
@@ -2594,50 +2979,95 @@ impl GarbageCollector for G1Collector {
         if index >= len {
             return Err(index as i32);
         }
-        let elem_size = crate::heap::element_byte_size(header.element_type);
-        let slot_ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + index * elem_size) };
+        let element_type = header.element_type;
+        let elem_size = crate::heap::element_byte_size(element_type);
+        let payload_off = index * elem_size;
+        let is_ref = element_type == ArrayElementType::Reference;
 
-        match header.element_type {
-            ArrayElementType::Int => {
-                let v = value.as_int().unwrap_or(0);
-                unsafe { std::ptr::write(slot_ptr as *mut i32, v) };
+        // C2c: SATB pre-barrier for reference element stores (log the OLD ref
+        // before overwriting it) while concurrent marking is active.
+        if is_ref && self.gc_state.is_marking_active() {
+            if let Ok(Value::Object(Some(old_ref))) = self.get_array_element(obj, index) {
+                self.satb_pre_barrier(old_ref.as_ptr() as usize);
             }
-            ArrayElementType::Long => {
-                let v = value.as_long().unwrap_or(0);
-                unsafe { std::ptr::write(slot_ptr as *mut i64, v) };
+        }
+
+        // Encode the element value into a fixed byte buffer.
+        let mut raw = [0u8; 8];
+        let p = raw.as_mut_ptr();
+        // SAFETY: each write stays within `raw`'s 8 bytes (elem_size <= 8).
+        unsafe {
+            match element_type {
+                ArrayElementType::Int => std::ptr::write(p as *mut i32, value.as_int().unwrap_or(0)),
+                ArrayElementType::Long => std::ptr::write(p as *mut i64, value.as_long().unwrap_or(0)),
+                ArrayElementType::Float => std::ptr::write(
+                    p as *mut f32,
+                    match value {
+                        Value::Float(f) => f,
+                        _ => 0.0,
+                    },
+                ),
+                ArrayElementType::Double => std::ptr::write(
+                    p as *mut f64,
+                    match value {
+                        Value::Double(d) => d,
+                        _ => 0.0,
+                    },
+                ),
+                ArrayElementType::Byte | ArrayElementType::Boolean => {
+                    std::ptr::write(p as *mut i8, value.as_int().unwrap_or(0) as i8)
+                }
+                ArrayElementType::Short => {
+                    std::ptr::write(p as *mut i16, value.as_int().unwrap_or(0) as i16)
+                }
+                ArrayElementType::Char => {
+                    std::ptr::write(p as *mut u16, value.as_int().unwrap_or(0) as u16)
+                }
+                ArrayElementType::Reference => {
+                    let r: u64 = match value {
+                        Value::Object(Some(r)) => r.as_ptr() as u64,
+                        _ => 0u64,
+                    };
+                    std::ptr::write(p as *mut u64, r)
+                }
             }
-            ArrayElementType::Float => {
-                let v = match value {
-                    Value::Float(f) => f,
-                    _ => 0.0,
-                };
-                unsafe { std::ptr::write(slot_ptr as *mut f32, v) };
+        }
+
+        // Write the raw bytes back — flat single-region path or humongous
+        // region-translated path. Either way the write is bounds-confined.
+        let stored = {
+            let regions = self.regions.lock();
+            let total_size = HEADER_SIZE
+                + crate::heap::array_data_size(len, element_type).unwrap_or(0);
+            if let Some((start, total_payload)) =
+                self.humongous_span(&regions, obj, total_size)
+            {
+                self.humongous_copy(
+                    &regions,
+                    start,
+                    total_payload,
+                    payload_off,
+                    raw.as_mut_ptr(),
+                    elem_size,
+                    true,
+                )
+            } else {
+                // SAFETY: `index < len` so the slot is inside the array payload.
+                let slot_ptr = unsafe { obj.as_ptr().add(HEADER_SIZE + payload_off) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(raw.as_ptr(), slot_ptr, elem_size);
+                }
+                true
             }
-            ArrayElementType::Double => {
-                let v = match value {
-                    Value::Double(d) => d,
-                    _ => 0.0,
-                };
-                unsafe { std::ptr::write(slot_ptr as *mut f64, v) };
-            }
-            ArrayElementType::Byte | ArrayElementType::Boolean => {
-                let v = value.as_int().unwrap_or(0) as i8;
-                unsafe { std::ptr::write(slot_ptr as *mut i8, v) };
-            }
-            ArrayElementType::Short => {
-                let v = value.as_int().unwrap_or(0) as i16;
-                unsafe { std::ptr::write(slot_ptr as *mut i16, v) };
-            }
-            ArrayElementType::Char => {
-                let v = value.as_int().unwrap_or(0) as u16;
-                unsafe { std::ptr::write(slot_ptr as *mut u16, v) };
-            }
-            ArrayElementType::Reference => {
-                let raw: u64 = match value {
-                    Value::Object(Some(r)) => r.as_ptr() as u64,
-                    _ => 0u64,
-                };
-                unsafe { std::ptr::write(slot_ptr as *mut u64, raw) };
+        };
+        if !stored {
+            return Err(index as i32);
+        }
+
+        // C2c: RSet post-barrier for reference element stores of a non-null ref.
+        if is_ref {
+            if let Value::Object(Some(target)) = value {
+                self.post_write_barrier_rset(obj, target);
             }
         }
         Ok(())
@@ -3157,6 +3587,84 @@ mod tests {
         let large = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, 150_000);
         assert_eq!(gc.array_length(large), 150_000);
         assert!(gc.count_regions(RegionType::HumongousStart) >= 1);
+    }
+
+    // C2 (round-12 gc): a humongous array spans multiple non-contiguous region
+    // buffers. Element access at HIGH indices must land in the owning
+    // continuation region — never OOB in unrelated heap memory. Round-trip
+    // values at low / boundary / high indices and confirm they read back.
+    #[test]
+    fn humongous_int_array_multi_region_roundtrip() {
+        let gc = make_collector();
+        // 1 MB regions → usable payload ≈ (1MB-40)/4 ≈ 262133 ints/region.
+        // 400_000 ints (~1.6 MB data) spans at least two regions.
+        let n = 400_000;
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Int, n);
+        assert!(gc.count_regions(RegionType::HumongousContinuation) >= 1);
+        // Write a recognizable pattern at indices in both the start region and
+        // the continuation region(s).
+        for &i in &[0usize, 1, 262_000, 262_133, 262_134, 300_000, n - 1] {
+            gc.set_array_element(arr, i, Value::Int((i as i32).wrapping_mul(7) ^ 0x5a5a))
+                .unwrap();
+        }
+        for &i in &[0usize, 1, 262_000, 262_133, 262_134, 300_000, n - 1] {
+            assert_eq!(
+                gc.get_array_element(arr, i).unwrap().as_int(),
+                Some((i as i32).wrapping_mul(7) ^ 0x5a5a),
+                "mismatch at index {i}",
+            );
+        }
+        // OOB index is rejected, not a wild write.
+        assert!(gc.set_array_element(arr, n, Value::Int(1)).is_err());
+        assert!(gc.get_array_element(arr, n).is_err());
+    }
+
+    // C2: long[] elements are 8 bytes; the per-region payload capacity
+    // (region_size - HEADER_SIZE) is not a multiple of 8 for HEADER_SIZE=40
+    // only when region_size isn't — but verify the straddle-safe copy path by
+    // exercising elements adjacent to a region boundary.
+    #[test]
+    fn humongous_long_array_boundary_roundtrip() {
+        let gc = make_collector();
+        let n = 200_000; // 8 bytes each ≈ 1.6 MB → multi-region
+        let arr = gc.alloc_array(ClassId::new(0), ArrayElementType::Long, n);
+        assert!(gc.count_regions(RegionType::HumongousContinuation) >= 1);
+        // usable/8 elements per region; probe around the first boundary.
+        let usable = (gc.config.region_size - HEADER_SIZE) / 8;
+        for &i in &[usable - 1, usable, usable + 1, n - 1] {
+            gc.set_array_element(arr, i, Value::Long(0x0123_4567_89ab_cdef ^ i as i64))
+                .unwrap();
+        }
+        for &i in &[usable - 1, usable, usable + 1, n - 1] {
+            assert_eq!(
+                gc.get_array_element(arr, i).unwrap().as_long(),
+                Some(0x0123_4567_89ab_cdef ^ i as i64),
+                "mismatch at index {i}",
+            );
+        }
+    }
+
+    // C2 / C2b: a humongous *object* (many reference slots) round-trips field
+    // values across regions, and out-of-layout field access is dropped rather
+    // than reading/writing neighboring memory.
+    #[test]
+    fn humongous_object_field_roundtrip_and_bounds() {
+        let gc = make_collector();
+        // > 512 KB of slots (16 bytes each) → humongous, multi-region.
+        let num_fields = (1024 * 1024) / SLOT_SIZE + 4; // > 1 region of slots
+        let obj = gc.alloc_object(ClassId::new(1), num_fields);
+        assert!(gc.count_regions(RegionType::HumongousContinuation) >= 1);
+        let per_region = (gc.config.region_size - HEADER_SIZE) / SLOT_SIZE;
+        for &i in &[0usize, per_region - 1, per_region, per_region + 1, num_fields - 1] {
+            gc.set_field(obj, i, Value::Int(i as i32));
+        }
+        for &i in &[0usize, per_region - 1, per_region, per_region + 1, num_fields - 1] {
+            assert_eq!(gc.get_field(obj, i).as_int(), Some(i as i32), "field {i}");
+        }
+        // Out-of-layout field read/write must be a benign no-op (drop), not OOB.
+        let oob = num_fields + 1000;
+        assert_eq!(gc.get_field(obj, oob), Value::Object(None));
+        gc.set_field(obj, oob, Value::Int(0xdead_u32 as i32)); // dropped silently
     }
 
     // -- Young collection --

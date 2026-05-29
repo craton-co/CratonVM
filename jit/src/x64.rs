@@ -12150,6 +12150,13 @@ impl Compiler {
                     while pc % 4 != 0 {
                         pc += 1;
                     }
+                    // Validate the fixed 12-byte header (default/low/high) is
+                    // fully in-bounds before reading it. Crafted/unverified
+                    // bytecode can place a tableswitch near the end of `code`;
+                    // indexing past `code_len` would panic. Bail instead.
+                    if pc + 12 > code_len {
+                        return false;
+                    }
                     let default_offset =
                         i32::from_be_bytes([code[pc], code[pc + 1], code[pc + 2], code[pc + 3]]);
                     let low = i32::from_be_bytes([
@@ -12164,8 +12171,23 @@ impl Compiler {
                         code[pc + 10],
                         code[pc + 11],
                     ]);
-                    let count = (high - low + 1).max(0) as usize; // Cast: address arithmetic
+                    // Compute the entry count in i64 so `high - low + 1` cannot
+                    // overflow (release builds have overflow-checks off, so the
+                    // old `(high - low + 1).max(0)` could wrap to a bogus
+                    // positive value and drive a ~16 GB allocation / OOB read).
+                    if low > high {
+                        return false;
+                    }
+                    let count_i64 = (high as i64) - (low as i64) + 1;
                     pc += 12;
+                    // The jump table is `count` i32 entries immediately after the
+                    // header. Reject any count that does not fit the remaining
+                    // bytes before allocating or reading it.
+                    let remaining_entries = (code_len - pc) / 4;
+                    if count_i64 < 0 || count_i64 as u64 > remaining_entries as u64 {
+                        return false;
+                    }
+                    let count = count_i64 as usize;
 
                     // Collect all targets from the bytecode
                     let mut targets = Vec::with_capacity(count);
@@ -12265,15 +12287,29 @@ impl Compiler {
                     while pc % 4 != 0 {
                         pc += 1;
                     }
+                    // Validate the fixed 8-byte header (default/npairs) is fully
+                    // in-bounds before reading it. Bail on crafted bytecode that
+                    // places the header past `code_len`.
+                    if pc + 8 > code_len {
+                        return false;
+                    }
                     let default_offset =
                         i32::from_be_bytes([code[pc], code[pc + 1], code[pc + 2], code[pc + 3]]);
-                    let npairs = i32::from_be_bytes([
-                        code[pc + 4],
-                        code[pc + 5],
-                        code[pc + 6],
-                        code[pc + 7],
-                    ]) as usize; // Cast: address arithmetic
+                    // `npairs` is a signed i32 in the classfile; a negative value
+                    // would become a huge usize and drive an OOM allocation /
+                    // OOB read. Reject it, and validate the pair table (8 bytes
+                    // each) fits the remaining bytes before allocating.
+                    let npairs_i32 =
+                        i32::from_be_bytes([code[pc + 4], code[pc + 5], code[pc + 6], code[pc + 7]]);
                     pc += 8;
+                    if npairs_i32 < 0 {
+                        return false;
+                    }
+                    let npairs = npairs_i32 as usize;
+                    let remaining_pairs = (code_len - pc) / 8;
+                    if npairs > remaining_pairs {
+                        return false;
+                    }
 
                     // Collect all (key, target) pairs
                     let mut pairs = Vec::with_capacity(npairs);
@@ -16752,9 +16788,13 @@ impl Compiler {
             if target_native >= 0 {
                 // rel32 = target - (patch_offset + 4)
                 let rel = target_native - (patch_offset as i32 + 4); // Cast: x86-64 rel32 displacement
-                self.buf
-                    .try_patch_i32(patch_offset, rel)
-                    .expect("patch_branches: forward-branch rel32 patch");
+                // `try_patch_i32` already sets the sticky `overflowed` flag and
+                // returns Err on an out-of-bounds offset. Honor the no-panic
+                // bail contract: drop the Err and let the driver's
+                // `if buf.overflowed() { return None; }` discard the method.
+                if self.buf.try_patch_i32(patch_offset, rel).is_err() {
+                    self.buf.mark_overflowed();
+                }
             }
         }
         // Patch jump table entries: each entry is an i32 offset from table_base to target
@@ -16766,9 +16806,10 @@ impl Compiler {
             };
             if target_native >= 0 {
                 let rel = target_native - table_base as i32; // Cast: x86-64 rel32 displacement
-                self.buf
-                    .try_patch_i32(entry_offset, rel)
-                    .expect("patch_branches: jump-table entry rel32 patch");
+                // See note above: bail via the overflowed flag, never panic.
+                if self.buf.try_patch_i32(entry_offset, rel).is_err() {
+                    self.buf.mark_overflowed();
+                }
             }
         }
     }
@@ -16777,9 +16818,10 @@ impl Compiler {
         for &patch_offset in &self.self_call_patches {
             // rel32 = entry - (patch_offset + 4)
             let rel = entry_offset as i32 - (patch_offset as i32 + 4); // Cast: x86-64 rel32 displacement
-            self.buf
-                .try_patch_i32(patch_offset, rel)
-                .expect("patch_self_calls: self-call rel32 patch");
+            // See `patch_branches`: bail via the overflowed flag, never panic.
+            if self.buf.try_patch_i32(patch_offset, rel).is_err() {
+                self.buf.mark_overflowed();
+            }
         }
     }
 }
@@ -25765,7 +25807,7 @@ mod tests {
         //   3: istore_3          ; i = 0
         //   4: iload_3           ; loop header — load i
         //   5: iload_1           ; load n
-        //   6: if_icmpge +15→21  ; exit if i >= n
+        //   6: if_icmpge +16→22  ; exit if i >= n
         //   9: iload_2           ; load s
         //  10: aload_0           ; load obj
         //  11: getfield #1       ; obj.x  (lowers to helper call)
@@ -25782,7 +25824,7 @@ mod tests {
             0x3e, // 3
             0x1d, // 4
             0x1b, // 5
-            0xa2, 0x00, 0x0f, // 6: if_icmpge +15
+            0xa2, 0x00, 0x10, // 6: if_icmpge +16 → 22
             0x1c, // 9
             0x2a, // 10
             0xb4, 0x00, 0x01, // 11: getfield #1
@@ -25830,16 +25872,6 @@ mod tests {
         let heap = GenerationalHeap::new();
         let obj = heap.alloc_object(ClassId::new(0), 2);
         heap.set_field(obj, 0, Value::Int(7));
-
-        if std::env::var_os("CRATONVM_DUMP_CODE").is_some() {
-            let entry = compiled.entry_ptr() as usize;
-            let helper = stub_getfield as *const () as usize;
-            eprintln!("ENTRY={:#x} HELPER={:#x}", entry, helper);
-            let bytes = unsafe { std::slice::from_raw_parts(entry as *const u8, 400) };
-            let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-            eprintln!("CODE={}", hex);
-            return;
-        }
 
         // n = 8 → loop trips 8 times. With a 4x unroll the body runs
         // a mix of original + copy bodies; correct dispatch from every
@@ -25988,12 +26020,12 @@ mod tests {
         //   3: istore_3
         //   4: iload_3            ; header
         //   5: iload_1            ; n
-        //   6: if_icmpge +12→18   ; exit
+        //   6: if_icmpge +16→22   ; exit
         //   9: iload_2
         //  10: aload_0            ; receiver
-        //  11: invokevirtual #1   ; → helper (panicking stub here, but
-        //                          we only check the compile, not run)
-        //  14: iadd
+        //  11: invokevirtual #1   ; obj.inc() → I (helper; panicking stub
+        //                          here, but we only check the compile)
+        //  14: iadd               ; s + ret
         //  15: istore_2
         //  16: iinc 3, 1
         //  19: goto -15 → 4
@@ -26003,7 +26035,7 @@ mod tests {
             0x03, 0x3d, 0x03, 0x3e,
             0x1d, // 4: iload_3
             0x1b, // 5: iload_1
-            0xa2, 0x00, 0x0f, // 6
+            0xa2, 0x00, 0x10, // 6: if_icmpge +16 → 22
             0x1c, // 9
             0x2a, // 10
             0xb6, 0x00, 0x01, // 11: invokevirtual #1
@@ -26021,12 +26053,20 @@ mod tests {
         // 'static lifetime to match the production lib.rs path.
         let class_name: &'static str = Box::leak("Foo".to_string().into_boxed_str());
         let method_name: &'static str = Box::leak("inc".to_string().into_boxed_str());
-        let desc: &'static str = Box::leak("(I)I".to_string().into_boxed_str());
+        // Zero-param instance method: the loop body is
+        //   s = s + obj.inc()  →  iload_2(s); aload_0(obj); invokevirtual;
+        //   iadd; istore_2
+        // so the invoke is net-zero on the operand stack (pops the
+        // receiver, pushes the int result), leaving `s` underneath for
+        // the following `iadd`. A `(I)I` descriptor (num_jit_args=2)
+        // would pop BOTH `s` and the receiver, underflowing the `iadd`
+        // and failing compilation before the PIC-mint path is reached.
+        let desc: &'static str = Box::leak("()I".to_string().into_boxed_str());
         let info = Box::new(JitInvokeInfo {
             class_name,
             method_name,
             descriptor: desc,
-            num_jit_args: 2, // receiver + s
+            num_jit_args: 1, // receiver only
             return_type: b'I',
             invoke_kind: 0, // virtual
         });
@@ -26070,7 +26110,7 @@ mod tests {
         // Body span is 15 bytes (pc 4..=19) → static heuristic picks
         // 4x unroll (3 extra copies). The inline-IC fast path engages
         // for invokevirtual with `args_fit && pic_ptr.is_some()`,
-        // which holds here (n=2, vm_ptr+2 ≤ ARG_REGS.len()). So 3
+        // which holds here (n=1, vm_ptr+1 ≤ ARG_REGS.len()). So 3
         // fresh PIC slots should be minted (one per copy).
         let method = compiled.expect("invokevirtual-in-loop must compile");
         // The compiled method does NOT carry the caller-supplied
@@ -26141,7 +26181,7 @@ mod tests {
             0x36, 0x04, // 3: istore 4 (i=0)
             0x15, 0x04, // 5: iload 4 (header)
             0x1c, // 7: iload_2 (n)
-            0xa2, 0x00, 0x14, // 8: if_icmpge +20 → 28
+            0xa2, 0x00, 0x15, // 8: if_icmpge +21 → 29
             0x1d, // 11: iload_3 (s)
             0x2a, // 12: aload_0 (a)
             0xb4, 0x00, 0x01, // 13: getfield #1
@@ -26151,7 +26191,7 @@ mod tests {
             0x60, // 21: iadd
             0x3e, // 22: istore_3
             0x84, 0x04, 0x01, // 23: iinc 4, 1
-            0xa7, 0xff, 0xec, // 26: goto -20 → 5
+            0xa7, 0xff, 0xeb, // 26: goto -21 → 5
             0x1d, // 29: iload_3
             0xac, // 30: ireturn
             0, 0,
@@ -26193,5 +26233,132 @@ mod tests {
         // every copy + the original execute exactly once.
         let result = unsafe { compiled.try_call(&[a.as_ptr() as i64, b.as_ptr() as i64, 4]).expect("test JIT call") };
         assert_eq!(result, 32);
+    }
+
+    /// Helper: drive `compile` over a raw `(I)I` method body. Returns whether
+    /// compilation succeeded (`Some`) or bailed to the interpreter (`None`).
+    /// Used by the switch-decode DoS regression tests below: a bail (`None`)
+    /// is the *expected* safe outcome for crafted/unverified switch bytecode.
+    fn try_compile_int_body(code: &[u8], code_len: usize) -> bool {
+        compile(
+            code,
+            code_len,
+            1,
+            1,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None,
+        )
+        .is_some()
+    }
+
+    /// M2a regression: a `tableswitch` whose `high - low + 1` count overflows
+    /// i32 (here low = i32::MIN, high = i32::MAX) must not wrap to a bogus
+    /// positive count and drive a ~16 GB allocation / out-of-bounds read.
+    /// Compilation must bail (return `None`) without panicking.
+    #[test]
+    fn test_tableswitch_count_overflow_bails() {
+        // iconst_0; tableswitch @ pc=1 (padding to pc=4):
+        //   default=+0, low=i32::MIN, high=i32::MAX
+        let mut code: Vec<u8> = vec![0x03, 0xaa, 0x00, 0x00]; // iconst_0 + pad to 4
+        code.extend_from_slice(&0i32.to_be_bytes()); // default
+        code.extend_from_slice(&i32::MIN.to_be_bytes()); // low
+        code.extend_from_slice(&i32::MAX.to_be_bytes()); // high
+        // (no jump-table entries follow — the count guard must reject first)
+        let code_len = code.len();
+        assert!(
+            !try_compile_int_body(&code, code_len),
+            "tableswitch with overflowing count must bail, not compile"
+        );
+    }
+
+    /// M2a regression: a `tableswitch` whose declared table extends past the
+    /// end of `code` must bail rather than index out of bounds.
+    #[test]
+    fn test_tableswitch_table_past_end_bails() {
+        // iconst_0; tableswitch: default=+0, low=0, high=999 (1000 entries)
+        // but no entry bytes follow → remaining-bytes guard must reject.
+        let mut code: Vec<u8> = vec![0x03, 0xaa, 0x00, 0x00];
+        code.extend_from_slice(&0i32.to_be_bytes()); // default
+        code.extend_from_slice(&0i32.to_be_bytes()); // low
+        code.extend_from_slice(&999i32.to_be_bytes()); // high → 1000 entries
+        let code_len = code.len();
+        assert!(
+            !try_compile_int_body(&code, code_len),
+            "tableswitch with table past end must bail, not compile"
+        );
+    }
+
+    /// M2a regression: a `tableswitch` header truncated by `code_len` must bail
+    /// before reading the 12-byte default/low/high header.
+    #[test]
+    fn test_tableswitch_truncated_header_bails() {
+        // iconst_0; tableswitch + only a few header bytes (header needs 12).
+        let mut code: Vec<u8> = vec![0x03, 0xaa, 0x00, 0x00];
+        code.extend_from_slice(&[0x00, 0x00, 0x00]); // truncated header
+        let code_len = code.len();
+        assert!(
+            !try_compile_int_body(&code, code_len),
+            "tableswitch with truncated header must bail, not compile"
+        );
+    }
+
+    /// M2b regression: a `lookupswitch` with a negative `npairs` must not be
+    /// reinterpreted as a huge usize and drive an OOM allocation / OOB read.
+    #[test]
+    fn test_lookupswitch_negative_npairs_bails() {
+        // iconst_0; lookupswitch @ pc=1 (padding to pc=4): default=+0, npairs=-1
+        let mut code: Vec<u8> = vec![0x03, 0xab, 0x00, 0x00];
+        code.extend_from_slice(&0i32.to_be_bytes()); // default
+        code.extend_from_slice(&(-1i32).to_be_bytes()); // npairs (negative)
+        let code_len = code.len();
+        assert!(
+            !try_compile_int_body(&code, code_len),
+            "lookupswitch with negative npairs must bail, not compile"
+        );
+    }
+
+    /// M2b regression: a `lookupswitch` whose declared pair table extends past
+    /// the end of `code` must bail rather than index out of bounds.
+    #[test]
+    fn test_lookupswitch_pairs_past_end_bails() {
+        // iconst_0; lookupswitch: default=+0, npairs=1000 but no pair bytes.
+        let mut code: Vec<u8> = vec![0x03, 0xab, 0x00, 0x00];
+        code.extend_from_slice(&0i32.to_be_bytes()); // default
+        code.extend_from_slice(&1000i32.to_be_bytes()); // npairs
+        let code_len = code.len();
+        assert!(
+            !try_compile_int_body(&code, code_len),
+            "lookupswitch with pair table past end must bail, not compile"
+        );
+    }
+
+    /// M2b regression: a `lookupswitch` header truncated by `code_len` must
+    /// bail before reading the 8-byte default/npairs header.
+    #[test]
+    fn test_lookupswitch_truncated_header_bails() {
+        let mut code: Vec<u8> = vec![0x03, 0xab, 0x00, 0x00];
+        code.extend_from_slice(&[0x00, 0x00, 0x00]); // truncated header (<8)
+        let code_len = code.len();
+        assert!(
+            !try_compile_int_body(&code, code_len),
+            "lookupswitch with truncated header must bail, not compile"
+        );
     }
 }

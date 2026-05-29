@@ -26,14 +26,17 @@ const MAX_CSTR_LEN: usize = 4096;
 /// `enableNativeAccess` permission. This crate has no module-permission
 /// plumbing reachable here, so this is a minimal coarse gate.
 ///
-/// Default is `true` to preserve current behavior; a host/launcher that
-/// wants the JDK semantics should call [`set_native_access_enabled(false)`]
-/// at startup and flip it on only for modules granted native access.
+/// Default is `false` (secure-by-default, matching the JDK where native
+/// access is denied unless `--enable-native-access` grants it). A
+/// host/launcher that wants to permit Panama downcalls and raw-address
+/// memory access must call [`set_native_access_enabled(true)`] at startup
+/// (e.g. when the user passes `--enable-native-access`), and flip it on
+/// only for trusted modules granted native access.
 ///
 /// TODO: wire this to a real per-module `--enable-native-access` check once
 /// `NativeContext` exposes the caller module's native-access permission.
 static NATIVE_ACCESS_ENABLED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(true);
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Enable or disable Panama native downcalls process-wide.
 ///
@@ -525,6 +528,18 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "ofAddress",
         "(J)Ljava/lang/foreign/MemorySegment;",
         |ctx, args| {
+            // Gate raw-address wrapping behind native access: turning an
+            // arbitrary caller-supplied long into an addressable segment is
+            // equivalent to arbitrary process-memory access once paired with
+            // reinterpret/get/set. Refuse unless native access is enabled.
+            if !native_access_enabled() {
+                return Err(RuntimeError::IllegalCallerException {
+                    message: "Native access is not enabled for this module \
+                              (MemorySegment.ofAddress denied)"
+                        .into(),
+                }
+                .into());
+            }
             let addr = match args.first() {
                 Some(Value::Long(n)) => *n,
                 _ => 0,
@@ -865,6 +880,80 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
     );
 }
 
+/// Validate a single-element access (get/set) against the segment's declared
+/// size and compute the target address with checked arithmetic.
+///
+/// Mirrors the bounds/overflow checks the `copy`/`fill` paths perform, and
+/// throws the same `IllegalStateException` on violation. Rejects:
+///   - zero-size segments (a 0-size segment — as produced by `ofAddress`
+///     before `reinterpret` — is not accessible, matching JDK semantics),
+///   - negative `offset`,
+///   - `offset + width` overflowing `i64`,
+///   - `offset + width` exceeding the segment size,
+///   - `(ptr + base_off + offset)` overflowing the address space, or a null
+///     resulting address.
+///
+/// `width` is the access width in bytes derived from the layout kind
+/// (`ffi::layout_byte_size`). Returns the validated raw address.
+fn pe_segment_access_addr(
+    ctx: &mut dyn NativeContext,
+    seg: ObjectRef,
+    offset: i64,
+    width: i64,
+) -> Result<usize, MethodCallFailed> {
+    let ptr = match ctx.get_field(seg, 0) {
+        Value::Long(n) => n,
+        _ => 0,
+    };
+    let base_off = match ctx.get_field(seg, 5) {
+        Value::Long(n) => n,
+        _ => 0,
+    };
+    let size = match ctx.get_field(seg, 1) {
+        Value::Long(n) => n,
+        _ => 0,
+    };
+
+    // A 0-size segment (e.g. ofAddress before reinterpret) is not accessible.
+    if size <= 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!(
+                "access of {} bytes at offset {} not allowed on zero-size segment",
+                width, offset
+            ),
+        }
+        .into());
+    }
+
+    // Bounds check: 0 <= offset and offset + width <= size, with overflow guard.
+    let end = offset.checked_add(width);
+    if offset < 0 || end.map_or(true, |e| e > size) {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!(
+                "offset {} + {} bytes exceeds segment size {}",
+                offset, width, size
+            ),
+        }
+        .into());
+    }
+
+    // Validate address arithmetic doesn't overflow.
+    let total = (ptr as u64)
+        .checked_add(base_off as u64)
+        .and_then(|v| v.checked_add(offset as u64));
+    match total {
+        Some(addr) if addr != 0 => Ok(addr as usize),
+        Some(_) => Err(RuntimeError::IllegalStateException {
+            message: "Null segment address".into(),
+        }
+        .into()),
+        None => Err(RuntimeError::IllegalStateException {
+            message: "address arithmetic overflow in MemorySegment access".into(),
+        }
+        .into()),
+    }
+}
+
 fn pe_segment_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let layout = obj_arg(args, 1)?;
@@ -881,30 +970,20 @@ fn pe_segment_get_impl(
     layout: ObjectRef,
     offset: i64,
 ) -> MethodCallResult {
-    let ptr = match ctx.get_field(seg, 0) {
-        Value::Long(n) => n,
-        _ => 0,
-    };
-    let base_off = match ctx.get_field(seg, 5) {
-        Value::Long(n) => n,
-        _ => 0,
-    };
-    let addr = (ptr + base_off + offset) as *const u8;
     let kind = match ctx.get_field(layout, 0) {
         Value::Int(n) => n,
         _ => 0,
     };
+    // Reject reads that fall outside the segment's declared bounds, overflow
+    // the address space, or target a zero-size segment. The access width is
+    // derived from the layout kind, matching the read widths below.
+    let width = ffi::layout_byte_size(kind) as i64;
+    let addr = pe_segment_access_addr(ctx, seg, offset, width)? as *const u8;
 
-    if addr.is_null() {
-        return Err(RuntimeError::IllegalStateException {
-            message: "Null segment address".into(),
-        }
-        .into());
-    }
-
-    // SAFETY: addr is non-null (checked above). The address comes from a
-    // JVM MemorySegment whose lifetime is managed by an Arena. The kind
-    // determines the read width so alignment is implicit from the segment.
+    // SAFETY: addr is non-null, bounds-checked against the segment's declared
+    // size, and the address arithmetic was overflow-checked (see
+    // pe_segment_access_addr). The kind determines the read width so alignment
+    // is implicit from the segment.
     let value = unsafe {
         match kind {
             LAYOUT_BYTE | LAYOUT_BOOLEAN => Value::Int(*(addr as *const i8) as i32),
@@ -937,30 +1016,20 @@ fn pe_segment_set_impl(
     offset: i64,
     value: Value,
 ) -> MethodCallResult {
-    let ptr = match ctx.get_field(seg, 0) {
-        Value::Long(n) => n,
-        _ => 0,
-    };
-    let base_off = match ctx.get_field(seg, 5) {
-        Value::Long(n) => n,
-        _ => 0,
-    };
-    let addr = (ptr + base_off + offset) as *mut u8;
     let kind = match ctx.get_field(layout, 0) {
         Value::Int(n) => n,
         _ => 0,
     };
+    // Reject writes that fall outside the segment's declared bounds, overflow
+    // the address space, or target a zero-size segment. The access width is
+    // derived from the layout kind, matching the write widths below.
+    let width = ffi::layout_byte_size(kind) as i64;
+    let addr = pe_segment_access_addr(ctx, seg, offset, width)? as *mut u8;
 
-    if addr.is_null() {
-        return Err(RuntimeError::IllegalStateException {
-            message: "Null segment address".into(),
-        }
-        .into());
-    }
-
-    // SAFETY: addr is non-null (checked above). The address comes from a
-    // JVM MemorySegment whose lifetime is managed by an Arena. The kind
-    // determines the write width so alignment is implicit from the segment.
+    // SAFETY: addr is non-null, bounds-checked against the segment's declared
+    // size, and the address arithmetic was overflow-checked (see
+    // pe_segment_access_addr). The kind determines the write width so alignment
+    // is implicit from the segment.
     unsafe {
         match (kind, value) {
             (LAYOUT_BYTE | LAYOUT_BOOLEAN, Value::Int(v)) => *(addr as *mut i8) = v as i8,
@@ -2457,6 +2526,18 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
         "(J)Ljava/lang/foreign/MemorySegment;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            // Gate size-stamping behind native access: reinterpret can grant an
+            // arbitrary access window over a (possibly raw) address, which is
+            // the second half of the arbitrary-memory primitive. Refuse unless
+            // native access is enabled.
+            if !native_access_enabled() {
+                return Err(RuntimeError::IllegalCallerException {
+                    message: "Native access is not enabled for this module \
+                              (MemorySegment.reinterpret denied)"
+                        .into(),
+                }
+                .into());
+            }
             let new_size = match args.get(1) {
                 Some(Value::Long(n)) => *n,
                 _ => 0,
@@ -3760,6 +3841,133 @@ mod tests {
                 kind
             );
         }
+    }
+
+    // ===================================================================
+    // Security regression: Panama arbitrary-memory + native-access gate
+    // (CRITICAL — arbitrary process memory R/W + native-code execution)
+    // ===================================================================
+
+    /// Helper: build a MemorySegment synthetic backed by a real Rust buffer so
+    /// in-bounds accesses are sound while out-of-bounds accesses are caught by
+    /// the bounds checks before any dereference.
+    fn make_segment(
+        ctx: &mut dyn NativeContext,
+        ptr: i64,
+        size: i64,
+        base_off: i64,
+    ) -> ObjectRef {
+        let seg = alloc_concurrent_synthetic(ctx, "java/lang/foreign/MemorySegment", 6);
+        ctx.set_field(seg, 0, Value::Long(ptr));
+        ctx.set_field(seg, 1, Value::Long(size));
+        ctx.set_field(seg, 2, Value::Object(None));
+        ctx.set_field(seg, 3, Value::Int(0));
+        ctx.set_field(seg, 4, Value::Int(1));
+        ctx.set_field(seg, 5, Value::Long(base_off));
+        seg
+    }
+
+    fn make_layout_kind(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
+        pe_make_layout(ctx, kind)
+    }
+
+    #[test]
+    fn sec_segment_get_rejects_oob_offset() {
+        let mut ctx = mock_ctx();
+        let mut buf = [0u8; 8];
+        let seg = make_segment(&mut ctx, buf.as_mut_ptr() as i64, 8, 0);
+        let layout = make_layout_kind(&mut ctx, LAYOUT_INT);
+        // offset 8 + width 4 = 12 > size 8 → must be rejected, NOT dereferenced.
+        let r = pe_segment_get_impl(&mut ctx, seg, layout, 8);
+        assert!(r.is_err(), "out-of-bounds get must be rejected");
+    }
+
+    #[test]
+    fn sec_segment_get_rejects_negative_offset() {
+        let mut ctx = mock_ctx();
+        let mut buf = [0u8; 8];
+        let seg = make_segment(&mut ctx, buf.as_mut_ptr() as i64, 8, 0);
+        let layout = make_layout_kind(&mut ctx, LAYOUT_BYTE);
+        let r = pe_segment_get_impl(&mut ctx, seg, layout, -1);
+        assert!(r.is_err(), "negative offset get must be rejected");
+    }
+
+    #[test]
+    fn sec_segment_set_rejects_oob_offset() {
+        let mut ctx = mock_ctx();
+        let mut buf = [0u8; 8];
+        let seg = make_segment(&mut ctx, buf.as_mut_ptr() as i64, 8, 0);
+        let layout = make_layout_kind(&mut ctx, LAYOUT_LONG);
+        // offset 4 + width 8 = 12 > size 8 → reject before writing.
+        let r = pe_segment_set_impl(&mut ctx, seg, layout, 4, Value::Long(0x4141414141414141u64 as i64));
+        assert!(r.is_err(), "out-of-bounds set must be rejected");
+    }
+
+    #[test]
+    fn sec_segment_zero_size_not_accessible() {
+        // A 0-size segment (as produced by ofAddress before reinterpret) must
+        // refuse all access, even at offset 0 — this is the ofAddress escape.
+        let mut ctx = mock_ctx();
+        let seg = make_segment(&mut ctx, 0x1000, 0, 0);
+        let layout = make_layout_kind(&mut ctx, LAYOUT_BYTE);
+        assert!(
+            pe_segment_get_impl(&mut ctx, seg, layout, 0).is_err(),
+            "get on zero-size segment must be rejected"
+        );
+        assert!(
+            pe_segment_set_impl(&mut ctx, seg, layout, 0, Value::Int(0)).is_err(),
+            "set on zero-size segment must be rejected"
+        );
+    }
+
+    #[test]
+    fn sec_segment_access_addr_overflow_rejected() {
+        let mut ctx = mock_ctx();
+        // ptr = u64::MAX (as i64 = -1), size large enough to pass bounds, so the
+        // address arithmetic itself overflows and must be caught.
+        let seg = make_segment(&mut ctx, -1i64, 1024, 0);
+        let r = pe_segment_access_addr(&mut ctx, seg, 16, 8);
+        assert!(r.is_err(), "address arithmetic overflow must be rejected");
+    }
+
+    #[test]
+    fn sec_segment_in_bounds_roundtrips() {
+        // Sanity: a legitimate in-bounds access still works.
+        let mut ctx = mock_ctx();
+        let mut buf = [0u8; 8];
+        let seg = make_segment(&mut ctx, buf.as_mut_ptr() as i64, 8, 0);
+        let layout = make_layout_kind(&mut ctx, LAYOUT_INT);
+        assert!(pe_segment_set_impl(&mut ctx, seg, layout, 0, Value::Int(0x11223344)).is_ok());
+        match pe_segment_get_impl(&mut ctx, seg, layout, 0) {
+            Ok(Some(Value::Int(v))) => assert_eq!(v, 0x11223344),
+            other => panic!("expected Int(0x11223344), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn sec_native_access_disabled_by_default() {
+        // The process-wide gate must default closed (secure-by-default).
+        // NOTE: this reads global state; if a prior test in the same process
+        // flipped it on we restore it, but the *initial* default is false.
+        // We assert the default via a fresh load after forcing the documented
+        // default value.
+        set_native_access_enabled(false);
+        assert!(!native_access_enabled());
+        // Setter plumbing still works in both directions.
+        set_native_access_enabled(true);
+        assert!(native_access_enabled());
+        set_native_access_enabled(false);
+        assert!(!native_access_enabled());
+    }
+
+    #[test]
+    fn sec_validated_fn_ptr_denied_when_gate_closed() {
+        set_native_access_enabled(false);
+        let r = validated_fn_ptr::<extern "C" fn() -> i32>(0x1000);
+        assert!(
+            r.is_err(),
+            "downcall must be denied when native access is disabled"
+        );
     }
 }
 

@@ -257,6 +257,31 @@ fn buffer_advance(ctx: &mut dyn NativeContext, buf: ObjectRef, new_pos: i32) {
     ctx.set_field(buf, 0, Value::Int(new_pos));
 }
 
+/// H3a: vet a fully-resolved UDP destination against the outbound-host
+/// policy before we `send_to` it. `decode_isa` has already resolved any
+/// hostname to a concrete `SocketAddr`, so (unlike the TCP non-blocking
+/// path) there is no DNS-rebind window left to close — we just need to
+/// run the same link-local / blocked-range check the TCP connect path
+/// uses. We reuse the public `outbound_policy::check_outbound` API by
+/// formatting the resolved address as an `IP:port` literal (bracketing
+/// IPv6 so `host_part` parses it), so the default policy's literal-IP
+/// link-local check fires against `169.254.169.254`, the broader
+/// `169.254.0.0/16` range, and the IPv6 link-local / AWS-metadata
+/// addresses. A denial maps to the same `IOException` the rest of this
+/// module raises (`io_error`), mirroring the TCP path's exception type.
+fn check_outbound_target(target: SocketAddr) -> Result<(), MethodCallFailed> {
+    let literal = match target {
+        SocketAddr::V4(_) => format!("{}:{}", target.ip(), target.port()),
+        SocketAddr::V6(_) => format!("[{}]:{}", target.ip(), target.port()),
+    };
+    if let Err(reason) = crate::outbound_policy::check_outbound(&literal) {
+        return Err(io_error(format!(
+            "send denied by outbound policy: {reason}"
+        )));
+    }
+    Ok(())
+}
+
 fn parse_inet_address(ctx: &dyn NativeContext, addr: ObjectRef) -> Option<IpAddr> {
     // Try IP text at slot 1 first (matches what net.rs encodes).
     let text = match ctx.get_field(addr, 1) {
@@ -327,6 +352,9 @@ fn dgram_send0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     let target = arg_obj(args, 2)
         .and_then(|o| decode_isa(ctx, o))
         .ok_or_else(|| io_error("send: target SocketAddress unparsable"))?;
+    // H3a: SSRF gate. Refuse datagrams to link-local cloud-metadata /
+    // blocked ranges before the real `sendto(2)`, matching the TCP path.
+    check_outbound_target(target)?;
     let (arr, position, limit) =
         buffer_view(ctx, buf).ok_or_else(|| io_error("send: buffer layout"))?;
     if position >= limit {
@@ -761,6 +789,43 @@ mod tests {
             assert!(left.is_ok(), "leave_multicast_v4 failed: {left:?}");
         }
         dgram_remove(id);
+    }
+
+    #[test]
+    fn h3a_send_blocks_link_local_metadata_v4() {
+        // AWS IMDS and the broader 169.254.0.0/16 range must be refused
+        // before send_to. Reset to the default policy first.
+        crate::outbound_policy::reset_policy();
+        let imds: SocketAddr = "169.254.169.254:80".parse().unwrap();
+        assert!(
+            check_outbound_target(imds).is_err(),
+            "expected 169.254.169.254 to be denied"
+        );
+        let neighbour: SocketAddr = "169.254.170.2:80".parse().unwrap();
+        assert!(
+            check_outbound_target(neighbour).is_err(),
+            "expected 169.254.0.0/16 neighbour to be denied"
+        );
+    }
+
+    #[test]
+    fn h3a_send_blocks_link_local_metadata_v6() {
+        crate::outbound_policy::reset_policy();
+        let imds_v6: SocketAddr = "[fd00:ec2::254]:80".parse().unwrap();
+        assert!(
+            check_outbound_target(imds_v6).is_err(),
+            "expected fd00:ec2::254 to be denied"
+        );
+    }
+
+    #[test]
+    fn h3a_send_allows_loopback() {
+        crate::outbound_policy::reset_policy();
+        let loopback: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        assert!(
+            check_outbound_target(loopback).is_ok(),
+            "default policy should allow loopback"
+        );
     }
 
     #[test]

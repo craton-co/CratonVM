@@ -664,6 +664,18 @@ impl PlatformBackend for Win32Backend {
             .get(&id)
             .ok_or(PlatformError::WindowNotFound)?;
         let hwnd = info.hwnd();
+
+        // width*height drives both the DIB allocation (via the BITMAPINFO
+        // below) and the `from_raw_parts_mut` slice length. A `u32` multiply
+        // wraps in release, so a hostile width/height could make the slice
+        // length disagree with the real DIB allocation -> heap OOB write.
+        // Compute the pixel count once with a checked `usize` multiply and
+        // bail if it overflows or doesn't fit the source buffer. Mirrors the
+        // cocoa backend's `blit_buffer` guard.
+        let pixel_count = match (width as usize).checked_mul(height as usize) {
+            Some(n) if n <= pixels.len() => n,
+            _ => return Err(PlatformError::CreationFailed("pixel buffer too small".into())),
+        };
         unsafe {
             // BeginPaint -> EndPaint pair. If we bail with `?` below the
             // guard's Drop closes the paint session.
@@ -711,9 +723,13 @@ impl PlatformBackend for Win32Backend {
             // SelectObject -> restore-previous pair.
             let _selected = SelectObjectGuard::select(hdc_mem, hbm_guard.handle());
             if !bits.is_null() {
+                // `pixel_count` is the checked `width as usize * height as
+                // usize` computed above; it matches the DIB allocation
+                // (32bpp, width*height pixels) exactly, so the slice can
+                // never extend past the real allocation.
                 let dst = std::slice::from_raw_parts_mut(
                     bits as *mut u32,
-                    (width * height) as usize,
+                    pixel_count,
                 );
                 for (i, &px) in pixels.iter().enumerate() {
                     if i >= dst.len() {
@@ -909,6 +925,22 @@ impl PlatformBackend for Win32Backend {
             return empty;
         }
 
+        // Clamp the DWrite-reported metrics to a sane maximum before they
+        // feed the DIB allocation and the `vec![0u32; tw*th]` / from_raw_parts
+        // slice below. A pathological layout (e.g. an enormous font size or a
+        // very long single line) could otherwise drive `tw * th` to overflow a
+        // `u32`, making the allocation and the slice length disagree.
+        const MAX_RASTER_DIM: u32 = 1 << 15; // 32768 px per side
+        let tw = tw.min(MAX_RASTER_DIM);
+        let th = th.min(MAX_RASTER_DIM);
+        // Pixel count via a checked `usize` multiply (clamped dims guarantee
+        // this fits, but compute it once and bail defensively on overflow so
+        // the DIB size and the slice length can never diverge).
+        let raster_px = match (tw as usize).checked_mul(th as usize) {
+            Some(n) => n,
+            None => return empty,
+        };
+
         let ca = (color >> 24) & 0xFF;
         let cr = (color >> 16) & 0xFF;
         let cg = (color >> 8) & 0xFF;
@@ -987,10 +1019,13 @@ impl PlatformBackend for Win32Backend {
             let text_w: Vec<u16> = text.encode_utf16().collect();
             let _ = TextOutW(hdc_mem, 0, 0, &text_w);
 
-            let mut px_out = vec![0u32; (tw * th) as usize];
+            let mut px_out = vec![0u32; raster_px];
             if !bits.is_null() {
+                // `raster_px` is the checked `tw as usize * th as usize`; the
+                // DIB above is 32bpp with the same clamped tw/th, so this
+                // slice never extends past the real allocation.
                 let src =
-                    std::slice::from_raw_parts(bits as *const u32, (tw * th) as usize);
+                    std::slice::from_raw_parts(bits as *const u32, raster_px);
                 for (i, &px) in src.iter().enumerate() {
                     let pb = (px >> 16) & 0xFF;
                     let pg = (px >> 8) & 0xFF;

@@ -1014,9 +1014,18 @@ fn parse_checkpoint_pool(
     }
     let mut pos = offset + size_len;
 
+    // SECURITY: all header/pool field decodes below must stay inside this
+    // record. `record_end` is already validated `<= data.len()`, but decoding
+    // against `&data[pos..]` would let a malformed checkpoint read varints out
+    // of the following section (events/metadata). Slice against `record_end`
+    // so a decode can never cross the record boundary. `pos` starts at
+    // `offset + size_len <= record_end` and only ever advances by bytes a
+    // decode reported it consumed from a `record_end`-bounded slice, so each
+    // `&data[pos..record_end]` below has `pos <= record_end` (a valid range).
+
     // Skip: type_id, timestamp, duration, delta, type_mask.
     for _ in 0..5 {
-        let (_, c) = decode_compressed_long(&data[pos..]).ok_or_else(|| {
+        let (_, c) = decode_compressed_long(&data[pos..record_end]).ok_or_else(|| {
             JfrDumpError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "checkpoint header field decode failed",
@@ -1025,7 +1034,7 @@ fn parse_checkpoint_pool(
         pos += c;
     }
     // Number of constant pools.
-    let (n_pools, c) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
+    let (n_pools, c) = decode_compressed_int(&data[pos..record_end]).ok_or_else(|| {
         JfrDumpError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
             "constant pool count decode failed",
@@ -1035,14 +1044,14 @@ fn parse_checkpoint_pool(
 
     let mut strings: Vec<std::sync::Arc<str>> = Vec::new();
     for _ in 0..n_pools {
-        let (pool_type, ptc) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
+        let (pool_type, ptc) = decode_compressed_int(&data[pos..record_end]).ok_or_else(|| {
             JfrDumpError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "pool type decode failed",
             ))
         })?;
         pos += ptc;
-        let (n_entries, nec) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
+        let (n_entries, nec) = decode_compressed_int(&data[pos..record_end]).ok_or_else(|| {
             JfrDumpError::Io(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "pool entry count decode failed",
@@ -1069,14 +1078,14 @@ fn parse_checkpoint_pool(
             }
             strings.reserve(n_entries as usize);
             for _ in 0..n_entries {
-                let (_idx, ic) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
+                let (_idx, ic) = decode_compressed_int(&data[pos..record_end]).ok_or_else(|| {
                     JfrDumpError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "pool entry index decode failed",
                     ))
                 })?;
                 pos += ic;
-                let (slen, lc) = decode_compressed_int(&data[pos..]).ok_or_else(|| {
+                let (slen, lc) = decode_compressed_int(&data[pos..record_end]).ok_or_else(|| {
                     JfrDumpError::Io(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "pool entry length decode failed",
@@ -1157,6 +1166,25 @@ pub fn read_events(
     let metadata_offset =
         u64::from_be_bytes(data[24..32].try_into().unwrap()) as usize;
 
+    // SECURITY: `checkpoint_offset` and `metadata_offset` come straight from the
+    // untrusted 72-byte header. They become the `events_start` / `events_end`
+    // bounds and seed the `parse_checkpoint_pool` walk; a crafted file can set
+    // either past EOF, which would later slice `&data[pos..]` with
+    // `pos > data.len()` and panic. Reject any offset that points past the end
+    // of the file before they are used.
+    if checkpoint_offset > data.len() {
+        return Err(JfrDumpError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "checkpoint_offset extends past EOF",
+        )));
+    }
+    if metadata_offset > data.len() {
+        return Err(JfrDumpError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "metadata_offset extends past EOF",
+        )));
+    }
+
     // J1 (round-2): the writer emits checkpoint BEFORE events, so we parse the
     // pool first, then walk events between (checkpoint_end .. metadata_offset).
     // Files written by older versions place the checkpoint AFTER events; we
@@ -1176,6 +1204,12 @@ pub fn read_events(
         } else {
             (Vec::new(), HEADER_SIZE as usize, checkpoint_offset)
         };
+    // SECURITY (defense-in-depth): the walk loop below indexes `&data[pos..]`
+    // for `pos < events_end`. `checkpoint_offset` / `metadata_offset` are
+    // already validated `<= data.len()` above, but clamp here too so the loop
+    // bound is provably in-bounds regardless of which layout branch produced
+    // `events_end`.
+    let events_end = events_end.min(data.len());
     let pool_ref: Option<&[std::sync::Arc<str>]> =
         if pool.is_empty() { None } else { Some(&pool) };
 
@@ -1735,6 +1769,96 @@ mod tests {
         std::fs::write(&path, &[0u8; 10]).unwrap();
         let result = read_jfr_header(&path);
         assert!(result.is_err());
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// Build a syntactically valid 72-byte JFR header with caller-chosen
+    /// `checkpoint_offset` (bytes 16..24) and `metadata_offset` (bytes 24..32).
+    /// All other fields are zeroed except the magic and minor version.
+    fn make_header_with_offsets(checkpoint_offset: u64, metadata_offset: u64) -> Vec<u8> {
+        let mut h = vec![0u8; HEADER_SIZE as usize];
+        h[0..4].copy_from_slice(&JFR_MAGIC);
+        // minor version 0 (bytes 6..8): absolute timestamps, simplest path.
+        h[16..24].copy_from_slice(&checkpoint_offset.to_be_bytes());
+        h[24..32].copy_from_slice(&metadata_offset.to_be_bytes());
+        h
+    }
+
+    /// SECURITY regression: a header whose `metadata_offset` points past the
+    /// end of the file must return `Err`, not panic on an out-of-bounds slice.
+    #[test]
+    fn test_read_events_metadata_offset_past_eof() {
+        let dir = std::env::temp_dir().join("jfr_test_meta_oob");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("meta_oob.jfr");
+
+        // checkpoint at header end (legacy/empty layout), metadata far past EOF.
+        let data = make_header_with_offsets(HEADER_SIZE, 0xFFFF_FFFF);
+        std::fs::write(&path, &data).unwrap();
+
+        let reg = EventTypeRegistry::new();
+        let result = read_events(&path, &reg);
+        assert!(result.is_err(), "metadata_offset past EOF must error, not panic");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// SECURITY regression: a header whose `checkpoint_offset` points past the
+    /// end of the file must return `Err`, not panic. This offset seeds both the
+    /// `parse_checkpoint_pool` walk and the legacy `events_end` bound.
+    #[test]
+    fn test_read_events_checkpoint_offset_past_eof() {
+        let dir = std::env::temp_dir().join("jfr_test_ckpt_oob");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ckpt_oob.jfr");
+
+        // checkpoint past EOF, metadata larger still (so the layout branch that
+        // treats checkpoint as events_end is taken).
+        let data = make_header_with_offsets(0xFFFF_FFFF, 0xFFFF_FFFF);
+        std::fs::write(&path, &data).unwrap();
+
+        let reg = EventTypeRegistry::new();
+        let result = read_events(&path, &reg);
+        assert!(result.is_err(), "checkpoint_offset past EOF must error, not panic");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// SECURITY regression: a checkpoint record that is in-bounds but whose
+    /// internal varint fields claim to extend toward the following section must
+    /// not read past `record_end`. We craft a checkpoint whose declared record
+    /// size is small but whose header-field varints would otherwise consume
+    /// bytes beyond the record. The bounded decode must return `Err` cleanly.
+    #[test]
+    fn test_parse_checkpoint_pool_fields_bounded_by_record() {
+        // Lay out a file: 72-byte header, then a checkpoint record at
+        // HEADER_SIZE whose declared size is just 1 byte (only the size field),
+        // leaving no room for the 5 mandatory header-field varints. The decode
+        // against `&data[pos..record_end]` must fail rather than reading into
+        // whatever follows.
+        let dir = std::env::temp_dir().join("jfr_test_ckpt_bounded");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ckpt_bounded.jfr");
+
+        let mut data = make_header_with_offsets(HEADER_SIZE, HEADER_SIZE + 8);
+        // Checkpoint record: size = 1 (consumes only the size byte). The five
+        // header-field decodes then see an empty `&data[pos..record_end]`.
+        data.extend_from_slice(&encode_compressed_int(1));
+        // Trailing bytes that, if the decode were unbounded, would be misread
+        // as header fields. They must be ignored.
+        data.extend_from_slice(&[0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F]);
+
+        std::fs::write(&path, &data).unwrap();
+
+        let reg = EventTypeRegistry::new();
+        // Must return Err (record-bounded decode fails) rather than silently
+        // reading the trailing bytes or panicking.
+        let result = read_events(&path, &reg);
+        assert!(result.is_err(), "checkpoint field decode must stay within record");
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

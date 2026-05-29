@@ -25,8 +25,8 @@ pub fn check_class_access(accessor: &Class, target: &Class) -> Result<(), Linkag
         return Ok(());
     }
 
-    // Package-private: same runtime package required
-    if same_runtime_package(&accessor.name, &target.name) {
+    // Package-private: same runtime package required (loader-aware, JVMS В§5.3)
+    if same_runtime_package(accessor, target) {
         return Ok(());
     }
 
@@ -72,7 +72,7 @@ pub fn check_field_access(
 
     // Protected: same package OR subclass
     if flags.contains(FieldAccessFlags::PROTECTED) {
-        if same_runtime_package(&accessor.name, &declaring.name) {
+        if same_runtime_package(accessor, declaring) {
             return Ok(());
         }
         if accessor.is_subclass_of(declaring.id, store) {
@@ -87,7 +87,7 @@ pub fn check_field_access(
     }
 
     // Package-private (no access modifier): same package only
-    if same_runtime_package(&accessor.name, &declaring.name) {
+    if same_runtime_package(accessor, declaring) {
         return Ok(());
     }
 
@@ -129,7 +129,7 @@ pub fn check_method_access(
 
     // Protected: same package OR subclass
     if flags.contains(MethodAccessFlags::PROTECTED) {
-        if same_runtime_package(&accessor.name, &declaring.name) {
+        if same_runtime_package(accessor, declaring) {
             return Ok(());
         }
         if accessor.is_subclass_of(declaring.id, store) {
@@ -144,7 +144,7 @@ pub fn check_method_access(
     }
 
     // Package-private: same package only
-    if same_runtime_package(&accessor.name, &declaring.name) {
+    if same_runtime_package(accessor, declaring) {
         return Ok(());
     }
 
@@ -214,16 +214,42 @@ fn confirmed_nest_host<'a>(class: &'a Class, store: &ClassStore) -> &'a str {
     }
 }
 
-/// Check if two classes are in the same runtime package.
+/// Check if two classes are in the same *runtime* package.
 ///
-/// The runtime package is determined by the package prefix of the fully-qualified
+/// Per JVMS В§5.3, a runtime package is identified by the tuple
+/// `(defining class loader, package name)` вЂ” NOT by the package-name
+/// string alone. Two classes named `java/lang/Xxx` are only in the same
+/// runtime package if they were *defined by the same class loader*.
+///
+/// This matters for security (finding H5): a user-defined class loader
+/// can define a class literally named `java/lang/Evil`. If package
+/// identity were computed from the name string alone, that class would
+/// be treated as a package-mate of the real bootstrap `java.lang.*`
+/// classes and could reach their package-private members. Comparing the
+/// defining-loader id as well closes that spoofing hole: the attacker's
+/// class lives in `(user-defined-loader, "java/lang")`, which is a
+/// distinct runtime package from `(bootstrap, "java/lang")`.
+///
+/// The package name itself is still the prefix of the fully-qualified
 /// internal name. For example:
 /// - `"java/lang/Object"` в†’ package `"java/lang"`
-/// - `"java/lang/String"` в†’ package `"java/lang"` (same)
-/// - `"java/util/List"` в†’ package `"java/util"` (different)
+/// - `"java/lang/String"` в†’ package `"java/lang"` (same name)
+/// - `"java/util/List"` в†’ package `"java/util"` (different name)
 /// - `"Foo"` в†’ default package `""` (no `/`)
 #[inline]
-pub fn same_runtime_package(name_a: &str, name_b: &str) -> bool {
+pub fn same_runtime_package(a: &Class, b: &Class) -> bool {
+    // Runtime package identity = (defining loader, package name).
+    a.loader_id == b.loader_id && same_package_name(&a.name, &b.name)
+}
+
+/// Compare only the package-*name* component of two internal class names.
+///
+/// This is the loader-unaware string comparison. It is NOT sufficient for
+/// access control on its own (see [`same_runtime_package`]); it is used
+/// where the defining loaders are already known to match (or are
+/// irrelevant, e.g. the JPMS package-export check).
+#[inline]
+fn same_package_name(name_a: &str, name_b: &str) -> bool {
     package_of(name_a) == package_of(name_b)
 }
 
@@ -410,26 +436,116 @@ mod tests {
         assert_eq!(package_of("Foo"), "");
     }
 
-    // --- same_runtime_package ---
+    // --- same_package_name (loader-unaware string comparison) ---
 
     #[test]
     fn same_package_java_lang() {
-        assert!(same_runtime_package("java/lang/Object", "java/lang/String"));
+        assert!(same_package_name("java/lang/Object", "java/lang/String"));
     }
 
     #[test]
     fn different_packages() {
-        assert!(!same_runtime_package("java/lang/Object", "java/util/List"));
+        assert!(!same_package_name("java/lang/Object", "java/util/List"));
     }
 
     #[test]
     fn same_default_package() {
-        assert!(same_runtime_package("Foo", "Bar"));
+        assert!(same_package_name("Foo", "Bar"));
     }
 
     #[test]
     fn default_vs_named_package() {
-        assert!(!same_runtime_package("Foo", "com/example/Bar"));
+        assert!(!same_package_name("Foo", "com/example/Bar"));
+    }
+
+    // --- same_runtime_package (loader-aware, JVMS В§5.3) ---
+
+    /// Build a class with an explicit defining loader for the
+    /// loader-aware runtime-package tests.
+    fn make_class_with_loader(
+        store: &mut ClassStore,
+        name: &str,
+        loader_id: ClassLoaderId,
+    ) -> ClassId {
+        let id = store.next_id();
+        store.add(Class {
+            id,
+            loader_id,
+            name: Arc::from(name),
+            source_file: None,
+            version: ClassFileVersion::JAVA_8,
+            state: ClassState::Loaded,
+            initializing_thread: None,
+            constant_pool: empty_cp(),
+            access_flags: ClassAccessFlags::SUPER, // package-private
+            superclass: None,
+            interfaces: vec![],
+            fields: vec![],
+            methods: vec![],
+            first_field_index: 0,
+            num_total_fields: 0,
+            bootstrap_methods: vec![],
+            annotations: Vec::new(),
+            nest_host: None,
+            nest_members: Vec::new(),
+            record_components: Vec::new(),
+            permitted_subclasses: Vec::new(),
+            inner_classes: Vec::new(),
+            enclosing_method: None,
+            hidden: false,
+            module_name: None,
+            is_synthetic_stub: false,
+            signature: None,
+            has_finalizer: false,
+            code_source: None,
+            array_info: None,
+            init_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        });
+        id
+    }
+
+    #[test]
+    fn same_loader_same_package_is_same_runtime_package() {
+        let mut store = ClassStore::new();
+        let a = make_class_with_loader(&mut store, "java/lang/A", ClassLoaderId::Bootstrap);
+        let b = make_class_with_loader(&mut store, "java/lang/B", ClassLoaderId::Bootstrap);
+        assert!(same_runtime_package(
+            store.get(a).unwrap(),
+            store.get(b).unwrap()
+        ));
+    }
+
+    #[test]
+    fn different_loader_same_package_name_is_distinct_runtime_package() {
+        // H5: a user-defined loader's `java/lang/Evil` must NOT be in the
+        // same runtime package as a bootstrap-defined `java/lang/Object`.
+        let mut store = ClassStore::new();
+        let boot = make_class_with_loader(&mut store, "java/lang/Object", ClassLoaderId::Bootstrap);
+        let evil =
+            make_class_with_loader(&mut store, "java/lang/Evil", ClassLoaderId::UserDefined(7));
+        assert!(!same_runtime_package(
+            store.get(boot).unwrap(),
+            store.get(evil).unwrap()
+        ));
+    }
+
+    #[test]
+    fn spoofed_java_lang_class_cannot_reach_package_private_member() {
+        // End-to-end: a user-defined-loader class named `java/lang/Evil`
+        // is denied package-private field/method access to a
+        // bootstrap-defined `java/lang` class.
+        let mut store = ClassStore::new();
+        let victim =
+            make_class_with_loader(&mut store, "java/lang/Object", ClassLoaderId::Bootstrap);
+        let evil =
+            make_class_with_loader(&mut store, "java/lang/Evil", ClassLoaderId::UserDefined(7));
+        let victim_c = store.get(victim).unwrap();
+        let evil_c = store.get(evil).unwrap();
+
+        // Package-private (no modifier) and protected non-subclass both denied.
+        assert!(check_field_access(evil_c, victim_c, FieldAccessFlags::empty(), &store).is_err());
+        assert!(check_method_access(evil_c, victim_c, MethodAccessFlags::empty(), &store).is_err());
+        assert!(check_class_access(evil_c, victim_c).is_err());
     }
 
     // --- check_class_access ---

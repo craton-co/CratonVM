@@ -21,9 +21,35 @@ use rustc_hash::FxHashMap;
 /// Each allocation gets a unique ID used as a key. The actual raw pointer
 /// and layout are stored so we can free the memory later.
 /// T10.9.B: FxHashMap — allocation IDs are internal monotonic counters.
+///
+/// # Security (M4b — raw pointer use-after-free)
+///
+/// A bare `*mut u8` handed out by [`allocate`](Self::allocate) /
+/// [`get_ptr`](Self::get_ptr) is **not** tied to the lifetime of its backing
+/// allocation: a concurrent (or later) [`free`](Self::free) of the same
+/// `alloc_id` deallocates the block out from under any retained pointer,
+/// leaving it dangling. Two mitigations live here:
+///
+///  * [`get_ptr_checked`](Self::get_ptr_checked) validates an
+///    `offset + len` window against the recorded allocation `size` and
+///    returns a pointer that is guaranteed in-bounds *at the moment of the
+///    call*. Consumers should request a fresh checked pointer for each access
+///    and MUST NOT retain it across any operation that could free the
+///    allocation.
+///  * Each allocation carries a monotonic **generation** stamped into a
+///    composite handle ([`AllocHandle`]). Because `alloc_id`s are reused only
+///    in the (astronomically distant) `i64` wrap case, the generation's job is
+///    to make a *stale handle fail closed* should id reuse ever occur: a
+///    handle whose generation does not match the live slot is rejected by
+///    [`get_ptr_checked_handle`](Self::get_ptr_checked_handle).
 pub struct NativeMemoryTable {
     allocations: FxHashMap<i64, NativeAllocation>,
     next_id: i64,
+    /// Monotonic generation counter. Bumped on every successful `allocate`
+    /// and every successful `free` so that a handle minted for one
+    /// allocation can never be confused with a later allocation that happens
+    /// to reuse the same `alloc_id`.
+    next_generation: u64,
     /// Running sum of `layout.size()` over all live allocations. Kept in
     /// sync by `allocate`/`free` so `live_bytes()` is O(1) instead of
     /// re-summing the whole map on every call.
@@ -33,18 +59,53 @@ pub struct NativeMemoryTable {
 struct NativeAllocation {
     ptr: *mut u8,
     layout: Layout,
+    /// Generation stamped at allocation time. A composite [`AllocHandle`]
+    /// must carry a matching generation to resolve to this allocation; a
+    /// mismatch means the handle is stale (the slot was freed and the
+    /// `alloc_id` reused) and the lookup fails closed.
+    generation: u64,
 }
 
-// Safety: NativeAllocation contains raw pointers, but they are only accessed
-// through NativeMemoryTable methods which are protected by a Mutex in SharedVm.
+// Safety: NativeAllocation contains raw pointers, but they are only ever
+// dereferenced (and the table only ever mutated) while the owning
+// `SharedVm` holds its `Mutex`. The pointers are never copied out and used
+// concurrently from two threads without that lock; the `unsafe impl`s below
+// merely assert that the *struct itself* may cross threads, which is sound
+// because every access path goes through that single lock. Do NOT relax this
+// to lock-free access without revisiting the use-after-free analysis in the
+// type-level docs above.
 unsafe impl Send for NativeAllocation {}
 unsafe impl Sync for NativeAllocation {}
+
+/// Composite handle for a native allocation that binds an `alloc_id` to the
+/// generation that minted it.
+///
+/// Holding an `AllocHandle` (rather than a bare `alloc_id`) lets a consumer
+/// detect that the underlying allocation has been freed and its id recycled:
+/// [`NativeMemoryTable::get_ptr_checked_handle`] rejects a handle whose
+/// generation no longer matches the live slot, so a stale handle fails closed
+/// instead of resolving to an unrelated allocation (M4b/M4c — confused
+/// deputy / use-after-free hardening).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocHandle {
+    pub alloc_id: i64,
+    pub generation: u64,
+}
+
+impl AllocHandle {
+    /// Construct a handle from its parts. Normally obtained from
+    /// [`NativeMemoryTable::allocate_handle`] rather than built by hand.
+    pub fn new(alloc_id: i64, generation: u64) -> Self {
+        Self { alloc_id, generation }
+    }
+}
 
 impl NativeMemoryTable {
     pub fn new() -> Self {
         Self {
             allocations: FxHashMap::default(),
             next_id: 1,
+            next_generation: 1,
             live_bytes: 0,
         }
     }
@@ -52,6 +113,16 @@ impl NativeMemoryTable {
     /// Allocate `size` bytes with `align` alignment. Returns (id, raw_pointer).
     ///
     /// The pointer is zeroed. Returns None if allocation fails.
+    ///
+    /// # Security (M4b)
+    ///
+    /// The returned `*mut u8` is the *base* of the allocation with no length
+    /// attached and no tie to the allocation's lifetime: a later
+    /// [`free`](Self::free) of the returned id leaves it dangling. Treat it
+    /// as valid only until the next operation that could free the block, and
+    /// prefer [`allocate_handle`](Self::allocate_handle) +
+    /// [`get_ptr_checked_handle`](Self::get_ptr_checked_handle) when the
+    /// pointer must survive across other table operations.
     pub fn allocate(&mut self, size: usize, align: usize) -> Option<(i64, *mut u8)> {
         let align = align.max(1);
         let size = size.max(1);
@@ -81,19 +152,54 @@ impl NativeMemoryTable {
                 return None;
             }
         };
+        // Stamp this allocation with a fresh generation. `saturating_add`
+        // guarantees forward progress even at the (unreachable in practice)
+        // `u64` ceiling; a saturated generation simply stops distinguishing
+        // handles, which is fail-closed-equivalent because it can only cause
+        // a stale handle to be *rejected*, never wrongly accepted.
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
         self.allocations
-            .insert(id, NativeAllocation { ptr, layout });
+            .insert(id, NativeAllocation { ptr, layout, generation });
         // Keep the running `live_bytes` total in sync. `id` is a fresh
         // monotonic counter, so this `insert` never replaces an entry.
         self.live_bytes += layout.size();
         Some((id, ptr))
     }
 
+    /// Allocate `size` bytes with `align` alignment and return a composite
+    /// [`AllocHandle`] (id + generation) alongside the base pointer.
+    ///
+    /// Prefer this over [`allocate`](Self::allocate) when the resulting
+    /// pointer will be revalidated later via
+    /// [`get_ptr_checked_handle`](Self::get_ptr_checked_handle): the handle
+    /// lets a stale `alloc_id` (after free + id reuse) be detected and
+    /// rejected (M4b/M4c).
+    pub fn allocate_handle(&mut self, size: usize, align: usize) -> Option<(AllocHandle, *mut u8)> {
+        let (id, ptr) = self.allocate(size, align)?;
+        // The generation just stamped is `next_generation - 1`; read it back
+        // from the table so the handle is always consistent with the slot.
+        let generation = self.allocations.get(&id).map(|a| a.generation)?;
+        Some((AllocHandle::new(id, generation), ptr))
+    }
+
     /// Free a single allocation by ID. Returns true if found and freed.
+    ///
+    /// # Security (M4b)
+    ///
+    /// After this returns, any bare `*mut u8` previously obtained for `id`
+    /// (via [`allocate`](Self::allocate) / [`get_ptr`](Self::get_ptr)) is
+    /// **dangling** — dereferencing it is undefined behaviour. The generation
+    /// counter is advanced so that if `id` is ever recycled, handles minted
+    /// for the freed allocation fail closed in
+    /// [`get_ptr_checked_handle`](Self::get_ptr_checked_handle).
     pub fn free(&mut self, id: i64) -> bool {
         if let Some(alloc) = self.allocations.remove(&id) {
             // Keep the running `live_bytes` total in sync.
             self.live_bytes -= alloc.layout.size();
+            // Advance the generation so a recycled `id` cannot be mistaken
+            // for this now-freed allocation by a stale handle.
+            self.next_generation = self.next_generation.saturating_add(1);
             // Safety: ptr was allocated with alloc::alloc_zeroed with this layout.
             unsafe { alloc::dealloc(alloc.ptr, alloc.layout) };
             true
@@ -109,9 +215,90 @@ impl NativeMemoryTable {
         }
     }
 
-    /// Get the raw pointer for an allocation. Returns None if not found.
+    /// Get the raw *base* pointer for an allocation. Returns None if not found.
+    ///
+    /// # Security (M4b)
+    ///
+    /// This returns the unvalidated base pointer with no length information.
+    /// A caller that then indexes into it is responsible for its own bounds
+    /// checking, and the pointer is invalidated by any subsequent
+    /// [`free`](Self::free) of `id`. For pointer arithmetic prefer
+    /// [`get_ptr_checked`](Self::get_ptr_checked), which validates the access
+    /// window against the recorded allocation size and fails closed on
+    /// overflow / out-of-range.
     pub fn get_ptr(&self, id: i64) -> Option<*mut u8> {
         self.allocations.get(&id).map(|a| a.ptr)
+    }
+
+    /// Return a pointer to `ptr + offset` for allocation `id`, but only if the
+    /// window `[offset, offset + len)` lies fully within the allocation's
+    /// recorded size. Returns `None` if the allocation is unknown, if
+    /// `offset + len` overflows `usize`, or if the window runs past the end of
+    /// the block.
+    ///
+    /// # Security (M4b)
+    ///
+    /// This is the bounds-checked alternative to [`get_ptr`](Self::get_ptr):
+    /// it guarantees the returned pointer addresses `len` valid bytes *at the
+    /// moment of the call*. It does **not** extend the allocation's lifetime —
+    /// the pointer must still not be retained across a possible
+    /// [`free`](Self::free). Pass `len == 0` to validate `offset <= size`
+    /// (a one-past-the-end offset is permitted for a zero-length window, matching
+    /// the usual C/Rust pointer rules).
+    pub fn get_ptr_checked(&self, id: i64, offset: usize, len: usize) -> Option<*mut u8> {
+        let alloc = self.allocations.get(&id)?;
+        let size = alloc.layout.size();
+        // `offset + len` must not overflow and must not exceed `size`.
+        let end = offset.checked_add(len)?;
+        if end > size {
+            return None;
+        }
+        // Safety: `offset <= size` and `size` is the exact byte length of the
+        // allocation `alloc.ptr` points at, so `add(offset)` stays within (or
+        // one-past) the same allocation, which is the precondition for
+        // `pointer::add`.
+        Some(unsafe { alloc.ptr.add(offset) })
+    }
+
+    /// Like [`get_ptr_checked`](Self::get_ptr_checked) but additionally
+    /// verifies the [`AllocHandle`]'s generation against the live slot, so a
+    /// stale handle (after the original allocation was freed and its
+    /// `alloc_id` recycled) fails closed instead of resolving to an unrelated
+    /// allocation.
+    ///
+    /// # Security (M4b / M4c)
+    ///
+    /// Returns `None` when the generation does not match — this is the
+    /// confused-deputy / use-after-free defence. Prefer this entry point for
+    /// any pointer that outlives the call that produced it.
+    pub fn get_ptr_checked_handle(
+        &self,
+        handle: AllocHandle,
+        offset: usize,
+        len: usize,
+    ) -> Option<*mut u8> {
+        let alloc = self.allocations.get(&handle.alloc_id)?;
+        if alloc.generation != handle.generation {
+            // Stale handle: the slot was freed (and possibly the id reused)
+            // since this handle was minted. Fail closed.
+            return None;
+        }
+        let size = alloc.layout.size();
+        let end = offset.checked_add(len)?;
+        if end > size {
+            return None;
+        }
+        // Safety: same invariant as `get_ptr_checked`, with the added
+        // guarantee that this is the very allocation the handle was minted
+        // for (generation matched).
+        Some(unsafe { alloc.ptr.add(offset) })
+    }
+
+    /// Return the current generation of allocation `id`, or `None` if the id
+    /// is not live. Lets a caller mint an [`AllocHandle`] for an id it already
+    /// holds (e.g. one returned by the legacy [`allocate`](Self::allocate)).
+    pub fn generation_of(&self, id: i64) -> Option<u64> {
+        self.allocations.get(&id).map(|a| a.generation)
     }
 
     /// Get the size of an allocation.
@@ -232,41 +419,137 @@ pub struct UpcallEntry {
     pub return_kind: i32,
 }
 
+/// A slot in the [`UpcallTable`]: the optional entry plus the generation that
+/// currently owns the slot. The generation is bumped every time the slot is
+/// vacated or reused so a handle minted for an old occupant can be detected.
+struct UpcallSlot {
+    entry: Option<UpcallEntry>,
+    /// Generation of the entry currently in this slot. A composite
+    /// [`UpcallHandle`] must carry a matching generation to resolve.
+    generation: u64,
+}
+
+/// Composite handle for an upcall registration: the slot index plus the
+/// generation that minted it.
+///
+/// # Security (M4c — confused deputy via slot reuse)
+///
+/// [`UpcallTable::register`] reuses vacated slots, so a bare slot index handed
+/// to native code can, after the original registration is
+/// [`remove`](UpcallTable::remove)d and the slot re-registered, resolve to a
+/// *different* Java object — a confused deputy. An `UpcallHandle` binds the
+/// index to the registering generation; [`UpcallTable::get_checked`] rejects a
+/// handle whose generation no longer matches the slot, so a stale trampoline
+/// fails closed instead of invoking an unrelated callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpcallHandle {
+    pub slot: usize,
+    pub generation: u64,
+}
+
+impl UpcallHandle {
+    /// Construct a handle from its parts. Normally obtained from
+    /// [`UpcallTable::register_handle`].
+    pub fn new(slot: usize, generation: u64) -> Self {
+        Self { slot, generation }
+    }
+}
+
 /// Table of upcall entries indexed by trampoline slot.
 pub struct UpcallTable {
-    entries: Vec<Option<UpcallEntry>>,
+    slots: Vec<UpcallSlot>,
+    /// Monotonic counter used to stamp each (re)registration with a unique
+    /// generation. Bumped on every `register` and every `remove`.
+    next_generation: u64,
 }
 
 impl UpcallTable {
     pub fn new() -> Self {
         Self {
-            entries: Vec::new(),
+            slots: Vec::new(),
+            next_generation: 1,
         }
     }
 
     /// Register an upcall entry. Returns the slot index.
+    ///
+    /// # Security (M4c)
+    ///
+    /// The bare index returned here does NOT distinguish between successive
+    /// occupants of a reused slot. Prefer
+    /// [`register_handle`](Self::register_handle) +
+    /// [`get_checked`](Self::get_checked) for native trampolines so a stale
+    /// index cannot resolve to a later, unrelated callback.
     pub fn register(&mut self, entry: UpcallEntry) -> usize {
+        self.register_handle(entry).slot
+    }
+
+    /// Register an upcall entry and return a generation-tagged
+    /// [`UpcallHandle`]. The slot index is reused from a vacated slot when
+    /// possible, but the generation is always fresh, so the handle uniquely
+    /// identifies *this* registration (M4c).
+    pub fn register_handle(&mut self, entry: UpcallEntry) -> UpcallHandle {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
         // Reuse an empty slot if available
-        for (i, slot) in self.entries.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(entry);
-                return i;
+        for (i, slot) in self.slots.iter_mut().enumerate() {
+            if slot.entry.is_none() {
+                slot.entry = Some(entry);
+                slot.generation = generation;
+                return UpcallHandle::new(i, generation);
             }
         }
-        let idx = self.entries.len();
-        self.entries.push(Some(entry));
-        idx
+        let idx = self.slots.len();
+        self.slots.push(UpcallSlot {
+            entry: Some(entry),
+            generation,
+        });
+        UpcallHandle::new(idx, generation)
     }
 
     /// Get an entry by slot index.
+    ///
+    /// # Security (M4c)
+    ///
+    /// This ignores generation, so it can return a *different* callback than
+    /// the one a stale index was minted for (confused deputy). Use
+    /// [`get_checked`](Self::get_checked) when resolving a handle that may have
+    /// outlived its registration.
     pub fn get(&self, index: usize) -> Option<&UpcallEntry> {
-        self.entries.get(index).and_then(|e| e.as_ref())
+        self.slots.get(index).and_then(|s| s.entry.as_ref())
+    }
+
+    /// Get an entry by generation-tagged handle. Returns `None` (fails closed)
+    /// when the slot is empty or its current generation does not match the
+    /// handle — i.e. the registration the handle referred to has since been
+    /// removed and/or the slot reused (M4c).
+    pub fn get_checked(&self, handle: UpcallHandle) -> Option<&UpcallEntry> {
+        let slot = self.slots.get(handle.slot)?;
+        if slot.generation != handle.generation {
+            return None;
+        }
+        slot.entry.as_ref()
+    }
+
+    /// Return the current generation of `index`, or `None` if the index is out
+    /// of range. Lets a caller mint an [`UpcallHandle`] for a slot it already
+    /// holds (e.g. one returned by the legacy [`register`](Self::register)).
+    pub fn generation_of(&self, index: usize) -> Option<u64> {
+        self.slots.get(index).map(|s| s.generation)
     }
 
     /// Remove an entry by slot index.
+    ///
+    /// Advances the slot's generation so that any handle still referring to
+    /// the removed occupant fails closed in [`get_checked`](Self::get_checked),
+    /// even after the slot is reused by a later [`register`](Self::register).
     pub fn remove(&mut self, index: usize) {
-        if index < self.entries.len() {
-            self.entries[index] = None;
+        if let Some(slot) = self.slots.get_mut(index) {
+            slot.entry = None;
+            // Bump the slot's generation so a stale handle for the just-removed
+            // entry can never match again.
+            self.next_generation = self.next_generation.saturating_add(1);
+            slot.generation = self.next_generation;
         }
     }
 }
@@ -357,6 +640,76 @@ mod tests {
         let mut table = NativeMemoryTable::new();
         let (id, _) = table.allocate(256, 16).unwrap();
         assert_eq!(table.get_size(id), Some(256));
+    }
+
+    // -----------------------------------------------------------------------
+    // M4b — bounds-checked pointer + generation handles
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_ptr_checked_validates_window() {
+        let mut table = NativeMemoryTable::new();
+        let (id, base) = table.allocate(64, 8).unwrap();
+        // Whole-allocation window is valid and equals the base pointer.
+        assert_eq!(table.get_ptr_checked(id, 0, 64), Some(base));
+        // Interior window is valid and offset correctly.
+        assert_eq!(table.get_ptr_checked(id, 16, 8), Some(unsafe { base.add(16) }));
+        // One-past-the-end zero-length window is allowed.
+        assert_eq!(table.get_ptr_checked(id, 64, 0), Some(unsafe { base.add(64) }));
+        // Past the end fails closed.
+        assert!(table.get_ptr_checked(id, 60, 8).is_none());
+        assert!(table.get_ptr_checked(id, 65, 0).is_none());
+        // Overflow of offset+len fails closed (no panic).
+        assert!(table.get_ptr_checked(id, usize::MAX, 1).is_none());
+        // Unknown id fails closed.
+        assert!(table.get_ptr_checked(999, 0, 1).is_none());
+    }
+
+    #[test]
+    fn get_ptr_checked_after_free_returns_none() {
+        let mut table = NativeMemoryTable::new();
+        let (id, _) = table.allocate(32, 8).unwrap();
+        assert!(table.get_ptr_checked(id, 0, 32).is_some());
+        assert!(table.free(id));
+        // After free the id no longer resolves — guards use-after-free at the
+        // table boundary.
+        assert!(table.get_ptr_checked(id, 0, 1).is_none());
+    }
+
+    #[test]
+    fn alloc_handle_detects_stale_after_free_and_reuse() {
+        let mut table = NativeMemoryTable::new();
+        let (h1, _) = table.allocate_handle(32, 8).unwrap();
+        let first_id = h1.alloc_id;
+        // The first handle resolves while live.
+        assert!(table.get_ptr_checked_handle(h1, 0, 32).is_some());
+        assert!(table.free(first_id));
+        // Force id reuse by rewinding next_id so the next allocation reuses
+        // `first_id`. This simulates the i64-wrap reuse scenario.
+        table.next_id = first_id;
+        let (h2, _) = table.allocate_handle(32, 8).unwrap();
+        assert_eq!(h2.alloc_id, first_id, "test setup: id should be reused");
+        // The fresh handle works...
+        assert!(table.get_ptr_checked_handle(h2, 0, 32).is_some());
+        // ...but the stale handle for the freed allocation fails closed even
+        // though the id now resolves to a *different* allocation.
+        assert_ne!(h1.generation, h2.generation);
+        assert!(table.get_ptr_checked_handle(h1, 0, 1).is_none());
+    }
+
+    #[test]
+    fn generation_of_tracks_live_slot() {
+        let mut table = NativeMemoryTable::new();
+        let (id, _) = table.allocate(8, 1).unwrap();
+        let gen = table.generation_of(id).unwrap();
+        // A hand-built handle with the live generation resolves.
+        let h = AllocHandle::new(id, gen);
+        assert!(table.get_ptr_checked_handle(h, 0, 8).is_some());
+        // A bogus generation fails closed.
+        let bad = AllocHandle::new(id, gen.wrapping_add(1));
+        assert!(table.get_ptr_checked_handle(bad, 0, 8).is_none());
+        assert!(table.free(id));
+        assert!(table.generation_of(id).is_none());
     }
 
     // -----------------------------------------------------------------------
@@ -663,6 +1016,59 @@ mod tests {
         let reused = table.register(entry2);
         assert_eq!(reused, 0);
         assert_eq!(table.get(0).unwrap().method_name, "third");
+    }
+
+    #[test]
+    fn upcall_handle_detects_slot_reuse() {
+        // M4c: a handle minted for the original occupant of a slot must NOT
+        // resolve after the slot is removed and reused by a different entry.
+        let mut table = UpcallTable::new();
+        let h0 = table.register_handle(UpcallEntry {
+            target: dummy_obj_ref(),
+            method_name: "first".to_string(),
+            method_descriptor: "()V".to_string(),
+            param_kinds: vec![],
+            return_kind: LAYOUT_LONG,
+        });
+        assert_eq!(h0.slot, 0);
+        assert_eq!(table.get_checked(h0).unwrap().method_name, "first");
+
+        // Remove and re-register: slot index 0 is reused, generation differs.
+        table.remove(h0.slot);
+        assert!(table.get_checked(h0).is_none(), "stale handle must fail closed after remove");
+
+        let h1 = table.register_handle(UpcallEntry {
+            target: dummy_obj_ref(),
+            method_name: "second".to_string(),
+            method_descriptor: "()V".to_string(),
+            param_kinds: vec![],
+            return_kind: LAYOUT_LONG,
+        });
+        assert_eq!(h1.slot, 0, "slot should be reused");
+        assert_ne!(h0.generation, h1.generation, "generation must advance on reuse");
+        // Fresh handle resolves to the new entry...
+        assert_eq!(table.get_checked(h1).unwrap().method_name, "second");
+        // ...stale handle still fails closed (confused-deputy defence).
+        assert!(table.get_checked(h0).is_none());
+        // The legacy unchecked `get` would have returned the WRONG entry here.
+        assert_eq!(table.get(0).unwrap().method_name, "second");
+    }
+
+    #[test]
+    fn upcall_generation_of_and_manual_handle() {
+        let mut table = UpcallTable::new();
+        let slot = table.register(UpcallEntry {
+            target: dummy_obj_ref(),
+            method_name: "apply".to_string(),
+            method_descriptor: "()V".to_string(),
+            param_kinds: vec![],
+            return_kind: LAYOUT_INT,
+        });
+        let gen = table.generation_of(slot).unwrap();
+        let h = UpcallHandle::new(slot, gen);
+        assert!(table.get_checked(h).is_some());
+        let bad = UpcallHandle::new(slot, gen.wrapping_add(1));
+        assert!(table.get_checked(bad).is_none());
     }
 
     #[test]

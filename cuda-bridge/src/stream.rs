@@ -117,6 +117,11 @@ pub(crate) struct StreamCuda {
     /// `cuStreamDestroy_v2`), so we don't have to add manual
     /// teardown here.
     pub(crate) stream: std::sync::Arc<cudarc::driver::safe::CudaStream>,
+    /// AUDIT 2026-05-29 (SOUND-1 / H10c): retained owning device so
+    /// `Stream::synchronize` can `bind_to_thread` before driving the
+    /// raw stream handle from a possibly-different thread. Required for
+    /// the `unsafe impl Send + Sync` on `Stream` to be sound.
+    device: std::sync::Arc<cudarc::driver::safe::CudaDevice>,
     id: u32,
 }
 
@@ -214,6 +219,7 @@ impl Stream {
                 // does not hold here.
                 #[allow(clippy::arc_with_non_send_sync)]
                 stream: std::sync::Arc::new(cuda_stream),
+                device,
                 id,
             },
         })
@@ -247,6 +253,15 @@ impl Stream {
     /// `cudarc::driver::result::stream::synchronize`.
     #[cfg(feature = "cuda")]
     pub fn synchronize(&self) -> Result<()> {
+        // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary
+        // context to this thread before driving the raw stream handle.
+        // The `unsafe impl Send + Sync` on `Stream` is sound only if
+        // every thread that drives the stream has first bound the
+        // device; this prelude enforces it. Cheap per-thread TLS check.
+        self.inner
+            .device
+            .bind_to_thread()
+            .map_err(|e| crate::DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
         // cudarc 0.13's `CudaStream` does not expose a `synchronize`
         // method directly — the safe wrapper assumes drop-time
         // synchronisation only. We drop down to

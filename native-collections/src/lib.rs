@@ -8427,6 +8427,55 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
     );
 }
 
+/// Maximum number of stream elements that may be materialized eagerly. This
+/// synthetic stream impl is non-lazy, so a range larger than this would OOM the
+/// VM. Mirrors the 64M runaway guard in `collection_elements_generic`
+/// (lib.rs ~641); a request beyond it throws `OutOfMemoryError` rather than
+/// allocating ~2.1 billion `Value`s for e.g. `IntStream.range(0, i32::MAX)`.
+const STREAM_RANGE_MAX_ELEMENTS: i128 = 64 * 1024 * 1024;
+
+/// Materialize the `count` ints `[start, start+count)` with widening arithmetic
+/// so `start + i` cannot wrap. `count` must already be clamped to `>= 0` by the
+/// caller (computed in a wider type to avoid overflow in `end - start`).
+fn range_int_elements(start: i64, count: i64) -> Result<Vec<Value>, MethodCallFailed> {
+    if count as i128 > STREAM_RANGE_MAX_ELEMENTS {
+        return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
+            message: format!(
+                "IntStream range of {count} elements exceeds the {STREAM_RANGE_MAX_ELEMENTS}-element materialization limit"
+            ),
+        }
+        .into());
+    }
+    let count = count.max(0) as usize;
+    let elems = (0..count)
+        // `start + i` is computed in i64 and narrowed; for a valid IntStream
+        // range every element fits in i32, so the cast is exact.
+        .map(|i| Value::Int((start + i as i64) as i32))
+        .collect();
+    Ok(elems)
+}
+
+/// Materialize the `count` longs `[start, start+count)` with widening
+/// arithmetic so `start + i` cannot wrap. `count` is an i128 (computed in a
+/// wider type to avoid overflow in `end - start`) and must be `>= 0`.
+fn range_long_elements(start: i64, count: i128) -> Result<Vec<Value>, MethodCallFailed> {
+    if count > STREAM_RANGE_MAX_ELEMENTS {
+        return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
+            message: format!(
+                "LongStream range of {count} elements exceeds the {STREAM_RANGE_MAX_ELEMENTS}-element materialization limit"
+            ),
+        }
+        .into());
+    }
+    let count = count.max(0) as usize;
+    let elems = (0..count)
+        // `start + i` is computed in i128 and narrowed; for a count within the
+        // cap and a valid range the result always fits in i64.
+        .map(|i| Value::Long((start as i128 + i as i128) as i64))
+        .collect();
+    Ok(elems)
+}
+
 fn native_int_stream_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let start = match args.first() {
         Some(Value::Int(v)) => *v,
@@ -8436,8 +8485,9 @@ fn native_int_stream_range(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let count = std::cmp::max(0, end - start) as usize;
-    let elems: Vec<Value> = (0..count).map(|i| Value::Int(start + i as i32)).collect();
+    // Widen to i64 so `end - start` cannot overflow when start == i32::MIN.
+    let count = (end as i64 - start as i64).max(0);
+    let elems = range_int_elements(start as i64, count)?;
     make_int_stream(ctx, &elems)
 }
 
@@ -8450,8 +8500,9 @@ fn native_int_stream_range_closed(ctx: &mut dyn NativeContext, args: &[Value]) -
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let count = std::cmp::max(0, end - start + 1) as usize;
-    let elems: Vec<Value> = (0..count).map(|i| Value::Int(start + i as i32)).collect();
+    // Widen to i64 so `end - start + 1` cannot overflow at the i32 boundaries.
+    let count = (end as i64 - start as i64 + 1).max(0);
+    let elems = range_int_elements(start as i64, count)?;
     make_int_stream(ctx, &elems)
 }
 
@@ -8737,8 +8788,9 @@ fn native_long_stream_range(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let count = std::cmp::max(0, end - start) as usize;
-    let elems: Vec<Value> = (0..count).map(|i| Value::Long(start + i as i64)).collect();
+    // Widen to i128 so `end - start` cannot overflow when start == i64::MIN.
+    let count = (end as i128 - start as i128).max(0);
+    let elems = range_long_elements(start, count)?;
     make_long_stream(ctx, &elems)
 }
 
@@ -8754,8 +8806,9 @@ fn native_long_stream_range_closed(
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let count = std::cmp::max(0, end - start + 1) as usize;
-    let elems: Vec<Value> = (0..count).map(|i| Value::Long(start + i as i64)).collect();
+    // Widen to i128 so `end - start + 1` cannot overflow at the i64 boundaries.
+    let count = (end as i128 - start as i128 + 1).max(0);
+    let elems = range_long_elements(start, count)?;
     make_long_stream(ctx, &elems)
 }
 
@@ -10055,7 +10108,25 @@ fn native_sj_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     let capacity = ctx.array_length(backing);
     if size as usize >= capacity {
-        let new_cap = capacity * 2;
+        // Overflow-safe doubling capped at 1<<30, mirroring `al_ensure_capacity`
+        // (lib.rs ~690). `saturating_mul` prevents `usize` overflow on absurd
+        // capacities; the cap then bounds the allocation. We always need room
+        // for at least one more element, so floor the growth at `capacity + 1`.
+        const SJ_MAX_CAPACITY: usize = 1 << 30;
+        let new_cap = std::cmp::min(
+            std::cmp::max(capacity.saturating_mul(2), capacity.saturating_add(1)),
+            SJ_MAX_CAPACITY,
+        );
+        if new_cap <= capacity {
+            // Already at the cap and full — refuse to grow further rather than
+            // allocating an array that cannot hold the new element.
+            return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
+                message: format!(
+                    "StringJoiner backing array exceeds the {SJ_MAX_CAPACITY}-element limit"
+                ),
+            }
+            .into());
+        }
         let new_backing = alloc_ref_array(ctx, new_cap);
         for i in 0..capacity {
             let v = ctx.get_array_element(backing, i);
@@ -24878,5 +24949,66 @@ mod tests {
             );
             assert_eq!(lbq_size(&ctx, q), 1);
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Stream range materialization — overflow-safe arithmetic + bounded eager
+    // count (H11a/H11b). These cover the pure helpers; the callers compute the
+    // count in a wider type before delegating here.
+
+    #[test]
+    fn range_int_elements_basic() {
+        let elems = range_int_elements(0, 5).unwrap();
+        assert_eq!(elems.len(), 5);
+        assert_eq!(elems[0], Value::Int(0));
+        assert_eq!(elems[4], Value::Int(4));
+    }
+
+    #[test]
+    fn range_int_elements_empty_or_negative_count() {
+        assert!(range_int_elements(10, 0).unwrap().is_empty());
+        assert!(range_int_elements(10, -3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn range_int_elements_no_wrap_near_i32_max() {
+        // start near i32::MAX: `start + i` must not wrap (would in pure i32).
+        let start = (i32::MAX - 2) as i64;
+        let elems = range_int_elements(start, 3).unwrap();
+        assert_eq!(elems[0], Value::Int(i32::MAX - 2));
+        assert_eq!(elems[2], Value::Int(i32::MAX));
+    }
+
+    #[test]
+    fn range_int_elements_rejects_over_cap() {
+        // Mimics IntStream.range(0, i32::MAX): count widened to i64, far past cap.
+        let count = i32::MAX as i64; // ~2.1 billion
+        assert!(range_int_elements(0, count).is_err());
+        // Exactly one over the cap also throws.
+        assert!(range_int_elements(0, STREAM_RANGE_MAX_ELEMENTS as i64 + 1).is_err());
+        // Exactly at the cap is allowed (no error from the guard itself).
+        assert!(range_int_elements(0, STREAM_RANGE_MAX_ELEMENTS as i64).is_ok());
+    }
+
+    #[test]
+    fn range_long_elements_basic_and_no_wrap() {
+        let elems = range_long_elements(0, 4).unwrap();
+        assert_eq!(elems.len(), 4);
+        assert_eq!(elems[3], Value::Long(3));
+
+        let start = i64::MAX - 2;
+        let elems = range_long_elements(start, 3).unwrap();
+        assert_eq!(elems[0], Value::Long(i64::MAX - 2));
+        assert_eq!(elems[2], Value::Long(i64::MAX));
+    }
+
+    #[test]
+    fn range_long_elements_rejects_over_cap() {
+        // LongStream.range(0, i64::MAX): count widened to i128, vastly past cap.
+        let count = i64::MAX as i128;
+        assert!(range_long_elements(0, count).is_err());
+        assert!(range_long_elements(0, STREAM_RANGE_MAX_ELEMENTS + 1).is_err());
+        assert!(range_long_elements(0, STREAM_RANGE_MAX_ELEMENTS).is_ok());
+        assert!(range_long_elements(10, -5).unwrap().is_empty());
     }
 }

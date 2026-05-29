@@ -594,23 +594,38 @@ impl VmHeap {
     pub fn read_char_array_bulk(&self, obj: ObjectRef) -> Vec<u16> {
         match self {
             VmHeap::Generational(h) => h.read_char_array_bulk(obj),
-            VmHeap::G1(_h) => {
-                // G1 uses the same object layout, so we can read directly
-                let header = self.get_header(obj);
-                let len = header.array_length as usize;
+            VmHeap::G1(h) => {
+                // Residual humongous OOB fix: a G1 humongous char[] (any
+                // char[] larger than ~region_size/2 — common for large
+                // Strings) is laid out across SEVERAL NON-contiguous region
+                // buffers, each with its own HEADER_SIZE prefix. The previous
+                // code read the whole payload as one flat contiguous run from
+                // `obj.as_ptr() + HEADER_SIZE`, which walks off the end of the
+                // start region's buffer once the offset exceeds one region's
+                // usable payload — a heap out-of-bounds read.
+                //
+                // vm_heap has no reachable G1 API to (a) detect that `obj` is a
+                // HumongousStart or (b) translate a flat offset through the
+                // region map (`humongous_span` / `humongous_copy` /
+                // `lookup_region_for_addr` are all private to g1.rs). The
+                // region-aware per-element accessor `G1Collector::get_array_element`
+                // IS reachable, and it already routes humongous arrays through
+                // `humongous_copy` (see g1.rs `get_array_element`), so every read
+                // is confined to the object's own backing memory regardless of
+                // how many regions it spans. Use it for the whole array: this is
+                // correct for both ordinary and humongous arrays and can never
+                // read out of bounds. (We deliberately do NOT keep the flat
+                // fast-path for the non-humongous case, because vm_heap cannot
+                // soundly tell the two apart without a new g1.rs API.)
+                let len = h.array_length(obj);
                 let mut out = vec![0u16; len];
-                // SAFETY: `obj` is a live `ObjectRef` whose header we
-                // just read. `HEADER_SIZE` offset lands exactly at
-                // the start of the array payload, and `len * 2` is
-                // the payload byte length (char = 2 bytes). The
-                // destination slice was just allocated with `len`
-                // u16 elements, so writing `len * 2` bytes is in
-                // bounds. Non-overlapping because source is in the
-                // heap arena and destination is the freshly-
-                // allocated `out` Vec on the caller's stack.
-                unsafe {
-                    let src = obj.as_ptr().add(HEADER_SIZE);
-                    std::ptr::copy_nonoverlapping(src, out.as_mut_ptr() as *mut u8, len * 2);
+                for (i, slot) in out.iter_mut().enumerate() {
+                    // Char elements decode to `Value::Int(u16 as i32)`; mask
+                    // back to the 16-bit code unit. `i < len` so the index is
+                    // always in bounds and `get_array_element` returns `Ok`.
+                    if let Ok(v) = h.get_array_element(obj, i) {
+                        *slot = v.as_int().unwrap_or(0) as u16;
+                    }
                 }
                 out
             }
@@ -618,12 +633,43 @@ impl VmHeap {
     }
 
     /// Raw pointer to array data region (after header).
+    ///
+    /// # UNSOUND for G1 humongous arrays — TODO(humongous-OOB)
+    ///
+    /// This returns a SINGLE flat base pointer `obj.as_ptr() + HEADER_SIZE`
+    /// and assumes the whole payload is contiguous after it. That holds for
+    /// the generational heap and for ordinary (single-region) G1 arrays, but
+    /// it is fundamentally unsound for a G1 **humongous** array: such an array
+    /// is laid out across several NON-contiguous region buffers (each with its
+    /// own HEADER_SIZE prefix), so the returned pointer is only valid for the
+    /// first region's worth of payload. Any caller that walks
+    /// `[base, base + len * stride)` (gpu_marshal bulk copies, vm_exec
+    /// arraycopy/bulk char read, jni `GetPrimitiveArrayCritical`) reads/writes
+    /// out of bounds once the offset crosses the first region boundary.
+    ///
+    /// The correct contract is to REFUSE (return `None` / "no contiguous
+    /// pointer available") for G1 humongous objects so callers fall back to a
+    /// per-element / region-aware path. That fix is NOT applied here because it
+    /// cannot be completed inside `vm_heap.rs` alone:
+    ///   1. vm_heap has no reachable G1 API to detect a `HumongousStart`
+    ///      object. `g1.rs` would need to expose something like
+    ///      `pub(crate) fn G1Collector::is_humongous(&self, obj: ObjectRef) -> bool`
+    ///      (a thin wrapper over `lookup_region_for_addr` +
+    ///      `RegionType::HumongousStart`, all currently private).
+    ///   2. Changing this method's return type to `Option<*mut u8>` to signal
+    ///      refusal would break the external callers in
+    ///      `vm/src/runtime/gpu_marshal.rs`, `vm/src/vm/vm_exec.rs`, and
+    ///      `vm/src/native/jni.rs`, which consume the bare `*mut u8` — those
+    ///      files are outside this change's allowed edit scope and must be
+    ///      updated to handle `None` (fall back to the region-aware
+    ///      `get_array_element` / `read_char_array_bulk` path).
+    ///
+    /// SAFETY (current, single-region only): `obj` is a live `ObjectRef` in the
+    /// heap arena; `HEADER_SIZE` offset is the layout-documented start of the
+    /// array payload region. The returned pointer is valid for the lifetime of
+    /// the object (which the caller must not drop while holding the pointer)
+    /// AND only for offsets that stay within the object's first region.
     pub fn array_data_ptr(&self, obj: ObjectRef) -> *mut u8 {
-        // SAFETY: `obj` is a live `ObjectRef` in the heap arena;
-        // `HEADER_SIZE` offset is the layout-documented start of
-        // the array payload region. The returned pointer is valid
-        // for the lifetime of the object (which the caller must
-        // not drop while holding the pointer).
         unsafe { obj.as_ptr().add(HEADER_SIZE) }
     }
 
@@ -1270,5 +1316,57 @@ mod concurrent_mark_controller_tests {
 
         // Cleanup so we don't strand the worker.
         heap.g1_signal_marking_complete();
+    }
+
+    /// Residual humongous OOB regression: `read_char_array_bulk` on a G1
+    /// humongous char[] must read every code unit correctly through the
+    /// region-aware path, never off the end of the start region's buffer.
+    ///
+    /// With `region_size = 1 MiB` the per-region usable payload is just under
+    /// 1 MiB, so a char[] of 600_000 elements (1.2 MB of payload) is humongous
+    /// (total > region_size/2) AND its payload spans TWO regions. The old flat
+    /// `copy_nonoverlapping(obj+HEADER_SIZE, .., len*2)` would have walked past
+    /// the first region's buffer; the per-element path must not.
+    #[test]
+    fn read_char_array_bulk_humongous_crosses_region_boundary() {
+        let heap = make_g1_heap();
+        let len = 600_000usize; // 1.2 MB payload > 1 MiB region => spans 2 regions
+        let arr = heap.alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Char, len);
+
+        // Write a position-dependent pattern so a stale/short read is detected.
+        // Sample a sparse set of indices (writing all 600k is wasteful), making
+        // sure to cover the first region, the boundary, and the tail.
+        let probe = |i: usize| -> u16 { ((i.wrapping_mul(2654435761)) & 0xFFFF) as u16 };
+        let region_usable_chars = (1024 * 1024 - HEADER_SIZE) / 2;
+        let mut indices = vec![0, 1, region_usable_chars - 1, region_usable_chars, region_usable_chars + 1, len - 1];
+        indices.dedup();
+        for &i in &indices {
+            heap.set_array_element(arr, i, Value::Int(probe(i) as i32)).unwrap();
+        }
+
+        let out = heap.read_char_array_bulk(arr);
+        assert_eq!(out.len(), len, "bulk read must return all elements");
+        for &i in &indices {
+            assert_eq!(out[i], probe(i), "code unit at index {i} (region-crossing read) corrupted");
+        }
+        // Indices we never wrote default to 0 (fresh zeroed payload).
+        assert_eq!(out[region_usable_chars / 2], 0, "untouched element must read as 0, not garbage");
+    }
+
+    /// Sanity: the ordinary (single-region) G1 char[] path still works through
+    /// the same per-element bulk reader.
+    #[test]
+    fn read_char_array_bulk_small_g1_array_roundtrips() {
+        let heap = make_g1_heap();
+        let len = 8usize;
+        let arr = heap.alloc_array(cratonvm_types::ClassId::new(0), ArrayElementType::Char, len);
+        for i in 0..len {
+            heap.set_array_element(arr, i, Value::Int((0x4100 + i) as i32)).unwrap();
+        }
+        let out = heap.read_char_array_bulk(arr);
+        assert_eq!(out.len(), len);
+        for i in 0..len {
+            assert_eq!(out[i], (0x4100 + i) as u16);
+        }
     }
 }

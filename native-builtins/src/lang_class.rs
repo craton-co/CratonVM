@@ -320,6 +320,46 @@ fn resolve_caller_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
     None
 }
 
+/// Loader-id sentinels (mirror of `NativeContext::loader_id_of_class`):
+/// `0 = Bootstrap`, `1 = Extension/Platform`, `2 = Application`,
+/// `3+ = UserDefined`. Only Bootstrap and the Platform loader define genuine
+/// JDK/boot-path classes; everything `>= 2` is user-controlled code that must
+/// be subject to the full deep-reflection check.
+const LOADER_ID_BOOTSTRAP: i32 = 0;
+const LOADER_ID_PLATFORM: i32 = 1;
+
+/// Does `class_name` look like a boot/JDK package name? This is necessary but
+/// **not** sufficient on its own — a user class loader can define a class with
+/// a `jdk/` or `sun/` package name, so callers must additionally confirm the
+/// class was actually defined by a trusted (Bootstrap/Platform) loader before
+/// treating it as JDK-internal. See `caller_is_jdk_internal`.
+fn looks_like_jdk_package(class_name: &str) -> bool {
+    class_name.starts_with("java/")
+        || class_name.starts_with("jdk/")
+        || class_name.starts_with("sun/")
+        || class_name.starts_with("com/sun/")
+}
+
+/// Decide whether a reflective access whose caller has been resolved to
+/// `accessor_name` / `accessor_loader_id` should be treated as a genuine
+/// JDK-internal (boot-path) caller — the only callers permitted to bypass the
+/// deep-reflection module check.
+///
+/// Pure function (no `ctx`) so it can be unit-tested directly. The policy is:
+/// the caller must BOTH be defined by a trusted loader (Bootstrap or Platform)
+/// AND carry a boot/JDK package name. Requiring the trusted loader closes the
+/// previous fail-open hole where any class whose *name* happened to start with
+/// a JDK prefix was trusted regardless of who defined it.
+fn caller_is_jdk_internal(accessor_name: Option<&str>, accessor_loader_id: i32) -> bool {
+    if accessor_loader_id != LOADER_ID_BOOTSTRAP && accessor_loader_id != LOADER_ID_PLATFORM {
+        return false;
+    }
+    match accessor_name {
+        Some(name) => looks_like_jdk_package(name),
+        None => false,
+    }
+}
+
 /// Perform the JEP 403 deep-reflection check for a reflective access to a
 /// member declared in `target_class_name`.
 ///
@@ -334,12 +374,17 @@ fn resolve_caller_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
 ///   * when called from `invoke/get/set` with `accessible_override == false`
 ///     → caller turns it into `IllegalAccessException`
 ///
-/// Returns `Ok(())` when:
-///   * `accessible_override == true` (JEP 403: the check was already paid)
-///   * the target class cannot be resolved (defensive: avoid blocking on
-///     an internal lookup failure)
-///   * there is no user frame (VM bootstrap — nothing to check against)
-///   * `NativeContext::check_deep_reflection_access` approves the edge
+/// Policy (H4 hardening — the decision is keyed on the *caller*, never on the
+/// target class name):
+///   * `accessible_override == true` → allow (JEP 403: check already paid).
+///   * No resolvable Java caller frame → VM bootstrap, nothing to check
+///     against → allow.
+///   * Caller is a genuine JDK-internal/boot-path caller (defined by the
+///     Bootstrap or Platform loader AND in a boot package) → allow, so
+///     legitimate JDK-internal-to-JDK-internal reflection keeps working.
+///   * Otherwise the caller is user code (Application / UserDefined loader):
+///       - if the target class is not loaded → fail CLOSED (deny);
+///       - else delegate to `NativeContext::check_deep_reflection_access`.
 fn check_reflection_module_access(
     ctx: &mut dyn NativeContext,
     target_class_name: &str,
@@ -350,63 +395,48 @@ fn check_reflection_module_access(
         // operations trust the override flag (JEP 403 §"API changes").
         return Ok(());
     }
-    let target_cid = match ctx.class_id_by_name(target_class_name) {
-        Some(cid) => cid,
-        None => return Ok(()),
-    };
+    // Resolve the caller FIRST: the access decision is keyed entirely on who
+    // is performing the reflection, never on the name of the target class.
     let accessor_cid = match resolve_caller_class_id(ctx) {
         Some(cid) => cid,
         // No user frame — either VM bootstrap or all frames are reflection
         // internals. Allow; we are not invoked from Java code.
         None => return Ok(()),
     };
-    // JDK-internal callers (java.base classes performing reflection on
+    let accessor_name = ctx.class_name_of_id(accessor_cid);
+    let accessor_loader_id = ctx.loader_id_of_class(accessor_cid);
+
+    // Genuine JDK-internal callers (java.base classes performing reflection on
     // their own private types — e.g. `StackStreamFactory$StackFrameBuffer.fill`
-    // constructing `StackFrameInfo` via `Constructor.newInstance`) must not
-    // be subject to the unnamed-module check. Our class loader does not
-    // always populate `module_name` for JDK inner classes, so the
-    // same-module rule (rule 1) misses and the check falls through to
-    // "module java.base does not opens java.lang to unnamed module".
-    // The accessor's *package*, not its module assignment, is the reliable
-    // signal that we are running JDK-internal code; trust it and skip.
-    if let Some(name) = ctx.class_name_of_id(accessor_cid) {
-        if name.starts_with("java/")
-            || name.starts_with("jdk/")
-            || name.starts_with("sun/")
-            || name.starts_with("com/sun/")
-        {
-            return Ok(());
-        }
-    }
-    // Second escape hatch — JDK-internal reflection driven from user code.
+    // constructing `StackFrameInfo` via `Constructor.newInstance`) must not be
+    // subject to the unnamed-module check: our class loader does not always
+    // populate `module_name` for JDK inner classes, so the same-module rule
+    // (rule 1) misses and the check falls through to a spurious denial.
     //
-    // The JDK reflectively constructs its own private types from inside
-    // boot-path machinery (e.g. `StackStreamFactory$StackFrameBuffer.fill`
-    // calling `Constructor.newInstance` to build `StackFrameInfo` while a
-    // user-code `StackWalker.walk(...)` is in progress). Our interpreter
-    // lacks a complete view of those nested JDK frames — `capture_stack_trace`
-    // sees only the outermost user frame (typically the SB3 launcher) — so
-    // the caller-class-based whitelist above misses and the call gets
-    // rejected as if user code were attempting deep reflection on
-    // encapsulated JDK internals.
-    //
-    // Use the *target class name* as a fallback signal: if the type being
-    // constructed is a JDK-internal type that user code does not normally
-    // instantiate directly (java.lang internal stack-walker frames,
-    // jdk.internal.* private impls, sun.* private impls), treat the access
-    // as JDK-mediated and allow it. This matches HotSpot's
-    // `Module.implAddOpensToAllUnnamed` behaviour for boot modules and the
-    // self-opening semantics of `java.base` for its own packages.
-    if target_class_name.starts_with("jdk/internal/")
-        || target_class_name.starts_with("sun/")
-        || target_class_name.starts_with("com/sun/")
-        || target_class_name.starts_with("java/lang/StackFrame")
-        || target_class_name.starts_with("java/lang/ClassFrame")
-        || target_class_name.starts_with("java/lang/StackStreamFactory")
-        || target_class_name.starts_with("java/lang/Module")
-    {
+    // We trust such callers ONLY when they are both defined by a trusted
+    // (Bootstrap/Platform) loader AND named in a boot package. We deliberately
+    // do NOT key this on the *target* class name: the previous implementation
+    // allowed any access whose target started with `jdk/internal/`, `sun/`,
+    // etc., which let arbitrary user code `setAccessible(true)` the private
+    // fields of the most sensitive classes (e.g. `jdk.internal.misc.Unsafe`)
+    // and defeat strong encapsulation (finding H4).
+    if caller_is_jdk_internal(accessor_name.as_deref(), accessor_loader_id) {
         return Ok(());
     }
+
+    // From here on the caller is user code (Application / UserDefined loader).
+    let target_cid = match ctx.class_id_by_name(target_class_name) {
+        Some(cid) => cid,
+        // Fail CLOSED for user-initiated reflection when the target class is
+        // not loaded: we cannot evaluate the module edge, and user code must
+        // not be granted deep access by default.
+        None => {
+            return Err(format!(
+                "cannot resolve target class {} for deep-reflection access check",
+                target_class_name.replace('/', ".")
+            ));
+        }
+    };
     ctx.check_deep_reflection_access(accessor_cid, target_cid)
 }
 
@@ -10105,6 +10135,53 @@ mod tests {
         let (params, ret) = parse_descriptor_param_and_return("(I)I");
         assert_eq!(params, vec!["I"]);
         assert_eq!(ret, "I");
+    }
+
+    // -----------------------------------------------------------------------
+    // caller_is_jdk_internal / looks_like_jdk_package (H4 access-control)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn jdk_package_name_recognized() {
+        assert!(looks_like_jdk_package("java/lang/String"));
+        assert!(looks_like_jdk_package("jdk/internal/misc/Unsafe"));
+        assert!(looks_like_jdk_package("sun/nio/ch/IOUtil"));
+        assert!(looks_like_jdk_package("com/sun/crypto/provider/AESCipher"));
+        assert!(!looks_like_jdk_package("com/acme/App"));
+        assert!(!looks_like_jdk_package("org/example/Main"));
+    }
+
+    #[test]
+    fn jdk_internal_caller_requires_trusted_loader() {
+        // Genuine boot-path caller: JDK package name + Bootstrap/Platform loader.
+        assert!(caller_is_jdk_internal(
+            Some("jdk/internal/misc/Unsafe"),
+            LOADER_ID_BOOTSTRAP
+        ));
+        assert!(caller_is_jdk_internal(
+            Some("sun/nio/ch/IOUtil"),
+            LOADER_ID_PLATFORM
+        ));
+    }
+
+    #[test]
+    fn user_code_spoofing_jdk_name_is_not_trusted() {
+        // A user class loader (loader id >= 2) defining a class whose name
+        // *looks* like a JDK package must NOT be treated as JDK-internal.
+        // This is the core of the H4 fix: the trust decision is keyed on the
+        // defining loader, not on the class name prefix.
+        assert!(!caller_is_jdk_internal(Some("jdk/internal/misc/Unsafe"), 2));
+        assert!(!caller_is_jdk_internal(Some("sun/nio/ch/IOUtil"), 7));
+        assert!(!caller_is_jdk_internal(Some("com/sun/Evil"), 3));
+    }
+
+    #[test]
+    fn non_jdk_caller_never_trusted() {
+        // Even a Bootstrap-loaded class with a non-JDK name is not trusted
+        // (defensive — should not normally occur).
+        assert!(!caller_is_jdk_internal(Some("com/acme/App"), LOADER_ID_BOOTSTRAP));
+        assert!(!caller_is_jdk_internal(None, LOADER_ID_BOOTSTRAP));
+        assert!(!caller_is_jdk_internal(Some("com/acme/App"), 2));
     }
 
     #[test]

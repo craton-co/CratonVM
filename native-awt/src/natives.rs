@@ -110,16 +110,61 @@ fn take_invocation_event_callback(event_hash: i32) -> Option<u64> {
 // FIFO eviction so a stream of orphaned peers (e.g. dropped Java refs that
 // never made it to `Component.removeNotify`) cannot grow it without bound.
 //
-// SAFETY: storing `ObjectRef` as a raw `usize` here keeps the side-table
-// from holding a "strong" pointer to GC-managed memory. We never deref the
-// reference except inside an active native call, so the worst case after a
-// stale lookup is `set_field_by_name` on a freed object — which the heap
-// path validates anyway and turns into a silent no-op.
+// SECURITY (finding H8 — GC raw-pointer resurrection / use-after-free):
+//
+// The previous implementation stored the source `ObjectRef` as a bare
+// `usize` (`source.as_ptr() as usize`) and later resurrected it via
+// `ObjectRef::from_raw`, handing the resulting reference back to the VM as
+// an event source. The side table holds NO GC root, and CratonVM's
+// collector is a *moving* collector (G1 evacuation + full-heap compaction
+// fallback — see `gc::g1` / `gc::heap`). If a collection runs between
+// registration and lookup, the stored pointer is dangling or points at an
+// unrelated object that occupies the old slot — a use-after-free / type
+// confusion the moment `set_field_by_name` dereferences it.
+//
+// There is no rooting / weak-handle / identity-hash→ObjectRef API reachable
+// from this crate (see `cratonvm_native_api::NativeContext` — it exposes
+// `identity_hash_code` and `gc_collection_count` but no way to pin an object
+// or resolve a live reference from a hash). So we cannot keep the pointer
+// alive, nor re-resolve it safely after a move.
+//
+// Mitigation implemented here: fail closed across GC boundaries. We stamp
+// every registration with the GC collection count observed at registration
+// time, alongside the object's stable identity hash. On lookup we only
+// resurrect the pointer when the GC count is *unchanged* since registration:
+// in that window the moving collector provably has not run, so the object
+// cannot have been relocated or freed and the raw pointer is still valid.
+// If any collection has occurred we treat the entry as stale and return
+// `None` (the event is synthesised with a `null` source — the JDK tolerates
+// a null `AWTEvent.source`), rather than dereferencing a pointer that may
+// have moved. `ensure_peer` re-registers on every observation, so a live
+// component that keeps being touched keeps a fresh, same-generation entry.
+//
+// The stored identity hash is currently only a diagnostic/consistency tag;
+// resolving it back to a live `ObjectRef` would let us drop the
+// generation gate entirely. See the orchestrator report for the precise VM
+// API that would enable that (a `object_for_identity_hash` / weak-handle
+// accessor on `NativeContext`).
 
 const MAX_PEER_SOURCES: usize = 10_000;
 
+#[derive(Clone, Copy)]
+struct PeerSourceEntry {
+    /// Raw object pointer captured at registration. Only valid to
+    /// resurrect while `gc_gen` still matches the live GC count.
+    ptr: usize,
+    /// Stable VM identity hash of the source component (GC-move
+    /// independent). Retained as a consistency tag for the eventual
+    /// hash→ObjectRef resolution path.
+    java_hash: i32,
+    /// GC collection count observed when this entry was (re)registered.
+    /// A change means a moving collection may have relocated/freed the
+    /// object, so `ptr` must not be resurrected.
+    gc_gen: u64,
+}
+
 struct PeerSourceTable {
-    map: FxHashMap<u64, usize>,
+    map: FxHashMap<u64, PeerSourceEntry>,
     order: std::collections::VecDeque<u64>,
 }
 
@@ -131,7 +176,7 @@ impl PeerSourceTable {
         }
     }
 
-    fn insert(&mut self, key: u64, ptr: usize) {
+    fn insert(&mut self, key: u64, entry: PeerSourceEntry) {
         while self.map.len() >= MAX_PEER_SOURCES {
             if let Some(old) = self.order.pop_front() {
                 self.map.remove(&old);
@@ -139,12 +184,12 @@ impl PeerSourceTable {
                 break;
             }
         }
-        if self.map.insert(key, ptr).is_none() {
+        if self.map.insert(key, entry).is_none() {
             self.order.push_back(key);
         }
     }
 
-    fn get(&self, key: u64) -> Option<usize> {
+    fn get(&self, key: u64) -> Option<PeerSourceEntry> {
         self.map.get(&key).copied()
     }
 }
@@ -154,21 +199,43 @@ fn peer_source_table() -> &'static Mutex<PeerSourceTable> {
     INSTANCE.get_or_init(|| Mutex::new(PeerSourceTable::new()))
 }
 
-fn register_peer_source(peer_id: PeerId, source: ObjectRef) {
-    peer_source_table()
-        .lock()
-        .insert(peer_id.0, source.as_ptr() as usize);
+/// Record the Java source component for a peer. `java_hash` is the source's
+/// stable VM identity hash and `gc_gen` is the current GC collection count
+/// (both read from an active `NativeContext` by the caller). See the module
+/// comment for why the GC generation is captured.
+fn register_peer_source(peer_id: PeerId, source: ObjectRef, java_hash: i32, gc_gen: u64) {
+    peer_source_table().lock().insert(
+        peer_id.0,
+        PeerSourceEntry {
+            ptr: source.as_ptr() as usize,
+            java_hash,
+            gc_gen,
+        },
+    );
 }
 
-fn lookup_peer_source(peer_id: PeerId) -> Option<ObjectRef> {
-    let ptr = peer_source_table().lock().get(peer_id.0)?;
-    if ptr == 0 {
+/// Resolve the Java source component for a peer, given the *current* GC
+/// collection count. Returns `None` (fail closed) when the entry is absent,
+/// the pointer is null, or any GC has occurred since registration — in the
+/// last case the moving collector may have relocated or freed the object, so
+/// resurrecting the raw pointer would be a use-after-free.
+fn lookup_peer_source(peer_id: PeerId, current_gc_gen: u64) -> Option<ObjectRef> {
+    let entry = peer_source_table().lock().get(peer_id.0)?;
+    if entry.ptr == 0 {
         return None;
     }
-    // SAFETY: see module comment above — we only reconstruct the ref to
-    // pass it back to the VM as a `Value::Object(Some(ref))`. The VM is
-    // responsible for validating the pointer before any heap access.
-    Some(unsafe { ObjectRef::from_raw(ptr as *mut u8) })
+    if entry.gc_gen != current_gc_gen {
+        // A (moving) collection ran since the source was registered. The
+        // cached pointer may be dangling/relocated — refuse to resurrect it.
+        return None;
+    }
+    // SAFETY: no GC has run since `register_peer_source` captured this
+    // pointer (the collection count is unchanged), so the moving collector
+    // has not relocated or freed the object and `ptr` still designates the
+    // same live heap object. We only reconstruct the ref to hand it back to
+    // the VM as a `Value::Object(Some(ref))`.
+    let _ = entry.java_hash; // retained for the future hash→ref resolution path
+    Some(unsafe { ObjectRef::from_raw(entry.ptr as *mut u8) })
 }
 
 // ---------------------------------------------------------------------------
@@ -409,18 +476,22 @@ fn read_string(ctx: &dyn NativeContext, args: &[Value], idx: usize) -> Option<St
 /// Get or create peer for a Java component object.
 fn ensure_peer(ctx: &mut dyn NativeContext, obj: ObjectRef, ctype: ComponentType) -> PeerId {
     let hash = ctx.identity_hash_code(obj);
+    // Stamp the source registration with the current GC collection count so
+    // `lookup_peer_source` can fail closed if a (moving) collection runs
+    // before the event is synthesised. See the peer-source module comment.
+    let gc_gen = ctx.gc_collection_count();
     let mut reg = peer::peer_registry().lock();
     if let Some(id) = reg.peer_for_java(hash) {
-        // Keep the source pointer fresh: a Java GC move can update the
-        // ObjectRef behind the same identity hash, so re-register on every
-        // observation. Stale entries here would feed bad sources into
+        // Keep the source entry fresh: re-register on every observation so a
+        // live component being repeatedly touched keeps a same-generation,
+        // valid pointer. Stale entries here would feed bad sources into
         // `EventQueue.getNextEvent`.
-        register_peer_source(id, obj);
+        register_peer_source(id, obj, hash, gc_gen);
         return id;
     }
     let id = reg.create_peer(ctype);
     reg.register_java_mapping(hash, id);
-    register_peer_source(id, obj);
+    register_peer_source(id, obj, hash, gc_gen);
     id
 }
 
@@ -1681,7 +1752,10 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
         }
         // All non-invocation event kinds: materialise the matching Java
         // class with `source` / `id` / `when` / modifiers / payload set.
-        let source = lookup_peer_source(evt.source_peer_id);
+        // Pass the current GC count so `lookup_peer_source` only resurrects
+        // the cached source pointer if no (moving) collection has run since
+        // it was registered (finding H8).
+        let source = lookup_peer_source(evt.source_peer_id, ctx.gc_collection_count());
         if let Some(plan) = plan_event_synthesis(&evt, source) {
             return materialise_event(ctx, &plan);
         }
@@ -1704,7 +1778,7 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
             // Swing's dispatch loop only consults `getNextEvent` anyway.
             return null_ok();
         }
-        let source = lookup_peer_source(evt.source_peer_id);
+        let source = lookup_peer_source(evt.source_peer_id, ctx.gc_collection_count());
         if let Some(plan) = plan_event_synthesis(&evt, source) {
             return materialise_event(ctx, &plan);
         }
@@ -2086,7 +2160,9 @@ mod tests {
         // peer-source table is process-wide but keyed by peer id, so a
         // unique peer id per test avoids cross-test interference.
         let source = fake_object_ref(7);
-        register_peer_source(PeerId(7), source);
+        // gc_gen 0 on both register and lookup: no collection runs in-test,
+        // so the same-generation gate (finding H8) permits the round-trip.
+        register_peer_source(PeerId(7), source, 7, 0);
 
         // Inject a synthetic MOUSE_PRESSED via a local EDT (the same
         // entry point the platform backends use after translating a
@@ -2109,7 +2185,7 @@ mod tests {
         assert_eq!(evt.id, event_id::MOUSE_PRESSED);
 
         // And this is what it would write into the Java MouseEvent object:
-        let plan = plan_event_synthesis(&evt, lookup_peer_source(evt.source_peer_id))
+        let plan = plan_event_synthesis(&evt, lookup_peer_source(evt.source_peer_id, 0))
             .expect("MouseEvent must produce a plan");
         assert_eq!(plan.class_name, "java/awt/event/MouseEvent");
         assert_eq!(find_field(&plan, "id"), Some(&Value::Int(event_id::MOUSE_PRESSED)));
@@ -2135,7 +2211,7 @@ mod tests {
     #[test]
     fn window_closing_event_returns_correct_window_event_class() {
         let source = fake_object_ref(3);
-        register_peer_source(PeerId(3), source);
+        register_peer_source(PeerId(3), source, 3, 0);
 
         let edt = crate::edt::EventDispatchThread::new();
         edt.post_event(AwtEvent::window(event_id::WINDOW_CLOSING, PeerId(3), 999));
@@ -2143,7 +2219,7 @@ mod tests {
         let evt = edt.poll_event().expect("window event must be present");
         assert_eq!(evt.id, event_id::WINDOW_CLOSING);
 
-        let plan = plan_event_synthesis(&evt, lookup_peer_source(evt.source_peer_id))
+        let plan = plan_event_synthesis(&evt, lookup_peer_source(evt.source_peer_id, 0))
             .expect("WindowEvent must produce a plan");
         assert_eq!(plan.class_name, "java/awt/event/WindowEvent");
         assert_eq!(
@@ -2162,7 +2238,7 @@ mod tests {
     #[test]
     fn key_event_carries_keycode_keychar_and_modifiers() {
         let source = fake_object_ref(5);
-        register_peer_source(PeerId(5), source);
+        register_peer_source(PeerId(5), source, 5, 0);
 
         let evt = AwtEvent::key(
             event_id::KEY_PRESSED,
@@ -2172,7 +2248,7 @@ mod tests {
             'a',
             modifiers::SHIFT_DOWN_MASK,
         );
-        let plan = plan_event_synthesis(&evt, lookup_peer_source(evt.source_peer_id))
+        let plan = plan_event_synthesis(&evt, lookup_peer_source(evt.source_peer_id, 0))
             .expect("KeyEvent must produce a plan");
         assert_eq!(plan.class_name, "java/awt/event/KeyEvent");
         assert_eq!(find_field(&plan, "keyCode"), Some(&Value::Int(crate::event::vk::VK_A)));
@@ -2194,6 +2270,26 @@ mod tests {
             .expect("PaintEvent must produce a plan");
         assert_eq!(plan.class_name, "java/awt/event/PaintEvent");
         assert_eq!(find_field(&plan, "id"), Some(&Value::Int(event_id::PAINT)));
+    }
+
+    /// Finding H8: `lookup_peer_source` must fail closed once a GC has run
+    /// since the source was registered. The cached raw pointer could have
+    /// been relocated/freed by the moving collector, so resurrecting it
+    /// would be a use-after-free. The same-generation entry round-trips;
+    /// a later generation yields `None`.
+    #[test]
+    fn peer_source_lookup_fails_closed_after_gc() {
+        let source = fake_object_ref(11);
+        // Registered at GC generation 5.
+        register_peer_source(PeerId(11), source, 11, 5);
+        // Same generation -> the pointer is provably still valid.
+        assert_eq!(lookup_peer_source(PeerId(11), 5), Some(source));
+        // A later generation means a (moving) collection ran -> refuse to
+        // resurrect the possibly-stale pointer.
+        assert_eq!(lookup_peer_source(PeerId(11), 6), None);
+        assert_eq!(lookup_peer_source(PeerId(11), u64::MAX), None);
+        // Unknown peer -> None.
+        assert_eq!(lookup_peer_source(PeerId(9999), 5), None);
     }
 
     /// Component / Focus / Action events are TODO and intentionally

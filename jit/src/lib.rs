@@ -841,6 +841,11 @@ impl CompiledMethod {
         self.entry
     }
 
+    /// Debug-only: raw emitted machine code bytes.
+    pub fn _buffer_slice_for_debug(&self) -> &[u8] {
+        self._buffer.as_slice()
+    }
+
     /// Backward-compatible alias for `needs_context()`.
     pub fn needs_heap(&self) -> bool {
         self.needs_context
@@ -3969,6 +3974,21 @@ fn try_compile_inner(
     compiled._jit_mic_slots = owned_mic_slots;
     compiled._jit_pic_slots = owned_pic_slots;
     compiled.inlined_methods = inlined_methods;
+
+    if let Ok(want) = std::env::var("CRATONVM_DBG_JIT_CODE") {
+        let full = format!("{}.{}{}", cached.class_name, cached.method_name, cached.method_descriptor);
+        if full.contains(&want) {
+            let slice = compiled._buffer_slice_for_debug();
+            let mut hex = String::new();
+            for b in slice {
+                hex.push_str(&format!("{:02x}", b));
+            }
+            eprintln!(
+                "[JIT_CODE] {} entry={:p} len={} param_jvm_slots={:?} span={} needs_heap={}\n{}",
+                full, compiled.entry, slice.len(), param_jvm_slots, param_slot_span, needs_heap, hex
+            );
+        }
+    }
 
     Some(compiled)
 }

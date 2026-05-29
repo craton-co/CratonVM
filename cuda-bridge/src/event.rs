@@ -175,6 +175,15 @@ impl Event {
 
     #[cfg(feature = "cuda")]
     pub fn synchronize(&self) -> Result<()> {
+        // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary
+        // context to this thread before driving the event. The
+        // `unsafe impl Send + Sync` on `EventCuda` is sound only if
+        // every thread that drives the handle has first bound the
+        // device; this prelude enforces it. Cheap per-thread TLS check.
+        self.inner
+            .device
+            .bind_to_thread()
+            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
         // `cuEventSynchronize` is a host-side wait: returns when the
         // event has completed on whatever stream recorded it. If the
         // event was never recorded the call returns immediately (the
@@ -201,6 +210,13 @@ impl Event {
 
     #[cfg(feature = "cuda")]
     pub fn query(&self) -> Result<bool> {
+        // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary
+        // context to this thread before querying the event (see
+        // `synchronize`).
+        self.inner
+            .device
+            .bind_to_thread()
+            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
         // cudarc's `result::event::query` returns `Ok(())` when the
         // event has fired and an `Err(CUDA_ERROR_NOT_READY)` when it
         // is still in flight. We map the not-ready code to
@@ -249,6 +265,16 @@ impl Stream {
 
     #[cfg(feature = "cuda")]
     pub fn record_event(&self, event: &Event) -> Result<()> {
+        // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary
+        // context to this thread before driving the stream/event. The
+        // event carries the `Arc<CudaDevice>`; binding through it also
+        // binds the context the stream belongs to (same primary
+        // context per device). Cheap per-thread TLS check.
+        event
+            .inner
+            .device
+            .bind_to_thread()
+            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
         // `cuEventRecord(event, stream)` enqueues the event onto the
         // stream's command queue. Subsequent `cuEventQuery` /
         // `cuEventSynchronize` calls observe completion of any work
@@ -277,6 +303,14 @@ impl Stream {
 
     #[cfg(feature = "cuda")]
     pub fn wait_event(&self, event: &Event) -> Result<()> {
+        // AUDIT 2026-05-29 (SOUND-1 / H10c): bind the owning primary
+        // context to this thread before driving the stream/event (see
+        // `record_event`).
+        event
+            .inner
+            .device
+            .bind_to_thread()
+            .map_err(|e| DeviceError::Driver(format!("bind_to_thread: {e:?}")))?;
         // `cuStreamWaitEvent(stream, event, CU_EVENT_WAIT_DEFAULT)`
         // inserts a barrier on this stream that blocks all subsequent
         // submissions until `event` fires on whichever stream

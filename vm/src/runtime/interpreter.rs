@@ -1179,6 +1179,94 @@ enum CachedCallResult {
 }
 
 // ---------------------------------------------------------------------------
+// H6 — native-stack-aware re-entrant recursion guard
+// ---------------------------------------------------------------------------
+//
+// The `execute` re-entrancy guard (see the `EXEC_DEPTH` block inside
+// `execute`) must trip — throwing a *catchable* `StackOverflowError` —
+// BEFORE deep re-entrant native dispatch (e.g. reflective `Method.invoke`
+// cascades) exhausts the OS thread's native stack and aborts the whole
+// process (uncatchable).
+//
+// The ceiling cannot be a single hard-coded constant because different
+// threads run on very different native stacks: the main VM thread is spawned
+// with a 128 MiB stack, whereas worker / `java.lang.Thread` carriers default
+// to 8 MiB (see `vm_exec.rs`, honouring `RUST_MIN_STACK`). A constant tuned
+// for one is wrong for the other — too low throttles legitimate deep
+// recursion on the big stack, too high lets a worker blow its 8 MiB stack
+// before the guard ever trips.
+//
+// So we derive a per-thread ceiling from the thread's ACTUAL native stack
+// size. Threads that host Java execution call
+// [`init_thread_exec_depth_ceiling`] with their configured native stack size
+// at start-up; the guard reads the resulting per-thread ceiling.
+
+/// Conservative estimate of how many bytes of native stack a single
+/// re-entrant `execute` level can consume. Each `execute` call adds several
+/// Rust frames (the recursive `execute_frame`, invoke dispatch, and the JIT
+/// entry trampoline). The original guard assumed ~6.4 KiB/level (10 000
+/// levels for a 64 MiB stack); we use a deliberately pessimistic 8 KiB so the
+/// derived ceiling trips with margin to spare before the OS guard page.
+const NATIVE_STACK_BYTES_PER_EXEC_LEVEL: usize = 8 * 1024;
+
+/// Fraction of the native stack we are willing to spend on re-entrant
+/// `execute` recursion before tripping the guard. The remainder is reserved
+/// head-room for the deepest single Java frame's own locals/operands plus any
+/// native callee (the verifier, GC, JIT) running on top of the deepest level.
+/// `2` => use at most half the stack for recursion depth.
+const NATIVE_STACK_SAFETY_DIVISOR: usize = 2;
+
+/// Default native stack assumption for a thread that never called
+/// [`init_thread_exec_depth_ceiling`]. The process main VM thread is spawned
+/// with a 128 MiB stack (see `vm-cli` `main`), so defaulting to 128 MiB keeps
+/// the deep-recursion head-room that workloads such as `binaryTrees` rely on
+/// even if the explicit init call is not wired for that thread. Worker carrier
+/// threads (8 MiB) DO call the init function and therefore get a correctly
+/// lowered ceiling rather than this default.
+const DEFAULT_NATIVE_STACK_BYTES: usize = 128 * 1024 * 1024;
+
+/// Absolute floor for the derived ceiling. Even on a tiny stack we allow at
+/// least this many re-entrant levels so ordinary (non-pathological) call
+/// graphs are never spuriously rejected.
+const MIN_EXEC_DEPTH_CEILING: u32 = 256;
+
+/// Compute the re-entrant `execute` depth ceiling for a thread whose native
+/// stack is `native_stack_bytes` large.
+#[inline]
+fn derive_exec_depth_ceiling(native_stack_bytes: usize) -> u32 {
+    let usable = native_stack_bytes / NATIVE_STACK_SAFETY_DIVISOR;
+    let levels = usable / NATIVE_STACK_BYTES_PER_EXEC_LEVEL;
+    // Clamp into u32 and apply the floor.
+    let levels = levels.min(u32::MAX as usize) as u32;
+    levels.max(MIN_EXEC_DEPTH_CEILING)
+}
+
+thread_local! {
+    /// Per-thread re-entrant `execute` depth ceiling, derived from the
+    /// thread's native stack size. Defaults to the main-VM-thread value
+    /// (`DEFAULT_NATIVE_STACK_BYTES`) so a thread that never calls
+    /// [`init_thread_exec_depth_ceiling`] still gets a safe (high) ceiling.
+    static EXEC_DEPTH_CEILING: std::cell::Cell<u32> =
+        std::cell::Cell::new(derive_exec_depth_ceiling(DEFAULT_NATIVE_STACK_BYTES));
+}
+
+/// Record the calling thread's native stack size so the re-entrant `execute`
+/// recursion guard can derive a correct [`StackOverflowError`] ceiling for it.
+///
+/// Call this ONCE, from inside the thread, before it begins executing Java
+/// bytecode. Worker / `java.lang.Thread` carriers (which default to an 8 MiB
+/// native stack) MUST call this so the guard trips before their smaller stack
+/// overflows; the process main thread may also call it but otherwise inherits
+/// the safe 128 MiB-derived default.
+///
+/// `native_stack_bytes` is the value passed to
+/// `std::thread::Builder::stack_size` for the calling thread.
+pub fn init_thread_exec_depth_ceiling(native_stack_bytes: usize) {
+    let ceiling = derive_exec_depth_ceiling(native_stack_bytes);
+    EXEC_DEPTH_CEILING.with(|c| c.set(ceiling));
+}
+
+// ---------------------------------------------------------------------------
 // Public entry point
 // ---------------------------------------------------------------------------
 
@@ -1211,14 +1299,16 @@ pub fn execute(
     // the implementation raise SOE at any depth; ByteBuddy's reflection
     // helpers catch `Throwable` and recover.
     //
-    // Limit calibration: Rust stack at 64 MB / ~6 KB per native frame
-    // ≈ 10 000 frames max before the OS guard page fires. 10_000 trips
-    // BEFORE we hit the guard page (each `execute` call adds 5-10 Rust
-    // frames, so an `execute` depth of 10_000 corresponds to 50_000-
-    // 100_000 native frames — well past the physical limit). The
-    // previous 50_000 ceiling was set when the EXEC_DEPTH guard was
-    // briefly disabled to recover from a class-loading regression; we
-    // lower it back to a value that actually trips before SOE.
+    // Limit calibration (H6): the ceiling is no longer a single hard-coded
+    // constant. It is derived per-thread from the thread's ACTUAL native
+    // stack size (see `EXEC_DEPTH_CEILING` / `derive_exec_depth_ceiling` /
+    // `init_thread_exec_depth_ceiling` above). The previous fixed `10_000`
+    // assumed a 64 MiB stack and overflowed the 8 MiB worker-carrier stack —
+    // a hard, uncatchable process abort — before it ever tripped. Each
+    // `execute` level burns several KiB of native stack (recursive
+    // `execute_frame` + invoke dispatch + JIT entry trampoline); the derived
+    // ceiling reserves head-room so the guard fires (throwing a catchable
+    // `StackOverflowError`) before the OS guard page does.
     thread_local! {
         static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
     }
@@ -1236,7 +1326,14 @@ pub fn execute(
         d.set(v + 1);
         v
     });
-    if depth > 10_000 {
+    // H6: trip against the per-thread ceiling derived from the thread's
+    // ACTUAL native stack size (see `EXEC_DEPTH_CEILING` /
+    // `init_thread_exec_depth_ceiling`). The previous hard-coded `10_000`
+    // was calibrated for a 64 MiB stack and overflowed the 8 MiB worker
+    // carriers' native stack — a hard, uncatchable process abort — before
+    // it tripped. Throwing here yields a *catchable* `StackOverflowError`.
+    let ceiling = EXEC_DEPTH_CEILING.with(|c| c.get());
+    if depth > ceiling {
         EXEC_DEPTH.with(|d| {
             let v = d.get();
             d.set(v.saturating_sub(1));
@@ -2823,7 +2920,21 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
         // unexpected stack states. Real JDK bytecode can produce patterns
         // (e.g. long/double on stack where int expected) that the fast path
         // doesn't handle. The slow path uses pop() with proper error handling.
-        let use_fast_path = !thread.frames[frame_idx].is_jdk_class;
+        // H7: the fast-path local-access handlers (lload/dload, istore/fstore,
+        // astore, lstore/dstore — and the `_unchecked` get/set helpers used by
+        // the iload/iadd/etc. fusions) index `frame.locals` with the raw
+        // bytecode operand WITHOUT a bounds check, relying entirely on the
+        // bytecode verifier having proven the operand `< max_locals`. When
+        // verification is globally disabled (`-noverify` / `-Xverify:none`)
+        // that invariant no longer holds, so an out-of-range operand would
+        // index out of bounds. Disable the unchecked fast path entirely in
+        // that mode and fall back to the bounds-checked slow path; the
+        // per-site checks below are a second line of defence (e.g. for
+        // per-class `skip_verification` generated classes that this cheap
+        // global flag does not cover). `skip_verification` is a single bool
+        // load — no per-instruction RwLock acquire.
+        let use_fast_path =
+            !thread.frames[frame_idx].is_jdk_class && !shared.config.skip_verification;
         debug_assert!(
             thread.frames[frame_idx].code.len() >= 2,
             "bytecode must be padded with at least 2 trailing bytes"
@@ -4188,7 +4299,17 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     continue;
                 }
                 // iload (0x15), fload (0x17), aload (0x19)
-                0x15 | 0x17 | 0x19 => {
+                //
+                // H7: `b1` is the raw bytecode operand. The `_unchecked`
+                // local accessors index `frame.locals` (len == max_locals)
+                // without a bounds check, relying on the verifier. Guard the
+                // index here as defence-in-depth for unverified bytecode
+                // (per-class `skip_verification` classes not covered by the
+                // global `use_fast_path` gate); on an out-of-range operand we
+                // skip the unchecked arm and fall through to the
+                // bounds-checked slow path (which re-decodes from `saved_pc`,
+                // unchanged here).
+                0x15 | 0x17 | 0x19 if (b1 as usize) < frame.max_locals as usize => {
                     let mut v = frame.get_local_unchecked(b1 as usize); // Cast: bytecode operand decoding
                     if opcode == 0x19 {
                         // Validated: see aload_0..3 above.
@@ -4203,7 +4324,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 // (`get_local_compact` + `push_compact_checked`). Avoids the
                 // lossy `to_value()`/`from_value()` round-trip that dropped
                 // collision-pattern longs (see lload_0..3 above).
-                0x16 | 0x18 => {
+                // H7: bounds-guard `b1` (see iload/fload/aload above).
+                0x16 | 0x18 if (b1 as usize) < frame.max_locals as usize => {
                     frame
                         .stack
                         .push_compact(frame.get_local_compact_unchecked(b1 as usize)); // Cast: bytecode operand decoding
@@ -4211,7 +4333,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     continue;
                 }
                 // istore (0x36), fstore (0x38)
-                0x36 | 0x38 => {
+                // H7: bounds-guard `b1` (see iload/fload/aload above).
+                0x36 | 0x38 if (b1 as usize) < frame.max_locals as usize => {
                     let v = frame.stack.pop_unchecked();
                     frame.set_local_unchecked(b1 as usize, v); // Cast: bytecode operand decoding
                     frame.pc = saved_pc + 2;
@@ -4219,7 +4342,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 }
                 // astore (0x3a) — reference local; coerce jlong jobject handles.
                 // Validated to reject aligned non-heap long bits (Letsgo AV).
-                0x3a => {
+                // H7: bounds-guard `b1` (see iload/fload/aload above).
+                0x3a if (b1 as usize) < frame.max_locals as usize => {
                     let v = frame.stack.pop_unchecked();
                     frame.set_local_unchecked(
                         b1 as usize, // Cast: bytecode operand decoding
@@ -4229,7 +4353,8 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     continue;
                 }
                 // lstore (0x37), dstore (0x39) — WP4.3 typed-pop routing.
-                0x37 | 0x39 => {
+                // H7: bounds-guard `b1` (see iload/fload/aload above).
+                0x37 | 0x39 if (b1 as usize) < frame.max_locals as usize => {
                     let cv = frame.stack.pop_compact();
                     let v = if opcode == 0x37 {
                         Value::Long(cv.as_long_unchecked())
@@ -15969,6 +16094,58 @@ fn double_to_long(v: f64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // H6 — native-stack-aware re-entrant recursion ceiling
+    // -----------------------------------------------------------------------
+
+    /// The derived ceiling must scale with the native stack size: a worker
+    /// carrier's 8 MiB stack gets a far lower ceiling than the main VM
+    /// thread's 128 MiB stack, and the 8 MiB ceiling must be small enough
+    /// that the guard trips before ~8 MiB of native stack is exhausted.
+    #[test]
+    fn exec_depth_ceiling_scales_with_native_stack() {
+        let worker = derive_exec_depth_ceiling(8 * 1024 * 1024);
+        let main = derive_exec_depth_ceiling(128 * 1024 * 1024);
+        assert!(
+            worker < main,
+            "8 MiB worker ceiling ({worker}) must be below 128 MiB main ceiling ({main})"
+        );
+        // 8 MiB / 2 (safety) / 8 KiB per level = 512 levels.
+        assert_eq!(worker, 512);
+        // 128 MiB / 2 / 8 KiB = 8192 levels.
+        assert_eq!(main, 8192);
+    }
+
+    /// The old hard-coded 10_000 ceiling overflowed an 8 MiB native stack
+    /// before tripping. The derived 8 MiB ceiling must be strictly below
+    /// that old constant so the guard now fires first.
+    #[test]
+    fn exec_depth_ceiling_for_8mib_below_legacy_constant() {
+        assert!(derive_exec_depth_ceiling(8 * 1024 * 1024) < 10_000);
+    }
+
+    /// Even a pathologically tiny stack must yield at least the floor so
+    /// ordinary (non-recursive) call graphs are never spuriously rejected.
+    #[test]
+    fn exec_depth_ceiling_respects_floor() {
+        assert_eq!(derive_exec_depth_ceiling(0), MIN_EXEC_DEPTH_CEILING);
+        assert_eq!(derive_exec_depth_ceiling(1024), MIN_EXEC_DEPTH_CEILING);
+    }
+
+    /// `init_thread_exec_depth_ceiling` must install the derived value into
+    /// the per-thread cell (verified on a fresh thread to avoid disturbing
+    /// the default on the test runner thread).
+    #[test]
+    fn init_thread_ceiling_installs_derived_value() {
+        let derived = std::thread::spawn(|| {
+            init_thread_exec_depth_ceiling(8 * 1024 * 1024);
+            EXEC_DEPTH_CEILING.with(|c| c.get())
+        })
+        .join()
+        .expect("ceiling probe thread must not panic");
+        assert_eq!(derived, derive_exec_depth_ceiling(8 * 1024 * 1024));
+    }
 
     // -----------------------------------------------------------------------
     // C8 — tail-call optimization must not discard an enclosing try/catch
