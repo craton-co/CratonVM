@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Long-running leak soak — Enhancement #2 from
 //! `review-2026-05-24/gc.md` §2.3.
 //!

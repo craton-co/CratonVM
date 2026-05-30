@@ -8,6 +8,7 @@ license.workspace = true
 description = "Java bytecode → PTX lowering for CratonVM GPU offload"
 readme = "README.md"
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 

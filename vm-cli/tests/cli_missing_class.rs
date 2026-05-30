@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! End-to-end check that invoking cratonvm with a nonexistent main
 //! class fails with a clear error and a non-zero exit code.
 //!

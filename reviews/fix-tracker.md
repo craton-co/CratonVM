@@ -24,6 +24,11 @@ Legend: ⬜ queued · 🔄 in wave · ✅ landed+built · ⏭️ deferred
 - ❗ classloading jar_signer::rsa_verify_accepts_valid_signature (RSA PKCS#1 v1.5 verify fails)
 - ℹ native-io socket_channel::nb_read_returns_eagain_zero — parallel-only flake (passes single-threaded)
 
+## Status @ b9e77ce — all code waves done & green
+- Commits: 8dcf0e3 (W1), ae9be14+f54c298 (W2), 2da3fed (W3), b9e77ce (jit prescan hang + vm-cli re-apply)
+- Tests green: gc 655/0 · native-collections 61/0 + integ (gc_relocation 8/0) · native-io 258/0 · jfr 286/0 · jit 686/0 (was hanging 400min on lookupswitch neg-npairs prescan — fixed) · reader 256/0 · native-api 138/0
+- ⚠️ CONCURRENT SESSION on dev: commits 51e223a..06dc83a (H2 GC/keycloak) interleaved; uncommitted WIP in native-builtins/lang_class.rs + vm/runtime/interpreter.rs (NOT mine — left untouched). continue_prompt.md actively theirs — do NOT modify.
+
 ## Wave 4 — DOCS + OSS metadata (mostly non-code)
 - ⏭️ W4-docs-crypto  — docs/CRYPTO_STATUS.md, SECURITY.md, CHANGELOG.md (reconcile crypto/SecMgr/zip-drift)
 - ⏭️ W4-docs-mode    — README.md, docs/INSTALL.md (default-mode reconcile; CLI flag table)

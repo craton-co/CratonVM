@@ -6,10 +6,19 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Command-line launcher for the CratonVM"
 readme = "README.md"
+# Committed compiled Java fixtures used by the tests/cli_*.rs integration
+# tests. Excluded from the published package so `cargo package` does not
+# ship opaque .class bytecode. The test .rs sources live directly under
+# tests/ and are unaffected.
+exclude = [
+    "tests/resources/**",
+    "**/*.class",
+]
 
 [[bin]]
 name = "cratonvm"

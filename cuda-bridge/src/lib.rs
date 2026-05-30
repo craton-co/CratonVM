@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Thin CUDA Driver API bridge.
 //!
 //! See the crate-level [`README.md`](../../README.md) for the build-mode

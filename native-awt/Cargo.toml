@@ -8,6 +8,7 @@ license.workspace = true
 description = "AWT/Swing/Java2D native peer implementation for CratonVM"
 readme = "README.md"
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 

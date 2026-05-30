@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Outbound-host policy hook and connect-timeout knob (task #16).
 //!
 //! SSRF hardening for the blocking NIO connect path. Guest code that

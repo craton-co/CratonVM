@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! x86-64 JIT code emitter for JVM bytecode methods.
 //!
 //! Compiles JVM bytecode directly to x86-64 machine code.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Concurrent-mark thread controller for G1 (task #54).
 //!
 //! Splits the G1 mark phase into:

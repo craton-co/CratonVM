@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Large-file synthesis test — exercises the reader against a hand-crafted
 //! class file pushed close to the JVMS §4.1 maxima:
 //!

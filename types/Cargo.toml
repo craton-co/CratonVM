@@ -8,6 +8,7 @@ license.workspace = true
 description = "Shared types for the CratonVM project"
 readme = "README.md"
 repository.workspace = true
+homepage.workspace = true
 keywords = ["jvm", "java", "bytecode", "types"]
 categories = ["data-structures", "encoding"]
 

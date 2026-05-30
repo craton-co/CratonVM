@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Minimal in-crate [`NativeContext`] implementation for trait-default-impl tests.
 //!
 //! Gated behind `#[cfg(any(test, feature = "test-mock"))]` so the symbol is

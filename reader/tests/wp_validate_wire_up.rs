@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Documents and pins the wiring decision for `ConstantPool::validate`.
 //!
 //! `reader/src/constant_pool.rs` defines `ConstantPool::validate` (lines

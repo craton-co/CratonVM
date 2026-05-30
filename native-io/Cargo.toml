@@ -8,6 +8,7 @@ license.workspace = true
 description = "Java I/O native methods for CratonVM"
 readme = "README.md"
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 

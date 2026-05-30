@@ -8,6 +8,7 @@ license.workspace = true
 description = "Java Flight Recorder support for CratonVM"
 readme = "README.md"
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 

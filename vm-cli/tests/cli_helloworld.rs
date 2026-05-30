@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! End-to-end smoke test: `cratonvm --classpath <dir> HelloWorld` prints
 //! "Hello, World!" and exits 0.
 //!

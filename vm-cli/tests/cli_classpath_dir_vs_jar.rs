@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Both classpath shapes work: HelloWorld can be loaded from a
 //! directory entry on the classpath AND from a JAR entry on the
 //! classpath.

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Switch-instruction padding tests for every legal `pc % 4` start.
 //!
 //! Per JVMS §6.5 (`tableswitch` / `lookupswitch`), the bytecode that

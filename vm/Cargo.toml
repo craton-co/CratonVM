@@ -6,10 +6,21 @@ rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 description = "Java Virtual Machine implementation in Rust"
 readme = "README.md"
+# Compiled Java test fixtures (.class files and the resource/boot-fixture
+# trees that hold them) are committed for the integration tests but must
+# not ship in the published crate — they bloat `cargo package` with ~2.5 MB
+# of opaque bytecode. Integration-test `.rs` sources live directly under
+# tests/ and are unaffected.
+exclude = [
+    "tests/resources/**",
+    "tests/wildfly_boot_fixtures/**",
+    "**/*.class",
+]
 
 [features]
 # NEW-11: `synthetic-jdk` is intentionally NOT in the default feature set.

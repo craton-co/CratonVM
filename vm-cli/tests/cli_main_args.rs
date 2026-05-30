@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! End-to-end check that program arguments after the main class are
 //! delivered to `public static void main(String[] args)` in order.
 //!

@@ -8,8 +8,17 @@ license.workspace = true
 description = "Class loading subsystem for CratonVM"
 readme = "README.md"
 repository.workspace = true
+homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Committed compiled Java fixtures (.class files under tests/fixtures/) used
+# by the redefine/security integration tests. Excluded from the published
+# package so `cargo package` does not ship opaque bytecode. Integration-test
+# .rs sources live directly under tests/ and are unaffected.
+exclude = [
+    "tests/fixtures/**",
+    "**/*.class",
+]
 
 [dependencies]
 cratonvm-types = { path = "../types", version = "0.3.0" }

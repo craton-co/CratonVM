@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Round-5 CRIT regression test: `NativeContext::atomic_fetch_add_int` and
 //! `_long` default impls must surface a field-type mismatch as
 //! `Err(MethodCallFailed)` wrapping `RuntimeError::IllegalArgumentException`,

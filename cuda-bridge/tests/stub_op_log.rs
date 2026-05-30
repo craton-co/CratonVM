@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Stub-mode integration tests for the Phase 2 async surfaces.
 //!
 //! These tests exercise the cross-module surfaces (`Stream`, `Event`,
