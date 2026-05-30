@@ -915,6 +915,21 @@ fn verify_inherited_abstract_methods_implemented(
         return Ok(());
     }
 
+    // Synthetic-stub classes carry no `.class` file: their method tables are
+    // curated/empty and the contract is fulfilled entirely by native
+    // registrations (see `Class::is_synthetic_stub`). Applying a *bytecode*-
+    // level abstract-implementation check to them is categorically wrong — it
+    // false-positives on inherited abstract methods that the VM satisfies via
+    // native dispatch. This was the regression that broke ALL reflection:
+    // `java/lang/reflect/Constructor` (a synthetic stub) inherits the
+    // package-private abstract `Executable.getAnnotationBytes()[B`, which the
+    // real JDK overrides but our stub's curated method table omits — so this
+    // check rejected `Constructor`, and every `Class.getDeclaredMethods()`
+    // call (which links `Constructor`) died with a verification error.
+    if class.is_synthetic_stub {
+        return Ok(());
+    }
+
     // Walk the superclass chain, inspecting each ancestor's declared abstract
     // methods.
     let mut current_id = class.superclass;
@@ -942,9 +957,22 @@ fn verify_inherited_abstract_methods_implemented(
                 if id == ancestor_id {
                     break;
                 }
-                let scan_class = match store.get(id) {
-                    Some(c) => c,
-                    None => break,
+                // The class under verification is NOT yet inserted into
+                // `store` at this point (verify_class_structure runs before the
+                // store insert — see class_manager.rs), so `store.get(class.id)`
+                // returns None. Consult the `class` parameter directly for its
+                // own id; otherwise the very first scan hop breaks and every
+                // concrete class that overrides an inherited abstract method is
+                // falsely rejected (Integer.intValue, StringBuilder.toString,
+                // reflect.Method/Constructor.getAnnotationBytes — the regression
+                // that broke all reflection).
+                let scan_class = if id == class.id {
+                    class
+                } else {
+                    match store.get(id) {
+                        Some(c) => c,
+                        None => break,
+                    }
                 };
                 if let Some(found) =
                     scan_class.find_method(&method.name, &method.descriptor)
