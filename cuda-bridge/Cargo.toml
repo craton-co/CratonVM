@@ -1,5 +1,5 @@
 [package]
-name = "cuda-bridge"
+name = "cratonvm-cuda-bridge"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -30,7 +30,7 @@ optional = true
 # NOTE: `default = []` means a plain `cargo build`/`cargo check` only
 # compiles `backend_stub.rs`. The real `backend_cuda.rs` is ONLY built
 # behind the `cuda` feature below, so it can silently rot against cudarc
-# API changes. CI MUST run `cargo check -p cuda-bridge --features cuda`
+# API changes. CI MUST run `cargo check -p cratonvm-cuda-bridge --features cuda`
 # to keep the real backend honest — see `.github/workflows/cuda-bridge.yml`.
 default = []
 # Compile against a real libcuda / nvcuda.dll via cudarc.

@@ -50,9 +50,9 @@ jobs:
 
       # Default backend — the stub. Must always stay green.
       - name: Check default (stub) backend
-        run: cargo check -p cuda-bridge
+        run: cargo check -p cratonvm-cuda-bridge
 
       # Real cudarc-backed backend. Guards against the `cuda` feature
       # rotting against cudarc API changes.
       - name: Check cuda backend
-        run: cargo check -p cuda-bridge --features cuda
+        run: cargo check -p cratonvm-cuda-bridge --features cuda

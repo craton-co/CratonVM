@@ -65,8 +65,8 @@ cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
 cratonvm-native-awt = { path = "../native-awt", version = "0.3.0" }
 # Optional, only pulled in by the `gpu-offload` feature. See the feature
 # table above. With `gpu-offload` off, these crates are not linked.
-cuda-bridge = { path = "../cuda-bridge", version = "0.3.0", optional = true }
-jit-cuda = { path = "../jit-cuda", version = "0.3.0", optional = true }
+cuda-bridge = { path = "../cuda-bridge", version = "0.3.0", optional = true, package = "cratonvm-cuda-bridge" }
+jit-cuda = { path = "../jit-cuda", version = "0.3.0", optional = true, package = "cratonvm-jit-cuda" }
 bytemuck = { version = "1.16", optional = true }
 thiserror.workspace = true
 tracing.workspace = true

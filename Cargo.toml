@@ -3,7 +3,10 @@ members = ["reader", "types", "native-api", "native-collections", "native-io", "
 resolver = "2"
 
 [workspace.package]
-publish = false
+# Note: members do NOT inherit a publish gate from here (none set
+# `publish.workspace = true`), so every library crate is publishable to
+# crates.io. The only crate withheld from publication is `fuzz`, which sets
+# its own `publish = false`. (A bare `publish = false` here would be inert.)
 authors = ["Craton Software Company"]
 version = "0.3.0"
 edition = "2021"

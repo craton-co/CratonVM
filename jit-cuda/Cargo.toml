@@ -1,5 +1,5 @@
 [package]
-name = "jit-cuda"
+name = "cratonvm-jit-cuda"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -20,7 +20,7 @@ cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
 # BEFORE ours and exposes the `DEP_CRATON_GPU_ANNOTATIONS_ANNOTATIONS_*`
 # env vars (via its `links = "craton-gpu-annotations"` declaration) to
 # our build.rs. The Rust code in this crate does not call into it.
-craton-gpu = { path = "../craton-gpu", version = "0.3.0" }
+craton-gpu = { path = "../craton-gpu", version = "0.3.0", package = "cratonvm-gpu" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
