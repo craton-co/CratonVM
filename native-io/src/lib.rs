@@ -14615,7 +14615,7 @@ mod bais_layout_tests {
         for (i, b) in bytes.iter().enumerate() {
             ctx.set_array_element(buf, i, Value::Int(*b as i32));
         }
-        let this = ctx.alloc_object(4);
+        let this = ctx.alloc_object_with_class(4, "java/io/ByteArrayInputStream");
         native_bais_init(ctx, &[Value::Object(Some(this)), Value::Object(Some(buf))])
             .expect("init ok");
         (this, buf)

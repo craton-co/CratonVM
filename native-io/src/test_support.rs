@@ -50,6 +50,12 @@ pub(crate) struct MockNativeContext {
     /// can return a real value. Populated lazily by `attach_string` /
     /// `create_string` so most tests pay nothing for it.
     pub strings: UnsafeCell<HashMap<usize, String>>,
+    /// Optional per-object class identity. `class_table[0]` is the sentinel
+    /// "unknown" name so `ClassId::new(0)` maps back to `None`. Objects are
+    /// only entered here via `alloc_object_with_class`; everything else stays
+    /// unknown, preserving the historic `class_id_of_object == 0` default.
+    class_table: Vec<String>,
+    obj_class: HashMap<usize, ClassId>,
 }
 
 impl MockNativeContext {
@@ -61,7 +67,30 @@ impl MockNativeContext {
             scripts: Vec::new(),
             calls: UnsafeCell::new(Vec::new()),
             strings: UnsafeCell::new(HashMap::new()),
+            class_table: vec![String::new()],
+            obj_class: HashMap::new(),
         }
+    }
+
+    /// Allocate an object whose `class_id_of_object` / `class_name_of_id`
+    /// resolve to `class_name`. Used by tests that exercise natives which
+    /// branch on the receiver's runtime class (e.g. the `ByteArrayInputStream`
+    /// fast path in `read([BII)`).
+    pub(crate) fn alloc_object_with_class(
+        &mut self,
+        num_fields: usize,
+        class_name: &str,
+    ) -> ObjectRef {
+        let obj = self.alloc_object(num_fields);
+        let cid = match self.class_table.iter().position(|n| n == class_name) {
+            Some(i) => ClassId::new(i as u32),
+            None => {
+                self.class_table.push(class_name.to_string());
+                ClassId::new((self.class_table.len() - 1) as u32)
+            }
+        };
+        self.obj_class.insert(obj.as_ptr() as usize, cid);
+        obj
     }
 
     fn strings_mut(&self) -> &mut HashMap<usize, String> {
@@ -222,8 +251,18 @@ impl NativeContext for MockNativeContext {
     fn invoke(&mut self, _c: &str, _m: &str, _d: &str, _a: &[Value]) -> MethodCallResult { Ok(None) }
     fn identity_hash_code(&self, o: ObjectRef) -> i32 { o.as_ptr() as i32 }
     fn record_printed_value(&mut self, _v: Value) {}
-    fn class_name_of_id(&self, _c: ClassId) -> Option<String> { None }
-    fn class_id_of_object(&self, _o: ObjectRef) -> ClassId { ClassId::new(0) }
+    fn class_name_of_id(&self, c: ClassId) -> Option<String> {
+        match self.class_table.get(c.as_u32() as usize) {
+            Some(name) if !name.is_empty() => Some(name.clone()),
+            _ => None,
+        }
+    }
+    fn class_id_of_object(&self, o: ObjectRef) -> ClassId {
+        self.obj_class
+            .get(&(o.as_ptr() as usize))
+            .copied()
+            .unwrap_or_else(|| ClassId::new(0))
+    }
     fn capture_stack_trace(&mut self, _h: i32) -> Vec<StackTraceEntry> { Vec::new() }
     fn get_stack_trace(&self, _h: i32) -> Option<&[StackTraceEntry]> { None }
     fn get_field_by_name(&self, _o: ObjectRef, _n: &str) -> Value { Value::Object(None) }

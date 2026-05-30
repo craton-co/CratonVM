@@ -491,10 +491,17 @@ impl FlightRecorder {
     }
 
     pub fn active_recording_count(&self) -> usize {
-        // `running_ids` is the cached set of Running recordings, kept in sync by
-        // `refresh_running_ids` after every state transition. Reading its length
-        // is O(1) versus an O(n) scan-and-filter of the full recordings map.
-        self.running_ids.len()
+        // Scan the authoritative recording state rather than the `running_ids`
+        // cache: a recording can be transitioned directly via
+        // `get_recording_mut(..).start()/stop()` without going through a
+        // FlightRecorder method that calls `refresh_running_ids`, so the cache
+        // can lag the real state. Counting `RecordingState::Running` is always
+        // correct regardless of how the transition happened. (The map is tiny —
+        // at most a handful of recordings — so the scan is not a hot path.)
+        self.recordings
+            .values()
+            .filter(|rec| rec.state == RecordingState::Running)
+            .count()
     }
 
     /// Dump a recording to a JFR binary file.
