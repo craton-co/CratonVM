@@ -29,6 +29,17 @@ Legend: ⬜ queued · 🔄 in wave · ✅ landed+built · ⏭️ deferred
 - Tests green: gc 655/0 · native-collections 61/0 + integ (gc_relocation 8/0) · native-io 258/0 · jfr 286/0 · jit 686/0 (was hanging 400min on lookupswitch neg-npairs prescan — fixed) · reader 256/0 · native-api 138/0
 - ⚠️ CONCURRENT SESSION on dev: commits 51e223a..06dc83a (H2 GC/keycloak) interleaved; uncommitted WIP in native-builtins/lang_class.rs + vm/runtime/interpreter.rs (NOT mine — left untouched). continue_prompt.md actively theirs — do NOT modify.
 
+## ✅ ALL WAVES COMPLETE — commit log on dev
+- 8dcf0e3 wave1 (critical/high, 9 crates) · ae9be14 + f54c298 wave2 · 2da3fed wave3
+- b9e77ce jit prescan-DoS + vm-cli re-apply · 0ad18f5 classloading 3 pre-existing
+- 0b0d67b docs reconcile · d7e0020 oss metadata (homepage/exclude/SPDX) · 98e8077 crate renames + publish
+- Verified green: gc 655/0, native-collections (incl gc_relocation 8/0), native-io 258/0,
+  jfr 286/0, reader 256/0, native-api 138/0, classloading 469/0, jit switch-bail 5/5.
+  Full workspace build (default + vm --features gpu-offload) green.
+- NOTE: a concurrent session is committing H2-GC/keycloak work to dev in parallel;
+  its WIP (native-builtins/src/lang_class.rs, vm/src/runtime/interpreter.rs) was left
+  untouched in every commit. dev is ~13 ahead of origin/dev (not pushed).
+
 ## Wave 4 — DOCS + OSS metadata (mostly non-code)
 - ⏭️ W4-docs-crypto  — docs/CRYPTO_STATUS.md, SECURITY.md, CHANGELOG.md (reconcile crypto/SecMgr/zip-drift)
 - ⏭️ W4-docs-mode    — README.md, docs/INSTALL.md (default-mode reconcile; CLI flag table)
