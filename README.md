@@ -6,8 +6,11 @@
 
 A Java Virtual Machine written entirely in Rust with a custom x86-64 JIT compiler.
 
-**No JDK installation, no `JAVA_HOME`, no `rt.jar` needed** — CratonVM provides its own
-synthetic implementations of the Java standard library classes.
+**Boots against a real JDK when one is present, and runs standalone when it isn't.**
+By default CratonVM loads the real `java.base` module from a detected JDK (via `JAVA_HOME`,
+`CRATONVM_JAVA_HOME`, or `java` on your `PATH`). When no JDK is found — or when you pass
+`--synthetic-jdk` — it falls back to its own synthetic Rust implementations of the Java
+standard library, so it can run with **no JDK installation, no `JAVA_HOME`, no `rt.jar`**.
 
 ## Features
 
@@ -76,9 +79,16 @@ cratonvm-cli [OPTIONS] <CLASS_NAME> [ARGS...]
 | `--verbose:class` | Print class loading trace to stderr. |
 | `--verbose:gc` | Print GC activity to stderr. |
 | `--Xbootclasspath <PATH>` | Override bootstrap classpath (advanced). |
-| `--java-home <PATH>` | Point to a JDK for boot/ext classpath discovery (advanced). |
+| `--java-home <PATH>` | Point to a specific JDK for boot/ext classpath discovery. Forces real-JDK boot from that JDK's `java.base`. |
+| `--synthetic-jdk` | Force synthetic JDK mode (built-in Rust stubs) even when a JDK is detected. Useful for hermetic runs or comparing backends. |
 | `--nojit` | Disable JIT compilation (interpreter only). |
 | `--noverify` | Skip bytecode verification. |
+
+By default the launcher probes the host for a real JDK (`JAVA_HOME`, `CRATONVM_JAVA_HOME`,
+or `java` on `PATH`). When a JDK with `jmods/java.base.jmod` or `lib/modules` is found, it
+boots from real JDK bytecode; otherwise it falls back to the synthetic stubs. `--java-home`
+forces real-JDK boot from the given JDK, while `--synthetic-jdk` forces synthetic mode and
+wins over `--java-home`.
 
 ### Examples
 
@@ -142,7 +152,6 @@ cargo run --release -p cratonvm-cli -- --Xmx 1g --classpath . BigProgram
   no on-screen rendering. **JavaFX** is out of tree (see [docs/javafx-status.md](docs/javafx-status.md)).
 - **No `java.sql`/JDBC** — no database connectivity.
 - **Limited reflection** — `Class.forName` / `Method.invoke` work; some edge cases unsupported.
-- **No custom classloaders** — only the three built-in loaders.
 - **Partial JNI** — function table structure exists; limited function implementations.
 - **No JAR main-class auto-detection** — you must specify the class name.
 
@@ -204,7 +213,7 @@ cratonvm/
 - **x86-64 JIT compiler** — method compilation with LICM, BCE, AVX2 SIMD, OSR
 - **Generational garbage collector** — young/old generation with write barriers and card table
 - **Native method registry** — 3,100+ registrations covering the Java SE standard library
-- **Synthetic class stubs** — JDK classes provided as native implementations; no `rt.jar` needed
+- **Synthetic class stubs** — JDK classes provided as native implementations for standalone (`--synthetic-jdk` / no-JDK) boot; the default path loads real `java.base` bytecode when a JDK is detected
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the codebase structure.
 See [BUILD_GUIDE.md](BUILD_GUIDE.md) for detailed build instructions, benchmarking, and project structure.

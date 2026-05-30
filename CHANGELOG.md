@@ -51,14 +51,13 @@ A cross-crate review-driven fix orchestrator landed 50+ commits across security,
 - SPDX `Apache-2.0` headers on every Rust source file across the workspace.
 - MSRV bumped to 1.77 and synchronized across `README.md`, `BUILD_GUIDE.md`, `CONTRIBUTING.md`, and `docs/INSTALL.md`.
 - Workspace version raised to `0.3.0`; every inter-crate `path = "../<crate>"` declaration now carries `version = "0.3.0"` so `cargo publish --dry-run` accepts the manifest.
-- Per-crate `README.md` added for crates.io rendering (17 crates).
+- Per-crate `README.md` added for crates.io rendering (all 18 workspace members, incl. `fuzz`).
 - `fuzz/` is now a workspace member (still nightly-only; `publish = false`).
-- Workspace crate-count references aligned to 17 workspace members plus `fuzz` (18 total) in `README.md`, `ARCHITECTURE.md`, `BUILD_GUIDE.md`.
+- Workspace crate-count references aligned to 18 workspace members (17 plus `fuzz`) in `README.md`, `ARCHITECTURE.md`, `BUILD_GUIDE.md`.
 - CI parked workflows reactivated with `clippy -D warnings` as a hard gate (`.github/workflows/ci.yml`).
 
 #### Known follow-ups
 - Re-enable JIT loop unrolling — previous byte-copy unrolling produced corrupt native code and was disabled (`jit/src/x64/unroll.rs`).
-- `zip` crate version drift: `native-io` is on `zip 2.x`, `native-builtins` still on `0.6` pending `SimpleFileOptions` migration (`Cargo.toml`, workspace `zip.workspace`).
 - Real-JDK boot via `java.base` JMOD remains opt-in; synthetic stubs cover the default path.
 - Concurrent GC marking is still serialized under STW; G1 / ZGC remain experimental.
 
@@ -177,7 +176,7 @@ A cross-crate review-driven fix orchestrator landed 50+ commits across security,
 - Bytecode interpreter with 200+ JVM instructions
 - `.class` file parser supporting all standard attributes
 - Command-line launcher with classpath and heap size configuration
-- CI pipeline with cross-platform testing, coverage, and Miri
+- CI pipeline with cross-platform testing (coverage and Miri jobs scaffolded but planned, not yet enabled)
 
 [Unreleased]: https://github.com/craton-co/cratonvm/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/craton-co/cratonvm/compare/v0.2.0...v0.3.0

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Round-9 cross-cutting HIGH-3: profile-guided optimization (PGO) recipe.
 #
 # The release profile already enables fat LTO + codegen-units=1, but cargo

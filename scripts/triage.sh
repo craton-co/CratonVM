@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Triage: run every app, capture rc + first meaningful error line.
 set +e
-ROOT="C:/craton/CratonVM"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APPS="$ROOT/apps"
 J="$ROOT/target/release/cratonvm.exe"
 TS=$(date +%H%M%S)

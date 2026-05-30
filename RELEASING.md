@@ -14,6 +14,15 @@ This document describes how to cut a new release of CratonVM.
 - The workspace version lives in `[workspace.package]` in the root
   `Cargo.toml` (`version = "X.Y.Z"`). Every workspace member inherits it via
   `version.workspace = true`.
+- Note that versions appear in **two** places, and both track the same
+  `X.Y.Z`: (1) each member's *package* version is inherited from the
+  workspace via `version.workspace = true` (so bumping
+  `[workspace.package].version` in the root `Cargo.toml` bumps every crate);
+  and (2) each inter-crate path dependency **also** carries an explicit
+  `version = "X.Y.Z"` alongside its `path = "..."` (e.g.
+  `cratonvm-reader = { path = "../reader", version = "0.3.0" }`), which local
+  builds ignore but crates.io requires (see §3.3). When you bump the
+  workspace version, update these explicit dep `version =` literals to match.
 
 ## 2. Cutting a release
 
@@ -43,14 +52,13 @@ This document describes how to cut a new release of CratonVM.
    git push origin vX.Y.Z
    ```
 
-5. **Build and publish the release artifacts.** A release-workflow
-   template lives at `.github/_disabled-workflows/release.yml`
-   (currently disabled — see RELEASING.md §2; move it into
-   `.github/workflows/` to enable automatic tag-triggered releases).
-   Until then, build and upload the artifacts manually:
-   - Build `cratonvm-cli` for `x86_64-unknown-linux-gnu`,
-     `x86_64-pc-windows-msvc`, and `aarch64-apple-darwin`.
-   - Attach the artifacts to a new GitHub Release for the tag.
+5. **Let the release workflow build and publish the artifacts.** Pushing a
+   `vX.Y.Z` tag triggers `.github/workflows/release.yml` (active; it runs
+   `on: push: tags: ['v*']`). It builds `cratonvm-cli` for
+   `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, and
+   `aarch64-apple-darwin` and attaches the artifacts to a GitHub Release for
+   the tag. No manual artifact build is required; just watch the workflow run
+   complete on the Actions tab.
 
 ## 3. Publishing to crates.io (when ready)
 

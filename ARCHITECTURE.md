@@ -120,8 +120,17 @@ crate, with shared API types in `cratonvm-jit-api`.
 - **`lib.rs`** — JIT infrastructure: compiled code cache, OSR entry points.
 - **`x64.rs`** — x86-64 machine code emitter with 26 optimization rounds.
 - **`aarch64.rs`** — AArch64 machine code backend (partial coverage).
+- **`ir.rs`, `ir_optimize.rs`, `ir_schedule.rs`, `ir_lower.rs`** — optional
+  sea-of-nodes IR pipeline (build, optimize, schedule, lower to x64).
 
-**Compilation pipeline:** Bytecode -> x86-64 native code (no IR).
+**Compilation pipeline:** the JIT has two paths. The default is a
+single-pass emitter that lowers bytecode directly to x86-64 native code
+(`x64::compile`). Methods that pass `ir_compatible()` instead go through
+an optional sea-of-nodes IR pipeline
+(`bytecode -> IrBuilder -> Graph -> optimize -> schedule -> lower -> x64`,
+in `ir.rs`, `ir_optimize.rs`, `ir_schedule.rs`, `ir_lower.rs`), which
+decouples optimization from instruction selection; others fall back to the
+direct single-pass path.
 
 Key optimizations: register allocation for locals, magic division,
 LICM, bounds check elimination, AVX2 SIMD, on-stack replacement (OSR).
@@ -170,9 +179,12 @@ Thin wrapper (~200 LoC) using `clap` for argument parsing. Constructs a
 3. **SoA value layout.** Frames and operand stacks store tags and payloads
    in separate arrays for better cache utilization during GC scanning.
 
-4. **Direct bytecode-to-x86-64.** The JIT compiles bytecode directly to
-   machine code without an intermediate representation. This keeps the
-   compiler simple at the cost of limiting cross-instruction optimizations.
+4. **Direct bytecode-to-x86-64, with an optional IR.** The JIT's default
+   path compiles bytecode directly to machine code in a single pass, which
+   keeps that path simple at the cost of limiting cross-instruction
+   optimizations. Methods that qualify (`ir_compatible()`) are instead
+   routed through an optional sea-of-nodes IR that enables broader
+   optimization before instruction selection.
 
 5. **FNV-1a native dispatch.** Native methods are looked up by hashing
    `"class_name.method_name:descriptor"`. O(1) dispatch with collision

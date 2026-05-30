@@ -19,9 +19,28 @@ production-ready as of the 0.3.0 release. Specific limitations:
   crates (constant-time, AES-NI capable). Previous in-tree implementation
   used T-table SBOX lookups (cache-timing oracle).
 - **JCA provider chain**: 13 provider names are advertised; only `SUN`,
-  `SunJCE`, and `SunRsaSign` are backed by real Service maps. Others
-  return null on `Provider.getService(...)` lookups by design — see
-  `Provider.getInfo()` for each provider's actual coverage.
+  `SunJCE`, and `SunRsaSign` are backed by real Service maps. Others —
+  including the `SunEC` *provider object* — return null on
+  `Provider.getService(...)` lookups by design. Note that EC/ECDSA and
+  Ed25519 are nonetheless reachable through the `Signature`,
+  `KeyPairGenerator`, and `KeyFactory` `getInstance(...)` natives, which
+  short-circuit algorithm resolution rather than consulting the provider
+  Service map. See `Provider.getInfo()` for each provider's actual
+  coverage and `docs/CRYPTO_STATUS.md` for the per-algorithm matrix.
+- **JCA `Signature` API**: RSA PKCS#1 v1.5 (SHA-1/256/384/512), ECDSA
+  (`SHA256withECDSA`, `SHA384withECDSA`, P-256/P-384), and `Ed25519` are
+  implemented. RSA-PSS, `NONEwithRSA`, and DSA are NOT backed —
+  unrecognised algorithms fail closed (`sign()` yields an empty array,
+  `verify()` returns `false`).
+- **Signed-JAR verification**: handled by a *separate* implementation
+  (`classloading/src/jar_signer.rs`) that verifies the PKCS#7 signer
+  block, the `.SF` digest binding, the SignerInfo signature, and the
+  X.509 chain to a trust anchor. It implements **RSA PKCS#1 v1.5
+  (SHA-1/256/384/512) only**; ECDSA and DSA signer blocks are
+  *recognised but fail closed* (`SigVerify::Unsupported` /
+  `TrustError::NotImplemented`), so ECDSA/DSA-signed JARs are rejected.
+  RSA-PSS is not handled. This differs from the JCA `Signature` API
+  above, which the JAR signer does not share code with.
 - **TLS (SunJSSE / SunJSSL)**: TLS endpoints are NOT supported. Use the
   process's external TLS terminator (nginx, Envoy) instead.
 
@@ -43,7 +62,24 @@ adversarial input.
 - The bytecode verifier does not implement full type inference for pre-Java 7 class files
 - Native method implementations may not enforce all JVM specification security constraints
 - The JIT compiler uses executable memory mappings (`mmap`/`VirtualAlloc` with `RWX` permissions)
-- No Security Manager implementation
+- **Partial Security Manager support (not a sandbox).** `java.lang.SecurityManager`,
+  `java.security.AccessController`, `AccessControlContext`, and `Policy` have native
+  implementations (`native-builtins/src/security_manager.rs`). `System.setSecurityManager`
+  installs a process-wide singleton; `checkPermission` and the convenience checks
+  (`checkRead`/`checkWrite`/`checkConnect`/`checkExec`/`checkDelete`/`checkExit`/
+  `checkPropertyAccess`/`checkCreateClassLoader`) route through a policy evaluator, and
+  `AccessController.doPrivileged` genuinely runs the action while tracking the caller's
+  code source on a per-thread privileged-frame stack. Enforcement is **policy-gated and
+  off by default**: with no `java.policy` loaded the evaluator is allow-all (matching the
+  JDK default for a programmatically-installed SecurityManager without a policy); it only
+  denies once a policy is parsed via `load_policy_file` / `set_active_policy`. Several
+  `checkAccess` variants are unconditional allow. `ProcessBuilder.start` / `Runtime.exec*`
+  consult the installed SecurityManager via `checkExec(command[0])` before any spawn
+  syscall. The Panama / FFI downcall path is **not** gated by the SecurityManager (a
+  documented follow-up), so native access bypasses these checks. This is **not** a
+  sandbox for untrusted code — stack-based access control is not enforced, no
+  `java.policy` is loaded by default, and the SecurityManager surface is deprecated for
+  removal (JEP 411).
 - No sandboxing of loaded Java classes
 
 ## Hardening Measures
