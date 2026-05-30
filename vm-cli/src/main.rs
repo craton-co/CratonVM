@@ -492,11 +492,13 @@ const VALUE_TAKING_OPTS: &[&str] = &[
     // them here keeps the separator-inserter from mistaking the value
     // token for a bare main-class name.
     "-Xmx",
+    "-Xms",
     "-Xshare",
     "-Xverify",
     "-Xbootclasspath",
     "-Xlog",
     "--Xmx",
+    "--Xms",
     "--Xbootclasspath",
     "--java-home",
     "--Xverify",
@@ -1576,6 +1578,29 @@ fn run() -> Result<()> {
             }
         }
     };
+    // Shared "run() completed" flag for the stack-dump watchdog. When `run()`
+    // returns (normally OR via `?`/early-return), the RAII guard below sets
+    // this to `true`; the watchdog checks it after its deadline sleep and
+    // again immediately before `abort()`, exiting cleanly without aborting a
+    // run that finished just after a tight deadline. Only meaningful when a
+    // watchdog is actually armed, but harmless otherwise.
+    let watchdog_completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // RAII guard: its Drop runs on every exit path of `run()` (normal return,
+    // early `return`, and `?` propagation), so the completed flag is always
+    // set once we leave this function. Instantiated right after the watchdog
+    // is spawned (see below).
+    struct WatchdogCompletionGuard {
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl Drop for WatchdogCompletionGuard {
+        fn drop(&mut self) {
+            self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    // Holds the guard alive until `run()` returns. `None` when no watchdog is
+    // armed (nothing to cancel).
+    let mut _watchdog_completion_guard: Option<WatchdogCompletionGuard> = None;
+
     if let Some(secs) = effective_watchdog {
         // Enable the native-call ring buffer so the watchdog's "0 Java
         // threads dumped" fallback can show the last ~64 native methods
@@ -1606,10 +1631,18 @@ fn run() -> Result<()> {
         // boot debugging.
         let watchdog_dump_path = args.dump_missing_natives.clone();
         let watchdog_dump_grouped_path = args.dump_missing_natives_grouped.clone();
+        let watchdog_completed_for_thread = std::sync::Arc::clone(&watchdog_completed);
         std::thread::Builder::new()
             .name("cratonvm-stack-watchdog".into())
             .spawn(move || {
                 std::thread::sleep(std::time::Duration::from_secs(secs));
+                // Cancellation: if `run()` already finished (e.g. it completed
+                // just after a tight deadline), don't dump or abort — exit
+                // cleanly. Checked here right after the deadline sleep, and
+                // again immediately before `abort()` below.
+                if watchdog_completed_for_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
                 // Banner first so the user can tell we got this far.
                 eprintln!(
                     "=== T19.H1 watchdog: deadline of {secs}s elapsed; \
@@ -1740,9 +1773,19 @@ fn run() -> Result<()> {
                 use std::io::Write;
                 let _ = std::io::stderr().flush();
 
+                // Final cancellation check: `run()` may have completed during
+                // the post-dump grace window. Don't abort a finished run.
+                if watchdog_completed_for_thread.load(std::sync::atomic::Ordering::SeqCst) {
+                    return;
+                }
                 std::process::abort();
             })
             .context("failed to spawn stack-dump watchdog thread")?;
+        // Arm the RAII guard so the completed flag is set on every exit path
+        // of `run()` once the watchdog is live.
+        _watchdog_completion_guard = Some(WatchdogCompletionGuard {
+            flag: std::sync::Arc::clone(&watchdog_completed),
+        });
         eprintln!(
             "[cratonvm] stack-dump watchdog armed: will dump + abort after {secs}s"
         );
@@ -2072,7 +2115,13 @@ fn run() -> Result<()> {
             let mut cur = exc_ref;
             let mut lines: Vec<String> = Vec::new();
             let mut prefix = "Exception in thread \"main\"";
-            for depth in 0..8 {
+            // Cap the cause-chain walk so a self-referential or pathologically
+            // deep chain can't loop forever. When the cap is hit with an
+            // unrendered cause still pending, a marker line is emitted (see the
+            // `next_cause` handling at the end of the loop) so deeply-wrapped
+            // exceptions are not silently truncated.
+            const MAX_CAUSE_DEPTH: usize = 8;
+            for depth in 0..MAX_CAUSE_DEPTH {
                 let cid = vm.shared.heap.class_id_of(cur);
                 // PERF: resolve the class name AND the Throwable field indices
                 // under a single read guard. These were two back-to-back
@@ -2487,11 +2536,19 @@ fn run() -> Result<()> {
                     }
                 }
                 if let Some(c) = next_cause {
+                    // If this is the last iteration the cap allows, the cause
+                    // `c` would never be rendered — emit a marker so deeply
+                    // wrapped exceptions are not silently cut off.
+                    if depth + 1 >= MAX_CAUSE_DEPTH {
+                        lines.push(
+                            "\t... (deeper causes truncated)".to_string(),
+                        );
+                        break;
+                    }
                     cur = c;
                     prefix = "Caused by:";
                     continue;
                 }
-                let _ = depth;
                 break;
             }
             let had_caused_by = lines.iter().any(|l| l.starts_with("Caused by:"));

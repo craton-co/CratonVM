@@ -9851,14 +9851,21 @@ impl Compiler {
                             if let Some(t) = base.checked_add_signed(def as isize) { // Cast: address arithmetic
                                 if t < code_len { branch_targets[t] = true; }
                             }
-                            let npairs = i32::from_be_bytes([code[q+4], code[q+5], code[q+6], code[q+7]]) as usize; // Widening: always safe
+                            // A negative `npairs` cast straight to `usize` becomes
+                            // ~1.8e19 and the loop below spins effectively forever
+                            // (a hang/DoS on crafted bytecode). Clamp negatives to
+                            // 0 and cap the iteration count to the pairs that
+                            // actually fit before `code_len`, so a bogus huge
+                            // `npairs` cannot drive an unbounded loop. The method
+                            // is rejected later by the main lookupswitch handler.
+                            let npairs_raw = i32::from_be_bytes([code[q+4], code[q+5], code[q+6], code[q+7]]);
+                            let npairs = npairs_raw.max(0) as usize;
                             q += 8;
-                            for _ in 0..npairs {
-                                if q + 8 <= code_len {
-                                    let off = i32::from_be_bytes([code[q+4], code[q+5], code[q+6], code[q+7]]);
-                                    if let Some(t) = base.checked_add_signed(off as isize) { // Cast: address arithmetic
-                                        if t < code_len { branch_targets[t] = true; }
-                                    }
+                            let max_pairs = (code_len - q) / 8;
+                            for _ in 0..npairs.min(max_pairs) {
+                                let off = i32::from_be_bytes([code[q+4], code[q+5], code[q+6], code[q+7]]);
+                                if let Some(t) = base.checked_add_signed(off as isize) { // Cast: address arithmetic
+                                    if t < code_len { branch_targets[t] = true; }
                                 }
                                 q += 8;
                             }
