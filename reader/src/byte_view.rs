@@ -56,10 +56,17 @@ impl ByteView {
     /// constructor that was only caught by a regression test; the
     /// runtime-offset call sites in `attribute.rs` have since been moved
     /// to `try_new` for defense-in-depth.
+    ///
+    /// Audit fix (LOW — DoS surface): narrowed from `pub` to
+    /// `pub(crate)` so a downstream crate cannot reach this panicking
+    /// constructor and turn a malformed class file into a process abort.
+    /// In-crate callers that have a provably in-bounds range may still
+    /// use it; everything deriving a range from untrusted bytes must use
+    /// [`ByteView::try_new`], which returns a [`ClassReaderError`].
     #[deprecated(note = "prefer try_new for runtime-derived offsets")]
     #[track_caller]
     #[inline]
-    pub fn new(source: Arc<[u8]>, range: Range<usize>) -> Self {
+    pub(crate) fn new(source: Arc<[u8]>, range: Range<usize>) -> Self {
         assert!(range.start <= range.end, "ByteView range start > end");
         assert!(
             range.end <= source.len(),

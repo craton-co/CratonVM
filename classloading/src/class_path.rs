@@ -434,14 +434,13 @@ impl ManifestInfo {
         // JAR manifests may carry file URLs (e.g. surefire booter jars emit
         // `file:/C:/...` entries). Treat those as absolute paths instead of
         // joining them to the launcher jar directory.
+        // `file:` URI paths are percent-decoded by `decode_percent_path`
+        // (a full RFC 3986 `%XX` decoder), replacing the prior no-op
+        // `replace('%', "%")` + hardcoded `%20/%5B/%5D/%7B/%7D` subset.
+        // Downstream reads are canonicalize-checked, so a decoded
+        // `..`/separator cannot escape the intended root.
         let from_file_uri = |rest: &str| -> PathBuf {
-            let mut path = rest.replace('%', "%");
-            path = path.replace("%20", " ");
-            path = path.replace("%5B", "[");
-            path = path.replace("%5D", "]");
-            path = path.replace("%7B", "{");
-            path = path.replace("%7D", "}");
-            let mut out = path;
+            let mut out = decode_percent_path(rest);
             if let Some(stripped) = out.strip_prefix("///") {
                 out = stripped.to_string();
             } else if let Some(stripped) = out.strip_prefix("//") {
@@ -605,6 +604,66 @@ pub(crate) fn is_safe_entry_name(name: &str) -> bool {
         }
     }
     true
+}
+
+/// Percent-decode an RFC 3986 `file:` URI path.
+///
+/// Each `%XX` escape (two upper- or lower-case hex digits) is decoded to the
+/// corresponding byte; the resulting byte sequence is then interpreted as
+/// UTF-8 (lossily, so a malformed/non-UTF-8 manifest cannot panic us). Any
+/// `%` not followed by two valid hex digits is preserved verbatim, so a
+/// literal `%` in a path is left intact rather than dropped.
+///
+/// This replaces the earlier `replace('%', "%")` no-op plus a hardcoded
+/// `%20/%5B/%5D/%7B/%7D` subset, which mangled any other escape (e.g.
+/// `%2520`, accented characters, `%28`/`%29`). Decoding is intentionally
+/// unconditional over the whole string; the surrounding `from_file_uri`
+/// logic still strips the leading `file:` slashes afterward, and downstream
+/// filesystem reads are canonicalize-vs-root checked, so a decoded separator
+/// or `..` cannot be used to escape the intended classpath root.
+pub(crate) fn decode_percent_path(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            // Need two hex digits following the '%'.
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Reject resource names that could escape the classpath root or be
+/// reinterpreted as a host path. This mirrors the input filter applied by
+/// [`ClassPath::find_class`] so that `getResource`/`getResourceAsStream`
+/// and the `find_all_resource_*` enumeration paths reject the same hostile
+/// inputs: `..` traversal, NUL bytes, leading `/` or `\\`, the alternate
+/// Windows separator `\\`, Windows drive letters (`:`), and `./` / `.\\`
+/// current-dir references. The caller is expected to have already stripped
+/// any leading `/` (HotSpot strips one leading slash from resource names);
+/// a *remaining* leading `/` after that strip is still rejected here.
+///
+/// The downstream canonicalize-vs-root check in each resource path remains
+/// the authoritative backstop; this is a cheap pre-filter that keeps the
+/// resource and class entry points symmetric.
+pub(crate) fn is_safe_resource_name(name: &str) -> bool {
+    !(name.contains("..")
+        || name.starts_with('/')
+        || name.starts_with('\\')
+        || name.contains("\\\\")
+        || name.contains('\0')
+        || name.contains(':') // Windows drive letters (C:)
+        || name.contains("./") // current-dir references
+        || name.contains(".\\")) // Windows current-dir references
 }
 
 /// Parse a `<jar-path>!/<prefix>/` specification of the form produced by
@@ -1842,8 +1901,11 @@ impl ClassPath {
     /// Searches all classpath entries in order; returns `Some(bytes)` on first match.
     pub fn find_resource(&self, resource_name: &str) -> Option<Vec<u8>> {
         let name = resource_name.trim_start_matches('/');
-        // Basic path safety
-        if name.contains("..") || name.contains('\0') || name.contains('\\') {
+        // Path safety: align with `find_class`'s input filter (rejects `..`,
+        // NUL, leading slashes, `\\`, drive letters `:`, and `./` / `.\\`)
+        // via the shared `is_safe_resource_name` helper. The canonicalize
+        // check below remains the authoritative backstop.
+        if !is_safe_resource_name(name) {
             return None;
         }
 
@@ -2036,7 +2098,9 @@ impl ClassPath {
     /// chain.
     pub fn find_all_resource_bytes(&self, resource_name: &str) -> Vec<Vec<u8>> {
         let name = resource_name.trim_start_matches('/');
-        if name.contains("..") || name.contains('\0') || name.contains('\\') {
+        // Same input filter as `find_class`/`find_resource` (see
+        // `is_safe_resource_name`).
+        if !is_safe_resource_name(name) {
             return Vec::new();
         }
         let mut out: Vec<Vec<u8>> = Vec::new();
@@ -2132,7 +2196,9 @@ impl ClassPath {
 
     pub fn find_all_resource_urls(&self, resource_name: &str) -> Vec<String> {
         let name = resource_name.trim_start_matches('/');
-        if name.contains("..") || name.contains('\0') || name.contains('\\') {
+        // Same input filter as `find_class`/`find_resource` (see
+        // `is_safe_resource_name`).
+        if !is_safe_resource_name(name) {
             return Vec::new();
         }
         // ES2-DBG: env-gated tracing for the classpath resource walk.

@@ -248,8 +248,17 @@ impl Instruction {
         code: &[u8],
         pc: &mut usize,
     ) -> Result<u16, crate::class_reader_error::ClassReaderError> {
+        // Audit fix (mirrors buffer.rs round-7 MED #7): compute the
+        // high offset with `checked_add` before the bounds check via
+        // `byte_at`, so a `*pc` near `usize::MAX` can't wrap to a small
+        // index (silently succeeding) or panic in a debug build. On
+        // overflow there can't be that many bytes left, so we surface
+        // `UnexpectedEndOfData` — the same error `byte_at` returns OOB.
+        let lo_idx = pc.checked_add(1).ok_or(
+            crate::class_reader_error::ClassReaderError::UnexpectedEndOfData { position: *pc },
+        )?;
         let hi = Self::byte_at(code, *pc)? as u16;
-        let lo = Self::byte_at(code, *pc + 1)? as u16;
+        let lo = Self::byte_at(code, lo_idx)? as u16;
         *pc += 2;
         Ok((hi << 8) | lo)
     }
@@ -265,10 +274,25 @@ impl Instruction {
         code: &[u8],
         pc: &mut usize,
     ) -> Result<i32, crate::class_reader_error::ClassReaderError> {
+        // Audit fix (mirrors buffer.rs round-7 MED #7): validate the
+        // highest offset (`*pc + 3`) with `checked_add` before any
+        // `byte_at`, so a `*pc` near `usize::MAX` can't wrap to a small
+        // index or panic in a debug build. On overflow there can't be
+        // that many bytes left, so we surface `UnexpectedEndOfData` —
+        // the same error `byte_at` returns when out of range.
+        let b1_idx = pc.checked_add(1).ok_or(
+            crate::class_reader_error::ClassReaderError::UnexpectedEndOfData { position: *pc },
+        )?;
+        let b2_idx = pc.checked_add(2).ok_or(
+            crate::class_reader_error::ClassReaderError::UnexpectedEndOfData { position: *pc },
+        )?;
+        let b3_idx = pc.checked_add(3).ok_or(
+            crate::class_reader_error::ClassReaderError::UnexpectedEndOfData { position: *pc },
+        )?;
         let b0 = Self::byte_at(code, *pc)? as u32;
-        let b1 = Self::byte_at(code, *pc + 1)? as u32;
-        let b2 = Self::byte_at(code, *pc + 2)? as u32;
-        let b3 = Self::byte_at(code, *pc + 3)? as u32;
+        let b1 = Self::byte_at(code, b1_idx)? as u32;
+        let b2 = Self::byte_at(code, b2_idx)? as u32;
+        let b3 = Self::byte_at(code, b3_idx)? as u32;
         *pc += 4;
         Ok(((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) as i32)
     }

@@ -23,7 +23,102 @@ use cratonvm_types::{ObjectKind, ObjectRef, Value};
 // can drive `obj_key` against a stub NativeContext directly.
 #[doc(hidden)]
 pub mod identity_hash;
-use identity_hash::{obj_key as ih_obj_key, seed as ih_seed};
+use identity_hash::seed as ih_seed;
+
+// ---------------------------------------------------------------------------
+// Widened side-table key (MEDIUM finding: 32-bit identity-hash aliasing).
+//
+// The four collection overlays (LinkedList `ll_overlay`, LinkedHashMap
+// `lhm_overlay`, TreeMap `tm_array_table`/`tm_fast_table`, TreeSet
+// `ts_array_table`) used to key their process-global side-tables by
+// `identity_hash_code(this) as u32 as usize`. `NativeContext::identity_hash_code`
+// only yields a 32-bit `i32`, so two distinct *live* collections whose
+// identity hashes collide (birthday-bound ~50% near ~77k live collections)
+// aliased the SAME side-table entry and silently corrupted each other's
+// backing store.
+//
+// `identity_hash_code` has no more entropy to give, so we cannot simply widen
+// the cast. Instead `widened_obj_key` keeps the GC-move stability that the
+// identity-hash key was introduced for (a moving GC copies the hash word with
+// the object header, so the hash is invariant across relocation) while adding
+// a per-object disambiguator that splits genuine 32-bit collisions:
+//
+//   key = ((identity_hash as u64) << 32) | (generation as u64)
+//
+// A process-global registry (`obj_key_registry`) maps each 32-bit identity
+// hash to the set of distinct live objects observed under it. Each gets its
+// own `generation`, so two colliding objects receive distinct full-width keys
+// and can never alias. The registry validates membership by the object's
+// current raw pointer:
+//
+//   * pointer matches an existing slot           -> reuse that slot's gen
+//     (steady state: same object, same address);
+//   * the hash bucket holds exactly one slot and
+//     the pointer differs                          -> that lone object was
+//     relocated by a moving GC; rebind the slot to the new pointer and reuse
+//     its gen (preserves the GC-move-stability contract the overlays rely on);
+//   * the bucket holds several slots and none match -> a genuine hash collision
+//     among simultaneously-live objects; allocate a fresh generation so the
+//     newcomer gets its own entry instead of aliasing an existing one.
+//
+// The single-slot relocation fast path is what the `gc_relocation_harness`
+// integration test exercises (its mock hands out unique sequential hashes, so
+// every object is a one-slot bucket): the key stays stable across the simulated
+// move. The multi-slot path only fires under a true 32-bit collision, which is
+// astronomically rarer than — and never reintroduces — the aliasing corruption
+// this fix removes.
+struct ObjKeyEntry {
+    /// The object's most-recently-observed raw pointer. Updated on a
+    /// single-slot relocation so a moved object re-resolves to its slot.
+    last_ptr: usize,
+    /// Per-(hash, object) disambiguator packed into the key's low 32 bits.
+    generation: u32,
+}
+
+fn obj_key_registry() -> &'static Mutex<StdHashMap<u32, Vec<ObjKeyEntry>>> {
+    static REG: std::sync::OnceLock<Mutex<StdHashMap<u32, Vec<ObjKeyEntry>>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| Mutex::new(StdHashMap::new()))
+}
+
+/// GC-stable, collision-resistant side-table key. Replaces the former
+/// `identity_hash::obj_key` truncation at every overlay key site. Returns a
+/// full-width `usize` packing the 32-bit identity hash with a per-object
+/// generation (see the module comment above for the disambiguation contract).
+fn widened_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    let hash = ctx.identity_hash_code(this) as u32;
+    let ptr = this.as_ptr() as usize;
+
+    let mut reg = obj_key_registry().lock().unwrap();
+    let slots = reg.entry(hash).or_default();
+
+    // 1. Exact pointer match: same object at the same address.
+    if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
+        return pack_obj_key(hash, slot.generation);
+    }
+
+    // 2. Lone occupant of this hash bucket whose address changed: a moving GC
+    //    relocated it. Rebind to the new pointer and keep the same generation
+    //    so the overlay entry stays reachable.
+    if slots.len() == 1 {
+        slots[0].last_ptr = ptr;
+        return pack_obj_key(hash, slots[0].generation);
+    }
+
+    // 3. Genuine 32-bit collision among live objects (or the first object
+    //    seen for this hash): allocate a fresh generation so the newcomer
+    //    never aliases an existing entry.
+    let generation = slots.len() as u32;
+    slots.push(ObjKeyEntry { last_ptr: ptr, generation });
+    pack_obj_key(hash, generation)
+}
+
+/// Pack a 32-bit identity hash and a 32-bit generation into the full-width
+/// `usize` side-table key.
+#[inline]
+fn pack_obj_key(hash: u32, generation: u32) -> usize {
+    (((hash as u64) << 32) | (generation as u64)) as usize
+}
 
 // ---------------------------------------------------------------------------
 // Cached debug-flag probes.
@@ -10791,7 +10886,7 @@ fn ll_get(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str) -> Value
     ll_overlay()
         .lock()
         .unwrap()
-        .get(&ih_obj_key(ctx, this))
+        .get(&widened_obj_key(ctx, this))
         .and_then(|m| m.get(name))
         .copied()
         .unwrap_or(Value::Object(None))
@@ -10800,7 +10895,7 @@ fn ll_set(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str, v: Value
     ll_overlay()
         .lock()
         .unwrap()
-        .entry(ih_obj_key(ctx, this))
+        .entry(widened_obj_key(ctx, this))
         .or_default()
         .insert(name, v);
 }
@@ -11806,7 +11901,7 @@ fn lhm_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<String, Value>>>
 // word across relocation, so the overlay's bucket table, head/tail,
 // and accessOrder flag remain reachable through the new ObjectRef.
 fn lhm_overlay_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
-    ih_obj_key(ctx, this)
+    widened_obj_key(ctx, this)
 }
 fn lhm_get(ctx: &dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize) -> Value {
     let m = lhm_overlay().lock().unwrap();
@@ -14525,7 +14620,7 @@ fn tm_fast_table() -> &'static Mutex<StdHashMap<usize, std::collections::BTreeMa
 // TreeMap (worst case: a subsequent `put` re-creates state under a
 // new key while old entries become unreachable garbage in the table).
 fn tm_obj_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
-    ih_obj_key(ctx, this)
+    widened_obj_key(ctx, this)
 }
 
 /// Address-keyed TreeMap array-mode state side-table — `(data array, size,

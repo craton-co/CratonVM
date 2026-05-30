@@ -319,6 +319,19 @@ const _: () = assert!(
      the golden-offset test in mod tests if the change is intentional",
 );
 
+// Compile-time enforcement of the golden ABI's per-field stride. The JIT
+// targets x86-64 exclusively and the documented helper offsets are computed
+// as `index * 8`, assuming an 8-byte `usize`. The `jit_runtime_helpers_field_size_is_eight`
+// test validates this, but a #[test] only runs when tests are compiled and
+// executed — a hypothetical 32-bit build would compile cleanly and silently
+// emit wrong offsets (4-byte stride). Pinning the size here turns that into
+// a build failure on any non-8-byte-usize target instead of a miscompile.
+const _: () = assert!(
+    core::mem::size_of::<usize>() == 8,
+    "JIT golden ABI requires an 8-byte usize (x86-64); offsets are computed as \
+     index * 8 and would be wrong on a non-64-bit target",
+);
+
 impl JitRuntimeHelpers {
     /// Validate that every mandatory helper pointer is non-null.
     ///

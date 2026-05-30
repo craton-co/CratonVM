@@ -12,14 +12,15 @@
 //! `tests/resources/PrintArgs.java`) prints each `args[i]` on its own
 //! line, so the expected stdout is the exact argv `\n`-joined.
 //!
-//! Bonus: this is the only e2e coverage that touches the MED bug at
-//! `vm-cli/src/main.rs:1392` — `string_array_class_id = ClassId::new(0)`
-//! is hard-coded to `java/lang/Object`, but `main(String[])` is
-//! supposed to receive a `[Ljava/lang/String;`. If a future fix
-//! resolves the actual `String` ClassId, PrintArgs's `args[i].length()`
-//! style downstream uses (not exercised here, but a follow-up test
-//! could add `args[i].length()` and check the printed integer)
-//! continue working — this test just guards the argv plumbing itself.
+//! Bonus: this is the only e2e coverage that touches the args-array
+//! element type. `run()` now resolves the real `java/lang/String`
+//! ClassId via `load_class_concurrent` (falling back to `ClassId::new(0)`
+//! only if that load fails), so `main(String[])` receives a proper
+//! `[Ljava/lang/String;` rather than a `[Ljava/lang/Object;`. Downstream
+//! uses that inspect `args.getClass().getComponentType()` or call
+//! `args[i].length()` (not exercised here, but a follow-up test could
+//! add it and check the printed integer) therefore work — this test
+//! just guards the argv plumbing itself.
 
 mod common;
 

@@ -5,38 +5,24 @@ Agents write code only (no build). Orchestrator builds + fixes + commits between
 
 Legend: ⬜ queued · 🔄 in wave · ✅ landed+built · ⏭️ deferred
 
-## Wave 1 — CRITICAL / HIGH (code)
-- 🔄 W1-awt-uaf      — native-awt/src/edt.rs, native-awt/src/natives.rs (EDT runnable UAF: GC-gen gate)
-- 🔄 W1-jit          — jit/src/x64.rs, jit/src/ir.rs, jit/src/platform.rs (truncated-bytecode OOB; checked tableswitch; expect→bail; protect diag)
-- 🔄 W1-coll         — native-collections/src/lib.rs (access-order LHM put; stream wrapping; listiterator noop; treemap unwrap; al_ensure_capacity None)
-- 🔄 W1-gc           — gc/src/heap.rs, gc/src/gen_heap.rs (zero-init Object(None) regression; unused_unsafe)
-- 🔄 W1-cuda-jit     — jit-cuda/src/lowering/emit.rs, jit-cuda/src/analyzer.rs (i2c zero-extend; getfield/estimated_work; pN_len cache)
-- 🔄 W1-cuda-bridge  — cuda-bridge/src/launch.rs, backend_cuda.rs, lib.rs (stream launch; dup event; dead code; intern cap; assert msg)
-- 🔄 W1-types        — types/src/compact_value.rs (degradation diagnostic + hardened docs; NO breaking API rename)
-- 🔄 W1-awt-render   — native-awt/src/graphics2d.rs, peer.rs, win32.rs, renderer.rs, font.rs (save composite; peer recursion→stack; measure_text chars; fill_polygon total_cmp; LRU)
-- 🔄 W1-vm           — vm/src/jit/helpers.rs, vm/src/runtime/value_stack.rs (jit_newarray try_alloc OOME; unwrap_or(0) fix)
+## Wave 1 — CRITICAL / HIGH (code) — ✅ COMMITTED 8dcf0e3, build+tests green
+- ✅ W1-awt-uaf · W1-jit · W1-coll · W1-gc(655/0) · W1-cuda-jit · W1-cuda-bridge · W1-types · W1-awt-render · W1-vm
+- ✅ orchestrator fix: helpers.rs Result vs Option; jit bytecode_len_at truncated-switch OOB (completes W1-jit)
 
-## Wave 2 — MEDIUM (code)
-- ⬜ W2-nb-panama    — native-builtins/src/panama.rs (setUtf8String zero-size; gate get/set/fill)
-- ⬜ W2-nb-unsafe    — native-builtins/src/lib.rs (Unsafe getAndSet/getAndAdd index bounds)
-- ⬜ W2-nb-asn1ser   — native-builtins/src/jca/asn1.rs, native-builtins/src/serialization.rs (OID overflow; JEP-290 limits)
-- ⬜ W2-nb-misc      — native-builtins/src/unsafe_natives.rs, native-builtins/src/zip_real.rs (arena freed mask; direct-bb inflate note)
-- ⬜ W2-nio-native   — native-io/src/nio_native.rs (range_len i64::MAX; read0/write0 size cap)
-- ⬜ W2-nio-dbb      — native-io/src/direct_buffer.rs (ABA double-free generation)
-- ⬜ W2-nio-ssrf     — native-io/src/outbound_policy.rs, native-io/src/socket_channel.rs (custom-policy on resolved IPs)
-- ⬜ W2-nio-tests    — native-io/src/lib.rs (confinement test isolation; stale FIS/FOS registration asserts)
-- ⬜ W2-jfr          — jfr/src/* (test isolation; delta-ts underflow; threshold cast; builtin validation; file-size cap; active_recording_count)
+## Wave 2 — MEDIUM (code) — ✅ COMMITTED ae9be14 + follow-up; native-io 258/0, jfr 286/0
+- ✅ W2-nb-panama · W2-nb-unsafe · W2-nb-asn1ser · W2-nb-misc
+- ✅ W2-nio-native · W2-nio-dbb · W2-nio-ssrf · W2-nio-tests · W2-jfr
+- ✅ orchestrator fix: mock alloc_object_with_class (BAIS bulk-read); jfr active_recording_count scan
 
-## Wave 3 — MEDIUM/LOW (code)
-- ⬜ W3-vmcli        — vm-cli/src/main.rs, vm-cli/tests/cli_main_args.rs (-Xms VALUE_TAKING_OPTS; watchdog cancel; stale doc; cause-chain cap marker)
-- ⬜ W3-reader       — reader/src/instruction.rs, byte_view.rs, attribute.rs, lib.rs (checked add; ByteView::new pub(crate); dispatch collapse)
-- ⬜ W3-native-api   — native-api/src/fd_table.rs, ffi.rs, native_ring.rs (path contract docs; align_up overflow; ring gating)
-- ⬜ W3-classloading — classloading/src/class_path.rs, verify_insn.rs (percent-decode; resource filter align; multianewarray dim>=1)
-- ⬜ W3-jit-api      — jit-api/src/lib.rs (const usize==8 assert; gpu-lowering decision)
-- ⬜ W3-craton-gpu   — craton-gpu/build.rs (rerun-if-changed guard)
-- ⬜ W3-numa-oldgen  — gc/src/numa.rs, gc/src/old_gen.rs (cpulist cap; free accounting)
-- ⬜ W3-perf-jit     — jit/src/lib.rs (oop_map sorted flag) [serialize after W1-jit if same files — lib.rs disjoint from x64.rs ✓]
-- ⬜ W3-fuzz         — fuzz/README.md, fuzz/Cargo.toml (target table + build.sh sync)
+## Wave 3 — MEDIUM/LOW (code) — ✅ built clean; tests green; pending commit (bundled w/ jit fix)
+- ✅ W3-vmcli · W3-reader(256/0) · W3-native-api(138/0) · W3-classloading · W3-jit-api
+- ✅ W3-craton-gpu · W3-numa-oldgen(gc 655/0) · W3-perf-jit · W3-coll-idhash(gc_relocation_harness 8/0)
+
+## Pre-existing failures (NOT ours — fail on base 6165d4c; in untouched files) — TODO separate
+- ❗ classloading proxy_gen::emitted_class_is_straight_line_no_handlers (proxy_gen.rs:1593 panic)
+- ❗ classloading verifier::concrete_class_missing_abstract_impl_rejected (verify_class_structure too lenient)
+- ❗ classloading jar_signer::rsa_verify_accepts_valid_signature (RSA PKCS#1 v1.5 verify fails)
+- ℹ native-io socket_channel::nb_read_returns_eagain_zero — parallel-only flake (passes single-threaded)
 
 ## Wave 4 — DOCS + OSS metadata (mostly non-code)
 - ⏭️ W4-docs-crypto  — docs/CRYPTO_STATUS.md, SECURITY.md, CHANGELOG.md (reconcile crypto/SecMgr/zip-drift)

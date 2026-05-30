@@ -1609,6 +1609,15 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
         0xaa => {
             let mut p = pc + 1;
             while p % 4 != 0 { p += 1; }
+            // Truncated header: a tableswitch placed near the end of `code` may
+            // not carry the full 12-byte default/low/high header. Reading it
+            // would index past `code_len` and panic. Return a length that
+            // consumes the rest of `code` so any walker that uses this helper
+            // terminates without an OOB read; the main compile loop's own
+            // `pc + 12 > code_len` guard then rejects the method.
+            if p + 12 > code.len() {
+                return code.len() - pc;
+            }
             let low = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
             let high = i32::from_be_bytes([code[p + 8], code[p + 9], code[p + 10], code[p + 11]]);
             // Checked `high - low + 1`: raw i32 arithmetic overflows on
@@ -1622,7 +1631,15 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
         0xab => {
             let mut p = pc + 1;
             while p % 4 != 0 { p += 1; }
-            let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]) as usize; // Widening: always safe
+            // Truncated header (see tableswitch above): bail to a remainder
+            // length rather than reading the 8-byte default/npairs header OOB.
+            if p + 8 > code.len() {
+                return code.len() - pc;
+            }
+            // A negative `npairs` (crafted bytecode) cast straight to usize would
+            // become an enormous value and overflow the address math below; clamp
+            // to 0 so the length stays sane (the main loop rejects such methods).
+            let npairs = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]).max(0) as usize; // Widening: always safe
             (p + 8 + npairs * 8) - pc
         }
         _ => 1,

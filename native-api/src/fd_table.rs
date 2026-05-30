@@ -263,6 +263,15 @@ impl FileDescriptorTable {
     }
 
     /// Open a file for reading. Returns the fd_id.
+    ///
+    /// # Security
+    ///
+    /// `path` is passed **verbatim** to the OS with no path-traversal or
+    /// sandbox check performed here. When the value originates from
+    /// Java-controlled input, the caller (the VM / native-io sandbox layer)
+    /// MUST sanitize it for path traversal before calling — this function
+    /// deliberately does not enforce that, to avoid duplicating (and
+    /// potentially conflicting with) the VM's own sandbox policy.
     pub fn open_read(&self, path: &str) -> Result<FdId, io::Error> {
         // Reserve fd first, before opening the file.
         // fds only need to be unique, not contiguous — on overflow we
@@ -281,6 +290,15 @@ impl FileDescriptorTable {
     }
 
     /// Open a file for writing (optionally appending). Returns the fd_id.
+    ///
+    /// # Security
+    ///
+    /// `path` is passed **verbatim** to the OS with no path-traversal or
+    /// sandbox check performed here. When the value originates from
+    /// Java-controlled input, the caller (the VM / native-io sandbox layer)
+    /// MUST sanitize it for path traversal before calling — this function
+    /// deliberately does not enforce that, to avoid duplicating (and
+    /// potentially conflicting with) the VM's own sandbox policy.
     pub fn open_write(&self, path: &str, append: bool) -> Result<FdId, io::Error> {
         // Reserve fd first, before opening the file.
         // fds only need to be unique, not contiguous — on overflow we
@@ -579,10 +597,21 @@ impl FileDescriptorTable {
     // -----------------------------------------------------------------------
 
     /// Open a file for read+write access (used by AsynchronousFileChannel).
+    ///
+    /// # Security
+    ///
+    /// `path` is passed **verbatim** to the OS with no path-traversal or
+    /// sandbox check performed here. When the value originates from
+    /// Java-controlled input, the caller (the VM / native-io sandbox layer)
+    /// MUST sanitize it for path traversal before calling — this function
+    /// deliberately does not enforce that, to avoid duplicating (and
+    /// potentially conflicting with) the VM's own sandbox policy.
     pub fn open_read_write(&self, path: &str, create: bool) -> Result<FdId, io::Error> {
+        // fds only need to be unique, not contiguous — on overflow we
+        // simply fail without rolling the counter back (a `fetch_sub`
+        // rollback would be racy and pointless).
         let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         if fd >= u32::MAX - 16 {
-            self.next_fd.fetch_sub(1, Ordering::Relaxed);
             return Err(io::Error::other("file descriptor limit exceeded"));
         }
         let file = fs::OpenOptions::new()
@@ -777,10 +806,21 @@ impl FileDescriptorTable {
     }
 
     /// Open a UDP socket. Returns the fd_id.
+    ///
+    /// # Security
+    ///
+    /// `bind_addr` is passed **verbatim** to the OS with no sandbox/SSRF
+    /// check performed here. When the value originates from Java-controlled
+    /// input, the caller (the VM / native-io sandbox layer) MUST sanitize it
+    /// before calling — this function deliberately does not enforce that, to
+    /// avoid duplicating (and potentially conflicting with) the VM's own
+    /// sandbox policy.
     pub fn open_udp(&self, bind_addr: Option<&str>) -> Result<FdId, io::Error> {
+        // fds only need to be unique, not contiguous — on overflow we
+        // simply fail without rolling the counter back (a `fetch_sub`
+        // rollback would be racy and pointless).
         let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         if fd >= u32::MAX - 16 {
-            self.next_fd.fetch_sub(1, Ordering::Relaxed);
             return Err(io::Error::other("file descriptor limit exceeded"));
         }
         let addr = bind_addr.unwrap_or("0.0.0.0:0");
@@ -839,10 +879,21 @@ impl FileDescriptorTable {
     }
 
     /// Connect a TCP stream to a remote address. Returns the fd_id.
+    ///
+    /// # Security
+    ///
+    /// `addr` is passed **verbatim** to the OS with no sandbox/SSRF check
+    /// performed here. When the value originates from Java-controlled input,
+    /// the caller (the VM / native-io sandbox layer) MUST sanitize it before
+    /// calling — this function deliberately does not enforce that, to avoid
+    /// duplicating (and potentially conflicting with) the VM's own sandbox
+    /// policy.
     pub fn open_tcp_connect(&self, addr: &str) -> Result<FdId, io::Error> {
+        // fds only need to be unique, not contiguous — on overflow we
+        // simply fail without rolling the counter back (a `fetch_sub`
+        // rollback would be racy and pointless).
         let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         if fd >= u32::MAX - 16 {
-            self.next_fd.fetch_sub(1, Ordering::Relaxed);
             return Err(io::Error::other("file descriptor limit exceeded"));
         }
         let stream = std::net::TcpStream::connect(addr)?;
@@ -892,6 +943,15 @@ impl FileDescriptorTable {
     }
 
     /// Open a TCP listener bound to the given address. Returns the fd_id.
+    ///
+    /// # Security
+    ///
+    /// `addr` is passed **verbatim** to the OS with no sandbox check
+    /// performed here. When the value originates from Java-controlled input,
+    /// the caller (the VM / native-io sandbox layer) MUST sanitize it before
+    /// calling — this function deliberately does not enforce that, to avoid
+    /// duplicating (and potentially conflicting with) the VM's own sandbox
+    /// policy.
     pub fn open_tcp_listener(&self, addr: &str) -> Result<FdId, io::Error> {
         // fds only need to be unique, not contiguous — on overflow we
         // simply fail without rolling the counter back.
@@ -1402,10 +1462,21 @@ impl FileDescriptorTable {
     // =========================================================================
 
     /// Connect via TLS to the given host:port. Returns the fd_id.
+    ///
+    /// # Security
+    ///
+    /// `host`/`port` are used **verbatim** to connect with no sandbox/SSRF
+    /// check performed here. When these originate from Java-controlled input,
+    /// the caller (the VM / native-io sandbox layer) MUST sanitize them
+    /// before calling — this function deliberately does not enforce that, to
+    /// avoid duplicating (and potentially conflicting with) the VM's own
+    /// sandbox policy.
     pub fn open_tls_connect(&self, host: &str, port: u16) -> Result<FdId, io::Error> {
+        // fds only need to be unique, not contiguous — on overflow we
+        // simply fail without rolling the counter back (a `fetch_sub`
+        // rollback would be racy and pointless).
         let fd = self.next_fd.fetch_add(1, Ordering::Relaxed);
         if fd >= u32::MAX - 16 {
-            self.next_fd.fetch_sub(1, Ordering::Relaxed);
             return Err(io::Error::other("file descriptor limit exceeded"));
         }
         let addr = format!("{}:{}", host, port);

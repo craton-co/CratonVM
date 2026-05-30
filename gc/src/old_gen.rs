@@ -268,6 +268,14 @@ impl OldGen {
     /// `ptr` must point to a block previously allocated from this OldGen,
     /// and `size` must be the exact size of that allocation.
     pub unsafe fn free(&mut self, ptr: *mut u8, size: usize) {
+        // Mirror the rounding `alloc` applied so accounting stays
+        // symmetric: `alloc` reserved `size.max(HEADER_SIZE.max(8))`
+        // bytes (and added that rounded amount to `used_bytes`), so a
+        // caller that frees with the originally-requested sub-HEADER_SIZE
+        // size must decrement — and return to the free list — the same
+        // rounded amount. This expression MUST match `alloc`'s rounding.
+        let size = size.max(HEADER_SIZE.max(8));
+
         let base = self.data.as_ptr() as usize;
         let addr = ptr as usize;
         debug_assert!(addr >= base && addr + size <= base + self.data.len());

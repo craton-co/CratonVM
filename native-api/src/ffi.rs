@@ -391,12 +391,21 @@ pub fn layout_alignment(kind: i32) -> usize {
 }
 
 /// Align `offset` up to the next multiple of `align`.
+///
+/// A hostile/large `offset` near `usize::MAX` must not wrap: the
+/// `offset + align - 1` term is computed with a checked add. On overflow we
+/// saturate to the largest representable aligned value (`usize::MAX` masked
+/// down to an `align` boundary) rather than wrapping back toward zero.
 pub fn align_up(offset: usize, align: usize) -> usize {
     if align == 0 {
         return offset;
     }
     debug_assert!(align.is_power_of_two(), "alignment must be a power of two");
-    (offset + align - 1) & !(align - 1)
+    match offset.checked_add(align - 1) {
+        Some(sum) => sum & !(align - 1),
+        // Overflow: saturate to the highest aligned value (never wrap).
+        None => usize::MAX & !(align - 1),
+    }
 }
 
 // ---------------------------------------------------------------------------

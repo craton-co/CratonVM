@@ -35,6 +35,10 @@ const RING_SIZE: usize = 64;
 /// `record_exit` early-return after a single relaxed load. The watchdog
 /// (or other diagnostic code) should call `enable(true)` when arming.
 ///
+/// This default of `false` is intentional, not an accidental disable: the
+/// ring is deliberately dormant until the watchdog integration wires it up,
+/// so it imposes no runtime cost in the meantime.
+///
 /// TODO: re-arm via `native_ring::enable(true)` when watchdog wires up.
 static ENABLED: AtomicBool = AtomicBool::new(false);
 

@@ -293,6 +293,14 @@ fn parse_cpulist(s: &str) -> Option<Vec<u32>> {
             if hi < lo {
                 return None;
             }
+            // Guard against a malformed cpulist (e.g. `0-4294967295`)
+            // forcing a multi-GB allocation. Real systems never expose
+            // more than a few thousand CPUs; reject an absurd range the
+            // same way other malformed input is rejected (return None).
+            const MAX_CPUS: u32 = 8192;
+            if hi - lo >= MAX_CPUS {
+                return None;
+            }
             for c in lo..=hi {
                 out.push(c);
             }

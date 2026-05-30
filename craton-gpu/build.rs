@@ -67,8 +67,16 @@ fn main() {
     }
 
     let java_root = resolve_java_root();
-    // Tell cargo to rerun when the chosen source tree changes.
-    println!("cargo:rerun-if-changed={}", java_root.display());
+    // Tell cargo to rerun when the chosen source tree changes. Only emit
+    // this when `java_root` actually exists: `resolve_java_root` returns a
+    // default candidate even when nothing is present, and cargo treats a
+    // missing `rerun-if-changed` path as perpetually dirty, which would
+    // force this build script to re-run on every build on hosts without
+    // the Java sources. The early-return paths below still emit the
+    // rustc-env / cargo metadata lines unconditionally.
+    if java_root.is_dir() {
+        println!("cargo:rerun-if-changed={}", java_root.display());
+    }
 
     // Helper: emit ALL four lines (two rustc-env, two cargo metadata)
     // and return. The rustc-env lines feed `env!()` in this crate's
@@ -180,6 +188,10 @@ fn resolve_java_root() -> PathBuf {
             return p;
         }
     }
+    // The first candidate is relative: cargo guarantees the build
+    // script's CWD is the crate root (craton-gpu/), so `..` resolves to
+    // the CratonVM workspace parent and finds a sibling craton-gpu-java
+    // checkout. The second is the default Windows install location.
     let candidates: [PathBuf; 2] = [
         PathBuf::from("../craton-gpu-java/src/main/java"),
         PathBuf::from("C:/craton/craton-gpu-java/src/main/java"),
@@ -189,6 +201,10 @@ fn resolve_java_root() -> PathBuf {
             return c.clone();
         }
     }
+    // No candidate exists: fall back to the default Windows install path.
+    // `main` will see it does not exist and emit a `cargo:warning=`
+    // rather than failing the build. (This default is Windows-targeted;
+    // non-Windows hosts are expected to set `$CRATON_GPU_JAVA_SRC`.)
     candidates[1].clone()
 }
 
@@ -220,6 +236,16 @@ fn collect_java(root: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 }
 
 /// Invoke `jar --create --file <jar> -C <classes_dir> .`.
+///
+/// NOTE (reproducibility): the JDK `jar` tool embeds each entry's file
+/// modification timestamp into the archive, so the produced jar is NOT
+/// byte-reproducible across builds even when the `.class` inputs are
+/// identical. There is no portable `jar` flag to normalize timestamps
+/// (the `--date` option only exists on recent JDKs and is not relied on
+/// here), so we leave the behaviour as-is. Downstream consumers that
+/// cache on content should key on the compiled class directory
+/// (`CRATON_GPU_ANNOTATIONS_DIR`), whose contents are deterministic,
+/// rather than on the hash of this jar.
 fn build_jar(classes_dir: &Path, jar_path: &Path) -> Result<(), String> {
     let mut cmd = Command::new("jar");
     cmd.arg("--create");

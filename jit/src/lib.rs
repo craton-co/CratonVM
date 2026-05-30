@@ -689,6 +689,19 @@ pub struct CompiledMethod {
     /// simulated-stack type tracker; see the NEW-12 section of
     /// `docs/roadmap.md` for the migration plan.
     pub oop_maps: Vec<OopMapEntry>,
+    /// NEW-12: cached flag — `true` once `oop_maps` is known to be
+    /// sorted by `native_pc_offset`.
+    ///
+    /// This exists purely to keep the O(n) sortedness scan off the
+    /// per-safepoint GC lookup path. `find_oop_map_for_pc` reads it: when
+    /// `false` it runs the `windows(2)` check once (sorting only if the
+    /// data is actually out of order) and then sets it `true`, so every
+    /// subsequent lookup skips the scan entirely. It starts `false`
+    /// because the production codegen path moves a fully-built vector in
+    /// wholesale (`cm.oop_maps = compiler.oop_maps`, bypassing
+    /// `push_oop_map`); any `push_oop_map` likewise clears it so the next
+    /// lookup re-verifies.
+    oop_maps_sorted: bool,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -741,6 +754,12 @@ impl CompiledMethod {
             inlined_methods: Vec::new(),
             deopt_points: Vec::new(),
             oop_maps: Vec::new(),
+            // Start unverified: the production codegen path moves a
+            // fully-built vector into `oop_maps` wholesale (bypassing
+            // `push_oop_map`), so the first `find_oop_map_for_pc` call
+            // must verify/sort once. `push_oop_map` keeps the flag
+            // precise for the incremental-build path.
+            oop_maps_sorted: false,
         }
     }
 
@@ -770,6 +789,12 @@ impl CompiledMethod {
             inlined_methods: Vec::new(),
             deopt_points: Vec::new(),
             oop_maps: Vec::new(),
+            // Start unverified: the production codegen path moves a
+            // fully-built vector into `oop_maps` wholesale (bypassing
+            // `push_oop_map`), so the first `find_oop_map_for_pc` call
+            // must verify/sort once. `push_oop_map` keeps the flag
+            // precise for the incremental-build path.
+            oop_maps_sorted: false,
         }
     }
 
@@ -787,6 +812,12 @@ impl CompiledMethod {
     /// lookup. Direct append is the common path because the compiler
     /// walks the method in bytecode order.
     pub fn push_oop_map(&mut self, entry: OopMapEntry) {
+        // A push invalidates any cached "sorted" knowledge from a prior
+        // `find_oop_map_for_pc` call, so clear the flag; the next lookup
+        // re-verifies (and sorts only if actually needed). This keeps the
+        // O(n) sortedness scan off the per-safepoint GC lookup path while
+        // remaining correct regardless of push order.
+        self.oop_maps_sorted = false;
         self.oop_maps.push(entry);
     }
 
@@ -802,17 +833,30 @@ impl CompiledMethod {
     /// lookups are O(log n) binary searches. Idempotent: the sort is
     /// cheap and runs only if the vector is out of order.
     pub fn find_oop_map_for_pc(&mut self, native_pc_offset: u32) -> Option<&OopMapEntry> {
-        // Ensure sorted for binary search. Checking sortedness is
-        // O(n) but runs only once per compiled method in practice;
-        // after the first call, the `is_sorted` check short-circuits.
-        let sorted = self
-            .oop_maps
-            .windows(2)
-            .all(|w| w[0].native_pc_offset <= w[1].native_pc_offset);
-        if !sorted {
-            self.oop_maps
-                .sort_by_key(|e| e.native_pc_offset);
+        // Ensure sorted for binary search. The O(n) `windows(2)`
+        // sortedness check (and any sort) runs at most once per compiled
+        // method: `oop_maps_sorted` caches the result so subsequent
+        // GC-time lookups skip the scan entirely. `push_oop_map` clears
+        // the flag, so a lookup after any push re-verifies. (The flag
+        // starts `false` to cover the wholesale
+        // `cm.oop_maps = compiler.oop_maps` codegen path, which bypasses
+        // `push_oop_map`.)
+        if !self.oop_maps_sorted {
+            let already_sorted = self
+                .oop_maps
+                .windows(2)
+                .all(|w| w[0].native_pc_offset <= w[1].native_pc_offset);
+            if !already_sorted {
+                self.oop_maps.sort_by_key(|e| e.native_pc_offset);
+            }
+            self.oop_maps_sorted = true;
         }
+        debug_assert!(
+            self.oop_maps
+                .windows(2)
+                .all(|w| w[0].native_pc_offset <= w[1].native_pc_offset),
+            "oop_maps must be sorted by native_pc_offset before binary search",
+        );
         match self
             .oop_maps
             .binary_search_by_key(&native_pc_offset, |e| e.native_pc_offset)

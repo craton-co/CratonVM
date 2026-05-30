@@ -1060,13 +1060,31 @@ pub fn verify_instruction(
         }
 
         Instruction::Multianewarray { index, dimensions } => {
-            // Pop `dimensions` int values
-            for _ in 0..*dimensions {
-                frame.pop_expect(&VType::Int, hierarchy)?;
+            // JVMS §4.10.1.9 multianewarray: `dimensions` must be >= 1, and
+            // it must not exceed the number of array dimensions of the
+            // referenced type (the leading `[` bracket count of the
+            // descriptor). HotSpot raises a VerifyError for both.
+            if *dimensions == 0 {
+                return Err(verify_err(
+                    "multianewarray: dimensions must be >= 1",
+                ));
             }
             let class_name = cp.get_class_name_arc(*index).ok_or_else(|| {
                 verify_err(&format!("multianewarray: invalid class index {index}"))
             })?;
+            // The referenced type must be an array type with at least
+            // `dimensions` leading brackets.
+            let bracket_count = class_name.bytes().take_while(|&b| b == b'[').count();
+            if bracket_count < *dimensions as usize {
+                return Err(verify_err(&format!(
+                    "multianewarray: dimensions {dimensions} exceeds array \
+                     bracket count {bracket_count} of type {class_name}"
+                )));
+            }
+            // Pop `dimensions` int values (counts), one per dimension.
+            for _ in 0..*dimensions {
+                frame.pop_expect(&VType::Int, hierarchy)?;
+            }
             // The result is an array reference
             frame.push(VType::ArrayRef(class_name))?;
             ok_through()
