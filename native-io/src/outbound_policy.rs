@@ -241,21 +241,27 @@ pub fn policy_connect(target: &str) -> Result<std::net::TcpStream, PolicyConnect
     let timeout = connect_timeout();
     let mut last_err: Option<std::io::Error> = None;
     for addr in addrs {
-        // Re-check policy against the *resolved* IP — this closes the
-        // hostname-aliasing escape (`metadata.google.internal` resolves
-        // to `169.254.169.254`).
-        if let IpAddr::V4(v4) = addr.ip() {
-            if is_v4_link_local(&v4) {
-                return Err(PolicyConnectError::Denied(format!(
-                    "resolved address {v4} is link-local; blocked by default policy"
-                )));
-            }
-        } else if let IpAddr::V6(v6) = addr.ip() {
-            if is_v6_link_local_or_metadata(&v6) {
-                return Err(PolicyConnectError::Denied(format!(
-                    "resolved address {v6} is link-local; blocked by default policy"
-                )));
-            }
+        // Re-check the *active* policy against the resolved IP — this
+        // closes the hostname-aliasing / DNS-rebind escape (e.g.
+        // `metadata.google.internal` resolves to `169.254.169.254`, or a
+        // custom RFC1918-denying policy bypassed by a hostname that
+        // resolves to a private IP). We re-invoke `check_outbound` per
+        // resolved address rather than hardcoding the built-in link-local
+        // ranges, so an embedder's `set_policy` is enforced here too. This
+        // mirrors `socket_channel.rs::resolve_and_vet` so both the blocking
+        // and non-blocking connect paths stay consistent. The built-in
+        // link-local block is subsumed by the default policy, so default
+        // behaviour is unchanged. A bracketed literal keeps IPv6
+        // `host:port` parsing unambiguous, matching `host_part`.
+        let literal = match addr {
+            SocketAddr::V4(_) => format!("{}:{}", addr.ip(), addr.port()),
+            SocketAddr::V6(_) => format!("[{}]:{}", addr.ip(), addr.port()),
+        };
+        if let Err(reason) = check_outbound(&literal) {
+            return Err(PolicyConnectError::Denied(format!(
+                "resolved address {} of {target} is blocked: {reason}",
+                addr.ip()
+            )));
         }
         match std::net::TcpStream::connect_timeout(&addr, timeout) {
             Ok(s) => return Ok(s),

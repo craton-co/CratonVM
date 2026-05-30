@@ -58,6 +58,15 @@ pub const FILE_STATE_COMPLETE: u8 = 1;
 /// Ticks per second (nanosecond resolution)
 pub const TICKS_PER_SECOND: u64 = 1_000_000_000;
 
+/// Maximum size (in bytes) of a `.jfr` file that the readers will load into
+/// memory. `read_events` / `read_jfr_header` slurp the whole file via
+/// `std::fs::read`; without a cap, pointing them at an arbitrarily large
+/// (possibly hostile) file would allocate unbounded memory and could OOM the
+/// process. 2 GiB is far above any realistic single-chunk dump this writer
+/// produces while still bounding the worst case. Oversized files are rejected
+/// with an `InvalidData` error before any bytes are read.
+pub const MAX_JFR_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Errors that can occur during JFR dump.
 #[derive(Debug)]
 pub enum JfrDumpError {
@@ -592,20 +601,6 @@ fn write_header<W: Write>(
 /// periodic snapshot paths where the cost of fsync per dump dominates and
 /// the dump is best-effort. The OS will still flush dirty pages on its
 /// own schedule.
-///
-/// TODO (round-7 MED #6, dump format change):
-///   Per-event timestamps are written as full 64-bit `start_time_ns` /
-///   `end_time_ns` values. Within a single chunk, ticks are highly
-///   correlated — encoding `start_time` as a delta from `chunk_start_time`
-///   (and `end_time` as a delta from `start_time`) would shrink most
-///   varints from 6-9 bytes to 1-2 bytes. Estimated 30-40% reduction in
-///   dump size on event-heavy traces.
-///   Wire format change: bump `JFR_VERSION_MINOR` to 1 and gate decode in
-///   `read_events` on the minor version. Writer must emit
-///   `chunk_start_time` (= `start_time_ns` of this header) before the first
-///   event record so a forward sweep can resolve deltas. Reader must keep
-///   a running `last_start_time` to decode end-time-relative-to-start
-///   without reseeding per event. Defer to round-8.
 pub fn dump_to_file(
     path: &Path,
     repository: &EventRepository,
@@ -663,6 +658,22 @@ pub fn dump_to_file(
     // emitted by the same thread within one tick.
     chunk_events.sort_by_key(|e| e.start_time);
 
+    // Round-10 LOW-2 fix (delta-timestamp underflow): per-event `start_time`
+    // is written as `start_time - chunk_start_time` (see `serialize_event_into`)
+    // and the reader reconstructs `delta + chunk_start_time`. If any event's
+    // absolute `start_time` is earlier than the caller-supplied `start_time_ns`,
+    // the saturating subtraction clamps its delta to 0 and read-back silently
+    // shifts it forward to `chunk_start_time`. Make the chunk's tick base the
+    // true minimum over the entire serialized set (repository + extra) so no
+    // event can predate it. `chunk_events` is sorted ascending by `start_time`,
+    // so the first element is that minimum; clamp down to it (but never above
+    // the caller's nominal start, which is the empty-chunk fallback). The same
+    // `chunk_start_time` is written into the header's `start_time_ns` field, so
+    // the reader's reconstruction stays exact.
+    let chunk_start_time = chunk_events
+        .first()
+        .map_or(start_time_ns, |first| first.start_time.min(start_time_ns));
+
     // Write to a sibling `<name>.jfr.part` file and atomically rename on
     // success.  If anything fails partway through, the prior `.jfr` file is
     // left intact and the `.part` scratch file is best-effort removed by the
@@ -707,14 +718,17 @@ pub fn dump_to_file(
         let file = std::fs::File::create(&part_path)?;
         let mut writer = io::BufWriter::new(file);
 
-        // Write placeholder header (will be updated at the end)
-        write_header(&mut writer, 0, 0, 0, start_time_ns, duration_ns, FILE_STATE_WRITING)?;
+        // Write placeholder header (will be updated at the end). The header's
+        // `start_time_ns` field carries `chunk_start_time` (the true minimum
+        // event tick) so the reader's delta reconstruction is exact — see the
+        // underflow fix above.
+        write_header(&mut writer, 0, 0, 0, chunk_start_time, duration_ns, FILE_STATE_WRITING)?;
 
         // J1: emit the checkpoint section (containing the string pool) BEFORE
         // the events so readers can resolve constant-pool indices during the
         // forward sweep. `checkpoint_offset` is recorded for the header.
         let checkpoint_offset = writer.seek(SeekFrom::Current(0))?;
-        write_checkpoint_section(&mut writer, start_time_ns, &string_pool)?;
+        write_checkpoint_section(&mut writer, chunk_start_time, &string_pool)?;
 
         // J2 (round-2): one reusable scratch buffer for every event body. Sized
         // for a typical event payload up front; serialize_event_into clears
@@ -728,9 +742,10 @@ pub fn dump_to_file(
         // `extra_events`, sorted by absolute `start_time`. This is what
         // produces a JMC-correct monotonic timeline within the chunk.
         //
-        // Round-5 Fix 3: pass `start_time_ns` as the chunk start so each
+        // Round-5 Fix 3: pass `chunk_start_time` as the chunk start so each
         // event's `start_time` is written as a delta. This is the writer
-        // half of the JFR_VERSION_MINOR=1 wire-format change.
+        // half of the JFR_VERSION_MINOR=1 wire-format change. `chunk_start_time`
+        // is the true minimum over the serialized set, so no delta underflows.
         for event in &chunk_events {
             serialize_event_into(
                 &mut scratch,
@@ -741,13 +756,13 @@ pub fn dump_to_file(
                 event.thread_id,
                 &event.fields,
                 pool_ref,
-                start_time_ns,
+                chunk_start_time,
             )?;
         }
 
         // Write metadata
         let metadata_offset = writer.seek(SeekFrom::Current(0))?;
-        write_metadata_section(&mut writer, registry, start_time_ns)?;
+        write_metadata_section(&mut writer, registry, chunk_start_time)?;
 
         // Compute final file size
         let file_size = writer.seek(SeekFrom::Current(0))?;
@@ -759,7 +774,7 @@ pub fn dump_to_file(
             file_size,
             checkpoint_offset,
             metadata_offset,
-            start_time_ns,
+            chunk_start_time,
             duration_ns,
             FILE_STATE_COMPLETE,
         )?;
@@ -781,9 +796,33 @@ pub fn dump_to_file(
     Ok(file_size)
 }
 
+/// Read an entire JFR file into memory, rejecting any file larger than
+/// [`MAX_JFR_FILE_BYTES`] *before* allocating.
+///
+/// SECURITY (DoS hardening): `read_events` / `read_jfr_header` operate on
+/// untrusted `.jfr` files and load the whole file via `std::fs::read`, which
+/// allocates a buffer sized to the file. A hostile or accidentally-huge file
+/// could otherwise exhaust memory. We stat the file first and bail with an
+/// `InvalidData` error if it exceeds the cap, so the oversized allocation
+/// never happens. (Files that grow between the stat and the read are still
+/// bounded by the OS-level read; the stat is the cheap first line of defence.)
+fn read_jfr_file_capped(path: &Path) -> Result<Vec<u8>, JfrDumpError> {
+    let len = std::fs::metadata(path)?.len();
+    if len > MAX_JFR_FILE_BYTES {
+        return Err(JfrDumpError::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "JFR file is {} bytes, exceeds maximum of {} bytes",
+                len, MAX_JFR_FILE_BYTES
+            ),
+        )));
+    }
+    Ok(std::fs::read(path)?)
+}
+
 /// Read and validate the header from a JFR file. Returns the parsed header fields.
 pub fn read_jfr_header(path: &Path) -> Result<JfrFileHeader, JfrDumpError> {
-    let data = std::fs::read(path)?;
+    let data = read_jfr_file_capped(path)?;
     if data.len() < HEADER_SIZE as usize {
         return Err(JfrDumpError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1140,7 +1179,7 @@ pub fn read_events(
     path: &Path,
     registry: &EventTypeRegistry,
 ) -> Result<Vec<EventInstance>, JfrDumpError> {
-    let data = std::fs::read(path)?;
+    let data = read_jfr_file_capped(path)?;
     if data.len() < HEADER_SIZE as usize {
         return Err(JfrDumpError::Io(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -1542,6 +1581,9 @@ mod tests {
 
     #[test]
     fn test_dump_empty_events() {
+        // Serialize against other global-ring tests so a concurrent emit/drain
+        // cannot perturb our "empty" invariant.
+        let _g = crate::repository::jfr_test_guard();
         // Drain any per-thread ring residue from earlier tests so this test's
         // "empty" invariant (checkpoint immediately after header) is not
         // perturbed by the dump-path drain we now perform. We cannot guarantee
@@ -1905,6 +1947,10 @@ mod tests {
         //   5. Reads the file back and verifies the pushed events are present.
         use crate::repository::{global_ring_registry, push_to_thread_ring};
 
+        // Serialize against other tests that drain the global registry, so a
+        // concurrent `drain_all()` cannot steal the events we push below.
+        let _g = crate::repository::jfr_test_guard();
+
         // Baseline drain — discard anything left over from prior tests.
         let _baseline = global_ring_registry().drain_all();
 
@@ -1992,6 +2038,10 @@ mod tests {
         // Push events with out-of-order start_times into a single thread shard
         // (which preserves push order). Verify the file emits them sorted.
         use crate::repository::{global_ring_registry, push_to_thread_ring};
+
+        // Serialize against other tests that drain the global registry, so a
+        // concurrent `drain_all()` cannot steal the events we push below.
+        let _g = crate::repository::jfr_test_guard();
 
         // Baseline drain.
         let _ = global_ring_registry().drain_all();
@@ -2121,6 +2171,10 @@ mod tests {
         // Round-5 wire-format change: the writer now emits
         // `JFR_VERSION_MINOR = 1` (delta-encoded timestamps). The previous
         // assertion `header.minor == 0` was stale.
+        // Serialize against other global-ring tests so a concurrent drain can't
+        // steal our emitted events before we drain them into the repository.
+        let _g = crate::repository::jfr_test_guard();
+
         let mut fr = crate::create_flight_recorder();
         let rid = fr.new_recording(crate::recording::RecordingSettings::new("dump-test"));
         fr.start_recording(rid);

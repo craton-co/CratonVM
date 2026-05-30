@@ -270,11 +270,15 @@ fn dbb_allocate(size: i64) -> Result<u64, MethodCallFailed> {
     // `Unsafe.setMemory(addr, n, 0)`.  Doing it here at the source
     // means callers don't have to issue a separate native.
     unsafe { std::ptr::write_bytes(addr, 0, usize_size) };
-    // Bug 2: a recycled address from the pool may still be marked
-    // freed from a prior cycle. Clear it so a legitimate later free
-    // of *this* allocation is not rejected and so the freed-set
-    // tracks only currently-freed memory (bounded by churn).
-    clear_freed(addr as u64);
+    // ABA fix: bump this address's live generation. Each free path then
+    // recovers the generation captured in its size-record at allocation
+    // time (`record_unsafe_alloc` / `register_cleaner` read the current
+    // generation) and presents (addr, generation) to the free guard. The
+    // freed-set is keyed by (addr, generation) and is never cleared on
+    // realloc, so a stale free for a recycled address is rejected by
+    // generation mismatch rather than passing a cleared guard. See
+    // `freed_addrs` / `mark_freed_or_check` for the invariant.
+    bump_generation(addr as u64);
     Ok(addr as u64)
 }
 
@@ -317,6 +321,11 @@ fn dbb_free(addr: u64, size: i64) {
 struct CleanerEntry {
     addr: u64,
     size: i64,
+    /// Generation this entry was registered against (the live generation
+    /// of `addr` at allocation time). Threaded to `dbb_free` so a Cleaner
+    /// that fires *after* its address has been recycled is rejected by the
+    /// (addr, generation) guard instead of freeing the live incarnation.
+    generation: u64,
     /// Set to true after the Cleaner's runnable has fired.  Idempotent
     /// guard so an explicit clean() followed by a finalizer-driven
     /// expire doesn't double-free.
@@ -335,12 +344,17 @@ fn next_cleaner_id() -> i32 {
 
 fn register_cleaner(addr: u64, size: i64) -> i32 {
     let id = next_cleaner_id();
+    // Capture the address's live generation now so the Cleaner runnable
+    // frees against the incarnation it was registered for, even if the
+    // address is recycled before the runnable fires (ABA guard).
+    let generation = current_generation(addr);
     if let Ok(mut g) = cleaners().lock() {
         g.insert(
             id,
             CleanerEntry {
                 addr,
                 size,
+                generation,
                 cleaned: false,
             },
         );
@@ -353,14 +367,17 @@ fn fire_cleaner(id: i32) -> bool {
         Ok(mut g) => match g.get_mut(&id) {
             Some(e) if !e.cleaned => {
                 e.cleaned = true;
-                Some((e.addr, e.size))
+                Some((e.addr, e.size, e.generation))
             }
             _ => None,
         },
         Err(_) => None,
     };
-    if let Some((addr, size)) = entry {
-        dbb_free(addr, size);
+    if let Some((addr, size, generation)) = entry {
+        // Generation-checked: if this address has since been recycled to a
+        // new live buffer, the guard rejects the free and the live
+        // incarnation is left untouched.
+        free_checked(addr, size, generation);
         if let Ok(mut g) = cleaners().lock() {
             g.remove(&id);
         }
@@ -383,18 +400,19 @@ fn fire_cleaner(id: i32) -> bool {
 ///
 /// This consumes the matching un-cleaned Cleaner entry (marking it cleaned
 /// so a later finalizer-driven `fire_cleaner` is an idempotent no-op) and
-/// returns the recorded size so the caller can `dbb_free` it exactly once.
-fn take_cleaner_size_for_addr(addr: u64) -> Option<i64> {
+/// returns the recorded `(size, generation)` so the caller can free it
+/// exactly once against the incarnation it was allocated for.
+fn take_cleaner_size_for_addr(addr: u64) -> Option<(i64, u64)> {
     let mut g = cleaners().lock().ok()?;
     let id = g
         .iter()
         .find(|(_, e)| e.addr == addr && !e.cleaned)
         .map(|(id, _)| *id)?;
-    let size = g.get(&id).map(|e| e.size)?;
+    let (size, generation) = g.get(&id).map(|e| (e.size, e.generation))?;
     // Remove the entry: this addr is being reclaimed now, and a stale
     // entry would let a later `fire_cleaner` double-free it.
     g.remove(&id);
-    Some(size)
+    Some((size, generation))
 }
 
 // ---------------------------------------------------------------------------
@@ -601,21 +619,6 @@ fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if addr == 0 {
         return Ok(None);
     }
-    // Bug 2 (CRIT): make freeing idempotent. The double-free guard must
-    // run *first* — before `take_unsafe_alloc` — so a second free is a
-    // no-op regardless of whether the address carries an Unsafe size
-    // record. Otherwise a `freeMemory` + `freeMemoryExplicit` race (or two
-    // racing `freeMemory` calls) could both pass the recorded-size check
-    // and call `dbb_free` twice, double-`pool_put`ing the address and
-    // corrupting the bucketed free-list. `mark_freed_or_check` atomically
-    // claims the address under a single lock: exactly one caller wins.
-    if mark_freed_or_check(addr) {
-        eprintln!(
-            "[direct_buffer] Unsafe.freeMemory({:#x}) called on already-freed address — skipping",
-            addr
-        );
-        return Ok(None);
-    }
     // Real-JDK Unsafe.freeMemory tracks size in `AllocationTable`; we
     // mimic that with `unsafe_allocs`. `dbb_free` deallocates with the
     // same `(size, align=8)` layout `dbb_allocate` used, so the dealloc
@@ -637,9 +640,18 @@ fn unsafe_free_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // the size do we leak (a wrong-layout `dealloc` would be UB) — but
     // such an address was never minted by our allocator, so there is no
     // reservation to refund either, and accounting stays balanced.
-    let size = take_unsafe_alloc(addr).or_else(|| take_cleaner_size_for_addr(addr));
-    if let Some(size) = size {
-        dbb_free(addr, size);
+    //
+    // ABA fix: each registry stamps the allocation-time generation into
+    // its record, so the `(size, generation)` we recover identifies the
+    // *exact incarnation* this free was issued against. Consuming the
+    // record is itself a single-winner claim (atomic `remove`), and
+    // `free_checked` re-validates the generation against the address's
+    // current live generation: a stale free whose record was already
+    // consumed finds nothing here, and a free that races in after the
+    // address was recycled is rejected by generation mismatch inside
+    // `free_checked` — neither can double-`pool_put` the live block.
+    if let Some((size, generation)) = take_unsafe_alloc(addr).or_else(|| take_cleaner_size_for_addr(addr)) {
+        free_checked(addr, size, generation);
     }
     Ok(None)
 }
@@ -657,82 +669,174 @@ fn unsafe_allocate_memory(_ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Long(addr as i64)))
 }
 
-/// Per-allocation (addr → size) table for Unsafe.allocate/freeMemory.
-/// Kept separate from the Cleaner registry because Unsafe-allocated
-/// memory has no associated Cleaner.
-fn unsafe_allocs() -> &'static Mutex<FxHashMap<u64, i64>> {
-    static U: OnceLock<Mutex<FxHashMap<u64, i64>>> = OnceLock::new();
+/// Per-allocation (addr → (size, generation)) table for
+/// Unsafe.allocate/freeMemory. Kept separate from the Cleaner registry
+/// because Unsafe-allocated memory has no associated Cleaner. The
+/// generation is the address's live generation captured at allocation
+/// time, so `freeMemory(addr)` (which carries no generation of its own)
+/// can present the correct (addr, generation) to the ABA guard.
+fn unsafe_allocs() -> &'static Mutex<FxHashMap<u64, (i64, u64)>> {
+    static U: OnceLock<Mutex<FxHashMap<u64, (i64, u64)>>> = OnceLock::new();
     U.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
 fn record_unsafe_alloc(addr: u64, size: i64) {
+    // Stamp the address's current live generation (set by `bump_generation`
+    // inside `dbb_allocate`) so a later `freeMemory(addr)` frees against
+    // *this* incarnation. The freed-set is keyed by (addr, generation) and
+    // is never cleared on realloc — there is deliberately nothing to clear
+    // here; a recycled address simply carries a fresh generation that has
+    // no freed entry yet.
+    let generation = current_generation(addr);
     if let Ok(mut g) = unsafe_allocs().lock() {
-        g.insert(addr, size);
+        g.insert(addr, (size, generation));
     }
-    // Bug 2: `dbb_allocate` already clears the freed-set entry for `addr`
-    // before returning; nothing to do here. (Kept as a comment so a future
-    // refactor that decouples Unsafe.allocateMemory from `dbb_allocate`
-    // remembers to re-add `clear_freed(addr)` here.)
 }
 
-fn take_unsafe_alloc(addr: u64) -> Option<i64> {
+fn take_unsafe_alloc(addr: u64) -> Option<(i64, u64)> {
     unsafe_allocs().lock().ok()?.remove(&addr)
 }
 
-/// Bug 2 (CRIT): `Unsafe.freeMemory(addr)` + `freeMemoryExplicit(addr, size)`
-/// on the same address previously double-pool_put'd the buffer (the first
-/// went through `take_unsafe_alloc` → `dbb_free`; the second went straight
-/// to `dbb_free` via the supplied size). A double pool_put corrupts the
-/// free-list — the same address ends up in two pool slots and is later
-/// handed to two distinct Java allocations simultaneously.
-///
-/// We track recently-freed addresses in a set and refuse to double-free.
-///
-/// Bug 2 (CRIT round-9 native-misc CRIT-9): the previous implementation
-/// kept a 4096-entry FIFO of freed addresses. Under high churn
-/// (millions of Unsafe.allocateMemory/freeMemory cycles per second), an
-/// address freed > 4096 distinct frees ago is evicted from the FIFO,
-/// and a subsequent rogue double-free path would no longer be caught —
-/// reintroducing the pool corruption this guard was added to prevent.
-///
-/// Switch to an unbounded `FxHashSet<u64>`. Trade-off:
-///   * Memory grows unbounded in pathological scenarios (the set tracks
-///     every distinct address that has ever been freed).
-///   * In practice, allocators recycle addresses heavily, so we
-///     proactively remove an address from the freed set the moment it
-///     is *re-allocated* (see `record_unsafe_alloc`). Under a healthy
-///     churn workload the set's size stays bounded by the live-but-freed
-///     working set + the small number of re-issued-but-not-yet-touched
-///     addresses, which is exactly what we want.
-///   * Correctness is now preserved indefinitely — no FIFO horizon.
-///
-/// Alternative considered: per-address generation counter (CAS on free).
-/// Rejected for round-10 in favour of the simpler set; revisit if memory
-/// turns out to be a concern.
-fn freed_addrs() -> &'static Mutex<rustc_hash::FxHashSet<u64>> {
-    static F: OnceLock<Mutex<rustc_hash::FxHashSet<u64>>> = OnceLock::new();
+// ---------------------------------------------------------------------------
+// ABA double-free guard — per-address generation / epoch
+// ---------------------------------------------------------------------------
+//
+// Bug 2 (CRIT): `Unsafe.freeMemory(addr)` + `freeMemoryExplicit(addr, size)`
+// on the same address previously double-pool_put'd the buffer (the first
+// went through `take_unsafe_alloc` → `dbb_free`; the second went straight
+// to `dbb_free` via the supplied size). A double pool_put corrupts the
+// free-list — the same address ends up in two pool slots and is later
+// handed to two distinct Java allocations simultaneously.
+//
+// History of this guard:
+//   * round-9: a 4096-entry FIFO of freed addresses — evicted entries
+//     under high churn reopened the double-free window.
+//   * round-10: an unbounded `FxHashSet<u64>` keyed by address alone,
+//     CLEARED on realloc (`clear_freed`) so it stayed bounded. That
+//     clear is exactly the ABA hole this finding flags: a stale
+//     `freeMemory(old_addr)` arriving AFTER the same address has been
+//     recycled to a new live buffer passes the (cleared) check and
+//     double-frees / pool_puts the live allocation. The per-address
+//     generation counter was noted as the alternative but rejected "for
+//     simplicity". The pool-corruption consequence is severe, so it is
+//     adopted here.
+//
+// Scheme (close the ABA window):
+//   * `generations`: addr -> current live generation (u64), bumped by
+//     `bump_generation` every time `dbb_allocate` hands the address out.
+//   * Every size-record (`unsafe_allocs`, `CleanerEntry`) captures the
+//     live generation at allocation time, so every free path can present
+//     the (addr, generation) it was *issued against* — even
+//     `Unsafe.freeMemory`, which carries only an address, recovers the
+//     generation from the record it consumes.
+//   * `freed_addrs`: the set of (addr, generation) pairs that have already
+//     been freed. It is NEVER cleared on realloc.
+//
+// Invariant enforced by `mark_freed_or_check(addr, gen)` — a free is
+// honoured iff BOTH hold:
+//   1. `gen == current_generation(addr)` — the free targets the live
+//      incarnation. A stale free issued against an older generation (its
+//      address since recycled) fails here and is rejected. THIS is what
+//      closes the ABA window: the recycled address now carries a newer
+//      generation, so the stale (addr, old_gen) free no longer matches.
+//   2. `(addr, gen)` is not already in `freed_addrs` — single-free
+//      idempotency within one incarnation (defeats freeMemory +
+//      freeMemoryExplicit double-free on the same live buffer).
+//
+// Memory bounding (without the buggy realloc-clear): when an address is
+// recycled, `bump_generation` prunes any freed-set entries for that
+// address's now-dead older generations — they can never be queried again
+// (only the current generation is ever validated). So the set stays
+// bounded by the live-but-freed working set, exactly as before, while no
+// longer reopening the window.
+
+/// addr -> current live generation. Bumped each time the address is handed
+/// out by `dbb_allocate`.
+fn generations() -> &'static Mutex<FxHashMap<u64, u64>> {
+    static G: OnceLock<Mutex<FxHashMap<u64, u64>>> = OnceLock::new();
+    G.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+/// Bump `addr`'s live generation and return the new value. Called from
+/// `dbb_allocate` the moment the address becomes live for a new buffer.
+/// Also prunes freed-set entries for this address's older (now-dead)
+/// generations so the freed-set stays bounded without the old, ABA-prone
+/// realloc-clear.
+fn bump_generation(addr: u64) -> u64 {
+    let next = {
+        let mut g = match generations().lock() {
+            Ok(g) => g,
+            Err(_) => return 0,
+        };
+        let slot = g.entry(addr).or_insert(0);
+        *slot = slot.wrapping_add(1);
+        *slot
+    };
+    // Drop stale freed-set entries for this address: only `next` (the new
+    // current generation) can ever be validated from now on, so any older
+    // (addr, *) pair is unreachable and safe to forget.
+    if let Ok(mut f) = freed_addrs().lock() {
+        f.retain(|&(a, gen)| a != addr || gen == next);
+    }
+    next
+}
+
+/// The current live generation for `addr`, or 0 if it has never been
+/// handed out (matching the initial value used before the first bump).
+fn current_generation(addr: u64) -> u64 {
+    generations()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(&addr).copied())
+        .unwrap_or(0)
+}
+
+/// Set of (addr, generation) pairs already freed. Never cleared on
+/// realloc; pruned per-address by `bump_generation`.
+fn freed_addrs() -> &'static Mutex<rustc_hash::FxHashSet<(u64, u64)>> {
+    static F: OnceLock<Mutex<rustc_hash::FxHashSet<(u64, u64)>>> = OnceLock::new();
     F.get_or_init(|| Mutex::new(rustc_hash::FxHashSet::default()))
 }
 
-/// Returns `true` if this addr was already freed (caller should skip).
-/// Otherwise records the addr and returns `false`.
-fn mark_freed_or_check(addr: u64) -> bool {
+/// Returns `true` if this free should be SKIPPED — either because the
+/// address has been recycled since this free was issued (generation
+/// mismatch: a stale free for a dead incarnation), or because this exact
+/// incarnation was already freed. Otherwise records (addr, generation)
+/// and returns `false`. Both checks run under the freed-set lock; the
+/// generation read is a snapshot taken first.
+fn mark_freed_or_check(addr: u64, generation: u64) -> bool {
+    // Stale-free / ABA check: reject a free whose generation no longer
+    // matches the address's current live generation. A `freeMemory` /
+    // Cleaner that fires after `addr` was recycled lands here and is
+    // dropped, leaving the live incarnation untouched.
+    if current_generation(addr) != generation {
+        return true;
+    }
     let mut g = match freed_addrs().lock() {
         Ok(g) => g,
         Err(_) => return false, // poisoned — best-effort: allow the free
     };
     // `HashSet::insert` returns `false` when the value was already
-    // present — that's exactly the "already freed" signal we need.
-    !g.insert(addr)
+    // present — that's exactly the "already freed this incarnation" signal.
+    !g.insert((addr, generation))
 }
 
-/// Remove `addr` from the freed-set. Called when an address is handed
-/// back out by `Unsafe.allocateMemory` so the set doesn't grow without
-/// bound in churn workloads where the allocator recycles addresses.
-fn clear_freed(addr: u64) {
-    if let Ok(mut g) = freed_addrs().lock() {
-        g.remove(&addr);
+/// Single chokepoint for every free path. Validates the (addr, generation)
+/// against the ABA guard and only then returns the block to the pool /
+/// OS via `dbb_free`. A stale or duplicate free is logged and skipped so
+/// the live allocation at `addr` is never double-`pool_put`.
+fn free_checked(addr: u64, size: i64, generation: u64) {
+    if addr == 0 || size <= 0 {
+        return;
     }
+    if mark_freed_or_check(addr, generation) {
+        eprintln!(
+            "[direct_buffer] free({:#x}, size={}, gen={}) skipped — stale (address recycled) or already-freed incarnation",
+            addr, size, generation
+        );
+        return;
+    }
+    dbb_free(addr, size);
 }
 
 /// `dbb_free_explicit(addr, size)` — escape hatch for Java callers
@@ -747,26 +851,23 @@ fn dbb_free_explicit(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if addr == 0 || size <= 0 {
         return Ok(None);
     }
-    // Bug 2 (CRIT): claim the address *first* (atomic, single-lock) so a
-    // racing `freeMemory(addr)` / `dbb_free_explicit` on the same address
-    // can never both reach `dbb_free` — that would double-`pool_put` the
-    // address and corrupt the bucketed free-list. Without this ordering,
-    // both `freeMemory(addr)` and `freeMemoryExplicit(addr, size)` on the
-    // same address could call `dbb_free` twice.
-    if mark_freed_or_check(addr) {
-        eprintln!(
-            "[direct_buffer] dbb_free_explicit({:#x}, {}) called on already-freed address — skipping",
-            addr, size
-        );
-        return Ok(None);
-    }
     // Drop any Unsafe.allocateMemory record so a later `freeMemory(addr)`
     // path doesn't also attempt a free (it would be caught by the
-    // freed-set above anyway, but this keeps the table tidy).
+    // freed-set inside `free_checked` anyway, but this keeps the table
+    // tidy and frees the recorded generation slot).
     let _ = take_unsafe_alloc(addr);
+    // `freeMemoryExplicit` is a synchronous Java call on a buffer the
+    // caller still holds, so it targets the address's *current* live
+    // incarnation. We resolve that generation and route through the shared
+    // ABA chokepoint: a racing `freeMemory(addr)` / second
+    // `freeMemoryExplicit` on the same live buffer is rejected by the
+    // (addr, generation) freed-set entry (single-free idempotency), and a
+    // later free that arrives after the address is recycled is rejected by
+    // generation mismatch — neither can double-`pool_put` the live block.
     // `size` is caller-supplied capacity captured at allocation time;
     // `dbb_free` deallocates with the same `(size, align=8)` layout.
-    dbb_free(addr, size);
+    let generation = current_generation(addr);
+    free_checked(addr, size, generation);
     Ok(None)
 }
 

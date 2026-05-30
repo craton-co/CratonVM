@@ -268,23 +268,56 @@ fn infl_inflate_bytes_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     ))))
 }
 
-fn infl_inflate_bytes_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Output is a direct buffer (long address) — we don't have raw memory for
-    // direct buffers in this VM. Fall back to a no-progress return so Java
-    // loops around to an array-backed path. (In practice the JDK prefers
-    // array paths when `isDirect() == false`.)
-    let _ = (ctx, args);
-    Ok(Some(Value::Long(0)))
+// audit-round6 (LOW, direct-ByteBuffer inflate no-op):
+//
+// These three natives cover the inflate combinations where at least one
+// side is a *direct* `ByteBuffer`, addressed by a raw `long` rather than a
+// `byte[]`. This VM has no raw-memory view into direct buffers here, so we
+// genuinely cannot make progress on them.
+//
+// The previous implementation returned a packed `Long(0)` ("no progress")
+// and claimed the JDK would "loop around to an array-backed path". That is
+// NOT correct: the JDK's `Inflater` dispatches to the native that matches
+// the buffer types the *caller* actually supplied (see
+// `java.util.zip.Inflater.inflate(ByteBuffer)` / `inflate(byte[],...)`),
+// and it does NOT retry with a different native when one reports no
+// progress. For a direct OUTPUT buffer there is no array-backed
+// alternative at all. A direct-only caller therefore sees
+// inputConsumed == 0 && outputConsumed == 0 && !finished forever and spins
+// in an infinite read loop.
+//
+// Since fully implementing direct-buffer inflate is out of scope, the safe
+// behavior is to fail LOUDLY rather than hang: surface
+// `RuntimeError::NotImplemented` so a future regression that routes a
+// direct-only caller here aborts with a clear message instead of wedging.
+// The common JAR/ZIP bootstrap path is array-backed and goes through
+// `infl_inflate_bytes_bytes`, so this path is not exercised today.
+fn infl_direct_buffer_unsupported(which: &str) -> MethodCallResult {
+    Err(RuntimeError::NotImplemented {
+        feature: format!(
+            "Inflater.{which}: direct-ByteBuffer inflate is not supported \
+             (this VM has no raw-memory view of direct buffers); use an \
+             array-backed Inflater path"
+        ),
+    }
+    .into())
 }
 
-fn infl_inflate_buffer_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let _ = (ctx, args);
-    Ok(Some(Value::Long(0)))
+fn infl_inflate_bytes_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // input: byte[], output: direct ByteBuffer (long addr). Cannot write the
+    // direct output buffer — no array fallback exists for a direct output.
+    infl_direct_buffer_unsupported("inflateBytesBuffer")
 }
 
-fn infl_inflate_buffer_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let _ = (ctx, args);
-    Ok(Some(Value::Long(0)))
+fn infl_inflate_buffer_bytes(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // input: direct ByteBuffer (long addr), output: byte[]. Cannot read the
+    // direct input bytes, so no progress is possible.
+    infl_direct_buffer_unsupported("inflateBufferBytes")
+}
+
+fn infl_inflate_buffer_buffer(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // Both sides are direct ByteBuffers — neither readable nor writable here.
+    infl_direct_buffer_unsupported("inflateBufferBuffer")
 }
 
 fn infl_get_adler(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -435,13 +468,9 @@ fn defl_end(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
 
-// Silence warnings for the RuntimeError import (kept for future error paths).
-#[allow(dead_code)]
-fn _unused_runtime_error() -> RuntimeError {
-    RuntimeError::NotImplemented {
-        feature: String::new(),
-    }
-}
+// audit-round6: `RuntimeError` is now used by the direct-buffer inflate
+// natives (`infl_direct_buffer_unsupported`), so the former
+// `_unused_runtime_error` import-silencing shim has been removed.
 #[allow(dead_code)]
 fn _unused_ret() -> ObjectRef {
     unreachable!()

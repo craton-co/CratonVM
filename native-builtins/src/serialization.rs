@@ -1464,23 +1464,33 @@ fn register_object_input_stream(r: &mut NativeMethodRegistry) {
             return Ok(Some(Value::Object(None)));
         }
         let tc = ois_buf_read(addr, 1);
-        match tc[0] {
-            TC_NULL => Ok(Some(Value::Object(None))),
+        let value = match tc[0] {
+            TC_NULL => Value::Object(None),
             TC_STRING => {
                 let len_bytes = ois_buf_read(addr, 2);
                 let len = u16::from_be_bytes([len_bytes[0], len_bytes[1]]) as usize;
                 let str_bytes = ois_buf_read(addr, len);
                 let s = String::from_utf8_lossy(&str_bytes).to_string();
                 let obj = ctx.create_string(&s);
-                Ok(Some(Value::Object(Some(obj))))
+                Value::Object(Some(obj))
             }
             TC_OBJECT => {
                 skip_class_desc(addr);
                 let obj = alloc_concurrent_synthetic(ctx, "java/lang/Object", 2);
-                Ok(Some(Value::Object(Some(obj))))
+                Value::Object(Some(obj))
             }
-            _ => Ok(Some(Value::Object(None))),
+            _ => Value::Object(None),
+        };
+        // JEP-290: mirror `readObject` and surface a sticky maxbytes (or
+        // other) rejection accumulated by `ois_buf_read` as an
+        // `IOException("filter status: REJECTED")`.
+        if let Some(reason) = filter_is_rejected(addr) {
+            return Err(RuntimeError::IOException {
+                message: format!("filter status: REJECTED: {}", reason),
+            }
+            .into());
         }
+        Ok(Some(value))
     });
 
     // Primitive readers — read actual big-endian bytes from OIS buffer
@@ -2361,11 +2371,23 @@ fn register_externalizable(r: &mut NativeMethodRegistry) {
 //                                     but not in sub-packages)
 //                 | '<fqcn>'         (exact class-name match)
 //
-// We deliberately do NOT enforce the maxdepth/maxrefs/maxbytes/maxarray
-// limits yet — the existing pre-filter limit enforcement in
-// `HandleState::max_references` already covers the most exploitable
-// surface, and a full FilterInfo wiring is out of scope for this fix.
-// TODO(JEP-290): plumb limits into `ois_read_value` / `ois_read_array`.
+// All four JEP-290 resource limits (maxdepth/maxrefs/maxbytes/maxarray)
+// are now enforced on the deserialization read paths:
+//
+//   * maxbytes  — `ois_buf_read` accounts every byte consumed via
+//     `filter_account_bytes`; once cumulative `bytes` exceeds the
+//     configured `max_bytes` the sticky `rejected` flag trips.
+//   * maxarray  — `ois_read_array` consults `filter_check_array` against
+//     the on-wire declared length *before* allocating the backing array,
+//     rejecting lengths greater than `max_array`.
+//   * maxdepth  — `ois_read_value` gates recursion through
+//     `filter_enter_depth` / `filter_exit_depth`.
+//   * maxrefs   — the `TC_REFERENCE` arm of `ois_read_value` bumps `refs`
+//     via `filter_account_ref`.
+//
+// Once any cap trips, `readObject` consults `filter_is_rejected` and
+// raises `IOException("filter status: REJECTED: ...")` — the
+// `ObjectInputFilter.Status.REJECTED` flow per JEP-290.
 
 /// Filter decision per JEP-290. Matches `ObjectInputFilter.Status`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

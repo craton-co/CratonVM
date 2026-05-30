@@ -13445,24 +13445,35 @@ mod io_tests {
 
     #[test]
     fn file_input_stream_methods_registered() {
+        // JDK-25 real-bytecode path: the legacy native `<init>(String)V` /
+        // `<init>(File)V` overrides were intentionally dropped (see FIS-FIX in
+        // `register_io_natives`). The constructor runs as real bytecode and
+        // calls `open0`; the I/O natives below store/recover the OS handle on
+        // the `FileDescriptor`. Assert the natives that ARE registered.
         let r = io_registry();
         let fis = "java/io/FileInputStream";
-        assert!(r.find(fis, "<init>", "(Ljava/lang/String;)V").is_some());
-        assert!(r.find(fis, "<init>", "(Ljava/io/File;)V").is_some());
-        assert!(r.find(fis, "read", "()I").is_some());
-        assert!(r.find(fis, "read", "([BII)I").is_some());
-        assert!(r.find(fis, "available", "()I").is_some());
-        assert!(r.find(fis, "close", "()V").is_some());
+        assert!(r.find(fis, "initIDs", "()V").is_some());
+        assert!(r.find(fis, "open0", "(Ljava/lang/String;)V").is_some());
+        assert!(r.find(fis, "read0", "()I").is_some());
+        assert!(r.find(fis, "readBytes", "([BII)I").is_some());
+        assert!(r.find(fis, "skip0", "(J)J").is_some());
+        assert!(r.find(fis, "available0", "()I").is_some());
     }
 
     #[test]
     fn file_output_stream_methods_registered() {
+        // JDK-25 real-bytecode path: the legacy native `<init>(String)V` /
+        // `<init>(File)V` overrides were intentionally dropped (see FOS-FIX in
+        // `register_io_natives`). The constructor runs as real bytecode and
+        // calls `open0`; the write/close natives below operate on the fd
+        // stashed on the `FileDescriptor`. Assert the natives that ARE
+        // registered.
         let r = io_registry();
         let fos = "java/io/FileOutputStream";
-        assert!(r.find(fos, "<init>", "(Ljava/lang/String;)V").is_some());
-        assert!(r.find(fos, "<init>", "(Ljava/io/File;)V").is_some());
-        assert!(r.find(fos, "write", "(I)V").is_some());
-        assert!(r.find(fos, "write", "([BII)V").is_some());
+        assert!(r.find(fos, "initIDs", "()V").is_some());
+        assert!(r.find(fos, "open0", "(Ljava/lang/String;Z)V").is_some());
+        assert!(r.find(fos, "write", "(IZ)V").is_some());
+        assert!(r.find(fos, "writeBytes", "([BIIZ)V").is_some());
         assert!(r.find(fos, "flush", "()V").is_some());
         assert!(r.find(fos, "close", "()V").is_some());
     }
@@ -13630,10 +13641,15 @@ mod io_tests {
     /// can. (Jetty's `start.jar` launcher reads `$JETTY_HOME/modules/*`.)
     #[test]
     fn path_validation_accepts_absolute_path_by_default() {
+        // Confinement is a process-global flag; serialize with the shared
+        // guard (same one watch.rs / random_access_file.rs use) and restore.
+        let _g = crate::test_support::confine_test_lock().lock();
+        let prev = is_path_confine_to_cwd();
         set_path_validation_enabled(true);
         set_path_confine_to_cwd(false);
         let result = validate_path("/etc/passwd");
         assert!(result.is_ok(), "absolute path rejected by default: {result:?}");
+        set_path_confine_to_cwd(prev);
     }
 
     /// AUDIT 2026-05-19: with CWD confinement explicitly ON, a path that
@@ -13642,13 +13658,17 @@ mod io_tests {
     /// regression guard for the opt-in confinement mode.
     #[test]
     fn path_validation_rejects_out_of_sandbox_absolute_when_confined() {
+        // Confinement is a process-global flag; serialize with the shared
+        // guard (same one watch.rs / random_access_file.rs use) and restore.
+        let _g = crate::test_support::confine_test_lock().lock();
+        let prev = is_path_confine_to_cwd();
         set_path_validation_enabled(true);
         set_path_confine_to_cwd(true);
         let result = validate_path("/etc/passwd");
         assert!(result.is_err(), "out-of-sandbox path accepted: {result:?}");
         let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("Path traversal detected"), "err = {err}");
-        set_path_confine_to_cwd(false);
+        set_path_confine_to_cwd(prev);
     }
 
     #[test]
@@ -13662,12 +13682,18 @@ mod io_tests {
 
     #[test]
     fn path_validation_accepts_normal_path() {
+        // Result depends on the process-global confinement flag; serialize
+        // with the shared guard and pin a known state for the duration.
+        let _g = crate::test_support::confine_test_lock().lock();
+        let prev = is_path_confine_to_cwd();
         set_path_validation_enabled(true);
+        set_path_confine_to_cwd(false);
         // A plain not-yet-existing file inside the sandbox (cwd) is
         // accepted: the parent (cwd) canonicalizes and the result stays
         // within the sandbox root.
         let result = validate_path("path_validation_normal_test.txt");
         assert!(result.is_ok(), "rejected in-sandbox path: {result:?}");
+        set_path_confine_to_cwd(prev);
     }
 
     #[test]
@@ -13684,9 +13710,15 @@ mod io_tests {
     /// AUDIT 2026-05-19: must also stay inside the sandbox root.
     #[test]
     fn path_validation_accepts_literal_dotdot_in_filename() {
+        // Result depends on the process-global confinement flag; serialize
+        // with the shared guard and pin a known state for the duration.
+        let _g = crate::test_support::confine_test_lock().lock();
+        let prev = is_path_confine_to_cwd();
         set_path_validation_enabled(true);
+        set_path_confine_to_cwd(false);
         let result = validate_path("foo..bar.txt");
         assert!(result.is_ok(), "rejected legitimate filename: {result:?}");
+        set_path_confine_to_cwd(prev);
     }
 
     /// AUDIT 2026-05-17: the null-byte check is a security check and
@@ -13716,12 +13748,17 @@ mod io_tests {
     /// CWD confinement.
     #[test]
     fn files_validated_path_rejects_dotdot_segment() {
+        // Confinement is a process-global flag; serialize with the shared
+        // guard (same one watch.rs / random_access_file.rs use) and restore.
+        let _g = crate::test_support::confine_test_lock().lock();
+        let prev = is_path_confine_to_cwd();
         set_path_validation_enabled(true);
         set_path_confine_to_cwd(false);
         let result = validated_path("../../etc/passwd");
         assert!(result.is_err(), "Files path with `..` segment accepted: {result:?}");
         let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("Path traversal detected"), "err = {err}");
+        set_path_confine_to_cwd(prev);
     }
 
     /// `validated_path` must reject an embedded null byte even when path
@@ -13743,11 +13780,15 @@ mod io_tests {
     /// result stays inside the sandbox root.
     #[test]
     fn files_validated_path_allows_nonexistent_in_sandbox() {
+        // Confinement is a process-global flag; serialize with the shared
+        // guard (same one watch.rs / random_access_file.rs use) and restore.
+        let _g = crate::test_support::confine_test_lock().lock();
+        let prev = is_path_confine_to_cwd();
         set_path_validation_enabled(true);
         set_path_confine_to_cwd(true);
         let result = validated_path("files_create_regression_target.txt");
         assert!(result.is_ok(), "in-sandbox not-yet-existing path rejected: {result:?}");
-        set_path_confine_to_cwd(false);
+        set_path_confine_to_cwd(prev);
     }
 
     // -----------------------------------------------------------------------

@@ -333,6 +333,9 @@ mod tests {
         // Tests must drain the rings via `drain_per_thread_into_repository`
         // before observing `event_count()`. Baseline drains keep cross-test
         // stragglers from leaking into our assertions.
+        // Serialize against other tests that drain the global ring registry,
+        // otherwise a concurrent `drain_all()` steals our events.
+        let _g = crate::repository::jfr_test_guard();
         let mut fr = create_flight_recorder();
         let r1 = fr.new_recording(RecordingSettings::new("rec1"));
         let r2 = fr.new_recording(RecordingSettings::new("rec2"));
@@ -368,6 +371,10 @@ mod tests {
 
     #[test]
     fn test_flight_recorder_create_start_stop() {
+        // start/stop toggle the process-global `JFR_ENABLED` flag; hold the
+        // test lock so we don't flip it under a concurrent `emit_*` test that
+        // depends on `is_enabled()`.
+        let _g = crate::repository::jfr_test_guard();
         let mut fr = FlightRecorder::new();
         let id = fr.new_recording(RecordingSettings::new("main"));
         assert_eq!(fr.active_recording_count(), 0);
@@ -456,6 +463,9 @@ mod tests {
 
     #[test]
     fn smoke_test_thread_ring_public_api() {
+        // Serialize against other tests that toggle `set_enabled` / drain the
+        // global ring registry; both would race this test's state otherwise.
+        let _g = crate::repository::jfr_test_guard();
         // (1) Toggle the global enable flag through the public API.
         let prior = is_enabled();
         set_enabled(true);

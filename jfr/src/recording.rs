@@ -142,7 +142,11 @@ impl Recording {
         }
         if let Some(&threshold) = self.settings.event_thresholds.get(&event.type_id) {
             let duration_ns = event.end_time.saturating_sub(event.start_time);
-            if duration_ns < threshold.as_nanos() as u64 {
+            // Saturating conversion: a threshold >= 2^64 ns must compare as
+            // "larger than any u64 duration" rather than wrapping to a tiny
+            // value via `as u64` (which would let every event through).
+            let threshold_ns = u64::try_from(threshold.as_nanos()).unwrap_or(u64::MAX);
+            if duration_ns < threshold_ns {
                 return;
             }
         }
@@ -172,7 +176,11 @@ impl Recording {
         }
         if let Some(&threshold) = self.settings.event_thresholds.get(&event.type_id) {
             let duration_ns = event.end_time.saturating_sub(event.start_time);
-            if duration_ns < threshold.as_nanos() as u64 {
+            // Saturating conversion: a threshold >= 2^64 ns must compare as
+            // "larger than any u64 duration" rather than wrapping to a tiny
+            // value via `as u64` (which would let every event through).
+            let threshold_ns = u64::try_from(threshold.as_nanos()).unwrap_or(u64::MAX);
+            if duration_ns < threshold_ns {
                 return false;
             }
         }
@@ -483,10 +491,10 @@ impl FlightRecorder {
     }
 
     pub fn active_recording_count(&self) -> usize {
-        self.recordings
-            .values()
-            .filter(|r| r.state == RecordingState::Running)
-            .count()
+        // `running_ids` is the cached set of Running recordings, kept in sync by
+        // `refresh_running_ids` after every state transition. Reading its length
+        // is O(1) versus an O(n) scan-and-filter of the full recordings map.
+        self.running_ids.len()
     }
 
     /// Dump a recording to a JFR binary file.
@@ -835,6 +843,10 @@ mod tests {
 
     #[test]
     fn test_flight_recorder_start_stop() {
+        // start/stop toggle the process-global `JFR_ENABLED` flag; hold the
+        // test lock so we don't flip it under a concurrent `emit_*` test that
+        // depends on `is_enabled()`.
+        let _g = crate::repository::jfr_test_guard();
         let mut fr = FlightRecorder::new();
         let id = fr.new_recording(RecordingSettings::new("r"));
         assert_eq!(fr.active_recording_count(), 0);
@@ -867,6 +879,9 @@ mod tests {
         fr.start_recording(r1);
         fr.start_recording(r2);
         // r3 is not started
+        // Serialize against other global-ring tests so a concurrent drain can't
+        // steal our event before we drain it.
+        let _g = crate::repository::jfr_test_guard();
         // Drain pre-existing thread-ring contents so cross-test bleed-through
         // doesn't pollute the per-recording event counts.
         let _ = crate::repository::global_ring_registry().drain_all();
@@ -889,6 +904,9 @@ mod tests {
         let id = fr.new_recording(RecordingSettings::new("ring"));
         fr.start_recording(id);
 
+        // Serialize against other global-ring tests so a concurrent drain can't
+        // steal our event before we drain it.
+        let _g = crate::repository::jfr_test_guard();
         // Drain any pending events from other tests on this thread before we
         // start, so our assertion is exact.
         let _ = crate::repository::global_ring_registry().drain_all();
@@ -983,6 +1001,10 @@ mod tests {
 
     #[test]
     fn test_recording_lifecycle() {
+        // start/stop toggle the process-global `JFR_ENABLED` flag; hold the
+        // test lock so we don't flip it under a concurrent `emit_*` test that
+        // depends on `is_enabled()`.
+        let _g = crate::repository::jfr_test_guard();
         let mut fr = FlightRecorder::new();
         let id = fr.new_recording(RecordingSettings::new("lifecycle"));
         {
@@ -1021,7 +1043,9 @@ mod tests {
     fn drain_single_recording_counts_filtered_events() {
         // Use a private FlightRecorder; the drain path is per-FR so this
         // does not perturb other tests. The global per-thread ring IS
-        // shared though, so we drain it first to clear stragglers.
+        // shared though, so we serialize against sibling global-ring tests
+        // and drain it first to clear stragglers.
+        let _g = crate::repository::jfr_test_guard();
         let _ = crate::repository::global_ring_registry().drain_all();
 
         // Unique-to-this-test type IDs (see module-level note) so cross-test
@@ -1077,6 +1101,7 @@ mod tests {
     /// increments `events_filtered_out` on every rejection.
     #[test]
     fn drain_multi_recording_counts_filtered_events_per_recording() {
+        let _g = crate::repository::jfr_test_guard();
         let _ = crate::repository::global_ring_registry().drain_all();
 
         // Unique-to-this-test type IDs (see module-level note).
@@ -1146,6 +1171,7 @@ mod tests {
     /// recording out of the fan-out entirely.
     #[test]
     fn drain_does_not_route_to_unstarted_recordings() {
+        let _g = crate::repository::jfr_test_guard();
         let _ = crate::repository::global_ring_registry().drain_all();
 
         let unique = EventTypeId(0xC3FF_0020);

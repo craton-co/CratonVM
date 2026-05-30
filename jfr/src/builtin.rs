@@ -50,6 +50,76 @@ fn cached_event_id(
     Some(id)
 }
 
+/// Common emit path for every built-in `emit_*` function: validate the event's
+/// runtime field shape against its registry-declared field types, then push it
+/// onto the calling thread's ring shard.
+///
+/// Finding 4(b) hardening: the ~55 built-ins construct their `EventInstance`
+/// fields by hand, so a future edit that desyncs a built-in's field shape from
+/// its `register_builtin_events` declaration (wrong field count, or a value
+/// variant that does not match the declared `type_name`) would silently
+/// corrupt the on-disk chunk — the writer dispatches on the runtime variant
+/// but the reader decodes off the declared type. Routing every built-in emit
+/// through here runs the same declared-type validation that
+/// [`emit_custom_event`] applies, **behind `debug_assert!`** so it fires loudly
+/// in debug/test builds while costing nothing in release. On a release-build
+/// mismatch we still push the event (built-ins have no `Result` to return and
+/// historically never dropped events), matching prior behaviour.
+#[inline]
+#[cfg_attr(not(debug_assertions), allow(unused_variables))]
+fn push_builtin_event(recorder: &FlightRecorder, event: EventInstance) {
+    #[cfg(debug_assertions)]
+    if let Err(e) = validate_builtin_field_shape(recorder, event.type_id, &event.fields) {
+        debug_assert!(
+            false,
+            "JFR built-in emit field shape does not match the registry \
+             declaration for type_id {:?}: {}",
+            event.type_id, e,
+        );
+    }
+    crate::repository::push_to_thread_ring(event);
+}
+
+/// Validate `field_values` against the registry-declared field types for
+/// `type_id` (the same declared-type check used by `emit_custom_event`'s
+/// [`validate_and_lock_shape`], minus the per-event-type shape lock which only
+/// the dynamic custom-event path needs). Returns `Ok(())` when the shape
+/// matches; `Err(EmitError)` otherwise. Only ever called from a `debug_assert!`.
+#[cfg(debug_assertions)]
+fn validate_builtin_field_shape(
+    recorder: &FlightRecorder,
+    type_id: EventTypeId,
+    field_values: &[EventValue],
+) -> Result<(), EmitError> {
+    let event_type = recorder
+        .type_registry
+        .get(type_id)
+        .ok_or(EmitError::UnknownEventType)?;
+    if event_type.fields.len() != field_values.len() {
+        return Err(EmitError::FieldCountMismatch {
+            expected: event_type.fields.len(),
+            actual: field_values.len(),
+        });
+    }
+    for (idx, (decl, value)) in event_type.fields.iter().zip(field_values.iter()).enumerate() {
+        let declared = FieldKind::from_declared(&decl.type_name).ok_or_else(|| {
+            EmitError::UnknownDeclaredType {
+                field_index: idx,
+                declared: decl.type_name.clone(),
+            }
+        })?;
+        let actual = FieldKind::of_value(value);
+        if !actual.matches_declared(declared) {
+            return Err(EmitError::DeclaredTypeMismatch {
+                field_index: idx,
+                declared,
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Register all built-in JVM event types into the given registry.
 pub fn register_builtin_events(registry: &mut EventTypeRegistry) {
     // Helper to build an EventType shell (id is overwritten by register).
@@ -933,7 +1003,7 @@ pub fn emit_gc_event(
             thread_id: current_jfr_thread_id(), // GC manager thread
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -969,7 +1039,7 @@ pub fn emit_class_load_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -998,7 +1068,7 @@ pub fn emit_class_load_event_arc(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1032,7 +1102,7 @@ pub fn emit_thread_start_event(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1060,7 +1130,7 @@ pub fn emit_thread_start_event_arc(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1100,7 +1170,7 @@ pub fn emit_compilation_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1136,7 +1206,7 @@ pub fn emit_compilation_event_arc(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1163,7 +1233,7 @@ pub fn emit_thread_end_event(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1187,7 +1257,7 @@ pub fn emit_thread_end_event_arc(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1213,7 +1283,7 @@ pub fn emit_thread_sleep_event(
                 EventValue::Long(sleep_time_ns),
             ],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1251,7 +1321,7 @@ pub fn emit_monitor_wait_event(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1285,7 +1355,7 @@ pub fn emit_monitor_wait_event_arc(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1320,7 +1390,7 @@ pub fn emit_monitor_enter_event(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1350,7 +1420,7 @@ pub fn emit_monitor_enter_event_arc(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1383,7 +1453,7 @@ pub fn emit_class_unload_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1410,7 +1480,7 @@ pub fn emit_class_unload_event_arc(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1441,7 +1511,7 @@ pub fn emit_thread_park_event(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1475,7 +1545,7 @@ pub fn emit_virtual_thread_pinned_event(
             thread_id: carrier_thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1505,7 +1575,7 @@ pub fn emit_virtual_thread_pinned_event_arc(
             thread_id: carrier_thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1539,7 +1609,7 @@ pub fn emit_gc_heap_summary_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1572,7 +1642,7 @@ pub fn emit_allocation_in_new_tlab_event(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1599,7 +1669,7 @@ pub fn emit_allocation_outside_tlab_event(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1628,7 +1698,7 @@ pub fn emit_allocation_in_new_tlab_event_arc(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1654,7 +1724,7 @@ pub fn emit_allocation_outside_tlab_event_arc(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1681,7 +1751,7 @@ pub fn emit_gc_phase_pause_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1706,7 +1776,7 @@ pub fn emit_young_gc_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1729,7 +1799,7 @@ pub fn emit_old_gc_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1760,7 +1830,7 @@ pub fn emit_metaspace_summary_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1791,7 +1861,7 @@ pub fn emit_execution_sample_event(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1820,7 +1890,7 @@ pub fn emit_execution_sample_event_arc(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1846,7 +1916,7 @@ pub fn emit_cpu_load_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1874,7 +1944,7 @@ pub fn emit_thread_statistics_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1906,7 +1976,7 @@ pub fn emit_active_recording_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1935,7 +2005,7 @@ pub fn emit_active_setting_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -1963,7 +2033,7 @@ pub fn emit_active_setting_event_arc(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2001,7 +2071,7 @@ pub fn emit_deoptimization_event(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2035,7 +2105,7 @@ pub fn emit_deoptimization_event_arc(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2066,7 +2136,7 @@ pub fn emit_file_read_event(
                 EventValue::Boolean(end_of_file),
             ],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2097,7 +2167,7 @@ pub fn emit_file_read_event_arc(
                 EventValue::Boolean(end_of_file),
             ],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2125,7 +2195,7 @@ pub fn emit_file_write_event(
                 EventValue::Long(bytes_written),
             ],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2152,7 +2222,7 @@ pub fn emit_file_write_event_arc(
                 EventValue::Long(bytes_written),
             ],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2185,7 +2255,7 @@ pub fn emit_socket_read_event(
                 EventValue::Boolean(end_of_stream),
             ],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2217,7 +2287,7 @@ pub fn emit_socket_read_event_arc(
                 EventValue::Boolean(end_of_stream),
             ],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2247,7 +2317,7 @@ pub fn emit_socket_write_event(
                 EventValue::Long(bytes_written),
             ],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2276,7 +2346,7 @@ pub fn emit_socket_write_event_arc(
                 EventValue::Long(bytes_written),
             ],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2303,7 +2373,7 @@ pub fn emit_safepoint_begin_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2326,7 +2396,7 @@ pub fn emit_safepoint_end_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2347,7 +2417,7 @@ pub fn emit_system_gc_event(
             thread_id,
             fields: smallvec![EventValue::Boolean(invoked_concurrent)],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2369,7 +2439,7 @@ pub fn emit_allocation_requiring_gc_event(
             thread_id,
             fields: smallvec![EventValue::Int(gc_id), EventValue::Long(size)],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2398,7 +2468,7 @@ pub fn emit_java_exception_throw_event(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2427,7 +2497,7 @@ pub fn emit_java_exception_throw_event_arc(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2456,7 +2526,7 @@ pub fn emit_network_utilization_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2485,7 +2555,7 @@ pub fn emit_network_utilization_event_arc(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2510,7 +2580,7 @@ pub fn emit_thread_cpu_load_event(
                 EventValue::Float(system),
             ],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2538,7 +2608,7 @@ pub fn emit_allocation_sample_event(
                 EventValue::Long(weight),
             ],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2564,7 +2634,7 @@ pub fn emit_allocation_sample_event_arc(
                 EventValue::Long(weight),
             ],
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2605,7 +2675,7 @@ pub fn emit_java_error_throw_event(
             thread_id,
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2657,7 +2727,7 @@ pub fn emit_physical_memory_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2701,7 +2771,7 @@ pub fn emit_initial_environment_variable_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2733,7 +2803,7 @@ pub fn emit_exception_statistics_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2765,7 +2835,7 @@ pub fn emit_module_require_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -2795,7 +2865,7 @@ pub fn emit_module_export_event(
             thread_id: current_jfr_thread_id(),
             fields,
         };
-        crate::repository::push_to_thread_ring(event);
+        push_builtin_event(recorder, event);
     }
 }
 
@@ -3496,13 +3566,20 @@ mod tests {
         fr
     }
 
-    /// Discard any events left in the process-wide per-thread ring registry
-    /// before the test under load runs. Without this baseline drain, events
-    /// pushed by other tests in parallel can leak into the recording's
-    /// repository when we call `drain_per_thread_into_repository` and break
-    /// exact `event_count() == N` assertions.
-    fn drain_ring_baseline() {
+    /// Acquire the process-wide test serialization lock and discard any events
+    /// left in the per-thread ring registry before the test under load runs.
+    ///
+    /// The returned [`MutexGuard`](parking_lot::MutexGuard) must be held for
+    /// the whole test (`let _g = drain_ring_baseline();`): it serializes this
+    /// test against every other test that emits into / drains the global ring,
+    /// so a concurrent `drain_all()` cannot steal events and break exact
+    /// `event_count() == N` assertions. The baseline drain then clears any
+    /// stragglers left on this thread's shard by earlier tests.
+    #[must_use]
+    fn drain_ring_baseline() -> parking_lot::MutexGuard<'static, ()> {
+        let guard = crate::repository::jfr_test_guard();
         let _ = crate::repository::global_ring_registry().drain_all();
+        guard
     }
 
     #[test]
@@ -3510,7 +3587,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_gc_event(&mut fr, 1, "G1 Young", "Allocation Failure", 1000, 500);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3522,7 +3599,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_class_load_event(&mut fr, "java/lang/Object", "bootstrap", "bootstrap", 2000, 100);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3534,7 +3611,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_thread_start_event(&mut fr, "main", "", 1, 3000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3546,7 +3623,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_compilation_event(&mut fr, "java/lang/String.hashCode:()I", 1, 3, true, false, 256, 128, 4000, 200);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3558,7 +3635,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_allocation_in_new_tlab_event(&mut fr, "java/lang/Object", 64, 4096, 1, 5000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3573,7 +3650,7 @@ mod tests {
         // FlightRecorder, `drain_per_thread_into_repository` discards every
         // drained event (regardless of which other test pushed it onto the
         // global ring), so the assertion remains exact.
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_gc_event(&mut fr, 1, "G1", "Test", 1000, 500);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3587,7 +3664,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_thread_end_event(&mut fr, "worker-1", 42, 6000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3599,7 +3676,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_thread_sleep_event(&mut fr, 1_000_000, 1, 7000, 1_000_000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3611,7 +3688,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_monitor_wait_event(&mut fr, "java/lang/Object", "main", 0, false, 0xDEAD, 1, 8000, 500);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3623,7 +3700,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_monitor_enter_event(&mut fr, "java/util/HashMap", "main", 0xBEEF, 1, 9000, 200);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3635,7 +3712,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_class_unload_event(&mut fr, "com/example/OldClass", "app", 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3647,7 +3724,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_thread_park_event(&mut fr, "java/util/concurrent/locks/AQS", 0, 0xCAFE, 1, 11000, 300);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3659,7 +3736,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_gc_heap_summary_event(&mut fr, 1, "Before GC", "G1 Eden", 1024 * 1024, 512 * 1024, 2048 * 1024, 12000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3671,7 +3748,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         // Use u64::MAX to test saturating_add doesn't overflow
         emit_thread_sleep_event(&mut fr, i64::MAX, 1, u64::MAX - 10, u64::MAX);
         fr.drain_per_thread_into_repository();
@@ -3704,7 +3781,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_deoptimization_event(
             &mut fr, "com/example/Foo.bar:()V", 1, "NullCheck", "Reinterpret", 42, 1, 10000,
         );
@@ -3729,7 +3806,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_file_read_event(&mut fr, "fd:3", 1024, false, 1, 10000, 500);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3743,7 +3820,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_file_write_event(&mut fr, "fd:1", 512, 1, 10000, 300);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3755,7 +3832,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_socket_read_event(&mut fr, "localhost", 8080, 256, false, 1, 10000, 2000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3769,7 +3846,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_socket_write_event(&mut fr, "example.com", 443, 128, 1, 10000, 1000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3781,7 +3858,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_gc_phase_pause_event(&mut fr, 1, "Mark", 10000, 5000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3793,7 +3870,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_young_gc_event(&mut fr, 1, 15, 10000, 3000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3805,7 +3882,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_old_gc_event(&mut fr, 2, 20000, 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3817,7 +3894,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_metaspace_summary_event(&mut fr, 1, "After GC", 1024, 2048, 4096, 15000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3829,7 +3906,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_allocation_outside_tlab_event(&mut fr, "java/lang/Object", 64, 1, 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3841,7 +3918,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_execution_sample_event(&mut fr, "main", "Main.run:5", "RUNNABLE", 1, 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3853,7 +3930,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_cpu_load_event(&mut fr, 0.25, 0.05, 0.60, 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3872,7 +3949,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_thread_statistics_event(&mut fr, 10, 3, 50, 12, 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3884,7 +3961,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_active_recording_event(&mut fr, 1, "default", "/tmp/rec.jfr", 0, 0, 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -3896,7 +3973,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_active_setting_event(&mut fr, 1, "threshold", "10ms", 10000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording_mut(rid).unwrap();
@@ -4051,7 +4128,7 @@ mod tests {
         );
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_custom_event(
             &mut fr,
             "test.CustomEvent",
@@ -4077,7 +4154,15 @@ mod tests {
     // and that the per-event-type shape lock cannot be bypassed by a
     // subsequent caller swapping variants.
 
-    fn t30_setup_recorder(field_type: &str) -> (FlightRecorder, EventTypeId, u64) {
+    fn t30_setup_recorder(
+        field_type: &str,
+    ) -> (FlightRecorder, EventTypeId, u64, parking_lot::MutexGuard<'static, ()>) {
+        // Hold the global test lock for the test's duration: these tests depend
+        // on `is_enabled()` staying true (set by our own `start_recording`); a
+        // concurrent test's `stop_recording` would otherwise flip the global
+        // `JFR_ENABLED` flag off, making `emit_custom_event` early-return
+        // `Ok(())` before validation runs and breaking the rejection asserts.
+        let guard = crate::repository::jfr_test_guard();
         let mut fr = crate::create_flight_recorder();
         let id = register_custom_event(
             &mut fr.type_registry,
@@ -4091,7 +4176,7 @@ mod tests {
         );
         let rid = fr.new_recording(RecordingSettings::new("task30"));
         fr.start_recording(rid);
-        (fr, id, rid)
+        (fr, id, rid, guard)
     }
 
     // Mismatch tests use `#[cfg_attr(debug_assertions, should_panic)]` because
@@ -4107,7 +4192,7 @@ mod tests {
     fn t30_float_vs_double_mismatch_rejected() {
         // Declared "double" + supplied `EventValue::Float(_)`:
         //   writer would emit 4 bytes, reader expects 8 → chunk desync.
-        let (mut fr, _id, _rid) = t30_setup_recorder("double");
+        let (mut fr, _id, _rid, _g) = t30_setup_recorder("double");
         let err = emit_custom_event(
             &mut fr,
             "test.task30.Validate",
@@ -4133,7 +4218,7 @@ mod tests {
     fn t30_double_vs_float_mismatch_rejected() {
         // Symmetric case: declared "float" + supplied `EventValue::Double(_)`.
         // Writer would emit 8 bytes, reader would read 4 — same desync hazard.
-        let (mut fr, _id, _rid) = t30_setup_recorder("float");
+        let (mut fr, _id, _rid, _g) = t30_setup_recorder("float");
         let err = emit_custom_event(
             &mut fr,
             "test.task30.Validate",
@@ -4157,7 +4242,7 @@ mod tests {
         // Declared "int" + supplied `EventValue::String(_)`.
         // The reader would try to varint-decode the string's tag/length
         // prefix as an i32 and then misread every following field.
-        let (mut fr, _id, _rid) = t30_setup_recorder("int");
+        let (mut fr, _id, _rid, _g) = t30_setup_recorder("int");
         let err = emit_custom_event(
             &mut fr,
             "test.task30.Validate",
@@ -4179,7 +4264,7 @@ mod tests {
     #[cfg_attr(debug_assertions, should_panic(expected = "validation failed"))]
     fn t30_int_vs_string_mismatch_rejected() {
         // Symmetric case: declared "string" + supplied `EventValue::Int(_)`.
-        let (mut fr, _id, _rid) = t30_setup_recorder("string");
+        let (mut fr, _id, _rid, _g) = t30_setup_recorder("string");
         let err = emit_custom_event(
             &mut fr,
             "test.task30.Validate",
@@ -4201,7 +4286,7 @@ mod tests {
     fn t30_correct_shape_succeeds_across_many_calls() {
         // Declared "double" + always-`Double` emits: every call must succeed,
         // and the per-event-type shape lock must accept all of them.
-        let (mut fr, _id, _rid) = t30_setup_recorder("double");
+        let (mut fr, _id, _rid, _g) = t30_setup_recorder("double");
         for i in 0..32u64 {
             let r = emit_custom_event(
                 &mut fr,
@@ -4218,7 +4303,7 @@ mod tests {
     fn t30_shape_lock_populated_on_first_emit() {
         // The first emit must populate `field_shape_lock` with the runtime
         // variant sequence; same-shape subsequent emits then keep working.
-        let (mut fr, type_id, _rid) = t30_setup_recorder("string");
+        let (mut fr, type_id, _rid, _g) = t30_setup_recorder("string");
         emit_custom_event(
             &mut fr,
             "test.task30.Validate",
@@ -4243,6 +4328,10 @@ mod tests {
     fn t30_field_count_mismatch_rejected() {
         // Declares 2 fields but emit supplies 1 — guards against partial
         // event payloads silently truncating the chunk.
+        // Hold the global test lock so a concurrent `stop_recording` cannot
+        // flip `JFR_ENABLED` off and make the emit early-return before
+        // validation runs.
+        let _g = crate::repository::jfr_test_guard();
         let mut fr = crate::create_flight_recorder();
         let _id = register_custom_event(
             &mut fr.type_registry,
@@ -4310,7 +4399,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_safepoint_begin_event(&mut fr, 1, 10, 0, 1000);
         emit_safepoint_end_event(&mut fr, 1, 1000, 500);
         fr.drain_per_thread_into_repository();
@@ -4323,7 +4412,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_java_exception_throw_event(&mut fr, "test error", "java.lang.RuntimeException", 1000, 1);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording(rid).unwrap();
@@ -4335,7 +4424,7 @@ mod tests {
         let mut fr = make_recorder();
         let rid = fr.new_recording(RecordingSettings::new("test"));
         fr.start_recording(rid);
-        drain_ring_baseline();
+        let _g = drain_ring_baseline();
         emit_network_utilization_event(&mut fr, "eth0", 1024, 512, 1000);
         fr.drain_per_thread_into_repository();
         let rec = fr.get_recording(rid).unwrap();

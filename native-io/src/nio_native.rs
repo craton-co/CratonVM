@@ -86,6 +86,14 @@ fn int_arg(args: &[Value], idx: usize) -> i32 {
 // sun/nio/ch/FileDispatcherImpl natives
 // ---------------------------------------------------------------------------
 
+/// Upper bound on the per-call transfer length for the FileDispatcher
+/// `read0`/`pread0`/`write0`/`pwrite0` paths. A JVM-supplied positive
+/// `len` (up to `i32::MAX`) would otherwise drive a `vec![0u8; len]`
+/// (~2 GiB) allocation before any I/O. We clamp `len` down to this cap so
+/// the allocation is bounded; a short transfer is legal for read/write
+/// (the caller loops). Mirrors `net.rs`'s `NET_MAX_TRANSFER` (`1 << 30`).
+const FD_MAX_TRANSFER: usize = 1 << 30;
+
 /// `read0(FileDescriptor, long addr, int len) -> int`
 /// Reads `len` bytes from the fd at its current position into the
 /// raw memory at `addr`. Returns bytes read, or -1 on EOF.
@@ -99,7 +107,9 @@ fn native_fd_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("read0: FileDescriptor has no open handle"));
     };
-    let mut buf = vec![0u8; len as usize];
+    // Clamp the allocation; a short read is legal (the caller loops).
+    let len = (len as usize).min(FD_MAX_TRANSFER);
+    let mut buf = vec![0u8; len];
     let n = ctx
         .fd_table()
         .read_bytes(fd, &mut buf)
@@ -129,7 +139,9 @@ fn native_fd_pread0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("pread0: FileDescriptor has no open handle"));
     };
-    let mut buf = vec![0u8; len as usize];
+    // Clamp the allocation; a short read is legal (the caller loops).
+    let len = (len as usize).min(FD_MAX_TRANSFER);
+    let mut buf = vec![0u8; len];
     let n = ctx
         .fd_table()
         .pread_at(fd, &mut buf, pos as u64)
@@ -154,14 +166,16 @@ fn native_fd_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("write0: FileDescriptor has no open handle"));
     };
-    let mut buf = vec![0u8; len as usize];
+    // Clamp the allocation; a short write is legal (the caller loops).
+    let len = (len as usize).min(FD_MAX_TRANSFER);
+    let mut buf = vec![0u8; len];
     unsafe {
-        std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len as usize);
+        std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
     }
     ctx.fd_table()
         .write_bytes(fd, &buf)
         .map_err(|e| io_error(format!("write0: {e}")))?;
-    Ok(Some(Value::Int(len)))
+    Ok(Some(Value::Int(len as i32)))
 }
 
 /// `pwrite0(FileDescriptor, long addr, int len, long pos) -> int`
@@ -176,9 +190,11 @@ fn native_fd_pwrite0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("pwrite0: FileDescriptor has no open handle"));
     };
-    let mut buf = vec![0u8; len as usize];
+    // Clamp the allocation; a short write is legal (the caller loops).
+    let len = (len as usize).min(FD_MAX_TRANSFER);
+    let mut buf = vec![0u8; len];
     unsafe {
-        std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len as usize);
+        std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
     }
     let n = ctx
         .fd_table()
@@ -376,9 +392,12 @@ mod os_lock {
     /// "the rest of the file / whole file". We clamp an overflowing or
     /// non-positive `size` to "lock the maximum range from `pos`".
     fn range_len(pos: u64, size: i64) -> u64 {
-        if size <= 0 {
+        if size <= 0 || size == i64::MAX {
             // Whole file from `pos`: lock the largest range that does
-            // not overflow past u64::MAX when added to `pos`.
+            // not overflow past u64::MAX when added to `pos`. The JDK
+            // passes `Long.MAX_VALUE` (`i64::MAX`) for a whole-file lock,
+            // so treat that as the sentinel too rather than locking only
+            // `[pos, pos + i64::MAX)`.
             u64::MAX - pos
         } else {
             let size = size as u64;

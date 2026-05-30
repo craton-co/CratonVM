@@ -53,6 +53,32 @@ pub fn native_access_enabled() -> bool {
     NATIVE_ACCESS_ENABLED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Defense-in-depth gate for the raw-address `MemorySegment` memory-access
+/// methods (get/set/getAtIndex/setAtIndex/copy/fill). These dereference a raw
+/// address derived from the segment's Java-controlled `ptr`/`offset` fields, so
+/// — like `ofAddress` and the downcall path — they must be denied unless native
+/// access has been granted for the module. Returns the same
+/// `IllegalCallerException` those other gated paths return.
+///
+/// NOTE: intentionally NOT applied to the shared `pe_segment_{get,set}_impl`
+/// helpers, because those are also invoked internally by the arena
+/// `allocateFrom` paths to initialize freshly-allocated, already-validated
+/// arena-backed segments; gating there would break legitimate allocation even
+/// when native access is off. Instead the gate is applied at each public JNI
+/// entry point (the methods a Java caller can reach directly).
+fn require_native_access(op: &str) -> Result<(), MethodCallFailed> {
+    if !native_access_enabled() {
+        return Err(RuntimeError::IllegalCallerException {
+            message: format!(
+                "Native access is not enabled for this module \
+                 (MemorySegment.{op} denied)"
+            ),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Safely transmute a raw function address to an extern "C" fn pointer.
 /// Returns an error if native access is not permitted, or if the address
 /// is null or misaligned.
@@ -449,6 +475,8 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "getAtIndex",
         "(Ljava/lang/foreign/ValueLayout;J)Ljava/lang/Object;",
         |ctx, args| {
+            // Defense-in-depth: dereferences the segment's raw `ptr` field.
+            require_native_access("getAtIndex")?;
             let this = obj_arg(args, 0)?;
             let layout = obj_arg(args, 1)?;
             let index = match args.get(2) {
@@ -470,6 +498,8 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "setAtIndex",
         "(Ljava/lang/foreign/ValueLayout;JLjava/lang/Object;)V",
         |ctx, args| {
+            // Defense-in-depth: dereferences the segment's raw `ptr` field.
+            require_native_access("setAtIndex")?;
             let this = obj_arg(args, 0)?;
             let layout = obj_arg(args, 1)?;
             let index = match args.get(2) {
@@ -731,6 +761,8 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "copy",
         "(Ljava/lang/foreign/MemorySegment;JLjava/lang/foreign/MemorySegment;JJ)V",
         |ctx, args| {
+            // Defense-in-depth: copy dereferences both segments' raw `ptr` fields.
+            require_native_access("copy")?;
             let src = obj_arg(args, 0)?;
             let src_offset = match args.get(1) {
                 Some(Value::Long(n)) => *n,
@@ -843,6 +875,8 @@ fn register_pe_memory_segment(r: &mut NativeMethodRegistry) {
         "fill",
         "(B)Ljava/lang/foreign/MemorySegment;",
         |ctx, args| {
+            // Defense-in-depth: fill writes to the segment's raw `ptr` field.
+            require_native_access("fill")?;
             let this = obj_arg(args, 0)?;
             let byte_val = match args.get(1) {
                 Some(Value::Int(n)) => *n as u8,
@@ -955,6 +989,8 @@ fn pe_segment_access_addr(
 }
 
 fn pe_segment_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Defense-in-depth: get() dereferences the segment's raw `ptr` field.
+    require_native_access("get")?;
     let this = obj_arg(args, 0)?;
     let layout = obj_arg(args, 1)?;
     let offset = match args.get(2) {
@@ -999,6 +1035,8 @@ fn pe_segment_get_impl(
 }
 
 fn pe_segment_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Defense-in-depth: set() dereferences the segment's raw `ptr` field.
+    require_native_access("set")?;
     let this = obj_arg(args, 0)?;
     let layout = obj_arg(args, 1)?;
     let offset = match args.get(2) {
@@ -2478,14 +2516,28 @@ fn register_pe2_string_marshaling(r: &mut NativeMethodRegistry) {
                 Value::Long(n) => n,
                 _ => 0,
             };
-            // Bounds check: string + null terminator must fit within segment
+            // Bounds check: string + null terminator must fit within segment.
+            // A segment with size 0 has unknown bounds (e.g. created via
+            // ofAddress or wrapping a raw function pointer); writing to such a
+            // segment is an arbitrary-native-write primitive. The READ path
+            // (getUtf8String) rejects zero-size segments, so the WRITE path must
+            // be symmetric and reject them too rather than skipping the bounds
+            // check and writing blindly to the raw address.
             let seg_size = match ctx.get_field(this, 1) {
-                Value::Long(n) => n,
-                _ => 0,
+                Value::Long(n) if n > 0 => n,
+                _ => {
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "setUtf8String on a segment with unknown bounds \
+                                  (size 0): reinterpret the segment with a known \
+                                  size before writing a C string"
+                            .into(),
+                    }
+                    .into());
+                }
             };
             let str_bytes = s.as_bytes();
             let needed = str_bytes.len() as i64 + 1; // +1 for null terminator
-            if seg_size > 0 && (offset < 0 || offset + needed > seg_size) {
+            if offset < 0 || offset + needed > seg_size {
                 return Err(RuntimeError::IllegalStateException {
                     message: format!(
                         "setUtf8String: offset {} + {} bytes exceeds segment size {}",

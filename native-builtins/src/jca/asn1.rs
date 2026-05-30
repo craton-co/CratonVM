@@ -258,6 +258,12 @@ pub fn read_oid(content: &[u8]) -> Result<String, DerError> {
             }
             let b = content[i];
             i += 1;
+            // Reject arcs that would overflow u64: if any of the top 7 bits of
+            // the accumulator are set, `v << 7` would discard them and yield a
+            // silently-wrong dotted-decimal value (and panics in debug builds).
+            if (v >> 57) != 0 {
+                return Err(DerError::TooLarge);
+            }
             v = (v << 7) | ((b & 0x7F) as u64);
             if (b & 0x80) == 0 {
                 break;

@@ -673,6 +673,9 @@ mod tests {
         // `drain_per_thread_into_repository` runs. Each emit batch below is
         // followed by an explicit drain. Baseline drain at the start clears
         // any stragglers from other tests running in parallel.
+        // Serialize against other global-ring tests so a concurrent emit/drain
+        // can't perturb our exact event-count assertions.
+        let _g = crate::repository::jfr_test_guard();
         let mut fr = crate::create_flight_recorder();
         let rid = fr.new_recording(crate::recording::RecordingSettings::new("stream-test"));
         fr.start_recording(rid);
@@ -712,6 +715,9 @@ mod tests {
         // the polled stream slice is materialised. The stream filter is what
         // we're actually exercising — it must accept only `gc_type_id`
         // events.
+        // Serialize against other global-ring tests so a concurrent emit/drain
+        // can't perturb our exact event-count assertions.
+        let _g = crate::repository::jfr_test_guard();
         let mut fr = crate::create_flight_recorder();
         let gc_type_id = fr.type_registry.find_by_name("jdk.GarbageCollection").unwrap();
 

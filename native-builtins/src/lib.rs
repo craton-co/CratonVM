@@ -12469,6 +12469,42 @@ pub(crate) fn unsafe_array_index_from_offset(
     }
 }
 
+/// Decode a JVM-controlled `Unsafe` byte offset into an array element index
+/// AND validate it against the array's length, all within this crate.
+///
+/// `unsafe_array_index_from_offset` deliberately returns the decoded
+/// (possibly out-of-range) index when the offset is out of bounds so a
+/// downstream bounds check can fail cleanly. But several `Unsafe`
+/// array get/set/getAndSet/getAndAdd/CAS call sites fed that index
+/// straight into `ctx.get_array_element` / `ctx.set_array_element` /
+/// `ctx.compare_and_swap_field` with no explicit check — making memory
+/// safety depend entirely on the host accessor validating the index (an
+/// out-of-crate invariant). If the host accessor trusted the index this
+/// would be an OOB read/write primitive reachable from Java via a forged
+/// byte offset.
+///
+/// This helper closes that gap: it decodes the offset and returns
+/// `Some(idx)` only when `idx < array_length`. On any out-of-bounds
+/// offset it returns `None`, and the caller short-circuits to a benign
+/// JDK-appropriate result (mirroring how the non-array / type-mismatch
+/// arms in these same handlers already fall back to a null/zero/no-op
+/// sentinel) instead of touching the heap. Out-of-bounds `Unsafe` access
+/// is undefined behaviour in the JDK, so a benign sentinel is a sound
+/// choice and keeps the hot path branch-light.
+#[inline]
+pub(crate) fn unsafe_checked_array_index(
+    ctx: &dyn NativeContext,
+    obj: cratonvm_types::ObjectRef,
+    offset: usize,
+) -> Option<usize> {
+    let idx = unsafe_array_index_from_offset(ctx, obj, offset);
+    if idx < ctx.array_length(obj) {
+        Some(idx)
+    } else {
+        None
+    }
+}
+
 /// Extract the object from args at the given position.
 pub(crate) fn unsafe_obj(args: &[Value], pos: usize) -> Option<cratonvm_types::ObjectRef> {
     match args.get(pos) {
@@ -13092,7 +13128,12 @@ pub(crate) fn native_unsafe_cas_int(ctx: &mut dyn NativeContext, args: &[Value])
         // Route through the locked CAS path so concurrent threads can't
         // interleave inside the load+compare+store. See the matching note
         // in `native_unsafe_cas_object` above.
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
+        // Bounds-check the decoded index in-crate before it reaches the
+        // host accessor; OOB offset => CAS fails (no heap touch).
+        let idx = match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(i) => i,
+            None => return Ok(Some(Value::Int(0))),
+        };
         let result = ctx.compare_and_swap_field(obj, idx, expected, new_val);
         return Ok(Some(Value::Int(if result { 1 } else { 0 })));
     }
@@ -13125,7 +13166,11 @@ pub(crate) fn native_unsafe_cas_long(ctx: &mut dyn NativeContext, args: &[Value]
     }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
         // Route through the locked CAS path. See `native_unsafe_cas_object`.
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
+        // Bounds-check the decoded index in-crate; OOB offset => CAS fails.
+        let idx = match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(i) => i,
+            None => return Ok(Some(Value::Int(0))),
+        };
         let result = ctx.compare_and_swap_field(obj, idx, expected, new_val);
         return Ok(Some(Value::Int(if result { 1 } else { 0 })));
     }
@@ -13250,7 +13295,11 @@ pub(crate) fn native_unsafe_cas_object(ctx: &mut dyn NativeContext, args: &[Valu
     // index keeps the contract: `compare_and_swap_field` reuses the second
     // arg directly when `is_array` is true.
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
+        // Bounds-check the decoded index in-crate; OOB offset => CAS fails.
+        let idx = match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(i) => i,
+            None => return Ok(Some(Value::Int(0))),
+        };
         let result = ctx.compare_and_swap_field(obj, idx, expected, new_val);
         return Ok(Some(Value::Int(if result { 1 } else { 0 })));
     }
@@ -13274,8 +13323,10 @@ pub(crate) fn native_unsafe_get_int_volatile(ctx: &mut dyn NativeContext, args: 
         }));
     }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
-        Ok(Some(ctx.get_array_element(obj, idx)))
+        match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(idx) => Ok(Some(ctx.get_array_element(obj, idx))),
+            None => Ok(Some(Value::Int(0))),
+        }
     } else {
         Ok(Some(ctx.get_field_volatile(obj, offset)))
     }
@@ -13297,8 +13348,10 @@ pub(crate) fn native_unsafe_put_int_volatile(ctx: &mut dyn NativeContext, args: 
         return Ok(None);
     }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
-        ctx.set_array_element(obj, idx, val);
+        if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
+            ctx.set_array_element(obj, idx, val);
+        }
+        // OOB offset => no-op (benign), never reaches the host accessor.
     } else {
         ctx.set_field_volatile(obj, offset, val);
     }
@@ -13325,8 +13378,10 @@ fn native_unsafe_get_long_volatile(
         }));
     }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
-        Ok(Some(ctx.get_array_element(obj, idx)))
+        match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(idx) => Ok(Some(ctx.get_array_element(obj, idx))),
+            None => Ok(Some(Value::Long(0))),
+        }
     } else {
         Ok(Some(ctx.get_field_volatile(obj, offset)))
     }
@@ -13351,8 +13406,10 @@ fn native_unsafe_put_long_volatile(
         return Ok(None);
     }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
-        ctx.set_array_element(obj, idx, val);
+        if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
+            ctx.set_array_element(obj, idx, val);
+        }
+        // OOB offset => no-op (benign), never reaches the host accessor.
     } else {
         ctx.set_field_volatile(obj, offset, val);
     }
@@ -13375,8 +13432,10 @@ fn native_unsafe_get_object_volatile(
         return Ok(Some(recover_object_arg(synthetic_get(ctx, obj, offset))));
     }
     let val = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
-        ctx.get_array_element(obj, idx)
+        match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(idx) => ctx.get_array_element(obj, idx),
+            None => Value::Object(None),
+        }
     } else {
         ctx.get_field_volatile(obj, offset)
     };
@@ -13405,8 +13464,10 @@ fn native_unsafe_put_object_volatile(
         return Ok(None);
     }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
-        ctx.set_array_element(obj, idx, val);
+        if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
+            ctx.set_array_element(obj, idx, val);
+        }
+        // OOB offset => no-op (benign), never reaches the host accessor.
     } else {
         ctx.set_field_volatile(obj, offset, val);
     }
@@ -13426,8 +13487,10 @@ pub(crate) fn native_unsafe_get_object(ctx: &mut dyn NativeContext, args: &[Valu
         return Ok(Some(recover_object_arg(synthetic_get(ctx, obj, offset))));
     }
     let val = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
-        ctx.get_array_element(obj, idx)
+        match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(idx) => ctx.get_array_element(obj, idx),
+            None => Value::Object(None),
+        }
     } else {
         ctx.get_field(obj, offset)
     };
@@ -13451,8 +13514,10 @@ pub(crate) fn native_unsafe_put_object(ctx: &mut dyn NativeContext, args: &[Valu
         return Ok(None);
     }
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
-        ctx.set_array_element(obj, idx, val);
+        if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
+            ctx.set_array_element(obj, idx, val);
+        }
+        // OOB offset => no-op (benign), never reaches the host accessor.
     } else {
         ctx.set_field(obj, offset, val);
     }
@@ -13713,8 +13778,10 @@ pub(crate) fn native_unsafe_get_int(ctx: &mut dyn NativeContext, args: &[Value])
         }
     };
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
-        Ok(Some(ctx.get_array_element(obj, idx)))
+        match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(idx) => Ok(Some(ctx.get_array_element(obj, idx))),
+            None => Ok(Some(Value::Int(0))),
+        }
     } else {
         Ok(Some(ctx.get_field(obj, offset)))
     }
@@ -13732,8 +13799,10 @@ pub(crate) fn native_unsafe_put_int(ctx: &mut dyn NativeContext, args: &[Value])
         }
     };
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
-        ctx.set_array_element(obj, idx, val);
+        if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
+            ctx.set_array_element(obj, idx, val);
+        }
+        // OOB offset => no-op (benign), never reaches the host accessor.
     } else {
         ctx.set_field(obj, offset, val);
     }
@@ -13755,8 +13824,10 @@ pub(crate) fn native_unsafe_get_long(ctx: &mut dyn NativeContext, args: &[Value]
         }
     };
     let v = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
-        ctx.get_array_element(obj, idx)
+        match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(idx) => ctx.get_array_element(obj, idx),
+            None => Value::Long(0),
+        }
     } else {
         ctx.get_field(obj, offset)
     };
@@ -13781,8 +13852,10 @@ pub(crate) fn native_unsafe_put_long(ctx: &mut dyn NativeContext, args: &[Value]
         }
     };
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
-        ctx.set_array_element(obj, idx, val);
+        if let Some(idx) = unsafe_checked_array_index(ctx, obj, offset) {
+            ctx.set_array_element(obj, idx, val);
+        }
+        // OOB offset => no-op (benign), never reaches the host accessor.
     } else {
         ctx.set_field(obj, offset, val);
     }
@@ -13887,7 +13960,11 @@ pub(crate) fn native_unsafe_get_and_add_int(ctx: &mut dyn NativeContext, args: &
         }
     };
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
+        // OOB offset => return 0 without touching the heap.
+        let idx = match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(i) => i,
+            None => return Ok(Some(Value::Int(0))),
+        };
         let current = ctx.get_array_element(obj, idx);
         if let Value::Int(old) = current {
             ctx.set_array_element(obj, idx, Value::Int(old.wrapping_add(delta)));
@@ -13927,7 +14004,11 @@ fn native_unsafe_get_and_set_int(ctx: &mut dyn NativeContext, args: &[Value]) ->
         }
     };
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
+        // OOB offset => return Int(0) without touching the heap.
+        let idx = match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(i) => i,
+            None => return Ok(Some(Value::Int(0))),
+        };
         let prev = ctx.get_array_element(obj, idx);
         ctx.set_array_element(obj, idx, new_val);
         return Ok(Some(prev));
@@ -14014,7 +14095,11 @@ fn native_unsafe_get_and_add_long(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
     };
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
+        // OOB offset => return 0 without touching the heap.
+        let idx = match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(i) => i,
+            None => return Ok(Some(Value::Long(0))),
+        };
         let current = ctx.get_array_element(obj, idx);
         if let Value::Long(old) = current {
             ctx.set_array_element(obj, idx, Value::Long(old.wrapping_add(delta)));
@@ -14052,7 +14137,11 @@ fn native_unsafe_get_and_set_long(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
     };
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
+        // OOB offset => return Long(0) without touching the heap.
+        let idx = match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(i) => i,
+            None => return Ok(Some(Value::Long(0))),
+        };
         let prev = ctx.get_array_element(obj, idx);
         ctx.set_array_element(obj, idx, new_val);
         return Ok(Some(prev));
@@ -14082,7 +14171,11 @@ fn native_unsafe_get_and_set_object(ctx: &mut dyn NativeContext, args: &[Value])
         }
     };
     if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
-        let idx = unsafe_array_index_from_offset(ctx, obj, offset);
+        // OOB offset => return null without touching the heap.
+        let idx = match unsafe_checked_array_index(ctx, obj, offset) {
+            Some(i) => i,
+            None => return Ok(Some(Value::Object(None))),
+        };
         let prev = ctx.get_array_element(obj, idx);
         ctx.set_array_element(obj, idx, new_val);
         return Ok(Some(prev));

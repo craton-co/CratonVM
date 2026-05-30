@@ -975,6 +975,31 @@ pub fn global_ring_registry() -> &'static ThreadRingRegistry {
     GLOBAL_RING_REGISTRY.get_or_init(ThreadRingRegistry::default)
 }
 
+/// Process-wide serialization lock for tests that touch shared global state
+/// (the [`global_ring_registry`] shards, [`crate::JFR_ENABLED`] via
+/// `set_enabled`, or any `drain_all`/`drain_per_thread_into_repository`
+/// path). The default `cargo test` runner executes tests on many threads in
+/// parallel; because all of these tests emit into the single process-wide
+/// ring registry and then destructively `drain_all()`, a concurrently-running
+/// test can steal another's events, and `set_enabled` toggles can race the
+/// `JFR_ENABLED` gate. Every such test acquires this lock for its whole
+/// duration (a `parking_lot::Mutex`, which does not poison on panic, so one
+/// failing test cannot wedge the rest).
+///
+/// `#[cfg(test)]` only — this is test scaffolding and adds nothing to the
+/// production build.
+#[cfg(test)]
+pub(crate) static JFR_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Acquire the global [`JFR_TEST_LOCK`] for the lifetime of the returned
+/// guard. Call this at the very top of any test that emits into the global
+/// ring registry, toggles `set_enabled`, or drains the rings, so such tests
+/// cannot interleave and steal each other's events.
+#[cfg(test)]
+pub(crate) fn jfr_test_guard() -> parking_lot::MutexGuard<'static, ()> {
+    JFR_TEST_LOCK.lock()
+}
+
 /// Push an event onto the calling thread's SPSC ring shard, registering it
 /// with the global registry on first call.
 ///
@@ -1290,6 +1315,9 @@ mod tests {
 
     #[test]
     fn push_to_thread_ring_records_event_visible_to_drain_all() {
+        // Serialize against other global-ring tests: a concurrent `drain_all`
+        // could steal this thread's event before we inspect our own shard.
+        let _g = jfr_test_guard();
         // Push an event with a unique tag, then verify it is reachable through
         // the same Arc shard that `register_current_thread` returns. We pop
         // every event out of the shard (SPSC consumer side) and search the
