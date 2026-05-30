@@ -881,7 +881,97 @@ pub fn verify_class_structure(class: &Class, store: &ClassStore) -> Result<(), L
     // class-hierarchy walk, and other corner cases that our walk misses.
     // Re-enable once the walk matches JVMS §5.4.3.3 method resolution.
     let _ = verify_abstract_method_implementation;
+    verify_inherited_abstract_methods_implemented(class, store)?;
     verify_code_attribute_presence(class)?;
+    Ok(())
+}
+
+/// A non-abstract (concrete), non-interface class must provide a concrete
+/// implementation for every abstract method it inherits from its superclass
+/// chain (JVMS §5.4.3.3 / AbstractMethodError-class structural check).
+///
+/// Scope: this check is intentionally limited to abstract methods inherited
+/// through the **superclass** chain. Interface (abstract/default) methods are
+/// NOT modeled here — the broader interface walk in
+/// `verify_abstract_method_implementation` / `verify_interface_methods` is
+/// disabled because its simplified resolution rejects legitimate JDK and
+/// third-party classes (miranda methods, inherited interface defaults, …).
+/// Superclass-inherited abstract methods are unambiguous, so we can enforce
+/// them safely.
+///
+/// "Implemented vs not": for each abstract method declared somewhere on the
+/// superclass chain, we walk from the concrete class up to (but not including)
+/// the declaring ancestor, looking for a method with the exact same
+/// name+descriptor that is itself concrete (non-abstract). If such an override
+/// exists anywhere in that span, the abstract method is considered implemented.
+fn verify_inherited_abstract_methods_implemented(
+    class: &Class,
+    store: &ClassStore,
+) -> Result<(), LinkageError> {
+    // Only concrete (non-abstract, non-interface) classes must implement
+    // inherited abstract methods. An abstract class (or interface) may leave
+    // them unimplemented.
+    if class.is_abstract() || class.is_interface() {
+        return Ok(());
+    }
+
+    // Walk the superclass chain, inspecting each ancestor's declared abstract
+    // methods.
+    let mut current_id = class.superclass;
+    while let Some(ancestor_id) = current_id {
+        let ancestor = match store.get(ancestor_id) {
+            Some(c) => c,
+            None => break,
+        };
+
+        for method in &ancestor.methods {
+            if !method.is_abstract() || method.is_static() {
+                continue;
+            }
+            // Constructors / class initializers are never abstract overrides.
+            if method.name.starts_with('<') {
+                continue;
+            }
+
+            // Look for a concrete override with the exact same name+descriptor
+            // anywhere from the concrete class (inclusive) up to — but not
+            // including — the declaring ancestor.
+            let mut scan_id = Some(class.id);
+            let mut implemented = false;
+            while let Some(id) = scan_id {
+                if id == ancestor_id {
+                    break;
+                }
+                let scan_class = match store.get(id) {
+                    Some(c) => c,
+                    None => break,
+                };
+                if let Some(found) =
+                    scan_class.find_method(&method.name, &method.descriptor)
+                {
+                    if !found.is_abstract() {
+                        implemented = true;
+                        break;
+                    }
+                }
+                scan_id = scan_class.superclass;
+            }
+
+            if !implemented {
+                return Err(LinkageError::VerifyError {
+                    class_name: class.name.to_string(),
+                    method_name: method.name.to_string(),
+                    message: format!(
+                        "concrete class must implement abstract method {}.{}{}",
+                        ancestor.name, method.name, method.descriptor,
+                    ),
+                });
+            }
+        }
+
+        current_id = ancestor.superclass;
+    }
+
     Ok(())
 }
 

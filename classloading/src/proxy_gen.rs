@@ -1581,7 +1581,19 @@ mod tests {
 
         for spec in &specs {
             let bytes = emit_proxy_classfile(spec).expect("emitter must succeed");
-            let cf = read_class(&bytes).expect("emitted class file must round-trip");
+            let mut cf = read_class(&bytes).expect("emitted class file must round-trip");
+            // `read_class` returns every attribute in its lazy `Raw` form,
+            // so `as_decoded()` would yield `None` until we force a decode.
+            // Decode each method's attributes against the class's constant
+            // pool before inspecting the Code attribute. We split the borrow
+            // (`constant_pool` immutable, `methods` mutable — disjoint fields)
+            // so the decode can mutate each `LazyAttribute` in place.
+            let cp = &cf.constant_pool;
+            for m in &mut cf.methods {
+                for attr in &mut m.attributes {
+                    attr.decode(cp).expect("method attribute must decode");
+                }
+            }
             for m in &cf.methods {
                 let code = m
                     .attributes
