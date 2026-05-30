@@ -792,3 +792,23 @@ test-compile`), classpath `target/classes;target/test-classes;<test deps>`, run
 object in a local across an explicit `System.gc()` that relocates it, then
 dereferences it — set `CRATONVM_GC_VERIFY_STALE=1` to surface the POST-GC STALE
 diagnostics.
+
+**CONFIRMED (read of `vm/src/memory/gc.rs`, session 2026-05-30).** The post-GC
+root-remap routine remaps ~16 categories — JNI globals (step 9), thread-local
+refs java_thread_obj/pending_async_exception (10), root_snapshot (11), scoped
+values incl. keys (12), resolution/condy cache (13), class-mirror reverse map
+(14), Integer/Boolean valueOf cache (15), LambdaMetafactory CallSite cache (16)
+— but it does **NOT** remap `thread.frames` interpreter **locals / operand
+stack**. `verify_no_stale_refs` then iterates exactly those frame slots and emits
+the POST-GC STALE LOCAL/STACK warnings — i.e. it's the canary proving the frame
+remap step is missing. (Hypothesis #1/#2/#3 above superseded: the frames ARE in
+`thread.frames` at remap time; the remap simply skips them.)
+
+**Fix (vm-crate-only, no gc-crate change needed): add a frame remap step before
+`verify_no_stale_refs(thread, pointer_map)`** that mirrors the verifier's loop —
+for each `thread.frames` frame, for each local and each operand-stack slot, if
+`Value::Object(Some(r))` and `pointer_map.get(r.as_ptr())` is Some, write the
+forwarded `ObjectRef`; route other value kinds through the existing
+`update_value_ref(val, pointer_map)` helper for completeness. Held pending the
+concurrent gc-crate refactor only out of caution; the change itself is isolated
+to `vm/src/memory/gc.rs` and uses the already-built `pointer_map`.
