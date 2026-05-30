@@ -1120,12 +1120,22 @@ impl Frame {
             let Some(old_ptr) = cv.as_object_ptr() else {
                 continue;
             };
-            // Filter long-bit-pattern false positives: only treat this slot
-            // as a real Object reference if old_ptr points at a live heap
-            // object pre-relocation.
-            if heap.is_object_address(old_ptr as usize).is_none() {
-                continue;
-            }
+            // Gate on `pointer_map` membership, NOT a live-header probe of
+            // `old_ptr`. After a moving GC, `old_ptr` is the *from-space*
+            // address, whose header has already been zeroed/reclaimed — so
+            // `heap.is_object_address(old_ptr)` returns `None` for precisely
+            // the slots that were relocated and need remapping, leaving them
+            // dangling. That was the H2 `TestAll` `System.gc()` crash:
+            // POST-GC STALE LOCAL + ZERO-HEADER on `Utils.collectGarbage` /
+            // `TestAll.*` frames, cascading into the OOBFIELD `class_id=0`
+            // probe, an IllegalMonitorStateException on frame pop, and a final
+            // NPE. The `pointer_map` is the authoritative record of
+            // relocations and is exactly the criterion `verify_no_stale_refs`
+            // uses, so remap iff the slot's address is a key: a long
+            // bit-pattern false positive (BC SM2) was never rooted and thus
+            // never appears as a key, so it is correctly left untouched —
+            // identical treatment to the rooting scan.
+            let _ = heap;
             if let Some(&new_addr) = pointer_map.get(&(old_ptr as usize)) {
                 *cv = CompactValue::try_from_pointer(new_addr as u64)
                     .unwrap_or_else(CompactValue::null);

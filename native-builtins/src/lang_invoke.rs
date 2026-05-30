@@ -4163,6 +4163,36 @@ pub(crate) fn native_mhn_init(
             let name_str = ctx.create_string("<init>");
             ctx.set_field_by_name(member_name, "name", Value::Object(Some(name_str)));
             ctx.set_field_by_name(member_name, "flags", Value::Int(flags));
+
+            // Populate `type` (the MethodType, MemberName slot 2). Unlike the
+            // Method case — where the Java `MemberName(Method)` constructor
+            // fills `type` itself — the constructor path leaves it unset, so
+            // `MemberName.getMethodType()` (which returns slot 2 directly)
+            // would hand back an uninitialized slot. Real JDK callers then do
+            // `getMethodType().changeReturnType(...)` / `.returnType()` on it;
+            // reading slot 0 of a garbage "MethodType" dereferences a wild
+            // pointer and SIGSEGVs. This is exactly the crash hit by
+            // `ReflectionFactory.newConstructorForSerialization` →
+            // `DirectMethodHandle.makeAllocator` (and thus any JUnit 4 run,
+            // whose RunNotifier builds serializable constructors).
+            //
+            // A constructor's invocation type is `(paramTypes...)void`, so
+            // build that MethodType from the reflected Constructor's
+            // `parameterTypes` and a void return mirror.
+            let ptypes = match ctx.get_field_by_name(ref_obj, "parameterTypes") {
+                Value::Object(Some(a)) => Value::Object(Some(a)),
+                _ => {
+                    let empty =
+                        ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+                    Value::Object(Some(empty))
+                }
+            };
+            let void_mirror = ctx.primitive_class_mirror(NAME_VOID);
+            let mt = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodType", 6);
+            ctx.set_field(mt, 0, Value::Object(Some(void_mirror)));
+            ctx.set_field(mt, 1, ptypes);
+            populate_method_type_form(ctx, mt);
+            ctx.set_field_by_name(member_name, "type", Value::Object(Some(mt)));
         }
         _ => {
             // Unknown ref object — bail quietly.

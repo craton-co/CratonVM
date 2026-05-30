@@ -985,16 +985,18 @@ impl ValueStack {
             let cv = self.slots[i];
             if cv.is_object() {
                 if let Some(old_ptr) = cv.as_object_ptr() {
-                    // Filter long-bit-pattern false positives (BC SM2 fix,
-                    // 2026-05-28): the bit-exact `CompactValue::long`
-                    // encoding lets longs with sub=SUB_OBJECT through
-                    // `is_object()`. Rewriting such a slot via the pointer
-                    // map would corrupt the primitive long value. Require
-                    // the address to be a live heap object before treating
-                    // it as a real reference.
-                    if heap.is_heap_addr(old_ptr as usize).is_none() {
-                        continue;
-                    }
+                    // Gate on `pointer_map` membership, NOT a live-header /
+                    // arena probe of `old_ptr`. Post-GC, `old_ptr` is the
+                    // *from-space* address whose memory has already been
+                    // zeroed/reclaimed, so `heap.is_heap_addr(old_ptr)` can
+                    // reject precisely the slots that were relocated and need
+                    // remapping — the operand-stack half of the H2 `TestAll`
+                    // POST-GC STALE STACK crash. The `pointer_map` is the
+                    // authoritative relocation record (and the exact criterion
+                    // `verify_no_stale_refs` checks): a long bit-pattern false
+                    // positive (BC SM2 `SUB_OBJECT`) was never rooted, so it
+                    // cannot be a key and is left untouched — identical to the
+                    // rooting scan's treatment.
                     if let Some(&new_addr) = pointer_map.get(&(old_ptr as usize)) {
                         // SAFETY: `new_addr` comes from a `HashMap<usize,
                         // usize>` of live-heap pointers populated by the GC
