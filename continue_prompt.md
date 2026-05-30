@@ -812,3 +812,49 @@ forwarded `ObjectRef`; route other value kinds through the existing
 `update_value_ref(val, pointer_map)` helper for completeness. Held pending the
 concurrent gc-crate refactor only out of caution; the change itself is isolated
 to `vm/src/memory/gc.rs` and uses the already-built `pointer_map`.
+
+---
+
+# CORRECTION + FIX: H2 GC stale-root crash — session 2026-05-30 (FIXED)
+
+**The two earlier entries above were WRONG** about the mechanism ("missing
+frame remap step"). `update_all_roots` (vm/src/memory/gc.rs) DOES remap
+`thread.frames` (step 1, via `Frame::update_local_refs` +
+`ValueStack::update_object_refs`). The real bug was INSIDE those two fns.
+
+**Actual root cause.** Both update fns gated each remap on
+`heap.is_object_address(old_ptr)` (frame locals) / `heap.is_heap_addr(old_ptr)`
+(operand stack). Those checks read/region-test the *pre-GC* address, but the
+update runs *after* evacuation when the young from-space region is reset — so a
+just-moved object's OLD address fails region containment, the filter skips it,
+and the live frame/stack root is left stale. `verify_no_stale_refs` (same fn,
+end of `update_all_roots`) uses raw `pointer_map` membership, which is why it
+flagged exactly the slots the filtered update skipped (the POST-GC STALE
+LOCAL/STACK messages). Cascade: stale roots → all-zero-header `get_field` →
+`IllegalMonitorStateException` in `Utils.collectGarbage` → NPE ~20 tests into
+`org.h2.test.TestAll`.
+
+**Fix (branch `fix/gc-frame-roots`, commit 7a3f0c2; vm-crate-only —
+frame.rs + value_stack.rs, NOT the gc crate).** The `pointer_map` (forwarding
+table) is authoritative: remap a slot iff its address is a key. The
+`is_object_address`/`is_heap_addr` pre-filter never actually protected the SM2
+long-bit case it was added for — a verbatim long is only rewritten if its value
+equals a relocated object's old address (a map key), and post-evacuation that
+address fails the region check identically for a real oop and a colliding long,
+so the filter only no-op'd non-key longs (never remapped anyway). The
+category-2 Double-as-oop heuristic in `update_object_refs` keeps its
+`is_heap_addr` guard (honest doubles span the full 64-bit space, not explicitly
+object-tagged).
+
+**Verified.** H2 TestAll runs to the time bound (rc=124, like HotSpot) with
+ZERO POST-GC STALE and zero stale-pointer/all-zero/NPE/monitor errors (was a
+hard crash). SM2 canary `bc-math-raw` 4/4; BC green set
+(util-encoders/util-utiltest/crypto-threshold) unregressed; unit tests
+`update_local_refs_does_not_touch_long_with_pointer_shaped_bits` and the two
+`t10_gc_*` pass. NOTE the synthetic "object in a local across System.gc()"
+repros (GcRoot/GcRoot2) do NOT trigger it — the survivors tenure before the
+GC moves them; H2 TestAll remains the reliable repro.
+
+**Not yet merged to dev** (dev checkout had a concurrent gc-crate refactor in
+flight; the fix is isolated on `fix/gc-frame-roots` to avoid collision). Merge
+when the gc-crate work settles.
