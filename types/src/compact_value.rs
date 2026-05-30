@@ -214,6 +214,14 @@ fn is_nan_tagged(v: u64) -> bool {
 // never touched on the hot well-formed-reference path.
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Once;
+
+/// Guards the one-time-per-process diagnostic emitted by
+/// [`note_object_degradation`] when the *first* long↔object collision is
+/// observed at runtime. A `Once` keeps the message to a single line no matter
+/// how many subsequent collisions the counter records — surfacing the danger
+/// early without spamming a hot crash log.
+static FIRST_DEGRADATION_DIAG: Once = Once::new();
 
 /// Process-wide count of NaN-box `SUB_OBJECT` slots that were degraded to a
 /// primitive `Value::Long` because their payload could not be a real heap
@@ -258,7 +266,40 @@ pub fn reset_object_degradation_count() -> u64 {
 #[cold]
 #[inline]
 pub(crate) fn note_object_degradation() {
-    OBJECT_DEGRADATION_COUNT.fetch_add(1, Ordering::Relaxed);
+    let prev = OBJECT_DEGRADATION_COUNT.fetch_add(1, Ordering::Relaxed);
+    // The very first collision (counter transitioning 0 -> 1) is the one worth
+    // shouting about: it means a long↔object bit-pattern collision has actually
+    // reached a context-free decoder at runtime. Emit a single diagnostic and
+    // never again — the counter itself tracks the rest.
+    if prev == 0 {
+        emit_first_degradation_diag();
+    }
+}
+
+/// Cold one-shot diagnostic for the first observed long↔object collision.
+///
+/// Kept out-of-line and `#[cold]` so the branch in [`note_object_degradation`]
+/// stays a single predicted-not-taken compare on the (already cold) degrade
+/// path. The crate has no logging dependency, so this writes one line to
+/// stderr behind a `Once`; the `debug_assert!` additionally turns the first
+/// collision into a test/fuzz failure where that is the desired behavior.
+#[cold]
+#[inline(never)]
+fn emit_first_degradation_diag() {
+    debug_assert!(
+        false,
+        "CompactValue: long↔object NaN-box collision degraded to Value::Long; \
+         a context-free decoder saw a primitive long whose bits match SUB_OBJECT \
+         (see object_degradation_count / the to_value Safety contract)"
+    );
+    FIRST_DEGRADATION_DIAG.call_once(|| {
+        eprintln!(
+            "CompactValue: first long↔object NaN-box collision degraded to \
+             Value::Long (SUB_OBJECT-patterned primitive long reached a \
+             context-free decoder). Subsequent collisions are counted by \
+             object_degradation_count() but not logged."
+        );
+    });
 }
 
 /// Round-8 branch-hint: the SUB_OBJECT degraded path (null or unaligned
@@ -420,6 +461,19 @@ impl CompactValue {
 
     // -- Tag query -----------------------------------------------------------
 
+    /// Extract the 3-bit NaN-box sub-tag (bits 49-47) as a `u64`.
+    ///
+    /// This is **only** meaningful once the slot has been confirmed
+    /// NaN-tagged via [`is_nan_tagged`]; on an untagged (Long/Double) slot the
+    /// result is just the corresponding bits of the raw value. Callers always
+    /// gate on `is_nan_tagged(self.0)` first. Centralizes the
+    /// `(self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK` shift/mask so the accessors
+    /// don't each recompute it — identical behavior, clearer intent.
+    #[inline(always)]
+    fn subtag(&self) -> u64 {
+        (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK
+    }
+
     /// Extract the logical type tag.
     ///
     /// **Important:** Long and Double are both stored as raw 64-bit values
@@ -431,7 +485,7 @@ impl CompactValue {
         if !is_nan_tagged(self.0) {
             return CompactTag::Double;
         }
-        match (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK {
+        match self.subtag() {
             SUB_INT => CompactTag::Int,
             SUB_FLOAT => CompactTag::Float,
             SUB_OBJECT => CompactTag::Object,
@@ -452,7 +506,7 @@ impl CompactValue {
         if !is_nan_tagged(self.0) {
             return None;
         }
-        if (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK != SUB_INT {
+        if self.subtag() != SUB_INT {
             return None;
         }
         // Payload is the zero-extended u32; reinterpret as i32.
@@ -560,7 +614,7 @@ impl CompactValue {
         if !is_nan_tagged(self.0) {
             return None;
         }
-        if (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK != SUB_FLOAT {
+        if self.subtag() != SUB_FLOAT {
             return None;
         }
         Some(f32::from_bits((self.0 & PAYLOAD_MASK) as u32))
@@ -581,7 +635,7 @@ impl CompactValue {
         if !is_nan_tagged(self.0) {
             return None;
         }
-        if (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK != SUB_OBJECT {
+        if self.subtag() != SUB_OBJECT {
             return None;
         }
         Some(self.0 & PAYLOAD_MASK)
@@ -590,13 +644,13 @@ impl CompactValue {
     /// Returns `true` if this value is tagged as Null.
     #[inline]
     pub fn is_null(&self) -> bool {
-        is_nan_tagged(self.0) && (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK == SUB_NULL
+        is_nan_tagged(self.0) && self.subtag() == SUB_NULL
     }
 
     /// Returns `true` if this value is tagged as Uninitialized.
     #[inline]
     pub fn is_uninitialized(&self) -> bool {
-        is_nan_tagged(self.0) && (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK == SUB_UNINIT
+        is_nan_tagged(self.0) && self.subtag() == SUB_UNINIT
     }
 
     /// Returns `true` if this slot holds a category-2 JVM value
@@ -694,7 +748,15 @@ impl CompactValue {
     /// `Value::Object(Some(_))` requires reconstructing the `ObjectRef` via
     /// unsafe `from_raw`.
     ///
-    /// # Safety / heap-validation contract (HIGH: NaN-box long↔object confusion)
+    /// # Safety / caller contract (HIGH: NaN-box long↔object confusion)
+    ///
+    /// **If the slot may have originated from a primitive `long` (anything not
+    /// provably a reference by JVM type context), you MUST NOT trust an
+    /// `Value::Object(Some(_))` returned here — route the decode through
+    /// [`to_value_checked`](Self::to_value_checked) with a live-heap predicate,
+    /// or through [`decode_by_descriptor`](Self::decode_by_descriptor) when the
+    /// declared type is known. The unchecked form can fabricate a heap
+    /// reference from attacker-controlled long bits.**
     ///
     /// `CompactValue::long` stores i64 bits **verbatim** (see its docs). A
     /// primitive long whose top bits coincide with `NANBOX_BITS`, whose
@@ -805,7 +867,14 @@ impl CompactValue {
     /// Used by the GC scanner to find root set entries without decoding the
     /// full `Value` enum.
     ///
-    /// # Safety / heap-validation contract (HIGH: NaN-box long↔object confusion)
+    /// # Safety / caller contract (HIGH: NaN-box long↔object confusion)
+    ///
+    /// **A `true` here is NOT proof of a live reference. If the slot may have
+    /// originated from a primitive `long`, you MUST validate the payload
+    /// against the live heap before dereferencing or rooting it — prefer
+    /// [`is_object_checked`](Self::is_object_checked) with a heap predicate.
+    /// The unchecked form reports `true` for long bits that merely match the
+    /// `SUB_OBJECT` pattern.**
     ///
     /// This is a **pure bit-pattern test**: it returns `true` for any slot
     /// whose NaN-box sub-tag is `SUB_OBJECT`, regardless of whether the
@@ -826,7 +895,7 @@ impl CompactValue {
     /// `VmHeap::is_object_address`).
     #[inline(always)]
     pub fn is_object(&self) -> bool {
-        is_nan_tagged(self.0) && (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK == SUB_OBJECT
+        is_nan_tagged(self.0) && self.subtag() == SUB_OBJECT
     }
 
     /// Heap-validated counterpart to [`is_object`](Self::is_object).
@@ -1031,7 +1100,7 @@ impl CompactValue {
         // Tagged: inspect the sub-tag.  For J/D descriptors the SUB_LONG_*
         // and untagged-double paths must yield the declared type, not
         // whatever `to_value` happens to return.
-        let sub = (self.0 >> SUBTAG_SHIFT) & SUBTAG_MASK;
+        let sub = self.subtag();
         match desc_byte {
             b'J' => match sub {
                 // An explicit long pair decodes to the stored i64.

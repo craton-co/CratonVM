@@ -835,7 +835,9 @@ impl PlatformBackend for Win32Backend {
     ) -> (f32, f32) {
         // Heuristic measurement — avoids interior mutability / UB.
         // Average character width ~ 0.6 * font size for proportional fonts.
-        let w = text.len() as f32 * font_size * 0.6;
+        // Count Unicode scalar values (not UTF-8 bytes) so multibyte / CJK
+        // text isn't over-measured by its byte length.
+        let w = text.chars().count() as f32 * font_size * 0.6;
         let h = font_size * 1.2;
         (w, h)
     }

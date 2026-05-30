@@ -8,23 +8,31 @@
 //! In stub mode the call records a `StreamOp::Launch { kernel, grid,
 //! block }` on the stream and returns `Ok(())`.
 //!
-//! In `cuda` mode this calls the same `cuLaunchKernel`-driving helper
-//! the default-stream `launch_raw` uses (`backend_cuda::
-//! launch_on_raw_stream`), passing `stream.raw()` instead of the
-//! device's default stream. The kernel-arg packing rules are
-//! identical between the two paths — `KernelArg::DevicePtr(u64)`
-//! storage cells fed into a `Vec<*mut c_void>` and submitted via
-//! `cudarc::driver::result::launch_kernel`.
+//! In `cuda` mode this routes the launch through
+//! [`backend_cuda::DeviceModuleInner::launch_raw_on_stream`], the real
+//! per-stream launch helper, passing the user `Stream`'s underlying
+//! cudarc `Arc<CudaStream>` (via `Stream::cuda_stream_arc()`). The
+//! kernel therefore actually runs on the caller's stream rather than the
+//! context's shared `compute` stream, so two kernels submitted on two
+//! different user streams can run concurrently instead of serialising on
+//! `ctx.compute`. The kernel-arg packing rules are shared with the
+//! default-stream `launch_raw` path (both funnel into
+//! `launch_raw_on_stream_inner`).
 //!
-//! AUDIT 2026-05-24 (HIGH correctness — cross-stream ordering): the
-//! kernel launch is now bracketed by event waits/records that enforce
-//! H→D / kernel / D→H ordering across the bridge's separate cudarc
-//! streams (`copy_h2d`, `compute`, `copy_d2h`). The choreography is:
+//! AUDIT 2026-05-29 (HIGH-2 fix — user stream honoured): previously this
+//! delegated to `DeviceModuleInner::launch_raw`, which hard-routes the
+//! launch onto `ctx.compute`; the user `stream` was used only for event
+//! bookkeeping, so cross-stream concurrency was lost and `launch_raw`'s
+//! internal per-buffer event stamping collided with the event this
+//! function stamps (a second, orphaned `CUevent` per launch). Switching
+//! to `launch_raw_on_stream` (which deliberately does NOT touch `e_h2d`,
+//! `e_k`, or the `last_write` slots — see its doc) makes this function
+//! the single owner of the cross-stream ordering choreography:
 //!
 //!   for each `KernelArg::DevicePtr` arg:
 //!     if buffer.last_write is set:
 //!         stream.wait_event(last_write)        // kernel waits on upload
-//!   <enqueue cuLaunchKernel>
+//!   <enqueue cuLaunchKernel on `stream`>
 //!   kernel_done = Event::new(ctx)
 //!   stream.record_event(kernel_done)           // kernel_done on user stream
 //!   for each `KernelArg::DevicePtr` arg:
@@ -33,9 +41,9 @@
 //! In stub mode the waits/records show up as `EventWait` / `EventRecord`
 //! ops in the user stream's log, which the integration tests assert
 //! against. In `cuda` mode the waits/records hit `cuStreamWaitEvent` /
-//! `cuEventRecord` on the user `Stream::raw()`, so the kernel actually
-//! waits on the prior upload's completion regardless of which cudarc
-//! stream the upload ran on.
+//! `cuEventRecord` on the user `Stream::raw()`, and because the kernel
+//! now runs on that same stream, `kernel_done` recorded on `stream`
+//! genuinely marks the kernel's retirement.
 
 use crate::{
     DeviceContext, DeviceModule, Event, KernelArg, KernelArgs, LaunchConfig, Result, Stream,
@@ -97,12 +105,13 @@ impl DeviceModule {
         // write. Snapshotting under the mutex avoids holding the lock
         // across `wait_event`.
         //
-        // AUDIT 2026-05-24: in cuda mode we ALSO have to make
-        // `ctx.compute` wait on the same events — the actual
-        // cuLaunchKernel goes onto `ctx.compute`, not the user
-        // `stream`. Without that second wait the kernel could start
-        // before the upload retires (the user stream waits, but the
-        // kernel is not on the user stream).
+        // AUDIT 2026-05-29 (HIGH-2 fix): the kernel now actually runs on
+        // the user `stream` (step 3 routes through
+        // `launch_raw_on_stream`), so gating the user stream behind each
+        // input's `last_write` event is sufficient — there is no longer
+        // a second, hidden launch on `ctx.compute` to mirror the wait
+        // onto. (The previous code launched on `ctx.compute` and had to
+        // duplicate every wait there.)
         for slot in &last_write_slots {
             let maybe_ev = slot
                 .lock()
@@ -111,26 +120,6 @@ impl DeviceModule {
                 .cloned();
             if let Some(ev) = maybe_ev {
                 stream.wait_event(&ev)?;
-                #[cfg(feature = "cuda")]
-                {
-                    // Mirror the wait onto `ctx.compute` — the stream
-                    // the kernel actually runs on.
-                    // SAFETY: `compute_raw` returns a `CUstream` owned
-                    // by `ctx`; the event handle is owned by `ev`
-                    // (Arc); both borrowed only for the FFI call.
-                    unsafe {
-                        cudarc::driver::result::stream::wait_event(
-                            ctx.inner().compute_raw(),
-                            ev.cu_event_raw(),
-                            cudarc::driver::sys::CUevent_wait_flags::CU_EVENT_WAIT_DEFAULT,
-                        )
-                    }
-                    .map_err(|e| {
-                        crate::DeviceError::Driver(format!(
-                            "cuStreamWaitEvent compute: {e:?}"
-                        ))
-                    })?;
-                }
             }
         }
 
@@ -140,7 +129,7 @@ impl DeviceModule {
             // Stub mode: no driver to call; just record the launch op.
             // `args` is consumed (dropped) at end of block to match the
             // cuda-mode lifetime so the keep-alive contract is symmetric.
-            let _ = ctx; // unused in stub mode
+            // (`ctx` is still used by step 4's `Event::new(ctx)`.)
             let _consume = args;
             stream.record_op(StreamOp::Launch {
                 kernel: kernel.to_string(),
@@ -151,31 +140,34 @@ impl DeviceModule {
 
         #[cfg(feature = "cuda")]
         {
-            // CUDA-MERGE-NOTE (2026-05-20): the bridge's `backend_cuda`
-            // backend was ported to cudarc 0.13, which does not expose a
-            // raw-`CUstream` launch helper (`launch_on_raw_stream`). The
-            // explicit-stream submission path was never completed against
-            // that API. Until a raw-stream launch helper lands, delegate
-            // to the context's standard compute-stream launch
-            // (`DeviceModuleInner::launch_raw`); the kernel still runs and
-            // is correctly ordered, it just shares the context's compute
-            // stream rather than `stream`'s.
+            // AUDIT 2026-05-29 (HIGH-2 fix): launch on the user-supplied
+            // `stream`, not `ctx.compute`. `backend_cuda` exposes the
+            // real per-stream launch helper `launch_raw_on_stream`, which
+            // funnels the same arg-marshalling as the default-stream path
+            // but submits `cuLaunchKernel` onto the `Arc<CudaStream>` we
+            // hand it. We pass the caller's stream via
+            // `Stream::cuda_stream_arc()`.
             //
-            // AUDIT 2026-05-24: the launch still happens on
-            // `ctx.compute` rather than `stream`, but the event waits
-            // recorded on `stream` above and the kernel_done event
-            // recorded on `stream` below propagate the producer/consumer
-            // dependency across both streams. The kernel itself is
-            // ordered behind upload by `launch_raw_inner`'s `wait_for(
-            // copy_h2d)` (in `from_host`) and the post-launch host-side
-            // wait_for(compute) so `kernel_done.record(stream)` only
-            // fires after the device's compute work is observable.
+            // Crucially, `launch_raw_on_stream` does NOT wait on `e_h2d`,
+            // record `e_k`, or stamp the `last_write` slots — it leaves
+            // all cross-stream ordering to the caller. That makes this
+            // function the SOLE owner of the event choreography (step 2's
+            // waits and step 4's `kernel_done` record + slot stamping),
+            // so there is no longer a duplicate/orphaned completion event
+            // per launch (the prior `launch_raw` delegation stamped its
+            // own per-buffer event that step 4 then overwrote).
             //
             // `DeviceModule(backend::DeviceModuleInner)` exposes its sole
             // field with module-private visibility; `launch.rs` is a child
             // of the crate root and so sees it.
             let module: &crate::backend_cuda::DeviceModuleInner = &self.0;
-            module.launch_raw(ctx.inner(), kernel, cfg, args)?;
+            module.launch_raw_on_stream(
+                ctx.inner(),
+                stream.cuda_stream_arc(),
+                kernel,
+                cfg,
+                args,
+            )?;
             stream.record_op(StreamOp::Launch {
                 kernel: kernel.to_string(),
                 grid: cfg.grid,
@@ -185,43 +177,18 @@ impl DeviceModule {
 
         // ── 4. Record kernel_done and propagate to buffers. ──
         //
-        // Stub mode: record on the user `stream` so the OpLog shows the
-        // event-discipline pattern the integration tests assert on.
-        //
-        // Cuda mode: record on `ctx.compute` — the stream the kernel
-        // actually ran on. Recording on the user `stream` would mark
-        // "user stream's queue position" rather than "kernel
-        // completion", because cuLaunchKernel ran on `ctx.compute`.
-        // A subsequent `cuStreamWaitEvent(any_stream, kernel_done)`
-        // will then correctly gate that stream behind the kernel's
-        // retirement on compute.
+        // AUDIT 2026-05-29 (HIGH-2 fix): the kernel now runs on the user
+        // `stream`, so `kernel_done` is recorded on `stream` itself — its
+        // queue position genuinely marks the kernel's retirement. (Under
+        // the old `ctx.compute` launch this had to record on
+        // `ctx.compute` instead, because the user stream's queue position
+        // said nothing about the kernel.) `Stream::record_event` calls
+        // `cuEventRecord` in cuda mode and appends `StreamOp::EventRecord`
+        // in stub mode, so the same call serves both backends; a
+        // subsequent `cuStreamWaitEvent(any_stream, kernel_done)`
+        // correctly gates that stream behind this kernel.
         let kernel_done = Arc::new(Event::new(ctx)?);
-        #[cfg(not(feature = "cuda"))]
-        {
-            stream.record_event(&kernel_done)?;
-        }
-        #[cfg(feature = "cuda")]
-        {
-            // SAFETY: `compute_raw` returns a `CUstream` owned by
-            // `ctx` and kept alive by the surrounding `&DeviceContext`.
-            // The event handle is owned by `kernel_done` (Arc); both
-            // are borrowed only for the duration of the FFI call.
-            unsafe {
-                cudarc::driver::result::event::record(
-                    kernel_done.cu_event_raw(),
-                    ctx.inner().compute_raw(),
-                )
-            }
-            .map_err(|e| {
-                crate::DeviceError::Driver(format!("cuEventRecord compute: {e:?}"))
-            })?;
-            // Also mark the user stream's op log so introspection
-            // sees the kernel_done marker. `record_op` is a no-op in
-            // cuda mode (the driver owns the queue) so this is free.
-            stream.record_op(StreamOp::EventRecord {
-                event_id: kernel_done.id(),
-            });
-        }
+        stream.record_event(&kernel_done)?;
         for slot in &last_write_slots {
             *slot
                 .lock()

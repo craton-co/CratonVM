@@ -51,17 +51,6 @@ fn map_err<E: std::fmt::Debug>(stage: &str) -> impl FnOnce(E) -> DeviceError + '
     move |e| DeviceError::Driver(format!("{stage}: {e:?}"))
 }
 
-/// Round-10 multi-GPU enumeration. Queries `cuDeviceGetCount` via
-/// cudarc's `result::device::get_count`. `cuInit` is idempotent so
-/// calling it here costs only a per-process atomic check after the
-/// first call (and `CudaContext::new` already calls it).
-pub(crate) fn device_count() -> Result<u32> {
-    cudarc::driver::result::init().map_err(map_err("cuInit"))?;
-    let n = cudarc::driver::result::device::get_count()
-        .map_err(map_err("cuDeviceGetCount"))?;
-    Ok(n.max(0) as u32)
-}
-
 pub(crate) fn probe() -> Result<DeviceCaps> {
     let dev = CudaDevice::new(0).map_err(map_err("CudaDevice::new(0)"))?;
     let name = dev.name().map_err(map_err("device name"))?;
@@ -231,26 +220,27 @@ impl DeviceContextInner {
     }
 
     /// AUDIT 2026-05-24 (HIGH correctness): expose `copy_h2d`'s raw
-    /// stream handle so `lib.rs::DeviceBuffer::from_host_async` can
-    /// `cuEventRecord` the buffer's `last_write` event on the same
-    /// stream the H→D copy ran on. Without this, a subsequent
-    /// `cuStreamWaitEvent(user_stream, last_write)` would observe an
-    /// event that was never recorded on the upload-side queue and
-    /// would not actually wait on the copy retiring (the cudarc
-    /// `htod_sync_copy` is sync today, so the practical effect is
-    /// nil — but the contract becomes correct against any future
-    /// async-upload refactor).
+    /// stream handle so callers can `cuEventRecord` an event on the same
+    /// stream the H→D copy ran on. Currently unused — `from_host_async`
+    /// routes uploads onto the *user* stream (H10a) rather than
+    /// `copy_h2d` — but retained as the documented accessor for any
+    /// future code that needs to order against the context's dedicated
+    /// upload stream.
+    #[allow(dead_code)]
     pub(crate) fn copy_h2d_raw(&self) -> cudarc::driver::sys::CUstream {
         self.copy_h2d.stream
     }
 
     /// AUDIT 2026-05-24 (HIGH correctness): expose `compute`'s raw
-    /// stream handle so `lib.rs::DeviceModule::launch_on_stream` can
-    /// `cuEventRecord` the kernel-done event on the stream the kernel
-    /// actually ran on. Recording it on the user `Stream` instead
-    /// would mark "user stream's queue position" rather than "kernel
-    /// completion", because the launch goes onto `ctx.compute` rather
-    /// than the user stream.
+    /// stream handle.
+    ///
+    /// AUDIT 2026-05-29 (HIGH-2 fix): no longer used by
+    /// `DeviceModule::launch_on_stream` — that path now launches on (and
+    /// records `kernel_done` on) the user `Stream` directly, so it no
+    /// longer needs the context's `compute` stream handle. Retained as
+    /// the documented accessor for the context's compute stream in case
+    /// future cross-stream bookkeeping needs it.
+    #[allow(dead_code)]
     pub(crate) fn compute_raw(&self) -> cudarc::driver::sys::CUstream {
         self.compute.stream
     }
@@ -330,30 +320,12 @@ impl DeviceModuleInner {
     ) -> Result<()> {
         // Round-7 PERF Fix 3: conservative default — assume a D→H copy
         // follows so callers that do read back results stay correctly
-        // ordered. The dedicated `launch_raw_no_d2h_sync` entry point
-        // skips the post-launch event when the caller knows no D→H
-        // copy follows (e.g. fire-and-forget kernels, or back-to-back
-        // launches on the compute stream with no `to_host` between).
+        // ordered, recording the per-buffer kernel-completion event a
+        // later `to_host` waits on. (`launch_raw_inner` still takes a
+        // `needs_d2h_sync` flag for symmetry / future fire-and-forget
+        // variants, but the only public entry today always passes
+        // `true`.)
         self.launch_raw_inner(ctx, kernel, cfg, args, /* needs_d2h_sync */ true)
-    }
-
-    /// Round-7 PERF Fix 3: launch variant for caller-known "kernel only,
-    /// no D→H follows" sequences. Skips the post-launch
-    /// `compute.record_event` + `copy_d2h.wait(evt)` pair, which is
-    /// dead bookkeeping when no `to_host` ever runs on this buffer
-    /// chain. Each unnecessary event-wait adds ~3 µs of CPU-side
-    /// driver overhead and contends on cudarc's per-context event
-    /// pool — measurable on tight back-to-back microkernel loops.
-    ///
-    /// Public surface: routed through `DeviceModule::launch_raw_no_sync`.
-    pub(crate) fn launch_raw_no_d2h_sync(
-        &self,
-        ctx: &DeviceContextInner,
-        kernel: &str,
-        cfg: &LaunchConfig,
-        args: KernelArgs,
-    ) -> Result<()> {
-        self.launch_raw_inner(ctx, kernel, cfg, args, /* needs_d2h_sync */ false)
     }
 
     /// Query the driver for the kernel's occupancy-optimal block size.
@@ -364,7 +336,7 @@ impl DeviceModuleInner {
     /// out to `cuOccupancyMaxPotentialBlockSize` in the driver). The
     /// returned size assumes zero dynamic shared memory and no block-
     /// size ceiling, which matches every kernel the bridge currently
-    /// launches; the caller (`LaunchConfig::elementwise_for_kernel`)
+    /// launches; the caller (`DeviceModule::elementwise_for_kernel`)
     /// falls back to 256 if this returns `None`.
     ///
     /// `ctx` is accepted but unused today — cudarc 0.13 reads the
@@ -391,8 +363,11 @@ impl DeviceModuleInner {
         }
     }
 
-    /// Launch on the context's `compute` stream. Public entry points
-    /// `launch_raw` / `launch_raw_no_d2h_sync` route here.
+    /// Launch on the context's `compute` stream. The default-stream
+    /// entry point `launch_raw` routes here (with `needs_d2h_sync =
+    /// true`). The explicit-stream path (`DeviceModule::launch_on_stream`
+    /// → `launch_raw_on_stream`) bypasses this and submits onto the
+    /// caller's stream instead.
     fn launch_raw_inner(
         &self,
         ctx: &DeviceContextInner,

@@ -132,6 +132,7 @@ fn platform_make_executable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
             flNewProtect: u32,
             lpflOldProtect: *mut u32,
         ) -> i32;
+        fn GetLastError() -> u32;
     }
 
     let mut old_protect: u32 = 0;
@@ -139,7 +140,11 @@ fn platform_make_executable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
         VirtualProtect(ptr, size, PAGE_EXECUTE_READ, &mut old_protect)
     };
     if ret == 0 {
-        Err(JitError::ProtectFailed(ret))
+        // VirtualProtect returns 0 on failure; surface GetLastError() so the
+        // diagnostic carries the actual OS error code rather than the useless
+        // `0` return value.
+        let err = unsafe { GetLastError() } as i32;
+        Err(JitError::ProtectFailed(err))
     } else {
         Ok(())
     }
@@ -157,6 +162,7 @@ fn platform_make_writable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
             flNewProtect: u32,
             lpflOldProtect: *mut u32,
         ) -> i32;
+        fn GetLastError() -> u32;
     }
 
     let mut old_protect: u32 = 0;
@@ -164,7 +170,11 @@ fn platform_make_writable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
         VirtualProtect(ptr, size, PAGE_READWRITE, &mut old_protect)
     };
     if ret == 0 {
-        Err(JitError::ProtectFailed(ret))
+        // VirtualProtect returns 0 on failure; surface GetLastError() so the
+        // diagnostic carries the actual OS error code rather than the useless
+        // `0` return value.
+        let err = unsafe { GetLastError() } as i32;
+        Err(JitError::ProtectFailed(err))
     } else {
         Ok(())
     }

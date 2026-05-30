@@ -521,7 +521,7 @@ impl Graphics2DState {
             transform: *self.renderer.transform(),
             clip: self.renderer.clip(),
             background: self.background,
-            composite: CompositeMode::SrcOver,
+            composite: self.renderer.composite(),
         };
         self.saved_states.push(state);
     }

@@ -616,31 +616,98 @@ pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i
     // mutators to park, runs collection, signals completion, and updates
     // roots from the pointer map. Reusing it here keeps the JIT helper
     // on the orchestrated STW path with zero JIT-specific divergence.
-    let data_size = cratonvm_types::array_data_size(length as usize, elem_type).unwrap_or(0);
+    // W1-vm (MED, audit §3): the probe size MUST match the real allocation
+    // size. `array_data_size` returns `None` when `HEADER_SIZE + length *
+    // elem_size` overflows `usize` — an allocation that can never succeed.
+    // The previous `.unwrap_or(0)` silently probed with size 0, which always
+    // passes `try_alloc_young_probe` and then hands the impossible length to
+    // the non-fallible `alloc_array` (abort / UB on the cast-to-usize). Treat
+    // the overflow case as an immediate, catchable OutOfMemoryError instead —
+    // the same outcome the interpreter reaches via `gc_alloc_array`'s
+    // `try_alloc_array` returning `None`.
+    let Ok(data_size) = cratonvm_types::array_data_size(length as usize, elem_type) else {
+        return jit_newarray_oom(vm, length as usize);
+    };
     let total_size = cratonvm_types::HEADER_SIZE + data_size;
-    if heap.try_alloc_young_probe(total_size).is_none() {
-        // Young gen full — trigger GC through the orchestrated STW path.
-        // CRIT (jit/gc audit, 2026-05): MUST retire the calling thread's
-        // TLAB before kicking off GC. The retire installs a synthetic
-        // `int[]` filler at the cursor so the heap walker can stride over
-        // the unused TLAB tail in O(1); without it, the walker
-        // mis-decodes the tail's zeroed bytes (or a half-init JIT object)
-        // and aborts with "implausible object size" / corrupts old gen
-        // when promote-on-pressure copies stale pointers. Mirrors
-        // `alloc_object_shared` in the interpreter (runtime/interpreter.rs
-        // line ~782).
-        if let Some((thread, _guard)) = jit_thread_mut() {
-            thread.tlab.retire();
-            // Route allocation-failure GC through the interpreter's
-            // orchestrated STW path (`maybe_gc_forced` -> `gc_barrier.request_stw()`
-            // + `wait_for_all()`), so other mutator threads are parked
-            // before the moving collector rewrites object addresses.
-            // (Resolves the prior FIXME that called `heap.collect_garbage`
-            // with an unchecked StopTheWorldToken.)
-            crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+    // Fast path: probe the young gen with the REAL allocation size and, on
+    // success, allocate without the fallible retry dance. This preserves the
+    // common-case cost of the original helper.
+    if heap.try_alloc_young_probe(total_size).is_some() {
+        if let Some(obj_ref) = heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) {
+            return jit_newarray_finish(obj_ref, atype, length);
         }
     }
-    let obj_ref = heap.alloc_array(ClassId::new(0), elem_type, length as usize);
+    // Slow path: young gen full (or the probe-then-alloc race lost the slot).
+    // Mirror the interpreter's `gc_alloc_array` (runtime/interpreter.rs:840):
+    // retire the TLAB, run an orchestrated STW GC, then retry the fallible
+    // `try_alloc_array`. CRIT (jit/gc audit, 2026-05): MUST retire the
+    // calling thread's TLAB before kicking off GC. The retire installs a
+    // synthetic `int[]` filler at the cursor so the heap walker can stride
+    // over the unused TLAB tail in O(1); without it, the walker mis-decodes
+    // the tail's zeroed bytes (or a half-init JIT object) and aborts with
+    // "implausible object size" / corrupts old gen when promote-on-pressure
+    // copies stale pointers. Mirrors `alloc_object_shared` in the interpreter
+    // (runtime/interpreter.rs line ~782).
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        thread.tlab.retire();
+        // Route allocation-failure GC through the interpreter's orchestrated
+        // STW path (`maybe_gc_forced` -> `gc_barrier.request_stw()` +
+        // `wait_for_all()`), so other mutator threads are parked before the
+        // moving collector rewrites object addresses. (Resolves the prior
+        // FIXME that called `heap.collect_garbage` with an unchecked
+        // StopTheWorldToken.)
+        crate::runtime::interpreter::maybe_gc_forced_pub(vm, thread);
+    }
+    // Retry after GC. On a second failure the heap is genuinely exhausted —
+    // surface a catchable `java/lang/OutOfMemoryError` exactly as the
+    // interpreter's `gc_alloc_array` does, instead of the old non-fallible
+    // `alloc_array` (which would abort the process on a real OOM).
+    let Some(obj_ref) = heap.try_alloc_array(ClassId::new(0), elem_type, length as usize) else {
+        return jit_newarray_oom(vm, length as usize);
+    };
+    jit_newarray_finish(obj_ref, atype, length)
+}
+
+/// W1-vm: surface an allocation failure from `jit_newarray` as a catchable
+/// `java/lang/OutOfMemoryError`, mirroring the interpreter's `gc_alloc_array`
+/// (runtime/interpreter.rs:853) OOM arm.
+///
+/// The `newarray` codegen site (`jit/src/x64.rs` ~16349) has no `i64::MIN`
+/// deopt guard — it pushes RAX straight onto the operand stack — so unlike
+/// the invoke-dispatch helpers we cannot signal via the deopt sentinel.
+/// Instead we use the same channel the void-return store helpers
+/// (`jit_iastore` etc.) use for null-array NPEs: stash the throwable in
+/// `JIT_PENDING_EXCEPTION` and return the `0`/null sentinel. The interpreter's
+/// post-JIT drain (runtime/interpreter.rs:14079) calls
+/// `take_jit_pending_exception()` on *every* JIT return path and routes the
+/// OOME through the JIT'd method's own exception table, giving a JIT'd
+/// `newarray` identical catchable-OOM semantics to the interpreter.
+///
+/// If the OOME object itself cannot be constructed (e.g. the heap is too
+/// exhausted to even allocate the throwable), we fall back to leaving the
+/// flag unset and returning `0` — the legacy behaviour — so this change is
+/// purely additive and never makes a previously-handled case worse.
+#[cold]
+fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
+    if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
+        let msg = format!("Java heap space (alloc_array length {})", length);
+        if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+            vm,
+            thread,
+            "java/lang/OutOfMemoryError",
+            Some(&msg),
+        ) {
+            set_jit_pending_exception(exc);
+        }
+    }
+    0
+}
+
+/// W1-vm: shared tail for the `jit_newarray` success paths — runs the optional
+/// allocation trace and converts the `ObjectRef` into the raw `i64` pointer the
+/// JIT caller expects. Factored out so the fast and slow paths stay identical.
+#[inline]
+unsafe fn jit_newarray_finish(obj_ref: ObjectRef, atype: i64, length: i64) -> i64 {
     let raw = obj_ref.as_ptr();
     if std::env::var_os("CRATON_JIT_NEWARRAY_TRACE").is_some() {
         let class_id_raw = std::ptr::read(raw as *const u32);

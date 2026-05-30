@@ -1022,14 +1022,23 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // bipush
             0x10 => {
+                if pc + 1 >= code_len {
+                    return None;
+                }
                 pc += 2;
             }
             // sipush
             0x11 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 pc += 3;
             }
             // iload, lload, fload, dload, aload (wide index)
             0x15..=0x19 => {
+                if pc + 1 >= code_len {
+                    return None;
+                }
                 pc += 2;
             }
             // iload_0..iload_3
@@ -1054,6 +1063,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // istore, lstore, fstore, dstore, astore (wide index)
             0x36..=0x3a => {
+                if pc + 1 >= code_len {
+                    return None;
+                }
                 pc += 2;
             }
             // istore_0..istore_3
@@ -1126,6 +1138,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // iinc
             0x84 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 pc += 3;
             }
             // i2l, i2f, i2d, l2i, l2f, l2d, f2i, f2l, f2d, d2i, d2l, d2f, i2b, i2c, i2s
@@ -1138,14 +1153,23 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // ifeq, ifne, iflt, ifge, ifgt, ifle
             0x99..=0x9e => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 pc += 3;
             }
             // if_icmpeq..if_icmple
             0x9f..=0xa4 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 pc += 3;
             }
             // goto
             0xa7 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 pc += 3;
             }
             // ireturn, lreturn, freturn, dreturn
@@ -1160,6 +1184,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             // Always set needs_heap because cross-method dispatch via
             // jit_invoke_dispatch requires vm_ptr stored at heap_local_offset.
             0xb8 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 invoke_ops.push((pc, cp_idx, op));
                 needs_heap = true;
@@ -1171,6 +1198,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // getstatic — static field read (needs vm context)
             0xb2 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 static_field_ops.push((pc, cp_idx));
                 needs_heap = true;
@@ -1178,6 +1208,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // putstatic — static field write (needs vm context)
             0xb3 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 static_field_ops.push((pc, cp_idx));
                 needs_heap = true;
@@ -1185,6 +1218,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // getfield — object field read
             0xb4 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 field_ops.push((pc, cp_idx));
                 pc += 3;
@@ -1201,6 +1237,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             // a bare `aload_0; aload_1; putfield; return` with no other
             // heap op to set the flag).
             0xb5 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 field_ops.push((pc, cp_idx));
                 needs_heap = true;
@@ -1208,6 +1247,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // newarray — needs heap for allocation
             0xbc => {
+                if pc + 1 >= code_len {
+                    return None;
+                }
                 needs_heap = true;
                 pc += 2;
             }
@@ -1217,6 +1259,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // checkcast — type check (pass-through or exception)
             0xc0 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 typecheck_ops.push((pc, cp_idx));
                 needs_heap = true;
@@ -1224,6 +1269,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // instanceof — type check (returns 0 or 1)
             0xc1 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 typecheck_ops.push((pc, cp_idx));
                 needs_heap = true;
@@ -1231,6 +1279,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // multianewarray — multi-dimensional array allocation (2D only for now)
             0xc5 => {
+                if pc + 3 >= code_len {
+                    return None;
+                }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 let ndims = code[pc + 3];
                 if ndims != 2 {
@@ -1242,14 +1293,23 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // if_acmpeq, if_acmpne — reference comparison branches
             0xa5 | 0xa6 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 pc += 3;
             }
             // ifnull, ifnonnull — null check branches
             0xc6 | 0xc7 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 pc += 3;
             }
             // invokevirtual, invokespecial — method dispatch via helper
             0xb6 | 0xb7 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 invoke_ops.push((pc, cp_idx, op));
                 needs_heap = true;
@@ -1278,7 +1338,13 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
                     i32::from_be_bytes([code[pc + 4], code[pc + 5], code[pc + 6], code[pc + 7]]);
                 let high =
                     i32::from_be_bytes([code[pc + 8], code[pc + 9], code[pc + 10], code[pc + 11]]);
-                let num_offsets = (high - low + 1).max(0) as usize; // Cast: address arithmetic
+                // Checked `high - low + 1`: raw i32 arithmetic overflows on
+                // attacker-controlled bounds. Bail (not JIT-eligible) on
+                // overflow or an out-of-range count.
+                let num_offsets = match checked_tableswitch_count(low, high) {
+                    Some(n) => n,
+                    None => return None,
+                };
                 pc += 12 + num_offsets * 4;
             }
             // lookupswitch — accept in scanner, emit CMP chain in compiler
@@ -1300,18 +1366,27 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // ldc — load int/float/string constant from CP (1-byte index)
             0x12 => {
+                if pc + 1 >= code_len {
+                    return None;
+                }
                 let cp_idx = code[pc + 1] as u16; // Widening: always safe
                 ldc_ops.push((pc, cp_idx));
                 pc += 2;
             }
             // ldc_w — load int/float/string constant from CP (2-byte index)
             0x13 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 ldc_ops.push((pc, cp_idx));
                 pc += 3;
             }
             // ldc2_w — load long/double constant from CP (2-byte index)
             0x14 => {
+                if pc + 2 >= code_len {
+                    return None;
+                }
                 let cp_idx = ((code[pc + 1] as u16) << 8) | (code[pc + 2] as u16); // Widening: always safe
                 ldc2w_ops.push((pc, cp_idx));
                 pc += 3;
@@ -1536,7 +1611,11 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
             while p % 4 != 0 { p += 1; }
             let low = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
             let high = i32::from_be_bytes([code[p + 8], code[p + 9], code[p + 10], code[p + 11]]);
-            let count = (high - low + 1).max(0) as usize; // Cast: address arithmetic
+            // Checked `high - low + 1`: raw i32 arithmetic overflows on
+            // attacker-controlled bounds. Such methods are already rejected by
+            // `jit_scan`; if one ever reaches here, fall back to a zero count
+            // (header-only length) rather than overflowing the address math.
+            let count = checked_tableswitch_count(low, high).unwrap_or(0);
             (p + 12 + count * 4) - pc
         }
         // lookupswitch — variable length
@@ -4548,21 +4627,21 @@ impl Compiler {
             // .nan: XOR EAX, EAX
             let nan_off = self.buf.pos();
             self.buf
-                .try_patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8)
-                .expect("emit_fp_to_int_nan_fixup: JP rel8 patch (i32 path)"); // Cast: x86-64 immediate encoding
+                .try_patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8) // Cast: x86-64 immediate encoding
+                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
             self.buf.emit(&[0x31, 0xC0]);
 
             // .done:
             let done_off = self.buf.pos();
             self.buf
-                .try_patch_byte(jne_patch, (done_off - jne_patch - 1) as u8)
-                .expect("emit_fp_to_int_nan_fixup: JNE rel8 patch (i32 path)"); // Cast: x86-64 immediate encoding
+                .try_patch_byte(jne_patch, (done_off - jne_patch - 1) as u8) // Cast: x86-64 immediate encoding
+                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
             self.buf
-                .try_patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8)
-                .expect("emit_fp_to_int_nan_fixup: JBE rel8 patch (i32 path)"); // Cast: x86-64 immediate encoding
+                .try_patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8) // Cast: x86-64 immediate encoding
+                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
             self.buf
-                .try_patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8)
-                .expect("emit_fp_to_int_nan_fixup: JMP rel8 patch (i32 path)"); // Cast: x86-64 immediate encoding
+                .try_patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8) // Cast: x86-64 immediate encoding
+                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
         } else {
             // 64-bit: CMP RAX with 0x8000000000000000
             // MOV RCX, 0x8000000000000000
@@ -4609,21 +4688,21 @@ impl Compiler {
             // .nan: XOR RAX, RAX (48 31 C0)
             let nan_off = self.buf.pos();
             self.buf
-                .try_patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8)
-                .expect("emit_fp_to_int_nan_fixup: JP rel8 patch (i64 path)"); // Cast: x86-64 immediate encoding
+                .try_patch_byte(jp_patch, (nan_off - jp_patch - 1) as u8) // Cast: x86-64 immediate encoding
+                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
             self.buf.emit(&[0x48, 0x31, 0xC0]);
 
             // .done:
             let done_off = self.buf.pos();
             self.buf
-                .try_patch_byte(jne_patch, (done_off - jne_patch - 1) as u8)
-                .expect("emit_fp_to_int_nan_fixup: JNE rel8 patch (i64 path)"); // Cast: x86-64 immediate encoding
+                .try_patch_byte(jne_patch, (done_off - jne_patch - 1) as u8) // Cast: x86-64 immediate encoding
+                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
             self.buf
-                .try_patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8)
-                .expect("emit_fp_to_int_nan_fixup: JBE rel8 patch (i64 path)"); // Cast: x86-64 immediate encoding
+                .try_patch_byte(jbe_patch, (done_off - jbe_patch - 1) as u8) // Cast: x86-64 immediate encoding
+                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
             self.buf
-                .try_patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8)
-                .expect("emit_fp_to_int_nan_fixup: JMP rel8 patch (i64 path)"); // Cast: x86-64 immediate encoding
+                .try_patch_byte(jmp_patch, (done_off - jmp_patch - 1) as u8) // Cast: x86-64 immediate encoding
+                .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
         }
     }
 
@@ -6050,7 +6129,7 @@ impl Compiler {
         let pos = simd_skip_patch;
         self.buf
             .try_patch_i32(pos, skip_rel)
-            .expect("emit_simd_int_array_sum: SIMD skip rel32 patch");
+            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
 
         // Now set up for scalar cleanup:
         // R10D needs to be updated to: old_i + num_simd_elements
@@ -6103,7 +6182,7 @@ impl Compiler {
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf
             .try_patch_i32(scalar_end_patch, end_rel)
-            .expect("emit_simd_int_array_sum: scalar-end rel32 patch");
+            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
     }
 
     /// Emit a vectorized double-array sum loop using AVX2 VADDPD.
@@ -6207,7 +6286,7 @@ impl Compiler {
         let skip_rel = (after_simd as i32) - (simd_skip_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf
             .try_patch_i32(simd_skip_patch, skip_rel)
-            .expect("emit_simd_fp_array_sum: SIMD skip rel32 patch");
+            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
 
         // --- Scalar cleanup loop ---
         let scalar_loop_start = self.buf.pos();
@@ -6243,7 +6322,7 @@ impl Compiler {
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf
             .try_patch_i32(scalar_end_patch, end_rel)
-            .expect("emit_simd_fp_array_sum: scalar-end rel32 patch");
+            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
     }
 
     // -----------------------------------------------------------------------
@@ -6568,7 +6647,7 @@ impl Compiler {
         let skip_rel = (after_simd as i32) - (simd_skip_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf
             .try_patch_i32(simd_skip_patch, skip_rel)
-            .expect("emit_simd_int_array_element_wise: SIMD skip rel32 patch");
+            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
 
         // --- Scalar remainder ---
         //
@@ -6626,7 +6705,7 @@ impl Compiler {
         let end_rel = (scalar_end as i32) - (scalar_end_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf
             .try_patch_i32(scalar_end_patch, end_rel)
-            .expect("emit_simd_int_array_element_wise: scalar-end rel32 patch");
+            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
     }
 
     fn emit_prologue(&mut self) {
@@ -7229,7 +7308,7 @@ impl Compiler {
         let rel = (self.buf.pos() as i32) - (patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf
             .try_patch_i32(patch, rel)
-            .expect("patch_rel32_to_here: rel32 patch out of bounds");
+            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
     }
 
     /// Emit the inline TLAB bump-pointer fast path for the `new` opcode
@@ -8514,12 +8593,12 @@ impl Compiler {
                 let rel32 = (self.buf.pos() as i32) - (*patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
                 self.buf
                     .try_patch_i32(*patch_off, rel32)
-                    .expect("try_emit_inline_body: forward branch rel32 patch (fallback)");
+                    .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
             } else {
                 let rel32 = (target_native as i32) - (*patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
                 self.buf
                     .try_patch_i32(*patch_off, rel32)
-                    .expect("try_emit_inline_body: forward branch rel32 patch");
+                    .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
             }
         }
 
@@ -8611,7 +8690,7 @@ impl Compiler {
         let jl_rel = left_start as i32 - (jl_patch as i32 + 4); // Cast: x86-64 rel32 displacement
         self.buf
             .try_patch_i32(jl_patch, jl_rel)
-            .expect("emit_binary_search_lookup: JL rel32 patch");
+            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
 
         // Left subtree
         self.emit_binary_search_lookup(left, default_target);
@@ -9200,10 +9279,10 @@ impl Compiler {
         );
         self.buf
             .try_patch_byte(jne1_patch, rel1 as u8)
-            .expect("emit_safe_idiv: JNE1 rel8 patch");
+            .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
         self.buf
             .try_patch_byte(jne2_patch, rel2 as u8)
-            .expect("emit_safe_idiv: JNE2 rel8 patch");
+            .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
 
         // Sign-extend RAX → RDX:RAX (or EAX → EDX:EAX), then IDIV.
         if is_64bit {
@@ -9244,7 +9323,7 @@ impl Compiler {
         );
         self.buf
             .try_patch_byte(jmp_after_patch, rel_jmp as u8)
-            .expect("emit_safe_idiv: JMP after-div rel8 patch");
+            .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
     }
 
     /// Emit out-of-line bounds check failure stubs at the end of the method.
@@ -9297,7 +9376,7 @@ impl Compiler {
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
             self.buf
                 .try_patch_i32(patch_off, rel32)
-                .expect("emit_bounds_check_stubs: JAE stub rel32 patch");
+                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
     }
 
@@ -9369,7 +9448,7 @@ impl Compiler {
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
             self.buf
                 .try_patch_i32(patch_off, rel32)
-                .expect("emit_null_check_store_stubs: JZ stub rel32 patch");
+                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
     }
 
@@ -9436,7 +9515,7 @@ impl Compiler {
             let rel32 = (stub_offset as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
             self.buf
                 .try_patch_i32(patch_off, rel32)
-                .expect("emit_exception_check_stub: JE stub rel32 patch");
+                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
     }
 
@@ -9464,7 +9543,7 @@ impl Compiler {
                 let rel32 = (stub_off as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
                 self.buf
                     .try_patch_i32(patch_off, rel32)
-                    .expect("emit_deopt_stubs: reused stub rel32 patch");
+                    .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                 continue;
             }
 
@@ -9518,7 +9597,7 @@ impl Compiler {
             let rel32 = (stub_off as i32) - (patch_off as i32 + 4); // Cast: x86-64 rel32 displacement
             self.buf
                 .try_patch_i32(patch_off, rel32)
-                .expect("emit_deopt_stubs: new stub rel32 patch");
+                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
         }
     }
 
@@ -9728,7 +9807,11 @@ impl Compiler {
                             }
                             let low = i32::from_be_bytes([code[q+4], code[q+5], code[q+6], code[q+7]]);
                             let high = i32::from_be_bytes([code[q+8], code[q+9], code[q+10], code[q+11]]);
-                            let cnt = (high - low + 1).max(0) as usize; // Cast: address arithmetic
+                            // Checked `high - low + 1`: raw i32 arithmetic
+                            // overflows on attacker-controlled bounds. Such
+                            // methods are rejected upstream by `jit_scan`; treat
+                            // an unparseable count as zero offsets here.
+                            let cnt = checked_tableswitch_count(low, high).unwrap_or(0);
                             q += 12;
                             for _ in 0..cnt {
                                 if q + 4 <= code_len {
@@ -11915,7 +11998,7 @@ impl Compiler {
                                                     - (shifted_po as i32 + 4); // Cast: x86-64 immediate encoding
                                                 self.buf
                                                     .try_patch_i32(shifted_po, rel)
-                                                    .expect("rel32 patch in unroll duplicator");
+                                                    .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                                             }
                                         } else {
                                             // External: defer to normal resolution
@@ -11974,8 +12057,8 @@ impl Compiler {
                                                 && delta <= i32::MAX as i128,
                                             "unrolled helper rel32 out of range",
                                         );
-                                        self.buf.try_patch_i32(copy_po, delta as i32)
-                                            .expect("unroll helper rel32 patch"); // Cast: rel32 displacement
+                                        self.buf.try_patch_i32(copy_po, delta as i32) // Cast: rel32 displacement
+                                            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                                     }
 
                                     // Per-clone MIC/PIC slots. For each IC
@@ -12022,7 +12105,7 @@ impl Compiler {
                                             self.buf.try_patch_byte(
                                                 copy_po + i,
                                                 bytes[i],
-                                            ).expect("unroll IC imm64 patch");
+                                            ).ok(); // on Err try_patch_byte set buf.overflowed; compile bails
                                         }
                                     }
 
@@ -12265,7 +12348,7 @@ impl Compiler {
                         let lea_rel = table_start as i32 - (lea_patch as i32 + 4); // Cast: x86-64 rel32 displacement
                         self.buf
                             .try_patch_i32(lea_patch, lea_rel)
-                            .expect("tableswitch: LEA rel32 patch");
+                            .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
 
                         // Emit jump table: count entries, each i32 offset from table_start
                         for &target in &targets {
@@ -13834,7 +13917,7 @@ impl Compiler {
                                 );
                                 self.buf
                                     .try_patch_byte(patch, rel as u8)
-                                    .expect("Arrays.equals intrinsic: rel8 patch");
+                                    .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
                             }
 
                             // boolean result in RAX → operand stack.
@@ -14312,7 +14395,7 @@ impl Compiler {
                             let pos = self.buf.pos();
                             self.buf
                                 .try_patch_i32(jmp_offset, rel)
-                                .expect("self-recursion tail JMP rel32 patch");
+                                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                             let _ = pos;
 
                             // Skip the following xreturn — we already jumped
@@ -14573,7 +14656,7 @@ impl Compiler {
                                         - (back as i32 + 4);
                                     self.buf
                                         .try_patch_i32(back, rel)
-                                        .expect("String.hashCode intrinsic: loop back-edge rel32 patch");
+                                        .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                                     self.patch_rel32_to_here(loop_done);
                                     self.patch_rel32_to_here(cached_done);
                                     // Result (EAX) is sign-extended on push.
@@ -14943,7 +15026,7 @@ impl Compiler {
                             let rel = loop_top as i32 - (back as i32 + 4);
                             self.buf
                                 .try_patch_i32(back, rel)
-                                .expect("String.compareTo intrinsic: loop back-edge rel32 patch");
+                                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                             // loop_done: result = len1 - len2.
                             self.patch_rel32_to_here(loop_done);
                             self.emit_alu_r32_r32(0x89, RAX, R14); // MOV EAX,R14D
@@ -15040,7 +15123,7 @@ impl Compiler {
                             let rel = loop_top as i32 - (back as i32 + 4);
                             self.buf
                                 .try_patch_i32(back, rel)
-                                .expect("String.indexOf(char) intrinsic: loop back-edge rel32 patch");
+                                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                             // found: result = i.
                             self.patch_rel32_to_here(found);
                             self.emit_alu_r32_r32(0x89, RAX, RDX); // MOV EAX,EDX
@@ -15191,7 +15274,7 @@ impl Compiler {
                                 inner_top as i32 - (inner_back as i32 + 4);
                             self.buf
                                 .try_patch_i32(inner_back, rel)
-                                .expect("String.indexOf(String) intrinsic: inner-loop back-edge rel32 patch");
+                                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                             // inner_break: INC R8D ; JMP outer_top.
                             self.patch_rel32_to_here(inner_break);
                             self.buf.emit(&[0x41, 0xFF, 0xC0]); // INC R8D
@@ -15200,7 +15283,7 @@ impl Compiler {
                                 outer_top as i32 - (outer_back as i32 + 4);
                             self.buf
                                 .try_patch_i32(outer_back, rel)
-                                .expect("String.indexOf(String) intrinsic: outer-loop back-edge rel32 patch");
+                                .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                             // match_found: result = i (R8D).
                             self.patch_rel32_to_here(match_found);
                             self.emit_alu_r32_r32(0x89, RAX, R8); // MOV EAX,R8D
@@ -16013,8 +16096,8 @@ impl Compiler {
                                         rel
                                     );
                                     self.buf
-                                        .try_patch_byte(*jne_patch, rel as u8)
-                                        .expect("inline PIC: inter-slot JNE rel8 patch"); // Cast: rel8 displacement
+                                        .try_patch_byte(*jne_patch, rel as u8) // Cast: rel8 displacement
+                                        .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
                                 }
 
                                 // .miss: patch all `je needs_ctx → .miss`
@@ -16034,8 +16117,8 @@ impl Compiler {
                                         rel
                                     );
                                     self.buf
-                                        .try_patch_i32(*patch, rel as i32)
-                                        .expect("inline PIC: miss-branch rel32 patch"); // Cast: rel32 displacement
+                                        .try_patch_i32(*patch, rel as i32) // Cast: rel32 displacement
+                                        .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                                 }
                                 // `miss_patches` (the legacy rel8 vector)
                                 // remains in scope for the MIC arm below;
@@ -16117,8 +16200,8 @@ impl Compiler {
                                         rel
                                     );
                                     self.buf
-                                        .try_patch_byte(*patch, rel as u8)
-                                        .expect("inline MIC: miss-branch rel8 patch"); // Cast: rel8 displacement
+                                        .try_patch_byte(*patch, rel as u8) // Cast: rel8 displacement
+                                        .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
                                 }
                             }
 
@@ -16199,8 +16282,8 @@ impl Compiler {
                                     rel
                                 );
                                 self.buf
-                                    .try_patch_byte(patch, rel as u8)
-                                    .expect("inline MIC: done-jump rel8 patch"); // Cast: rel8 displacement
+                                    .try_patch_byte(patch, rel as u8) // Cast: rel8 displacement
+                                    .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
                             }
                             for patch in &done_patches32 {
                                 // `patch` points at the start of the rel32
@@ -16215,8 +16298,8 @@ impl Compiler {
                                     rel
                                 );
                                 self.buf
-                                    .try_patch_i32(*patch, rel as i32)
-                                    .expect("inline PIC: done-jump rel32 patch"); // Cast: rel32 displacement
+                                    .try_patch_i32(*patch, rel as i32) // Cast: rel32 displacement
+                                    .ok(); // on Err try_patch_i32 set buf.overflowed; compile bails
                             }
                             // T1.1.2 — every virtual/interface dispatch is
                             // a full safepoint: the callee may allocate,

@@ -681,6 +681,9 @@ impl SoftwareRenderer {
     pub fn set_composite(&mut self, mode: CompositeMode) {
         self.composite_mode = mode;
     }
+    pub fn composite(&self) -> CompositeMode {
+        self.composite_mode
+    }
 
     /// Fill the entire buffer with the given color.
     pub fn clear(&mut self, color: u32) {
@@ -1118,7 +1121,9 @@ impl SoftwareRenderer {
                 }
             }
 
-            intersections.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            // total_cmp is panic-free (no NaN unwrap) and faster than the
+            // partial_cmp().unwrap() path.
+            intersections.sort_unstable_by(f64::total_cmp);
 
             // Fill between pairs (even-odd rule)
             let mut i = 0;

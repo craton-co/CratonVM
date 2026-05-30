@@ -56,6 +56,27 @@ use crate::event::{AwtEvent, AwtEventData, PeerId, event_id};
 /// (at minimum) dequeued the corresponding invocation event.
 type CompletionHandle = Arc<(Mutex<bool>, Condvar)>;
 
+/// A pending Runnable registered for an `invokeLater` / `invokeAndWait`
+/// invocation, together with the GC generation observed when it was
+/// registered.
+///
+/// The `gc_gen` stamp is the GC-safety gate: `invokeLater` is asynchronous,
+/// so a moving collector can relocate or free the heap object that `runnable`
+/// points to before the EDT dispatches it. On dispatch we compare the live
+/// GC count against this stamp and refuse to hand back the pointer when they
+/// differ (see [`EventDispatchThread::take_runnable_checked`]). This mirrors
+/// the peer-source side-table's `PeerSourceEntry.gc_gen` gate in `natives.rs`.
+#[derive(Clone, Copy)]
+struct RunnableEntry {
+    /// The Runnable's bare object reference, captured at registration. Only
+    /// safe to resurrect while `gc_gen` still matches the live GC count.
+    runnable: ObjectRef,
+    /// GC collection count observed when this entry was registered. A change
+    /// means a moving collection may have relocated/freed the object, so
+    /// `runnable` must not be dereferenced.
+    gc_gen: u64,
+}
+
 // ---------------------------------------------------------------------------
 // Thread-local EDT marker
 // ---------------------------------------------------------------------------
@@ -136,7 +157,17 @@ pub struct EventDispatchThread {
     /// Side-table of pending Runnables, keyed by callback_id.  Populated by
     /// `register_runnable` (called from the `invokeLater` /
     /// `invokeAndWait` natives); read & removed by the `InvocationEvent.
-    /// dispatch()V` native via [`Self::take_runnable`].
+    /// dispatch()V` native via [`Self::take_runnable_checked`].
+    ///
+    /// Each entry pairs the Runnable's bare `ObjectRef` with the GC
+    /// collection count observed at registration time. Because
+    /// `invokeLater` is asynchronous, a moving collection can relocate or
+    /// free the object between registration and dispatch — resurrecting the
+    /// stale pointer would be a use-after-free / type confusion. We fail
+    /// closed across GC boundaries exactly like the peer-source side-table
+    /// in `natives.rs` (`lookup_peer_source`): the dispatch site only
+    /// receives the Runnable when the live GC count still matches the
+    /// stamp, otherwise the entry is dropped and dispatch is skipped.
     ///
     /// If a posted `InvocationEvent` is never dispatched (e.g. because the
     /// app GC's it before draining the queue, or the EDT shuts down with
@@ -144,7 +175,7 @@ pub struct EventDispatchThread {
     /// [`Self::MAX_RUNNABLES`] entries with FIFO eviction so misbehaving
     /// callers can't grow this map without bound. The `insertion_order`
     /// VecDeque tracks the eviction order.
-    runnables: Mutex<FxHashMap<u64, ObjectRef>>,
+    runnables: Mutex<FxHashMap<u64, RunnableEntry>>,
     runnables_order: Mutex<VecDeque<u64>>,
     /// Monotonic counter for callback ids.  We can't reuse the Runnable's
     /// identity hash because (a) two separate `invokeLater(sameRunnable)`
@@ -198,12 +229,19 @@ impl EventDispatchThread {
     /// We now take both locks atomically (consistent ordering: runnables
     /// before runnables_order, the same as `take_runnable` and `stop`) so
     /// the eviction loop sees an internally-consistent view of the table.
-    pub fn register_runnable(&self, callback_id: u64, runnable: ObjectRef) {
+    /// `gc_gen` is the GC collection count captured by the caller at
+    /// registration time (read from an active `NativeContext` via
+    /// `gc_collection_count()`). It is stored alongside the Runnable and
+    /// re-checked at dispatch by [`Self::take_runnable_checked`] so a stale
+    /// (post-collection) pointer is never resurrected — the same fail-closed
+    /// gate the peer-source side-table uses (`lookup_peer_source`).
+    pub fn register_runnable(&self, callback_id: u64, runnable: ObjectRef, gc_gen: u64) {
         let mut map = self.runnables.lock();
         let mut order = self.runnables_order.lock();
         // Evict oldest entries if at capacity.  Both locks held: the
-        // dispatcher in `take_runnable` is blocked behind `map` here, so
-        // we know `map.len()` and `order` cannot diverge mid-eviction.
+        // dispatcher in `take_runnable_checked` is blocked behind `map`
+        // here, so we know `map.len()` and `order` cannot diverge
+        // mid-eviction.
         while map.len() >= Self::MAX_RUNNABLES {
             if let Some(old) = order.pop_front() {
                 map.remove(&old);
@@ -211,13 +249,15 @@ impl EventDispatchThread {
                 break;
             }
         }
-        if map.insert(callback_id, runnable).is_none() {
+        if map.insert(callback_id, RunnableEntry { runnable, gc_gen }).is_none() {
             order.push_back(callback_id);
         }
     }
 
-    /// Remove and return the Runnable registered for `callback_id`, if
-    /// any.  Called by `InvocationEvent.dispatch()V`.
+    /// Remove and return the [`RunnableEntry`] registered for `callback_id`,
+    /// if any.  This is the raw, GC-unchecked removal; callers on the
+    /// dispatch path MUST go through [`Self::take_runnable_checked`] so the
+    /// GC-generation gate is applied.
     ///
     /// RACE FIX (round-5 audit): hold both `runnables` and
     /// `runnables_order` for the full remove+order-cleanup so that a
@@ -225,7 +265,7 @@ impl EventDispatchThread {
     /// while we have already removed the corresponding `map` entry but
     /// not yet swept the order tracker.  See `register_runnable` for the
     /// full hazard description.
-    pub fn take_runnable(&self, callback_id: u64) -> Option<ObjectRef> {
+    fn take_runnable_entry(&self, callback_id: u64) -> Option<RunnableEntry> {
         let mut map = self.runnables.lock();
         let mut order = self.runnables_order.lock();
         let removed = map.remove(&callback_id);
@@ -238,6 +278,37 @@ impl EventDispatchThread {
             }
         }
         removed
+    }
+
+    /// Remove and return the Runnable registered for `callback_id`, but ONLY
+    /// when the live GC count (`current_gc_gen`) still matches the count
+    /// stamped at registration.  Called by `InvocationEvent.dispatch()V`.
+    ///
+    /// Returns `None` (fail closed) when the entry is absent OR a (moving)
+    /// collection has run since registration. In the latter case the moving
+    /// collector may have relocated or freed the Runnable object, so
+    /// dereferencing the cached pointer would be a use-after-free / type
+    /// confusion. We therefore drop the entry and let dispatch skip the
+    /// stale Runnable rather than calling `run()` through a dangling
+    /// pointer. This mirrors `natives.rs::lookup_peer_source`, which fails
+    /// closed across the same GC boundary for cached peer-source pointers.
+    ///
+    /// The entry is unconditionally removed (whether or not the generation
+    /// matched): a stale Runnable is never going to become safe to dispatch,
+    /// so keeping it would only leak the side-table slot.
+    pub fn take_runnable_checked(
+        &self,
+        callback_id: u64,
+        current_gc_gen: u64,
+    ) -> Option<ObjectRef> {
+        let entry = self.take_runnable_entry(callback_id)?;
+        if entry.gc_gen != current_gc_gen {
+            // A collection ran since the Runnable was registered; the
+            // cached pointer may be dangling/relocated — refuse to
+            // resurrect it. The caller skips dispatch in this case.
+            return None;
+        }
+        Some(entry.runnable)
     }
 
     // -- lifecycle ----------------------------------------------------------
@@ -318,9 +389,14 @@ impl EventDispatchThread {
     /// High-level form: allocate a callback id, register the Runnable,
     /// post the invocation event.  Returns the callback id for callers
     /// that want to correlate with completion later.
-    pub fn invoke_later_runnable(&self, runnable: ObjectRef, peer_id: PeerId) -> u64 {
+    ///
+    /// `gc_gen` is the GC collection count captured by the caller (via
+    /// `gc_collection_count()`) and stamped on the registry entry so the
+    /// dispatch site can fail closed if a moving collection runs before the
+    /// Runnable is dispatched. See [`Self::register_runnable`].
+    pub fn invoke_later_runnable(&self, runnable: ObjectRef, peer_id: PeerId, gc_gen: u64) -> u64 {
         let id = self.next_callback_id();
-        self.register_runnable(id, runnable);
+        self.register_runnable(id, runnable, gc_gen);
         self.invoke_later(id, peer_id);
         id
     }
@@ -395,16 +471,22 @@ impl EventDispatchThread {
     /// [`InvokeAndWaitError::OnEdt`] when called from the EDT so the
     /// native bridge can throw `IllegalStateException` instead of
     /// panicking across the JNI boundary.
+    ///
+    /// `gc_gen` is the GC collection count captured by the caller (via
+    /// `gc_collection_count()`) and stamped on the registry entry so the
+    /// dispatch site can fail closed if a moving collection runs before the
+    /// Runnable is dispatched. See [`Self::register_runnable`].
     pub fn invoke_and_wait_runnable(
         &self,
         runnable: ObjectRef,
         peer_id: PeerId,
+        gc_gen: u64,
     ) -> Result<u64, InvokeAndWaitError> {
         if is_edt() {
             return Err(InvokeAndWaitError::OnEdt);
         }
         let id = self.next_callback_id();
-        self.register_runnable(id, runnable);
+        self.register_runnable(id, runnable, gc_gen);
         self.invoke_and_wait(id, peer_id)?;
         Ok(id)
     }
@@ -1017,9 +1099,40 @@ mod tests {
         let edt = make_edt();
         let runnable = fake_object_ref(42);
         let id = edt.next_callback_id();
-        edt.register_runnable(id, runnable);
-        assert_eq!(edt.take_runnable(id), Some(runnable));
-        assert_eq!(edt.take_runnable(id), None, "second take should be empty");
+        // Register and take within the same GC generation (gc_gen == 0).
+        edt.register_runnable(id, runnable, 0);
+        assert_eq!(edt.take_runnable_checked(id, 0), Some(runnable));
+        assert_eq!(
+            edt.take_runnable_checked(id, 0),
+            None,
+            "second take should be empty"
+        );
+    }
+
+    #[test]
+    fn take_runnable_fails_closed_after_gc() {
+        // GC-safety gate (matches `natives.rs::lookup_peer_source`): if a
+        // moving collection has run since the Runnable was registered, the
+        // cached pointer may be dangling/relocated, so the checked take must
+        // return None (fail closed) and drop the entry rather than handing
+        // back a stale pointer.
+        let edt = make_edt();
+        let runnable = fake_object_ref(99);
+        let id = edt.next_callback_id();
+        edt.register_runnable(id, runnable, 5);
+        // A collection ran: live gen (6) != stamped gen (5) -> fail closed.
+        assert_eq!(
+            edt.take_runnable_checked(id, 6),
+            None,
+            "must fail closed when a GC ran since registration"
+        );
+        // The stale entry must have been dropped, so even a now-matching
+        // generation finds nothing.
+        assert_eq!(
+            edt.take_runnable_checked(id, 5),
+            None,
+            "stale entry must be removed even on a generation mismatch"
+        );
     }
 
     #[test]
@@ -1037,7 +1150,7 @@ mod tests {
         let edt = make_edt();
         let runnable = fake_object_ref(7);
         let id = edt.next_callback_id();
-        edt.register_runnable(id, runnable);
+        edt.register_runnable(id, runnable, 0);
 
         // Register a completion handle to detect spurious signalling.
         let handle: CompletionHandle = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1060,14 +1173,14 @@ mod tests {
         edt.start();
         let runnable = fake_object_ref(123);
         let id = edt.next_callback_id();
-        edt.register_runnable(id, runnable);
+        edt.register_runnable(id, runnable, 0);
 
         let edt2 = Arc::clone(&edt);
         let dispatcher = std::thread::spawn(move || {
             // Wait for the event to land then "dispatch" it.
             loop {
                 if let Some(_evt) = edt2.poll_event() {
-                    assert_eq!(edt2.take_runnable(id), Some(runnable));
+                    assert_eq!(edt2.take_runnable_checked(id, 0), Some(runnable));
                     // pretend Runnable.run() ran here
                     let signalled = edt2.signal_invocation_complete(id);
                     assert!(signalled, "waiter should have been registered");

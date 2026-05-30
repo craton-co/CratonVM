@@ -281,24 +281,31 @@ impl Heap {
     /// `descriptor_bytes[i]` must be the first byte of the JVM field
     /// descriptor for field index `i` (e.g. `b'I'` for int, `b'J'` for long,
     /// `b'L'`/`b'['` for reference types). Fields not covered by
-    /// `descriptor_bytes` (when `descriptor_bytes.len() < num_fields`) keep
-    /// their zeroed representation, which decodes as `Value::Object(None)`
-    /// — the correct default for reference slots.
+    /// `descriptor_bytes` (when `descriptor_bytes.len() < num_fields`) are
+    /// initialized to an explicit `Value::Object(None)` — the correct
+    /// default for reference slots.
     ///
-    /// This fixes a subtle correctness bug: zeroed memory read via
-    /// `read_slot` decodes as `Value::Object(None)`, the zero-discriminant
-    /// variant of [`Value`]. For reference fields this is correct
-    /// (`null`). For primitive fields the JVM spec §2.3 mandates a typed
-    /// zero — `Value::Int(0)` for I/S/B/C/Z, `Value::Long(0)` for J,
-    /// `Value::Float(0.0)` for F, `Value::Double(0.0)` for D. Without this
-    /// default-init, an unwritten `int` field reads as `Object(None)`,
-    /// which breaks `Unsafe.compareAndSetInt` comparisons against
-    /// `Int(0)` (e.g. `ConcurrentHashMap.initTable`) and livelocks the
-    /// caller in a CAS retry loop.
+    /// This fixes a subtle correctness bug. `read_slot` does a raw
+    /// `ptr::read::<Value>`; after `Value::Object` became
+    /// `Option<ObjectRef>` with a `NonNull` niche, the all-zero bit pattern
+    /// left by `alloc_zeroed` decodes as `Value::Int(0)` (the
+    /// discriminant-0 variant of [`Value`]), NOT `Value::Object(None)`.
+    /// So neither a primitive nor a reference default can be obtained "for
+    /// free" from zeroed memory any more — both must be written explicitly.
+    /// For primitive fields the JVM spec §2.3 mandates a typed zero —
+    /// `Value::Int(0)` for I/S/B/C/Z, `Value::Long(0)` for J,
+    /// `Value::Float(0.0)` for F, `Value::Double(0.0)` for D. For reference
+    /// fields the default is `null` (`Value::Object(None)`). Without this
+    /// explicit default-init an unwritten reference field reads as
+    /// `Int(0)`, violating the documented slot contract, and an unwritten
+    /// `int` field would (under the OLD zeroed==Object(None) decode) read as
+    /// `Object(None)`, breaking `Unsafe.compareAndSetInt` comparisons
+    /// against `Int(0)` (e.g. `ConcurrentHashMap.initTable`) and livelocking
+    /// the caller in a CAS retry loop.
     ///
-    /// Unknown/malformed descriptor bytes fall through to the zeroed
-    /// default (`Object(None)`), matching the legacy behavior so this
-    /// cannot regress non-primitive paths.
+    /// Unknown/malformed descriptor bytes initialize to the reference
+    /// default (`Object(None)`), matching the legacy intent so this cannot
+    /// regress non-primitive paths.
     ///
     /// # Panics
     /// Panics if `num_fields * SLOT_SIZE` overflows.
@@ -309,17 +316,30 @@ impl Heap {
         descriptor_bytes: &[u8],
     ) -> ObjectRef {
         let obj = self.alloc_object(class_id, num_fields);
-        // Populate primitive-typed slots with the correct tagged-zero Value.
-        // Bounds: only write within [0 .. min(num_fields, descriptor_bytes.len())).
-        let n = num_fields.min(descriptor_bytes.len());
-        for i in 0..n {
-            if let Some(default) = default_value_for_descriptor(descriptor_bytes[i]) {
-                // SAFETY: `i < num_fields == header.num_slots`, so `slot_ptr`
-                // lands within the freshly-allocated object's field region.
-                unsafe {
-                    let ptr = slot_ptr(obj, i);
-                    write_slot(ptr, default);
-                }
+        // Initialize EVERY slot with an explicitly-tagged default `Value`.
+        //
+        // R-niche fix: `read_slot` does a raw `ptr::read::<Value>`, and after
+        // `Value::Object` became `Option<ObjectRef>` with a `NonNull` niche,
+        // the all-zero bit pattern that `alloc_zeroed` leaves now decodes as
+        // `Value::Int(0)` (the discriminant-0 variant), NOT `Value::Object(None)`.
+        // A zeroed slot and a slot written with `Value::Int(0)` are therefore
+        // bit-indistinguishable, so the decode rule cannot be recovered in
+        // `read_slot` alone. We instead make the reference/uninitialized default
+        // EXPLICIT here: every primitive slot gets its spec-mandated typed zero,
+        // and every reference-typed (`L`/`[`), unknown-descriptor, or
+        // descriptor-uncovered slot gets an explicit `Value::Object(None)`
+        // (discriminant 4) so a later `get_field` reads back the documented
+        // `null` rather than a bogus `Int(0)`.
+        for i in 0..num_fields {
+            let default = descriptor_bytes
+                .get(i)
+                .and_then(|&b| default_value_for_descriptor(b))
+                .unwrap_or(Value::Object(None));
+            // SAFETY: `i < num_fields == header.num_slots`, so `slot_ptr`
+            // lands within the freshly-allocated object's field region.
+            unsafe {
+                let ptr = slot_ptr(obj, i);
+                write_slot(ptr, default);
             }
         }
         obj
@@ -1339,12 +1359,22 @@ unsafe fn slot_ptr(obj_ref: ObjectRef, index: usize) -> *mut u8 {
     obj_ref.as_ptr().add(HEADER_SIZE + index * SLOT_SIZE)
 }
 
-/// Read a `Value` from a slot. We store values as 8-byte tagged unions:
-/// - Bytes 0..4: the "raw" 32-bit or first half of 64-bit data
-/// - Bytes 4..8: tag or second half
+/// Read a `Value` from a slot.
 ///
-/// For simplicity in Phase 1, we store the raw `Value` enum directly.
-/// This is slightly wasteful but works correctly.
+/// We store the raw 16-byte `Value` enum directly in the slot. The first
+/// byte is the variant discriminant (`Int=0`, `Long=1`, `Float=2`,
+/// `Double=3`, `Object=4`, `ReturnAddress=5`, `Uninitialized=6`); the niche
+/// `Object(None)` is discriminant 4 with an all-zero pointer payload.
+///
+/// DECODE RULE (R-niche): there is no "zero bytes decode to null" shortcut.
+/// Since `Value::Object` gained a `NonNull` niche, the all-zero bit pattern
+/// has discriminant byte 0 and decodes as `Value::Int(0)` — bit-identical to
+/// a slot that was explicitly written `Value::Int(0)`. A read therefore
+/// returns exactly the variant whose discriminant was last *written* into the
+/// slot. Reference/uninitialized slots are NOT left zeroed: callers that need
+/// the `null` default (e.g. `alloc_object_with_descriptors`) write an explicit
+/// `Value::Object(None)` so the discriminant byte is 4 and this read yields
+/// `null`, not `Int(0)`.
 ///
 /// # Safety
 /// The pointer must be valid and 8-byte aligned.

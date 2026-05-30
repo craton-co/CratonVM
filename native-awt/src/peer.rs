@@ -195,40 +195,47 @@ impl PeerRegistry {
         self.peers.get_mut(&id)
     }
 
-    /// Recursively destroy a peer and all its children.
+    /// Destroy a peer and all its descendants.
+    ///
+    /// Uses an explicit heap-allocated work-stack rather than recursion so a
+    /// deeply nested Component tree cannot overflow the native thread stack.
+    /// The same set of peers is torn down with the same per-peer operations
+    /// as the previous recursive implementation.
     pub fn destroy(&mut self, id: PeerId) {
-        // Collect children first to avoid borrow issues.
-        let children: Vec<PeerId> = self
-            .peers
-            .get(&id)
-            .map(|p| p.children.clone())
-            .unwrap_or_default();
-
-        // Recursively destroy children.
-        for child_id in children {
-            self.destroy(child_id);
-        }
-
-        // Remove from parent's child list.
-        if let Some(peer) = self.peers.get(&id) {
-            if let Some(parent_id) = peer.parent_id {
-                if let Some(parent) = self.peers.get_mut(&parent_id) {
-                    parent.children.retain(|c| *c != id);
-                }
+        // Gather the whole subtree (root + all descendants) via an explicit
+        // stack walk. Each visited peer is recorded so we can tear it down
+        // afterward regardless of traversal order.
+        let mut to_destroy: Vec<PeerId> = Vec::new();
+        let mut work: Vec<PeerId> = vec![id];
+        while let Some(cur) = work.pop() {
+            if let Some(peer) = self.peers.get(&cur) {
+                work.extend(peer.children.iter().copied());
+                to_destroy.push(cur);
             }
         }
 
-        // Remove java mapping entries that point to this peer in O(1) via
-        // the reverse map. Previously this used `java_to_peer.retain(...)`,
-        // which is O(map size) per destroyed peer -- making destroy() of a
-        // tree O(n^2). Now it's O(1) per peer, so the whole tree teardown
-        // is O(n).
-        if let Some(java_hash) = self.peer_to_java.remove(&id) {
-            self.java_to_peer.remove(&java_hash);
-        }
+        for victim in to_destroy {
+            // Remove from parent's child list.
+            if let Some(peer) = self.peers.get(&victim) {
+                if let Some(parent_id) = peer.parent_id {
+                    if let Some(parent) = self.peers.get_mut(&parent_id) {
+                        parent.children.retain(|c| *c != victim);
+                    }
+                }
+            }
 
-        // Remove the peer itself.
-        self.peers.remove(&id);
+            // Remove java mapping entries that point to this peer in O(1) via
+            // the reverse map. Previously this used `java_to_peer.retain(...)`,
+            // which is O(map size) per destroyed peer -- making destroy() of a
+            // tree O(n^2). Now it's O(1) per peer, so the whole tree teardown
+            // is O(n).
+            if let Some(java_hash) = self.peer_to_java.remove(&victim) {
+                self.java_to_peer.remove(&java_hash);
+            }
+
+            // Remove the peer itself.
+            self.peers.remove(&victim);
+        }
     }
 
     /// Establish a parent-child relationship.
@@ -279,30 +286,64 @@ impl PeerRegistry {
     /// Hit-test: find the deepest child of `root` that contains the point (x, y)
     /// in the root's coordinate space.
     pub fn find_peer_at(&self, root: PeerId, x: i32, y: i32) -> Option<PeerId> {
-        let root_peer = self.peers.get(&root)?;
+        // Iterative depth-first hit-test using an explicit heap stack so a
+        // deeply nested Component tree cannot overflow the native thread
+        // stack. Each stack entry holds a peer and the query point expressed
+        // in that peer's parent coordinate space — exactly the (id, x, y)
+        // triple the recursive version passed down.
+        //
+        // The recursion never backtracks to a sibling once a child contains
+        // the point, so the walk is a single descending path: at each level
+        // we follow the first (top-most, via `children.iter().rev()`) visible
+        // child that contains the point. The stack therefore holds at most
+        // one pending entry, but using a heap Vec keeps depth heap-bounded.
+        let mut stack: Vec<(PeerId, i32, i32)> = vec![(root, x, y)];
 
-        // Check if point is within root bounds.
-        if !root_peer.contains_point(x - root_peer.x, y - root_peer.y) {
-            return None;
-        }
+        while let Some((id, px, py)) = stack.pop() {
+            let peer = match self.peers.get(&id) {
+                Some(p) => p,
+                None => continue,
+            };
 
-        // Check children in reverse order (top-most first, like Z-order).
-        for &child_id in root_peer.children.iter().rev() {
-            if let Some(child) = self.peers.get(&child_id) {
-                if !child.visible {
-                    continue;
+            // Check if point is within this peer's bounds.
+            if !peer.contains_point(px - peer.x, py - peer.y) {
+                continue;
+            }
+
+            // Point is inside this peer. Convert to child coordinate space and
+            // push visible children. If none yield a hit, the deepest peer that
+            // contains the point is returned, preserving the recursive
+            // semantics: a peer is returned only after all its (top-most-first)
+            // children have failed to contain the point.
+            let child_x = px - peer.x;
+            let child_y = py - peer.y;
+
+            // The recursive version returns the FIRST top-most child whose
+            // subtree contains the point, and never backtracks to a sibling
+            // once such a child is found. So we descend along a single path:
+            // pick the first (top-most) visible child that contains the point
+            // and continue from there; if none does, this peer is the answer.
+            let mut descended = false;
+            for &child_id in peer.children.iter().rev() {
+                if let Some(child) = self.peers.get(&child_id) {
+                    if !child.visible {
+                        continue;
+                    }
+                    if child.contains_point(child_x - child.x, child_y - child.y) {
+                        stack.push((child_id, child_x, child_y));
+                        descended = true;
+                        break;
+                    }
                 }
-                // Convert to child's coordinate space.
-                let child_x = x - root_peer.x;
-                let child_y = y - root_peer.y;
-                if let Some(hit) = self.find_peer_at(child_id, child_x, child_y) {
-                    return Some(hit);
-                }
+            }
+
+            if !descended {
+                // No child was hit; this peer is the deepest match.
+                return Some(id);
             }
         }
 
-        // No child was hit, return root itself.
-        Some(root)
+        None
     }
 
     /// Register a mapping from a Java object's identity hash code to a peer ID.

@@ -479,8 +479,15 @@ impl GenerationalHeap {
     /// of the correctly-tagged zero, breaking `Unsafe.compareAndSetInt`
     /// comparisons against `Int(0)`.
     ///
-    /// Fields beyond `descriptor_bytes.len()` keep the zeroed default
-    /// (`Object(None)`), matching the reference-slot spec default.
+    /// Fields beyond `descriptor_bytes.len()`, reference-typed (`L`/`[`)
+    /// fields, and unknown-descriptor fields are initialized to an explicit
+    /// `Value::Object(None)`, the reference-slot spec default.
+    ///
+    /// R-niche fix: zeroed memory no longer decodes as `Object(None)` (after
+    /// the `NonNull` niche it decodes as `Int(0)`), so the `null` default must
+    /// be written explicitly rather than left to `alloc_zeroed`. See
+    /// [`crate::heap::Heap::alloc_object_with_descriptors`] for the full
+    /// rationale.
     pub fn alloc_object_with_descriptors(
         &self,
         class_id: ClassId,
@@ -488,11 +495,12 @@ impl GenerationalHeap {
         descriptor_bytes: &[u8],
     ) -> ObjectRef {
         let obj = self.alloc_object(class_id, num_fields);
-        let n = num_fields.min(descriptor_bytes.len());
-        for i in 0..n {
-            if let Some(default) = crate::heap::default_value_for_descriptor(descriptor_bytes[i]) {
-                self.set_field(obj, i, default);
-            }
+        for i in 0..num_fields {
+            let default = descriptor_bytes
+                .get(i)
+                .and_then(|&b| crate::heap::default_value_for_descriptor(b))
+                .unwrap_or(Value::Object(None));
+            self.set_field(obj, i, default);
         }
         obj
     }
@@ -507,11 +515,15 @@ impl GenerationalHeap {
         descriptor_bytes: &[u8],
     ) -> Option<ObjectRef> {
         let obj = self.try_alloc_object(class_id, num_fields)?;
-        let n = num_fields.min(descriptor_bytes.len());
-        for i in 0..n {
-            if let Some(default) = crate::heap::default_value_for_descriptor(descriptor_bytes[i]) {
-                self.set_field(obj, i, default);
-            }
+        // R-niche fix: write every slot's default explicitly (primitive typed
+        // zero, else `Object(None)`) — zeroed memory no longer decodes as null.
+        // See `alloc_object_with_descriptors` for the rationale.
+        for i in 0..num_fields {
+            let default = descriptor_bytes
+                .get(i)
+                .and_then(|&b| crate::heap::default_value_for_descriptor(b))
+                .unwrap_or(Value::Object(None));
+            self.set_field(obj, i, default);
         }
         Some(obj)
     }
@@ -2571,9 +2583,11 @@ impl GenerationalHeap {
                     continue;
                 }
             }
-            // SAFETY: `cursor` is within `used`; the from-space region
-            // `[base, base+used)` is backed by mapped, allocated memory.
-            let obj_ptr = unsafe { (from_base + cursor) as *mut u8 };
+            // `cursor` is within `used`; the from-space region
+            // `[base, base+used)` is backed by mapped, allocated memory. The
+            // integer-to-pointer cast itself is safe; only the header deref
+            // on the next line requires `unsafe`.
+            let obj_ptr = (from_base + cursor) as *mut u8;
             let header = unsafe { &mut *(obj_ptr as *const ObjectHeader as *mut ObjectHeader) };
             let total_size = gen_object_total_size(header);
             // Defensive: a corrupt / zero-size header would desynchronise
@@ -3717,9 +3731,11 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
                 continue;
             }
         }
-        // SAFETY: `cursor` is within `used`; the arena's `[base, base+used)`
-        // region is backed by mapped, allocated memory.
-        let obj_ptr = unsafe { (base + cursor) as *mut u8 };
+        // `cursor` is within `used`; the arena's `[base, base+used)` region
+        // is backed by mapped, allocated memory. The integer-to-pointer cast
+        // itself is safe; only the header deref on the next line requires
+        // `unsafe`.
+        let obj_ptr = (base + cursor) as *mut u8;
         // SAFETY: `obj_ptr` is 8-byte-aligned (bump arena) and points at the
         // start of an object header within the live region.
         let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
@@ -3740,6 +3756,15 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
 }
 
 /// Read a `Value` from a slot pointer.
+///
+/// DECODE RULE (R-niche): the 16-byte `Value` is read raw, returning the
+/// variant whose discriminant was last *written* into the slot. After
+/// `Value::Object` gained a `NonNull` niche, the all-zero bit pattern decodes
+/// as `Value::Int(0)`, NOT `Value::Object(None)` — there is no "zeroed slot
+/// reads as null" shortcut. Reference/uninitialized slots are therefore
+/// written an explicit `Value::Object(None)` (see
+/// `GenerationalHeap::alloc_object_with_descriptors`); this read does not
+/// synthesize `null` from zero bytes.
 ///
 /// # Safety
 ///

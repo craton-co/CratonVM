@@ -322,11 +322,13 @@ pub fn analyze_with_annotations(
 /// has_backward_branch, is_dot_product_reduction)`.
 ///
 /// `hint` selectively loosens specific rejections — see [`AdmissionHint`]
-/// for the policy table. `this_field_cps` collects the CP indices of the
-/// `getfield` receiver-access pattern (Phase 9 #2). The `has_backward`
-/// flag lets `analyze` recognise counted-loop shapes without a second
-/// pass — the work estimator's branch-direction check needs the same
-/// `pc / instruction_size` walk the classifier already performs.
+/// for the policy table. `this_field_cps` is always empty: non-static
+/// this-field methods are rejected outright (the emitter has no
+/// `getfield` lowering and never binds `this`), so the analyzer and the
+/// emitter agree and no round-trip is wasted. The `has_backward` flag
+/// lets `analyze` recognise counted-loop shapes without a second pass —
+/// the work estimator's branch-direction check needs the same `pc /
+/// instruction_size` walk the classifier already performs.
 ///
 /// `is_dot_product_reduction` (the 4th element) is `true` when the body
 /// matches the dot-product / sum reduction shape that `lowering::emit`
@@ -342,7 +344,12 @@ fn scan_bytecode(
     let bytes = &code.code;
     let mut pc = 0usize;
     let mut prev_op: Option<u8> = None;
-    let mut this_field_cps: Vec<u16> = Vec::new();
+    // Non-static this-field methods are now rejected outright (the
+    // emitter cannot lower them — see the `NonStaticReceiverMisuse`
+    // handling in the walk below), so no receiver-access CP indices are
+    // ever collected. The field is retained in `KernelSignature` for ABI
+    // stability but is always empty.
+    let this_field_cps: Vec<u16> = Vec::new();
     let mut has_backward = false;
     // Dot-product reduction shape probes: the body reads array elements
     // (`iaload`/`laload`/`faload`/`daload`/`baload`/`saload`/`caload`,
@@ -350,6 +357,16 @@ fn scan_bytecode(
     // arithmetic `*add` (`iadd`/`ladd`/`fadd`/`dadd`, 0x60..=0x63).
     let mut body_has_array_load = false;
     let mut body_has_add = false;
+    // Literal loop-bound recovery for the work estimate. The canonical
+    // counted loop compares the induction variable against its bound with
+    // a forward `if_icmp*` (`iload iv; <bound>; if_icmpge exit`). When the
+    // bound is a compile-time literal (`iconst_*`/`bipush`/`sipush`) it is
+    // the value pushed immediately before that forward comparison.
+    // `last_const` tracks the most-recent such push; `literal_bound`
+    // captures it at the first forward conditional branch so the work
+    // estimate can use the real trip count instead of a flat default.
+    let mut last_const: Option<i32> = None;
+    let mut literal_bound: Option<i32> = None;
 
     while pc < bytes.len() {
         let op = bytes[pc];
@@ -361,6 +378,17 @@ fn scan_bytecode(
             body_has_add = true;
         }
 
+        // Track literal integer pushes so a forward exit-comparison can
+        // recover its bound operand for the work estimate.
+        let pushed_const: Option<i32> = match op {
+            0x02..=0x08 => Some(op as i32 - 0x03), // iconst_m1..iconst_5
+            0x10 if pc + 1 < bytes.len() => Some(bytes[pc + 1] as i8 as i32), // bipush
+            0x11 if pc + 2 < bytes.len() => {
+                Some(i16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]) as i32) // sipush
+            }
+            _ => None,
+        };
+
         // Branch-direction probe (formerly `estimate_work`): a backward
         // branch marks a counted loop.
         if (0x99..=0xA7).contains(&op) || op == 0xC6 || op == 0xC7 {
@@ -368,6 +396,13 @@ fn scan_bytecode(
                 let off = i16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]) as i32;
                 if off < 0 {
                     has_backward = true;
+                } else if literal_bound.is_none()
+                    && (0x9F..=0xA4).contains(&op)
+                    && last_const.is_some()
+                {
+                    // Forward `if_icmp*` (canonical loop-exit family):
+                    // the most-recent literal push is the bound operand.
+                    literal_bound = last_const;
                 }
             }
         } else if op == 0xC8 && pc + 5 <= bytes.len() {
@@ -382,34 +417,29 @@ fn scan_bytecode(
             }
         }
 
-        // Phase 9 #2 — non-static receiver-access pattern handling.
-        // For non-static methods, `aload_0` (0x2A) loads `this`. The
-        // only supported follow-up is `getfield` (0xB4) of a
-        // primitive-array field; anything else (e.g. invokevirtual
-        // on this, astore_*) lacks a GPU lowering today.
+        // Non-static receiver-access pattern handling.
+        //
+        // The analyzer and the lowering emitter MUST agree on what they
+        // accept: a method admitted here only to be rejected by `walk`
+        // wastes an analyze→lower round-trip and pollutes the per-method
+        // blacklist. The emitter has NO `getfield` (0xB4) dispatch arm
+        // and `bind_param_locals` never binds `this` (slot 0 of a
+        // non-static method), so the `aload_0; getfield <prim-array>`
+        // receiver-access shape can never lower — `walk` always rejects
+        // it via the default `UnsupportedNode` arm. Reject it here
+        // instead so the two layers stay in sync. (Full `getfield`
+        // lowering — binding `this` and resolving the field — is larger
+        // scope and not attempted.)
         //
         // For static methods, `aload_0` loads the first array
-        // parameter — same as `aload_<n>` for any other slot — and
-        // does not interact with `getfield` because static-context
-        // `getfield` rejects anyway via `classify`.
+        // parameter — same as `aload_<n>` for any other slot — and does
+        // not interact with `getfield` because static-context `getfield`
+        // rejects anyway via `classify`.
         if !is_static && prev_op == Some(0x2A) {
-            if op == 0xB4 {
-                // Read the 2-byte CP index following getfield.
-                if pc + 2 >= bytes.len() {
-                    return Err(Reason::BadDescriptor);
-                }
-                let cp_index = u16::from_be_bytes([bytes[pc + 1], bytes[pc + 2]]);
-                this_field_cps.push(cp_index);
-                // Skip the default `classify` rejection of 0xB4 —
-                // it's accepted here as the receiver-access shape.
-                prev_op = Some(op);
-                pc += 3; // getfield is 3 bytes total
-                continue;
-            } else {
-                // `aload_0` followed by something other than
-                // getfield — not the supported pattern.
-                return Err(Reason::NonStaticReceiverMisuse);
-            }
+            // `aload_0` loads `this` in a non-static method; neither the
+            // getfield receiver-access shape nor any other use of `this`
+            // has a GPU lowering today.
+            return Err(Reason::NonStaticReceiverMisuse);
         }
 
         match classify(op, hint, prev_op) {
@@ -417,9 +447,28 @@ fn scan_bytecode(
             OpClass::Reject(r) => return Err(r),
         }
         prev_op = Some(op);
+        // Carry the literal pushed by this op (if any) into the next
+        // iteration so a following forward `if_icmp*` can read it as its
+        // bound operand. Any non-pushing op clears it.
+        last_const = pushed_const;
         pc += instruction_size(bytes, pc)?;
     }
-    let estimated_work = if has_backward { 1 << 20 } else { bytes.len().max(1) };
+    // Work estimate: prefer a recovered literal trip bound when available
+    // (`for (i = 0; i < N; i++)` with a literal N runs N iterations). Fall
+    // back to the flat `1 << 20` only when the loop has a backward branch
+    // but no recoverable literal bound (e.g. the bound is an
+    // `arraylength` known only at runtime). Straight-line kernels keep
+    // their bytecode-length proxy. Stay conservative: clamp a recovered
+    // bound to at least 1 and never above the flat default.
+    const FLAT_LOOP_WORK: usize = 1 << 20;
+    let estimated_work = if has_backward {
+        match literal_bound {
+            Some(n) if n > 0 => (n as usize).min(FLAT_LOOP_WORK),
+            _ => FLAT_LOOP_WORK,
+        }
+    } else {
+        bytes.len().max(1)
+    };
     // A dot-product / sum reduction is a counted loop whose body both
     // reads from arrays and accumulates with an arithmetic add. This is
     // the exact shape `lowering::emit` lowers (counted loop + scalar
@@ -701,38 +750,20 @@ mod tests {
 
     /// `NonStaticScale.scaleInPlace(I)V` is a non-static method whose
     /// body reads `this.data` (primitive-array field) via the
-    /// `aload_0; getfield <data-cp>` pattern. Pre-Phase 9 #2 this
-    /// rejected as `NonStatic`; now it's `Eligible` with the
-    /// getfield CP index recorded in `this_field_cps` (the
-    /// marshaller / emitter use it in Phase 9 #2 push 2).
+    /// `aload_0; getfield <data-cp>` pattern. The lowering emitter has
+    /// no `getfield` arm and never binds `this`, so this shape can never
+    /// lower; the analyzer must agree and reject it up front (rather than
+    /// admit it and waste an analyze→lower round-trip). See the
+    /// `NonStaticReceiverMisuse` handling in `scan_bytecode`.
     #[test]
-    fn accept_non_static_with_this_field_pattern() {
+    fn reject_non_static_this_field_pattern() {
         let method = load_method("NonStaticScale", "scaleInPlace", "(I)V");
-        match analyze(&method) {
-            OffloadVerdict::Eligible(sig) => {
-                // The body accesses `this.data` multiple times
-                // (length read, indexed load, indexed store) — every
-                // access goes through `aload_0; getfield <data>`, so
-                // we expect ≥ 3 cps. Duplicates are intentional;
-                // the marshaller may de-dup.
-                assert!(
-                    sig.this_field_cps.len() >= 3,
-                    "expected ≥3 this_field_cps entries, got {:?}",
-                    sig.this_field_cps,
-                );
-                // Every cp index should be the same field
-                // (`NonStaticScale.data`).
-                let first = sig.this_field_cps[0];
-                for &cp in &sig.this_field_cps {
-                    assert_eq!(
-                        cp, first,
-                        "expected every this_field_cp entry to point at the same field; got {:?}",
-                        sig.this_field_cps,
-                    );
-                }
-            }
-            v => panic!("expected Eligible for non-static this-access pattern, got {v:?}"),
-        }
+        assert_eq!(
+            analyze(&method),
+            OffloadVerdict::Rejected(Reason::NonStaticReceiverMisuse),
+            "non-static this-field methods must be rejected — analyzer and \
+             emitter must agree, and the emitter cannot lower them",
+        );
     }
 
     /// Sanity check: static methods that still use `aload_0` (to

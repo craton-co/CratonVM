@@ -32,7 +32,8 @@ use crate::swing;
 // identity hash to the `callback_id` here so the
 // `InvocationEvent.dispatch()V` native (which only receives the event
 // object as `this`) can find the matching Runnable via
-// `edt::get_edt().take_runnable(callback_id)`.
+// `edt::get_edt().take_runnable_checked(callback_id, gc_gen)` (the checked
+// variant fails closed across GC boundaries — see the dispatch native).
 //
 // A separate side-table (rather than a synthetic field on the event) avoids
 // having to teach the JDK class layout about an extra slot — synthetic
@@ -1745,18 +1746,24 @@ fn materialise_event(
 fn register_event_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/awt/EventQueue", "isDispatchThread", "()Z",
         |_ctx, _args| bool_ok(edt::is_edt()));
-    registry.register("java/awt/EventQueue", "invokeLater", "(Ljava/lang/Runnable;)V", |_ctx, args| {
+    registry.register("java/awt/EventQueue", "invokeLater", "(Ljava/lang/Runnable;)V", |ctx, args| {
         if let Some(runnable) = get_obj(args, 0) {
             // Allocate a fresh callback id, register the Runnable, post
             // an InvocationEvent.  The EDT will dequeue it via
             // `getNextEvent` and dispatch it through
             // `InvocationEvent.dispatch()V` (registered below).
-            edt::get_edt().invoke_later_runnable(runnable, PeerId(0));
+            //
+            // Capture the current GC collection count and stamp it on the
+            // registry entry: `invokeLater` is asynchronous, so a moving
+            // collection can relocate/free the Runnable before dispatch.
+            // The dispatch site fails closed on a generation mismatch
+            // (see `take_runnable_checked`), mirroring `lookup_peer_source`.
+            edt::get_edt().invoke_later_runnable(runnable, PeerId(0), ctx.gc_collection_count());
         }
         void_ok()
     });
     registry.register("java/awt/EventQueue", "invokeAndWait",
-        "(Ljava/lang/Runnable;)V", |_ctx, args| {
+        "(Ljava/lang/Runnable;)V", |ctx, args| {
         if let Some(runnable) = get_obj(args, 0) {
             // Block until the Runnable's `dispatch()V` native finishes
             // calling `run()`. Round-9 misc fix: when called from the
@@ -1764,8 +1771,12 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
             // boundary (UB on most VMs). Convert the structured error
             // into the JDK-spec'd `IllegalStateException` so the Java
             // caller observes the documented behaviour instead.
+            //
+            // Stamp the current GC count so dispatch can fail closed if a
+            // moving collection runs before the Runnable is dispatched.
+            let gc_gen = ctx.gc_collection_count();
             if let Err(InvokeAndWaitError::OnEdt) =
-                edt::get_edt().invoke_and_wait_runnable(runnable, PeerId(0))
+                edt::get_edt().invoke_and_wait_runnable(runnable, PeerId(0), gc_gen)
             {
                 return Err(RuntimeError::IllegalStateException {
                     message: InvokeAndWaitError::OnEdt.jdk_message().to_string(),
@@ -1879,7 +1890,17 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
             // dispatched.  Nothing to do.
             return void_ok();
         };
-        let runnable = edt::get_edt().take_runnable(callback_id);
+        // Resurrect the Runnable pointer ONLY if no (moving) GC has run
+        // since it was registered. `invokeLater` is asynchronous, so the
+        // moving collector may have relocated or freed the Runnable object
+        // in the meantime; dereferencing a stale pointer via `invoke_virtual`
+        // would be a use-after-free / type confusion reachable from any
+        // Swing app. We therefore fail closed across the GC boundary exactly
+        // like `lookup_peer_source` does for cached peer-source pointers: on
+        // a generation mismatch `take_runnable_checked` returns `None`, we
+        // skip the `run()` call entirely, and only signal completion so a
+        // blocked `invokeAndWait` waiter doesn't hang.
+        let runnable = edt::get_edt().take_runnable_checked(callback_id, ctx.gc_collection_count());
         if let Some(runnable) = runnable {
             // Run on whatever thread invoked us — by contract this is
             // the EDT, since the EDT dispatch loop is what calls
@@ -1893,8 +1914,17 @@ fn register_event_natives(registry: &mut NativeMethodRegistry) {
             // Surface any exception thrown by Runnable.run() to the EDT.
             result?;
         } else {
-            // Runnable already taken (e.g. dispatched twice).  Still
-            // signal so a waiter doesn't hang.
+            // Either the Runnable was already taken (e.g. dispatched
+            // twice) or `take_runnable_checked` failed closed because a GC
+            // ran since registration (stale/relocated pointer). In both
+            // cases we must NOT dereference the pointer; still signal so a
+            // waiting `invokeAndWait` caller doesn't hang.
+            tracing::warn!(
+                callback_id,
+                "InvocationEvent.dispatch: Runnable skipped (already taken or \
+                 invalidated by a GC since registration); failing closed to \
+                 avoid a use-after-free"
+            );
             edt::get_edt().signal_invocation_complete(callback_id);
         }
         void_ok()
@@ -2105,25 +2135,31 @@ fn register_swing_natives(registry: &mut NativeMethodRegistry) {
 
     registry.register("javax/swing/SwingUtilities", "isEventDispatchThread", "()Z",
         |_ctx, _args| bool_ok(edt::is_edt()));
-    registry.register("javax/swing/SwingUtilities", "invokeLater", "(Ljava/lang/Runnable;)V", |_ctx, args| {
+    registry.register("javax/swing/SwingUtilities", "invokeLater", "(Ljava/lang/Runnable;)V", |ctx, args| {
         if let Some(runnable) = get_obj(args, 0) {
             // Same plumbing as `EventQueue.invokeLater` — register the
             // Runnable so `InvocationEvent.dispatch()V` can find it,
-            // then post.
-            edt::get_edt().invoke_later_runnable(runnable, PeerId(0));
+            // then post. Stamp the current GC count so dispatch fails
+            // closed if a moving collection runs first (see
+            // `take_runnable_checked` / `lookup_peer_source`).
+            edt::get_edt().invoke_later_runnable(runnable, PeerId(0), ctx.gc_collection_count());
         }
         void_ok()
     });
     registry.register("javax/swing/SwingUtilities", "invokeAndWait",
-        "(Ljava/lang/Runnable;)V", |_ctx, args| {
+        "(Ljava/lang/Runnable;)V", |ctx, args| {
         if let Some(runnable) = get_obj(args, 0) {
             // Round-9 misc fix: surface the EDT-from-EDT case as an
             // `IllegalStateException` on the Java thread instead of
             // panicking across the JNI boundary. The wording matches
             // the JDK exactly so existing exception filters keep
             // working.
+            //
+            // Stamp the current GC count so dispatch can fail closed if a
+            // moving collection runs before the Runnable is dispatched.
+            let gc_gen = ctx.gc_collection_count();
             if let Err(InvokeAndWaitError::OnEdt) =
-                edt::get_edt().invoke_and_wait_runnable(runnable, PeerId(0))
+                edt::get_edt().invoke_and_wait_runnable(runnable, PeerId(0), gc_gen)
             {
                 return Err(RuntimeError::IllegalStateException {
                     message: InvokeAndWaitError::OnEdt.jdk_message().to_string(),

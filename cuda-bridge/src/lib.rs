@@ -52,11 +52,29 @@ pub struct LaunchConfig {
     pub shared_bytes: u32,
 }
 
+/// Default 1-D block size used by [`LaunchConfig::elementwise`] when no
+/// occupancy autotune is available (stub mode, or when the driver query
+/// returns nothing). Kept as a named constant so the autotune fallback
+/// in [`DeviceModule::elementwise_for_kernel`] uses the same value.
+pub(crate) const DEFAULT_ELEMENTWISE_BLOCK: u32 = 256;
+
 impl LaunchConfig {
     /// One-dimensional launch sized to cover `n` elements with the
     /// default block size of 256 threads.
+    ///
+    /// For an occupancy-tuned block size, use
+    /// [`DeviceModule::elementwise_for_kernel`], which queries the driver
+    /// for the kernel's optimal block size and falls back to this default.
     pub fn elementwise(n: u32) -> Self {
-        let block = 256u32;
+        Self::elementwise_with_block(n, DEFAULT_ELEMENTWISE_BLOCK)
+    }
+
+    /// One-dimensional launch sized to cover `n` elements with an
+    /// explicit `block` size. The grid is `ceil(n / block)` (at least
+    /// one block). `block` is clamped to at least 1 so a degenerate
+    /// `0` never produces a div-by-zero or a zero-thread launch.
+    pub(crate) fn elementwise_with_block(n: u32, block: u32) -> Self {
+        let block = block.max(1);
         let grid = n.div_ceil(block).max(1);
         Self {
             grid: (grid, 1, 1),
@@ -156,6 +174,21 @@ impl DeviceContext {
     }
 }
 
+/// Hard cap on the number of distinct kernel names the process-wide
+/// interner will ever leak. Real workloads compile a small, finite set
+/// of kernel identifiers (tens to low hundreds), so this bound is far
+/// above any legitimate need while capping the worst case at a fixed,
+/// bounded amount of leaked memory (≈ this many short boxed strings).
+#[cfg(feature = "cuda")]
+const MAX_INTERNED_KERNEL_NAMES: usize = 4096;
+
+/// `'static` sentinel returned once the interner is saturated. It is a
+/// deliberately invalid kernel name: any `get_func` lookup against it
+/// fails with [`DeviceError::KernelNotFound`] (a clean, surfaced error)
+/// rather than silently growing the process heap without bound.
+#[cfg(feature = "cuda")]
+const INTERN_OVERFLOW_SENTINEL: &str = "__cratonvm_kernel_name_intern_overflow__";
+
 /// Process-wide kernel-name interner.
 ///
 /// AUDIT 2026-05-20 (PERF Fix #2): cudarc 0.13 needs `&'static str`
@@ -165,23 +198,47 @@ impl DeviceContext {
 /// once and cached here. Subsequent loads of the same name return the
 /// already-interned `'static` slot — zero new allocation, zero leak.
 ///
-/// The cache only ever grows by *distinct* kernel name, which is the
-/// genuinely bounded quantity (a finite set of kernel identifiers the
-/// process ever compiles), so the total leaked memory is bounded.
+/// AUDIT 2026-05-29 (FINDING 5 — bound the leak): the previous "the set
+/// only grows by distinct name, so it's bounded" reasoning held only for
+/// trusted callers. A caller that loads modules with attacker- or
+/// codegen-controlled *unique* kernel names in a loop could leak one
+/// boxed string per name without limit — an unbounded-growth DoS vector.
+/// The interner now caps the number of distinct names it will leak at
+/// [`MAX_INTERNED_KERNEL_NAMES`]. Past the cap it logs once and returns a
+/// shared `'static` overflow sentinel ([`INTERN_OVERFLOW_SENTINEL`])
+/// instead of leaking further; the subsequent kernel lookup fails
+/// cleanly with `KernelNotFound` rather than corrupting state or growing
+/// the heap. The cap is far above any legitimate kernel-name count.
 #[cfg(feature = "cuda")]
 fn intern_kernel_name(name: &str) -> &'static str {
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
     use std::sync::OnceLock;
 
     static INTERNED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    static WARNED: AtomicBool = AtomicBool::new(false);
     let set = INTERNED.get_or_init(|| Mutex::new(HashSet::new()));
     let mut guard = set.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(&existing) = guard.get(name) {
         return existing;
     }
-    // First sighting of this name: leak exactly one boxed string and
-    // record the `'static` reference so future calls reuse it.
+    // First sighting of this name. Refuse to leak past the cap so a
+    // caller feeding unbounded distinct names cannot grow the heap
+    // without limit.
+    if guard.len() >= MAX_INTERNED_KERNEL_NAMES {
+        // Log exactly once to avoid spamming on a hot mis-use path.
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "cuda-bridge: kernel-name interner saturated at {MAX_INTERNED_KERNEL_NAMES} \
+                 distinct names; further names are not interned and their loads will fail \
+                 with KernelNotFound (possible unbounded-name misuse)"
+            );
+        }
+        return INTERN_OVERFLOW_SENTINEL;
+    }
+    // Leak exactly one boxed string and record the `'static` reference
+    // so future calls reuse it.
     let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
     guard.insert(leaked);
     leaked
@@ -231,6 +288,40 @@ impl DeviceModule {
         args: KernelArgs,
     ) -> Result<()> {
         self.0.launch_raw(&ctx.0, kernel, cfg, args)
+    }
+
+    /// Build a 1-D elementwise [`LaunchConfig`] for `kernel` sized to
+    /// cover `n` elements, using the kernel's occupancy-optimal block
+    /// size when the driver can report it.
+    ///
+    /// Round-8 autotune: replaces the hardcoded block size of
+    /// [`LaunchConfig::elementwise`] with a per-kernel value queried via
+    /// `cuOccupancyMaxPotentialBlockSize` (wrapped by
+    /// `DeviceModuleInner::optimal_block_size`). If the query is
+    /// unavailable — stub mode has no driver, and the cuda path falls
+    /// back when the driver returns nothing — the default block size of
+    /// [`crate::DEFAULT_ELEMENTWISE_BLOCK`] (256) is used, so the result
+    /// is identical to `LaunchConfig::elementwise(n)` in that case.
+    pub fn elementwise_for_kernel(
+        &self,
+        ctx: &DeviceContext,
+        kernel: &str,
+        n: u32,
+    ) -> LaunchConfig {
+        #[cfg(feature = "cuda")]
+        let block = self
+            .0
+            .optimal_block_size(&ctx.0, kernel)
+            .unwrap_or(DEFAULT_ELEMENTWISE_BLOCK);
+        #[cfg(not(feature = "cuda"))]
+        let block = {
+            // Stub mode: no driver to query, so the autotune degenerates
+            // to the default block size. `ctx` / `kernel` are unused here
+            // but kept on the signature for backend parity.
+            let _ = (ctx, kernel);
+            DEFAULT_ELEMENTWISE_BLOCK
+        };
+        LaunchConfig::elementwise_with_block(n, block)
     }
 
     /// Stub-only test constructor — see [`DeviceContext::for_test`].
@@ -506,9 +597,14 @@ unsafe impl<T: Sync> Sync for DeviceBuffer<T> {}
 
 #[cfg(feature = "cuda")]
 impl<T: DeviceElem> DeviceBuffer<T> {
+    // Reject zero-sized types: a `DeviceBuffer<T>` with `size_of::<T>()
+    // == 0` would compute a zero-byte allocation and zero-length copies,
+    // which the device-transfer paths are not meant to handle. (The
+    // `DeviceRepr` bound itself is enforced by the `DeviceElem` trait
+    // bound on this impl, not by this assert.)
     const ASSERT_DEVICE_REPR: () = assert!(
         std::mem::size_of::<T>() > 0,
-        "T must implement DeviceRepr when cuda feature is enabled"
+        "DeviceBuffer<T> rejects zero-sized types (size_of::<T>() must be > 0)"
     );
     /// Allocate `len` elements on the device, contents undefined.
     pub fn uninit(ctx: &DeviceContext, len: usize) -> Result<Self> {

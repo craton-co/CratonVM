@@ -105,9 +105,15 @@ pub struct FontEngine {
     ///
     /// The family name is interned to an `Arc<str>` so the key carries a
     /// cheap (refcount-bump) clone instead of a fresh `String` allocation
-    /// on every lookup. The cache is bounded by `METRICS_CACHE_CAP` to
-    /// prevent unbounded growth.
-    metrics_cache: FxHashMap<(Arc<str>, i32, i32), FontMetrics>,
+    /// on every lookup. The cache is bounded by `METRICS_CACHE_CAP` and
+    /// evicts the least-recently-used entry once that cap is reached.
+    ///
+    /// Each value carries the value of `tick` at its last access; on a hit
+    /// the stored tick is refreshed, and on an at-cap insert the entry with
+    /// the smallest tick (oldest use) is dropped.
+    metrics_cache: FxHashMap<(Arc<str>, i32, i32), (FontMetrics, u64)>,
+    /// Monotonic logical clock used to order cache accesses for LRU eviction.
+    tick: u64,
 }
 
 /// Logical font family categories.
@@ -122,6 +128,7 @@ impl FontEngine {
     pub fn new() -> Self {
         FontEngine {
             metrics_cache: FxHashMap::default(),
+            tick: 0,
         }
     }
 
@@ -129,22 +136,38 @@ impl FontEngine {
     ///
     /// The family name is interned to a process-global `Arc<str>` so the
     /// cache key avoids a fresh `String` allocation on every lookup. The
-    /// cache is bounded by [`METRICS_CACHE_CAP`]; if the bound is reached
-    /// the cache is cleared wholesale before insertion (see the constant's
-    /// docs for the trade-off).
+    /// cache is bounded by [`METRICS_CACHE_CAP`]; when the bound is reached
+    /// the least-recently-used entry is evicted before insertion.
     pub fn get_metrics(&mut self, spec: &FontSpec) -> FontMetrics {
         let family: Arc<str> = intern_arc(&spec.family);
         let key = (Arc::clone(&family), spec.style, spec.size);
-        if let Some(m) = self.metrics_cache.get(&key).copied() {
-            return m;
+
+        // Bump the logical clock on every access so hits and inserts share a
+        // single monotonic ordering for LRU.
+        self.tick = self.tick.wrapping_add(1);
+        let now = self.tick;
+
+        if let Some(entry) = self.metrics_cache.get_mut(&key) {
+            // Hit: refresh last-use so this entry counts as recently used.
+            entry.1 = now;
+            return entry.0;
         }
 
         let m = Self::compute_metrics(spec);
         if self.metrics_cache.len() >= METRICS_CACHE_CAP {
-            // Coarse eviction: drop everything. See METRICS_CACHE_CAP docs.
-            self.metrics_cache.clear();
+            // LRU eviction: drop the single entry with the smallest last-use
+            // tick (least recently used). Linear scan, but only on inserts at
+            // cap and avoids the re-warm thrash of clearing wholesale.
+            if let Some(oldest) = self
+                .metrics_cache
+                .iter()
+                .min_by_key(|(_, v)| v.1)
+                .map(|(k, _)| k.clone())
+            {
+                self.metrics_cache.remove(&oldest);
+            }
         }
-        self.metrics_cache.insert(key, m);
+        self.metrics_cache.insert(key, (m, now));
         m
     }
 
@@ -426,32 +449,54 @@ pub struct GlyphBitmap {
 
 /// Process-wide cache of rasterized glyphs.
 ///
-/// Eviction strategy: when the map reaches `cap`, drop the first
-/// `cap / 2` entries observed during hashmap iteration. FxHashMap's
-/// iteration order is deterministic for a given insertion history but not
-/// LRU-ordered, so this is effectively pseudo-random eviction. That's the
-/// right trade-off here:
-///
-///   - True LRU would require per-lookup bookkeeping (linked-list pointer
-///     updates under the same mutex), making the hot get path measurably
-///     slower for the steady-state cache-hit case we're optimizing.
-///   - The working set of an interactive UI is small (a few hundred glyphs)
-///     and refills cheaply: a missed glyph just re-rasterizes once, then
-///     stays hot.
-///   - The cap is a soft pressure-release valve, not a precision tool.
-///
-/// If profiling later shows excessive thrashing on real workloads, swap the
-/// internals for a real LRU without changing the public API.
+/// Eviction strategy: when the map reaches `cap`, evict the single
+/// least-recently-used entry before inserting the new one. Each map value
+/// carries the value of a monotonic logical clock (`tick`) at its last use;
+/// a hit refreshes that stamp and an at-cap insert drops the entry with the
+/// smallest stamp. The clock lives under the same mutex as the map, so the
+/// bookkeeping is a single integer write on the hot path — far cheaper than
+/// the re-warm thrash of the previous "drop half the map" approach, which
+/// could evict hot glyphs and force redundant re-rasterization.
 pub struct GlyphAtlas {
-    cache: Mutex<rustc_hash::FxHashMap<GlyphKey, Arc<GlyphBitmap>>>,
+    cache: Mutex<GlyphCache>,
     cap: usize,
+}
+
+/// Mutex-guarded interior of [`GlyphAtlas`]: the glyph map plus the logical
+/// clock that orders entries for LRU eviction. Each map value pairs the
+/// shared bitmap with the `tick` value at its last access.
+struct GlyphCache {
+    map: rustc_hash::FxHashMap<GlyphKey, (Arc<GlyphBitmap>, u64)>,
+    /// Monotonic logical clock; bumped on every access (hit or insert).
+    tick: u64,
+}
+
+impl GlyphCache {
+    fn new() -> Self {
+        GlyphCache {
+            map: rustc_hash::FxHashMap::default(),
+            tick: 0,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    fn clear(&mut self) {
+        self.map.clear();
+    }
 }
 
 impl GlyphAtlas {
     /// Construct an empty atlas with the given soft cap.
     pub fn new(cap: usize) -> Self {
         GlyphAtlas {
-            cache: Mutex::new(rustc_hash::FxHashMap::default()),
+            cache: Mutex::new(GlyphCache::new()),
             cap,
         }
     }
@@ -501,9 +546,17 @@ impl GlyphAtlas {
         key: GlyphKey,
         fontdue_font: &fontdue::Font,
     ) -> Arc<GlyphBitmap> {
-        // Hot path: scoped lock, drops before any work.
-        if let Some(g) = self.cache.lock().get(&key).cloned() {
-            return g;
+        // Hot path: scoped lock, drops before any work. On a hit we also
+        // refresh the entry's last-use tick so it counts as recently used
+        // for LRU ordering.
+        {
+            let mut cache = self.cache.lock();
+            cache.tick = cache.tick.wrapping_add(1);
+            let now = cache.tick;
+            if let Some(entry) = cache.map.get_mut(&key) {
+                entry.1 = now;
+                return Arc::clone(&entry.0);
+            }
         }
 
         // Miss: enter the insert path under a single lock acquisition so
@@ -511,36 +564,41 @@ impl GlyphAtlas {
         // first inserter wins, the rest get the cached entry. This
         // preserves `Arc::ptr_eq` for downstream identity caches.
         let mut cache = self.cache.lock();
+        cache.tick = cache.tick.wrapping_add(1);
+        let now = cache.tick;
 
-        // Bulk-evict BEFORE the `entry` lookup. If we are about to insert
-        // and we're already at cap, free space first.
-        if cache.len() >= self.cap && !cache.contains_key(&key) {
-            // Pseudo-random bulk eviction: drop the first half of whatever
-            // the iterator yields. Cheaper than tracking LRU and adequate
-            // for the soft-cap role this serves. See `GlyphAtlas` docs.
-            let drop_count = cache.len() / 2;
-            let keys_to_drop: Vec<GlyphKey> =
-                cache.keys().take(drop_count).copied().collect();
-            for k in keys_to_drop {
-                cache.remove(&k);
+        // LRU-evict BEFORE the `entry` lookup. If we are about to insert a new
+        // key and we're already at cap, drop the single least-recently-used
+        // entry (smallest last-use tick) to make room. Linear scan, but only
+        // on at-cap inserts; avoids the re-warm thrash of bulk eviction.
+        if cache.map.len() >= self.cap && !cache.map.contains_key(&key) {
+            if let Some(oldest) = cache
+                .map
+                .iter()
+                .min_by_key(|(_, v)| v.1)
+                .map(|(k, _)| *k)
+            {
+                cache.map.remove(&oldest);
             }
         }
 
-        Arc::clone(cache.entry(key).or_insert_with(|| {
+        let entry = cache.map.entry(key).or_insert_with(|| {
             // `from_u32` is the safe path — we never want to panic on a
             // surrogate or out-of-range code point sneaked in by upstream
             // string handling.
             let ch = std::char::from_u32(key.ch).unwrap_or(' ');
             let (metrics, alpha_vec) = fontdue_font.rasterize(ch, key.size as f32);
-            Arc::new(GlyphBitmap {
+            let bitmap = Arc::new(GlyphBitmap {
                 alpha: alpha_vec.into(),
                 width: metrics.width as u32,
                 height: metrics.height as u32,
                 bearing_x: metrics.xmin,
                 bearing_y: metrics.ymin,
                 advance: metrics.advance_width,
-            })
-        }))
+            });
+            (bitmap, now)
+        });
+        Arc::clone(&entry.0)
     }
 }
 
@@ -831,16 +889,19 @@ mod tests {
         // Directly poke a bitmap in so we don't need a real fontdue font.
         {
             let mut cache = atlas.cache.lock();
-            cache.insert(
+            cache.map.insert(
                 GlyphKey::new("Dialog", 12, false, false, 'A'),
-                Arc::new(GlyphBitmap {
-                    alpha: Vec::<u8>::new().into(),
-                    width: 0,
-                    height: 0,
-                    bearing_x: 0,
-                    bearing_y: 0,
-                    advance: 0.0,
-                }),
+                (
+                    Arc::new(GlyphBitmap {
+                        alpha: Vec::<u8>::new().into(),
+                        width: 0,
+                        height: 0,
+                        bearing_x: 0,
+                        bearing_y: 0,
+                        advance: 0.0,
+                    }),
+                    0,
+                ),
             );
         }
         assert_eq!(atlas.len(), 1);

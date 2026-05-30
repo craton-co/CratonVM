@@ -150,6 +150,11 @@ pub(crate) struct Emitter<'a> {
     /// by `bind_param_locals`; used by `array_param_of` to map an
     /// `aload`'d array reference back to its parameter index.
     pub param_ptr_reg: Vec<String>,
+    /// For each parameter index: the cached `pN_len` kernel-parameter
+    /// name. Built once in `bind_param_locals` (mirroring
+    /// `param_ptr_reg`) so each array op can index it instead of
+    /// re-running `format!("p{param_idx}_len")` on every access.
+    pub param_len_name: Vec<String>,
     /// Local slot of the loop induction variable (if we are in a loop).
     pub iv_slot: Option<u16>,
     /// Loop-bound register; populated once we emit the prologue. Used
@@ -190,6 +195,9 @@ impl<'a> Emitter<'a> {
             locals: Locals::default(),
             sig,
             param_ptr_reg: vec![String::new(); sig.param_kinds.len()],
+            param_len_name: (0..sig.param_kinds.len())
+                .map(|i| format!("p{i}_len"))
+                .collect(),
             iv_slot: None,
             bound_reg: None,
             tid_reg: None,
@@ -348,8 +356,9 @@ impl<'a> Emitter<'a> {
     }
 
     /// Emit a bounds check: if `index >= len` jump to failure label.
-    /// `len_param` is the kernel-parameter name (e.g., `p0_len`).
-    fn emit_bounds_check(&mut self, index: &Reg, len_param: &str) {
+    /// `param_idx` selects the cached `pN_len` kernel-parameter name
+    /// (see `param_len_name`).
+    fn emit_bounds_check(&mut self, index: &Reg, param_idx: usize) {
         self.used_bounds_label = true;
         let len = self.regs.fresh_reg(RegKind::S32);
         let p_neg = self.regs.fresh_reg(RegKind::Pred);
@@ -357,7 +366,7 @@ impl<'a> Emitter<'a> {
         writeln!(
             self.body,
             "    ld.param.s32 {}, [{}];",
-            len.name, len_param
+            len.name, self.param_len_name[param_idx]
         )
         .unwrap();
         // index < 0 also fails — Java semantics.
@@ -647,7 +656,11 @@ impl<'a> Emitter<'a> {
             0x8F => self.conv("cvt.rzi.s64.f64", RegKind::F64, RegKind::S64)?, // d2l
             0x90 => self.conv("cvt.rn.f32.f64", RegKind::F64, RegKind::F32)?, // d2f
             0x91 => self.conv_truncate_i32(8)?,                                // i2b
-            0x92 => self.conv_truncate_i32(16)?,                               // i2c (unsigned 16)
+            // i2c — Java `char` is an UNSIGNED 16-bit value, so JVMS i2c
+            // zero-extends the low 16 bits (not sign-extends like i2b/i2s).
+            // Route through the zero-extending helper so e.g. 0xFFFF maps
+            // to 65535 rather than -1.
+            0x92 => self.conv_zext_u16()?,                                     // i2c (unsigned 16)
             0x93 => self.conv_truncate_i32(16)?,                               // i2s
             // ── compares (push int -1/0/1) ──────────────────────────
             // AUDIT 2026-05-19: `lcmp` (0x94) was dispatched to
@@ -1151,6 +1164,19 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// Zero-extend the low 16 bits of an int — the JVMS `i2c` semantics.
+    /// Java `char` is an UNSIGNED 16-bit value, so `i2c` masks to the low
+    /// 16 bits rather than sign-extending (which is what
+    /// `conv_truncate_i32(16)` does for the signed `i2b`/`i2s`). For an
+    /// input with bit 15 set (e.g. 0xFFFF) this yields 65535, not -1.
+    fn conv_zext_u16(&mut self) -> Result<(), LoweringError> {
+        let a = self.stack.pop()?;
+        let r = self.regs.fresh_reg(RegKind::S32);
+        writeln!(self.body, "    and.b32 {}, {}, 0xFFFF;", r.name, a.name).unwrap();
+        self.stack.push(r);
+        Ok(())
+    }
+
     // AUDIT 2026-05-19: `cmp_long_or_float` was removed — it always
     // returned `Err`, so every `*cmp*` opcode now rejects explicitly at
     // the `emit_op` dispatch site instead of routing through dead code.
@@ -1190,8 +1216,7 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
-        self.emit_bounds_check(&index, &len_param);
+        self.emit_bounds_check(&index, param_idx);
         let offset = self.regs.fresh_reg(RegKind::U64);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
@@ -1228,8 +1253,7 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
-        self.emit_bounds_check(&index, &len_param);
+        self.emit_bounds_check(&index, param_idx);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
         let raw = self.regs.fresh_reg(RegKind::S32);
@@ -1275,8 +1299,7 @@ impl<'a> Emitter<'a> {
         let index = self.stack.pop()?;
         let array_ref = self.stack.pop()?;
         let (param_idx, _kind) = self.array_param_of(&array_ref)?;
-        let len_param = format!("p{param_idx}_len");
-        self.emit_bounds_check(&index, &len_param);
+        self.emit_bounds_check(&index, param_idx);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let offset = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
@@ -1335,8 +1358,7 @@ impl<'a> Emitter<'a> {
         } else {
             u64::MAX
         };
-        let len_param = format!("p{param_idx}_len");
-        self.emit_bounds_check(&index, &len_param);
+        self.emit_bounds_check(&index, param_idx);
         let offset = self.regs.fresh_reg(RegKind::U64);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
@@ -1378,8 +1400,7 @@ impl<'a> Emitter<'a> {
         } else {
             u64::MAX
         };
-        let len_param = format!("p{param_idx}_len");
-        self.emit_bounds_check(&index, &len_param);
+        self.emit_bounds_check(&index, param_idx);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
         writeln!(
@@ -1415,8 +1436,7 @@ impl<'a> Emitter<'a> {
         } else {
             u64::MAX
         };
-        let len_param = format!("p{param_idx}_len");
-        self.emit_bounds_check(&index, &len_param);
+        self.emit_bounds_check(&index, param_idx);
         let byte_idx = self.regs.fresh_reg(RegKind::U64);
         let offset = self.regs.fresh_reg(RegKind::U64);
         let addr = self.regs.fresh_reg(RegKind::U64);
@@ -1453,8 +1473,8 @@ impl<'a> Emitter<'a> {
         let r = self.regs.fresh_reg(RegKind::S32);
         writeln!(
             self.body,
-            "    ld.param.s32 {}, [p{param_idx}_len];",
-            r.name
+            "    ld.param.s32 {}, [{}];",
+            r.name, self.param_len_name[param_idx]
         )
         .unwrap();
         self.stack.push(r);

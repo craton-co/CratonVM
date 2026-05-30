@@ -272,6 +272,22 @@ impl ValueStack {
     /// Push without error wrapping. Used by the fast-path interpreter
     /// for verified bytecode where stack overflow is impossible.
     ///
+    /// # Invariant
+    /// The caller MUST guarantee `self.len < self.max_size` before calling.
+    /// This is satisfied by the classfile verifier, which proves every
+    /// method's operand stack never exceeds its declared `max_stack`; the
+    /// fast-path interpreter relies on that proof and skips the bounds check
+    /// for speed. The invariant is only `debug_assert!`-checked here, so in a
+    /// release build a verifier gap (e.g. running with `skip_verification`)
+    /// turns the would-be controlled panic into a *silent* slot overwrite at
+    /// `self.len == max_size`. Memory safety is still upheld — the slot index
+    /// is Rust-bounds-checked against the backing vec, so an out-of-range
+    /// `len` produces a controlled index panic, never UB.
+    ///
+    /// Slow / deopt / unverified callers that cannot uphold the invariant
+    /// must use the checked sibling [`Self::push_checked`] (or [`Self::push`]),
+    /// which returns an `Err` on overflow instead of relying on the verifier.
+    ///
     /// # Panics
     /// Panics if the stack is full. This is a safety net — verified bytecode
     /// should never trigger this.
@@ -302,6 +318,15 @@ impl ValueStack {
     /// Push a pre-encoded `CompactValue` directly — zero-cost over writing
     /// `slots[n] = cv`. Used internally where the compact form is already
     /// in hand (e.g. `dup`, `swap`, local reload).
+    ///
+    /// # Invariant
+    /// The caller MUST guarantee `self.len < self.max_size` before calling.
+    /// As with [`Self::push_unchecked`], this is enforced by the classfile
+    /// verifier's `max_stack` proof and only `debug_assert!`-checked here for
+    /// speed; a verifier gap under `skip_verification` degrades to a Rust
+    /// bounds-checked index panic (controlled, never UB) rather than a clean
+    /// `Err`. Slow / deopt / unverified callers must use the checked sibling
+    /// [`Self::push_compact_checked`] instead.
     ///
     /// # Panics
     /// Panics if the stack is full.
@@ -532,6 +557,18 @@ impl ValueStack {
 
     /// Push an i32 directly as a `CompactValue::int(_)` without going
     /// through `Value::Int(_) → from_value(_)`.
+    ///
+    /// # Invariant
+    /// The caller MUST guarantee `self.len < self.max_size` before calling.
+    /// Like the other unchecked pushes ([`Self::push_unchecked`],
+    /// [`Self::push_compact`]) this is the classfile verifier's `max_stack`
+    /// contract, only `debug_assert!`-checked here for speed; under a
+    /// verifier gap (`skip_verification`) the overflow degrades to a Rust
+    /// bounds-checked index panic (controlled, never UB) rather than an
+    /// `Err`. Slow / deopt / unverified callers that cannot rely on the
+    /// verifier must use a checked push such as [`Self::push_checked`]
+    /// (there is no int-specialised checked variant — wrap the value as
+    /// `Value::Int` for the slow path).
     ///
     /// # Panics
     /// Panics if the stack is full.

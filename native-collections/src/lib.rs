@@ -686,7 +686,10 @@ fn al_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usi
     let old_cap = data.map_or(0, |d| ctx.array_length(d));
 
     if min_cap <= old_cap {
-        return data.unwrap();
+        // `old_cap == 0` implies the backing array is None (e.g. a freshly
+        // constructed list asked to ensure capacity 0). Unwrapping would
+        // panic, so allocate an empty array as the None-safe fallback.
+        return data.unwrap_or_else(|| alloc_ref_array(ctx, 0));
     }
 
     // Grow: max(old_cap * 1.5, min_cap) — matches Java's ArrayList strategy.
@@ -8524,13 +8527,13 @@ fn native_int_stream_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Int(0))),
     };
     let elements = int_stream_elements(ctx, this);
-    let sum: i32 = elements
-        .iter()
-        .map(|v| match v {
-            Value::Int(i) => *i,
-            _ => 0,
-        })
-        .sum();
+    // JDK `IntStream.sum()` has wrapping (two's-complement) overflow
+    // semantics; using `Iterator::sum` would panic in debug builds, so fold
+    // with `wrapping_add` instead.
+    let sum: i32 = elements.iter().fold(0i32, |acc, v| match v {
+        Value::Int(i) => acc.wrapping_add(*i),
+        _ => acc,
+    });
     Ok(Some(Value::Int(sum)))
 }
 
@@ -8825,13 +8828,13 @@ fn native_long_stream_sum(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(Some(Value::Long(0))),
     };
     let elements = stream_elements(ctx, this);
-    let sum: i64 = elements
-        .iter()
-        .map(|v| match v {
-            Value::Long(l) => *l,
-            _ => 0,
-        })
-        .sum();
+    // JDK `LongStream.sum()` has wrapping (two's-complement) overflow
+    // semantics; fold with `wrapping_add` to match and avoid debug-build
+    // panics from `Iterator::sum`.
+    let sum: i64 = elements.iter().fold(0i64, |acc, v| match v {
+        Value::Long(l) => acc.wrapping_add(*l),
+        _ => acc,
+    });
     Ok(Some(Value::Long(sum)))
 }
 
@@ -11124,8 +11127,14 @@ fn native_ll_listitr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     Ok(None)
 }
 
+/// LinkedList's `ListIterator` is backed by an immutable snapshot taken at
+/// `listIterator()` time, so structural mutation through the iterator cannot
+/// be honoured. Per the JDK contract, an iterator that does not support a
+/// mutation must throw `UnsupportedOperationException` rather than silently
+/// no-op'ing (which would mask caller bugs and diverge from real JDK
+/// behaviour). Used for both `remove()` and `add(Object)`.
 fn native_ll_listitr_remove_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
+    Err(unsupported_op())
 }
 
 fn native_ll_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -12327,6 +12336,13 @@ fn native_lhm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     if let Some(node) = lhm_find_node(ctx, this, &key_val)? {
         let old = ctx.get_field(node, LHM_NODE_VALUE);
         ctx.set_field(node, LHM_NODE_VALUE, value);
+        // Access-order semantics: re-inserting a value for an existing key
+        // counts as a structural access, so the entry must move to the tail
+        // of the insertion-order list (mirrors `native_lhm_get`). With
+        // insertion-order (the default) this is left untouched.
+        if lhm_is_access_order(ctx, this) {
+            lhm_move_to_tail(ctx, this, node);
+        }
         return Ok(Some(old));
     }
 
@@ -13398,7 +13414,13 @@ fn native_pq_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     let (_, size) = pq_state(ctx, this);
     pq_ensure_capacity(ctx, this, (size + 1) as usize);
     let (data, _) = pq_state(ctx, this);
-    let buf = data.unwrap();
+    // `pq_ensure_capacity` allocates a buffer for any `min_cap >= 1`, so this
+    // is normally `Some`. Guard against a None backing array (size/data
+    // divergence) rather than panicking on `unwrap`.
+    let buf = match data {
+        Some(b) => b,
+        None => return Ok(Some(Value::Int(0))),
+    };
     ctx.set_array_element(buf, size as usize, elem);
     ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(size + 1));
     pq_sift_up(ctx, this, buf, size as usize)?;
@@ -15239,13 +15261,17 @@ fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     }
     let (data_opt, size, _) = tm_state(ctx, this);
-    if size == 0 {
-        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
-            message: "TreeMap is empty".to_string(),
+    // Treat a None backing array as empty: a divergence between the size
+    // counter and the data array must not panic via `unwrap`.
+    let data = match data_opt {
+        Some(d) if size != 0 => d,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: "TreeMap is empty".to_string(),
+            }
+            .into());
         }
-        .into());
-    }
-    let data = data_opt.unwrap();
+    };
     Ok(Some(ctx.get_array_element(data, 0)))
 }
 
@@ -15272,13 +15298,16 @@ fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     }
     let (data_opt, size, _) = tm_state(ctx, this);
-    if size == 0 {
-        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
-            message: "TreeMap is empty".to_string(),
+    // Treat a None backing array as empty rather than panicking on `unwrap`.
+    let data = match data_opt {
+        Some(d) if size != 0 => d,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: "TreeMap is empty".to_string(),
+            }
+            .into());
         }
-        .into());
-    }
-    let data = data_opt.unwrap();
+    };
     Ok(Some(ctx.get_array_element(data, (size as usize - 1) * 2)))
 }
 
@@ -15455,10 +15484,11 @@ fn native_tm_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
     }
     let (data_opt, size, _) = tm_state(ctx, this);
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let data = data_opt.unwrap();
+    // Treat a None backing array as empty rather than panicking on `unwrap`.
+    let data = match data_opt {
+        Some(d) if size != 0 => d,
+        _ => return Ok(Some(Value::Object(None))),
+    };
     let k = ctx.get_array_element(data, 0);
     let v = ctx.get_array_element(data, 1);
     let entry = tm_make_entry(ctx, k, v);
@@ -15482,10 +15512,11 @@ fn native_tm_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         }
     }
     let (data_opt, size, _) = tm_state(ctx, this);
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let data = data_opt.unwrap();
+    // Treat a None backing array as empty rather than panicking on `unwrap`.
+    let data = match data_opt {
+        Some(d) if size != 0 => d,
+        _ => return Ok(Some(Value::Object(None))),
+    };
     let last = (size as usize - 1) * 2;
     let k = ctx.get_array_element(data, last);
     let v = ctx.get_array_element(data, last + 1);
@@ -15515,10 +15546,11 @@ fn native_tm_poll_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
     }
     let (data_opt, size, _) = tm_state(ctx, this);
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let data = data_opt.unwrap();
+    // Treat a None backing array as empty rather than panicking on `unwrap`.
+    let data = match data_opt {
+        Some(d) if size != 0 => d,
+        _ => return Ok(Some(Value::Object(None))),
+    };
     let k = ctx.get_array_element(data, 0);
     let v = ctx.get_array_element(data, 1);
     tm_remove_at(ctx, data, size, 0);
@@ -15549,10 +15581,11 @@ fn native_tm_poll_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
     }
     let (data_opt, size, _) = tm_state(ctx, this);
-    if size == 0 {
-        return Ok(Some(Value::Object(None)));
-    }
-    let data = data_opt.unwrap();
+    // Treat a None backing array as empty rather than panicking on `unwrap`.
+    let data = match data_opt {
+        Some(d) if size != 0 => d,
+        _ => return Ok(Some(Value::Object(None))),
+    };
     let last = (size as usize - 1) * 2;
     let k = ctx.get_array_element(data, last);
     let v = ctx.get_array_element(data, last + 1);
@@ -16172,13 +16205,16 @@ fn native_ts_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         }
     };
     let (data_opt, size, _) = ts_state(ctx, this);
-    if size == 0 {
-        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
-            message: "TreeSet is empty".to_string(),
+    // Treat a None backing array as empty rather than panicking on `unwrap`.
+    let data = match data_opt {
+        Some(d) if size != 0 => d,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: "TreeSet is empty".to_string(),
+            }
+            .into());
         }
-        .into());
-    }
-    let data = data_opt.unwrap();
+    };
     Ok(Some(ctx.get_array_element(data, 0)))
 }
 
@@ -16193,13 +16229,16 @@ fn native_ts_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         }
     };
     let (data_opt, size, _) = ts_state(ctx, this);
-    if size == 0 {
-        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
-            message: "TreeSet is empty".to_string(),
+    // Treat a None backing array as empty rather than panicking on `unwrap`.
+    let data = match data_opt {
+        Some(d) if size != 0 => d,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: "TreeSet is empty".to_string(),
+            }
+            .into());
         }
-        .into());
-    }
-    let data = data_opt.unwrap();
+    };
     Ok(Some(ctx.get_array_element(data, (size - 1) as usize)))
 }
 
@@ -21860,13 +21899,16 @@ fn native_cslm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     // Bug 1: shared read lock.
     let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
-    if size == 0 {
-        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
-            message: "ConcurrentSkipListMap is empty".to_string(),
+    // Treat a None keys array as empty rather than panicking on `unwrap`.
+    let keys = match keys_opt {
+        Some(k) if size != 0 => k,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: "ConcurrentSkipListMap is empty".to_string(),
+            }
+            .into());
         }
-        .into());
-    }
-    let keys = keys_opt.unwrap();
+    };
     Ok(Some(ctx.get_array_element(keys, 0)))
 }
 
@@ -21883,13 +21925,16 @@ fn native_cslm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // Bug 1: shared read lock.
     let _guard = cslm_stripe_for(ctx, this).read();
     let (keys_opt, _, size) = cslm_state(ctx, this);
-    if size == 0 {
-        return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
-            message: "ConcurrentSkipListMap is empty".to_string(),
+    // Treat a None keys array as empty rather than panicking on `unwrap`.
+    let keys = match keys_opt {
+        Some(k) if size != 0 => k,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+                message: "ConcurrentSkipListMap is empty".to_string(),
+            }
+            .into());
         }
-        .into());
-    }
-    let keys = keys_opt.unwrap();
+    };
     Ok(Some(ctx.get_array_element(keys, (size - 1) as usize)))
 }
 
