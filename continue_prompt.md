@@ -644,3 +644,151 @@ tree and can pin the CPU at 100%, inflating cratonvm timings ~2–3× and timing
 long suites. Pass/fail is still valid; treat timing as approximate unless that
 session is idle. Use `git commit <pathspec>` to land work without disturbing its
 uncommitted files.
+
+---
+
+# Keycloak test-suite errors — session 2026-05-30 (JUnit-4 crash fixed; ~84 functional failures remain)
+
+Keycloak `core` is **JUnit 4** (43 test classes). Run directly under CratonVM via
+`org.junit.runner.JUnitCore` (Surefire's junit4 fork also works once the JVM-path
+rules are met — the `-Djvm` must be `<dir>/bin/java*` and the forked CratonVM
+needs `CRATONVM_JAVA_HOME`; a `bin/java.bat` shim that sets it satisfies both).
+
+Classpath: build keycloak first (already built here); deps via
+`mvn -o org.apache.maven.plugins:maven-dependency-plugin:3.1.2:build-classpath
+-Dmdep.includeScope=test` →
+`CP = core/target/classes;core/target/test-classes;<deps>`.
+
+## 1. (FIXED) JUnit-4 hard SIGSEGV — `newConstructorForSerialization`
+
+Every JUnit-4 run segfaulted (exit 139) right after printing `JUnit version
+4.13.2`, before any test ran — under BOTH `--nojit` and JIT (HotSpot fine).
+JUnit 3 (textui) and JUnit 5 (platform) were unaffected.
+
+Root cause: `MethodHandleNatives.init` (native-builtins/src/lang_invoke.rs) did
+not populate the `type` (MethodType) field for **Constructor** MemberNames
+(it did for Field; Method relies on the Java ctor). `MemberName.getMethodType()`
+returns slot 2 directly, so the JDK serialization path
+`ReflectionFactory.newConstructorForSerialization` →
+`DirectMethodHandle.makeAllocator` → `getMethodType().changeReturnType()` /
+`.returnType()` dereferenced a wild MethodType pointer → SIGSEGV.
+
+Fix: branch **`fix/junit4-serialization-ctor`** (patch at
+`C:/Projects/0001-native-invoke-populate-constructor-MemberName-Method.patch`)
+— in the Constructor arm of `native_mhn_init`, build the `(parameterTypes...)void`
+MethodType and store it in `type`. Minimal repro (no JUnit): `SerCtor.java` calling
+`ReflectionFactory.newConstructorForSerialization(C.class).newInstance()` on a
+Serializable `C`. NOT yet merged to dev (dev checkout was busy with another
+agent's WIP).
+
+### Remaining JIT-only issue exposed by the fix
+Under `--nojit` JUnit 4 now works (`OK (2 tests)`). Under **JIT** the tests run but
+all FAIL with `NoClassDefFoundError: Could not initialize class
+java.lang.invoke.LambdaForm` via reflective `Method.invoke` (DirectMethodHandle
+accessor). So `LambdaForm.<clinit>` fails under JIT — a separate, pre-existing
+JIT bug. Run keycloak under `--nojit` until that is fixed.
+
+## 2. Functional failures: CratonVM 102 vs HotSpot 18  →  ~84 CratonVM-specific
+
+With the JUnit-4 fix (`--nojit`), keycloak core executes. HotSpot fails 18
+(artifacts of the standalone JUnitCore runner missing Surefire resources — e.g.
+crypto-provider registration — they fail on HotSpot too, so NOT CratonVM bugs).
+CratonVM fails **102** → **~84 CratonVM-specific** failures. Spot-verified:
+`JsonParserTest` HotSpot 10/10 OK vs CratonVM 7 fail; `SkeletonKeyTokenTest`
+HotSpot 5/5 OK vs CratonVM 5 fail.
+
+The 84 CratonVM-only failures, by area:
+
+- **SD-JWT — `org.keycloak.sdjwt.*` (the large majority, ~60):**
+  - `SdJwtVerificationTest` (16): `sdJwtVerificationShouldFail_*` (Duplicate
+    Digest/Salt, Expired, ForbiddenClaimNames, IssuedInTheFuture, NbfInvalid,
+    SdArrayElementIsNotString, InsecureHashAlg, WrongVerifier), `settingsTest`,
+    `testSdJwtVerification_*` (EnforceIdempotence, FlatSdJwt, RecursiveSdJwt,
+    UndisclosedArrayElements, UndisclosedNestedFields)
+  - `SdJwsTest` (~14): `shouldValidateAgeSinceIssued[_IfJwtIsTooOld]`,
+    `testPayloadJwsConstruction`, `testSignedJwsConstruction`,
+    `testVerifyExpClaim_*`, `testVerifyIssClaim_*`, `testVerifyNotBeforeClaim_*`,
+    `testVerifySignature_{Positive,WrongPublicKey}`, `testVerifyVctClaim_*`
+  - `sdjwtvp.SdJwtVPVerificationTest` (~24): `testShouldFail_If*` (Kb*, Cnf*,
+    DisclosureLength*, ReplayChecks*, KeyBinding*), `testShouldTolerate*`,
+    `testVerif*`
+  - `TimeClaimVerifierTest` (7): `testVerify{Age,Exp,Iat,NotBefore}*`
+  - `DisclosureRedListTest` (7): `testDefaultRedListed*`
+  - `consumer.SdJwtPresentationConsumerTest` (2), `IssuerSignedJWTTest` (1),
+    `SdJwtTest.settingsTest` (1)
+- **JSON parsing — `org.keycloak.JsonParserTest` (7):** `testReadClaimsParameter`,
+  `testReadClientPolicy`, `testReadOIDCClientRep[WithJWKS|WithPairwise]`,
+  `testResourceRepresentationParsing`, `testUnwrap` — JSON/Jackson
+  deserialization round-trips diverge from HotSpot.
+- **Token serialization — `org.keycloak.SkeletonKeyTokenTest` (5):** `testRSA`,
+  `testSerialization`, `testToken`, `testTokenWithoutResourceAccess`,
+  `testZipException`.
+- **Representations (4):** `representations.IDTokenTest.testSetAddressMethodWorks`,
+  `representations.UserInfoTest.testSetAddressMethodWorks`,
+  `representations.workflows.WorkflowDefinitionTest.{testFullDefinition,testOnEventAsString}`.
+
+Common threads: JSON/Jackson (de)serialization correctness and SD-JWT crypto
+signature / time-claim verification (which itself leans on JSON). These are
+distinct from the JUnit-4 crash and are the next functional gaps to chase.
+HotSpot's own 18 (not CratonVM bugs): KeyPairVerifierTest, RSAVerifierTest,
+CertificateIdentityExtractorTest, jose.{HmacTest,JWETest,jwk.*}, util.{JWKSUtils,
+PemUtils}Test, sdjwt.* signing-side, JWKUtilTest.testBigInteger380bit… — all need
+Surefire's resource/provider setup the standalone runner lacks.
+
+---
+
+# GC stale-root crash (H2 TestAll) — root cause + fix plan — session 2026-05-30
+
+**Symptom.** `org.h2.test.TestAll` under CratonVM crashes ~20 tests in (NPE at
+`TestAll.main:437`, "Cannot invoke contains on null"). Triggered by H2's
+`org/h2/util/Utils.collectGarbage()` which calls `System.gc()`. The moving GC
+relocates objects, then the log shows a cascade:
+- `POST-GC STALE LOCAL/STACK: frame[N] <method> local/stack[M] still points to
+  relocated addr 0x.. (should be 0x..)` — for `TestAll.main`/`run`/`testAll` and
+  `Utils.collectGarbage` frames.
+- `Stale pointer detected in invokevirtual receiver (all-zero header)` +
+  `gen_heap::get_field/set_field out-of-bounds ... class_id=ClassId(0)
+  java/lang/Object` (OOBFIELD family).
+- `IllegalMonitorStateException` in `Utils.collectGarbage` (implicit monitorexit
+  on frame pop — monitor ownership lost across the corruption).
+- final `NullPointerException` → process exit.
+
+**Where.** `vm/src/memory/gc.rs`:
+- Root update pass (~lines 156-185): for each `vm.threads()` → `thread.frames`
+  → each frame, forwards `frame.locals[i]` / `frame.stack[i]` when
+  `slot.as_object()` is Some and its old addr is in the `forwarding` map
+  (`take_forwarding_map()`).
+- Post-GC verifier (~lines 187-214, gated by `CRATONVM_GC_VERIFY_STALE` or
+  debug) uses the SAME iteration and flags any slot whose `as_object()` addr is
+  still a forwarding KEY → emits the POST-GC STALE messages above.
+
+**The contradiction to resolve.** Update and verify use identical
+`frame.locals/stack[i].as_object()` + same forwarding map, so if the update ran
+the verify could not flag it. Yet H2 flags `TestAll.main`/`Utils.collectGarbage`
+frames. Leading hypotheses (verify next session):
+1. **Active frame not in `thread.frames` at synchronous-GC time.** `System.gc()`
+   runs inline from the executing native; the currently-executing interpreter
+   frame(s) may be held in a Rust-local (or detached for speed) and not present
+   in `thread.frames` during the update pass, so their roots are never forwarded;
+   they reappear (stale) when pushed back, which the verifier then sees. → Fix:
+   ensure the active/executing frame chain is enumerated+updated (sync the live
+   frame into `thread.frames`, or update roots through the live frame too).
+2. **Representation mismatch.** Object roots that live as `Value::Long`
+   (tagged/JNI-style handles) or raw CompactValue slots are not matched by
+   `as_object()` → never forwarded. → Fix: forward any slot whose decoded bits
+   are a heap pointer in the forwarding map, not just `Value::Object`.
+3. **Forwarding-map coverage.** `take_forwarding_map()` may omit some relocated
+   objects (e.g. promoted/old-gen moves), so `forwarding.get(old)` misses. →
+   verify the map includes every relocation.
+
+**CAUTION — coordinate.** The actual relocation + `take_forwarding_map` live in
+the **gc crate** (`gc/src/gen_heap.rs`, `heap.rs`), which a concurrent session is
+mid-refactoring (uncommitted). Land the vm-side frame-root fix only against a
+clean gc-crate state to avoid a cross-crate collision on core memory code.
+
+**Repro.** Build H2 (`apps/_test-suites/h2database/h2`, `mvn -o -DskipTests
+test-compile`), classpath `target/classes;target/test-classes;<test deps>`, run
+`org.h2.test.TestAll` (bounded). A smaller repro: any program that holds an
+object in a local across an explicit `System.gc()` that relocates it, then
+dereferences it — set `CRATONVM_GC_VERIFY_STALE=1` to surface the POST-GC STALE
+diagnostics.
