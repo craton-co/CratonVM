@@ -3513,6 +3513,24 @@ impl ClassManager {
                 message: format!("attribute decode failed: {e}"),
             })?;
 
+        // Eagerly decode each method's attribute table too — mirrors
+        // `define_class_with_options`. The Step-5 verifier
+        // (`verify_code_attribute_presence`) and the post-swap interpreter
+        // both read the `Code` attribute via `method.code()`, which only
+        // returns `Some` for an *already-decoded* attribute. Without this,
+        // every method's `Code` stays a lazy `Raw` attribute, so the verifier
+        // sees a concrete method with no Code and rejects the redefine with
+        // "non-abstract non-native method must have Code attribute" (observed
+        // on `Foo.<init>` in the wp2_4b_redefine suite). Field attributes stay
+        // lazy — nothing on this path reads them.
+        for m in new_class_file.methods.iter_mut() {
+            force_decode_all(&mut m.attributes, &new_class_file.constant_pool)
+                .map_err(|e| LinkageError::UnsupportedClassRedefinitionError {
+                    class_name: existing_name.clone(),
+                    message: format!("method attribute decode failed: {e}"),
+                })?;
+        }
+
         // ---- Step 3: name match (always enforced) ----
         // `new_class_file.this_class` is `Arc<str>` (round 4 reader),
         // `existing_name` is `String`. Compare via `&str` to avoid an
