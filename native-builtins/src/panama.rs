@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Panama FFI native method registrations.
 
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
