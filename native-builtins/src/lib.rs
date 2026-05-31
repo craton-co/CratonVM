@@ -444,6 +444,10 @@ pub mod tls;
 pub mod http2;
 pub mod t27_tls;
 pub mod t3_impl;
+// Step 1 of the limb-based BigInteger rewrite (docs/biginteger-limb-rewrite-scope.md).
+// Additive only — nothing routes through it yet; later steps migrate the
+// BigInteger natives off the O(digits^2) decimal-string primitives onto this.
+pub(crate) mod bigint;
 #[cfg(feature = "legacy-synthetic-crypto")]
 pub mod crypto;
 #[allow(dead_code)]
