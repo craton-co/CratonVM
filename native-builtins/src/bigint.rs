@@ -359,6 +359,110 @@ impl BigInt {
             Self::normalize(q, false)
         }
     }
+
+    // -----------------------------------------------------------------
+    // division / remainder / modulo
+    // -----------------------------------------------------------------
+
+    /// In-place `r = (r << 1) | bit`.
+    fn shl1_or_mag(r: &mut Vec<u32>, bit: u32) {
+        let mut carry = (bit & 1) as u64;
+        for limb in r.iter_mut() {
+            let v = ((*limb as u64) << 1) | carry;
+            *limb = v as u32;
+            carry = v >> 32;
+        }
+        if carry > 0 {
+            r.push(carry as u32);
+        }
+    }
+
+    /// Unsigned magnitude division: `(quotient, remainder) = a divmod b`.
+    /// `b` must be non-empty (non-zero). Both results are normalized.
+    ///
+    /// Binary long division (process `a` MSB→LSB, shifting into a running
+    /// remainder). O(bits(a) · limbs) — far faster than the decimal
+    /// repeated-subtraction `bi_div_unsigned`, and exact. (Knuth Algorithm D /
+    /// Montgomery are the later perf-polish steps in the scope doc; this is the
+    /// correctness-first foundation step 3 routes through.)
+    fn divmod_mag(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        debug_assert!(!b.is_empty(), "divmod_mag: zero divisor");
+        if Self::cmp_mag(a, b) == Ordering::Less {
+            let mut r = a.to_vec();
+            while r.last() == Some(&0) {
+                r.pop();
+            }
+            return (Vec::new(), r);
+        }
+        let total_bits = a.len() * 32;
+        let mut q = vec![0u32; a.len()];
+        let mut r: Vec<u32> = Vec::new();
+        for bit_idx in (0..total_bits).rev() {
+            let bit = (a[bit_idx / 32] >> (bit_idx % 32)) & 1;
+            Self::shl1_or_mag(&mut r, bit);
+            if Self::cmp_mag(&r, b) != Ordering::Less {
+                r = Self::sub_mag(&r, b);
+                while r.last() == Some(&0) {
+                    r.pop();
+                }
+                q[bit_idx / 32] |= 1u32 << (bit_idx % 32);
+            }
+        }
+        while q.last() == Some(&0) {
+            q.pop();
+        }
+        while r.last() == Some(&0) {
+            r.pop();
+        }
+        (q, r)
+    }
+
+    /// Truncated quotient (rounds toward zero) — `BigInteger.divide`. Sign is
+    /// `sign(self) * sign(o)`. Returns zero for a zero divisor (matching the
+    /// decimal reference; the native layer raises ArithmeticException upstream).
+    pub(crate) fn div(&self, o: &BigInt) -> BigInt {
+        if o.is_zero() || self.is_zero() {
+            return BigInt::zero();
+        }
+        let (q, _) = Self::divmod_mag(&self.mag, &o.mag);
+        Self::normalize(q, self.neg != o.neg)
+    }
+
+    /// Remainder with the sign of the dividend — `BigInteger.remainder`.
+    pub(crate) fn rem(&self, o: &BigInt) -> BigInt {
+        if o.is_zero() || self.is_zero() {
+            return BigInt::zero();
+        }
+        let (_, r) = Self::divmod_mag(&self.mag, &o.mag);
+        Self::normalize(r, self.neg)
+    }
+
+    /// Truncated `(quotient, remainder)` together — `BigInteger.divideAndRemainder`.
+    pub(crate) fn divmod(&self, o: &BigInt) -> (BigInt, BigInt) {
+        if o.is_zero() || self.is_zero() {
+            return (BigInt::zero(), BigInt::zero());
+        }
+        let (q, r) = Self::divmod_mag(&self.mag, &o.mag);
+        (
+            Self::normalize(q, self.neg != o.neg),
+            Self::normalize(r, self.neg),
+        )
+    }
+
+    /// Non-negative result in `[0, |o|)` — `BigInteger.mod` (real BigInteger
+    /// requires a positive modulus; we reduce against `|o|`).
+    pub(crate) fn modulo(&self, o: &BigInt) -> BigInt {
+        if o.is_zero() {
+            return BigInt::zero();
+        }
+        let r = self.rem(o);
+        if r.is_neg() {
+            // r in (-|o|, 0): the non-negative representative is |o| - |r|.
+            Self::normalize(Self::sub_mag(&o.mag, &r.mag), false)
+        } else {
+            r
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -368,8 +472,8 @@ impl BigInt {
 mod tests {
     use super::*;
     use crate::{
-        bi_add_str, bi_compare, bi_mul_str, bi_shift_left_str, bi_shift_right_str,
-        bi_sub_str,
+        bi_add_str, bi_compare, bi_div_str, bi_mod_str, bi_mul_str, bi_shift_left_str,
+        bi_shift_right_str, bi_sub_str,
     };
 
     // Deterministic LCG so the spread is reproducible without a rand dep.
@@ -460,6 +564,63 @@ mod tests {
                     bi_compare(a, c).cmp(&0),
                     "cmp {a} ? {c}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn div_rem_mod_match_decimal() {
+        let mut state = 0x0bad_c0de_1357_9bdfu64;
+        let mut operands = edge_cases();
+        for _ in 0..400 {
+            operands.push(rand_decimal(&mut state));
+        }
+        let n = operands.len();
+        for i in 0..n {
+            for j in 0..n {
+                if i >= 20 && (i + j) % 7 != 0 {
+                    continue;
+                }
+                let a = &operands[i];
+                let c = &operands[j];
+                if c == "0" {
+                    continue; // divide-by-zero raised upstream; not exercised here
+                }
+                let ba = b(a);
+                let bc = b(c);
+
+                // Truncated divide + sign-of-dividend remainder vs the decimal
+                // reference.
+                assert_eq!(ba.div(&bc).to_decimal(), bi_div_str(a, c), "div {a}/{c}");
+                assert_eq!(ba.rem(&bc).to_decimal(), bi_mod_str(a, c), "rem {a}%{c}");
+
+                // divmod agrees with the separate div/rem.
+                let (q, r) = ba.divmod(&bc);
+                assert_eq!(q, ba.div(&bc), "divmod q {a}/{c}");
+                assert_eq!(r, ba.rem(&bc), "divmod r {a}%{c}");
+
+                // Fundamental identity: a == q*c + r.
+                assert_eq!(q.mul(&bc).add(&r), ba, "q*c+r==a for {a},{c}");
+                // |r| < |c|.
+                assert_eq!(
+                    BigInt::cmp_mag(r.mag_le(), bc.mag_le()),
+                    Ordering::Less,
+                    "|r| < |c| for {a},{c}"
+                );
+
+                // BigInteger.mod is non-negative and == (rem + |c|) % |c|.
+                let m = ba.modulo(&bc);
+                assert!(!m.is_neg(), "mod non-negative {a} mod {c}");
+                let want_mod = {
+                    let c_abs = c.trim_start_matches('-');
+                    let rr = bi_mod_str(a, c_abs);
+                    if let Some(stripped) = rr.strip_prefix('-') {
+                        if stripped == "0" { "0".to_string() } else { bi_add_str(&rr, c_abs) }
+                    } else {
+                        rr
+                    }
+                };
+                assert_eq!(m.to_decimal(), want_mod, "mod {a} mod {c}");
             }
         }
     }
