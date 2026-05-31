@@ -1,0 +1,105 @@
+  protected void _renameProperties(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_1
+         1: invokeinterface #197,  1          // InterfaceMethod java/util/Map.entrySet:()Ljava/util/Set;
+         6: invokeinterface #198,  1          // InterfaceMethod java/util/Set.iterator:()Ljava/util/Iterator;
+        11: astore_2
+        12: aconst_null
+        13: astore_3
+        14: aload_2
+        15: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        20: ifeq          142
+        23: aload_2
+        24: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        29: checkcast     #199                // class java/util/Map$Entry
+        32: astore        4
+        34: aload         4
+        36: invokeinterface #200,  1          // InterfaceMethod java/util/Map$Entry.getValue:()Ljava/lang/Object;
+        41: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+        44: astore        5
+        46: aload         5
+        48: invokevirtual #201                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.findExplicitNames:()Ljava/util/Set;
+        51: astore        6
+        53: aload         6
+        55: invokeinterface #202,  1          // InterfaceMethod java/util/Collection.isEmpty:()Z
+        60: ifeq          66
+        63: goto          14
+        66: aload_2
+        67: invokeinterface #187,  1          // InterfaceMethod java/util/Iterator.remove:()V
+        72: aload_3
+        73: ifnonnull     84
+        76: new           #98                 // class java/util/LinkedList
+        79: dup
+        80: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+        83: astore_3
+        84: aload         6
+        86: invokeinterface #203,  1          // InterfaceMethod java/util/Collection.size:()I
+        91: iconst_1
+        92: if_icmpne     127
+        95: aload         6
+        97: invokeinterface #79,  1           // InterfaceMethod java/util/Collection.iterator:()Ljava/util/Iterator;
+       102: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       107: checkcast     #184                // class com/fasterxml/jackson/databind/PropertyName
+       110: astore        7
+       112: aload_3
+       113: aload         5
+       115: aload         7
+       117: invokevirtual #204                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.withName:(Lcom/fasterxml/jackson/databind/PropertyName;)Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;
+       120: invokevirtual #100                // Method java/util/LinkedList.add:(Ljava/lang/Object;)Z
+       123: pop
+       124: goto          14
+       127: aload_3
+       128: aload         5
+       130: aload         6
+       132: invokevirtual #205                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.explode:(Ljava/util/Collection;)Ljava/util/Collection;
+       135: invokevirtual #206                // Method java/util/LinkedList.addAll:(Ljava/util/Collection;)Z
+       138: pop
+       139: goto          14
+       142: aload_3
+       143: ifnull        253
+       146: aload_3
+       147: invokevirtual #138                // Method java/util/LinkedList.iterator:()Ljava/util/Iterator;
+       150: astore        4
+       152: aload         4
+       154: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       159: ifeq          253
+       162: aload         4
+       164: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       169: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       172: astore        5
+       174: aload         5
+       176: invokevirtual #190                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getName:()Ljava/lang/String;
+       179: astore        6
+       181: aload_1
+       182: aload         6
+       184: invokeinterface #183,  2          // InterfaceMethod java/util/Map.get:(Ljava/lang/Object;)Ljava/lang/Object;
+       189: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       192: astore        7
+       194: aload         7
+       196: ifnonnull     213
+       199: aload_1
+       200: aload         6
+       202: aload         5
+       204: invokeinterface #113,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+       209: pop
+       210: goto          220
+       213: aload         7
+       215: aload         5
+       217: invokevirtual #207                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.addAll:(Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;)V
+       220: aload_0
+       221: aload         5
+       223: aload_0
+       224: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       227: invokevirtual #208                // Method _replaceCreatorProperty:(Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;Ljava/util/List;)Z
+       230: ifeq          250
+       233: aload_0
+       234: getfield      #56                 // Field _ignoredPropertyNames:Ljava/util/HashSet;
+       237: ifnull        250
+       240: aload_0
+       241: getfield      #56                 // Field _ignoredPropertyNames:Ljava/util/HashSet;
+       244: aload         6
+       246: invokevirtual #209                // Method java/util/HashSet.remove:(Ljava/lang/Object;)Z
+       249: pop
+       250: goto          152
+       253: return
+

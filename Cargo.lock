@@ -415,10 +415,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "craton-gpu"
-version = "0.3.0"
-
-[[package]]
 name = "cratonvm-classloading"
 version = "0.3.0"
 dependencies = [
@@ -444,15 +440,24 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
+ "cratonvm-cuda-bridge",
  "cratonvm-native-api",
  "cratonvm-native-builtins",
  "cratonvm-vm",
- "cuda-bridge",
  "mimalloc",
  "tempfile",
  "tracing",
  "tracing-subscriber",
  "zip",
+]
+
+[[package]]
+name = "cratonvm-cuda-bridge"
+version = "0.3.0"
+dependencies = [
+ "bytemuck",
+ "cudarc",
+ "thiserror",
 ]
 
 [[package]]
@@ -477,6 +482,10 @@ dependencies = [
  "rustc-hash",
  "tracing",
 ]
+
+[[package]]
+name = "cratonvm-gpu"
+version = "0.3.0"
 
 [[package]]
 name = "cratonvm-jfr"
@@ -507,6 +516,17 @@ version = "0.3.0"
 dependencies = [
  "cratonvm-reader",
  "cratonvm-types",
+]
+
+[[package]]
+name = "cratonvm-jit-cuda"
+version = "0.3.0"
+dependencies = [
+ "cratonvm-gpu",
+ "cratonvm-jit-api",
+ "cratonvm-reader",
+ "cratonvm-types",
+ "thiserror",
 ]
 
 [[package]]
@@ -637,10 +657,12 @@ dependencies = [
  "bitfield-struct",
  "bytemuck",
  "cratonvm-classloading",
+ "cratonvm-cuda-bridge",
  "cratonvm-gc",
  "cratonvm-jfr",
  "cratonvm-jit",
  "cratonvm-jit-api",
+ "cratonvm-jit-cuda",
  "cratonvm-native-api",
  "cratonvm-native-awt",
  "cratonvm-native-builtins",
@@ -649,9 +671,7 @@ dependencies = [
  "cratonvm-reader",
  "cratonvm-types",
  "criterion",
- "cuda-bridge",
  "indexmap",
- "jit-cuda",
  "libc",
  "libloading",
  "parking_lot",
@@ -761,15 +781,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0369ee1ad671834580515889b80f2ea915f23b8be8d0daa4bbaf2ac5c7590835"
 dependencies = [
  "cipher",
-]
-
-[[package]]
-name = "cuda-bridge"
-version = "0.3.0"
-dependencies = [
- "bytemuck",
- "cudarc",
- "thiserror",
 ]
 
 [[package]]
@@ -1240,17 +1251,6 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "jit-cuda"
-version = "0.3.0"
-dependencies = [
- "craton-gpu",
- "cratonvm-jit-api",
- "cratonvm-reader",
- "cratonvm-types",
- "thiserror",
-]
 
 [[package]]
 name = "jobserver"

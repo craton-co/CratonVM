@@ -7868,6 +7868,36 @@ fn raf_read_fully(ctx: &mut dyn NativeContext, fd_id: i32, buf: &mut [u8]) -> Re
 // ---------------------------------------------------------------------------
 
 /// Read the path string from a File object (field 0).
+/// Percent-encode a slashified absolute path for use in a `file:` URI,
+/// matching `sun.net.www.ParseUtil.encodePath` / what `File.toURI()` produces.
+/// Leaves the path separator `/` and the RFC 2396 path-segment characters
+/// unreserved; everything else (including space, `^`, `#`, `?`, `%`,
+/// non-ASCII bytes via UTF-8) is `%XX`-encoded.
+fn encode_file_uri_path(path: &str) -> String {
+    // Unreserved (RFC 2396 §2.3) + the sub-delims/path chars the JDK leaves
+    // literal in a file URI path: letters, digits, `_-.!~*'()`, plus the
+    // path-meaningful `/`, `:`, `@`, `&`, `=`, `+`, `$`, `,`. The JDK's
+    // ParseUtil keeps `:` (drive letter / scheme-ish) and these sub-delims.
+    fn keep(b: u8) -> bool {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'/' | b'_' | b'-' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')'
+                    | b':' | b'@' | b'&' | b'=' | b'+' | b'$' | b','
+            )
+    }
+    let mut out = String::with_capacity(path.len());
+    for &b in path.as_bytes() {
+        if keep(b) {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push_str(&format!("{:02X}", b));
+        }
+    }
+    out
+}
+
 fn file_read_path(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
     // Prefer the real-JDK `getPath()` implementation when Available (correct
     // `prefixLength` + internal path for `java.io.File` loaded from modules).
@@ -8672,14 +8702,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "toURI", "()Ljava/net/URI;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
-        // Normalise to forward-slashes and ensure absolute path starts with /.
-        let norm = path.replace('\\', "/");
-        let abs = if norm.starts_with('/') { norm } else { format!("/{norm}") };
-        // Per `File.toURI()`, the result is `new URI("file", null, path, null)`
+        // Per `File.toURI()`, the result is `new URI("file", null, slashify(absPath, isDir), null)`,
         // which renders as `file:/C:/...` — a SINGLE slash before the path
-        // (no `//authority`). Emitting `file://` + `/C:/...` here produced
-        // the malformed `file:///C:/...` whose `URI.toURL()` returned null
-        // and broke every `URLClassLoader` built from `File.toURI().toURL()`.
+        // (no `//authority`). Emitting `file://` + `/C:/...` produced the
+        // malformed `file:///C:/...` whose `URI.toURL()` returned null and
+        // broke every `URLClassLoader` built from `File.toURI().toURL()`.
         let mut dir_path = path.replace('\\', "/");
         if !dir_path.starts_with('/') {
             dir_path = format!("/{dir_path}");
@@ -8689,8 +8716,13 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         if is_dir && !dir_path.ends_with('/') {
             dir_path.push('/');
         }
-        let full = format!("file:{dir_path}");
-        let _ = abs;
+        // RFC 2396 percent-encoding, matching `sun.net.www.ParseUtil.encodePath`
+        // used by `File.toURI()`. Without this, special path chars (`^`, space,
+        // `#`, `?`, …) leaked into the URI literally, so `File.toURI()` returned
+        // `file:/a b/c` instead of `file:/a%20b/c` (Tomcat UriUtil tests; any
+        // `new URI(File.toURI().toString())` round-trip on such paths threw).
+        let encoded = encode_file_uri_path(&dir_path);
+        let full = format!("file:{encoded}");
         // Allocate a real URI and populate named + positional fields so both
         // `URI` natives and any real-JDK bytecode see consistent state.
         let uri = alloc_concurrent_synthetic(ctx, "java/net/URI", 7);
@@ -17862,8 +17894,28 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         "wrap",
         "(Ljava/lang/CharSequence;)Ljava/nio/CharBuffer;",
         |ctx, args| {
+            // The arg is any CharSequence, not necessarily a String. For a
+            // real String `read_string` works; for other implementations
+            // (e.g. Tomcat's `CharChunk`, StringBuilder, CharBuffer) it
+            // returns None/empty, so fall back to a virtual `toString()`.
+            // Without this fallback `CharBuffer.wrap(charChunk)` produced an
+            // empty buffer, so `MessageBytes.toBytes` (which does
+            // `encoder.encode(CharBuffer.wrap(charC))`) encoded nothing —
+            // 144 Tomcat MessageBytes-conversion failures.
             let s = match args.first() {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                Some(Value::Object(Some(s))) => {
+                    let direct = ctx.read_string(*s).unwrap_or_default();
+                    if !direct.is_empty() {
+                        direct
+                    } else {
+                        match ctx.invoke_virtual(*s, "toString", "()Ljava/lang/String;", &[]) {
+                            Ok(Some(Value::Object(Some(strref)))) => {
+                                ctx.read_string(strref).unwrap_or_default()
+                            }
+                            _ => direct,
+                        }
+                    }
+                }
                 _ => String::new(),
             };
             let chars: Vec<u16> = s.encode_utf16().collect();
@@ -18049,9 +18101,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         if pos >= lim {
-            return Err(RuntimeError::IllegalStateException {
-                message: "BufferUnderflowException".into(),
-            }
+            return Err(RuntimeError::BufferUnderflowException
             .into());
         }
         let arr = match ctx.get_field(this, CB_FIELD_ARRAY) {
@@ -18106,9 +18156,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             _ => 0,
         };
         if pos >= lim {
-            return Err(RuntimeError::IllegalStateException {
-                message: "BufferOverflowException".into(),
-            }
+            return Err(RuntimeError::BufferOverflowException
             .into());
         }
         let arr = match ctx.get_field(this, CB_FIELD_ARRAY) {

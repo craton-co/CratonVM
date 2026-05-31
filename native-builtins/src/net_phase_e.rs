@@ -413,6 +413,14 @@ const HS_PORT: usize = 4;
 fn ioex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
     RuntimeError::IOException { message: message.into() }.into()
 }
+
+/// Throw the concrete `java.net.UnknownHostException` (a subclass of
+/// IOException). Code that catches `UnknownHostException` specifically (e.g.
+/// Tomcat `NetMask`) misses a bare IOException, so host-resolution failures
+/// must use this rather than `ioex("UnknownHostException: ...")`.
+fn uhex<S: Into<String>>(message: S) -> cratonvm_types::error::MethodCallFailed {
+    RuntimeError::UnknownHostException { message: message.into() }.into()
+}
 /// A missing jar/zip entry must surface as `java.io.FileNotFoundException`
 /// (a subclass of `IOException`), matching the real JDK's
 /// `JarURLConnection.getInputStream()` contract. Callers such as SmallRye
@@ -690,11 +698,11 @@ fn resolve_host(host: &str) -> Result<IpAddr, cratonvm_types::error::MethodCallF
     }
     let lookup = format!("{host}:0");
     let mut iter = std::net::ToSocketAddrs::to_socket_addrs(&lookup.as_str()).map_err(|e| {
-        ioex(format!("UnknownHostException: {host}: {e}"))
+        uhex(format!("{host}: {e}"))
     })?;
     match iter.next() {
         Some(sa) => Ok(sa.ip()),
-        None => Err(ioex(format!("UnknownHostException: {host}"))),
+        None => Err(uhex(format!("{host}"))),
     }
 }
 
@@ -1153,9 +1161,16 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         // Mirror the real JDK's `URL` protocol set. Anything else — most
         // importantly a single-letter Windows drive scheme like `C` — has
         // no stream handler and must raise `MalformedURLException`.
+        // `war` is Tomcat's scheme, registered via
+        // `TomcatURLStreamHandlerFactory.register()` →
+        // `URL.setURLStreamHandlerFactory`. We don't model the factory
+        // registry, but `war:` is unambiguous (not a Windows drive letter like
+        // the `C:` case the unknown-protocol path deliberately rejects), so
+        // accepting it lets `URI.create("war:file:/...").toURL()` succeed —
+        // which `UriUtil.warToJar` (and WebResources) rely on.
         const KNOWN_PROTOCOLS: &[&str] = &[
             "file", "jar", "http", "https", "ftp", "jrt", "jmod", "mailto",
-            "news", "jndi",
+            "news", "jndi", "war",
         ];
         let proto_lc = proto.to_ascii_lowercase();
         if proto.is_empty() {
@@ -1973,11 +1988,11 @@ fn register_re3_inet_address(r: &mut NativeMethodRegistry) {
                     }
                 }
                 Err(e) => {
-                    return Err(ioex(format!("UnknownHostException: {host}: {e}")));
+                    return Err(uhex(format!("{host}: {e}")));
                 }
             }
             if addrs.is_empty() {
-                return Err(ioex(format!("UnknownHostException: {host}")));
+                return Err(uhex(format!("{host}")));
             }
             let arr = ctx.new_ref_array(ClassId::new(0), addrs.len());
             let name = if host.is_empty() { "localhost".to_string() } else { host };

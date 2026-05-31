@@ -894,34 +894,26 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // depend on the synthetic vs JDK-25 byte[]+coder field layout.
     // Drop these when RKC16N.6 lands a proper fix (move the originals
     // into essentials, or fix bytecode dispatch).
+    // `String.charAt(i)` indexes by UTF-16 CODE UNIT. The previous
+    // `read_string().chars().collect()` indexed by code POINT, so for a string
+    // containing a surrogate pair `charAt(0)` returned the combined code point
+    // (e.g. 0x10401) instead of the high surrogate (0xD801), and indices past
+    // the first supplementary char were all off. Delegate to the layout-aware
+    // code-unit accessor (reads the compact `value: byte[]` + coder).
     registry.register(
         "java/lang/String", "charAt", "(I)C",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Err(cratonvm_types::error::RuntimeError::NullPointerException {
-                    message: Some("String.charAt on null".to_string()),
-                }.into()),
-            };
-            let index = match args.get(1) { Some(Value::Int(v)) => *v, _ => 0 };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let chars: Vec<char> = s.chars().collect();
-            if index < 0 || (index as usize) >= chars.len() {
-                return Err(cratonvm_types::error::RuntimeError::StringIndexOutOfBoundsException { index }.into());
-            }
-            Ok(Some(Value::Int(chars[index as usize] as i32)))
-        },
+        crate::lang_string::native_string_char_at,
     );
     registry.register(
         "java/lang/String", "length", "()I",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Int(0))),
-            };
-            let s = ctx.read_string(this).unwrap_or_default();
-            Ok(Some(Value::Int(s.chars().count() as i32)))
-        },
+        // `String.length()` returns the UTF-16 CODE-UNIT count, not the
+        // code-POINT count. The previous `read_string().chars().count()` decoded
+        // to Rust `char`s (Unicode scalar values), so a surrogate pair counted
+        // as 1 instead of 2 — `new String(new char[]{0xD801,0xDC01}).length()`
+        // returned 1, and `charAt`/`codePointCount`/UTF-8 surrogate encoding
+        // all broke downstream. Delegate to the layout-aware code-unit counter
+        // (reads the compact `value: byte[]` length / coder).
+        crate::lang_string::native_string_length,
     );
     registry.register(
         "java/lang/String", "isEmpty", "()Z",
@@ -22240,9 +22232,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 }.into()),
             };
             if pos >= lim {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "BufferUnderflowException".into(),
-                }.into());
+                return Err(RuntimeError::BufferUnderflowException.into());
             }
             let ch = ctx.get_array_element(arr, (pos + off) as usize);
             cb_set_pos(ctx, this, pos + 1);
@@ -22295,9 +22285,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
                 }.into()),
             };
             if pos >= lim {
-                return Err(RuntimeError::IllegalStateException {
-                    message: "BufferOverflowException".into(),
-                }.into());
+                return Err(RuntimeError::BufferOverflowException.into());
             }
             ctx.set_array_element(arr, (pos + off) as usize, ch);
             cb_set_pos(ctx, this, pos + 1);
@@ -27769,8 +27757,8 @@ fn native_inet_get_by_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
 
     // Resolution failed — return exception (UnknownHostException)
-    Err(RuntimeError::IllegalArgumentException {
-        message: format!("UnknownHostException: {}", hostname),
+    Err(RuntimeError::UnknownHostException {
+        message: hostname.to_string(),
     }
     .into())
 }

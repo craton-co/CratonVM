@@ -1,4 +1,43 @@
-# Hand-off: keycloak Jackson "Conflicting getter" bug (OPEN)
+# Hand-off: keycloak Jackson "Conflicting getter" bug (RESOLVED 2026-05-30)
+
+## RESOLUTION (root cause + fix)
+**Root cause:** CratonVM models `java.util.*` maps natively (`synthetic-jdk`,
+on by default). `Map.keySet()` / `entrySet()` / `values()` returned a
+**detached snapshot** (a fresh `HashSet`/`ArrayList`), so mutating through the
+view — `view.remove`, `view.iterator().remove()`, `removeIf` — never reached
+the backing map. Jackson's `POJOPropertiesCollector._renameProperties` does
+`props.entrySet().iterator().remove()` then re-`get`s the same key; the dead
+snapshot left the entry in `props`, so the renamed builder was merged with
+itself (`POJOPropertyBuilder.addAll` → `merge` concatenates the `_getters`
+chain), giving the property TWO getters wrapping the same `Method` →
+`getGetter()` throws "Conflicting getter definitions … getY() vs getY()".
+This is why the HARD EVIDENCE below saw 2 `AnnotatedMethod`s over one Method.
+
+**Fix** (`native-collections/src/lib.rs`): the view snapshots now carry a
+reference to the *source* map and the shared removal natives propagate to it
+(live-view semantics), routing through the map's own `remove` via
+`invoke_virtual` so HashMap/LinkedHashMap/TreeMap/CHM sources are each handled
+correctly. keySet/entrySet snapshots use a dedicated synthetic backing
+(`cratonvm/util/MapViewBacking`, source + view-kind in high slots);
+`native_hs_remove` deletes the key (or `entry.getKey()`) from the source.
+`values()` and the ArrayList-backed TreeMap entrySet stash the source in the
+element array's last capacity slot; `native_al_itr_remove` /
+`native_al_remove_obj` / `native_al_remove_if` propagate via
+`propagate_list_removal` (entrySet by key, values by value). TreeMap keySet
+keeps its sorted array-backed `TreeSet` with the source in the element array's
+trailing slot; `native_ts_itr_remove`/`native_ts_remove`/`native_ts_clear`
+propagate. A missing `TreeSet$Itr` arm in the `Iterator.remove` dispatcher
+(`native_itr_remove_noop`) was also added so `TreeSet.iterator().remove()`
+(and TreeMap keySet iteration) deletes instead of throwing UOE — a pre-existing
+bug surfaced by this work.
+
+Verified: `pkgtest.PkgRepro` → `{"y":42}` on both interpreter and JIT paths;
+HashMap/LinkedHashMap/TreeMap keySet/entrySet/values iterator-remove +
+removeIf + view-remove + clear all write through (probes pass), sorted order
+preserved; `cargo test -p cratonvm-vm` green.
+
+----
+(original investigation notes follow)
 
 ## Symptom
 Keycloak core tests fail under CratonVM (`--nojit`): Jackson throws

@@ -2181,7 +2181,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let pos = s2_bb_pos(ctx, this);
         if pos >= s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferUnderflowException".into() }.into());
+            return Err(RuntimeError::BufferUnderflowException.into());
         }
         let b = s2_bb_get_byte(ctx, this, pos);
         ctx.set_field(this, BB_POS, Value::Int(pos + 1));
@@ -2199,7 +2199,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         let pos = s2_bb_pos(ctx, this);
         if pos + len > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferUnderflowException".into() }.into());
+            return Err(RuntimeError::BufferUnderflowException.into());
         }
         let arr = s2_bb_arr(ctx, this).unwrap_or(dst);
         for i in 0..len as usize {
@@ -2215,7 +2215,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(dst) as i32;
         let pos = s2_bb_pos(ctx, this);
         if pos + len > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferUnderflowException".into() }.into());
+            return Err(RuntimeError::BufferUnderflowException.into());
         }
         let arr = s2_bb_arr(ctx, this).unwrap_or(dst);
         for i in 0..len as usize {
@@ -2232,7 +2232,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i8;
         let pos = s2_bb_pos(ctx, this);
         if pos >= s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferOverflowException".into() }.into());
+            return Err(RuntimeError::BufferOverflowException.into());
         }
         s2_bb_put_byte(ctx, this, pos, b);
         ctx.set_field(this, BB_POS, Value::Int(pos + 1));
@@ -2252,7 +2252,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let len = args.get(3).and_then(|v| v.as_int()).unwrap_or(0);
         let pos = s2_bb_pos(ctx, this);
         if pos + len > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferOverflowException".into() }.into());
+            return Err(RuntimeError::BufferOverflowException.into());
         }
         let arr = s2_bb_arr(ctx, this).unwrap_or(src);
         for i in 0..len as usize {
@@ -2268,7 +2268,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let len = ctx.array_length(src) as i32;
         let pos = s2_bb_pos(ctx, this);
         if pos + len > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferOverflowException".into() }.into());
+            return Err(RuntimeError::BufferOverflowException.into());
         }
         let arr = s2_bb_arr(ctx, this).unwrap_or(src);
         for i in 0..len as usize {
@@ -2286,7 +2286,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let n = (src_lim - src_pos).max(0);
         let pos = s2_bb_pos(ctx, this);
         if pos + n > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferOverflowException".into() }.into());
+            return Err(RuntimeError::BufferOverflowException.into());
         }
         let src_arr = match s2_bb_arr(ctx, src) { Some(a) => a, None => return Ok(Some(Value::Object(Some(this)))) };
         let dst_arr = match s2_bb_arr(ctx, this) { Some(a) => a, None => return Ok(Some(Value::Object(Some(this)))) };
@@ -2304,7 +2304,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let pos = s2_bb_pos(ctx, this);
         if pos + 2 > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferUnderflowException".into() }.into());
+            return Err(RuntimeError::BufferUnderflowException.into());
         }
         let v = s2_bb_read2(ctx, this, pos);
         ctx.set_field(this, BB_POS, Value::Int(pos + 2));
@@ -2320,7 +2320,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i16;
         let pos = s2_bb_pos(ctx, this);
         if pos + 2 > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferOverflowException".into() }.into());
+            return Err(RuntimeError::BufferOverflowException.into());
         }
         s2_bb_write2(ctx, this, pos, v);
         ctx.set_field(this, BB_POS, Value::Int(pos + 2));
@@ -2339,7 +2339,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let pos = s2_bb_pos(ctx, this);
         if pos + 2 > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferUnderflowException".into() }.into());
+            return Err(RuntimeError::BufferUnderflowException.into());
         }
         let v = s2_bb_read2(ctx, this, pos) as u16;
         ctx.set_field(this, BB_POS, Value::Int(pos + 2));
@@ -2355,7 +2355,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as i16;
         let pos = s2_bb_pos(ctx, this);
         if pos + 2 > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferOverflowException".into() }.into());
+            return Err(RuntimeError::BufferOverflowException.into());
         }
         s2_bb_write2(ctx, this, pos, v);
         ctx.set_field(this, BB_POS, Value::Int(pos + 2));
@@ -2374,7 +2374,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let pos = s2_bb_pos(ctx, this);
         if pos + 4 > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferUnderflowException".into() }.into());
+            return Err(RuntimeError::BufferUnderflowException.into());
         }
         let v = s2_bb_read4(ctx, this, pos);
         ctx.set_field(this, BB_POS, Value::Int(pos + 4));
@@ -2390,7 +2390,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let v = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let pos = s2_bb_pos(ctx, this);
         if pos + 4 > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferOverflowException".into() }.into());
+            return Err(RuntimeError::BufferOverflowException.into());
         }
         s2_bb_write4(ctx, this, pos, v);
         ctx.set_field(this, BB_POS, Value::Int(pos + 4));
@@ -2409,7 +2409,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let pos = s2_bb_pos(ctx, this);
         if pos + 8 > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferUnderflowException".into() }.into());
+            return Err(RuntimeError::BufferUnderflowException.into());
         }
         let v = s2_bb_read8(ctx, this, pos);
         ctx.set_field(this, BB_POS, Value::Int(pos + 8));
@@ -2425,7 +2425,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let v = match args.get(1) { Some(Value::Long(l)) => *l, Some(Value::Int(i)) => *i as i64, _ => 0 };
         let pos = s2_bb_pos(ctx, this);
         if pos + 8 > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferOverflowException".into() }.into());
+            return Err(RuntimeError::BufferOverflowException.into());
         }
         s2_bb_write8(ctx, this, pos, v);
         ctx.set_field(this, BB_POS, Value::Int(pos + 8));
@@ -2444,7 +2444,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let pos = s2_bb_pos(ctx, this);
         if pos + 4 > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferUnderflowException".into() }.into());
+            return Err(RuntimeError::BufferUnderflowException.into());
         }
         let bits = s2_bb_read4(ctx, this, pos) as u32;
         ctx.set_field(this, BB_POS, Value::Int(pos + 4));
@@ -2460,7 +2460,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let v = match args.get(1) { Some(Value::Float(f)) => *f, Some(Value::Int(i)) => f32::from_bits(*i as u32), _ => 0.0 };
         let pos = s2_bb_pos(ctx, this);
         if pos + 4 > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferOverflowException".into() }.into());
+            return Err(RuntimeError::BufferOverflowException.into());
         }
         s2_bb_write4(ctx, this, pos, v.to_bits() as i32);
         ctx.set_field(this, BB_POS, Value::Int(pos + 4));
@@ -2472,7 +2472,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let pos = s2_bb_pos(ctx, this);
         if pos + 8 > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferUnderflowException".into() }.into());
+            return Err(RuntimeError::BufferUnderflowException.into());
         }
         let bits = s2_bb_read8(ctx, this, pos) as u64;
         ctx.set_field(this, BB_POS, Value::Int(pos + 8));
@@ -2483,7 +2483,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let v = match args.get(1) { Some(Value::Double(d)) => *d, _ => 0.0 };
         let pos = s2_bb_pos(ctx, this);
         if pos + 8 > s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferOverflowException".into() }.into());
+            return Err(RuntimeError::BufferOverflowException.into());
         }
         s2_bb_write8(ctx, this, pos, v.to_bits() as i64);
         ctx.set_field(this, BB_POS, Value::Int(pos + 8));
@@ -2670,7 +2670,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let pos  = s2_bb_pos(ctx, this);
         if pos >= s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferUnderflowException".into() }.into());
+            return Err(RuntimeError::BufferUnderflowException.into());
         }
         let bs = { let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1); if m < 0 { -(m+1) } else { 0 } };
         let v  = s2_bb_read4(ctx, this, bs + pos * 4);
@@ -2688,7 +2688,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let v    = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let pos  = s2_bb_pos(ctx, this);
         if pos >= s2_bb_limit(ctx, this) {
-            return Err(RuntimeError::IllegalStateException { message: "BufferOverflowException".into() }.into());
+            return Err(RuntimeError::BufferOverflowException.into());
         }
         let bs = { let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1); if m < 0 { -(m+1) } else { 0 } };
         s2_bb_write4(ctx, this, bs + pos * 4, v);

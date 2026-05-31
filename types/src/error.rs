@@ -246,6 +246,14 @@ pub enum RuntimeError {
     #[error("IOException: {message}")]
     IOException { message: String },
 
+    /// `java.net.UnknownHostException` — a host name could not be resolved or
+    /// is malformed. A subclass of IOException; must be thrown as the concrete
+    /// type because real code catches it specifically (e.g. Tomcat
+    /// `NetMask` catches `UnknownHostException` to convert to
+    /// IllegalArgumentException — a bare IOException escapes that catch).
+    #[error("UnknownHostException: {message}")]
+    UnknownHostException { message: String },
+
     #[error("FileNotFoundException: {path}")]
     FileNotFoundException { path: String },
 
@@ -270,6 +278,19 @@ pub enum RuntimeError {
 
     #[error("NoSuchElementException: {message}")]
     NoSuchElementException { message: String },
+
+    /// `java.nio.BufferUnderflowException` — a relative `get` was attempted on
+    /// a buffer with no elements remaining. Distinct from IllegalStateException
+    /// because real code catches it specifically (e.g. Tomcat
+    /// `CharsetUtil.isAsciiSuperset`); folding it into IllegalStateException
+    /// makes those `catch (BufferUnderflowException)` blocks miss.
+    #[error("BufferUnderflowException")]
+    BufferUnderflowException,
+
+    /// `java.nio.BufferOverflowException` — a relative `put` was attempted on a
+    /// buffer with no space remaining.
+    #[error("BufferOverflowException")]
+    BufferOverflowException,
 
     #[error("InputMismatchException: {message}")]
     InputMismatchException { message: String },

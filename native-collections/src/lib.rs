@@ -944,6 +944,7 @@ pub fn native_al_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    resync_values_view(ctx, this);
     let (_, size) = al_state(ctx, this);
     Ok(Some(Value::Int(size)))
 }
@@ -953,6 +954,7 @@ pub fn native_al_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
+    resync_values_view(ctx, this);
     let (_, size) = al_state(ctx, this);
     Ok(Some(Value::Int(if size == 0 { 1 } else { 0 })))
 }
@@ -966,6 +968,7 @@ pub fn native_al_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(i)) => *i,
         _ => return Ok(Some(Value::Object(None))),
     };
+    resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
     if index < 0 || index >= size {
         // JDK contract: out-of-range index throws IndexOutOfBoundsException
@@ -1097,6 +1100,9 @@ pub fn native_al_remove_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(Some(Value::Int(0))),
     };
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    // Live `values()` view: a successful removal must also drop the matching
+    // entry from the source map.
+    let view_src = values_view_source(ctx, this);
     let (data, size) = al_state(ctx, this);
     let data = match data {
         Some(d) => d,
@@ -1119,6 +1125,9 @@ pub fn native_al_remove_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             }
             ctx.set_array_element(data, size - 1, Value::Object(None));
             al_set_size(ctx, this, (size - 1) as i32);
+            if let Some(source) = view_src {
+                propagate_list_removal(ctx, source, elem)?;
+            }
             return Ok(Some(Value::Int(1)));
         }
     }
@@ -1130,6 +1139,10 @@ pub fn native_al_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Live `values()` view: clearing the view clears the source map.
+    if let Some(source) = values_view_source(ctx, this) {
+        ctx.invoke_virtual(source, "clear", "()V", &[])?;
+    }
     let (data, size) = al_state(ctx, this);
     if let Some(d) = data {
         for i in 0..(size as usize) {
@@ -1145,6 +1158,7 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    resync_values_view(ctx, this);
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     let (data, size) = al_state(ctx, this);
     let data = match data {
@@ -1273,6 +1287,7 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    resync_values_view(ctx, this);
     // `java/util/List.iterator()` / `Collection.iterator()` / `Iterable.iterator()`
     // are all wired to this native at the interface level (see
     // `register_interface_natives`).  When the receiver is *not* a
@@ -3315,15 +3330,12 @@ fn native_map_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         return native_tm_key_set(ctx, args);
     }
     let keys = map_collect_keys(ctx, this);
-    // Build a HashSet from the keys
+    // Build a HashSet from the keys, backed by a view backing that remembers
+    // the source map so `keySet().remove(k)` / `keySet().iterator().remove()`
+    // write through to it (live-view semantics).
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
-    let backing_map = alloc_backing_map(ctx);
-    // Initialize the backing map
     let cap = std::cmp::max(keys.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
-    let buckets = alloc_ref_array(ctx, cap);
-    ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    set_map_size(ctx, backing_map, 0);
-    ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    let backing_map = alloc_view_backing(ctx, this, VIEW_KIND_KEYSET, cap);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
 
     // Add each key
@@ -3357,14 +3369,19 @@ fn native_map_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         return native_tm_values(ctx, args);
     }
     let values = map_collect_values(ctx, this);
-    // Build an ArrayList from the values
+    // Build an ArrayList from the values. Reserve one extra trailing slot and
+    // stash the source map there so `values().iterator().remove()` /
+    // `values().remove(v)` can write through to the backing map (live-view
+    // semantics). The slot lives beyond the logical size, so it is invisible
+    // to size-based operations yet still GC-scanned as part of the array.
     let __al_n_fields = al_slots(ctx).2;
     let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
-    let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY);
+    let cap = std::cmp::max(values.len(), AL_DEFAULT_CAPACITY) + 1;
     let buf = alloc_ref_array(ctx, cap);
     for (i, val) in values.iter().enumerate() {
         ctx.set_array_element(buf, i, *val);
     }
+    ctx.set_array_element(buf, cap - 1, Value::Object(Some(this)));
     al_set_data(ctx, list, buf);
     al_set_size(ctx, list, values.len() as i32);
     Ok(Some(Value::Object(Some(list))))
@@ -3379,14 +3396,12 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         return native_tm_entry_set(ctx, args);
     }
     let entries = map_collect_entries(ctx, this);
-    // Build a HashSet of Map.Entry objects
+    // Build a HashSet of Map.Entry objects, backed by a view backing that
+    // remembers the source map so removing an entry through the set (or its
+    // iterator) deletes the corresponding key from the source map.
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
-    let backing_map = alloc_backing_map(ctx);
     let cap = std::cmp::max(entries.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
-    let buckets = alloc_ref_array(ctx, cap);
-    ctx.set_field(backing_map, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    set_map_size(ctx, backing_map, 0);
-    ctx.set_field(backing_map, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    let backing_map = alloc_view_backing(ctx, this, VIEW_KIND_ENTRYSET, cap);
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
 
     // Each entry is a Map.Entry object with 2 fields: key and value.
@@ -3559,6 +3574,333 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 const HS_FIELD_MAP: usize = 0;
 const HS_NUM_FIELDS: usize = 1;
+
+// ---------------------------------------------------------------------------
+// Live map-view write-through (keySet / entrySet / values)
+//
+// `Map.keySet()`, `Map.entrySet()` and `Map.values()` must return *live*
+// views: removing through them (`view.remove(o)`, `view.iterator().remove()`,
+// `view.removeIf(...)`) has to delete the corresponding entry from the
+// *backing* map. CratonVM models maps natively and these accessors used to
+// hand back a detached snapshot (a fresh `HashSet`/`ArrayList`), so removals
+// silently vanished — e.g. Jackson's `POJOPropertiesCollector._renameProperties`
+// does `props.entrySet().iterator().remove()` then re-`get`s the same key; with
+// a dead snapshot the entry survived and the property was merged with itself,
+// producing the "Conflicting getter definitions" failure.
+//
+// Fix: the snapshot's backing HashMap (for keySet/entrySet) carries a
+// reference to the *source* map in a high, never-name-resolved slot, and the
+// values snapshot (an ArrayList) stashes the source in the last capacity slot
+// of its element array. The shared removal natives (`native_hs_remove`,
+// `native_al_itr_remove`, `native_al_remove_obj`) detect that marker and
+// propagate the removal to the source map. Both carriers are GC-scanned
+// (a synthetic class's declared field block / a live `Object[]`), so the
+// stored `ObjectRef` survives a moving GC.
+//
+// The marker slots are chosen well above any real `java/util/HashMap` field
+// index so `map_state` / `set_map_size`'s name-resolved writes never clobber
+// them; the view backing is a dedicated synthetic class allocated with exactly
+// `VIEW_BACKING_FIELDS` slots so the GC scans the marker slots.
+const VIEW_BACKING_FIELDS: usize = 16;
+const VIEW_BACKING_SRC_SLOT: usize = 15;
+const VIEW_BACKING_KIND_SLOT: usize = 14;
+/// `VIEW_KIND_KEYSET`: the set's elements are the source map's keys.
+const VIEW_KIND_KEYSET: i32 = 0;
+/// `VIEW_KIND_ENTRYSET`: the set's elements are `Map.Entry` objects whose key
+/// (slot 0) identifies the source-map entry to delete on removal.
+const VIEW_KIND_ENTRYSET: i32 = 1;
+
+/// Allocate the backing HashMap for a keySet/entrySet view: a synthetic
+/// `cratonvm/util/MapViewBacking` with the usual `(buckets, size, capacity)`
+/// state in slots 0..3 plus the source-map reference and view-kind marker in
+/// the high slots.
+fn alloc_view_backing(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    kind: i32,
+    cap: usize,
+) -> ObjectRef {
+    let backing = alloc_synthetic(ctx, "cratonvm/util/MapViewBacking", VIEW_BACKING_FIELDS);
+    let buckets = alloc_ref_array(ctx, cap);
+    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    set_map_size(ctx, backing, 0);
+    ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    ctx.set_field(backing, VIEW_BACKING_KIND_SLOT, Value::Int(kind));
+    ctx.set_field(backing, VIEW_BACKING_SRC_SLOT, Value::Object(Some(source)));
+    backing
+}
+
+/// If `backing` is a keySet/entrySet view backing carrying a source-map
+/// reference, return it. Returns `None` for ordinary HashSet backings (real
+/// `java/util/HashMap`, fewer than `VIEW_BACKING_FIELDS` slots).
+fn view_backing_source(ctx: &dyn NativeContext, backing: ObjectRef) -> Option<ObjectRef> {
+    if ctx.object_num_fields(backing) > VIEW_BACKING_SRC_SLOT {
+        if let Value::Object(Some(src)) = ctx.get_field(backing, VIEW_BACKING_SRC_SLOT) {
+            return Some(src);
+        }
+    }
+    None
+}
+
+/// The view kind (keySet vs entrySet) stored on a view backing.
+fn view_backing_kind(ctx: &dyn NativeContext, backing: ObjectRef) -> i32 {
+    if ctx.object_num_fields(backing) > VIEW_BACKING_KIND_SLOT {
+        if let Value::Int(k) = ctx.get_field(backing, VIEW_BACKING_KIND_SLOT) {
+            return k;
+        }
+    }
+    VIEW_KIND_KEYSET
+}
+
+/// Remove `key` from `source` by dispatching through the map's own virtual
+/// `remove(Object)` so the correct backend fires (HashMap buckets,
+/// LinkedHashMap overlay, TreeMap tree, ConcurrentHashMap segments).
+fn source_map_remove(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    key: Value,
+) -> Result<(), MethodCallFailed> {
+    ctx.invoke_virtual(
+        source,
+        "remove",
+        "(Ljava/lang/Object;)Ljava/lang/Object;",
+        &[key],
+    )?;
+    Ok(())
+}
+
+/// Collect `(key, value)` pairs from any of the natively-modelled maps,
+/// dispatching on the concrete backend so a LinkedHashMap's overlay / a
+/// TreeMap's tree are read correctly rather than as empty bucket tables.
+fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(Value, Value)> {
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(source))
+        .unwrap_or_default();
+    if cls == "java/util/LinkedHashMap" {
+        let ks = lhm_collect_keys(ctx, source);
+        let vs = lhm_collect_values(ctx, source);
+        return ks.into_iter().zip(vs).collect();
+    }
+    if is_tree_map_receiver(ctx, source) {
+        return tm_collect_pairs(ctx, source);
+    }
+    map_collect_entries(ctx, source)
+}
+
+/// Build a keySet/entrySet view: a `HashSet` snapshot whose backing remembers
+/// the source map (+ kind) so removals write through.
+fn make_view_set_of(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    kind: i32,
+    elems: &[Value],
+) -> Result<ObjectRef, MethodCallFailed> {
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let cap = std::cmp::max(elems.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+    let backing = alloc_view_backing(ctx, source, kind, cap);
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing)));
+    let sentinel = Value::Int(1);
+    for elem in elems {
+        native_map_put(ctx, &[Value::Object(Some(backing)), *elem, sentinel])?;
+    }
+    Ok(set)
+}
+
+/// Build a `values()` view: an `ArrayList` snapshot whose element array stashes
+/// the source map in its last capacity slot so removals write through.
+fn make_view_list_of(ctx: &mut dyn NativeContext, source: ObjectRef, vals: &[Value]) -> ObjectRef {
+    let __al_n_fields = al_slots(ctx).2;
+    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
+    let cap = std::cmp::max(vals.len(), AL_DEFAULT_CAPACITY) + 1;
+    let buf = alloc_ref_array(ctx, cap);
+    for (i, val) in vals.iter().enumerate() {
+        ctx.set_array_element(buf, i, *val);
+    }
+    ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
+    al_set_data(ctx, list, buf);
+    al_set_size(ctx, list, vals.len() as i32);
+    list
+}
+
+/// Refresh a keySet/entrySet view's backing HashSet from its live source map,
+/// so reads (`contains`/`size`/`isEmpty`/`iterator`) reflect mutations made
+/// DIRECTLY to the source map after the view was obtained — JDK keySet/entrySet
+/// views are live. Without this, `map.keySet()` then `map.remove(k)` left the
+/// snapshot reporting `contains(k)==true` (Tomcat `ParameterMap` setUp asserts
+/// the opposite). No-op for an ordinary HashSet (backing carries no source).
+fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
+    let backing = match hs_backing_map(ctx, set) {
+        Some(b) => b,
+        None => return,
+    };
+    let source = match view_backing_source(ctx, backing) {
+        Some(s) => s,
+        None => return,
+    };
+    let kind = view_backing_kind(ctx, backing);
+    // Rebuild the backing map's contents from the live source.
+    let cap = ctx
+        .get_field(backing, MAP_FIELD_CAPACITY)
+        .as_int()
+        .unwrap_or(MAP_DEFAULT_CAPACITY as i32)
+        .max(MAP_DEFAULT_CAPACITY as i32);
+    let buckets = alloc_ref_array(ctx, cap as usize);
+    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+    ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap));
+    set_map_size(ctx, backing, 0);
+    let sentinel = Value::Int(1);
+    if kind == VIEW_KIND_ENTRYSET {
+        let entries = collect_entries_any(ctx, source);
+        for (k, v) in entries {
+            let entry = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
+            ctx.set_field(entry, 0, k);
+            ctx.set_field(entry, 1, v);
+            let _ = native_map_put(ctx, &[Value::Object(Some(backing)), Value::Object(Some(entry)), sentinel]);
+        }
+    } else {
+        let keys = collect_keys_any(ctx, source);
+        for k in keys {
+            let _ = native_map_put(ctx, &[Value::Object(Some(backing)), k, sentinel]);
+        }
+    }
+}
+
+/// Collect keys from any natively-modelled map (HashMap / LinkedHashMap /
+/// TreeMap / CHM), dispatching on the concrete backend.
+fn collect_keys_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<Value> {
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(source))
+        .unwrap_or_default();
+    if cls == "java/util/LinkedHashMap" {
+        return lhm_collect_keys(ctx, source);
+    }
+    if is_tree_map_receiver(ctx, source) {
+        return tm_collect_pairs(ctx, source).into_iter().map(|(k, _)| k).collect();
+    }
+    map_collect_keys(ctx, source)
+}
+
+/// Refresh an ArrayList-backed map view (`values()` OR TreeMap `entrySet()`)
+/// from its live source map, preserving the trailing source-marker slot.
+/// Mirrors `resync_view_set`. The element kind is inferred from the list's
+/// current head element: a `Map.Entry`/`HashMap$Entry` element means this is an
+/// entrySet view (rebuild with Entry objects), otherwise a values view (raw
+/// values). Inferring avoids a separate kind marker and keeps TreeMap
+/// entrySet's Entry elements from being clobbered with bare values (which
+/// caused `ClassCastException: Integer cannot be cast to Map$Entry`).
+fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) {
+    let source = match values_view_source(ctx, list) {
+        Some(s) => s,
+        None => return,
+    };
+    // Determine whether elements are Map.Entry (entrySet) by inspecting the
+    // current head element's class.
+    let is_entry_view = {
+        let (data, size) = al_state(ctx, list);
+        match data {
+            Some(d) if size > 0 => match ctx.get_array_element(d, 0) {
+                Value::Object(Some(e)) => ctx
+                    .class_name_of_id(ctx.class_id_of_object(e))
+                    .map(|n| n.contains("Entry"))
+                    .unwrap_or(false),
+                _ => false,
+            },
+            _ => false,
+        }
+    };
+    let entries = collect_entries_any(ctx, source);
+    let vals: Vec<Value> = if is_entry_view {
+        entries
+            .into_iter()
+            .map(|(k, v)| {
+                let entry = tm_make_entry(ctx, k, v);
+                Value::Object(Some(entry))
+            })
+            .collect()
+    } else {
+        entries.into_iter().map(|(_, v)| v).collect()
+    };
+    let cap = vals.len().max(AL_DEFAULT_CAPACITY) + 1;
+    let buf = alloc_ref_array(ctx, cap);
+    for (i, v) in vals.iter().enumerate() {
+        ctx.set_array_element(buf, i, *v);
+    }
+    ctx.set_array_element(buf, cap - 1, Value::Object(Some(source)));
+    al_set_data(ctx, list, buf);
+    al_set_size(ctx, list, vals.len() as i32);
+}
+
+/// If `list`'s element array carries a `values()`-view source-map marker in
+/// its last capacity slot, return it. The marker is only present when the
+/// array is longer than the logical size (so a normal full ArrayList, whose
+/// `length == size`, never matches) and the trailing slot is non-null (spare
+/// capacity slots of a normal list are always null).
+fn values_view_source(ctx: &dyn NativeContext, list: ObjectRef) -> Option<ObjectRef> {
+    let (data, size) = al_state(ctx, list);
+    let data = data?;
+    let dlen = ctx.array_length(data) as i32;
+    if dlen > size {
+        if let Value::Object(Some(src)) = ctx.get_array_element(data, (dlen - 1) as usize) {
+            return Some(src);
+        }
+    }
+    None
+}
+
+/// Delete the first entry of `source` whose value equals `value` (identity
+/// first, then `.equals`). Used to propagate a `values()`-view removal back to
+/// the backing map.
+fn remove_source_entry_by_value(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    value: Value,
+) -> Result<(), MethodCallFailed> {
+    let entries = collect_entries_any(ctx, source);
+    for (k, v) in entries {
+        if values_equal(ctx, &v, &value) {
+            source_map_remove(ctx, source, k)?;
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Propagate the removal of `removed` (an element of an ArrayList-backed map
+/// view) to the source map. For an `entrySet()` view the element is a
+/// `Map.Entry`, so delete its key (slot 0); for a `values()` view the element
+/// is a value, so delete the first entry whose value matches.
+fn propagate_list_removal(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+    removed: Value,
+) -> Result<(), MethodCallFailed> {
+    if let Value::Object(Some(e)) = removed {
+        let cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(e))
+            .unwrap_or_default();
+        if cls.contains("Entry") {
+            let key = ctx.get_field(e, 0);
+            return source_map_remove(ctx, source, key);
+        }
+    }
+    remove_source_entry_by_value(ctx, source, removed)
+}
+
+/// If `ts` is a TreeMap `keySet()` view (an array-backed `TreeSet` whose
+/// element array stashes the source map in its last capacity slot), return the
+/// source map. Mirrors `values_view_source`: the marker only exists when the
+/// array is longer than the logical size and the trailing slot is non-null.
+fn ts_view_source(ctx: &dyn NativeContext, ts: ObjectRef) -> Option<ObjectRef> {
+    let (data, size, _) = ts_state(ctx, ts);
+    let data = data?;
+    let dlen = ctx.array_length(data) as i32;
+    if dlen > size {
+        if let Value::Object(Some(src)) = ctx.get_array_element(data, (dlen - 1) as usize) {
+            return Some(src);
+        }
+    }
+    None
+}
 
 /// Get the backing HashMap from a HashSet.
 fn hs_backing_map(ctx: &dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
@@ -4034,6 +4376,7 @@ fn native_hs_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    resync_view_set(ctx, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),
@@ -4047,6 +4390,7 @@ fn native_hs_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
+    resync_view_set(ctx, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return Ok(Some(Value::Int(1))),
@@ -4086,6 +4430,22 @@ fn native_hs_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let remove_args = [Value::Object(Some(backing)), elem];
     let old = native_map_remove(ctx, &remove_args)?;
     let was_present = !matches!(old, Some(Value::Object(None)));
+    // Live keySet/entrySet view: propagate the removal to the source map.
+    // The backing carries the source-map reference + kind when this HashSet
+    // was produced by `Map.keySet()` / `Map.entrySet()`. For an entrySet the
+    // element is a `Map.Entry`, so delete its key (slot 0); for a keySet it is
+    // the key itself.
+    if let Some(source) = view_backing_source(ctx, backing) {
+        let key = if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
+            match elem {
+                Value::Object(Some(e)) => ctx.get_field(e, 0),
+                _ => elem,
+            }
+        } else {
+            elem
+        };
+        source_map_remove(ctx, source, key)?;
+    }
     Ok(Some(Value::Int(if was_present { 1 } else { 0 })))
 }
 
@@ -4094,6 +4454,7 @@ fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    resync_view_set(ctx, this);
     let elem = args.get(1).copied().unwrap_or(Value::Object(None));
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
@@ -4112,6 +4473,10 @@ fn native_hs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(m) => m,
         None => return Ok(None),
     };
+    // Live keySet/entrySet view: clearing the view clears the source map.
+    if let Some(source) = view_backing_source(ctx, backing) {
+        ctx.invoke_virtual(source, "clear", "()V", &[])?;
+    }
     let clear_args = [Value::Object(Some(backing))];
     native_map_clear(ctx, &clear_args)
 }
@@ -4121,6 +4486,7 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    resync_view_set(ctx, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => {
@@ -4158,6 +4524,7 @@ fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    resync_view_set(ctx, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return Ok(Some(Value::Object(None))),
@@ -4175,6 +4542,7 @@ fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    resync_view_set(ctx, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => {
@@ -4367,9 +4735,22 @@ fn native_al_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Value::Object(Some(l)) => l,
         _ => return Ok(None),
     };
+    // Live `values()` view: capture the element about to be removed and, after
+    // removing it from the snapshot, delete the matching entry from the source
+    // map. Captured before removal because the shift clobbers the slot.
+    let view_src = values_view_source(ctx, list);
+    let removed = if view_src.is_some() {
+        let (data, _) = al_state(ctx, list);
+        data.map(|d| ctx.get_array_element(d, last_ret as usize))
+    } else {
+        None
+    };
     // Delegate to the list's own native removal so backing-array shifting and
     // size bookkeeping stay in one place.
     native_al_remove_at(ctx, &[Value::Object(Some(list)), Value::Int(last_ret)])?;
+    if let (Some(source), Some(value)) = (view_src, removed) {
+        propagate_list_removal(ctx, source, value)?;
+    }
     // Real-JDK: cursor = lastRet; lastRet = -1;
     ctx.set_field(this, cursor_slot, Value::Int(last_ret));
     ctx.set_field(this, last_ret_slot, Value::Int(-1));
@@ -5254,6 +5635,7 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
     let data = match data {
         Some(d) => d,
@@ -5301,6 +5683,7 @@ fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
+    resync_view_set(ctx, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return Ok(None),
@@ -5666,13 +6049,19 @@ fn native_al_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Int(0))),
     };
 
+    // Live map view: removed elements must also be deleted from the source map.
+    let view_src = values_view_source(ctx, this);
+
     // Snapshot elements, then test each with the predicate.
     let mut keep = Vec::with_capacity(size);
+    let mut dropped = Vec::new();
     for i in 0..size {
         let elem = ctx.get_array_element(data, i);
         let result = ctx.invoke_virtual(predicate, "test", "(Ljava/lang/Object;)Z", &[elem])?;
         let is_true = matches!(result, Some(Value::Int(v)) if v != 0);
-        if !is_true {
+        if is_true {
+            dropped.push(elem);
+        } else {
             keep.push(elem);
         }
     }
@@ -5683,11 +6072,18 @@ fn native_al_remove_if(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     for (i, val) in keep.iter().enumerate() {
         ctx.set_array_element(data, i, *val);
     }
-    // Clear trailing slots.
+    // Clear trailing slots (the `values()`-view source marker, if any, lives
+    // beyond `size` and is therefore untouched).
     for i in keep.len()..size {
         ctx.set_array_element(data, i, Value::Object(None));
     }
     al_set_size(ctx, this, keep.len() as i32);
+
+    if let Some(source) = view_src {
+        for elem in dropped {
+            propagate_list_removal(ctx, source, elem)?;
+        }
+    }
 
     Ok(Some(Value::Int(if removed { 1 } else { 0 })))
 }
@@ -6871,6 +7267,7 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
+    resync_values_view(ctx, this);
     let (data, size) = al_state(ctx, this);
     let elements: Vec<Value> = match data {
         Some(d) => (0..size as usize)
@@ -6889,6 +7286,7 @@ fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(r))) => *r,
         _ => return make_stream(ctx, &[]),
     };
+    resync_view_set(ctx, this);
     let backing = match hs_backing_map(ctx, this) {
         Some(m) => m,
         None => return make_stream(ctx, &[]),
@@ -12654,8 +13052,12 @@ fn native_lhm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Live view: the returned set carries `this` as the source map so
+    // `keySet().remove` / `iterator().remove` write through (the propagation
+    // routes through LinkedHashMap.remove via virtual dispatch).
     let keys = lhm_collect_keys(ctx, this);
-    make_set_of(ctx, &keys)
+    let set = make_view_set_of(ctx, this, VIEW_KIND_KEYSET, &keys)?;
+    Ok(Some(Value::Object(Some(set))))
 }
 
 fn native_lhm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -12664,7 +13066,8 @@ fn native_lhm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let vals = lhm_collect_values(ctx, this);
-    make_list_of(ctx, &vals)
+    let list = make_view_list_of(ctx, this, &vals);
+    Ok(Some(Value::Object(Some(list))))
 }
 
 fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -12683,7 +13086,9 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         entries.push(Value::Object(Some(entry)));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
     }
-    make_set_of(ctx, &entries)
+    // Live view: removals delete the matching key from the LinkedHashMap.
+    let set = make_view_set_of(ctx, this, VIEW_KIND_ENTRYSET, &entries)?;
+    Ok(Some(Value::Object(Some(set))))
 }
 
 fn native_lhm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15699,10 +16104,16 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let pairs = tm_collect_pairs(ctx, this);
     let size = pairs.len() as i32;
     let ts = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
-    let buf = alloc_ref_array(ctx, std::cmp::max(pairs.len(), TS_DEFAULT_CAPACITY));
+    // Reserve one extra trailing slot and stash the source TreeMap there so the
+    // keySet view writes through (`keySet().remove` / `iterator().remove`).
+    // The slot lives beyond the logical size, so sorted iteration / binary
+    // search (which use `size`) never see it, yet it is GC-scanned.
+    let cap = std::cmp::max(pairs.len(), TS_DEFAULT_CAPACITY) + 1;
+    let buf = alloc_ref_array(ctx, cap);
     for (i, (k, _)) in pairs.iter().enumerate() {
         ctx.set_array_element(buf, i, *k);
     }
+    ctx.set_array_element(buf, cap - 1, Value::Object(Some(this)));
     ts_set_slot(ctx, ts, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, ts, TS_FIELD_SIZE, Value::Int(size));
     let comparator = tm_get_slot(ctx, this, TM_FIELD_COMPARATOR);
@@ -15742,17 +16153,11 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Live view: the ArrayList stashes the source TreeMap so
+    // `values().iterator().remove()` deletes the matching entry from the tree.
     let pairs = tm_collect_pairs(ctx, this);
-    let size = pairs.len() as i32;
-    let __al_n_fields = al_slots(ctx).2;
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
-    let cap = std::cmp::max(size as usize, AL_DEFAULT_CAPACITY);
-    let buf = alloc_ref_array(ctx, cap);
-    for (i, (_, v)) in pairs.iter().enumerate() {
-        ctx.set_array_element(buf, i, *v);
-    }
-    al_set_data(ctx, list, buf);
-    al_set_size(ctx, list, size);
+    let vals: Vec<Value> = pairs.into_iter().map(|(_, v)| v).collect();
+    let list = make_view_list_of(ctx, this, &vals);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -15762,17 +16167,13 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Object(None))),
     };
     let pairs = tm_collect_pairs(ctx, this);
-    let size = pairs.len() as i32;
-    let __al_n_fields = al_slots(ctx).2;
-    let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
-    let cap = std::cmp::max(size as usize, AL_DEFAULT_CAPACITY);
-    let buf = alloc_ref_array(ctx, cap);
-    for (i, (k, v)) in pairs.into_iter().enumerate() {
-        let entry = tm_make_entry(ctx, k, v);
-        ctx.set_array_element(buf, i, Value::Object(Some(entry)));
-    }
-    al_set_data(ctx, list, buf);
-    al_set_size(ctx, list, size);
+    // Live view: build Map.Entry objects and stash the source TreeMap so
+    // removing an entry through the list (or its iterator) deletes the key.
+    let entries: Vec<Value> = pairs
+        .into_iter()
+        .map(|(k, v)| Value::Object(Some(tm_make_entry(ctx, k, v))))
+        .collect();
+    let list = make_view_list_of(ctx, this, &entries);
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -16233,6 +16634,10 @@ fn native_ts_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Ok(idx) => {
             ts_remove_at(ctx, data, size, idx);
             ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
+            // Live TreeMap keySet view: delete the key from the source TreeMap.
+            if let Some(source) = ts_view_source(ctx, this) {
+                source_map_remove(ctx, source, elem)?;
+            }
             Ok(Some(Value::Int(1)))
         }
         Err(_) => Ok(Some(Value::Int(0))),
@@ -16283,6 +16688,10 @@ fn native_ts_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Live TreeMap keySet view: clearing the view clears the source TreeMap.
+    if let Some(source) = ts_view_source(ctx, this) {
+        ctx.invoke_virtual(source, "clear", "()V", &[])?;
+    }
     let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
     ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
     ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
@@ -16513,6 +16922,11 @@ fn native_ts_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             ts_remove_at(ctx, data, size, idx);
             ts_set_slot(ctx, owner, TS_FIELD_SIZE, Value::Int(size - 1));
         }
+    }
+    // Live TreeMap keySet view: the element is a key, so delete it from the
+    // source TreeMap as well.
+    if let Some(source) = ts_view_source(ctx, owner) {
+        source_map_remove(ctx, source, last)?;
     }
     Ok(None)
 }
@@ -21218,6 +21632,7 @@ fn native_itr_remove_noop(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             "java/util/ArrayList$Itr" | "java/util/ArrayList$ListItr" => {
                 return native_al_itr_remove(ctx, args);
             }
+            "java/util/TreeSet$Itr" => return native_ts_itr_remove(ctx, args),
             _ => {}
         }
     }

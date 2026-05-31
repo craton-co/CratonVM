@@ -1,0 +1,84 @@
+warning: C:\Projects\cratonvm\vm-cli\Cargo.toml: file `C:\Projects\cratonvm\vm-cli\src\main.rs` found to be present in multiple build targets:
+  * `bin` target `cratonvm`
+  * `bin` target `java`
+warning: C:\Projects\cratonvm\Cargo.toml: `panic` setting is ignored for `bench` profile
+    Blocking waiting for file lock on artifact directory
+warning: unknown and unstable feature specified for `-Ctarget-feature`: `pclmul`
+  |
+  = note: it is still passed through to the codegen backend, but use of this feature might be unsound and the behavior of this feature can change in the future
+  = help: you might have meant: `pclmulqdq`
+
+warning: `cratonvm-types` (lib) generated 1 warning
+warning: `cratonvm-native-api` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-reader` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-jit-api` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-jit` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-classloading` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-native-collections` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-vm` (build script) generated 1 warning (1 duplicate)
+   Compiling cratonvm-vm v0.3.0 (C:\Projects\cratonvm\vm)
+warning: type `RuntimeTlsIdentity` is more private than the item `set_runtime_tls_identity`
+   --> native-builtins\src\t27_tls.rs:127:1
+    |
+127 | pub fn set_runtime_tls_identity(identity: Option<RuntimeTlsIdentity>) {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `set_runtime_tls_identity` is reachable at visibility `pub`
+    |
+note: but type `RuntimeTlsIdentity` is only usable at visibility `pub(crate)`
+   --> native-builtins\src\t27_tls.rs:108:1
+    |
+108 | pub(crate) struct RuntimeTlsIdentity {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: `cratonvm-native-builtins` (lib) generated 2 warnings (1 duplicate)
+warning: `cratonvm-native-awt` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-native-io` (lib) generated 1 warning (1 duplicate)
+warning: unnecessary `unsafe` block
+    --> gc\src\gen_heap.rs:2576:27
+     |
+2576 |             let obj_ptr = unsafe { (from_base + cursor) as *mut u8 };
+     |                           ^^^^^^ unnecessary `unsafe` block
+     |
+     = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+    --> gc\src\gen_heap.rs:3722:23
+     |
+3722 |         let obj_ptr = unsafe { (base + cursor) as *mut u8 };
+     |                       ^^^^^^ unnecessary `unsafe` block
+
+warning: `cratonvm-gc` (lib) generated 3 warnings (1 duplicate)
+warning: `cratonvm-jfr` (lib) generated 1 warning (1 duplicate)
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:108:1
+    |
+108 | / /// `CRATONVM_DBG_JETTY` — trace dispatch into the `org/eclipse/jetty/start/`
+109 | | /// launcher package (every invokevirtual/invokespecial receiver + args) so
+110 | | /// the boot-test NPE at `Main.start(Main.java:397)` can be pinpointed.
+    | |_----------------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:121:1
+    |
+121 | / /// `CRATONVM_DBG_CHARSET=1` — targeted diagnostic for the bare
+122 | | /// `NullPointerException: charset` blocker (keycloak26 Picocli /
+123 | | /// Hazelcast JAXP-XPath). When set, the `Athrow` opcode handler and
+124 | | /// `throw_runtime_error` dump the full live Java thread stack
+125 | | /// (`class.method:pc` for every frame) the moment an NPE whose message
+126 | | /// is exactly `charset` is thrown — pinpointing the JDK method and app
+127 | | /// call site that dereferenced a null `Charset`.
+    | |_------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: `cratonvm-vm` (lib) generated 3 warnings (1 duplicate)
+   Compiling cratonvm-cli v0.3.0 (C:\Projects\cratonvm\vm-cli)
+warning: `cratonvm-cli` (bin "cratonvm") generated 1 warning (1 duplicate)
+    Finished `release` profile [optimized] target(s) in 40m 59s

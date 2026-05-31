@@ -1,0 +1,10 @@
+[DBG_VIEW] native_hs_remove: backing_nfields=16 src=true kind=1
+HashMap entrySet it.remove: size=2 get(b)=null (expect 2/null)
+[DBG_VIEW] native_lhm_key_set: set_nfields=3 backing_nfields=Some(16)
+[DBG_VIEW] native_hs_remove: backing_nfields=16 src=true kind=0
+LHM keySet it.remove: size=2 get(b)=null (expect 2/null)
+LHM values it.remove: size=2 get(b)=null (expect 2/null)
+ArrayList it.remove: size=2 contains(b)=false (expect 2/false)
+[DBG_VIEW] native_hs_remove: backing_nfields=16 src=true kind=1
+HashMap<Int> it.remove: size=2 get(2)=null (expect 2/null)
+TreeMap it.remove: size=3 get(b)=2 (expect 2/null)

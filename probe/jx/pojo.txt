@@ -1,0 +1,2692 @@
+Compiled from "POJOPropertiesCollector.java"
+public class com.fasterxml.jackson.databind.introspect.POJOPropertiesCollector {
+  protected final com.fasterxml.jackson.databind.cfg.MapperConfig<?> _config;
+
+  protected final com.fasterxml.jackson.databind.introspect.AccessorNamingStrategy _accessorNaming;
+
+  protected final boolean _forSerialization;
+
+  protected final com.fasterxml.jackson.databind.JavaType _type;
+
+  protected final com.fasterxml.jackson.databind.introspect.AnnotatedClass _classDef;
+
+  protected final com.fasterxml.jackson.databind.introspect.VisibilityChecker<?> _visibilityChecker;
+
+  protected final com.fasterxml.jackson.databind.AnnotationIntrospector _annotationIntrospector;
+
+  protected final boolean _useAnnotations;
+
+  protected final boolean _isRecordType;
+
+  protected boolean _collected;
+
+  protected java.util.LinkedHashMap<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder> _properties;
+
+  protected java.util.LinkedList<com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder> _creatorProperties;
+
+  protected java.util.Map<com.fasterxml.jackson.databind.PropertyName, com.fasterxml.jackson.databind.PropertyName> _fieldRenameMappings;
+
+  protected java.util.LinkedList<com.fasterxml.jackson.databind.introspect.AnnotatedMember> _anyGetters;
+
+  protected java.util.LinkedList<com.fasterxml.jackson.databind.introspect.AnnotatedMember> _anyGetterField;
+
+  protected java.util.LinkedList<com.fasterxml.jackson.databind.introspect.AnnotatedMethod> _anySetters;
+
+  protected java.util.LinkedList<com.fasterxml.jackson.databind.introspect.AnnotatedMember> _anySetterField;
+
+  protected java.util.LinkedList<com.fasterxml.jackson.databind.introspect.AnnotatedMember> _jsonKeyAccessors;
+
+  protected java.util.LinkedList<com.fasterxml.jackson.databind.introspect.AnnotatedMember> _jsonValueAccessors;
+
+  protected java.util.HashSet<java.lang.String> _ignoredPropertyNames;
+
+  protected java.util.LinkedHashMap<java.lang.Object, com.fasterxml.jackson.databind.introspect.AnnotatedMember> _injectables;
+
+  protected com.fasterxml.jackson.annotation.JsonFormat$Value _formatOverrides;
+
+  protected final boolean _stdBeanNaming;
+
+  protected java.lang.String _mutatorPrefix;
+
+  protected com.fasterxml.jackson.databind.introspect.POJOPropertiesCollector(com.fasterxml.jackson.databind.cfg.MapperConfig<?>, boolean, com.fasterxml.jackson.databind.JavaType, com.fasterxml.jackson.databind.introspect.AnnotatedClass, com.fasterxml.jackson.databind.introspect.AccessorNamingStrategy);
+    Code:
+         0: aload_0
+         1: invokespecial #1                  // Method java/lang/Object."<init>":()V
+         4: aload_0
+         5: ldc           #2                  // String set
+         7: putfield      #3                  // Field _mutatorPrefix:Ljava/lang/String;
+        10: aload_0
+        11: aload_1
+        12: putfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        15: aload_0
+        16: iload_2
+        17: putfield      #5                  // Field _forSerialization:Z
+        20: aload_0
+        21: aload_3
+        22: putfield      #6                  // Field _type:Lcom/fasterxml/jackson/databind/JavaType;
+        25: aload_0
+        26: aload         4
+        28: putfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+        31: aload_0
+        32: aload_0
+        33: getfield      #6                  // Field _type:Lcom/fasterxml/jackson/databind/JavaType;
+        36: invokevirtual #8                  // Method com/fasterxml/jackson/databind/JavaType.isRecordType:()Z
+        39: putfield      #9                  // Field _isRecordType:Z
+        42: aload_1
+        43: invokevirtual #10                 // Method com/fasterxml/jackson/databind/cfg/MapperConfig.isAnnotationProcessingEnabled:()Z
+        46: ifeq          68
+        49: aload_0
+        50: iconst_1
+        51: putfield      #11                 // Field _useAnnotations:Z
+        54: aload_0
+        55: aload_0
+        56: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        59: invokevirtual #12                 // Method com/fasterxml/jackson/databind/cfg/MapperConfig.getAnnotationIntrospector:()Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        62: putfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        65: goto          80
+        68: aload_0
+        69: iconst_0
+        70: putfield      #11                 // Field _useAnnotations:Z
+        73: aload_0
+        74: invokestatic  #14                 // Method com/fasterxml/jackson/databind/AnnotationIntrospector.nopInstance:()Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        77: putfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        80: aload_0
+        81: aload_0
+        82: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        85: aload_3
+        86: invokevirtual #15                 // Method com/fasterxml/jackson/databind/JavaType.getRawClass:()Ljava/lang/Class;
+        89: aload         4
+        91: invokevirtual #16                 // Method com/fasterxml/jackson/databind/cfg/MapperConfig.getDefaultVisibilityChecker:(Ljava/lang/Class;Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;)Lcom/fasterxml/jackson/databind/introspect/VisibilityChecker;
+        94: putfield      #17                 // Field _visibilityChecker:Lcom/fasterxml/jackson/databind/introspect/VisibilityChecker;
+        97: aload_0
+        98: aload         5
+       100: putfield      #18                 // Field _accessorNaming:Lcom/fasterxml/jackson/databind/introspect/AccessorNamingStrategy;
+       103: aload_0
+       104: aload_1
+       105: getstatic     #19                 // Field com/fasterxml/jackson/databind/MapperFeature.USE_STD_BEAN_NAMING:Lcom/fasterxml/jackson/databind/MapperFeature;
+       108: invokevirtual #20                 // Method com/fasterxml/jackson/databind/cfg/MapperConfig.isEnabled:(Lcom/fasterxml/jackson/databind/MapperFeature;)Z
+       111: putfield      #21                 // Field _stdBeanNaming:Z
+       114: return
+
+  protected com.fasterxml.jackson.databind.introspect.POJOPropertiesCollector(com.fasterxml.jackson.databind.cfg.MapperConfig<?>, boolean, com.fasterxml.jackson.databind.JavaType, com.fasterxml.jackson.databind.introspect.AnnotatedClass, java.lang.String);
+    Code:
+         0: aload_0
+         1: aload_1
+         2: iload_2
+         3: aload_3
+         4: aload         4
+         6: aload_1
+         7: aload         4
+         9: aload         5
+        11: invokestatic  #22                 // Method _accessorNaming:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;Ljava/lang/String;)Lcom/fasterxml/jackson/databind/introspect/AccessorNamingStrategy;
+        14: invokespecial #23                 // Method "<init>":(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;ZLcom/fasterxml/jackson/databind/JavaType;Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;Lcom/fasterxml/jackson/databind/introspect/AccessorNamingStrategy;)V
+        17: aload_0
+        18: aload         5
+        20: putfield      #3                  // Field _mutatorPrefix:Ljava/lang/String;
+        23: return
+
+  private static com.fasterxml.jackson.databind.introspect.AccessorNamingStrategy _accessorNaming(com.fasterxml.jackson.databind.cfg.MapperConfig<?>, com.fasterxml.jackson.databind.introspect.AnnotatedClass, java.lang.String);
+    Code:
+         0: aload_2
+         1: ifnonnull     7
+         4: ldc           #2                  // String set
+         6: astore_2
+         7: new           #24                 // class com/fasterxml/jackson/databind/introspect/DefaultAccessorNamingStrategy$Provider
+        10: dup
+        11: invokespecial #25                 // Method com/fasterxml/jackson/databind/introspect/DefaultAccessorNamingStrategy$Provider."<init>":()V
+        14: aload_2
+        15: invokevirtual #26                 // Method com/fasterxml/jackson/databind/introspect/DefaultAccessorNamingStrategy$Provider.withSetterPrefix:(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/introspect/DefaultAccessorNamingStrategy$Provider;
+        18: aload_0
+        19: aload_1
+        20: invokevirtual #27                 // Method com/fasterxml/jackson/databind/introspect/DefaultAccessorNamingStrategy$Provider.forPOJO:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;)Lcom/fasterxml/jackson/databind/introspect/AccessorNamingStrategy;
+        23: areturn
+
+  public com.fasterxml.jackson.databind.cfg.MapperConfig<?> getConfig();
+    Code:
+         0: aload_0
+         1: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+         4: areturn
+
+  public com.fasterxml.jackson.databind.JavaType getType();
+    Code:
+         0: aload_0
+         1: getfield      #6                  // Field _type:Lcom/fasterxml/jackson/databind/JavaType;
+         4: areturn
+
+  public boolean isRecordType();
+    Code:
+         0: aload_0
+         1: getfield      #9                  // Field _isRecordType:Z
+         4: ireturn
+
+  public com.fasterxml.jackson.databind.introspect.AnnotatedClass getClassDef();
+    Code:
+         0: aload_0
+         1: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+         4: areturn
+
+  public com.fasterxml.jackson.databind.AnnotationIntrospector getAnnotationIntrospector();
+    Code:
+         0: aload_0
+         1: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+         4: areturn
+
+  public java.util.List<com.fasterxml.jackson.databind.introspect.BeanPropertyDefinition> getProperties();
+    Code:
+         0: aload_0
+         1: invokevirtual #28                 // Method getPropertyMap:()Ljava/util/Map;
+         4: astore_1
+         5: new           #29                 // class java/util/ArrayList
+         8: dup
+         9: aload_1
+        10: invokeinterface #30,  1           // InterfaceMethod java/util/Map.values:()Ljava/util/Collection;
+        15: invokespecial #31                 // Method java/util/ArrayList."<init>":(Ljava/util/Collection;)V
+        18: areturn
+
+  public java.util.Map<java.lang.Object, com.fasterxml.jackson.databind.introspect.AnnotatedMember> getInjectables();
+    Code:
+         0: aload_0
+         1: getfield      #32                 // Field _collected:Z
+         4: ifne          11
+         7: aload_0
+         8: invokevirtual #33                 // Method collectAll:()V
+        11: aload_0
+        12: getfield      #34                 // Field _injectables:Ljava/util/LinkedHashMap;
+        15: areturn
+
+  public com.fasterxml.jackson.databind.introspect.AnnotatedMember getJsonKeyAccessor();
+    Code:
+         0: aload_0
+         1: getfield      #32                 // Field _collected:Z
+         4: ifne          11
+         7: aload_0
+         8: invokevirtual #33                 // Method collectAll:()V
+        11: aload_0
+        12: getfield      #35                 // Field _jsonKeyAccessors:Ljava/util/LinkedList;
+        15: ifnull        84
+        18: aload_0
+        19: getfield      #35                 // Field _jsonKeyAccessors:Ljava/util/LinkedList;
+        22: invokevirtual #36                 // Method java/util/LinkedList.size:()I
+        25: iconst_1
+        26: if_icmple     72
+        29: aload_0
+        30: aload_0
+        31: getfield      #35                 // Field _jsonKeyAccessors:Ljava/util/LinkedList;
+        34: invokevirtual #37                 // Method _resolveFieldVsGetter:(Ljava/util/List;)Z
+        37: ifne          72
+        40: aload_0
+        41: ldc           #38                 // String Multiple \'as-key\' properties defined (%s vs %s)
+        43: iconst_2
+        44: anewarray     #39                 // class java/lang/Object
+        47: dup
+        48: iconst_0
+        49: aload_0
+        50: getfield      #35                 // Field _jsonKeyAccessors:Ljava/util/LinkedList;
+        53: iconst_0
+        54: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        57: aastore
+        58: dup
+        59: iconst_1
+        60: aload_0
+        61: getfield      #35                 // Field _jsonKeyAccessors:Ljava/util/LinkedList;
+        64: iconst_1
+        65: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        68: aastore
+        69: invokevirtual #41                 // Method reportProblem:(Ljava/lang/String;[Ljava/lang/Object;)V
+        72: aload_0
+        73: getfield      #35                 // Field _jsonKeyAccessors:Ljava/util/LinkedList;
+        76: iconst_0
+        77: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        80: checkcast     #42                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMember
+        83: areturn
+        84: aconst_null
+        85: areturn
+
+  public com.fasterxml.jackson.databind.introspect.AnnotatedMember getJsonValueAccessor();
+    Code:
+         0: aload_0
+         1: getfield      #32                 // Field _collected:Z
+         4: ifne          11
+         7: aload_0
+         8: invokevirtual #33                 // Method collectAll:()V
+        11: aload_0
+        12: getfield      #43                 // Field _jsonValueAccessors:Ljava/util/LinkedList;
+        15: ifnull        84
+        18: aload_0
+        19: getfield      #43                 // Field _jsonValueAccessors:Ljava/util/LinkedList;
+        22: invokevirtual #36                 // Method java/util/LinkedList.size:()I
+        25: iconst_1
+        26: if_icmple     72
+        29: aload_0
+        30: aload_0
+        31: getfield      #43                 // Field _jsonValueAccessors:Ljava/util/LinkedList;
+        34: invokevirtual #37                 // Method _resolveFieldVsGetter:(Ljava/util/List;)Z
+        37: ifne          72
+        40: aload_0
+        41: ldc           #44                 // String Multiple \'as-value\' properties defined (%s vs %s)
+        43: iconst_2
+        44: anewarray     #39                 // class java/lang/Object
+        47: dup
+        48: iconst_0
+        49: aload_0
+        50: getfield      #43                 // Field _jsonValueAccessors:Ljava/util/LinkedList;
+        53: iconst_0
+        54: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        57: aastore
+        58: dup
+        59: iconst_1
+        60: aload_0
+        61: getfield      #43                 // Field _jsonValueAccessors:Ljava/util/LinkedList;
+        64: iconst_1
+        65: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        68: aastore
+        69: invokevirtual #41                 // Method reportProblem:(Ljava/lang/String;[Ljava/lang/Object;)V
+        72: aload_0
+        73: getfield      #43                 // Field _jsonValueAccessors:Ljava/util/LinkedList;
+        76: iconst_0
+        77: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        80: checkcast     #42                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMember
+        83: areturn
+        84: aconst_null
+        85: areturn
+
+  public com.fasterxml.jackson.databind.introspect.AnnotatedMember getAnyGetter();
+    Code:
+         0: aload_0
+         1: invokevirtual #45                 // Method getAnyGetterMethod:()Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;
+         4: areturn
+
+  public com.fasterxml.jackson.databind.introspect.AnnotatedMember getAnyGetterField();
+    Code:
+         0: aload_0
+         1: getfield      #32                 // Field _collected:Z
+         4: ifne          11
+         7: aload_0
+         8: invokevirtual #33                 // Method collectAll:()V
+        11: aload_0
+        12: getfield      #46                 // Field _anyGetterField:Ljava/util/LinkedList;
+        15: ifnull        72
+        18: aload_0
+        19: getfield      #46                 // Field _anyGetterField:Ljava/util/LinkedList;
+        22: invokevirtual #36                 // Method java/util/LinkedList.size:()I
+        25: iconst_1
+        26: if_icmple     61
+        29: aload_0
+        30: ldc           #47                 // String Multiple \'any-getter\' fields defined (%s vs %s)
+        32: iconst_2
+        33: anewarray     #39                 // class java/lang/Object
+        36: dup
+        37: iconst_0
+        38: aload_0
+        39: getfield      #46                 // Field _anyGetterField:Ljava/util/LinkedList;
+        42: iconst_0
+        43: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        46: aastore
+        47: dup
+        48: iconst_1
+        49: aload_0
+        50: getfield      #46                 // Field _anyGetterField:Ljava/util/LinkedList;
+        53: iconst_1
+        54: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        57: aastore
+        58: invokevirtual #41                 // Method reportProblem:(Ljava/lang/String;[Ljava/lang/Object;)V
+        61: aload_0
+        62: getfield      #46                 // Field _anyGetterField:Ljava/util/LinkedList;
+        65: invokevirtual #48                 // Method java/util/LinkedList.getFirst:()Ljava/lang/Object;
+        68: checkcast     #42                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMember
+        71: areturn
+        72: aconst_null
+        73: areturn
+
+  public com.fasterxml.jackson.databind.introspect.AnnotatedMember getAnyGetterMethod();
+    Code:
+         0: aload_0
+         1: getfield      #32                 // Field _collected:Z
+         4: ifne          11
+         7: aload_0
+         8: invokevirtual #33                 // Method collectAll:()V
+        11: aload_0
+        12: getfield      #49                 // Field _anyGetters:Ljava/util/LinkedList;
+        15: ifnull        72
+        18: aload_0
+        19: getfield      #49                 // Field _anyGetters:Ljava/util/LinkedList;
+        22: invokevirtual #36                 // Method java/util/LinkedList.size:()I
+        25: iconst_1
+        26: if_icmple     61
+        29: aload_0
+        30: ldc           #50                 // String Multiple \'any-getter\' methods defined (%s vs %s)
+        32: iconst_2
+        33: anewarray     #39                 // class java/lang/Object
+        36: dup
+        37: iconst_0
+        38: aload_0
+        39: getfield      #49                 // Field _anyGetters:Ljava/util/LinkedList;
+        42: iconst_0
+        43: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        46: aastore
+        47: dup
+        48: iconst_1
+        49: aload_0
+        50: getfield      #49                 // Field _anyGetters:Ljava/util/LinkedList;
+        53: iconst_1
+        54: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        57: aastore
+        58: invokevirtual #41                 // Method reportProblem:(Ljava/lang/String;[Ljava/lang/Object;)V
+        61: aload_0
+        62: getfield      #49                 // Field _anyGetters:Ljava/util/LinkedList;
+        65: invokevirtual #48                 // Method java/util/LinkedList.getFirst:()Ljava/lang/Object;
+        68: checkcast     #42                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMember
+        71: areturn
+        72: aconst_null
+        73: areturn
+
+  public com.fasterxml.jackson.databind.introspect.AnnotatedMember getAnySetterField();
+    Code:
+         0: aload_0
+         1: getfield      #32                 // Field _collected:Z
+         4: ifne          11
+         7: aload_0
+         8: invokevirtual #33                 // Method collectAll:()V
+        11: aload_0
+        12: getfield      #51                 // Field _anySetterField:Ljava/util/LinkedList;
+        15: ifnull        72
+        18: aload_0
+        19: getfield      #51                 // Field _anySetterField:Ljava/util/LinkedList;
+        22: invokevirtual #36                 // Method java/util/LinkedList.size:()I
+        25: iconst_1
+        26: if_icmple     61
+        29: aload_0
+        30: ldc           #52                 // String Multiple \'any-setter\' fields defined (%s vs %s)
+        32: iconst_2
+        33: anewarray     #39                 // class java/lang/Object
+        36: dup
+        37: iconst_0
+        38: aload_0
+        39: getfield      #51                 // Field _anySetterField:Ljava/util/LinkedList;
+        42: iconst_0
+        43: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        46: aastore
+        47: dup
+        48: iconst_1
+        49: aload_0
+        50: getfield      #51                 // Field _anySetterField:Ljava/util/LinkedList;
+        53: iconst_1
+        54: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        57: aastore
+        58: invokevirtual #41                 // Method reportProblem:(Ljava/lang/String;[Ljava/lang/Object;)V
+        61: aload_0
+        62: getfield      #51                 // Field _anySetterField:Ljava/util/LinkedList;
+        65: invokevirtual #48                 // Method java/util/LinkedList.getFirst:()Ljava/lang/Object;
+        68: checkcast     #42                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMember
+        71: areturn
+        72: aconst_null
+        73: areturn
+
+  public com.fasterxml.jackson.databind.introspect.AnnotatedMethod getAnySetterMethod();
+    Code:
+         0: aload_0
+         1: getfield      #32                 // Field _collected:Z
+         4: ifne          11
+         7: aload_0
+         8: invokevirtual #33                 // Method collectAll:()V
+        11: aload_0
+        12: getfield      #53                 // Field _anySetters:Ljava/util/LinkedList;
+        15: ifnull        72
+        18: aload_0
+        19: getfield      #53                 // Field _anySetters:Ljava/util/LinkedList;
+        22: invokevirtual #36                 // Method java/util/LinkedList.size:()I
+        25: iconst_1
+        26: if_icmple     61
+        29: aload_0
+        30: ldc           #54                 // String Multiple \'any-setter\' methods defined (%s vs %s)
+        32: iconst_2
+        33: anewarray     #39                 // class java/lang/Object
+        36: dup
+        37: iconst_0
+        38: aload_0
+        39: getfield      #53                 // Field _anySetters:Ljava/util/LinkedList;
+        42: iconst_0
+        43: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        46: aastore
+        47: dup
+        48: iconst_1
+        49: aload_0
+        50: getfield      #53                 // Field _anySetters:Ljava/util/LinkedList;
+        53: iconst_1
+        54: invokevirtual #40                 // Method java/util/LinkedList.get:(I)Ljava/lang/Object;
+        57: aastore
+        58: invokevirtual #41                 // Method reportProblem:(Ljava/lang/String;[Ljava/lang/Object;)V
+        61: aload_0
+        62: getfield      #53                 // Field _anySetters:Ljava/util/LinkedList;
+        65: invokevirtual #48                 // Method java/util/LinkedList.getFirst:()Ljava/lang/Object;
+        68: checkcast     #55                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMethod
+        71: areturn
+        72: aconst_null
+        73: areturn
+
+  public java.util.Set<java.lang.String> getIgnoredPropertyNames();
+    Code:
+         0: aload_0
+         1: getfield      #56                 // Field _ignoredPropertyNames:Ljava/util/HashSet;
+         4: areturn
+
+  public com.fasterxml.jackson.databind.introspect.ObjectIdInfo getObjectIdInfo();
+    Code:
+         0: aload_0
+         1: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+         4: aload_0
+         5: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+         8: invokevirtual #57                 // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findObjectIdInfo:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Lcom/fasterxml/jackson/databind/introspect/ObjectIdInfo;
+        11: astore_1
+        12: aload_1
+        13: ifnull        29
+        16: aload_0
+        17: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        20: aload_0
+        21: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+        24: aload_1
+        25: invokevirtual #58                 // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findObjectReferenceInfo:(Lcom/fasterxml/jackson/databind/introspect/Annotated;Lcom/fasterxml/jackson/databind/introspect/ObjectIdInfo;)Lcom/fasterxml/jackson/databind/introspect/ObjectIdInfo;
+        28: astore_1
+        29: aload_1
+        30: areturn
+
+  protected java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder> getPropertyMap();
+    Code:
+         0: aload_0
+         1: getfield      #32                 // Field _collected:Z
+         4: ifne          11
+         7: aload_0
+         8: invokevirtual #33                 // Method collectAll:()V
+        11: aload_0
+        12: getfield      #59                 // Field _properties:Ljava/util/LinkedHashMap;
+        15: areturn
+
+  public com.fasterxml.jackson.databind.introspect.AnnotatedMethod getJsonValueMethod();
+    Code:
+         0: aload_0
+         1: invokevirtual #60                 // Method getJsonValueAccessor:()Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;
+         4: astore_1
+         5: aload_1
+         6: instanceof    #55                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMethod
+         9: ifeq          17
+        12: aload_1
+        13: checkcast     #55                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMethod
+        16: areturn
+        17: aconst_null
+        18: areturn
+
+  public java.lang.Class<?> findPOJOBuilderClass();
+    Code:
+         0: aload_0
+         1: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+         4: aload_0
+         5: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+         8: invokevirtual #61                 // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findPOJOBuilder:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;)Ljava/lang/Class;
+        11: areturn
+
+  public com.fasterxml.jackson.annotation.JsonFormat$Value getFormatOverrides();
+    Code:
+         0: aload_0
+         1: getfield      #62                 // Field _formatOverrides:Lcom/fasterxml/jackson/annotation/JsonFormat$Value;
+         4: ifnonnull     77
+         7: aconst_null
+         8: astore_1
+         9: aload_0
+        10: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        13: ifnull        28
+        16: aload_0
+        17: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        20: aload_0
+        21: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+        24: invokevirtual #63                 // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findFormat:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Lcom/fasterxml/jackson/annotation/JsonFormat$Value;
+        27: astore_1
+        28: aload_0
+        29: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        32: aload_0
+        33: getfield      #6                  // Field _type:Lcom/fasterxml/jackson/databind/JavaType;
+        36: invokevirtual #15                 // Method com/fasterxml/jackson/databind/JavaType.getRawClass:()Ljava/lang/Class;
+        39: invokevirtual #64                 // Method com/fasterxml/jackson/databind/cfg/MapperConfig.getDefaultPropertyFormat:(Ljava/lang/Class;)Lcom/fasterxml/jackson/annotation/JsonFormat$Value;
+        42: astore_2
+        43: aload_2
+        44: ifnull        62
+        47: aload_1
+        48: ifnonnull     56
+        51: aload_2
+        52: astore_1
+        53: goto          62
+        56: aload_1
+        57: aload_2
+        58: invokevirtual #65                 // Method com/fasterxml/jackson/annotation/JsonFormat$Value.withOverrides:(Lcom/fasterxml/jackson/annotation/JsonFormat$Value;)Lcom/fasterxml/jackson/annotation/JsonFormat$Value;
+        61: astore_1
+        62: aload_0
+        63: aload_1
+        64: ifnonnull     73
+        67: invokestatic  #66                 // Method com/fasterxml/jackson/annotation/JsonFormat$Value.empty:()Lcom/fasterxml/jackson/annotation/JsonFormat$Value;
+        70: goto          74
+        73: aload_1
+        74: putfield      #62                 // Field _formatOverrides:Lcom/fasterxml/jackson/annotation/JsonFormat$Value;
+        77: aload_0
+        78: getfield      #62                 // Field _formatOverrides:Lcom/fasterxml/jackson/annotation/JsonFormat$Value;
+        81: areturn
+
+  protected void collectAll();
+    Code:
+         0: new           #67                 // class java/util/LinkedHashMap
+         3: dup
+         4: invokespecial #68                 // Method java/util/LinkedHashMap."<init>":()V
+         7: astore_1
+         8: aload_0
+         9: invokevirtual #69                 // Method isRecordType:()Z
+        12: istore_2
+        13: iload_2
+        14: ifeq          24
+        17: aload_0
+        18: getfield      #5                  // Field _forSerialization:Z
+        21: ifeq          29
+        24: aload_0
+        25: aload_1
+        26: invokevirtual #70                 // Method _addFields:(Ljava/util/Map;)V
+        29: aload_0
+        30: aload_1
+        31: invokevirtual #71                 // Method _addMethods:(Ljava/util/Map;)V
+        34: aload_0
+        35: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+        38: invokevirtual #72                 // Method com/fasterxml/jackson/databind/introspect/AnnotatedClass.isNonStaticInnerClass:()Z
+        41: ifne          60
+        44: aload_0
+        45: getfield      #5                  // Field _forSerialization:Z
+        48: ifeq          55
+        51: iload_2
+        52: ifne          60
+        55: aload_0
+        56: aload_1
+        57: invokevirtual #73                 // Method _addCreators:(Ljava/util/Map;)V
+        60: aload_0
+        61: aload_1
+        62: invokevirtual #74                 // Method _removeUnwantedProperties:(Ljava/util/Map;)V
+        65: aload_0
+        66: aload_1
+        67: invokevirtual #75                 // Method _removeUnwantedAccessor:(Ljava/util/Map;)V
+        70: aload_0
+        71: aload_1
+        72: invokevirtual #76                 // Method _renameProperties:(Ljava/util/Map;)V
+        75: aload_0
+        76: aload_1
+        77: invokevirtual #77                 // Method _addInjectables:(Ljava/util/Map;)V
+        80: aload_1
+        81: invokevirtual #78                 // Method java/util/LinkedHashMap.values:()Ljava/util/Collection;
+        84: invokeinterface #79,  1           // InterfaceMethod java/util/Collection.iterator:()Ljava/util/Iterator;
+        89: astore_3
+        90: aload_3
+        91: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        96: ifeq          122
+        99: aload_3
+       100: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       105: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       108: astore        4
+       110: aload         4
+       112: aload_0
+       113: getfield      #5                  // Field _forSerialization:Z
+       116: invokevirtual #83                 // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.mergeAnnotations:(Z)V
+       119: goto          90
+       122: aload_0
+       123: invokespecial #84                 // Method _findNamingStrategy:()Lcom/fasterxml/jackson/databind/PropertyNamingStrategy;
+       126: astore_3
+       127: aload_3
+       128: ifnull        137
+       131: aload_0
+       132: aload_1
+       133: aload_3
+       134: invokevirtual #85                 // Method _renameUsing:(Ljava/util/Map;Lcom/fasterxml/jackson/databind/PropertyNamingStrategy;)V
+       137: aload_1
+       138: invokevirtual #78                 // Method java/util/LinkedHashMap.values:()Ljava/util/Collection;
+       141: invokeinterface #79,  1           // InterfaceMethod java/util/Collection.iterator:()Ljava/util/Iterator;
+       146: astore        4
+       148: aload         4
+       150: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       155: ifeq          178
+       158: aload         4
+       160: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       165: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       168: astore        5
+       170: aload         5
+       172: invokevirtual #86                 // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.trimByVisibility:()V
+       175: goto          148
+       178: aload_0
+       179: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       182: getstatic     #87                 // Field com/fasterxml/jackson/databind/MapperFeature.USE_WRAPPER_NAME_AS_PROPERTY_NAME:Lcom/fasterxml/jackson/databind/MapperFeature;
+       185: invokevirtual #20                 // Method com/fasterxml/jackson/databind/cfg/MapperConfig.isEnabled:(Lcom/fasterxml/jackson/databind/MapperFeature;)Z
+       188: ifeq          196
+       191: aload_0
+       192: aload_1
+       193: invokevirtual #88                 // Method _renameWithWrappers:(Ljava/util/Map;)V
+       196: aload_0
+       197: aload_1
+       198: invokevirtual #89                 // Method _sortProperties:(Ljava/util/Map;)V
+       201: aload_0
+       202: aload_1
+       203: putfield      #59                 // Field _properties:Ljava/util/LinkedHashMap;
+       206: aload_0
+       207: iconst_1
+       208: putfield      #32                 // Field _collected:Z
+       211: return
+
+  protected void _addFields(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_0
+         1: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+         4: astore_2
+         5: aload_0
+         6: getfield      #5                  // Field _forSerialization:Z
+         9: ifne          29
+        12: aload_0
+        13: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        16: getstatic     #90                 // Field com/fasterxml/jackson/databind/MapperFeature.ALLOW_FINAL_FIELDS_AS_MUTATORS:Lcom/fasterxml/jackson/databind/MapperFeature;
+        19: invokevirtual #20                 // Method com/fasterxml/jackson/databind/cfg/MapperConfig.isEnabled:(Lcom/fasterxml/jackson/databind/MapperFeature;)Z
+        22: ifne          29
+        25: iconst_1
+        26: goto          30
+        29: iconst_0
+        30: istore_3
+        31: aload_0
+        32: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        35: getstatic     #91                 // Field com/fasterxml/jackson/databind/MapperFeature.PROPAGATE_TRANSIENT_MARKER:Lcom/fasterxml/jackson/databind/MapperFeature;
+        38: invokevirtual #20                 // Method com/fasterxml/jackson/databind/cfg/MapperConfig.isEnabled:(Lcom/fasterxml/jackson/databind/MapperFeature;)Z
+        41: istore        4
+        43: aload_0
+        44: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+        47: invokevirtual #92                 // Method com/fasterxml/jackson/databind/introspect/AnnotatedClass.fields:()Ljava/lang/Iterable;
+        50: invokeinterface #93,  1           // InterfaceMethod java/lang/Iterable.iterator:()Ljava/util/Iterator;
+        55: astore        5
+        57: aload         5
+        59: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        64: ifeq          576
+        67: aload         5
+        69: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        74: checkcast     #94                 // class com/fasterxml/jackson/databind/introspect/AnnotatedField
+        77: astore        6
+        79: getstatic     #95                 // Field java/lang/Boolean.TRUE:Ljava/lang/Boolean;
+        82: aload_2
+        83: aload_0
+        84: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        87: aload         6
+        89: invokevirtual #96                 // Method com/fasterxml/jackson/databind/AnnotationIntrospector.hasAsKey:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/Annotated;)Ljava/lang/Boolean;
+        92: invokevirtual #97                 // Method java/lang/Boolean.equals:(Ljava/lang/Object;)Z
+        95: ifeq          126
+        98: aload_0
+        99: getfield      #35                 // Field _jsonKeyAccessors:Ljava/util/LinkedList;
+       102: ifnonnull     116
+       105: aload_0
+       106: new           #98                 // class java/util/LinkedList
+       109: dup
+       110: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+       113: putfield      #35                 // Field _jsonKeyAccessors:Ljava/util/LinkedList;
+       116: aload_0
+       117: getfield      #35                 // Field _jsonKeyAccessors:Ljava/util/LinkedList;
+       120: aload         6
+       122: invokevirtual #100                // Method java/util/LinkedList.add:(Ljava/lang/Object;)Z
+       125: pop
+       126: getstatic     #95                 // Field java/lang/Boolean.TRUE:Ljava/lang/Boolean;
+       129: aload_2
+       130: aload         6
+       132: invokevirtual #101                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.hasAsValue:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Ljava/lang/Boolean;
+       135: invokevirtual #97                 // Method java/lang/Boolean.equals:(Ljava/lang/Object;)Z
+       138: ifeq          172
+       141: aload_0
+       142: getfield      #43                 // Field _jsonValueAccessors:Ljava/util/LinkedList;
+       145: ifnonnull     159
+       148: aload_0
+       149: new           #98                 // class java/util/LinkedList
+       152: dup
+       153: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+       156: putfield      #43                 // Field _jsonValueAccessors:Ljava/util/LinkedList;
+       159: aload_0
+       160: getfield      #43                 // Field _jsonValueAccessors:Ljava/util/LinkedList;
+       163: aload         6
+       165: invokevirtual #100                // Method java/util/LinkedList.add:(Ljava/lang/Object;)Z
+       168: pop
+       169: goto          57
+       172: getstatic     #95                 // Field java/lang/Boolean.TRUE:Ljava/lang/Boolean;
+       175: aload_2
+       176: aload         6
+       178: invokevirtual #102                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.hasAnyGetter:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Ljava/lang/Boolean;
+       181: invokevirtual #97                 // Method java/lang/Boolean.equals:(Ljava/lang/Object;)Z
+       184: istore        7
+       186: getstatic     #95                 // Field java/lang/Boolean.TRUE:Ljava/lang/Boolean;
+       189: aload_2
+       190: aload         6
+       192: invokevirtual #103                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.hasAnySetter:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Ljava/lang/Boolean;
+       195: invokevirtual #97                 // Method java/lang/Boolean.equals:(Ljava/lang/Object;)Z
+       198: istore        8
+       200: iload         7
+       202: ifne          210
+       205: iload         8
+       207: ifeq          279
+       210: iload         7
+       212: ifeq          243
+       215: aload_0
+       216: getfield      #46                 // Field _anyGetterField:Ljava/util/LinkedList;
+       219: ifnonnull     233
+       222: aload_0
+       223: new           #98                 // class java/util/LinkedList
+       226: dup
+       227: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+       230: putfield      #46                 // Field _anyGetterField:Ljava/util/LinkedList;
+       233: aload_0
+       234: getfield      #46                 // Field _anyGetterField:Ljava/util/LinkedList;
+       237: aload         6
+       239: invokevirtual #100                // Method java/util/LinkedList.add:(Ljava/lang/Object;)Z
+       242: pop
+       243: iload         8
+       245: ifeq          57
+       248: aload_0
+       249: getfield      #51                 // Field _anySetterField:Ljava/util/LinkedList;
+       252: ifnonnull     266
+       255: aload_0
+       256: new           #98                 // class java/util/LinkedList
+       259: dup
+       260: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+       263: putfield      #51                 // Field _anySetterField:Ljava/util/LinkedList;
+       266: aload_0
+       267: getfield      #51                 // Field _anySetterField:Ljava/util/LinkedList;
+       270: aload         6
+       272: invokevirtual #100                // Method java/util/LinkedList.add:(Ljava/lang/Object;)Z
+       275: pop
+       276: goto          57
+       279: aload_2
+       280: aload         6
+       282: invokevirtual #104                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findImplicitPropertyName:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)Ljava/lang/String;
+       285: astore        9
+       287: aload         9
+       289: ifnonnull     299
+       292: aload         6
+       294: invokevirtual #105                // Method com/fasterxml/jackson/databind/introspect/AnnotatedField.getName:()Ljava/lang/String;
+       297: astore        9
+       299: aload_0
+       300: getfield      #18                 // Field _accessorNaming:Lcom/fasterxml/jackson/databind/introspect/AccessorNamingStrategy;
+       303: aload         6
+       305: aload         9
+       307: invokevirtual #106                // Method com/fasterxml/jackson/databind/introspect/AccessorNamingStrategy.modifyFieldName:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedField;Ljava/lang/String;)Ljava/lang/String;
+       310: astore        9
+       312: aload         9
+       314: ifnonnull     320
+       317: goto          57
+       320: aload_0
+       321: aload         9
+       323: invokespecial #107                // Method _propNameFromSimple:(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/PropertyName;
+       326: astore        10
+       328: aload_2
+       329: aload_0
+       330: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       333: aload         6
+       335: aload         10
+       337: invokevirtual #108                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findRenameByField:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/AnnotatedField;Lcom/fasterxml/jackson/databind/PropertyName;)Lcom/fasterxml/jackson/databind/PropertyName;
+       340: astore        11
+       342: aload         11
+       344: ifnull        389
+       347: aload         11
+       349: aload         10
+       351: invokevirtual #109                // Method com/fasterxml/jackson/databind/PropertyName.equals:(Ljava/lang/Object;)Z
+       354: ifne          389
+       357: aload_0
+       358: getfield      #110                // Field _fieldRenameMappings:Ljava/util/Map;
+       361: ifnonnull     375
+       364: aload_0
+       365: new           #111                // class java/util/HashMap
+       368: dup
+       369: invokespecial #112                // Method java/util/HashMap."<init>":()V
+       372: putfield      #110                // Field _fieldRenameMappings:Ljava/util/Map;
+       375: aload_0
+       376: getfield      #110                // Field _fieldRenameMappings:Ljava/util/Map;
+       379: aload         11
+       381: aload         10
+       383: invokeinterface #113,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+       388: pop
+       389: aload_0
+       390: getfield      #5                  // Field _forSerialization:Z
+       393: ifeq          407
+       396: aload_2
+       397: aload         6
+       399: invokevirtual #114                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findNameForSerialization:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Lcom/fasterxml/jackson/databind/PropertyName;
+       402: astore        12
+       404: goto          415
+       407: aload_2
+       408: aload         6
+       410: invokevirtual #115                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findNameForDeserialization:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Lcom/fasterxml/jackson/databind/PropertyName;
+       413: astore        12
+       415: aload         12
+       417: ifnull        424
+       420: iconst_1
+       421: goto          425
+       424: iconst_0
+       425: istore        13
+       427: iload         13
+       429: istore        14
+       431: iload         14
+       433: ifeq          455
+       436: aload         12
+       438: invokevirtual #116                // Method com/fasterxml/jackson/databind/PropertyName.isEmpty:()Z
+       441: ifeq          455
+       444: aload_0
+       445: aload         9
+       447: invokespecial #107                // Method _propNameFromSimple:(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/PropertyName;
+       450: astore        12
+       452: iconst_0
+       453: istore        14
+       455: aload         12
+       457: ifnull        464
+       460: iconst_1
+       461: goto          465
+       464: iconst_0
+       465: istore        15
+       467: iload         15
+       469: ifne          485
+       472: aload_0
+       473: getfield      #17                 // Field _visibilityChecker:Lcom/fasterxml/jackson/databind/introspect/VisibilityChecker;
+       476: aload         6
+       478: invokeinterface #117,  2          // InterfaceMethod com/fasterxml/jackson/databind/introspect/VisibilityChecker.isFieldVisible:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedField;)Z
+       483: istore        15
+       485: aload_2
+       486: aload         6
+       488: invokevirtual #118                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.hasIgnoreMarker:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)Z
+       491: istore        16
+       493: aload         6
+       495: invokevirtual #119                // Method com/fasterxml/jackson/databind/introspect/AnnotatedField.isTransient:()Z
+       498: ifeq          525
+       501: iload         13
+       503: ifne          525
+       506: iload         4
+       508: ifeq          517
+       511: iconst_1
+       512: istore        16
+       514: goto          525
+       517: iload         16
+       519: ifne          525
+       522: goto          57
+       525: iload_3
+       526: ifeq          553
+       529: aload         12
+       531: ifnonnull     553
+       534: iload         16
+       536: ifne          553
+       539: aload         6
+       541: invokevirtual #120                // Method com/fasterxml/jackson/databind/introspect/AnnotatedField.getModifiers:()I
+       544: invokestatic  #121                // Method java/lang/reflect/Modifier.isFinal:(I)Z
+       547: ifeq          553
+       550: goto          57
+       553: aload_0
+       554: aload_1
+       555: aload         9
+       557: invokevirtual #122                // Method _property:(Ljava/util/Map;Ljava/lang/String;)Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;
+       560: aload         6
+       562: aload         12
+       564: iload         14
+       566: iload         15
+       568: iload         16
+       570: invokevirtual #123                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.addField:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedField;Lcom/fasterxml/jackson/databind/PropertyName;ZZZ)V
+       573: goto          57
+       576: return
+
+  protected void _addCreators(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_0
+         1: getfield      #11                 // Field _useAnnotations:Z
+         4: ifeq          179
+         7: aload_0
+         8: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+        11: invokevirtual #124                // Method com/fasterxml/jackson/databind/introspect/AnnotatedClass.getConstructors:()Ljava/util/List;
+        14: invokeinterface #125,  1          // InterfaceMethod java/util/List.iterator:()Ljava/util/Iterator;
+        19: astore_2
+        20: aload_2
+        21: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        26: ifeq          93
+        29: aload_2
+        30: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        35: checkcast     #126                // class com/fasterxml/jackson/databind/introspect/AnnotatedConstructor
+        38: astore_3
+        39: aload_0
+        40: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+        43: ifnonnull     57
+        46: aload_0
+        47: new           #98                 // class java/util/LinkedList
+        50: dup
+        51: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+        54: putfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+        57: iconst_0
+        58: istore        4
+        60: aload_3
+        61: invokevirtual #128                // Method com/fasterxml/jackson/databind/introspect/AnnotatedConstructor.getParameterCount:()I
+        64: istore        5
+        66: iload         4
+        68: iload         5
+        70: if_icmpge     90
+        73: aload_0
+        74: aload_1
+        75: aload_3
+        76: iload         4
+        78: invokevirtual #129                // Method com/fasterxml/jackson/databind/introspect/AnnotatedConstructor.getParameter:(I)Lcom/fasterxml/jackson/databind/introspect/AnnotatedParameter;
+        81: invokevirtual #130                // Method _addCreatorParam:(Ljava/util/Map;Lcom/fasterxml/jackson/databind/introspect/AnnotatedParameter;)V
+        84: iinc          4, 1
+        87: goto          66
+        90: goto          20
+        93: aload_0
+        94: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+        97: invokevirtual #131                // Method com/fasterxml/jackson/databind/introspect/AnnotatedClass.getFactoryMethods:()Ljava/util/List;
+       100: invokeinterface #125,  1          // InterfaceMethod java/util/List.iterator:()Ljava/util/Iterator;
+       105: astore_2
+       106: aload_2
+       107: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       112: ifeq          179
+       115: aload_2
+       116: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       121: checkcast     #55                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMethod
+       124: astore_3
+       125: aload_0
+       126: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       129: ifnonnull     143
+       132: aload_0
+       133: new           #98                 // class java/util/LinkedList
+       136: dup
+       137: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+       140: putfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       143: iconst_0
+       144: istore        4
+       146: aload_3
+       147: invokevirtual #132                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getParameterCount:()I
+       150: istore        5
+       152: iload         4
+       154: iload         5
+       156: if_icmpge     176
+       159: aload_0
+       160: aload_1
+       161: aload_3
+       162: iload         4
+       164: invokevirtual #133                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getParameter:(I)Lcom/fasterxml/jackson/databind/introspect/AnnotatedParameter;
+       167: invokevirtual #130                // Method _addCreatorParam:(Ljava/util/Map;Lcom/fasterxml/jackson/databind/introspect/AnnotatedParameter;)V
+       170: iinc          4, 1
+       173: goto          152
+       176: goto          106
+       179: aload_0
+       180: invokevirtual #69                 // Method isRecordType:()Z
+       183: ifeq          406
+       186: new           #29                 // class java/util/ArrayList
+       189: dup
+       190: invokespecial #134                // Method java/util/ArrayList."<init>":()V
+       193: astore_2
+       194: aload_0
+       195: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+       198: aload_0
+       199: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+       202: aload_0
+       203: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       206: aload_2
+       207: invokestatic  #135                // Method com/fasterxml/jackson/databind/jdk14/JDK14Util.findRecordConstructor:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;Lcom/fasterxml/jackson/databind/AnnotationIntrospector;Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Ljava/util/List;)Lcom/fasterxml/jackson/databind/introspect/AnnotatedConstructor;
+       210: astore_3
+       211: aload_3
+       212: ifnull        406
+       215: aload_0
+       216: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       219: ifnonnull     233
+       222: aload_0
+       223: new           #98                 // class java/util/LinkedList
+       226: dup
+       227: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+       230: putfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       233: new           #136                // class java/util/HashSet
+       236: dup
+       237: invokespecial #137                // Method java/util/HashSet."<init>":()V
+       240: astore        4
+       242: aload_0
+       243: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       246: invokevirtual #138                // Method java/util/LinkedList.iterator:()Ljava/util/Iterator;
+       249: astore        5
+       251: aload         5
+       253: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       258: ifeq          330
+       261: aload         5
+       263: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       268: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       271: astore        6
+       273: aload         6
+       275: invokevirtual #139                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getConstructorParameters:()Ljava/util/Iterator;
+       278: astore        7
+       280: aload         7
+       282: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       287: ifeq          327
+       290: aload         7
+       292: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       297: checkcast     #140                // class com/fasterxml/jackson/databind/introspect/AnnotatedParameter
+       300: astore        8
+       302: aload         8
+       304: invokevirtual #141                // Method com/fasterxml/jackson/databind/introspect/AnnotatedParameter.getOwner:()Lcom/fasterxml/jackson/databind/introspect/AnnotatedWithParams;
+       307: aload_3
+       308: invokevirtual #142                // Method com/fasterxml/jackson/databind/introspect/AnnotatedWithParams.equals:(Ljava/lang/Object;)Z
+       311: ifeq          324
+       314: aload         4
+       316: aload         8
+       318: invokeinterface #143,  2          // InterfaceMethod java/util/Set.add:(Ljava/lang/Object;)Z
+       323: pop
+       324: goto          280
+       327: goto          251
+       330: aload_0
+       331: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       334: invokevirtual #144                // Method java/util/LinkedList.isEmpty:()Z
+       337: ifne          350
+       340: aload         4
+       342: invokeinterface #145,  1          // InterfaceMethod java/util/Set.isEmpty:()Z
+       347: ifne          406
+       350: iconst_0
+       351: istore        5
+       353: iload         5
+       355: aload_3
+       356: invokevirtual #128                // Method com/fasterxml/jackson/databind/introspect/AnnotatedConstructor.getParameterCount:()I
+       359: if_icmpge     406
+       362: aload_3
+       363: iload         5
+       365: invokevirtual #129                // Method com/fasterxml/jackson/databind/introspect/AnnotatedConstructor.getParameter:(I)Lcom/fasterxml/jackson/databind/introspect/AnnotatedParameter;
+       368: astore        6
+       370: aload         4
+       372: aload         6
+       374: invokeinterface #146,  2          // InterfaceMethod java/util/Set.contains:(Ljava/lang/Object;)Z
+       379: ifne          400
+       382: aload_0
+       383: aload_1
+       384: aload         6
+       386: aload_2
+       387: iload         5
+       389: invokeinterface #147,  2          // InterfaceMethod java/util/List.get:(I)Ljava/lang/Object;
+       394: checkcast     #148                // class java/lang/String
+       397: invokespecial #149                // Method _addCreatorParam:(Ljava/util/Map;Lcom/fasterxml/jackson/databind/introspect/AnnotatedParameter;Ljava/lang/String;)V
+       400: iinc          5, 1
+       403: goto          353
+       406: return
+
+  protected void _addCreatorParam(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>, com.fasterxml.jackson.databind.introspect.AnnotatedParameter);
+    Code:
+         0: aload_0
+         1: aload_1
+         2: aload_2
+         3: aconst_null
+         4: invokespecial #149                // Method _addCreatorParam:(Ljava/util/Map;Lcom/fasterxml/jackson/databind/introspect/AnnotatedParameter;Ljava/lang/String;)V
+         7: return
+
+  private void _addCreatorParam(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>, com.fasterxml.jackson.databind.introspect.AnnotatedParameter, java.lang.String);
+    Code:
+         0: aload_3
+         1: ifnull        10
+         4: aload_3
+         5: astore        4
+         7: goto          29
+        10: aload_0
+        11: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        14: aload_2
+        15: invokevirtual #104                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findImplicitPropertyName:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)Ljava/lang/String;
+        18: astore        4
+        20: aload         4
+        22: ifnonnull     29
+        25: ldc           #150                // String
+        27: astore        4
+        29: aload_0
+        30: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        33: aload_2
+        34: invokevirtual #115                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findNameForDeserialization:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Lcom/fasterxml/jackson/databind/PropertyName;
+        37: astore        5
+        39: aload         5
+        41: ifnull        56
+        44: aload         5
+        46: invokevirtual #116                // Method com/fasterxml/jackson/databind/PropertyName.isEmpty:()Z
+        49: ifne          56
+        52: iconst_1
+        53: goto          57
+        56: iconst_0
+        57: istore        6
+        59: iload         6
+        61: ifne          135
+        64: aload         4
+        66: invokevirtual #151                // Method java/lang/String.isEmpty:()Z
+        69: ifeq          73
+        72: return
+        73: aload_0
+        74: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        77: aload_0
+        78: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        81: aload_2
+        82: invokevirtual #141                // Method com/fasterxml/jackson/databind/introspect/AnnotatedParameter.getOwner:()Lcom/fasterxml/jackson/databind/introspect/AnnotatedWithParams;
+        85: invokevirtual #152                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findCreatorAnnotation:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/Annotated;)Lcom/fasterxml/jackson/annotation/JsonCreator$Mode;
+        88: astore        7
+        90: aload_3
+        91: ifnull        98
+        94: iconst_1
+        95: goto          99
+        98: iconst_0
+        99: istore        8
+       101: aload         7
+       103: ifnull        122
+       106: aload         7
+       108: getstatic     #153                // Field com/fasterxml/jackson/annotation/JsonCreator$Mode.DISABLED:Lcom/fasterxml/jackson/annotation/JsonCreator$Mode;
+       111: if_acmpeq     122
+       114: aload         7
+       116: getstatic     #154                // Field com/fasterxml/jackson/annotation/JsonCreator$Mode.DELEGATING:Lcom/fasterxml/jackson/annotation/JsonCreator$Mode;
+       119: if_acmpne     128
+       122: iload         8
+       124: ifne          128
+       127: return
+       128: aload         4
+       130: invokestatic  #155                // Method com/fasterxml/jackson/databind/PropertyName.construct:(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/PropertyName;
+       133: astore        5
+       135: aload_0
+       136: aload         4
+       138: invokespecial #156                // Method _checkRenameByField:(Ljava/lang/String;)Ljava/lang/String;
+       141: astore        4
+       143: iload         6
+       145: ifeq          166
+       148: aload         4
+       150: invokevirtual #151                // Method java/lang/String.isEmpty:()Z
+       153: ifeq          166
+       156: aload_0
+       157: aload_1
+       158: aload         5
+       160: invokevirtual #157                // Method _property:(Ljava/util/Map;Lcom/fasterxml/jackson/databind/PropertyName;)Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;
+       163: goto          173
+       166: aload_0
+       167: aload_1
+       168: aload         4
+       170: invokevirtual #122                // Method _property:(Ljava/util/Map;Ljava/lang/String;)Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;
+       173: astore        7
+       175: aload         7
+       177: aload_2
+       178: aload         5
+       180: iload         6
+       182: iconst_1
+       183: iconst_0
+       184: invokevirtual #158                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.addCtor:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedParameter;Lcom/fasterxml/jackson/databind/PropertyName;ZZZ)V
+       187: aload_0
+       188: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       191: aload         7
+       193: invokevirtual #100                // Method java/util/LinkedList.add:(Ljava/lang/Object;)Z
+       196: pop
+       197: return
+
+  protected void _addMethods(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_0
+         1: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+         4: invokevirtual #159                // Method com/fasterxml/jackson/databind/introspect/AnnotatedClass.memberMethods:()Ljava/lang/Iterable;
+         7: invokeinterface #93,  1           // InterfaceMethod java/lang/Iterable.iterator:()Ljava/util/Iterator;
+        12: astore_2
+        13: aload_2
+        14: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        19: ifeq          128
+        22: aload_2
+        23: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        28: checkcast     #55                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMethod
+        31: astore_3
+        32: aload_3
+        33: invokevirtual #132                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getParameterCount:()I
+        36: istore        4
+        38: iload         4
+        40: ifne          56
+        43: aload_0
+        44: aload_1
+        45: aload_3
+        46: aload_0
+        47: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        50: invokevirtual #160                // Method _addGetterMethod:(Ljava/util/Map;Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Lcom/fasterxml/jackson/databind/AnnotationIntrospector;)V
+        53: goto          125
+        56: iload         4
+        58: iconst_1
+        59: if_icmpne     75
+        62: aload_0
+        63: aload_1
+        64: aload_3
+        65: aload_0
+        66: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        69: invokevirtual #161                // Method _addSetterMethod:(Ljava/util/Map;Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Lcom/fasterxml/jackson/databind/AnnotationIntrospector;)V
+        72: goto          125
+        75: iload         4
+        77: iconst_2
+        78: if_icmpne     125
+        81: getstatic     #95                 // Field java/lang/Boolean.TRUE:Ljava/lang/Boolean;
+        84: aload_0
+        85: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        88: aload_3
+        89: invokevirtual #103                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.hasAnySetter:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Ljava/lang/Boolean;
+        92: invokevirtual #97                 // Method java/lang/Boolean.equals:(Ljava/lang/Object;)Z
+        95: ifeq          125
+        98: aload_0
+        99: getfield      #53                 // Field _anySetters:Ljava/util/LinkedList;
+       102: ifnonnull     116
+       105: aload_0
+       106: new           #98                 // class java/util/LinkedList
+       109: dup
+       110: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+       113: putfield      #53                 // Field _anySetters:Ljava/util/LinkedList;
+       116: aload_0
+       117: getfield      #53                 // Field _anySetters:Ljava/util/LinkedList;
+       120: aload_3
+       121: invokevirtual #100                // Method java/util/LinkedList.add:(Ljava/lang/Object;)Z
+       124: pop
+       125: goto          13
+       128: return
+
+  protected void _addGetterMethod(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>, com.fasterxml.jackson.databind.introspect.AnnotatedMethod, com.fasterxml.jackson.databind.AnnotationIntrospector);
+    Code:
+         0: aload_2
+         1: invokevirtual #162                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getRawReturnType:()Ljava/lang/Class;
+         4: astore        4
+         6: aload         4
+         8: getstatic     #163                // Field java/lang/Void.TYPE:Ljava/lang/Class;
+        11: if_acmpeq     34
+        14: aload         4
+        16: ldc           #164                // class java/lang/Void
+        18: if_acmpne     35
+        21: aload_0
+        22: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        25: getstatic     #165                // Field com/fasterxml/jackson/databind/MapperFeature.ALLOW_VOID_VALUED_PROPERTIES:Lcom/fasterxml/jackson/databind/MapperFeature;
+        28: invokevirtual #20                 // Method com/fasterxml/jackson/databind/cfg/MapperConfig.isEnabled:(Lcom/fasterxml/jackson/databind/MapperFeature;)Z
+        31: ifne          35
+        34: return
+        35: getstatic     #95                 // Field java/lang/Boolean.TRUE:Ljava/lang/Boolean;
+        38: aload_3
+        39: aload_2
+        40: invokevirtual #102                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.hasAnyGetter:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Ljava/lang/Boolean;
+        43: invokevirtual #97                 // Method java/lang/Boolean.equals:(Ljava/lang/Object;)Z
+        46: ifeq          77
+        49: aload_0
+        50: getfield      #49                 // Field _anyGetters:Ljava/util/LinkedList;
+        53: ifnonnull     67
+        56: aload_0
+        57: new           #98                 // class java/util/LinkedList
+        60: dup
+        61: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+        64: putfield      #49                 // Field _anyGetters:Ljava/util/LinkedList;
+        67: aload_0
+        68: getfield      #49                 // Field _anyGetters:Ljava/util/LinkedList;
+        71: aload_2
+        72: invokevirtual #100                // Method java/util/LinkedList.add:(Ljava/lang/Object;)Z
+        75: pop
+        76: return
+        77: getstatic     #95                 // Field java/lang/Boolean.TRUE:Ljava/lang/Boolean;
+        80: aload_3
+        81: aload_0
+        82: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        85: aload_2
+        86: invokevirtual #96                 // Method com/fasterxml/jackson/databind/AnnotationIntrospector.hasAsKey:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/Annotated;)Ljava/lang/Boolean;
+        89: invokevirtual #97                 // Method java/lang/Boolean.equals:(Ljava/lang/Object;)Z
+        92: ifeq          123
+        95: aload_0
+        96: getfield      #35                 // Field _jsonKeyAccessors:Ljava/util/LinkedList;
+        99: ifnonnull     113
+       102: aload_0
+       103: new           #98                 // class java/util/LinkedList
+       106: dup
+       107: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+       110: putfield      #35                 // Field _jsonKeyAccessors:Ljava/util/LinkedList;
+       113: aload_0
+       114: getfield      #35                 // Field _jsonKeyAccessors:Ljava/util/LinkedList;
+       117: aload_2
+       118: invokevirtual #100                // Method java/util/LinkedList.add:(Ljava/lang/Object;)Z
+       121: pop
+       122: return
+       123: getstatic     #95                 // Field java/lang/Boolean.TRUE:Ljava/lang/Boolean;
+       126: aload_3
+       127: aload_2
+       128: invokevirtual #101                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.hasAsValue:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Ljava/lang/Boolean;
+       131: invokevirtual #97                 // Method java/lang/Boolean.equals:(Ljava/lang/Object;)Z
+       134: ifeq          165
+       137: aload_0
+       138: getfield      #43                 // Field _jsonValueAccessors:Ljava/util/LinkedList;
+       141: ifnonnull     155
+       144: aload_0
+       145: new           #98                 // class java/util/LinkedList
+       148: dup
+       149: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+       152: putfield      #43                 // Field _jsonValueAccessors:Ljava/util/LinkedList;
+       155: aload_0
+       156: getfield      #43                 // Field _jsonValueAccessors:Ljava/util/LinkedList;
+       159: aload_2
+       160: invokevirtual #100                // Method java/util/LinkedList.add:(Ljava/lang/Object;)Z
+       163: pop
+       164: return
+       165: aload_3
+       166: aload_2
+       167: invokevirtual #114                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findNameForSerialization:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Lcom/fasterxml/jackson/databind/PropertyName;
+       170: astore        6
+       172: aload         6
+       174: ifnull        181
+       177: iconst_1
+       178: goto          182
+       181: iconst_0
+       182: istore        7
+       184: iload         7
+       186: ifne          270
+       189: aload_3
+       190: aload_2
+       191: invokevirtual #104                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findImplicitPropertyName:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)Ljava/lang/String;
+       194: astore        4
+       196: aload         4
+       198: ifnonnull     215
+       201: aload_0
+       202: getfield      #18                 // Field _accessorNaming:Lcom/fasterxml/jackson/databind/introspect/AccessorNamingStrategy;
+       205: aload_2
+       206: aload_2
+       207: invokevirtual #166                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getName:()Ljava/lang/String;
+       210: invokevirtual #167                // Method com/fasterxml/jackson/databind/introspect/AccessorNamingStrategy.findNameForRegularGetter:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Ljava/lang/String;)Ljava/lang/String;
+       213: astore        4
+       215: aload         4
+       217: ifnonnull     255
+       220: aload_0
+       221: getfield      #18                 // Field _accessorNaming:Lcom/fasterxml/jackson/databind/introspect/AccessorNamingStrategy;
+       224: aload_2
+       225: aload_2
+       226: invokevirtual #166                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getName:()Ljava/lang/String;
+       229: invokevirtual #168                // Method com/fasterxml/jackson/databind/introspect/AccessorNamingStrategy.findNameForIsGetter:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Ljava/lang/String;)Ljava/lang/String;
+       232: astore        4
+       234: aload         4
+       236: ifnonnull     240
+       239: return
+       240: aload_0
+       241: getfield      #17                 // Field _visibilityChecker:Lcom/fasterxml/jackson/databind/introspect/VisibilityChecker;
+       244: aload_2
+       245: invokeinterface #169,  2          // InterfaceMethod com/fasterxml/jackson/databind/introspect/VisibilityChecker.isIsGetterVisible:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;)Z
+       250: istore        5
+       252: goto          348
+       255: aload_0
+       256: getfield      #17                 // Field _visibilityChecker:Lcom/fasterxml/jackson/databind/introspect/VisibilityChecker;
+       259: aload_2
+       260: invokeinterface #170,  2          // InterfaceMethod com/fasterxml/jackson/databind/introspect/VisibilityChecker.isGetterVisible:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;)Z
+       265: istore        5
+       267: goto          348
+       270: aload_3
+       271: aload_2
+       272: invokevirtual #104                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findImplicitPropertyName:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)Ljava/lang/String;
+       275: astore        4
+       277: aload         4
+       279: ifnonnull     315
+       282: aload_0
+       283: getfield      #18                 // Field _accessorNaming:Lcom/fasterxml/jackson/databind/introspect/AccessorNamingStrategy;
+       286: aload_2
+       287: aload_2
+       288: invokevirtual #166                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getName:()Ljava/lang/String;
+       291: invokevirtual #167                // Method com/fasterxml/jackson/databind/introspect/AccessorNamingStrategy.findNameForRegularGetter:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Ljava/lang/String;)Ljava/lang/String;
+       294: astore        4
+       296: aload         4
+       298: ifnonnull     315
+       301: aload_0
+       302: getfield      #18                 // Field _accessorNaming:Lcom/fasterxml/jackson/databind/introspect/AccessorNamingStrategy;
+       305: aload_2
+       306: aload_2
+       307: invokevirtual #166                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getName:()Ljava/lang/String;
+       310: invokevirtual #168                // Method com/fasterxml/jackson/databind/introspect/AccessorNamingStrategy.findNameForIsGetter:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Ljava/lang/String;)Ljava/lang/String;
+       313: astore        4
+       315: aload         4
+       317: ifnonnull     326
+       320: aload_2
+       321: invokevirtual #166                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getName:()Ljava/lang/String;
+       324: astore        4
+       326: aload         6
+       328: invokevirtual #116                // Method com/fasterxml/jackson/databind/PropertyName.isEmpty:()Z
+       331: ifeq          345
+       334: aload_0
+       335: aload         4
+       337: invokespecial #107                // Method _propNameFromSimple:(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/PropertyName;
+       340: astore        6
+       342: iconst_0
+       343: istore        7
+       345: iconst_1
+       346: istore        5
+       348: aload_0
+       349: aload         4
+       351: invokespecial #156                // Method _checkRenameByField:(Ljava/lang/String;)Ljava/lang/String;
+       354: astore        4
+       356: aload_3
+       357: aload_2
+       358: invokevirtual #118                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.hasIgnoreMarker:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)Z
+       361: istore        8
+       363: aload_0
+       364: aload_1
+       365: aload         4
+       367: invokevirtual #122                // Method _property:(Ljava/util/Map;Ljava/lang/String;)Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;
+       370: aload_2
+       371: aload         6
+       373: iload         7
+       375: iload         5
+       377: iload         8
+       379: invokevirtual #171                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.addGetter:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Lcom/fasterxml/jackson/databind/PropertyName;ZZZ)V
+       382: return
+
+  protected void _addSetterMethod(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>, com.fasterxml.jackson.databind.introspect.AnnotatedMethod, com.fasterxml.jackson.databind.AnnotationIntrospector);
+    Code:
+         0: aload_3
+         1: aload_2
+         2: invokevirtual #115                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findNameForDeserialization:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Lcom/fasterxml/jackson/databind/PropertyName;
+         5: astore        6
+         7: aload         6
+         9: ifnull        16
+        12: iconst_1
+        13: goto          17
+        16: iconst_0
+        17: istore        7
+        19: iload         7
+        21: ifne          71
+        24: aload_3
+        25: aload_2
+        26: invokevirtual #104                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findImplicitPropertyName:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)Ljava/lang/String;
+        29: astore        4
+        31: aload         4
+        33: ifnonnull     50
+        36: aload_0
+        37: getfield      #18                 // Field _accessorNaming:Lcom/fasterxml/jackson/databind/introspect/AccessorNamingStrategy;
+        40: aload_2
+        41: aload_2
+        42: invokevirtual #166                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getName:()Ljava/lang/String;
+        45: invokevirtual #172                // Method com/fasterxml/jackson/databind/introspect/AccessorNamingStrategy.findNameForMutator:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Ljava/lang/String;)Ljava/lang/String;
+        48: astore        4
+        50: aload         4
+        52: ifnonnull     56
+        55: return
+        56: aload_0
+        57: getfield      #17                 // Field _visibilityChecker:Lcom/fasterxml/jackson/databind/introspect/VisibilityChecker;
+        60: aload_2
+        61: invokeinterface #173,  2          // InterfaceMethod com/fasterxml/jackson/databind/introspect/VisibilityChecker.isSetterVisible:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;)Z
+        66: istore        5
+        68: goto          130
+        71: aload_3
+        72: aload_2
+        73: invokevirtual #104                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findImplicitPropertyName:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)Ljava/lang/String;
+        76: astore        4
+        78: aload         4
+        80: ifnonnull     97
+        83: aload_0
+        84: getfield      #18                 // Field _accessorNaming:Lcom/fasterxml/jackson/databind/introspect/AccessorNamingStrategy;
+        87: aload_2
+        88: aload_2
+        89: invokevirtual #166                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getName:()Ljava/lang/String;
+        92: invokevirtual #172                // Method com/fasterxml/jackson/databind/introspect/AccessorNamingStrategy.findNameForMutator:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Ljava/lang/String;)Ljava/lang/String;
+        95: astore        4
+        97: aload         4
+        99: ifnonnull     108
+       102: aload_2
+       103: invokevirtual #166                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getName:()Ljava/lang/String;
+       106: astore        4
+       108: aload         6
+       110: invokevirtual #116                // Method com/fasterxml/jackson/databind/PropertyName.isEmpty:()Z
+       113: ifeq          127
+       116: aload_0
+       117: aload         4
+       119: invokespecial #107                // Method _propNameFromSimple:(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/PropertyName;
+       122: astore        6
+       124: iconst_0
+       125: istore        7
+       127: iconst_1
+       128: istore        5
+       130: aload_0
+       131: aload         4
+       133: invokespecial #156                // Method _checkRenameByField:(Ljava/lang/String;)Ljava/lang/String;
+       136: astore        4
+       138: aload_3
+       139: aload_2
+       140: invokevirtual #118                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.hasIgnoreMarker:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)Z
+       143: istore        8
+       145: aload_0
+       146: aload_1
+       147: aload         4
+       149: invokevirtual #122                // Method _property:(Ljava/util/Map;Ljava/lang/String;)Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;
+       152: aload_2
+       153: aload         6
+       155: iload         7
+       157: iload         5
+       159: iload         8
+       161: invokevirtual #174                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.addSetter:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Lcom/fasterxml/jackson/databind/PropertyName;ZZZ)V
+       164: return
+
+  protected void _addInjectables(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_0
+         1: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+         4: invokevirtual #92                 // Method com/fasterxml/jackson/databind/introspect/AnnotatedClass.fields:()Ljava/lang/Iterable;
+         7: invokeinterface #93,  1           // InterfaceMethod java/lang/Iterable.iterator:()Ljava/util/Iterator;
+        12: astore_2
+        13: aload_2
+        14: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        19: ifeq          48
+        22: aload_2
+        23: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        28: checkcast     #94                 // class com/fasterxml/jackson/databind/introspect/AnnotatedField
+        31: astore_3
+        32: aload_0
+        33: aload_0
+        34: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        37: aload_3
+        38: invokevirtual #175                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findInjectableValue:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)Lcom/fasterxml/jackson/annotation/JacksonInject$Value;
+        41: aload_3
+        42: invokevirtual #176                // Method _doAddInjectable:(Lcom/fasterxml/jackson/annotation/JacksonInject$Value;Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)V
+        45: goto          13
+        48: aload_0
+        49: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+        52: invokevirtual #159                // Method com/fasterxml/jackson/databind/introspect/AnnotatedClass.memberMethods:()Ljava/lang/Iterable;
+        55: invokeinterface #93,  1           // InterfaceMethod java/lang/Iterable.iterator:()Ljava/util/Iterator;
+        60: astore_2
+        61: aload_2
+        62: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        67: ifeq          107
+        70: aload_2
+        71: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        76: checkcast     #55                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMethod
+        79: astore_3
+        80: aload_3
+        81: invokevirtual #132                // Method com/fasterxml/jackson/databind/introspect/AnnotatedMethod.getParameterCount:()I
+        84: iconst_1
+        85: if_icmpeq     91
+        88: goto          61
+        91: aload_0
+        92: aload_0
+        93: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        96: aload_3
+        97: invokevirtual #175                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findInjectableValue:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)Lcom/fasterxml/jackson/annotation/JacksonInject$Value;
+       100: aload_3
+       101: invokevirtual #176                // Method _doAddInjectable:(Lcom/fasterxml/jackson/annotation/JacksonInject$Value;Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;)V
+       104: goto          61
+       107: return
+
+  protected void _doAddInjectable(com.fasterxml.jackson.annotation.JacksonInject$Value, com.fasterxml.jackson.databind.introspect.AnnotatedMember);
+    Code:
+         0: aload_1
+         1: ifnonnull     5
+         4: return
+         5: aload_1
+         6: invokevirtual #177                // Method com/fasterxml/jackson/annotation/JacksonInject$Value.getId:()Ljava/lang/Object;
+         9: astore_3
+        10: aload_0
+        11: getfield      #34                 // Field _injectables:Ljava/util/LinkedHashMap;
+        14: ifnonnull     28
+        17: aload_0
+        18: new           #67                 // class java/util/LinkedHashMap
+        21: dup
+        22: invokespecial #68                 // Method java/util/LinkedHashMap."<init>":()V
+        25: putfield      #34                 // Field _injectables:Ljava/util/LinkedHashMap;
+        28: aload_0
+        29: getfield      #34                 // Field _injectables:Ljava/util/LinkedHashMap;
+        32: aload_3
+        33: aload_2
+        34: invokevirtual #178                // Method java/util/LinkedHashMap.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+        37: checkcast     #42                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMember
+        40: astore        4
+        42: aload         4
+        44: ifnull        80
+        47: aload         4
+        49: invokevirtual #179                // Method java/lang/Object.getClass:()Ljava/lang/Class;
+        52: aload_2
+        53: invokevirtual #179                // Method java/lang/Object.getClass:()Ljava/lang/Class;
+        56: if_acmpne     80
+        59: aload_0
+        60: ldc           #180                // String Duplicate injectable value with id \'%s\' (of type %s)
+        62: iconst_2
+        63: anewarray     #39                 // class java/lang/Object
+        66: dup
+        67: iconst_0
+        68: aload_3
+        69: aastore
+        70: dup
+        71: iconst_1
+        72: aload_3
+        73: invokestatic  #181                // Method com/fasterxml/jackson/databind/util/ClassUtil.classNameOf:(Ljava/lang/Object;)Ljava/lang/String;
+        76: aastore
+        77: invokevirtual #41                 // Method reportProblem:(Ljava/lang/String;[Ljava/lang/Object;)V
+        80: return
+
+  private com.fasterxml.jackson.databind.PropertyName _propNameFromSimple(java.lang.String);
+    Code:
+         0: aload_1
+         1: aconst_null
+         2: invokestatic  #182                // Method com/fasterxml/jackson/databind/PropertyName.construct:(Ljava/lang/String;Ljava/lang/String;)Lcom/fasterxml/jackson/databind/PropertyName;
+         5: areturn
+
+  private java.lang.String _checkRenameByField(java.lang.String);
+    Code:
+         0: aload_0
+         1: getfield      #110                // Field _fieldRenameMappings:Ljava/util/Map;
+         4: ifnull        36
+         7: aload_0
+         8: getfield      #110                // Field _fieldRenameMappings:Ljava/util/Map;
+        11: aload_0
+        12: aload_1
+        13: invokespecial #107                // Method _propNameFromSimple:(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/PropertyName;
+        16: invokeinterface #183,  2          // InterfaceMethod java/util/Map.get:(Ljava/lang/Object;)Ljava/lang/Object;
+        21: checkcast     #184                // class com/fasterxml/jackson/databind/PropertyName
+        24: astore_2
+        25: aload_2
+        26: ifnull        36
+        29: aload_2
+        30: invokevirtual #185                // Method com/fasterxml/jackson/databind/PropertyName.getSimpleName:()Ljava/lang/String;
+        33: astore_1
+        34: aload_1
+        35: areturn
+        36: aload_1
+        37: areturn
+
+  protected void _removeUnwantedProperties(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_1
+         1: invokeinterface #30,  1           // InterfaceMethod java/util/Map.values:()Ljava/util/Collection;
+         6: invokeinterface #79,  1           // InterfaceMethod java/util/Collection.iterator:()Ljava/util/Iterator;
+        11: astore_2
+        12: aload_2
+        13: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        18: ifeq          129
+        21: aload_2
+        22: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        27: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+        30: astore_3
+        31: aload_3
+        32: invokevirtual #186                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.anyVisible:()Z
+        35: ifne          47
+        38: aload_2
+        39: invokeinterface #187,  1          // InterfaceMethod java/util/Iterator.remove:()V
+        44: goto          12
+        47: aload_3
+        48: invokevirtual #188                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.anyIgnorals:()Z
+        51: ifeq          126
+        54: aload_0
+        55: invokevirtual #69                 // Method isRecordType:()Z
+        58: ifeq          83
+        61: aload_0
+        62: getfield      #5                  // Field _forSerialization:Z
+        65: ifne          83
+        68: aload_3
+        69: invokevirtual #189                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.removeIgnored:()V
+        72: aload_0
+        73: aload_3
+        74: invokevirtual #190                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getName:()Ljava/lang/String;
+        77: invokevirtual #191                // Method _collectIgnorals:(Ljava/lang/String;)V
+        80: goto          12
+        83: aload_3
+        84: invokevirtual #192                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.anyExplicitsWithoutIgnoral:()Z
+        87: ifne          107
+        90: aload_2
+        91: invokeinterface #187,  1          // InterfaceMethod java/util/Iterator.remove:()V
+        96: aload_0
+        97: aload_3
+        98: invokevirtual #190                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getName:()Ljava/lang/String;
+       101: invokevirtual #191                // Method _collectIgnorals:(Ljava/lang/String;)V
+       104: goto          12
+       107: aload_3
+       108: invokevirtual #189                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.removeIgnored:()V
+       111: aload_3
+       112: invokevirtual #193                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.couldDeserialize:()Z
+       115: ifne          126
+       118: aload_0
+       119: aload_3
+       120: invokevirtual #190                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getName:()Ljava/lang/String;
+       123: invokevirtual #191                // Method _collectIgnorals:(Ljava/lang/String;)V
+       126: goto          12
+       129: return
+
+  protected void _removeUnwantedAccessor(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_0
+         1: invokevirtual #69                 // Method isRecordType:()Z
+         4: ifne          24
+         7: aload_0
+         8: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        11: getstatic     #194                // Field com/fasterxml/jackson/databind/MapperFeature.INFER_PROPERTY_MUTATORS:Lcom/fasterxml/jackson/databind/MapperFeature;
+        14: invokevirtual #20                 // Method com/fasterxml/jackson/databind/cfg/MapperConfig.isEnabled:(Lcom/fasterxml/jackson/databind/MapperFeature;)Z
+        17: ifeq          24
+        20: iconst_1
+        21: goto          25
+        24: iconst_0
+        25: istore_2
+        26: aload_1
+        27: invokeinterface #30,  1           // InterfaceMethod java/util/Map.values:()Ljava/util/Collection;
+        32: invokeinterface #79,  1           // InterfaceMethod java/util/Collection.iterator:()Ljava/util/Iterator;
+        37: astore_3
+        38: aload_3
+        39: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        44: ifeq          80
+        47: aload_3
+        48: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        53: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+        56: astore        4
+        58: aload         4
+        60: iload_2
+        61: aload_0
+        62: getfield      #5                  // Field _forSerialization:Z
+        65: ifeq          72
+        68: aconst_null
+        69: goto          73
+        72: aload_0
+        73: invokevirtual #195                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.removeNonVisible:(ZLcom/fasterxml/jackson/databind/introspect/POJOPropertiesCollector;)Lcom/fasterxml/jackson/annotation/JsonProperty$Access;
+        76: pop
+        77: goto          38
+        80: return
+
+  protected void _collectIgnorals(java.lang.String);
+    Code:
+         0: aload_0
+         1: getfield      #5                  // Field _forSerialization:Z
+         4: ifne          38
+         7: aload_1
+         8: ifnull        38
+        11: aload_0
+        12: getfield      #56                 // Field _ignoredPropertyNames:Ljava/util/HashSet;
+        15: ifnonnull     29
+        18: aload_0
+        19: new           #136                // class java/util/HashSet
+        22: dup
+        23: invokespecial #137                // Method java/util/HashSet."<init>":()V
+        26: putfield      #56                 // Field _ignoredPropertyNames:Ljava/util/HashSet;
+        29: aload_0
+        30: getfield      #56                 // Field _ignoredPropertyNames:Ljava/util/HashSet;
+        33: aload_1
+        34: invokevirtual #196                // Method java/util/HashSet.add:(Ljava/lang/Object;)Z
+        37: pop
+        38: return
+
+  protected void _renameProperties(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_1
+         1: invokeinterface #197,  1          // InterfaceMethod java/util/Map.entrySet:()Ljava/util/Set;
+         6: invokeinterface #198,  1          // InterfaceMethod java/util/Set.iterator:()Ljava/util/Iterator;
+        11: astore_2
+        12: aconst_null
+        13: astore_3
+        14: aload_2
+        15: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        20: ifeq          142
+        23: aload_2
+        24: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        29: checkcast     #199                // class java/util/Map$Entry
+        32: astore        4
+        34: aload         4
+        36: invokeinterface #200,  1          // InterfaceMethod java/util/Map$Entry.getValue:()Ljava/lang/Object;
+        41: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+        44: astore        5
+        46: aload         5
+        48: invokevirtual #201                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.findExplicitNames:()Ljava/util/Set;
+        51: astore        6
+        53: aload         6
+        55: invokeinterface #202,  1          // InterfaceMethod java/util/Collection.isEmpty:()Z
+        60: ifeq          66
+        63: goto          14
+        66: aload_2
+        67: invokeinterface #187,  1          // InterfaceMethod java/util/Iterator.remove:()V
+        72: aload_3
+        73: ifnonnull     84
+        76: new           #98                 // class java/util/LinkedList
+        79: dup
+        80: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+        83: astore_3
+        84: aload         6
+        86: invokeinterface #203,  1          // InterfaceMethod java/util/Collection.size:()I
+        91: iconst_1
+        92: if_icmpne     127
+        95: aload         6
+        97: invokeinterface #79,  1           // InterfaceMethod java/util/Collection.iterator:()Ljava/util/Iterator;
+       102: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       107: checkcast     #184                // class com/fasterxml/jackson/databind/PropertyName
+       110: astore        7
+       112: aload_3
+       113: aload         5
+       115: aload         7
+       117: invokevirtual #204                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.withName:(Lcom/fasterxml/jackson/databind/PropertyName;)Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;
+       120: invokevirtual #100                // Method java/util/LinkedList.add:(Ljava/lang/Object;)Z
+       123: pop
+       124: goto          14
+       127: aload_3
+       128: aload         5
+       130: aload         6
+       132: invokevirtual #205                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.explode:(Ljava/util/Collection;)Ljava/util/Collection;
+       135: invokevirtual #206                // Method java/util/LinkedList.addAll:(Ljava/util/Collection;)Z
+       138: pop
+       139: goto          14
+       142: aload_3
+       143: ifnull        253
+       146: aload_3
+       147: invokevirtual #138                // Method java/util/LinkedList.iterator:()Ljava/util/Iterator;
+       150: astore        4
+       152: aload         4
+       154: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       159: ifeq          253
+       162: aload         4
+       164: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       169: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       172: astore        5
+       174: aload         5
+       176: invokevirtual #190                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getName:()Ljava/lang/String;
+       179: astore        6
+       181: aload_1
+       182: aload         6
+       184: invokeinterface #183,  2          // InterfaceMethod java/util/Map.get:(Ljava/lang/Object;)Ljava/lang/Object;
+       189: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       192: astore        7
+       194: aload         7
+       196: ifnonnull     213
+       199: aload_1
+       200: aload         6
+       202: aload         5
+       204: invokeinterface #113,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+       209: pop
+       210: goto          220
+       213: aload         7
+       215: aload         5
+       217: invokevirtual #207                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.addAll:(Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;)V
+       220: aload_0
+       221: aload         5
+       223: aload_0
+       224: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       227: invokevirtual #208                // Method _replaceCreatorProperty:(Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;Ljava/util/List;)Z
+       230: ifeq          250
+       233: aload_0
+       234: getfield      #56                 // Field _ignoredPropertyNames:Ljava/util/HashSet;
+       237: ifnull        250
+       240: aload_0
+       241: getfield      #56                 // Field _ignoredPropertyNames:Ljava/util/HashSet;
+       244: aload         6
+       246: invokevirtual #209                // Method java/util/HashSet.remove:(Ljava/lang/Object;)Z
+       249: pop
+       250: goto          152
+       253: return
+
+  protected void _renameUsing(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>, com.fasterxml.jackson.databind.PropertyNamingStrategy);
+    Code:
+         0: aload_0
+         1: getfield      #6                  // Field _type:Lcom/fasterxml/jackson/databind/JavaType;
+         4: invokevirtual #210                // Method com/fasterxml/jackson/databind/JavaType.isEnumType:()Z
+         7: ifeq          24
+        10: aload_0
+        11: invokevirtual #211                // Method getFormatOverrides:()Lcom/fasterxml/jackson/annotation/JsonFormat$Value;
+        14: invokevirtual #212                // Method com/fasterxml/jackson/annotation/JsonFormat$Value.getShape:()Lcom/fasterxml/jackson/annotation/JsonFormat$Shape;
+        17: getstatic     #213                // Field com/fasterxml/jackson/annotation/JsonFormat$Shape.OBJECT:Lcom/fasterxml/jackson/annotation/JsonFormat$Shape;
+        20: if_acmpeq     24
+        23: return
+        24: aload_1
+        25: invokeinterface #30,  1           // InterfaceMethod java/util/Map.values:()Ljava/util/Collection;
+        30: aload_1
+        31: invokeinterface #214,  1          // InterfaceMethod java/util/Map.size:()I
+        36: anewarray     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+        39: invokeinterface #215,  2          // InterfaceMethod java/util/Collection.toArray:([Ljava/lang/Object;)[Ljava/lang/Object;
+        44: checkcast     #216                // class "[Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;"
+        47: astore_3
+        48: aload_1
+        49: invokeinterface #217,  1          // InterfaceMethod java/util/Map.clear:()V
+        54: aload_3
+        55: astore        4
+        57: aload         4
+        59: arraylength
+        60: istore        5
+        62: iconst_0
+        63: istore        6
+        65: iload         6
+        67: iload         5
+        69: if_icmpge     394
+        72: aload         4
+        74: iload         6
+        76: aaload
+        77: astore        7
+        79: aload         7
+        81: invokevirtual #218                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getFullName:()Lcom/fasterxml/jackson/databind/PropertyName;
+        84: astore        8
+        86: aconst_null
+        87: astore        9
+        89: aload         7
+        91: invokevirtual #219                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.isExplicitlyNamed:()Z
+        94: ifeq          110
+        97: aload_0
+        98: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       101: getstatic     #220                // Field com/fasterxml/jackson/databind/MapperFeature.ALLOW_EXPLICIT_PROPERTY_RENAMING:Lcom/fasterxml/jackson/databind/MapperFeature;
+       104: invokevirtual #20                 // Method com/fasterxml/jackson/databind/cfg/MapperConfig.isEnabled:(Lcom/fasterxml/jackson/databind/MapperFeature;)Z
+       107: ifeq          300
+       110: aload_0
+       111: getfield      #5                  // Field _forSerialization:Z
+       114: ifeq          179
+       117: aload         7
+       119: invokevirtual #221                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.hasGetter:()Z
+       122: ifeq          148
+       125: aload_2
+       126: aload_0
+       127: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       130: aload         7
+       132: invokevirtual #222                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getGetter:()Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;
+       135: aload         8
+       137: invokevirtual #185                // Method com/fasterxml/jackson/databind/PropertyName.getSimpleName:()Ljava/lang/String;
+       140: invokevirtual #223                // Method com/fasterxml/jackson/databind/PropertyNamingStrategy.nameForGetterMethod:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Ljava/lang/String;)Ljava/lang/String;
+       143: astore        9
+       145: goto          300
+       148: aload         7
+       150: invokevirtual #224                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.hasField:()Z
+       153: ifeq          300
+       156: aload_2
+       157: aload_0
+       158: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       161: aload         7
+       163: invokevirtual #225                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getField:()Lcom/fasterxml/jackson/databind/introspect/AnnotatedField;
+       166: aload         8
+       168: invokevirtual #185                // Method com/fasterxml/jackson/databind/PropertyName.getSimpleName:()Ljava/lang/String;
+       171: invokevirtual #226                // Method com/fasterxml/jackson/databind/PropertyNamingStrategy.nameForField:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/AnnotatedField;Ljava/lang/String;)Ljava/lang/String;
+       174: astore        9
+       176: goto          300
+       179: aload         7
+       181: invokevirtual #227                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.hasSetter:()Z
+       184: ifeq          210
+       187: aload_2
+       188: aload_0
+       189: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       192: aload         7
+       194: invokevirtual #228                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getSetterUnchecked:()Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;
+       197: aload         8
+       199: invokevirtual #185                // Method com/fasterxml/jackson/databind/PropertyName.getSimpleName:()Ljava/lang/String;
+       202: invokevirtual #229                // Method com/fasterxml/jackson/databind/PropertyNamingStrategy.nameForSetterMethod:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Ljava/lang/String;)Ljava/lang/String;
+       205: astore        9
+       207: goto          300
+       210: aload         7
+       212: invokevirtual #230                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.hasConstructorParameter:()Z
+       215: ifeq          241
+       218: aload_2
+       219: aload_0
+       220: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       223: aload         7
+       225: invokevirtual #231                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getConstructorParameter:()Lcom/fasterxml/jackson/databind/introspect/AnnotatedParameter;
+       228: aload         8
+       230: invokevirtual #185                // Method com/fasterxml/jackson/databind/PropertyName.getSimpleName:()Ljava/lang/String;
+       233: invokevirtual #232                // Method com/fasterxml/jackson/databind/PropertyNamingStrategy.nameForConstructorParameter:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/AnnotatedParameter;Ljava/lang/String;)Ljava/lang/String;
+       236: astore        9
+       238: goto          300
+       241: aload         7
+       243: invokevirtual #224                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.hasField:()Z
+       246: ifeq          272
+       249: aload_2
+       250: aload_0
+       251: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       254: aload         7
+       256: invokevirtual #233                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getFieldUnchecked:()Lcom/fasterxml/jackson/databind/introspect/AnnotatedField;
+       259: aload         8
+       261: invokevirtual #185                // Method com/fasterxml/jackson/databind/PropertyName.getSimpleName:()Ljava/lang/String;
+       264: invokevirtual #226                // Method com/fasterxml/jackson/databind/PropertyNamingStrategy.nameForField:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/AnnotatedField;Ljava/lang/String;)Ljava/lang/String;
+       267: astore        9
+       269: goto          300
+       272: aload         7
+       274: invokevirtual #221                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.hasGetter:()Z
+       277: ifeq          300
+       280: aload_2
+       281: aload_0
+       282: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       285: aload         7
+       287: invokevirtual #234                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getGetterUnchecked:()Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;
+       290: aload         8
+       292: invokevirtual #185                // Method com/fasterxml/jackson/databind/PropertyName.getSimpleName:()Ljava/lang/String;
+       295: invokevirtual #223                // Method com/fasterxml/jackson/databind/PropertyNamingStrategy.nameForGetterMethod:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/AnnotatedMethod;Ljava/lang/String;)Ljava/lang/String;
+       298: astore        9
+       300: aload         9
+       302: ifnull        331
+       305: aload         8
+       307: aload         9
+       309: invokevirtual #235                // Method com/fasterxml/jackson/databind/PropertyName.hasSimpleName:(Ljava/lang/String;)Z
+       312: ifne          331
+       315: aload         7
+       317: aload         9
+       319: invokevirtual #236                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.withSimpleName:(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;
+       322: astore        7
+       324: aload         9
+       326: astore        10
+       328: goto          338
+       331: aload         8
+       333: invokevirtual #185                // Method com/fasterxml/jackson/databind/PropertyName.getSimpleName:()Ljava/lang/String;
+       336: astore        10
+       338: aload_1
+       339: aload         10
+       341: invokeinterface #183,  2          // InterfaceMethod java/util/Map.get:(Ljava/lang/Object;)Ljava/lang/Object;
+       346: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       349: astore        11
+       351: aload         11
+       353: ifnonnull     370
+       356: aload_1
+       357: aload         10
+       359: aload         7
+       361: invokeinterface #113,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+       366: pop
+       367: goto          377
+       370: aload         11
+       372: aload         7
+       374: invokevirtual #207                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.addAll:(Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;)V
+       377: aload_0
+       378: aload         7
+       380: aload_0
+       381: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       384: invokevirtual #208                // Method _replaceCreatorProperty:(Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;Ljava/util/List;)Z
+       387: pop
+       388: iinc          6, 1
+       391: goto          65
+       394: return
+
+  protected void _renameWithWrappers(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_1
+         1: invokeinterface #197,  1          // InterfaceMethod java/util/Map.entrySet:()Ljava/util/Set;
+         6: invokeinterface #198,  1          // InterfaceMethod java/util/Set.iterator:()Ljava/util/Iterator;
+        11: astore_2
+        12: aconst_null
+        13: astore_3
+        14: aload_2
+        15: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        20: ifeq          138
+        23: aload_2
+        24: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        29: checkcast     #199                // class java/util/Map$Entry
+        32: astore        4
+        34: aload         4
+        36: invokeinterface #200,  1          // InterfaceMethod java/util/Map$Entry.getValue:()Ljava/lang/Object;
+        41: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+        44: astore        5
+        46: aload         5
+        48: invokevirtual #237                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getPrimaryMember:()Lcom/fasterxml/jackson/databind/introspect/AnnotatedMember;
+        51: astore        6
+        53: aload         6
+        55: ifnonnull     61
+        58: goto          14
+        61: aload_0
+        62: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        65: aload         6
+        67: invokevirtual #238                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findWrapperName:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Lcom/fasterxml/jackson/databind/PropertyName;
+        70: astore        7
+        72: aload         7
+        74: ifnull        14
+        77: aload         7
+        79: invokevirtual #239                // Method com/fasterxml/jackson/databind/PropertyName.hasSimpleName:()Z
+        82: ifne          88
+        85: goto          14
+        88: aload         7
+        90: aload         5
+        92: invokevirtual #218                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getFullName:()Lcom/fasterxml/jackson/databind/PropertyName;
+        95: invokevirtual #109                // Method com/fasterxml/jackson/databind/PropertyName.equals:(Ljava/lang/Object;)Z
+        98: ifne          135
+       101: aload_3
+       102: ifnonnull     113
+       105: new           #98                 // class java/util/LinkedList
+       108: dup
+       109: invokespecial #99                 // Method java/util/LinkedList."<init>":()V
+       112: astore_3
+       113: aload         5
+       115: aload         7
+       117: invokevirtual #204                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.withName:(Lcom/fasterxml/jackson/databind/PropertyName;)Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;
+       120: astore        5
+       122: aload_3
+       123: aload         5
+       125: invokevirtual #100                // Method java/util/LinkedList.add:(Ljava/lang/Object;)Z
+       128: pop
+       129: aload_2
+       130: invokeinterface #187,  1          // InterfaceMethod java/util/Iterator.remove:()V
+       135: goto          14
+       138: aload_3
+       139: ifnull        219
+       142: aload_3
+       143: invokevirtual #138                // Method java/util/LinkedList.iterator:()Ljava/util/Iterator;
+       146: astore        4
+       148: aload         4
+       150: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       155: ifeq          219
+       158: aload         4
+       160: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       165: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       168: astore        5
+       170: aload         5
+       172: invokevirtual #190                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getName:()Ljava/lang/String;
+       175: astore        6
+       177: aload_1
+       178: aload         6
+       180: invokeinterface #183,  2          // InterfaceMethod java/util/Map.get:(Ljava/lang/Object;)Ljava/lang/Object;
+       185: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       188: astore        7
+       190: aload         7
+       192: ifnonnull     209
+       195: aload_1
+       196: aload         6
+       198: aload         5
+       200: invokeinterface #113,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+       205: pop
+       206: goto          216
+       209: aload         7
+       211: aload         5
+       213: invokevirtual #207                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.addAll:(Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;)V
+       216: goto          148
+       219: return
+
+  protected void _sortProperties(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_0
+         1: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+         4: astore_2
+         5: aload_2
+         6: aload_0
+         7: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+        10: invokevirtual #240                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findSerializationSortAlphabetically:(Lcom/fasterxml/jackson/databind/introspect/Annotated;)Ljava/lang/Boolean;
+        13: astore_3
+        14: aload_3
+        15: ifnonnull     28
+        18: aload_0
+        19: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        22: invokevirtual #241                // Method com/fasterxml/jackson/databind/cfg/MapperConfig.shouldSortPropertiesAlphabetically:()Z
+        25: goto          32
+        28: aload_3
+        29: invokevirtual #242                // Method java/lang/Boolean.booleanValue:()Z
+        32: istore        4
+        34: aload_0
+        35: aload_1
+        36: invokeinterface #30,  1           // InterfaceMethod java/util/Map.values:()Ljava/util/Collection;
+        41: invokespecial #243                // Method _anyIndexed:(Ljava/util/Collection;)Z
+        44: istore        5
+        46: aload_2
+        47: aload_0
+        48: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+        51: invokevirtual #244                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findSerializationPropertyOrder:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;)[Ljava/lang/String;
+        54: astore        6
+        56: iload         4
+        58: ifne          79
+        61: iload         5
+        63: ifne          79
+        66: aload_0
+        67: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+        70: ifnonnull     79
+        73: aload         6
+        75: ifnonnull     79
+        78: return
+        79: aload_1
+        80: invokeinterface #214,  1          // InterfaceMethod java/util/Map.size:()I
+        85: istore        7
+        87: iload         4
+        89: ifeq          104
+        92: new           #245                // class java/util/TreeMap
+        95: dup
+        96: invokespecial #246                // Method java/util/TreeMap."<init>":()V
+        99: astore        8
+       101: goto          118
+       104: new           #67                 // class java/util/LinkedHashMap
+       107: dup
+       108: iload         7
+       110: iload         7
+       112: iadd
+       113: invokespecial #247                // Method java/util/LinkedHashMap."<init>":(I)V
+       116: astore        8
+       118: aload_1
+       119: invokeinterface #30,  1           // InterfaceMethod java/util/Map.values:()Ljava/util/Collection;
+       124: invokeinterface #79,  1           // InterfaceMethod java/util/Collection.iterator:()Ljava/util/Iterator;
+       129: astore        9
+       131: aload         9
+       133: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       138: ifeq          171
+       141: aload         9
+       143: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       148: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       151: astore        10
+       153: aload         8
+       155: aload         10
+       157: invokevirtual #190                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getName:()Ljava/lang/String;
+       160: aload         10
+       162: invokeinterface #113,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+       167: pop
+       168: goto          131
+       171: new           #67                 // class java/util/LinkedHashMap
+       174: dup
+       175: iload         7
+       177: iload         7
+       179: iadd
+       180: invokespecial #247                // Method java/util/LinkedHashMap."<init>":(I)V
+       183: astore        9
+       185: aload         6
+       187: ifnull        323
+       190: aload         6
+       192: astore        10
+       194: aload         10
+       196: arraylength
+       197: istore        11
+       199: iconst_0
+       200: istore        12
+       202: iload         12
+       204: iload         11
+       206: if_icmpge     323
+       209: aload         10
+       211: iload         12
+       213: aaload
+       214: astore        13
+       216: aload         8
+       218: aload         13
+       220: invokeinterface #248,  2          // InterfaceMethod java/util/Map.remove:(Ljava/lang/Object;)Ljava/lang/Object;
+       225: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       228: astore        14
+       230: aload         14
+       232: ifnonnull     300
+       235: aload_1
+       236: invokeinterface #30,  1           // InterfaceMethod java/util/Map.values:()Ljava/util/Collection;
+       241: invokeinterface #79,  1           // InterfaceMethod java/util/Collection.iterator:()Ljava/util/Iterator;
+       246: astore        15
+       248: aload         15
+       250: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       255: ifeq          300
+       258: aload         15
+       260: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       265: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       268: astore        16
+       270: aload         13
+       272: aload         16
+       274: invokevirtual #249                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getInternalName:()Ljava/lang/String;
+       277: invokevirtual #250                // Method java/lang/String.equals:(Ljava/lang/Object;)Z
+       280: ifeq          297
+       283: aload         16
+       285: astore        14
+       287: aload         16
+       289: invokevirtual #190                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getName:()Ljava/lang/String;
+       292: astore        13
+       294: goto          300
+       297: goto          248
+       300: aload         14
+       302: ifnull        317
+       305: aload         9
+       307: aload         13
+       309: aload         14
+       311: invokeinterface #113,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+       316: pop
+       317: iinc          12, 1
+       320: goto          202
+       323: iload         5
+       325: ifeq          476
+       328: new           #245                // class java/util/TreeMap
+       331: dup
+       332: invokespecial #246                // Method java/util/TreeMap."<init>":()V
+       335: astore        10
+       337: aload         8
+       339: invokeinterface #197,  1          // InterfaceMethod java/util/Map.entrySet:()Ljava/util/Set;
+       344: invokeinterface #198,  1          // InterfaceMethod java/util/Set.iterator:()Ljava/util/Iterator;
+       349: astore        11
+       351: aload         11
+       353: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       358: ifeq          422
+       361: aload         11
+       363: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       368: checkcast     #199                // class java/util/Map$Entry
+       371: astore        12
+       373: aload         12
+       375: invokeinterface #200,  1          // InterfaceMethod java/util/Map$Entry.getValue:()Ljava/lang/Object;
+       380: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       383: astore        13
+       385: aload         13
+       387: invokevirtual #251                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getMetadata:()Lcom/fasterxml/jackson/databind/PropertyMetadata;
+       390: invokevirtual #252                // Method com/fasterxml/jackson/databind/PropertyMetadata.getIndex:()Ljava/lang/Integer;
+       393: astore        14
+       395: aload         14
+       397: ifnull        419
+       400: aload         10
+       402: aload         14
+       404: aload         13
+       406: invokeinterface #113,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+       411: pop
+       412: aload         11
+       414: invokeinterface #187,  1          // InterfaceMethod java/util/Iterator.remove:()V
+       419: goto          351
+       422: aload         10
+       424: invokeinterface #30,  1           // InterfaceMethod java/util/Map.values:()Ljava/util/Collection;
+       429: invokeinterface #79,  1           // InterfaceMethod java/util/Collection.iterator:()Ljava/util/Iterator;
+       434: astore        12
+       436: aload         12
+       438: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       443: ifeq          476
+       446: aload         12
+       448: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       453: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       456: astore        13
+       458: aload         9
+       460: aload         13
+       462: invokevirtual #190                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getName:()Ljava/lang/String;
+       465: aload         13
+       467: invokeinterface #113,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+       472: pop
+       473: goto          436
+       476: aload_0
+       477: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       480: ifnull        643
+       483: iload         4
+       485: ifeq          501
+       488: aload_0
+       489: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       492: getstatic     #253                // Field com/fasterxml/jackson/databind/MapperFeature.SORT_CREATOR_PROPERTIES_FIRST:Lcom/fasterxml/jackson/databind/MapperFeature;
+       495: invokevirtual #20                 // Method com/fasterxml/jackson/databind/cfg/MapperConfig.isEnabled:(Lcom/fasterxml/jackson/databind/MapperFeature;)Z
+       498: ifeq          643
+       501: iload         4
+       503: ifeq          572
+       506: new           #245                // class java/util/TreeMap
+       509: dup
+       510: invokespecial #246                // Method java/util/TreeMap."<init>":()V
+       513: astore        11
+       515: aload_0
+       516: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       519: invokevirtual #138                // Method java/util/LinkedList.iterator:()Ljava/util/Iterator;
+       522: astore        12
+       524: aload         12
+       526: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       531: ifeq          562
+       534: aload         12
+       536: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       541: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       544: astore        13
+       546: aload         11
+       548: aload         13
+       550: invokevirtual #190                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getName:()Ljava/lang/String;
+       553: aload         13
+       555: invokevirtual #254                // Method java/util/TreeMap.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+       558: pop
+       559: goto          524
+       562: aload         11
+       564: invokevirtual #255                // Method java/util/TreeMap.values:()Ljava/util/Collection;
+       567: astore        10
+       569: goto          578
+       572: aload_0
+       573: getfield      #127                // Field _creatorProperties:Ljava/util/LinkedList;
+       576: astore        10
+       578: aload         10
+       580: invokeinterface #79,  1           // InterfaceMethod java/util/Collection.iterator:()Ljava/util/Iterator;
+       585: astore        11
+       587: aload         11
+       589: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+       594: ifeq          643
+       597: aload         11
+       599: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+       604: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+       607: astore        12
+       609: aload         12
+       611: invokevirtual #190                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getName:()Ljava/lang/String;
+       614: astore        13
+       616: aload         8
+       618: aload         13
+       620: invokeinterface #256,  2          // InterfaceMethod java/util/Map.containsKey:(Ljava/lang/Object;)Z
+       625: ifeq          640
+       628: aload         9
+       630: aload         13
+       632: aload         12
+       634: invokeinterface #113,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+       639: pop
+       640: goto          587
+       643: aload         9
+       645: aload         8
+       647: invokeinterface #257,  2          // InterfaceMethod java/util/Map.putAll:(Ljava/util/Map;)V
+       652: aload_1
+       653: invokeinterface #217,  1          // InterfaceMethod java/util/Map.clear:()V
+       658: aload_1
+       659: aload         9
+       661: invokeinterface #257,  2          // InterfaceMethod java/util/Map.putAll:(Ljava/util/Map;)V
+       666: return
+
+  private boolean _anyIndexed(java.util.Collection<com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_1
+         1: invokeinterface #79,  1           // InterfaceMethod java/util/Collection.iterator:()Ljava/util/Iterator;
+         6: astore_2
+         7: aload_2
+         8: invokeinterface #80,  1           // InterfaceMethod java/util/Iterator.hasNext:()Z
+        13: ifeq          41
+        16: aload_2
+        17: invokeinterface #81,  1           // InterfaceMethod java/util/Iterator.next:()Ljava/lang/Object;
+        22: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+        25: astore_3
+        26: aload_3
+        27: invokevirtual #251                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getMetadata:()Lcom/fasterxml/jackson/databind/PropertyMetadata;
+        30: invokevirtual #258                // Method com/fasterxml/jackson/databind/PropertyMetadata.hasIndex:()Z
+        33: ifeq          38
+        36: iconst_1
+        37: ireturn
+        38: goto          7
+        41: iconst_0
+        42: ireturn
+
+  protected boolean _resolveFieldVsGetter(java.util.List<com.fasterxml.jackson.databind.introspect.AnnotatedMember>);
+    Code:
+         0: aload_1
+         1: iconst_0
+         2: invokeinterface #147,  2          // InterfaceMethod java/util/List.get:(I)Ljava/lang/Object;
+         7: checkcast     #42                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMember
+        10: astore_2
+        11: aload_1
+        12: iconst_1
+        13: invokeinterface #147,  2          // InterfaceMethod java/util/List.get:(I)Ljava/lang/Object;
+        18: checkcast     #42                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMember
+        21: astore_3
+        22: aload_2
+        23: instanceof    #94                 // class com/fasterxml/jackson/databind/introspect/AnnotatedField
+        26: ifeq          47
+        29: aload_3
+        30: instanceof    #55                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMethod
+        33: ifeq          72
+        36: aload_1
+        37: iconst_0
+        38: invokeinterface #259,  2          // InterfaceMethod java/util/List.remove:(I)Ljava/lang/Object;
+        43: pop
+        44: goto          74
+        47: aload_2
+        48: instanceof    #55                 // class com/fasterxml/jackson/databind/introspect/AnnotatedMethod
+        51: ifeq          72
+        54: aload_3
+        55: instanceof    #94                 // class com/fasterxml/jackson/databind/introspect/AnnotatedField
+        58: ifeq          72
+        61: aload_1
+        62: iconst_1
+        63: invokeinterface #259,  2          // InterfaceMethod java/util/List.remove:(I)Ljava/lang/Object;
+        68: pop
+        69: goto          74
+        72: iconst_0
+        73: ireturn
+        74: aload_1
+        75: invokeinterface #260,  1          // InterfaceMethod java/util/List.size:()I
+        80: iconst_1
+        81: if_icmpgt     0
+        84: iconst_1
+        85: ireturn
+
+  protected void reportProblem(java.lang.String, java.lang.Object...);
+    Code:
+         0: aload_2
+         1: arraylength
+         2: ifle          11
+         5: aload_1
+         6: aload_2
+         7: invokestatic  #261                // Method java/lang/String.format:(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;
+        10: astore_1
+        11: new           #262                // class java/lang/IllegalArgumentException
+        14: dup
+        15: new           #263                // class java/lang/StringBuilder
+        18: dup
+        19: invokespecial #264                // Method java/lang/StringBuilder."<init>":()V
+        22: ldc_w         #265                // String Problem with definition of
+        25: invokevirtual #266                // Method java/lang/StringBuilder.append:(Ljava/lang/String;)Ljava/lang/StringBuilder;
+        28: aload_0
+        29: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+        32: invokevirtual #267                // Method java/lang/StringBuilder.append:(Ljava/lang/Object;)Ljava/lang/StringBuilder;
+        35: ldc_w         #268                // String :
+        38: invokevirtual #266                // Method java/lang/StringBuilder.append:(Ljava/lang/String;)Ljava/lang/StringBuilder;
+        41: aload_1
+        42: invokevirtual #266                // Method java/lang/StringBuilder.append:(Ljava/lang/String;)Ljava/lang/StringBuilder;
+        45: invokevirtual #269                // Method java/lang/StringBuilder.toString:()Ljava/lang/String;
+        48: invokespecial #270                // Method java/lang/IllegalArgumentException."<init>":(Ljava/lang/String;)V
+        51: athrow
+
+  protected com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder _property(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>, com.fasterxml.jackson.databind.PropertyName);
+    Code:
+         0: aload_2
+         1: invokevirtual #185                // Method com/fasterxml/jackson/databind/PropertyName.getSimpleName:()Ljava/lang/String;
+         4: astore_3
+         5: aload_1
+         6: aload_3
+         7: invokeinterface #183,  2          // InterfaceMethod java/util/Map.get:(Ljava/lang/Object;)Ljava/lang/Object;
+        12: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+        15: astore        4
+        17: aload         4
+        19: ifnonnull     54
+        22: new           #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+        25: dup
+        26: aload_0
+        27: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        30: aload_0
+        31: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        34: aload_0
+        35: getfield      #5                  // Field _forSerialization:Z
+        38: aload_2
+        39: invokespecial #271                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder."<init>":(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/AnnotationIntrospector;ZLcom/fasterxml/jackson/databind/PropertyName;)V
+        42: astore        4
+        44: aload_1
+        45: aload_3
+        46: aload         4
+        48: invokeinterface #113,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+        53: pop
+        54: aload         4
+        56: areturn
+
+  protected com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder _property(java.util.Map<java.lang.String, com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>, java.lang.String);
+    Code:
+         0: aload_1
+         1: aload_2
+         2: invokeinterface #183,  2          // InterfaceMethod java/util/Map.get:(Ljava/lang/Object;)Ljava/lang/Object;
+         7: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+        10: astore_3
+        11: aload_3
+        12: ifnonnull     48
+        15: new           #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+        18: dup
+        19: aload_0
+        20: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        23: aload_0
+        24: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+        27: aload_0
+        28: getfield      #5                  // Field _forSerialization:Z
+        31: aload_2
+        32: invokestatic  #155                // Method com/fasterxml/jackson/databind/PropertyName.construct:(Ljava/lang/String;)Lcom/fasterxml/jackson/databind/PropertyName;
+        35: invokespecial #271                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder."<init>":(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/AnnotationIntrospector;ZLcom/fasterxml/jackson/databind/PropertyName;)V
+        38: astore_3
+        39: aload_1
+        40: aload_2
+        41: aload_3
+        42: invokeinterface #113,  3          // InterfaceMethod java/util/Map.put:(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;
+        47: pop
+        48: aload_3
+        49: areturn
+
+  private com.fasterxml.jackson.databind.PropertyNamingStrategy _findNamingStrategy();
+    Code:
+         0: aload_0
+         1: getfield      #13                 // Field _annotationIntrospector:Lcom/fasterxml/jackson/databind/AnnotationIntrospector;
+         4: aload_0
+         5: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+         8: invokevirtual #272                // Method com/fasterxml/jackson/databind/AnnotationIntrospector.findNamingStrategy:(Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;)Ljava/lang/Object;
+        11: astore_1
+        12: aload_1
+        13: ifnonnull     24
+        16: aload_0
+        17: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+        20: invokevirtual #273                // Method com/fasterxml/jackson/databind/cfg/MapperConfig.getPropertyNamingStrategy:()Lcom/fasterxml/jackson/databind/PropertyNamingStrategy;
+        23: areturn
+        24: aload_1
+        25: instanceof    #274                // class com/fasterxml/jackson/databind/PropertyNamingStrategy
+        28: ifeq          36
+        31: aload_1
+        32: checkcast     #274                // class com/fasterxml/jackson/databind/PropertyNamingStrategy
+        35: areturn
+        36: aload_1
+        37: instanceof    #275                // class java/lang/Class
+        40: ifne          61
+        43: aload_0
+        44: ldc_w         #276                // String AnnotationIntrospector returned PropertyNamingStrategy definition of type %s; expected type `PropertyNamingStrategy` or `Class<PropertyNamingStrategy>` instead
+        47: iconst_1
+        48: anewarray     #39                 // class java/lang/Object
+        51: dup
+        52: iconst_0
+        53: aload_1
+        54: invokestatic  #181                // Method com/fasterxml/jackson/databind/util/ClassUtil.classNameOf:(Ljava/lang/Object;)Ljava/lang/String;
+        57: aastore
+        58: invokevirtual #41                 // Method reportProblem:(Ljava/lang/String;[Ljava/lang/Object;)V
+        61: aload_1
+        62: checkcast     #275                // class java/lang/Class
+        65: astore_2
+        66: aload_2
+        67: ldc_w         #274                // class com/fasterxml/jackson/databind/PropertyNamingStrategy
+        70: if_acmpne     75
+        73: aconst_null
+        74: areturn
+        75: ldc_w         #274                // class com/fasterxml/jackson/databind/PropertyNamingStrategy
+        78: aload_2
+        79: invokevirtual #277                // Method java/lang/Class.isAssignableFrom:(Ljava/lang/Class;)Z
+        82: ifne          103
+        85: aload_0
+        86: ldc_w         #278                // String AnnotationIntrospector returned Class %s; expected `Class<PropertyNamingStrategy>`
+        89: iconst_1
+        90: anewarray     #39                 // class java/lang/Object
+        93: dup
+        94: iconst_0
+        95: aload_2
+        96: invokestatic  #181                // Method com/fasterxml/jackson/databind/util/ClassUtil.classNameOf:(Ljava/lang/Object;)Ljava/lang/String;
+        99: aastore
+       100: invokevirtual #41                 // Method reportProblem:(Ljava/lang/String;[Ljava/lang/Object;)V
+       103: aload_0
+       104: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       107: invokevirtual #279                // Method com/fasterxml/jackson/databind/cfg/MapperConfig.getHandlerInstantiator:()Lcom/fasterxml/jackson/databind/cfg/HandlerInstantiator;
+       110: astore_3
+       111: aload_3
+       112: ifnull        138
+       115: aload_3
+       116: aload_0
+       117: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       120: aload_0
+       121: getfield      #7                  // Field _classDef:Lcom/fasterxml/jackson/databind/introspect/AnnotatedClass;
+       124: aload_2
+       125: invokevirtual #280                // Method com/fasterxml/jackson/databind/cfg/HandlerInstantiator.namingStrategyInstance:(Lcom/fasterxml/jackson/databind/cfg/MapperConfig;Lcom/fasterxml/jackson/databind/introspect/Annotated;Ljava/lang/Class;)Lcom/fasterxml/jackson/databind/PropertyNamingStrategy;
+       128: astore        4
+       130: aload         4
+       132: ifnull        138
+       135: aload         4
+       137: areturn
+       138: aload_2
+       139: aload_0
+       140: getfield      #4                  // Field _config:Lcom/fasterxml/jackson/databind/cfg/MapperConfig;
+       143: invokevirtual #281                // Method com/fasterxml/jackson/databind/cfg/MapperConfig.canOverrideAccessModifiers:()Z
+       146: invokestatic  #282                // Method com/fasterxml/jackson/databind/util/ClassUtil.createInstance:(Ljava/lang/Class;Z)Ljava/lang/Object;
+       149: checkcast     #274                // class com/fasterxml/jackson/databind/PropertyNamingStrategy
+       152: areturn
+
+  protected void _updateCreatorProperty(com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder, java.util.List<com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_0
+         1: aload_1
+         2: aload_2
+         3: invokevirtual #208                // Method _replaceCreatorProperty:(Lcom/fasterxml/jackson/databind/introspect/POJOPropertyBuilder;Ljava/util/List;)Z
+         6: pop
+         7: return
+
+  protected boolean _replaceCreatorProperty(com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder, java.util.List<com.fasterxml.jackson.databind.introspect.POJOPropertyBuilder>);
+    Code:
+         0: aload_2
+         1: ifnull        66
+         4: aload_1
+         5: invokevirtual #249                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getInternalName:()Ljava/lang/String;
+         8: astore_3
+         9: iconst_0
+        10: istore        4
+        12: aload_2
+        13: invokeinterface #260,  1          // InterfaceMethod java/util/List.size:()I
+        18: istore        5
+        20: iload         4
+        22: iload         5
+        24: if_icmpge     66
+        27: aload_2
+        28: iload         4
+        30: invokeinterface #147,  2          // InterfaceMethod java/util/List.get:(I)Ljava/lang/Object;
+        35: checkcast     #82                 // class com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder
+        38: invokevirtual #249                // Method com/fasterxml/jackson/databind/introspect/POJOPropertyBuilder.getInternalName:()Ljava/lang/String;
+        41: aload_3
+        42: invokevirtual #250                // Method java/lang/String.equals:(Ljava/lang/Object;)Z
+        45: ifeq          60
+        48: aload_2
+        49: iload         4
+        51: aload_1
+        52: invokeinterface #283,  3          // InterfaceMethod java/util/List.set:(ILjava/lang/Object;)Ljava/lang/Object;
+        57: pop
+        58: iconst_1
+        59: ireturn
+        60: iinc          4, 1
+        63: goto          20
+        66: iconst_0
+        67: ireturn
+}

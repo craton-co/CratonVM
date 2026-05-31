@@ -432,6 +432,9 @@ pub fn throw_runtime_error(
             ("java/lang/IllegalArgumentException", Some(message.as_str()))
         }
         RuntimeError::IOException { message } => ("java/io/IOException", Some(message.as_str())),
+        RuntimeError::UnknownHostException { message } => {
+            ("java/net/UnknownHostException", Some(message.as_str()))
+        }
         RuntimeError::FileNotFoundException { path } => {
             ("java/io/FileNotFoundException", Some(path.as_str()))
         }
@@ -457,6 +460,8 @@ pub fn throw_runtime_error(
         RuntimeError::NoSuchElementException { message } => {
             ("java/util/NoSuchElementException", Some(message.as_str()))
         }
+        RuntimeError::BufferUnderflowException => ("java/nio/BufferUnderflowException", None),
+        RuntimeError::BufferOverflowException => ("java/nio/BufferOverflowException", None),
         RuntimeError::InputMismatchException { message } => {
             ("java/util/InputMismatchException", Some(message.as_str()))
         }

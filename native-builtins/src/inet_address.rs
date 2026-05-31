@@ -48,8 +48,8 @@ use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 // ---------------------------------------------------------------------------
 
 fn unknown_host<S: Into<String>>(msg: S) -> MethodCallFailed {
-    RuntimeError::IOException {
-        message: format!("UnknownHostException: {}", msg.into()),
+    RuntimeError::UnknownHostException {
+        message: msg.into(),
     }
     .into()
 }

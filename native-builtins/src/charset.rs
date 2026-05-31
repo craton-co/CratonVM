@@ -161,6 +161,22 @@ pub(crate) fn alloc_byte_buffer(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Ob
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
     }
+    // Real-JDK field names (Buffer + ByteBuffer). Without these, when the
+    // concrete `java/nio/ByteBuffer` class is loaded from the JDK image its
+    // `hasArray()` / `array()` bytecode reads the named `hb` / `isReadOnly`
+    // fields — which stayed null/0 — so `hasArray()` returned false and
+    // `array()` threw UnsupportedOperationException. That broke Tomcat
+    // `MessageBytes.toBytes` (`encoder.encode(cb).array()`), failing 288
+    // MessageBytes-conversion tests. Mirrors the same fix already applied to
+    // `alloc_char_buffer` above.
+    ctx.set_field_by_name(obj, "hb", Value::Object(Some(arr)));
+    ctx.set_field_by_name(obj, "offset", Value::Int(0));
+    ctx.set_field_by_name(obj, "isReadOnly", Value::Int(0));
+    ctx.set_field_by_name(obj, "position", Value::Int(0));
+    ctx.set_field_by_name(obj, "limit", Value::Int(cap as i32));
+    ctx.set_field_by_name(obj, "capacity", Value::Int(cap as i32));
+    ctx.set_field_by_name(obj, "mark", Value::Int(-1));
+    // Indexed fallback for synthetic-mode consumers.
     ctx.set_field(obj, BUF_FIELD_ARRAY, Value::Object(Some(arr)));
     ctx.set_field(obj, BUF_FIELD_POS, Value::Int(0));
     ctx.set_field(obj, BUF_FIELD_LIMIT, Value::Int(cap as i32));
@@ -213,7 +229,22 @@ fn alloc_coder_result(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
 }
 
 /// Read the `(array, pos, limit)` triple from a Buffer-shaped object.
+///
+/// Prefer the real-JDK named fields (`hb`/`position`/`limit`). When the
+/// concrete `java/nio/{Char,Byte}Buffer` class is loaded from the JDK image
+/// (which it is in the default real-JDK build), the synthetic indexed slots
+/// 0/1/2 no longer line up with `hb`/pos/limit — slot 0 is some inherited
+/// `Buffer` int field, so the indexed read returns `None`/0 and
+/// `CharsetEncoder.encode(CharBuffer.wrap(...))` produced an EMPTY ByteBuffer
+/// (Tomcat `MessageBytes.toBytes` → wrong bytes / 288 test failures). The
+/// named read matches what `cb_write_hb` / `alloc_*_buffer` actually populate.
+/// Indexed slots are kept as a fallback for synthetic-mode-only consumers.
 fn buf_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32, i32)> {
+    if let Value::Object(Some(a)) = ctx.get_field_by_name(this, "hb") {
+        let pos = ctx.get_field_by_name(this, "position").as_int().unwrap_or(0);
+        let lim = ctx.get_field_by_name(this, "limit").as_int().unwrap_or(0);
+        return Some((a, pos, lim));
+    }
     let arr = match ctx.get_field(this, BUF_FIELD_ARRAY) {
         Value::Object(Some(a)) => a,
         _ => return None,
@@ -224,6 +255,10 @@ fn buf_state(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, i32
 }
 
 fn set_pos(ctx: &dyn NativeContext, obj: ObjectRef, pos: i32) {
+    // Update both the real-JDK named `position` field (read back by buffer
+    // bytecode) and the synthetic indexed slot, mirroring `buf_state`'s
+    // dual-layout read.
+    ctx.set_field_by_name(obj, "position", Value::Int(pos));
     ctx.set_field(obj, BUF_FIELD_POS, Value::Int(pos));
 }
 

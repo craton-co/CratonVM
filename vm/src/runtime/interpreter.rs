@@ -11069,6 +11069,12 @@ fn try_stackless_invoke(
     if let Some(callback) = native_cb {
         let result = safe_native_call(shared, thread, callback, args)?;
         if let Some(value) = result {
+            if std::env::var_os("CRATONVM_DBG_STACKLESS").is_some() {
+                eprintln!(
+                    "[STACKLESS_RET] {}.{}{} -> {:?}",
+                    class_name, method_name, descriptor, value
+                );
+            }
             // T18.K4 — tag-exact push for J/D native-override return values.
             // `coerce_value_for_return` may widen/narrow the type-erased
             // native result; we then push via the category-2 aware path so

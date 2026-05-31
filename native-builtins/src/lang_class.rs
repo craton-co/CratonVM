@@ -296,12 +296,24 @@ const REFLECTION_INTERNAL_CLASSES: &[&str] = &[
 /// a pure native context).
 ///
 /// The stack trace comes from `NativeContext::capture_stack_trace(0)` which
-/// returns entries from innermost to outermost. We skip every entry whose
-/// `class_name` matches a reflection-internal prefix, then resolve the next
-/// user frame to a `ClassId` via `class_id_by_name`.
+/// returns entries **outermost-first** (`trace[0]` is `main`, the last entry is
+/// the innermost / current frame — the same order the exception printer uses).
+/// The *immediate* caller of the reflection API is therefore at the END of the
+/// trace, so we iterate in reverse, skip every entry whose `class_name` matches
+/// a reflection-internal prefix, and resolve the first remaining (innermost)
+/// frame to a `ClassId`.
+///
+/// Iterating innermost-first matches real-JDK `Reflection.getCallerClass()`
+/// semantics (the access decision keys on the *immediate* caller, not on the
+/// outermost `main`). It is also what lets legitimate JDK-internal-mediated
+/// reflection work: e.g. `StackStreamFactory$StackFrameBuffer.fill` constructing
+/// a `StackFrameInfo` via `Constructor.newInstance` resolves to the java.base
+/// `StackFrameBuffer` frame (allowed by `caller_is_jdk_internal`) instead of
+/// the user `main` further out, which previously produced a spurious
+/// `IllegalAccessException` (Spring Boot `deduceMainApplicationClass`).
 fn resolve_caller_class_id(ctx: &mut dyn NativeContext) -> Option<ClassId> {
     let trace = ctx.capture_stack_trace(0);
-    for entry in &trace {
+    for entry in trace.iter().rev() {
         let name: &str = &entry.class_name;
         let is_internal = REFLECTION_INTERNAL_CLASSES.iter().any(|prefix| {
             if prefix.ends_with('/') {
