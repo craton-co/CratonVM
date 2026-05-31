@@ -23913,6 +23913,62 @@ pub(crate) fn bi_is_probable_prime_str(value: &str) -> bool {
         }
         i += 2;
     }
+    // No small factor < 1000. The old code returned `true` here — a
+    // trial-division-only test that wrongly classifies EVERY large
+    // composite with no small factor as prime (e.g. a product of two
+    // 256-bit primes, the RSA/Miller-Rabin stress case). That broke
+    // `BigInteger.isProbablePrime` and, transitively,
+    // `BigIntegers.createRandomPrime` (which validates candidates via
+    // `isProbablePrime`, so it returned composites), failing BouncyCastle
+    // `PrimesTest`. Decide it properly with a real Miller-Rabin test.
+    bi_miller_rabin_str(abs)
+}
+
+/// Deterministic-base Miller-Rabin probable-prime test on the unsigned
+/// decimal magnitude `n`. `n` is assumed odd and to have no prime factor
+/// below 1000 (the caller filters those first). Uses a fixed set of small
+/// prime bases: this is the standard "strong probable prime" test —
+/// deterministic for n below ~3.3e24 (first 13 bases) and astronomically
+/// reliable beyond that, matching `BigInteger.isProbablePrime`'s contract.
+pub(crate) fn bi_miller_rabin_str(n: &str) -> bool {
+    // Write n-1 = d * 2^s with d odd.
+    let n_minus_1 = bi_sub_str(n, "1");
+    let mut d = n_minus_1.clone();
+    let mut s: u32 = 0;
+    loop {
+        let last = d.bytes().last().map(|b| b - b'0').unwrap_or(0);
+        if last & 1 == 1 {
+            break;
+        }
+        d = bi_div_str(&d, "2");
+        s += 1;
+    }
+    const BASES: &[u32] = &[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41];
+    for &a in BASES {
+        let a_str = a.to_string();
+        // base must be in [2, n-2]; for the large n we reach here this is
+        // always true, but guard for safety.
+        if bi_cmp_unsigned(&a_str, n) >= 0 {
+            continue;
+        }
+        // x = a^d mod n
+        let mut x = bi_mod_pow_str(&a_str, &d, n);
+        if bi_cmp_unsigned(&x, "1") == 0 || bi_cmp_unsigned(&x, &n_minus_1) == 0 {
+            continue; // probable prime for this base
+        }
+        let mut witnessed_composite = true;
+        for _ in 0..s.saturating_sub(1) {
+            // x = x^2 mod n
+            x = bi_mod_unsigned(&bi_mul_unsigned(&x, &x), n);
+            if bi_cmp_unsigned(&x, &n_minus_1) == 0 {
+                witnessed_composite = false;
+                break;
+            }
+        }
+        if witnessed_composite {
+            return false; // definitely composite
+        }
+    }
     true
 }
 
