@@ -188,6 +188,17 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     remap lives in `gc.rs` (`gc_update_lambda_callsite_cache_refs`).
     cratonvm_native_builtins::lang_invoke::gc_scan_lambda_callsite_cache_roots(&mut roots);
 
+    // 17. Overlay-backed collections (LinkedList / LinkedHashMap / TreeMap /
+    //     TreeSet). These keep their backing arrays + nodes in process-global
+    //     Rust side-tables, invisible to the field-tracing scan above. Without
+    //     this, a moving young-gen GC reclaims/relocates a backing array
+    //     reachable only through an overlay, leaving a dangling pointer that
+    //     later reads as a zero-header (class_id=0) object — the
+    //     `LinkedHashMap.get` crash on DaCapo's Config map. The matching
+    //     post-compaction remap lives in `gc.rs`
+    //     (`gc_update_collection_overlay_refs`).
+    cratonvm_native_collections::gc_scan_collection_overlay_roots(&mut roots);
+
     roots
 }
 

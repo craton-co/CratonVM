@@ -15258,6 +15258,124 @@ fn ts_array_table() -> &'static Mutex<StdHashMap<usize, TsArrayState>> {
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
+// ---------------------------------------------------------------------------
+// GC integration for overlay-backed collections
+// ---------------------------------------------------------------------------
+//
+// LinkedList, LinkedHashMap, TreeMap and TreeSet model their backing storage
+// (bucket/element arrays, list/tree nodes, comparator) in process-global Rust
+// side-tables ("overlays") keyed by a GC-stable object key, NOT in the Java
+// object's own fields. The VM's field-tracing root scanner therefore never
+// sees those backing objects. When the ONLY reference to a backing array is
+// the overlay, a moving young-gen GC reclaims or relocates it and the overlay
+// is left holding a dangling pointer — which later surfaces as a read of a
+// zero-header object (`class_id=0`, `num_slots=0`), e.g. `LinkedHashMap.get`
+// crashing on DaCapo's `Config` map (`lhm_state` → `array_length` on a freed
+// bucket array).
+//
+// These two functions plug the overlays into the GC the same way the
+// Integer/Boolean valueOf cache and the LambdaMetafactory CallSite cache are
+// (see `roots.rs` step 15/16 + `gc.rs`): `..._roots` reports every top-level
+// ObjectRef the overlays hold so the collector keeps the whole backing graph
+// live and relocates it; `..._refs` repoints the overlays to the moved
+// addresses afterwards. Only the top-level entry points need handling — once
+// the bucket/element array (and head/tail/data) are live roots, the collector
+// traces and updates the rest of the node graph (array elements + node fields)
+// through the normal heap walk.
+
+/// Push every top-level ObjectRef held by the overlay-backed collections onto
+/// `roots` so a moving GC keeps the backing storage live and relocates it.
+pub fn gc_scan_collection_overlay_roots(roots: &mut Vec<ObjectRef>) {
+    fn push_val(roots: &mut Vec<ObjectRef>, v: &Value) {
+        if let Value::Object(Some(r)) = v {
+            roots.push(*r);
+        }
+    }
+    // LinkedList + LinkedHashMap: inner name -> Value maps (head/tail/table…).
+    if let Ok(ll) = ll_overlay().lock() {
+        for inner in ll.values() {
+            for v in inner.values() {
+                push_val(roots, v);
+            }
+        }
+    }
+    if let Ok(lhm) = lhm_overlay().lock() {
+        for inner in lhm.values() {
+            for v in inner.values() {
+                push_val(roots, v);
+            }
+        }
+    }
+    // TreeMap + TreeSet: backing array (`data`) + comparator.
+    if let Ok(tm) = tm_array_table().lock() {
+        for st in tm.values() {
+            if let Some(r) = st.data {
+                roots.push(r);
+            }
+            push_val(roots, &st.comparator);
+        }
+    }
+    if let Ok(ts) = ts_array_table().lock() {
+        for st in ts.values() {
+            if let Some(r) = st.data {
+                roots.push(r);
+            }
+            push_val(roots, &st.comparator);
+        }
+    }
+}
+
+/// Repoint every top-level ObjectRef held by the overlay-backed collections to
+/// its relocated address after a moving GC. Mirror of
+/// `gc_scan_collection_overlay_roots`.
+pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    fn remap_val(v: &mut Value, pm: &StdHashMap<usize, usize>) {
+        if let Value::Object(Some(r)) = v {
+            if let Some(&new_addr) = pm.get(&(r.as_ptr() as usize)) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *r = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+    fn remap_ref(r: &mut Option<ObjectRef>, pm: &StdHashMap<usize, usize>) {
+        if let Some(obj) = r {
+            if let Some(&new_addr) = pm.get(&(obj.as_ptr() as usize)) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *r = Some(unsafe { ObjectRef::from_raw(new_addr as *mut u8) });
+            }
+        }
+    }
+    if let Ok(mut ll) = ll_overlay().lock() {
+        for inner in ll.values_mut() {
+            for v in inner.values_mut() {
+                remap_val(v, pointer_map);
+            }
+        }
+    }
+    if let Ok(mut lhm) = lhm_overlay().lock() {
+        for inner in lhm.values_mut() {
+            for v in inner.values_mut() {
+                remap_val(v, pointer_map);
+            }
+        }
+    }
+    if let Ok(mut tm) = tm_array_table().lock() {
+        for st in tm.values_mut() {
+            remap_ref(&mut st.data, pointer_map);
+            remap_val(&mut st.comparator, pointer_map);
+        }
+    }
+    if let Ok(mut ts) = ts_array_table().lock() {
+        for st in ts.values_mut() {
+            remap_ref(&mut st.data, pointer_map);
+            remap_val(&mut st.comparator, pointer_map);
+        }
+    }
+}
+
 /// Read a TreeSet "slot" (`TS_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
 /// address-keyed side-table. Returns layout-independent defaults when no
 /// entry exists yet.

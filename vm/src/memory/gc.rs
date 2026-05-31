@@ -236,6 +236,12 @@ pub fn update_all_roots(
     //     Same scan/update contract as the Integer.valueOf cache.
     cratonvm_native_builtins::lang_invoke::gc_update_lambda_callsite_cache_refs(pointer_map);
 
+    // 17. Overlay-backed collections (LinkedList / LinkedHashMap / TreeMap /
+    //     TreeSet) keep their backing arrays + nodes in process-global Rust
+    //     side-tables. Their roots are scanned in `roots.rs` step 17; repoint
+    //     the stored ObjectRefs to their relocated addresses here.
+    cratonvm_native_collections::gc_update_collection_overlay_refs(pointer_map);
+
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);
 }
