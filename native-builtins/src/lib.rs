@@ -747,6 +747,16 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/CharSequence;)Ljava/io/PrintStream;",
         native_printstream_append,
     );
+    // Our System.out/err are fd-backed synthetic PrintStreams (slot 0 = fd
+    // id); their inherited FilterOutputStream `out` field is never populated.
+    // The real-JDK `PrintStream.flush()`/`close()` bytecode dereferences that
+    // null `out` (`out.flush()`) → NPE ("Cannot invoke flush on null") for any
+    // program that calls `System.out.flush()`. Route both through the fd-aware
+    // natives instead: flush drains the fd's buffer, close is a no-op (we must
+    // never close the process stdout/stderr). Mirrors the synthetic-mode
+    // PrintStream registration and the long-standing fd-stream flush contract.
+    registry.register("java/io/PrintStream", "flush", "()V", native_printstream_flush);
+    registry.register("java/io/PrintStream", "close", "()V", native_printstream_close);
     // PrintWriter
     registry.register(
         "java/io/PrintWriter",

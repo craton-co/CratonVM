@@ -51,6 +51,7 @@ done
 # so a baseline diff only cares about the probe's actual output.
 filter_volatile() {
     sed 's/\x1b\[[0-9;]*m//g' \
+      | sed 's/@[0-9a-f]\{1,\}/@<id>/g' \
       | grep -vE '^\[?(2026|2025|2024|2027)-[0-9]+-[0-9]+T[0-9]+:[0-9]+:[0-9]+\.[0-9]+Z' \
       | grep -vE '^\[cratonvm[^]]*\]' \
       | grep -vE 'WARN cratonvm' \
