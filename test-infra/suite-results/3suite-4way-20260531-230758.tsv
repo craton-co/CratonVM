@@ -1,0 +1,11 @@
+suite	task	variant	rc	pass	wall_s	note
+bc	math	tornadovm	0	PASS	2	OK (
+bc	math-raw	tornadovm	0	PASS	1	OK (
+bc	util-encoders	tornadovm	0	PASS	1	OK (
+bc	util-utiltest	tornadovm	0	PASS	1	OK (
+bc	asn1	tornadovm	0	PASS	2	All tests successful
+bc	crypto-prng	tornadovm	0	PASS	1	All tests successful
+dacapo	avrora	tornadovm	127	FAIL	1	FAILED
+dacapo	luindex	tornadovm	0	PASS	12	PASSED
+dacapo	sunflow	tornadovm	0	PASS	3	PASSED
+dacapo	fop	tornadovm	0	PASS	3	PASSED

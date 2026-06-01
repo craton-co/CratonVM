@@ -1,0 +1,41 @@
+suite	task	variant	rc	pass	wall_s	note
+bc	math	cratonvm-cpu	0	PASS	31	OK (
+bc	math-raw	cratonvm-cpu	0	PASS	3	OK (
+bc	util-encoders	cratonvm-cpu	0	PASS	35	OK (
+bc	util-utiltest	cratonvm-cpu	0	PASS	2	OK (
+bc	asn1	cratonvm-cpu	0	PASS	40	All tests successful
+bc	crypto-prng	cratonvm-cpu	0	FAIL	67	
+dacapo	avrora	cratonvm-cpu	0	PASS	6	PASSED
+dacapo	luindex	cratonvm-cpu	127	FAIL	15	
+dacapo	sunflow	cratonvm-cpu	127	FAIL	4	
+dacapo	fop	cratonvm-cpu	1	FAIL	40	
+bc	math	cratonvm-gpu	0	PASS	28	OK (
+bc	math-raw	cratonvm-gpu	0	PASS	2	OK (
+bc	util-encoders	cratonvm-gpu	0	PASS	24	OK (
+bc	util-utiltest	cratonvm-gpu	0	PASS	2	OK (
+bc	asn1	cratonvm-gpu	0	PASS	30	All tests successful
+bc	crypto-prng	cratonvm-gpu	0	FAIL	45	
+dacapo	avrora	cratonvm-gpu	0	PASS	6	PASSED
+dacapo	luindex	cratonvm-gpu	127	FAIL	15	
+dacapo	sunflow	cratonvm-gpu	127	FAIL	5	
+dacapo	fop	cratonvm-gpu	1	FAIL	40	
+bc	math	hotspot	0	PASS	0	OK (
+bc	math-raw	hotspot	0	PASS	0	OK (
+bc	util-encoders	hotspot	0	PASS	1	OK (
+bc	util-utiltest	hotspot	0	PASS	1	OK (
+bc	asn1	hotspot	0	PASS	1	All tests successful
+bc	crypto-prng	hotspot	0	PASS	1	All tests successful
+dacapo	avrora	hotspot	127	FAIL	1	FAILED
+dacapo	luindex	hotspot	0	PASS	14	PASSED
+dacapo	sunflow	hotspot	0	PASS	2	PASSED
+dacapo	fop	hotspot	0	PASS	3	PASSED
+bc	math	tornadovm	1	FAIL	1	
+bc	math-raw	tornadovm	1	FAIL	0	
+bc	util-encoders	tornadovm	1	FAIL	0	
+bc	util-utiltest	tornadovm	1	FAIL	1	
+bc	asn1	tornadovm	1	FAIL	0	
+bc	crypto-prng	tornadovm	1	FAIL	0	
+dacapo	avrora	tornadovm	1	FAIL	1	
+dacapo	luindex	tornadovm	1	FAIL	0	
+dacapo	sunflow	tornadovm	1	FAIL	0	
+dacapo	fop	tornadovm	1	FAIL	1	
