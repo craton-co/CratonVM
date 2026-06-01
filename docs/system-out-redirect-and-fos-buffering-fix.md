@@ -144,3 +144,38 @@ The tractable underlying bugs in these chains have been fixed and committed
 unbuffered FOS). The remaining work is large and regression-prone (the RAF
 real-bytecode experiment already SEGV'd avrora), so it should be scoped and
 undertaken deliberately rather than as a quick patch.
+
+### Follow-up: why real-bytecode RAF SEGVs avrora (the JIT re-entrancy UB)
+A second attempt re-applied the RAF real-bytecode change and diagnosed the
+avrora SEGV to the bottom:
+
+1. **It is NOT the cleaner stale-address bug** — that was real and is now fixed
+   (defer cleaner/finalizer dispatch under a JIT thread-borrow + GC-relocate the
+   deferred queues; commit "fix(gc): defer cleaner/finalizer …"). Applying that
+   fix did not stop the avrora SEGV.
+2. **A debug build pinned the actual fault**: `jit_thread_mut: aliasing &mut
+   JvmThread borrow detected (a prior JitThreadGuard is still live)` at
+   `jit/helpers.rs:214`. The backtrace is pure nested `jit_invoke_dispatch`
+   (no cleaner/GC frames): a JIT method's `jit_invoke_dispatch` holds the
+   `&mut JvmThread` (slow path, `helpers.rs:2031`) across `bail_to_interpreter`,
+   whose interpreter execution calls another JIT method whose code re-enters
+   `jit_invoke_dispatch` → `jit_thread_mut` → a second live `&mut JvmThread` to
+   the same thread. With the debug assert neutered the build runs on to a hard
+   SEGV, i.e. the aliasing is genuine UB, not a benign over-assert: the inner
+   call mutates `thread` (frame push/realloc) while the outer holds derived
+   state, so under sustained load the outer dereferences moved/freed memory.
+3. Real-bytecode RAF exposes this latent bug because the real RAF ctor +
+   `FileDescriptor`/`Cleaner`/`FileCleanable` machinery adds more JIT-compiled
+   methods to the nesting, deepening the `jit_invoke_dispatch` chains until the
+   aliasing turns fatal. Synthetic-native RAF avoided it by never running that
+   bytecode.
+
+**Conclusion**: real-bytecode RAF is blocked on a JIT re-entrancy redesign —
+JIT helpers obtain `&mut JvmThread` from a thread-local raw pointer
+(`jit_thread_mut`), and nested interpreter↔JIT calls create overlapping `&mut`
+borrows to the same thread. Making this sound (e.g. a borrow-token / single-owner
+discipline threaded through `bail_to_interpreter`, or re-deriving all
+thread-internal references after every nested call) is a JIT-subsystem effort,
+not a localized fix, and masking it (JIT skip-list for RAF-path methods) is
+disallowed by the no-mask rule. The RAF change was reverted to keep avrora green;
+the cleaner/finalizer GC-safety hardening (independently correct) was kept.
