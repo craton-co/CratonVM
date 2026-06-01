@@ -924,6 +924,27 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
     if let Some(r) = thread.native_pending_return {
         snapshot.push(r);
     }
+
+    // CRIT GC×JIT fix: also publish the conservative roots of every active JIT
+    // frame on THIS thread into the snapshot.
+    //
+    // The cross-thread STW collector reads each thread's `root_snapshot` (via
+    // `collect_all_root_snapshots`) — it does NOT call `collect_roots` for a
+    // non-current thread (that path's `scan_active_jit_frames` is thread-local
+    // and would scan the *collector's* empty JIT chain, not the parked
+    // worker's). So an object whose only live reference lives in a worker
+    // thread's JIT spill slot was INVISIBLE to a GC triggered by another
+    // thread → reclaimed/relocated out from under the JIT frame, leaving a
+    // dangling/garbage receiver (the avrora real-RAF SEGV: `jit_putfield_int`
+    // writing through obj_ptr=0x1 in JIT-compiled LegacyInstrVisitor.visit).
+    //
+    // `update_root_snapshot` always runs on the thread it is snapshotting
+    // (mutators call it for themselves at `safepoint_check`), so the
+    // thread-local `scan_active_jit_frames` captures exactly that worker's live
+    // JIT spill region. When the thread is not in JIT the chain is empty and
+    // this is a no-op. False positives are filtered by `is_object_address` and
+    // are harmless (compaction is already deferred while any thread is in JIT).
+    crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut snapshot);
 }
 
 /// Check if a stop-the-world pause is requested and participate if so.
