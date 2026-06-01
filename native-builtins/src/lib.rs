@@ -1282,9 +1282,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // are reachable in BOTH synthetic-jdk and real-JDK feature configurations.
     crate::lang_misc::register_throwable_subclass_natives(registry);
 
-    // Surefire bootstrap compatibility: keep the BufferedReader/InputStreamReader
-    // constructor chain available even in "essential-only" native registration
-    // paths. Some harnesses hit these before R3 phase natives are wired.
+    // RDR-MIGRATION 2026-06-01: the BufferedReader/InputStreamReader
+    // constructor shadows below assumed the synthetic byte[]-backed Reader
+    // layout (reader/stream at slot 0) and broke the REAL JDK Reader bytecode
+    // — they prevented the real ctor from setting up `cb`/`nextChar`/`sd`, so
+    // a subsequent real `readLine()`/`read()` saw a null buffer. The Reader
+    // stack now runs real JDK bytecode (see servlet.rs RDR-MIGRATION note), so
+    // these synthetic `<init>` shadows are kept only under `synthetic-jdk`.
+    #[cfg(feature = "synthetic-jdk")]
+    {
     registry.register(
         "java/io/InputStreamReader",
         "<init>",
@@ -1340,6 +1346,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    } // end #[cfg(feature = "synthetic-jdk")] synthetic Reader ctor shadows
     // Also wire the full R3 bundle in essential mode so readLine/lines/close
     // are available during early Maven/Surefire bootstrap.
     register_r3_resource_loading(registry);

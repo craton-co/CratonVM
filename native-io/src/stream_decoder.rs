@@ -6,23 +6,23 @@
 //! The JDK class normally wraps a `CharsetDecoder` around an
 //! `InputStream` to produce a `Reader`.  The JDK bytecode reaches
 //! deep into `sun.nio.ch.*` internals that we don't cover, so we
-//! expose a synthetic layout and implement the public method surface
-//! natively.
+//! implement the public method surface natively over the underlying
+//! `InputStream`.
 //!
-//! Synthetic field layout (7 fields):
-//! | slot | meaning                                                   |
-//! |------|-----------------------------------------------------------|
-//! | 0    | underlying `java.io.InputStream`                          |
-//! | 1    | `java.lang.String` — canonical charset name               |
-//! | 2    | `char[]` — decoded read-ahead buffer (may be null)        |
-//! | 3    | `int`    — read-ahead buffer read position                |
-//! | 4    | `int`    — read-ahead buffer valid length                 |
-//! | 5    | `byte[]` — carryover of incomplete trailing byte sequence |
-//! | 6    | `int`    — valid bytes in the carryover buffer            |
+//! State model (GC-safe — see the comment on the slot constants below):
+//! * slot 0 of the SD object holds the underlying `java.io.InputStream`
+//!   (a real reference field the collector scans/relocates);
+//! * slot 4 holds a stable `int` id (a primitive the collector ignores)
+//!   keying a Rust side-table that owns the charset name and the
+//!   incomplete-byte carry.
 //!
-//! Multi-byte boundaries are preserved correctly by carrying the
-//! trailing incomplete bytes (UTF-8 leading or continuation bytes,
-//! UTF-16 odd dangling byte) between calls.
+//! Each `read` decodes the complete prefix of (carry + freshly-read bytes)
+//! straight into the caller's `char[]` and carries the trailing incomplete
+//! byte sequence (UTF-8 lead/continuation bytes, UTF-16 odd dangling byte)
+//! to the next call, so multi-byte boundaries are preserved. No decoded
+//! read-ahead `char[]` is buffered in an object field (such a field is not
+//! in the real StreamDecoder reference map, so the collector would free it
+//! mid-stream — the cause of the prior readLine hang).
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
@@ -30,19 +30,38 @@ use cratonvm_types::{ArrayElementType, ObjectRef, Value};
 
 use cratonvm_native_api::charset as engine;
 
-/// Slot indices.
-const SD_INPUT: usize = 0;
-const SD_NAME: usize = 1;
-const SD_CHARS: usize = 2;
-const SD_POS: usize = 3;
-const SD_LEN: usize = 4;
-const SD_CARRY: usize = 5;
-const SD_CARRY_LEN: usize = 6;
-
+// GC-safe state model.
+//
+// The SD object is allocated with the REAL `sun.nio.cs.StreamDecoder` class id
+// (so `InputStreamReader` bytecode dispatches `sd.read(...)` to our natives) but
+// only `SD_NUM_FIELDS` slots. The collector scans that object using the *real*
+// class's reference map, which does NOT mark our scratch slots as references —
+// so an object reference (a decoded `char[]` / carry `byte[]`) stored in one of
+// them is NOT rooted and gets collected mid-stream (the readLine hang). Only:
+//   * slot 0 — the underlying `InputStream` — is a real reference field (`in`)
+//     that the collector scans and relocates, so it is safe to keep there; and
+//   * a primitive (`int`) stored in a scratch slot persists (the collector
+//     ignores it).
+// Therefore the mutable per-decoder state (charset name + the incomplete-byte
+// carry) lives in a Rust side-table keyed by a stable `int` id stored in a
+// primitive slot. The `InputStream` is re-read from slot 0 on every call (never
+// cached in Rust, so GC motion is transparent).
+const SD_INPUT: usize = 0; // real `in` field — GC-scanned reference, persists
+const SD_ID: usize = 4; // scratch primitive slot — holds the side-table key
 const SD_NUM_FIELDS: usize = 7;
 
-/// Maximum bytes to pull from the underlying stream per refill.
-const REFILL_BYTES: usize = 4096;
+struct SdState {
+    name: String,
+    carry: Vec<u8>,
+}
+
+fn sd_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, SdState>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, SdState>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+static SD_NEXT_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
 fn obj_arg(args: &[Value], i: usize) -> Option<ObjectRef> {
     match args.get(i) {
@@ -55,12 +74,8 @@ fn int_arg(args: &[Value], i: usize) -> i32 {
     args.get(i).and_then(|v| v.as_int()).unwrap_or(0)
 }
 
-/// Read the canonical charset name from slot 1.
-fn name_of(ctx: &dyn NativeContext, this: ObjectRef) -> String {
-    match ctx.get_field(this, SD_NAME) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "UTF-8".to_string()),
-        _ => "UTF-8".to_string(),
-    }
+fn sd_id(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    ctx.get_field(this, SD_ID).as_int().unwrap_or(0)
 }
 
 /// Allocate and return a synthetic StreamDecoder wrapping `is`.
@@ -74,14 +89,18 @@ pub(crate) fn alloc_stream_decoder(
         Err(_) => cratonvm_types::ClassId::new(0),
     };
     let obj = ctx.alloc_object(cid, SD_NUM_FIELDS);
-    let name = ctx.create_string(charset_name);
+    let id = SD_NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // slot 0 (`in`) is a real GC-scanned reference; slot 4 is a scratch
+    // primitive holding the side-table key. Everything else stays zero-init.
     ctx.set_field(obj, SD_INPUT, Value::Object(Some(is)));
-    ctx.set_field(obj, SD_NAME, Value::Object(Some(name)));
-    ctx.set_field(obj, SD_CHARS, Value::Object(None));
-    ctx.set_field(obj, SD_POS, Value::Int(0));
-    ctx.set_field(obj, SD_LEN, Value::Int(0));
-    ctx.set_field(obj, SD_CARRY, Value::Object(None));
-    ctx.set_field(obj, SD_CARRY_LEN, Value::Int(0));
+    ctx.set_field(obj, SD_ID, Value::Int(id));
+    sd_table().lock().unwrap().insert(
+        id,
+        SdState {
+            name: charset_name.to_string(),
+            carry: Vec::new(),
+        },
+    );
     obj
 }
 
@@ -184,17 +203,26 @@ fn native_sd_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(o) => o,
         None => return Ok(Some(Value::Int(-1))),
     };
-    // Allocate a 1-element output char[] and delegate to read([CII).
     let out = ctx.new_array(ArrayElementType::Char, 1);
-    let n = refill_and_copy(ctx, this, out, 0, 1)?;
-    if n <= 0 {
-        return Ok(Some(Value::Int(-1)));
+    // `decode_into` always consumes ≥1 fresh byte when the carry alone can't
+    // form a char, so the loop makes progress and terminates (a full char
+    // needs ≤4 bytes; EOF flushes). Bounded for safety.
+    for _ in 0..8 {
+        let n = decode_into(ctx, this, out, 0, 1)?;
+        if n > 0 {
+            let ch = match ctx.get_array_element(out, 0) {
+                Value::Int(v) => v & 0xFFFF,
+                _ => -1,
+            };
+            return Ok(Some(Value::Int(ch)));
+        }
+        if n < 0 {
+            return Ok(Some(Value::Int(-1)));
+        }
+        // n == 0: incomplete multi-byte sequence; decode_into pulled more
+        // bytes into the carry — retry.
     }
-    let ch = match ctx.get_array_element(out, 0) {
-        Value::Int(v) => v & 0xFFFF,
-        _ => -1,
-    };
-    Ok(Some(Value::Int(ch)))
+    Ok(Some(Value::Int(-1)))
 }
 
 /// `read(char[] cbuf, int off, int len) -> int`.
@@ -212,11 +240,14 @@ fn native_sd_read_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if len == 0 {
         return Ok(Some(Value::Int(0)));
     }
-    let n = refill_and_copy(ctx, this, out, off, len)?;
+    // May return 0 when only an incomplete multi-byte tail was read; the
+    // caller (`BufferedReader.fill`'s `do { } while (n == 0)`) retries, and
+    // each call consumes fresh bytes so it converges (or hits EOF → -1).
+    let n = decode_into(ctx, this, out, off, len)?;
     Ok(Some(Value::Int(n)))
 }
 
-/// `close()` — closes the underlying InputStream.
+/// `close()` — closes the underlying InputStream and drops side-table state.
 fn native_sd_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_arg(args, 0) {
         Some(o) => o,
@@ -226,6 +257,8 @@ fn native_sd_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         let _ = ctx.invoke_virtual(is, "close", "()V", &[]);
     }
     ctx.set_field(this, SD_INPUT, Value::Object(None));
+    let id = sd_id(ctx, this);
+    sd_table().lock().unwrap().remove(&id);
     Ok(None)
 }
 
@@ -235,9 +268,14 @@ fn native_sd_ready(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(o) => o,
         None => return Ok(Some(Value::Int(0))),
     };
-    let valid = ctx.get_field(this, SD_LEN).as_int().unwrap_or(0)
-        - ctx.get_field(this, SD_POS).as_int().unwrap_or(0);
-    if valid > 0 {
+    let id = sd_id(ctx, this);
+    let has_carry = sd_table()
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|s| !s.carry.is_empty())
+        .unwrap_or(false);
+    if has_carry {
         return Ok(Some(Value::Int(1)));
     }
     if let Value::Object(Some(is)) = ctx.get_field(this, SD_INPUT) {
@@ -249,153 +287,110 @@ fn native_sd_ready(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(Some(Value::Int(0)))
 }
 
-/// Fill the read-ahead char buffer if needed and copy up to `len`
-/// chars into `out[off..off+len]`. Returns number of chars copied, or
-/// -1 at EOF.
-fn refill_and_copy(
+/// Read fresh bytes from the underlying stream, decode the complete prefix
+/// (prepending any carried incomplete bytes), copy the decoded chars straight
+/// into `out[off..]`, and persist the new incomplete tail as the carry.
+///
+/// Returns the number of chars written, or -1 at EOF with nothing buffered.
+/// May return 0 mid-stream when only an incomplete multi-byte tail was read
+/// (the caller retries; each call consumes ≥1 fresh byte, so it converges).
+///
+/// The total bytes considered (`carry + fresh`) is kept ≤ `len`, and chars ≤
+/// bytes for every charset, so the decoded chars always fit in `out[off..len]`
+/// — no read-ahead char buffer (and thus no GC-collectable scratch field) is
+/// needed.
+fn decode_into(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     out: ObjectRef,
     off: usize,
     len: usize,
 ) -> Result<i32, cratonvm_types::error::MethodCallFailed> {
-    let mut produced = 0usize;
-    while produced < len {
-        let pos = ctx.get_field(this, SD_POS).as_int().unwrap_or(0) as usize;
-        let limit = ctx.get_field(this, SD_LEN).as_int().unwrap_or(0) as usize;
-        if pos < limit {
-            let buf = match ctx.get_field(this, SD_CHARS) {
-                Value::Object(Some(a)) => a,
-                _ => break,
+    if len == 0 {
+        return Ok(0);
+    }
+    let id = sd_id(ctx, this);
+    let (name, mut bytes) = {
+        let t = sd_table().lock().unwrap();
+        match t.get(&id) {
+            Some(s) => (s.name.clone(), s.carry.clone()),
+            None => ("UTF-8".to_string(), Vec::new()),
+        }
+    };
+
+    // Keep total bytes ≤ len so decoded chars ≤ len. Force ≥1 fresh byte when
+    // the carry alone fills `len` (tiny len) so we always make progress.
+    let mut want = len.saturating_sub(bytes.len());
+    if want == 0 && !bytes.is_empty() {
+        want = 4;
+    }
+    let mut eof = false;
+    if want > 0 {
+        if let Value::Object(Some(is)) = ctx.get_field(this, SD_INPUT) {
+            let tmp = ctx.new_array(ArrayElementType::Byte, want);
+            let r = ctx.invoke_virtual(
+                is,
+                "read",
+                "([BII)I",
+                &[
+                    Value::Object(Some(tmp)),
+                    Value::Int(0),
+                    Value::Int(want as i32),
+                ],
+            )?;
+            let n = match r {
+                Some(Value::Int(v)) => v,
+                _ => -1,
             };
-            let take = (limit - pos).min(len - produced);
-            // AUDIT 2026-05-17: bulk copy via the primitive-array
-            // intrinsic. char[] is a primitive array so the VM override
-            // uses a single `ptr::copy` between the two payloads.
-            if take > 0 {
-                let ok = ctx.bulk_array_copy(buf, pos, out, off + produced, take);
-                if !ok {
-                    // Fall back to per-element if the VM rejected the
-                    // bulk (shouldn't happen for two well-formed char[]
-                    // arrays of matching kind).
-                    for i in 0..take {
-                        let c = ctx.get_array_element(buf, pos + i);
-                        ctx.set_array_element(out, off + produced + i, c);
-                    }
-                }
+            if n > 0 {
+                let start = bytes.len();
+                bytes.resize(start + n as usize, 0);
+                ctx.read_byte_array_into(tmp, 0, &mut bytes[start..]);
+            } else {
+                eof = true;
             }
-            ctx.set_field(this, SD_POS, Value::Int((pos + take) as i32));
-            produced += take;
-            continue;
+        } else {
+            eof = true;
         }
-
-        // Buffer empty: refill from underlying stream.
-        let refilled = refill(ctx, this)?;
-        if refilled == 0 {
-            // EOF
-            break;
-        }
-    }
-    if produced == 0 {
-        // Either requested 0, or EOF on empty buffer. Return -1 only
-        // on EOF per `Reader.read` contract.
-        let pos = ctx.get_field(this, SD_POS).as_int().unwrap_or(0);
-        let limit = ctx.get_field(this, SD_LEN).as_int().unwrap_or(0);
-        if pos >= limit {
-            return Ok(-1);
-        }
-    }
-    Ok(produced as i32)
-}
-
-/// Pull bytes from the underlying InputStream and decode into the
-/// read-ahead buffer. Returns the number of chars produced (0 at EOF).
-fn refill(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-) -> Result<usize, cratonvm_types::error::MethodCallFailed> {
-    let is = match ctx.get_field(this, SD_INPUT) {
-        Value::Object(Some(s)) => s,
-        _ => return Ok(0),
-    };
-
-    // Read REFILL_BYTES from the InputStream into a temporary byte[].
-    let tmp = ctx.new_array(ArrayElementType::Byte, REFILL_BYTES);
-    let n = ctx.invoke_virtual(
-        is,
-        "read",
-        "([BII)I",
-        &[
-            Value::Object(Some(tmp)),
-            Value::Int(0),
-            Value::Int(REFILL_BYTES as i32),
-        ],
-    )?;
-    let n = match n {
-        Some(Value::Int(v)) => v,
-        _ => -1,
-    };
-
-    // Copy read bytes into a Rust Vec<u8>, prepending any carryover.
-    // AUDIT 2026-05-17: bulk-read both buffers via NativeContext intrinsic.
-    let carry_len = ctx.get_field(this, SD_CARRY_LEN).as_int().unwrap_or(0) as usize;
-    let read_len = if n > 0 { n as usize } else { 0 };
-    let mut bytes: Vec<u8> = vec![0u8; carry_len + read_len];
-    if carry_len > 0 {
-        if let Value::Object(Some(carr)) = ctx.get_field(this, SD_CARRY) {
-            ctx.read_byte_array_into(carr, 0, &mut bytes[..carry_len]);
-        }
-    }
-    if read_len > 0 {
-        ctx.read_byte_array_into(tmp, 0, &mut bytes[carry_len..carry_len + read_len]);
     }
 
     if bytes.is_empty() {
-        // EOF with no carryover.
-        return Ok(0);
+        return Ok(-1);
     }
 
-    // Split off incomplete trailing bytes for the next call. At true
-    // EOF (`n < 0`) we flush everything, so a stale incomplete
-    // sequence emerges as replacement chars.
-    let name = name_of(ctx, this);
-    let split = if n < 0 {
+    // At true EOF, flush everything (a dangling incomplete sequence decodes to
+    // U+FFFD via the lossy decoder); otherwise carry the incomplete tail.
+    let split = if eof {
         bytes.len()
     } else {
         split_complete_prefix(&name, &bytes)
     };
-    let (decodable, carry) = bytes.split_at(split);
-
-    // Decode with lossy fallback so arbitrary bad bytes turn into
-    // U+FFFD instead of erroring out mid-stream.
+    let (decodable, rest) = bytes.split_at(split);
     let chars = engine::decode_bytes_lossy(&name, decodable);
-
-    // Stash chars into the read-ahead buffer.
-    // AUDIT 2026-05-17: bulk write via NativeContext intrinsic. The VM
-    // override does a single `copy_nonoverlapping` into the compact
-    // char-array payload, eliminating the per-element virtual dispatch.
-    let char_arr = ctx.new_array(ArrayElementType::Char, chars.len());
-    if !chars.is_empty() {
-        ctx.write_char_array_from(char_arr, 0, &chars);
-    }
-    ctx.set_field(this, SD_CHARS, Value::Object(Some(char_arr)));
-    ctx.set_field(this, SD_POS, Value::Int(0));
-    ctx.set_field(this, SD_LEN, Value::Int(chars.len() as i32));
-
-    // Save carryover bytes (if any) for the next refill.
-    if !carry.is_empty() {
-        let carr = ctx.new_array(ArrayElementType::Byte, carry.len());
-        // AUDIT 2026-05-17: bulk write via NativeContext intrinsic.
-        ctx.write_byte_array_from(carr, 0, carry);
-        ctx.set_field(this, SD_CARRY, Value::Object(Some(carr)));
-        ctx.set_field(this, SD_CARRY_LEN, Value::Int(carry.len() as i32));
-    } else {
-        ctx.set_field(this, SD_CARRY, Value::Object(None));
-        ctx.set_field(this, SD_CARRY_LEN, Value::Int(0));
+    let ncopy = chars.len().min(len);
+    if ncopy > 0 {
+        ctx.write_char_array_from(out, off, &chars[..ncopy]);
     }
 
-    Ok(chars.len())
+    // Persist the incomplete trailing bytes for the next call.
+    {
+        let mut t = sd_table().lock().unwrap();
+        let entry = t.entry(id).or_insert_with(|| SdState {
+            name: name.clone(),
+            carry: Vec::new(),
+        });
+        entry.carry = rest.to_vec();
+    }
+
+    if ncopy == 0 {
+        if eof {
+            return Ok(-1);
+        }
+        return Ok(0);
+    }
+    Ok(ncopy as i32)
 }
+
 
 /// Return the byte index up to which `bytes` forms a complete multi-byte
 /// sequence for the named charset. Bytes past this index should be
@@ -496,8 +491,15 @@ pub fn register_stream_decoder_natives(registry: &mut NativeMethodRegistry) {
                 Some(o) => o,
                 None => return Ok(Some(Value::Object(None))),
             };
-            let name_val = ctx.get_field(this, SD_NAME);
-            Ok(Some(name_val))
+            let id = sd_id(ctx, this);
+            let name = sd_table()
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| "UTF-8".to_string());
+            let s = ctx.create_string(&name);
+            Ok(Some(Value::Object(Some(s))))
         },
     );
 }

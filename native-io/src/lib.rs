@@ -3845,20 +3845,28 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/io/FileWriter", "flush", "()V", native_fos_flush);
     registry.register("java/io/FileWriter", "close", "()V", native_fos_close);
 
-    // InputStreamReader — register UNCONDITIONALLY (even in real-JDK
-    // mode).  The real JDK's InputStreamReader delegates through
-    // StreamDecoder/Charset/NIO, a deep chain that includes native
-    // methods we only partially cover; in practice this produces
-    // spurious `read() == -1` / `read(char[]) == 0` returns even
-    // when the underlying InputStream has bytes ready (seen on KC16's
-    // MXParser.fillBuf → reader.read(char[]) EOFException even though
-    // our FIS successfully delivered 1884 bytes).  Our native
-    // implementation sidesteps the StreamDecoder entirely: it stores
-    // the underlying InputStream on <init> and dispatches read/read
-    // directly to it via invokevirtual, decoding bytes as Latin-1.
-    // Latin-1 is wrong for general UTF-8 content but correct for ASCII
-    // (module.xml, standard XML declarations, simple config files) —
-    // which covers every file the bootstrap path reads.
+    // RDR-MIGRATION 2026-06-01: the InputStreamReader natives below used to be
+    // registered UNCONDITIONALLY (even in real-JDK mode). They were a
+    // "StreamDecoder-bypass": store the underlying InputStream on <init> and
+    // decode bytes directly in `native_isr_read*`. That shadowed the real JDK
+    // InputStreamReader bytecode and, crucially, never set up the real
+    // InputStreamReader `sd` (StreamDecoder) field — so a real BufferedReader
+    // wrapping it could `read()`/`read(char[])` but `readLine()` (which uses
+    // the real `in`/`cb`/`fill` machinery) misbehaved.
+    //
+    // We now run the REAL InputStreamReader bytecode, which builds a real
+    // `sun.nio.cs.StreamDecoder` via `StreamDecoder.forInputStreamReader(...)`.
+    // That factory + the decoder's read/ready/close are provided by the
+    // `stream_decoder` native shim (registered above via
+    // `register_stream_decoder_natives`), which drives the underlying stream
+    // through `in.read([BII)I` virtually and decodes with the real charset
+    // engine (full UTF-8/UTF-16/Latin-1 — no longer ASCII-only). This makes
+    // FileReader → InputStreamReader → StreamDecoder → FileInputStream a
+    // fully real-bytecode path, analogous to the FileInputStream open0/read0
+    // surface. The old synthetic ISR natives are kept only under
+    // `synthetic-jdk`.
+    #[cfg(feature = "synthetic-jdk")]
+    {
     registry.register(
         "java/io/InputStreamReader",
         "<init>",
@@ -3915,6 +3923,7 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/nio/CharBuffer;)I",
         native_reader_read_charbuffer,
     );
+    } // end #[cfg(feature = "synthetic-jdk")] synthetic InputStreamReader natives
 
     // Subsequent synthetic-only Reader/Writer overrides assume our
     // synthetic 1-3-field layouts (fd at slot 0) and corrupt state
@@ -5821,6 +5830,16 @@ const SW_FIELD_BUF: usize = 0;
 const SW_FIELD_COUNT: usize = 1;
 
 fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
+    // RDR-MIGRATION 2026-06-01: the synthetic StringReader natives below use a
+    // 3-field layout (content/pos/length) that does not match the real JDK
+    // StringReader (str/length/next/mark). They shadowed the real bytecode and
+    // — combined with the synthetic BufferedReader natives — made
+    // `new BufferedReader(new StringReader(...)).readLine()` return 0 lines.
+    // Real StringReader bytecode is self-contained (no native primitives), so
+    // it runs correctly on its own and feeds a real BufferedReader. Keep the
+    // synthetic StringReader natives only under `synthetic-jdk`.
+    #[cfg(feature = "synthetic-jdk")]
+    {
     let sr = "java/io/StringReader";
     registry.register(sr, "<init>", "(Ljava/lang/String;)V", native_sr_init);
     registry.register(sr, "read", "()I", native_sr_read);
@@ -5832,6 +5851,7 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     registry.register(sr, "markSupported", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
+    }
 
     let sw = "java/io/StringWriter";
     registry.register(sw, "<init>", "()V", native_sw_init);
@@ -5867,9 +5887,19 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
         native_sw_append_cs,
     );
 
-    // Also register Reader/Writer base class read/close for dispatch
-    registry.register("java/io/Reader", "read", "()I", native_sr_read);
+    // RDR-MIGRATION 2026-06-01: the blanket `java/io/Reader.read()I` native
+    // (backed by `native_sr_read`, which assumes the synthetic StringReader
+    // 3-field layout) was registered on the base class and so applied to EVERY
+    // Reader subclass — corrupting real FileReader/CharArrayReader/etc. The
+    // real `Reader.read()I` and `Reader.read(CharBuffer)` are concrete bytecode
+    // that delegate to the subclass's `read([CII)I`, so they run correctly
+    // without a native. Keep the synthetic base-Reader natives under
+    // `synthetic-jdk` only. `Reader.close()` stays a no-op universally (the
+    // real default is a no-op anyway and some synthetic readers rely on it).
     registry.register("java/io/Reader", "close", "()V", native_noop_void);
+    #[cfg(feature = "synthetic-jdk")]
+    {
+    registry.register("java/io/Reader", "read", "()I", native_sr_read);
     // RA.3: Reader.read(java.nio.CharBuffer) default fills the buffer via
     // char[] + read([CII)I, then advances the buffer's position.
     registry.register(
@@ -5878,6 +5908,7 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/nio/CharBuffer;)I",
         native_reader_read_charbuffer,
     );
+    }
     registry.register("java/io/Writer", "write", "(I)V", native_sw_write_int);
     registry.register("java/io/Writer", "flush", "()V", native_noop_void);
     registry.register("java/io/Writer", "close", "()V", native_noop_void);
@@ -8055,6 +8086,15 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(raf, "readUTF", "()Ljava/lang/String;", native_raf_read_line); // simplified
 
+    // RDR-MIGRATION 2026-06-01: CharArrayReader synthetic natives (3-field
+    // buf/pos/count) shadowed real CharArrayReader bytecode (buf/pos/markedPos/
+    // count) and only implemented `read()I` — a real BufferedReader wrapping it
+    // calls `read([CII)I`, which had no native and ran real bytecode against
+    // the wrong field layout. Run the whole CharArrayReader as real bytecode
+    // (self-contained, no native primitives) and keep the synthetic natives
+    // under `synthetic-jdk`.
+    #[cfg(feature = "synthetic-jdk")]
+    {
     // CharArrayReader = 3-field synthetic (buf=0, pos=1, count=2)
     let car = "java/io/CharArrayReader";
     registry.register(car, "<init>", "([C)V", native_car_init);
@@ -8062,6 +8102,7 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     registry.register(car, "read", "()I", native_car_read);
     registry.register(car, "ready", "()Z", native_car_ready);
     registry.register(car, "close", "()V", native_noop_void);
+    }
 
     // CharArrayWriter = 2-field synthetic (buf=0, count=1)
     let caw = "java/io/CharArrayWriter";
@@ -8080,6 +8121,14 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     registry.register(caw, "flush", "()V", native_noop_void);
     registry.register(caw, "close", "()V", native_noop_void);
 
+    // RDR-MIGRATION 2026-06-01: LineNumberReader extends BufferedReader; its
+    // synthetic readLine/<init> natives (4-field in/lineNumber/pos/content)
+    // shadowed the real bytecode and broke once the rest of the Reader stack
+    // went real. Real LineNumberReader bytecode builds on real BufferedReader,
+    // which now works, so run it as real bytecode and keep the synthetic
+    // natives under `synthetic-jdk`.
+    #[cfg(feature = "synthetic-jdk")]
+    {
     // LineNumberReader = 4-field synthetic (in=0, lineNumber=1, pos=2, content=3)
     let lnr = "java/io/LineNumberReader";
     registry.register(lnr, "<init>", "(Ljava/io/Reader;)V", native_lnr_init);
@@ -8092,6 +8141,7 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     registry.register(lnr, "getLineNumber", "()I", native_lnr_get_line_number);
     registry.register(lnr, "setLineNumber", "(I)V", native_lnr_set_line_number);
     registry.register(lnr, "close", "()V", native_noop_void);
+    }
 }
 
 const RAF_FIELD_FD: usize = 0;

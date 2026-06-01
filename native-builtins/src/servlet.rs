@@ -15,6 +15,7 @@ use std::io::{Read as StdRead, Write as StdWrite};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::OnceLock;
 
+#[cfg(feature = "synthetic-jdk")]
 fn r3_get_input_stream(ctx: &dyn NativeContext, buffered_reader: ObjectRef) -> Option<ObjectRef> {
     // BufferedReader.field[0] = Reader (InputStreamReader)
     let reader = match ctx.get_field(buffered_reader, 0) {
@@ -126,6 +127,33 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // -------------------------------------------------------------------------
+    // RDR-MIGRATION 2026-06-01: the synthetic Reader-stack natives below
+    // (InputStream.read/close, InputStreamReader.<init>/read/close,
+    // BufferedReader.<init>/readLine/lines/close, Reader.close) used to be
+    // registered UNCONDITIONALLY. They shadowed the REAL JDK Reader bytecode
+    // via `native_methods.find(class_name, …)` and broke every real reader:
+    // the blanket `BufferedReader.readLine` returned null for real readers
+    // (its synthetic byte[]-backed layout never matched a real FileReader /
+    // InputStreamReader), so `new BufferedReader(new FileReader(f)).readLine()`
+    // returned 0 lines.
+    //
+    // The whole java.io Reader stack now runs REAL JDK bytecode
+    // (FileReader → InputStreamReader → sun.nio.cs.StreamDecoder → the
+    // underlying InputStream), exactly like the FileInputStream/FileOutputStream
+    // open0/read0 surface. The StreamDecoder native shim
+    // (native-io::stream_decoder) drives `in.read([BII)I` virtually, so it
+    // works over a real FileInputStream *and* over the synthetic
+    // ByteArrayInputStream produced by `getResourceAsStream` above — meaning
+    // the r3 resource-loading use case (`new BufferedReader(new
+    // InputStreamReader(getResourceAsStream(...)))`) keeps working end-to-end
+    // through real bytecode without any synthetic Reader native.
+    //
+    // These synthetic shadows are therefore retired in real-JDK mode and only
+    // kept under `synthetic-jdk` (the no-real-JDK stub build), where there is
+    // no real Reader bytecode to defer to.
+    #[cfg(feature = "synthetic-jdk")]
+    {
     // -------------------------------------------------------------------------
     // java.io.InputStream.close() — no-op
     // -------------------------------------------------------------------------
@@ -310,6 +338,7 @@ pub(crate) fn register_r3_resource_loading(r: &mut NativeMethodRegistry) {
     // -------------------------------------------------------------------------
     r.register("java/io/BufferedReader", "close", "()V", native_noop_with_this);
     r.register("java/io/Reader", "close", "()V", native_noop_with_this);
+    } // end #[cfg(feature = "synthetic-jdk")] synthetic Reader-stack block
 }
 
 // =============================================================================
