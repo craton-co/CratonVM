@@ -343,6 +343,17 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
 /// Per the `Cleaner` contract, exceptions thrown by an action are caught
 /// and logged — they must not propagate into the GC pipeline.
 fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
+    // Re-entrancy safety: if a JIT helper currently holds the `&mut JvmThread`
+    // (we were reached via `jit_invoke_dispatch` → `bail_to_interpreter` →
+    // interpreter → `maybe_gc`), running a cleaner action's `run()` could
+    // execute JIT-compiled code that calls `jit_thread_mut`, aliasing the live
+    // borrow (debug: aliasing assert; release: UB/SEGV — the avrora crash
+    // exposed by real-bytecode RAF's FileCleanable cleanups). Leave the actions
+    // queued; they are GC-relocated (`update_after_gc`) and run at the next
+    // top-level (non-JIT) safepoint.
+    if crate::jit::helpers::is_jit_thread_set() {
+        return;
+    }
     // S-bytebuddy r3 — independent recursion guard for cleaner-action
     // dispatch. A Runnable.run() invoked from here can itself enqueue
     // (or trigger GC of) another Cleanable, which lands back in
@@ -446,6 +457,13 @@ fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
 
 /// Dequeue pending finalizable objects and invoke their finalize() method.
 fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
+    // Same JIT-borrow re-entrancy guard as `run_cleaner_actions`: a `finalize()`
+    // invoked while a JIT helper holds the `&mut JvmThread` could re-enter the
+    // JIT and alias the borrow. Defer to the next top-level safepoint; the
+    // queue is GC-relocated via `FinalizerThread::update_after_gc`.
+    if crate::jit::helpers::is_jit_thread_set() {
+        return;
+    }
     loop {
         let obj_addr = match shared.finalizer_thread.dequeue() {
             Some(addr) => addr,
@@ -532,6 +550,14 @@ fn process_references_after_gc(
         let actual = pointer_map.get(obj_addr).copied().unwrap_or(*obj_addr);
         shared.finalizer_thread.enqueue(actual);
     }
+
+    // Relocate any cleaner actions DEFERRED from earlier GC cycles (queued but
+    // not yet run because a JIT borrow was live — see `run_cleaner_actions`).
+    // Their cleanable objects may have been evacuated by this collection, so
+    // remap their raw addresses before any later drain dereferences them.
+    shared.cleaner_thread.update_after_gc(pointer_map);
+    // Same for any finalizers deferred from earlier GC cycles.
+    shared.finalizer_thread.update_after_gc(pointer_map);
 
     // Submit cleaner actions — same pre-GC→post-GC relocation as above.
     // Without this, run_cleaner_actions later derefs a stale address

@@ -657,6 +657,28 @@ impl CleanerThread {
         lock.drain(..).collect()
     }
 
+    /// Relocate every pending cleaner-action address through a GC pointer map.
+    ///
+    /// Cleaner actions can be *deferred* across GC cycles (e.g. when the only
+    /// safepoint is reached from inside a JIT helper that holds the `&mut
+    /// JvmThread`, running the action's `run()` there would re-enter the JIT
+    /// and alias the borrow — so the interpreter leaves the actions queued and
+    /// runs them at the next top-level safepoint). While queued, the cleanable
+    /// objects they point at can be evacuated by a compacting collector, so
+    /// their raw addresses must be remapped on every GC or a later
+    /// `drain_actions` would deref freed/moved memory → SEGV.
+    pub fn update_after_gc(&self, pointer_map: &HashMap<usize, usize>) {
+        if pointer_map.is_empty() {
+            return;
+        }
+        let mut lock = self.pending_actions.lock();
+        for addr in lock.iter_mut() {
+            if let Some(&new) = pointer_map.get(addr) {
+                *addr = new;
+            }
+        }
+    }
+
     pub fn pending_count(&self) -> usize {
         self.pending_actions.lock().len()
     }
@@ -747,6 +769,23 @@ impl FinalizerThread {
     /// Check if an object has already been finalized.
     pub fn was_finalized(&self, obj_addr: usize) -> bool {
         self.already_finalized.lock().contains(&obj_addr)
+    }
+
+    /// Relocate every queued finalizable object address through a GC pointer
+    /// map. Like cleaner actions, finalizers can be deferred across GC cycles
+    /// (a `finalize()` invoked while a JIT borrow is live would alias the
+    /// `&mut JvmThread`), so a persisted queue entry must track object motion
+    /// or `dequeue` would later hand the interpreter a freed/moved address.
+    pub fn update_after_gc(&self, pointer_map: &HashMap<usize, usize>) {
+        if pointer_map.is_empty() {
+            return;
+        }
+        let mut queue = self.finalization_queue.lock();
+        for addr in queue.iter_mut() {
+            if let Some(&new) = pointer_map.get(addr) {
+                *addr = new;
+            }
+        }
     }
 
     pub fn pending_count(&self) -> usize {
