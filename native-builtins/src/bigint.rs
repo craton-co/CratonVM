@@ -378,39 +378,101 @@ impl BigInt {
     }
 
     /// Unsigned magnitude division: `(quotient, remainder) = a divmod b`.
-    /// `b` must be non-empty (non-zero). Both results are normalized.
+    /// `b` must be non-zero. Both results are normalized.
     ///
-    /// Binary long division (process `a` MSB→LSB, shifting into a running
-    /// remainder). O(bits(a) · limbs) — far faster than the decimal
-    /// repeated-subtraction `bi_div_unsigned`, and exact. (Knuth Algorithm D /
-    /// Montgomery are the later perf-polish steps in the scope doc; this is the
-    /// correctness-first foundation step 3 routes through.)
-    fn divmod_mag(a: &[u32], b: &[u32]) -> (Vec<u32>, Vec<u32>) {
-        debug_assert!(!b.is_empty(), "divmod_mag: zero divisor");
-        if Self::cmp_mag(a, b) == Ordering::Less {
-            let mut r = a.to_vec();
-            while r.last() == Some(&0) {
-                r.pop();
-            }
-            return (Vec::new(), r);
+    /// Knuth Algorithm D (TAOCP 4.3.1), base 2^32, in the Hacker's-Delight
+    /// `divmnu` formulation: O(len(q) · len(v)) word ops — vs the O(bits·limbs)
+    /// bit-at-a-time long division it replaces, which made the modPow inner
+    /// loop (thousands of reductions per isProbablePrime) ~1 s/call. A single
+    /// 32-bit divisor takes the simple word-at-a-time path. Validated against
+    /// the decimal `bi_div_str`/`bi_mod_str` reference (div_rem_mod_match_decimal).
+    fn divmod_mag(a_in: &[u32], b_in: &[u32]) -> (Vec<u32>, Vec<u32>) {
+        // Trim operands to their significant length.
+        let mut alen = a_in.len();
+        while alen > 0 && a_in[alen - 1] == 0 {
+            alen -= 1;
         }
-        let total_bits = a.len() * 32;
-        let mut q = vec![0u32; a.len()];
-        let mut r: Vec<u32> = Vec::new();
-        for bit_idx in (0..total_bits).rev() {
-            let bit = (a[bit_idx / 32] >> (bit_idx % 32)) & 1;
-            Self::shl1_or_mag(&mut r, bit);
-            if Self::cmp_mag(&r, b) != Ordering::Less {
-                r = Self::sub_mag(&r, b);
-                while r.last() == Some(&0) {
-                    r.pop();
-                }
-                q[bit_idx / 32] |= 1u32 << (bit_idx % 32);
+        let mut n = b_in.len();
+        while n > 0 && b_in[n - 1] == 0 {
+            n -= 1;
+        }
+        debug_assert!(n > 0, "divmod_mag: zero divisor");
+        let a = &a_in[..alen];
+        let v = &b_in[..n];
+
+        if Self::cmp_mag(a, v) == Ordering::Less {
+            return (Vec::new(), a.to_vec());
+        }
+
+        // Single-word divisor: straightforward long division.
+        if n == 1 {
+            let d = v[0] as u64;
+            let mut q = vec![0u32; alen];
+            let mut rem: u64 = 0;
+            for i in (0..alen).rev() {
+                let cur = (rem << 32) | (a[i] as u64);
+                q[i] = (cur / d) as u32;
+                rem = cur % d;
             }
+            while q.last() == Some(&0) {
+                q.pop();
+            }
+            let r = if rem == 0 { Vec::new() } else { vec![rem as u32] };
+            return (q, r);
+        }
+
+        const BASE: u64 = 1u64 << 32;
+        // Normalize so the divisor's top word has its high bit set.
+        let shift = v[n - 1].leading_zeros() as usize;
+        let mut vn = Self::shl_mag(v, shift);
+        vn.resize(n, 0); // shift < 32 with top-word leading zeros consumed → exactly n words
+        let m = alen - n;
+        let mut un = Self::shl_mag(a, shift);
+        un.resize(alen + 1, 0); // need index m+n
+
+        let mut q = vec![0u32; m + 1];
+        for j in (0..=m).rev() {
+            let num = ((un[j + n] as u64) << 32) | (un[j + n - 1] as u64);
+            let mut qhat = num / (vn[n - 1] as u64);
+            let mut rhat = num % (vn[n - 1] as u64);
+            // Correct the estimate so qhat is exact or 1 too high.
+            while qhat >= BASE
+                || qhat * (vn[n - 2] as u64) > (rhat << 32) | (un[j + n - 2] as u64)
+            {
+                qhat -= 1;
+                rhat += vn[n - 1] as u64;
+                if rhat >= BASE {
+                    break;
+                }
+            }
+            // Multiply and subtract: un[j..j+n] -= qhat * vn.
+            let mut k: i64 = 0; // borrow
+            for i in 0..n {
+                let p = qhat * (vn[i] as u64);
+                let t = (un[j + i] as i64) - k - ((p & 0xFFFF_FFFF) as i64);
+                un[j + i] = t as u32;
+                k = (p >> 32) as i64 - (t >> 32);
+            }
+            let t = (un[j + n] as i64) - k;
+            un[j + n] = t as u32;
+            if t < 0 {
+                // qhat was one too large — add the divisor back.
+                qhat -= 1;
+                let mut carry: u64 = 0;
+                for i in 0..n {
+                    let s = (un[j + i] as u64) + (vn[i] as u64) + carry;
+                    un[j + i] = s as u32;
+                    carry = s >> 32;
+                }
+                un[j + n] = (un[j + n] as u64 + carry) as u32;
+            }
+            q[j] = qhat as u32;
         }
         while q.last() == Some(&0) {
             q.pop();
         }
+        // Remainder = un[0..n] >> shift (denormalize).
+        let (mut r, _) = Self::shr_mag(&un[..n], shift);
         while r.last() == Some(&0) {
             r.pop();
         }
