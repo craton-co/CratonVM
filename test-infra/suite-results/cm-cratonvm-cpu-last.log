@@ -1,0 +1,1773 @@
+[INFO] Scanning for projects...
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Build Order:
+[INFO] 
+[INFO] Apache Commons Math                                                [pom]
+[INFO] Miscellaneous core classes                                         [jar]
+[INFO] Artificial neural networks                                         [jar]
+[INFO] Transforms                                                         [jar]
+[INFO] Exception classes (Legacy)                                         [jar]
+[INFO] Miscellaneous core classes (Legacy)                                [jar]
+[INFO] Apache Commons Math (Legacy)                                       [jar]
+[INFO] Apache Commons Math Documentation                                  [jar]
+[INFO] Example applications                                               [pom]
+[INFO] SOFM                                                               [pom]
+[INFO] SOFM: Chinese Rings                                                [jar]
+[INFO] SOFM: Traveling Salesman Problem                                   [jar]
+[INFO] K-Means                                                            [pom]
+[INFO] K-Means: Image Clustering                                          [jar]
+[INFO] 
+[INFO] --------------< org.apache.commons:commons-math4-parent >---------------
+[INFO] Building Apache Commons Math 4.0-SNAPSHOT                         [1/14]
+[INFO]   from pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ commons-math4-parent ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ commons-math4-parent ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ commons-math4-parent ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ commons-math4-parent ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited, you can override in pom.xml
+[INFO] No known issue in 20 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ commons-math4-parent ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ commons-math4-parent ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ commons-math4-parent ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ commons-math4-parent ---
+[WARNING] Ignoring project type pom - supportedProjectTypes = [jar, bundle]
+[INFO] 
+[INFO] --- jacoco:0.8.14:prepare-agent (prepare-agent) @ commons-math4-parent ---
+[INFO] argLine set to -javaagent:C:\\Users\\Victor\\.m2\\repository\\org\\jacoco\\org.jacoco.agent\\0.8.14\\org.jacoco.agent-0.8.14-runtime.jar=destfile=C:\\craton\\CratonVM\\apps\\_test-suites\\commons-math\\target\\jacoco.exec -XX:+EnableDynamicAgentLoading
+[INFO] 
+[INFO] ---------------< org.apache.commons:commons-math4-core >----------------
+[INFO] Building Miscellaneous core classes 4.0-SNAPSHOT                  [2/14]
+[INFO]   from commons-math-core\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ commons-math4-core ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ commons-math4-core ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ commons-math4-core ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ commons-math4-core ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 22 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ commons-math4-core ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ commons-math4-core ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ commons-math4-core ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- resources:3.4.0:resources (default-resources) @ commons-math4-core ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-core\src\main\resources
+[INFO] Copying 1 resource from . to target\classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ commons-math4-core ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ commons-math4-core ---
+[INFO] Writing manifest: C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-core\target\osgi\MANIFEST.MF
+[INFO] 
+[INFO] --- resources:3.4.0:testResources (default-testResources) @ commons-math4-core ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-core\src\test\resources
+[INFO] Copying 1 resource from . to target\test-classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ commons-math4-core ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- surefire:3.5.5:test (default-test) @ commons-math4-core ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running org.apache.commons.math4.core.jdkmath.JdkMathTest
+[WARNING] Tests run: 1, Failures: 0, Errors: 0, Skipped: 1, Time elapsed: 0.060 s -- in org.apache.commons.math4.core.jdkmath.JdkMathTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 1
+[INFO] 
+[INFO] 
+[INFO] -------------< org.apache.commons:commons-math4-neuralnet >-------------
+[INFO] Building Artificial neural networks 4.0-SNAPSHOT                  [3/14]
+[INFO]   from commons-math-neuralnet\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ commons-math4-neuralnet ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ commons-math4-neuralnet ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ commons-math4-neuralnet ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ commons-math4-neuralnet ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 23 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ commons-math4-neuralnet ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ commons-math4-neuralnet ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ commons-math4-neuralnet ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- resources:3.4.0:resources (default-resources) @ commons-math4-neuralnet ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-neuralnet\src\main\resources
+[INFO] Copying 1 resource from . to target\classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ commons-math4-neuralnet ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ commons-math4-neuralnet ---
+[INFO] Writing manifest: C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-neuralnet\target\osgi\MANIFEST.MF
+[INFO] 
+[INFO] --- resources:3.4.0:testResources (default-testResources) @ commons-math4-neuralnet ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-neuralnet\src\test\resources
+[INFO] Copying 1 resource from . to target\test-classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ commons-math4-neuralnet ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- jacoco:0.8.14:prepare-agent (prepare-agent) @ commons-math4-neuralnet ---
+[INFO] argLine set to -javaagent:C:\\Users\\Victor\\.m2\\repository\\org\\jacoco\\org.jacoco.agent\\0.8.14\\org.jacoco.agent-0.8.14-runtime.jar=destfile=C:\\craton\\CratonVM\\apps\\_test-suites\\commons-math\\commons-math-neuralnet\\target\\jacoco.exec -XX:+EnableDynamicAgentLoading
+[INFO] 
+[INFO] --- surefire:3.5.5:test (default-test) @ commons-math4-neuralnet ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running org.apache.commons.math4.neuralnet.MapRankingTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.273 s -- in org.apache.commons.math4.neuralnet.MapRankingTest
+[INFO] Running org.apache.commons.math4.neuralnet.NetworkTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.026 s -- in org.apache.commons.math4.neuralnet.NetworkTest
+[INFO] Running org.apache.commons.math4.neuralnet.NeuronTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.016 s -- in org.apache.commons.math4.neuralnet.NeuronTest
+[INFO] Running org.apache.commons.math4.neuralnet.oned.NeuronStringTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in org.apache.commons.math4.neuralnet.oned.NeuronStringTest
+[INFO] Running org.apache.commons.math4.neuralnet.sofm.KohonenUpdateActionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.025 s -- in org.apache.commons.math4.neuralnet.sofm.KohonenUpdateActionTest
+[INFO] Running org.apache.commons.math4.neuralnet.sofm.LearningFactorFunctionFactoryTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.032 s -- in org.apache.commons.math4.neuralnet.sofm.LearningFactorFunctionFactoryTest
+[INFO] Running org.apache.commons.math4.neuralnet.sofm.NeighbourhoodSizeFunctionFactoryTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.020 s -- in org.apache.commons.math4.neuralnet.sofm.NeighbourhoodSizeFunctionFactoryTest
+[INFO] Running org.apache.commons.math4.neuralnet.sofm.util.ExponentialDecayFunctionTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.neuralnet.sofm.util.ExponentialDecayFunctionTest
+[INFO] Running org.apache.commons.math4.neuralnet.sofm.util.QuasiSigmoidDecayFunctionTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in org.apache.commons.math4.neuralnet.sofm.util.QuasiSigmoidDecayFunctionTest
+[INFO] Running org.apache.commons.math4.neuralnet.twod.NeuronSquareMesh2DTest
+[INFO] Tests run: 19, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.043 s -- in org.apache.commons.math4.neuralnet.twod.NeuronSquareMesh2DTest
+[INFO] Running org.apache.commons.math4.neuralnet.twod.util.LocationFinderTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.neuralnet.twod.util.LocationFinderTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 66, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] 
+[INFO] -------------< org.apache.commons:commons-math4-transform >-------------
+[INFO] Building Transforms 4.0-SNAPSHOT                                  [4/14]
+[INFO]   from commons-math-transform\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ commons-math4-transform ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ commons-math4-transform ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ commons-math4-transform ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ commons-math4-transform ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 23 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ commons-math4-transform ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ commons-math4-transform ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ commons-math4-transform ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- resources:3.4.0:resources (default-resources) @ commons-math4-transform ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-transform\src\main\resources
+[INFO] Copying 1 resource from . to target\classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ commons-math4-transform ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ commons-math4-transform ---
+[INFO] Writing manifest: C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-transform\target\osgi\MANIFEST.MF
+[INFO] 
+[INFO] --- resources:3.4.0:testResources (default-testResources) @ commons-math4-transform ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-transform\src\test\resources
+[INFO] Copying 1 resource from . to target\test-classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ commons-math4-transform ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- jacoco:0.8.14:prepare-agent (prepare-agent) @ commons-math4-transform ---
+[INFO] argLine set to -javaagent:C:\\Users\\Victor\\.m2\\repository\\org\\jacoco\\org.jacoco.agent\\0.8.14\\org.jacoco.agent-0.8.14-runtime.jar=destfile=C:\\craton\\CratonVM\\apps\\_test-suites\\commons-math\\commons-math-transform\\target\\jacoco.exec -XX:+EnableDynamicAgentLoading
+[INFO] 
+[INFO] --- surefire:3.5.5:test (default-test) @ commons-math4-transform ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running org.apache.commons.math4.transform.FastCosineTransformerTest
+[ERROR] Tests run: 18, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.223 s <<< FAILURE! -- in org.apache.commons.math4.transform.FastCosineTransformerTest
+[ERROR] org.apache.commons.math4.transform.FastCosineTransformerTest.testTransformReal[0] -- Time elapsed: 0.013 s <<< FAILURE!
+java.lang.AssertionError: 3, 1 (1,00000e-15, 1,33603e-18) expected:<0.0013360252819122373> but was:<0.0013360252819122342>
+	at org.apache.commons.math4.transform.RealTransformerAbstractTest.doTestTransformReal(RealTransformerAbstractTest.java:304)
+	at org.apache.commons.math4.transform.RealTransformerAbstractTest.testTransformReal(RealTransformerAbstractTest.java:248)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+
+[INFO] Running org.apache.commons.math4.transform.FastFourierTransformerTest
+[INFO] Tests run: 10, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.069 s -- in org.apache.commons.math4.transform.FastFourierTransformerTest
+[INFO] Running org.apache.commons.math4.transform.FastHadamardTransformerTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.transform.FastHadamardTransformerTest
+[INFO] Running org.apache.commons.math4.transform.FastSineTransformerTest
+[ERROR] Tests run: 20, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.064 s <<< FAILURE! -- in org.apache.commons.math4.transform.FastSineTransformerTest
+[ERROR] org.apache.commons.math4.transform.FastSineTransformerTest.testTransformReal[0] -- Time elapsed: 0.002 s <<< FAILURE!
+java.lang.AssertionError: 8, 1 (1,00000e-14, 4,56027e-17) expected:<0.004560267034623956> but was:<0.004560267034624005>
+	at org.apache.commons.math4.transform.RealTransformerAbstractTest.doTestTransformReal(RealTransformerAbstractTest.java:304)
+	at org.apache.commons.math4.transform.RealTransformerAbstractTest.testTransformReal(RealTransformerAbstractTest.java:248)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+
+[INFO] Running org.apache.commons.math4.transform.TransformUtilsTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.transform.TransformUtilsTest
+[INFO] Running org.apache.commons.math4.transform.FastSineTransformerTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in org.apache.commons.math4.transform.FastSineTransformerTest
+[INFO] Running org.apache.commons.math4.transform.FastCosineTransformerTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.transform.FastCosineTransformerTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[WARNING] Flakes: 
+[WARNING] org.apache.commons.math4.transform.FastCosineTransformerTest.testTransformReal[0]
+[ERROR]   Run 1: FastCosineTransformerTest>RealTransformerAbstractTest.testTransformReal:248->RealTransformerAbstractTest.doTestTransformReal:304 3, 1 (1,00000e-15, 1,33603e-18) expected:<0.0013360252819122373> but was:<0.0013360252819122342>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.transform.FastSineTransformerTest.testTransformReal[0]
+[ERROR]   Run 1: FastSineTransformerTest>RealTransformerAbstractTest.testTransformReal:248->RealTransformerAbstractTest.doTestTransformReal:304 8, 1 (1,00000e-14, 4,56027e-17) expected:<0.004560267034623956> but was:<0.004560267034624005>
+[INFO]   Run 2: PASS
+[INFO] 
+[INFO] 
+[WARNING] Tests run: 56, Failures: 0, Errors: 0, Skipped: 0, Flakes: 2
+[INFO] 
+[INFO] 
+[INFO] ---------< org.apache.commons:commons-math4-legacy-exception >----------
+[INFO] Building Exception classes (Legacy) 4.0-SNAPSHOT                  [5/14]
+[INFO]   from commons-math-legacy-exception\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ commons-math4-legacy-exception ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ commons-math4-legacy-exception ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ commons-math4-legacy-exception ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ commons-math4-legacy-exception ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 23 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ commons-math4-legacy-exception ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ commons-math4-legacy-exception ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ commons-math4-legacy-exception ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- resources:3.4.0:resources (default-resources) @ commons-math4-legacy-exception ---
+[INFO] Copying 2 resources from src\main\resources to target\classes
+[INFO] Copying 1 resource from . to target\classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ commons-math4-legacy-exception ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ commons-math4-legacy-exception ---
+[WARNING] Manifest org.apache.commons:commons-math4-legacy-exception:jar:4.0-SNAPSHOT : Export org.apache.commons.math4.legacy.exception,  has 1,  private references [org.apache.commons.math4.legacy.exception.util]
+[INFO] Writing manifest: C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-legacy-exception\target\osgi\MANIFEST.MF
+[INFO] 
+[INFO] --- resources:3.4.0:testResources (default-testResources) @ commons-math4-legacy-exception ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-legacy-exception\src\test\resources
+[INFO] Copying 1 resource from . to target\test-classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ commons-math4-legacy-exception ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- jacoco:0.8.14:prepare-agent (prepare-agent) @ commons-math4-legacy-exception ---
+[INFO] argLine set to -javaagent:C:\\Users\\Victor\\.m2\\repository\\org\\jacoco\\org.jacoco.agent\\0.8.14\\org.jacoco.agent-0.8.14-runtime.jar=destfile=C:\\craton\\CratonVM\\apps\\_test-suites\\commons-math\\commons-math-legacy-exception\\target\\jacoco.exec -XX:+EnableDynamicAgentLoading
+[INFO] 
+[INFO] --- surefire:3.5.5:test (default-test) @ commons-math4-legacy-exception ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running org.apache.commons.math4.legacy.exception.DimensionMismatchExceptionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.081 s -- in org.apache.commons.math4.legacy.exception.DimensionMismatchExceptionTest
+[INFO] Running org.apache.commons.math4.legacy.exception.MaxCountExceededExceptionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in org.apache.commons.math4.legacy.exception.MaxCountExceededExceptionTest
+[INFO] Running org.apache.commons.math4.legacy.exception.NonMonotonicSequenceExceptionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.exception.NonMonotonicSequenceExceptionTest
+[INFO] Running org.apache.commons.math4.legacy.exception.NotFiniteNumberExceptionTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.exception.NotFiniteNumberExceptionTest
+[INFO] Running org.apache.commons.math4.legacy.exception.NotPositiveExceptionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in org.apache.commons.math4.legacy.exception.NotPositiveExceptionTest
+[INFO] Running org.apache.commons.math4.legacy.exception.NotStrictlyPositiveExceptionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in org.apache.commons.math4.legacy.exception.NotStrictlyPositiveExceptionTest
+[INFO] Running org.apache.commons.math4.legacy.exception.NullArgumentExceptionTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.exception.NullArgumentExceptionTest
+[INFO] Running org.apache.commons.math4.legacy.exception.NumberIsTooLargeExceptionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.exception.NumberIsTooLargeExceptionTest
+[INFO] Running org.apache.commons.math4.legacy.exception.NumberIsTooSmallExceptionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.exception.NumberIsTooSmallExceptionTest
+[INFO] Running org.apache.commons.math4.legacy.exception.OutOfRangeExceptionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.exception.OutOfRangeExceptionTest
+[INFO] Running org.apache.commons.math4.legacy.exception.TooManyEvaluationsExceptionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.038 s -- in org.apache.commons.math4.legacy.exception.TooManyEvaluationsExceptionTest
+[INFO] Running org.apache.commons.math4.legacy.exception.util.ArgUtilsTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.exception.util.ArgUtilsTest
+[INFO] Running org.apache.commons.math4.legacy.exception.util.ExceptionContextTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.066 s -- in org.apache.commons.math4.legacy.exception.util.ExceptionContextTest
+[INFO] Running org.apache.commons.math4.legacy.exception.util.LocalizedFormatsTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.052 s -- in org.apache.commons.math4.legacy.exception.util.LocalizedFormatsTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 25, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] 
+[INFO] ------------< org.apache.commons:commons-math4-legacy-core >------------
+[INFO] Building Miscellaneous core classes (Legacy) 4.0-SNAPSHOT         [6/14]
+[INFO]   from commons-math-legacy-core\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ commons-math4-legacy-core ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ commons-math4-legacy-core ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ commons-math4-legacy-core ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ commons-math4-legacy-core ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 23 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ commons-math4-legacy-core ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ commons-math4-legacy-core ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ commons-math4-legacy-core ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- resources:3.4.0:resources (default-resources) @ commons-math4-legacy-core ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-legacy-core\src\main\resources
+[INFO] Copying 1 resource from . to target\classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ commons-math4-legacy-core ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ commons-math4-legacy-core ---
+[INFO] Writing manifest: C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-legacy-core\target\osgi\MANIFEST.MF
+[INFO] 
+[INFO] --- resources:3.4.0:testResources (default-testResources) @ commons-math4-legacy-core ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-legacy-core\src\test\resources
+[INFO] Copying 1 resource from . to target\test-classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ commons-math4-legacy-core ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- jacoco:0.8.14:prepare-agent (prepare-agent) @ commons-math4-legacy-core ---
+[INFO] argLine set to -javaagent:C:\\Users\\Victor\\.m2\\repository\\org\\jacoco\\org.jacoco.agent\\0.8.14\\org.jacoco.agent-0.8.14-runtime.jar=destfile=C:\\craton\\CratonVM\\apps\\_test-suites\\commons-math\\commons-math-legacy-core\\target\\jacoco.exec -XX:+EnableDynamicAgentLoading
+[INFO] 
+[INFO] --- surefire:3.5.5:test (default-test) @ commons-math4-legacy-core ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+Cannot find AccurateMath method corresponding to: public static double java.lang.StrictMath.sqrt(double)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.multiplyExact(long,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.multiplyHigh(long,long)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.unsignedMultiplyHigh(long,long)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.negateExact(long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.negateExact(int)
+Cannot find AccurateMath method corresponding to: public static double java.lang.StrictMath.fma(double,double,double)
+Cannot find AccurateMath method corresponding to: public static float java.lang.StrictMath.fma(float,float,float)
+Cannot find AccurateMath method corresponding to: public static double java.lang.StrictMath.clamp(double,double,double)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.clamp(long,long,long)
+Cannot find AccurateMath method corresponding to: public static float java.lang.StrictMath.clamp(float,float,float)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.clamp(long,int,int)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.floorMod(long,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.floorDiv(long,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.ceilDiv(long,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.ceilDiv(long,long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.ceilDiv(int,int)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.ceilMod(int,int)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.ceilMod(long,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.ceilMod(long,long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.unsignedMultiplyExact(int,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.unsignedMultiplyExact(long,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.unsignedMultiplyExact(long,long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.divideExact(int,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.divideExact(long,long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.floorDivExact(int,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.floorDivExact(long,long)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.ceilDivExact(long,long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.ceilDivExact(int,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.multiplyFull(int,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.absExact(long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.absExact(int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.powExact(long,int)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.powExact(int,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.unsignedPowExact(long,int)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.unsignedPowExact(int,int)
+Cannot find AccurateMath method corresponding to: public static double java.lang.StrictMath.sqrt(double)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.multiplyExact(long,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.multiplyHigh(long,long)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.unsignedMultiplyHigh(long,long)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.negateExact(long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.negateExact(int)
+Cannot find AccurateMath method corresponding to: public static double java.lang.StrictMath.fma(double,double,double)
+Cannot find AccurateMath method corresponding to: public static float java.lang.StrictMath.fma(float,float,float)
+Cannot find AccurateMath method corresponding to: public static double java.lang.StrictMath.clamp(double,double,double)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.clamp(long,long,long)
+Cannot find AccurateMath method corresponding to: public static float java.lang.StrictMath.clamp(float,float,float)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.clamp(long,int,int)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.floorMod(long,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.floorDiv(long,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.ceilDiv(long,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.ceilDiv(long,long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.ceilDiv(int,int)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.ceilMod(int,int)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.ceilMod(long,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.ceilMod(long,long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.unsignedMultiplyExact(int,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.unsignedMultiplyExact(long,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.unsignedMultiplyExact(long,long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.divideExact(int,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.divideExact(long,long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.floorDivExact(int,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.floorDivExact(long,long)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.ceilDivExact(long,long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.ceilDivExact(int,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.multiplyFull(int,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.absExact(long)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.absExact(int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.powExact(long,int)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.powExact(int,int)
+Cannot find AccurateMath method corresponding to: public static long java.lang.StrictMath.unsignedPowExact(long,int)
+Cannot find AccurateMath method corresponding to: public static int java.lang.StrictMath.unsignedPowExact(int,int)
+[INFO] Running org.apache.commons.math4.legacy.core.dfp.DfpDecTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.259 s -- in org.apache.commons.math4.legacy.core.dfp.DfpDecTest
+[INFO] Running org.apache.commons.math4.legacy.core.dfp.DfpMathTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.021 s -- in org.apache.commons.math4.legacy.core.dfp.DfpMathTest
+[INFO] Running org.apache.commons.math4.legacy.core.dfp.DfpTest
+[INFO] Tests run: 78, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.212 s -- in org.apache.commons.math4.legacy.core.dfp.DfpTest
+[INFO] Running org.apache.commons.math4.legacy.core.IntegerSequenceTest
+[INFO] Tests run: 16, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.048 s -- in org.apache.commons.math4.legacy.core.IntegerSequenceTest
+[INFO] Running org.apache.commons.math4.legacy.core.jdkmath.AccurateMathStrictComparisonTest
+[INFO] Tests run: 69, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.125 s -- in org.apache.commons.math4.legacy.core.jdkmath.AccurateMathStrictComparisonTest
+[INFO] Running org.apache.commons.math4.legacy.core.jdkmath.AccurateMathTest
+[INFO] Tests run: 70, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 7.231 s -- in org.apache.commons.math4.legacy.core.jdkmath.AccurateMathTest
+[INFO] Running org.apache.commons.math4.legacy.core.MathArraysTest
+[INFO] Tests run: 44, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.033 s -- in org.apache.commons.math4.legacy.core.MathArraysTest
+[INFO] Running org.apache.commons.math4.legacy.core.PairTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.core.PairTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[INFO] Tests run: 288, Failures: 0, Errors: 0, Skipped: 0
+[INFO] 
+[INFO] 
+[INFO] --------------< org.apache.commons:commons-math4-legacy >---------------
+[INFO] Building Apache Commons Math (Legacy) 4.0-SNAPSHOT                [7/14]
+[INFO]   from commons-math-legacy\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ commons-math4-legacy ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ commons-math4-legacy ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ commons-math4-legacy ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ commons-math4-legacy ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 23 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ commons-math4-legacy ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ commons-math4-legacy ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ commons-math4-legacy ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- resources:3.4.0:resources (default-resources) @ commons-math4-legacy ---
+[INFO] Copying 1 resource from src\main\resources to target\classes
+[INFO] Copying 1 resource from . to target\classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ commons-math4-legacy ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ commons-math4-legacy ---
+[INFO] Writing manifest: C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-legacy\target\osgi\MANIFEST.MF
+[INFO] 
+[INFO] --- resources:3.4.0:testResources (default-testResources) @ commons-math4-legacy ---
+[INFO] Copying 20 resources from src\test\resources to target\test-classes
+[INFO] Copying 1 resource from . to target\test-classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ commons-math4-legacy ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- jacoco:0.8.14:prepare-agent (prepare-agent) @ commons-math4-legacy ---
+[INFO] argLine set to -javaagent:C:\\Users\\Victor\\.m2\\repository\\org\\jacoco\\org.jacoco.agent\\0.8.14\\org.jacoco.agent-0.8.14-runtime.jar=destfile=C:\\craton\\CratonVM\\apps\\_test-suites\\commons-math\\commons-math-legacy\\target\\jacoco.exec -XX:+EnableDynamicAgentLoading
+[INFO] 
+[INFO] --- surefire:3.5.5:test (default-test) @ commons-math4-legacy ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[INFO] 
+[INFO] -------------------------------------------------------
+[INFO]  T E S T S
+[INFO] -------------------------------------------------------
+[INFO] Running org.apache.commons.math4.legacy.analysis.differentiation.DerivativeStructureTest
+[INFO] Tests run: 124, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.123 s -- in org.apache.commons.math4.legacy.analysis.differentiation.DerivativeStructureTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.differentiation.DSCompilerTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.032 s -- in org.apache.commons.math4.legacy.analysis.differentiation.DSCompilerTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.differentiation.FiniteDifferencesDifferentiatorTest
+[INFO] Tests run: 15, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.072 s -- in org.apache.commons.math4.legacy.analysis.differentiation.FiniteDifferencesDifferentiatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.differentiation.GradientFunctionTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.078 s -- in org.apache.commons.math4.legacy.analysis.differentiation.GradientFunctionTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.differentiation.JacobianFunctionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.011 s -- in org.apache.commons.math4.legacy.analysis.differentiation.JacobianFunctionTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.differentiation.SparseGradientTest
+[INFO] Tests run: 120, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.368 s -- in org.apache.commons.math4.legacy.analysis.differentiation.SparseGradientTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.function.BivariateFunctionTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.analysis.function.BivariateFunctionTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.function.GaussianTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.legacy.analysis.function.GaussianTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.function.HarmonicOscillatorTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in org.apache.commons.math4.legacy.analysis.function.HarmonicOscillatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.function.LogisticTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.017 s -- in org.apache.commons.math4.legacy.analysis.function.LogisticTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.function.LogitTest
+[INFO] Tests run: 15, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.071 s -- in org.apache.commons.math4.legacy.analysis.function.LogitTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.function.SigmoidTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.analysis.function.SigmoidTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.function.SincTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.267 s -- in org.apache.commons.math4.legacy.analysis.function.SincTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.function.SqrtTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in org.apache.commons.math4.legacy.analysis.function.SqrtTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.function.StepFunctionTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in org.apache.commons.math4.legacy.analysis.function.StepFunctionTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.function.UnivariateDifferentiableFunctionTest
+[INFO] Tests run: 23, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.037 s -- in org.apache.commons.math4.legacy.analysis.function.UnivariateDifferentiableFunctionTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.function.UnivariateFunctionTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.010 s -- in org.apache.commons.math4.legacy.analysis.function.UnivariateFunctionTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.FunctionUtilsTest
+[INFO] Tests run: 15, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.248 s -- in org.apache.commons.math4.legacy.analysis.FunctionUtilsTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.gauss.BaseRuleFactoryTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.028 s -- in org.apache.commons.math4.legacy.analysis.integration.gauss.BaseRuleFactoryTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.gauss.GaussIntegratorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.analysis.integration.gauss.GaussIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.gauss.HermiteParametricTest
+[INFO] Tests run: 30, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.050 s -- in org.apache.commons.math4.legacy.analysis.integration.gauss.HermiteParametricTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.gauss.HermiteTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in org.apache.commons.math4.legacy.analysis.integration.gauss.HermiteTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.gauss.LaguerreTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.059 s -- in org.apache.commons.math4.legacy.analysis.integration.gauss.LaguerreTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreHighPrecisionParametricTest
+[INFO] Tests run: 30, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.846 s -- in org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreHighPrecisionParametricTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreHighPrecisionTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 3.482 s -- in org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreHighPrecisionTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreParametricTest
+[INFO] Tests run: 30, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.014 s -- in org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreParametricTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.018 s -- in org.apache.commons.math4.legacy.analysis.integration.gauss.LegendreTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.IterativeLegendreGaussIntegratorTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.021 s -- in org.apache.commons.math4.legacy.analysis.integration.IterativeLegendreGaussIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.MidPointIntegratorTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.analysis.integration.MidPointIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.RombergIntegratorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.analysis.integration.RombergIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.SimpsonIntegratorTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.analysis.integration.SimpsonIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.integration.TrapezoidIntegratorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.analysis.integration.TrapezoidIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.AkimaSplineInterpolatorTest
+[WARNING] Tests run: 6, Failures: 0, Errors: 0, Skipped: 1, Time elapsed: 0.018 s -- in org.apache.commons.math4.legacy.analysis.interpolation.AkimaSplineInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.BicubicInterpolatingFunctionTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.055 s -- in org.apache.commons.math4.legacy.analysis.interpolation.BicubicInterpolatingFunctionTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.BicubicInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.018 s -- in org.apache.commons.math4.legacy.analysis.interpolation.BicubicInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.ClampedSplineInterpolatorTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in org.apache.commons.math4.legacy.analysis.interpolation.ClampedSplineInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.DividedDifferenceInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.analysis.interpolation.DividedDifferenceInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.FieldHermiteInterpolatorTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.879 s -- in org.apache.commons.math4.legacy.analysis.interpolation.FieldHermiteInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.HermiteInterpolatorTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.030 s -- in org.apache.commons.math4.legacy.analysis.interpolation.HermiteInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.LinearInterpolatorTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.analysis.interpolation.LinearInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.LoessInterpolatorTest
+[INFO] Tests run: 22, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.023 s -- in org.apache.commons.math4.legacy.analysis.interpolation.LoessInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.MicrosphereProjectionInterpolatorTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.037 s -- in org.apache.commons.math4.legacy.analysis.interpolation.MicrosphereProjectionInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.NevilleInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in org.apache.commons.math4.legacy.analysis.interpolation.NevilleInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.PiecewiseBicubicSplineInterpolatingFunctionTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.013 s -- in org.apache.commons.math4.legacy.analysis.interpolation.PiecewiseBicubicSplineInterpolatingFunctionTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.PiecewiseBicubicSplineInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.026 s -- in org.apache.commons.math4.legacy.analysis.interpolation.PiecewiseBicubicSplineInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.SplineInterpolatorTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.analysis.interpolation.SplineInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.TricubicInterpolatingFunctionTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.236 s -- in org.apache.commons.math4.legacy.analysis.interpolation.TricubicInterpolatingFunctionTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.TricubicInterpolatorTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.011 s -- in org.apache.commons.math4.legacy.analysis.interpolation.TricubicInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest
+[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.022 s <<< FAILURE! -- in org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest
+[ERROR] org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest.testSine -- Time elapsed: 0.009 s <<< FAILURE!
+java.lang.AssertionError: Delta: 1e-7 expected:<-0.11689097439330373> but was:<-0.11689081779464591>
+	at org.junit.Assert.fail(Assert.java:89)
+	at org.junit.Assert.failNotEquals(Assert.java:835)
+	at org.junit.Assert.assertEquals(Assert.java:555)
+	at org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest.testSine(UnivariatePeriodicInterpolatorTest.java:78)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+
+[INFO] Running org.apache.commons.math4.legacy.analysis.polynomials.PolynomialFunctionLagrangeFormTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.analysis.polynomials.PolynomialFunctionLagrangeFormTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.polynomials.PolynomialFunctionNewtonFormTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.analysis.polynomials.PolynomialFunctionNewtonFormTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.polynomials.PolynomialFunctionTest
+[INFO] Tests run: 10, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.analysis.polynomials.PolynomialFunctionTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.polynomials.PolynomialSplineFunctionTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in org.apache.commons.math4.legacy.analysis.polynomials.PolynomialSplineFunctionTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.polynomials.PolynomialsUtilsTest
+[INFO] Tests run: 18, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.544 s -- in org.apache.commons.math4.legacy.analysis.polynomials.PolynomialsUtilsTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.BisectionSolverTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.analysis.solvers.BisectionSolverTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.BracketingNthOrderBrentSolverTest
+[INFO] Tests run: 15, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.021 s -- in org.apache.commons.math4.legacy.analysis.solvers.BracketingNthOrderBrentSolverTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.BrentSolverTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.013 s -- in org.apache.commons.math4.legacy.analysis.solvers.BrentSolverTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.FieldBracketingNthOrderBrentSolverTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.703 s -- in org.apache.commons.math4.legacy.analysis.solvers.FieldBracketingNthOrderBrentSolverTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.IllinoisSolverTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in org.apache.commons.math4.legacy.analysis.solvers.IllinoisSolverTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.LaguerreSolverTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in org.apache.commons.math4.legacy.analysis.solvers.LaguerreSolverTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.MullerSolver2Test
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.analysis.solvers.MullerSolver2Test
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.MullerSolverTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.analysis.solvers.MullerSolverTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.NewtonRaphsonSolverTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.analysis.solvers.NewtonRaphsonSolverTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.PegasusSolverTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.analysis.solvers.PegasusSolverTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.RegulaFalsiSolverTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.analysis.solvers.RegulaFalsiSolverTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.RiddersSolverTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.analysis.solvers.RiddersSolverTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.SecantSolverTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.analysis.solvers.SecantSolverTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.solvers.UnivariateSolverUtilsTest
+[INFO] Tests run: 22, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in org.apache.commons.math4.legacy.analysis.solvers.UnivariateSolverUtilsTest
+[INFO] Running org.apache.commons.math4.legacy.distribution.AbstractIntegerDistributionTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.distribution.AbstractIntegerDistributionTest
+[INFO] Running org.apache.commons.math4.legacy.distribution.EmpiricalDistributionTest
+[INFO] Tests run: 23, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.449 s -- in org.apache.commons.math4.legacy.distribution.EmpiricalDistributionTest
+[INFO] Running org.apache.commons.math4.legacy.distribution.EnumeratedIntegerDistributionTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.047 s -- in org.apache.commons.math4.legacy.distribution.EnumeratedIntegerDistributionTest
+[INFO] Running org.apache.commons.math4.legacy.distribution.EnumeratedRealDistributionTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.040 s -- in org.apache.commons.math4.legacy.distribution.EnumeratedRealDistributionTest
+[INFO] Running org.apache.commons.math4.legacy.distribution.fitting.MultivariateNormalMixtureExpectationMaximizationTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.071 s -- in org.apache.commons.math4.legacy.distribution.fitting.MultivariateNormalMixtureExpectationMaximizationTest
+[INFO] Running org.apache.commons.math4.legacy.distribution.MixtureMultivariateNormalDistributionTest
+[WARNING] Tests run: 5, Failures: 0, Errors: 0, Skipped: 1, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.distribution.MixtureMultivariateNormalDistributionTest
+[INFO] Running org.apache.commons.math4.legacy.distribution.MultivariateNormalDistributionTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.224 s -- in org.apache.commons.math4.legacy.distribution.MultivariateNormalDistributionTest
+[INFO] Running org.apache.commons.math4.legacy.field.linalg.FieldLUDecompositionTest
+[INFO] Tests run: 13, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.022 s -- in org.apache.commons.math4.legacy.field.linalg.FieldLUDecompositionTest
+[INFO] Running org.apache.commons.math4.legacy.field.linalg.FP64FieldDenseMatrixTest
+[INFO] Tests run: 15, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.legacy.field.linalg.FP64FieldDenseMatrixTest
+[INFO] Running org.apache.commons.math4.legacy.filter.KalmanFilterTest
+[ERROR] Tests run: 5, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.019 s <<< FAILURE! -- in org.apache.commons.math4.legacy.filter.KalmanFilterTest
+[ERROR] org.apache.commons.math4.legacy.filter.KalmanFilterTest.testCannonball -- Time elapsed: 0.013 s <<< FAILURE!
+java.lang.AssertionError
+	at org.junit.Assert.fail(Assert.java:87)
+	at org.junit.Assert.assertTrue(Assert.java:42)
+	at org.junit.Assert.assertTrue(Assert.java:53)
+	at org.apache.commons.math4.legacy.filter.KalmanFilterTest.testCannonball(KalmanFilterTest.java:413)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+
+[INFO] Running org.apache.commons.math4.legacy.fitting.GaussianCurveFitterTest
+[INFO] Tests run: 13, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.093 s -- in org.apache.commons.math4.legacy.fitting.GaussianCurveFitterTest
+[INFO] Running org.apache.commons.math4.legacy.fitting.HarmonicCurveFitterTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.013 s -- in org.apache.commons.math4.legacy.fitting.HarmonicCurveFitterTest
+[INFO] Running org.apache.commons.math4.legacy.fitting.leastsquares.DifferentiatorVectorMultivariateJacobianFunctionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.067 s -- in org.apache.commons.math4.legacy.fitting.leastsquares.DifferentiatorVectorMultivariateJacobianFunctionTest
+[INFO] Running org.apache.commons.math4.legacy.fitting.leastsquares.EvaluationRmsCheckerTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.fitting.leastsquares.EvaluationRmsCheckerTest
+[INFO] Running org.apache.commons.math4.legacy.fitting.leastsquares.EvaluationTest
+[INFO] Tests run: 10, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.048 s -- in org.apache.commons.math4.legacy.fitting.leastsquares.EvaluationTest
+[INFO] Running org.apache.commons.math4.legacy.fitting.leastsquares.GaussNewtonOptimizerWithCholeskyTest
+[INFO] Tests run: 21, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.078 s -- in org.apache.commons.math4.legacy.fitting.leastsquares.GaussNewtonOptimizerWithCholeskyTest
+[INFO] Running org.apache.commons.math4.legacy.fitting.leastsquares.GaussNewtonOptimizerWithLUTest
+[INFO] Tests run: 21, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.031 s -- in org.apache.commons.math4.legacy.fitting.leastsquares.GaussNewtonOptimizerWithLUTest
+[INFO] Running org.apache.commons.math4.legacy.fitting.leastsquares.GaussNewtonOptimizerWithQRTest
+[INFO] Tests run: 21, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.027 s -- in org.apache.commons.math4.legacy.fitting.leastsquares.GaussNewtonOptimizerWithQRTest
+[INFO] Running org.apache.commons.math4.legacy.fitting.leastsquares.GaussNewtonOptimizerWithSVDTest
+[INFO] Tests run: 21, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.136 s -- in org.apache.commons.math4.legacy.fitting.leastsquares.GaussNewtonOptimizerWithSVDTest
+[INFO] Running org.apache.commons.math4.legacy.fitting.leastsquares.LevenbergMarquardtOptimizerTest
+[ERROR] Tests run: 25, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.074 s <<< FAILURE! -- in org.apache.commons.math4.legacy.fitting.leastsquares.LevenbergMarquardtOptimizerTest
+[ERROR] org.apache.commons.math4.legacy.fitting.leastsquares.LevenbergMarquardtOptimizerTest.testCircleFitting2 -- Time elapsed: 0.013 s <<< FAILURE!
+java.lang.AssertionError: Delta=9.555272030377143 expected:<654.321> but was:<642.3239574074405>
+	at org.junit.Assert.fail(Assert.java:89)
+	at org.junit.Assert.failNotEquals(Assert.java:835)
+	at org.junit.Assert.assertEquals(Assert.java:555)
+	at org.apache.commons.math4.legacy.fitting.leastsquares.LevenbergMarquardtOptimizerTest.testCircleFitting2(LevenbergMarquardtOptimizerTest.java:272)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+
+[INFO] Running org.apache.commons.math4.legacy.fitting.leastsquares.MinpackTest
+[INFO] Tests run: 18, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.112 s -- in org.apache.commons.math4.legacy.fitting.leastsquares.MinpackTest
+[INFO] Running org.apache.commons.math4.legacy.fitting.PolynomialCurveFitterTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.848 s -- in org.apache.commons.math4.legacy.fitting.PolynomialCurveFitterTest
+[INFO] Running org.apache.commons.math4.legacy.fitting.SimpleCurveFitterTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.fitting.SimpleCurveFitterTest
+[INFO] Running org.apache.commons.math4.legacy.fitting.WeightedObservedPointsTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.fitting.WeightedObservedPointsTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.BinaryChromosomeTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in org.apache.commons.math4.legacy.genetics.BinaryChromosomeTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.BinaryMutationTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.genetics.BinaryMutationTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.ChromosomeTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in org.apache.commons.math4.legacy.genetics.ChromosomeTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.CycleCrossoverTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.legacy.genetics.CycleCrossoverTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.ElitisticListPopulationTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.genetics.ElitisticListPopulationTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.FitnessCachingTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.017 s -- in org.apache.commons.math4.legacy.genetics.FitnessCachingTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.FixedElapsedTimeTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 3.005 s -- in org.apache.commons.math4.legacy.genetics.FixedElapsedTimeTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.FixedGenerationCountTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.genetics.FixedGenerationCountTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.ListPopulationTest
+[INFO] Tests run: 10, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.012 s -- in org.apache.commons.math4.legacy.genetics.ListPopulationTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.NPointCrossoverTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.genetics.NPointCrossoverTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.OnePointCrossoverTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s -- in org.apache.commons.math4.legacy.genetics.OnePointCrossoverTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.OrderedCrossoverTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.genetics.OrderedCrossoverTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.RandomKeyMutationTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.genetics.RandomKeyMutationTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.RandomKeyTest
+[INFO] Tests run: 10, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in org.apache.commons.math4.legacy.genetics.RandomKeyTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.TournamentSelectionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.genetics.TournamentSelectionTest
+[INFO] Running org.apache.commons.math4.legacy.genetics.UniformCrossoverTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.081 s -- in org.apache.commons.math4.legacy.genetics.UniformCrossoverTest
+[INFO] Running org.apache.commons.math4.legacy.linear.Array2DRowRealMatrixTest
+[INFO] Tests run: 39, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.039 s -- in org.apache.commons.math4.legacy.linear.Array2DRowRealMatrixTest
+[INFO] Running org.apache.commons.math4.legacy.linear.ArrayFieldVectorTest
+[INFO] Tests run: 20, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.034 s -- in org.apache.commons.math4.legacy.linear.ArrayFieldVectorTest
+[INFO] Running org.apache.commons.math4.legacy.linear.ArrayRealVectorTest
+[INFO] Tests run: 108, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.120 s -- in org.apache.commons.math4.legacy.linear.ArrayRealVectorTest
+[INFO] Running org.apache.commons.math4.legacy.linear.BiDiagonalTransformerTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in org.apache.commons.math4.legacy.linear.BiDiagonalTransformerTest
+[INFO] Running org.apache.commons.math4.legacy.linear.BigRealFieldTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.linear.BigRealFieldTest
+[INFO] Running org.apache.commons.math4.legacy.linear.BigRealTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.016 s -- in org.apache.commons.math4.legacy.linear.BigRealTest
+[INFO] Running org.apache.commons.math4.legacy.linear.BlockFieldMatrixTest
+[INFO] Tests run: 46, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 3.851 s -- in org.apache.commons.math4.legacy.linear.BlockFieldMatrixTest
+[INFO] Running org.apache.commons.math4.legacy.linear.BlockRealMatrixTest
+[INFO] Tests run: 48, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.127 s -- in org.apache.commons.math4.legacy.linear.BlockRealMatrixTest
+[INFO] Running org.apache.commons.math4.legacy.linear.CholeskyDecompositionTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.linear.CholeskyDecompositionTest
+[INFO] Running org.apache.commons.math4.legacy.linear.CholeskySolverTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.linear.CholeskySolverTest
+[INFO] Running org.apache.commons.math4.legacy.linear.ConjugateGradientTest
+[INFO] Tests run: 17, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.087 s -- in org.apache.commons.math4.legacy.linear.ConjugateGradientTest
+[INFO] Running org.apache.commons.math4.legacy.linear.DiagonalMatrixTest
+[INFO] Tests run: 29, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.legacy.linear.DiagonalMatrixTest
+[INFO] Running org.apache.commons.math4.legacy.linear.EigenDecompositionTest
+[WARNING] Tests run: 30, Failures: 0, Errors: 0, Skipped: 2, Time elapsed: 0.228 s -- in org.apache.commons.math4.legacy.linear.EigenDecompositionTest
+[INFO] Running org.apache.commons.math4.legacy.linear.EigenSolverTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.linear.EigenSolverTest
+[INFO] Running org.apache.commons.math4.legacy.linear.FieldLUDecompositionTest
+[INFO] Tests run: 10, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.014 s -- in org.apache.commons.math4.legacy.linear.FieldLUDecompositionTest
+[INFO] Running org.apache.commons.math4.legacy.linear.FieldLUSolverTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.linear.FieldLUSolverTest
+[INFO] Running org.apache.commons.math4.legacy.linear.FieldMatrixImplTest
+[INFO] Tests run: 37, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 1.281 s -- in org.apache.commons.math4.legacy.linear.FieldMatrixImplTest
+[INFO] Running org.apache.commons.math4.legacy.linear.FrenchRealVectorFormatTest
+[INFO] Tests run: 30, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.017 s -- in org.apache.commons.math4.legacy.linear.FrenchRealVectorFormatTest
+[INFO] Running org.apache.commons.math4.legacy.linear.HessenbergTransformerTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.032 s -- in org.apache.commons.math4.legacy.linear.HessenbergTransformerTest
+[INFO] Running org.apache.commons.math4.legacy.linear.LUDecompositionTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.linear.LUDecompositionTest
+[INFO] Running org.apache.commons.math4.legacy.linear.LUSolverTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.linear.LUSolverTest
+[INFO] Running org.apache.commons.math4.legacy.linear.MatrixDimensionMismatchExceptionTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s -- in org.apache.commons.math4.legacy.linear.MatrixDimensionMismatchExceptionTest
+[INFO] Running org.apache.commons.math4.legacy.linear.MatrixUtilsTest
+[INFO] Tests run: 22, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.020 s -- in org.apache.commons.math4.legacy.linear.MatrixUtilsTest
+[INFO] Running org.apache.commons.math4.legacy.linear.OpenIntToDoubleHashMapTest
+[INFO] Tests run: 17, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.050 s -- in org.apache.commons.math4.legacy.linear.OpenIntToDoubleHashMapTest
+[INFO] Running org.apache.commons.math4.legacy.linear.OpenIntToFieldTest
+[INFO] Tests run: 17, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.039 s -- in org.apache.commons.math4.legacy.linear.OpenIntToFieldTest
+[INFO] Running org.apache.commons.math4.legacy.linear.OpenMapRealMatrixTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.linear.OpenMapRealMatrixTest
+[INFO] Running org.apache.commons.math4.legacy.linear.QRDecompositionTest
+[INFO] Tests run: 10, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.038 s -- in org.apache.commons.math4.legacy.linear.QRDecompositionTest
+[INFO] Running org.apache.commons.math4.legacy.linear.QRSolverTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.031 s -- in org.apache.commons.math4.legacy.linear.QRSolverTest
+[INFO] Running org.apache.commons.math4.legacy.linear.RealMatrixFormatTest
+[WARNING] Tests run: 29, Failures: 0, Errors: 0, Skipped: 1, Time elapsed: 0.006 s -- in org.apache.commons.math4.legacy.linear.RealMatrixFormatTest
+[INFO] Running org.apache.commons.math4.legacy.linear.RealVectorFormatTest
+[INFO] Tests run: 30, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.linear.RealVectorFormatTest
+[INFO] Running org.apache.commons.math4.legacy.linear.RealVectorTest
+[WARNING] Tests run: 106, Failures: 0, Errors: 0, Skipped: 24, Time elapsed: 0.075 s -- in org.apache.commons.math4.legacy.linear.RealVectorTest
+[INFO] Running org.apache.commons.math4.legacy.linear.RectangularCholeskyDecompositionTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.linear.RectangularCholeskyDecompositionTest
+[INFO] Running org.apache.commons.math4.legacy.linear.RRQRDecompositionTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.049 s -- in org.apache.commons.math4.legacy.linear.RRQRDecompositionTest
+[INFO] Running org.apache.commons.math4.legacy.linear.RRQRSolverTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.016 s -- in org.apache.commons.math4.legacy.linear.RRQRSolverTest
+[INFO] Running org.apache.commons.math4.legacy.linear.SchurTransformerTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.044 s -- in org.apache.commons.math4.legacy.linear.SchurTransformerTest
+[INFO] Running org.apache.commons.math4.legacy.linear.SingularValueDecompositionTest
+[INFO] Tests run: 13, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.423 s -- in org.apache.commons.math4.legacy.linear.SingularValueDecompositionTest
+[INFO] Running org.apache.commons.math4.legacy.linear.SingularValueSolverTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.linear.SingularValueSolverTest
+[INFO] Running org.apache.commons.math4.legacy.linear.SparseFieldMatrixTest
+[INFO] Tests run: 24, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.015 s -- in org.apache.commons.math4.legacy.linear.SparseFieldMatrixTest
+[INFO] Running org.apache.commons.math4.legacy.linear.SparseFieldVectorTest
+[INFO] Tests run: 17, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.027 s -- in org.apache.commons.math4.legacy.linear.SparseFieldVectorTest
+[INFO] Running org.apache.commons.math4.legacy.linear.SparseRealMatrixTest
+[INFO] Tests run: 27, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in org.apache.commons.math4.legacy.linear.SparseRealMatrixTest
+[INFO] Running org.apache.commons.math4.legacy.linear.SparseRealVectorTest
+[INFO] Tests run: 106, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.077 s -- in org.apache.commons.math4.legacy.linear.SparseRealVectorTest
+[INFO] Running org.apache.commons.math4.legacy.linear.SymmLQTest
+[INFO] Tests run: 36, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.087 s -- in org.apache.commons.math4.legacy.linear.SymmLQTest
+[INFO] Running org.apache.commons.math4.legacy.linear.TriDiagonalTransformerTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.linear.TriDiagonalTransformerTest
+[INFO] Running org.apache.commons.math4.legacy.linear.UnmodifiableArrayRealVectorTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.026 s -- in org.apache.commons.math4.legacy.linear.UnmodifiableArrayRealVectorTest
+[INFO] Running org.apache.commons.math4.legacy.linear.UnmodifiableOpenMapRealVectorTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.055 s -- in org.apache.commons.math4.legacy.linear.UnmodifiableOpenMapRealVectorTest
+[INFO] Running org.apache.commons.math4.legacy.ml.clustering.DBSCANClustererTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.013 s -- in org.apache.commons.math4.legacy.ml.clustering.DBSCANClustererTest
+[INFO] Running org.apache.commons.math4.legacy.ml.clustering.ElkanKMeansPlusPlusClustererTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.019 s -- in org.apache.commons.math4.legacy.ml.clustering.ElkanKMeansPlusPlusClustererTest
+[INFO] Running org.apache.commons.math4.legacy.ml.clustering.evaluation.CalinskiHarabaszTest
+[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.031 s <<< FAILURE! -- in org.apache.commons.math4.legacy.ml.clustering.evaluation.CalinskiHarabaszTest
+[ERROR] org.apache.commons.math4.legacy.ml.clustering.evaluation.CalinskiHarabaszTest.test_compare_to_skLearn -- Time elapsed: 0.006 s <<< FAILURE!
+java.lang.AssertionError: expected:<1.0> but was:<0.935605657114974>
+	at org.junit.Assert.fail(Assert.java:89)
+	at org.junit.Assert.failNotEquals(Assert.java:835)
+	at org.junit.Assert.assertEquals(Assert.java:555)
+	at org.junit.Assert.assertEquals(Assert.java:685)
+	at org.apache.commons.math4.legacy.ml.clustering.evaluation.CalinskiHarabaszTest.test_compare_to_skLearn(CalinskiHarabaszTest.java:103)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+
+[INFO] Running org.apache.commons.math4.legacy.ml.clustering.evaluation.SumOfClusterVariancesTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.ml.clustering.evaluation.SumOfClusterVariancesTest
+[INFO] Running org.apache.commons.math4.legacy.ml.clustering.FuzzyKMeansClustererTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.011 s -- in org.apache.commons.math4.legacy.ml.clustering.FuzzyKMeansClustererTest
+[INFO] Running org.apache.commons.math4.legacy.ml.clustering.KMeansPlusPlusClustererTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.032 s -- in org.apache.commons.math4.legacy.ml.clustering.KMeansPlusPlusClustererTest
+[INFO] Running org.apache.commons.math4.legacy.ml.clustering.MiniBatchKMeansClustererTest
+[ERROR] Tests run: 2, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.230 s <<< FAILURE! -- in org.apache.commons.math4.legacy.ml.clustering.MiniBatchKMeansClustererTest
+[ERROR] org.apache.commons.math4.legacy.ml.clustering.MiniBatchKMeansClustererTest.testCompareToKMeans -- Time elapsed: 0.228 s <<< FAILURE!
+java.lang.AssertionError: Different score ratio 52,445703%!, diff points ratio: 45,094340%
+	at org.junit.Assert.fail(Assert.java:89)
+	at org.junit.Assert.assertTrue(Assert.java:42)
+	at org.apache.commons.math4.legacy.ml.clustering.MiniBatchKMeansClustererTest.testCompareToKMeans(MiniBatchKMeansClustererTest.java:87)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+
+[INFO] Running org.apache.commons.math4.legacy.ml.clustering.MultiKMeansPlusPlusClustererTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.ml.clustering.MultiKMeansPlusPlusClustererTest
+[INFO] Running org.apache.commons.math4.legacy.ml.distance.CanberraDistanceTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s -- in org.apache.commons.math4.legacy.ml.distance.CanberraDistanceTest
+[INFO] Running org.apache.commons.math4.legacy.ml.distance.ChebyshevDistanceTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.ml.distance.ChebyshevDistanceTest
+[INFO] Running org.apache.commons.math4.legacy.ml.distance.EarthMoversDistanceTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.ml.distance.EarthMoversDistanceTest
+[INFO] Running org.apache.commons.math4.legacy.ml.distance.EuclideanDistanceTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s -- in org.apache.commons.math4.legacy.ml.distance.EuclideanDistanceTest
+[INFO] Running org.apache.commons.math4.legacy.ml.distance.ManhattanDistanceTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.ml.distance.ManhattanDistanceTest
+[INFO] Running org.apache.commons.math4.legacy.ode.ContinuousOutputFieldModelTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.096 s -- in org.apache.commons.math4.legacy.ode.ContinuousOutputFieldModelTest
+[INFO] Running org.apache.commons.math4.legacy.ode.ContinuousOutputModelTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.041 s -- in org.apache.commons.math4.legacy.ode.ContinuousOutputModelTest
+[INFO] Running org.apache.commons.math4.legacy.ode.events.CloseEventsTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.legacy.ode.events.CloseEventsTest
+[INFO] Running org.apache.commons.math4.legacy.ode.events.EventFilterTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.063 s -- in org.apache.commons.math4.legacy.ode.events.EventFilterTest
+[INFO] Running org.apache.commons.math4.legacy.ode.events.EventStateTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.014 s -- in org.apache.commons.math4.legacy.ode.events.EventStateTest
+[INFO] Running org.apache.commons.math4.legacy.ode.events.OverlappingEventsTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.ode.events.OverlappingEventsTest
+[INFO] Running org.apache.commons.math4.legacy.ode.events.ReappearingEventTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in org.apache.commons.math4.legacy.ode.events.ReappearingEventTest
+[INFO] Running org.apache.commons.math4.legacy.ode.FieldExpandableODETest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.ode.FieldExpandableODETest
+[INFO] Running org.apache.commons.math4.legacy.ode.FirstOrderConverterTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.027 s -- in org.apache.commons.math4.legacy.ode.FirstOrderConverterTest
+[INFO] Running org.apache.commons.math4.legacy.ode.JacobianMatricesTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.435 s -- in org.apache.commons.math4.legacy.ode.JacobianMatricesTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.AdamsBashforthFieldIntegratorTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.155 s -- in org.apache.commons.math4.legacy.ode.nonstiff.AdamsBashforthFieldIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.AdamsBashforthIntegratorTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.065 s -- in org.apache.commons.math4.legacy.ode.nonstiff.AdamsBashforthIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.AdamsMoultonFieldIntegratorTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.134 s -- in org.apache.commons.math4.legacy.ode.nonstiff.AdamsMoultonFieldIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.AdamsMoultonIntegratorTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.068 s -- in org.apache.commons.math4.legacy.ode.nonstiff.AdamsMoultonIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.AdamsNordsieckTransformerTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.ode.nonstiff.AdamsNordsieckTransformerTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.ClassicalRungeKuttaFieldIntegratorTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.488 s -- in org.apache.commons.math4.legacy.ode.nonstiff.ClassicalRungeKuttaFieldIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.ClassicalRungeKuttaIntegratorTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.066 s -- in org.apache.commons.math4.legacy.ode.nonstiff.ClassicalRungeKuttaIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.ClassicalRungeKuttaStepInterpolatorTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.049 s -- in org.apache.commons.math4.legacy.ode.nonstiff.ClassicalRungeKuttaStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.ClassicalRungKuttaFieldStepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.ode.nonstiff.ClassicalRungKuttaFieldStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.Decimal64Test
+[INFO] Tests run: 64, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.020 s -- in org.apache.commons.math4.legacy.ode.nonstiff.Decimal64Test
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince54FieldIntegratorTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.120 s -- in org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince54FieldIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince54FieldStepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince54FieldStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince54IntegratorTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.024 s -- in org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince54IntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince54StepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.018 s -- in org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince54StepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince853FieldIntegratorTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.073 s -- in org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince853FieldIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince853FieldStepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince853FieldStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince853IntegratorTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.029 s -- in org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince853IntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince853StepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.015 s -- in org.apache.commons.math4.legacy.ode.nonstiff.DormandPrince853StepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.EulerFieldIntegratorTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.207 s -- in org.apache.commons.math4.legacy.ode.nonstiff.EulerFieldIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.EulerFieldStepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.ode.nonstiff.EulerFieldStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.EulerIntegratorTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.025 s -- in org.apache.commons.math4.legacy.ode.nonstiff.EulerIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.EulerStepInterpolatorTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.013 s -- in org.apache.commons.math4.legacy.ode.nonstiff.EulerStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.GillFieldIntegratorTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.301 s -- in org.apache.commons.math4.legacy.ode.nonstiff.GillFieldIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.GillFieldStepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.ode.nonstiff.GillFieldStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.GillIntegratorTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.052 s -- in org.apache.commons.math4.legacy.ode.nonstiff.GillIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.GillStepInterpolatorTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.029 s -- in org.apache.commons.math4.legacy.ode.nonstiff.GillStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.GraggBulirschStoerIntegratorTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.130 s -- in org.apache.commons.math4.legacy.ode.nonstiff.GraggBulirschStoerIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.GraggBulirschStoerStepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.016 s -- in org.apache.commons.math4.legacy.ode.nonstiff.GraggBulirschStoerStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.HighamHall54FieldIntegratorTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.084 s -- in org.apache.commons.math4.legacy.ode.nonstiff.HighamHall54FieldIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.HighamHall54FieldStepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.ode.nonstiff.HighamHall54FieldStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.HighamHall54IntegratorTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.031 s -- in org.apache.commons.math4.legacy.ode.nonstiff.HighamHall54IntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.HighamHall54StepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.017 s -- in org.apache.commons.math4.legacy.ode.nonstiff.HighamHall54StepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.LutherFieldIntegratorTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.798 s -- in org.apache.commons.math4.legacy.ode.nonstiff.LutherFieldIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.LutherFieldStepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.ode.nonstiff.LutherFieldStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.LutherIntegratorTest
+[INFO] Tests run: 9, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.079 s -- in org.apache.commons.math4.legacy.ode.nonstiff.LutherIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.LutherStepInterpolatorTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.015 s -- in org.apache.commons.math4.legacy.ode.nonstiff.LutherStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.MidpointFieldIntegratorTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.162 s -- in org.apache.commons.math4.legacy.ode.nonstiff.MidpointFieldIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.MidpointFieldStepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.ode.nonstiff.MidpointFieldStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.MidpointIntegratorTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.043 s -- in org.apache.commons.math4.legacy.ode.nonstiff.MidpointIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.MidpointStepInterpolatorTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.legacy.ode.nonstiff.MidpointStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.ThreeEighthesFieldIntegratorTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.171 s -- in org.apache.commons.math4.legacy.ode.nonstiff.ThreeEighthesFieldIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.ThreeEighthesFieldStepInterpolatorTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.ode.nonstiff.ThreeEighthesFieldStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.ThreeEighthesIntegratorTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.030 s -- in org.apache.commons.math4.legacy.ode.nonstiff.ThreeEighthesIntegratorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.nonstiff.ThreeEighthesStepInterpolatorTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.018 s -- in org.apache.commons.math4.legacy.ode.nonstiff.ThreeEighthesStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.sampling.DummyStepInterpolatorTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.ode.sampling.DummyStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.sampling.NordsieckStepInterpolatorTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.036 s -- in org.apache.commons.math4.legacy.ode.sampling.NordsieckStepInterpolatorTest
+[INFO] Running org.apache.commons.math4.legacy.ode.sampling.StepNormalizerOutputOverlapTest
+[INFO] Tests run: 16, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.014 s -- in org.apache.commons.math4.legacy.ode.sampling.StepNormalizerOutputOverlapTest
+[INFO] Running org.apache.commons.math4.legacy.ode.sampling.StepNormalizerOutputTest
+[INFO] Tests run: 16, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.legacy.ode.sampling.StepNormalizerOutputTest
+[INFO] Running org.apache.commons.math4.legacy.ode.sampling.StepNormalizerTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in org.apache.commons.math4.legacy.ode.sampling.StepNormalizerTest
+[INFO] Running org.apache.commons.math4.legacy.optim.BaseOptimizerTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in org.apache.commons.math4.legacy.optim.BaseOptimizerTest
+[INFO] Running org.apache.commons.math4.legacy.optim.linear.SimplexSolverTest
+[INFO] Tests run: 32, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.117 s -- in org.apache.commons.math4.legacy.optim.linear.SimplexSolverTest
+[INFO] Running org.apache.commons.math4.legacy.optim.linear.SimplexTableauTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.optim.linear.SimplexTableauTest
+[INFO] Running org.apache.commons.math4.legacy.optim.nonlinear.scalar.gradient.NonLinearConjugateGradientOptimizerTest
+[INFO] Tests run: 13, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.036 s -- in org.apache.commons.math4.legacy.optim.nonlinear.scalar.gradient.NonLinearConjugateGradientOptimizerTest
+[INFO] Running org.apache.commons.math4.legacy.optim.nonlinear.scalar.MultiStartMultivariateOptimizerTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.031 s -- in org.apache.commons.math4.legacy.optim.nonlinear.scalar.MultiStartMultivariateOptimizerTest
+[INFO] Running org.apache.commons.math4.legacy.optim.nonlinear.scalar.MultivariateFunctionMappingAdapterTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.015 s -- in org.apache.commons.math4.legacy.optim.nonlinear.scalar.MultivariateFunctionMappingAdapterTest
+[INFO] Running org.apache.commons.math4.legacy.optim.nonlinear.scalar.MultivariateFunctionPenaltyAdapterTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.010 s -- in org.apache.commons.math4.legacy.optim.nonlinear.scalar.MultivariateFunctionPenaltyAdapterTest
+[INFO] Running org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.BOBYQAOptimizerTest
+[WARNING] Tests run: 18, Failures: 0, Errors: 0, Skipped: 1, Time elapsed: 9.758 s -- in org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.BOBYQAOptimizerTest
+[INFO] Running org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest
+[ERROR] Tests run: 24, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 3.009 s <<< FAILURE! -- in org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest
+[ERROR] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest.testDiagonalRosen -- Time elapsed: 0.504 s <<< FAILURE!
+java.lang.AssertionError: Delta: 1.0E-10 expected:<0.0> but was:<5.76303892876155E-10>
+	at org.junit.Assert.fail(Assert.java:89)
+	at org.junit.Assert.failNotEquals(Assert.java:835)
+	at org.junit.Assert.assertEquals(Assert.java:555)
+	at org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest.doTest(CMAESOptimizerTest.java:520)
+	at org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest.testDiagonalRosen(CMAESOptimizerTest.java:373)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+
+[INFO] Running org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.PowellOptimizerTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.012 s -- in org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.PowellOptimizerTest
+[INFO] Running org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexTest
+[INFO] Running org.apache.commons.math4.legacy.optim.PointValuePairTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s -- in org.apache.commons.math4.legacy.optim.PointValuePairTest
+[INFO] Running org.apache.commons.math4.legacy.optim.PointVectorValuePairTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s -- in org.apache.commons.math4.legacy.optim.PointVectorValuePairTest
+[INFO] Running org.apache.commons.math4.legacy.optim.SimplePointCheckerTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.optim.SimplePointCheckerTest
+[INFO] Running org.apache.commons.math4.legacy.optim.SimpleValueCheckerTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.optim.SimpleValueCheckerTest
+[INFO] Running org.apache.commons.math4.legacy.optim.SimpleVectorValueCheckerTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.optim.SimpleVectorValueCheckerTest
+[INFO] Running org.apache.commons.math4.legacy.optim.univariate.BracketFinderTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in org.apache.commons.math4.legacy.optim.univariate.BracketFinderTest
+[INFO] Running org.apache.commons.math4.legacy.optim.univariate.BrentOptimizerTest
+[INFO] Tests run: 10, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.048 s -- in org.apache.commons.math4.legacy.optim.univariate.BrentOptimizerTest
+[INFO] Running org.apache.commons.math4.legacy.optim.univariate.MultiStartUnivariateOptimizerTest
+[INFO] Tests run: 5, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in org.apache.commons.math4.legacy.optim.univariate.MultiStartUnivariateOptimizerTest
+[INFO] Running org.apache.commons.math4.legacy.optim.univariate.SimpleUnivariateValueCheckerTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s -- in org.apache.commons.math4.legacy.optim.univariate.SimpleUnivariateValueCheckerTest
+[INFO] Running org.apache.commons.math4.legacy.random.CorrelatedVectorFactoryTest
+[ERROR] Tests run: 3, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.056 s <<< FAILURE! -- in org.apache.commons.math4.legacy.random.CorrelatedVectorFactoryTest
+[ERROR] org.apache.commons.math4.legacy.random.CorrelatedVectorFactoryTest.testMeanAndCovariance -- Time elapsed: 0.014 s <<< FAILURE!
+java.lang.AssertionError: expected:<4.340000000000001> but was:<4.112856374968304>
+	at org.junit.Assert.fail(Assert.java:89)
+	at org.junit.Assert.failNotEquals(Assert.java:835)
+	at org.junit.Assert.assertEquals(Assert.java:555)
+	at org.junit.Assert.assertEquals(Assert.java:685)
+	at org.apache.commons.math4.legacy.random.CorrelatedVectorFactoryTest.testMeanAndCovariance(CorrelatedVectorFactoryTest.java:111)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+
+[INFO] Running org.apache.commons.math4.legacy.random.HaltonSequenceGeneratorTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.random.HaltonSequenceGeneratorTest
+[INFO] Running org.apache.commons.math4.legacy.random.SobolSequenceGeneratorTest
+[INFO] Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.064 s -- in org.apache.commons.math4.legacy.random.SobolSequenceGeneratorTest
+[INFO] Running org.apache.commons.math4.legacy.special.BesselJTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.012 s -- in org.apache.commons.math4.legacy.special.BesselJTest
+[INFO] Running org.apache.commons.math4.legacy.stat.CertifiedDataTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.015 s -- in org.apache.commons.math4.legacy.stat.CertifiedDataTest
+[INFO] Running org.apache.commons.math4.legacy.stat.correlation.CovarianceTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.003 s -- in org.apache.commons.math4.legacy.stat.correlation.CovarianceTest
+[INFO] Running org.apache.commons.math4.legacy.stat.correlation.KendallsCorrelationTest
+[INFO] Tests run: 25, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.489 s -- in org.apache.commons.math4.legacy.stat.correlation.KendallsCorrelationTest
+[INFO] Running org.apache.commons.math4.legacy.stat.correlation.PearsonsCorrelationTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in org.apache.commons.math4.legacy.stat.correlation.PearsonsCorrelationTest
+[INFO] Running org.apache.commons.math4.legacy.stat.correlation.SpearmansRankCorrelationTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.010 s -- in org.apache.commons.math4.legacy.stat.correlation.SpearmansRankCorrelationTest
+[INFO] Running org.apache.commons.math4.legacy.stat.correlation.StorelessCovarianceTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.stat.correlation.StorelessCovarianceTest
+[INFO] Running org.apache.commons.math4.legacy.stat.data.LewTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.005 s -- in org.apache.commons.math4.legacy.stat.data.LewTest
+[INFO] Running org.apache.commons.math4.legacy.stat.data.LotteryTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.stat.data.LotteryTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.AggregateSummaryStatisticsTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.021 s -- in org.apache.commons.math4.legacy.stat.descriptive.AggregateSummaryStatisticsTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.DescriptiveStatisticsTest
+[INFO] Tests run: 17, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.023 s -- in org.apache.commons.math4.legacy.stat.descriptive.DescriptiveStatisticsTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.moment.SemiVarianceTest
+[INFO] Tests run: 11, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in org.apache.commons.math4.legacy.stat.descriptive.moment.SemiVarianceTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.moment.VectorialCovarianceTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.stat.descriptive.moment.VectorialCovarianceTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.moment.VectorialMeanTest
+[INFO] Tests run: 3, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.stat.descriptive.moment.VectorialMeanTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.MultivariateSummaryStatisticsTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.017 s -- in org.apache.commons.math4.legacy.stat.descriptive.MultivariateSummaryStatisticsTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.rank.PSquarePercentileTest
+[INFO] Tests run: 47, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 8.787 s -- in org.apache.commons.math4.legacy.stat.descriptive.rank.PSquarePercentileTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.ResizableDoubleArrayTest
+[INFO] Tests run: 15, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.007 s -- in org.apache.commons.math4.legacy.stat.descriptive.ResizableDoubleArrayTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.StatisticalSummaryValuesTest
+[INFO] Tests run: 2, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.001 s -- in org.apache.commons.math4.legacy.stat.descriptive.StatisticalSummaryValuesTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.SummaryStatisticsTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.legacy.stat.descriptive.SummaryStatisticsTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.SynchronizedDescriptiveStatisticsTest
+[INFO] Tests run: 17, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.006 s -- in org.apache.commons.math4.legacy.stat.descriptive.SynchronizedDescriptiveStatisticsTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.SynchronizedMultivariateSummaryStatisticsTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.stat.descriptive.SynchronizedMultivariateSummaryStatisticsTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.SynchronizedSummaryStatisticsTest
+[INFO] Tests run: 12, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.stat.descriptive.SynchronizedSummaryStatisticsTest
+[INFO] Running org.apache.commons.math4.legacy.stat.FrequencyTest
+[INFO] Tests run: 14, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.legacy.stat.FrequencyTest
+[INFO] Running org.apache.commons.math4.legacy.stat.regression.GLSMultipleLinearRegressionTest
+[INFO] Tests run: 21, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.320 s -- in org.apache.commons.math4.legacy.stat.regression.GLSMultipleLinearRegressionTest
+[INFO] Running org.apache.commons.math4.legacy.stat.regression.MillerUpdatingRegressionTest
+[INFO] Tests run: 17, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.021 s -- in org.apache.commons.math4.legacy.stat.regression.MillerUpdatingRegressionTest
+[INFO] Running org.apache.commons.math4.legacy.stat.regression.OLSMultipleLinearRegressionTest
+[INFO] Tests run: 28, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.010 s -- in org.apache.commons.math4.legacy.stat.regression.OLSMultipleLinearRegressionTest
+[INFO] Running org.apache.commons.math4.legacy.stat.regression.SimpleRegressionTest
+[INFO] Tests run: 22, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in org.apache.commons.math4.legacy.stat.regression.SimpleRegressionTest
+[INFO] Running org.apache.commons.math4.legacy.stat.StatUtilsTest
+[INFO] Tests run: 18, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.legacy.stat.StatUtilsTest
+[INFO] Running org.apache.commons.math4.legacy.util.ComplexFormatTest
+[INFO] Tests run: 40, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.034 s -- in org.apache.commons.math4.legacy.util.ComplexFormatTest
+[INFO] Running org.apache.commons.math4.legacy.util.FrenchComplexFormatTest
+[INFO] Tests run: 40, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.010 s -- in org.apache.commons.math4.legacy.util.FrenchComplexFormatTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.moment.WeightedMeanTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.056 s -- in org.apache.commons.math4.legacy.stat.descriptive.moment.WeightedMeanTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.moment.WeightedVarianceTest
+[INFO] Tests run: 8, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.011 s -- in org.apache.commons.math4.legacy.stat.descriptive.moment.WeightedVarianceTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.StatisticsTest
+[INFO] Tests run: 6, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.097 s -- in org.apache.commons.math4.legacy.stat.descriptive.StatisticsTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.summary.WeightedProductTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.008 s -- in org.apache.commons.math4.legacy.stat.descriptive.summary.WeightedProductTest
+[INFO] Running org.apache.commons.math4.legacy.stat.descriptive.summary.WeightedSumTest
+[INFO] Tests run: 7, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.009 s -- in org.apache.commons.math4.legacy.stat.descriptive.summary.WeightedSumTest
+[INFO] Running org.apache.commons.math4.legacy.filter.KalmanFilterTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.004 s -- in org.apache.commons.math4.legacy.filter.KalmanFilterTest
+[INFO] Running org.apache.commons.math4.legacy.ml.clustering.evaluation.CalinskiHarabaszTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.ml.clustering.evaluation.CalinskiHarabaszTest
+[INFO] Running org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.479 s <<< FAILURE! -- in org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest
+[ERROR] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest.testDiagonalRosen -- Time elapsed: 0.479 s <<< FAILURE!
+java.lang.AssertionError: Delta: 1.0E-10 expected:<0.0> but was:<1.2993403625235896E-10>
+	at org.junit.Assert.fail(Assert.java:89)
+	at org.junit.Assert.failNotEquals(Assert.java:835)
+	at org.junit.Assert.assertEquals(Assert.java:555)
+	at org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest.doTest(CMAESOptimizerTest.java:520)
+	at org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest.testDiagonalRosen(CMAESOptimizerTest.java:373)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+
+[INFO] Running org.apache.commons.math4.legacy.ml.clustering.MiniBatchKMeansClustererTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.142 s -- in org.apache.commons.math4.legacy.ml.clustering.MiniBatchKMeansClustererTest
+[INFO] Running org.apache.commons.math4.legacy.random.CorrelatedVectorFactoryTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.002 s -- in org.apache.commons.math4.legacy.random.CorrelatedVectorFactoryTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0 s <<< FAILURE! -- in org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest
+[ERROR] org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest.testSine -- Time elapsed: 0 s <<< FAILURE!
+java.lang.AssertionError: Delta: 1e-7 expected:<-0.14219626687682438> but was:<-0.1421963739951697>
+	at org.junit.Assert.fail(Assert.java:89)
+	at org.junit.Assert.failNotEquals(Assert.java:835)
+	at org.junit.Assert.assertEquals(Assert.java:555)
+	at org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest.testSine(UnivariatePeriodicInterpolatorTest.java:78)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+
+[INFO] Running org.apache.commons.math4.legacy.fitting.leastsquares.LevenbergMarquardtOptimizerTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.011 s -- in org.apache.commons.math4.legacy.fitting.leastsquares.LevenbergMarquardtOptimizerTest
+[INFO] Running org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0.479 s -- in org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest
+[ERROR] Tests run: 1, Failures: 1, Errors: 0, Skipped: 0, Time elapsed: 0.001 s <<< FAILURE! -- in org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest
+[ERROR] org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest.testSine -- Time elapsed: 0 s <<< FAILURE!
+java.lang.AssertionError: Delta: 1e-7 expected:<-0.0918934573525522> but was:<-0.09189366406325825>
+	at org.junit.Assert.fail(Assert.java:89)
+	at org.junit.Assert.failNotEquals(Assert.java:835)
+	at org.junit.Assert.assertEquals(Assert.java:555)
+	at org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest.testSine(UnivariatePeriodicInterpolatorTest.java:78)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:565)
+
+[INFO] Running org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 0 s -- in org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest
+[INFO] 
+[INFO] Results:
+[INFO] 
+[WARNING] Flakes: 
+[WARNING] org.apache.commons.math4.legacy.analysis.interpolation.UnivariatePeriodicInterpolatorTest.testSine
+[ERROR]   Run 1: UnivariatePeriodicInterpolatorTest.testSine:78 Delta: 1e-7 expected:<-0.11689097439330373> but was:<-0.11689081779464591>
+[ERROR]   Run 2: UnivariatePeriodicInterpolatorTest.testSine:78 Delta: 1e-7 expected:<-0.14219626687682438> but was:<-0.1421963739951697>
+[ERROR]   Run 3: UnivariatePeriodicInterpolatorTest.testSine:78 Delta: 1e-7 expected:<-0.0918934573525522> but was:<-0.09189366406325825>
+[INFO]   Run 4: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.filter.KalmanFilterTest.testCannonball
+[ERROR]   Run 1: KalmanFilterTest.testCannonball:413
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.fitting.leastsquares.LevenbergMarquardtOptimizerTest.testCircleFitting2
+[ERROR]   Run 1: LevenbergMarquardtOptimizerTest.testCircleFitting2:272 Delta=9.555272030377143 expected:<654.321> but was:<642.3239574074405>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.ml.clustering.MiniBatchKMeansClustererTest.testCompareToKMeans
+[ERROR]   Run 1: MiniBatchKMeansClustererTest.testCompareToKMeans:87 Different score ratio 52,445703%!, diff points ratio: 45,094340%
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.ml.clustering.evaluation.CalinskiHarabaszTest.test_compare_to_skLearn
+[ERROR]   Run 1: CalinskiHarabaszTest.test_compare_to_skLearn:103 expected:<1.0> but was:<0.935605657114974>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.CMAESOptimizerTest.testDiagonalRosen
+[ERROR]   Run 1: CMAESOptimizerTest.testDiagonalRosen:373->doTest:520 Delta: 1.0E-10 expected:<0.0> but was:<5.76303892876155E-10>
+[ERROR]   Run 2: CMAESOptimizerTest.testDiagonalRosen:373->doTest:520 Delta: 1.0E-10 expected:<0.0> but was:<1.2993403625235896E-10>
+[INFO]   Run 3: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.random.CorrelatedVectorFactoryTest.testMeanAndCovariance
+[ERROR]   Run 1: CorrelatedVectorFactoryTest.testMeanAndCovariance:111 expected:<4.340000000000001> but was:<4.112856374968304>
+[INFO]   Run 2: PASS
+[INFO] 
+[INFO] 
+[WARNING] Tests run: 3204, Failures: 0, Errors: 0, Skipped: 30, Flakes: 7
+[INFO] 
+[INFO] 
+[INFO] --- surefire:3.5.5:test (flaky-tests) @ commons-math4-legacy ---
+[INFO] Using auto detected provider org.apache.maven.surefire.junitplatform.JUnitPlatformProvider
+[WARNING] Flakes: 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerMultiDirectionalTest.testFourExtremaMaximize1
+[ERROR]   Run 1: SimplexOptimizerMultiDirectionalTest.testFourExtremaMaximize1:75->doTest:176 org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.OptimTestUtils$FourExtrema@2fab4aff: nEval=100
+[ERROR]   Run 2: SimplexOptimizerMultiDirectionalTest.testFourExtremaMaximize1:75->doTest:176 org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.OptimTestUtils$FourExtrema@7f92b990: nEval=100
+[INFO]   Run 3: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerMultiDirectionalTest.testFourExtremaMaximize2
+[ERROR]   Run 1: SimplexOptimizerMultiDirectionalTest.testFourExtremaMaximize2:97->doTest:176 org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.OptimTestUtils$FourExtrema@44a2b17b: nEval=112
+[ERROR]   Run 2: SimplexOptimizerMultiDirectionalTest.testFourExtremaMaximize2:97->doTest:176 org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.OptimTestUtils$FourExtrema@6c1832aa: nEval=112
+[INFO]   Run 3: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerNelderMeadTest.testFourExtremaMaximize1
+[ERROR]   Run 1: SimplexOptimizerNelderMeadTest.testFourExtremaMaximize1:146->doTest:248 org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.OptimTestUtils$FourExtrema@740abb5: nEval=100 < 100
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[10]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [CIGAR dim=11]: nEval=3588 < 3300 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[11]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [SPHERE dim=2]: nEval=142 < 140 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[13]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [ELLI dim=2]: nEval=236 < 210 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[14]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [TWO_AXES dim=2]: nEval=258 < 240 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[1]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [PARABOLA dim=8]: nEval=1618 < 1600 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[21]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [SUM_POW dim=11]: distance to optimum f([-4.878470168302576E-6, 9.104232235608578E-6, -1.2498375725630492E-4, -0.0024371869656319776, 2.3798028711664865E-4, 0.0033811826679771007, 0.006220974001583515, 3.1135308344487633E-4, 0.006690658664563837, -0.004999483719847431, -0.003450603525762652])=2.3886466379876066E-11 ==> expected: <0.0> but was: <0.011743445515541932>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[23]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [GRIEWANK dim=2]: nEval=140 < 140 ==> expected: <true> but was: <false>
+[ERROR]   Run 2: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [GRIEWANK dim=2]: nEval=152 < 140 ==> expected: <true> but was: <false>
+[ERROR]   Run 3: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [GRIEWANK dim=2]: nEval=150 < 140 ==> expected: <true> but was: <false>
+[ERROR]   Run 4: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [GRIEWANK dim=2]: nEval=146 < 140 ==> expected: <true> but was: <false>
+[INFO]   Run 5: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[24]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [GRIEWANK dim=11]: nEval=2400 < 2200 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[29]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [PERM dim=2]: distance to optimum f([1.16225126308594, 1.7022393832350002])=3.838684055596173E-6 ==> expected: <0.0> but was: <0.3390971207032817>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[30]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [STYBLINSKI_TANG dim=2]: nEval=160 < 150 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[3]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [ROSENBROCK dim=2]: nEval=17846 < 11000 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[5]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [ROSENBROCK dim=8]: distance to optimum f([1.000488437333831, 1.0009776871122105, 0.9992714158302816, 0.9985425663818696, 0.9994445013424261, 0.9988823864696285, 0.9989602579949353, 0.997912081980258])=2.1729933685561E-6 ==> expected: <0.0> but was: <0.003293553494051457>
+[ERROR]   Run 2: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [ROSENBROCK dim=8]: nEval=171114 < 130000 ==> expected: <true> but was: <false>
+[ERROR]   Run 3: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [ROSENBROCK dim=8]: distance to optimum f([0.9994790227510861, 0.9989524366447471, 0.9992474211758462, 0.9984888586863938, 0.9995076403569952, 0.999011367559848, 1.0015673824148488, 1.0031458269189968])=3.553778070386807E-6 ==> expected: <0.0> but was: <0.004217991938333862>
+[INFO]   Run 4: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithHedarFukushima(Task)[8]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithHedarFukushima:107 [POWELL dim=8]: distance to optimum f([-0.043178540250577636, 0.004317872193681542, -0.01871808947025823, -0.01878664939180868, 0.035283578266605276, -0.003527015252928342, 0.015299374222086241, 0.015328695445814111])=9.549082546362616E-6 ==> expected: <0.0> but was: <0.06567150001931635>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithMultiDirectional(Task)[12]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [ROSENBROCK dim=16]: nEval=452354 < 420000 ==> expected: <true> but was: <false>
+[ERROR]   Run 2: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [ROSENBROCK dim=16]: nEval=429314 < 420000 ==> expected: <true> but was: <false>
+[ERROR]   Run 3: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [ROSENBROCK dim=16]: nEval=447362 < 420000 ==> expected: <true> but was: <false>
+[INFO]   Run 4: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithMultiDirectional(Task)[13]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [POWELL dim=4]: distance to optimum f([-0.04410346599987136, 0.004410697901139571, -0.019114555934638178, -0.019175023779387068])=7.185693886719806E-6 ==> expected: <0.0> but was: <0.05193859600235067>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithMultiDirectional(Task)[14]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [POWELL dim=4]: distance to optimum f([-0.042954089605503426, 0.004292557814855018, -0.018621662501788986, -0.018675838017817394])=6.4662233868080634E-6 ==> expected: <0.0> but was: <0.05058688670426139>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithMultiDirectional(Task)[15]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [POWELL dim=8]: nEval=47193 < 46000 ==> expected: <true> but was: <false>
+[ERROR]   Run 2: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [POWELL dim=8]: nEval=55785 < 46000 ==> expected: <true> but was: <false>
+[INFO]   Run 3: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithMultiDirectional(Task)[17]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [CIGAR dim=2]: nEval=163 < 160 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithMultiDirectional(Task)[31]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [ACKLEY dim=6]: distance to optimum f([-0.9391952601539084, -1.1755888733588904E-6, 2.86766208779099E-7, 0.939196968092062, 2.179390542658699E-6, 2.1748330083504186E-6])=2.1200533617536412 ==> expected: <0.0> but was: <1.3282238823255037>
+[ERROR]   Run 2: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [ACKLEY dim=6]: distance to optimum f([0.9391954549999704, -1.953637670970565E-6, 1.9448927289777984E-6, -1.0516683657257886E-6, -1.8980170108587516E-7, 0.9391993190408687])=2.120053361746607 ==> expected: <0.0> but was: <1.3282256824757508>
+[INFO]   Run 3: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithMultiDirectional(Task)[32]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [RASTRIGIN dim=2]: distance to optimum f([0.9949583604964831, -5.758182153314806E-7])=0.9949590571743023 ==> expected: <0.0> but was: <0.9949583604966498>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithMultiDirectional(Task)[36]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [LEVY dim=9]: nEval=1720 < 1400 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithMultiDirectional(Task)[38]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [ZAKHAROV dim=2]: nEval=135 < 130 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithMultiDirectional(Task)[40]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [PERM dim=2]: distance to optimum f([1.1619380889324527, 1.7028938054655625])=2.0590454034730477E-6 ==> expected: <0.0> but was: <0.33837262814511165>
+[ERROR]   Run 2: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [PERM dim=2]: distance to optimum f([1.1625673706825945, 1.7015782680536546])=6.2051129539743504E-6 ==> expected: <0.0> but was: <0.33982889828339863>
+[ERROR]   Run 3: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [PERM dim=2]: distance to optimum f([1.1619605892173623, 1.7028467589975693])=2.1684416085119726E-6 ==> expected: <0.0> but was: <0.33842470521208085>
+[ERROR]   Run 4: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [PERM dim=2]: distance to optimum f([1.1625715829191117, 1.7015694578674987])=6.240536929774475E-6 ==> expected: <0.0> but was: <0.33983865002427877>
+[INFO]   Run 5: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithMultiDirectional(Task)[41]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [STYBLINSKI_TANG dim=2]: nEval=131 < 120 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithMultiDirectional(Task)[8]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithMultiDirectional:101 [ROSENBROCK dim=4]: nEval=46282 < 41000 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithNelderMead(Task)[20]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ACKLEY dim=6]: nEval=789 < 700 ==> expected: <true> but was: <false>
+[ERROR]   Run 2: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ACKLEY dim=6]: distance to optimum f([0.9713208543913026, 1.5196126648349564E-6, 0.9713128519086529, -0.9713095738038254, 1.9416735897857689, 2.3502950161744205E-6])=3.8361731914474437 ==> expected: <0.0> but was: <2.569134382608416>
+[ERROR]   Run 3: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ACKLEY dim=6]: distance to optimum f([-7.701709270105997E-6, -0.9078150270512133, 2.9275517041619365E-6, -2.570498161556951E-6, -1.6234046122098344E-6, 3.31775297571885E-6])=1.5017465682952573 ==> expected: <0.0> but was: <0.907815027099757>
+[ERROR]   Run 4: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ACKLEY dim=6]: distance to optimum f([0.9684455932120657, -9.599941604139703E-7, 3.107410477061461E-6, -1.9356033844904683, 0.96844853022294, 3.186051150596085E-6])=3.5740978552049403 ==> expected: <0.0> but was: <2.371147377278462>
+[ERROR]   Run 5: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ACKLEY dim=6]: distance to optimum f([2.5816514914084347E-6, -4.713328388965222E-6, 0.9713213091223563, -1.9416733320300459, 0.971326721037761, -0.971319427762563])=3.836173192067591 ==> expected: <0.0> but was: <2.569143328748256>
+[ERROR]   Run 6: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ACKLEY dim=6]: distance to optimum f([2.5529956802402064E-5, -0.9392080381063248, 5.372715430240294E-6, 8.937748074859478E-6, -0.9391958965631086, 3.6720907146849176E-6])=2.1200533696937645 ==> expected: <0.0> but was: <1.3282321603313652>
+[INFO]   Run 7: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithNelderMead(Task)[22]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithNelderMead:95 [GRIEWANK dim=2]: distance to optimum f([3.14003991413262, 4.438431059827916])=0.0073960405285692365 ==> expected: <0.0> but was: <5.4368668307391115>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithNelderMead(Task)[24]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithNelderMead:95 [LEVY dim=2]: nEval=76 < 75 ==> expected: <true> but was: <false>
+[ERROR]   Run 2: SimplexOptimizerTest.testFunctionWithNelderMead:95 [LEVY dim=2]: nEval=85 < 75 ==> expected: <true> but was: <false>
+[ERROR]   Run 3: SimplexOptimizerTest.testFunctionWithNelderMead:95 [LEVY dim=2]: nEval=75 < 75 ==> expected: <true> but was: <false>
+[INFO]   Run 4: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithNelderMead(Task)[26]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithNelderMead:95 [SCHWEFEL dim=2]: nEval=85 < 85 ==> expected: <true> but was: <false>
+[ERROR]   Run 2: SimplexOptimizerTest.testFunctionWithNelderMead:95 [SCHWEFEL dim=2]: nEval=88 < 85 ==> expected: <true> but was: <false>
+[INFO]   Run 3: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithNelderMead(Task)[27]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ZAKHAROV dim=2]: nEval=89 < 85 ==> expected: <true> but was: <false>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithNelderMead(Task)[28]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithNelderMead:95 [PERM dim=2]: distance to optimum f([1.1610823363141214, 1.704679770864851])=2.457178538408515E-10 ==> expected: <0.0> but was: <0.33639494171115697>
+[INFO]   Run 2: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithNelderMead(Task)[2]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithNelderMead:95 [PARABOLA dim=16]: nEval=3903 < 3600 ==> expected: <true> but was: <false>
+[ERROR]   Run 2: SimplexOptimizerTest.testFunctionWithNelderMead:95 [PARABOLA dim=16]: distance to optimum f([5.27981208811689E-4, 1.6448223348484802E-4, 2.1375285701291582E-4, -6.337006537340164E-4, -2.9592075472432955E-4, 4.31667215170997E-5, -2.49603347554156E-4, 6.537425561609479E-6, -1.2808979884375418E-4, 3.2411944872033627E-4, -6.85220513822181E-4, -3.402166691259047E-4, -8.427019273091034E-4, 5.727390856402128E-4, -1.4535104033621378E-4, 5.51564474572715E-4])=2.9751242335493125E-6 ==> expected: <0.0> but was: <0.001724854844196842>
+[ERROR]   Run 3: SimplexOptimizerTest.testFunctionWithNelderMead:95 [PARABOLA dim=16]: nEval=4359 < 3600 ==> expected: <true> but was: <false>
+[INFO]   Run 4: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithNelderMead(Task)[5]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ROSENBROCK dim=8]: nEval=2313 < 2200 ==> expected: <true> but was: <false>
+[ERROR]   Run 2: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ROSENBROCK dim=8]: distance to optimum f([1.0101736888817408, 1.0204795419772332, 0.9665908331276379, 0.9342132355961632, 1.0226295288526477, 1.0458874676695809, 0.9869588954040829, 0.9740418702406758])=0.001904204691810202 ==> expected: <0.0> but was: <0.0971011666345682>
+[ERROR]   Run 3: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ROSENBROCK dim=8]: distance to optimum f([0.9962552223835476, 0.9925178866500171, 1.0050457959018466, 1.0101340336395173, 1.0010823108493745, 1.0021675364449505, 1.001647027460776, 1.003324785999709])=4.347948845911764E-5 ==> expected: <0.0> but was: <0.014758068507901336>
+[ERROR]   Run 4: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ROSENBROCK dim=8]: distance to optimum f([0.9905260455395193, 0.9810907033314124, 1.0101943103422464, 1.0204864805043927, 0.9773733572777846, 0.9552381321427814, 0.9973221805122048, 0.994620762823168])=7.132175904161697E-4 ==> expected: <0.0> but was: <0.059351780471949826>
+[ERROR]   Run 5: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ROSENBROCK dim=8]: distance to optimum f([0.9964056800314942, 0.9928428438076022, 0.9869527045892086, 0.9740578957946895, 0.9682971290378828, 0.9373043946238482, 1.0675691151658027, 1.1401001067824161])=0.005778277718526056 ==> expected: <0.0> but was: <0.17331129482636365>
+[ERROR]   Run 6: SimplexOptimizerTest.testFunctionWithNelderMead:95 [ROSENBROCK dim=8]: distance to optimum f([0.9843026879574672, 0.9690030676134128, 1.0439871181163793, 1.0902078436282117, 1.1416861670302338, 1.3043730013949364, 0.9612348582445187, 0.9240167779854107])=0.023856079707389875 ==> expected: <0.0> but was: <0.3623170119990196>
+[INFO]   Run 7: PASS
+[INFO] 
+[WARNING] org.apache.commons.math4.legacy.optim.nonlinear.scalar.noderiv.SimplexOptimizerTest.testFunctionWithNelderMead(Task)[7]
+[ERROR]   Run 1: SimplexOptimizerTest.testFunctionWithNelderMead:95 [POWELL dim=4]: distance to optimum f([-0.004458554908767813, 4.4428190322687636E-4, -0.0016259714806437018, -0.00161627579452841])=1.5569316295363991E-9 ==> expected: <0.0> but was: <0.005033113249657469>
+[ERROR]   Run 2: SimplexOptimizerTest.testFunctionWithNelderMead:95 [POWELL dim=4]: distance to optimum f([0.008243115180923688, -8.234374072325758E-4, 0.0037649469929584897, 0.0037745124357490348])=9.390259205467048E-9 ==> expected: <0.0> but was: <0.009851333261899922>
+[INFO]   Run 3: PASS
+[INFO] 
+[INFO] 
+[INFO] ----------------< org.apache.commons:commons-math-docs >----------------
+[INFO] Building Apache Commons Math Documentation 4.0-SNAPSHOT           [8/14]
+[INFO]   from commons-math-docs\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ commons-math-docs ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ commons-math-docs ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ commons-math-docs ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ commons-math-docs ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 22 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ commons-math-docs ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ commons-math-docs ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ commons-math-docs ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- resources:3.4.0:resources (default-resources) @ commons-math-docs ---
+[INFO] Skipping the execution.
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ commons-math-docs ---
+[INFO] Not compiling main sources
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ commons-math-docs ---
+[INFO] Writing manifest: C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-docs\target\osgi\MANIFEST.MF
+[INFO] 
+[INFO] --- resources:3.4.0:testResources (default-testResources) @ commons-math-docs ---
+[INFO] Not copying test resources
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ commons-math-docs ---
+[INFO] Not compiling test sources
+[INFO] 
+[INFO] --- surefire:3.5.5:test (default-test) @ commons-math-docs ---
+[INFO] Tests are skipped.
+[INFO] 
+[INFO] --------------< org.apache.commons:commons-math-examples >--------------
+[INFO] Building Example applications 4.0-SNAPSHOT                        [9/14]
+[INFO]   from commons-math-examples\pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ commons-math-examples ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ commons-math-examples ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ commons-math-examples ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ commons-math-examples ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 19 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ commons-math-examples ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ commons-math-examples ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ commons-math-examples ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ commons-math-examples ---
+[WARNING] Ignoring project type pom - supportedProjectTypes = [jar, bundle]
+[INFO] 
+[INFO] ------------------< org.apache.commons:examples-sofm >------------------
+[INFO] Building SOFM 4.0-SNAPSHOT                                       [10/14]
+[INFO]   from commons-math-examples\examples-sofm\pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ examples-sofm ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ examples-sofm ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ examples-sofm ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ examples-sofm ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 19 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ examples-sofm ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ examples-sofm ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ examples-sofm ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ examples-sofm ---
+[WARNING] Ignoring project type pom - supportedProjectTypes = [jar, bundle]
+[INFO] 
+[INFO] -----------< org.apache.commons:examples-sofm-chinese-rings >-----------
+[INFO] Building SOFM: Chinese Rings 4.0-SNAPSHOT                        [11/14]
+[INFO]   from commons-math-examples\examples-sofm\chinese-rings\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ examples-sofm-chinese-rings ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ examples-sofm-chinese-rings ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ examples-sofm-chinese-rings ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ examples-sofm-chinese-rings ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 22 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ examples-sofm-chinese-rings ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ examples-sofm-chinese-rings ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ examples-sofm-chinese-rings ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- resources:3.4.0:resources (default-resources) @ examples-sofm-chinese-rings ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-examples\examples-sofm\chinese-rings\src\main\resources
+[INFO] Copying 1 resource from . to target\classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ examples-sofm-chinese-rings ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ examples-sofm-chinese-rings ---
+[INFO] Writing manifest: C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-examples\examples-sofm\chinese-rings\target\osgi\MANIFEST.MF
+[INFO] 
+[INFO] --- resources:3.4.0:testResources (default-testResources) @ examples-sofm-chinese-rings ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-examples\examples-sofm\chinese-rings\src\test\resources
+[INFO] Copying 1 resource from . to target\test-classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ examples-sofm-chinese-rings ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.5.5:test (default-test) @ examples-sofm-chinese-rings ---
+[INFO] 
+[INFO] ----------------< org.apache.commons:examples-sofm-tsp >----------------
+[INFO] Building SOFM: Traveling Salesman Problem 4.0-SNAPSHOT           [12/14]
+[INFO]   from commons-math-examples\examples-sofm\tsp\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ examples-sofm-tsp ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ examples-sofm-tsp ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ examples-sofm-tsp ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ examples-sofm-tsp ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 22 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ examples-sofm-tsp ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ examples-sofm-tsp ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ examples-sofm-tsp ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- resources:3.4.0:resources (default-resources) @ examples-sofm-tsp ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-examples\examples-sofm\tsp\src\main\resources
+[INFO] Copying 1 resource from . to target\classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ examples-sofm-tsp ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ examples-sofm-tsp ---
+[INFO] Writing manifest: C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-examples\examples-sofm\tsp\target\osgi\MANIFEST.MF
+[INFO] 
+[INFO] --- resources:3.4.0:testResources (default-testResources) @ examples-sofm-tsp ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-examples\examples-sofm\tsp\src\test\resources
+[INFO] Copying 1 resource from . to target\test-classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ examples-sofm-tsp ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.5.5:test (default-test) @ examples-sofm-tsp ---
+[INFO] 
+[INFO] -----------------< org.apache.commons:examples-kmeans >-----------------
+[INFO] Building K-Means 4.0-SNAPSHOT                                    [13/14]
+[INFO]   from commons-math-examples\examples-kmeans\pom.xml
+[INFO] --------------------------------[ pom ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ examples-kmeans ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ examples-kmeans ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ examples-kmeans ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ examples-kmeans ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 19 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ examples-kmeans ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ examples-kmeans ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ examples-kmeans ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ examples-kmeans ---
+[WARNING] Ignoring project type pom - supportedProjectTypes = [jar, bundle]
+[INFO] 
+[INFO] --------------< org.apache.commons:examples-kmeans-image >--------------
+[INFO] Building K-Means: Image Clustering 4.0-SNAPSHOT                  [14/14]
+[INFO]   from commons-math-examples\examples-kmeans\image\pom.xml
+[INFO] --------------------------------[ jar ]---------------------------------
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-maven-version) @ examples-kmeans-image ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- enforcer:3.6.2:enforce (enforce-java-version) @ examples-kmeans-image ---
+[INFO] Skipping Rule Enforcement.
+[INFO] 
+[INFO] --- apache-rat:0.17:check (rat-check) @ examples-kmeans-image ---
+[WARNING]  Parameter 'excludes' is deprecated: Deprecated for removal since 0.17: Use <inputExclude> instead.
+[INFO] RAT will not execute since it is configured to be skipped via system property 'rat.skip'.
+[INFO] 
+[INFO] --- artifact:3.6.1:check-buildplan (check-buildplan) @ examples-kmeans-image ---
+[INFO] <project.build.outputTimestamp> property (= 2026-02-21T11:59:32Z) is inherited from outside the reactor, you can override in parent POM from reactor C:\craton\CratonVM\apps\_test-suites\commons-math\pom.xml
+[INFO] No known issue in 22 plugins
+[INFO] 
+[INFO] --- build-helper:3.6.1:parse-version (parse-version) @ examples-kmeans-image ---
+[INFO] 
+[INFO] --- antrun:3.2.0:run (javadoc.resources) @ examples-kmeans-image ---
+[INFO] Executing tasks
+[INFO] Executed tasks
+[INFO] 
+[INFO] --- remote-resources:3.3.0:process (process-resource-bundles) @ examples-kmeans-image ---
+[INFO] Skipping remote resources execution.
+[INFO] 
+[INFO] --- resources:3.4.0:resources (default-resources) @ examples-kmeans-image ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-examples\examples-kmeans\image\src\main\resources
+[INFO] Copying 1 resource from . to target\classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:compile (default-compile) @ examples-kmeans-image ---
+[INFO] Nothing to compile - all classes are up to date.
+[INFO] 
+[INFO] --- bundle:6.0.0:manifest (bundle-manifest) @ examples-kmeans-image ---
+[INFO] Writing manifest: C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-examples\examples-kmeans\image\target\osgi\MANIFEST.MF
+[INFO] 
+[INFO] --- resources:3.4.0:testResources (default-testResources) @ examples-kmeans-image ---
+[INFO] skip non existing resourceDirectory C:\craton\CratonVM\apps\_test-suites\commons-math\commons-math-examples\examples-kmeans\image\src\test\resources
+[INFO] Copying 1 resource from . to target\test-classes\META-INF
+[INFO] 
+[INFO] --- compiler:3.15.0:testCompile (default-testCompile) @ examples-kmeans-image ---
+[INFO] No sources to compile
+[INFO] 
+[INFO] --- surefire:3.5.5:test (default-test) @ examples-kmeans-image ---
+[INFO] ------------------------------------------------------------------------
+[INFO] Reactor Summary for Apache Commons Math 4.0-SNAPSHOT:
+[INFO] 
+[INFO] Apache Commons Math ................................ SUCCESS [  4.512 s]
+[INFO] Miscellaneous core classes ......................... SUCCESS [  2.568 s]
+[INFO] Artificial neural networks ......................... SUCCESS [  2.450 s]
+[INFO] Transforms ......................................... SUCCESS [  2.458 s]
+[INFO] Exception classes (Legacy) ......................... SUCCESS [  2.243 s]
+[INFO] Miscellaneous core classes (Legacy) ................ SUCCESS [ 11.171 s]
+[INFO] Apache Commons Math (Legacy) ....................... SUCCESS [01:04 min]
+[INFO] Apache Commons Math Documentation .................. SUCCESS [  0.196 s]
+[INFO] Example applications ............................... SUCCESS [  0.115 s]
+[INFO] SOFM ............................................... SUCCESS [  0.117 s]
+[INFO] SOFM: Chinese Rings ................................ SUCCESS [  0.362 s]
+[INFO] SOFM: Traveling Salesman Problem ................... SUCCESS [  0.240 s]
+[INFO] K-Means ............................................ SUCCESS [  0.153 s]
+[INFO] K-Means: Image Clustering .......................... SUCCESS [  0.363 s]
+[INFO] ------------------------------------------------------------------------
+[INFO] BUILD SUCCESS
+[INFO] ------------------------------------------------------------------------
+[INFO] Total time:  01:32 min
+[INFO] Finished at: 2026-06-01T03:21:16-03:00
+[INFO] ------------------------------------------------------------------------

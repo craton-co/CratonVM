@@ -1,4 +1,14 @@
-# crypto-prng HMacDRBG #9.1 KAT failure — root cause (2026-06-01)
+# crypto-prng HMacDRBG #9.1 KAT failure — root cause + FIX (2026-06-01)
+
+> **RESOLVED.** Fixed by making the long `getfield`/`putfield`,
+> `getstatic`/`putstatic`, every `invoke*` argument/return marshalling path,
+> and the JIT-call arg convention **kinds-aware** (read `KIND_LONG` slots
+> bit-exact via `as_long_unchecked`) instead of decoding via the lossy
+> `tag()` / `decode_by_descriptor(b'J')` i2l-widening heuristic. The minimal
+> repro below now matches HotSpot; `crypto-prng RegressionTest` reports
+> "HMacDRBG: Okay / All tests successful"; commons-math 3204/3204 and the BC
+> green suites stay green. See "Fix (applied)" at the bottom.
+
 
 `bc-crypto-prng-regression` reports exactly one failure on CratonVM (HotSpot +
 TornadoVM pass): `HMacDRBG: Test #9.1 failed`. Traced it to the bottom.
@@ -54,15 +64,41 @@ collision-shaped long. Most inputs never hit it (the whole BC asn1/util/math
 crypto suite, HashDRBG, HMAC-SHA1/256, SHA-512 DRBG vectors all pass). DRBG
 vector #9's specific personalization → K1 → ipad block is one that does.
 
-## Fix
-The real fix is in the interpreter's `CompactValue` long handling — find the
-remaining opcode path (suspect: long `getfield`/`putfield` of the `H1..H8`
-fields, or a long array `laload`/`lastore`, or a specific long arithmetic op)
-that drops the high bits for a collision-shaped value, and apply the same
-descriptor-aware long decode as `69d1401`. This is the documented deep
-value-representation work, not a stub. The minimal SHA-384 repro above is
-deterministic and ~10 lines — ideal for bisecting the exact opcode by tracing
-the long ops in `LongDigest.processBlock`.
+## Fix (applied)
+Bisected with `LongBug.java` (round-trips `0xFFFC0000FACE1234L` — top 14 bits
+collide with the NaN-box + `SUB_INT` sub-tag, **and** payload bits 47-32 are 0
+so it is bit-identical to `CompactValue::int(0xFACE1234)`). Result: `local`,
+`long[]`, `lxor/ladd/lor/land`, `lshift` round-trip fine, but **`field`,
+`call`, and `Long.rotateRight` corrupt** `0xFFFC0000FACE1234` →
+`0xFFFFFFFFFACE1234` (decoded as a tagged int, truncated to the low 32 bits,
+sign-extended).
+
+Root cause: those paths decoded the slot with `cv.tag()` /
+`decode_by_descriptor(b'J')`, whose `SUB_INT`-with-`payload < 2^32` arm applies
+JVMS i2l widening — correct for a genuine int that forgot its `i2l`, but it
+truncates a collision-shaped long. The ambiguity is unresolvable from the 8
+bytes alone (see `docs/bc-ec-mod-mododdinverse-investigation.md`); the resolver
+is the operand stack's parallel `kinds[]` array (`KIND_LONG`), which
+`pop_long`/`pop_double` already consult. These paths simply weren't consulting
+it.
+
+Made them kinds-aware (mirrors commit `69d1401`'s `pop_long` fix), so a slot a
+genuine long producer pushed (`lload`/`ladd`/long return/long getfield) is read
+bit-exact, while the `KIND_UNKNOWN` fallback keeps the i2l-widening crutch for
+synthetic int-where-long:
+- **Putfield-J / Putstatic-J** → pop via `ValueStack::pop_long`.
+- **Getfield-J / Getstatic-J** → push via `push_compact_long(_checked)`
+  (mark `KIND_LONG`; D sibling marks `KIND_DOUBLE`).
+- **`push_invoke_return_value`** → `push_compact_long` / `push_compact_double`.
+- **All `invoke*` arg marshalling** (slow virtual/static, cached fast paths,
+  intrinsic, JIT-call ABI) → pop with the new
+  `ValueStack::pop_compact_with_long_mark[_unchecked]` /
+  `pop_arg_for_descriptor_checked` and decode through `decode_arg_kind_aware`.
+- **Fast-path `lreturn`** → kinds-aware decode.
+
+No `CompactValue::decode_by_descriptor` change (its bit-only heuristic stays as
+the documented fallback). No allow-list entries, no stubs — pure
+value-representation correctness.
 
 ## Separately noticed (real, unrelated, easy)
 `String.format("%02x", aByte)` sign-extends on CratonVM ("ffffffb0" vs HotSpot

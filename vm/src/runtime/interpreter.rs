@@ -3507,7 +3507,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     // i/l/f/d-return; areturn still normalizes jobject-as-Long
                     // handles via `coerce_value_for_return`. See
                     // docs/bc-ec-mod-mododdinverse-investigation.md.
-                    let cv = frame.stack.pop_compact();
+                    let (cv, is_long) = frame.stack.pop_compact_with_long_mark_unchecked();
                     let desc_byte = match opcode {
                         0xad => b'J', // lreturn
                         0xae => b'F', // freturn
@@ -3519,11 +3519,13 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     // / bridges can leave a jobject as `Value::Long` on the stack;
                     // fast-path frames (non-JDK packages) must still normalize
                     // before pushing to the caller or returning from the outer VM.
+                    // lreturn (0xad): a KIND_LONG slot is read bit-exact so a
+                    // collision-shaped long return keeps its high bits.
                     let value = if opcode == 0xb0 {
                         let ret = crate::jit::return_type(frame.method_descriptor());
                         coerce_value_for_return(cv.to_value(), ret)
                     } else {
-                        cv.decode_by_descriptor(desc_byte)
+                        decode_arg_kind_aware(cv, is_long, desc_byte)
                     };
                     if crate::runtime::env_cache::trace_sb_filter() {
                         let cn = frame.class_name();
@@ -6545,7 +6547,7 @@ fn execute_instruction(
                 };
                 thread.frames[frame_idx]
                     .stack
-                    .push_compact_checked(CompactValue::long(bits))?;
+                    .push_compact_long_checked(CompactValue::long(bits))?;
             } else if matches!(desc_byte, Some(b'D')) {
                 let d: f64 = match value {
                     Value::Double(x) => x,
@@ -6560,7 +6562,7 @@ fn execute_instruction(
                 };
                 thread.frames[frame_idx]
                     .stack
-                    .push_compact_checked(CompactValue::double(d))?;
+                    .push_compact_double_checked(CompactValue::double(d))?;
             } else {
                 // T12/T14: Coerce zero-initialized heap slots for reference fields.
                 // The GC heap zeroes memory on allocation; for reference-typed
@@ -6615,34 +6617,14 @@ fn execute_instruction(
             let desc_byte = resolve_field_descriptor_byte(shared, current_class_id, *index);
             let value: Value = match desc_byte {
                 Some(b'J') => {
-                    use crate::types::CompactTag;
-                    let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                    let lv = match cv.tag() {
-                        // Unambiguously a long (explicit VTAG_LONG).
-                        CompactTag::Long => cv.as_long_unchecked(),
-                        // Untagged slot — raw 64-bit bits are a Long or
-                        // were synthesized by `CompactValue::long` (same
-                        // encoding as `CompactValue::double`).  Reinterpret
-                        // the bit pattern as i64.
-                        CompactTag::Double => cv.raw_bits() as i64,
-                        // Int widens to long (mirrors JVMS i2l semantics
-                        // when upstream bytecode forgot the conversion).
-                        CompactTag::Int => match cv.to_value() {
-                            Value::Int(x) => x as i64,
-                            _ => 0,
-                        },
-                        // Zero-initialized or uninitialized slot → 0L.
-                        CompactTag::Null | CompactTag::Uninitialized => 0,
-                        other => {
-                            return Err(VmError::Internal {
-                                message: format!(
-                                    "putfield: tag {other:?} incompatible with J-descriptor field",
-                                ),
-                            }
-                            .into());
-                        }
-                    };
-                    Value::Long(lv)
+                    // Kinds-aware bit-exact pop: a slot marked KIND_LONG (the
+                    // genuine long producer case) is read verbatim, so a
+                    // collision-shaped long whose `0xFFFC_…` top bits + low
+                    // 32-bit payload masquerade as a tagged int (SHA-512
+                    // H1..H8 working variables) is stored without truncation.
+                    // The KIND_UNKNOWN fallback inside `pop_long` keeps the
+                    // i2l-widening crutch for synthetic int-where-long.
+                    Value::Long(thread.frames[frame_idx].stack.pop_long()?)
                 }
                 Some(b'D') => {
                     use crate::types::CompactTag;
@@ -8622,7 +8604,9 @@ fn push_static_field_value(
                     .into());
                 }
             };
-            stack.push_compact(crate::types::CompactValue::long(lv));
+            // Mark KIND_LONG so a downstream `pop_long` reads the slot
+            // bit-exact (collision-shaped longs keep their high bits).
+            stack.push_compact_long(crate::types::CompactValue::long(lv));
             Ok(())
         }
         Some(b'D') => {
@@ -8640,7 +8624,7 @@ fn push_static_field_value(
                     .into());
                 }
             };
-            stack.push_compact(crate::types::CompactValue::double(dv));
+            stack.push_compact_double(crate::types::CompactValue::double(dv));
             Ok(())
         }
         _ => {
@@ -8683,38 +8667,13 @@ fn pop_static_field_value(
     use crate::types::CompactTag;
     match desc_byte {
         Some(b'J') => {
-            let cv = stack.pop_compact();
-            let lv = match cv.tag() {
-                // Unambiguously a long (explicit VTAG_LONG).
-                CompactTag::Long => cv.as_long_unchecked(),
-                // A double slot carries the long bits verbatim for
-                // `CompactValue::long`/`CompactValue::double` (both
-                // untagged); reinterpret as i64.
-                CompactTag::Double => cv.raw_bits() as i64,
-                // SUB_INT slot: disambiguate via the same logic as
-                // `decode_by_descriptor(b'J')` / `ValueStack::pop_long`. A real
-                // int has payload < 2^32 and widens (JVMS i2l); a SUB_INT
-                // pattern with payload bits 32-46 set is a collision long whose
-                // bits masquerade as Int (BC safegcd 0xFFFC_… accumulators) and
-                // must reinterpret bit-exact. The prior `to_value()` decode
-                // dropped the high bits of such longs. See
-                // docs/bc-ec-mod-mododdinverse-investigation.md.
-                CompactTag::Int => match cv.decode_by_descriptor(b'J') {
-                    Value::Long(x) => x,
-                    _ => 0,
-                },
-                // Zero-initialized or uninitialized slot → 0L default.
-                CompactTag::Null | CompactTag::Uninitialized => 0,
-                other => {
-                    return Err(VmError::Internal {
-                        message: format!(
-                            "putstatic: tag {other:?} incompatible with J-descriptor field",
-                        ),
-                    }
-                    .into());
-                }
-            };
-            Ok(Value::Long(lv))
+            // Kinds-aware bit-exact pop (mirrors Putfield-J): a KIND_LONG slot
+            // is read verbatim so a collision-shaped long (SHA-512 working
+            // variables, BC safegcd `0xFFFC_…` accumulators) keeps its high
+            // bits instead of being truncated by the SUB_INT i2l-widening
+            // heuristic. The KIND_UNKNOWN fallback in `pop_long` preserves the
+            // widening contract for synthetic int-where-long.
+            Ok(Value::Long(stack.pop_long()?))
         }
         Some(b'D') => {
             let cv = stack.pop_compact();
@@ -8775,11 +8734,15 @@ fn push_invoke_return_value(
 ) -> Result<(), RuntimeError> {
     match value {
         Value::Long(x) => {
-            stack.push_compact(crate::types::CompactValue::long(x));
+            // Mark KIND_LONG so the caller's subsequent `pop_long` reads the
+            // return value bit-exact. Without this a collision-shaped long
+            // return (e.g. `Long.rotateRight` in SHA-512) is decoded as a
+            // tagged int and truncated.
+            stack.push_compact_long(crate::types::CompactValue::long(x));
             Ok(())
         }
         Value::Double(d) => {
-            stack.push_compact(crate::types::CompactValue::double(d));
+            stack.push_compact_double(crate::types::CompactValue::double(d));
             Ok(())
         }
         other => stack.push(other),
@@ -8831,6 +8794,28 @@ fn coerce_invoke_arg_for_descriptor(param_desc: &str, v: Value) -> Value {
     }
 }
 
+/// Decode a popped argument slot to a `Value`, honoring the operand stack's
+/// `KIND_LONG` mark.
+///
+/// When `is_long` is set the slot was pushed by a genuine long producer, so a
+/// `J`-descriptor parameter reads the raw 64 bits verbatim — a collision-shaped
+/// long (top bits `0xFFFC_…`, low 32-bit payload, indistinguishable from a
+/// tagged int by bit pattern alone) keeps its high bits instead of being
+/// truncated. All other cases (including `D` reinterpreting the long bits, and
+/// any non-long-marked slot) fall through to the descriptor-aware decode, which
+/// preserves the legacy i2l-widening behavior for synthetic int-where-long.
+#[inline]
+fn decode_arg_kind_aware(cv: CompactValue, is_long: bool, pd_byte: u8) -> Value {
+    if is_long {
+        match pd_byte {
+            b'J' => return Value::Long(cv.as_long_unchecked()),
+            b'D' => return Value::Double(f64::from_bits(cv.as_long_unchecked() as u64)),
+            _ => {}
+        }
+    }
+    cv.decode_by_descriptor(pd_byte)
+}
+
 /// Pop `invokevirtual` / `invokespecial` / `invokeinterface` arguments from
 /// the operand stack (slow-path order) and apply `coerce_invoke_arg_for_descriptor`
 /// so cached fast paths match `execute_invoke`.
@@ -8847,16 +8832,21 @@ fn pop_coerced_invoke_args_virtual(
     // BC SM2 fix (2026-05-28): use raw CompactValue + descriptor-aware
     // decode so a Long-collision-with-SUB_OBJECT bit pattern doesn't
     // round-trip through Value::Object and lose bits.
-    let mut tmp_cv: Vec<CompactValue> = Vec::with_capacity(num_params + 1);
+    // Pop slots as (CompactValue, is_KIND_LONG). The long-mark lets a
+    // `J`-descriptor argument that is a collision-shaped long (`0xFFFC_…`
+    // top bits, low 32-bit payload — e.g. a SHA-512 working variable passed
+    // to `Long.rotateRight`) decode bit-exact instead of being truncated by
+    // `decode_by_descriptor(b'J')`'s i2l-widening fallback.
+    let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params + 1);
     for _ in 0..num_params {
-        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_checked()?);
+        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?);
     }
-    tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_checked()?);
+    tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?);
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params + 1);
     args.push(coerce_invoke_arg_for_descriptor(
         "Ljava/lang/Object;",
-        tmp_cv[0].decode_by_descriptor(b'L'),
+        tmp_cv[0].0.decode_by_descriptor(b'L'),
     ));
     for i in 0..num_params {
         let pd = param_descs
@@ -8864,7 +8854,8 @@ fn pop_coerced_invoke_args_virtual(
             .map(|s| s.as_str())
             .unwrap_or("Ljava/lang/Object;");
         let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
-        let v = tmp_cv[i + 1].decode_by_descriptor(pd_byte);
+        let (cv, is_long) = tmp_cv[i + 1];
+        let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
     }
     Ok((args, method_descriptor))
@@ -8885,19 +8876,19 @@ fn pop_coerced_invoke_args_static(
     // with the parameter descriptor. `CompactValue::to_value()` would
     // mis-decode a Long whose bits collide with SUB_OBJECT as
     // Value::Object — the descriptor-aware decode keeps the long bits.
-    let mut tmp_cv: Vec<CompactValue> = Vec::with_capacity(num_params);
+    let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params);
     for _ in 0..num_params {
-        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_checked()?);
+        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?);
     }
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
-    for (i, cv) in tmp_cv.into_iter().enumerate() {
+    for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
         let pd = param_descs
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or("Ljava/lang/Object;");
         let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
-        let v = cv.decode_by_descriptor(pd_byte);
+        let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
     }
     Ok((args, method_descriptor))
@@ -8967,13 +8958,13 @@ fn execute_invoke_kind(
     // then widened — corrupting `J` args to invokevirtual/special callees.
     // Mirrors `pop_coerced_invoke_args_virtual`. See
     // docs/bc-ec-mod-mododdinverse-investigation.md.
-    let mut tmp_cv: Vec<CompactValue> = Vec::with_capacity(num_params + 1);
+    let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params + 1);
     for _ in 0..num_params {
-        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_checked()?);
+        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?);
     }
-    tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_checked()?); // receiver
+    tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?); // receiver
     tmp_cv.reverse();
-    let recv_val = tmp_cv[0].decode_by_descriptor(b'L');
+    let recv_val = tmp_cv[0].0.decode_by_descriptor(b'L');
     if std::env::var_os("CRATONVM_DBG_JETTY2").is_some()
         && &*method_name == "getClasspath"
     {
@@ -8990,7 +8981,8 @@ fn execute_invoke_kind(
             .map(|s| s.as_str())
             .unwrap_or("Ljava/lang/Object;");
         let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
-        let v = tmp_cv[i + 1].decode_by_descriptor(pd_byte);
+        let (cv, is_long) = tmp_cv[i + 1];
+        let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
     }
 
@@ -11415,19 +11407,19 @@ fn execute_invokestatic(
     // with the NaN-tagged SUB_OBJECT space is not silently coerced to 0L
     // by `to_value() -> Value::Object`. The descriptor-aware decode
     // path (`decode_by_descriptor(b'J')`) reinterprets the raw bits.
-    let mut tmp_cv: Vec<CompactValue> = Vec::with_capacity(num_params);
+    let mut tmp_cv: Vec<(CompactValue, bool)> = Vec::with_capacity(num_params);
     for _ in 0..num_params {
-        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_checked()?);
+        tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?);
     }
     tmp_cv.reverse();
     let mut args = Vec::with_capacity(num_params);
-    for (i, cv) in tmp_cv.into_iter().enumerate() {
+    for (i, (cv, is_long)) in tmp_cv.into_iter().enumerate() {
         let pd = param_descs
             .get(i)
             .map(|s| s.as_str())
             .unwrap_or("Ljava/lang/Object;");
         let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
-        let v = cv.decode_by_descriptor(pd_byte);
+        let v = decode_arg_kind_aware(cv, is_long, pd_byte);
         args.push(coerce_invoke_arg_for_descriptor(pd, v));
     }
 
@@ -11601,15 +11593,15 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
     // colliding with SUB_OBJECT survives intact (instead of being
     // converted to `Value::Object(None)` by `to_value()` and then
     // coerced to 0L).
-    let mut cv_buf: [CompactValue; MAX_INTRINSIC_ARGS] =
-        [CompactValue::uninitialized(); MAX_INTRINSIC_ARGS];
+    let mut cv_buf: [(CompactValue, bool); MAX_INTRINSIC_ARGS] =
+        [(CompactValue::uninitialized(), false); MAX_INTRINSIC_ARGS];
     for i in (0..total).rev() {
-        cv_buf[i] = thread.frames[frame_idx].stack.pop_compact_checked()?;
+        cv_buf[i] = thread.frames[frame_idx].stack.pop_compact_with_long_mark()?;
     }
     let base = if with_receiver {
         buf[0] = coerce_invoke_arg_for_descriptor(
             "Ljava/lang/Object;",
-            cv_buf[0].decode_by_descriptor(b'L'),
+            cv_buf[0].0.decode_by_descriptor(b'L'),
         );
         1
     } else {
@@ -11621,9 +11613,10 @@ fn pop_coerced_invoke_args_intrinsic<'b>(
             .map(|s| &**s)
             .unwrap_or("Ljava/lang/Object;");
         let pd_byte = pd.as_bytes().first().copied().unwrap_or(b'L');
+        let (cv, is_long) = cv_buf[base + i];
         buf[base + i] = coerce_invoke_arg_for_descriptor(
             pd,
-            cv_buf[base + i].decode_by_descriptor(pd_byte),
+            decode_arg_kind_aware(cv, is_long, pd_byte),
         );
     }
     Ok(&buf[..total])
@@ -12058,15 +12051,17 @@ fn execute_invokestatic_cached(
             let mut args_vec: Vec<Value> = Vec::new();
             let args_slice: &[Value] = if num_params <= MAX_INLINE_ARGS {
                 for i in (0..num_params).rev() {
-                    let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                    args_buf[i] = cv.decode_by_descriptor(pd_byte(i));
+                    args_buf[i] = thread.frames[frame_idx]
+                        .stack
+                        .pop_arg_for_descriptor_checked(pd_byte(i))?;
                 }
                 &args_buf[..num_params]
             } else {
                 args_vec.resize(num_params, Value::Uninitialized);
                 for i in (0..num_params).rev() {
-                    let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                    args_vec[i] = cv.decode_by_descriptor(pd_byte(i));
+                    args_vec[i] = thread.frames[frame_idx]
+                        .stack
+                        .pop_arg_for_descriptor_checked(pd_byte(i))?;
                 }
                 &args_vec
             };
@@ -13986,7 +13981,7 @@ fn execute_jit_call(
     let (param_descs, _) = split_method_descriptor(&cached.method_descriptor);
     let is_static = cached.is_static;
     for i in (0..np).rev() {
-        let cv = thread.frames[frame_idx].stack.pop_compact();
+        let (cv, is_long) = thread.frames[frame_idx].stack.pop_compact_with_long_mark_unchecked();
         let desc_byte = if is_static {
             param_descs
                 .get(i)
@@ -14000,7 +13995,7 @@ fn execute_jit_call(
                 .and_then(|s| s.as_bytes().first().copied())
                 .unwrap_or(b'L')
         };
-        let v = cv.decode_by_descriptor(desc_byte);
+        let v = decode_arg_kind_aware(cv, is_long, desc_byte);
         jit_args[i] = match v {
             Value::Int(x) => x as i64,
             Value::Long(x) => x,
@@ -14557,15 +14552,17 @@ fn execute_invokevirtual_vtable_fast(
     let mut args_vec: Vec<Value> = Vec::new();
     let args_slice: &[Value] = if total_args <= MAX_INLINE_ARGS {
         for i in (0..total_args).rev() {
-            let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            args_buf[i] = cv.decode_by_descriptor(arg_desc_byte(i));
+            args_buf[i] = thread.frames[frame_idx]
+                .stack
+                .pop_arg_for_descriptor_checked(arg_desc_byte(i))?;
         }
         &args_buf[..total_args]
     } else {
         args_vec.resize(total_args, Value::Uninitialized);
         for i in (0..total_args).rev() {
-            let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            args_vec[i] = cv.decode_by_descriptor(arg_desc_byte(i));
+            args_vec[i] = thread.frames[frame_idx]
+                .stack
+                .pop_arg_for_descriptor_checked(arg_desc_byte(i))?;
         }
         &args_vec
     };
@@ -14786,15 +14783,17 @@ fn execute_invokevirtual_cached(
                     let mut args_vec: Vec<Value> = Vec::new();
                     let args_slice: &[Value] = if total_args <= MAX_INLINE_ARGS {
                         for i in (0..total_args).rev() {
-                            let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                            args_buf[i] = cv.decode_by_descriptor(arg_desc_byte(i));
+                            args_buf[i] = thread.frames[frame_idx]
+                                .stack
+                                .pop_arg_for_descriptor_checked(arg_desc_byte(i))?;
                         }
                         &args_buf[..total_args]
                     } else {
                         args_vec.resize(total_args, Value::Uninitialized);
                         for i in (0..total_args).rev() {
-                            let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                            args_vec[i] = cv.decode_by_descriptor(arg_desc_byte(i));
+                            args_vec[i] = thread.frames[frame_idx]
+                                .stack
+                                .pop_arg_for_descriptor_checked(arg_desc_byte(i))?;
                         }
                         &args_vec
                     };
@@ -15060,15 +15059,17 @@ fn execute_invokevirtual_cached(
             let mut args_vec: Vec<Value> = Vec::new();
             let args_slice: &[Value] = if total_args <= MAX_INLINE_ARGS {
                 for i in (0..total_args).rev() {
-                    let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                    args_buf[i] = cv.decode_by_descriptor(arg_desc_byte(i));
+                    args_buf[i] = thread.frames[frame_idx]
+                        .stack
+                        .pop_arg_for_descriptor_checked(arg_desc_byte(i))?;
                 }
                 &args_buf[..total_args]
             } else {
                 args_vec.resize(total_args, Value::Uninitialized);
                 for i in (0..total_args).rev() {
-                    let cv = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                    args_vec[i] = cv.decode_by_descriptor(arg_desc_byte(i));
+                    args_vec[i] = thread.frames[frame_idx]
+                        .stack
+                        .pop_arg_for_descriptor_checked(arg_desc_byte(i))?;
                 }
                 &args_vec
             };
