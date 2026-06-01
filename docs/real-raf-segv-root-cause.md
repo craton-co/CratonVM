@@ -125,17 +125,46 @@ debug build times out in the *file-load* phase before ever reaching the
 simulation phase where the crash lives. release is fast enough to reach it and
 crashes identically.
 
-### Most likely real cause (next session)
-A JIT operand-stack / codegen bug in `LegacyInstrVisitor.visit(CPI)` (or a method
-it calls) that puts the int/boolean `1` where the field-11 `putfield` receiver
-should be — reached only when avrora parses the REAL ELF program (real-RAF). The
-synthetic RAF natives likely feed different bytes, so avrora simulates a
-different instruction stream that never hits this CPI path — which is why
-aggressive-JIT + synthetic does NOT reproduce it. Next steps: dump the verified
-bytecode of `visit(CPI)` (javap -c on avrora-cvs-20091224.jar inside dacapo.jar)
-and compare the JIT's operand-stack tracking around its field-11 `putfield`
-against the interpreter; or diff the bytes avrora reads from the ELF under
-synthetic vs real RAF.
+### Real cause (refined): JIT clobbers local-0 (`this`) across a call in visit(CPI)
+
+`LegacyInterpreter.visit(CPI)` (the real bytecode, javap-confirmed) is:
+
+```
+0:   aload_0; aload_0; getfield pc; iconst_2; iadd; putfield nextPC  // this.nextPC = this.pc+2
+15:  ... invokevirtual getRegisterByte  // -> low(); a CALL
+...  // flag computation into locals 6..11
+160: aload_0; <nested ifeq/ifne/goto -> 0|1>; putfield H:Z          // this.H = bool
+199: putfield C:Z ; 205: putfield N:Z ; ...                          // more flag stores
+```
+
+Decisive evidence from `CRATONVM_DBG_JIT_PUTFIELD`: the FIRST non-canonical
+receiver is `field_index=11` (a flag field, stored at offset ~160, AFTER the
+call), NOT the `nextPC` putfield (field #6, offset 7, BEFORE the call, same
+`aload_0 this`). Since the one-shot did not fire on `nextPC`, `this` was VALID at
+offset 7 and CORRUPTED to `0x1` by offset 160 — i.e. **`this` (local 0) is
+clobbered across the `getRegisterByte`→`low()` call**. The clobber value `0x1`
+is a boolean/small-int. This is a JIT **register/spill preservation** bug around
+a method call, NOT GC and NOT the putfield codegen itself.
+
+Suspected mechanism (Windows x64): the JIT maps locals to callee-saved GPRs and
+spills register-resident locals to frame slots before a safepoint call
+(`emit_pre_safepoint_spill`). A frame-layout overlap — e.g. local-0's spill slot
+falling in the 32-byte shadow space the callee may write, or a `used_callee_saved`
+gap so a callee clobbers a callee-saved reg holding `this` — would corrupt
+local 0 across the call. Why only real-RAF: `visit(CPI)` is JIT-compiled only
+when the real ELF program contains CPI instructions; synthetic RAF feeds
+different bytes (different simulated program), so `visit(CPI)` never compiles —
+which is exactly why aggressive-JIT + synthetic does NOT reproduce.
+
+Reproduction status: NOT minimally reproducible yet — four faithful Java
+reconstructions (`scratch/cpi/Cpi*.java`: the putfield pattern, the
+getRegisterByte/low call, the visitor invokeinterface double-dispatch, and a
+register-pressure-heavy callee) all produce CORRECT results on CratonVM. The bug
+needs the exact register allocation / frame offsets the real (large) method
+produces. Next steps: (1) instrument the JIT to dump, for `visit(CPI)`, which
+storage holds local 0 and whether it is in `used_callee_saved` / its spill-slot
+offset vs the shadow-space range; (2) or pin local 0 to a non-clobbered slot and
+confirm the crash disappears, then fix the frame-layout/preservation gap.
 
 **NOT acceptable** (no-mask rule): a non-canonical-receiver guard in
 `jit_putfield_int` to skip/deopt the write.
