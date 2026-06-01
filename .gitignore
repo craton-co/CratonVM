@@ -101,3 +101,4 @@ test-infra/suite-results/*.tsv
 # regression-suite.sh generated artifacts (per-run, machine-specific)
 test-infra/_regression-cratonvm-shim.bat
 test-infra/suite-results/_cm-*.log
+/target-gpu/
