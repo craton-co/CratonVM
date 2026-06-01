@@ -427,10 +427,6 @@ mod windows_fault {
     }
 
     fn is_fatal(code: u32) -> bool {
-        // NOTE: EXCEPTION_STACK_OVERFLOW is deliberately excluded. The VEH
-        // runs on the faulting thread's (now-exhausted) stack, so capturing a
-        // backtrace there would itself fault; and the Rust runtime already
-        // emits a "thread '…' has overflowed its stack" abort for that case.
         matches!(
             code,
             EXCEPTION_ACCESS_VIOLATION
@@ -438,6 +434,7 @@ mod windows_fault {
                 | EXCEPTION_ILLEGAL_INSTRUCTION
                 | EXCEPTION_PRIV_INSTRUCTION
                 | EXCEPTION_INT_DIVIDE_BY_ZERO
+                | EXCEPTION_STACK_OVERFLOW
         )
     }
 
@@ -504,9 +501,18 @@ mod windows_fault {
 
         let module_base = unsafe { GetModuleHandleW(core::ptr::null()) } as usize;
         let mut raw: [*mut core::ffi::c_void; 62] = [core::ptr::null_mut(); 62];
-        let n = unsafe {
-            RtlCaptureStackBackTrace(0, 62, raw.as_mut_ptr(), core::ptr::null_mut())
-        } as usize;
+        // EXCEPTION_STACK_OVERFLOW fires on an exhausted stack: walking it
+        // (RtlCaptureStackBackTrace / dbghelp) would itself fault. Skip the walk
+        // (n=0 disables both the raw loop and the symbolize loop); the faulting
+        // PC + RVA from the exception record still pinpoint the recursion site.
+        let n = if code == EXCEPTION_STACK_OVERFLOW {
+            0
+        } else {
+            let captured = unsafe {
+                RtlCaptureStackBackTrace(0, 62, raw.as_mut_ptr(), core::ptr::null_mut())
+            };
+            captured as usize
+        };
 
         let tname = std::thread::current()
             .name()

@@ -99,30 +99,46 @@ JIT frame).
 debug build** (it advances all the way to real-RAF I/O); synthetic avrora still
 PASSES in both debug and release (no regression).
 
-## The fix — part 2 NOT done: STW marking freshness for in-JIT threads
+Part 1 closes a real latent cross-thread reclamation gap, **but it does NOT fix
+the avrora real-RAF SEGV** (see below). Keep it on its own correctness merits.
 
-A **release** build of `CRATONVM_REAL_RAF=1` avrora still crashes (debug does
-not). The remaining gap: the collector defers *compaction* while any thread is
-in JIT (`any_thread_in_jit`/`gc_must_defer`) but still *marks* — and marking
-uses each thread's last-published snapshot. A worker thread actively executing
-JIT-compiled code that has NOT parked at a safepoint since entering its current
-JIT frame has a STALE snapshot (missing the current frame's JIT roots), so
-marking reclaims the receiver. Part 1 fixes snapshot *content*; this is a
-snapshot *freshness* / STW-coordination gap. Debug hides it (slower JIT, more
-likely parked at a poll when GC fires); release exposes it.
+## Part 2 — avrora real-RAF SEGV is NOT a GC reclamation/relocation bug
 
-Tractable completions (follow-up):
-- Guarantee every in-JIT thread reaches a safepoint poll and republishes
-  (`update_root_snapshot`, now JIT-aware) before STW marking proceeds — i.e. the
-  collector must WAIT for all in-JIT threads to park, and JIT code must poll
-  safepoints densely enough that it always can.
-- OR have the STW collector scan each in-JIT thread's JIT stack directly from a
-  per-thread (SP, JIT-chain) snapshot captured at the safepoint (the
-  "future enhancement" named in `conservative_roots.rs`).
+The earlier "GC×JIT roots" hypothesis is **disproven** by experiment (all on
+`release-with-debug`, which reproduces the release crash WITH symbols):
+
+| experiment | result |
+|---|---|
+| Part 1 applied (JIT roots in snapshot) | still SEGVs in `visit(CPI)`, obj_ptr=0x1 |
+| instrumented `update_root_snapshot` | scan captures 20–37 JIT roots on ~74% of safepoints — the fix IS exercised |
+| young-gen GC during the run | runs NON-MOVING while any thread is in JIT (no relocation); only ~1 young GC total |
+| `CRATONVM_DBG_NO_CONC_GC=1` (disable old-gen concurrent GC) | still SEGVs |
+| JIT disabled | no SEGV |
+| synthetic RAF (incl. aggressive JIT forcing visit(CPI) to compile) | no SEGV |
+
+So: relocation is prevented (non-moving while in JIT), reclamation now has the
+JIT roots (part 1) AND the old-gen collector can be off — yet it still crashes.
+GC is **ruled out**. The earlier "debug build is fixed by part 1" conclusion was
+a **timing artifact**: part 1 adds a conservative JIT-frame scan to every
+safepoint, which slows the (already byte-by-byte) real-RAF I/O enough that the
+debug build times out in the *file-load* phase before ever reaching the
+simulation phase where the crash lives. release is fast enough to reach it and
+crashes identically.
+
+### Most likely real cause (next session)
+A JIT operand-stack / codegen bug in `LegacyInstrVisitor.visit(CPI)` (or a method
+it calls) that puts the int/boolean `1` where the field-11 `putfield` receiver
+should be — reached only when avrora parses the REAL ELF program (real-RAF). The
+synthetic RAF natives likely feed different bytes, so avrora simulates a
+different instruction stream that never hits this CPI path — which is why
+aggressive-JIT + synthetic does NOT reproduce it. Next steps: dump the verified
+bytecode of `visit(CPI)` (javap -c on avrora-cvs-20091224.jar inside dacapo.jar)
+and compare the JIT's operand-stack tracking around its field-11 `putfield`
+against the interpreter; or diff the bytes avrora reads from the ELF under
+synthetic vs real RAF.
 
 **NOT acceptable** (no-mask rule): a non-canonical-receiver guard in
-`jit_putfield_int` to skip/deopt the write — that hides the GC corruption and
-would silently produce wrong results.
+`jit_putfield_int` to skip/deopt the write.
 
 Reproduce: `CRATONVM_REAL_RAF=1 [CRATONVM_DBG_JIT_PUTFIELD=1] cratonvm --jar
 dacapo.jar avrora -s small`; symbolize `hs_err` RVAs with `CRATONVM_SYMBOLIZE=...`

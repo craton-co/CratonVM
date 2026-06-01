@@ -925,25 +925,27 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
         snapshot.push(r);
     }
 
-    // CRIT GC×JIT fix: also publish the conservative roots of every active JIT
-    // frame on THIS thread into the snapshot.
+    // Cross-thread JIT-root hardening: also publish the conservative roots of
+    // every active JIT frame on THIS thread into the snapshot.
     //
     // The cross-thread STW collector reads each thread's `root_snapshot` (via
     // `collect_all_root_snapshots`) — it does NOT call `collect_roots` for a
     // non-current thread (that path's `scan_active_jit_frames` is thread-local
     // and would scan the *collector's* empty JIT chain, not the parked
-    // worker's). So an object whose only live reference lives in a worker
-    // thread's JIT spill slot was INVISIBLE to a GC triggered by another
-    // thread → reclaimed/relocated out from under the JIT frame, leaving a
-    // dangling/garbage receiver (the avrora real-RAF SEGV: `jit_putfield_int`
-    // writing through obj_ptr=0x1 in JIT-compiled LegacyInstrVisitor.visit).
+    // worker's). So an object whose only live reference lives in a *parked*
+    // worker thread's JIT spill slot was absent from the snapshot the collector
+    // marks from — a latent reclamation risk for the non-moving young-gen sweep
+    // (relocation is already prevented: the collector runs non-moving while any
+    // thread is in JIT). `update_root_snapshot` always runs on the thread it is
+    // snapshotting, so the thread-local scan captures exactly that worker's live
+    // JIT spill region; empty (no-op) when not in JIT; false positives filtered
+    // by `is_object_address`.
     //
-    // `update_root_snapshot` always runs on the thread it is snapshotting
-    // (mutators call it for themselves at `safepoint_check`), so the
-    // thread-local `scan_active_jit_frames` captures exactly that worker's live
-    // JIT spill region. When the thread is not in JIT the chain is empty and
-    // this is a no-op. False positives are filtered by `is_object_address` and
-    // are harmless (compaction is already deferred while any thread is in JIT).
+    // NOTE: this closes a real latent gap but does NOT fix the avrora real-RAF
+    // SEGV — that crash was experimentally shown to be NOT a GC reclamation /
+    // relocation bug (it reproduces with the young sweep capturing these JIT
+    // roots and with the concurrent old-gen collector disabled). See
+    // docs/real-raf-segv-root-cause.md.
     crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut snapshot);
 }
 
