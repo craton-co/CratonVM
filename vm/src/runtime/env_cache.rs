@@ -93,6 +93,7 @@ pub fn intrinsics_disabled() -> bool {
 cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
 cached_is_set!(jit_mic_dbg, "CRATONVM_DBG_JIT_MIC");
 cached_is_set!(jit_entry_dbg, "CRATONVM_DBG_JIT_ENTRY");
+cached_is_set!(jit_putfield_diag, "CRATONVM_DBG_JIT_PUTFIELD");
 cached_is_set!(letsgo_dbg, "CRATONVM_DBG_LETSGO");
 
 // ── Frame-trace and interpreter hot-path flags ──────────────────────────

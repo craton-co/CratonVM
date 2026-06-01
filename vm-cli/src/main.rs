@@ -2648,6 +2648,27 @@ fn main() {
     // below is preserved. No-op on non-Windows targets.
     cratonvm_vm::runtime::crash_handler::install_hardware_fault_handler();
 
+    // Diagnostic: CRATONVM_SYMBOLIZE=0x11BF183,0xAB10E resolves exe-relative
+    // RVAs (as printed by the VEH crash report) against THIS binary's symbols
+    // in a clean context, then exits. Used to symbolize a multi-threaded crash
+    // whose racy teardown truncated the in-handler symbolization.
+    if let Ok(spec) = std::env::var("CRATONVM_SYMBOLIZE") {
+        let rvas: Vec<usize> = spec
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+                usize::from_str_radix(s, 16).ok()
+            })
+            .collect();
+        for (rva, name) in cratonvm_vm::runtime::crash_handler::symbolize_rvas(&rvas) {
+            match name {
+                Some(n) => println!("0x{:X}\t{}", rva, n),
+                None => println!("0x{:X}\t<unresolved>", rva),
+            }
+        }
+        std::process::exit(0);
+    }
+
     // Self-test hook for the hardware-fault handler: when CRATONVM_TEST_SEGV=1,
     // deliberately trigger an access violation right after installing the
     // handler so the VEH path (faulting PC + symbolized backtrace) can be

@@ -8050,8 +8050,30 @@ fn native_files_is_writable(_ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 // Phase 36: I/O extras — RandomAccessFile, CharArrayReader/Writer
 // ===========================================================================
 
+/// Diagnostic gate: when `CRATONVM_REAL_RAF=1`, the synthetic
+/// `java.io.RandomAccessFile` natives are NOT registered, so RAF runs its real
+/// JDK bytecode. Read once and cached. See `register_io_extras_natives`.
+pub(crate) fn real_raf_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        std::env::var("CRATONVM_REAL_RAF").as_deref() == Ok("1")
+    })
+}
+
 fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
-    // RandomAccessFile = 2-field synthetic (fd=0, path=1)
+    // RandomAccessFile = 2-field synthetic (fd=0, path=1).
+    //
+    // DIAGNOSTIC GATE (CRATONVM_REAL_RAF=1): skip these synthetic natives so
+    // `java.io.RandomAccessFile` runs its REAL JDK bytecode (real ctor ->
+    // `new FileDescriptor(); open0(...)`, plus the native-io platform primitives
+    // open0/read0/write0/seek0/...). The synthetic `<init>` otherwise shadows the
+    // real ctor via native-override priority, leaving `this.fd` null. Real-RAF is
+    // required for DaCapo luindex (FSDirectory.sync -> RAF.getFD().sync()); it is
+    // gated rather than removed because the real ctor's FileCleanable/Cleaner/
+    // PhantomReference path still has a separate crash under sustained load that
+    // is being diagnosed (see crash_handler VEH). Default (unset) = synthetic.
+    if !real_raf_enabled() {
     let raf = "java/io/RandomAccessFile";
     registry.register(
         raf,
@@ -8085,6 +8107,7 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
         native_raf_read_line,
     );
     registry.register(raf, "readUTF", "()Ljava/lang/String;", native_raf_read_line); // simplified
+    } // end !real_raf_enabled()
 
     // RDR-MIGRATION 2026-06-01: CharArrayReader synthetic natives (3-field
     // buf/pos/count) shadowed real CharArrayReader bytecode (buf/pos/markedPos/

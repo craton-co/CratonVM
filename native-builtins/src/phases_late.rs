@@ -3570,7 +3570,13 @@ pub(crate) fn register_phase57_natives(registry: &mut NativeMethodRegistry) {
     register_phase57_nio_file(registry);
     register_phase57_process(registry);
     register_phase57_text(registry);
-    register_phase57_random_access_file(registry);
+    // DIAGNOSTIC GATE (CRATONVM_REAL_RAF=1): skip the high-level RAF natives so
+    // RandomAccessFile runs real JDK bytecode (mirrors the native-io gate in
+    // `register_io_extras_natives`). Both must be skipped together — either one
+    // shadows the real ctor via native-override priority.
+    if std::env::var("CRATONVM_REAL_RAF").as_deref() != Ok("1") {
+        register_phase57_random_access_file(registry);
+    }
     register_phase57_file(registry);
     register_phase57_file_channel(registry);
 }

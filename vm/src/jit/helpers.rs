@@ -1332,10 +1332,14 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i64) {
     if obj_ptr == 0 { return; }
-    // DIAGNOSTIC (one-shot): the real-bytecode-RAF SEGV is a write through a
-    // near-null/garbage receiver here. Report the actual obj_ptr/field_index
-    // BEFORE dereferencing so we can tell a tagged value from a moved pointer.
-    {
+    // DIAGNOSTIC (gated by CRATONVM_DBG_JIT_PUTFIELD, one-shot, zero release
+    // cost when off): a JIT operand-stack miscompile can hand this helper a
+    // non-canonical receiver (e.g. the int/boolean `1` instead of an object
+    // pointer), and the unchecked write below then faults through ~null. When
+    // enabled, report obj_ptr/field_index + the containing JIT method BEFORE
+    // dereferencing, so the miscompiled method/bytecode can be pinned. (Pinned
+    // case: avrora real-RAF -> LegacyInstrVisitor.visit(CPI), obj_ptr=0x1.)
+    if crate::runtime::env_cache::jit_putfield_diag() {
         let bits = obj_ptr as u64;
         if (bits & 0x7) != 0 || bits >= (1u64 << 48) {
             use std::sync::atomic::{AtomicBool, Ordering};

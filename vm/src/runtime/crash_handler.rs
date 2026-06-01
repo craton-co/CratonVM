@@ -303,6 +303,99 @@ mod windows_fault {
             first: u32,
             handler: VectoredHandler,
         ) -> *mut core::ffi::c_void;
+        fn RtlCaptureStackBackTrace(
+            frames_to_skip: u32,
+            frames_to_capture: u32,
+            back_trace: *mut *mut core::ffi::c_void,
+            back_trace_hash: *mut u32,
+        ) -> u16;
+        fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
+        fn GetCurrentProcess() -> *mut core::ffi::c_void;
+        fn GetLastError() -> u32;
+        fn GetModuleFileNameW(module: *mut core::ffi::c_void, filename: *mut u16, size: u32) -> u32;
+    }
+
+    // dbghelp symbolization of a *known* address. Unlike a full stack walk
+    // (std's `Backtrace::force_capture`, which re-faults on the corrupted /
+    // JIT-mixed stacks these crashes produce), SymFromAddr only resolves one
+    // address and does not touch the broken stack — so it survives.
+    #[link(name = "dbghelp")]
+    extern "system" {
+        fn SymSetOptions(options: u32) -> u32;
+        fn SymInitializeW(
+            process: *mut core::ffi::c_void,
+            search_path: *const u16,
+            invade_process: i32,
+        ) -> i32;
+        fn SymLoadModuleExW(
+            process: *mut core::ffi::c_void,
+            file: *mut core::ffi::c_void,
+            image_name: *const u16,
+            module_name: *const u16,
+            base_of_dll: u64,
+            dll_size: u32,
+            data: *mut core::ffi::c_void,
+            flags: u32,
+        ) -> u64;
+        fn SymFromAddr(
+            process: *mut core::ffi::c_void,
+            address: u64,
+            displacement: *mut u64,
+            symbol: *mut SymbolInfo,
+        ) -> i32;
+    }
+
+    // Matches DbgHelp.h SYMBOL_INFO (the trailing `name` is a flexible array;
+    // callers over-allocate). repr(C) reproduces the field padding exactly.
+    #[repr(C)]
+    struct SymbolInfo {
+        size_of_struct: u32,
+        type_index: u32,
+        reserved: [u64; 2],
+        index: u32,
+        size: u32,
+        mod_base: u64,
+        flags: u32,
+        value: u64,
+        address: u64,
+        register: u32,
+        scope: u32,
+        tag: u32,
+        name_len: u32,
+        max_name_len: u32,
+        name: [u8; 1],
+    }
+
+    const SYMOPT_UNDNAME: u32 = 0x0000_0002;
+    const SYMOPT_DEFERRED_LOADS: u32 = 0x0000_0004;
+    const SYMOPT_LOAD_LINES: u32 = 0x0000_0010;
+
+    /// Resolve a single instruction address to `function+0xNN` via dbghelp.
+    /// `process` must be the value from `GetCurrentProcess()` and dbghelp must
+    /// already be initialized (see the handler). Returns None if unresolved.
+    unsafe fn symbolize(process: *mut core::ffi::c_void, addr: usize) -> Option<String> {
+        if addr == 0 {
+            return None;
+        }
+        // Over-allocate: header + room for a long demangled Rust symbol.
+        let mut buf = [0u64; 320];
+        let sym = buf.as_mut_ptr() as *mut SymbolInfo;
+        (*sym).size_of_struct = core::mem::size_of::<SymbolInfo>() as u32;
+        (*sym).max_name_len = 2000;
+        let mut disp: u64 = 0;
+        if SymFromAddr(process, addr as u64, &mut disp, sym) == 0 {
+            return None;
+        }
+        let name_off = core::mem::offset_of!(SymbolInfo, name);
+        let name_ptr = (sym as *const u8).add(name_off);
+        let len = ((*sym).name_len as usize).min(2000);
+        let bytes = core::slice::from_raw_parts(name_ptr, len);
+        let s = String::from_utf8_lossy(bytes).into_owned();
+        Some(if disp != 0 {
+            format!("{}+0x{:X}", s, disp)
+        } else {
+            s
+        })
     }
 
     // Win32 NTSTATUS exception codes we treat as fatal hardware faults.
@@ -389,20 +482,47 @@ mod windows_fault {
             ("", 0)
         };
 
-        // We are about to die regardless, so the normal async-signal-safety
-        // restrictions do not apply on Windows: a VEH runs in ordinary thread
-        // context (not an interrupt), so allocation / stdio / dbghelp are
-        // permitted. Print to stderr directly.
-        use std::io::Write;
-        let mut err = std::io::stderr().lock();
-        let _ = writeln!(err, "\n#");
+        // We are about to die regardless. A Windows VEH runs in ordinary thread
+        // context (not an interrupt), so allocation / stdio are permitted.
+        //
+        // CRITICAL ORDERING for multi-threaded crashes: several worker threads
+        // can fault on the same bug almost simultaneously. The first one in
+        // latches HANDLING; a second faulting thread sees the latch, returns
+        // CONTINUE_SEARCH, and its unhandled fault TerminateProcess-es us — which
+        // can truncate a slow, per-line stderr dump mid-walk. So we:
+        //   1. capture the raw stack ONCE (fast, fills the whole array),
+        //   2. build the ENTIRE report into a String (no I/O yet),
+        //   3. write it to the hs_err file in a SINGLE write_all + flush, then
+        //      mirror to stderr in a single write,
+        //   4. only THEN attempt fragile dbghelp symbolization.
+        // That makes the complete raw frame list survive the race.
+        //
+        // `writeln!` into the `report` String needs `fmt::Write` in scope; the
+        // file/stderr sinks use fully-qualified `std::io::Write` calls so the
+        // two traits don't collide.
+        use core::fmt::Write as _;
+
+        let module_base = unsafe { GetModuleHandleW(core::ptr::null()) } as usize;
+        let mut raw: [*mut core::ffi::c_void; 62] = [core::ptr::null_mut(); 62];
+        let n = unsafe {
+            RtlCaptureStackBackTrace(0, 62, raw.as_mut_ptr(), core::ptr::null_mut())
+        } as usize;
+
+        let tname = std::thread::current()
+            .name()
+            .map(String::from)
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        let pid = std::process::id();
+
+        let mut report = String::with_capacity(4096);
+        let _ = writeln!(report, "\n#");
         let _ = writeln!(
-            err,
+            report,
             "# A fatal error has been detected by the CratonVM Runtime Environment:"
         );
-        let _ = writeln!(err, "#");
+        let _ = writeln!(report, "#");
         let _ = writeln!(
-            err,
+            report,
             "#  {} (0x{:08X}) at pc=0x{:016X}",
             code_name(code),
             code,
@@ -410,59 +530,67 @@ mod windows_fault {
         );
         if !op.is_empty() {
             let _ = writeln!(
-                err,
+                report,
                 "#  Faulting access: {} at address 0x{:016X}",
                 op, data_addr
             );
         }
-        let _ = writeln!(
-            err,
-            "#  pid={} tid={}",
-            std::process::id(),
-            super::get_tid()
-        );
-        let tname = std::thread::current()
-            .name()
-            .map(String::from)
-            .unwrap_or_else(|| "<unnamed>".to_string());
-        let _ = writeln!(err, "#  thread: \"{}\"", tname);
-        let _ = writeln!(err, "#");
-        let _ = writeln!(err, "Native frames (most recent call first):");
-
-        // Capture and symbolize. force_capture ignores RUST_BACKTRACE so we
-        // always get frames on a fatal fault. On Windows this walks the stack
-        // via dbghelp; symbols resolve when the binary carries debug info
-        // (build `--profile release-with-debug`).
-        let bt = std::backtrace::Backtrace::force_capture();
-        let bt_str = bt.to_string();
-        for line in bt_str.lines().take(80) {
-            let _ = writeln!(err, "  {}", line);
+        let _ = writeln!(report, "#  pid={} tid={}", pid, super::get_tid());
+        let _ = writeln!(report, "#  thread: \"{}\"", tname);
+        let _ = writeln!(report, "#  exe module base: 0x{:016X}", module_base);
+        if module_base != 0 && fault_addr >= module_base {
+            let _ = writeln!(report, "#  faulting RVA: 0x{:X}", fault_addr - module_base);
         }
-        let _ = writeln!(err, "#");
-        let _ = err.flush();
-
-        // Also persist a marker file (rich, since we can allocate here).
-        let pid = std::process::id();
-        let path =
-            std::path::PathBuf::from(format!("hs_err_pid{}.log", pid));
-        if let Ok(mut f) = std::fs::File::create(&path) {
-            let _ = writeln!(
-                f,
-                "# CratonVM fatal Windows exception\n#  {} (0x{:08X}) at pc=0x{:016X}",
-                code_name(code),
-                code,
-                fault_addr
-            );
-            if !op.is_empty() {
-                let _ = writeln!(
-                    f,
-                    "#  Faulting access: {} at 0x{:016X}",
-                    op, data_addr
-                );
+        let _ = writeln!(report, "#");
+        let _ = writeln!(report, "Native frames (most recent call first) [raw]:");
+        for (i, &a) in raw.iter().take(n).enumerate() {
+            let a = a as usize;
+            if module_base != 0 && a >= module_base && a < module_base + 0x8000_0000 {
+                let _ = writeln!(report, "  {:2}: 0x{:016X}  (exe+0x{:X})", i, a, a - module_base);
+            } else {
+                let _ = writeln!(report, "  {:2}: 0x{:016X}  (external/jit)", i, a);
             }
-            let _ = writeln!(f, "#  pid={} tid={} thread={}", pid, super::get_tid(), tname);
-            let _ = writeln!(f, "\nNative frames:\n{}", bt_str);
-            let _ = f.flush();
+        }
+        let _ = writeln!(report, "#");
+        let _ = writeln!(
+            report,
+            "# Symbolize offline with the SAME binary:\n\
+             #   CRATONVM_SYMBOLIZE=<comma-separated exe+0x RVAs> cratonvm X"
+        );
+
+        // (2->3) Single-shot file write FIRST (most reliable sink).
+        if let Ok(mut f) =
+            std::fs::File::create(std::path::PathBuf::from(format!("hs_err_pid{}.log", pid)))
+        {
+            let _ = std::io::Write::write_all(&mut f, report.as_bytes());
+            let _ = std::io::Write::flush(&mut f);
+        }
+        // Mirror to stderr in one write.
+        {
+            let mut err = std::io::stderr().lock();
+            let _ = std::io::Write::write_all(&mut err, report.as_bytes());
+            let _ = std::io::Write::flush(&mut err);
+        }
+
+        // (4) Best-effort in-process symbolization. dbghelp can itself re-fault
+        // on a wrecked thread state; the raw report above is already persisted,
+        // so a death here loses nothing actionable.
+        let process = unsafe { GetCurrentProcess() };
+        unsafe {
+            SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+            SymInitializeW(process, core::ptr::null(), 0);
+        }
+        let mut sym_report = String::with_capacity(2048);
+        let _ = writeln!(sym_report, "Native frames [symbolized, best-effort]:");
+        for (i, &a) in raw.iter().take(n).enumerate() {
+            if let Some(name) = unsafe { symbolize(process, a as usize) } {
+                let _ = writeln!(sym_report, "  {:2}: {}", i, name);
+            }
+        }
+        {
+            let mut err = std::io::stderr().lock();
+            let _ = std::io::Write::write_all(&mut err, sym_report.as_bytes());
+            let _ = std::io::Write::flush(&mut err);
         }
 
         // Continue searching — let the OS finish terminating the process the
@@ -482,6 +610,99 @@ mod windows_fault {
         unsafe {
             AddVectoredExceptionHandler(1, vectored_handler);
         }
+    }
+
+    /// Symbolize exe-relative RVAs in a NORMAL (non-crash) context, where
+    /// dbghelp is reliable — used by the `CRATONVM_SYMBOLIZE` startup hook to
+    /// resolve the raw addresses the VEH prints for a multi-threaded crash
+    /// (whose racy teardown truncates in-handler symbolization). Resolves each
+    /// `module_base + rva` against the running exe's own symbols/PDB.
+    pub fn symbolize_rvas(rvas: &[usize]) -> Vec<(usize, Option<String>)> {
+        let module_base = unsafe { GetModuleHandleW(core::ptr::null()) } as usize;
+        let process = unsafe { GetCurrentProcess() };
+        let verbose = std::env::var("CRATONVM_SYMBOLIZE_DBG").as_deref() == Ok("1");
+        // Build a search path = the exe's own directory, so dbghelp finds the
+        // co-located cratonvm.pdb regardless of cwd / _NT_SYMBOL_PATH.
+        let mut exe_path = [0u16; 1024];
+        let exe_len =
+            unsafe { GetModuleFileNameW(core::ptr::null_mut(), exe_path.as_mut_ptr(), 1024) }
+                as usize;
+        // Strip the file name to get the directory (find last '\\').
+        let dir_end = exe_path[..exe_len]
+            .iter()
+            .rposition(|&c| c == b'\\' as u16)
+            .unwrap_or(exe_len);
+        let mut search_path: Vec<u16> = exe_path[..dir_end].to_vec();
+        search_path.push(0);
+        unsafe {
+            SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
+            let ok = SymInitializeW(process, search_path.as_ptr(), 1);
+            if verbose {
+                let dir = String::from_utf16_lossy(&exe_path[..dir_end]);
+                eprintln!(
+                    "[sym] SymInitialize ok={} base=0x{:X} dir={} err={}",
+                    ok, module_base, dir, GetLastError()
+                );
+            }
+            // Explicitly load the exe's own module + PDB so SymFromAddr can
+            // resolve addresses inside it. invade=FALSE above keeps init cheap;
+            // we load just the main module here. image_name = full exe path.
+            let mut path_buf = [0u16; 1024];
+            let len = GetModuleFileNameW(
+                core::ptr::null_mut(),
+                path_buf.as_mut_ptr(),
+                path_buf.len() as u32,
+            );
+            let loaded = if len > 0 {
+                SymLoadModuleExW(
+                    process,
+                    core::ptr::null_mut(),
+                    path_buf.as_ptr(),
+                    core::ptr::null(),
+                    module_base as u64,
+                    0,
+                    core::ptr::null_mut(),
+                    0,
+                )
+            } else {
+                0
+            };
+            if verbose {
+                eprintln!(
+                    "[sym] SymLoadModuleExW -> base=0x{:X} err={}",
+                    loaded,
+                    GetLastError()
+                );
+            }
+        }
+        rvas.iter()
+            .map(|&rva| {
+                let abs = module_base.wrapping_add(rva);
+                let r = unsafe { symbolize(process, abs) };
+                if verbose && r.is_none() {
+                    eprintln!(
+                        "[sym] SymFromAddr 0x{:X} failed err={}",
+                        abs,
+                        unsafe { GetLastError() }
+                    );
+                }
+                (rva, r)
+            })
+            .collect()
+    }
+}
+
+/// Symbolize a list of exe-relative RVAs against the running binary's symbols.
+/// Windows-only diagnostic helper for the `CRATONVM_SYMBOLIZE` startup hook;
+/// returns `(rva, Some("function+0xNN"))` per input. Empty on non-Windows.
+pub fn symbolize_rvas(_rvas: &[usize]) -> Vec<(usize, Option<String>)> {
+    #[cfg(windows)]
+    {
+        windows_fault::symbolize_rvas(_rvas)
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
     }
 }
 
