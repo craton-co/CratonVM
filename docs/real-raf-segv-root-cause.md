@@ -81,19 +81,49 @@ Decisive experiments (all on `avrora -s small`):
   conservative scanning). Under the extra real-RAF GC pressure, a relocation
   during `visit(CPI)` corrupts that receiver slot to `0x1`.
 
-## The fix (not done — scoped for follow-up)
+## The fix — part 1 DONE: cross-thread JIT roots in the snapshot
 
-This is a JIT/GC subsystem effort, not a localized patch:
+Commit "fix(gc): scan active JIT frames in the cross-thread root snapshot".
 
-- **Proper fix:** emit precise oop maps during JIT codegen so the GC root
-  scanner exactly enumerates+relocates object references in JIT frames (the
-  `has_precise_oop_maps()` path already exists but is never populated), OR make
-  the conservative JIT-frame scan correctly preserve+update receiver slots
-  across a multi-threaded STW relocation.
-- **NOT acceptable** (no-mask rule): adding a non-canonical-receiver guard to
-  `jit_putfield_int` to skip/deopt the write — that hides the GC corruption and
-  would silently produce wrong avrora results.
+The STW collector reads each thread's roots via `collect_all_root_snapshots()`
+(the only cross-thread path; `collect_roots`, which *did* scan JIT frames, runs
+only on the current thread / in tests). But `update_root_snapshot`
+(interpreter.rs) scanned only `thread.frames` + native pins — it NEVER scanned
+the thread's active JIT spill region. So a worker thread's JIT-held receiver was
+entirely absent from the snapshot the collector reads. Fix:
+`update_root_snapshot` now also calls `scan_active_jit_frames` (it always runs on
+the thread it snapshots, so the thread-local scan captures that worker's live
+JIT frame).
 
-Until then RAF stays synthetic (default). Reproduce with:
-`CRATONVM_REAL_RAF=1 CRATONVM_DBG_JIT_PUTFIELD=1 cratonvm --jar dacapo.jar avrora -s small`
-and symbolize the `hs_err` RVAs with `CRATONVM_SYMBOLIZE=...` on the same binary.
+**Verified:** with this fix, `CRATONVM_REAL_RAF=1` avrora **no longer SEGVs in a
+debug build** (it advances all the way to real-RAF I/O); synthetic avrora still
+PASSES in both debug and release (no regression).
+
+## The fix — part 2 NOT done: STW marking freshness for in-JIT threads
+
+A **release** build of `CRATONVM_REAL_RAF=1` avrora still crashes (debug does
+not). The remaining gap: the collector defers *compaction* while any thread is
+in JIT (`any_thread_in_jit`/`gc_must_defer`) but still *marks* — and marking
+uses each thread's last-published snapshot. A worker thread actively executing
+JIT-compiled code that has NOT parked at a safepoint since entering its current
+JIT frame has a STALE snapshot (missing the current frame's JIT roots), so
+marking reclaims the receiver. Part 1 fixes snapshot *content*; this is a
+snapshot *freshness* / STW-coordination gap. Debug hides it (slower JIT, more
+likely parked at a poll when GC fires); release exposes it.
+
+Tractable completions (follow-up):
+- Guarantee every in-JIT thread reaches a safepoint poll and republishes
+  (`update_root_snapshot`, now JIT-aware) before STW marking proceeds — i.e. the
+  collector must WAIT for all in-JIT threads to park, and JIT code must poll
+  safepoints densely enough that it always can.
+- OR have the STW collector scan each in-JIT thread's JIT stack directly from a
+  per-thread (SP, JIT-chain) snapshot captured at the safepoint (the
+  "future enhancement" named in `conservative_roots.rs`).
+
+**NOT acceptable** (no-mask rule): a non-canonical-receiver guard in
+`jit_putfield_int` to skip/deopt the write — that hides the GC corruption and
+would silently produce wrong results.
+
+Reproduce: `CRATONVM_REAL_RAF=1 [CRATONVM_DBG_JIT_PUTFIELD=1] cratonvm --jar
+dacapo.jar avrora -s small`; symbolize `hs_err` RVAs with `CRATONVM_SYMBOLIZE=...`
+on the same binary (use `--profile release-with-debug` for symbols).
