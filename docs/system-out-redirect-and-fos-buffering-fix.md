@@ -97,3 +97,50 @@ fixed. `sunflow` (AWT/Java2D/ImageIO native surface) and `fop`
 (ClassLoader-modelled-as-Object / classloader isolation + SEGV) remain the
 large, separate efforts documented in
 `docs/dacapo-luindex-sunflow-fop-investigation.md`.
+
+### Follow-up: `BufferedReader.readLine` root cause (the synthetic Reader stack)
+Deeper investigation (2026-06-01, second pass) pinned #2 precisely, and it is
+the **same synthetic-native-shadows-real-bytecode pattern as RAF — but spread
+across the entire `java.io` Reader stack**:
+
+- `servlet.rs::register_r3_resource_loading` (always registered) installs a
+  blanket `BufferedReader.readLine()` native for a synthetic byte[]-backed r3
+  resource reader (`BufferedReader.field0→InputStreamReader.field0→byte[]`,
+  pos@1, count@3). Via `native_methods.find(class_name,…)` it beats real
+  bytecode, and for a *real* `BufferedReader` the layout doesn't match →
+  `r3_get_input_stream` returns None → the native returns **null**. That is
+  why every real `readLine()` returns 0 lines (`read()` is unaffected — it has
+  its own dispatch).
+- Removing that native does NOT fix it: real `readLine` bytecode then throws
+  `IOException: Stream closed` because the underlying Reader stack is *also*
+  synthetic — `Reader.read`→`native_sr_read` (native-io lib.rs ~5871, ungated),
+  `InputStreamReader.read`→`native_isr_read` (~3886), `FileReader`/`StringReader`
+  are synthetic-native-backed, and the real `BufferedReader`/`ensureOpen`
+  bytecode sees a null `in`. `read()` works only because it routes through the
+  synthetic `Reader.read` natives; `readLine()` (real bytecode using
+  `in`/`cb`/`fill`) does not mesh with them.
+
+So a correct `readLine` requires making the whole Reader I/O stack real-bytecode
+(`FileReader`→`InputStreamReader`→`StreamDecoder`→`FileInputStream`, plus
+`BufferedReader` itself), exactly analogous to the RAF migration — and it will
+hit the same class of cascading issues (Cleaner/PhantomReference, GC under
+load). It is a subsystem migration, not a localized fix. The blanket
+`readLine` native is left in place (returns null for real readers — the
+pre-existing behavior) rather than throwing, to avoid regressing apps that
+currently tolerate the null.
+
+### Net assessment of luindex/sunflow/fop
+All three are blocked by **subsystem-level** work, not bug fixes:
+- **luindex**: real-bytecode I/O stack (RAF *and* Reader) + Cleaner/
+  PhantomReference support that survives GC under load. Two independent deep
+  migrations.
+- **sunflow**: AWT/Java2D/ImageIO native surface (Toolkit, Disposer, image
+  codecs, rasterizers).
+- **fop**: ClassLoader-modelled-as-`Object` / classloader-isolation + the
+  resulting SEGV.
+
+The tractable underlying bugs in these chains have been fixed and committed
+(SHA-384 long decode; System.setOut redirect; PrintStream user-stream routing;
+unbuffered FOS). The remaining work is large and regression-prone (the RAF
+real-bytecode experiment already SEGV'd avrora), so it should be scoped and
+undertaken deliberately rather than as a quick patch.
