@@ -25,6 +25,14 @@ use crate::vm::SharedVm;
 // ---------------------------------------------------------------------------
 
 thread_local! {
+    /// DIAGNOSTIC: name of the most recently dispatched JIT callee on this
+    /// thread (`class.method desc`). Set at the top of `jit_invoke_dispatch` /
+    /// `jit_invoke_virtual_mic`. Read by `jit_putfield_int` when it sees a
+    /// non-canonical receiver, to name the miscompiled method. Only touched on
+    /// dispatch (cheap) and never in release-critical inner loops.
+    static CURRENT_JIT_CALLEE: std::cell::RefCell<String> =
+        const { std::cell::RefCell::new(String::new()) };
+
     /// Stores a raw pointer to the current thread's JvmThread.
     /// Safety invariant: only ONE `&mut JvmThread` is derived from this at a time,
     /// and only within a single JIT helper call scope. The pointer is set before
@@ -103,6 +111,41 @@ pub struct JitThreadScope {
     prev_ptr: *mut JvmThread,
     #[cfg(debug_assertions)]
     prev_borrow: bool,
+}
+
+/// DIAGNOSTIC: read the current dispatched JIT callee name.
+fn current_jit_callee() -> String {
+    CURRENT_JIT_CALLEE.with(|c| c.borrow().clone())
+}
+
+/// DIAGNOSTIC RAII guard: records `info` as the current callee, and on drop
+/// restores the PREVIOUS value. This makes `current_jit_callee()` name the
+/// method whose body is *currently executing inline* (the one containing a
+/// faulting putfield), rather than a sub-call it dispatched and returned from.
+struct JitCalleeGuard(String);
+impl JitCalleeGuard {
+    fn new(info: &JitInvokeInfo) -> Self {
+        let prev = CURRENT_JIT_CALLEE.with(|c| {
+            let mut s = c.borrow_mut();
+            let prev = s.clone();
+            s.clear();
+            s.push_str(info.class_name);
+            s.push('.');
+            s.push_str(info.method_name);
+            s.push_str(info.descriptor);
+            prev
+        });
+        JitCalleeGuard(prev)
+    }
+}
+impl Drop for JitCalleeGuard {
+    fn drop(&mut self) {
+        CURRENT_JIT_CALLEE.with(|c| {
+            let mut s = c.borrow_mut();
+            s.clear();
+            s.push_str(&self.0);
+        });
+    }
 }
 
 /// Set the current thread's JvmThread pointer for JIT helper access.
@@ -1289,6 +1332,24 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i64) {
     if obj_ptr == 0 { return; }
+    // DIAGNOSTIC (one-shot): the real-bytecode-RAF SEGV is a write through a
+    // near-null/garbage receiver here. Report the actual obj_ptr/field_index
+    // BEFORE dereferencing so we can tell a tagged value from a moved pointer.
+    {
+        let bits = obj_ptr as u64;
+        if (bits & 0x7) != 0 || bits >= (1u64 << 48) {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[JIT-PFI-BAD] non-canonical receiver obj_ptr=0x{:x} field_index={} val=0x{:x} (write would target 0x{:x}) current_jit_callee={}",
+                    bits, field_index, val as u64,
+                    bits.wrapping_add((HEADER_SIZE + field_index as usize * SLOT_SIZE) as u64),
+                    current_jit_callee(),
+                );
+            }
+        }
+    }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
     if std::env::var_os("CRATON_JIT_PFI_TRACE").is_some() {
@@ -1951,6 +2012,13 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // SAFETY: vm_ptr and info_ptr originate from JIT code; both point to valid, live objects.
     let vm = &*(vm_ptr as *const SharedVm);
     let info = &*(info_ptr as *const JitInvokeInfo);
+    // DIAGNOSTIC (gated): record the dispatched callee (restored on return) so
+    // a downstream jit_putfield_int miscompile can name the offending method.
+    let _callee_guard = if crate::runtime::env_cache::jit_putfield_diag() {
+        Some(JitCalleeGuard::new(info))
+    } else {
+        None
+    };
     // Defensive gate: when the user-facing CRATONVM_DISABLE_JIT kill-switch is set,
     // no JIT code should be executing — so this dispatch helper must never run.
     // Reaching it means a JIT entry point bypassed the flag (a real bug). Returning
@@ -2288,6 +2356,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     jit_safepoint_flush_satb(vm_ptr);
     let vm = &*(vm_ptr as *const SharedVm);
     let info = &*(info_ptr as *const JitInvokeInfo);
+    let _callee_guard = if crate::runtime::env_cache::jit_putfield_diag() {
+        Some(JitCalleeGuard::new(info))
+    } else {
+        None
+    };
     if num_args < 0 || (num_args > 0 && (args_ptr as *const i64).is_null()) {
         return 0;
     }
@@ -3252,8 +3325,18 @@ mod tests {
         // probe is overwhelmingly likely to fail and drive the
         // `maybe_gc_forced_pub` arm. We use unrooted allocations so
         // they're immediately dead and the post-GC retry succeeds.
+        //
+        // CRIT: use the *fallible* `try_alloc_array`, not the panicking
+        // `alloc_array`. On a 1 MB young gen this loop intentionally runs
+        // the from-space to exhaustion; `alloc_array` would hit
+        // `alloc_young`'s hard `std::process::abort()` (surfacing on
+        // Windows as STATUS_STACK_BUFFER_OVERRUN / 0xC0000409) the instant
+        // the heap filled — killing the test process during *setup*, before
+        // `jit_newarray` is ever reached. `try_alloc_array` instead returns
+        // `None` once the gen is full, which we harmlessly drop: the gen is
+        // now pressured exactly as the test requires.
         for _ in 0..256 {
-            let _ = vm_box.heap.alloc_array(
+            let _ = vm_box.heap.try_alloc_array(
                 ClassId::new(0),
                 ArrayElementType::Int,
                 1024,
