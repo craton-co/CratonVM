@@ -102,3 +102,4 @@ test-infra/suite-results/*.tsv
 test-infra/_regression-cratonvm-shim.bat
 test-infra/suite-results/_cm-*.log
 /target-gpu/
+hs_err_pid*.log

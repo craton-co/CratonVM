@@ -2638,6 +2638,31 @@ fn run() -> Result<()> {
 }
 
 fn main() {
+    // Hardware-fault diagnostics. On Windows a SEGV/access violation is a
+    // structured exception that bypasses the Rust panic hook below entirely;
+    // without this, a native fault (e.g. the JIT-dispatch SEGV) kills the
+    // process with empty stderr and a bare STATUS_ACCESS_VIOLATION exit code.
+    // This registers a vectored exception handler that prints the faulting PC
+    // + a symbolized backtrace and then lets the process die as before. It
+    // does NOT install a panic hook, so the visibility-first hook set up just
+    // below is preserved. No-op on non-Windows targets.
+    cratonvm_vm::runtime::crash_handler::install_hardware_fault_handler();
+
+    // Self-test hook for the hardware-fault handler: when CRATONVM_TEST_SEGV=1,
+    // deliberately trigger an access violation right after installing the
+    // handler so the VEH path (faulting PC + symbolized backtrace) can be
+    // validated without needing to reproduce a real crash. Gated behind an env
+    // var so it never affects normal runs.
+    if std::env::var("CRATONVM_TEST_SEGV").as_deref() == Ok("1") {
+        eprintln!("[cratonvm] CRATONVM_TEST_SEGV=1: forcing an access violation");
+        // SAFETY: intentional null/wild dereference to exercise the fault
+        // handler. This is dead code on every normal run.
+        unsafe {
+            let p = 0xdead_beef_usize as *mut u8;
+            std::ptr::write_volatile(p, 0);
+        }
+    }
+
     // I1 — Visibility-first panic hook.
     //
     // The previous T14 hook silenced **every** Rust panic by routing it to

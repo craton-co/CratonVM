@@ -253,6 +253,254 @@ pub fn write_crash_report(info: &CrashInfo, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// ── Windows hardware-fault handler (vectored exception handler) ─────────────
+//
+// On Windows a hardware fault (access violation, illegal instruction, …) is a
+// *structured exception*, NOT a Rust panic — so it bypasses the panic hook
+// entirely and the process dies via the OS default handler with no diagnostic
+// (a bare `STATUS_ACCESS_VIOLATION` exit code and empty stderr). That is why
+// the JIT-dispatch SEGV, the sunflow Java2D SEGV, and the fop SEGV were all
+// "un-localizable" on this dev box: there was nothing capturing the faulting
+// PC or a backtrace.
+//
+// `install_hardware_fault_handler` registers a vectored exception handler
+// (VEH) that, on a genuinely fatal fault, prints the faulting exception code,
+// the faulting instruction address, and a symbolized native backtrace to
+// stderr (and writes an `hs_err_pid<pid>.log`), THEN returns
+// `EXCEPTION_CONTINUE_SEARCH` so normal exception processing continues and the
+// process still terminates exactly as before. It does not swallow the fault
+// and it does not alter control flow — it is a pure diagnostic tap.
+//
+// Symbol resolution requires the binary to carry debug info: build with the
+// `release-with-debug` profile (`--profile release-with-debug`), which keeps
+// line tables and does not strip. A plain `release` build (which strips
+// debuginfo) still prints the faulting address, usable with the `.map` file.
+#[cfg(windows)]
+mod windows_fault {
+    use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+    #[repr(C)]
+    struct ExceptionRecord {
+        exception_code: u32,
+        exception_flags: u32,
+        exception_record: *mut ExceptionRecord,
+        exception_address: *mut core::ffi::c_void,
+        number_parameters: u32,
+        exception_information: [usize; 15],
+    }
+
+    #[repr(C)]
+    struct ExceptionPointers {
+        exception_record: *mut ExceptionRecord,
+        context_record: *mut core::ffi::c_void,
+    }
+
+    type VectoredHandler =
+        unsafe extern "system" fn(*mut ExceptionPointers) -> i32;
+
+    extern "system" {
+        fn AddVectoredExceptionHandler(
+            first: u32,
+            handler: VectoredHandler,
+        ) -> *mut core::ffi::c_void;
+    }
+
+    // Win32 NTSTATUS exception codes we treat as fatal hardware faults.
+    const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    const EXCEPTION_IN_PAGE_ERROR: u32 = 0xC000_0006;
+    const EXCEPTION_ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+    const EXCEPTION_PRIV_INSTRUCTION: u32 = 0xC000_0096;
+    const EXCEPTION_INT_DIVIDE_BY_ZERO: u32 = 0xC000_0094;
+    const EXCEPTION_STACK_OVERFLOW: u32 = 0xC000_00FD;
+
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    // 0 = idle, 1 = handling. A plain bool swap would let a fault *inside* the
+    // handler recurse forever; this latches so a second fault falls straight
+    // through to the OS.
+    static HANDLING: AtomicU8 = AtomicU8::new(0);
+
+    fn code_name(code: u32) -> &'static str {
+        match code {
+            EXCEPTION_ACCESS_VIOLATION => "EXCEPTION_ACCESS_VIOLATION (SIGSEGV)",
+            EXCEPTION_IN_PAGE_ERROR => "EXCEPTION_IN_PAGE_ERROR",
+            EXCEPTION_ILLEGAL_INSTRUCTION => "EXCEPTION_ILLEGAL_INSTRUCTION (SIGILL)",
+            EXCEPTION_PRIV_INSTRUCTION => "EXCEPTION_PRIV_INSTRUCTION",
+            EXCEPTION_INT_DIVIDE_BY_ZERO => "EXCEPTION_INT_DIVIDE_BY_ZERO (SIGFPE)",
+            EXCEPTION_STACK_OVERFLOW => "EXCEPTION_STACK_OVERFLOW",
+            _ => "UNKNOWN",
+        }
+    }
+
+    fn is_fatal(code: u32) -> bool {
+        // NOTE: EXCEPTION_STACK_OVERFLOW is deliberately excluded. The VEH
+        // runs on the faulting thread's (now-exhausted) stack, so capturing a
+        // backtrace there would itself fault; and the Rust runtime already
+        // emits a "thread '…' has overflowed its stack" abort for that case.
+        matches!(
+            code,
+            EXCEPTION_ACCESS_VIOLATION
+                | EXCEPTION_IN_PAGE_ERROR
+                | EXCEPTION_ILLEGAL_INSTRUCTION
+                | EXCEPTION_PRIV_INSTRUCTION
+                | EXCEPTION_INT_DIVIDE_BY_ZERO
+        )
+    }
+
+    unsafe extern "system" fn vectored_handler(
+        info: *mut ExceptionPointers,
+    ) -> i32 {
+        if info.is_null() {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let rec = (*info).exception_record;
+        if rec.is_null() {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        let code = (*rec).exception_code;
+        // Ignore everything that is not a genuine fatal hardware fault — in
+        // particular Rust's own SEH unwind exceptions and debugger
+        // breakpoints must pass through untouched.
+        if !is_fatal(code) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+        // Re-entry latch. If a fault occurs while we are already reporting one
+        // (e.g. dbghelp itself trips), bail to the OS immediately rather than
+        // looping. Never reset — one report per process is enough.
+        if HANDLING.swap(1, Ordering::SeqCst) != 0 {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        let fault_addr = (*rec).exception_address as usize;
+        // For an access violation, exception_information[0] is the access type
+        // (0=read, 1=write, 8=execute) and [1] is the faulting data address.
+        let (op, data_addr) = if code == EXCEPTION_ACCESS_VIOLATION
+            && (*rec).number_parameters >= 2
+        {
+            let op = match (*rec).exception_information[0] {
+                0 => "read",
+                1 => "write",
+                8 => "execute",
+                _ => "?",
+            };
+            (op, (*rec).exception_information[1])
+        } else {
+            ("", 0)
+        };
+
+        // We are about to die regardless, so the normal async-signal-safety
+        // restrictions do not apply on Windows: a VEH runs in ordinary thread
+        // context (not an interrupt), so allocation / stdio / dbghelp are
+        // permitted. Print to stderr directly.
+        use std::io::Write;
+        let mut err = std::io::stderr().lock();
+        let _ = writeln!(err, "\n#");
+        let _ = writeln!(
+            err,
+            "# A fatal error has been detected by the CratonVM Runtime Environment:"
+        );
+        let _ = writeln!(err, "#");
+        let _ = writeln!(
+            err,
+            "#  {} (0x{:08X}) at pc=0x{:016X}",
+            code_name(code),
+            code,
+            fault_addr
+        );
+        if !op.is_empty() {
+            let _ = writeln!(
+                err,
+                "#  Faulting access: {} at address 0x{:016X}",
+                op, data_addr
+            );
+        }
+        let _ = writeln!(
+            err,
+            "#  pid={} tid={}",
+            std::process::id(),
+            super::get_tid()
+        );
+        let tname = std::thread::current()
+            .name()
+            .map(String::from)
+            .unwrap_or_else(|| "<unnamed>".to_string());
+        let _ = writeln!(err, "#  thread: \"{}\"", tname);
+        let _ = writeln!(err, "#");
+        let _ = writeln!(err, "Native frames (most recent call first):");
+
+        // Capture and symbolize. force_capture ignores RUST_BACKTRACE so we
+        // always get frames on a fatal fault. On Windows this walks the stack
+        // via dbghelp; symbols resolve when the binary carries debug info
+        // (build `--profile release-with-debug`).
+        let bt = std::backtrace::Backtrace::force_capture();
+        let bt_str = bt.to_string();
+        for line in bt_str.lines().take(80) {
+            let _ = writeln!(err, "  {}", line);
+        }
+        let _ = writeln!(err, "#");
+        let _ = err.flush();
+
+        // Also persist a marker file (rich, since we can allocate here).
+        let pid = std::process::id();
+        let path =
+            std::path::PathBuf::from(format!("hs_err_pid{}.log", pid));
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            let _ = writeln!(
+                f,
+                "# CratonVM fatal Windows exception\n#  {} (0x{:08X}) at pc=0x{:016X}",
+                code_name(code),
+                code,
+                fault_addr
+            );
+            if !op.is_empty() {
+                let _ = writeln!(
+                    f,
+                    "#  Faulting access: {} at 0x{:016X}",
+                    op, data_addr
+                );
+            }
+            let _ = writeln!(f, "#  pid={} tid={} thread={}", pid, super::get_tid(), tname);
+            let _ = writeln!(f, "\nNative frames:\n{}", bt_str);
+            let _ = f.flush();
+        }
+
+        // Continue searching — let the OS finish terminating the process the
+        // same way it would have without us. We only added the diagnostic.
+        EXCEPTION_CONTINUE_SEARCH
+    }
+
+    /// Register the vectored exception handler. Idempotent.
+    pub fn install() {
+        if INSTALLED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // `first = 1` -> run before any frame-based (SEH) handlers, so we see
+        // the fault even if some inner frame would otherwise swallow it. We
+        // still return CONTINUE_SEARCH, so a legitimate handler downstream is
+        // unaffected.
+        unsafe {
+            AddVectoredExceptionHandler(1, vectored_handler);
+        }
+    }
+}
+
+/// Install a process-wide hardware-fault diagnostic handler.
+///
+/// On Windows this registers a vectored exception handler that prints the
+/// faulting PC + a symbolized backtrace on an access violation / illegal
+/// instruction / etc., then lets the process terminate normally (see
+/// [`windows_fault`]). On other platforms it is currently a no-op (the Unix
+/// signal path lives in [`install_crash_handler`]).
+///
+/// Unlike [`install_crash_handler`], this does NOT touch the Rust panic hook,
+/// so it can be called alongside a caller that installs its own panic hook
+/// (as `vm-cli` does).
+pub fn install_hardware_fault_handler() {
+    #[cfg(windows)]
+    windows_fault::install();
+}
+
 /// Install the crash handler (Rust panic hook + platform signal handlers).
 ///
 /// Should be called once during VM startup. It is safe to call multiple times;
