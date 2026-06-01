@@ -634,6 +634,130 @@ impl BigInt {
         }
         true
     }
+
+    // -----------------------------------------------------------------
+    // two's-complement bit operations (BigInteger semantics)
+    // -----------------------------------------------------------------
+
+    /// Number of bits in the minimal magnitude (highest set bit + 1; 0 for zero).
+    fn mag_bits(mag: &[u32]) -> usize {
+        match mag.last() {
+            None => 0,
+            Some(&top) => (mag.len() - 1) * 32 + (32 - top.leading_zeros() as usize),
+        }
+    }
+
+    /// Two's-complement representation in exactly `len` words (little-endian),
+    /// sign-extended. `len` must be at least the magnitude word count.
+    fn to_twos(&self, len: usize) -> Vec<u32> {
+        let mut w = vec![0u32; len];
+        for (i, &m) in self.mag.iter().enumerate() {
+            w[i] = m;
+        }
+        if self.neg {
+            // negate over the full width: ~w + 1 (high zero words become the
+            // sign-extended 1s automatically via ~0 + carry).
+            let mut carry = 1u64;
+            for x in w.iter_mut() {
+                let v = (!*x as u64) + carry;
+                *x = v as u32;
+                carry = v >> 32;
+            }
+        }
+        w
+    }
+
+    /// Interpret a two's-complement word vector (top bit = sign) as a BigInt.
+    fn from_twos(w: &[u32]) -> BigInt {
+        let neg = w.last().map_or(false, |&top| (top >> 31) & 1 == 1);
+        if neg {
+            let mut m = w.to_vec();
+            let mut carry = 1u64;
+            for x in m.iter_mut() {
+                let v = (!*x as u64) + carry;
+                *x = v as u32;
+                carry = v >> 32;
+            }
+            Self::normalize(m, true)
+        } else {
+            Self::normalize(w.to_vec(), false)
+        }
+    }
+
+    fn bitop(&self, o: &BigInt, f: impl Fn(u32, u32) -> u32) -> BigInt {
+        // +1 word so the sign of each operand (and the result) is representable.
+        let len = self.mag.len().max(o.mag.len()) + 1;
+        let aw = self.to_twos(len);
+        let bw = o.to_twos(len);
+        let rw: Vec<u32> = (0..len).map(|i| f(aw[i], bw[i])).collect();
+        Self::from_twos(&rw)
+    }
+
+    pub(crate) fn and(&self, o: &BigInt) -> BigInt {
+        self.bitop(o, |x, y| x & y)
+    }
+    pub(crate) fn or(&self, o: &BigInt) -> BigInt {
+        self.bitop(o, |x, y| x | y)
+    }
+    pub(crate) fn xor(&self, o: &BigInt) -> BigInt {
+        self.bitop(o, |x, y| x ^ y)
+    }
+    /// `~self == -(self + 1)`.
+    pub(crate) fn not(&self) -> BigInt {
+        self.add(&Self::small(1)).neg_value()
+    }
+
+    /// `BigInteger.bitLength()` — bits in the minimal two's-complement
+    /// representation, excluding the sign bit.
+    pub(crate) fn bit_length(&self) -> u32 {
+        let mb = Self::mag_bits(&self.mag);
+        if self.neg {
+            // magBitLength-1 iff the magnitude is an exact power of two.
+            let pow2 = self.mag.last().map_or(false, |&t| t.count_ones() == 1)
+                && self.mag[..self.mag.len().saturating_sub(1)]
+                    .iter()
+                    .all(|&w| w == 0);
+            (if pow2 { mb - 1 } else { mb }) as u32
+        } else {
+            mb as u32
+        }
+    }
+
+    /// `BigInteger.bitCount()` — bits differing from the sign bit.
+    pub(crate) fn bit_count(&self) -> u32 {
+        if self.is_zero() {
+            return 0;
+        }
+        if !self.neg {
+            self.mag.iter().map(|w| w.count_ones()).sum()
+        } else {
+            // Count the 0-bits of the two's-complement (the sign-extended top
+            // word is all-1s and contributes nothing).
+            let len = self.mag.len() + 1;
+            let tw = self.to_twos(len);
+            tw.iter().map(|w| w.count_zeros()).sum::<u32>()
+        }
+    }
+
+    /// `BigInteger.testBit(n)`.
+    pub(crate) fn test_bit(&self, n: u32) -> bool {
+        let word = (n / 32) as usize;
+        let len = self.mag.len().max(word + 1) + 1;
+        let tw = self.to_twos(len);
+        (tw[word] >> (n % 32)) & 1 == 1
+    }
+
+    /// `BigInteger.getLowestSetBit()` — index of the rightmost set bit, or -1
+    /// for zero. Same for both signs (two's-complement preserves the lowest set
+    /// bit of the magnitude).
+    pub(crate) fn lowest_set_bit(&self) -> i32 {
+        for (i, &w) in self.mag.iter().enumerate() {
+            if w != 0 {
+                return (i as i32) * 32 + w.trailing_zeros() as i32;
+            }
+        }
+        -1
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -643,8 +767,9 @@ impl BigInt {
 mod tests {
     use super::*;
     use crate::{
-        bi_add_str, bi_compare, bi_div_str, bi_is_probable_prime_str, bi_mod_pow_str,
-        bi_mod_str, bi_mul_str, bi_shift_left_str, bi_shift_right_str, bi_sub_str,
+        bi_add_str, bi_bitwise_and, bi_bitwise_or, bi_bitwise_xor, bi_compare, bi_div_str,
+        bi_is_probable_prime_str, bi_mod_pow_str, bi_mod_str, bi_mul_str, bi_shift_left_str,
+        bi_shift_right_str, bi_sub_str,
     };
 
     // Deterministic LCG so the spread is reproducible without a rand dep.
@@ -867,6 +992,94 @@ mod tests {
             bi_is_probable_prime_str(&semiprime.to_decimal()),
             "semiprime vs decimal ref"
         );
+    }
+
+    #[test]
+    fn bit_ops_correct() {
+        let one = b("1");
+        let neg_one = b("-1");
+        let zero = b("0");
+
+        // Known exact values (BigInteger semantics).
+        assert_eq!(b("5").not().to_decimal(), "-6"); // ~5 = -6
+        assert_eq!(b("-5").not().to_decimal(), "4"); // ~(-5) = 4
+        assert_eq!(b("0").not().to_decimal(), "-1"); // ~0 = -1
+        assert_eq!(b("12").and(&b("10")).to_decimal(), "8");
+        assert_eq!(b("12").or(&b("10")).to_decimal(), "14");
+        assert_eq!(b("12").xor(&b("10")).to_decimal(), "6");
+        // Negative two's-complement (matches java.math.BigInteger):
+        // -8 = …11111000, 12 = …00001100 → &=…1000=8, |=…11111100=-4, ^=…11110100=-12.
+        assert_eq!(b("-8").and(&b("12")).to_decimal(), "8");
+        assert_eq!(b("-8").or(&b("12")).to_decimal(), "-4");
+        assert_eq!(b("-8").xor(&b("12")).to_decimal(), "-12");
+        // bitLength / bitCount / lowestSetBit edge cases.
+        assert_eq!(neg_one.bit_length(), 0);
+        assert_eq!(b("-2").bit_length(), 1);
+        assert_eq!(b("-4").bit_length(), 2);
+        assert_eq!(b("-3").bit_length(), 2);
+        assert_eq!(b("17").bit_length(), 5);
+        assert_eq!(b("255").bit_count(), 8);
+        assert_eq!(neg_one.bit_count(), 0);
+        assert_eq!(b("-256").bit_count(), 8);
+        assert_eq!(b("0").lowest_set_bit(), -1);
+        assert_eq!(b("48").lowest_set_bit(), 4); // 48 = 0b110000
+        assert_eq!(b("-48").lowest_set_bit(), 4);
+
+        // Algebraic identities over a deterministic spread of both signs.
+        let mut state = 0x1313_2424_3535_4646u64;
+        let mut vals: Vec<BigInt> = edge_cases().iter().map(|s| b(s)).collect();
+        for _ in 0..150 {
+            vals.push(b(&rand_decimal(&mut state)));
+        }
+        for x in &vals {
+            // ~x == -(x+1); x ^ -1 == ~x; x ^ 0 == x; x & 0 == 0; x | 0 == x.
+            assert_eq!(x.not(), x.add(&one).neg_value(), "~x for {}", x.to_decimal());
+            assert_eq!(x.xor(&neg_one), x.not(), "x^-1 for {}", x.to_decimal());
+            assert_eq!(x.xor(&zero), *x);
+            assert_eq!(x.and(&zero), zero);
+            assert_eq!(x.or(&zero), *x);
+            assert_eq!(x.and(x), *x);
+            assert_eq!(x.or(x), *x);
+            assert_eq!(x.xor(x), zero);
+            // testBit consistency with the value: x.testBit(i) reconstructs x
+            // for a few low bits via OR of set bits is overkill; check against
+            // shifting instead: bit i of x == ((x >> i) is odd).
+            for i in [0u32, 1, 5, 31, 32, 33, 64] {
+                let shifted_odd = x.shr(i).and(&one) == one;
+                assert_eq!(x.test_bit(i), shifted_odd, "testBit {} bit {i}", x.to_decimal());
+            }
+        }
+        // Cross-identity: (a&b) | (a^b) == a|b; De Morgan ~(a&b)==(~a)|(~b).
+        for x in &vals {
+            for y in vals.iter().take(20) {
+                assert_eq!(x.and(y).or(&x.xor(y)), x.or(y), "consistency");
+                assert_eq!(x.and(y).not(), x.not().or(&y.not()), "De Morgan");
+            }
+        }
+    }
+
+    #[test]
+    fn positive_bit_ops_match_decimal() {
+        // For non-negative operands the decimal reference (which works on
+        // magnitudes) is authoritative.
+        let mut state = 0x9999_7777_5555_3333u64;
+        let mut pos: Vec<String> = vec!["0", "1", "255", "65535", "4294967296"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        for _ in 0..150 {
+            pos.push(rand_decimal(&mut state).trim_start_matches('-').to_string());
+        }
+        for a in &pos {
+            // bitLength / bitCount vs decimal ref.
+            assert_eq!(b(a).bit_length(), crate::bi_bit_length_str(a) as u32, "bitLen {a}");
+            assert_eq!(b(a).bit_count(), crate::bi_bit_count_str(a) as u32, "bitCnt {a}");
+            for c in pos.iter().take(25) {
+                assert_eq!(b(a).and(&b(c)).to_decimal(), bi_bitwise_and(a, c), "and {a}&{c}");
+                assert_eq!(b(a).or(&b(c)).to_decimal(), bi_bitwise_or(a, c), "or {a}|{c}");
+                assert_eq!(b(a).xor(&b(c)).to_decimal(), bi_bitwise_xor(a, c), "xor {a}^{c}");
+            }
+        }
     }
 
     #[test]

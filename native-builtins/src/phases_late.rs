@@ -35033,138 +35033,77 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         let v = bi_read_int(ctx, obj_arg(args, 0)?);
         Ok(Some(Value::Int(if v.is_probable_prime() { 1 } else { 0 })))
     });
+    // shiftLeft/shiftRight via limb BigInt (rewrite step 4). Negative counts
+    // flip direction (BigInteger contract). Arithmetic (floor) right shift.
     r.register(bi, "shiftLeft", "(I)Ljava/math/BigInteger;", |ctx, args| {
-        let v = bi_read(ctx, obj_arg(args, 0)?);
+        let v = bi_read_int(ctx, obj_arg(args, 0)?);
         let n = match args.get(1) {
             Some(Value::Int(i)) => *i,
             _ => 0,
         };
-        let res = bi_shift_left_str(&v, n);
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
+        let res = if n >= 0 { v.shl(n as u32) } else { v.shr(n.unsigned_abs()) };
+        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))))
     });
     r.register(
         bi,
         "shiftRight",
         "(I)Ljava/math/BigInteger;",
         |ctx, args| {
-            let v = bi_read(ctx, obj_arg(args, 0)?);
+            let v = bi_read_int(ctx, obj_arg(args, 0)?);
             let n = match args.get(1) {
                 Some(Value::Int(i)) => *i,
                 _ => 0,
             };
-            let res = bi_shift_right_str(&v, n);
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
+            let res = if n >= 0 { v.shr(n as u32) } else { v.shl(n.unsigned_abs()) };
+            Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))))
         },
     );
-    r.register(
-        bi,
-        "and",
-        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-        |ctx, args| {
-            let a_dec = bi_read(ctx, obj_arg(args, 0)?);
-            let b_dec = bi_read(ctx, obj_arg(args, 1)?);
-            // bi_bitwise_and treats inputs as non-negative magnitudes. For
-            // most BC callers (curve primes, masks) both operands are
-            // non-negative — handle the negative case by computing on the
-            // two's-complement magnitude, which for AND with positives just
-            // means returning 0 in the negative-only bits (good enough for
-            // the typical "mask" pattern).
-            let (a_neg, a_abs) = bi_parse_sign(&a_dec);
-            let (b_neg, b_abs) = bi_parse_sign(&b_dec);
-            let res = if !a_neg && !b_neg {
-                bi_bitwise_and(a_abs, b_abs)
-            } else if a_neg && !b_neg {
-                // (-a) & b  ==  b minus bits where (-a) is 0
-                // Quick approximation: low |a|.bit_length bits of (-a) in two's
-                // complement, then mask with b. Use bi_to_byte_array_str round-trip.
-                let bytes_a = bi_to_byte_array_str(&a_dec);
-                let mag_a = bi_from_byte_array_with_signum(
-                    1,
-                    &bytes_a.iter().map(|&b| !b).collect::<Vec<u8>>(),
-                );
-                // Approximate: take the AND of (~a magnitude) and b magnitude,
-                // then add 1's complement adjustment for negative range.
-                bi_bitwise_and(bi_parse_sign(&mag_a).1, b_abs)
-            } else if !a_neg && b_neg {
-                let bytes_b = bi_to_byte_array_str(&b_dec);
-                let mag_b = bi_from_byte_array_with_signum(
-                    1,
-                    &bytes_b.iter().map(|&b| !b).collect::<Vec<u8>>(),
-                );
-                bi_bitwise_and(a_abs, bi_parse_sign(&mag_b).1)
-            } else {
-                // Both negative: (-a) & (-b) — full two's-complement result is
-                // negative; fall back to bitwise on magnitudes for a reasonable
-                // (signless) approximation. Not exact for the rare case BC hits;
-                // BC EC code never ANDs two negatives.
-                let r = bi_bitwise_and(a_abs, b_abs);
-                if r == "0" { r } else { format!("-{}", r) }
-            };
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
-        },
-    );
-    r.register(
-        bi,
-        "or",
-        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-        |ctx, args| {
-            let a_dec = bi_read(ctx, obj_arg(args, 0)?);
-            let b_dec = bi_read(ctx, obj_arg(args, 1)?);
-            let (a_neg, a_abs) = bi_parse_sign(&a_dec);
-            let (b_neg, b_abs) = bi_parse_sign(&b_dec);
-            let res = if !a_neg && !b_neg {
-                bi_bitwise_or(a_abs, b_abs)
-            } else {
-                let r = bi_bitwise_or(a_abs, b_abs);
-                if (a_neg || b_neg) && r != "0" {
-                    format!("-{}", r)
-                } else {
-                    r
-                }
-            };
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
-        },
-    );
-    r.register(
-        bi,
-        "xor",
-        "(Ljava/math/BigInteger;)Ljava/math/BigInteger;",
-        |ctx, args| {
-            let a_dec = bi_read(ctx, obj_arg(args, 0)?);
-            let b_dec = bi_read(ctx, obj_arg(args, 1)?);
-            let (a_neg, a_abs) = bi_parse_sign(&a_dec);
-            let (b_neg, b_abs) = bi_parse_sign(&b_dec);
-            let r = bi_bitwise_xor(a_abs, b_abs);
-            // a_neg XOR b_neg => result negative.
-            let res = if a_neg != b_neg && r != "0" {
-                format!("-{}", r)
-            } else {
-                r
-            };
-            Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
-        },
-    );
+    // Bitwise and/or/xor/not via limb BigInt with FULL two's-complement
+    // semantics (rewrite step 4). The previous decimal versions were explicit
+    // approximations for negative operands ("not exact for the rare case BC
+    // hits"); BigInt::{and,or,xor,not} are exact for both signs (validated by
+    // bigint::tests::bit_ops_correct against algebraic identities + the decimal
+    // reference for non-negatives).
+    r.register(bi, "and", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", |ctx, args| {
+        let a = bi_read_int(ctx, obj_arg(args, 0)?);
+        let b = bi_read_int(ctx, obj_arg(args, 1)?);
+        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.and(&b))))))
+    });
+    r.register(bi, "or", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", |ctx, args| {
+        let a = bi_read_int(ctx, obj_arg(args, 0)?);
+        let b = bi_read_int(ctx, obj_arg(args, 1)?);
+        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.or(&b))))))
+    });
+    r.register(bi, "xor", "(Ljava/math/BigInteger;)Ljava/math/BigInteger;", |ctx, args| {
+        let a = bi_read_int(ctx, obj_arg(args, 0)?);
+        let b = bi_read_int(ctx, obj_arg(args, 1)?);
+        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.xor(&b))))))
+    });
     r.register(bi, "not", "()Ljava/math/BigInteger;", |ctx, args| {
-        let a = bi_read(ctx, obj_arg(args, 0)?);
-        let res = bi_not_str(&a);
-        Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
+        let a = bi_read_int(ctx, obj_arg(args, 0)?);
+        Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &a.not())))))
     });
     r.register(bi, "testBit", "(I)Z", |ctx, args| {
-        let v = bi_read(ctx, obj_arg(args, 0)?);
+        let v = bi_read_int(ctx, obj_arg(args, 0)?);
         let n = match args.get(1) {
             Some(Value::Int(i)) => *i,
             _ => 0,
         };
-        let bit = bi_test_bit_str(&v, n);
-        Ok(Some(Value::Int(if bit { 1 } else { 0 })))
+        if n < 0 {
+            return Err(RuntimeError::ArithmeticException {
+                message: "Negative bit address".into(),
+            }
+            .into());
+        }
+        Ok(Some(Value::Int(if v.test_bit(n as u32) { 1 } else { 0 })))
     });
     r.register(bi, "bitLength", "()I", |ctx, args| {
-        let v = bi_read(ctx, obj_arg(args, 0)?);
-        Ok(Some(Value::Int(bi_bit_length_str(&v) as i32)))
+        let v = bi_read_int(ctx, obj_arg(args, 0)?);
+        Ok(Some(Value::Int(v.bit_length() as i32)))
     });
     r.register(bi, "bitCount", "()I", |ctx, args| {
-        let v = bi_read(ctx, obj_arg(args, 0)?);
-        Ok(Some(Value::Int(bi_bit_count_str(&v) as i32)))
+        let v = bi_read_int(ctx, obj_arg(args, 0)?);
+        Ok(Some(Value::Int(v.bit_count() as i32)))
     });
     r.register(bi, "toByteArray", "()[B", |ctx, args| {
         let v = bi_read(ctx, obj_arg(args, 0)?);
