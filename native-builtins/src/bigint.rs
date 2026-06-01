@@ -463,6 +463,115 @@ impl BigInt {
             r
         }
     }
+
+    // -----------------------------------------------------------------
+    // modular exponentiation + primality (the hot crypto natives)
+    // -----------------------------------------------------------------
+
+    /// Small non-negative constant.
+    fn small(v: u32) -> BigInt {
+        if v == 0 {
+            BigInt::zero()
+        } else {
+            BigInt { neg: false, mag: vec![v] }
+        }
+    }
+
+    /// `self^exp mod modulus`, all magnitudes; `exp` must be non-negative and
+    /// `modulus` positive (the native layer handles negative exponents via
+    /// modInverse and a zero/negative modulus separately). Square-and-multiply
+    /// with word-based mul + non-negative `modulo` — no decimal anywhere.
+    pub(crate) fn modpow(&self, exp: &BigInt, modulus: &BigInt) -> BigInt {
+        if modulus.is_zero() {
+            return BigInt::zero();
+        }
+        let one = Self::small(1);
+        if modulus.cmp(&one) == Ordering::Equal {
+            return BigInt::zero(); // anything mod 1 == 0
+        }
+        let mut result = one; // 1, already < modulus since modulus > 1
+        let mut base = self.modulo(modulus);
+        let ebits = exp.mag.len() * 32;
+        for i in 0..ebits {
+            if (exp.mag[i / 32] >> (i % 32)) & 1 == 1 {
+                result = result.mul(&base).modulo(modulus);
+            }
+            if i + 1 < ebits {
+                base = base.mul(&base).modulo(modulus);
+            }
+        }
+        result
+    }
+
+    /// Strong-probable-prime (Miller-Rabin) test with fixed small-prime bases —
+    /// mirrors the decimal `bi_is_probable_prime_str` (trial division < 1000,
+    /// then 13 fixed bases), but on words so the inner `modPow` is fast.
+    pub(crate) fn is_probable_prime(&self) -> bool {
+        if self.neg || self.is_zero() {
+            return false;
+        }
+        let one = Self::small(1);
+        let two = Self::small(2);
+        let three = Self::small(3);
+        if self.cmp(&one) == Ordering::Equal {
+            return false;
+        }
+        if self.cmp(&two) == Ordering::Equal || self.cmp(&three) == Ordering::Equal {
+            return true;
+        }
+        // even
+        if self.mag[0] & 1 == 0 {
+            return false;
+        }
+        // trial division by small odd numbers < 1000 (fast composite filter)
+        let mut d = 3u32;
+        while d < 1000 {
+            let dd = Self::small(d);
+            if self.cmp(&dd) == Ordering::Less {
+                break;
+            }
+            if self.modulo(&dd).is_zero() {
+                return self.cmp(&dd) == Ordering::Equal;
+            }
+            d += 2;
+        }
+        self.miller_rabin()
+    }
+
+    fn miller_rabin(&self) -> bool {
+        let one = Self::small(1);
+        let n_minus_1 = self.sub(&one);
+        // n-1 = d * 2^s, d odd
+        let mut d = n_minus_1.clone();
+        let mut s: u32 = 0;
+        while !d.is_zero() && d.mag[0] & 1 == 0 {
+            d = d.shr(1);
+            s += 1;
+        }
+        const BASES: &[u32] = &[2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41];
+        for &a in BASES {
+            let a_bi = Self::small(a);
+            if a_bi.cmp(self) != Ordering::Less {
+                continue;
+            }
+            let mut x = a_bi.modpow(&d, self);
+            if x.cmp(&one) == Ordering::Equal || x.cmp(&n_minus_1) == Ordering::Equal {
+                continue;
+            }
+            let mut composite = true;
+            for _ in 0..s.saturating_sub(1) {
+                x = x.mul(&x).modulo(self);
+                if x.cmp(&n_minus_1) == Ordering::Equal {
+                    composite = false;
+                    break;
+                }
+            }
+            if composite {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -472,8 +581,8 @@ impl BigInt {
 mod tests {
     use super::*;
     use crate::{
-        bi_add_str, bi_compare, bi_div_str, bi_mod_str, bi_mul_str, bi_shift_left_str,
-        bi_shift_right_str, bi_sub_str,
+        bi_add_str, bi_compare, bi_div_str, bi_is_probable_prime_str, bi_mod_pow_str,
+        bi_mod_str, bi_mul_str, bi_shift_left_str, bi_shift_right_str, bi_sub_str,
     };
 
     // Deterministic LCG so the spread is reproducible without a rand dep.
@@ -623,6 +732,79 @@ mod tests {
                 assert_eq!(m.to_decimal(), want_mod, "mod {a} mod {c}");
             }
         }
+    }
+
+    #[test]
+    fn modpow_matches_decimal() {
+        let mut state = 0xa5a5_5a5a_dead_0001u64;
+        // non-negative exponents, positive moduli > 1
+        let bases = ["0", "1", "2", "7", "255", "4294967297",
+            "123456789012345678901234567890",
+            "115792089237316195423570985008687907853269984665640564039457584007913129639747"];
+        let exps = ["0", "1", "2", "3", "17", "65537", "1000003"];
+        let mods = ["2", "3", "97", "65537", "1000000007",
+            "987654321098765432109876543211",
+            "115792089237316195423570985008687907853269984665640564039457584007913129639747"];
+        for ba in bases {
+            for e in exps {
+                for m in mods {
+                    let got = b(ba).modpow(&b(e), &b(m)).to_decimal();
+                    let want = bi_mod_pow_str(ba, e, m);
+                    assert_eq!(got, want, "modpow({ba}^{e} mod {m})");
+                }
+            }
+        }
+        // a few random non-negative cases
+        for _ in 0..120 {
+            let ba = rand_decimal(&mut state).trim_start_matches('-').to_string();
+            let e = rand_decimal(&mut state).trim_start_matches('-').to_string();
+            let m = {
+                let s = rand_decimal(&mut state).trim_start_matches('-').to_string();
+                if s == "0" || s == "1" { "1000000007".to_string() } else { s }
+            };
+            assert_eq!(
+                b(&ba).modpow(&b(&e), &b(&m)).to_decimal(),
+                bi_mod_pow_str(&ba, &e, &m),
+                "rand modpow({ba}^{e} mod {m})"
+            );
+        }
+    }
+
+    #[test]
+    fn is_probable_prime_matches_decimal() {
+        let primes = [
+            "2", "3", "5", "7", "97", "65537",
+            "32416190071", // 10-digit prime
+            "115792089237316195423570985008687907853269984665640564039457584007913129639747",
+        ];
+        let composites = ["0", "1", "4", "9", "15", "100", "32416190073"];
+        for p in primes {
+            assert!(b(p).is_probable_prime(), "{p} should be prime");
+            assert_eq!(
+                b(p).is_probable_prime(),
+                bi_is_probable_prime_str(p),
+                "prime {p} vs decimal ref"
+            );
+        }
+        for c in composites {
+            assert!(!b(c).is_probable_prime(), "{c} should be composite");
+            assert_eq!(
+                b(c).is_probable_prime(),
+                bi_is_probable_prime_str(c),
+                "composite {c} vs decimal ref"
+            );
+        }
+        // Hard case the trial-division stub got wrong: a product of two large
+        // primes (no small factor) must be detected composite by MR.
+        let p256 = "115792089237316195423570985008687907853269984665640564039457584007913129639747";
+        let q256 = "115792089237316195423570985008687907853269984665640564039457584007913129640297";
+        let semiprime = b(p256).mul(&b(q256));
+        assert!(!semiprime.is_probable_prime(), "p*q must be composite");
+        assert_eq!(
+            semiprime.is_probable_prime(),
+            bi_is_probable_prime_str(&semiprime.to_decimal()),
+            "semiprime vs decimal ref"
+        );
     }
 
     #[test]

@@ -18,6 +18,7 @@ use crate::{native_cf_then_apply, native_cf_then_accept};
 use crate::normalize_charset_name;
 use crate::bi_alloc;
 use crate::bi_read;
+use crate::{bi_alloc_int, bi_read_int};
 use crate::{
     bi_add_str, bi_bit_count_str, bi_bit_length_str, bi_bitwise_and, bi_bitwise_or,
     bi_bitwise_xor, bi_cmp_unsigned, bi_compare, bi_from_byte_array_signed,
@@ -35026,9 +35027,11 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(bi, "isProbablePrime", "(I)Z", |ctx, args| {
-        let v = bi_read(ctx, obj_arg(args, 0)?);
-        let prime = bi_is_probable_prime_str(&v);
-        Ok(Some(Value::Int(if prime { 1 } else { 0 })))
+        // Limb-based Miller-Rabin (rewrite step 3): read mag:[I directly into
+        // BigInt — no decimal round-trip — so the inner modPow is fast. This
+        // is the hot path for createRandomPrime / RSA key-gen.
+        let v = bi_read_int(ctx, obj_arg(args, 0)?);
+        Ok(Some(Value::Int(if v.is_probable_prime() { 1 } else { 0 })))
     });
     r.register(bi, "shiftLeft", "(I)Ljava/math/BigInteger;", |ctx, args| {
         let v = bi_read(ctx, obj_arg(args, 0)?);
@@ -35278,27 +35281,35 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
         "modPow",
         "(Ljava/math/BigInteger;Ljava/math/BigInteger;)Ljava/math/BigInteger;",
         |ctx, args| {
-            let base = bi_read(ctx, obj_arg(args, 0)?);
-            let exp = bi_read(ctx, obj_arg(args, 1)?);
-            let m = bi_read(ctx, obj_arg(args, 2)?);
-            if m == "0" {
+            // Limb-based modPow (rewrite step 3). The non-negative-exponent
+            // case — the crypto hot path (Miller-Rabin, RSA, DH) — runs
+            // entirely on words via BigInt: read mag:[I directly, square-and-
+            // multiply on limbs, write mag:[I back, with NO decimal round-trip.
+            let m_int = bi_read_int(ctx, obj_arg(args, 2)?);
+            if m_int.is_zero() {
                 return Err(RuntimeError::ArithmeticException {
                     message: "modulus is zero".into(),
                 }
                 .into());
             }
-            // Negative exponent: compute (base^-1)^|exp| mod m.
-            let res = if exp.starts_with('-') {
-                let inv = bi_mod_inverse_str(&base, &m).ok_or_else(|| {
-                    MethodCallFailed::from(RuntimeError::ArithmeticException {
-                        message: "BigInteger not invertible.".into(),
-                    })
-                })?;
-                let pos_exp = exp.trim_start_matches('-');
-                bi_mod_pow_str(&inv, pos_exp, &m)
-            } else {
-                bi_mod_pow_str(&base, &exp, &m)
-            };
+            let exp_int = bi_read_int(ctx, obj_arg(args, 1)?);
+            if !exp_int.is_neg() {
+                let base_int = bi_read_int(ctx, obj_arg(args, 0)?);
+                let res = base_int.modpow(&exp_int, &m_int);
+                return Ok(Some(Value::Object(Some(bi_alloc_int(ctx, &res)))));
+            }
+            // Negative exponent is rare (modInverse-based); keep the decimal
+            // path until step 5 lands a limb modInverse.
+            let base = bi_read(ctx, obj_arg(args, 0)?);
+            let exp = bi_read(ctx, obj_arg(args, 1)?);
+            let m = bi_read(ctx, obj_arg(args, 2)?);
+            let inv = bi_mod_inverse_str(&base, &m).ok_or_else(|| {
+                MethodCallFailed::from(RuntimeError::ArithmeticException {
+                    message: "BigInteger not invertible.".into(),
+                })
+            })?;
+            let pos_exp = exp.trim_start_matches('-');
+            let res = bi_mod_pow_str(&inv, pos_exp, &m);
             Ok(Some(Value::Object(Some(bi_alloc(ctx, &res)))))
         },
     );

@@ -23174,6 +23174,70 @@ pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
     obj
 }
 
+/// Read a `BigInteger` instance directly into the limb-based [`crate::bigint::BigInt`]
+/// — `O(words)`, with NO decimal conversion (unlike `bi_read`, which builds a
+/// decimal string via `mag_words_to_decimal`). This is the fast read boundary
+/// for the limb rewrite (step 3): the `mag:[I` field is big-endian base-2^32,
+/// so we reverse it into little-endian limbs.
+pub(crate) fn bi_read_int(ctx: &dyn NativeContext, this: ObjectRef) -> crate::bigint::BigInt {
+    use crate::bigint::BigInt;
+    if let Some((sig_i, mag_i)) = bi_layout(ctx) {
+        let signum = match ctx.get_field(this, sig_i) {
+            Value::Int(s) => s,
+            _ => 0,
+        };
+        if signum == 0 {
+            return BigInt::zero();
+        }
+        let mag = match ctx.get_field(this, mag_i) {
+            Value::Object(Some(o)) => o,
+            _ => return BigInt::zero(),
+        };
+        let len = ctx.array_length(mag);
+        // big-endian array (index 0 = most significant) → little-endian limbs.
+        let mut words: Vec<u32> = Vec::with_capacity(len);
+        for i in (0..len).rev() {
+            let w = match ctx.get_array_element(mag, i) {
+                Value::Int(v) => v as u32,
+                _ => 0,
+            };
+            words.push(w);
+        }
+        BigInt::from_le_words(signum < 0, words)
+    } else {
+        // Synthetic-stub fallback: parse the decimal string.
+        let s = match ctx.get_field(this, BI_FIELD_VALUE) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0".to_string()),
+            _ => "0".to_string(),
+        };
+        BigInt::from_decimal(&s)
+    }
+}
+
+/// Allocate a `BigInteger` from a limb-based [`crate::bigint::BigInt`] —
+/// `O(words)`, writing `signum` + big-endian `mag:[I` directly with NO decimal
+/// conversion (unlike `bi_alloc`, which goes through `decimal_to_mag_words`).
+/// Fast write boundary for the limb rewrite.
+pub(crate) fn bi_alloc_int(ctx: &mut dyn NativeContext, v: &crate::bigint::BigInt) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "java/math/BigInteger", 2);
+    let signum = v.signum();
+    if let Some((sig_i, mag_i)) = bi_layout(ctx) {
+        let le = v.mag_le(); // little-endian limbs
+        let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, le.len());
+        // little-endian limbs → big-endian array.
+        for (i, &w) in le.iter().rev().enumerate() {
+            ctx.set_array_element(mag_arr, i, Value::Int(w as i32));
+        }
+        ctx.set_field(obj, sig_i, Value::Int(signum));
+        ctx.set_field(obj, mag_i, Value::Object(Some(mag_arr)));
+    } else {
+        let s = ctx.create_string(&v.to_decimal());
+        ctx.set_field(obj, BI_FIELD_VALUE, Value::Object(Some(s)));
+        ctx.set_field(obj, BI_FIELD_SIGNUM, Value::Int(signum));
+    }
+    obj
+}
+
 /// Simple big integer addition using string-based decimal arithmetic.
 pub(crate) fn bi_add_str(a: &str, b: &str) -> String {
     let (a_neg, a_abs) = bi_parse_sign(a);
