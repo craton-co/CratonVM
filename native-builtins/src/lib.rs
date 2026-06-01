@@ -10777,9 +10777,12 @@ pub(crate) fn system_clear_overridden_stream(name: &'static str) {
     system_overridden_streams().lock().remove(name);
 }
 
-/// Read the current override for the given stream name, if any.
-#[allow(dead_code)]
-pub(crate) fn system_overridden_stream(name: &'static str) -> Option<ObjectRef> {
+/// Read the current override for the given stream name ("in"/"out"/"err"),
+/// if one was installed via `System.setIn/setOut/setErr` (→ `setIn0`/`setOut0`/
+/// `setErr0`). The interpreter's `getstatic System.out/err` bootstrap intercept
+/// consults this so a user redirect is honored instead of always returning the
+/// canonical synthetic fd-backed stream.
+pub fn system_overridden_stream(name: &str) -> Option<ObjectRef> {
     system_overridden_streams().lock().get(name).copied()
 }
 
@@ -11017,7 +11020,63 @@ fn stream_fd(ctx: &dyn NativeContext, args: &[Value]) -> Option<u32> {
 }
 
 /// Write text to real stdout/stderr if this is a system stream (dual-mode).
-fn stream_write(ctx: &dyn NativeContext, args: &[Value], text: &str) {
+/// When the receiver `PrintStream` wraps a real underlying `OutputStream`
+/// (its `FilterOutputStream.out` field is non-null — i.e. a user
+/// `new PrintStream(fos/...)` or DaCapo's `TeePrintStream`/`TeeOutputStream`,
+/// typically installed via `System.setOut`), write `bytes` through
+/// `out.write([B,0,len)` so the real stream chain (tee → screen + digest →
+/// file) observes the output, exactly as the JDK `PrintStream` bytecode would.
+///
+/// Returns `true` when it routed through `out`; `false` when `out` is null —
+/// the canonical synthetic `System.out`/`System.err` (fd-backed, no real
+/// underlying stream) — so the caller falls back to the fd fast-path.
+///
+/// This closes the `System.setOut`/`System.setErr` redirection gap: the
+/// blanket `println`/`print` natives previously resolved every PrintStream to
+/// a fixed fd (1/2) and wrote straight to the console, leaving a redirected
+/// file empty (DaCapo luindex's `stdout.log` digest validation saw the
+/// empty-input SHA-1).
+fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &[u8]) -> bool {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return false,
+    };
+    // Cheap null-probe (no allocation): canonical synthetic out/err have a
+    // null `out` and must take the fd fast-path. The result ObjectRef is
+    // intentionally discarded — see the GC note below.
+    if !matches!(ctx.get_field_by_name(this, "out"), Value::Object(Some(_))) {
+        return false;
+    }
+    // Allocate + fill the byte[] FIRST — `new_array` can trigger a compacting
+    // GC. `this` is pinned for the duration of the native call (safe_native_call
+    // → native_pin_roots), but a `Value::Object` resolved from `this.out`
+    // BEFORE the allocation is NOT pinned and would dangle if the collector
+    // moved it (the avrora SEGV regression). Re-resolve `out` AFTER the
+    // allocation; there is no GC safepoint between that read and the
+    // invoke_virtual (which pins `out`/`arr` as its own args).
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+    ctx.write_byte_array_from(arr, 0, bytes);
+    let out = match ctx.get_field_by_name(this, "out") {
+        Value::Object(Some(o)) => o,
+        _ => return false,
+    };
+    let _ = ctx.invoke_virtual(
+        out,
+        "write",
+        "([BII)V",
+        &[
+            Value::Object(Some(arr)),
+            Value::Int(0),
+            Value::Int(bytes.len() as i32),
+        ],
+    );
+    true
+}
+
+fn stream_write(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
+    if route_write_through_out(ctx, args, text.as_bytes()) {
+        return;
+    }
     if let Some(fd) = stream_fd(ctx, args) {
         let _ = ctx.fd_table().write_string(fd, text);
     }
@@ -11036,8 +11095,14 @@ fn host_line_separator(ctx: &dyn NativeContext) -> String {
 /// `println` to honour `line.separator` and emit NO leading BOM (the
 /// underlying `stream_write` writes UTF-8 bytes raw, which is what Java
 /// specifies for println).
-fn stream_writeln(ctx: &dyn NativeContext, args: &[Value], text: &str) {
+fn stream_writeln(ctx: &mut dyn NativeContext, args: &[Value], text: &str) {
     let sep = host_line_separator(ctx);
+    // User/Tee streams: write text+separator as one buffer through `out`.
+    let mut buf = text.as_bytes().to_vec();
+    buf.extend_from_slice(sep.as_bytes());
+    if route_write_through_out(ctx, args, &buf) {
+        return;
+    }
     if let Some(fd) = stream_fd(ctx, args) {
         let _ = ctx.fd_table().write_string(fd, text);
         let _ = ctx.fd_table().write_string(fd, &sep);
@@ -11387,6 +11452,15 @@ fn native_printwriter_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn native_printstream_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // User/Tee streams: propagate flush() to the real underlying stream so a
+    // redirected file (e.g. DaCapo stdout.log) is durable before its digest is
+    // read. Canonical synthetic out/err (out==null) flush the fd directly.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if let Value::Object(Some(out)) = ctx.get_field_by_name(*this, "out") {
+            let _ = ctx.invoke_virtual(out, "flush", "()V", &[]);
+            return Ok(None);
+        }
+    }
     if let Some(fd) = stream_fd(ctx, args) {
         let _ = ctx.fd_table().flush(fd);
     }
@@ -11400,25 +11474,30 @@ fn native_printstream_close(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Me
 
 fn native_printstream_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // args[0]=this, args[1]=byte[], args[2]=off, args[3]=len
-    if let Some(fd) = stream_fd(ctx, args) {
-        let arr = match args.get(1) {
-            Some(Value::Object(Some(a))) => *a,
-            _ => return Ok(None),
-        };
-        let off = match args.get(2) {
-            Some(Value::Int(o)) => *o as usize,
-            _ => 0,
-        };
-        let len = match args.get(3) {
-            Some(Value::Int(l)) => *l as usize,
-            _ => 0,
-        };
-        let mut buf = vec![0u8; len];
-        for (i, slot) in buf.iter_mut().enumerate() {
-            if let Value::Int(b) = ctx.get_array_element(arr, off + i) {
-                *slot = b as u8;
-            }
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let off = match args.get(2) {
+        Some(Value::Int(o)) => *o as usize,
+        _ => 0,
+    };
+    let len = match args.get(3) {
+        Some(Value::Int(l)) => *l as usize,
+        _ => 0,
+    };
+    let mut buf = vec![0u8; len];
+    for (i, slot) in buf.iter_mut().enumerate() {
+        if let Value::Int(b) = ctx.get_array_element(arr, off + i) {
+            *slot = b as u8;
         }
+    }
+    // User/Tee streams route through the real underlying stream; canonical
+    // synthetic out/err (out==null) write to the fd directly.
+    if route_write_through_out(ctx, args, &buf) {
+        return Ok(None);
+    }
+    if let Some(fd) = stream_fd(ctx, args) {
         let _ = ctx.fd_table().write_bytes(fd, &buf);
     }
     Ok(None)

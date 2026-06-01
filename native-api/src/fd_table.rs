@@ -485,7 +485,21 @@ impl FileDescriptorTable {
                 Ok(())
             }
             FileEntry::FileWrite(writer) => {
-                writer.lock().write_all(data)?;
+                // Java's `FileOutputStream.write` is UNBUFFERED — each write
+                // reaches the OS immediately and is visible to a concurrent
+                // reader on a separate handle. Our `BufWriter` would otherwise
+                // hold the bytes in userspace, so a second open of the same
+                // path reads an empty/partial file (DaCapo luindex's
+                // `FileDigest` re-reads `stdout.log` without first flushing the
+                // writer → empty-input SHA-1, digest validation fails). Flush
+                // after the write to restore the immediate-visibility
+                // contract; apps that want batching use `BufferedOutputStream`
+                // (Java-side), which hands us already-coalesced chunks — so
+                // this matches HotSpot, whose FOS issues a `write()` syscall
+                // per call too.
+                let mut w = writer.lock();
+                w.write_all(data)?;
+                w.flush()?;
                 Ok(())
             }
             // WP1.12 — bulk write to subprocess stdin.

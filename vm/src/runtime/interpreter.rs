@@ -6361,8 +6361,31 @@ fn execute_instruction(
                 resolve_field_descriptor_byte(shared, current_class_id, *index);
             if let Some(ref fname) = field_name_for_intercept {
                 if fname == "out" || fname == "err" {
-                    let (out, err) = shared.ensure_system_streams();
-                    let stream = if fname == "out" { out } else { err };
+                    // Honor System.setOut/setErr: a user-installed stream wins
+                    // over the canonical synthetic fd-backed stream. Read it
+                    // from the *static field* (which setOut0/setErr0 populate
+                    // via set_static_field) rather than the native-builtins
+                    // override map: the static field is a GC root that the
+                    // collector updates on object motion, whereas the map holds
+                    // a raw ObjectRef that goes stale when GC moves/frees the
+                    // user stream (DaCapo's TeePrintStream → "stale pointer …
+                    // falling back to CP class PrintStream", empty stdout.log).
+                    // A null/absent field means no override yet → canonical.
+                    let overridden = match get_static_shared(
+                        shared,
+                        field.declaring_class_id,
+                        field.field_index,
+                    ) {
+                        Value::Object(Some(s)) => Some(s),
+                        _ => None,
+                    };
+                    let stream = match overridden {
+                        Some(s) => s,
+                        None => {
+                            let (out, err) = shared.ensure_system_streams();
+                            if fname == "out" { out } else { err }
+                        }
+                    };
                     thread.frames[frame_idx]
                         .stack
                         .push(Value::Object(Some(stream)))?;
