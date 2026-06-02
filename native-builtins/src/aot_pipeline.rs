@@ -977,6 +977,22 @@ mod tests {
     // Integration tests — full startup/shutdown pipeline
     // -----------------------------------------------------------------------
 
+    /// FIX(test-isolation): the integration tests below drive the PROCESS-GLOBAL
+    /// `PIPELINE_STATE` through multi-step sequences (reset → record → flush →
+    /// load → assert). Each `with_state` op is individually locked, but the
+    /// *sequences* interleave under parallel `cargo test` — and the `--workspace`
+    /// build enables `experimental-aot`, running these alongside the whole
+    /// suite — so a sibling's `reset_pipeline_state()` / records clobber another
+    /// test's accumulated state, yielding wrong counts (e.g.
+    /// `aot_profiles_written != 2`, `cds_classes_loaded != 2`). Serialize the
+    /// whole-test sequences on this lock so each runs atomically against the
+    /// global pipeline state. Poison-tolerant so a panicking test can't wedge
+    /// the rest.
+    fn pipeline_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Use a fresh state for integration tests so they don't fight the global
     /// mutex-backed globals in other tests. We simulate the pipeline by
     /// inserting config, populating state, flushing, then reading back.
@@ -997,6 +1013,7 @@ mod tests {
     /// `startup_load` recovers them.
     #[test]
     fn integration_aot_profile_roundtrip() {
+        let _guard = pipeline_test_lock(); // FIX(test-isolation): serialize global PIPELINE_STATE seq
         reset_pipeline_state();
         let root = tmp_dir_with_suffix("aot_rt");
         let java_home = tmp_dir_with_suffix("aot_rt_jh");
@@ -1043,6 +1060,7 @@ mod tests {
     /// Integration test #2: CDS roundtrip with matching build ID.
     #[test]
     fn integration_cds_roundtrip() {
+        let _guard = pipeline_test_lock(); // FIX(test-isolation): serialize global PIPELINE_STATE seq
         reset_pipeline_state();
         let root = tmp_dir_with_suffix("cds_rt");
         let java_home = tmp_dir_with_suffix("cds_rt_jh");
@@ -1086,6 +1104,7 @@ mod tests {
     /// Integration test #3: stale cache rejection on JDK-build-ID mismatch.
     #[test]
     fn integration_stale_cache_rejected_on_build_id_mismatch() {
+        let _guard = pipeline_test_lock(); // FIX(test-isolation): serialize global PIPELINE_STATE seq
         reset_pipeline_state();
         let root = tmp_dir_with_suffix("stale");
         let java_home_a = tmp_dir_with_suffix("stale_jha");
