@@ -8412,71 +8412,38 @@ impl Compiler {
                     cpc += 1;
                 }
 
-                // ifeq (0x99), ifne (0x9a), iflt (0x9b), ifge (0x9c), ifgt (0x9d), ifle (0x9e)
+                // ifeq..ifle (0x99..0x9e) — internal control flow: BAIL.
+                //
+                // Inlining a callee with internal branches is unsound in this
+                // single linear-pass emitter: operand-stack slots are handed
+                // out by a *growing* `next_spill_offset` (see `push_stack`),
+                // not indexed by stack depth. At a control-flow merge the two
+                // incoming paths therefore (a) hold the merged operand in
+                // different frame slots and (b) leave the linear-pass stack
+                // model with stray entries. The canonical trigger is the
+                // diamond javac emits for `return <cond>`
+                // (`iconst_1; goto L; iconst_0; L: ireturn`): one path reads
+                // the return value from a slot it never wrote (garbage), and
+                // the caller's operand-stack model desyncs by one slot, which
+                // later stores through a bogus frame offset and SIGSEGVs
+                // (observed: Modifier.isStatic / any small `(arg & k)!=0`
+                // predicate hot-inlined into a loop). Bail to the normal,
+                // correct call path; straight-line callees still inline.
                 0x99..=0x9e => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
-                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
-
-                    self.pop_to_rax();
-                    // TEST EAX, EAX
-                    self.buf.emit(&[0x85, 0xC0]);
-                    // Jcc rel32
-                    let cc = match op {
-                        0x99 => 0x84u8, // JE
-                        0x9a => 0x85,    // JNE
-                        0x9b => 0x8C,    // JL
-                        0x9c => 0x8D,    // JGE
-                        0x9d => 0x8F,    // JG
-                        0x9e => 0x8E,    // JLE
-                        _ => unreachable!(),
-                    };
-                    self.buf.emit(&[0x0F, cc]);
-                    let patch_off = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                    branch_patches.push((patch_off, target));
-                    cpc += 3;
+                    self.next_spill_offset = callee_local_base;
+                    return false;
                 }
 
-                // if_icmpeq..if_icmple
+                // if_icmpeq..if_icmple — internal control flow: BAIL (see 0x99 note).
                 0x9f..=0xa4 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
-                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
-
-                    let top = self.pop_stack();
-                    self.pop_to_rax();
-                    self.load_slot_to_reg(RCX, top);
-                    // CMP EAX, ECX
-                    self.buf.emit(&[0x39, 0xC8]);
-                    let cc = match op {
-                        0x9f => 0x84u8, // JE
-                        0xa0 => 0x85,    // JNE
-                        0xa1 => 0x8C,    // JL
-                        0xa2 => 0x8D,    // JGE
-                        0xa3 => 0x8F,    // JG
-                        0xa4 => 0x8E,    // JLE
-                        _ => unreachable!(),
-                    };
-                    self.buf.emit(&[0x0F, cc]);
-                    let patch_off = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                    branch_patches.push((patch_off, target));
-                    cpc += 3;
+                    self.next_spill_offset = callee_local_base;
+                    return false;
                 }
 
-                // goto
+                // goto — internal control flow: BAIL (see 0x99 note).
                 0xa7 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
-                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
-
-                    // JMP rel32
-                    self.buf.emit_byte(0xE9);
-                    let patch_off = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                    branch_patches.push((patch_off, target));
-                    cpc += 3;
+                    self.next_spill_offset = callee_local_base;
+                    return false;
                 }
 
                 // ireturn, lreturn, areturn, freturn, dreturn
@@ -8644,36 +8611,16 @@ impl Compiler {
                     cpc += 3;
                 }
 
-                // if_acmpeq (0xa5), if_acmpne (0xa6)
+                // if_acmpeq/if_acmpne — internal control flow: BAIL (see 0x99 note).
                 0xa5 | 0xa6 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
-                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
-                    let top = self.pop_stack();
-                    self.pop_to_rax();
-                    self.load_slot_to_reg(RCX, top);
-                    self.rex_w(); self.buf.emit(&[0x39, 0xC8]); // CMP RAX, RCX
-                    let cc = if op == 0xa5 { 0x84u8 } else { 0x85 }; // JE / JNE
-                    self.buf.emit(&[0x0F, cc]);
-                    let patch_off = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                    branch_patches.push((patch_off, target));
-                    cpc += 3;
+                    self.next_spill_offset = callee_local_base;
+                    return false;
                 }
 
-                // ifnull (0xc6), ifnonnull (0xc7)
+                // ifnull/ifnonnull — internal control flow: BAIL (see 0x99 note).
                 0xc6 | 0xc7 => {
-                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
-                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
-                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
-                    self.pop_to_rax();
-                    self.rex_w(); self.buf.emit(&[0x85, 0xC0]); // TEST RAX, RAX
-                    let cc = if op == 0xc6 { 0x84u8 } else { 0x85 }; // JE / JNE
-                    self.buf.emit(&[0x0F, cc]);
-                    let patch_off = self.buf.pos();
-                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
-                    branch_patches.push((patch_off, target));
-                    cpc += 3;
+                    self.next_spill_offset = callee_local_base;
+                    return false;
                 }
 
                 // Unsupported opcode in inline context — bail out
