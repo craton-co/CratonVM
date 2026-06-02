@@ -894,17 +894,19 @@ All items below are **committed on `dev`** (commits `aa6d231`, `3229e28`,
   `0744269`).
 
 ### OPEN / TO RE-VERIFY (build lock was held by a concurrent session)
-- **jit `differential_double_{sum,product}_loop_matches_host`** — pre-existing
-  (fails on `0744269`). **RE-VERIFIED 2026-06-02 against dev tip `e0ecdc4`:
-  still FAILS** (the JIT inliner/IR-gate fix did NOT address it). Precise
-  characterization: `diagnostic_int_sum_loop` **passes** (int accumulation loop
-  → 45 OK), but the double sum (→45) and product (→720) loops both return
-  **`0.0`** — the double accumulator stays at its initial value. ⇒ **real JIT
-  codegen bug in category-2 (double) local load/store across a loop**
-  (`dstore_0`/`dload_0`, opcodes 0x47/0x26 etc.; emit sites in `x64.rs`). Any
-  JIT-compiled double accumulation (DoubleStream, numeric loops) is affected.
-  This is in the active real-RAF JIT owner's domain — fix on an isolated branch
-  to avoid collision.
+- **jit `differential_double_{sum,product}_loop_matches_host`** — **RESOLVED
+  2026-06-02 (commit `0658070`). It was NOT a JIT codegen bug — it was a typo in
+  the TEST FIXTURE** in `jit/tests/differential.rs`: the loops used opcode `0x48`
+  (`dstore_1`) where the comment said `dstore_0`, so the accumulator was stored
+  to local 1 but read from local 0 (`dload_0`) → it stayed at its `dconst`
+  initial value and the loop returned `0.0` (a real interpreter would too). The
+  JIT's category-2 (double) local back-edge codegen was **verified correct** by
+  disassembly (local 0→XMM9, local 1→XMM8; `dstore_0`→`0x47` yields `45.0` with
+  the *unmodified* JIT). Fixed the four store sites `0x48`→`0x47`; `x64.rs`
+  untouched. Now 6/6 differential pass and the full `cargo test -p cratonvm-jit`
+  (686 lib + 6 differential + integration) is green. (Prior notes here calling
+  it a "real JIT codegen bug" were wrong — corrected after actually disassembling
+  the emitted code.)
 - **native-builtins `aot_pipeline::integration_{aot_profile,cds}_roundtrip`** —
   **RE-VERIFIED 2026-06-02: pass in isolation** (`--features experimental-aot
   --test-threads=1`). NOT a real failure — only **parallel-flaky** under
