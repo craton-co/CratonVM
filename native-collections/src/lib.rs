@@ -877,6 +877,17 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/Object;)[Ljava/lang/Object;",
         native_al_to_array_typed,
     );
+    // Also the 0-arg form: `EnumSet.allOf(...).toArray()` resolves to
+    // AbstractCollection.toArray(), whose real bytecode loops `iterator()` —
+    // and our `Iterable.iterator` native only models ArrayList layout, so it
+    // would iterate zero elements. Route it through `native_al_to_array`, which
+    // uses the generic `collect_collection_elements` (handles EnumSet etc.).
+    r.register(
+        "java/util/AbstractCollection",
+        "toArray",
+        "()[Ljava/lang/Object;",
+        native_al_to_array,
+    );
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_al_iterator);
     r.register(c, "ensureCapacity", "(I)V", native_al_ensure_capacity);
     r.register(c, "trimToSize", "()V", native_al_trim_to_size);
@@ -1220,16 +1231,24 @@ pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data, size) = al_state(ctx, this);
-    let size = size as usize;
-    let result = alloc_ref_array(ctx, size);
-    if let Some(d) = data {
-        for i in 0..size {
-            let val = ctx.get_array_element(d, i);
-            ctx.set_array_element(result, i, val);
-        }
+    let elems = al_or_collection_elements(ctx, this);
+    let result = alloc_ref_array(ctx, elems.len());
+    for (i, val) in elems.iter().enumerate() {
+        ctx.set_array_element(result, i, *val);
     }
     Ok(Some(Value::Object(Some(result))))
+}
+
+/// Read elements for the `toArray` / `forEach` natives. These are registered on
+/// `AbstractCollection`, so they also intercept non-ArrayList collections
+/// (EnumSet/TreeSet/...). `al_state` cannot be trusted to return `None` for
+/// those — for a `RegularEnumSet` it reports an empty ArrayList (size 0), which
+/// made `EnumSet.allOf(...).toArray()`/`forEach`/`new ArrayList<>(enumSet)` all
+/// see zero elements. Delegate to `collect_collection_elements`, whose
+/// ArrayList-layout heuristics handle the fast path and whose iterator fallback
+/// materialises everything else through the real `iterator()`.
+fn al_or_collection_elements(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    collect_collection_elements(ctx, this)
 }
 
 /// `ArrayList.toArray(T[])` / `AbstractCollection.toArray(T[])` —
@@ -1245,13 +1264,12 @@ pub fn native_al_to_array_typed(
         _ => return Ok(Some(Value::Object(None))),
     };
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
-    let (data, size) = al_state(ctx, this);
-    let size = size as usize;
+    let elems = al_or_collection_elements(ctx, this);
+    let size = elems.len();
     if dbg_sbload() {
         eprintln!(
-            "[DBG_SBLOAD] AL.toArray(T[]) size={} data_some={} template_some={}",
+            "[DBG_SBLOAD] AL.toArray(T[]) size={} template_some={}",
             size,
-            data.is_some(),
             matches!(template, Value::Object(Some(_)))
         );
     }
@@ -1259,11 +1277,8 @@ pub fn native_al_to_array_typed(
         Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
         _ => alloc_ref_array(ctx, size),
     };
-    if let Some(d) = data {
-        for i in 0..size {
-            let val = ctx.get_array_element(d, i);
-            ctx.set_array_element(target, i, val);
-        }
+    for (i, val) in elems.iter().enumerate() {
+        ctx.set_array_element(target, i, *val);
     }
     let target_len = ctx.array_length(target);
     if target_len > size {
@@ -1337,6 +1352,33 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                 .unwrap_or(0);
             let backing = snapshot.unwrap_or_else(|| alloc_ref_array(ctx, 0));
             let wrapper = alloc_arraylist_with(ctx, backing, snap_len);
+            let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
+            let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
+            ctx.set_field(itr, list_slot, Value::Object(Some(wrapper)));
+            ctx.set_field(itr, cursor_slot, Value::Int(0));
+            return Ok(Some(Value::Object(Some(itr))));
+        }
+    }
+    // EnumSet reached via the `Iterable.iterator()` interface native: the
+    // indexed ArrayList$Itr below would call `this.get(cursor)`, but
+    // RegularEnumSet has no `get(int)`, and `al_state` can't read its elements
+    // either (it would iterate zero / NoSuchMethodError). Snapshot the real
+    // elements into an ArrayList-shaped wrapper and iterate THAT. Scoped to
+    // EnumSet specifically (by class name) so ordinary lists keep their live,
+    // remove()-capable iterator — `is_subclass`-based detection is unreliable
+    // (it reports false for ArrayList under the unit-test mock context, which
+    // would wrongly snapshot a real ArrayList and break `iterator().remove()`).
+    {
+        let cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_default();
+        if cls == "java/util/RegularEnumSet" || cls == "java/util/JumboEnumSet" {
+            let elems = collect_collection_elements(ctx, this);
+            let backing = alloc_ref_array(ctx, elems.len());
+            for (i, v) in elems.iter().enumerate() {
+                ctx.set_array_element(backing, i, *v);
+            }
+            let wrapper = alloc_arraylist_with(ctx, backing, elems.len() as i32);
             let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
             let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
             ctx.set_field(itr, list_slot, Value::Object(Some(wrapper)));
@@ -4986,6 +5028,51 @@ fn native_arrays_as_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 const OPT_FIELD_VALUE: usize = 0;
 const OPT_NUM_FIELDS: usize = 1;
 
+// Primitive Optionals (`OptionalInt`/`OptionalLong`/`OptionalDouble`) do NOT
+// share the generic `Optional` layout. The real JDK classes declare
+// `boolean isPresent` first (field 0) and the primitive `value` second
+// (field 1); emptiness is the `isPresent` flag, not a null value. Our natives
+// previously stored the value at field 0 (the generic-Optional convention),
+// which is invisible-but-wrong while a *native* getter reads it back, but
+// breaks the moment the real JDK `getAsInt()/getAsLong()/getAsDouble()`
+// bytecode runs (it reads `value` at field 1) — e.g. `IntStream.average()
+// .getAsDouble()` returned 0.0. Use the real 2-field layout everywhere so both
+// native and real-bytecode consumers agree.
+const OPT_PRIM_FIELD_PRESENT: usize = 0;
+const OPT_PRIM_FIELD_VALUE: usize = 1;
+const OPT_PRIM_NUM_FIELDS: usize = 2;
+
+/// Build an `OptionalInt`/`OptionalLong`/`OptionalDouble` with the real JDK
+/// field layout. `value = Some(v)` → present; `None` → empty.
+fn make_opt_prim(ctx: &mut dyn NativeContext, class_name: &str, value: Option<Value>) -> ObjectRef {
+    let opt = alloc_synthetic(ctx, class_name, OPT_PRIM_NUM_FIELDS);
+    match value {
+        Some(v) => {
+            ctx.set_field(opt, OPT_PRIM_FIELD_PRESENT, Value::Int(1));
+            ctx.set_field(opt, OPT_PRIM_FIELD_VALUE, v);
+        }
+        None => {
+            ctx.set_field(opt, OPT_PRIM_FIELD_PRESENT, Value::Int(0));
+        }
+    }
+    opt
+}
+
+/// Mark a primitive Optional present and store its value (real layout).
+fn set_opt_prim_value(ctx: &mut dyn NativeContext, opt: ObjectRef, value: Value) {
+    ctx.set_field(opt, OPT_PRIM_FIELD_PRESENT, Value::Int(1));
+    ctx.set_field(opt, OPT_PRIM_FIELD_VALUE, value);
+}
+
+/// Read the value of a primitive Optional, honouring `isPresent` (field 0).
+fn opt_prim_value(ctx: &dyn NativeContext, this: ObjectRef) -> Option<Value> {
+    if matches!(ctx.get_field(this, OPT_PRIM_FIELD_PRESENT), Value::Int(1)) {
+        Some(ctx.get_field(this, OPT_PRIM_FIELD_VALUE))
+    } else {
+        None
+    }
+}
+
 fn register_optional_natives(r: &mut NativeMethodRegistry) {
     let o = "java/util/Optional";
     r.register(o, "empty", "()Ljava/util/Optional;", native_opt_empty);
@@ -5636,17 +5723,11 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     resync_values_view(ctx, this);
-    let (data, size) = al_state(ctx, this);
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-    let len = size as usize;
     // Collect elements first to avoid borrowing issues during invoke_virtual.
-    let mut elems = Vec::with_capacity(len);
-    for i in 0..len {
-        elems.push(ctx.get_array_element(data, i));
-    }
+    // Use the generic helper so non-ArrayList collections (EnumSet/TreeSet/…)
+    // routed here through the AbstractCollection/Iterable interface natives are
+    // materialised via their real iterator instead of seeing an empty backing.
+    let elems = al_or_collection_elements(ctx, this);
     for elem in &elems {
         ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[*elem])?;
     }
@@ -6686,7 +6767,7 @@ fn stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
     // at field 0 — fall through to materialize via Stream.toArray().
     let class_id = ctx.class_id_of_object(stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    let is_synthetic = class_name == "java/util/stream/Stream";
+    let is_synthetic = is_synthetic_stream(&class_name);
     if is_synthetic {
         if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
@@ -6699,11 +6780,31 @@ fn stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
     Vec::new()
 }
 
+/// True for CratonVM's synthetic Stream / IntStream / LongStream / DoubleStream
+/// objects (all share the `STREAM_FIELD_ELEMENTS` backing-array layout). The
+/// primitive-stream interface names must be included — `make_int_stream` etc.
+/// allocate objects whose class is the interface name `java/util/stream/IntStream`,
+/// and `int_stream_elements` delegates here; previously only the bare
+/// `java/util/stream/Stream` matched, so EVERY primitive-stream terminal that
+/// read elements this way (e.g. `IntStream.average()`) saw an empty stream and
+/// returned the empty/zero result. Real JDK primitive streams are concrete
+/// `*Pipeline` classes, not these interface names, so they still fall through to
+/// the `toArray()` materialisation path.
+fn is_synthetic_stream(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "java/util/stream/Stream"
+            | "java/util/stream/IntStream"
+            | "java/util/stream/LongStream"
+            | "java/util/stream/DoubleStream"
+    )
+}
+
 /// Mutable variant of stream_elements that can invoke virtual methods.
 fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
     let class_id = ctx.class_id_of_object(stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    let is_synthetic = class_name == "java/util/stream/Stream";
+    let is_synthetic = is_synthetic_stream(&class_name);
     if is_synthetic {
         if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
@@ -7268,16 +7369,12 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return make_stream(ctx, &[]),
     };
     resync_values_view(ctx, this);
-    let (data, size) = al_state(ctx, this);
-    let elements: Vec<Value> = match data {
-        Some(d) => (0..size as usize)
-            .map(|i| ctx.get_array_element(d, i))
-            .collect(),
-        // Foreign collection (not ArrayList-shaped): the interface-level
-        // `stream` registration caught e.g. a Guava `Maps$Values`. Walk
-        // its real iterator instead of returning an empty stream.
-        None => collection_elements_generic(ctx, this),
-    };
+    // `al_state` returns an empty ArrayList (Some, size 0) — not None — for a
+    // non-ArrayList collection like RegularEnumSet, so the old `Some` branch
+    // produced an empty stream for `enumSet.stream()`. Use the generic helper,
+    // whose ArrayList heuristics keep the fast path and whose iterator fallback
+    // walks EnumSet/TreeSet/foreign collections.
+    let elements = al_or_collection_elements(ctx, this);
     make_stream(ctx, &elements)
 }
 
@@ -7987,6 +8084,12 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         c,
+        "joining",
+        "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/util/stream/Collector;",
+        native_collectors_joining_full,
+    );
+    r.register(
+        c,
         "counting",
         "()Ljava/util/stream/Collector;",
         native_collectors_counting,
@@ -8126,6 +8229,21 @@ fn native_collectors_joining_delim(
     let c = make_collector(ctx, COLLECTOR_TAG_JOINING_DELIM);
     let delim = args.first().copied().unwrap_or(Value::Object(None));
     ctx.set_field(c, COLLECTOR_FIELD_ARG1, delim);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+/// `Collectors.joining(delimiter, prefix, suffix)` — captures all three so the
+/// JOINING_DELIM application can wrap the joined elements. Without this the
+/// 3-arg overload fell through to real JDK bytecode that produced an opaque
+/// `Collector` the native `collect()` terminal didn't recognise → "".
+fn native_collectors_joining_full(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_JOINING_DELIM);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, args.first().copied().unwrap_or(Value::Object(None)));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, args.get(1).copied().unwrap_or(Value::Object(None)));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG3, args.get(2).copied().unwrap_or(Value::Object(None)));
     Ok(Some(Value::Object(Some(c))))
 }
 
@@ -8376,15 +8494,26 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             Ok(Some(Value::Object(Some(s))))
         }
         COLLECTOR_TAG_JOINING_DELIM => {
-            let delim_str = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
-                Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
-                _ => String::new(),
+            let read = |ctx: &dyn NativeContext, field: usize| -> String {
+                match ctx.get_field(collector, field) {
+                    Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+                    _ => String::new(),
+                }
             };
+            let delim_str = read(ctx, COLLECTOR_FIELD_ARG1);
+            // ARG2 = prefix, ARG3 = suffix for the 3-arg
+            // `Collectors.joining(delimiter, prefix, suffix)`. They are unset
+            // (→ "") for the 1-arg `joining(delimiter)` form, so the same arm
+            // serves both. Previously the 3-arg form wasn't registered at all
+            // and prefix/suffix were ignored, so e.g.
+            // `joining(",","[","]")` produced "" instead of "[1,2,3]".
+            let prefix = read(ctx, COLLECTOR_FIELD_ARG2);
+            let suffix = read(ctx, COLLECTOR_FIELD_ARG3);
             let mut parts = Vec::with_capacity(elements.len());
             for elem in &elements {
                 parts.push(obj_to_display_string(ctx, elem));
             }
-            let joined = parts.join(&delim_str);
+            let joined = format!("{}{}{}", prefix, parts.join(&delim_str), suffix);
             let s = ctx.create_string(&joined);
             Ok(Some(Value::Object(Some(s))))
         }
@@ -9063,12 +9192,12 @@ fn native_int_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = int_stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
     if let Some(min) = elements
         .iter()
         .filter_map(|v| match v {
@@ -9077,7 +9206,7 @@ fn native_int_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         })
         .min()
     {
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Int(min));
+        set_opt_prim_value(ctx, opt, Value::Int(min));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9086,12 +9215,12 @@ fn native_int_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = int_stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
     if let Some(max) = elements
         .iter()
         .filter_map(|v| match v {
@@ -9100,7 +9229,7 @@ fn native_int_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         })
         .max()
     {
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Int(max));
+        set_opt_prim_value(ctx, opt, Value::Int(max));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9189,12 +9318,12 @@ fn native_int_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = int_stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
     if !elements.is_empty() {
         let sum: i64 = elements
             .iter()
@@ -9204,7 +9333,7 @@ fn native_int_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             })
             .sum();
         let avg = sum as f64 / elements.len() as f64;
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(avg));
+        set_opt_prim_value(ctx, opt, Value::Double(avg));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9364,12 +9493,12 @@ fn native_long_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalLong", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalLong", None);
     if let Some(min) = elements
         .iter()
         .filter_map(|v| match v {
@@ -9378,7 +9507,7 @@ fn native_long_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         })
         .min()
     {
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Long(min));
+        set_opt_prim_value(ctx, opt, Value::Long(min));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9387,12 +9516,12 @@ fn native_long_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalLong", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalLong", None);
     if let Some(max) = elements
         .iter()
         .filter_map(|v| match v {
@@ -9401,7 +9530,7 @@ fn native_long_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         })
         .max()
     {
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Long(max));
+        set_opt_prim_value(ctx, opt, Value::Long(max));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9410,12 +9539,12 @@ fn native_long_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
     if !elements.is_empty() {
         let sum: i64 = elements
             .iter()
@@ -9425,7 +9554,7 @@ fn native_long_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             })
             .sum();
         let avg = sum as f64 / elements.len() as f64;
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(avg));
+        set_opt_prim_value(ctx, opt, Value::Double(avg));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9641,12 +9770,12 @@ fn native_double_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
     if let Some(min) = elements
         .iter()
         .filter_map(|v| match v {
@@ -9655,7 +9784,7 @@ fn native_double_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         })
         .reduce(f64::min)
     {
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(min));
+        set_opt_prim_value(ctx, opt, Value::Double(min));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9664,12 +9793,12 @@ fn native_double_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
     if let Some(max) = elements
         .iter()
         .filter_map(|v| match v {
@@ -9678,7 +9807,7 @@ fn native_double_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         })
         .reduce(f64::max)
     {
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(max));
+        set_opt_prim_value(ctx, opt, Value::Double(max));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9687,12 +9816,12 @@ fn native_double_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
     if !elements.is_empty() {
         let sum: f64 = elements
             .iter()
@@ -9702,7 +9831,7 @@ fn native_double_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             })
             .sum();
         let avg = sum / elements.len() as f64;
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(avg));
+        set_opt_prim_value(ctx, opt, Value::Double(avg));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -11037,14 +11166,12 @@ fn native_opt_int_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
-    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Int(val));
+    let opt = make_opt_prim(ctx, "java/util/OptionalInt", Some(Value::Int(val)));
     Ok(Some(Value::Object(Some(opt))))
 }
 
 fn native_opt_int_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
-    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Object(None));
+    let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
     Ok(Some(Value::Object(Some(opt))))
 }
 
@@ -11058,13 +11185,13 @@ fn native_opt_int_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .into())
         }
     };
-    match ctx.get_field(this, OPT_FIELD_VALUE) {
-        Value::Int(v) => Ok(Some(Value::Int(v))),
-        Value::Object(None) => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+    match opt_prim_value(ctx, this) {
+        Some(Value::Int(v)) => Ok(Some(Value::Int(v))),
+        Some(other) => Ok(Some(other)),
+        None => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No value present".to_string(),
         }
         .into()),
-        other => Ok(Some(other)),
     }
 }
 
@@ -11073,26 +11200,20 @@ fn native_opt_int_is_present(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let present = !matches!(ctx.get_field(this, OPT_FIELD_VALUE), Value::Object(None));
-    Ok(Some(Value::Int(if present { 1 } else { 0 })))
+    Ok(Some(Value::Int(if opt_prim_value(ctx, this).is_some() { 1 } else { 0 })))
 }
 
 fn native_opt_int_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => {
-            return match args.get(1) {
-                Some(Value::Int(v)) => Ok(Some(Value::Int(*v))),
-                _ => Ok(Some(Value::Int(0))),
-            }
-        }
-    };
     let default_val = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    match ctx.get_field(this, OPT_FIELD_VALUE) {
-        Value::Int(v) => Ok(Some(Value::Int(v))),
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(default_val))),
+    };
+    match opt_prim_value(ctx, this) {
+        Some(Value::Int(v)) => Ok(Some(Value::Int(v))),
         _ => Ok(Some(Value::Int(default_val))),
     }
 }
@@ -11106,7 +11227,7 @@ fn native_opt_int_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    if let Value::Int(v) = ctx.get_field(this, OPT_FIELD_VALUE) {
+    if let Some(Value::Int(v)) = opt_prim_value(ctx, this) {
         ctx.invoke_virtual(consumer, "accept", "(I)V", &[Value::Int(v)])?;
     }
     Ok(None)
@@ -11119,14 +11240,12 @@ fn native_opt_long_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
-    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Long(val));
+    let opt = make_opt_prim(ctx, "java/util/OptionalLong", Some(Value::Long(val)));
     Ok(Some(Value::Object(Some(opt))))
 }
 
 fn native_opt_long_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
-    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Object(None));
+    let opt = make_opt_prim(ctx, "java/util/OptionalLong", None);
     Ok(Some(Value::Object(Some(opt))))
 }
 
@@ -11140,13 +11259,13 @@ fn native_opt_long_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             .into())
         }
     };
-    match ctx.get_field(this, OPT_FIELD_VALUE) {
-        Value::Long(v) => Ok(Some(Value::Long(v))),
-        Value::Object(None) => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+    match opt_prim_value(ctx, this) {
+        Some(Value::Long(v)) => Ok(Some(Value::Long(v))),
+        Some(other) => Ok(Some(other)),
+        None => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No value present".to_string(),
         }
         .into()),
-        other => Ok(Some(other)),
     }
 }
 
@@ -11155,26 +11274,20 @@ fn native_opt_long_is_present(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let present = !matches!(ctx.get_field(this, OPT_FIELD_VALUE), Value::Object(None));
-    Ok(Some(Value::Int(if present { 1 } else { 0 })))
+    Ok(Some(Value::Int(if opt_prim_value(ctx, this).is_some() { 1 } else { 0 })))
 }
 
 fn native_opt_long_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => {
-            return match args.get(1) {
-                Some(Value::Long(v)) => Ok(Some(Value::Long(*v))),
-                _ => Ok(Some(Value::Long(0))),
-            }
-        }
-    };
     let default_val = match args.get(1) {
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    match ctx.get_field(this, OPT_FIELD_VALUE) {
-        Value::Long(v) => Ok(Some(Value::Long(v))),
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Long(default_val))),
+    };
+    match opt_prim_value(ctx, this) {
+        Some(Value::Long(v)) => Ok(Some(Value::Long(v))),
         _ => Ok(Some(Value::Long(default_val))),
     }
 }
@@ -11188,7 +11301,7 @@ fn native_opt_long_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    if let Value::Long(v) = ctx.get_field(this, OPT_FIELD_VALUE) {
+    if let Some(Value::Long(v)) = opt_prim_value(ctx, this) {
         ctx.invoke_virtual(consumer, "accept", "(J)V", &[Value::Long(v)])?;
     }
     Ok(None)
@@ -11201,14 +11314,12 @@ fn native_opt_double_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
-    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(val));
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", Some(Value::Double(val)));
     Ok(Some(Value::Object(Some(opt))))
 }
 
 fn native_opt_double_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
-    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Object(None));
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
     Ok(Some(Value::Object(Some(opt))))
 }
 
@@ -11222,13 +11333,13 @@ fn native_opt_double_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             .into())
         }
     };
-    match ctx.get_field(this, OPT_FIELD_VALUE) {
-        Value::Double(v) => Ok(Some(Value::Double(v))),
-        Value::Object(None) => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+    match opt_prim_value(ctx, this) {
+        Some(Value::Double(v)) => Ok(Some(Value::Double(v))),
+        Some(other) => Ok(Some(other)),
+        None => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No value present".to_string(),
         }
         .into()),
-        other => Ok(Some(other)),
     }
 }
 
@@ -11237,26 +11348,20 @@ fn native_opt_double_is_present(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let present = !matches!(ctx.get_field(this, OPT_FIELD_VALUE), Value::Object(None));
-    Ok(Some(Value::Int(if present { 1 } else { 0 })))
+    Ok(Some(Value::Int(if opt_prim_value(ctx, this).is_some() { 1 } else { 0 })))
 }
 
 fn native_opt_double_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => {
-            return match args.get(1) {
-                Some(Value::Double(v)) => Ok(Some(Value::Double(*v))),
-                _ => Ok(Some(Value::Double(0.0))),
-            }
-        }
-    };
     let default_val = match args.get(1) {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    match ctx.get_field(this, OPT_FIELD_VALUE) {
-        Value::Double(v) => Ok(Some(Value::Double(v))),
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Double(default_val))),
+    };
+    match opt_prim_value(ctx, this) {
+        Some(Value::Double(v)) => Ok(Some(Value::Double(v))),
         _ => Ok(Some(Value::Double(default_val))),
     }
 }
@@ -11270,7 +11375,7 @@ fn native_opt_double_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    if let Value::Double(v) = ctx.get_field(this, OPT_FIELD_VALUE) {
+    if let Some(Value::Double(v)) = opt_prim_value(ctx, this) {
         ctx.invoke_virtual(consumer, "accept", "(D)V", &[Value::Double(v)])?;
     }
     Ok(None)
@@ -14475,6 +14580,46 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
                 return vec![v];
             }
         }
+        // RegularEnumSet — a real-JDK class CratonVM doesn't synthetically
+        // back. Its state is a `long elements` bitmask over the inherited
+        // `Enum<E>[] universe` array (no element array the slot heuristics
+        // below can find — worse, the HashSet heuristic false-matches the
+        // `elementType` Class field as a backing map and returns empty). And
+        // routing through `iterator()` doesn't help: the `Iterable.iterator`
+        // interface native (`native_al_iterator`) also only models ArrayList
+        // layout, so a reflective `invoke_virtual("iterator")` yields an empty
+        // iterator. Extract elements directly from the bitmask so
+        // `EnumSet.allOf(...).toArray()/stream()/forEach()` and
+        // `new ArrayList<>(enumSet)` (e.g. JUnit @Parameters over an EnumSet,
+        // WildFly subsystem tests) see the real members. JumboEnumSet (>64
+        // constants) stores a `long[] elements`; handle both.
+        if cls_name == "java/util/RegularEnumSet" || cls_name == "java/util/JumboEnumSet" {
+            if let Value::Object(Some(universe)) = ctx.get_field_by_name(coll, "universe") {
+                // Membership: walk the inherited `universe` (all constants of the
+                // enum, in ordinal order) and keep those the set contains. We
+                // deliberately use `contains()` rather than the `elements`
+                // bitmask: native slot-access of the inherited `long elements`
+                // field reads 0 here (a category-2 / inherited-layout
+                // name→slot bug — the real `getfield` bytecode in
+                // `RegularEnumSet.contains` reads the true value, so `contains`
+                // is reliable). This yields the correct subset for partial sets,
+                // not just `allOf`. Iterating in ordinal order matches
+                // EnumSet's iteration contract.
+                let ulen = ctx.array_length(universe);
+                let mut out = Vec::with_capacity(ulen);
+                for i in 0..ulen {
+                    let elem = ctx.get_array_element(universe, i);
+                    let contained = matches!(
+                        ctx.invoke_virtual(coll, "contains", "(Ljava/lang/Object;)Z", &[elem]),
+                        Ok(Some(Value::Int(v))) if v != 0
+                    );
+                    if contained {
+                        out.push(elem);
+                    }
+                }
+                return out;
+            }
+        }
     }
     // KC-Charset fix (2026-05-25): receiver-layout guard for the speculative
     // probe sequence below. `collect_collection_elements` is invoked through
@@ -14597,6 +14742,12 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
         }
     }
+    // No layout heuristic matched and it's not an EnumSet. Return empty rather
+    // than driving `iterator()` here: the `Iterable.iterator()` native
+    // (`native_al_iterator`) itself snapshots non-list collections via THIS
+    // function, so calling `iterator()` from here would recurse. Genuinely
+    // unmodelled collection layouts therefore materialise empty (status quo for
+    // those) — EnumSet, handled directly above, is the case that matters.
     Vec::new()
 }
 

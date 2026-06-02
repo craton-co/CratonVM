@@ -8032,15 +8032,46 @@ fn synthetic_implements(
                 || obj_name.contains("Collection"));
     }
 
-    // Collection → Set/List supertype
-    if target_class_name == "java/util/Collection"
-        || target_class_name == "java/util/Set"
-        || target_class_name == "java/util/List"
-    {
-        return obj_name.starts_with("java/util/")
-            && (obj_name.contains("List")
-                || obj_name.contains("Set")
-                || obj_name.contains("Queue"));
+    // Collection / Set / List supertypes. These MUST stay distinct: a Set is
+    // not a List and vice-versa. The previous shape admitted any List/Set/Queue
+    // name for ALL THREE targets, so `x instanceof List` returned true for a
+    // HashSet / RegularEnumSet (name contains "Set") — which broke real code
+    // that branches on `parameters instanceof List` (JUnit's
+    // Parameterized$RunnersFactory.allParameters over an `EnumSet`-typed
+    // @Parameters: it took the List branch and called `enumSet.get(0)` →
+    // NoSuchMethodError RegularEnumSet.get(I)). Match each interface only
+    // against the class-name family that actually implements it.
+    if obj_name.starts_with("java/util/") {
+        match target_class_name {
+            "java/util/Collection" | "java/lang/Iterable" => {
+                if obj_name.contains("List")
+                    || obj_name.contains("Set")
+                    || obj_name.contains("Queue")
+                    || obj_name.contains("Deque")
+                    || obj_name.contains("Collection")
+                {
+                    return true;
+                }
+            }
+            "java/util/List" => {
+                // Lists only (ArrayList, LinkedList, CopyOnWriteArrayList,
+                // Arrays$ArrayList, …). A Set/Queue is NOT a List.
+                if obj_name.contains("List") {
+                    return true;
+                }
+            }
+            "java/util/Set" => {
+                if obj_name.contains("Set") {
+                    return true;
+                }
+            }
+            "java/util/Queue" | "java/util/Deque" => {
+                if obj_name.contains("Queue") || obj_name.contains("Deque") {
+                    return true;
+                }
+            }
+            _ => {}
+        }
     }
 
     // Comparable
