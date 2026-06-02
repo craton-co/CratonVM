@@ -1066,11 +1066,42 @@ pub fn register_wildfly_naming_natives(r: &mut NativeMethodRegistry) {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     /// Counter so parallel tests generate unique JNDI sub-roots.  Without
     /// this, two tests that both bind `java:comp/env/Foo` race for the
     /// same key in the process-wide store.
     static SEQ: AtomicU32 = AtomicU32::new(1);
+
+    // FIX(test-isolation): `bindings_store()` is a single PROCESS-GLOBAL
+    // `RwLock<HashMap<..>>` (see `bindings_store()` above) shared by every
+    // test in this module.  Unique sub-roots keep the *keys* from colliding,
+    // but the test-only `reset_bindings_for_test()` calls `store.clear()` on
+    // the WHOLE map — so a sibling test's reset, running on another worker
+    // thread under `cargo test`, can wipe a test's freshly-bound keys in the
+    // window between its `bind_value()` calls and its count/list assertion.
+    // That is why `t19_2_b_list_bindings_returns_all_direct_children` and
+    // `t19_2_b_concurrent_bind_lookup_no_data_race` pass with
+    // `--test-threads=1` but fail in the full parallel run.
+    //
+    // Serialize every store-mutating test through this module lock so each
+    // test's reset + bind + assert sequence is atomic with respect to the
+    // others.  Combined with the pre-existing unique sub-roots, this makes
+    // the exact-count and list assertions deterministic without weakening
+    // them.  Production semantics are untouched — this lock lives only in the
+    // `#[cfg(test)]` module.
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Acquire the module-wide test lock for the duration of a
+    /// store-mutating test.  Recovers from a poisoned lock (a panicking
+    /// test must not deadlock the rest of the suite) and clears the global
+    /// store so the calling test starts from a clean slate while holding
+    /// exclusive access.
+    fn test_isolation_guard() -> MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        reset_bindings_for_test();
+        guard
+    }
 
     fn unique_subroot(tag: &str) -> String {
         let n = SEQ.fetch_add(1, Ordering::SeqCst);
@@ -1103,7 +1134,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn t19_2_b_bind_lookup_round_trip() {
-        reset_bindings_for_test();
+        let _guard = test_isolation_guard(); // FIX(test-isolation)
         let name = unique_subroot("roundtrip");
         let full = format!("{name}/leaf");
         let obj = fake_object_ref(1);
@@ -1117,7 +1148,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn t19_2_b_rebind_replaces_previous() {
-        reset_bindings_for_test();
+        let _guard = test_isolation_guard(); // FIX(test-isolation)
         let name = unique_subroot("rebind");
         let full = format!("{name}/thing");
         let a = fake_object_ref(11);
@@ -1133,7 +1164,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn t19_2_b_unbind_removes_entry() {
-        reset_bindings_for_test();
+        let _guard = test_isolation_guard(); // FIX(test-isolation)
         let name = unique_subroot("unbind");
         let full = format!("{name}/leaf");
         bind_value(&full, "X", fake_object_ref(33)).unwrap();
@@ -1151,7 +1182,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn t19_2_b_lookup_missing_name_throws_name_not_found() {
-        reset_bindings_for_test();
+        let _guard = test_isolation_guard(); // FIX(test-isolation)
         let name = unique_subroot("missing");
         let full = format!("{name}/nope");
         let err = lookup_value(&full).unwrap_err();
@@ -1163,7 +1194,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn t19_2_b_hierarchical_path_walk() {
-        reset_bindings_for_test();
+        let _guard = test_isolation_guard(); // FIX(test-isolation)
         let root = unique_subroot("hier");
         let full = format!("{root}/ds/KeycloakDS");
         let obj = fake_object_ref(44);
@@ -1217,7 +1248,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn t19_2_b_service_based_naming_store_registers_msc_service() {
-        reset_bindings_for_test();
+        let _guard = test_isolation_guard(); // FIX(test-isolation)
         let name = unique_subroot("mscreg");
         let full = format!("{name}/SvcThing");
         let obj = fake_object_ref(55);
@@ -1238,7 +1269,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn t19_2_b_list_bindings_returns_all_direct_children() {
-        reset_bindings_for_test();
+        let _guard = test_isolation_guard(); // FIX(test-isolation)
         let root = unique_subroot("listbind");
         bind_value(
             &format!("{root}/child1"),
@@ -1279,7 +1310,7 @@ mod tests {
     // ---------------------------------------------------------------
     #[test]
     fn t19_2_b_concurrent_bind_lookup_no_data_race() {
-        reset_bindings_for_test();
+        let _guard = test_isolation_guard(); // FIX(test-isolation)
         let root = unique_subroot("race");
         let handles: Vec<_> = (0..4)
             .map(|tid| {
@@ -1351,7 +1382,7 @@ mod tests {
 
     #[test]
     fn t19_2_b_url_reference_lookup_refuses_to_connect() {
-        reset_bindings_for_test();
+        let _guard = test_isolation_guard(); // FIX(test-isolation)
         let name = unique_subroot("urlref");
         let full = format!("{name}/thing");
         // Manually install a URL-ref entry to simulate what a

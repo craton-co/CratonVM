@@ -1230,12 +1230,84 @@ mod tests {
     use crate::test_utils::mock_ctx;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicI32;
+    use std::sync::{Mutex as StdMutex, MutexGuard};
+
+    // FIX(test-isolation): The exit trampoline of every loop spawned via
+    // `spawn_vertx_event_loop_with_ctx` pushes its VM ThreadId onto the
+    // PROCESS-GLOBAL `NATIVE_THREAD_DEAD_QUEUE` (see `push_native_thread_dead`).
+    // Each per-test `mock_ctx()` hands out VM ThreadIds starting at 1, so
+    // concurrently-running sibling tests produce *colliding* numeric ids on
+    // that one shared queue. When this test's `flush_native_thread_deaths`
+    // loop drains the queue, it sees ids pushed by OTHER tests (and other
+    // tests drain ids pushed by THIS test), so its `alive_after == 0`
+    // expectation never settles under `cargo test`'s default parallelism —
+    // even though it is correct when run alone (`--test-threads=1`).
+    //
+    // Fix WITHOUT weakening any assertion: serialize every test in this module
+    // that PUSHES to or DRAINS the shared dead-queue, and snapshot/reset the
+    // queue at the start of each such test while holding the lock so a
+    // sibling that finished just before us can't leave stragglers behind.
+    // `dead_queue_guard()` returns the held lock (which also drains the queue
+    // as the "reset" step); callers bind it to a `_guard` local that lives to
+    // end of scope. Poisoning is recovered (a panicking sibling must not
+    // wedge the rest of the suite).
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// FIX(test-isolation): acquire the module-wide serialization lock and
+    /// reset the shared `NATIVE_THREAD_DEAD_QUEUE` so no sibling's leftover
+    /// dead-ids pollute this test. Hold the returned guard for the whole test.
+    #[must_use]
+    fn dead_queue_guard() -> MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Reset: drop any entries a previous (now-finished) test left behind.
+        let _ = drain_native_thread_dead_queue();
+        guard
+    }
+
+    // FIX(test-isolation): Reset the shared dead-queue at a point INSIDE the
+    // test where we are about to call a native (`native_vertx_init`) whose
+    // body internally calls `flush_native_thread_deaths(ctx)`. The guard drains
+    // the queue at acquire, but a *prior* (already-finished, lock-released)
+    // sibling's event-loop carrier OS thread is DETACHED in the mock
+    // (`attach_join_handle_to_native_thread` drops the `JoinHandle`), so it can
+    // exit and `push_native_thread_dead(colliding_id)` AFTER our acquire-time
+    // drain. Because every `mock_ctx()` hands out ThreadIds starting at 1, that
+    // straggler id collides with an id THIS ctx just registered; init's internal
+    // flush would then `unregister_native_thread(colliding_id)` and flip our own
+    // freshly-registered entry's `alive` flag to false mid-test.
+    //
+    // We hold `TEST_LOCK` for the whole test, so no *guarded* sibling runs
+    // concurrently — the only writer to the queue is such a detached straggler.
+    // Spin-drain until the queue is observed empty immediately before each
+    // queue-flushing native call: every straggler has a single bounded push at
+    // carrier-exit, so once we observe an empty queue the prior carriers have
+    // drained and no new guarded pusher exists. This makes init's internal
+    // flush a no-op w.r.t. foreign ids, so it cannot touch this ctx's entries.
+    fn reset_dead_queue_before_flush_native() {
+        // Bounded spin: drain repeatedly until we observe an empty queue twice
+        // in a row, so any in-flight straggler push has been absorbed before we
+        // hand control to a native that flushes the queue into our ctx.
+        for _ in 0..256 {
+            let first = drain_native_thread_dead_queue();
+            let second = drain_native_thread_dead_queue();
+            if first.is_empty() && second.is_empty() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Final unconditional drain so we never leave entries for the flush.
+        let _ = drain_native_thread_dead_queue();
+    }
 
     // -----------------------------------------------------------------------
     // T19.6-v1: vertx_init allocates loops and sets fields
     // -----------------------------------------------------------------------
     #[test]
     fn vertx_init_allocates_loops_and_sets_fields() {
+        // FIX(test-isolation): init/close spawn _with_ctx loops + close()
+        // flushes the shared dead-queue; serialize so this can't pollute (or
+        // be polluted by) the K2/K4 dead-queue tests under `cargo test`.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
         let result = native_vertx_init(
@@ -1298,6 +1370,8 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn vertx_close_sets_terminated_state() {
+        // FIX(test-isolation): init + close() flush the shared dead-queue.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
         native_vertx_init(&mut ctx, &[Value::Object(Some(mirror)), Value::Int(1)]).expect("init");
@@ -1314,6 +1388,8 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn nel_execute_enqueues_without_error() {
+        // FIX(test-isolation): init + close() flush the shared dead-queue.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         // Allocate a VertxImpl (starts a loop).
         let vm = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
@@ -1611,6 +1687,9 @@ mod tests {
     /// for the loop.
     #[test]
     fn t19_k2_spawn_with_ctx_registers_as_non_daemon() {
+        // FIX(test-isolation): this test's shutdown pushes onto the shared
+        // dead-queue and then drains it; serialize so it can't race siblings.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let before = ctx.registered_native_threads().len();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-1", false)
@@ -1648,6 +1727,8 @@ mod tests {
     /// in the production path; loop's `vm_thread_id` mirrors it.
     #[test]
     fn t19_k2_vm_thread_id_assigned_on_spawn_with_ctx() {
+        // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-2", false)
             .expect("spawn");
@@ -1660,8 +1741,10 @@ mod tests {
     /// the dead-queue once the loop terminates.
     #[test]
     fn t19_k2_loop_exit_pushes_vm_thread_id_to_dead_queue() {
-        // Drain leftover entries from previous tests.
-        let _ = drain_native_thread_dead_queue();
+        // FIX(test-isolation): this test drains the shared dead-queue looking
+        // for ITS id; a concurrent sibling draining first would steal it.
+        // Serialize + reset (the guard drains leftover entries for us).
+        let _guard = dead_queue_guard();
 
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-3", false)
@@ -1695,7 +1778,9 @@ mod tests {
     /// flips to false.
     #[test]
     fn t19_k2_flush_dead_threads_calls_unregister() {
-        let _ = drain_native_thread_dead_queue();
+        // FIX(test-isolation): this test repeatedly flushes the shared
+        // dead-queue against its own ctx; serialize + reset.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-4", false)
             .expect("spawn");
@@ -1737,10 +1822,17 @@ mod tests {
     /// its own VM thread.
     #[test]
     fn t19_k2_vertx_init_registers_one_vm_thread_per_pool_slot() {
+        // FIX(test-isolation): close() flushes the shared dead-queue; serialize.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let before = ctx.registered_native_threads().len();
         let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
         let pool = 3;
+        // FIX(test-isolation): drain prior-test straggler dead-ids before the
+        // init whose internal `flush_native_thread_deaths` would otherwise
+        // unregister a colliding id and flip a `[before..]` entry's `alive`
+        // flag — see `reset_dead_queue_before_flush_native` for the mechanism.
+        reset_dead_queue_before_flush_native();
         native_vertx_init(
             &mut ctx,
             &[Value::Object(Some(mirror)), Value::Int(pool)],
@@ -1768,7 +1860,8 @@ mod tests {
     /// notifications via `flush_native_thread_deaths`.
     #[test]
     fn t19_k2_vertx_close_flushes_dead_threads() {
-        let _ = drain_native_thread_dead_queue();
+        // FIX(test-isolation): serialize on the shared dead-queue and reset it.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
         native_vertx_init(
@@ -1831,6 +1924,8 @@ mod tests {
     /// caller asks for it.
     #[test]
     fn t19_k2_spawn_with_ctx_daemon_true_registered_as_daemon() {
+        // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-8", true)
             .expect("spawn");
@@ -1845,7 +1940,9 @@ mod tests {
     /// stays at 0; the dead-queue is not poisoned.
     #[test]
     fn t19_k2_legacy_loop_exit_does_not_push_dead_id() {
-        let _ = drain_native_thread_dead_queue();
+        // FIX(test-isolation): this test drains the shared dead-queue and
+        // inspects every entry; a sibling's pushed ids would pollute it.
+        let _guard = dead_queue_guard();
         let el = spawn_vertx_event_loop("k2-test-9-legacy").expect("spawn");
         shutdown_vertx_loop(el.id as i64);
         // Wait briefly for OS thread exit.
@@ -1863,12 +1960,22 @@ mod tests {
     /// no races).
     #[test]
     fn t19_k2_multiple_vertx_instances_register_independently() {
+        // FIX(test-isolation): close() flushes the shared dead-queue; serialize.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let before = ctx.registered_native_threads().len();
         let mirror_a = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
         let mirror_b = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
+        // FIX(test-isolation): `native_vertx_init` internally calls
+        // `flush_native_thread_deaths(ctx)`. Drain any prior-test straggler
+        // (colliding) dead-id from the shared queue right before each init so
+        // that internal flush cannot `unregister_native_thread` one of THIS
+        // ctx's freshly-registered (colliding-id) entries and flip its `alive`
+        // flag — which would make a `[before..]` entry's `assert!(alive)` fail.
+        reset_dead_queue_before_flush_native();
         native_vertx_init(&mut ctx, &[Value::Object(Some(mirror_a)), Value::Int(2)])
             .expect("init A");
+        reset_dead_queue_before_flush_native();
         native_vertx_init(&mut ctx, &[Value::Object(Some(mirror_b)), Value::Int(3)])
             .expect("init B");
         let after = ctx.registered_native_threads().len();
@@ -1888,6 +1995,8 @@ mod tests {
     /// would resolve correctly since the OS thread is dedicated.
     #[test]
     fn t19_k2_current_vertx_loop_resolves_inside_loop_body() {
+        // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-11", false)
             .expect("spawn");
@@ -1920,8 +2029,11 @@ mod tests {
     /// then nothing.
     #[test]
     fn t19_k2_drain_dead_queue_is_idempotent() {
+        // FIX(test-isolation): this test inspects the shared dead-queue
+        // directly and asserts draining empties it — a concurrent sibling
+        // pushing/draining would break the idempotence check. Serialize + reset.
+        let _guard = dead_queue_guard();
         // Push synthetic ids by spawning + shutting down.
-        let _ = drain_native_thread_dead_queue();
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k2-test-12", false)
             .expect("spawn");
@@ -1965,6 +2077,8 @@ mod tests {
     /// mirror after `register_native_thread`.
     #[test]
     fn t19_k4_spawn_with_ctx_registers_java_thread_mirror() {
+        // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-test-1", false)
             .expect("spawn_with_ctx");
@@ -1989,6 +2103,8 @@ mod tests {
     /// loop's name string (round-tripped through ctx.create_string).
     #[test]
     fn t19_k4_thread_mirror_name_field_set_to_loop_name() {
+        // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-name-test", false)
             .expect("spawn");
@@ -2010,6 +2126,8 @@ mod tests {
     /// stable id without going through the registry.
     #[test]
     fn t19_k4_thread_mirror_tid_field_matches_vm_thread_id() {
+        // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-tid-test", false)
             .expect("spawn");
@@ -2030,6 +2148,8 @@ mod tests {
     /// pointers.
     #[test]
     fn t19_k4_vertx_init_creates_distinct_mirrors_per_slot() {
+        // FIX(test-isolation): close() flushes the shared dead-queue; serialize.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let mirror_obj = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
         let pool: i32 = 5;
@@ -2080,6 +2200,8 @@ mod tests {
     /// keeps the process alive past `main()`.
     #[test]
     fn t19_k4_spawn_default_is_non_daemon_with_mirror() {
+        // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-non-daemon", false)
             .expect("spawn");
@@ -2100,6 +2222,8 @@ mod tests {
     /// blocks on us.)
     #[test]
     fn t19_k4_daemon_spawn_still_attaches_mirror() {
+        // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-daemon-true", true)
             .expect("spawn");
@@ -2133,6 +2257,8 @@ mod tests {
     /// reallocation, no GC churn.)
     #[test]
     fn t19_k4_mirror_ptr_stable_over_loop_lifetime() {
+        // FIX(test-isolation): shutdown pushes onto the shared dead-queue.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-stable-ptr", false)
             .expect("spawn");
@@ -2160,6 +2286,8 @@ mod tests {
     /// mirrors per slot — no leakage between groups.
     #[test]
     fn t19_k4_multiple_vertx_groups_have_disjoint_mirrors() {
+        // FIX(test-isolation): close() flushes the shared dead-queue; serialize.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let m_a = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
         let m_b = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
@@ -2191,7 +2319,9 @@ mod tests {
     /// mirror).
     #[test]
     fn t19_k4_shutdown_does_not_clear_mirror_ptr() {
-        let _ = drain_native_thread_dead_queue();
+        // FIX(test-isolation): this test drains/flushes the shared dead-queue
+        // waiting for its own shutdown event; serialize + reset.
+        let _guard = dead_queue_guard();
         let mut ctx = mock_ctx();
         let el = spawn_vertx_event_loop_with_ctx(&mut ctx, "k4-shutdown-keep", false)
             .expect("spawn");
