@@ -17,9 +17,19 @@
 //! `cards` / `dirty_cards` state is protected by a separate
 //! `Mutex<CardCells>` inside the table so the collector can safely
 //! mark/clear/drain while mutators continue to enqueue dirty offsets.
+//!
+//! SECURITY FIX (V6) — cross-thread buffer drain invariant: every
+//! thread's dirty buffer is registered in the global `BUFFER_REGISTRY`
+//! on first use. At a stop-the-world safepoint the collector calls
+//! [`CardTable::flush_all`], which walks the registry and folds *every*
+//! thread's buffered old→young edges into `pending_offsets` before
+//! `drain_pending`. This removes the previous cross-crate obligation
+//! (that each mutator flush its own buffer before parking) whose
+//! violation could free a still-reachable young object (use-after-free).
+//! INVARIANT: `flush_all` may run only at STW, with all mutators parked.
 
 use parking_lot::Mutex;
-use std::cell::RefCell;
+use std::sync::Arc;
 
 /// Number of bytes covered by a single card.
 pub const CARD_SIZE: usize = 512;
@@ -34,6 +44,59 @@ pub const CARD_DIRTY: u8 = 1;
 /// auto-flushed into the shared card table.
 pub const THREAD_BUFFER_FLUSH_THRESHOLD: usize = 64;
 
+/// SECURITY FIX (V6): a thread's dirty buffer, shared via `Arc` between the
+/// owning mutator (fast path) and the global [`BUFFER_REGISTRY`] so the
+/// collector can drain it at a stop-the-world safepoint even if the owning
+/// thread parked without flushing.
+///
+/// The inner `Mutex` is contended only in the (impossible-by-construction at
+/// STW) case where a mutator runs concurrently with the collector's drain. By
+/// the GC's stop-the-world invariant every mutator is parked at a safepoint
+/// before the collector drains, so the lock is effectively uncontended on the
+/// fast path; it exists purely to make the cross-thread read at STW sound
+/// (a bare `RefCell` is `!Sync` and could not legally be read by the
+/// collector thread).
+type ThreadBuffer = Arc<Mutex<Vec<usize>>>;
+
+/// SECURITY FIX (V6): global intrusive registry of every thread's dirty
+/// buffer. The collector walks this list at STW (via [`CardTable::flush_all`])
+/// and folds every thread's buffered offsets into `pending_offsets`, closing
+/// the cross-thread use-after-free hole where a mutator could buffer up to
+/// `THREAD_BUFFER_FLUSH_THRESHOLD - 1` old→young edges and then park at a
+/// safepoint without flushing, causing a minor GC to miss the root and free a
+/// still-reachable young object.
+///
+/// Entries are `Arc` clones of the per-thread buffers; a thread removes its
+/// entry on exit (see [`DirtyBufferGuard`]) so the registry never holds a
+/// dangling buffer. Identity is matched on `Arc::as_ptr` so removal is exact.
+static BUFFER_REGISTRY: Mutex<Vec<ThreadBuffer>> = Mutex::new(Vec::new());
+
+/// SECURITY FIX (V6): RAII handle stored in TLS. Holds the thread's shared
+/// dirty buffer and removes it from [`BUFFER_REGISTRY`] when the thread exits,
+/// so the collector never dereferences a freed buffer.
+struct DirtyBufferGuard {
+    buffer: ThreadBuffer,
+}
+
+impl Drop for DirtyBufferGuard {
+    fn drop(&mut self) {
+        // SECURITY FIX (V6): deregister this thread's buffer so the collector
+        // never drains a buffer belonging to a dead thread. We cannot fold
+        // residual offsets into `pending_offsets` here (no `&CardTable` is in
+        // scope), but that is safe: a thread that is tearing down is no longer
+        // a GC root and holds no live references the collector must preserve,
+        // and the registry holds an `Arc` clone so the underlying buffer
+        // storage stays alive until both this guard and the registry entry
+        // are dropped. Match the registry entry by `Arc` identity for exact
+        // removal.
+        let self_ptr = Arc::as_ptr(&self.buffer);
+        let mut reg = BUFFER_REGISTRY.lock();
+        if let Some(pos) = reg.iter().position(|b| Arc::as_ptr(b) == self_ptr) {
+            reg.swap_remove(pos);
+        }
+    }
+}
+
 thread_local! {
     /// T5.5.2 — per-thread write buffer of byte offsets (into the
     /// region covered by the card table) that have been dirtied.
@@ -42,7 +105,16 @@ thread_local! {
     /// shared `CardTable`. When the buffer fills or a safepoint fires,
     /// [`CardTable::flush_dirty_buffer`] drains it into the
     /// shared-side `pending_offsets` vector under the mutex.
-    static THREAD_DIRTY_BUFFER: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    ///
+    /// SECURITY FIX (V6): the buffer is an `Arc<Mutex<Vec<usize>>>` (not a
+    /// bare `RefCell`) registered in [`BUFFER_REGISTRY`] on first use so the
+    /// collector can drain it cross-thread at STW. [`DirtyBufferGuard`]
+    /// deregisters it on thread exit.
+    static THREAD_DIRTY_BUFFER: DirtyBufferGuard = {
+        let buffer: ThreadBuffer = Arc::new(Mutex::new(Vec::new()));
+        BUFFER_REGISTRY.lock().push(Arc::clone(&buffer));
+        DirtyBufferGuard { buffer }
+    };
 }
 
 /// Authoritative card-bitmap state. Locked exclusively by the collector
@@ -258,8 +330,12 @@ impl CardTable {
     /// where the collector calls [`Self::drain_pending`] (or
     /// [`Self::flush_all`] then [`Self::drain_pending`]).
     pub fn thread_local_dirty(&self, offset: usize) {
-        let should_flush = THREAD_DIRTY_BUFFER.with(|buf| {
-            let mut b = buf.borrow_mut();
+        // SECURITY FIX (V6): push into the registered per-thread buffer
+        // (Arc<Mutex<..>>). The lock is uncontended on the mutator fast path
+        // (only this thread touches it outside STW); it is acquirable by the
+        // collector only at STW, when this thread is parked.
+        let should_flush = THREAD_DIRTY_BUFFER.with(|guard| {
+            let mut b = guard.buffer.lock();
             b.push(offset);
             b.len() >= THREAD_BUFFER_FLUSH_THRESHOLD
         });
@@ -276,8 +352,8 @@ impl CardTable {
     /// that happens in [`Self::drain_pending`] under the cells lock, so
     /// the hot-path cost remains a single lock acquisition.
     pub fn flush_dirty_buffer(&self) {
-        THREAD_DIRTY_BUFFER.with(|buf| {
-            let mut local = buf.borrow_mut();
+        THREAD_DIRTY_BUFFER.with(|guard| {
+            let mut local = guard.buffer.lock();
             if local.is_empty() {
                 return;
             }
@@ -287,22 +363,51 @@ impl CardTable {
         });
     }
 
-    /// T5.5.2 — Public alias used by the collector at GC start.
+    /// T5.5.2 / SECURITY FIX (V6) — Drain EVERY thread's dirty buffer into
+    /// the shared pending list. Called by the collector at GC start (before
+    /// `scan_dirty_cards`).
     ///
-    /// **The collector MUST call this (or `flush_dirty_buffer`) on the
-    /// safepoint thread before scanning dirty cards.** Each mutator is
-    /// responsible for flushing its OWN buffer at the safepoint — this
-    /// call only drains the *current* thread's buffer.
+    /// # SECURITY FIX (V6) — closes a cross-thread use-after-free
     ///
-    /// In CratonVM's stop-the-world model the safepoint sync barrier
-    /// guarantees every mutator has either stopped at a safepoint or
-    /// flushed before parking, so a single collector-side
-    /// `drain_pending` after each mutator's own flush is sufficient to
-    /// merge every queued offset into the authoritative bitmap before
-    /// the dirty-card scan.
-    #[inline]
+    /// Previously this was a thin alias for [`Self::flush_dirty_buffer`],
+    /// which drains only the *calling* (collector) thread's buffer. That
+    /// relied on every mutator flushing its OWN buffer before parking at a
+    /// safepoint. A mutator that buffered fewer than
+    /// [`THREAD_BUFFER_FLUSH_THRESHOLD`] old→young edges and then parked
+    /// without flushing would leave those edges invisible to the collector;
+    /// the minor GC would miss the old→young root and free a still-reachable
+    /// young object (UAF when the mutator resumes and dereferences it).
+    ///
+    /// The fix removes that cross-thread obligation entirely: the collector
+    /// now walks the global [`BUFFER_REGISTRY`] and drains every registered
+    /// thread buffer itself. No VM-side safepoint flush is required for
+    /// correctness.
+    ///
+    /// # Concurrency invariant
+    ///
+    /// This MUST be called only when mutators are stopped at the
+    /// stop-the-world safepoint. Under STW no mutator is executing the write
+    /// barrier, so each per-thread buffer mutex is uncontended and a thread
+    /// cannot append a new offset between our drain and the subsequent
+    /// [`Self::drain_pending`]. We still take each buffer's lock (rather than
+    /// reading it racily) so the cross-thread access is well-defined even if
+    /// a thread is parked mid-`push`. The registry lock is held for the whole
+    /// walk so a concurrently *exiting* thread cannot remove (and free) a
+    /// buffer we are about to drain.
     pub fn flush_all(&self) {
-        self.flush_dirty_buffer();
+        let reg = BUFFER_REGISTRY.lock();
+        for buf in reg.iter() {
+            // Lock order matches the mutator fast path (buffer-lock before
+            // pending-lock) so the two can never deadlock even if, contrary
+            // to the STW invariant, they were ever to run concurrently.
+            let mut local = buf.lock();
+            if local.is_empty() {
+                continue;
+            }
+            let mut shared = self.pending_offsets.lock();
+            shared.reserve(local.len());
+            shared.append(&mut *local);
+        }
     }
 
     /// T5.5.2 — Fold any thread-submitted offsets from

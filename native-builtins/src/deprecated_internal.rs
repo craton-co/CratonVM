@@ -19,18 +19,29 @@ use crate::{alloc_concurrent_synthetic, obj_arg};
 
 // ===========================================================================
 // Off-heap memory tracking (T8.4.2)
+//
+// SECURITY FIX (V5): this *tracked* store is no longer wired to any native —
+// `register_unsafe_deprecated_natives` now routes off-heap allocate/realloc/
+// free/setMemory/copyMemory through the single arena store
+// (`crate::unsafe_natives::register_consolidated_off_heap_store`). The code is
+// retained (not deleted) per the V5 directive but is dead; the
+// `#[allow(dead_code)]` attributes below keep the build warning-clean without
+// removing a store whose deletion would be risky.
 // ===========================================================================
 
 /// Global counter for generating unique memory addresses.
+#[allow(dead_code)]
 static NEXT_MEM_ADDR: AtomicU64 = AtomicU64::new(0x1_0000_0000); // start above 4GB
 
 /// Tracked off-heap memory blocks: address -> Vec<u8>.
+#[allow(dead_code)]
 fn off_heap_store() -> &'static Mutex<HashMap<u64, Vec<u8>>> {
     static INSTANCE: std::sync::OnceLock<Mutex<HashMap<u64, Vec<u8>>>> =
         std::sync::OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[allow(dead_code)]
 fn tracked_allocate(size: usize) -> u64 {
     let addr = NEXT_MEM_ADDR.fetch_add(size as u64 + 64, Ordering::Relaxed);
     let block = vec![0u8; size];
@@ -41,6 +52,7 @@ fn tracked_allocate(size: usize) -> u64 {
     addr
 }
 
+#[allow(dead_code)]
 fn tracked_free(addr: u64) -> bool {
     off_heap_store()
         .lock()
@@ -49,6 +61,7 @@ fn tracked_free(addr: u64) -> bool {
         .is_some()
 }
 
+#[allow(dead_code)]
 fn tracked_realloc(old_addr: u64, new_size: usize) -> Result<u64, &'static str> {
     let mut store = off_heap_store().lock().unwrap_or_else(|e| e.into_inner());
     let old_block = store.remove(&old_addr).ok_or("invalid address for realloc")?;
@@ -60,6 +73,7 @@ fn tracked_realloc(old_addr: u64, new_size: usize) -> Result<u64, &'static str> 
     Ok(new_addr)
 }
 
+#[allow(dead_code)]
 fn tracked_set_memory(addr: u64, offset: usize, count: usize, value: u8) -> bool {
     let mut store = off_heap_store().lock().unwrap_or_else(|e| e.into_inner());
     if let Some(block) = store.get_mut(&addr) {
@@ -74,6 +88,7 @@ fn tracked_set_memory(addr: u64, offset: usize, count: usize, value: u8) -> bool
     false
 }
 
+#[allow(dead_code)]
 fn tracked_copy_memory(
     src_addr: u64,
     src_offset: usize,
@@ -118,6 +133,7 @@ fn tracked_copy_memory(
     }
 }
 
+#[allow(dead_code)]
 fn tracked_read(addr: u64, offset: usize, count: usize) -> Option<Vec<u8>> {
     let store = off_heap_store().lock().unwrap_or_else(|e| e.into_inner());
     store.get(&addr).and_then(|block| {
@@ -370,29 +386,27 @@ fn register_unsafe_deprecated_natives(r: &mut NativeMethodRegistry) {
         native_unsafe_define_class,
     );
 
-    // --- T8.4.2: tracked off-heap memory operations ---
-    r.register(u, "allocateMemory", "(J)J", native_tracked_allocate_memory);
-    r.register(u, "freeMemory", "(J)V", native_tracked_free_memory);
-    r.register(u, "reallocateMemory", "(JJ)J", native_tracked_realloc_memory);
-    r.register(u, "setMemory", "(Ljava/lang/Object;JJB)V", native_tracked_set_memory);
-    r.register(
-        u,
-        "copyMemory",
-        "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
-        native_tracked_copy_memory,
-    );
-
-    // Also for jdk/internal/misc/Unsafe (0-suffix variants)
-    r.register(u2, "allocateMemory0", "(J)J", native_tracked_allocate_memory);
-    r.register(u2, "freeMemory0", "(J)V", native_tracked_free_memory);
-    r.register(u2, "reallocateMemory0", "(JJ)J", native_tracked_realloc_memory);
-    r.register(u2, "setMemory0", "(Ljava/lang/Object;JJB)V", native_tracked_set_memory);
-    r.register(
-        u2,
-        "copyMemory0",
-        "(Ljava/lang/Object;JLjava/lang/Object;JJ)V",
-        native_tracked_copy_memory,
-    );
+    // --- T8.4.2: off-heap memory operations ---
+    // SECURITY FIX (V5): previously these routed to the *tracked* store
+    // (`off_heap_store`, base 0x1_0000_0000) — a SECOND, disjoint off-heap
+    // allocator from the *arena* store (base 0x10_0000_0000) that the raw
+    // single-`long` get/put natives and freeMemory use. An address returned by
+    // this `allocateMemory` was therefore NOT readable through the raw get/put
+    // path `java.nio.Bits` relies on, and the two stores could alias each
+    // other's freed ranges. Route allocate/reallocate/free/setMemory/copyMemory
+    // through the SINGLE bounds-checked arena store (the one carrying the
+    // per-thread use-after-free cache) so every off-heap address agrees on one
+    // address space. `register_deprecated_internal_natives` is sometimes called
+    // standalone AND, in the KC26 real-JDK boot path, re-invoked AFTER
+    // `register_essential_natives` — so wiring the consolidated store here is
+    // required to keep the live wiring single-store on every path, not just
+    // when `register_unsafe_wp1_2` happens to run last.
+    //
+    // The legacy `native_tracked_*` / `tracked_*` / `off_heap_store` code below
+    // is intentionally retained (now `#[allow(dead_code)]`) rather than deleted,
+    // per the V5 directive to keep the unused store's code if removing it is
+    // risky. Nothing is wired to it any longer.
+    crate::unsafe_natives::register_consolidated_off_heap_store(r);
 }
 
 fn native_unsafe_define_class(
@@ -503,6 +517,7 @@ fn native_unsafe_define_class(
     }
 }
 
+#[allow(dead_code)]
 fn native_tracked_allocate_memory(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -523,6 +538,7 @@ fn native_tracked_allocate_memory(
     Ok(Some(Value::Long(addr as i64)))
 }
 
+#[allow(dead_code)]
 fn native_tracked_free_memory(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -549,6 +565,7 @@ fn native_tracked_free_memory(
     Ok(None)
 }
 
+#[allow(dead_code)]
 fn native_tracked_realloc_memory(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -584,6 +601,7 @@ fn native_tracked_realloc_memory(
     }
 }
 
+#[allow(dead_code)]
 fn native_tracked_set_memory(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -632,6 +650,7 @@ fn native_tracked_set_memory(
     Ok(None)
 }
 
+#[allow(dead_code)]
 fn native_tracked_copy_memory(
     _ctx: &mut dyn NativeContext,
     args: &[Value],

@@ -129,9 +129,17 @@ pub fn verify_class_bytecode(
 
     if !any_jsr {
         // Common path — no subroutines anywhere. Delegate to the
-        // standard verifier unchanged.
+        // standard verifier unchanged. `verify_bytecode` now self-selects
+        // strict-by-default for untrusted classes (SECURITY FIX V4).
         return super::bytecode_verifier::verify_bytecode(class, hierarchy);
     }
+
+    // SECURITY FIX (V4): strict branch-target frame checking is the default
+    // for untrusted (non-bootstrap-trusted) classes, consistent with
+    // `bytecode_verifier::verify_bytecode`. The per-method JSR path below
+    // honours the same decision so a JSR-containing untrusted class does not
+    // silently downgrade its non-JSR sibling methods to lenient mode.
+    let strict = !super::bytecode_verifier::class_is_bootstrap_trusted(class);
 
     // At least one method in this class uses jsr/ret. Walk methods
     // individually so we can apply the structural-only fallback to the
@@ -153,7 +161,7 @@ pub fn verify_class_bytecode(
             // `bytecode_verifier::verify_method` but in isolation per
             // method, so a real bug in this method cannot be masked by
             // a tolerated failure in a JSR-using method.
-            verify_method_typestate(class, method, hierarchy)?;
+            verify_method_typestate(class, method, hierarchy, strict)?;
         }
     }
 
@@ -183,6 +191,10 @@ fn verify_method_typestate(
     class: &Class,
     method: &ClassFileMethod,
     hierarchy: &dyn ClassHierarchy,
+    // SECURITY FIX (V4): `true` for untrusted code — enforce spec-compliant
+    // per-branch-target frame checking; `false` only for pre-verified trusted
+    // bootstrap classes.
+    strict: bool,
 ) -> Result<(), LinkageError> {
     // Structural sanity is a prerequisite for type-state verification:
     // we can't walk instructions if the bytecode itself is malformed.
@@ -357,6 +369,20 @@ fn verify_method_typestate(
             && !declared_frames.contains_key(&(pc as u16))
             && !handler_targets.contains_key(&(pc as u16))
         {
+            // SECURITY FIX (V4): in strict mode (untrusted code) unreachable
+            // code with no declared frame is a VerifyError (JVMS §4.10.1).
+            // Trusted bootstrap classes stay lenient and skip it silently.
+            if strict {
+                return Err(LinkageError::VerifyError {
+                    class_name: class_name.to_string(),
+                    method_name: method.name.to_string(),
+                    message: format!(
+                        "unreachable code at bytecode offset {pc}: \
+                         no StackMapTable frame declared and control \
+                         does not fall through"
+                    ),
+                });
+            }
             // Lenient mode — skip unreachable code silently.
             let (_, next_pc) = match Instruction::decode(bytecode, pc) {
                 Ok(r) => r,
@@ -397,6 +423,27 @@ fn verify_method_typestate(
             },
             other => other,
         })?;
+
+        // SECURITY FIX (V4): in strict mode (untrusted code) every branch
+        // target of this instruction must have a declared StackMapTable frame
+        // (JVMS §4.10.1). A frameless target reached with a typed stack would
+        // otherwise be accepted without a merge-point type check — the
+        // type-confusion hole the lenient default left open. Trusted bootstrap
+        // classes stay lenient (`strict == false`).
+        if strict && requires_stack_map && parsed_table.is_some() {
+            for &target in &result.branch_targets {
+                if !declared_frames.contains_key(&target) {
+                    return Err(LinkageError::VerifyError {
+                        class_name: class_name.to_string(),
+                        method_name: method.name.to_string(),
+                        message: format!(
+                            "strict verification: branch target at offset {target} \
+                             has no StackMapTable frame"
+                        ),
+                    });
+                }
+            }
+        }
 
         verified = result.falls_through;
         if !result.falls_through && next_pc < bytecode.len() {

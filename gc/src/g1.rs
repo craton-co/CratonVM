@@ -304,6 +304,28 @@ pub struct G1Collector {
     /// time/correctness trade — no crash, just longer mark.
     mark_worklist_overflowed: AtomicBool,
 
+    /// SECURITY FIX (V7a): RSet write-barrier TLS-cache epoch.
+    ///
+    /// `post_write_barrier_rset`'s fast path caches a stable `*const
+    /// G1Region` keyed by region index. Because the regions `Vec` never
+    /// reallocates, that pointer stays address-valid even after the
+    /// region is recycled (reset to `Free` and re-typed) by a
+    /// collection. The old fast path therefore could record an inbound
+    /// reference into a *just-recycled* region's rset (only the slow path
+    /// gated on `RegionType::Free`), holding a reference that the next GC
+    /// drains as garbage.
+    ///
+    /// This monotonic counter is bumped (under the `regions` lock, with
+    /// `Release` ordering) at every point that recycles/retypes regions:
+    /// the start of `young_collection`, `mixed_collection`, and
+    /// `cleanup`. The fast path stamps the current epoch into its TLS
+    /// entry and re-loads + compares it (with `Acquire`) on every hit; a
+    /// mismatch forces the slow path, which re-validates `region_type !=
+    /// Free` under the lock. The `Release`/`Acquire` pair establishes the
+    /// happens-before edge so a reclassification can never be missed by a
+    /// concurrent mutator's cached entry.
+    rset_cache_epoch: AtomicU64,
+
     /// Address-to-region lookup table for O(log R) `region_for_ptr` queries.
     ///
     /// Each entry is `(base_addr, region_idx)`, sorted ascending by
@@ -372,6 +394,8 @@ impl G1Collector {
             mixed_gc_remaining: AtomicU64::new(0),
             mark_worklist: Mutex::new(Vec::new()),
             mark_worklist_overflowed: AtomicBool::new(false),
+            // SECURITY FIX (V7a): start the RSet TLS-cache epoch at 0.
+            rset_cache_epoch: AtomicU64::new(0),
             region_lookup,
         }
     }
@@ -593,6 +617,12 @@ impl G1Collector {
     ) -> GcResult {
         let start = std::time::Instant::now();
         let mut regions = self.regions.lock();
+        // SECURITY FIX (V7a): this collection will reset/retype CSet
+        // regions (Phase 5). Bump the RSet TLS-cache epoch *before* any
+        // reclassification so every mutator's fast-path cache entry is
+        // invalidated and falls to the Free-gated slow path. `Release`
+        // pairs with the `Acquire` load on the fast path.
+        self.rset_cache_epoch.fetch_add(1, Ordering::Release);
         let mut pointer_map: HashMap<usize, usize> = HashMap::new();
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
@@ -699,6 +729,12 @@ impl G1Collector {
             bytes_freed += regions[cset_idx].cursor;
             regions[cset_idx].reset();
         }
+
+        // SECURITY FIX (V7b): after the CSet is freed, scan survivors for
+        // any slot still pointing into a freed CSet region with no
+        // forwarding entry (incomplete remembered set => UAF). No-op on
+        // the release/quiet path; aborts in debug.
+        self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
 
         // TODO(round-9 gc HIGH-9, humongous-reclaim-young):
         // ----------------------------------------------------
@@ -875,6 +911,10 @@ impl G1Collector {
     ) -> GcResult {
         let start = std::time::Instant::now();
         let mut regions = self.regions.lock();
+        // SECURITY FIX (V7a): mixed GC resets/retypes CSet regions
+        // (Phase 5). Invalidate every mutator's RSet fast-path cache
+        // before any reclassification — see `rset_cache_epoch`.
+        self.rset_cache_epoch.fetch_add(1, Ordering::Release);
         let mut pointer_map: HashMap<usize, usize> = HashMap::new();
         let mut objects_copied = 0usize;
         let mut bytes_copied = 0usize;
@@ -998,6 +1038,12 @@ impl G1Collector {
             bytes_freed += regions[cset_idx].cursor;
             regions[cset_idx].reset();
         }
+
+        // SECURITY FIX (V7b): mixed GC frees old regions as well as young
+        // ones, where a stale/incomplete rset is most likely. Verify no
+        // survivor slot dangles into a freed CSet region. No-op on the
+        // release/quiet path; aborts in debug.
+        self.verify_no_dangling_into_cset(&regions, &cset_set, &pointer_map);
 
         let cur_eden = self.current_eden.load(Ordering::Relaxed);
         if cset_set.contains(&cur_eden) {
@@ -1417,6 +1463,128 @@ impl G1Collector {
         }
     }
 
+    /// SECURITY FIX (V7b): defensive post-evacuation dangling-pointer
+    /// verification.
+    ///
+    /// Remembered-set completeness is a hard UAF precondition: Phase-2
+    /// only evacuates objects reachable from CSet rset sources, and
+    /// Phase-5 then frees (resets) every CSet region. If a live
+    /// cross-region edge into the CSet was missing from some rset, the
+    /// referent is neither evacuated nor entered into `pointer_map`, so
+    /// Phase-4 leaves the referring slot untouched — a dangling pointer
+    /// into a region whose backing buffer was just zero-filled and will
+    /// be re-typed for unrelated objects (classic UAF).
+    ///
+    /// This pass runs AFTER Phase-5 over every surviving (non-CSet,
+    /// non-Free) region and inspects each reference slot. A slot whose
+    /// target lands inside a CSet region (those addresses still map to
+    /// the same region indices — `reset` only zero-fills, it never
+    /// reallocates the buffer) but is NOT a key in `pointer_map` is a
+    /// dangling reference into a freed region. Rather than silently leave
+    /// it dangling we abort (debug builds) / log (release builds).
+    ///
+    /// Cost: an extra walk of survivor/old regions. To keep production
+    /// overhead near-zero it is gated on `debug_assertions` OR the
+    /// existing `gc_log_enabled` verify flag; the common (release, quiet)
+    /// path skips it entirely.
+    fn verify_no_dangling_into_cset(
+        &self,
+        regions: &[G1Region],
+        cset: &std::collections::HashSet<usize>,
+        pointer_map: &HashMap<usize, usize>,
+    ) {
+        let verify = cfg!(debug_assertions) || self.gc_log_enabled.load(Ordering::Relaxed);
+        if !verify {
+            return;
+        }
+
+        // Closure: classify a referent address. Returns true if `addr`
+        // is a dangling pointer into a (now-freed) CSet region.
+        let is_dangling = |addr: usize| -> bool {
+            if addr == 0 {
+                return false;
+            }
+            match self.lookup_region_for_addr(addr) {
+                Some(tgt_idx) if cset.contains(&tgt_idx) => {
+                    // Target sits in a freed CSet region. If it was
+                    // properly evacuated it would have a forwarding entry.
+                    !pointer_map.contains_key(&addr)
+                }
+                _ => false,
+            }
+        };
+
+        for i in 0..regions.len() {
+            if cset.contains(&i) || regions[i].region_type == RegionType::Free {
+                continue;
+            }
+
+            let cursor = regions[i].cursor;
+            let base = regions[i].data.as_ptr();
+            let mut offset = 0usize;
+
+            while offset < cursor {
+                let obj_ptr = unsafe { base.add(offset) };
+                let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                if is_humongous_filler(header) {
+                    break;
+                }
+                let obj_size = object_total_size(header);
+                if obj_size < HEADER_SIZE || offset + obj_size > cursor {
+                    break;
+                }
+
+                let data_start = unsafe { obj_ptr.add(HEADER_SIZE) };
+                if header.kind == ObjectKind::Array {
+                    if header.element_type == ArrayElementType::Reference {
+                        for k in 0..header.array_length as usize {
+                            let slot_ptr = unsafe { data_start.add(k * 8) };
+                            let raw: u64 = unsafe { std::ptr::read(slot_ptr as *const u64) };
+                            if is_dangling(raw as usize) {
+                                self.report_dangling_cset_ref(i, obj_ptr as usize, raw as usize);
+                            }
+                        }
+                    }
+                } else {
+                    for slot_idx in 0..header.num_slots as usize {
+                        let slot_ptr = unsafe { data_start.add(slot_idx * SLOT_SIZE) };
+                        let value = unsafe { std::ptr::read(slot_ptr as *const Value) };
+                        if let Value::Object(Some(ref_obj)) = value {
+                            let ref_addr = ref_obj.as_ptr() as usize;
+                            if is_dangling(ref_addr) {
+                                self.report_dangling_cset_ref(i, obj_ptr as usize, ref_addr);
+                            }
+                        }
+                    }
+                }
+
+                offset += obj_size;
+            }
+        }
+    }
+
+    /// SECURITY FIX (V7b): report a detected dangling-into-CSet slot.
+    /// In debug builds this is a hard abort (the heap is corrupt and any
+    /// further mutation risks a UAF); in release builds (reached only via
+    /// the `gc_log_enabled` verify flag) it logs loudly so the condition
+    /// is observable without crashing a production VM.
+    #[cold]
+    #[inline(never)]
+    fn report_dangling_cset_ref(&self, holder_region: usize, holder_obj: usize, target: usize) {
+        eprintln!(
+            "[g1][SECURITY V7b] post-evacuation dangling reference: object {:#x} in \
+             surviving region {} still points at {:#x}, which lies in a freed CSet \
+             region with no forwarding entry (incomplete remembered set => UAF)",
+            holder_obj, holder_region, target
+        );
+        debug_assert!(
+            false,
+            "G1 post-evacuation dangling reference into freed CSet region (V7b): \
+             holder_obj={:#x} holder_region={} target={:#x}",
+            holder_obj, holder_region, target
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Concurrent Marking
     // -----------------------------------------------------------------------
@@ -1801,6 +1969,11 @@ impl G1Collector {
     /// free completely empty old regions.
     pub fn cleanup(&self) {
         let mut regions = self.regions.lock();
+        // SECURITY FIX (V7a): cleanup recycles completely-empty Old
+        // regions (reset to Free below). Invalidate every mutator's RSet
+        // fast-path cache before that reclassification — see
+        // `rset_cache_epoch`.
+        self.rset_cache_epoch.fetch_add(1, Ordering::Release);
         let region_size = self.config.region_size;
 
         for region in regions.iter_mut() {
@@ -2280,21 +2453,41 @@ impl G1Collector {
 
         let collector_id = self as *const Self as usize;
 
+        // SECURITY FIX (V7a): snapshot the current reclassification epoch.
+        // Pairs (`Acquire`) with the `Release` bump performed under the
+        // regions lock at the start of every recycle/retype phase
+        // (`young_collection`/`mixed_collection`/`cleanup`).
+        let cur_epoch = self.rset_cache_epoch.load(Ordering::Acquire);
+
         thread_local! {
-            // (collector_id, region_idx, *const G1Region). `Cell` is
-            // sufficient — the pointer is `Copy` and never escapes
-            // the with() block other than as a deref-then-call.
-            static LAST_RSET_TARGET: std::cell::Cell<Option<(usize, usize, *const G1Region)>>
+            // SECURITY FIX (V7a): now (collector_id, region_idx,
+            // *const G1Region, epoch). `Cell` is sufficient — the
+            // pointer is `Copy` and never escapes the with() block other
+            // than as a deref-then-call.
+            static LAST_RSET_TARGET: std::cell::Cell<Option<(usize, usize, *const G1Region, u64)>>
                 = const { std::cell::Cell::new(None) };
         }
 
         let hit = LAST_RSET_TARGET.with(|cell| {
-            if let Some((cached_collector, cached_idx, cached_ptr)) = cell.get() {
-                if cached_collector == collector_id && cached_idx == dst_idx {
+            if let Some((cached_collector, cached_idx, cached_ptr, cached_epoch)) = cell.get() {
+                // SECURITY FIX (V7a): only honour the fast path when the
+                // cache was populated in the *current* reclassification
+                // epoch. A stale `cached_epoch` means a collection has
+                // recycled/retyped regions since the entry was captured,
+                // so the cached `*const G1Region` may now name a Free (or
+                // re-typed) region whose rset we must NOT touch. On
+                // mismatch we fall through to the Free-gated slow path,
+                // which re-validates under the regions lock and refreshes
+                // the cache with the new epoch.
+                if cached_collector == collector_id
+                    && cached_idx == dst_idx
+                    && cached_epoch == cur_epoch
+                {
                     // SAFETY: see method-level invariant. `cached_ptr`
                     // was captured from `&regions[dst_idx]` (Vec never
-                    // reallocates) and the collector identity check
-                    // rules out reuse across collector instances.
+                    // reallocates), the collector identity check rules
+                    // out reuse across collector instances, and the
+                    // epoch check rules out a recycled region.
                     // `add_reference` takes `&self` (interior
                     // `parking_lot::Mutex` on the FxHashSet — see
                     // `RememberedSet`).
@@ -2323,24 +2516,24 @@ impl G1Collector {
         // `is_addr_in_live_region` (line 2324) and `is_object_address`
         // (line 2267) already apply on the read-side root-scan paths.
         //
-        // The fast-path TLS cache hit above does not need a re-check
-        // because G1 phase transitions invalidate the cache via the
-        // collector-identity mismatch path: when the collector moves a
-        // region between Eden/Survivor/Old/Free, the cached `*const
-        // G1Region` is still address-valid (Vec never reallocates), but
-        // any subsequent `post_write_barrier_rset` call that hits a *new*
-        // destination region will re-take this slow path and re-validate.
-        // A stale cache entry can therefore briefly admit a write to a
-        // region that just freed, but the window is bounded by the
-        // mutator's next cross-region store and the next GC drains the
-        // (now-stale) RSet entries before any region is reclassified.
+        // SECURITY FIX (V7a): the fast-path TLS cache is now also gated
+        // by `rset_cache_epoch` (see above). When the collector moves a
+        // region between Eden/Survivor/Old/Free it bumps the epoch under
+        // this same lock, so the previously-documented stale-cache window
+        // — where a cache entry could briefly admit a write into a
+        // just-freed region — is closed: any cached entry from before the
+        // bump fails the epoch comparison and is forced down this
+        // Free-gated slow path. We re-read the epoch under the lock so the
+        // value stamped into the cache is consistent with the
+        // `region_type` we validate.
         let regions = self.regions.lock();
         if regions[dst_idx].region_type == RegionType::Free {
             return;
         }
+        let epoch_under_lock = self.rset_cache_epoch.load(Ordering::Acquire);
         let region_ptr: *const G1Region = &regions[dst_idx];
         LAST_RSET_TARGET.with(|cell| {
-            cell.set(Some((collector_id, dst_idx, region_ptr)));
+            cell.set(Some((collector_id, dst_idx, region_ptr, epoch_under_lock)));
         });
         regions[dst_idx].rset.add_reference(src_idx);
     }

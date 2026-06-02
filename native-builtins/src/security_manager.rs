@@ -42,6 +42,25 @@ fn dbg_dopriv_enabled() -> bool {
     *DBG_DOPRIV.get_or_init(|| std::env::var_os("CRATONVM_DBG_DOPRIV").is_some())
 }
 
+// SECURITY FIX (V10): strict opt-in for the certification profile.
+//
+// Default runtime behavior: "no policy loaded = no enforcement" — when no
+// java.policy is installed the VM allows everything, matching JDK semantics
+// and the no-SecurityManager compatibility path. This is intentionally NOT
+// changed, because silently denying with no policy would break the
+// JDK-compat case.
+//
+// When `CRATONVM_REQUIRE_POLICY` is set, a missing policy instead DENIES
+// (fail-closed). The certification profile sets this flag so that the
+// absence of an explicitly-loaded policy can never be mistaken for an
+// allow-all grant. The flag must be set before the first permission check.
+static REQUIRE_POLICY: OnceLock<bool> = OnceLock::new();
+
+#[inline]
+fn require_policy_enabled() -> bool {
+    *REQUIRE_POLICY.get_or_init(|| std::env::var_os("CRATONVM_REQUIRE_POLICY").is_some())
+}
+
 // ---------------------------------------------------------------------------
 // Global SecurityManager singleton
 // ---------------------------------------------------------------------------
@@ -238,7 +257,11 @@ pub fn policy_allows_full_generic<S: AsRef<str>>(
 ) -> bool {
     let g = ACTIVE_POLICY.read().unwrap_or_else(|e| e.into_inner());
     match g.as_ref() {
-        None => true, // no policy loaded → allow-all
+        // SECURITY FIX (V10): no policy loaded = no enforcement (allow-all),
+        // matching JDK behavior — UNLESS CRATONVM_REQUIRE_POLICY is set, in
+        // which case a missing policy fails closed (deny). The certification
+        // profile sets the flag; the default stays JDK-compatible.
+        None => !require_policy_enabled(),
         Some(p) => p.implies_full(permission_class, target, actions, code_base, cert_digests),
     }
 }
@@ -628,25 +651,42 @@ fn register_security_manager(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // checkAccess(Thread)V — allow all thread access
+    // checkAccess(Thread)V — delegates to checkPermission with
+    // RuntimePermission("modifyThread") so a loaded policy can deny it.
+    // SECURITY FIX (V10): previously hardcoded `Ok(None)` (always allow),
+    // which meant a restrictive java.policy could never constrain thread
+    // access. Route through check_permission_impl like the other checkXxx
+    // handlers; under the default (no policy) the impl still allows.
     r.register(
         sm,
         "checkAccess",
         "(Ljava/lang/Thread;)V",
-        |_ctx, _args| {
-            // Thread access is always permitted under the default allow-all policy.
-            Ok(None)
+        |ctx, args| {
+            let _thread = obj_arg(args, 1)?;
+            let perm =
+                alloc_concurrent_synthetic(ctx, "java/lang/RuntimePermission", 2);
+            let name = ctx.create_string("modifyThread");
+            ctx.set_field(perm, 0, Value::Object(Some(name)));
+            ctx.set_field(perm, 1, Value::Object(None)); // no actions
+            check_permission_impl(ctx, perm)
         },
     );
 
-    // checkAccess(ThreadGroup)V — allow all thread-group access
+    // checkAccess(ThreadGroup)V — delegates to checkPermission with
+    // RuntimePermission("modifyThreadGroup") so a loaded policy can deny it.
+    // SECURITY FIX (V10): previously hardcoded `Ok(None)` (always allow).
     r.register(
         sm,
         "checkAccess",
         "(Ljava/lang/ThreadGroup;)V",
-        |_ctx, _args| {
-            // ThreadGroup access is always permitted under the default allow-all policy.
-            Ok(None)
+        |ctx, args| {
+            let _group = obj_arg(args, 1)?;
+            let perm =
+                alloc_concurrent_synthetic(ctx, "java/lang/RuntimePermission", 2);
+            let name = ctx.create_string("modifyThreadGroup");
+            ctx.set_field(perm, 0, Value::Object(Some(name)));
+            ctx.set_field(perm, 1, Value::Object(None)); // no actions
+            check_permission_impl(ctx, perm)
         },
     );
 
@@ -1226,9 +1266,12 @@ fn register_policy_natives(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let perm = match args.last() {
                 Some(Value::Object(Some(o))) => *o,
-                // No permission object to evaluate (e.g. null) — preserve
-                // the lenient default and allow.
-                _ => return Ok(Some(Value::Int(1))),
+                // SECURITY FIX (V10): a null permission argument must DENY,
+                // not allow. Returning allow for a null permission means a
+                // caller asking "do I have <null>?" is told yes, which is
+                // an unconditional bypass. A null permission carries no
+                // grant to satisfy, so deny it.
+                _ => return Ok(Some(Value::Int(0))),
             };
             let allowed = policy_implies_permission(ctx, perm);
             Ok(Some(Value::Int(if allowed { 1 } else { 0 })))

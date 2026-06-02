@@ -3248,8 +3248,28 @@ fn find_safe_array_accesses(
                                     // Array ref is invariant in this loop.
                                     // Mark this access as safe if bound_local exists
                                     // (meaning the loop is bounded by some local).
-                                    if bounds.bound_local.is_some() {
-                                        safe_pcs.insert(pc);
+                                    //
+                                    // SECURITY FIX (V16): the access is only
+                                    // safe to elide if the BOUND local is also
+                                    // loop-invariant. The header range guard
+                                    // (emitted in `compile`) proves
+                                    // `array.length >= bound` ONCE at entry. If
+                                    // the loop body raises `bound` afterwards,
+                                    // the per-iteration exit test `iv < bound`
+                                    // can admit `iv >= array.length` on a later
+                                    // trip — an out-of-bounds access past the
+                                    // stale guard. Requiring `bound` ∉ modified
+                                    // ties the guarded value to the value the
+                                    // exit test reads every iteration, closing
+                                    // the gap. (Array-ref and IV invariance are
+                                    // already enforced above and in
+                                    // `find_induction_variable` respectively.)
+                                    if let Some(bl) = bounds.bound_local {
+                                        let bound_invariant =
+                                            bl < 64 && (modified & (1u64 << bl)) == 0;
+                                        if bound_invariant {
+                                            safe_pcs.insert(pc);
+                                        }
                                     }
                                 }
                             }
@@ -3381,7 +3401,27 @@ fn analyze_bounds_elimination(
         // find array accesses using IV as index that weren't already proven safe.
         // For these, we emit a single range guard at the loop header and mark
         // all such accesses as safe.
-        if let Some(bound_local) = bounds.bound_local {
+        //
+        // SECURITY FIX (V16) SOUNDNESS INVARIANT: the header guard proves
+        // `array.length >= bound_local` exactly ONCE on loop entry, then every
+        // per-element bounds check is elided. For that single guard to keep
+        // every elided access in range, three locals must be loop-invariant
+        // *after* the guard:
+        //   1. the IV is `0..bound` step 1 — enforced by
+        //      `find_induction_variable` (modified only by one canonical
+        //      iinc/iadd-istore, no conflicting xstore).
+        //   2. the array local is not reassigned — enforced inside
+        //      `find_speculative_array_accesses` (`modified & (1<<al)==0`).
+        //   3. the BOUND local is not raised inside the loop. If it were, a
+        //      later iteration's exit test `iv < bound` could pass with
+        //      `iv >= array.length` — an OOB access past the stale guard.
+        // (1) and (2) were already checked; (3) was NOT. Enforce it here so the
+        // speculative guard is only installed when `bound_local` is invariant.
+        let bound_invariant = bounds
+            .bound_local
+            .map(|bl| bl < 64 && (modified & (1u64 << bl)) == 0)
+            .unwrap_or(false);
+        if let Some(bound_local) = bounds.bound_local.filter(|_| bound_invariant) {
             let speculative_accesses = find_speculative_array_accesses(
                 code,
                 header,
@@ -3444,6 +3484,20 @@ fn find_speculative_array_accesses(
                         if let Some(a_pc) = arr_pc {
                             let arr_local = extract_aload_local(code, a_pc);
                             if let Some(al) = arr_local {
+                                // SECURITY FIX (V16): array-local invariance.
+                                // `al < 64` is load-bearing, not just a bitmask
+                                // bound: locals >= 64 cannot be represented in
+                                // the `modified` u64, so we conservatively
+                                // refuse to elide their checks (the `&&`
+                                // short-circuits and the access is not marked
+                                // safe). A modified array local is likewise
+                                // rejected, so the header guard's
+                                // `array.length` cannot go stale via
+                                // reassignment. IV invariance is guaranteed by
+                                // `find_induction_variable`; bound-local
+                                // invariance is enforced by the caller
+                                // (`analyze_bounds_elimination`) before this
+                                // function is invoked.
                                 if al < 64 && (modified & (1u64 << al)) == 0 {
                                     result.push((pc, al));
                                 }
@@ -4370,6 +4424,15 @@ impl Compiler {
     /// Flush the simulated stack to canonical spill offsets (base_spill + i*8).
     /// This ensures that all paths reaching a merge point agree on frame layout.
     fn canonicalize_stack(&mut self) {
+        // SECURITY FIX (V15) INVARIANT: unlike the dead-code merge
+        // reconstruction (which clears+rebuilds `self.stack` and so must
+        // also rebuild `stack_oop_marks`), this routine never changes the
+        // stack DEPTH — it only relocates each live slot's spill offset in
+        // place. The oop-ness of a value is independent of which frame slot
+        // backs it, so `stack_oop_marks[i]` stays correct for `stack[i]`
+        // across the relocation. We therefore intentionally leave
+        // `stack_oop_marks` untouched here; the parallel vector remains in
+        // lock-step by index and is still sound at the next safepoint.
         let base = self.base_spill_offset;
         for i in 0..self.stack.len() {
             let canonical_off = base + (i as i32) * 8; // Cast: x86-64 immediate encoding
@@ -9140,7 +9203,19 @@ impl Compiler {
     ///
     /// The stub is emitted later by `emit_bounds_check_stubs()` after the main code.
     fn emit_bounds_check(&mut self, bc_pc: usize) {
-        // Skip if loop analysis proved this access is safe
+        // Skip if loop analysis proved this access is safe.
+        //
+        // SECURITY FIX (V16) INVARIANT: `bounds_safe_pcs` only contains a PC
+        // when `analyze_bounds_elimination` proved — for the enclosing counted
+        // loop — that the index IV ranges over `[0, bound)` step 1, the array
+        // local is loop-invariant, AND the bound local is loop-invariant (so a
+        // single `array.length >= bound` header guard, emitted as a
+        // SpeculativeBCEGuard, keeps every elided access in range). All three
+        // invariance facts derive from `find_modified_locals` /
+        // `find_induction_variable`; if ANY of the array-ref, IV, or bound
+        // local is written in the loop body, the PC is excluded here and the
+        // full per-access check below is emitted. Do not add a PC to
+        // `bounds_safe_pcs` from any path that does not establish all three.
         if self.bounds_safe_pcs.contains(&bc_pc) {
             return;
         }
@@ -9927,6 +10002,26 @@ impl Compiler {
                         self.stack.push(StackSlot::Frame(canonical_off));
                     }
                     self.next_spill_offset = base + (expected_depth as i32) * 8; // Cast: x86-64 immediate encoding
+                    // SECURITY FIX (V15): rebuild the parallel oop-mark
+                    // vector in lock-step with the reconstructed stack.
+                    // Previously only `self.stack` was rebuilt here, leaving
+                    // `stack_oop_marks` holding stale type bits from the DEAD
+                    // predecessor path. At the next safepoint,
+                    // `emit_oop_map_for_safepoint` would index those stale
+                    // bits against the freshly canonicalised frame slots and
+                    // could emit an oop map that mislabels a slot (a stale
+                    // `true` pins a non-reference word; a stale `false` would
+                    // omit a real oop, which the conservative frame sweep
+                    // still catches, but we must not rely on that here). We
+                    // reset every reconstructed slot to `false` (conservative
+                    // / sound default): the merge-target's own bytecode will
+                    // re-tag any slot that genuinely holds an oop as it
+                    // re-executes the producing instruction. Resetting to a
+                    // known length also keeps marks aligned with `stack`,
+                    // satisfying the lock-step invariant assumed everywhere
+                    // marks is read.
+                    self.stack_oop_marks.clear();
+                    self.stack_oop_marks.resize(expected_depth, false);
                 } else {
                     self.pc_to_native[pc] = -1;
                     pc += bytecode_len_at(code, pc);
@@ -15911,6 +16006,17 @@ impl Compiler {
                                 let ic_imm64_off = self.buf.pos() + 2;
                                 self.emit_mov_imm64_full(R10, pic as *const _ as i64); // Cast: function pointer for JIT call target
                                 self.ic_patches.push((ic_imm64_off, 1)); // 1 = PIC
+                                // SECURITY FIX (V1) INVARIANT: R10 holds the
+                                // PIC slot base pointer from here until each
+                                // per-slot `MOV R11,[R10+disp]; CALL R11`
+                                // below. Code emitted in this window (receiver
+                                // load, NPE guard, class_id load, the per-slot
+                                // CMP/JNE cascade) must touch only RAX and R10
+                                // itself — it must NOT route through any helper
+                                // that clobbers R10 (e.g. emit_bounds_check,
+                                // SIMD lowering). The ABI marshalling below
+                                // targets ARG_REGS only (RCX/RDX/RSI/R8/R9/RDI
+                                // — never R10), so R10 stays the trusted base.
 
                                 // ---- Hoist callee ABI marshalling out of
                                 // the 3-way cascade. Previously each slot
@@ -16117,13 +16223,43 @@ impl Compiler {
                                     // the top of the PIC body). Slot
                                     // bodies must NOT touch ARG_REGS.
 
-                                    // CALL qword [R10 + ENTRY_PTR_OFFS[i]]
-                                    // 4 bytes: REX.B (0x41) + FF /2 + modrm
-                                    //   modrm = mod(01) reg(/2=010) rm(010)
-                                    //         = 0b01_010_010 = 0x52
-                                    //   + disp8.
-                                    self.buf
-                                        .emit(&[0x41, 0xFF, 0x52, ENTRY_PTR_OFFS[i]]);
+                                    // SECURITY FIX (V1): do NOT keep the
+                                    // call target live in memory addressed
+                                    // through R10 across an indirect CALL.
+                                    // R10 is the shared bounds-check / SIMD
+                                    // scratch register (see SCRATCH_REGS
+                                    // exclusion and emit_bounds_check, which
+                                    // clobbers R10D). Previously this site
+                                    // emitted `CALL qword [R10 + disp]`, so
+                                    // ANY R10-clobbering instruction emitted
+                                    // in the window between `MOV R10,&slot`
+                                    // and the CALL would corrupt the call
+                                    // target → indirect call to an attacker-
+                                    // influenced address. We close the window
+                                    // to a single, fixed instruction pair:
+                                    // load the entry_ptr into R11 (a
+                                    // caller-saved scratch reg that is NOT in
+                                    // ARG_REGS / SCRATCH_REGS / LOCAL_REGS and
+                                    // is clobbered by the call anyway) and
+                                    // CALL R11. The R10→R11 load reads R10
+                                    // exactly once, immediately before the
+                                    // CALL, with nothing emittable in between,
+                                    // so no later codegen can perturb the
+                                    // target. INVARIANT: nothing may be
+                                    // emitted between this entry-ptr load and
+                                    // the paired `CALL R11` below.
+                                    //
+                                    // MOV R11, qword [R10 + ENTRY_PTR_OFFS[i]]
+                                    if ENTRY_PTR_OFFS[i] == 0 {
+                                        // 3 bytes: REX.WRB + 8B /r + ModRM(00,R11,R10)
+                                        self.buf.emit(&[0x4D, 0x8B, 0x1A]);
+                                    } else {
+                                        // 4 bytes: REX.WRB + 8B /r + ModRM(01,R11,R10) + disp8
+                                        self.buf
+                                            .emit(&[0x4D, 0x8B, 0x5A, ENTRY_PTR_OFFS[i]]);
+                                    }
+                                    // CALL R11  (3 bytes: REX.B + FF /2 + ModRM(11,/2,R11))
+                                    self.buf.emit(&[0x41, 0xFF, 0xD3]);
 
                                     // JMP rel32 → .done. Use rel32 because
                                     // for slots 0 and 1 the skip distance
@@ -16186,6 +16322,15 @@ impl Compiler {
                                 let ic_imm64_off = self.buf.pos() + 2;
                                 self.emit_mov_imm64_full(R10, mic as *const _ as i64); // Cast: function pointer for JIT call target
                                 self.ic_patches.push((ic_imm64_off, 0)); // 0 = MIC
+                                // SECURITY FIX (V1) INVARIANT: R10 holds the
+                                // MIC slot base pointer from here until the
+                                // `MOV R11,[R10+8]; CALL R11` below. Every
+                                // instruction emitted in this window (receiver
+                                // load into RAX, NPE guard, class_id/needs-ctx
+                                // checks, and the ARG_REGS marshalling loop)
+                                // touches only RAX, R10, and ARG_REGS — never
+                                // R10 as a destination — so the call target
+                                // base cannot be perturbed before the CALL.
 
                                 // Load receiver pointer into RAX. Receiver is
                                 // arg_slots[0], spilled at the *highest* offset
@@ -16234,9 +16379,28 @@ impl Compiler {
                                     self.emit_load_local(ARG_REGS[i + 1], spill_off);
                                 }
 
-                                // CALL qword [R10 + 8]  — cached_entry_ptr.
-                                // 4 bytes: REX.B (0x41) + FF /2 + modrm(01 010 010) + disp8
-                                self.buf.emit(&[0x41, 0xFF, 0x52, 0x08]);
+                                // SECURITY FIX (V1): same hardening as the
+                                // PIC arm — never CALL indirectly through a
+                                // target addressed by R10, because R10 is the
+                                // shared bounds-check / SIMD scratch register
+                                // and any R10-clobbering instruction emitted
+                                // in the window between `MOV R10,&slot` and
+                                // the CALL would redirect the call. The
+                                // ABI-marshalling loop above this point loads
+                                // into ARG_REGS (never R10), so R10 is intact
+                                // here today, but we still tighten the window
+                                // to a single fixed pair: load the cached
+                                // entry_ptr into R11 (caller-saved scratch,
+                                // not in ARG_REGS / SCRATCH_REGS / LOCAL_REGS,
+                                // clobbered by the call anyway) and CALL R11.
+                                // INVARIANT: nothing may be emitted between
+                                // this load and the paired `CALL R11`.
+                                //
+                                // MOV R11, qword [R10 + 8]  — cached_entry_ptr.
+                                // 4 bytes: REX.WRB + 8B /r + ModRM(01,R11,R10) + disp8
+                                self.buf.emit(&[0x4D, 0x8B, 0x5A, 0x08]);
+                                // CALL R11  (3 bytes: REX.B + FF /2 + ModRM(11,/2,R11))
+                                self.buf.emit(&[0x41, 0xFF, 0xD3]);
 
                                 // JMP rel8 → .done  (2 bytes, patched)
                                 self.buf.emit(&[0xEB, 0x00]);

@@ -698,7 +698,40 @@ pub fn jobject_to_obj(jobj: JObject) -> Option<ObjectRef> {
         })
     } else {
         // Local ref: raw heap pointer.
-        Some(unsafe { ObjectRef::from_raw(jobj as *mut u8) })
+        //
+        // SECURITY FIX (V3): Previously this branch blindly reconstructed an
+        // ObjectRef from the caller-supplied pointer with no validation, while
+        // the global-ref branch above is protected by a locked table lookup. A
+        // forged native pointer would become a wild read/write, and a local ref
+        // held across a GC safepoint could be a stale from-space pointer under
+        // the moving/generational collector. Mirror the global-ref path's
+        // defensive posture: validate the address against the live heap (the
+        // same `heap.is_heap_addr` check the GC root scanners use) and return
+        // `None` on failure. `is_heap_addr` returns a freshly reconstructed
+        // ObjectRef for a confirmed-live, aligned heap address, so we use its
+        // result directly instead of an unchecked `from_raw`.
+        //
+        // The heap is reached through the same thread-local `JNI_SHARED_VM`
+        // context the global-ref path uses (`SharedVm::heap`).
+        //
+        // FOLLOW-UP: the long-term fix is a full per-thread JNI local-handle
+        // table (indirection handles validated on every access, like HotSpot's
+        // JNIHandleBlock) so a local jobject can never be a raw heap pointer at
+        // all. This address-validity gate is the minimum viable mitigation; it
+        // does not catch a forged pointer that happens to land on a live
+        // object, which only the handle table would fully prevent.
+        JNI_SHARED_VM.with(|c| {
+            let borrow = c.borrow();
+            match borrow.as_ref() {
+                Some(shared) => shared.heap.is_heap_addr(jobj as usize),
+                None => {
+                    tracing::warn!(
+                        "jobject_to_obj: local ref {jobj:#x} resolved outside JNI context"
+                    );
+                    None
+                }
+            }
+        })
     }
 }
 

@@ -48,10 +48,43 @@ use cratonvm_types::error::LinkageError;
 /// type-inference pass. [`verify_bytecode_strict`] forces strict mode
 /// unconditionally regardless of version.
 pub fn verify_bytecode(class: &Class, hierarchy: &dyn ClassHierarchy) -> Result<(), LinkageError> {
-    // `false` here means "do not *force* strict"; strict is still enabled
-    // automatically per method for Java 7+ classes carrying a StackMapTable
-    // (see `verify_method`'s `effective_strict`).
-    verify_bytecode_inner(class, hierarchy, false)
+    // SECURITY FIX (V4): strict verification is now the DEFAULT for any class
+    // that is NOT a trusted bootstrap/platform class. Trusted bootstrap
+    // classes (loaded by the bootstrap loader from a `java/`/`jdk/`/`sun/`/
+    // `com/sun/` package) were pre-verified by javac/jlink, so we keep the
+    // lenient path for them to preserve compatibility with the small set of
+    // legitimately frameless branch targets that ship in the JDK image.
+    //
+    // For application / untrusted code, full per-branch-target frame checking
+    // is engaged: a branch to a frameless target reached with a typed stack is
+    // rejected (JVMS §4.10.1), closing the type-confusion hole the lenient
+    // default left open. The escape hatch remains `--noverify`
+    // (`config.skip_verification`, gated at the VM entry point) and the
+    // explicit `verify_bytecode_strict` (`-Xverify:all`).
+    let force_strict = !class_is_bootstrap_trusted(class);
+    verify_bytecode_inner(class, hierarchy, force_strict)
+}
+
+/// SECURITY FIX (V4): trust predicate for the strict-by-default decision.
+///
+/// A class is treated as trusted (and therefore eligible for the lenient
+/// pre-verified default) ONLY when BOTH hold:
+///   (a) its defining loader is the bootstrap loader, AND
+///   (b) it lives in a trusted JDK package prefix (`java/`, `jdk/`, `sun/`,
+///       `com/sun/`).
+///
+/// This mirrors `vm::vm_util::verifier_skip_eligible` so the "trusted"
+/// determination is consistent between the verifier-skip gate (V13) and the
+/// strict-mode gate (V4). A forged class name alone (e.g. `java/lang/Evil`
+/// defined by an application loader) does NOT earn trust, because the
+/// loader-identity check (a) fails — such a class is verified strictly.
+pub(crate) fn class_is_bootstrap_trusted(class: &Class) -> bool {
+    let is_bootstrap_loaded = class.loader_id == crate::class::ClassLoaderId::Bootstrap;
+    let has_trusted_prefix = class.name.starts_with("java/")
+        || class.name.starts_with("jdk/")
+        || class.name.starts_with("sun/")
+        || class.name.starts_with("com/sun/");
+    is_bootstrap_loaded && has_trusted_prefix
 }
 
 /// Strict variant of [`verify_bytecode`] that rejects branch targets without
@@ -60,6 +93,13 @@ pub fn verify_bytecode(class: &Class, hierarchy: &dyn ClassHierarchy) -> Result<
 /// This matches the literal JVM spec requirement but may reject class files
 /// produced by some compilers (e.g. branches within basic blocks that don't
 /// cross type-state boundaries).
+///
+/// SECURITY (V4): this is the explicit `-Xverify:all` escape hatch — it forces
+/// strict mode for EVERY class, including trusted bootstrap classes that the
+/// default [`verify_bytecode`] would otherwise verify leniently. Untrusted
+/// application classes already default to strict via [`verify_bytecode`]; this
+/// entry point exists to additionally subject the trusted JDK image to the
+/// spec-literal check when a deployment wants maximum scrutiny.
 pub fn verify_bytecode_strict(
     class: &Class,
     hierarchy: &dyn ClassHierarchy,
@@ -116,19 +156,19 @@ fn verify_method(
     // Java 7+ (version >= 51) requires StackMapTable for verification
     let requires_stack_map = version.major >= ClassFileVersion::JAVA_7.major;
 
-    // M1: strict branch-target verification is OPT-IN, not the default.
+    // SECURITY FIX (V4): strict branch-target verification is now the DEFAULT
+    // for untrusted (non-bootstrap-trusted) classes. `strict_verification` is
+    // threaded from the entry point: it is `true` for application/untrusted
+    // code (see `verify_bytecode`'s `force_strict`) and for `-Xverify:all`
+    // (`verify_bytecode_strict`); it is `false` only for pre-verified trusted
+    // bootstrap classes, which stay lenient to tolerate the small set of
+    // legitimately frameless branch targets that ship in the JDK image.
     //
     // JVMS §4.10.1 requires Java 7+ classfiles to declare a frame at every
-    // branch target, so in principle a missing frame is a VerifyError. In
-    // practice, javac edge cases and bytecode-rewriting frameworks (proguard,
-    // CGLIB/ByteBuddy, shaded jars) legitimately emit branch targets without a
-    // declared frame; defaulting to strict would turn previously-loadable
-    // real-world classes (e.g. heavily-processed BouncyCastle / Spring jars)
-    // into load-time VerifyErrors — a compatibility regression. Strict
-    // checking is therefore engaged only when the caller explicitly asks for
-    // it (`verify_bytecode_strict`, i.e. `-Xverify:all`). The remaining
-    // verifier passes (worklist type inference, unreachable-code rejection,
-    // operand-stack bounds) still apply in the default lenient mode.
+    // branch target, so for untrusted code a branch to a frameless target
+    // reached with a typed stack is a VerifyError. The remaining verifier
+    // passes (worklist type inference, unreachable-code rejection,
+    // operand-stack bounds) apply in both modes.
     let effective_strict = strict_verification;
 
     if requires_stack_map && stack_map_table.is_none() {
@@ -2008,14 +2048,16 @@ mod tests {
             m1_goto_code(),
             m1_stackmap_frame_at_5(),
         );
-        // M1 is opt-in: the DEFAULT entry point stays lenient even for Java 7+
-        // (a missing frame at a branch target is tolerated to preserve
-        // compatibility with bytecode-rewritten jars). Strict rejection is
-        // only via `verify_bytecode_strict` — see `m1_explicit_strict_entry_*`.
+        // SECURITY FIX (V4): `make_class_with_stackmap` builds an
+        // Application-loaded (untrusted) class, so the DEFAULT entry point is
+        // now STRICT — a Java 7+ branch target without a declared frame is
+        // rejected. (Previously this default was lenient; that was the V4
+        // type-confusion hole.) See `v4_bootstrap_trusted_*` for the case
+        // that stays lenient.
         let res = verify_bytecode(&class, &MockHierarchy);
         assert!(
-            res.is_ok(),
-            "Java 7+ branch target without a frame must be tolerated by the lenient default, got {res:?}"
+            res.is_err(),
+            "untrusted Java 7+ branch target without a frame must be rejected by the strict default, got {res:?}"
         );
     }
 
@@ -2052,6 +2094,137 @@ mod tests {
             m1_stackmap_frame_at_5(),
         );
         assert!(verify_bytecode_strict(&class, &MockHierarchy).is_err());
+    }
+
+    // =======================================================================
+    // V4 — strict verification is the SECURE DEFAULT for untrusted classes.
+    //
+    // The lenient default now applies ONLY to trusted bootstrap classes
+    // (bootstrap loader + java/jdk/sun/com.sun prefix). Application /
+    // untrusted classes are routed through the strict path so a branch to a
+    // frameless target reached with a typed stack is rejected.
+    // =======================================================================
+
+    /// Mark a class as a trusted bootstrap class (bootstrap loader + trusted
+    /// package prefix) so the lenient default applies.
+    fn as_bootstrap_trusted(mut class: Class) -> Class {
+        class.loader_id = ClassLoaderId::Bootstrap;
+        class.name = Arc::from("java/lang/Demo");
+        class
+    }
+
+    /// SECURITY FIX (V4): the same Java 7+ frameless-branch-target shape that
+    /// is rejected for an untrusted (Application) class is TOLERATED for a
+    /// trusted bootstrap class, since those are pre-verified by javac/jlink.
+    #[test]
+    fn v4_bootstrap_trusted_stays_lenient() {
+        let class = as_bootstrap_trusted(make_class_with_stackmap(
+            ClassFileVersion::JAVA_8,
+            "()V",
+            0,
+            1,
+            m1_goto_code(),
+            m1_stackmap_frame_at_5(),
+        ));
+        assert!(class_is_bootstrap_trusted(&class));
+        let res = verify_bytecode(&class, &MockHierarchy);
+        assert!(
+            res.is_ok(),
+            "trusted bootstrap class must stay lenient, got {res:?}"
+        );
+    }
+
+    /// SECURITY FIX (V4): a bootstrap-LOADED class whose name is NOT in a
+    /// trusted prefix is still untrusted, so the strict default applies.
+    /// (Guards against a non-trusted-prefix bootstrap edge being treated as
+    /// trusted.)
+    #[test]
+    fn v4_bootstrap_loaded_untrusted_prefix_is_strict() {
+        let mut class = make_class_with_stackmap(
+            ClassFileVersion::JAVA_8,
+            "()V",
+            0,
+            1,
+            m1_goto_code(),
+            m1_stackmap_frame_at_5(),
+        );
+        class.loader_id = ClassLoaderId::Bootstrap;
+        class.name = Arc::from("org/evil/Forged");
+        assert!(!class_is_bootstrap_trusted(&class));
+        assert!(
+            verify_bytecode(&class, &MockHierarchy).is_err(),
+            "bootstrap-loaded but untrusted-prefix class must be verified strictly"
+        );
+    }
+
+    /// SECURITY FIX (V4): a forged trusted-prefix NAME defined by a
+    /// non-bootstrap (Application) loader must NOT earn trust — the strict
+    /// default applies and the frameless branch target is rejected. This is
+    /// the core anti-spoofing property shared with V13's skip gate.
+    #[test]
+    fn v4_forged_trusted_name_nonbootstrap_loader_is_strict() {
+        let mut class = make_class_with_stackmap(
+            ClassFileVersion::JAVA_8,
+            "()V",
+            0,
+            1,
+            m1_goto_code(),
+            m1_stackmap_frame_at_5(),
+        );
+        // Forge a JDK name but keep the Application defining loader.
+        class.name = Arc::from("java/lang/EvilString");
+        class.loader_id = ClassLoaderId::Application;
+        assert!(
+            !class_is_bootstrap_trusted(&class),
+            "name prefix alone must not confer trust without bootstrap loader identity"
+        );
+        assert!(
+            verify_bytecode(&class, &MockHierarchy).is_err(),
+            "forged java/ name from an application loader must be verified strictly"
+        );
+    }
+
+    /// SECURITY FIX (V4): a frameless-branch target reached with a *typed*
+    /// (non-empty) operand stack is the concrete type-confusion case the
+    /// strict default must reject for untrusted code. The branch target at
+    /// offset 4 has NO declared frame; the goto is reached after pushing an
+    /// int, so a lenient merge would silently accept an inconsistent stack.
+    #[test]
+    fn v4_untrusted_typed_stack_frameless_branch_rejected() {
+        //   0: iconst_0        (0x03)              push int
+        //   1: goto +3         (0xa7 0x00 0x03)    → branch target = offset 4
+        //   4: pop             (0x57)              (frameless target)
+        //   5: return          (0xb1)
+        // StackMapTable declares a frame ONLY at offset 5 (frame_type=5),
+        // NOT at the real branch target offset 4.
+        let code = vec![0x03, 0xa7, 0x00, 0x03, 0x57, 0xb1];
+        let stack_map = vec![0x00, 0x01, 0x05]; // one same_frame at offset 5
+        let class = make_class_with_stackmap(
+            ClassFileVersion::JAVA_8,
+            "()V",
+            1,
+            1,
+            code,
+            stack_map,
+        );
+        // Default (Application loader) is untrusted → strict → rejected.
+        assert!(
+            verify_bytecode(&class, &MockHierarchy).is_err(),
+            "untrusted frameless branch target with a typed stack must be rejected"
+        );
+        // And the trusted-bootstrap variant of the same class is tolerated.
+        let trusted = as_bootstrap_trusted(make_class_with_stackmap(
+            ClassFileVersion::JAVA_8,
+            "()V",
+            1,
+            1,
+            vec![0x03, 0xa7, 0x00, 0x03, 0x57, 0xb1],
+            vec![0x00, 0x01, 0x05],
+        ));
+        assert!(
+            verify_bytecode(&trusted, &MockHierarchy).is_ok(),
+            "trusted bootstrap variant must stay lenient"
+        );
     }
 }
 

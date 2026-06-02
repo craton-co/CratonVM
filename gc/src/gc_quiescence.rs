@@ -15,8 +15,9 @@
 //! [`enter`] and [`leave`] entry points.
 //!
 //! Semantics:
-//! - `enter()` increments the global counter (Acquire/Release ordering so
-//!   GC threads on other cores observe the change).
+//! - `enter()` increments the global counter (AcqRel ordering — SECURITY
+//!   FIX (V8) — so the increment is both released to and acquired against
+//!   GC threads on other cores that observe the change via `is_active()`).
 //! - `leave()` decrements.
 //! - `is_active()` returns `true` whenever any thread anywhere in the
 //!   process has at least one outstanding `enter()` without a matching
@@ -31,8 +32,33 @@ static JIT_ACTIVE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// Increment the global JIT-active counter. Called from the VM crate's
 /// `JitEntryGuard::enter` immediately before transferring control to JIT
 /// code. Returns the new depth (1-based).
+///
+/// SECURITY FIX (V8): use `AcqRel` rather than a bare `Release`.
+///
+/// The previous `Release`-only RMW had no acquire half, so this store was
+/// not ordered against prior loads on the entering thread and — more
+/// importantly — the ordering intent against the collector's
+/// `is_active()` (`Acquire` load) was not self-contained. The
+/// happens-before edge that makes the divert-to-non-moving path
+/// (`gen_heap::collect_garbage_inner`, the `is_active()` check before any
+/// relocation) sound is:
+///
+///   enter() [AcqRel RMW, makes the incremented depth visible] ──hb──▶
+///       the JIT thread reaches the STW safepoint poll ──hb──▶
+///       collector observes all threads parked, then loads is_active()
+///       [Acquire] ──▶ sees depth > 0 ──▶ runs the NON-MOVING sweep
+///       (never relocates objects out from under the JIT thread's raw
+///        heap pointers held in registers/spill slots).
+///
+/// The STW safepoint barrier supplies the synchronization between the
+/// JIT thread and the collector; the `AcqRel` here guarantees that once a
+/// thread has incremented the counter, no subsequent collector
+/// `is_active()` load can be reordered to observe the pre-increment value
+/// (which would let the mover relocate live JIT-referenced objects =>
+/// use-after-free). `AcqRel` does not weaken the existing release
+/// visibility — it only adds the missing acquire half.
 pub fn enter() -> usize {
-    JIT_ACTIVE_DEPTH.fetch_add(1, Ordering::Release) + 1
+    JIT_ACTIVE_DEPTH.fetch_add(1, Ordering::AcqRel) + 1
 }
 
 /// Decrement the global JIT-active counter. Called from the VM crate's

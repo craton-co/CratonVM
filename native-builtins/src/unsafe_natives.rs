@@ -549,6 +549,287 @@ fn native_unsafe_free_memory(
 }
 
 // ---------------------------------------------------------------------------
+// SECURITY FIX (V5) — single bounds-checked off-heap store.
+// ---------------------------------------------------------------------------
+//
+// Previously CratonVM had TWO disjoint off-heap allocators:
+//   * the *tracked* store (deprecated_internal.rs, base 0x1_0000_0000) — wired
+//     to allocateMemory / reallocateMemory / setMemory / copyMemory; and
+//   * the *arena* store (lib.rs `unsafe_arena`, base 0x10_0000_0000) — wired to
+//     the raw single-`long` get/put natives (getByte(J)/putByte(J)/…) and to
+//     freeMemory(J).
+// The stores never share an address, so an address returned by
+// `allocateMemory` was NOT readable through the raw get/put path that
+// `java.nio.Bits` uses — it threw IllegalArgumentException, and an address
+// freed via the arena path could still be aliased by the tracked store.
+//
+// These natives consolidate ALL off-heap addressing onto the *arena* store
+// (the one with the per-thread UAF cache and bounds-checked accessors). They
+// are registered as the LAST word on these (class,name,descriptor) keys in
+// BOTH `register_unsafe_wp1_2` (essential-natives mode) and
+// `register_unsafe_define_class` (synthetic-overrides mode), so whichever
+// registration path runs, the live wiring resolves to a single store.
+//
+// Base ranges do not collide: the tracked store (now unused by the live
+// wiring) starts at 0x1_0000_0000 and the arena store at 0x10_0000_0000.
+// Every address the live natives hand out comes from the arena allocator, so
+// alloc/realloc/free/get/put/setMemory/copyMemory all agree on the address
+// space.
+
+/// Upper bound on a single `setMemory` / `copyMemory` request. Mirrors the
+/// 256 MiB cap `lib.rs` applies, so an attacker-controlled `bytes` cannot
+/// drive an unbounded loop.
+const V5_MAX_OFF_HEAP_OP: usize = 256 * 1024 * 1024;
+
+/// SECURITY FIX (V5): allocateMemory(long) routed to the arena store so the
+/// returned address is readable via the raw get/put natives.
+fn native_unsafe_allocate_memory_consolidated(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let size = match args.get(1) {
+        Some(Value::Long(s)) => *s,
+        Some(Value::Int(s)) => *s as i64,
+        _ => 0,
+    };
+    if size < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("allocateMemory: negative size {size}"),
+        }
+        .into());
+    }
+    let addr = crate::unsafe_arena_allocate(size as usize);
+    Ok(Some(Value::Long(addr)))
+}
+
+/// SECURITY FIX (V5): reallocateMemory(long,long) routed to the arena store.
+/// realloc(NULL, size) == alloc(size), matching the JDK contract.
+fn native_unsafe_reallocate_memory_consolidated(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let old_addr = match args.get(1) {
+        Some(Value::Long(a)) => *a,
+        Some(Value::Int(a)) => *a as i64,
+        _ => 0,
+    };
+    let new_size = match args.get(2) {
+        Some(Value::Long(s)) => *s,
+        Some(Value::Int(s)) => *s as i64,
+        _ => 0,
+    };
+    if new_size < 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: format!("reallocateMemory: negative size {new_size}"),
+        }
+        .into());
+    }
+    let addr = if old_addr == 0 {
+        crate::unsafe_arena_allocate(new_size as usize)
+    } else {
+        crate::unsafe_arena_reallocate(old_addr, new_size as usize)
+    };
+    // The arena may have moved/resized under this address — drop the
+    // per-thread window so a stale range can't mask a later access.
+    invalidate_arena_cache();
+    Ok(Some(Value::Long(addr)))
+}
+
+/// SECURITY FIX (V5): setMemory(Object,long,long,byte). The off-heap form
+/// (null object) writes into the arena store byte-by-byte through the
+/// bounds-checked `put_byte` accessor; the on-heap form (non-null object)
+/// preserves the prior bounds-checked array/field behavior.
+fn native_unsafe_set_memory_consolidated(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let obj = match args.get(1) {
+        Some(Value::Object(Some(o))) => Some(*o),
+        _ => None,
+    };
+    let offset = match args.get(2) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    let bytes = match args.get(3) {
+        Some(Value::Long(v)) => *v as usize,
+        Some(Value::Int(v)) => *v as usize,
+        _ => 0,
+    };
+    let value = match args.get(4) {
+        Some(Value::Int(v)) => *v as u8,
+        _ => 0,
+    };
+    if bytes == 0 {
+        return Ok(None);
+    }
+    if bytes > V5_MAX_OFF_HEAP_OP {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!(
+                "Unsafe.setMemory size {bytes} exceeds maximum of {V5_MAX_OFF_HEAP_OP} bytes"
+            ),
+        }
+        .into());
+    }
+
+    match obj {
+        // On-heap target: keep the bounds-checked array fill (and bounded
+        // object-field slot fill) that lib.rs already performs.
+        Some(obj_ref) => {
+            let off = offset as usize;
+            if ctx.heap_kind_of(obj_ref) == cratonvm_types::ObjectKind::Array
+                && ctx.heap_element_type_of(obj_ref)
+                    != cratonvm_types::ArrayElementType::Reference
+            {
+                let fill = vec![value; bytes];
+                if crate::unsafe_array_write_bytes(ctx, obj_ref, off, &fill) {
+                    return Ok(None);
+                }
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                    index: off as i32,
+                }
+                .into());
+            }
+            let fill_value = Value::Int(value as i32);
+            for i in 0..bytes {
+                ctx.set_field(obj_ref, off + i, fill_value);
+            }
+            Ok(None)
+        }
+        // Off-heap target: write into the single arena store. Each write is
+        // bounds-checked; the first out-of-arena byte aborts with IAE so an
+        // attacker-controlled (addr, bytes) cannot scribble past an arena.
+        None => {
+            for i in 0..bytes as i64 {
+                if !crate::unsafe_arena_put_byte(offset + i, value) {
+                    invalidate_arena_cache();
+                    return Err(RuntimeError::IllegalArgumentException {
+                        message: format!(
+                            "Unsafe.setMemory: address 0x{:x} is not in any live arena",
+                            offset + i
+                        ),
+                    }
+                    .into());
+                }
+            }
+            refresh_arena_cache(offset, bytes);
+            Ok(None)
+        }
+    }
+}
+
+/// SECURITY FIX (V5): copyMemory(Object,long,Object,long,long). The fully
+/// off-heap form (both objects null) copies through the single arena store
+/// with per-byte bounds checks; any form touching a heap object delegates to
+/// the existing bounds-checked lib.rs handler.
+fn native_unsafe_copy_memory_consolidated(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let src_null = matches!(args.get(1), Some(Value::Object(None)) | None);
+    let dst_null = matches!(args.get(3), Some(Value::Object(None)) | None);
+
+    // Any heap-object side → keep lib.rs's bounds-checked array/field copy.
+    if !(src_null && dst_null) {
+        return crate::native_unsafe_copy_memory(ctx, args);
+    }
+
+    // Fully off-heap copy: route through the arena store.
+    let src_addr = match args.get(2) {
+        Some(Value::Long(a)) => *a,
+        Some(Value::Int(a)) => *a as i64,
+        _ => 0,
+    };
+    let dst_addr = match args.get(4) {
+        Some(Value::Long(a)) => *a,
+        Some(Value::Int(a)) => *a as i64,
+        _ => 0,
+    };
+    let bytes = match args.get(5) {
+        Some(Value::Long(b)) => *b as usize,
+        Some(Value::Int(b)) => *b as usize,
+        _ => 0,
+    };
+    if bytes == 0 {
+        return Ok(None);
+    }
+    if bytes > V5_MAX_OFF_HEAP_OP {
+        return Err(RuntimeError::IllegalStateException {
+            message: format!(
+                "Unsafe.copyMemory size {bytes} exceeds maximum of {V5_MAX_OFF_HEAP_OP} bytes"
+            ),
+        }
+        .into());
+    }
+
+    // Read the source bytes first (handles overlapping ranges within the
+    // same arena correctly), then write them into the destination. Every
+    // access is bounds-checked by the arena accessors.
+    let mut buf = Vec::with_capacity(bytes);
+    for i in 0..bytes as i64 {
+        match crate::unsafe_arena_try_get_byte(src_addr + i) {
+            Some(v) => buf.push(v),
+            None => {
+                invalidate_arena_cache();
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: format!(
+                        "Unsafe.copyMemory: src address 0x{:x} is not in any live arena",
+                        src_addr + i
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+    for (i, b) in buf.iter().enumerate() {
+        if !crate::unsafe_arena_put_byte(dst_addr + i as i64, *b) {
+            invalidate_arena_cache();
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!(
+                    "Unsafe.copyMemory: dst address 0x{:x} is not in any live arena",
+                    dst_addr + i as i64
+                ),
+            }
+            .into());
+        }
+    }
+    refresh_arena_cache(dst_addr, bytes);
+    Ok(None)
+}
+
+/// SECURITY FIX (V5): register the consolidated off-heap memory natives so
+/// allocate/reallocate/free/setMemory/copyMemory AND every raw single-`long`
+/// get/put all resolve to the SAME (arena) store. Called from both
+/// `register_unsafe_wp1_2` and `register_unsafe_define_class` so it wins as
+/// the last registration in essential-only AND synthetic-overrides modes.
+pub(crate) fn register_consolidated_off_heap_store(registry: &mut NativeMethodRegistry) {
+    let u = "sun/misc/Unsafe";
+    let u2 = "jdk/internal/misc/Unsafe";
+
+    // allocate / reallocate / free — sun.misc + jdk.internal.misc (0-suffix).
+    registry.register(u, "allocateMemory", "(J)J", native_unsafe_allocate_memory_consolidated);
+    registry.register(u, "reallocateMemory", "(JJ)J", native_unsafe_reallocate_memory_consolidated);
+    registry.register(u, "freeMemory", "(J)V", native_unsafe_free_memory);
+    registry.register(u2, "allocateMemory0", "(J)J", native_unsafe_allocate_memory_consolidated);
+    registry.register(u2, "reallocateMemory0", "(JJ)J", native_unsafe_reallocate_memory_consolidated);
+    registry.register(u2, "freeMemory0", "(J)V", native_unsafe_free_memory);
+    // Some JDK builds expose the unsuffixed forms on jdk.internal.misc.Unsafe.
+    registry.register(u2, "allocateMemory", "(J)J", native_unsafe_allocate_memory_consolidated);
+    registry.register(u2, "reallocateMemory", "(JJ)J", native_unsafe_reallocate_memory_consolidated);
+    registry.register(u2, "freeMemory", "(J)V", native_unsafe_free_memory);
+
+    // setMemory / copyMemory — off-heap form routed to the arena, on-heap
+    // form delegated to the bounds-checked lib.rs handlers.
+    registry.register(u, "setMemory", "(Ljava/lang/Object;JJB)V", native_unsafe_set_memory_consolidated);
+    registry.register(u2, "setMemory", "(Ljava/lang/Object;JJB)V", native_unsafe_set_memory_consolidated);
+    registry.register(u2, "setMemory0", "(Ljava/lang/Object;JJB)V", native_unsafe_set_memory_consolidated);
+    registry.register(u, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory_consolidated);
+    registry.register(u2, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory_consolidated);
+    registry.register(u2, "copyMemory0", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory_consolidated);
+}
+
+// ---------------------------------------------------------------------------
 // 6. defineClass — real impl replacing the null-returning stub.
 // ---------------------------------------------------------------------------
 //
@@ -655,14 +936,24 @@ fn native_unsafe_define_class(
     }
 
     let slashed_name = name.replace('.', "/");
-    // WP2.3-B: Unsafe.defineClass is a JDK-trusted entry point. The bytes
-    // come from the privileged caller (ByteBuddy / CGLIB / Hibernate), so
-    // we skip verification — matching real HotSpot, where
-    // `Unsafe::defineClass0` invokes `SystemDictionary::resolve_from_stream`
-    // with the verifier disabled for class data presented through Unsafe.
+    // SECURITY FIX (V9): do NOT unconditionally skip verification.
+    // Previously `skip_verification: true` was hard-coded on the theory that
+    // Unsafe.defineClass bytes always come from a privileged caller. But
+    // Unsafe is reachable from attacker-influenced code (deserialization,
+    // reflection bridges), so skipping the verifier on attacker-controlled
+    // bytes would let a malformed/hostile class file bypass bytecode safety
+    // checks. Gate the skip behind the same process-wide native-access trust
+    // gate used elsewhere (`panama::native_access_enabled`, secure-by-default
+    // false). When native access is granted the host has opted into trusting
+    // privileged native paths (e.g. ByteBuddy/CGLIB toolchains under
+    // --enable-native-access), so we preserve the HotSpot fast path; otherwise
+    // we VERIFY. Ideally this would be a per-caller trusted-caller predicate,
+    // but no such hook is reachable from this native — the native-access gate
+    // is the closest trust signal available here.
+    let skip_verification = crate::panama::native_access_enabled();
     let opts = cratonvm_native_api::DefineClassFull {
         code_source_url: pd_url,
-        skip_verification: true,
+        skip_verification,
         ..Default::default()
     };
     match ctx.define_class_full(&slashed_name, &bytes, loader_id, opts) {
@@ -759,10 +1050,16 @@ fn native_unsafe_define_anonymous_class(
     //    flatten to the application loader (loader_id = 0); the backend
     //    treats hidden classes as living in their host's namespace via
     //    `nest_host_class_name`, so visibility still resolves correctly.
+    // SECURITY FIX (V9): gate `skip_verification` behind the native-access
+    // trust gate (secure-by-default false) rather than hard-coding `true`.
+    // defineAnonymousClass takes attacker-influenceable bytes just like
+    // defineClass; only skip the verifier when the host has granted native
+    // access (a deliberate trust opt-in), otherwise verify the bytes. See the
+    // companion note in `native_unsafe_define_class`.
     let opts = cratonvm_native_api::DefineClassFull {
         override_name: Some(hidden_name.clone()),
         hidden: true,
-        skip_verification: true,
+        skip_verification: crate::panama::native_access_enabled(),
         nest_host_class_name: host_internal_name,
         ..Default::default()
     };
@@ -792,6 +1089,14 @@ fn native_unsafe_define_anonymous_class(
 pub fn register_unsafe_define_class(r: &mut NativeMethodRegistry) {
     let u = "sun/misc/Unsafe";
     let u2 = "jdk/internal/misc/Unsafe";
+
+    // SECURITY FIX (V5): in synthetic-overrides mode `register_unsafe_natives`
+    // runs AGAIN (re-wiring allocateMemory to a heap byte array and freeMemory
+    // to a no-op) AFTER `register_unsafe_wp1_2` already consolidated the store.
+    // This function is the last unsafe-related registration on that path, so
+    // re-assert the single arena store here to keep the live wiring consistent
+    // in BOTH essential-only and synthetic modes.
+    register_consolidated_off_heap_store(r);
 
     // Legacy `sun.misc.Unsafe.defineClass`.
     r.register(
@@ -1270,6 +1575,14 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
     // the same key, so this becomes the live impl.)
     registry.register(u, "freeMemory", "(J)V", native_unsafe_free_memory);
     registry.register(u2, "freeMemory0", "(J)V", native_unsafe_free_memory);
+
+    // SECURITY FIX (V5): consolidate allocate/reallocate/free/setMemory/
+    // copyMemory AND the raw get/put natives onto the SINGLE arena store.
+    // This is the last memory-native registration in essential-natives mode,
+    // so it overrides the disjoint tracked-store wiring from
+    // deprecated_internal and the heap-array wiring from
+    // register_unsafe_natives.
+    register_consolidated_off_heap_store(registry);
 
     // 6. Real defineClass replacing the stub.
     registry.register(

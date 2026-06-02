@@ -12,10 +12,17 @@
 > fix the `JIT-PFI-BAD` diagnostic never fires, synthetic avrora still passes,
 > and all 686 jit unit tests pass.
 >
-> Real-RAF avrora now advances past `visit(CPI)` and SEGVs **elsewhere** — a
-> *different* crash the experiments below never reached because the deterministic
-> `obj_ptr=0x1` fault always fired first. See the new bottom section
-> "Part 3 — second blocker: corrupted MIC/PIC slot pointer in commit()→advance".
+> Real-RAF avrora then advanced past `visit(CPI)` and SEGV'd **elsewhere** — a
+> *second*, distinct, pre-existing bug the experiments below never reached because
+> the deterministic `obj_ptr=0x1` fault always fired first. That one is now also
+> **FIXED**: it was a **JIT code use-after-free** — deoptimization frees a
+> method's code buffer (`jit_cache.remove` → `ExecutableBuffer::drop` →
+> `VirtualFree`) while baked-in direct `CALL rel32` sites in other methods still
+> target it, so a later call faults (execute) at the freed 64KB buffer. Fix: JIT
+> code is now retained for the process lifetime (no free-on-drop). With both fixes
+> real-RAF avrora runs to completion (only a pre-existing, JIT-independent digest
+> mismatch remains). Full analysis: "Part 3 — ROOT CAUSE + FIX: JIT code
+> use-after-free on deopt" at the bottom.
 
 This supersedes the earlier hypothesis in
 `system-out-redirect-and-fos-buffering-fix.md` (§"why real-bytecode RAF SEGVs
@@ -325,10 +332,57 @@ Facts established:
   bounds-check / SIMD scratch (x64.rs ~3492), and the IC imm64 is rewritten by
   the unroll duplicator via `ic_patches` (x64.rs ~3678) — both are prime suspects.
 
-**Next step:** dump the emitted JIT bytes around the faulting caller (frame 1 raw
-RA, an `external/jit` address) to see the exact instruction sequence feeding R10,
-and check (a) whether `commit()` is inlined into a method that uses R10 as a
-bounds-check/SIMD scratch between the IC `MOV R10` and the `CALL [R10+off]`, and
-(b) whether the `ic_patches` unroll rewrite ever bakes a frame/stack address into
-the `MOV R10, imm64`. A standing VEH register dump + `current_jit_callee` readout
-are now wired in (`crash_handler.rs`) to make the next capture cheap.
+### Part 3 — ROOT CAUSE + FIX (2026-06-02): JIT code use-after-free on deopt
+
+The R10 "stack address" was a red herring — the decisive signal was that the
+faulting target (`0x4F0X0000`) is **64KB-aligned, unmapped, and shifts with the
+address-space layout** (with `RUST_MIN_STACK=64MB` it moved to `0x60E60000`).
+That is the signature of a **freed JIT code buffer**: code is allocated with
+`VirtualAlloc`/`mmap` at 64KB granularity (`jit/src/platform.rs`), and an
+`execute` fault at such a base means a call/branch landed on a buffer that was
+already returned to the OS.
+
+Confirmed by experiment: leaking every `ExecutableBuffer` instead of freeing it
+makes the SEGV **disappear** (avrora then runs to completion — only the
+pre-existing, JIT-independent digest mismatch remains, exactly as with JIT off).
+
+**Mechanism.** `ExecutableBuffer::drop` (`jit/src/lib.rs`) `VirtualFree`s the
+code. A `CompiledMethod` is dropped — and thus its code freed — when it is
+removed from the JIT cache, notably by
+`DeoptimizationController::deoptimize` → `jit_cache.remove(...)`
+(`vm/src/jit/helpers.rs` ~2823) on `ReceiverTypeChanged` / `ClassCheck` /
+`ClassLoading` / speculation failure. But other compiled methods contain
+**baked-in direct `CALL rel32`** instructions (and cached MIC/PIC entry pointers)
+that target that code — emitted by `direct_calls` / `try_jit_compile_callee`
+(interpreter.rs). There is **no back-reference mechanism** to find and patch those
+inbound call sites, so after the callee's code is freed they dangle, and the next
+call through one faults (execute) at the now-unmapped 64KB buffer base. avrora is
+hot and deoptimises in the simulation dispatch path
+(`commit → MainClock.advance → DeltaQueue.advance/advanceSlow → Link.fire`), so
+this fires there. Not GC, not a float, not the spill bug.
+
+**Fix (`jit/src/lib.rs`):** retain JIT code for the process lifetime —
+`ExecutableBuffer::drop` no longer frees the mapping (it accounts the bytes in
+`RETAINED_JIT_CODE_BYTES` and leaves the region mapped + registered). Freeing is
+unsafe until the JIT tracks inbound call sites and patches/invalidates them at a
+safepoint before reclamation (a real code-cache sweeper — the proper long-term
+fix). `CRATONVM_JIT_FREE_CODE=1` restores the old free-on-drop behaviour for A/B
+testing only (it reintroduces the UAF).
+
+**Verified:** with the fix, `CRATONVM_REAL_RAF=1` avrora no longer hits the
+execute-fault SEGV (was 5/5 crashes; now runs to completion). Synthetic avrora
+still exits 0; `cargo test -p cratonvm-jit --lib` = 686 passed.
+
+**Diagnostics added this session (kept):** the Windows VEH (`crash_handler.rs`)
+now dumps the x64 GPRs, the `current_jit_callee` (when
+`CRATONVM_DBG_JIT_PUTFIELD=1`), and VirtualQuery-guarded code bytes preceding each
+JIT return address + memory around R10 — this is what localized the bug.
+
+### Still open (separate, pre-existing — NOT this SEGV)
+
+- **avrora digest mismatch** under real RAF (EXIT 127): avrora runs to completion
+  but its output digest is wrong. Present with JIT **off** too, so it is a
+  non-JIT correctness gap, independent of the crashes fixed above.
+- **Rare near-null read fault** (~1 in 5 runs; e.g. `read at 0x4`): a distinct,
+  non-deterministic fault (likely a worker-thread race — avrora runs Thread-2/3/4),
+  unrelated to the freed-code UAF. Use the new VEH GPR/callee dump to localize.

@@ -342,12 +342,32 @@ pub fn is_class_initialized_via_manager(shared: &SharedVm, class_id: ClassId) ->
 /// re-running Pass 3 just pays cost without finding anything.
 #[inline]
 fn verifier_skip_eligible(class: &Class) -> bool {
+    // SECURITY FIX (V13): the verifier-skip MUST be gated on the actual
+    // defining-classloader IDENTITY being the bootstrap loader, not on the
+    // class name alone. `class.loader_id` is assigned by the VM at
+    // define-class time from the loader that actually defined the class
+    // (see `ClassManager::define_class*`); a user `ClassLoader.defineClass`
+    // cannot forge `ClassLoaderId::Bootstrap` for itself. The name-prefix
+    // check is retained only as a secondary narrowing — it is necessary but
+    // NOT sufficient. A class in a trusted prefix (e.g. a forged
+    // `java/lang/EvilString`) defined by a non-bootstrap loader fails the
+    // identity check and is therefore verified, not skipped.
+    //
+    // This is the same trust predicate used by the strict-by-default
+    // decision in `classloading::bytecode_verifier::class_is_bootstrap_trusted`
+    // (SECURITY FIX V4), keeping the "trusted" determination consistent:
+    // a class that is not skip-eligible here is exactly a class that the
+    // bytecode verifier treats as untrusted and verifies strictly.
     let is_bootstrap_loaded = class.loader_id == cratonvm_types::ClassLoaderId::Bootstrap;
+    if !is_bootstrap_loaded {
+        // Identity gate failed: never skip, regardless of name prefix.
+        return false;
+    }
     let has_trusted_prefix = class.name.starts_with("java/")
         || class.name.starts_with("jdk/")
         || class.name.starts_with("sun/")
         || class.name.starts_with("com/sun/");
-    is_bootstrap_loaded && has_trusted_prefix
+    has_trusted_prefix
 }
 
 /// Full class initialization sequence (JVM spec 5.5).

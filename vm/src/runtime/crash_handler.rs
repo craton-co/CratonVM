@@ -878,7 +878,13 @@ pub fn install_crash_handler() {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            // Already handling a crash — just let the process die.
+            // SECURITY FIX (V17): A report is already being (or has been)
+            // written by the first panic — do NOT write a second one (that
+            // race produced interleaved/garbled hs_err_pid<pid>.log output).
+            // Still chain to the previous hook so this panic's default output
+            // fires and the process aborts exactly as before; we just skip the
+            // report-writing section.
+            prev(panic_info);
             return;
         }
 
@@ -908,8 +914,14 @@ pub fn install_crash_handler() {
         // Invoke the previous hook so the default Rust output is preserved.
         prev(panic_info);
 
-        // Reset so a cascading panic in the previous hook can still be caught.
-        CRASH_IN_PROGRESS.store(false, Ordering::SeqCst);
+        // SECURITY FIX (V17): Do NOT reset CRASH_IN_PROGRESS here. The previous
+        // code stored `false`, which let two near-simultaneous panics both pass
+        // the CAS guard above and race to write the same hs_err_pid<pid>.log,
+        // producing interleaved output. We now latch the guard for the life of
+        // the process — matching the Windows VEH `HANDLING` latch (one report
+        // per process). Any subsequent/concurrent panic short-circuits at the
+        // guard above: it still chains to `prev` (so the process aborts) but
+        // does not write a second, interleaved report.
     }));
 
     // Platform-specific signal installation (Unix only).

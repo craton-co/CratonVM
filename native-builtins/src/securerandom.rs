@@ -549,7 +549,17 @@ pub(crate) fn native_secure_random_next_int(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let v = os_random_u64().unwrap_or(0);
+    // SECURITY FIX (V2): propagate entropy failure instead of silently
+    // returning a predictable 0. Matches `native_secure_random_next_bytes`.
+    let v = match os_random_u64() {
+        Some(v) => v,
+        None => {
+            return Err(cratonvm_types::error::RuntimeError::SecurityException {
+                message: "OS entropy source unavailable".to_string(),
+            }
+            .into());
+        }
+    };
     Ok(Some(Value::Int(v as i32)))
 }
 
@@ -571,7 +581,18 @@ pub(crate) fn native_secure_random_next_int_bound(
     // unbiased for arbitrary bounds (JDK uses the same approach).
     let bound_u = bound as u32;
     loop {
-        let raw = (os_random_u64().unwrap_or(0) >> 32) as u32;
+        // SECURITY FIX (V2): propagate entropy failure instead of silently
+        // drawing from a predictable 0. Matches `native_secure_random_next_bytes`.
+        let entropy = match os_random_u64() {
+            Some(v) => v,
+            None => {
+                return Err(cratonvm_types::error::RuntimeError::SecurityException {
+                    message: "OS entropy source unavailable".to_string(),
+                }
+                .into());
+            }
+        };
+        let raw = (entropy >> 32) as u32;
         // Largest multiple of `bound` that fits in u32.  `r < threshold`
         // → unbiased.  The expected number of rejections is < 1.
         let threshold = u32::MAX - (u32::MAX % bound_u);
@@ -585,7 +606,17 @@ pub(crate) fn native_secure_random_next_long(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let v = os_random_u64().unwrap_or(0);
+    // SECURITY FIX (V2): propagate entropy failure instead of silently
+    // returning a predictable 0. Matches `native_secure_random_next_bytes`.
+    let v = match os_random_u64() {
+        Some(v) => v,
+        None => {
+            return Err(cratonvm_types::error::RuntimeError::SecurityException {
+                message: "OS entropy source unavailable".to_string(),
+            }
+            .into());
+        }
+    };
     Ok(Some(Value::Long(v as i64)))
 }
 
@@ -629,7 +660,17 @@ pub(crate) fn native_secure_random_next_double(
     _args: &[Value],
 ) -> MethodCallResult {
     // 53 bits of entropy → IEEE-754 double in [0, 1).
-    let v = os_random_u64().unwrap_or(0);
+    // SECURITY FIX (V2): propagate entropy failure instead of silently
+    // returning a predictable 0.0. Matches `native_secure_random_next_bytes`.
+    let v = match os_random_u64() {
+        Some(v) => v,
+        None => {
+            return Err(cratonvm_types::error::RuntimeError::SecurityException {
+                message: "OS entropy source unavailable".to_string(),
+            }
+            .into());
+        }
+    };
     let bits = v >> 11; // top 53 bits
     let d = bits as f64 / ((1u64 << 53) as f64);
     Ok(Some(Value::Double(d)))
@@ -639,7 +680,17 @@ pub(crate) fn native_secure_random_next_boolean(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let v = os_random_u64().unwrap_or(0);
+    // SECURITY FIX (V2): propagate entropy failure instead of silently
+    // returning a predictable false. Matches `native_secure_random_next_bytes`.
+    let v = match os_random_u64() {
+        Some(v) => v,
+        None => {
+            return Err(cratonvm_types::error::RuntimeError::SecurityException {
+                message: "OS entropy source unavailable".to_string(),
+            }
+            .into());
+        }
+    };
     Ok(Some(Value::Int((v & 1) as i32)))
 }
 
@@ -648,7 +699,17 @@ pub(crate) fn native_secure_random_next_float(
     _args: &[Value],
 ) -> MethodCallResult {
     // 24 bits → float in [0, 1).
-    let v = os_random_u64().unwrap_or(0);
+    // SECURITY FIX (V2): propagate entropy failure instead of silently
+    // returning a predictable 0.0. Matches `native_secure_random_next_bytes`.
+    let v = match os_random_u64() {
+        Some(v) => v,
+        None => {
+            return Err(cratonvm_types::error::RuntimeError::SecurityException {
+                message: "OS entropy source unavailable".to_string(),
+            }
+            .into());
+        }
+    };
     let bits = (v >> 40) as u32; // top 24 bits
     let f = bits as f32 / ((1u32 << 24) as f32);
     Ok(Some(Value::Float(f)))
