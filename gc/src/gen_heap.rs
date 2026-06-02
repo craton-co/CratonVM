@@ -1759,6 +1759,14 @@ impl GenerationalHeap {
             *root = unsafe { ObjectRef::from_raw(new_ptr) };
         }
 
+        // Old-gen addresses needing card re-mark after Phase 3's `clear_all()`
+        // (applied via `mark_dirty_bulk`). Declared before Phase 1b so a
+        // PERSISTENT old→young edge processed via a dirty card whose referent
+        // STAYS young is re-remembered — otherwise the edge is remembered for
+        // exactly one cycle (the promoting one) and the cycle after the dirty-
+        // card fixup forgets it.
+        let mut deferred_dirty_cards: Vec<usize> = Vec::new();
+
         // Phase 1b: Forward old→young references from dirty cards
         // Ref arrays use compact 8-byte pointers; object fields use 16-byte Value.
         for &(old_obj, slot_idx, _) in &extra_roots {
@@ -1794,6 +1802,11 @@ impl GenerationalHeap {
                         );
                         // SAFETY: Writing the forwarded pointer back to the same valid slot.
                         unsafe { std::ptr::write(slot_ptr as *mut u64, new_ptr as u64) };
+                        // Persistent old→young edge: re-remember if the referent
+                        // stayed young (not promoted), so it survives clear_all().
+                        if !old_gen.contains(new_ptr) {
+                            deferred_dirty_cards.push(old_obj.as_ptr() as usize);
+                        }
                     }
                 }
             } else {
@@ -1820,6 +1833,11 @@ impl GenerationalHeap {
                             Value::Object(Some(unsafe { ObjectRef::from_raw(new_ptr) }));
                         // SAFETY: Writing updated Value back to the same valid slot.
                         unsafe { std::ptr::write(slot_ptr as *mut Value, new_value) };
+                        // Persistent old→young edge: re-remember if the referent
+                        // stayed young (see Phase 1b array branch).
+                        if !old_gen.contains(new_ptr) {
+                            deferred_dirty_cards.push(old_obj.as_ptr() as usize);
+                        }
                     }
                 }
             }
@@ -1839,10 +1857,8 @@ impl GenerationalHeap {
         // CRIT-P2 fix: FxHashSet (replaces std HashSet/SipHash) for cheap
         // dedup of promoted-object scans.
         let mut scanned_promoted: FxHashSet<usize> = FxHashSet::default();
-        // Accumulate old-gen addresses needing card dirty marks after GC.
-        // These arise when a promoted object contains a reference that was
-        // forwarded to young to-space (old→young cross-gen reference).
-        let mut deferred_dirty_cards: Vec<usize> = Vec::new();
+        // `deferred_dirty_cards` declared above (before Phase 1b); both the
+        // dirty-card fixup and the promoted-object scan accumulate into it.
 
         loop {
             let mut made_progress = false;
@@ -2010,8 +2026,19 @@ impl GenerationalHeap {
                                 // Mark card dirty if the forwarded ref landed in young
                                 // to-space — this old→young cross-gen reference must be
                                 // visible to the NEXT minor GC's dirty card scan.
+                                //
+                                // BUGFIX: use `deferred_dirty_cards` (re-marked AFTER
+                                // Phase 3's `clear_all()` via `mark_dirty_bulk`), NOT a
+                                // direct `card_table.mark_dirty` — the latter is wiped by
+                                // `clear_all()` and the edge is forgotten next cycle. The
+                                // array branch already does this; the object-field branch
+                                // didn't, so a promoted old object holding a young object
+                                // in a *field* (e.g. BouncyCastle X9ECParametersHolder
+                                // .params -> young X9ECParameters) lost its remembered-set
+                                // entry → the next minor GC relocated the referent without
+                                // updating the field → stale all-zero-header receiver.
                                 if !old_gen.contains(new_ref_ptr) {
-                                    card_table.mark_dirty(obj_ptr as usize);
+                                    deferred_dirty_cards.push(obj_ptr as usize);
                                 }
                             }
                         }
