@@ -172,3 +172,58 @@ confirm the crash disappears, then fix the frame-layout/preservation gap.
 Reproduce: `CRATONVM_REAL_RAF=1 [CRATONVM_DBG_JIT_PUTFIELD=1] cratonvm --jar
 dacapo.jar avrora -s small`; symbolize `hs_err` RVAs with `CRATONVM_SYMBOLIZE=...`
 on the same binary (use `--profile release-with-debug` for symbols).
+
+## Part 2 — DEEP DIVE RESULT: a runtime JIT spill-slot corruption (not yet fixed)
+
+A second, exhaustive pass (3 parallel x64.rs audits + bytecode extraction + JIT
+instrumentation) localized the mechanism precisely. Each step ruled a layer out
+(all on `release-with-debug`, which reproduces the release crash with symbols):
+
+- **Ground truth (frame dump):** `LegacyInterpreter.visit(CPI)` has
+  num_locals=12, max_stack=8; local 0 (`this`) is graph-colored to RDI (reg 7),
+  and ALL 7 Windows LOCAL_REGS are consumed by locals (extreme register
+  pressure).
+- **Not GC** (young GC is non-moving while in JIT; disabling concurrent old-gen
+  GC doesn't help; JIT-off doesn't crash).
+- **Not register-clobber of `this`:** forcing local 0 to SPILL
+  (`assignments[0]=None`) does NOT fix it — the crash just moves to the
+  structurally identical `visit(CPC)`.
+- **Not inlining** (disabling method inlining doesn't help).
+- **Not call-boundary preservation:** a post-call reload of register-mapped
+  locals + hoisting the inline-IC-cascade spill (so all dispatch paths spill
+  before the CALL) does NOT fix it.
+- **Not the compile-time operand-stack ORDER:** instrumenting the putfield
+  emission (`CRATONVM_DBG_JIT_PF11`) shows the codegen MODEL is CORRECT — at the
+  faulting field-11 store the receiver is `obj_slot=Frame(base_spill+0)` (=
+  `this`) and `val_slot=Frame(base_spill+8)`. The JIT loads the right slot as the
+  receiver.
+
+**The actual bug:** at RUNTIME, `Frame(base_spill+0)` holds `0x1` (a boolean),
+not `this`, by the time the field-11 putfield executes. So the receiver's
+canonical operand-stack slot is being **overwritten with a computed boolean
+during the nested-branch flag computation** in these AVR compare-instruction
+visitors (`this.<flag> = <0|1 via nested ifeq/ifne/goto>`), while the
+compile-time model still believes `this` lives at `base_spill+0`. The model is
+right; the emitted code writes the boolean into the receiver's slot on some
+control-flow path. This is a JIT **branch/merge spill-slot codegen** bug
+(`branch_target_stack_depth` + `canonicalize_stack` + the dead-code stack
+reconstruction at x64.rs ~9954, and the live-merge guard at ~9974 which skips
+`canonicalize_stack` when `stack.len() != expected_depth`). A static trace of
+visit(CPI)'s H/C/N/V/S stores looked self-consistent, so the divergence is in
+the actual emitted slot WRITES, not the model.
+
+**Next step (clear):** disassemble the generated machine code for visit(CPI)
+around bytecode pc 229–285 (the V/S flag stores) and find the instruction that
+writes the boolean to `[rbp-(base_spill+0)]`; or emit a runtime write-guard on
+`base_spill+0`. Reproduction methodology (re-add these gated diagnostics; all
+were removed to keep the tree clean):
+- in `Compiler::new` (x64.rs ~3958): dump frame layout + `local_assignments`
+  for methods whose `field_info` contains `field_index==11`.
+- in the top-level putfield handler (x64.rs ~12825): print `obj_slot`/`val_slot`
+  for `field_index==11`.
+- `regalloc.rs` after `color_graph`: optional `assignments[0]=None` to spill
+  `this`.
+A real secondary defect was also found and should be fixed: the dead-code stack
+reconstruction (x64.rs ~9955) rebuilds `self.stack` but NOT
+`self.stack_oop_marks`, desyncing the oop map at every dead-merge (a GC/oop-map
+correctness gap, distinct from this SEGV).
