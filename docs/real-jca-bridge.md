@@ -1,5 +1,43 @@
 # Real-JCA bridge — removing synthetic key intrinsics so real BouncyCastle keys flow
 
+## HANDOFF (latest)
+
+**Done (all on `dev`):** Real BouncyCastle EC + RSA keys, X509 cert generation,
+PEM decode, key round-trips, `getPublicFromPrivate` — all verified deterministic
+via standalone drivers under `CRATONVM_REAL_JCA=1`. The original
+`ClassCastException ... cannot be cast to ECPrivateKey` is gone. ~15 fixes,
+including:
+- JCA bridge: `GetInstance.getInstance`/`getService`/`getServices`,
+  `Provider$Service.newInstance` (reflective real-SPI instantiation),
+  `Provider.getProperty`, `EventHelper.isLoggingSecurity` shim.
+- 3 **general** GC-correctness fixes: `333b24b` (frame-locals young-object
+  rooting via `is_heap_addr`), `c4b6069` (old→young remembered-set for OBJECT
+  fields of promoted objects), `3e82a1a` (same for reference ARRAYS in the
+  resurrection drain). These fixed the X9ECParameters staleness (PemLoop
+  2000/2000), the `Object→Locale` CCE, and the intermittent "Not able to load
+  any cryptoProvider" init failure.
+
+**Remaining before flipping real-JCA to default (do NOT delete shims — keep as
+an opt-out gate; finish only after these):**
+1. **Residual ~25% stale-ref non-determinism** — some runs still hit a stale
+   `Locale` / `loadClass`-on-`Object` (`ClassLoader`→`Object`) corruption →
+   NO-SUMMARY/abnormal exit-1. NOT the two card cases above (those are fixed).
+   Suspects: dirty-card *scan* coverage building `extra_roots`, a write-barrier
+   gap on some PUTFIELD, or the `CompactValue` long/object value-corruption
+   family. Method to chase: the heap-stale verifier (a `CRATONVM_DBG_HEAP_STALE`
+   walk of `update_all_roots` reporting any field holding a pointer_map key /
+   zeroed-header addr — see git history; it pinpointed `CustomNamedCurves$11`).
+2. **JIT-on SEGV** on BC EC — SEPARATE documented JIT allocate-then-putfield
+   miscompile (BC JIT-banned in `jit/skip_list.rs`); JIT-off is unaffected.
+3. Flip `crate::real_jca_mode()` default-true (opt-out env for synthetic) +
+   finish the top-level `crate::crypto_impl` migration (so the feature-off build
+   compiles), then retire the gate.
+
+**Reproducers / tooling:** drivers in `/tmp/ecdrv/` (EcDriver, RsaDrv, PemEc,
+PemLoop — PemLoop is the deterministic GC reproducer: default heap vs `--Xmx 4g`).
+`CRATONVM_REAL_JCA=1`, `CRATONVM_DISABLE_JIT=1`, `CRATONVM_DBG_STALE_RECV=1`,
+`CRATONVM_DBG_ATHROW=1`. Keycloak crypto cp: `apps/keycloak/crypto/default/cratonvm-cryptodef-cp.txt` + core/crypto-default target classes.
+
 ## STATUS: real BC keys flow (commits a9244b5, 7882ae6 on dev)
 
 `BCECDSACryptoProviderTest` (3/3), `DefaultCryptoKeyPairVerifierTest` (4/4 clean
