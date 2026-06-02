@@ -908,10 +908,18 @@ All items below are **committed on `dev`** (commits `aa6d231`, `3229e28`,
   it a "real JIT codegen bug" were wrong — corrected after actually disassembling
   the emitted code.)
 - **native-builtins `aot_pipeline::integration_{aot_profile,cds}_roundtrip`** —
-  **RE-VERIFIED 2026-06-02: pass in isolation** (`--features experimental-aot
-  --test-threads=1`). NOT a real failure — only **parallel-flaky** under
-  `--workspace` (CDS/temp-file global-state race). Needs a shared test lock /
-  unique temp path if `--workspace` test runs must be green.
+  **RESOLVED 2026-06-02 (commit `ad134d1`).** Root cause: the 3 sequence-driving
+  integration tests (`integration_aot_profile_roundtrip`,
+  `integration_cds_roundtrip`, `integration_stale_cache_rejected_on_build_id_mismatch`)
+  drive the process-global `PIPELINE_STATE` through multi-step
+  reset→record→flush→load→assert sequences; each `with_state` op is locked but
+  the *sequences* interleaved under parallel `--workspace` (which enables
+  `experimental-aot`), clobbering counts. Added a module-level poison-tolerant
+  `pipeline_test_lock()` and guarded those 3 tests so each sequence runs
+  atomically. Verified: full `cargo test -p cratonvm-native-builtins --lib
+  --features experimental-aot` (parallel) = **0 failed**; `aot_pipeline` filter
+  4× parallel = green. (tmp dirs were already unique via pid+nanos, so this was
+  global-state interleaving, not a filesystem race.)
 - **vm integration (89 files): 349 passed / 48 failed** before a hang on
   `driver_discovered_from_jar_on_classpath` (spawns real `java`, hung holding
   the cargo lock). The 48 are dominated by WIP-JVM feature gaps (`clinit_*`,
