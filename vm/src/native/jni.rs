@@ -751,9 +751,13 @@ impl JniLocalFrame {
         obj_to_jobject(obj)
     }
     pub fn remove(&mut self, obj: JObject) {
-        if let Some(oref) = jobject_to_obj(obj) {
-            self.refs.retain(|r| *r != oref);
-        }
+        // SECURITY FIX (V3) follow-up: match the stored ref by its raw jobject
+        // handle directly. The frame's own refs are already trusted, live
+        // ObjectRefs, so removal must NOT route through the heap-validating
+        // `jobject_to_obj` (which returns `None` outside an active JNI context
+        // — e.g. in unit tests or any non-JNI caller — and would silently leak
+        // the ref). `obj_to_jobject` is a pure ref→handle conversion.
+        self.refs.retain(|r| obj_to_jobject(*r) != obj);
     }
 }
 
