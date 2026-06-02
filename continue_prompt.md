@@ -858,3 +858,56 @@ GC moves them; H2 TestAll remains the reliable repro.
 **Not yet merged to dev** (dev checkout had a concurrent gc-crate refactor in
 flight; the fix is isolated on `fix/gc-frame-roots` to avoid collision). Merge
 when the gc-crate work settles.
+
+---
+
+## Session 2026-06-02 — security audit + test-suite hardening (agent)
+
+All items below are **committed on `dev`** (commits `aa6d231`, `3229e28`,
+`1c9fbfc`, `b641bc7`, `da4b3df`, `eb0577e`, `023236f`, `467cb80`, `9c2b330`,
+`4e1a4b4`, `452873a`, `72640c2`; soak-test tweak swept into `14cd48a`).
+
+### DONE / VERIFIED
+- **Security audit (multi-agent) + remediation.** 18 findings (V1–V18): JIT
+  R10 inline-cache wild-call, SecureRandom entropy-failure→throw, JNI local-ref
+  heap validation, **strict bytecode verification default for untrusted classes**,
+  off-heap `Unsafe` store consolidation, GC card-buffer STW drain + quiescence
+  AcqRel, G1 rset epoch-gating, SecurityManager policy routing, crash-report
+  latch, etc. **Real jar-signer crypto** (ECDSA P-256/P-384 + DSA + RFC 5280
+  path validation via RustCrypto) replacing the fail-closed stub — 37 jar_signer
+  tests pass. Docs reconciled (W^X, unsafe inventory).
+- **All 17 crate lib (unit) suites GREEN** in their default config: vm 2622,
+  native-builtins 2622 (**de-flaked to 2622/0 in parallel, 3× consecutive** —
+  root cause was `MockNativeContext` reusing low identities across tests; now
+  globally-unique), jit 686, gc 663, classloading 480, native-io 258, types 267,
+  reader 256, jfr 286, native-awt 236, native-api 138, native-collections 61,
+  jit-cuda 42, jit-api 28, cuda-bridge 16.
+- **Repaired** the V3 JNI regression + harness `should_panic` count, and **10
+  pre-existing vm lib failures** (instrument object-size 32→40 header, roots
+  orphan-heap, vec-pool stats gate, value_stack `into_inner`/`scan_object_refs`
+  [a real **GC-safety** fix: was dropping live young-object roots], soak-test
+  determinism). All baseline-classified vs `0744269` so only genuine regressions
+  were touched.
+- **Integration suites run & GREEN:** classloading, gc, reader, types,
+  native-api, native-collections, native-awt, jit-cuda. **vm-cli** 67 pass / 1
+  pre-existing (`main_args_delivered_in_order`, empty stdout — pre-existing on
+  `0744269`).
+
+### OPEN / TO RE-VERIFY (build lock was held by a concurrent session)
+- **jit `differential_double_{sum,product}_loop_matches_host`** — pre-existing
+  (fails on `0744269`): JIT double-accumulation loops return `0.0`. The
+  `JIT inliner/IR-gate` fix in `e0ecdc4` (x64.rs operand-stack slot allocation)
+  **likely fixes this** — re-run `cargo test -p cratonvm-jit --test differential`
+  to confirm.
+- **native-builtins `aot_pipeline::integration_{aot_profile,cds}_roundtrip`** —
+  pre-existing **parallel-flaky** under `--workspace` (`experimental-aot`
+  feature; pass in isolation). CDS/temp-file global-state race — needs a shared
+  test lock / unique temp path.
+- **vm integration (89 files): 349 passed / 48 failed** before a hang on
+  `driver_discovered_from_jar_on_classpath` (spawns real `java`, hung holding
+  the cargo lock). The 48 are dominated by WIP-JVM feature gaps (`clinit_*`,
+  `io_file_*`, `io_byte_buffer_*`, `t4_7_jfr_*`) and brittle source-scanner
+  tests (`t11_*_safety_comments`, `t11_3_interpreter_casts_annotated` — count
+  shifts whenever source is edited). A few are in the audit zone
+  (`shared_vm_ranked_accessors_*` ↔ V11 lock ordering). Re-run + baseline-classify
+  once the tree is clean (was not, due to the concurrent real-JCA/real-RAF session).
