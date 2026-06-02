@@ -747,14 +747,35 @@ unsafe impl Sync for CompiledMethod {}
 
 impl Drop for CompiledMethod {
     fn drop(&mut self) {
-        // Purge any cached OSR trampolines that point into this method's code
-        // range. After Drop, `self._buffer` releases its executable mapping, so
-        // any stale `target_addr` in the global cache would be a use-after-free
-        // hazard if a future compile reused the same address.
+        // The emitted machine code is RETAINED for the process lifetime (see
+        // `ExecutableBuffer::drop`) because other compiled methods bake direct
+        // `CALL rel32` / IC-slot pointers into it with no back-reference to patch
+        // on reclamation. That code ALSO holds RAW pointers into THIS method's
+        // interned strings, `JitInvokeInfo`s, and MIC/PIC slots. Freeing those
+        // boxes here while the code lives on makes the next MIC/PIC dispatch read
+        // a freed `JitInvokeInfo` — a garbage class/method name (embedded NUL
+        // bytes) that corrupts dispatch and panics when logged (avrora real-RAF
+        // `Thread-N` `core::fmt` slice panic on `MainClock.<garbage>`; see
+        // docs/real-raf-segv-root-cause.md). So leak this metadata too, keeping
+        // it alive exactly as long as the code that references it. This completes
+        // the code-retention fix — the two MUST go together.
         //
-        // `target_addr` for an OSR entry is `self.entry + native_offset`, where
-        // `native_offset < self._buffer.pos()` (the emitted code length). Pruning
-        // by half-open range `[entry, entry + pos)` covers every such address.
+        // `CRATONVM_JIT_FREE_CODE=1` restores full freeing (code + metadata +
+        // OSR-trampoline purge) for A/B testing — it reintroduces the UAF.
+        if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_none() {
+            std::mem::forget(std::mem::take(&mut self._jit_strings));
+            std::mem::forget(std::mem::take(&mut self._jit_invoke_infos));
+            std::mem::forget(std::mem::take(&mut self._jit_mic_slots));
+            std::mem::forget(std::mem::take(&mut self._jit_pic_slots));
+            return;
+        }
+        // FREE mode: purge any cached OSR trampolines that point into this
+        // method's code range. After Drop, `self._buffer` releases its
+        // executable mapping, so any stale `target_addr` in the global cache
+        // would be a use-after-free hazard if a future compile reused the same
+        // address. `target_addr` for an OSR entry is `self.entry +
+        // native_offset`, where `native_offset < self._buffer.pos()`; pruning by
+        // half-open range `[entry, entry + pos)` covers every such address.
         #[cfg(target_arch = "x86_64")]
         {
             let start = self.entry as usize;

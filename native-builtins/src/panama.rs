@@ -2700,18 +2700,51 @@ mod tests {
     // from leaking into sibling tests — leaked state is what causes the
     // order-dependent flakiness this fix addresses. The production gate is
     // unchanged; only the test scope flips the flag.
+    //
+    // FIX(test-isolation): `NATIVE_ACCESS_ENABLED` is a single process-global
+    // `AtomicBool` shared by every test in this binary. The previous guard
+    // snapshotted the *prior* value and restored it on drop, but that is
+    // unsound under parallel execution and is exactly why
+    // `panama_cif_cache_reuses_cif_across_calls` still flaked: with two tests
+    // A and B, A enables (prior=false); B enables (prior=true, because A had
+    // already flipped it on); A finishes first and its guard restores false;
+    // B is now mid-downcall yet the gate reads false, so `validated_fn_ptr`
+    // denies it with `IllegalCallerException`. Snapshot/restore gives no
+    // mutual exclusion. The fix is to serialize every test that toggles the
+    // flag behind one module-level mutex, so only a single such test ever
+    // observes (or mutates) the flag at a time. While the lock is held the
+    // flag cannot be flipped out from under the running test.
+    static NATIVE_ACCESS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct NativeAccessGuard {
         prev: bool,
+        // FIX(test-isolation): hold the serialization lock for the entire
+        // lifetime of the guard. Acquiring it here means no other guarded
+        // (or directly-locked) test can touch `NATIVE_ACCESS_ENABLED` until
+        // this guard is dropped. Field order matters for drop: `prev` is
+        // restored in `Drop::drop` *before* this `_lock` field is dropped
+        // (Rust drops struct fields in declaration order, after the explicit
+        // `Drop` impl runs), so the flag is reset while we still hold the
+        // lock, and the lock is released only afterwards.
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
     impl NativeAccessGuard {
         fn enable() -> Self {
+            // Recover from a poisoned lock: a panicking guarded test must not
+            // wedge the rest of the suite. The `()` payload carries no state,
+            // so the poisoned inner guard is perfectly usable.
+            let lock = NATIVE_ACCESS_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = native_access_enabled();
             set_native_access_enabled(true);
-            NativeAccessGuard { prev }
+            NativeAccessGuard { prev, _lock: lock }
         }
     }
     impl Drop for NativeAccessGuard {
         fn drop(&mut self) {
+            // Restore the prior value while still holding the lock; `_lock`
+            // is released immediately afterwards when the struct fields drop.
             set_native_access_enabled(self.prev);
         }
     }
@@ -3849,6 +3882,13 @@ mod tests {
     /// the throwable `java/lang/IllegalCallerException` class.
     #[test]
     fn task57_native_access_gate_emits_illegal_caller_exception() {
+        // FIX(test-isolation): serialize with the guarded downcall tests.
+        // This test sets the flag *false*; without the shared lock it could
+        // run concurrently with a guarded test mid-downcall and either steal
+        // its `true` value or have its own `false` stomped, corrupting both.
+        let _lk = NATIVE_ACCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Save and restore the global flag — other tests rely on the default
         // (enabled) behaviour and may run in parallel.
         let prev = native_access_enabled();
@@ -3888,6 +3928,11 @@ mod tests {
     /// new variant.
     #[test]
     fn task57_other_gate_failures_still_emit_illegal_state() {
+        // FIX(test-isolation): serialize with the guarded downcall tests so
+        // no concurrent test can flip the flag out from under us.
+        let _lk = NATIVE_ACCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Ensure the gate is open so we exercise the non-access paths.
         let prev = native_access_enabled();
         set_native_access_enabled(true);
@@ -4047,6 +4092,13 @@ mod tests {
         // flipped it on we restore it, but the *initial* default is false.
         // We assert the default via a fresh load after forcing the documented
         // default value.
+        // FIX(test-isolation): this test both writes and reads the global
+        // flag, so it must serialize with every other flag-toggling test;
+        // otherwise a concurrent guarded downcall test could flip the flag
+        // between our `set` and our `assert`, breaking these assertions.
+        let _lk = NATIVE_ACCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_native_access_enabled(false);
         assert!(!native_access_enabled());
         // Setter plumbing still works in both directions.
@@ -4058,6 +4110,11 @@ mod tests {
 
     #[test]
     fn sec_validated_fn_ptr_denied_when_gate_closed() {
+        // FIX(test-isolation): serialize so a concurrent guarded test cannot
+        // re-enable the flag between our `set false` and the denial check.
+        let _lk = NATIVE_ACCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         set_native_access_enabled(false);
         let r = validated_fn_ptr::<extern "C" fn() -> i32>(0x1000);
         assert!(
