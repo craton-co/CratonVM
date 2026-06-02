@@ -27,8 +27,24 @@
 //! (that each mutator flush its own buffer before parking) whose
 //! violation could free a still-reachable young object (use-after-free).
 //! INVARIANT: `flush_all` may run only at STW, with all mutators parked.
+//!
+//! SECURITY FIX (V6) — table-id scoping (regression fix): the per-thread
+//! buffer is process-global, but a buffered byte-offset is meaningful only
+//! relative to the `base_addr` of the *specific* `CardTable` it was dirtied
+//! against. With more than one live `CardTable` (e.g. many `GenerationalHeap`
+//! instances across parallel test threads) the original V6 `flush_all` drained
+//! (and emptied) buffer entries belonging to OTHER tables, stealing their
+//! buffered old→young offsets and causing the victim collector to miss roots
+//! and free still-reachable young objects. To fix this every table is given a
+//! unique [`CardTable::id`] and every buffered entry is tagged `(table_id,
+//! offset)`. `flush_all`/`flush_dirty_buffer` drain ONLY entries whose
+//! `table_id == self.id` (via `Vec::retain`), leaving other tables' entries
+//! intact. The global cross-thread registry is unchanged, so a collector for
+//! table A still drains table A's offsets buffered by OTHER threads — the V6
+//! property is preserved while the cross-table theft is eliminated.
 
 use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Number of bytes covered by a single card.
@@ -49,6 +65,13 @@ pub const THREAD_BUFFER_FLUSH_THRESHOLD: usize = 64;
 /// collector can drain it at a stop-the-world safepoint even if the owning
 /// thread parked without flushing.
 ///
+/// SECURITY FIX (V6) — table-id scoping: each element is a
+/// `(table_id, offset)` pair. `table_id` identifies which [`CardTable`] the
+/// `offset` was dirtied against, so a collector draining one table never
+/// consumes another table's buffered offsets. The single global buffer per
+/// thread therefore multiplexes the dirty edges of *all* tables that thread
+/// has touched.
+///
 /// The inner `Mutex` is contended only in the (impossible-by-construction at
 /// STW) case where a mutator runs concurrently with the collector's drain. By
 /// the GC's stop-the-world invariant every mutator is parked at a safepoint
@@ -56,7 +79,7 @@ pub const THREAD_BUFFER_FLUSH_THRESHOLD: usize = 64;
 /// fast path; it exists purely to make the cross-thread read at STW sound
 /// (a bare `RefCell` is `!Sync` and could not legally be read by the
 /// collector thread).
-type ThreadBuffer = Arc<Mutex<Vec<usize>>>;
+type ThreadBuffer = Arc<Mutex<Vec<(u64, usize)>>>;
 
 /// SECURITY FIX (V6): global intrusive registry of every thread's dirty
 /// buffer. The collector walks this list at STW (via [`CardTable::flush_all`])
@@ -70,6 +93,12 @@ type ThreadBuffer = Arc<Mutex<Vec<usize>>>;
 /// entry on exit (see [`DirtyBufferGuard`]) so the registry never holds a
 /// dangling buffer. Identity is matched on `Arc::as_ptr` so removal is exact.
 static BUFFER_REGISTRY: Mutex<Vec<ThreadBuffer>> = Mutex::new(Vec::new());
+
+/// SECURITY FIX (V6) — table-id scoping: monotonic source of process-unique
+/// [`CardTable::id`] values. Starts at 1 so 0 can serve as a never-assigned
+/// sentinel in tests/debugging. Wraparound after 2^64 tables is not a
+/// practical concern.
+static NEXT_TABLE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// SECURITY FIX (V6): RAII handle stored in TLS. Holds the thread's shared
 /// dirty buffer and removes it from [`BUFFER_REGISTRY`] when the thread exits,
@@ -106,10 +135,11 @@ thread_local! {
     /// [`CardTable::flush_dirty_buffer`] drains it into the
     /// shared-side `pending_offsets` vector under the mutex.
     ///
-    /// SECURITY FIX (V6): the buffer is an `Arc<Mutex<Vec<usize>>>` (not a
-    /// bare `RefCell`) registered in [`BUFFER_REGISTRY`] on first use so the
-    /// collector can drain it cross-thread at STW. [`DirtyBufferGuard`]
-    /// deregisters it on thread exit.
+    /// SECURITY FIX (V6): the buffer is an `Arc<Mutex<Vec<(u64, usize)>>>`
+    /// (not a bare `RefCell`) registered in [`BUFFER_REGISTRY`] on first use
+    /// so the collector can drain it cross-thread at STW. Each element is a
+    /// `(table_id, offset)` pair so a per-table drain consumes only its own
+    /// entries. [`DirtyBufferGuard`] deregisters it on thread exit.
     static THREAD_DIRTY_BUFFER: DirtyBufferGuard = {
         let buffer: ThreadBuffer = Arc::new(Mutex::new(Vec::new()));
         BUFFER_REGISTRY.lock().push(Arc::clone(&buffer));
@@ -140,6 +170,12 @@ struct CardCells {
 /// hits its auto-flush threshold or when the collector calls
 /// [`Self::drain_pending`] at GC start.
 pub struct CardTable {
+    /// SECURITY FIX (V6) — table-id scoping: process-unique identifier for
+    /// this table, assigned from [`NEXT_TABLE_ID`] in [`CardTable::new`].
+    /// Every offset this table buffers into a per-thread registry buffer is
+    /// tagged with this id so draining is table-scoped and one table can never
+    /// steal another's buffered old→young edges.
+    id: u64,
     /// Base address of the memory region this table covers (immutable).
     base_addr: usize,
     /// Total size of the covered region in bytes (immutable).
@@ -158,6 +194,10 @@ impl CardTable {
     pub fn new(base_addr: usize, region_size: usize) -> Self {
         let num_cards = region_size.div_ceil(CARD_SIZE);
         Self {
+            // SECURITY FIX (V6): assign a process-unique id so buffered
+            // offsets can be drained table-scoped (Relaxed is sufficient: we
+            // only need uniqueness, not ordering relative to other memory).
+            id: NEXT_TABLE_ID.fetch_add(1, Ordering::Relaxed),
             base_addr,
             region_size,
             cells: Mutex::new(CardCells {
@@ -329,14 +369,26 @@ impl CardTable {
     /// The final update to the shared bitmap is deferred to a safepoint,
     /// where the collector calls [`Self::drain_pending`] (or
     /// [`Self::flush_all`] then [`Self::drain_pending`]).
+    ///
+    /// # SECURITY FIX (V6) — table-id scoping
+    ///
+    /// The entry pushed is `(self.id, offset)`. The single per-thread buffer
+    /// is shared by *all* tables this thread touches, so the auto-flush
+    /// threshold is evaluated against the buffer's TOTAL length across tables
+    /// (the simplest correct policy: it strictly upper-bounds per-table
+    /// backlog and keeps the fast path a single length check). When it trips,
+    /// [`Self::flush_dirty_buffer`] flushes only this table's entries; any
+    /// other table's entries stay buffered until their own auto-flush or
+    /// `flush_all` handles them.
     pub fn thread_local_dirty(&self, offset: usize) {
         // SECURITY FIX (V6): push into the registered per-thread buffer
-        // (Arc<Mutex<..>>). The lock is uncontended on the mutator fast path
-        // (only this thread touches it outside STW); it is acquirable by the
-        // collector only at STW, when this thread is parked.
+        // (Arc<Mutex<..>>), tagging the entry with this table's id so a drain
+        // by another table cannot consume it. The lock is uncontended on the
+        // mutator fast path (only this thread touches it outside STW); it is
+        // acquirable by the collector only at STW, when this thread is parked.
         let should_flush = THREAD_DIRTY_BUFFER.with(|guard| {
             let mut b = guard.buffer.lock();
-            b.push(offset);
+            b.push((self.id, offset));
             b.len() >= THREAD_BUFFER_FLUSH_THRESHOLD
         });
         if should_flush {
@@ -351,6 +403,14 @@ impl CardTable {
     /// The offsets themselves are *not* yet resolved to card indices —
     /// that happens in [`Self::drain_pending`] under the cells lock, so
     /// the hot-path cost remains a single lock acquisition.
+    ///
+    /// # SECURITY FIX (V6) — table-id scoping
+    ///
+    /// Only entries tagged with `self.id` are moved into this table's
+    /// `pending_offsets`; entries belonging to other tables sharing this
+    /// thread's buffer are retained untouched. We therefore use `Vec::retain`
+    /// rather than a blanket `Vec::append`, fixing the regression where one
+    /// table's flush emptied another table's buffered old→young edges.
     pub fn flush_dirty_buffer(&self) {
         THREAD_DIRTY_BUFFER.with(|guard| {
             let mut local = guard.buffer.lock();
@@ -358,8 +418,16 @@ impl CardTable {
                 return;
             }
             let mut shared = self.pending_offsets.lock();
-            shared.reserve(local.len());
-            shared.append(&mut *local);
+            // Move out only this table's offsets, leaving foreign entries in
+            // place. `retain` keeps the non-matching tail in a single pass.
+            local.retain(|&(table_id, offset)| {
+                if table_id == self.id {
+                    shared.push(offset);
+                    false
+                } else {
+                    true
+                }
+            });
         });
     }
 
@@ -383,6 +451,21 @@ impl CardTable {
     /// thread buffer itself. No VM-side safepoint flush is required for
     /// correctness.
     ///
+    /// # SECURITY FIX (V6) — table-id scoping (cross-table theft fix)
+    ///
+    /// From every registered thread buffer this drains ONLY the entries
+    /// tagged with `self.id`, leaving entries belonging to other live
+    /// `CardTable`s in place (`Vec::retain`, not `Vec::append`). This fixes
+    /// the regression where `flush_all` on table A emptied the buffered
+    /// old→young offsets that other threads had recorded against table B,
+    /// causing B's collector to miss roots and free reachable young objects.
+    ///
+    /// The V6 cross-thread property is preserved: because the walk still
+    /// covers EVERY registered thread buffer, table A's collector drains all
+    /// of table A's offsets no matter which thread buffered them — including a
+    /// thread that buffered fewer than [`THREAD_BUFFER_FLUSH_THRESHOLD`] edges
+    /// and then parked without flushing.
+    ///
     /// # Concurrency invariant
     ///
     /// This MUST be called only when mutators are stopped at the
@@ -405,8 +488,16 @@ impl CardTable {
                 continue;
             }
             let mut shared = self.pending_offsets.lock();
-            shared.reserve(local.len());
-            shared.append(&mut *local);
+            // SECURITY FIX (V6): take only this table's offsets; retain every
+            // foreign-table entry so another table's collector still finds it.
+            local.retain(|&(table_id, offset)| {
+                if table_id == self.id {
+                    shared.push(offset);
+                    false
+                } else {
+                    true
+                }
+            });
         }
     }
 
@@ -815,10 +906,10 @@ mod tests {
     }
 
     #[test]
-    fn flush_all_is_alias_for_flush_dirty_buffer() {
-        // T5.5.2 — `flush_all` is documented as the GC-entry hook. It
-        // should be functionally identical to `flush_dirty_buffer` for
-        // the current thread.
+    fn flush_all_drains_this_threads_buffer() {
+        // T5.5.2 — `flush_all` is the GC-entry hook. For a single table on
+        // the calling thread it folds this thread's buffered offsets into
+        // `pending_offsets`, equivalent to `flush_dirty_buffer`.
         let ct = CardTable::new(0x0, 4096);
         ct.thread_local_dirty(0);
         assert_eq!(ct.pending_count(), 0);
@@ -827,5 +918,131 @@ mod tests {
         let newly = ct.drain_pending();
         assert_eq!(newly, 1);
         assert!(ct.is_dirty(0));
+    }
+
+    // -----------------------------------------------------------------
+    // SECURITY FIX (V6) — table-id scoping regression tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn distinct_tables_have_distinct_ids() {
+        let a = CardTable::new(0x0, 4096);
+        let b = CardTable::new(0x0, 4096);
+        assert_ne!(a.id, b.id, "each CardTable must get a unique id");
+    }
+
+    #[test]
+    fn flush_all_does_not_steal_other_tables_entries() {
+        // SECURITY FIX (V6): two tables, interleaved dirties on the SAME
+        // thread (so both feed the one per-thread buffer). Draining table A
+        // must not consume table B's buffered offsets, and vice-versa.
+        //
+        // Offsets are chosen so each lands on a distinct card and the two
+        // tables' dirty card sets differ, proving no theft / no leakage.
+        let a = CardTable::new(0x0, 8192);
+        let b = CardTable::new(0x0, 8192);
+
+        // Interleave below the auto-flush threshold so everything stays in
+        // the shared per-thread buffer until we explicitly flush.
+        a.thread_local_dirty(0);            // A: card 0
+        b.thread_local_dirty(CARD_SIZE);    // B: card 1
+        a.thread_local_dirty(2 * CARD_SIZE);// A: card 2
+        b.thread_local_dirty(3 * CARD_SIZE);// B: card 3
+
+        // Drain A via flush_all: only A's offsets should land in A's pending.
+        a.flush_all();
+        assert_eq!(a.pending_count(), 2, "A should own exactly its 2 offsets");
+        // B's offsets must still be buffered (untouched by A's flush).
+        assert_eq!(b.pending_count(), 0, "B's buffered offsets must survive A's flush");
+
+        let a_new = a.drain_pending();
+        assert_eq!(a_new, 2);
+        assert!(a.is_dirty(0));
+        assert!(a.is_dirty(2));
+        assert!(!a.is_dirty(1), "A must not have B's card 1");
+        assert!(!a.is_dirty(3), "A must not have B's card 3");
+
+        // Now drain B: its offsets were preserved through A's flush.
+        b.flush_all();
+        assert_eq!(b.pending_count(), 2, "B's offsets recovered intact");
+        let b_new = b.drain_pending();
+        assert_eq!(b_new, 2);
+        assert!(b.is_dirty(1));
+        assert!(b.is_dirty(3));
+        assert!(!b.is_dirty(0), "B must not have A's card 0");
+        assert!(!b.is_dirty(2), "B must not have A's card 2");
+    }
+
+    #[test]
+    fn flush_dirty_buffer_is_table_scoped() {
+        // Same property as above, but exercising the per-thread
+        // `flush_dirty_buffer` path rather than the registry-wide `flush_all`.
+        let a = CardTable::new(0x0, 8192);
+        let b = CardTable::new(0x0, 8192);
+
+        a.thread_local_dirty(0);
+        b.thread_local_dirty(CARD_SIZE);
+
+        a.flush_dirty_buffer();
+        assert_eq!(a.pending_count(), 1);
+        assert_eq!(b.pending_count(), 0, "A's flush must not take B's entry");
+
+        b.flush_dirty_buffer();
+        assert_eq!(b.pending_count(), 1, "B's entry still available after A flushed");
+
+        assert_eq!(a.drain_pending(), 1);
+        assert_eq!(b.drain_pending(), 1);
+        assert!(a.is_dirty(0));
+        assert!(b.is_dirty(1));
+    }
+
+    #[test]
+    fn cross_thread_v6_property_preserved_per_table() {
+        // SECURITY FIX (V6): a *worker* thread buffers an old→young edge for
+        // table A below the auto-flush threshold and then parks WITHOUT
+        // flushing. A's `flush_all` (run on the main thread) must still recover
+        // that edge from the global registry — the V6 cross-thread property —
+        // while leaving table B's edge (buffered on the main thread) intact.
+        use std::sync::mpsc;
+
+        let a = std::sync::Arc::new(CardTable::new(0x0, 8192));
+        let b = CardTable::new(0x0, 8192);
+
+        // Main thread buffers one edge for B (card 1), unflushed.
+        b.thread_local_dirty(CARD_SIZE);
+
+        // Worker buffers one edge for A (card 2), then parks until released so
+        // its buffer is still registered while we run `flush_all`.
+        let (tx_ready, rx_ready) = mpsc::channel::<()>();
+        let (tx_go, rx_go) = mpsc::channel::<()>();
+        let a_worker = std::sync::Arc::clone(&a);
+        let handle = std::thread::spawn(move || {
+            a_worker.thread_local_dirty(2 * CARD_SIZE);
+            tx_ready.send(()).unwrap();
+            rx_go.recv().unwrap(); // park: never flushes its own buffer
+        });
+
+        // Wait until the worker has buffered, then drain A across every
+        // registered thread buffer.
+        rx_ready.recv().unwrap();
+        a.flush_all();
+        assert_eq!(
+            a.pending_count(),
+            1,
+            "A's collector must recover the worker thread's unflushed edge"
+        );
+        assert_eq!(a.drain_pending(), 1);
+        assert!(a.is_dirty(2), "worker's old→young edge for A is live");
+
+        // A's cross-thread drain must not have disturbed B's buffered edge.
+        assert_eq!(b.pending_count(), 0);
+        b.flush_all();
+        assert_eq!(b.pending_count(), 1, "B's edge survived A's cross-thread drain");
+        assert_eq!(b.drain_pending(), 1);
+        assert!(b.is_dirty(1));
+
+        // Release the worker and join.
+        tx_go.send(()).unwrap();
+        handle.join().unwrap();
     }
 }

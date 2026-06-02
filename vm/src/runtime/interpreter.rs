@@ -9762,6 +9762,11 @@ fn execute_invoke_kind(
     // Wrapped in an RAII guard so nested invokes restore the parent's slot.
     let _cp_iface_guard = crate::vm::PendingCpIfaceGuard::new(cp_resolved_class_id);
 
+    if std::env::var_os("CRATONVM_DBG_ITRREM").is_some() && &*method_name == "remove" && &*method_descriptor == "()V" {
+        eprintln!("[ITRREM execute_invoke_kind] invoke_class={} is_interface={}",
+                  &*invoke_class, is_interface);
+    }
+
     if let Some(res) = intercept_force_registered_native(
         shared,
         thread,
@@ -11164,6 +11169,10 @@ fn try_stackless_invoke(
     if crate::runtime::env_cache::bd_debug() && (method_name == "intValue" || (class_name.contains("BigDecimal") && (method_name == "<init>" || method_name == "intValue"))) {
         eprintln!("[try_stackless_invoke] class_name={} method={} desc={} native_cb={} walk_native={}",
                   class_name, method_name, descriptor, native_cb.is_some(), walk_native_hierarchy);
+    }
+    if std::env::var_os("CRATONVM_DBG_ITRREM").is_some() && method_name == "remove" && descriptor == "()V" {
+        eprintln!("[ITRREM try_stackless] class_name={} native_cb={} walk_native={}",
+                  class_name, native_cb.is_some(), walk_native_hierarchy);
     }
     if let Some(callback) = native_cb {
         let result = safe_native_call(shared, thread, callback, args)?;

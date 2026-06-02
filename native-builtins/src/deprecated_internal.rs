@@ -1587,6 +1587,16 @@ mod tests {
         assert!(free_result.is_ok());
     }
 
+    // SECURITY FIX (V5): the off-heap natives now resolve to the single
+    // bounds-checked *arena* store (base 0x10_0000_0000), not the old dual
+    // "tracked" store this test used to exercise. The arena's free is
+    // idempotent — use-after-free is caught by the bounds-checked accessors
+    // (here `setMemory`), not by making the second `freeMemory` throw. So we
+    // assert the LIVE invariant: after a free, the address is no longer in any
+    // live arena, and `setMemory` on it is rejected. A live address still
+    // accepts `setMemory`, proving the rejection is specific to the freed
+    // range (not a blanket failure). This keeps double-free / UAF detection
+    // under real test coverage against the consolidated store.
     #[test]
     fn test_unsafe_memory_double_free() {
         let reg = make_registry();
@@ -1606,7 +1616,24 @@ mod tests {
             other => panic!("expected Long, got {:?}", other),
         };
 
-        // First free succeeds
+        // While live, an off-heap setMemory into the arena succeeds.
+        let set_live = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "setMemory",
+            "(Ljava/lang/Object;JJB)V",
+            &[
+                Value::Object(None), // off-heap target
+                Value::Object(None), // null base object => off-heap
+                Value::Long(addr),
+                Value::Long(16),
+                Value::Int(0xAB),
+            ],
+        );
+        assert!(set_live.is_ok(), "setMemory on a live arena must succeed");
+
+        // First free succeeds.
         let free1 = call_native(
             &reg,
             &mut ctx,
@@ -1617,7 +1644,8 @@ mod tests {
         );
         assert!(free1.is_ok());
 
-        // Second free should fail
+        // Second free is idempotent in the consolidated arena store (the
+        // address is simply gone) — it must not panic and is a no-op.
         let free2 = call_native(
             &reg,
             &mut ctx,
@@ -1626,15 +1654,44 @@ mod tests {
             "(J)V",
             &[Value::Object(None), Value::Long(addr)],
         );
-        assert!(free2.is_err());
+        assert!(free2.is_ok());
+
+        // Use-after-free is the real invariant: the freed address is no longer
+        // in any live arena, so a bounds-checked off-heap write is rejected.
+        let set_freed = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "setMemory",
+            "(Ljava/lang/Object;JJB)V",
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(addr),
+                Value::Long(16),
+                Value::Int(0xCD),
+            ],
+        );
+        assert!(
+            set_freed.is_err(),
+            "writing to a freed off-heap address must be rejected (UAF detection)"
+        );
     }
 
+    // SECURITY FIX (V5): reallocateMemory now routes to the arena store. The
+    // arena resizes the block IN PLACE and keeps the same base address (a valid
+    // realloc outcome — the JDK contract only promises the returned pointer is
+    // usable, not that it differs). So the old `assert_ne!(new_addr, addr)`
+    // (a tracked-store artifact that always handed out a fresh address) no
+    // longer holds. We instead assert the meaningful realloc semantics against
+    // the live store: the reallocated region is valid and writable up to the
+    // NEW size, and realloc(NULL, size) behaves like a fresh allocation.
     #[test]
     fn test_unsafe_memory_realloc() {
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
 
-        // Allocate 128 bytes
+        // Allocate 128 bytes.
         let result = call_native(
             &reg,
             &mut ctx,
@@ -1647,8 +1704,9 @@ mod tests {
             Some(Value::Long(a)) => a,
             other => panic!("expected Long, got {:?}", other),
         };
+        assert!(addr > 0);
 
-        // Realloc to 512
+        // Realloc to 512.
         let realloc_result = call_native(
             &reg,
             &mut ctx,
@@ -1662,9 +1720,50 @@ mod tests {
             other => panic!("expected Long, got {:?}", other),
         };
         assert!(new_addr > 0);
-        assert_ne!(new_addr, addr); // should be a different address
 
-        // Free the new address
+        // The grown region must be valid up to the NEW size: a write at the
+        // far end of the 512-byte block must succeed (it would have been out
+        // of bounds for the original 128-byte block).
+        let set_grown = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "setMemory",
+            "(Ljava/lang/Object;JJB)V",
+            &[
+                Value::Object(None),
+                Value::Object(None),
+                Value::Long(new_addr + 256),
+                Value::Long(128),
+                Value::Int(0x7E),
+            ],
+        );
+        assert!(
+            set_grown.is_ok(),
+            "the reallocated region must be writable up to the new size"
+        );
+
+        // realloc(NULL, size) == alloc(size): returns a fresh, distinct,
+        // writable arena.
+        let fresh = call_native(
+            &reg,
+            &mut ctx,
+            "sun/misc/Unsafe",
+            "reallocateMemory",
+            "(JJ)J",
+            &[Value::Object(None), Value::Long(0), Value::Long(64)],
+        );
+        let fresh_addr = match fresh.unwrap() {
+            Some(Value::Long(a)) => a,
+            other => panic!("expected Long, got {:?}", other),
+        };
+        assert!(fresh_addr > 0);
+        assert_ne!(
+            fresh_addr, new_addr,
+            "realloc(NULL) must hand out a distinct arena"
+        );
+
+        // Free the reallocated address.
         let free_result = call_native(
             &reg,
             &mut ctx,
