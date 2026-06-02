@@ -1,5 +1,37 @@
 # Real-JCA bridge — removing synthetic key intrinsics so real BouncyCastle keys flow
 
+## STATUS: real BC keys flow (commits a9244b5, 7882ae6 on dev)
+
+`BCECDSACryptoProviderTest` (3/3), `DefaultCryptoKeyPairVerifierTest` (4/4 clean
+`OK`), `DefaultSecureRandomTest` pass under `CRATONVM_REAL_JCA` (JIT off). Driver
+(`/tmp/ecdrv/EcDriver`) proves `KeyPairGenerator("ECDSA","BC")` →
+`BCECPrivateKey`/`BCECPublicKey`, `isECPrivateKey==true`, `getPublicFromPrivate`
+round-trips equal. The original `ClassCastException` is gone.
+
+### Remaining before flipping real-JCA to default (keep shims as opt-in, do NOT delete)
+1. **JIT SEGV is a generic JUnit-harness-under-JIT miscompile, NOT crypto.** The
+   driver runs the full keygen+derive JIT-ON and succeeds; every `JUnitCore` run
+   SEGVs JIT-ON with zero progress output (crash during framework startup/JIT
+   warmup, before any test). This is the broad allocate-then-putfield JIT-codegen
+   bug (BC is already JIT-banned in `jit/skip_list.rs` for it). Real crypto apps
+   work JIT-on; only the JUnit *test harness* under JIT crashes. → value/JIT-
+   codegen domain (concurrent agent); a pragmatic correctness-first option is to
+   JIT-skip the offending harness path.
+2. **RSA / ECDH / PEM coverage gaps** (real per-algorithm work, not synthetic
+   stubs): `DefaultCryptoRSAVerifierTest` → "Error creating X509v1Certificate" /
+   `cannot construct SigAlgName` / RSA-cipher `block incorrect`; `BCEcdhEs...`,
+   `PemUtilsBCTest` (3/6), `DefaultKeyStoreTypesTest` (2/3). These are genuine BC
+   code paths the VM doesn't fully support yet (X509 cert generation, ECDH,
+   PEM parse, keystore types).
+3. **`Object→Locale` CCE** in `org.junit...SynchronizedRunListener.testRunFinished`
+   (result-summary printing; intermittent) — generic value-corruption, makes
+   `exit=1` even when tests pass.
+
+Flipping real-JCA to default before (1)+(2) would regress the gauntlet (crypto-
+using apps with unsupported algorithms) and crash JUnit-under-JIT. So: address
+(1)+(2), then flip (real `real_jca_mode()` default true with synthetic kept as an
+opt-out env gate; no code deleted — synthetic path retained for optimization).
+
 ## Goal
 
 Stop fabricating bare-interface `java/security/PublicKey`/`PrivateKey` synthetics
