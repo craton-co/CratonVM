@@ -2251,14 +2251,14 @@ mod tests {
         // mock allocates contiguous tids starting at 1 (or wherever
         // it was after previous tests). Walk the new range.
         for i in 0..pool {
-            let tid = (before_thread_count + i as usize) as u64 + 1;
-            // mock's tid scheme: 1-based, shared across all spawn calls
-            // in this test. Adjust by reading the actual ids back.
+            // FIX(test-isolation): tids are no longer 1-based — MockNativeContext
+            // now assigns globally-unique tids from `native_tid_base`, so the
+            // k-th registration has tid `native_tid_base + k` (read it back
+            // rather than assuming a base of 1).
             let entries = ctx.registered_native_threads();
-            let entry = &entries[before_thread_count + i as usize];
-            // entries are stored in insertion order; tid == entry index + 1.
-            let actual_tid = (before_thread_count + i as usize + 1) as u64;
-            let _ = tid; // kept for clarity
+            let slot = before_thread_count + i as usize;
+            let entry = &entries[slot];
+            let actual_tid = ctx.native_tid_base + slot as u64;
             assert_eq!(entry.0, format!("vert.x-eventloop-{i}"));
             let ptr = ctx.native_thread_java_obj_ptr(actual_tid);
             assert_ne!(ptr, 0, "slot {i} must have a mirror");
@@ -2390,7 +2390,8 @@ mod tests {
         // Collect mirror pointers for the 4 new entries.
         let mut ptrs = Vec::new();
         for i in 0..4 {
-            let tid = (before + i + 1) as u64;
+            // FIX(test-isolation): tids start at native_tid_base, not 1.
+            let tid = ctx.native_tid_base + (before + i) as u64;
             let p = ctx.native_thread_java_obj_ptr(tid);
             assert_ne!(p, 0, "entry {i} must have a mirror");
             ptrs.push(p);

@@ -9,11 +9,117 @@
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use cratonvm_native_api::{
     AnnotationData, FieldMetadata, MethodMetadata, NativeContext, StackTraceEntry,
 };
 use cratonvm_types::error::{MethodCallFailed, MethodCallResult};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectKind, ObjectRef, Value};
+
+// FIX(test-isolation): ROOT-CAUSE fix for parallel-test flakiness.
+//
+// Every `MockNativeContext` used to seed its per-instance identity
+// counters (`next_ptr`, `next_class_id`, `next_native_tid`,
+// `next_alloc_id`) at the SAME fixed low values (8 / 1 / 1 / 1). When
+// tests in different modules run in PARALLEL, the identities they hand
+// out collide inside PROCESS-GLOBAL, identity-keyed side maps that the
+// production shims maintain (ReentrantLock / Condition / StampedLock
+// maps keyed by `ObjectRef.as_ptr()` / `identity_hash_code`, the vertx
+// `NATIVE_THREAD_DEAD_QUEUE` keyed by thread id, etc.). Single-threaded
+// the whole suite passes; only parallel runs flake.
+//
+// The fix: hand each `MockNativeContext` instance a globally-unique,
+// non-overlapping BLOCK of every identity space, by reserving a unique
+// monotonically-increasing sequence number per instance and striding
+// each counter's base by that sequence. WITHIN-instance increment
+// behaviour is unchanged (still += 8 per object, += 1 per class / tid /
+// alloc), so per-ctx heap layouts and any field-offset / pointer
+// arithmetic in tests stay byte-for-byte identical — only the BASE of
+// each instance's block shifts.
+
+/// Monotonic per-instance sequence. Each `MockNativeContext` reserves
+/// one value via `fetch_add` and strides its identity bases by it.
+static GLOBAL_CTX_SEQ: AtomicU64 = AtomicU64::new(0);
+
+// --- Per-instance strides (one block per ctx) ---------------------------
+//
+// A full test run creates on the order of ~10K MockNativeContexts. All
+// strides below must give comfortable headroom past that before any
+// space wraps; the analysis is noted at each constant.
+
+/// Pointer-space stride, in bytes. 0x10_0000 == 1,048,576 bytes per
+/// ctx; with the in-ctx step of +8 bytes/object that is ~131,072
+/// objects per ctx before the next block begins. It is a multiple of 8,
+/// so adding it to the base of 8 keeps every minted pointer 8-byte
+/// aligned. Headroom (usize == 64-bit on all CI targets):
+/// usize::MAX / 0x10_0000 ≈ 1.76e13 ctxs before pointer space wraps —
+/// vastly more than the ~10K a run creates.
+const PTR_STRIDE: usize = 0x10_0000;
+
+/// Native-thread-id stride. 4096 ids per ctx (in-ctx step +1). Headroom
+/// (u64): u64::MAX / 4096 ≈ 4.5e15 ctxs — far beyond ~10K.
+const TID_STRIDE: u64 = 4096;
+
+/// Native-allocation-id stride (i64). 1,000,000 ids per ctx (in-ctx
+/// step +1). Headroom (i64): i64::MAX / 1_000_000 ≈ 9.2e12 ctxs.
+const ALLOC_STRIDE: i64 = 1_000_000;
+
+/// Seeded identity bases for one MockNativeContext instance. Computed
+/// once per constructor by `reserve_identity_block()` so all
+/// constructor paths share identical seeding logic (no drift).
+struct IdentitySeed {
+    next_ptr: usize,
+    next_class_id: u32,
+    next_native_tid: u64,
+    next_alloc_id: i64,
+}
+
+/// FIX(test-isolation): reserve a globally-unique, non-overlapping block
+/// of every identity space for a single MockNativeContext instance.
+///
+/// `next_class_id` is special-cased: rather than striding a u32 (which
+/// would overflow after only ~1M ctxs with any reasonable stride), class
+/// ids are pulled from a SINGLE process-global `AtomicU32` so each minted
+/// class id is unique across all ctxs with no striding math and no
+/// overflow-headroom worry until 4.29e9 *total* class allocations across
+/// the whole process — far past a run's needs. The per-instance
+/// `next_class_id` is simply seeded to the next free global value and the
+/// in-ctx `+= 1` reserves the rest lazily; see `alloc_class_id`.
+fn reserve_identity_block() -> IdentitySeed {
+    let seq = GLOBAL_CTX_SEQ.fetch_add(1, Ordering::Relaxed);
+    IdentitySeed {
+        // base 8 keeps the first pointer non-null + 8-byte aligned;
+        // PTR_STRIDE is a multiple of 8 so alignment is preserved.
+        next_ptr: 8 + (seq as usize).wrapping_mul(PTR_STRIDE),
+        // Globally-unique class ids: reserve a fresh block large enough
+        // that the in-ctx `+= 1` walk never reaches the next ctx's base.
+        // Each ctx reserves CLASS_BLOCK ids up front from the shared
+        // global, guaranteeing no two ctxs ever overlap.
+        next_class_id: alloc_class_block(),
+        next_native_tid: 1 + seq.wrapping_mul(TID_STRIDE),
+        next_alloc_id: 1 + (seq as i64).wrapping_mul(ALLOC_STRIDE),
+    }
+}
+
+/// Per-ctx class-id block size pulled from the shared global counter.
+/// 4096 ids per ctx (in-ctx step +1). Reserving from one shared
+/// `AtomicU32` (rather than striding `seq`) avoids u32 overflow math:
+/// headroom is u32::MAX / 4096 ≈ 1.05e6 ctxs before class-id space
+/// wraps — comfortably past the ~10K a run creates.
+const CLASS_BLOCK: u32 = 4096;
+
+/// Shared global class-id allocator. Starts at 1 (0 is reserved as the
+/// "synthetic / unknown class" id used throughout the mock, e.g. string
+/// objects and class mirrors are minted with `ClassId::new(0)`).
+static GLOBAL_CLASS_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// FIX(test-isolation): reserve a fresh, non-overlapping block of
+/// `CLASS_BLOCK` class ids and return its base. Each MockNativeContext
+/// seeds `next_class_id` from this; its in-ctx `+= 1` walk stays inside
+/// the reserved block under normal test loads.
+fn alloc_class_block() -> u32 {
+    GLOBAL_CLASS_ID.fetch_add(CLASS_BLOCK, Ordering::Relaxed)
+}
 
 #[cfg(target_os = "windows")]
 extern "system" {
@@ -170,7 +276,20 @@ pub(crate) struct MockNativeContext {
     /// T19_K2: counter feeding ThreadId values handed back from
     /// `register_native_thread`. Starts at 1 (0 is reserved as "no
     /// registration" / mock not configured).
+    ///
+    /// FIX(test-isolation): the BASE of this counter is now shifted per
+    /// instance (see `reserve_identity_block`) so ids are globally
+    /// unique across parallel ctxs. The in-ctx step is still +1.
     pub(crate) next_native_tid: UnsafeCell<u64>,
+    /// FIX(test-isolation): the seeded base of `next_native_tid` for this
+    /// instance. The k-th `register_native_thread` call hands out
+    /// `native_tid_base + k` and pushes to slot `k` of
+    /// `registered_native_threads`, so the side-map / vec index for a
+    /// given `thread_id` is `thread_id - native_tid_base` (NOT
+    /// `thread_id - 1`, which only held when the base was the fixed 1).
+    /// Storing the base keeps that index math correct after the base
+    /// shifts, preserving the exact within-instance behaviour.
+    pub(crate) native_tid_base: u64,
     /// T19_K4: tracks `set_native_thread_java_obj` calls. Maps the
     /// 1-based ThreadId to the raw `ObjectRef.as_ptr() as usize` of
     /// the attached `java.lang.Thread` mirror. Tests assert that
@@ -210,17 +329,26 @@ pub(crate) struct MockNativeContext {
 
 impl MockNativeContext {
     pub(crate) fn new() -> Self {
+        // FIX(test-isolation): seed every identity counter from a
+        // globally-unique, non-overlapping block so two ctxs in parallel
+        // (in any module) never collide in process-global identity-keyed
+        // side maps. Within-ctx increment behaviour is unchanged — only
+        // the per-instance BASE shifts. This is the single seeding site;
+        // any future constructor MUST route through `reserve_identity_block`
+        // to avoid drift.
+        let seed = reserve_identity_block();
         Self {
             heap: UnsafeCell::new(Vec::new()),
             ptr_to_index: UnsafeCell::new(HashMap::new()),
             class_names: HashMap::new(),
             name_to_id: HashMap::new(),
-            next_class_id: 1,
-            // Start at 8 so first pointer is 8-byte aligned and non-null
-            next_ptr: 8,
+            next_class_id: seed.next_class_id,
+            // Base is 8 + seq*PTR_STRIDE, so the first pointer stays
+            // 8-byte aligned and non-null; subsequent objects still += 8.
+            next_ptr: seed.next_ptr,
             properties: HashMap::new(),
             native_allocs: UnsafeCell::new(HashMap::new()),
-            next_alloc_id: UnsafeCell::new(1),
+            next_alloc_id: UnsafeCell::new(seed.next_alloc_id),
             upcall_entries: UnsafeCell::new(Vec::new()),
             invoke_virtual_result: UnsafeCell::new(None),
             hidden_classes: UnsafeCell::new(std::collections::HashSet::new()),
@@ -238,7 +366,8 @@ impl MockNativeContext {
             osc_cache_map: UnsafeCell::new(HashMap::new()),
             resources_override: UnsafeCell::new(HashMap::new()),
             registered_native_threads: UnsafeCell::new(Vec::new()),
-            next_native_tid: UnsafeCell::new(1),
+            next_native_tid: UnsafeCell::new(seed.next_native_tid),
+            native_tid_base: seed.next_native_tid,
             native_thread_java_objs: UnsafeCell::new(HashMap::new()),
             registered_classpath: UnsafeCell::new(Vec::new()),
             nest_host_override: UnsafeCell::new(HashMap::new()),
@@ -411,6 +540,19 @@ impl MockNativeContext {
     fn entry_index(&self, obj: ObjectRef) -> usize {
         let ptr_val = obj.as_ptr() as usize;
         *self.ptr_map_ref().get(&ptr_val).expect("invalid ObjectRef in mock heap")
+    }
+
+    /// FIX(test-isolation): map a `thread_id` handed out by
+    /// `register_native_thread` back to its 0-based slot in
+    /// `registered_native_threads`. The k-th registration returns
+    /// `native_tid_base + k`, so the index is `thread_id -
+    /// native_tid_base`. Returns `None` if `thread_id` is below the
+    /// instance base (i.e. not a tid this ctx ever minted), which the
+    /// callers treat exactly like the old out-of-range case.
+    fn native_tid_slot(&self, thread_id: u64) -> Option<usize> {
+        thread_id
+            .checked_sub(self.native_tid_base)
+            .map(|i| i as usize)
     }
 }
 
@@ -808,10 +950,15 @@ impl NativeContext for MockNativeContext {
         if thread_id == 0 {
             return;
         }
+        // FIX(test-isolation): index relative to this instance's tid
+        // base (see `native_tid_slot`), not `thread_id - 1` — the base
+        // is now shifted per instance for global uniqueness.
+        let idx = match self.native_tid_slot(thread_id) {
+            Some(i) => i,
+            None => return,
+        };
         // SAFETY: single-threaded test code.
         unsafe {
-            // Indices are 1-based to match the ids handed out.
-            let idx = (thread_id as usize).saturating_sub(1);
             let v = &mut *self.registered_native_threads.get();
             if let Some(entry) = v.get_mut(idx) {
                 entry.2 = false;
@@ -831,9 +978,13 @@ impl NativeContext for MockNativeContext {
         // (mock doesn't model joining).
         let _ =
             unsafe { Box::from_raw(join_handle_ptr as *mut std::thread::JoinHandle<()>) };
+        // FIX(test-isolation): base-relative index (see native_tid_slot).
+        let idx = match self.native_tid_slot(thread_id) {
+            Some(i) => i,
+            None => return false,
+        };
         // SAFETY: single-threaded test code.
         unsafe {
-            let idx = (thread_id as usize).saturating_sub(1);
             let v = &*self.registered_native_threads.get();
             v.get(idx).is_some()
         }
@@ -847,9 +998,13 @@ impl NativeContext for MockNativeContext {
         if thread_id == 0 {
             return false;
         }
+        // FIX(test-isolation): base-relative index (see native_tid_slot).
+        let idx = match self.native_tid_slot(thread_id) {
+            Some(i) => i,
+            None => return false,
+        };
         // SAFETY: single-threaded test code.
         unsafe {
-            let idx = (thread_id as usize).saturating_sub(1);
             let v = &*self.registered_native_threads.get();
             if v.get(idx).is_none() {
                 return false;
