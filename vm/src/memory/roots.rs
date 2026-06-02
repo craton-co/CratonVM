@@ -211,7 +211,9 @@ mod tests {
     use super::*;
     use crate::classloading::ClassId;
     use crate::config::VmConfig;
-    use crate::memory::heap::Heap;
+    // FIX: `Heap` import removed — the locals/stack root tests now allocate
+    // from `shared.heap` (the heap actually scanned) instead of an orphan
+    // `Heap::new()`, so the standalone `Heap` type is no longer referenced.
     use crate::runtime::frame::Frame;
     use crate::threading::jvm_thread::ThreadId;
     use std::sync::Arc;
@@ -223,8 +225,11 @@ mod tests {
     #[test]
     fn roots_from_frame_locals() {
         let shared = test_shared_vm();
-        let heap = Heap::new();
-        let obj = heap.alloc_object(ClassId::new(0), 0);
+        // FIX: allocate from `shared.heap` (the heap the scanner validates
+        // against via `is_object_address`), not an orphan `Heap::new()`.
+        // The frame scanner drops any slot whose address is not resident in
+        // the heap being scanned — a foreign-heap object can never be a root.
+        let obj = shared.heap.alloc_object(ClassId::new(0), 0);
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let frame = Frame::new(
@@ -249,9 +254,12 @@ mod tests {
     #[test]
     fn roots_from_frame_stack() {
         let shared = test_shared_vm();
-        let heap = Heap::new();
-        let obj1 = heap.alloc_object(ClassId::new(0), 0);
-        let obj2 = heap.alloc_object(ClassId::new(0), 0);
+        // FIX: allocate from `shared.heap` so the operand-stack scanner's
+        // `is_heap_addr` validation recognizes the objects as live heap
+        // residents. Objects from a disconnected `Heap::new()` are correctly
+        // rejected by the scanner and would never appear as roots.
+        let obj1 = shared.heap.alloc_object(ClassId::new(0), 0);
+        let obj2 = shared.heap.alloc_object(ClassId::new(0), 0);
 
         let mut thread = JvmThread::new(ThreadId(0), "test");
         let mut frame = Frame::new(

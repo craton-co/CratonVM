@@ -17215,6 +17215,18 @@ mod tests {
         use crate::vm::Vm;
         let vm = Vm::new(VmConfig::new());
 
+        // FIX: the VecPool stat counters (acquire/hit/release_stored) are
+        // gated behind the process-wide `VEC_POOL_STATS_ENABLED` flag, which
+        // defaults to `false` so release builds skip the per-frame fetch_adds
+        // on the hot path (see alloc_fastpath.rs `VEC_POOL_STATS_ENABLED`).
+        // Without enabling stats the counters never advance and the round-trip
+        // asserts `0 == 2`. Enable stats for the duration of this diagnostic
+        // round-trip, snapshotting the prior gate state so we restore it and
+        // don't leak the flag into other tests.
+        use crate::runtime::alloc_fastpath::VecPool;
+        let stats_were_enabled = VecPool::<u64>::stats_enabled();
+        VecPool::<u64>::enable_stats();
+
         let before_op_count = vm.shared.operand_stack_pool.acquire_count();
         let before_op_hits = vm.shared.operand_stack_pool.acquire_hit_count();
         let before_op_stored = vm.shared.operand_stack_pool.release_stored_count();
@@ -17239,6 +17251,13 @@ mod tests {
         assert!(
             vm.shared.operand_stack_pool.release_stored_count() > before_op_stored
         );
+
+        // FIX: restore the global stat gate to its prior state so this test
+        // does not leak `VEC_POOL_STATS_ENABLED = true` into sibling tests
+        // that assert the counters stay at 0 while stats are disabled.
+        if !stats_were_enabled {
+            VecPool::<u64>::disable_stats();
+        }
     }
 
     #[test]

@@ -252,9 +252,20 @@ impl ValueStack {
     /// type tag inline); callers that pool both halves will simply see a
     /// fresh empty allocation for the tag slot.
     pub fn into_inner(self) -> (Vec<u64>, Vec<u8>) {
-        // Return the `kinds` array as the tag half so the pool can recycle its
-        // allocation (it is re-cleared on the next `from_pooled`).
-        (compact_vec_to_u64(self.slots), self.kinds)
+        // FIX: clear the `kinds` array before handing it back. The documented
+        // contract (and the `from_pooled` round-trip) is that the tag half is
+        // returned *empty* — CompactValue encodes its type tag inline, so the
+        // pool only needs the allocation, not the stale marks. Returning the
+        // marks un-cleared (the previous behavior) leaked a non-empty tag vec
+        // out of `into_inner`, contradicting the doc contract and the pooling
+        // invariant relied on by `into_inner_preserves_capacity`.
+        //
+        // `Vec::clear` preserves capacity, so the pool still recycles the
+        // allocation (`from_pooled` clears+resizes it back to KIND_UNKNOWN);
+        // we get the empty contract *and* zero reallocation.
+        let mut kinds = self.kinds;
+        kinds.clear();
+        (compact_vec_to_u64(self.slots), kinds)
     }
 
     pub fn push(&mut self, value: Value) -> Result<(), RuntimeError> {
@@ -1000,16 +1011,42 @@ impl ValueStack {
             let cv = self.slots[i];
             if cv.is_object() {
                 if let Some(ptr) = cv.as_object_ptr() {
-                    // Filter long-bit-pattern false positives: with the
-                    // bit-exact `CompactValue::long` encoding (BC SM2 fix,
-                    // 2026-05-28) a long whose natural sub-tag is SUB_OBJECT
-                    // satisfies `is_object()`. Drop the slot from the root
-                    // set unless its payload is a live heap address.
-                    if ptr != 0 && heap.is_heap_addr(ptr as usize).is_some() {
-                        // SAFETY: ptr was either stored by
-                        // `CompactValue::object` from a valid ObjectRef, or
-                        // it's a JNI-smuggled jobject whose address has been
-                        // heap-validated above.
+                    // FIX: distinguish a *genuine* object reference from a
+                    // long-bit-pattern false positive using the parallel
+                    // `kinds` mark instead of unconditionally heap-validating.
+                    //
+                    // The `kinds` side-array records JVM type context at push
+                    // time: a real `Value::Object` push (and the dup/swap/local
+                    // reload paths) leaves the slot `KIND_UNKNOWN`, whereas a
+                    // primitive long that collides into the `SUB_OBJECT`
+                    // sub-tag is only ever produced by a genuine long producer
+                    // (`push_long` / `push(Value::Long)` / long return), which
+                    // marks the slot `KIND_LONG`. So:
+                    //
+                    //   * `KIND_LONG` ⇒ primitive long masquerading as an
+                    //     object — NEVER root it (this is the letsgo-segv L1
+                    //     requirement; treating a primitive long as a live
+                    //     pointer is exactly the SEGV trigger). Fall through to
+                    //     the loose heap-validated smuggle path below so a JNI
+                    //     long-as-jobject still survives iff it points at the
+                    //     heap.
+                    //   * otherwise ⇒ a reference recorded by JVM type context.
+                    //     Root it unconditionally: a genuine object slot is a
+                    //     live root even when its payload is a young / mid-init
+                    //     address `is_heap_addr` cannot yet vouch for. The prior
+                    //     code dropped such roots (use-after-free risk for newly
+                    //     allocated objects) — the regression this fixes.
+                    if ptr != 0 && self.kinds[i] != KIND_LONG && self.kinds[i] != KIND_DOUBLE {
+                        // SAFETY: the slot was stored by `CompactValue::object`
+                        // from a valid ObjectRef (genuine reference per the
+                        // kind mark); reconstructing the ObjectRef from its
+                        // 47-bit payload is the inverse of that encode.
+                        roots.push(unsafe { ObjectRef::from_raw(ptr as *mut u8) });
+                    } else if ptr != 0 && heap.is_heap_addr(ptr as usize).is_some() {
+                        // KIND_LONG slot whose bits look like SUB_OBJECT: only a
+                        // live heap address is rooted (JNI long-as-jobject
+                        // smuggle); a numeric long is filtered out, preserving
+                        // the letsgo-segv safety guarantee.
                         roots.push(unsafe { ObjectRef::from_raw(ptr as *mut u8) });
                     }
                 }
@@ -1361,7 +1398,22 @@ mod tests {
         // payload 0 → widens to 0L; payload 0x1234 → widens to 0x1234L.
         for &(bits, widened) in &[(NANBOX, 0i64), (NANBOX | 0x1234, 0x1234i64)] {
             let mut stack = ValueStack::new(2);
-            stack.push_long(bits as i64).unwrap();
+            // FIX: push via the *unmarked* compact path (`push_compact`), NOT
+            // `push_long`. `push_long` is a genuine long producer: it marks the
+            // slot `KIND_LONG`, which `pop_long` honors by reading the bits
+            // bit-exact (see `pop_long_preserves_resolvable_nan_tag_collisions`,
+            // which pushes via `push_long` and asserts bit-exact round-trip). A
+            // `KIND_LONG` slot therefore NEVER widens — so the old `push_long`
+            // here contradicted the design and yielded the raw bits
+            // (-1125899906842624) instead of the widened value.
+            //
+            // The i2l-widening fallback this test pins is only reachable for an
+            // UNRESOLVABLE collision slot, i.e. one pushed *without* the long
+            // mark (e.g. `lload_N`'s `push_compact`, or a synthetic int-where-
+            // long). Such a SUB_INT slot with payload < 2^32 is bit-identical to
+            // a real `CompactValue::int`, so `pop_long` applies JVMS i2l
+            // sign-extension — the documented unsalvageable residual.
+            stack.push_compact(crate::types::CompactValue::long(bits as i64));
             assert_eq!(stack.pop_long().unwrap(), widened);
         }
     }

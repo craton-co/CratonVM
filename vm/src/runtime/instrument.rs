@@ -1366,30 +1366,38 @@ mod tests {
 
     #[test]
     fn approximate_object_size_object() {
-        // Header (32) + 5 slots * 16 = 32 + 80 = 112.
+        // FIX: HEADER_SIZE grew 32 -> 40 (mark_word added for thin-locks; see
+        // cratonvm_types::heap_types::HEADER_SIZE). Expectation was stale.
+        // Header (40) + 5 slots * 16 = 40 + 80 = 120.
         let sz = approximate_object_size(ObjectKind::Object, ArrayElementType::Reference, 0, 5);
-        assert_eq!(sz, 112);
+        assert_eq!(sz, 120);
     }
 
     #[test]
     fn approximate_object_size_byte_array() {
-        // Header (32) + 10 bytes aligned-up-to-8 = 32 + 16 = 48.
+        // FIX: HEADER_SIZE grew 32 -> 40 (mark_word added for thin-locks; see
+        // cratonvm_types::heap_types::HEADER_SIZE). Expectation was stale.
+        // Header (40) + 10 bytes aligned-up-to-8 = 40 + 16 = 56.
         let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Byte, 10, 0);
-        assert_eq!(sz, 48);
+        assert_eq!(sz, 56);
     }
 
     #[test]
     fn approximate_object_size_long_array() {
-        // Header (32) + 4 * 8 = 32 + 32 = 64.
+        // FIX: HEADER_SIZE grew 32 -> 40 (mark_word added for thin-locks; see
+        // cratonvm_types::heap_types::HEADER_SIZE). Expectation was stale.
+        // Header (40) + 4 * 8 = 40 + 32 = 72.
         let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Long, 4, 0);
-        assert_eq!(sz, 64);
+        assert_eq!(sz, 72);
     }
 
     #[test]
     fn approximate_object_size_ref_array() {
-        // Header (32) + 3 refs * 8 = 32 + 24 = 56.
+        // FIX: HEADER_SIZE grew 32 -> 40 (mark_word added for thin-locks; see
+        // cratonvm_types::heap_types::HEADER_SIZE). Expectation was stale.
+        // Header (40) + 3 refs * 8 = 40 + 24 = 64.
         let sz = approximate_object_size(ObjectKind::Array, ArrayElementType::Reference, 3, 0);
-        assert_eq!(sz, 56);
+        assert_eq!(sz, 64);
     }
 
     #[test]
