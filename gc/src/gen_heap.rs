@@ -2155,8 +2155,18 @@ impl GenerationalHeap {
                                         );
                                         // SAFETY: Writing forwarded pointer back to the same valid ref-array slot.
                                         unsafe { std::ptr::write(s_ptr as *mut u64, new_ref_ptr as u64); }
+                                        // BUGFIX (same class as the object-field fix): use
+                                        // `deferred_dirty_cards` (re-applied AFTER clear_all
+                                        // via mark_dirty_bulk), NOT a direct
+                                        // `card_table.mark_dirty` which clear_all() wipes.
+                                        // An old reference ARRAY holding a young object (e.g.
+                                        // ArrayList.elementData with the ServiceLoader provider
+                                        // instances) promoted via this resurrection drain
+                                        // otherwise loses its remembered-set entry → the next
+                                        // minor GC relocates/collects the young element →
+                                        // "Not able to load any cryptoProvider".
                                         if !old_gen.contains(new_ref_ptr) {
-                                            card_table.mark_dirty(obj_ptr as usize);
+                                            deferred_dirty_cards.push(obj_ptr as usize);
                                         }
                                     }
                                 }
