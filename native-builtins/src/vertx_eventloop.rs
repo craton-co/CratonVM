@@ -1243,25 +1243,82 @@ mod tests {
     // expectation never settles under `cargo test`'s default parallelism —
     // even though it is correct when run alone (`--test-threads=1`).
     //
-    // Fix WITHOUT weakening any assertion: serialize every test in this module
-    // that PUSHES to or DRAINS the shared dead-queue, and snapshot/reset the
-    // queue at the start of each such test while holding the lock so a
-    // sibling that finished just before us can't leave stragglers behind.
-    // `dead_queue_guard()` returns the held lock (which also drains the queue
-    // as the "reset" step); callers bind it to a `_guard` local that lives to
-    // end of scope. Poisoning is recovered (a panicking sibling must not
-    // wedge the rest of the suite).
+    // Fix WITHOUT weakening any assertion: serialize EVERY test in this module
+    // that touches ANY shared process-global (the dead-queue, the loop
+    // registry, the join-handle map, the id counters, or the per-mirror group
+    // map) on the SINGLE module-wide `TEST_LOCK`, and reset the globals to a
+    // clean baseline at the start of each such test while holding the lock so a
+    // sibling that finished just before us can't leave stragglers behind. The
+    // unified `isolated_vertx_test()` helper (below) returns the held lock and
+    // performs the reset; callers bind it to a `_guard` local that lives to end
+    // of scope. `dead_queue_guard()` is a back-compat alias for the same thing.
+    // Poisoning is recovered (a panicking sibling must not wedge the suite).
     static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
-    /// FIX(test-isolation): acquire the module-wide serialization lock and
-    /// reset the shared `NATIVE_THREAD_DEAD_QUEUE` so no sibling's leftover
-    /// dead-ids pollute this test. Hold the returned guard for the whole test.
+    // FIX(test-isolation): Inventory of every PROCESS-GLOBAL mutable static in
+    // this module that a test in here reads, asserts on, or mutates — and the
+    // exact reset each one needs for a clean, exclusive baseline. The unified
+    // `isolated_vertx_test()` guard below holds `TEST_LOCK` (so no two guarded
+    // tests run concurrently) and performs every reset listed here:
+    //
+    //   * `NATIVE_THREAD_DEAD_QUEUE` (Mutex<Vec<u64>>): drained to empty so a
+    //     sibling's leftover dead-ids cannot be drained/flushed by this test.
+    //   * `VERTX_LOOP_REGISTRY` (Mutex<HashMap<id,loop>>): not force-cleared
+    //     (joining a stranger's loop is unsafe); instead every guarded test
+    //     owns the lock for its whole body, so the only entries it ever sees
+    //     are the ones it created. Tests assert on *deltas* / their own ids,
+    //     never on an absolute registry size, so leftover entries from an
+    //     UN-guarded local test are irrelevant.
+    //   * `VERTX_LOOP_JOIN_HANDLES` (Mutex<HashMap<id,join>>): same as above —
+    //     mutated only via spawn/shutdown which are now serialized.
+    //   * `NEXT_LOOP_ID` / `LOOP_ID_HWM` (AtomicU64): monotonic counters. Tests
+    //     never assert an exact id value, only "> 0" / "rejected past HWM", so
+    //     no reset is required — serialization alone removes the interleaving
+    //     hazard (a sibling bumping the HWM mid-`lookup_rejects_invalid_ids`).
+    //   * `VERTX_GROUPS` (Mutex<HashMap<mirror_ptr,ids>>): keyed by the unique
+    //     per-test mirror pointer, so entries never collide across tests; the
+    //     init/close pair each test runs adds and removes its own key. Held
+    //     under the lock for the whole body, so no concurrent writer exists.
+    //
+    // NOTE on per-loop DispatchStats: `VertxEventLoop.stats` is a PER-LOOP
+    // field, NOT a global — `dispatch_stats_increment` reads `el.stats` of the
+    // loop IT spawned. Its historical flakiness came from sharing the global
+    // registry/join-handle maps and `NEXT_LOOP_ID` with concurrent siblings
+    // (spawn/shutdown contention), not from a shared counter. Serializing it
+    // under `isolated_vertx_test()` removes that contention; there is no global
+    // dispatch-stats counter to zero.
+
+    /// FIX(test-isolation): Acquire the module-wide serialization lock and
+    /// reset every shared process-global this module's tests touch to a clean
+    /// baseline (see the inventory comment above). Returns the held guard;
+    /// bind it to a `_guard` local that lives to the end of the test so the
+    /// lock is held for the whole body. Poisoning is recovered so a panicking
+    /// sibling cannot wedge the rest of the suite.
+    #[must_use]
+    fn isolated_vertx_test() -> MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_shared_globals();
+        guard
+    }
+
+    /// FIX(test-isolation): Reset all test-observable shared globals while the
+    /// caller holds `TEST_LOCK`. Drains the dead-queue (the only global that
+    /// carries cross-test-colliding values); the registry/group maps and id
+    /// counters need no value reset because tests assert on deltas/their own
+    /// ids and the lock makes their view exclusive (see inventory above).
+    fn reset_shared_globals() {
+        // Drop any dead-ids a previous (now-finished) test left behind.
+        let _ = drain_native_thread_dead_queue();
+    }
+
+    /// FIX(test-isolation): Back-compat alias. The dead-queue tests historically
+    /// called `dead_queue_guard()`; it now delegates to the single unified
+    /// `isolated_vertx_test()` so there is exactly one `TEST_LOCK` and one reset
+    /// path. Kept so the call sites read intent-fully where dead-queue is the
+    /// focus, but it is the SAME lock + SAME reset.
     #[must_use]
     fn dead_queue_guard() -> MutexGuard<'static, ()> {
-        let guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Reset: drop any entries a previous (now-finished) test left behind.
-        let _ = drain_native_thread_dead_queue();
-        guard
+        isolated_vertx_test()
     }
 
     // FIX(test-isolation): Reset the shared dead-queue at a point INSIDE the
@@ -1334,6 +1391,10 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn vertx_init_rejects_invalid_pool_size() {
+        // FIX(test-isolation): init touches the shared loop registry / id
+        // counters on its way to validating the pool size; serialize so a
+        // sibling spawn/shutdown can't race the maps mid-call.
+        let _guard = isolated_vertx_test();
         let mut ctx = mock_ctx();
         let mirror = alloc_concurrent_synthetic(&mut ctx, CLS_VERTX_IMPL, VERTX_NUM_SLOTS);
         assert!(
@@ -1547,6 +1608,9 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn vertx_loop_runs_scheduled_task() {
+        // FIX(test-isolation): spawn/shutdown mutate the shared loop registry,
+        // join-handle map and `NEXT_LOOP_ID`; serialize against siblings.
+        let _guard = isolated_vertx_test();
         let el = spawn_vertx_event_loop("test-runs-task").expect("spawn");
         let raw_id = el.id as i64;
 
@@ -1575,6 +1639,10 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn lookup_rejects_invalid_ids() {
+        // FIX(test-isolation): `lookup_vertx_loop` reads the shared
+        // `LOOP_ID_HWM`; serialize so a concurrent sibling spawn bumping the
+        // high-water mark can't perturb the bounds this test probes.
+        let _guard = isolated_vertx_test();
         assert!(lookup_vertx_loop(-1).is_none(), "negative id must be None");
         assert!(lookup_vertx_loop(0).is_none(), "zero id must be None");
         assert!(lookup_vertx_loop(i64::MAX).is_none(), "huge id must be None");
@@ -1585,6 +1653,9 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn loop_survives_panicking_task() {
+        // FIX(test-isolation): spawn/shutdown mutate the shared loop registry,
+        // join-handle map and `NEXT_LOOP_ID`; serialize against siblings.
+        let _guard = isolated_vertx_test();
         let el = spawn_vertx_event_loop("test-panic").expect("spawn");
         let raw_id = el.id as i64;
         for _ in 0..200 {
@@ -1617,6 +1688,14 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn dispatch_stats_increment() {
+        // FIX(test-isolation): `el.stats` is per-loop, but this test's
+        // spawn/shutdown share the global loop registry, join-handle map and
+        // `NEXT_LOOP_ID` with every other spawning test. Under default
+        // `cargo test` parallelism that contention is what made this test
+        // flake. Serialize on the unified lock so spawn/shutdown and the
+        // dead-queue are exclusively ours; the per-loop stats it asserts on
+        // are then read from a loop no sibling can touch.
+        let _guard = isolated_vertx_test();
         let el = spawn_vertx_event_loop("test-stats").expect("spawn");
         let raw_id = el.id as i64;
         for _ in 0..200 {
@@ -1642,6 +1721,9 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn concurrent_8_thread_schedule_no_race() {
+        // FIX(test-isolation): spawn/shutdown mutate the shared loop registry,
+        // join-handle map and `NEXT_LOOP_ID`; serialize against siblings.
+        let _guard = isolated_vertx_test();
         let el = spawn_vertx_event_loop("test-concurrent").expect("spawn");
         let raw_id = el.id as i64;
         for _ in 0..200 {
@@ -1904,6 +1986,12 @@ mod tests {
     /// keeping the unit tests deterministic.
     #[test]
     fn t19_k2_legacy_spawn_does_not_register_vm_thread() {
+        // FIX(test-isolation): even the legacy (no-ctx) spawn mutates the
+        // shared loop registry / join-handle map / `NEXT_LOOP_ID`, and this
+        // test asserts a registered-thread DELTA of zero — a sibling's
+        // `_with_ctx` spawn registering on the same mock would not affect this
+        // ctx, but spawn/shutdown map contention is still serialized here.
+        let _guard = isolated_vertx_test();
         let mut ctx = mock_ctx();
         let before = ctx.registered_native_threads().len();
         let el = spawn_vertx_event_loop("k2-test-7-legacy").expect("spawn");
@@ -2185,6 +2273,9 @@ mod tests {
     /// accidentally pollute the K4 mock state.
     #[test]
     fn t19_k4_legacy_spawn_does_not_allocate_mirror() {
+        // FIX(test-isolation): legacy spawn/shutdown still mutate the shared
+        // loop registry / join-handle map / `NEXT_LOOP_ID`; serialize.
+        let _guard = isolated_vertx_test();
         let el = spawn_vertx_event_loop("k4-legacy-spawn").expect("spawn");
         assert_eq!(
             el.java_thread_mirror_ptr.load(Ordering::Acquire),

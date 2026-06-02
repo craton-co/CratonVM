@@ -414,11 +414,62 @@ to `native_itr_remove_noop`. Verified: `LinkedList.iterator().remove()` now work
 in isolation (`[x,z]` after removing the middle element), the avrora UOE is gone,
 and `Digest validation failed` no longer appears.
 
-### Still open (separate, pre-existing — NOT the digest, NOT the fixed SEGVs)
+### Part 5 — FIXED (2026-06-02): JIT *metadata* use-after-free (completes Part 3)
 
-- **Rare worker-thread memory corruption** (e.g. `core::fmt` panic on a corrupted
-  class-name string `avrora/sim/clock/MainClock.   80…`, or `read at 0x4`/`0x3D`):
-  a non-deterministic fault on avrora's Thread-2/3/4. Appears amplified when the
-  binary also includes the concurrent audit-remediation's in-flight
-  `native-builtins` (`unsafe_natives`/`panama`/`lang_string`) edits, so isolate
-  on a clean tree before localizing. Use the VEH GPR/callee dump.
+The "rare worker-thread memory corruption" (a `core::fmt` slice panic on a
+corrupted class/method string `avrora/sim/clock/MainClock.<NUL bytes>`, plus
+`read at 0x4`/`0x3D`) was the SAME use-after-free as Part 3, but for the JIT
+*metadata*, not the code. Backtrace (isolated clean build):
+`jit_invoke_virtual_mic → invoke_or_native → invoke_on_class_shared_inner →
+tracing log → str slice panic`. The MIC dispatch read a **freed `JitInvokeInfo`**
+(garbage class/method name with embedded NUL).
+
+Part 3 retained the executable code (`ExecutableBuffer::drop`) but the emitted
+code also holds RAW pointers into the owning `CompiledMethod`'s
+`_jit_strings` / `_jit_invoke_infos` / `_jit_mic_slots` / `_jit_pic_slots`
+(jit/src/lib.rs). Those boxes were still freed when a deoptimised/evicted
+`CompiledMethod` dropped, so the retained code dangled into them.
+
+Fix: `Drop for CompiledMethod` now leaks (`mem::forget`) that metadata for the
+process lifetime too, exactly mirroring the code retention — the two MUST go
+together. `CRATONVM_JIT_FREE_CODE=1` restores full freeing.
+
+**Verified (isolated clean worktree at the pre-audit checkpoint):** real-RAF
+avrora went from 5/5 corruption crashes → **0/8 crashes**, no digest failure, no
+UOE. Our `LinkedList.iterator().remove()` was also stress-tested vs real JDK
+(remove first/last/consecutive/all/then-add) — byte-identical, so the remaining
+issue below is NOT a remove() bug.
+
+### Still open — avrora simulation does not terminate within the watchdog
+
+With all crashes + the digest pollution gone, real-RAF avrora now runs the radio
+medium *correctly* — nodes exchange real packets (`<====`/`---->` with data),
+which they never did before (the broken `it.remove()` had left the medium's
+transmission list unmanaged). But the simulation advances far past the old
+UOE-truncated stop (`~2.07M` cycles) to tens of millions of cycles and the 120s
+stack-dump watchdog aborts it (main parked in `RippleSynchronizer.join` →
+`Thread.join`; worker threads still progressing, events distinct = not a tight
+loop). Open question: genuinely non-terminating (a correctness divergence vs the
+reference simulation) or just slower than HotSpot past the 120s default watchdog.
+Next: run with `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1` + a long timeout to see if it
+completes; if not, diff our event stream against a real-JVM avrora run to find the
+divergence point.
+
+**Findings (2026-06-02), reframing what "pass" means here:**
+- **Real JDK 25 also FAILS this benchmark** (`avrora -s small`): it fails at
+  startup (4 lines, no banner, no simulation — the 2009 DaCapo avrora uses
+  JDK APIs changed/removed since). Its digest fails too. So the benchmark's
+  built-in empty-`stderr` digest (`0xda39a3ee…`) is a JDK-6-era artifact not
+  achievable on any modern runtime, and there is **no working reference run** to
+  diff against on this box.
+- **Synthetic avrora (`CRATONVM_REAL_RAF` unset) is a false pass:** it completes
+  EXIT 0 in seconds but prints **zero** simulation events — the synthetic
+  `RandomAccessFile` shim short-circuits ELF loading so avrora simulates nothing.
+  This is exactly the kind of stub the project forbids; the green check is empty.
+- **With real RAF + all the fixes above, our VM runs the real simulation further
+  than JDK 25 does** — it loads the TinyOS ELFs and the nodes exchange real radio
+  packets. The watchdog-off run (>7 min) keeps advancing (tens of millions of
+  cycles, distinct events) without terminating. Whether that is a genuine
+  non-termination/divergence or just our interpreter being far slower than HotSpot
+  over a long simulation is the open question — and it needs a *working* reference
+  avrora (an older JDK, or a standalone avrora jar run outside DaCapo) to settle.
