@@ -133,12 +133,10 @@ pub(crate) fn register_collections_extras_natives(r: &mut NativeMethodRegistry) 
         "(Ljava/util/Collection;Ljava/lang/Object;)I",
         native_collections_frequency,
     );
-    r.register(
-        cu,
-        "disjoint",
-        "(Ljava/util/Collection;Ljava/util/Collection;)Z",
-        native_return_false,
-    );
+    // `Collections.disjoint` intentionally left unregistered — the real pure-Java
+    // implementation runs correctly on CratonVM. A native stub here (previously
+    // `native_return_false`, and a conflicting always-true stub in phases_late)
+    // produced wrong answers; see the note in phases_late.rs.
     r.register(
         cu,
         "nCopies",

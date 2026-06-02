@@ -3573,6 +3573,25 @@ fn try_compile_inner(
         let num_params = prologue_param_slots;
         let builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
         if let Some(mut graph) = builder.build(code, code_len) {
+            // Correctness gate: the IR backend miscompiles a *pure* (call-free)
+            // method that contains a conditional branch / φ merge. The canonical
+            // failure is a tiny leaf predicate like
+            // `static boolean f(int m){ return (m & K) != 0; }`
+            // (e.g. `java.lang.reflect.Modifier.isStatic`): once hot-called in a
+            // loop its IR-compiled body SIGSEGVs with a write through a near-null
+            // base (faulting address == the masked constant / 0). Methods that
+            // contain an `invoke*` lower correctly through the same pipeline, and
+            // branch-free leaf methods are fine — only call-free *branchy* methods
+            // are affected. Until the IR φ/branch lowering bug is root-fixed,
+            // decline IR for this exact shape and let the single-pass bytecode-x64
+            // backend (which compiles arbitrary control flow correctly) handle it.
+            // Bisected from keycloak JsonParserTest / SkeletonKeyTokenTest SIGSEGVs
+            // and a standalone `Modifier.isStatic` hot-loop repro.
+            let has_conditional_branch =
+                graph.nodes.iter().any(|n| matches!(n.op, ir::Op::If));
+            if has_conditional_branch && scan.invoke_ops.is_empty() {
+                // Fall through to the single-pass backend below.
+            } else {
             ir_optimize::optimize(&mut graph);
 
             // --- Escape analysis (Phase 41 + G46 wiring) ---
@@ -3597,6 +3616,7 @@ fn try_compile_inner(
             ) {
                 return Some(compiled);
             }
+            } // end else (IR-lowering path)
         }
     }
 

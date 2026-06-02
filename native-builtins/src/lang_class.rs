@@ -3910,6 +3910,23 @@ pub(crate) fn create_method_object(
     let empty_byte_arr3 = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
     ctx.set_field_by_name(obj, "annotationDefault", Value::Object(Some(empty_byte_arr3)));
 
+    // WP2.1: populate the JDK `signature` field from the JVMS §4.7.9 Signature
+    // attribute when the method is generic. The real JDK `Method.getGenericReturnType()`
+    // / `getGenericParameterTypes()` are pure-Java methods that read this field
+    // via `getGenericSignature()`; when it is null they fall back to the erased
+    // `returnType` / `parameterTypes`. CratonVM dispatches those reflective
+    // getters to the JDK bytecode (not the registered natives), so leaving
+    // `signature` null made every generic method type come back erased — which
+    // breaks Jackson bean-property type resolution (`Map<String,Foo>` getter →
+    // `LinkedHashMap` values → ClassCastException). Setting it here makes the
+    // JDK Java code recover the full `ParameterizedType`, matching real-JVM
+    // behaviour. Mirrors how `create_field_object` relies on the field
+    // Signature attribute for `Field.getGenericType()`.
+    if let Some(sig) = ctx.method_signature(meta.declaring_class_id, &meta.name, &meta.descriptor) {
+        let sig_obj = ctx.create_string(&sig);
+        ctx.set_field_by_name(obj, "signature", Value::Object(Some(sig_obj)));
+    }
+
     // --- CratonVM extra metadata (append after JDK layout) ---
     ctx.set_field(
         obj,

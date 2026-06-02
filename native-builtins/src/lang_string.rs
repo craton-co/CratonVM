@@ -3218,8 +3218,28 @@ pub(crate) fn format_arg(ctx: &dyn NativeContext, val: &Value, spec: char) -> St
                     _ => "true".to_string(),
                 };
             }
-            // For %s: read string or call toString
-            if spec == 's' || spec == 'h' || spec == 'H' {
+            // For %s: a String formats as its characters; a boxed primitive
+            // wrapper (Integer/Long/Short/Byte/Boolean/Character/Float/Double)
+            // formats as its value — real OpenJDK does `String.valueOf(arg)`,
+            // i.e. the wrapper's `toString`. The previous code only handled
+            // String and returned "null" for every other object, so
+            // `String.format("%s", someLong)` produced "null" (e.g. keycloak
+            // TimeClaimVerifier's expiry messages: "now: 'null', iat: 'null'").
+            // Unbox wrappers and re-format the primitive; non-wrapper objects
+            // keep the prior "null" fallback (a full toString dispatch would
+            // need &mut NativeContext).
+            if spec == 's' {
+                if let Some(s) = ctx.read_string(*obj) {
+                    return s;
+                }
+                let inner = unbox_obj(ctx, *obj);
+                if !matches!(inner, Value::Object(_)) {
+                    return format_arg(ctx, &inner, spec);
+                }
+                return "null".to_string();
+            }
+            // %h / %H: hashcode hex (left as-is — String fast path or "null").
+            if spec == 'h' || spec == 'H' {
                 return ctx.read_string(*obj).unwrap_or_else(|| "null".to_string());
             }
             // Try to unbox wrapper to primitive and recurse
