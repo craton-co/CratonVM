@@ -127,7 +127,11 @@ fn double_sum_loop_n10() -> Vec<u8> {
         // 0:  dconst_0          ; push 0.0
         0x0e,
         // 1:  dstore_0          ; s = 0.0  (locals 0+1)
-        0x48,
+        // FIX: was 0x48 (dstore_1) — a typo that stored the accumulator into
+        // local 1 while every dload_0 (0x26) read local 0, so `s` never
+        // updated and the JIT (correctly) returned the initial 0.0. dstore_0
+        // is 0x47.
+        0x47,
         // 2:  iconst_0          ; push 0
         0x03,
         // 3:  istore_2          ; i = 0
@@ -148,7 +152,7 @@ fn double_sum_loop_n10() -> Vec<u8> {
         // 13: dadd              ; s + (double)i
         0x63,
         // 14: dstore_0          ; s = ...
-        0x48,
+        0x47, // FIX: was 0x48 (dstore_1) — see note at PC 1.
         // 15: iinc 2 1          ; i++
         0x84, 0x02, 0x01,
         // 18: goto -14 → PC 4
@@ -166,7 +170,7 @@ fn double_sum_loop_n10() -> Vec<u8> {
 fn double_loop_body_once() -> Vec<u8> {
     vec![
         0x0e,  // dconst_0
-        0x48,  // dstore_0
+        0x47,  // dstore_0   FIX: was 0x48 (dstore_1) — accumulator must use local 0.
         0x03,  // iconst_0
         0x3d,  // istore_2
         // Body
@@ -174,7 +178,7 @@ fn double_loop_body_once() -> Vec<u8> {
         0x1c,  // iload_2
         0x87,  // i2d
         0x63,  // dadd
-        0x48,  // dstore_0
+        0x47,  // dstore_0   FIX: was 0x48 (dstore_1).
         // Return
         0x26,  // dload_0
         0xaf,  // dreturn
@@ -271,7 +275,7 @@ fn double_product_loop_n6() -> Vec<u8> {
         // 0: dconst_1            ; push 1.0
         0x0f,
         // 1: dstore_0            ; s = 1.0
-        0x48,
+        0x47, // FIX: was 0x48 (dstore_1) — typo; dstore_0 is 0x47 (see sum-loop note).
         // 2: iconst_1            ; push 1
         0x04,
         // 3: istore_2            ; i = 1
@@ -292,7 +296,7 @@ fn double_product_loop_n6() -> Vec<u8> {
         // 13: dmul
         0x6b,
         // 14: dstore_0
-        0x48,
+        0x47, // FIX: was 0x48 (dstore_1) — see PC 1.
         // 15: iinc 2 1
         0x84, 0x02, 0x01,
         // 18: goto -14 → PC 4
