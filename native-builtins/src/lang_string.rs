@@ -3014,12 +3014,15 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
                 continue;
             }
 
-            // Parse optional flags: -, +, 0, ' ', #, (
+            // Parse optional flags: -, +, 0, ' ', #, (, and ',' (grouping).
+            // ',' was previously missing, so `%,d` failed to parse and the
+            // whole spec was emitted literally ("%,d") — and worse, the arg it
+            // should have consumed shifted onto the next conversion.
             // Every chars[i] read below is guarded by `i < chars.len()` via
             // chars.get(i) — a format specifier that runs off the end of the
             // string must throw, not panic.
             let mut flags = String::new();
-            while chars.get(i).is_some_and(|c| "-+0 #(".contains(*c)) {
+            while chars.get(i).is_some_and(|c| "-+0 #(,".contains(*c)) {
                 flags.push(chars[i]);
                 i += 1;
             }
@@ -3103,7 +3106,7 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
 /// Format a single argument with flags, width, and precision support.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn format_arg_full(
-    ctx: &dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     val: &Value,
     spec: char,
     flags: &str,
@@ -3143,6 +3146,13 @@ pub(crate) fn format_arg_full(
 
     let mut formatted = raw;
 
+    // ',' grouping flag: insert a thousands separator into the integer part of
+    // %d / %f values (Java's Formatter; the locale separator is ',' for the
+    // root/US locale, which is what CratonVM formats against).
+    if flags.contains(',') && matches!(spec, 'd' | 'f' | 'g' | 'G') {
+        formatted = group_thousands(&formatted);
+    }
+
     // Add sign for numeric types
     if plus_sign && matches!(spec, 'd' | 'f' | 'e' | 'E' | 'g' | 'G') && !formatted.starts_with('-')
     {
@@ -3171,6 +3181,35 @@ pub(crate) fn format_arg_full(
     formatted
 }
 
+/// Insert ',' thousands separators into the integer part of a numeric string
+/// (for the `%,d` / `%,f` grouping flag). Preserves a leading sign and any
+/// fractional part (`.xxx`).
+fn group_thousands(s: &str) -> String {
+    let (sign, rest) = match s.strip_prefix('-') {
+        Some(r) => ("-", r),
+        None => ("", s),
+    };
+    let (int_part, frac_part) = match rest.find('.') {
+        Some(p) => (&rest[..p], &rest[p..]),
+        None => (rest, ""),
+    };
+    if !int_part.chars().all(|c| c.is_ascii_digit()) || int_part.len() <= 3 {
+        return s.to_string();
+    }
+    let digits: Vec<char> = int_part.chars().collect();
+    let len = digits.len();
+    let mut grouped = String::with_capacity(len + len / 3);
+    for (idx, ch) in digits.iter().enumerate() {
+        // Comma before this digit when the number of digits remaining (incl.
+        // this one) is a positive multiple of 3, and it's not the leading digit.
+        if idx != 0 && (len - idx) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(*ch);
+    }
+    format!("{sign}{grouped}{frac_part}")
+}
+
 /// Extract a float value from a Value (unboxing wrappers as needed).
 fn extract_float_value(ctx: &dyn NativeContext, val: &Value) -> f64 {
     match val {
@@ -3190,7 +3229,7 @@ fn extract_float_value(ctx: &dyn NativeContext, val: &Value) -> f64 {
 }
 
 /// Format a single argument for String.format.
-pub(crate) fn format_arg(ctx: &dyn NativeContext, val: &Value, spec: char) -> String {
+pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -> String {
     // Helper: unbox wrapper object to primitive
     fn unbox_obj(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> Value {
         let nf = ctx.object_num_fields(obj);
@@ -3218,16 +3257,12 @@ pub(crate) fn format_arg(ctx: &dyn NativeContext, val: &Value, spec: char) -> St
                     _ => "true".to_string(),
                 };
             }
-            // For %s: a String formats as its characters; a boxed primitive
-            // wrapper (Integer/Long/Short/Byte/Boolean/Character/Float/Double)
-            // formats as its value — real OpenJDK does `String.valueOf(arg)`,
-            // i.e. the wrapper's `toString`. The previous code only handled
-            // String and returned "null" for every other object, so
-            // `String.format("%s", someLong)` produced "null" (e.g. keycloak
-            // TimeClaimVerifier's expiry messages: "now: 'null', iat: 'null'").
-            // Unbox wrappers and re-format the primitive; non-wrapper objects
-            // keep the prior "null" fallback (a full toString dispatch would
-            // need &mut NativeContext).
+            // For %s: real OpenJDK does `String.valueOf(arg)` == `arg.toString()`.
+            // A String formats as its characters; a boxed primitive wrapper
+            // formats as its value; any other object (enum, record, bean, …)
+            // formats via its `toString()`. The previous code only handled
+            // String + wrappers and returned "null" for everything else, so e.g.
+            // `String.format("%s", Color.GREEN)` printed "null".
             if spec == 's' {
                 if let Some(s) = ctx.read_string(*obj) {
                     return s;
@@ -3236,7 +3271,13 @@ pub(crate) fn format_arg(ctx: &dyn NativeContext, val: &Value, spec: char) -> St
                 if !matches!(inner, Value::Object(_)) {
                     return format_arg(ctx, &inner, spec);
                 }
-                return "null".to_string();
+                // Non-wrapper object: dispatch to toString().
+                match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(s)))) => {
+                        return ctx.read_string(s).unwrap_or_else(|| "null".to_string());
+                    }
+                    _ => return "null".to_string(),
+                }
             }
             // %h / %H: hashcode hex (left as-is — String fast path or "null").
             if spec == 'h' || spec == 'H' {

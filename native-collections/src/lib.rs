@@ -6686,7 +6686,7 @@ fn stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
     // at field 0 — fall through to materialize via Stream.toArray().
     let class_id = ctx.class_id_of_object(stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    let is_synthetic = class_name == "java/util/stream/Stream";
+    let is_synthetic = is_synthetic_stream(&class_name);
     if is_synthetic {
         if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
@@ -6699,11 +6699,31 @@ fn stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
     Vec::new()
 }
 
+/// True for CratonVM's synthetic Stream / IntStream / LongStream / DoubleStream
+/// objects (all share the `STREAM_FIELD_ELEMENTS` backing-array layout). The
+/// primitive-stream interface names must be included — `make_int_stream` etc.
+/// allocate objects whose class is the interface name `java/util/stream/IntStream`,
+/// and `int_stream_elements` delegates here; previously only the bare
+/// `java/util/stream/Stream` matched, so EVERY primitive-stream terminal that
+/// read elements this way (e.g. `IntStream.average()`) saw an empty stream and
+/// returned the empty/zero result. Real JDK primitive streams are concrete
+/// `*Pipeline` classes, not these interface names, so they still fall through to
+/// the `toArray()` materialisation path.
+fn is_synthetic_stream(class_name: &str) -> bool {
+    matches!(
+        class_name,
+        "java/util/stream/Stream"
+            | "java/util/stream/IntStream"
+            | "java/util/stream/LongStream"
+            | "java/util/stream/DoubleStream"
+    )
+}
+
 /// Mutable variant of stream_elements that can invoke virtual methods.
 fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Value> {
     let class_id = ctx.class_id_of_object(stream);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-    let is_synthetic = class_name == "java/util/stream/Stream";
+    let is_synthetic = is_synthetic_stream(&class_name);
     if is_synthetic {
         if let Value::Object(Some(arr)) = ctx.get_field(stream, STREAM_FIELD_ELEMENTS) {
             let len = ctx.array_length(arr);
@@ -7987,6 +8007,12 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         c,
+        "joining",
+        "(Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/util/stream/Collector;",
+        native_collectors_joining_full,
+    );
+    r.register(
+        c,
         "counting",
         "()Ljava/util/stream/Collector;",
         native_collectors_counting,
@@ -8126,6 +8152,21 @@ fn native_collectors_joining_delim(
     let c = make_collector(ctx, COLLECTOR_TAG_JOINING_DELIM);
     let delim = args.first().copied().unwrap_or(Value::Object(None));
     ctx.set_field(c, COLLECTOR_FIELD_ARG1, delim);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+/// `Collectors.joining(delimiter, prefix, suffix)` — captures all three so the
+/// JOINING_DELIM application can wrap the joined elements. Without this the
+/// 3-arg overload fell through to real JDK bytecode that produced an opaque
+/// `Collector` the native `collect()` terminal didn't recognise → "".
+fn native_collectors_joining_full(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_JOINING_DELIM);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, args.first().copied().unwrap_or(Value::Object(None)));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, args.get(1).copied().unwrap_or(Value::Object(None)));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG3, args.get(2).copied().unwrap_or(Value::Object(None)));
     Ok(Some(Value::Object(Some(c))))
 }
 
@@ -8376,15 +8417,26 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             Ok(Some(Value::Object(Some(s))))
         }
         COLLECTOR_TAG_JOINING_DELIM => {
-            let delim_str = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
-                Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
-                _ => String::new(),
+            let read = |ctx: &dyn NativeContext, field: usize| -> String {
+                match ctx.get_field(collector, field) {
+                    Value::Object(Some(r)) => ctx.read_string(r).unwrap_or_default(),
+                    _ => String::new(),
+                }
             };
+            let delim_str = read(ctx, COLLECTOR_FIELD_ARG1);
+            // ARG2 = prefix, ARG3 = suffix for the 3-arg
+            // `Collectors.joining(delimiter, prefix, suffix)`. They are unset
+            // (→ "") for the 1-arg `joining(delimiter)` form, so the same arm
+            // serves both. Previously the 3-arg form wasn't registered at all
+            // and prefix/suffix were ignored, so e.g.
+            // `joining(",","[","]")` produced "" instead of "[1,2,3]".
+            let prefix = read(ctx, COLLECTOR_FIELD_ARG2);
+            let suffix = read(ctx, COLLECTOR_FIELD_ARG3);
             let mut parts = Vec::with_capacity(elements.len());
             for elem in &elements {
                 parts.push(obj_to_display_string(ctx, elem));
             }
-            let joined = parts.join(&delim_str);
+            let joined = format!("{}{}{}", prefix, parts.join(&delim_str), suffix);
             let s = ctx.create_string(&joined);
             Ok(Some(Value::Object(Some(s))))
         }
