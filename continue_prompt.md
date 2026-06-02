@@ -895,14 +895,21 @@ All items below are **committed on `dev`** (commits `aa6d231`, `3229e28`,
 
 ### OPEN / TO RE-VERIFY (build lock was held by a concurrent session)
 - **jit `differential_double_{sum,product}_loop_matches_host`** — pre-existing
-  (fails on `0744269`): JIT double-accumulation loops return `0.0`. The
-  `JIT inliner/IR-gate` fix in `e0ecdc4` (x64.rs operand-stack slot allocation)
-  **likely fixes this** — re-run `cargo test -p cratonvm-jit --test differential`
-  to confirm.
+  (fails on `0744269`). **RE-VERIFIED 2026-06-02 against dev tip `e0ecdc4`:
+  still FAILS** (the JIT inliner/IR-gate fix did NOT address it). Precise
+  characterization: `diagnostic_int_sum_loop` **passes** (int accumulation loop
+  → 45 OK), but the double sum (→45) and product (→720) loops both return
+  **`0.0`** — the double accumulator stays at its initial value. ⇒ **real JIT
+  codegen bug in category-2 (double) local load/store across a loop**
+  (`dstore_0`/`dload_0`, opcodes 0x47/0x26 etc.; emit sites in `x64.rs`). Any
+  JIT-compiled double accumulation (DoubleStream, numeric loops) is affected.
+  This is in the active real-RAF JIT owner's domain — fix on an isolated branch
+  to avoid collision.
 - **native-builtins `aot_pipeline::integration_{aot_profile,cds}_roundtrip`** —
-  pre-existing **parallel-flaky** under `--workspace` (`experimental-aot`
-  feature; pass in isolation). CDS/temp-file global-state race — needs a shared
-  test lock / unique temp path.
+  **RE-VERIFIED 2026-06-02: pass in isolation** (`--features experimental-aot
+  --test-threads=1`). NOT a real failure — only **parallel-flaky** under
+  `--workspace` (CDS/temp-file global-state race). Needs a shared test lock /
+  unique temp path if `--workspace` test runs must be green.
 - **vm integration (89 files): 349 passed / 48 failed** before a hang on
   `driver_discovered_from_jar_on_classpath` (spawns real `java`, hung holding
   the cargo lock). The 48 are dominated by WIP-JVM feature gaps (`clinit_*`,
