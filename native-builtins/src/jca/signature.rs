@@ -607,6 +607,12 @@ fn sig_get_provider_null(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 // ---------------------------------------------------------------------------
 
 pub fn register(r: &mut NativeMethodRegistry) {
+    // Real-JCA bring-up: skip the synthetic Signature short-circuit so
+    // Signature.getInstance falls through to the real JDK 25 + BouncyCastle
+    // provider bytecode operating on concrete BC keys.
+    if crate::real_jca_mode() {
+        return;
+    }
     let cls = "java/security/Signature";
 
     r.register(cls, "getInstance", "(Ljava/lang/String;)Ljava/security/Signature;", sig_get_instance);

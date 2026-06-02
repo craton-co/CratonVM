@@ -608,6 +608,13 @@ fn clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResul
 // ---------------------------------------------------------------------------
 
 pub fn register(r: &mut NativeMethodRegistry) {
+    // Real-JCA bring-up: skip these synthetic short-circuit shims so
+    // KeyPairGenerator/KeyFactory.getInstance fall through to the real
+    // JDK 25 + BouncyCastle provider bytecode (yields concrete BCEC/BCRSA
+    // keys instead of bare-interface `java/security/PrivateKey` synthetics).
+    if crate::real_jca_mode() {
+        return;
+    }
     let kpg = "java/security/KeyPairGenerator";
     r.register(kpg, "getInstance", "(Ljava/lang/String;)Ljava/security/KeyPairGenerator;", kpg_get_instance);
     r.register(

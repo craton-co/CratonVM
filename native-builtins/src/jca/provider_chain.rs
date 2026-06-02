@@ -1012,6 +1012,139 @@ fn provider_service_get_class_name(ctx: &mut dyn NativeContext, args: &[Value]) 
     Ok(Some(ctx.get_field(this, 3)))
 }
 
+// ---------------------------------------------------------------------------
+// Real-JCA bring-up — `sun.security.jca.GetInstance` bridge + reflective
+// `Provider$Service.newInstance`.
+//
+// In real-JCA mode (CRATONVM_REAL_JCA) the synthetic KeyPairGenerator /
+// KeyFactory / Signature short-circuits in `jca::key_factory` / `jca::signature`
+// are NOT registered, so `KeyPairGenerator.getInstance(alg, "BC")` runs the
+// real JDK 25 bytecode. That bytecode reaches
+// `sun.security.jca.GetInstance.getService(type, algorithm, provider)`, which
+// does `Providers.getProviderList().getProvider(provider)` — but our
+// `Providers` shim returns null, so the JDK NPEs before it ever consults a
+// `Provider`.
+//
+// These natives intercept `GetInstance.getService` (the documented entry point
+// for `getInstance(type, clazz, algorithm, provider)`) and resolve the Service
+// straight from OUR provider service map — the same map BouncyCastle populated
+// via `Provider.put` / `parseLegacyPut`. The returned `Provider$Service` carries
+// the real BC implementation class name; the real JDK bytecode then calls
+// `service.newInstance(null)`, which our `provider_service_new_instance` native
+// reflectively instantiates (real BC `*Spi`), so the *real* BC keygen/sign
+// bytecode runs and yields concrete `BCECPrivateKey` / `BCRSAPublicKey`
+// instances. No synthetic key material is fabricated here — these are pure
+// JDK-bridge natives that route service resolution through our chain.
+// ---------------------------------------------------------------------------
+
+/// Build a `Provider$Service` for `(provider, type, algorithm)` from the global
+/// service map, or `None` if the provider has no such entry. Materialises a
+/// fresh `Provider` synthetic to attach as the service's owning provider.
+fn resolve_service(
+    ctx: &mut dyn NativeContext,
+    provider: &str,
+    type_str: &str,
+    algo: &str,
+) -> Option<ObjectRef> {
+    let entry = get_service_entry(provider, type_str, algo)?;
+    let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
+    let prov_obj = make_provider(ctx, provider, ver, coverage);
+    Some(make_service(ctx, &entry, prov_obj))
+}
+
+/// `sun.security.jca.GetInstance.getService(String type, String algorithm,
+/// String provider)` — provider-qualified resolution. Returns our
+/// `Provider$Service` synthetic, or throws `NoSuchAlgorithmException`
+/// (matching the JDK contract) when the provider has no matching entry.
+fn getinstance_get_service_provider(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let type_str = read_arg_string(ctx, args, 0);
+    let algo = read_arg_string(ctx, args, 1);
+    let provider = read_arg_string(ctx, args, 2);
+    match resolve_service(ctx, &provider, &type_str, &algo) {
+        Some(svc) => Ok(Some(Value::Object(Some(svc)))),
+        None => Err(cratonvm_types::error::RuntimeError::NotImplemented {
+            feature: format!(
+                "no {type_str} {algo} implementation registered for provider {provider}"
+            ),
+        }
+        .into()),
+    }
+}
+
+/// `sun.security.jca.GetInstance.getService(String type, String algorithm)` —
+/// no-provider form: walk our provider chain in order and return the first
+/// match (mirrors `ProviderList.getService`).
+fn getinstance_get_service_search(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let type_str = read_arg_string(ctx, args, 0);
+    let algo = read_arg_string(ctx, args, 1);
+    for (name, _, _) in snapshot() {
+        if let Some(svc) = resolve_service(ctx, &name, &type_str, &algo) {
+            return Ok(Some(Value::Object(Some(svc))));
+        }
+    }
+    Err(cratonvm_types::error::RuntimeError::NotImplemented {
+        feature: format!("no {type_str} {algo} implementation registered in any provider"),
+    }
+    .into())
+}
+
+/// `java.security.Provider$Service.newInstance(Object constructorParameter)` —
+/// reflectively instantiate the entry's implementation class (a real BC `*Spi`)
+/// and run its no-arg constructor, so the genuine provider bytecode produces the
+/// SPI object the JDK's `GetInstance.getInstance(Service, clazz)` then wraps.
+fn provider_service_new_instance(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let class_name = {
+        let by_name = ctx.get_field_by_name(this, "className");
+        let raw = match by_name {
+            Value::Object(Some(s)) => Some(s),
+            _ => match ctx.get_field(this, 3) {
+                Value::Object(Some(s)) => Some(s),
+                _ => None,
+            },
+        };
+        match raw.and_then(|s| ctx.read_string(s)) {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                return Err(cratonvm_types::error::RuntimeError::NotImplemented {
+                    feature: "Provider$Service.newInstance with no className".into(),
+                }
+                .into())
+            }
+        }
+    };
+    let internal = class_name.replace('.', "/");
+    // Allocate + run the no-arg constructor (real BC SPI bytecode).
+    let obj = match ctx.new_object(&internal)? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                class_name: class_name.clone(),
+            }
+            .into())
+        }
+    };
+    ctx.invoke(&internal, "<init>", "()V", &[Value::Object(Some(obj))])?;
+    Ok(Some(Value::Object(Some(obj))))
+}
+
+/// Helper: read an argument as a Rust String (empty if null / not a String).
+fn read_arg_string(ctx: &mut dyn NativeContext, args: &[Value], idx: usize) -> String {
+    match args.get(idx) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 #[cfg(test)]
 static TEST_SERVICE_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -1078,24 +1211,30 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     // moves on to the next algorithm immediately.  EC support is not
     // registered, but the provider chain continues normally and downstream
     // WildFly subsystems initialize.
-    r.register(
-        "org/bouncycastle/jcajce/provider/asymmetric/EC",
-        "<clinit>",
-        "()V",
-        clinit_noop,
-    );
-    r.register(
-        "org/bouncycastle/jcajce/provider/asymmetric/EC$Mappings",
-        "<clinit>",
-        "()V",
-        clinit_noop,
-    );
-    r.register(
-        "org/bouncycastle/jcajce/provider/asymmetric/EC$Mappings",
-        "configure",
-        "(Lorg/bouncycastle/jcajce/provider/config/ConfigurableProvider;)V",
-        clinit_noop,
-    );
+    // Real-JCA bring-up: when CRATONVM_REAL_JCA is set we WANT BC's EC
+    // asymmetric provider to configure for real (so EC services register and
+    // KeyPairGenerator/Signature("EC","BC") resolve real BC SPIs). Skip these
+    // no-ops in that mode; the WildFly-era no-ops stay the default.
+    if !crate::real_jca_mode() {
+        r.register(
+            "org/bouncycastle/jcajce/provider/asymmetric/EC",
+            "<clinit>",
+            "()V",
+            clinit_noop,
+        );
+        r.register(
+            "org/bouncycastle/jcajce/provider/asymmetric/EC$Mappings",
+            "<clinit>",
+            "()V",
+            clinit_noop,
+        );
+        r.register(
+            "org/bouncycastle/jcajce/provider/asymmetric/EC$Mappings",
+            "configure",
+            "(Lorg/bouncycastle/jcajce/provider/config/ConfigurableProvider;)V",
+            clinit_noop,
+        );
+    }
 
     // WP6.5 finish: service-map population + lookup.
     //
@@ -1141,6 +1280,32 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         provider_service_get_class_name,
     );
+
+    // Real-JCA bring-up: bridge `sun.security.jca.GetInstance.getService` to our
+    // provider service map, and instantiate real provider SPIs reflectively.
+    // Only wired in real-JCA mode — in synthetic mode the key_factory/signature
+    // short-circuits handle getInstance and these would never be reached.
+    if crate::real_jca_mode() {
+        let gi = "sun/security/jca/GetInstance";
+        r.register(
+            gi,
+            "getService",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Ljava/security/Provider$Service;",
+            getinstance_get_service_provider,
+        );
+        r.register(
+            gi,
+            "getService",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/Provider$Service;",
+            getinstance_get_service_search,
+        );
+        r.register(
+            svc,
+            "newInstance",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            provider_service_new_instance,
+        );
+    }
 
     let sec = "java/security/Security";
     r.register(sec, "getProviders", "()[Ljava/security/Provider;", security_get_providers);
