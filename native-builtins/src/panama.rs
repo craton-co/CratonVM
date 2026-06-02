@@ -2690,6 +2690,32 @@ fn r3_get_input_stream(ctx: &dyn NativeContext, buffered_reader: ObjectRef) -> O
 mod tests {
     use super::*;
 
+    // FIX(test): RAII guard that enables the process-wide native-access gate
+    // for the duration of a downcall test and restores the previous value on
+    // drop (even on panic). The Panama implementation is secure-by-default
+    // (`NATIVE_ACCESS_ENABLED == false`), so tests that exercise the real
+    // downcall machinery (abs/strlen/snprintf/…) must grant native access
+    // first or `validated_fn_ptr` denies them with an IllegalCallerException.
+    // Using a guard (rather than a bare set/reset pair) keeps the global flag
+    // from leaking into sibling tests — leaked state is what causes the
+    // order-dependent flakiness this fix addresses. The production gate is
+    // unchanged; only the test scope flips the flag.
+    struct NativeAccessGuard {
+        prev: bool,
+    }
+    impl NativeAccessGuard {
+        fn enable() -> Self {
+            let prev = native_access_enabled();
+            set_native_access_enabled(true);
+            NativeAccessGuard { prev }
+        }
+    }
+    impl Drop for NativeAccessGuard {
+        fn drop(&mut self) {
+            set_native_access_enabled(self.prev);
+        }
+    }
+
     #[test]
     fn test_linker_native_call_convention() {
         // Verify calling convention for downcalls
@@ -3190,6 +3216,8 @@ mod tests {
     fn test_85_3_downcall_strlen() {
         // Call C strlen through the downcall mechanism
         let mut ctx = mock_ctx();
+        // FIX(test): grant native access for the real libffi downcall.
+        let _na = NativeAccessGuard::enable();
 
         // Look up strlen
         let strlen_addr = ctx.find_native_symbol(-1, "strlen");
@@ -3239,6 +3267,8 @@ mod tests {
     fn test_85_3_downcall_abs() {
         // Call C abs() — int abs(int)
         let mut ctx = mock_ctx();
+        // FIX(test): grant native access for the real libffi downcall.
+        let _na = NativeAccessGuard::enable();
 
         let abs_addr = ctx.find_native_symbol(-1, "abs");
         if abs_addr.is_none() { return; }
@@ -3284,6 +3314,8 @@ mod tests {
         use std::sync::atomic::Ordering;
 
         let mut ctx = mock_ctx();
+        // FIX(test): grant native access for the real libffi downcall.
+        let _na = NativeAccessGuard::enable();
         let abs_addr = ctx.find_native_symbol(-1, "abs");
         if abs_addr.is_none() {
             // Platform without symbol lookup — skip.
@@ -3412,6 +3444,8 @@ mod tests {
         // Call a function with void return — use memset (returns void* but we treat it as void)
         // Actually, let's use a simpler approach: call abs with void descriptor
         let mut ctx = mock_ctx();
+        // FIX(test): grant native access for the real libffi downcall.
+        let _na = NativeAccessGuard::enable();
 
         // We'll test that a downcall with -1 return kind produces Value::Object(None)
         let abs_addr = ctx.find_native_symbol(-1, "abs");
@@ -3584,6 +3618,8 @@ mod tests {
             a + b + c + d + e + f + g + h + i + j + k + l
         }
         let mut ctx = mock_ctx();
+        // FIX(test): grant native access for the real libffi downcall.
+        let _na = NativeAccessGuard::enable();
         let fn_addr = sum12 as usize as i64;
 
         // Build descriptor: int(int,int,int,int,int,int,int,int,int,int,int,int)
@@ -3625,6 +3661,8 @@ mod tests {
             a as f64 + b + c as f64 + d as f64
         }
         let mut ctx = mock_ctx();
+        // FIX(test): grant native access for the real libffi downcall.
+        let _na = NativeAccessGuard::enable();
         let fn_addr = mix as usize as i64;
 
         let ret_layout = make_layout(&mut ctx, LAYOUT_DOUBLE);
@@ -3674,6 +3712,9 @@ mod tests {
         // Look up snprintf — present on every supported platform. On
         // MSVC Windows the symbol is named `snprintf` in ucrt.
         let mut ctx = mock_ctx();
+        // FIX(test): grant native access for the real libffi downcall (keeps
+        // this test from depending on a sibling having left the gate open).
+        let _na = NativeAccessGuard::enable();
         let snprintf_addr = match ctx.find_native_symbol(-1, "snprintf") {
             Some(a) => a as i64,
             None => return, // platform without symbol lookup → skip

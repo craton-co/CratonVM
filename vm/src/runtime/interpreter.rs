@@ -9762,11 +9762,6 @@ fn execute_invoke_kind(
     // Wrapped in an RAII guard so nested invokes restore the parent's slot.
     let _cp_iface_guard = crate::vm::PendingCpIfaceGuard::new(cp_resolved_class_id);
 
-    if std::env::var_os("CRATONVM_DBG_ITRREM").is_some() && &*method_name == "remove" && &*method_descriptor == "()V" {
-        eprintln!("[ITRREM execute_invoke_kind] invoke_class={} is_interface={}",
-                  &*invoke_class, is_interface);
-    }
-
     if let Some(res) = intercept_force_registered_native(
         shared,
         thread,
@@ -10910,44 +10905,9 @@ fn intercept_force_registered_native(
     if !force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor) {
         return None;
     }
-    let cb = match shared
+    let cb = shared
         .native_methods
-        .find(class_name, method_name, method_descriptor)
-    {
-        Some(cb) => cb,
-        None => {
-            // `class_name` here is the *resolved* (often interface) class — e.g.
-            // `java/util/Iterator` for `invokeinterface Iterator.remove()V`. The
-            // concrete native lives on the receiver's ACTUAL class (our synthetic
-            // `LinkedList$Itr` / `HashMap$KeyItr` / array-iterator overlays), not
-            // on the interface. Without this fallback, `Iterator.remove()`
-            // resolves to the throwing interface DEFAULT method even though the
-            // receiver class registers a working native `remove()` — the avrora
-            // real-RAF digest mismatch (`LinkedList.iterator().remove()` →
-            // `UnsupportedOperationException: remove`, polluting System.err).
-            // Route by receiver class so a registered receiver-class native beats
-            // the interface default. Only reached when `force_native_*` is true
-            // AND the interface-class lookup missed, so existing force cases
-            // (URL.getHost, ConstantCallSite.getTarget, …) are unaffected.
-            let recv_cb = match args.first() {
-                Some(Value::Object(Some(obj))) => {
-                    let cid = shared.heap.class_id_of(*obj);
-                    let rname = shared
-                        .class_manager
-                        .read()
-                        .get_class(cid)
-                        .map(|c| c.name.to_string());
-                    rname.and_then(|n| {
-                        shared
-                            .native_methods
-                            .find(&n, method_name, method_descriptor)
-                    })
-                }
-                _ => None,
-            };
-            recv_cb?
-        }
-    };
+        .find(class_name, method_name, method_descriptor)?;
     if method_name == "getTarget" && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some() {
         eprintln!("[ccs-probe] intercept_force_registered_native: dispatching native callback");
     }
@@ -11169,10 +11129,6 @@ fn try_stackless_invoke(
     if crate::runtime::env_cache::bd_debug() && (method_name == "intValue" || (class_name.contains("BigDecimal") && (method_name == "<init>" || method_name == "intValue"))) {
         eprintln!("[try_stackless_invoke] class_name={} method={} desc={} native_cb={} walk_native={}",
                   class_name, method_name, descriptor, native_cb.is_some(), walk_native_hierarchy);
-    }
-    if std::env::var_os("CRATONVM_DBG_ITRREM").is_some() && method_name == "remove" && descriptor == "()V" {
-        eprintln!("[ITRREM try_stackless] class_name={} native_cb={} walk_native={}",
-                  class_name, native_cb.is_some(), walk_native_hierarchy);
     }
     if let Some(callback) = native_cb {
         let result = safe_native_call(shared, thread, callback, args)?;

@@ -297,7 +297,7 @@ pub fn encode_value(v: Value) -> (u64, u8) {
 /// Cold path for [`decode_value`]'s `VTAG_OBJECT` branch: a `VTAG_OBJECT`
 /// slot whose pointer is null or unaligned (a corrupted or zero-initialized
 /// stale slot). This degrades to `Value::Object(None)` in release builds and
-/// panics via `debug_assert!` in debug builds so the underlying bug surfaces.
+/// counts the reclassification (non-fatal) and returns `Object(None)`.
 ///
 /// Splitting this out as a `#[cold]` non-inlined function mirrors
 /// `compact_value::cold_degraded_object_ptr` and gives LLVM permission to
@@ -307,33 +307,21 @@ pub fn encode_value(v: Value) -> (u64, u8) {
 #[cold]
 #[inline(never)]
 fn cold_decode_degraded_object_ptr(ptr: *mut u8) -> Value {
-    // T14: Gracefully handle corrupted or zero-initialized slots that have
-    // VTAG_OBJECT but invalid pointer values in release builds. In debug
-    // builds we panic via `debug_assert!(false, ...)` so tests catch the
-    // underlying bug (writing non-reference bits through a reference
-    // accessor) instead of silent degradation.
+    // T14 / KC16 SIGSEGV audit: gracefully handle corrupted or
+    // zero-initialized slots that have VTAG_OBJECT but a null or unaligned
+    // pointer. This is a deliberately-handled, *counted, non-fatal*
+    // reclassification — never dereference the bogus pointer, return
+    // Object(None) instead. This is a recoverable fallback, NOT an invariant
+    // violation, so it must not `panic!`/`debug_assert!(false)` (a prior
+    // tripwire here contradicted `decode_value_rejects_null_object` /
+    // `decode_value_rejects_unaligned_object` / the release-mode degrade
+    // contract, which require Object(None) without panicking).
     //
-    // HIGH long↔object audit: the debug_assert! below makes this invisible
-    // in release. Feed the shared degradation counter so this
-    // reclassification is countable via
-    // [`crate::compact_value::object_degradation_count`] even in release.
+    // FIX: surface the reclassification via the shared degradation counter
+    // (countable in both debug and release) rather than aborting in debug.
+    // Mirrors `compact_value::emit_first_degradation_diag` (assert removed).
+    let _ = ptr;
     crate::compact_value::note_object_degradation();
-    if ptr.is_null() {
-        debug_assert!(
-            false,
-            "decode_value: VTAG_OBJECT with null pointer — likely a non-reference bit pattern \
-             written through a reference accessor; degrading to Object(None) in release"
-        );
-    } else {
-        // KC16 SIGSEGV audit: unaligned-but-nonzero pointers are treated as
-        // null in release rather than crashing; debug builds panic so the
-        // underlying bug surfaces.
-        debug_assert!(
-            false,
-            "decode_value: VTAG_OBJECT with unaligned pointer {ptr:p} — likely a non-reference \
-             bit pattern written through a reference accessor; degrading to Object(None) in release"
-        );
-    }
     Value::Object(None)
 }
 

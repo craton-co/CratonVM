@@ -9951,6 +9951,15 @@ pub(crate) fn native_class_get_protection_domain0(
         return Ok(Some(Value::Object(None)));
     }
 
+    // FIX: Preserve the original, untransformed code-base URL string (e.g.
+    // `file:/opt/app.jar`). The transforms below rewrite `code_base` into a
+    // HotSpot-style filesystem path for the synthetic `java.net.URL` object,
+    // which loses the source URL. `CodeSource.location` (slot 0 / the
+    // `location` field) must carry the load URL itself — `getCodeSource()
+    // .getLocation()` callers and our tests read it as the code base URL,
+    // not a derived path.
+    let location_url = code_base.clone();
+
     // Nested JAR `code_source` is `jar:file:/outer.jar!/inner.jar`. Spring's
     // `Archive.create(File)` requires the outer filesystem path only.
     let code_base = if let Some(rest) = code_base.strip_prefix("jar:file:") {
@@ -10000,7 +10009,15 @@ pub(crate) fn native_class_get_protection_domain0(
     // Slot-based writes cover the synthetic layout; name-based writes
     // cover the real-JDK-loaded layout. At least one lands on the right
     // slot for each mode.
-    ctx.set_field(cs, 0, Value::Object(Some(url_obj)));
+    //
+    // FIX: The synthetic `CodeSource` layout exposes the load URL as a
+    // String in slot 0 (this is what `getCodeSource().getLocation()` style
+    // callers and the T19.N1 test read). Populate it with the real code base
+    // URL (`location_url`) instead of leaving it empty / a bare URL object.
+    let location_str = ctx.create_string(&location_url);
+    ctx.set_field(cs, 0, Value::Object(Some(location_str)));
+    // Real-JDK `CodeSource.location` is typed `java.net.URL`; the name-based
+    // write targets that layout with the constructed URL object.
     ctx.set_field_by_name(cs, "location", Value::Object(Some(url_obj)));
 
     // Attach signer certs as fresh byte[] copies on slot 1.

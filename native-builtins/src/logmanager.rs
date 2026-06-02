@@ -157,6 +157,45 @@ fn is_valid_logger_name(name: &str) -> bool {
     true
 }
 
+/// SECURITY FIX: Validate a JVM *internal* (binary) class name in its
+/// slash-separated form (e.g. `com/example/MyConfig`). This is distinct
+/// from `is_valid_logger_name`, which validates dotted logger names and
+/// therefore cannot be reused here: by the time the LogManager property
+/// has been converted to internal form, every `.` (including the dots of
+/// a `..` traversal token) has already become `/`, so a path-traversal /
+/// absolute-path payload would slip past the dotted-form `../` check.
+///
+/// A name is accepted only if ALL hold:
+///   * non-empty and <= 512 chars (resource guardrail),
+///   * contains no ASCII control char (< 0x20 or == 0x7F) and no NUL,
+///   * contains no `\` or `:` (Windows separator / drive-letter / URL),
+///   * splits on `/` into one or more segments where every segment is
+///     non-empty (rejects leading/trailing `/` and empty `//` segments,
+///     i.e. absolute paths like `/////////etc/passwd`) and no segment is
+///     `.` or `..` (rejects `../../../etc/passwd`-style traversal).
+fn is_valid_internal_class_name(internal: &str) -> bool {
+    if internal.is_empty() || internal.len() > 512 {
+        return false;
+    }
+    for ch in internal.chars() {
+        if ch == '\\' || ch == ':' {
+            return false;
+        }
+        if (ch as u32) < 0x20 || ch == '\u{7f}' {
+            return false;
+        }
+    }
+    // Every `/`-separated segment must be a real identifier-ish token:
+    // non-empty (no leading/trailing/double slash) and not a `.`/`..`
+    // filesystem relative-path component.
+    for segment in internal.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return false;
+        }
+    }
+    true
+}
+
 /// Rebuild an `ObjectRef` from a raw u64 address.
 ///
 /// # Safety
@@ -224,10 +263,18 @@ fn try_allocate_property_log_manager(ctx: &mut dyn NativeContext) -> Option<Obje
         return None;
     }
 
-    // Sanity-check the class name — reject obvious traversal / control
-    // bytes so a hostile property value can't drag the unified loader
-    // into a path it shouldn't probe.
-    if !is_valid_logger_name(&internal) {
+    // SECURITY FIX: validate the *class name* with a dedicated
+    // class-name validator, NOT `is_valid_logger_name`. The previous code
+    // ran `is_valid_logger_name(&internal)` against the already
+    // slash-converted form, so a traversal payload like
+    // `../../../etc/passwd` had its dots rewritten to slashes
+    // (`/////////etc/passwd`) *before* the `../` substring check ran —
+    // defeating the check and letting an absolute filesystem-like path
+    // through as a "class name". A valid binary/internal class name has no
+    // leading/trailing/empty segments and no `.`/`..` segments, so
+    // `is_valid_internal_class_name` rejects such payloads outright and we
+    // fall back to the JDK default.
+    if !is_valid_internal_class_name(&internal) {
         tracing::warn!(
             class = %dotted,
             "java.util.logging.manager: rejecting suspicious class name"

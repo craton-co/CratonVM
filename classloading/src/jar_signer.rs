@@ -33,7 +33,7 @@
 //! * Reject (return `None`) for ANY parse error, truncation, OID mismatch,
 //!   or digest mismatch — never panic.
 //!
-//! # What is real now (tasks #1 + #40)
+//! # What is real now (tasks #1 + #40 + jar-signer crypto)
 //!
 //! * **RSA public-key signature verification (PKCS#1 v1.5,
 //!   SHA-1/256/384/512).**  The SignerInfo signature over the DER-encoded
@@ -46,6 +46,33 @@
 //!   here (that crate depends on `classloading`, so importing it back
 //!   would form a build cycle), and the workspace lock has no standalone
 //!   `rsa` / `num-bigint` crate to reuse.
+//! * **ECDSA signature verification (P-256 / P-384, SHA-256/384/512).**
+//!   FEAT(jar-signer): the SignerInfo signature and each X.509 chain
+//!   link signed with `ecdsa-with-SHA*` are verified with the audited
+//!   RustCrypto `ecdsa` + `p256` / `p384` crates.  The curve is recovered
+//!   from the SPKI `id-ecPublicKey` named-curve parameter; the wire
+//!   signature is the DER `SEQUENCE { r, s }` form CMS / X.509 emit.
+//! * **DSA (DSS) signature verification.**  FEAT(jar-signer): legacy
+//!   `*.DSA` signer blocks and DSA-signed chain links are verified with
+//!   the RustCrypto `dsa` crate.  The `(p, q, g)` domain parameters and
+//!   the public value `y` are parsed from the SPKI; the signature is the
+//!   DER `SEQUENCE { r, s }` form.  SHA-1 and SHA-256 DSA digests are
+//!   supported (`id-dsa-with-sha1`, `id-dsa-with-sha256`).
+//! * **RFC 5280 certification-path validation.**  FEAT(jar-signer):
+//!   [`verify_chain`] now enforces, in addition to signature-link and
+//!   validity-window checks: name-chaining (each cert's issuer DN must
+//!   equal its parent's subject DN — already present), BasicConstraints
+//!   (a present `cA=false` on a cert used to certify another is rejected;
+//!   `pathLenConstraint` is honoured against the count of intervening
+//!   non-self-issued CAs), KeyUsage (a CA cert with KeyUsage MUST assert
+//!   `keyCertSign`; a leaf with KeyUsage MUST assert `digitalSignature`),
+//!   and ExtendedKeyUsage (a leaf with an EKU MUST include
+//!   `id-kp-codeSigning` or `anyExtendedKeyUsage`).  Unknown *critical*
+//!   extensions on any cert cause rejection (fail-closed, RFC 5280
+//!   §6.1.4 (f)).  Extensions are parsed with the audited `x509-cert`
+//!   crate.  Posture for *absent* extensions is enforce-if-present (a
+//!   legacy cert that omits BasicConstraints / KeyUsage is not rejected
+//!   for the omission), matching stock HotSpot jarsigner.
 //! * **Trust-store loading.**  [`TrustStore::load_default`] reads, in
 //!   priority order: the `javax.net.ssl.trustStore` sys-prop (PEM, JKS,
 //!   or PKCS#12 — auto-detected), a `CRATONVM_TRUST_PEM` PEM bundle, an
@@ -59,19 +86,26 @@
 //!   window against wall-clock time, and refuses any leaf with no path to
 //!   a trust anchor.  Fail-closed throughout.
 //!
-//! # Out of scope — `TODO(post-orchestrator)`
+//! # Residual gaps — precisely documented (fail-closed for all)
 //!
-//! * **ECDSA / DSA signature verification.**  Elliptic-curve point
-//!   arithmetic is not reachable here without porting ~350 lines of P-256
-//!   field math or adding a brand-new `p256`/`ecdsa` external dependency
-//!   (neither is in the workspace lock; the task forbids new deps).  EC
-//!   signature algorithms are *recognised* but surface as
-//!   [`TrustError::NotImplemented`] / a verification failure — fail-closed.
-//!   Follow-up: hoist `cratonvm-native-builtins::crypto_impl`'s EC code
-//!   into a shared crate (`cratonvm-crypto-core`) and call it here.
-//! * **Full RFC 5280 path constraints.**  We verify link signatures and
-//!   validity dates; BasicConstraints / KeyUsage / name constraints /
-//!   revocation (CRL / OCSP) are a documented follow-up.
+//! * **Revocation checking (CRL / OCSP).**  RFC 5280 §6.3 revocation is
+//!   NOT performed: a cert that chains and is in-validity is accepted
+//!   even if its issuer has since revoked it.  This matches stock
+//!   HotSpot jarsigner behaviour absent an explicit `-revCheck`, and
+//!   revocation needs network I/O the classloader deliberately avoids.
+//! * **NameConstraints / PolicyConstraints / policy mapping.**  RFC 5280
+//!   §6.1.4 name-constraint and certificate-policy processing is not
+//!   implemented.  Because an unprocessed `nameConstraints` is the only
+//!   RFC-5280 extension whose *absence of enforcement* could broaden
+//!   trust, and CAs mark it critical, such a chain is **rejected** by the
+//!   unknown-critical-extension gate (fail-closed) rather than silently
+//!   accepted.
+//! * **DSA digests beyond SHA-1 / SHA-256.**  `id-dsa-with-sha224` and
+//!   the SHA-384/512 DSA OIDs are recognised but rejected as
+//!   unsupported (real DSA-signed JARs only use SHA-1 / SHA-256).
+//! * **EC curves beyond P-256 / P-384.**  P-521, the Brainpool curves,
+//!   and explicit-parameter EC keys surface as unsupported (no JAR
+//!   signer in the wild uses them).
 //! * **Multiple-signer SignerInfo dispatch.**  We only verify the first
 //!   `SignerInfo`; multi-signer JARs (rare) collapse to "first signer
 //!   verified".
@@ -1024,12 +1058,11 @@ mod sha2ext {
 // here is the correct and safe reachable implementation (it mirrors the
 // math `native-builtins::crypto_impl::Rsa::verify_sha256` performs).
 //
-// ECDSA verification requires elliptic-curve point arithmetic that is NOT
-// reachable without either porting ~350 lines of P-256 field math or
-// adding a brand-new `p256`/`ecdsa` external dependency (forbidden by the
-// task constraints — neither crate is in the workspace lock).  ECDSA
-// therefore surfaces as `TrustError::NotImplemented` / `SigVerify::
-// Unsupported`, which keeps the module fail-closed.  See the REPORT.
+// FEAT(jar-signer): ECDSA (P-256 / P-384) and DSA verification are now
+// real, delegated to the audited RustCrypto `ecdsa` + `p256` / `p384` and
+// `dsa` crates respectively.  Only RSA stays on the in-module `BigUint`
+// (it has no external `rsa` crate in the lock and the math is pure
+// public-data modexp — no secret-dependent timing concern).
 // ---------------------------------------------------------------------------
 
 /// Minimal unsigned big-integer over little-endian u32 limbs.  Only the
@@ -1246,11 +1279,17 @@ struct RsaPublicKey {
 /// The public-key flavour recovered from a `SubjectPublicKeyInfo`.
 enum PublicKey {
     Rsa(RsaPublicKey),
-    /// Elliptic-curve key — recognised but not verifiable here (no EC point
-    /// arithmetic reachable; see module docs).  Carries the curve OID for
-    /// diagnostics only.
-    EcUnsupported,
-    /// Some other key type we do not handle.
+    /// FEAT(jar-signer): NIST P-256 (secp256r1) EC public key.  Carries the
+    /// full DER `SubjectPublicKeyInfo` so the RustCrypto `p256` decoder can
+    /// re-validate the point on the curve.
+    EcP256(Vec<u8>),
+    /// FEAT(jar-signer): NIST P-384 (secp384r1) EC public key (full SPKI DER).
+    EcP384(Vec<u8>),
+    /// FEAT(jar-signer): DSA (DSS) public key (full SPKI DER); the `dsa`
+    /// crate recovers `(p, q, g, y)` from it.
+    Dsa(Vec<u8>),
+    /// An EC key on a curve we do not verify (P-521, Brainpool, ...), or
+    /// any other key type.  Fail-closed.
     Other,
 }
 
@@ -1277,6 +1316,8 @@ enum SigVerify {
 fn parse_spki(spki_der: &[u8]) -> Result<PublicKey, &'static str> {
     let spki = read_seq_strict(spki_der)?;
     let mut c = Cursor::new(&spki);
+    // The AlgorithmIdentifier carries the key-type OID and, for EC keys,
+    // the named-curve parameter OID; keep the whole SEQUENCE content.
     let alg_seq = c.read_seq_raw()?;
     let alg_oid = first_oid_of_seq(&alg_seq)?;
     let (bitstr, _) = c.read_tlv()?;
@@ -1308,28 +1349,62 @@ fn parse_spki(spki_der: &[u8]) -> Result<PublicKey, &'static str> {
             let k = (n.bit_length() + 7) / 8;
             Ok(PublicKey::Rsa(RsaPublicKey { n, e, k }))
         }
-        // id-ecPublicKey
-        "1.2.840.10045.2.1" => Ok(PublicKey::EcUnsupported),
+        // FEAT(jar-signer): id-ecPublicKey — dispatch on the named-curve
+        // parameter OID inside the AlgorithmIdentifier.
+        "1.2.840.10045.2.1" => match ec_named_curve_oid(&alg_seq) {
+            // prime256v1 / secp256r1 (NIST P-256)
+            Some(ref o) if o == "1.2.840.10045.3.1.7" => {
+                Ok(PublicKey::EcP256(spki_der.to_vec()))
+            }
+            // secp384r1 (NIST P-384)
+            Some(ref o) if o == "1.3.132.0.34" => Ok(PublicKey::EcP384(spki_der.to_vec())),
+            // Any other / absent curve — unsupported, fail-closed.
+            _ => Ok(PublicKey::Other),
+        },
+        // FEAT(jar-signer): id-dsa key OID (1.2.840.10040.4.1).
+        "1.2.840.10040.4.1" => Ok(PublicKey::Dsa(spki_der.to_vec())),
         _ => Ok(PublicKey::Other),
     }
 }
 
-/// Map a signature-algorithm OID to the digest used in its PKCS#1 v1.5
-/// DigestInfo, and whether it is an RSA or EC signature.
+/// Extract the named-curve OID from an `id-ecPublicKey` AlgorithmIdentifier
+/// SEQUENCE content (`SEQUENCE { algorithm OID, namedCurve OID }`).  Returns
+/// `None` if the parameter is absent or is not an OID (e.g. `implicitCurve`
+/// or explicit `ECParameters` — both of which we do not support).
+fn ec_named_curve_oid(alg_seq_content: &[u8]) -> Option<String> {
+    let mut c = Cursor::new(alg_seq_content);
+    let _alg = c.read_oid().ok()?; // id-ecPublicKey
+    c.read_oid().ok()
+}
+
+/// The public-key signature family named by a `signatureAlgorithm` OID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SigFamily {
+    Rsa,
+    Ecdsa,
+    Dsa,
+}
+
+/// Map a signature-algorithm OID to `(digest, family)`.  Returns `None`
+/// for an OID we do not recognise at all (fail-closed upstream).
 ///
-/// Returns `(digest_alg, is_rsa)`.
-fn sig_alg_digest(oid: &str) -> Option<(DigestAlg, bool)> {
+/// FEAT(jar-signer): extended to cover the ECDSA and DSA combined OIDs.
+fn sig_alg_digest(oid: &str) -> Option<(DigestAlg, SigFamily)> {
     match oid {
         // RSA PKCS#1 v1.5
-        "1.2.840.113549.1.1.5" => Some((DigestAlg::Sha1, true)), // sha1WithRSA
-        "1.2.840.113549.1.1.11" => Some((DigestAlg::Sha256, true)), // sha256WithRSA
-        "1.2.840.113549.1.1.12" => Some((DigestAlg::Sha384, true)), // sha384WithRSA
-        "1.2.840.113549.1.1.13" => Some((DigestAlg::Sha512, true)), // sha512WithRSA
+        "1.2.840.113549.1.1.5" => Some((DigestAlg::Sha1, SigFamily::Rsa)), // sha1WithRSA
+        "1.2.840.113549.1.1.11" => Some((DigestAlg::Sha256, SigFamily::Rsa)), // sha256WithRSA
+        "1.2.840.113549.1.1.12" => Some((DigestAlg::Sha384, SigFamily::Rsa)), // sha384WithRSA
+        "1.2.840.113549.1.1.13" => Some((DigestAlg::Sha512, SigFamily::Rsa)), // sha512WithRSA
         // ECDSA
-        "1.2.840.10045.4.1" => Some((DigestAlg::Sha1, false)), // ecdsa-with-SHA1
-        "1.2.840.10045.4.3.2" => Some((DigestAlg::Sha256, false)), // ecdsa-with-SHA256
-        "1.2.840.10045.4.3.3" => Some((DigestAlg::Sha384, false)), // ecdsa-with-SHA384
-        "1.2.840.10045.4.3.4" => Some((DigestAlg::Sha512, false)), // ecdsa-with-SHA512
+        "1.2.840.10045.4.1" => Some((DigestAlg::Sha1, SigFamily::Ecdsa)), // ecdsa-with-SHA1
+        "1.2.840.10045.4.3.2" => Some((DigestAlg::Sha256, SigFamily::Ecdsa)), // ecdsa-with-SHA256
+        "1.2.840.10045.4.3.3" => Some((DigestAlg::Sha384, SigFamily::Ecdsa)), // ecdsa-with-SHA384
+        "1.2.840.10045.4.3.4" => Some((DigestAlg::Sha512, SigFamily::Ecdsa)), // ecdsa-with-SHA512
+        // DSA (DSS).  id-dsa-with-sha1 (1.2.840.10040.4.3) and the NIST
+        // SHA-256 DSA OID (2.16.840.1.101.3.4.3.2).
+        "1.2.840.10040.4.3" => Some((DigestAlg::Sha1, SigFamily::Dsa)), // id-dsa-with-sha1
+        "2.16.840.1.101.3.4.3.2" => Some((DigestAlg::Sha256, SigFamily::Dsa)), // id-dsa-with-sha256
         _ => None,
     }
 }
@@ -1352,14 +1427,24 @@ fn normalize_signer_sig_alg(sig_oid: &str, digest: DigestAlg) -> Option<String> 
             }
             .to_string(),
         ),
-        // id-ecPublicKey — combine with the digest (still surfaces as
-        // Unsupported downstream, but yields a precise diagnostic).
+        // id-ecPublicKey — combine with the digest.  FEAT(jar-signer):
+        // now resolves to a verifiable ECDSA combined OID.
         "1.2.840.10045.2.1" => Some(
             match digest {
                 DigestAlg::Sha1 => "1.2.840.10045.4.1",
                 DigestAlg::Sha256 => "1.2.840.10045.4.3.2",
                 DigestAlg::Sha384 => "1.2.840.10045.4.3.3",
                 DigestAlg::Sha512 => "1.2.840.10045.4.3.4",
+            }
+            .to_string(),
+        ),
+        // FEAT(jar-signer): bare id-dsa key OID — combine with the digest.
+        "1.2.840.10040.4.1" => Some(
+            match digest {
+                DigestAlg::Sha256 => "2.16.840.1.101.3.4.3.2",
+                // SHA-1 (or anything the DSA path doesn't special-case)
+                // maps to id-dsa-with-sha1.
+                _ => "1.2.840.10040.4.3",
             }
             .to_string(),
         ),
@@ -1447,15 +1532,18 @@ fn rsa_pkcs1v15_verify(
 /// Verify a signature `sig` over `message` using the public key encoded in
 /// `signer_spki_der`, where `sig_alg_oid` names the signature algorithm.
 ///
-/// RSA PKCS#1 v1.5 (SHA-1/256/384/512) is fully verified.  ECDSA / DSA and
-/// any unrecognised algorithm return `SigVerify::Unsupported` (fail-closed).
+/// FEAT(jar-signer): RSA PKCS#1 v1.5 (SHA-1/256/384/512), ECDSA P-256/P-384
+/// (SHA-256/384/512), and DSA (SHA-1/256) are all fully verified.  A
+/// recognised algorithm whose key/curve we cannot handle returns
+/// `SigVerify::Unsupported`; an unrecognised OID likewise.  A
+/// well-formed-but-invalid signature returns `SigVerify::Bad`.
 fn verify_signature_with_spki(
     signer_spki_der: &[u8],
     sig_alg_oid: &str,
     message: &[u8],
     sig: &[u8],
 ) -> SigVerify {
-    let (digest_alg, is_rsa) = match sig_alg_digest(sig_alg_oid) {
+    let (digest_alg, family) = match sig_alg_digest(sig_alg_oid) {
         Some(v) => v,
         None => return SigVerify::Unsupported,
     };
@@ -1463,12 +1551,121 @@ fn verify_signature_with_spki(
         Ok(k) => k,
         Err(_) => return SigVerify::Bad,
     };
-    match (key, is_rsa) {
-        (PublicKey::Rsa(rsa), true) => rsa_pkcs1v15_verify(&rsa, digest_alg, message, sig),
-        // EC key with an EC signature algorithm — recognised, not verifiable.
-        (PublicKey::EcUnsupported, false) => SigVerify::Unsupported,
-        // Algorithm / key-type mismatch, or unsupported key type.
+    match (key, family) {
+        (PublicKey::Rsa(rsa), SigFamily::Rsa) => {
+            rsa_pkcs1v15_verify(&rsa, digest_alg, message, sig)
+        }
+        (PublicKey::EcP256(spki), SigFamily::Ecdsa) => {
+            ecdsa_p256_verify(&spki, digest_alg, message, sig)
+        }
+        (PublicKey::EcP384(spki), SigFamily::Ecdsa) => {
+            ecdsa_p384_verify(&spki, digest_alg, message, sig)
+        }
+        (PublicKey::Dsa(spki), SigFamily::Dsa) => {
+            dsa_verify(&spki, digest_alg, message, sig)
+        }
+        // Recognised algorithm but a key type / curve we do not handle
+        // (P-521, Brainpool, key/alg mismatch, ...).  Fail-closed.
         _ => SigVerify::Unsupported,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FEAT(jar-signer): ECDSA verification (P-256 / P-384) via RustCrypto.
+//
+// The wire signature in both CMS SignerInfo and X.509 `signatureValue` is
+// the DER `Ecdsa-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` form,
+// which `ecdsa::Signature::from_der` parses.  The verifying key is decoded
+// from the full `SubjectPublicKeyInfo` DER (the RustCrypto decoder rejects
+// a point that is not on the curve, giving us point-validation for free).
+//
+// `VerifyingKey::verify_prehash` takes the raw message *digest*; we compute
+// it with the digest the signature OID names.  This matches X.509 / CMS
+// semantics exactly (ECDSA signs H(tbs) / H(SignedAttributes)).
+// ---------------------------------------------------------------------------
+
+fn ecdsa_p256_verify(
+    spki_der: &[u8],
+    digest_alg: DigestAlg,
+    message: &[u8],
+    sig: &[u8],
+) -> SigVerify {
+    use p256::ecdsa::signature::hazmat::PrehashVerifier;
+    use p256::ecdsa::{Signature, VerifyingKey};
+    use p256::pkcs8::DecodePublicKey;
+
+    let vk = match VerifyingKey::from_public_key_der(spki_der) {
+        Ok(k) => k,
+        Err(_) => return SigVerify::Bad,
+    };
+    let signature = match Signature::from_der(sig) {
+        Ok(s) => s,
+        Err(_) => return SigVerify::Bad,
+    };
+    let prehash = raw_digest(digest_alg, message);
+    match vk.verify_prehash(&prehash, &signature) {
+        Ok(()) => SigVerify::Ok,
+        Err(_) => SigVerify::Bad,
+    }
+}
+
+fn ecdsa_p384_verify(
+    spki_der: &[u8],
+    digest_alg: DigestAlg,
+    message: &[u8],
+    sig: &[u8],
+) -> SigVerify {
+    use p384::ecdsa::signature::hazmat::PrehashVerifier;
+    use p384::ecdsa::{Signature, VerifyingKey};
+    use p384::pkcs8::DecodePublicKey;
+
+    let vk = match VerifyingKey::from_public_key_der(spki_der) {
+        Ok(k) => k,
+        Err(_) => return SigVerify::Bad,
+    };
+    let signature = match Signature::from_der(sig) {
+        Ok(s) => s,
+        Err(_) => return SigVerify::Bad,
+    };
+    let prehash = raw_digest(digest_alg, message);
+    match vk.verify_prehash(&prehash, &signature) {
+        Ok(()) => SigVerify::Ok,
+        Err(_) => SigVerify::Bad,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FEAT(jar-signer): DSA (DSS) verification via the RustCrypto `dsa` crate.
+//
+// The `*.DSA` signer block / X.509 link carries a DER
+// `Dss-Sig-Value ::= SEQUENCE { r INTEGER, s INTEGER }` signature.  The
+// `dsa::VerifyingKey` is decoded from the SPKI DER (it recovers `(p,q,g)`
+// and `y`).  DSA verifies over the raw message digest, so we hash with the
+// OID-named digest (SHA-1 or SHA-256) and call `verify_prehash`.
+// ---------------------------------------------------------------------------
+
+fn dsa_verify(spki_der: &[u8], digest_alg: DigestAlg, message: &[u8], sig: &[u8]) -> SigVerify {
+    use dsa::pkcs8::DecodePublicKey;
+    use dsa::signature::hazmat::PrehashVerifier;
+    use dsa::{Signature, VerifyingKey};
+
+    // DSA in JARs uses SHA-1 or SHA-256 only; reject anything else.
+    if !matches!(digest_alg, DigestAlg::Sha1 | DigestAlg::Sha256) {
+        return SigVerify::Unsupported;
+    }
+    let vk = match VerifyingKey::from_public_key_der(spki_der) {
+        Ok(k) => k,
+        Err(_) => return SigVerify::Bad,
+    };
+    // `Signature` decodes from the DER `SEQUENCE { r, s }` via `TryFrom<&[u8]>`.
+    let signature = match Signature::try_from(sig) {
+        Ok(s) => s,
+        Err(_) => return SigVerify::Bad,
+    };
+    let prehash = raw_digest(digest_alg, message);
+    match vk.verify_prehash(&prehash, &signature) {
+        Ok(()) => SigVerify::Ok,
+        Err(_) => SigVerify::Bad,
     }
 }
 
@@ -1540,6 +1737,17 @@ pub enum TrustError {
     /// A cert in the chain is outside its `[notBefore, notAfter]`
     /// validity window relative to the current wall-clock time.
     Expired,
+    /// FEAT(jar-signer): RFC 5280 §6.1.4 — a CA cert in the path asserts
+    /// `BasicConstraints.cA = false`, or its KeyUsage lacks `keyCertSign`,
+    /// or the `pathLenConstraint` was exceeded.
+    BasicConstraintsViolation,
+    /// FEAT(jar-signer): RFC 5280 — the leaf's KeyUsage forbids
+    /// `digitalSignature`, or its ExtendedKeyUsage does not permit
+    /// code signing.
+    KeyUsageViolation,
+    /// FEAT(jar-signer): RFC 5280 §6.1.4(f) — a cert carries a *critical*
+    /// extension this validator does not recognise / process.
+    UnknownCriticalExtension,
 }
 
 /// Hard cap on chain depth.  Real-world TLS / code-signing chains run
@@ -2071,6 +2279,10 @@ pub struct X509Cert<'a> {
     pub not_after: &'a [u8],
     /// `notAfter` ASN.1 tag.
     pub not_after_tag: u8,
+    /// FEAT(jar-signer): the complete Certificate DER (entire outer
+    /// SEQUENCE), kept so RFC 5280 extension processing can re-parse the
+    /// cert with the `x509-cert` crate.
+    pub full_der: &'a [u8],
 }
 
 impl<'a> X509Cert<'a> {
@@ -2181,6 +2393,7 @@ impl<'a> X509Cert<'a> {
             not_before_tag,
             not_after,
             not_after_tag,
+            full_der: &der[..total],
         })
     }
 
@@ -2315,6 +2528,179 @@ fn cert_dates_ok(cert: &X509Cert) -> bool {
     true
 }
 
+// ---------------------------------------------------------------------------
+// FEAT(jar-signer): RFC 5280 extension processing.
+//
+// We parse the certificate's extensions with the audited `x509-cert` crate
+// and enforce the subset relevant to JAR code-signing path validation:
+//
+//   * BasicConstraints (§4.2.1.9) — a cert used to certify another cert
+//     MUST be a CA (`cA = TRUE`); `pathLenConstraint` bounds the number of
+//     intervening non-self-issued CA certs below it.
+//   * KeyUsage (§4.2.1.3) — a CA cert MUST assert `keyCertSign`; a leaf
+//     (end-entity) MUST assert `digitalSignature` (or `nonRepudiation`).
+//   * ExtendedKeyUsage (§4.2.1.12) — a leaf carrying an EKU MUST permit
+//     `id-kp-codeSigning` (or `anyExtendedKeyUsage`).
+//   * Unknown *critical* extensions (§6.1.4(f)) — reject (fail-closed).
+//
+// Posture for *absent* extensions: enforce-if-present.  RFC 5280 requires
+// conforming CAs to carry BasicConstraints/KeyUsage, but real legacy roots
+// (and self-signed code-signing certs) often omit them, and HotSpot's
+// jarsigner accepts such certs.  We therefore do NOT hard-reject a cert
+// for *lacking* an extension; we only reject when a *present* extension
+// forbids the role the cert is being used in.  Unknown-critical-extension
+// rejection still applies regardless.
+// ---------------------------------------------------------------------------
+
+/// OID text constants (rendered dotted-decimal) for the extensions we
+/// recognise as "processed".  Any *critical* extension whose OID is not in
+/// this set causes [`TrustError::UnknownCriticalExtension`].
+const OID_EXT_BASIC_CONSTRAINTS: &str = "2.5.29.19";
+const OID_EXT_KEY_USAGE: &str = "2.5.29.15";
+const OID_EXT_EXT_KEY_USAGE: &str = "2.5.29.37";
+const OID_EXT_SUBJECT_KEY_ID: &str = "2.5.29.14";
+const OID_EXT_AUTHORITY_KEY_ID: &str = "2.5.29.35";
+const OID_EXT_SUBJECT_ALT_NAME: &str = "2.5.29.17";
+const OID_EXT_AUTHORITY_INFO_ACCESS: &str = "1.3.6.1.5.5.7.1.1";
+const OID_KP_CODE_SIGNING: &str = "1.3.6.1.5.5.7.3.3";
+const OID_ANY_EXT_KEY_USAGE: &str = "2.5.29.37.0";
+
+/// Parsed RFC 5280 extension facts for one certificate.
+#[derive(Default, Debug)]
+struct CertExtFacts {
+    /// `Some(is_ca)` if a BasicConstraints extension was present.
+    basic_ca: Option<bool>,
+    /// `pathLenConstraint`, if present.
+    path_len: Option<u8>,
+    /// `Some(())` if a KeyUsage extension was present, with the two bits
+    /// we care about.
+    key_usage_present: bool,
+    ku_digital_signature: bool,
+    ku_key_cert_sign: bool,
+    /// `Some(true)` if an ExtendedKeyUsage extension permits code signing
+    /// (codeSigning or anyExtendedKeyUsage); `Some(false)` if an EKU is
+    /// present but does not; `None` if no EKU extension at all.
+    eku_allows_code_signing: Option<bool>,
+}
+
+/// Parse `cert_der` with `x509-cert` and extract the RFC 5280 facts we
+/// enforce.  Returns `Err(UnknownCriticalExtension)` if the cert carries a
+/// critical extension we do not process; `Err(Malformed)` if it will not
+/// decode at all.  A cert with no extensions yields all-`None` facts.
+fn extract_ext_facts(cert_der: &[u8]) -> Result<CertExtFacts, TrustError> {
+    use der::Decode;
+    use x509_cert::ext::pkix::{BasicConstraints, ExtendedKeyUsage, KeyUsage};
+    use x509_cert::Certificate;
+
+    let cert = Certificate::from_der(cert_der).map_err(|_| TrustError::Malformed)?;
+    let mut facts = CertExtFacts::default();
+
+    let exts = match &cert.tbs_certificate.extensions {
+        Some(e) => e,
+        None => return Ok(facts), // v1/v2 cert or no extensions.
+    };
+
+    // First pass: reject any unrecognised *critical* extension (§6.1.4(f)).
+    for ext in exts.iter() {
+        if !ext.critical {
+            continue;
+        }
+        let oid = ext.extn_id.to_string();
+        let recognised = matches!(
+            oid.as_str(),
+            OID_EXT_BASIC_CONSTRAINTS
+                | OID_EXT_KEY_USAGE
+                | OID_EXT_EXT_KEY_USAGE
+                | OID_EXT_SUBJECT_KEY_ID
+                | OID_EXT_AUTHORITY_KEY_ID
+                | OID_EXT_SUBJECT_ALT_NAME
+                | OID_EXT_AUTHORITY_INFO_ACCESS
+        );
+        if !recognised {
+            warn!("jar signer: cert carries unprocessed critical extension {}", oid);
+            return Err(TrustError::UnknownCriticalExtension);
+        }
+    }
+
+    // BasicConstraints.
+    if let Ok(Some((_crit, bc))) = exts_get::<BasicConstraints>(&cert) {
+        facts.basic_ca = Some(bc.ca);
+        facts.path_len = bc.path_len_constraint;
+    }
+    // KeyUsage.
+    if let Ok(Some((_crit, ku))) = exts_get::<KeyUsage>(&cert) {
+        facts.key_usage_present = true;
+        facts.ku_digital_signature = ku.digital_signature() || ku.non_repudiation();
+        facts.ku_key_cert_sign = ku.key_cert_sign();
+    }
+    // ExtendedKeyUsage.
+    if let Ok(Some((_crit, eku))) = exts_get::<ExtendedKeyUsage>(&cert) {
+        let allows = eku.0.iter().any(|o| {
+            let s = o.to_string();
+            s == OID_KP_CODE_SIGNING || s == OID_ANY_EXT_KEY_USAGE
+        });
+        facts.eku_allows_code_signing = Some(allows);
+    }
+
+    Ok(facts)
+}
+
+/// Helper: typed extension lookup that swallows the (already-handled)
+/// decode errors into `Ok(None)`.  Delegates to `x509-cert`'s
+/// `TbsCertificate::get::<T>()`, which decodes the single matching
+/// extension by its `AssociatedOid`.
+fn exts_get<'a, T>(cert: &'a x509_cert::Certificate) -> Result<Option<(bool, T)>, ()>
+where
+    T: der::Decode<'a> + const_oid::AssociatedOid,
+{
+    cert.tbs_certificate.get::<T>().map_err(|_| ())
+}
+
+/// Enforce RFC 5280 constraints on the **leaf** (end-entity) certificate.
+fn check_leaf_ext_facts(facts: &CertExtFacts) -> Result<(), TrustError> {
+    // If a KeyUsage extension is present it MUST allow digitalSignature
+    // (or nonRepudiation) — a leaf used to sign a JAR.
+    if facts.key_usage_present && !facts.ku_digital_signature {
+        warn!("jar signer: leaf KeyUsage forbids digitalSignature");
+        return Err(TrustError::KeyUsageViolation);
+    }
+    // If an ExtendedKeyUsage is present it MUST permit code signing.
+    if let Some(false) = facts.eku_allows_code_signing {
+        warn!("jar signer: leaf ExtendedKeyUsage does not permit codeSigning");
+        return Err(TrustError::KeyUsageViolation);
+    }
+    Ok(())
+}
+
+/// Enforce RFC 5280 constraints on a certificate being used as a **CA**
+/// (an intermediate or the trust anchor) to certify the cert below it.
+/// `ca_certs_below` is the count of non-self-issued CA certs already seen
+/// below this one in the path, used for `pathLenConstraint` checking.
+fn check_ca_ext_facts(facts: &CertExtFacts, ca_certs_below: usize) -> Result<(), TrustError> {
+    // If BasicConstraints is present, cA MUST be TRUE.
+    if let Some(false) = facts.basic_ca {
+        warn!("jar signer: CA cert has BasicConstraints cA=FALSE");
+        return Err(TrustError::BasicConstraintsViolation);
+    }
+    // pathLenConstraint: max number of non-self-issued intermediate CAs
+    // that may follow below this cert in the path.
+    if let Some(max) = facts.path_len {
+        if ca_certs_below > max as usize {
+            warn!(
+                "jar signer: pathLenConstraint {} exceeded ({} CAs below)",
+                max, ca_certs_below
+            );
+            return Err(TrustError::BasicConstraintsViolation);
+        }
+    }
+    // If KeyUsage is present it MUST allow keyCertSign.
+    if facts.key_usage_present && !facts.ku_key_cert_sign {
+        warn!("jar signer: CA cert KeyUsage forbids keyCertSign");
+        return Err(TrustError::BasicConstraintsViolation);
+    }
+    Ok(())
+}
+
 /// Walk `leaf` → `intermediates` → `trust_store` building a chain.
 ///
 /// At each step the current cert's `issuer` DN is looked up first
@@ -2328,6 +2714,8 @@ fn cert_dates_ok(cert: &X509Cert) -> bool {
 ///   * Real-crypto algorithm — `Err(NotImplemented)`.
 ///   * Chain exceeds [`MAX_CHAIN_LEN`] — `Err(TooLong)`.
 ///   * Already-visited cert — `Err(Cyclic)`.
+///   * RFC 5280 extension violation — `Err(BasicConstraintsViolation)` /
+///     `Err(KeyUsageViolation)` / `Err(UnknownCriticalExtension)`.
 pub fn verify_chain<'a>(
     leaf: &'a X509Cert<'a>,
     intermediates: &'a [X509Cert<'a>],
@@ -2346,11 +2734,29 @@ pub fn verify_chain<'a>(
         return Err(TrustError::Expired);
     }
 
+    // FEAT(jar-signer): RFC 5280 leaf extension checks (KeyUsage /
+    // ExtendedKeyUsage / unknown-critical).  Skipped for stub-sig
+    // fixtures (which carry no extensions and aren't real certs).
+    if leaf.sig_alg_oid != OID_STUB_SIG {
+        let facts = extract_ext_facts(leaf.full_der)?;
+        check_leaf_ext_facts(&facts)?;
+    }
+
+    // Number of (non-self-issued) CA certs encountered below the cert
+    // currently being validated as a CA — drives pathLenConstraint.
+    let mut ca_certs_below: usize = 0;
+
     for _step in 0..MAX_CHAIN_LEN {
         if let Some(anchor) = trust_store.find_anchor_by_subject(current.issuer_dn) {
             let parent = X509Cert::parse(&anchor.der).map_err(|_| TrustError::Malformed)?;
             if parent.sig_alg_oid != OID_STUB_SIG && !cert_dates_ok(&parent) {
                 return Err(TrustError::Expired);
+            }
+            // FEAT(jar-signer): the anchor certifies `current`, so it acts
+            // as a CA — enforce BasicConstraints / KeyUsage on it.
+            if parent.sig_alg_oid != OID_STUB_SIG {
+                let facts = extract_ext_facts(parent.full_der)?;
+                check_ca_ext_facts(&facts, ca_certs_below)?;
             }
             current.link_signature_ok(&parent)?;
             return Ok(());
@@ -2367,8 +2773,20 @@ pub fn verify_chain<'a>(
                 if parent.sig_alg_oid != OID_STUB_SIG && !cert_dates_ok(parent) {
                     return Err(TrustError::Expired);
                 }
+                // FEAT(jar-signer): `parent` is an intermediate CA that
+                // certifies `current` — enforce CA constraints, counting
+                // the non-self-issued CAs already below it.
+                if parent.sig_alg_oid != OID_STUB_SIG {
+                    let facts = extract_ext_facts(parent.full_der)?;
+                    check_ca_ext_facts(&facts, ca_certs_below)?;
+                }
                 current.link_signature_ok(parent)?;
                 visited.push(parent.subject_dn.to_vec());
+                // A non-self-issued intermediate adds to the CA count that
+                // the *next* (higher) CA's pathLenConstraint must cover.
+                if !parent.is_self_signed() {
+                    ca_certs_below += 1;
+                }
                 current = parent;
             }
             None => {
@@ -3329,16 +3747,17 @@ mod tests {
     }
 
     #[test]
-    fn ecdsa_signature_algorithm_is_unsupported_not_accepted() {
+    fn ecdsa_malformed_ec_key_is_bad_not_accepted() {
         use super::{verify_signature_with_spki, SigVerify};
-        // An EC SPKI (id-ecPublicKey) with an ECDSA sig alg must surface as
-        // Unsupported — fail-closed, never Ok.
+        // FEAT(jar-signer): an EC SPKI carrying an all-zero (off-curve)
+        // "point" must NEVER verify.  With real ECDSA wired up the point
+        // fails to decode → Bad (still fail-closed, never Ok).
         let ec_algid = {
             let mut inner = oid("1.2.840.10045.2.1"); // id-ecPublicKey
             inner.extend_from_slice(&oid("1.2.840.10045.3.1.7")); // prime256v1
             seq(&inner)
         };
-        let bs = vec![0u8; 65]; // uncompressed point placeholder
+        let bs = vec![0u8; 65]; // uncompressed point placeholder (off-curve)
         let mut bit = vec![0u8];
         bit.extend_from_slice(&bs);
         let ec_spki = seq(&[ec_algid.as_slice(), tlv(0x03, &bit).as_slice()].concat());
@@ -3348,7 +3767,307 @@ mod tests {
             b"message",
             &[0u8; 64],
         );
-        assert_eq!(r, SigVerify::Unsupported);
+        assert_ne!(r, SigVerify::Ok, "off-curve EC key must never verify");
+    }
+
+    #[test]
+    fn ecdsa_p256_round_trip_real_signature() {
+        use super::{verify_signature_with_spki, DigestAlg, SigVerify};
+        use p256::ecdsa::signature::hazmat::PrehashSigner;
+        use p256::ecdsa::SigningKey;
+        use spki::EncodePublicKey;
+
+        // Fixed 32-byte scalar → deterministic key (no RNG needed).
+        let sk = SigningKey::from_slice(&[0x11u8; 32]).expect("p256 signing key");
+        let vk = sk.verifying_key();
+        // `EncodePublicKey` on the elliptic-curve `PublicKey` is gated on
+        // `pkcs8` (which we enable); the ecdsa `VerifyingKey` wrapper's
+        // own impl is gated on `pem` (which we don't), so convert.
+        let pk = p256::PublicKey::from(vk);
+        let spki = pk.to_public_key_der().expect("spki encode").as_bytes().to_vec();
+
+        let msg = b"jarsigner-signed-attributes-bytes";
+        // ECDSA-with-SHA256: sign the SHA-256 prehash; emit DER (r,s).
+        let prehash = super::raw_digest(DigestAlg::Sha256, msg);
+        let der_sig: ecdsa::der::Signature<p256::NistP256> = sk
+            .sign_prehash(&prehash)
+            .expect("p256 sign");
+        let sig_der = der_sig.as_bytes().to_vec();
+
+        assert_eq!(
+            verify_signature_with_spki(&spki, "1.2.840.10045.4.3.2", msg, &sig_der),
+            SigVerify::Ok,
+            "valid P-256 ECDSA signature must verify"
+        );
+        // Tampered message → Bad.
+        assert_eq!(
+            verify_signature_with_spki(&spki, "1.2.840.10045.4.3.2", b"evil", &sig_der),
+            SigVerify::Bad
+        );
+        // The SPKI must classify as EcP256.
+        assert!(matches!(
+            super::parse_spki(&spki).unwrap(),
+            super::PublicKey::EcP256(_)
+        ));
+    }
+
+    #[test]
+    fn ecdsa_p384_round_trip_real_signature() {
+        use super::{verify_signature_with_spki, DigestAlg, SigVerify};
+        use p384::ecdsa::signature::hazmat::PrehashSigner;
+        use p384::ecdsa::SigningKey;
+        use spki::EncodePublicKey;
+
+        let sk = SigningKey::from_slice(&[0x22u8; 48]).expect("p384 signing key");
+        let vk = sk.verifying_key();
+        let pk = p384::PublicKey::from(vk);
+        let spki = pk.to_public_key_der().expect("spki encode").as_bytes().to_vec();
+
+        let msg = b"another signed-attrs blob";
+        let prehash = super::raw_digest(DigestAlg::Sha384, msg);
+        let der_sig: ecdsa::der::Signature<p384::NistP384> = sk
+            .sign_prehash(&prehash)
+            .expect("p384 sign");
+        let sig_der = der_sig.as_bytes().to_vec();
+
+        assert_eq!(
+            verify_signature_with_spki(&spki, "1.2.840.10045.4.3.3", msg, &sig_der),
+            SigVerify::Ok,
+            "valid P-384 ECDSA signature must verify"
+        );
+        assert!(matches!(
+            super::parse_spki(&spki).unwrap(),
+            super::PublicKey::EcP384(_)
+        ));
+    }
+
+    /// Parse a run of hex into big-endian bytes (test helper for DSA params).
+    fn hexbytes(h: &str) -> Vec<u8> {
+        let cleaned: Vec<u8> = h.bytes().filter(|b| b.is_ascii_hexdigit()).collect();
+        cleaned
+            .chunks(2)
+            .map(|c| {
+                let hi = (c[0] as char).to_digit(16).unwrap();
+                let lo = (c[1] as char).to_digit(16).unwrap();
+                (hi * 16 + lo) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dsa_round_trip_real_signature() {
+        use super::{verify_signature_with_spki, DigestAlg, SigVerify};
+        use dsa::pkcs8::EncodePublicKey;
+        use dsa::signature::hazmat::PrehashSigner;
+        use dsa::{BigUint, Components, SigningKey, VerifyingKey};
+
+        // RFC 6979 A.2.1 1024-bit DSA test key (same vector the `dsa`
+        // crate ships in its own tests — exercises the real verify path).
+        let p = BigUint::from_bytes_be(&hexbytes(
+            "86F5CA03DCFEB225063FF830A0C769B9DD9D6153AD91D7CE27F787C43278B447\
+             E6533B86B18BED6E8A48B784A14C252C5BE0DBF60B86D6385BD2F12FB763ED88\
+             73ABFD3F5BA2E0A8C0A59082EAC056935E529DAF7C610467899C77ADEDFC846C\
+             881870B7B19B2B58F9BE0521A17002E3BDD6B86685EE90B3D9A1B02B782B1779",
+        ));
+        let q = BigUint::from_bytes_be(&hexbytes("996F967F6C8E388D9E28D01E205FBA957A5698B1"));
+        let g = BigUint::from_bytes_be(&hexbytes(
+            "07B0F92546150B62514BB771E2A0C0CE387F03BDA6C56B505209FF25FD3C133D\
+             89BBCD97E904E09114D9A7DEFDEADFC9078EA544D2E401AEECC40BB9FBBF78FD\
+             87995A10A1C27CB7789B594BA7EFB5C4326A9FE59A070E136DB77175464ADCA4\
+             17BE5DCE2F40D10A46A3A3943F26AB7FD9C0398FF8C76EE0A56826A8A88F1DBD",
+        ));
+        let x = BigUint::from_bytes_be(&hexbytes("411602CB19A6CCC34494D79D98EF1E7ED5AF25F7"));
+        let y = BigUint::from_bytes_be(&hexbytes(
+            "5DF5E01DED31D0297E274E1691C192FE5868FEF9E19A84776454B100CF16F653\
+             92195A38B90523E2542EE61871C0440CB87C322FC4B4D2EC5E1E7EC766E1BE8D\
+             4CE935437DC11C3C8FD426338933EBFE739CB3465F4D3668C5E473508253B1E6\
+             82F65CBDC4FAE93C2EA212390E54905A86E2223170B44EAA7DA5DD9FFCFB7F3B",
+        ));
+        let components = Components::from_components(p, q, g).expect("dsa components");
+        let vk = VerifyingKey::from_components(components, y).expect("dsa verifying key");
+        let sk = SigningKey::from_components(vk.clone(), x).expect("dsa signing key");
+
+        let spki = vk.to_public_key_der().expect("dsa spki").as_bytes().to_vec();
+        assert!(matches!(
+            super::parse_spki(&spki).unwrap(),
+            super::PublicKey::Dsa(_)
+        ));
+
+        let msg = b"dsa-signed .SF attributes";
+        let prehash = super::raw_digest(DigestAlg::Sha1, msg);
+        let sig: dsa::Signature = sk.sign_prehash(&prehash).expect("dsa sign");
+        let sig_der = {
+            use dsa::signature::SignatureEncoding;
+            sig.to_bytes().to_vec()
+        };
+
+        // id-dsa-with-sha1 (1.2.840.10040.4.3).
+        assert_eq!(
+            verify_signature_with_spki(&spki, "1.2.840.10040.4.3", msg, &sig_der),
+            SigVerify::Ok,
+            "valid DSA signature must verify"
+        );
+        // Tampered message → Bad.
+        assert_eq!(
+            verify_signature_with_spki(&spki, "1.2.840.10040.4.3", b"evil", &sig_der),
+            SigVerify::Bad
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // FEAT(jar-signer) — RFC 5280 extension processing tests.
+    //
+    // These build *real* RSA-signed certs (reusing the RSA-512 test key)
+    // carrying X.509v3 extensions, then drive them through `verify_chain`
+    // on the production path (no stub-sig short-circuit).
+    // ---------------------------------------------------------------------
+
+    /// Build a real RSA (sha256WithRSA) cert with the given v3 `extensions`
+    /// DER (the inner SEQUENCE OF Extension content; pass `&[]` for none).
+    /// Signed by the RSA-512 test key; SPKI is that same key.
+    fn build_rsa_cert_with_exts(subject_cn: &str, issuer_cn: &str, extensions: &[u8]) -> Vec<u8> {
+        let spki = rsa_spki(RSA512_N, 65537);
+        let subject_dn = x509_name(subject_cn);
+        let issuer_dn = x509_name(issuer_cn);
+        let validity = seq(&[
+            tlv(0x17, b"200101000000Z").as_slice(),
+            tlv(0x18, b"20990101000000Z").as_slice(),
+        ]
+        .concat());
+        let mut tbs_body = [
+            ctx_imp(0, &integer(2)).as_slice(),
+            integer(1).as_slice(),
+            algorithm_identifier("1.2.840.113549.1.1.11").as_slice(),
+            issuer_dn.as_slice(),
+            validity.as_slice(),
+            subject_dn.as_slice(),
+            spki.as_slice(),
+        ]
+        .concat();
+        if !extensions.is_empty() {
+            // extensions [3] EXPLICIT SEQUENCE OF Extension.
+            let ext_seq = seq(extensions);
+            let ext_explicit = tlv(0xA3, &ext_seq);
+            tbs_body.extend_from_slice(&ext_explicit);
+        }
+        let tbs = seq(&tbs_body);
+        let sig = rsa_sign(&tbs, DigestAlg::Sha256, RSA512_N, RSA512_D);
+        let mut bs = vec![0u8];
+        bs.extend_from_slice(&sig);
+        seq(&[
+            tbs.as_slice(),
+            algorithm_identifier("1.2.840.113549.1.1.11").as_slice(),
+            tlv(0x03, &bs).as_slice(),
+        ]
+        .concat())
+    }
+
+    /// Build an Extension ::= SEQUENCE { extnID OID, critical BOOL?, extnValue OCTET STRING }.
+    fn extension(oid_dotted: &str, critical: bool, value_der: &[u8]) -> Vec<u8> {
+        let mut inner = oid(oid_dotted);
+        if critical {
+            inner.extend_from_slice(&[0x01, 0x01, 0xFF]); // BOOLEAN TRUE
+        }
+        inner.extend_from_slice(&octet(value_der));
+        seq(&inner)
+    }
+
+    /// BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE, ... }.
+    /// `cA=TRUE` is encoded explicitly; `cA=FALSE` is the canonical empty
+    /// SEQUENCE (the DEFAULT is omitted), which decodes to `ca = false`.
+    fn basic_constraints(ca: bool) -> Vec<u8> {
+        if ca {
+            seq(&[0x01, 0x01, 0xFF])
+        } else {
+            seq(&[])
+        }
+    }
+
+    /// KeyUsage ::= BIT STRING.  `first_byte` is the big-endian usage byte
+    /// (bit 0 = digitalSignature = 0x80; bit 5 = keyCertSign = 0x04).
+    /// Encoded canonically (DER) with the unused-bits count set to the
+    /// number of trailing zero bits, as `der`'s BitString decoder expects.
+    fn key_usage(first_byte: u8) -> Vec<u8> {
+        let unused = if first_byte == 0 {
+            0
+        } else {
+            first_byte.trailing_zeros() as u8
+        };
+        tlv(0x03, &[unused, first_byte])
+    }
+
+    #[test]
+    fn rfc5280_leaf_keyusage_without_digitalsignature_rejected() {
+        use super::*;
+        // Leaf with KeyUsage = keyCertSign only (no digitalSignature) →
+        // must be rejected for code-signing use.
+        let ku = extension("2.5.29.15", true, &key_usage(0x04)); // keyCertSign
+        let leaf_der = build_rsa_cert_with_exts("Leaf", "Root", &ku);
+        let root_der = build_rsa_cert_with_exts("Root", "Root", &[]);
+
+        let leaf = X509Cert::parse(&leaf_der).expect("parse leaf");
+        let mut ts = TrustStore::empty();
+        ts.add_anchor_der(root_der);
+        let err = verify_chain(&leaf, &[], &ts).expect_err("leaf KU must reject");
+        assert_eq!(err, TrustError::KeyUsageViolation);
+    }
+
+    #[test]
+    fn rfc5280_leaf_with_digitalsignature_and_codesigning_eku_accepted() {
+        use super::*;
+        // Leaf with digitalSignature KU + codeSigning EKU, chaining to a
+        // root that is a proper CA → accepted.
+        let ku = extension("2.5.29.15", true, &key_usage(0x80)); // digitalSignature
+        let eku_val = seq(&oid("1.3.6.1.5.5.7.3.3")); // id-kp-codeSigning
+        let eku = extension("2.5.29.37", false, &eku_val);
+        let leaf_exts = [ku.as_slice(), eku.as_slice()].concat();
+        let leaf_der = build_rsa_cert_with_exts("Leaf", "Root", &leaf_exts);
+
+        // Root: CA + keyCertSign.
+        let root_bc = extension("2.5.29.19", true, &basic_constraints(true));
+        let root_ku = extension("2.5.29.15", true, &key_usage(0x04)); // keyCertSign
+        let root_exts = [root_bc.as_slice(), root_ku.as_slice()].concat();
+        let root_der = build_rsa_cert_with_exts("Root", "Root", &root_exts);
+
+        let leaf = X509Cert::parse(&leaf_der).expect("parse leaf");
+        let mut ts = TrustStore::empty();
+        ts.add_anchor_der(root_der);
+        verify_chain(&leaf, &[], &ts).expect("compliant code-signing chain must verify");
+    }
+
+    #[test]
+    fn rfc5280_intermediate_with_ca_false_rejected() {
+        use super::*;
+        // Intermediate carries BasicConstraints cA=FALSE but is used to
+        // certify the leaf → BasicConstraintsViolation.
+        let leaf_der = build_rsa_cert_with_exts("Leaf", "Inter", &[]);
+        let int_bc = extension("2.5.29.19", true, &basic_constraints(false));
+        let int_der = build_rsa_cert_with_exts("Inter", "Root", &int_bc);
+        let root_der = build_rsa_cert_with_exts("Root", "Root", &[]);
+
+        let leaf = X509Cert::parse(&leaf_der).expect("parse leaf");
+        let int_cert = X509Cert::parse(&int_der).expect("parse int");
+        let mut ts = TrustStore::empty();
+        ts.add_anchor_der(root_der);
+        let err = verify_chain(&leaf, std::slice::from_ref(&int_cert), &ts)
+            .expect_err("cA=false intermediate must reject");
+        assert_eq!(err, TrustError::BasicConstraintsViolation);
+    }
+
+    #[test]
+    fn rfc5280_unknown_critical_extension_rejected() {
+        use super::*;
+        // Leaf carries a bogus *critical* extension we do not process →
+        // UnknownCriticalExtension (fail-closed, RFC 5280 §6.1.4(f)).
+        let bogus = extension("1.2.3.4.5.6.7", true, &[0x01, 0x02]);
+        let leaf_der = build_rsa_cert_with_exts("Leaf", "Root", &bogus);
+        let root_der = build_rsa_cert_with_exts("Root", "Root", &[]);
+
+        let leaf = X509Cert::parse(&leaf_der).expect("parse leaf");
+        let mut ts = TrustStore::empty();
+        ts.add_anchor_der(root_der);
+        let err = verify_chain(&leaf, &[], &ts).expect_err("unknown critical ext must reject");
+        assert_eq!(err, TrustError::UnknownCriticalExtension);
     }
 
     // ---------------------------------------------------------------------

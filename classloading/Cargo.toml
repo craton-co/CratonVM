@@ -58,12 +58,47 @@ sha2 = "0.10"
 # JKS is hand-rolled in-module (the format is fully open).
 p12 = "0.6"
 
+# FEAT(jar-signer): real ECDSA / DSA signer-block verification + RFC 5280
+# certification-path validation.  All RustCrypto, pure-Rust (no OpenSSL),
+# audited, and already on the `der = 0.7` / `spki = 0.7` / `signature = 2`
+# axis that the workspace lock pins (via `native-builtins`), so they slot
+# in without churning unrelated transitive versions.
+#
+# * `x509-cert` — RFC 5280 Certificate / TBSCertificate / extension parsing
+#   (BasicConstraints, KeyUsage, ExtendedKeyUsage) for path validation.
+# * `ecdsa` + `p256` + `p384` — ECDSA P-256 / P-384 signature verification
+#   over the CMS SignedAttributes and over each X.509 chain link's TBS.
+# * `dsa` — DSA (DSS) signature verification for legacy `*.DSA` signer
+#   blocks and DSA-signed chain links.
+# * `const-oid` — typed OID constants shared with `x509-cert`.
+# * `der` — DER decoding of ECDSA `SEQUENCE { r, s }` signatures and of
+#   the EC / DSA AlgorithmIdentifier parameters in the SPKI.
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+# `pkcs8` feature gives `VerifyingKey::from_public_key_der` (SPKI decoding);
+# `ecdsa` feature pulls `ecdsa-core` with `der` (DER `r,s` signatures) +
+# the verifying path.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
+dsa = "0.6"
+const-oid = { version = "0.9", default-features = false }
+der = { version = "0.7", default-features = false, features = ["oid"] }
+
 [dev-dependencies]
 # Used by `tests/wp_security_robustness.rs` to materialise synthetic JARs
 # and `.class` fixtures into a tempdir for the classloading hardening
 # tests (zip-slip, zip-bomb, bad magic, two-loader isolation, circular
 # hierarchy, redefine rollback).
 tempfile = "3"
+# Test-only: the jar-signer round-trip tests sign with ECDSA and DER-encode
+# the (r,s) signature + the SPKI public key. `p256`'s `ecdsa` feature does not
+# turn on the ecdsa crate's `der` module, and `EncodePublicKey` lives in
+# `spki`; pull both here (test builds only — no production binary impact).
+# Versions match the production p256/p384 0.13 axis (ecdsa 0.16 / spki 0.7).
+ecdsa = { version = "0.16", features = ["der"] }
+spki = { version = "0.7", features = ["alloc"] }
+# `EncodePublicKey::to_public_key_der` for `PublicKey<C>` is gated on
+# elliptic-curve's `alloc` + `pkcs8` features; force them on for test builds.
+elliptic-curve = { version = "0.13", features = ["alloc", "pkcs8", "sec1"] }
 
 [lints]
 workspace = true

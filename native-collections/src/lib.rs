@@ -21751,6 +21751,17 @@ fn native_itr_remove_noop(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                 return native_al_itr_remove(ctx, args);
             }
             "java/util/TreeSet$Itr" => return native_ts_itr_remove(ctx, args),
+            // `LinkedList.iterator()` returns our forward `LinkedList$Itr`
+            // (node-backed, fully mutable). Its `remove()` unlinks the last
+            // node returned by `next()` — route to it so JDK code that does
+            // `it.remove()` while draining a LinkedList works instead of
+            // hitting the throwing default below. (Real-RAF avrora's
+            // `Medium$Receiver.earliestNewTransmission` does exactly this on a
+            // `LinkedList<Transmission>`, and the UOE it threw polluted
+            // System.err → DaCapo digest mismatch. The snapshot-based
+            // `LinkedList$ListItr` is intentionally NOT routed here: it has no
+            // backing list and correctly throws UOE.)
+            "java/util/LinkedList$Itr" => return native_ll_itr_remove(ctx, args),
             _ => {}
         }
     }

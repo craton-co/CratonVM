@@ -378,11 +378,47 @@ now dumps the x64 GPRs, the `current_jit_callee` (when
 `CRATONVM_DBG_JIT_PUTFIELD=1`), and VirtualQuery-guarded code bytes preceding each
 JIT return address + memory around R10 — this is what localized the bug.
 
-### Still open (separate, pre-existing — NOT this SEGV)
+### Part 4 — FIXED (2026-06-02): avrora digest mismatch = `LinkedList.iterator().remove()`
 
-- **avrora digest mismatch** under real RAF (EXIT 127): avrora runs to completion
-  but its output digest is wrong. Present with JIT **off** too, so it is a
-  non-JIT correctness gap, independent of the crashes fixed above.
-- **Rare near-null read fault** (~1 in 5 runs; e.g. `read at 0x4`): a distinct,
-  non-deterministic fault (likely a worker-thread race — avrora runs Thread-2/3/4),
-  unrelated to the freed-code UAF. Use the new VEH GPR/callee dump to localize.
+The real-RAF avrora digest mismatch (EXIT 127) was NOT a simulation-correctness
+bug — avrora's `stdout` is correct. DaCapo digests the benchmark's captured
+`System.err` and expects it EMPTY (`0xda39a3ee…` = SHA-1 of ""); ours was
+non-empty (and non-deterministic across runs). Capturing the tee'd `System.err`
+(it also mirrors to the real process stderr) showed a Java exception trace:
+
+```
+java.lang.UnsupportedOperationException: remove
+  at avrora.sim.radio.Medium$Receiver.earliestNewTransmission(Medium.java:496)
+  ...
+```
+
+`Medium$Receiver.earliestNewTransmission` does `transmissions.iterator().remove()`
+on a `java.util.LinkedList` (javap-confirmed: `transmissions = new LinkedList()`,
+bytecode `invokeinterface Iterator.remove ()V`). The message `remove` is the JDK
+**default `Iterator.remove()`** (`throw new UnsupportedOperationException("remove")`).
+
+Root cause: `invokeinterface Iterator.remove()V` is force-routed (via
+`force_native_over_real_jdk_bytecode` + `intercept_force_registered_native`) to
+the receiver-dispatching native `native_itr_remove_noop`
+(`native-collections/src/lib.rs`). That dispatcher matches `HashMap$KeyItr`,
+`ArrayList$Itr`/`$ListItr`, `TreeSet$Itr` and routes them to their working
+removes, but **had no arm for `LinkedList$Itr`** (the class our native
+`LinkedList.iterator()` returns), so it fell to the `_ => UOE("remove")` arm —
+even though `native_ll_itr_remove` exists and works. (`hasNext`/`next` worked
+because they are *abstract* in `Iterator` and dispatch straight to the
+receiver-class natives; only `remove`, which has an interface default, was
+force-routed through the dispatcher.)
+
+Fix (one line): add `"java/util/LinkedList$Itr" => return native_ll_itr_remove(...)`
+to `native_itr_remove_noop`. Verified: `LinkedList.iterator().remove()` now works
+in isolation (`[x,z]` after removing the middle element), the avrora UOE is gone,
+and `Digest validation failed` no longer appears.
+
+### Still open (separate, pre-existing — NOT the digest, NOT the fixed SEGVs)
+
+- **Rare worker-thread memory corruption** (e.g. `core::fmt` panic on a corrupted
+  class-name string `avrora/sim/clock/MainClock.   80…`, or `read at 0x4`/`0x3D`):
+  a non-deterministic fault on avrora's Thread-2/3/4. Appears amplified when the
+  binary also includes the concurrent audit-remediation's in-flight
+  `native-builtins` (`unsafe_natives`/`panama`/`lang_string`) edits, so isolate
+  on a clean tree before localizing. Use the VEH GPR/callee dump.

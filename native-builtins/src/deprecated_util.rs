@@ -736,9 +736,16 @@ fn collect_hashtable(ctx: &dyn NativeContext, this: ObjectRef, want_keys: bool) 
     out
 }
 
+// FIX: added `type_marker` param. The synthetic Enumeration carries a
+// discriminator in field 2 (1 = keys snapshot, 0 = values/elements snapshot)
+// so callers can tell a keys()-enumeration from an elements()-enumeration.
+// The previous signature only wrote fields 0 (array) and 1 (cursor) and never
+// populated field 2, so keys() produced an enumeration whose marker silently
+// defaulted to Int(0) — indistinguishable from an elements() enumeration.
 fn make_hashtable_enumeration(
     ctx: &mut dyn NativeContext,
     snapshot: Vec<Value>,
+    type_marker: i32,
 ) -> MethodCallResult {
     // Allocate the concrete synthetic `java/util/Enumeration$Impl` helper
     // class (field 0 = Object[] array, field 1 = Int cursor). It is
@@ -757,9 +764,14 @@ fn make_hashtable_enumeration(
     for (i, v) in snapshot.into_iter().enumerate() {
         ctx.set_array_element(arr, i, v);
     }
-    let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 2);
+    // FIX: allocate 3 fields (was 2) so the type marker in field 2 has a
+    // backing slot; fields 0/1 (array, cursor) keep the layout that
+    // `register_enumeration_impl_natives` reads.
+    let en = alloc_concurrent_synthetic(ctx, "java/util/Enumeration$Impl", 3);
     ctx.set_field(en, 0, Value::Object(Some(arr)));
     ctx.set_field(en, 1, Value::Int(0));
+    // FIX: stamp the keys/values discriminator into field 2.
+    ctx.set_field(en, 2, Value::Int(type_marker));
     Ok(Some(Value::Object(Some(en))))
 }
 
@@ -770,7 +782,8 @@ fn native_hashtable_elements(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let values = collect_hashtable(ctx, this, false);
-    make_hashtable_enumeration(ctx, values)
+    // FIX: type marker 0 = values/elements snapshot.
+    make_hashtable_enumeration(ctx, values, 0)
 }
 
 /// `keys()Ljava/util/Enumeration;` — snapshot of keys.
@@ -780,7 +793,8 @@ fn native_hashtable_keys(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let keys = collect_hashtable(ctx, this, true);
-    make_hashtable_enumeration(ctx, keys)
+    // FIX: type marker 1 = keys snapshot.
+    make_hashtable_enumeration(ctx, keys, 1)
 }
 
 // ---------------------------------------------------------------------------

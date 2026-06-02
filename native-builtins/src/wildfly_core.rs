@@ -822,6 +822,11 @@ const DU_FIELD_ATTACHMENTS: usize = 1;
 const DU_FIELD_SERVICE_NAME: usize = 2;
 const DU_NUM_FIELDS: usize = 3;
 
+// Canonical-name slot for an `org.jboss.msc.service.ServiceName` mirror.
+// Mirrors the (private) `SN_FIELD_CANONICAL` in jboss_msc.rs: slot 1 holds the
+// full dotted name, which is the slot `read_java_service_name` reads back.
+const SN_FIELD_CANONICAL: usize = 1;
+
 const EXEC_FIELD_NAME: usize = 0;
 const EXEC_FIELD_CORE: usize = 1;
 const EXEC_FIELD_MAX: usize = 2;
@@ -857,6 +862,19 @@ fn native_services_deployment_unit_name(
     // R80: must populate `name` + `hashCode` (not just `canonicalName`) so
     // JDK `ServiceName.equals` does not NPE on `this.name == null`.
     let obj = crate::jboss_msc::alloc_java_service_name(ctx, &sn);
+    // FIX: `alloc_java_service_name` writes the full dotted name via
+    // `set_field_by_name(obj, "canonicalName", ..)` and the leaf segment via
+    // `set_field_by_name(obj, "name", ..)`. The canonical-state slot for a
+    // `ServiceName` mirror is slot 1 (`SN_FIELD_CANONICAL`), which is also the
+    // slot `read_java_service_name` reads back. When the `"canonicalName"`
+    // field name does not resolve to slot 1, the by-name write is dropped while
+    // the `"name"` write lands the *leaf* segment ("war") into slot 1 —
+    // truncating the mirror to the trailing dot-separated component instead of
+    // the full `jboss.deployment.unit.<archive>` name. Anchor the canonical
+    // dotted name into the canonical slot explicitly so the mirror always holds
+    // the complete hierarchical service name.
+    let canonical = ctx.create_string(sn.canonical());
+    ctx.set_field(obj, SN_FIELD_CANONICAL, Value::Object(Some(canonical)));
     Ok(Some(Value::Object(Some(obj))))
 }
 
@@ -891,6 +909,13 @@ fn native_deployment_unit_get_service_name(
             };
             let sn = wildfly_deployment_unit_name(&name);
             let obj = crate::jboss_msc::alloc_java_service_name(ctx, &sn);
+            // FIX: same canonical-slot truncation as in
+            // `native_services_deployment_unit_name` — anchor the full dotted
+            // name into the canonical slot so readers of slot 1 see
+            // `jboss.deployment.unit.<archive>` rather than just the leaf
+            // segment.
+            let canonical = ctx.create_string(sn.canonical());
+            ctx.set_field(obj, SN_FIELD_CANONICAL, Value::Object(Some(canonical)));
             Ok(Some(Value::Object(Some(obj))))
         }
     }

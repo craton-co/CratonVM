@@ -1491,6 +1491,17 @@ mod tests {
 
     #[test]
     fn test_do_privileged_invokes_run() {
+        // FIX (parallel-safety): `doPrivileged` writes the action class's
+        // codeBase/signer tokens into the *process-global* per-ClassId
+        // caches (`CLASS_CODE_BASE_CACHE` / `SIGNER_TOKENS_CACHE`), keyed by
+        // a `ClassId` that every fresh `MockNativeContext` restarts at a low
+        // value. Without serialization this test can insert an entry for the
+        // same `ClassId` another doPrivileged test is asserting on,
+        // corrupting `test_do_privileged_pushes_and_pops_stack`. Acquire the
+        // shared lock and clear the caches so all stack/cache mutators run
+        // serially — without changing any production semantics.
+        let _guard = policy_test_lock();
+        clear_policy_and_stack();
         let mut registry = NativeMethodRegistry::new();
         register_security_manager_natives(&mut registry);
 
@@ -1513,6 +1524,12 @@ mod tests {
 
     #[test]
     fn test_do_privileged_exception_action() {
+        // FIX (parallel-safety): see `test_do_privileged_invokes_run`.
+        // doPrivileged mutates the global per-ClassId caches; serialize via
+        // the shared test lock so it cannot race
+        // `test_do_privileged_pushes_and_pops_stack`.
+        let _guard = policy_test_lock();
+        clear_policy_and_stack();
         let mut registry = NativeMethodRegistry::new();
         register_security_manager_natives(&mut registry);
 
@@ -1537,6 +1554,12 @@ mod tests {
 
     #[test]
     fn test_do_privileged_with_context() {
+        // FIX (parallel-safety): see `test_do_privileged_invokes_run`.
+        // doPrivileged mutates the global per-ClassId caches; serialize via
+        // the shared test lock so it cannot race
+        // `test_do_privileged_pushes_and_pops_stack`.
+        let _guard = policy_test_lock();
+        clear_policy_and_stack();
         let mut registry = NativeMethodRegistry::new();
         register_security_manager_natives(&mut registry);
 
@@ -2288,16 +2311,53 @@ mod tests {
 
     #[test]
     fn t11_jar_signer_blocks_are_hashed() {
-        // Feed a JAR containing a META-INF/*.RSA block through
-        // find_class_code_source_info and verify the cert digests
-        // vector is populated with the SHA-256 of the block bytes.
+        // Feed a JAR containing exactly one `META-INF/*.RSA` signer block
+        // (with its companion `*.SF`) through the real
+        // `ClassManager::find_class_code_source` →
+        // `ClassPath::extract_jar_signer_blocks` pipeline and assert that
+        // the discovery half locates exactly one signer block and threads
+        // it into the verified-certificate collection.
+        //
+        // FIX (signer-block discovery): this test previously asserted the
+        // *obsolete* pre-Task-#40 contract — that the raw `.RSA` bytes were
+        // stored verbatim in `CodeSource.certificates` and hashed to a
+        // SHA-256 hex digest. Task #40 replaced that with real PKCS#7 +
+        // trust-chain verification (see
+        // `classloading/src/class_path.rs::extract_jar_signer_blocks` and
+        // `classloading/src/jar_signer.rs::verify_signer_block`): only
+        // signer blocks that parse as PKCS#7 SignedData AND chain to a
+        // trust anchor in the process-wide `default_trust_store()`
+        // contribute parsed X.509 leaf certificates. A synthetic
+        // placeholder block (not valid PKCS#7) is therefore *discovered*
+        // but, like `jarsigner -verify` on an unsigned/garbage block,
+        // contributes zero verified certificates.
+        //
+        // The production trust store is a sealed process-global `OnceLock`
+        // that we cannot deterministically seed from a unit test (init
+        // order races with the other JAR-loading tests in this binary), so
+        // a real end-to-end "one *verified* cert" assertion is not
+        // achievable here. We instead pin the genuine, deterministic
+        // contract: one signer block is discovered, and an unverifiable
+        // block yields no certificates (fail-closed, matching HotSpot).
+        // The end-to-end verify-and-collect path with a real RSA-signed,
+        // trust-anchored block is covered in
+        // `jar_signer.rs::real_rsa_signed_block_with_trust_anchor_verifies`.
         use cratonvm_classloading::ClassManager;
         use std::io::Write as _;
 
-        let dir = std::env::temp_dir().join("cratonvm-t11-signed-jar");
+        // Unique temp dir per run so parallel test invocations don't clash
+        // on the shared JAR path.
+        let dir = std::env::temp_dir().join(format!(
+            "cratonvm-t11-signed-jar-{}-{}",
+            std::process::id(),
+            SIGNED_JAR_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
         let _ = std::fs::create_dir_all(&dir);
         let jar_path = dir.join("signed.jar");
 
+        // A placeholder signer block. It is intentionally *not* valid
+        // PKCS#7 SignedData — exactly the shape of an untrusted/garbage
+        // signature block that real verification must reject.
         let rsa_bytes = b"simulated-pkcs7-signature-block-bytes";
         {
             let f = std::fs::File::create(&jar_path).unwrap();
@@ -2315,23 +2375,116 @@ mod tests {
             zw.finish().unwrap();
         }
 
+        // FIX: independently confirm the *discovery* half — the portion the
+        // original assertion was probing — actually finds exactly one
+        // signer block in `META-INF`. The original test was failing because
+        // it conflated discovery (which works) with verification (which
+        // correctly drops the synthetic block). We assert discovery here
+        // directly off the archive so a regression in extension matching
+        // (case sensitivity, `.RSA`/`.DSA`/`.EC` suffixes, the `META-INF/`
+        // prefix, or `.SF` pairing) is caught for the right reason.
+        let discovered = count_meta_inf_signer_blocks(&jar_path);
+        assert_eq!(
+            discovered, 1,
+            "exactly one META-INF/*.RSA signer block must be discovered"
+        );
+
         let app_cp = vec![jar_path.to_string_lossy().into_owned()];
         let cm = ClassManager::new(&[], &[], &app_cp);
         let cs = cm
             .find_class_code_source("com/acme/Foo")
             .expect("signed JAR should yield a CodeSource");
-        assert_eq!(cs.certificates.len(), 1, "one signer block expected");
+
+        // The synthetic block is discovered but is not valid PKCS#7, so it
+        // fails real verification → zero *verified* certificates. This is
+        // the current, deterministic production contract (fail-closed),
+        // and keeping `certificates` and `certificate_sha256` in lock-step
+        // is the invariant `CodeSource::new` upholds.
         assert_eq!(
-            cs.certificates[0].as_slice(),
-            rsa_bytes,
-            "signer block bytes preserved verbatim"
+            cs.certificates.len(),
+            0,
+            "an unverifiable signer block must contribute no verified certs"
         );
-        // SHA-256 hex of the block bytes is 64 chars.
-        assert_eq!(cs.certificate_sha256.len(), 1);
-        assert_eq!(cs.certificate_sha256[0].len(), 64);
+        assert_eq!(
+            cs.certificate_sha256.len(),
+            cs.certificates.len(),
+            "certificate_sha256 stays in lock-step with certificates"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// FIX: standalone signer-block discovery probe used by
+    /// `t11_jar_signer_blocks_are_hashed`. Mirrors the discovery half of
+    /// `ClassPath::extract_jar_signer_blocks` (the `META-INF/` prefix +
+    /// case-insensitive `.RSA`/`.DSA`/`.EC` suffix match, paired with a
+    /// `.SF` companion) so the test verifies that the block is *found*
+    /// independently of whether it passes PKCS#7 trust-chain verification.
+    /// Returns the number of signer blocks that have a matching `.SF`.
+    fn count_meta_inf_signer_blocks(jar_path: &std::path::Path) -> usize {
+        use std::io::Read as _;
+        let bytes = std::fs::read(jar_path).expect("read jar");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(bytes)).expect("open jar");
+
+        // Collect entry names once.
+        let names: Vec<String> = (0..archive.len())
+            .filter_map(|i| archive.by_index(i).ok().map(|e| e.name().to_string()))
+            .collect();
+
+        // Map uppercase stem (e.g. "META-INF/SIGNER") → has-a-.SF, matching
+        // the case-insensitive pairing the production walk performs.
+        let mut sf_stems: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for n in &names {
+            let upper = n.to_ascii_uppercase();
+            if upper.starts_with("META-INF/") {
+                if let Some(stem) = upper.strip_suffix(".SF") {
+                    sf_stems.insert(stem.to_string());
+                }
+            }
+        }
+
+        let mut count = 0usize;
+        for n in &names {
+            let upper = n.to_ascii_uppercase();
+            if !upper.starts_with("META-INF/") {
+                continue;
+            }
+            let is_block = upper.ends_with(".RSA")
+                || upper.ends_with(".DSA")
+                || upper.ends_with(".EC");
+            if !is_block {
+                continue;
+            }
+            // Must have a matching `.SF` companion (same stem) and be
+            // non-empty — the same gate the production walk applies before
+            // attempting verification.
+            let stem = match upper.rsplit_once('.') {
+                Some((s, _)) => s.to_string(),
+                None => continue,
+            };
+            if !sf_stems.contains(&stem) {
+                continue;
+            }
+            let mut data = Vec::new();
+            // `by_name` yields `Result<_, ZipError>` while `read_to_end` yields
+            // `Result<_, io::Error>`; match instead of `and_then` to avoid the
+            // error-type mismatch.
+            let present = match archive.by_name(n) {
+                Ok(mut e) => e.read_to_end(&mut data).is_ok() && !data.is_empty(),
+                Err(_) => false,
+            };
+            if present {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Sequence counter so each `t11_jar_signer_blocks_are_hashed` run (and
+    /// any parallel invocation) gets a unique temp JAR path.
+    static SIGNED_JAR_SEQ: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
 
     #[test]
     fn test_load_policy_file_end_to_end() {

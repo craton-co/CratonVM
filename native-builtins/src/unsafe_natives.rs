@@ -1815,25 +1815,60 @@ mod tests {
 
     #[test]
     fn free_memory_evicts_arena() {
+        // FIX: this test previously asserted that a getInt after freeMemory
+        // returned Some(Int(0)) — the obsolete "free is a no-op, reads return
+        // 0" contract. Under the consolidated bounds-checked arena (SECURITY
+        // FIX V5/V9), freeMemory EVICTS the block: a subsequent access is a
+        // use-after-free and must be rejected ("not in any live arena"). The
+        // old assertion's .unwrap() panicked on that (correct) Err. Rewritten
+        // to exercise the live consolidated arena path and to genuinely prove
+        // eviction: writes/reads succeed while live, then error after free.
         let mut ctx = MockNativeContext::new();
+        // Allocate through the consolidated arena allocator — the same path
+        // `register_consolidated_off_heap_store` wires `allocateMemory` to via
+        // `native_unsafe_allocate_memory_consolidated`. Use the RETURNED addr.
         let addr = crate::unsafe_arena_allocate(32);
+
+        // While live: putInt and getInt round-trip successfully.
         native_unsafe_put_int_at_address(
             &mut ctx,
             &[dummy_this(), Value::Long(addr), Value::Int(42)],
         )
         .unwrap();
+        let live = native_unsafe_get_int_at_address(
+            &mut ctx,
+            &[dummy_this(), Value::Long(addr)],
+        )
+        .unwrap();
+        assert_eq!(live, Some(Value::Int(42)), "read must succeed while arena is live");
+
+        // Free evicts the arena block.
         native_unsafe_free_memory(
             &mut ctx,
             &[dummy_this(), Value::Long(addr)],
         )
         .unwrap();
-        // After free, subsequent reads return 0.
-        let got = native_unsafe_get_int_at_address(
+
+        // After free, the address is no longer in any live arena: getInt must
+        // error (use-after-free rejected) rather than silently returning 0.
+        let after_free = native_unsafe_get_int_at_address(
             &mut ctx,
             &[dummy_this(), Value::Long(addr)],
-        )
-        .unwrap();
-        assert_eq!(got, Some(Value::Int(0)));
+        );
+        assert!(
+            after_free.is_err(),
+            "getInt after free must be rejected (arena evicted), got {after_free:?}",
+        );
+
+        // putInt to the freed address is likewise rejected.
+        let put_after_free = native_unsafe_put_int_at_address(
+            &mut ctx,
+            &[dummy_this(), Value::Long(addr), Value::Int(7)],
+        );
+        assert!(
+            put_after_free.is_err(),
+            "putInt after free must be rejected (arena evicted), got {put_after_free:?}",
+        );
     }
 
     #[test]

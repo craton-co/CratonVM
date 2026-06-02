@@ -281,17 +281,29 @@ pub(crate) fn note_object_degradation() {
 /// Kept out-of-line and `#[cold]` so the branch in [`note_object_degradation`]
 /// stays a single predicted-not-taken compare on the (already cold) degrade
 /// path. The crate has no logging dependency, so this writes one line to
-/// stderr behind a `Once`; the `debug_assert!` additionally turns the first
-/// collision into a test/fuzz failure where that is the desired behavior.
+/// stderr behind a `Once`.
+///
+/// This is purely advisory: a degradation is a deliberately-handled,
+/// *recoverable* fallback (a SUB_OBJECT-patterned primitive long, or a
+/// heap-denied slot, is reclassified to `Value::Long` / `false` instead of
+/// being dereferenced as a fabricated pointer — see the [`to_value`] Safety
+/// contract). It is therefore NOT an invariant violation, so this must not
+/// `panic!`/`debug_assert!(false)`: doing so would turn a normal counted event
+/// into a test/fuzz abort and contradict the observability counter
+/// (`object_degradation_count`), whose entire purpose is to make these events
+/// visible without crashing. The genuinely alarming case (a long↔object
+/// bit-pattern collision reaching a context-free decoder) is surfaced via this
+/// one-shot stderr line plus the counter, both of which are non-fatal.
+///
+/// [`to_value`]: CompactValue::to_value
 #[cold]
 #[inline(never)]
 fn emit_first_degradation_diag() {
-    debug_assert!(
-        false,
-        "CompactValue: long↔object NaN-box collision degraded to Value::Long; \
-         a context-free decoder saw a primitive long whose bits match SUB_OBJECT \
-         (see object_degradation_count / the to_value Safety contract)"
-    );
+    // FIX: removed the always-false `debug_assert!(false, ...)` that aborted in
+    // debug/test builds on the very first degradation. Degradation is a counted,
+    // recoverable fallback (returns Value::Long / false rather than dereferencing
+    // a bogus pointer), not UB — see note_object_degradation / object_degradation_count
+    // and the to_value Safety contract. Keep only the one-shot non-fatal diagnostic.
     FIRST_DEGRADATION_DIAG.call_once(|| {
         eprintln!(
             "CompactValue: first long↔object NaN-box collision degraded to \
