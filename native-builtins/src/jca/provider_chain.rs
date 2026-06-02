@@ -939,16 +939,6 @@ fn service_classname_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMa
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
-fn next_service_id() -> i64 {
-    use std::sync::atomic::{AtomicI64, Ordering};
-    static N: AtomicI64 = AtomicI64::new(1);
-    N.fetch_add(1, Ordering::Relaxed)
-}
-
-/// Slot index (on the synthetic `Provider$Service`) holding the GC-stable
-/// service id used to look up the className in `service_classname_table`.
-const SVC_SLOT_ID: usize = 4;
-
 /// Allocate a `Provider$Service` synthetic populated from a stored
 /// `ServiceEntry`.  Used by `provider_get_service_native` and the
 /// `Cipher.getInstance(algo, providerName)` resolution path.
@@ -972,13 +962,16 @@ fn make_service(ctx: &mut dyn NativeContext, entry: &ServiceEntry, prov: ObjectR
     // Slot 3 reserved for className so the new `Service.getClassName`
     // accessor (registered below) returns the right string.
     ctx.set_field(svc, 3, Value::Object(Some(class_s)));
-    // GC-stable className: keep it in a side table keyed by an integer id
-    // stashed in slot SVC_SLOT_ID (see `service_classname_table` docs).
-    let sid = next_service_id();
+    // GC-stable className: key the side table on the service's identity hash
+    // (stored in the object header, preserved across moving-GC relocation) so
+    // `newInstance` retrieves the className without depending on object slots
+    // — the synthetic `Provider$Service`'s reference slots are neither reliably
+    // forwarded by the collector nor int-writable (writes to ref slots coerce
+    // to null), making slot-based storage unreliable.
+    let ih = ctx.identity_hash_code(svc) as i64;
     service_classname_table()
         .lock()
-        .insert(sid, entry.class_name.clone());
-    ctx.set_field(svc, SVC_SLOT_ID, Value::Long(sid));
+        .insert(ih, entry.class_name.clone());
     svc
 }
 
@@ -1236,6 +1229,45 @@ fn getinstance_instance_provider_obj(
     }
 }
 
+/// `sun.security.jca.GetInstance.getServices(String type, String algorithm)` —
+/// returns an `Iterator<Provider$Service>` over every matching service in the
+/// provider chain. Used by the lazy `KeyFactory(String)` / `Signature(String)`
+/// / `Cipher` constructors (`serviceIterator` pattern) whose path does NOT go
+/// through `GetInstance.getInstance`; without this the bytecode reaches
+/// `Providers.getProviderList()` (which our shim leaves null) and NPEs on
+/// `list.getServices(...)`.
+fn getinstance_get_services(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let type_str = read_arg_string(ctx, args, 0);
+    let algo = read_arg_string(ctx, args, 1);
+    let al = "java/util/ArrayList";
+    let al_cid = ctx
+        .ensure_class_initialized(al)
+        .map_err(|_| cratonvm_types::error::RuntimeError::NotImplemented {
+            feature: "GetInstance.getServices: ArrayList not loaded".into(),
+        })?;
+    let mut list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
+    ctx.invoke(al, "<init>", "()V", &[Value::Object(Some(list))])?;
+    let pin = ctx.pin_native_root(list);
+    for (name, _, _) in snapshot() {
+        if let Some(svc) = resolve_service(ctx, &name, &type_str, &algo) {
+            list = ctx.read_native_pin(pin, list);
+            ctx.invoke(
+                al,
+                "add",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(list)), Value::Object(Some(svc))],
+            )?;
+        }
+    }
+    list = ctx.read_native_pin(pin, list);
+    let it = ctx.invoke(al, "iterator", "()Ljava/util/Iterator;", &[Value::Object(Some(list))]);
+    ctx.unpin_native_roots(pin);
+    it
+}
+
 fn getinstance_instance_search(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1264,14 +1296,10 @@ fn provider_service_new_instance(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let class_name = {
-        // Primary: GC-stable side-table lookup via the integer id in
-        // slot SVC_SLOT_ID (object slots holding String refs are not reliably
-        // forwarded — see `service_classname_table`).
-        let from_id = match ctx.get_field(this, SVC_SLOT_ID) {
-            Value::Long(id) => service_classname_table().lock().get(&id).cloned(),
-            Value::Int(id) => service_classname_table().lock().get(&(id as i64)).cloned(),
-            _ => None,
-        };
+        // Primary: GC-stable side-table lookup keyed by identity hash (header,
+        // preserved across relocation — see `service_classname_table`).
+        let ih = ctx.identity_hash_code(this) as i64;
+        let from_id = service_classname_table().lock().get(&ih).cloned();
         // Fallbacks: real `className` field, then the slot-3 mirror.
         let fallback = || {
             let by_name = ctx.get_field_by_name(this, "className");
@@ -1285,16 +1313,6 @@ fn provider_service_new_instance(
             raw.and_then(|s| ctx.read_string(s))
         };
         let resolved = from_id.filter(|s| !s.is_empty()).or_else(fallback);
-        if std::env::var_os("CRATONVM_DIAG_JCA").is_some() {
-            let cid = ctx.class_id_of_object(this);
-            let cname = ctx.class_name_of_id(cid).unwrap_or_default();
-            eprintln!(
-                "[JCA-DIAG] newInstance this.class={cname} slot{SVC_SLOT_ID}={:?} slot3={:?} resolved={:?}",
-                ctx.get_field(this, SVC_SLOT_ID),
-                ctx.get_field(this, 3),
-                resolved
-            );
-        }
         match resolved {
             Some(s) if !s.is_empty() => s,
             _ => {
@@ -1510,6 +1528,13 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
             "getInstance",
             "(Ljava/lang/String;Ljava/lang/Class;Ljava/lang/String;)Lsun/security/jca/GetInstance$Instance;",
             getinstance_instance_search,
+        );
+        // Lazy serviceIterator path (KeyFactory/Signature/Cipher constructors).
+        r.register(
+            gi,
+            "getServices",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/util/Iterator;",
+            getinstance_get_services,
         );
     }
 
