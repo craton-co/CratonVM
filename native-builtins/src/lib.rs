@@ -517,6 +517,18 @@ pub mod x509_manager;
 // apps/cipher_probe/CipherProbe.java).  Future signature/mac modules
 // land alongside `cipher` here.
 pub mod jca;
+
+/// Real-JCA bring-up gate. When `CRATONVM_REAL_JCA` is set, the synthetic
+/// key/keypair/signature short-circuit shims (both `crypto.rs` and
+/// `jca::key_factory`/`jca::signature`) are NOT registered and BouncyCastle's
+/// EC provider configuration is allowed to run, so `KeyPairGenerator.getInstance`
+/// / `KeyFactory.getInstance` / `Signature.getInstance` fall through to the real
+/// JDK 25 + BouncyCastle provider bytecode and yield concrete
+/// `ECPrivateKey`/`RSAPublicKey` instances instead of bare-interface synthetics.
+pub fn real_jca_mode() -> bool {
+    std::env::var_os("CRATONVM_REAL_JCA").is_some()
+}
+
 pub mod deprecated_lang;
 pub mod deprecated_io_util;
 pub mod deprecated_util;
@@ -1570,7 +1582,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // bc_probe / EJBCA: wire KeyGenerator shims into real-JDK mode. The full
     // crypto module is gated to synthetic-jdk, but bc_probe needs init/
     // getInstance/generateKey to bypass JDK bytecode that derefs `this.spi`.
-    crypto::register_key_generator_for_real_jdk(registry);
+    if !crate::real_jca_mode() {
+        crypto::register_key_generator_for_real_jdk(registry);
+    }
     // T19.H2: SharedSecrets JavaLangAccess shim — returns a non-null
     // System$1-shaped object whose currentCarrierThread() forwards to
     // the current thread. Fixes "Cannot invoke currentCarrierThread on null"
@@ -9421,7 +9435,9 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
 
     // --- Phase 9.3: JDK 25 Cryptography (KDF, ML-KEM, ML-DSA, PEM) ---
     #[cfg(feature = "legacy-synthetic-crypto")]
-    register_crypto_natives(registry);
+    if !crate::real_jca_mode() {
+        register_crypto_natives(registry);
+    }
 
     // --- Phase 10: ClassLoader hierarchy ---
     classloader::register_classloader_natives(registry);
