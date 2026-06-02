@@ -877,6 +877,17 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
         "([Ljava/lang/Object;)[Ljava/lang/Object;",
         native_al_to_array_typed,
     );
+    // Also the 0-arg form: `EnumSet.allOf(...).toArray()` resolves to
+    // AbstractCollection.toArray(), whose real bytecode loops `iterator()` —
+    // and our `Iterable.iterator` native only models ArrayList layout, so it
+    // would iterate zero elements. Route it through `native_al_to_array`, which
+    // uses the generic `collect_collection_elements` (handles EnumSet etc.).
+    r.register(
+        "java/util/AbstractCollection",
+        "toArray",
+        "()[Ljava/lang/Object;",
+        native_al_to_array,
+    );
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_al_iterator);
     r.register(c, "ensureCapacity", "(I)V", native_al_ensure_capacity);
     r.register(c, "trimToSize", "()V", native_al_trim_to_size);
@@ -1220,16 +1231,24 @@ pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let (data, size) = al_state(ctx, this);
-    let size = size as usize;
-    let result = alloc_ref_array(ctx, size);
-    if let Some(d) = data {
-        for i in 0..size {
-            let val = ctx.get_array_element(d, i);
-            ctx.set_array_element(result, i, val);
-        }
+    let elems = al_or_collection_elements(ctx, this);
+    let result = alloc_ref_array(ctx, elems.len());
+    for (i, val) in elems.iter().enumerate() {
+        ctx.set_array_element(result, i, *val);
     }
     Ok(Some(Value::Object(Some(result))))
+}
+
+/// Read elements for the `toArray` / `forEach` natives. These are registered on
+/// `AbstractCollection`, so they also intercept non-ArrayList collections
+/// (EnumSet/TreeSet/...). `al_state` cannot be trusted to return `None` for
+/// those — for a `RegularEnumSet` it reports an empty ArrayList (size 0), which
+/// made `EnumSet.allOf(...).toArray()`/`forEach`/`new ArrayList<>(enumSet)` all
+/// see zero elements. Delegate to `collect_collection_elements`, whose
+/// ArrayList-layout heuristics handle the fast path and whose iterator fallback
+/// materialises everything else through the real `iterator()`.
+fn al_or_collection_elements(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    collect_collection_elements(ctx, this)
 }
 
 /// `ArrayList.toArray(T[])` / `AbstractCollection.toArray(T[])` —
@@ -1245,13 +1264,12 @@ pub fn native_al_to_array_typed(
         _ => return Ok(Some(Value::Object(None))),
     };
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
-    let (data, size) = al_state(ctx, this);
-    let size = size as usize;
+    let elems = al_or_collection_elements(ctx, this);
+    let size = elems.len();
     if dbg_sbload() {
         eprintln!(
-            "[DBG_SBLOAD] AL.toArray(T[]) size={} data_some={} template_some={}",
+            "[DBG_SBLOAD] AL.toArray(T[]) size={} template_some={}",
             size,
-            data.is_some(),
             matches!(template, Value::Object(Some(_)))
         );
     }
@@ -1259,11 +1277,8 @@ pub fn native_al_to_array_typed(
         Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
         _ => alloc_ref_array(ctx, size),
     };
-    if let Some(d) = data {
-        for i in 0..size {
-            let val = ctx.get_array_element(d, i);
-            ctx.set_array_element(target, i, val);
-        }
+    for (i, val) in elems.iter().enumerate() {
+        ctx.set_array_element(target, i, *val);
     }
     let target_len = ctx.array_length(target);
     if target_len > size {
@@ -1337,6 +1352,33 @@ pub fn native_al_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
                 .unwrap_or(0);
             let backing = snapshot.unwrap_or_else(|| alloc_ref_array(ctx, 0));
             let wrapper = alloc_arraylist_with(ctx, backing, snap_len);
+            let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
+            let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
+            ctx.set_field(itr, list_slot, Value::Object(Some(wrapper)));
+            ctx.set_field(itr, cursor_slot, Value::Int(0));
+            return Ok(Some(Value::Object(Some(itr))));
+        }
+    }
+    // EnumSet reached via the `Iterable.iterator()` interface native: the
+    // indexed ArrayList$Itr below would call `this.get(cursor)`, but
+    // RegularEnumSet has no `get(int)`, and `al_state` can't read its elements
+    // either (it would iterate zero / NoSuchMethodError). Snapshot the real
+    // elements into an ArrayList-shaped wrapper and iterate THAT. Scoped to
+    // EnumSet specifically (by class name) so ordinary lists keep their live,
+    // remove()-capable iterator — `is_subclass`-based detection is unreliable
+    // (it reports false for ArrayList under the unit-test mock context, which
+    // would wrongly snapshot a real ArrayList and break `iterator().remove()`).
+    {
+        let cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(this))
+            .unwrap_or_default();
+        if cls == "java/util/RegularEnumSet" || cls == "java/util/JumboEnumSet" {
+            let elems = collect_collection_elements(ctx, this);
+            let backing = alloc_ref_array(ctx, elems.len());
+            for (i, v) in elems.iter().enumerate() {
+                ctx.set_array_element(backing, i, *v);
+            }
+            let wrapper = alloc_arraylist_with(ctx, backing, elems.len() as i32);
             let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
             let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
             ctx.set_field(itr, list_slot, Value::Object(Some(wrapper)));
@@ -5681,17 +5723,11 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     resync_values_view(ctx, this);
-    let (data, size) = al_state(ctx, this);
-    let data = match data {
-        Some(d) => d,
-        None => return Ok(None),
-    };
-    let len = size as usize;
     // Collect elements first to avoid borrowing issues during invoke_virtual.
-    let mut elems = Vec::with_capacity(len);
-    for i in 0..len {
-        elems.push(ctx.get_array_element(data, i));
-    }
+    // Use the generic helper so non-ArrayList collections (EnumSet/TreeSet/…)
+    // routed here through the AbstractCollection/Iterable interface natives are
+    // materialised via their real iterator instead of seeing an empty backing.
+    let elems = al_or_collection_elements(ctx, this);
     for elem in &elems {
         ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[*elem])?;
     }
@@ -7333,16 +7369,12 @@ fn native_al_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => return make_stream(ctx, &[]),
     };
     resync_values_view(ctx, this);
-    let (data, size) = al_state(ctx, this);
-    let elements: Vec<Value> = match data {
-        Some(d) => (0..size as usize)
-            .map(|i| ctx.get_array_element(d, i))
-            .collect(),
-        // Foreign collection (not ArrayList-shaped): the interface-level
-        // `stream` registration caught e.g. a Guava `Maps$Values`. Walk
-        // its real iterator instead of returning an empty stream.
-        None => collection_elements_generic(ctx, this),
-    };
+    // `al_state` returns an empty ArrayList (Some, size 0) — not None — for a
+    // non-ArrayList collection like RegularEnumSet, so the old `Some` branch
+    // produced an empty stream for `enumSet.stream()`. Use the generic helper,
+    // whose ArrayList heuristics keep the fast path and whose iterator fallback
+    // walks EnumSet/TreeSet/foreign collections.
+    let elements = al_or_collection_elements(ctx, this);
     make_stream(ctx, &elements)
 }
 
@@ -14548,6 +14580,46 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
                 return vec![v];
             }
         }
+        // RegularEnumSet — a real-JDK class CratonVM doesn't synthetically
+        // back. Its state is a `long elements` bitmask over the inherited
+        // `Enum<E>[] universe` array (no element array the slot heuristics
+        // below can find — worse, the HashSet heuristic false-matches the
+        // `elementType` Class field as a backing map and returns empty). And
+        // routing through `iterator()` doesn't help: the `Iterable.iterator`
+        // interface native (`native_al_iterator`) also only models ArrayList
+        // layout, so a reflective `invoke_virtual("iterator")` yields an empty
+        // iterator. Extract elements directly from the bitmask so
+        // `EnumSet.allOf(...).toArray()/stream()/forEach()` and
+        // `new ArrayList<>(enumSet)` (e.g. JUnit @Parameters over an EnumSet,
+        // WildFly subsystem tests) see the real members. JumboEnumSet (>64
+        // constants) stores a `long[] elements`; handle both.
+        if cls_name == "java/util/RegularEnumSet" || cls_name == "java/util/JumboEnumSet" {
+            if let Value::Object(Some(universe)) = ctx.get_field_by_name(coll, "universe") {
+                // Membership: walk the inherited `universe` (all constants of the
+                // enum, in ordinal order) and keep those the set contains. We
+                // deliberately use `contains()` rather than the `elements`
+                // bitmask: native slot-access of the inherited `long elements`
+                // field reads 0 here (a category-2 / inherited-layout
+                // name→slot bug — the real `getfield` bytecode in
+                // `RegularEnumSet.contains` reads the true value, so `contains`
+                // is reliable). This yields the correct subset for partial sets,
+                // not just `allOf`. Iterating in ordinal order matches
+                // EnumSet's iteration contract.
+                let ulen = ctx.array_length(universe);
+                let mut out = Vec::with_capacity(ulen);
+                for i in 0..ulen {
+                    let elem = ctx.get_array_element(universe, i);
+                    let contained = matches!(
+                        ctx.invoke_virtual(coll, "contains", "(Ljava/lang/Object;)Z", &[elem]),
+                        Ok(Some(Value::Int(v))) if v != 0
+                    );
+                    if contained {
+                        out.push(elem);
+                    }
+                }
+                return out;
+            }
+        }
     }
     // KC-Charset fix (2026-05-25): receiver-layout guard for the speculative
     // probe sequence below. `collect_collection_elements` is invoked through
@@ -14670,6 +14742,12 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
         }
     }
+    // No layout heuristic matched and it's not an EnumSet. Return empty rather
+    // than driving `iterator()` here: the `Iterable.iterator()` native
+    // (`native_al_iterator`) itself snapshots non-list collections via THIS
+    // function, so calling `iterator()` from here would recurse. Genuinely
+    // unmodelled collection layouts therefore materialise empty (status quo for
+    // those) — EnumSet, handled directly above, is the case that matters.
     Vec::new()
 }
 
