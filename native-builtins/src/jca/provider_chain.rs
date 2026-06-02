@@ -1123,18 +1123,17 @@ fn provider_service_new_instance(
         }
     };
     let internal = class_name.replace('.', "/");
-    // Allocate + run the no-arg constructor (real BC SPI bytecode).
-    let obj = match ctx.new_object(&internal)? {
-        Some(Value::Object(Some(o))) => o,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
-                class_name: class_name.clone(),
-            }
-            .into())
+    // GC-safe allocate + run the no-arg constructor (real BC SPI bytecode). The
+    // SPI constructor can allocate enough to trigger a moving GC, so we must not
+    // hold the raw reference across `<init>` — `new_object_initialized` pins it
+    // and returns the forwarded reference.
+    match ctx.new_object_initialized(&internal, "()V", &[])? {
+        Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
+        _ => Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
+            class_name: class_name.clone(),
         }
-    };
-    ctx.invoke(&internal, "<init>", "()V", &[Value::Object(Some(obj))])?;
-    Ok(Some(Value::Object(Some(obj))))
+        .into()),
+    }
 }
 
 /// Helper: read an argument as a Rust String (empty if null / not a String).

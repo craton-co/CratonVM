@@ -2131,21 +2131,15 @@ pub(crate) fn native_class_new_instance(ctx: &mut dyn NativeContext, args: &[Val
         .class_name_of_id(class_id)
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Allocate and call <init>()V
-    let obj_val = ctx.new_object(&class_name)?;
-    let obj = match obj_val {
-        Some(Value::Object(Some(obj))) => obj,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::NotImplemented {
-                feature: "Class.newInstance: new_object failed".to_string(),
-            }
-            .into())
+    // GC-safe allocate + `<init>()V` — pins the new object across the
+    // constructor under the moving collector (see `new_object_initialized`).
+    match ctx.new_object_initialized(&class_name, "()V", &[])? {
+        Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
+        _ => Err(cratonvm_types::error::RuntimeError::NotImplemented {
+            feature: "Class.newInstance: new_object failed".to_string(),
         }
-    };
-
-    // Call <init>()V
-    ctx.invoke(&class_name, "<init>", "()V", &[Value::Object(Some(obj))])?;
-    Ok(Some(Value::Object(Some(obj))))
+        .into()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5895,18 +5889,6 @@ pub(crate) fn native_constructor_new_instance(
         }
     }
 
-    // Allocate the new object
-    let obj_val = ctx.new_object(&class_name)?;
-    let obj = match obj_val {
-        Some(Value::Object(Some(o))) => o,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
-                message: format!("Constructor.newInstance: failed to allocate {class_name}"),
-            }
-            .into())
-        }
-    };
-
     // Parse parameter types
     let (param_descs, _) = parse_descriptor_param_and_return(&descriptor);
 
@@ -5929,8 +5911,11 @@ pub(crate) fn native_constructor_new_instance(
         )));
     }
 
-    // Build invocation args: [this_obj, ...coerced_args]
-    let mut invoke_args: Vec<Value> = vec![Value::Object(Some(obj))];
+    // Coerce the constructor arguments BEFORE allocating, so the new object is
+    // never held by native code (unrooted) across an allocation. The `<init>`
+    // arguments follow the implicit `this` that `new_object_initialized`
+    // prepends.
+    let mut init_args: Vec<Value> = Vec::with_capacity(param_descs.len());
     for (i, pdesc) in param_descs.iter().enumerate() {
         let arg_val = if let Some(arr) = args_array {
             ctx.get_array_element(arr, i)
@@ -5938,13 +5923,20 @@ pub(crate) fn native_constructor_new_instance(
             Value::Object(None)
         };
         let coerced = coerce_arg_strict(ctx, arg_val, pdesc, "Constructor.newInstance argument")?;
-        invoke_args.push(coerced);
+        init_args.push(coerced);
     }
 
-    // Call <init>; wrap any Java exception in InvocationTargetException per
-    // `Constructor.newInstance` javadoc.
-    match ctx.invoke(&class_name, "<init>", &descriptor, &invoke_args) {
-        Ok(_) => Ok(Some(Value::Object(Some(obj)))),
+    // GC-safe allocate + `<init>`: pins the new object as a GC root across the
+    // constructor under the moving collector, so a heavy `<init>` that triggers
+    // a relocation doesn't leave us returning a stale pointer (which would
+    // resolve to a reused `java.lang.Object`). Wrap any Java exception in
+    // InvocationTargetException per the `Constructor.newInstance` javadoc.
+    match ctx.new_object_initialized(&class_name, &descriptor, &init_args) {
+        Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+        Ok(_) => Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+            message: format!("Constructor.newInstance: failed to allocate {class_name}"),
+        }
+        .into()),
         Err(failure) => Err(wrap_as_invocation_target_exception(ctx, failure)),
     }
 }
