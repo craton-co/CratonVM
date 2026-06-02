@@ -696,6 +696,22 @@ fn aliases() -> &'static parking_lot::Mutex<FxHashMap<(String, String, String), 
     MAP.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
 }
 
+/// Process-wide RAW provider properties, keyed `(provider_name, exact_put_key)
+/// → value`. Mirrors what a real `Provider`'s inherited `Properties` table
+/// holds: every `put`/`parseLegacyPut(key, value)` is recorded verbatim here so
+/// `Provider.getProperty(key)` returns it. Needed because our `put` natives
+/// capture into the structured service/alias maps but never populate the
+/// synthetic Provider's real Hashtable, and real JDK code (e.g. BouncyCastle's
+/// `X509SignatureUtil.lookupAlg` → `Security.getProvider("BC").getProperty(
+/// "Alg.Alias.Signature.OID.<oid>")`) reads aliases back via `getProperty`.
+/// Keyed by provider *name* (not object) so it survives the fresh synthetic
+/// `Provider` instance handed out by each `Security.getProvider` call.
+fn provider_properties() -> &'static parking_lot::Mutex<FxHashMap<(String, String), String>> {
+    use std::sync::OnceLock;
+    static MAP: OnceLock<parking_lot::Mutex<FxHashMap<(String, String), String>>> = OnceLock::new();
+    MAP.get_or_init(|| parking_lot::Mutex::new(FxHashMap::default()))
+}
+
 /// Engine type normalisation: ASCII uppercase, no leading/trailing dots.
 /// JDK's `Provider$ServiceKey` uses case-insensitive comparison for both
 /// type and algorithm.
@@ -893,6 +909,9 @@ fn provider_put_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => String::new(),
     };
     let provider_name = provider_name_of(ctx, this);
+    provider_properties()
+        .lock()
+        .insert((provider_name.clone(), key.clone()), value.clone());
     apply_legacy_put(&provider_name, &key, &value);
     // Hashtable.put contract: return previous value (null on first put).
     Ok(Some(Value::Object(None)))
@@ -921,8 +940,34 @@ fn provider_parse_legacy_put_native(
         _ => String::new(),
     };
     let provider_name = provider_name_of(ctx, this);
+    provider_properties()
+        .lock()
+        .insert((provider_name.clone(), name.clone()), value.clone());
     apply_legacy_put(&provider_name, &name, &value);
     Ok(None)
+}
+
+/// `java.security.Provider.getProperty(String key)` — return the value recorded
+/// for `(this-provider-name, key)` by `put`/`parseLegacyPut`, or null. Bypasses
+/// the real `Provider.getProperty` (which calls `checkInitialized()` and throws
+/// `IllegalStateException` on our synthetic providers whose `initialized` flag
+/// is never set), and returns the alias/property values BouncyCastle's
+/// `X509SignatureUtil.lookupAlg` etc. read back via `getProperty`.
+fn provider_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let pname = provider_name_of(ctx, this);
+    let val = provider_properties().lock().get(&(pname, key)).cloned();
+    match val {
+        Some(v) => {
+            let s = ctx.create_string(&v);
+            Ok(Some(Value::Object(Some(s))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
 }
 
 /// GC-stable side table mapping a synthetic `Provider$Service` id to its
@@ -1535,6 +1580,28 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
             "getServices",
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/util/Iterator;",
             getinstance_get_services,
+        );
+        // Provider.getProperty — return captured put/alias values, bypassing the
+        // real getProperty's checkInitialized() (which NPEs on our synthetic
+        // providers). Used by BC's X509SignatureUtil.lookupAlg to map signature
+        // OIDs back to names during cert parsing.
+        r.register(
+            prov,
+            "getProperty",
+            "(Ljava/lang/String;)Ljava/lang/String;",
+            provider_get_property,
+        );
+        // jdk.internal.event.EventHelper.isLoggingSecurity() — JFR security-event
+        // logging gate. Its real body dereferences the static `JUJA`
+        // (`SharedSecrets.getJavaUtilJarAccess()`), which is null in our VM, so it
+        // NPEs ("Cannot invoke isInitializing on null") on the
+        // CertificateFactory.generateCertificate -> JCAUtil.tryCommitCertEvent
+        // path. We don't emit JFR security events, so report logging-off (false).
+        r.register(
+            "jdk/internal/event/EventHelper",
+            "isLoggingSecurity",
+            "()Z",
+            |_ctx, _args| Ok(Some(Value::Int(0))),
         );
     }
 
