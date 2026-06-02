@@ -1709,7 +1709,27 @@ mod tests {
         el.schedule_task(Box::new(move || { b2.wait(); })).ok();
         barrier.wait();
 
-        let snap = el.stats.snapshot();
+        // FIX(test-isolation): `barrier.wait()` only proves the 5th task has
+        // STARTED (it is parked in `b2.wait()`); the loop bumps `tasks_run`
+        // when each task body RETURNS, so the 5th task's count lands slightly
+        // after the rendezvous. Under parallel CPU load that lag can leave
+        // `tasks_run` momentarily at 4. Poll for the eventual condition with a
+        // generous timeout instead of asserting instantly — same assertion
+        // intent (>=5 tasks run, >=1 select cycle), just not racing dispatch.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let snap = loop {
+            let snap = el.stats.snapshot();
+            if snap.tasks_run >= 5 && snap.select_calls >= 1 {
+                break snap;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out waiting for dispatch stats: tasks_run={}, select_calls={}",
+                    snap.tasks_run, snap.select_calls
+                );
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
         assert!(snap.tasks_run >= 5, "tasks_run={}", snap.tasks_run);
         assert!(snap.select_calls >= 1, "select_calls={}", snap.select_calls);
 
