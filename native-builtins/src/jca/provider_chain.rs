@@ -1046,7 +1046,32 @@ fn resolve_service(
     type_str: &str,
     algo: &str,
 ) -> Option<ObjectRef> {
-    let entry = get_service_entry(provider, type_str, algo)?;
+    let entry = get_service_entry(provider, type_str, algo);
+    if std::env::var_os("CRATONVM_DIAG_JCA").is_some() {
+        match &entry {
+            Some(e) => eprintln!(
+                "[JCA-DIAG] getService({provider},{type_str},{algo}) -> entry algo={:?} class={:?}",
+                e.algorithm, e.class_name
+            ),
+            None => {
+                let svc = services().lock();
+                let count = svc.get(provider).map(|m| m.len()).unwrap_or(0);
+                let kpg: Vec<String> = svc
+                    .get(provider)
+                    .map(|m| {
+                        m.iter()
+                            .filter(|((t, _), _)| t == &normalize_engine(type_str))
+                            .map(|((_, a), e)| format!("{a}={}", e.class_name))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                eprintln!(
+                    "[JCA-DIAG] getService({provider},{type_str},{algo}) -> NONE; provider has {count} entries; {type_str} entries: {kpg:?}"
+                );
+            }
+        }
+    }
+    let entry = entry?;
     let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
     let prov_obj = make_provider(ctx, provider, ver, coverage);
     Some(make_service(ctx, &entry, prov_obj))
@@ -1123,18 +1148,17 @@ fn provider_service_new_instance(
         }
     };
     let internal = class_name.replace('.', "/");
-    // Allocate + run the no-arg constructor (real BC SPI bytecode).
-    let obj = match ctx.new_object(&internal)? {
-        Some(Value::Object(Some(o))) => o,
-        _ => {
-            return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
-                class_name: class_name.clone(),
-            }
-            .into())
+    // GC-safe allocate + run the no-arg constructor (real BC SPI bytecode). The
+    // SPI constructor can allocate enough to trigger a moving GC, so we must not
+    // hold the raw reference across `<init>` — `new_object_initialized` pins it
+    // and returns the forwarded reference.
+    match ctx.new_object_initialized(&internal, "()V", &[])? {
+        Some(v @ Value::Object(Some(_))) => Ok(Some(v)),
+        _ => Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
+            class_name: class_name.clone(),
         }
-    };
-    ctx.invoke(&internal, "<init>", "()V", &[Value::Object(Some(obj))])?;
-    Ok(Some(Value::Object(Some(obj))))
+        .into()),
+    }
 }
 
 /// Helper: read an argument as a Rust String (empty if null / not a String).

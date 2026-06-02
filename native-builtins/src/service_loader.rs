@@ -237,8 +237,15 @@ fn native_sl_iterator(
         .map_err(|_| MethodCallFailed::InternalError(VmError::Internal {
             message: "ArrayList: not loaded".to_string(),
         }))?;
-    let list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
+    let mut list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
     ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
+    // Pin the providers list as a GC root: the loop below repeatedly calls into
+    // Java (forName / newInstance / add), each of which can trigger a moving-GC
+    // collection that relocates `list`. Without re-reading the forwarded
+    // reference, `add` would mutate a stale (reused) object and the loader would
+    // silently produce zero providers (the keycloak `CryptoIntegration` "Not
+    // able to load any cryptoProvider" failure under real BouncyCastle).
+    let list_pin = ctx.pin_native_root(list);
 
     let diag = matches!(
         std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
@@ -333,6 +340,8 @@ fn native_sl_iterator(
                 continue;
             }
         };
+        // Re-read the (possibly forwarded) list reference before mutating it.
+        list = ctx.read_native_pin(list_pin, list);
         ctx.invoke(
             al_cls,
             "add",
@@ -340,6 +349,8 @@ fn native_sl_iterator(
             &[Value::Object(Some(list)), Value::Object(Some(inst))],
         )?;
     }
+    // Loop done: pick up the final forwarded list reference (still pinned).
+    list = ctx.read_native_pin(list_pin, list);
 
     if diag {
         let size = ctx
@@ -350,6 +361,7 @@ fn native_sl_iterator(
             "[SL-DBG] iterator() final list size={:?}",
             size
         );
+        list = ctx.read_native_pin(list_pin, list);
     }
     let it = ctx.invoke(
         al_cls,
@@ -357,6 +369,9 @@ fn native_sl_iterator(
         "()Ljava/util/Iterator;",
         &[Value::Object(Some(list))],
     )?;
+    // The returned iterator now keeps `list` reachable via the Java object
+    // graph, so the native pin can be released.
+    ctx.unpin_native_roots(list_pin);
     Ok(it)
 }
 

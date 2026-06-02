@@ -2299,7 +2299,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     //     through to synthetic streams" — downstream init levels still bump.
     registry.register(
         "java/lang/Class", "desiredAssertionStatus", "()Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |_ctx, _args| Ok(Some(Value::Int(assertion_status_default()))),
     );
     // S110 — initPhase1 wires up System.out/err synthetic streams *and*
     // System.in (a FileInputStream-shaped object whose slot 0 holds the
@@ -2859,7 +2859,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(m_obj))))
         },
     );
-    registry.register("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    registry.register("java/lang/Class", "desiredAssertionStatus0", "(Ljava/lang/Class;)Z", |_ctx, _args| Ok(Some(Value::Int(assertion_status_default()))));
     registry.register("java/lang/Class", "forName0", "(Ljava/lang/String;ZLjava/lang/ClassLoader;Ljava/lang/Class;)Ljava/lang/Class;", native_class_for_name);
     // Public-name `Class.forName` overloads. In stock OpenJDK these are
     // Java methods that forward to `forName0`; in synthetic-jdk mode the
@@ -7394,7 +7394,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/lang/Class",
         "desiredAssertionStatus0",
         "(Ljava/lang/Class;)Z",
-        native_return_false,
+        native_assertion_status,
     );
     registry.register(
         "java/lang/Class",
@@ -10444,6 +10444,27 @@ fn native_surefire_forkedbooter_exit_code(
 /// Exception <init>(Ljava/lang/Throwable;)V — sets cause (field 1)
 pub(crate) fn native_return_false(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Int(0))) // false
+}
+
+/// Default JVM-wide assertion status reported by `Class.desiredAssertionStatus`
+/// / `desiredAssertionStatus0`. Real HotSpot returns `false` unless `-ea` is on;
+/// CratonVM mirrors that, but honours `CRATONVM_ENABLE_ASSERTIONS=1` so test
+/// harnesses can reproduce Surefire's default (Surefire forks the test JVM with
+/// `-ea`). When enabled, `<clinit>` stores `$assertionsDisabled = false`, so
+/// `assert` statements in real bytecode (e.g. keycloak JWKUtil.toIntegerBytes)
+/// actually throw `AssertionError` on violation instead of being no-ops.
+pub(crate) fn assertion_status_default() -> i32 {
+    if std::env::var_os("CRATONVM_ENABLE_ASSERTIONS").is_some() {
+        1
+    } else {
+        0
+    }
+}
+
+/// `Class.desiredAssertionStatus0(Class)` / `desiredAssertionStatus()` honouring
+/// the `CRATONVM_ENABLE_ASSERTIONS` flag — see [`assertion_status_default`].
+pub(crate) fn native_assertion_status(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Int(assertion_status_default())))
 }
 
 pub(crate) fn native_return_zero(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -34694,7 +34715,7 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/Object;",
         native_class_get_enum_constants,
     );
-    registry.register(c, "desiredAssertionStatus", "()Z", native_return_false);
+    registry.register(c, "desiredAssertionStatus", "()Z", native_assertion_status);
     registry.register(
         c,
         "cast",

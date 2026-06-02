@@ -8415,6 +8415,26 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                         &[*elem],
                     )?
                     .unwrap_or(Value::Object(None));
+                // The 2-arg `Collectors.toMap(keyFn, valFn)` installs a throwing
+                // merger in real OpenJDK: a duplicate key raises
+                // `IllegalStateException("Duplicate key ...")`. The previous
+                // implementation silently last-wins-merged, so callers relying on
+                // the throw never saw it (e.g. keycloak IssuerSignedJWT.build()
+                // detects duplicate claim names exactly this way, then rethrows as
+                // IllegalArgumentException). Detect duplicates by Java `equals`
+                // over the keys collected so far and throw to match the JDK.
+                if let Value::Object(Some(kref)) = k {
+                    for (existing_k, _) in &pairs {
+                        if let Value::Object(Some(eref)) = existing_k {
+                            if map_keys_equal(ctx, *eref, kref)? {
+                                return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
+                                    message: "Duplicate key".to_string(),
+                                }
+                                .into());
+                            }
+                        }
+                    }
+                }
                 pairs.push((k, v));
             }
             make_map_of(ctx, &pairs)
@@ -20479,12 +20499,15 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Collection;Ljava/lang/Object;)I",
         native_collections_frequency,
     );
-    r.register(
-        c,
-        "disjoint",
-        "(Ljava/util/Collection;Ljava/util/Collection;)Z",
-        native_collections_disjoint,
-    );
+    // `Collections.disjoint` deliberately NOT registered: the previous native
+    // (`native_collections_disjoint`) only read ArrayList-backed collections via
+    // `al_state` and bailed to "disjoint = true" for any other Collection — so
+    // `Collections.disjoint(hashSetA, hashSetB)` always claimed no overlap even
+    // when the sets shared elements (keycloak DisclosureRedList red-list guard
+    // never fired). The real pure-Java `Collections.disjoint` iterates one
+    // collection and calls `contains` on the other; both work for HashSet on
+    // CratonVM, so we let the real bytecode run. (Two more stale stubs lived in
+    // native-builtins phases_early/phases_late — also removed.)
     r.register(
         c,
         "max",
@@ -20689,6 +20712,9 @@ fn native_collections_frequency(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     Ok(Some(Value::Int(count)))
 }
 
+// Retained for reference only — no longer registered (see the note at the
+// `Collections` registration site); the real JDK bytecode handles `disjoint`.
+#[allow(dead_code)]
 fn native_collections_disjoint(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let c1 = match args.first() {
         Some(Value::Object(Some(o))) => *o,

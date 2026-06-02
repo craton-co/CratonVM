@@ -72,10 +72,71 @@ concurrently (see `docs/bc-ec-mod-mododdinverse-investigation.md`, the parallel
   long/object NaN-tag collision drops genuine object slots) — the exact case the
   concurrent `roots.rs` `kinds`-based root fix repairs.
 
+## Update — integrated the agent's value-stack/GC/JIT fix (merge 9a8af62)
+
+The concurrent agent's fix landed on branch `kc-springboot-wildfly-tests`
+(`419a6f5 "Fix 7 VM bugs surfaced by the keycloak core+crypto-default test
+suite"`), **not on `dev`**. Merged it into this branch (clean, no conflicts —
+my files are `native-builtins/jca/*`+`lib.rs`, theirs are `vm/` core). Re-tested
+`BCECDSACryptoProviderTest` under `CRATONVM_REAL_JCA=1`:
+
+- **JIT on:** still SEGVs (same JIT frame) — the allocate-then-putfield / JIT
+  codegen miscompile is NOT fully fixed for the BC EC path.
+- **JIT off:** no longer crashes (exit 1, not 139) — progress — but the test
+  errors `IllegalStateException: Not able to load any cryptoProvider`.
+
+Root-caused the JIT-off failure with a minimal driver: in real-JCA mode,
+`Class.forName("...DefaultCryptoProvider").getDeclaredConstructor().newInstance()`
+returns a bare **`java.lang.Object`** (synthetic mode returns the correct class).
+`DefaultCryptoProvider`'s ctor runs `new BouncyCastleProvider()` (heavy real BC
+code) only in real-JCA mode. So `ServiceLoader` instantiates the provider, gets a
+wrong-typed object, the `sorted(...).collect()` / cast yields CCE
+(`Constable cannot be cast to CryptoProvider`) or an empty provider list → the
+`IllegalState`. `native_constructor_new_instance` (lang_class.rs) allocates the
+correct class and runs `<init>`; the returned `ObjectRef` is corrupted on the
+**invoke/return path** — the same `CompactValue` long/object NaN-tag collision
+family (cf. commit `e08017d "kinds-aware long decode on field/invoke/return
+paths"`), surfacing here because the heavy BC ctor floods the long-collision band.
+
+**Conclusion:** the agent's value-stack/GC fix is necessary but **not complete**.
+
+### Additional moving-GC native bugs fixed on this branch (commit 0847afc)
+
+Root-caused with a `--Xmx 6g` proxy test (large heap = no GC = correct result):
+native code holding a raw `ObjectRef` across a re-entrant Java call that can
+allocate returns a **stale** pointer (resolves to a reused `java.lang.Object`)
+under the moving collector. Fixed by pinning in `thread.native_pin_roots` (which
+GC forwards in place):
+- `NativeContext::new_object_initialized` (alloc + `<init>` pinned) — used by
+  `Constructor.newInstance`, `Class.newInstance`, `Provider$Service.newInstance`.
+- `NativeContext::{pin_native_root,read_native_pin,unpin_native_roots}` — used by
+  `service_loader.rs` to keep the providers `ArrayList` live across the
+  forName/newInstance/add loop + `iterator()`.
+
+Verified: reflective `newInstance` of a heavy-ctor class now returns the correct
+type at default heap (was `java.lang.Object`); keycloak `CryptoIntegration` gets
+**past** "Not able to load any cryptoProvider" into real `KeyPairGenerator(
+"ECDSA","BC")` resolution via the bridge.
+
+### Remaining: non-deterministic core value-corruption (concurrent agent's domain)
+
+After the above, the EC test still fails — but the failure point **varies run to
+run** (`Provider$Service.newInstance with no className`; `NoSuchMethodError
+java/lang/Class.loadClass`; `ClassCastException Object cannot be cast to Locale`
+in JUnit's result listener; JIT-on SEGV). This non-determinism is the signature
+of the residual operand-stack `CompactValue` long/object NaN-tag corruption +
+synchronized-method monitor-object loss — the same core value-representation /
+JIT-codegen family the concurrent agent owns and has **not** fully closed. Do not
+duplicate (branch-integration rule). The JCA bridge + GC-safety fixes are correct
+and validated as far as the VM allows; end-to-end green needs that core fix
+completed.
+
 ## Integration plan
 
-1. Land the concurrent value-stack `kinds` type-tag + GC-roots fix (not this
-   branch — do not duplicate).
+1. Land the **complete** value-stack `kinds` type-tag + GC-roots + invoke/return
+   + JIT-codegen fix (concurrent agent's domain — do not duplicate). Residual
+   symptoms to drive it to closure: reflective `newInstance` → `java.lang.Object`
+   under heavy-long ctors; monitor-ownership WARNs; BC-EC JIT SEGV.
 2. Rebase this bridge on top; re-run the keycloak `crypto/default` suite under
    `CRATONVM_REAL_JCA=1` (both JIT on and off) — expect real `BCEC*Key` to flow.
 3. Once green across the suite, make real-JCA the default: delete the synthetic

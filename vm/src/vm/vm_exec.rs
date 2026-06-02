@@ -941,6 +941,78 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         Ok(Some(Value::Object(Some(obj_ref))))
     }
 
+    fn new_object_initialized(
+        &mut self,
+        class_name: &str,
+        init_desc: &str,
+        init_args: &[Value],
+    ) -> MethodCallResult {
+        let class_id = self.shared.load_class_concurrent(class_name)?;
+        let num_fields = self
+            .shared
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .map(|c| c.num_total_fields)
+            .unwrap_or(0);
+        let obj_ref = self.shared.heap.alloc_object(class_id, num_fields);
+        crate::runtime::interpreter::init_primitive_fields(self.shared, obj_ref, class_id);
+
+        // Pin the freshly-allocated object as a GC root across `<init>`. The
+        // moving collector forwards `native_pin_roots` entries in place (see
+        // memory/gc.rs), so after a relocation triggered by a heavy constructor
+        // (e.g. BouncyCastle provider setup) we read back the up-to-date address
+        // instead of returning a stale pointer that resolves to a reused
+        // `java.lang.Object`. This mirrors how the bytecode `new`/`invokespecial`
+        // path keeps the dup'd reference live on the (scanned) operand stack.
+        let pin_idx = self.thread.native_pin_roots.len();
+        self.thread.native_pin_roots.push(obj_ref);
+
+        let mut full = Vec::with_capacity(init_args.len() + 1);
+        full.push(Value::Object(Some(obj_ref)));
+        full.extend_from_slice(init_args);
+        let init_result = invoke_shared(
+            self.shared,
+            self.thread,
+            class_name,
+            "<init>",
+            init_desc,
+            &full,
+        );
+
+        // Read the (possibly forwarded) reference back before unpinning.
+        let forwarded = self
+            .thread
+            .native_pin_roots
+            .get(pin_idx)
+            .copied()
+            .unwrap_or(obj_ref);
+        self.thread.native_pin_roots.truncate(pin_idx);
+
+        init_result?;
+        Ok(Some(Value::Object(Some(forwarded))))
+    }
+
+    fn pin_native_root(&mut self, obj: ObjectRef) -> usize {
+        let idx = self.thread.native_pin_roots.len();
+        self.thread.native_pin_roots.push(obj);
+        idx
+    }
+
+    fn read_native_pin(&self, handle: usize, fallback: ObjectRef) -> ObjectRef {
+        self.thread
+            .native_pin_roots
+            .get(handle)
+            .copied()
+            .unwrap_or(fallback)
+    }
+
+    fn unpin_native_roots(&mut self, base: usize) {
+        if base < self.thread.native_pin_roots.len() {
+            self.thread.native_pin_roots.truncate(base);
+        }
+    }
+
     fn invoke(
         &mut self,
         class_name: &str,

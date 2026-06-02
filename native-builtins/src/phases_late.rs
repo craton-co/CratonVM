@@ -1380,14 +1380,14 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(count)))
         },
     );
-    r.register(
-        coll,
-        "disjoint",
-        "(Ljava/util/Collection;Ljava/util/Collection;)Z",
-        |_ctx, _args| {
-            Ok(Some(Value::Int(1))) // assume disjoint
-        },
-    );
+    // NOTE: `Collections.disjoint` is deliberately NOT registered as a native.
+    // It used to be stubbed here to always return `1` ("assume disjoint"), which
+    // silently produced wrong answers (e.g. keycloak DisclosureRedListTest:
+    // `Collections.disjoint(redList, {"vct"})` returned true even though both
+    // sets share "vct", so the red-list guard never threw). The real
+    // `java.util.Collections.disjoint` is a small pure-Java method (iterate one
+    // collection, `contains` on the other, with the Set-size optimisation) and
+    // runs correctly on CratonVM, so we let the real bytecode handle it.
 }
 
 /// Helper to init a map-like object with 3 fields (buckets, size, capacity)

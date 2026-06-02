@@ -273,6 +273,66 @@ pub trait NativeContext {
     /// Returns an ObjectRef wrapped as `Value::Object(Some(ref))`.
     fn new_object(&mut self, class_name: &str) -> MethodCallResult;
 
+    /// Allocate an object of `class_name` and run its `<init>` constructor
+    /// (`init_desc`, with `init_args` as the post-`this` arguments), returning
+    /// the freshly-constructed object.
+    ///
+    /// **GC-safety:** unlike `new_object` followed by a separate `invoke(...,
+    /// "<init>", ...)`, this keeps the new object pinned as a GC root across the
+    /// `<init>` call and returns the *forwarded* reference. Under the moving
+    /// collector, a heavy constructor (e.g. BouncyCastle provider setup that
+    /// allocates enough to trigger a collection) relocates the object; a native
+    /// that held the pre-`<init>` raw `ObjectRef` would otherwise return a stale
+    /// pointer that resolves to a reused `java.lang.Object`. Reflective
+    /// construction paths (`Constructor.newInstance`, `Class.newInstance`,
+    /// `Provider$Service.newInstance`) must use this instead of `new_object` +
+    /// `invoke`.
+    ///
+    /// The default implementation is the non-GC-safe `new_object` + `invoke`
+    /// pair (sufficient for test mocks with no moving GC); the real VM overrides
+    /// it with the pinned variant.
+    fn new_object_initialized(
+        &mut self,
+        class_name: &str,
+        init_desc: &str,
+        init_args: &[Value],
+    ) -> MethodCallResult {
+        let obj_val = self.new_object(class_name)?;
+        if let Some(Value::Object(Some(obj))) = obj_val {
+            let mut full = Vec::with_capacity(init_args.len() + 1);
+            full.push(Value::Object(Some(obj)));
+            full.extend_from_slice(init_args);
+            self.invoke(class_name, "<init>", init_desc, &full)?;
+        }
+        Ok(obj_val)
+    }
+
+    /// Pin a heap object as a GC root and return an opaque handle index.
+    ///
+    /// Native code that holds an `ObjectRef` across a re-entrant call
+    /// (`invoke` / `new_object_initialized` / any operation that can allocate)
+    /// MUST pin it first: under the moving collector the object may relocate,
+    /// leaving the raw `ObjectRef` stale (it then resolves to a reused, usually
+    /// `java.lang.Object`, slot). After the call, read the forwarded reference
+    /// back with [`read_native_pin`] before using it. Unpin the whole batch with
+    /// [`unpin_native_roots`] passing the index returned by the *first* pin.
+    ///
+    /// Default impl is a no-op (handle 0) for test mocks with no moving GC.
+    fn pin_native_root(&mut self, _obj: ObjectRef) -> usize {
+        0
+    }
+
+    /// Read back a pinned object by handle, returning its current (post-GC,
+    /// possibly forwarded) reference. `fallback` is returned when the handle is
+    /// out of range. Default impl returns `fallback` (mocks don't relocate).
+    fn read_native_pin(&self, _handle: usize, fallback: ObjectRef) -> ObjectRef {
+        fallback
+    }
+
+    /// Release all native pin roots from `base` (a handle returned by
+    /// [`pin_native_root`]) onward. Default impl is a no-op.
+    fn unpin_native_roots(&mut self, _base: usize) {}
+
     /// Invoke a method by class name, method name, descriptor, and arguments.
     fn invoke(
         &mut self,
