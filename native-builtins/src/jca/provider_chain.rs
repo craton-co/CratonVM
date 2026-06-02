@@ -925,6 +925,30 @@ fn provider_parse_legacy_put_native(
     Ok(None)
 }
 
+/// GC-stable side table mapping a synthetic `Provider$Service` id to its
+/// implementation class name. The `Provider$Service` synthetic's object slots
+/// hold `String` references that are NOT reliably traced/forwarded by the moving
+/// collector (the class is allocated as a synthetic stub whose raw slots the GC
+/// does not treat as declared reference fields), so a className kept only in an
+/// object slot can go stale across the `getService` -> `newInstance` window and
+/// read back empty. Keying on an integer id (primitives are never relocated)
+/// makes className retrieval robust.
+fn service_classname_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i64, String>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i64, String>>> = OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn next_service_id() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static N: AtomicI64 = AtomicI64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Slot index (on the synthetic `Provider$Service`) holding the GC-stable
+/// service id used to look up the className in `service_classname_table`.
+const SVC_SLOT_ID: usize = 4;
+
 /// Allocate a `Provider$Service` synthetic populated from a stored
 /// `ServiceEntry`.  Used by `provider_get_service_native` and the
 /// `Cipher.getInstance(algo, providerName)` resolution path.
@@ -948,6 +972,13 @@ fn make_service(ctx: &mut dyn NativeContext, entry: &ServiceEntry, prov: ObjectR
     // Slot 3 reserved for className so the new `Service.getClassName`
     // accessor (registered below) returns the right string.
     ctx.set_field(svc, 3, Value::Object(Some(class_s)));
+    // GC-stable className: keep it in a side table keyed by an integer id
+    // stashed in slot SVC_SLOT_ID (see `service_classname_table` docs).
+    let sid = next_service_id();
+    service_classname_table()
+        .lock()
+        .insert(sid, entry.class_name.clone());
+    ctx.set_field(svc, SVC_SLOT_ID, Value::Long(sid));
     svc
 }
 
@@ -1119,6 +1150,110 @@ fn getinstance_get_service_search(
     .into())
 }
 
+/// Resolve `(provider, type, algorithm)` to a real implementation class, build
+/// its SPI via the real constructor, and wrap it in a `GetInstance$Instance`
+/// (provider + impl) built via that class's real `(Provider, Object)`
+/// constructor. This bypasses the `Provider$Service` object entirely — its
+/// raw-slot className storage is not GC-stable (the synthetic object's
+/// reference slots are not forwarded by the moving collector), whereas the
+/// className here is read straight from the Rust-side `ServiceEntry` and the
+/// resulting objects are constructed by their real `<init>` (proper, traced
+/// fields). Returns `None` if no implementation is registered.
+fn build_jca_instance(
+    ctx: &mut dyn NativeContext,
+    provider: &str,
+    type_str: &str,
+    algo: &str,
+) -> Option<MethodCallResult> {
+    let entry = get_service_entry(provider, type_str, algo)?;
+    if entry.class_name.is_empty() {
+        return None;
+    }
+    let internal = entry.class_name.replace('.', "/");
+    Some((|| {
+        // 1. Instantiate the real SPI (runs genuine provider bytecode), pinned.
+        let impl_ref = match ctx.new_object_initialized(&internal, "()V", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
+                    class_name: entry.class_name.clone(),
+                }
+                .into())
+            }
+        };
+        // Pin the SPI across the Provider allocation below (which can GC).
+        let pin = ctx.pin_native_root(impl_ref);
+        let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
+        let prov_obj = make_provider(ctx, provider, ver, coverage);
+        let impl_ref = ctx.read_native_pin(pin, impl_ref);
+        // 2. Build GetInstance$Instance(provider, impl) via its real ctor.
+        let inst = ctx.new_object_initialized(
+            "sun/security/jca/GetInstance$Instance",
+            "(Ljava/security/Provider;Ljava/lang/Object;)V",
+            &[Value::Object(Some(prov_obj)), Value::Object(Some(impl_ref))],
+        );
+        ctx.unpin_native_roots(pin);
+        inst
+    })())
+}
+
+fn getinstance_instance_provider(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (String type, Class clazz, String algorithm, String provider)
+    let type_str = read_arg_string(ctx, args, 0);
+    let algo = read_arg_string(ctx, args, 2);
+    let provider = read_arg_string(ctx, args, 3);
+    match build_jca_instance(ctx, &provider, &type_str, &algo) {
+        Some(r) => r,
+        None => Err(cratonvm_types::error::RuntimeError::NotImplemented {
+            feature: format!("no {type_str} {algo} implementation for provider {provider}"),
+        }
+        .into()),
+    }
+}
+
+fn getinstance_instance_provider_obj(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (String type, Class clazz, String algorithm, Provider provider)
+    let type_str = read_arg_string(ctx, args, 0);
+    let algo = read_arg_string(ctx, args, 2);
+    let provider = match args.get(3) {
+        Some(Value::Object(Some(p))) => {
+            read_provider_name_version(ctx, *p).map(|(n, _)| n).unwrap_or_default()
+        }
+        _ => String::new(),
+    };
+    match build_jca_instance(ctx, &provider, &type_str, &algo) {
+        Some(r) => r,
+        None => Err(cratonvm_types::error::RuntimeError::NotImplemented {
+            feature: format!("no {type_str} {algo} implementation for provider {provider}"),
+        }
+        .into()),
+    }
+}
+
+fn getinstance_instance_search(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (String type, Class clazz, String algorithm) — search the chain.
+    let type_str = read_arg_string(ctx, args, 0);
+    let algo = read_arg_string(ctx, args, 2);
+    for (name, _, _) in snapshot() {
+        if let Some(r) = build_jca_instance(ctx, &name, &type_str, &algo) {
+            return r;
+        }
+    }
+    Err(cratonvm_types::error::RuntimeError::NotImplemented {
+        feature: format!("no {type_str} {algo} implementation in any provider"),
+    }
+    .into())
+}
+
 /// `java.security.Provider$Service.newInstance(Object constructorParameter)` —
 /// reflectively instantiate the entry's implementation class (a real BC `*Spi`)
 /// and run its no-arg constructor, so the genuine provider bytecode produces the
@@ -1129,15 +1264,38 @@ fn provider_service_new_instance(
 ) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let class_name = {
-        let by_name = ctx.get_field_by_name(this, "className");
-        let raw = match by_name {
-            Value::Object(Some(s)) => Some(s),
-            _ => match ctx.get_field(this, 3) {
-                Value::Object(Some(s)) => Some(s),
-                _ => None,
-            },
+        // Primary: GC-stable side-table lookup via the integer id in
+        // slot SVC_SLOT_ID (object slots holding String refs are not reliably
+        // forwarded — see `service_classname_table`).
+        let from_id = match ctx.get_field(this, SVC_SLOT_ID) {
+            Value::Long(id) => service_classname_table().lock().get(&id).cloned(),
+            Value::Int(id) => service_classname_table().lock().get(&(id as i64)).cloned(),
+            _ => None,
         };
-        match raw.and_then(|s| ctx.read_string(s)) {
+        // Fallbacks: real `className` field, then the slot-3 mirror.
+        let fallback = || {
+            let by_name = ctx.get_field_by_name(this, "className");
+            let raw = match by_name {
+                Value::Object(Some(s)) => Some(s),
+                _ => match ctx.get_field(this, 3) {
+                    Value::Object(Some(s)) => Some(s),
+                    _ => None,
+                },
+            };
+            raw.and_then(|s| ctx.read_string(s))
+        };
+        let resolved = from_id.filter(|s| !s.is_empty()).or_else(fallback);
+        if std::env::var_os("CRATONVM_DIAG_JCA").is_some() {
+            let cid = ctx.class_id_of_object(this);
+            let cname = ctx.class_name_of_id(cid).unwrap_or_default();
+            eprintln!(
+                "[JCA-DIAG] newInstance this.class={cname} slot{SVC_SLOT_ID}={:?} slot3={:?} resolved={:?}",
+                ctx.get_field(this, SVC_SLOT_ID),
+                ctx.get_field(this, 3),
+                resolved
+            );
+        }
+        match resolved {
             Some(s) if !s.is_empty() => s,
             _ => {
                 return Err(cratonvm_types::error::RuntimeError::NotImplemented {
@@ -1328,6 +1486,30 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
             "newInstance",
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             provider_service_new_instance,
+        );
+        // Preferred path: intercept GetInstance.getInstance directly and return
+        // a fully-built Instance (provider + real SPI impl). This avoids the
+        // Provider$Service object round-trip whose raw-slot className storage is
+        // not GC-stable. Covers the String-provider, Provider-object, and
+        // no-provider overloads used by KeyPairGenerator/KeyFactory/Signature/
+        // Cipher/MessageDigest.getInstance.
+        r.register(
+            gi,
+            "getInstance",
+            "(Ljava/lang/String;Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;)Lsun/security/jca/GetInstance$Instance;",
+            getinstance_instance_provider,
+        );
+        r.register(
+            gi,
+            "getInstance",
+            "(Ljava/lang/String;Ljava/lang/Class;Ljava/lang/String;Ljava/security/Provider;)Lsun/security/jca/GetInstance$Instance;",
+            getinstance_instance_provider_obj,
+        );
+        r.register(
+            gi,
+            "getInstance",
+            "(Ljava/lang/String;Ljava/lang/Class;Ljava/lang/String;)Lsun/security/jca/GetInstance$Instance;",
+            getinstance_instance_search,
         );
     }
 

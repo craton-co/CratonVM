@@ -34,6 +34,23 @@ pub fn update_all_roots(
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, &shared.heap);
         frame.stack.update_object_refs(pointer_map, &shared.heap);
+        // Forward the synchronized-method monitor object too. A `synchronized`
+        // method records the object it locked on entry in `monitor_on_exit` and
+        // releases it on frame-pop. If a GC during the method body relocates
+        // that object (its locals/operand-stack copies are forwarded above, and
+        // the monitor table is remapped by the collector), a stale
+        // `monitor_on_exit` would make the implicit `monitorexit` target the
+        // old address — surfacing as "thread does not own the monitor"
+        // (observed in BouncyCastle's synchronized `X9ECParametersHolder.
+        // getParameters` / `X9ECPoint.getPoint`, which allocate inside the
+        // locked region). Keep it consistent with the relocated object.
+        if let Some(ref mut obj_ref) = frame.monitor_on_exit {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
     }
 
     for obj_ref in &mut thread.native_pin_roots {
