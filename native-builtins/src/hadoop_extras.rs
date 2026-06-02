@@ -16,25 +16,13 @@
 
 #![allow(clippy::needless_pass_by_value)]
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
+use cratonvm_native_api::NativeMethodRegistry;
 
-#[allow(dead_code)]
-const CN_VERSION_INFO: &str = "org/apache/hadoop/util/VersionInfo";
-#[allow(dead_code)]
-const CN_RUN_JAR: &str = "org/apache/hadoop/util/RunJar";
-
-#[allow(dead_code)]
-fn hadoop_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[hadoop-shim] main short-circuited (boot-test mode)");
-    Ok(None)
-}
-
-#[allow(dead_code)]
-fn hadoop_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
-}
+// HYGIENE (audit): the dead `hadoop_main_noop` / `hadoop_clinit_noop`
+// fake-main / fake-<clinit> short-circuit helpers (and the
+// `CN_VERSION_INFO` / `CN_RUN_JAR` consts that only named them) were
+// deleted. They were `#[allow(dead_code)]` and unreferenced — a latent
+// re-introduction risk under the "no synthetic stubs" policy.
 
 /// Install Hadoop boot-test short-circuits.
 pub fn register_hadoop_stubs(registry: &mut NativeMethodRegistry) {

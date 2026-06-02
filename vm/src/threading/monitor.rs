@@ -25,6 +25,10 @@ use rustc_hash::FxHashMap;
 use cratonvm_types::{self as types, ObjectHeader};
 
 use crate::error::{MethodCallFailed, RuntimeError, VmError};
+// SECURITY FIX (V11): wire the L6 `monitors` registry through the lock-order
+// enforcement framework so the documented hierarchy is actually checked at
+// runtime in debug builds.
+use crate::runtime::lock_order::{LockLevel, OrderedMutex};
 use crate::threading::jvm_thread::ThreadId;
 use crate::types::ObjectRef;
 
@@ -636,19 +640,34 @@ pub struct MonitorTable {
     /// Inflated-monitor registry — keys are object pointer addresses.
     /// Populated lazily on inflation; consulted by GC remap only.
     /// T10.9.B: FxHashMap — keys are object pointer addresses (internal).
-    monitors: Mutex<FxHashMap<usize, Arc<Monitor>>>,
+    ///
+    // SECURITY FIX (V11): this registry lock is the `monitors` lock at
+    // hierarchy level L6 (`docs/lock-order.md`). It is wrapped in
+    // `OrderedMutex` at `LockLevel::Monitors` so that, in debug builds, any
+    // attempt to acquire a *lower*-or-equal-level lock first and then this
+    // registry trips the descending-order debug assertion. All accesses are
+    // confined to this file (the field is private), so the wrapper change has
+    // no blast radius outside `monitor.rs`.
+    monitors: OrderedMutex<FxHashMap<usize, Arc<Monitor>>>,
     /// Per-object CAS locks for compareAndSwap operations.
     /// Provides mutual exclusion for non-atomic CAS emulation on Value slots.
     /// T10.9.B: FxHashMap — object pointer addresses (internal).
-    cas_locks: Mutex<FxHashMap<usize, Arc<Mutex<()>>>>,
+    ///
+    // SECURITY FIX (V11): the CAS-lock *registry* (the outer map) is also part
+    // of the L6 `monitors` subsystem; wrap it at `LockLevel::Monitors` too. The
+    // inner per-object `Arc<Mutex<()>>` stays a plain `parking_lot::Mutex`: it
+    // is an L6-internal sub-lock with no global ordering constraints and is
+    // never held while acquiring another tracked lock.
+    cas_locks: OrderedMutex<FxHashMap<usize, Arc<Mutex<()>>>>,
 }
 
 impl MonitorTable {
     /// Create an empty monitor table.
     pub fn new() -> Self {
         Self {
-            monitors: Mutex::new(FxHashMap::default()),
-            cas_locks: Mutex::new(FxHashMap::default()),
+            // SECURITY FIX (V11): both registries live at L6 (`monitors`).
+            monitors: OrderedMutex::new(FxHashMap::default(), LockLevel::Monitors),
+            cas_locks: OrderedMutex::new(FxHashMap::default(), LockLevel::Monitors),
         }
     }
 
@@ -656,7 +675,9 @@ impl MonitorTable {
     /// object has never been inflated.
     fn lookup_inflated(&self, obj_ref: ObjectRef) -> Option<Arc<Monitor>> {
         let key = obj_ref.as_ptr() as usize;
-        let monitors = self.monitors.lock();
+        // SECURITY FIX (V11): OrderedMutex::lock() returns a LockResult; the
+        // registry is never poisoned (no panic is held across it), so unwrap.
+        let monitors = self.monitors.lock().expect("monitors registry poisoned");
         monitors.get(&key).cloned()
     }
 
@@ -687,7 +708,8 @@ impl MonitorTable {
         header: &ObjectHeader,
     ) -> Result<Arc<Monitor>, MethodCallFailed> {
         let key = obj_ref.as_ptr() as usize;
-        let mut monitors = self.monitors.lock();
+        // SECURITY FIX (V11): OrderedMutex::lock() returns a LockResult.
+        let mut monitors = self.monitors.lock().expect("monitors registry poisoned");
         loop {
             let cur = header.mark_word.load(Ordering::Acquire);
             match ObjectHeader::mark_state(cur) {
@@ -897,7 +919,8 @@ impl MonitorTable {
     /// for the legacy fallback when a `ThreadId` exceeds `u32::MAX`.
     fn inflate_for_legacy(&self, obj_ref: ObjectRef) -> Arc<Monitor> {
         let key = obj_ref.as_ptr() as usize;
-        let mut monitors = self.monitors.lock();
+        // SECURITY FIX (V11): OrderedMutex::lock() returns a LockResult.
+        let mut monitors = self.monitors.lock().expect("monitors registry poisoned");
         monitors
             .entry(key)
             .or_insert_with(|| Arc::new(Monitor::new()))
@@ -1115,7 +1138,8 @@ impl MonitorTable {
             s if s == types::MARK_INFLATED => {
                 let key = obj_ref.as_ptr() as usize;
                 let monitor = {
-                    let monitors = self.monitors.lock();
+                    // SECURITY FIX (V11): OrderedMutex::lock() -> LockResult.
+                    let monitors = self.monitors.lock().expect("monitors registry poisoned");
                     monitors.get(&key).cloned()
                 };
                 match monitor {
@@ -1138,7 +1162,8 @@ impl MonitorTable {
     {
         let key = obj_ref.as_ptr() as usize;
         let lock = {
-            let mut cas = self.cas_locks.lock();
+            // SECURITY FIX (V11): OrderedMutex::lock() -> LockResult.
+            let mut cas = self.cas_locks.lock().expect("cas_locks registry poisoned");
             cas.entry(key)
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
@@ -1170,7 +1195,8 @@ impl MonitorTable {
             s if s == types::MARK_INFLATED => {
                 let key = obj_ref.as_ptr() as usize;
                 let monitor = {
-                    let monitors = self.monitors.lock();
+                    // SECURITY FIX (V11): OrderedMutex::lock() -> LockResult.
+                    let monitors = self.monitors.lock().expect("monitors registry poisoned");
                     monitors.get(&key).cloned()
                 };
                 monitor.and_then(|m| {
@@ -1203,7 +1229,8 @@ impl MonitorTable {
             s if s == types::MARK_INFLATED => {
                 let key = obj_ref.as_ptr() as usize;
                 let monitor = {
-                    let monitors = self.monitors.lock();
+                    // SECURITY FIX (V11): OrderedMutex::lock() -> LockResult.
+                    let monitors = self.monitors.lock().expect("monitors registry poisoned");
                     monitors.get(&key).cloned()
                 };
                 monitor.map_or(0, |m| m.state.lock().entry_count)
@@ -1221,20 +1248,30 @@ impl MonitorTable {
         if pointer_map.is_empty() {
             return;
         }
-        let mut monitors = self.monitors.lock();
-        // Drain all entries, re-key those whose address has changed
-        let entries: Vec<(usize, Arc<Monitor>)> = monitors.drain().collect();
-        for (old_key, monitor) in entries {
-            let new_key = pointer_map.get(&old_key).copied().unwrap_or(old_key);
-            monitors.insert(new_key, monitor);
+        // SECURITY FIX (V11): both `monitors` and `cas_locks` are wrapped at
+        // the SAME hierarchy level (L6). The lock-order checker forbids holding
+        // one and then acquiring the other (equal level => not strictly
+        // descending). Scope each guard so only one L6 registry lock is held at
+        // a time; the two maps are independent so this is purely additive
+        // safety with no behavioural change.
+        {
+            let mut monitors = self.monitors.lock().expect("monitors registry poisoned");
+            // Drain all entries, re-key those whose address has changed
+            let entries: Vec<(usize, Arc<Monitor>)> = monitors.drain().collect();
+            for (old_key, monitor) in entries {
+                let new_key = pointer_map.get(&old_key).copied().unwrap_or(old_key);
+                monitors.insert(new_key, monitor);
+            }
         }
 
-        // Also remap CAS locks
-        let mut cas = self.cas_locks.lock();
-        let cas_entries: Vec<(usize, Arc<Mutex<()>>)> = cas.drain().collect();
-        for (old_key, lock) in cas_entries {
-            let new_key = pointer_map.get(&old_key).copied().unwrap_or(old_key);
-            cas.insert(new_key, lock);
+        // Also remap CAS locks (separate L6 critical section).
+        {
+            let mut cas = self.cas_locks.lock().expect("cas_locks registry poisoned");
+            let cas_entries: Vec<(usize, Arc<Mutex<()>>)> = cas.drain().collect();
+            for (old_key, lock) in cas_entries {
+                let new_key = pointer_map.get(&old_key).copied().unwrap_or(old_key);
+                cas.insert(new_key, lock);
+            }
         }
     }
 }
@@ -1253,7 +1290,8 @@ impl cratonvm_gc::MonitorCleanup for MonitorTable {
 
 impl std::fmt::Debug for MonitorTable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let count = self.monitors.lock().len();
+        // SECURITY FIX (V11): OrderedMutex::lock() -> LockResult.
+        let count = self.monitors.lock().expect("monitors registry poisoned").len();
         f.debug_struct("MonitorTable")
             .field("active_monitors", &count)
             .finish()
@@ -1682,7 +1720,8 @@ mod tests {
 
     /// Returns the active monitor count in the table's fallback registry.
     fn monitor_registry_len(table: &MonitorTable) -> usize {
-        table.monitors.lock().len()
+        // SECURITY FIX (V11): registry is now an OrderedMutex (LockResult).
+        table.monitors.lock().expect("monitors registry poisoned").len()
     }
 
     #[test]

@@ -61,7 +61,14 @@ adversarial input.
 
 - The bytecode verifier does not implement full type inference for pre-Java 7 class files
 - Native method implementations may not enforce all JVM specification security constraints
-- The JIT compiler uses executable memory mappings (`mmap`/`VirtualAlloc` with `RWX` permissions)
+- The JIT compiler uses executable memory mappings. These enforce **W^X (write
+  xor execute)** on every platform — no page is ever simultaneously writable and
+  executable. Pages are allocated read/write, code is emitted, then the region is
+  flipped to read/execute: Windows allocates `PAGE_READWRITE` via `VirtualAlloc`
+  then flips to `PAGE_EXECUTE_READ` with `VirtualProtect`; Linux/FreeBSD `mmap`
+  `PROT_READ|PROT_WRITE` then `mprotect` to `PROT_READ|PROT_EXEC` (flushing the
+  I-cache via `__clear_cache` on aarch64 first); macOS-arm64 uses `MAP_JIT` and
+  `sys_icache_invalidate` before the RW→RX flip. See `jit/src/platform.rs`.
 - **Partial Security Manager support (not a sandbox).** `java.lang.SecurityManager`,
   `java.security.AccessController`, `AccessControlContext`, and `Policy` have native
   implementations (`native-builtins/src/security_manager.rs`). `System.setSecurityManager`
@@ -81,6 +88,19 @@ adversarial input.
   `java.policy` is loaded by default, and the SecurityManager surface is deprecated for
   removal (JEP 411).
 - No sandboxing of loaded Java classes
+- **Incomplete signed-JAR trust.** The signed-JAR verifier
+  (`classloading/src/jar_signer.rs`) implements RSA PKCS#1 v1.5 only. ECDSA and
+  DSA signer blocks, RSA-PSS, and full RFC 5280 certification-path validation are
+  **NOT** implemented. Signed-jar trust currently **fails closed**: a signed jar
+  whose signature cannot be verified by the supported path is rejected, but the
+  VM cannot cryptographically *establish trust* in the general case. Do not rely
+  on jar signatures as a trust boundary.
+- **Known JIT crash (under investigation).** A JIT-related native crash is
+  tracked in [`docs/real-raf-segv-root-cause.md`](docs/real-raf-segv-root-cause.md).
+  Two distinct root causes documented there have been fixed; the area remains
+  under active investigation and is disclosed here as a known issue rather than
+  hidden. Use `--nojit` to run the interpreter only if you need to avoid the JIT
+  entirely.
 
 ## Hardening Measures
 
@@ -117,8 +137,17 @@ CratonVM uses `unsafe` Rust in the following subsystems:
 | JIT (x64, aarch64) | Executable memory mapping and code emission | W^X via `mprotect`/`VirtualProtect`, buffer bounds checks |
 | ObjectRef | Send/Sync for heap pointers | Single-threaded execution model; monitor protocol for future threading |
 | FFI (native-api) | Calling native libraries via `libloading` | Library paths restricted to classpath |
+| native-io | Raw syscalls / FFI for file, socket, NIO channel, and selector I/O | FD-table ownership, length/bounds checks on buffers |
+| native-awt | Platform windowing/Java2D peers (Win32, Cocoa, X11) | Headless by default; peer handles validated before use |
+| cuda-bridge | CUDA Driver API FFI for optional GPU offload | Opt-in Cargo feature; not built into the default CPU-only binary |
+| types | `ObjectRef`/`Value` representation and transmutes | Layout assertions; constructed only by the VM runtime |
+| jfr | Java Flight Recorder buffer encoding | Bounded ring buffers, length-checked writes |
 
-All `unsafe` blocks carry `// SAFETY:` comments documenting the relied-upon invariant.
+`unsafe` blocks in the core subsystems (GC, JIT, and `ObjectRef`) are documented
+with `// SAFETY:` comments describing the relied-upon invariant. Full
+`// SAFETY:` coverage across all subsystems above is still in progress — the
+peripheral subsystems (native-io, native-awt, cuda-bridge, jfr) are not yet
+fully annotated.
 
 ## Reporting a Vulnerability
 

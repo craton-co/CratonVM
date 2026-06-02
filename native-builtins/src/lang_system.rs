@@ -125,21 +125,28 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
     let src_len = ctx.array_length(src) as i32;
     let dest_len = ctx.array_length(dest) as i32;
 
+    // SECURITY FIX (V14): widen the end-offset additions to i64 so that
+    // `src_pos + length` / `dest_pos + length` cannot wrap to a negative
+    // value (Rust `+` wraps in release builds) and silently defeat the
+    // `> len` bounds check. The individual >= 0 checks and the
+    // ArrayIndexOutOfBoundsException semantics are preserved.
+    let src_end = src_pos as i64 + length as i64;
+    let dest_end = dest_pos as i64 + length as i64;
     if src_pos < 0
         || dest_pos < 0
         || length < 0
-        || src_pos + length > src_len
-        || dest_pos + length > dest_len
+        || src_end > src_len as i64
+        || dest_end > dest_len as i64
     {
         return Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException {
             index: if src_pos < 0 {
                 src_pos
             } else if dest_pos < 0 {
                 dest_pos
-            } else if src_pos + length > src_len {
-                src_pos + length
+            } else if src_end > src_len as i64 {
+                src_end as i32
             } else {
-                dest_pos + length
+                dest_end as i32
             },
         }
         .into());

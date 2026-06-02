@@ -36,29 +36,13 @@
 // TODO orchestrator: wire `hazelcast_extras::register_hazelcast_stubs(registry);`
 // into `register_essential_natives` in `lib.rs`.
 
-#![allow(clippy::needless_pass_by_value)]
+use cratonvm_native_api::NativeMethodRegistry;
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
-
-#[allow(dead_code)]
-const CN_MEMBER_STARTER: &str = "com/hazelcast/core/server/HazelcastMemberStarter";
-#[allow(dead_code)]
-const CN_CLUSTER: &str = "com/hazelcast/cluster/Cluster";
-
-/// Generic `main([Ljava/lang/String;)V` no-op for Hazelcast entry points.
-#[allow(dead_code)]
-fn hazelcast_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[hazelcast-shim] main short-circuited (boot-test mode)");
-    Ok(None)
-}
-
-/// Generic `<clinit>()V` no-op for Hazelcast entry-point classes.
-#[allow(dead_code)]
-fn hazelcast_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
-}
+// HYGIENE (audit): the dead `hazelcast_main_noop` / `hazelcast_clinit_noop`
+// fake-main / fake-<clinit> short-circuit helpers (and the
+// `CN_MEMBER_STARTER` / `CN_CLUSTER` consts that only named them) were
+// deleted. They were `#[allow(dead_code)]` and unreferenced — a latent
+// re-introduction risk under the "no synthetic stubs" policy.
 
 /// Install every Hazelcast boot-test short-circuit this module owns.
 ///
@@ -68,8 +52,6 @@ fn hazelcast_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> Metho
 /// work; they have been removed so Hazelcast runs against real bytecode.
 pub fn register_hazelcast_stubs(registry: &mut NativeMethodRegistry) {
     let _ = registry;
-    let _ = CN_MEMBER_STARTER;
-    let _ = CN_CLUSTER;
 }
 
 #[cfg(test)]

@@ -39,35 +39,14 @@
 // TODO orchestrator: wire `hbase_extras::register_hbase_stubs(registry);`
 // into `register_essential_natives` in `lib.rs`.
 
-#![allow(clippy::needless_pass_by_value)]
+use cratonvm_native_api::NativeMethodRegistry;
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
-
-#[allow(dead_code)]
-const CN_VERSION_INFO: &str = "org/apache/hadoop/hbase/util/VersionInfo";
-#[allow(dead_code)]
-const CN_HMASTER: &str = "org/apache/hadoop/hbase/HMaster";
-#[allow(dead_code)]
-const CN_HBCK2: &str = "org/apache/hadoop/hbase/HBCK2";
-#[allow(dead_code)]
-const CN_HBASE_FSCK: &str = "org/apache/hadoop/hbase/util/HBaseFsck";
-
-/// Generic `main([Ljava/lang/String;)V` no-op for HBase entry points.
-#[allow(dead_code)]
-fn hbase_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[hbase-shim] main short-circuited (boot-test mode)");
-    Ok(None)
-}
-
-/// Generic `<clinit>()V` no-op for HBase entry-point classes. The real
-/// clinit pulls in Hadoop `Configuration` static fields which NPE under
-/// CratonVM's partial bootstrap.
-#[allow(dead_code)]
-fn hbase_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
-}
+// HYGIENE (audit): the dead `hbase_main_noop` / `hbase_clinit_noop`
+// fake-main / fake-<clinit> short-circuit helpers (and the
+// `CN_VERSION_INFO` / `CN_HMASTER` / `CN_HBCK2` / `CN_HBASE_FSCK` consts
+// that only named them) were deleted. They were `#[allow(dead_code)]`
+// and unreferenced — a latent re-introduction risk under the "no
+// synthetic stubs" policy.
 
 /// Install every HBase boot-test short-circuit this module owns.
 ///

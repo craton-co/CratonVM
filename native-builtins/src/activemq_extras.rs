@@ -20,20 +20,12 @@
 //! activemq_extras::register_activemq_stubs(registry);
 //! ```
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
+use cratonvm_native_api::NativeMethodRegistry;
 
-#[allow(dead_code)]
-fn activemq_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[activemq-shim] console/Main.main short-circuited (System.exit(1) bypass)");
-    Ok(None)
-}
-
-#[allow(dead_code)]
-fn activemq_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
-}
+// HYGIENE (audit): the dead `activemq_main_noop` / `activemq_void_noop`
+// fake-main / fake-<clinit> short-circuit helpers were deleted. They were
+// `#[allow(dead_code)]` and unreferenced — a latent re-introduction risk
+// under the "no synthetic stubs" policy.
 
 pub fn register_activemq_stubs(registry: &mut NativeMethodRegistry) {
     // DISABLED per "no synthetic stubs" policy. The two registrations here

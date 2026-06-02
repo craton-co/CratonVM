@@ -38,31 +38,13 @@
 // TODO orchestrator: wire `ignite_extras::register_ignite_stubs(registry);`
 // into `register_essential_natives` in `lib.rs`.
 
-#![allow(clippy::needless_pass_by_value)]
+use cratonvm_native_api::NativeMethodRegistry;
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
-
-#[allow(dead_code)]
-const CN_CMDLINE_STARTUP: &str = "org/apache/ignite/startup/cmdline/CommandLineStartup";
-#[allow(dead_code)]
-const CN_IGNITION: &str = "org/apache/ignite/Ignition";
-
-/// Generic `main([Ljava/lang/String;)V` no-op for Ignite entry points.
-#[allow(dead_code)]
-fn ignite_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[ignite-shim] main short-circuited (boot-test mode)");
-    Ok(None)
-}
-
-/// Generic `<clinit>()V` no-op for Ignite entry-point classes. The real
-/// clinit walks JMX / Unsafe / classloader machinery that NPEs under
-/// CratonVM's partial bootstrap.
-#[allow(dead_code)]
-fn ignite_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
-}
+// HYGIENE (audit): the dead `ignite_main_noop` / `ignite_clinit_noop`
+// fake-main / fake-<clinit> short-circuit helpers (and the
+// `CN_CMDLINE_STARTUP` / `CN_IGNITION` consts that only named them) were
+// deleted. They were `#[allow(dead_code)]` and unreferenced — a latent
+// re-introduction risk under the "no synthetic stubs" policy.
 
 /// Install every Ignite boot-test short-circuit this module owns.
 ///
@@ -72,8 +54,6 @@ fn ignite_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 /// against real bytecode.
 pub fn register_ignite_stubs(registry: &mut NativeMethodRegistry) {
     let _ = registry;
-    let _ = CN_CMDLINE_STARTUP;
-    let _ = CN_IGNITION;
 }
 
 #[cfg(test)]

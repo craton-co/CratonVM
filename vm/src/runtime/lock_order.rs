@@ -32,11 +32,21 @@
 //!
 //! ## Usage
 //!
-//! The wrappers are currently unused at the call sites; the codebase still
-//! uses raw `std::sync::Mutex`/`RwLock`. Wiring them in is incremental —
-//! starting with the highest-level locks (class_manager, heap, monitors) so
-//! that violations originating in the interpreter / GC paths trip the
-//! assertion early.
+//! Wiring is incremental, starting with the highest-level locks. As of the
+//! V11 hardening pass the **L6 `monitors` registry** is wired: both internal
+//! maps of [`crate::threading::monitor::MonitorTable`] (`monitors` and
+//! `cas_locks`) are [`OrderedMutex`] at [`LockLevel::Monitors`]. See
+//! `docs/lock-order.md` ("Runtime enforcement status") for the authoritative,
+//! non-aspirational list of which locks are checked vs still raw.
+//!
+//! The other two high-level locks named in the doc are **not** wired and the
+//! checker therefore does not observe them:
+//! - `class_manager` (L10) is a `parking_lot::RwLock` reached from ~19 modules
+//!   (including FFI/JNI surfaces this pass is not permitted to touch); swapping
+//!   its type would ripple guard-API changes through those files.
+//! - `heap` (L8) is defined in the separate `gc` crate (`gc/src/vm_heap.rs`),
+//!   which cannot depend on `vm::runtime::lock_order` without a circular crate
+//!   dependency.
 
 use std::fmt;
 use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, LockResult};
@@ -856,6 +866,45 @@ mod tests {
         let dbg = format!("{:?}", rw);
         assert!(dbg.contains("OrderedRwLock"));
         assert!(dbg.contains("ClassManager"));
+    }
+
+    // -- V11 wiring invariants (monitors registry) --------------------------
+
+    // SECURITY FIX (V11): the real `MonitorTable` now holds two L6 registries
+    // (`monitors` and `cas_locks`). The checker must forbid nesting one inside
+    // the other (equal level is not strictly descending). This reproduces the
+    // exact shape of the bug that `remap_after_gc` was restructured to avoid.
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn v11_two_monitor_level_registries_must_not_nest() {
+        let monitors = OrderedMutex::new((), LockLevel::Monitors);
+        let cas_locks = OrderedMutex::new((), LockLevel::Monitors);
+        let _m = monitors.lock().unwrap();
+        let _c = cas_locks.lock().unwrap(); // same level (L6) => violation
+    }
+
+    // SECURITY FIX (V11): acquiring a lower-level lock *after* the L6 monitors
+    // registry is the documented, allowed direction and must NOT trip.
+    #[test]
+    fn v11_monitors_then_lower_ok() {
+        let monitors = OrderedMutex::new((), LockLevel::Monitors);
+        let scratch = OrderedMutex::new((), LockLevel::Scratch); // L0 < L6
+        let _m = monitors.lock().unwrap();
+        let _s = scratch.lock().unwrap();
+    }
+
+    // SECURITY FIX (V11): holding the L6 monitors registry and then reaching
+    // *up* for class_manager (L10) is the canonical forbidden monitor ->
+    // class_manager inversion from docs/lock-order.md. Even though
+    // class_manager itself is not yet wrapped, the check fires the moment any
+    // higher-level OrderedRwLock is acquired under a held monitor.
+    #[test]
+    #[should_panic(expected = "lock order violation")]
+    fn v11_monitors_then_classmanager_inverts() {
+        let monitors = OrderedMutex::new((), LockLevel::Monitors);
+        let class_manager = OrderedRwLock::new((), LockLevel::ClassManager);
+        let _m = monitors.lock().unwrap();
+        let _c = class_manager.write().unwrap(); // L10 under L6 => violation
     }
 
     #[test]

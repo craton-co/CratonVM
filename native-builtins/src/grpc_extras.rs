@@ -37,35 +37,13 @@
 // TODO orchestrator: wire `grpc_extras::register_grpc_stubs(registry);`
 // into `register_essential_natives` in `lib.rs`.
 
-#![allow(clippy::needless_pass_by_value)]
+use cratonvm_native_api::NativeMethodRegistry;
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
-
-#[allow(dead_code)]
-const CN_HELLO_WORLD_SERVER: &str = "io/grpc/examples/helloworld/HelloWorldServer";
-#[allow(dead_code)]
-const CN_HELLO_WORLD_CLIENT: &str = "io/grpc/examples/helloworld/HelloWorldClient";
-#[allow(dead_code)]
-const CN_ROUTE_GUIDE_SERVER: &str = "io/grpc/examples/routeguide/RouteGuideServer";
-#[allow(dead_code)]
-const CN_ROUTE_GUIDE_CLIENT: &str = "io/grpc/examples/routeguide/RouteGuideClient";
-
-/// Generic `main([Ljava/lang/String;)V` no-op for gRPC example entry points.
-#[allow(dead_code)]
-fn grpc_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[grpc-shim] main short-circuited (boot-test mode)");
-    Ok(None)
-}
-
-/// Generic `<clinit>()V` no-op for gRPC example classes. The real clinit
-/// pulls in Netty's static initializer chain which probes for
-/// `sun.misc.Unsafe` and epoll native transport.
-#[allow(dead_code)]
-fn grpc_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
-}
+// HYGIENE (audit): the dead `grpc_main_noop` / `grpc_clinit_noop`
+// fake-main / fake-<clinit> short-circuit helpers (and the
+// `CN_HELLO_WORLD_*` / `CN_ROUTE_GUIDE_*` consts that only named them)
+// were deleted. They were `#[allow(dead_code)]` and unreferenced — a
+// latent re-introduction risk under the "no synthetic stubs" policy.
 
 /// Install every gRPC boot-test short-circuit this module owns.
 ///
@@ -75,10 +53,6 @@ fn grpc_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCall
 /// against real bytecode.
 pub fn register_grpc_stubs(registry: &mut NativeMethodRegistry) {
     let _ = registry;
-    let _ = CN_HELLO_WORLD_SERVER;
-    let _ = CN_HELLO_WORLD_CLIENT;
-    let _ = CN_ROUTE_GUIDE_SERVER;
-    let _ = CN_ROUTE_GUIDE_CLIENT;
 }
 
 #[cfg(test)]

@@ -23,20 +23,12 @@
 //! felix_extras::register_felix_stubs(registry);
 //! ```
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
+use cratonvm_native_api::NativeMethodRegistry;
 
-#[allow(dead_code)]
-fn felix_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[felix-shim] main/Main.main short-circuited (SEGV bypass)");
-    Ok(None)
-}
-
-#[allow(dead_code)]
-fn felix_void_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
-}
+// HYGIENE (audit): the dead `felix_main_noop` / `felix_void_noop`
+// fake-main / fake-<clinit> short-circuit helpers were deleted. They were
+// `#[allow(dead_code)]` and unreferenced — a latent re-introduction risk
+// under the "no synthetic stubs" policy.
 
 pub fn register_felix_stubs(registry: &mut NativeMethodRegistry) {
     // DISABLED per "no synthetic stubs" policy. Every registration in this

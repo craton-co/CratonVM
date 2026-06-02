@@ -10905,9 +10905,44 @@ fn intercept_force_registered_native(
     if !force_native_over_real_jdk_bytecode(class_name, method_name, method_descriptor) {
         return None;
     }
-    let cb = shared
+    let cb = match shared
         .native_methods
-        .find(class_name, method_name, method_descriptor)?;
+        .find(class_name, method_name, method_descriptor)
+    {
+        Some(cb) => cb,
+        None => {
+            // `class_name` here is the *resolved* (often interface) class — e.g.
+            // `java/util/Iterator` for `invokeinterface Iterator.remove()V`. The
+            // concrete native lives on the receiver's ACTUAL class (our synthetic
+            // `LinkedList$Itr` / `HashMap$KeyItr` / array-iterator overlays), not
+            // on the interface. Without this fallback, `Iterator.remove()`
+            // resolves to the throwing interface DEFAULT method even though the
+            // receiver class registers a working native `remove()` — the avrora
+            // real-RAF digest mismatch (`LinkedList.iterator().remove()` →
+            // `UnsupportedOperationException: remove`, polluting System.err).
+            // Route by receiver class so a registered receiver-class native beats
+            // the interface default. Only reached when `force_native_*` is true
+            // AND the interface-class lookup missed, so existing force cases
+            // (URL.getHost, ConstantCallSite.getTarget, …) are unaffected.
+            let recv_cb = match args.first() {
+                Some(Value::Object(Some(obj))) => {
+                    let cid = shared.heap.class_id_of(*obj);
+                    let rname = shared
+                        .class_manager
+                        .read()
+                        .get_class(cid)
+                        .map(|c| c.name.to_string());
+                    rname.and_then(|n| {
+                        shared
+                            .native_methods
+                            .find(&n, method_name, method_descriptor)
+                    })
+                }
+                _ => None,
+            };
+            recv_cb?
+        }
+    };
     if method_name == "getTarget" && std::env::var_os("CRATONVM_DBG_CCSPROBE").is_some() {
         eprintln!("[ccs-probe] intercept_force_registered_native: dispatching native callback");
     }

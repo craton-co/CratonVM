@@ -285,9 +285,63 @@ impl ReferenceProcessor {
     // -- Main entry point ---------------------------------------------------
 
     /// Process all reference types in HotSpot order.
+    ///
+    /// This is the legacy entry point: it has no access to a heap-graph
+    /// tracing primitive, so it can only mark the *direct* finalizer referents
+    /// as live before clearing soft/weak refs (see
+    /// [`Self::process_references_with_finalizer_trace`] for the full
+    /// transitive closure and a discussion of the residual gap).
     pub fn process_references(
         &mut self,
         is_marked: &dyn Fn(usize) -> bool,
+        free_heap_mb: usize,
+        current_time_ms: u64,
+    ) -> ReferenceProcessingResult {
+        // SECURITY FIX (V18): route the legacy entry point through the
+        // finalizer-aware path with no transitive tracer. Passing `None`
+        // still closes the common single-hop case (a weak/soft ref whose
+        // referent *is* a finalizable object) by treating the direct
+        // finalizer referents as live for Phases 1-2.
+        self.process_references_with_finalizer_trace(
+            is_marked,
+            None,
+            free_heap_mb,
+            current_time_ms,
+        )
+    }
+
+    /// Process all reference types in HotSpot order, recomputing the
+    /// finalizer-reachable closure before soft/weak refs are cleared.
+    ///
+    /// SECURITY FIX (V18): spec-conformance. Previously, Phase 1 (soft) and
+    /// Phase 2 (weak) cleared references using a single `is_marked` snapshot
+    /// that did *not* include objects kept alive only because they are
+    /// reachable from an about-to-be-finalized object. A finalizer that ran
+    /// in this same cycle could therefore observe an already-nulled
+    /// weak/soft referent. HotSpot avoids this by treating the
+    /// finalizer-reachable set as live during weak/soft processing.
+    ///
+    /// `trace_from`, when supplied, is the heap's "mark + trace from a set of
+    /// roots" primitive: given the finalizer roots (the referents of finalizer
+    /// references whose referent is currently unmarked, i.e. those about to be
+    /// enqueued for finalization), it returns *all* addresses transitively
+    /// reachable from them. This is the same `&dyn Fn` callback mechanism the
+    /// module already uses for `is_marked` — the heap owns the field layout,
+    /// so only it can walk the graph; reference.rs has no field-offset
+    /// knowledge and intentionally does not gain a cross-module dependency on
+    /// `gen_heap`/`g1`.
+    ///
+    /// When `trace_from` is `None` (legacy callers), we fall back to marking
+    /// only the *direct* finalizer referents as live. RESIDUAL GAP: in that
+    /// mode a weak/soft ref to an object reachable only *transitively* through
+    /// a finalizable object (depth >= 2) can still be cleared prematurely.
+    /// Closing that gap fully requires a caller to pass `trace_from`, which in
+    /// turn requires the heap (`gen_heap.rs` / `g1.rs`) to expose its tracing
+    /// primitive — an out-of-scope change for this fix.
+    pub fn process_references_with_finalizer_trace(
+        &mut self,
+        is_marked: &dyn Fn(usize) -> bool,
+        trace_from: Option<&dyn Fn(&[usize]) -> Vec<usize>>,
         free_heap_mb: usize,
         current_time_ms: u64,
     ) -> ReferenceProcessingResult {
@@ -298,9 +352,44 @@ impl ReferenceProcessor {
         self.stats.phantom_refs_discovered = self.phantom_refs.len();
         self.stats.finalizer_refs_discovered = self.finalizer_refs.len();
 
-        // Phase 1-4
-        self.process_soft_refs(is_marked, free_heap_mb, current_time_ms);
-        self.process_weak_refs(is_marked);
+        // SECURITY FIX (V18): Phase 0 — compute the finalizer-reachable
+        // closure *before* any soft/weak ref is cleared.
+        //
+        // Roots are the referents of finalizer references that are not
+        // already marked (those are exactly the objects Phase 3 will enqueue
+        // for finalization and which must stay live for the finalizer to run)
+        // and not already cleared/enqueued in a prior cycle.
+        let finalizer_roots: Vec<usize> = self
+            .finalizer_refs
+            .iter()
+            .filter(|e| !e.cleared && !e.enqueued && !is_marked(e.referent))
+            .map(|e| e.referent)
+            .collect();
+
+        // Build the live closure. With a tracer we get the full transitive
+        // set; without one we keep only the direct referents (single hop).
+        let finalizer_live: HashSet<usize> = if finalizer_roots.is_empty() {
+            HashSet::new()
+        } else if let Some(trace) = trace_from {
+            trace(&finalizer_roots).into_iter().collect()
+        } else {
+            finalizer_roots.iter().copied().collect()
+        };
+
+        // Augmented liveness predicate used for Phases 1-2 only: an object is
+        // "live" if the collector already marked it OR it is reachable from a
+        // to-be-finalized object. Phases 3-4 keep using the raw `is_marked`
+        // snapshot so finalizers/phantoms are still discovered correctly.
+        let is_live = |addr: usize| -> bool {
+            is_marked(addr) || finalizer_live.contains(&addr)
+        };
+
+        // Phase 1-2 (soft, weak) honour the finalizer-reachable closure.
+        self.process_soft_refs(&is_live, free_heap_mb, current_time_ms);
+        self.process_weak_refs(&is_live);
+        // Phase 3-4 (final, phantom) use the raw collector marking so that
+        // the about-to-be-finalized objects are still discovered/enqueued and
+        // phantom reachability is unaffected by the resurrection closure.
         self.process_final_refs(is_marked);
         self.process_phantom_refs(is_marked);
 
@@ -1436,5 +1525,89 @@ mod tests {
     fn finalizer_dropped_count_initially_zero() {
         let ft = FinalizerThread::new();
         assert_eq!(ft.dropped_count(), 0);
+    }
+
+    // ======================================================================
+    // V18: finalizer-reachable closure protects weak/soft refs
+    // ======================================================================
+
+    // 50. A weak ref whose referent is itself a to-be-finalized object must
+    //     NOT be cleared in the same cycle the finalizer is enqueued
+    //     (single-hop closure, no tracer needed).
+    #[test]
+    fn v18_weak_ref_to_finalizable_object_not_cleared() {
+        let mut proc = ReferenceProcessor::new();
+        // finalizable object lives at 0x200; nothing is marked.
+        proc.discover_reference(ReferenceType::Finalizer, 0x100, 0x200, None);
+        // weak ref points directly at the finalizable object 0x200.
+        proc.discover_reference(ReferenceType::Weak, 0x300, 0x200, Some(0x400));
+
+        let result = proc.process_references(&always_dead, 64, 0);
+
+        // The finalizer is enqueued for the object...
+        assert_eq!(result.stats.finalizer_refs_enqueued, 1);
+        // ...but the weak ref to that same object must survive this cycle.
+        assert_eq!(result.stats.weak_refs_cleared, 0);
+        assert!(!proc.weak_refs[0].cleared);
+    }
+
+    // 51. With a tracer, a weak ref reachable only transitively (depth 2)
+    //     through a finalizable object is also protected.
+    #[test]
+    fn v18_transitive_closure_protects_weak_ref_with_tracer() {
+        let mut proc = ReferenceProcessor::new();
+        // 0x200 is finalizable; 0x500 is reachable only via 0x200's fields.
+        proc.discover_reference(ReferenceType::Finalizer, 0x100, 0x200, None);
+        proc.discover_reference(ReferenceType::Weak, 0x300, 0x500, Some(0x400));
+
+        // Tracer: from root 0x200, reach {0x200, 0x500}.
+        let trace = |roots: &[usize]| -> Vec<usize> {
+            let mut out = roots.to_vec();
+            if roots.contains(&0x200) {
+                out.push(0x500);
+            }
+            out
+        };
+
+        let result = proc.process_references_with_finalizer_trace(
+            &always_dead,
+            Some(&trace),
+            64,
+            0,
+        );
+
+        assert_eq!(result.stats.finalizer_refs_enqueued, 1);
+        // Transitively reachable referent must not be cleared this cycle.
+        assert_eq!(result.stats.weak_refs_cleared, 0);
+        assert!(!proc.weak_refs[0].cleared);
+    }
+
+    // 52. Residual gap: WITHOUT a tracer, a transitively-reachable (depth 2)
+    //     weak referent is still cleared. This documents the known gap that
+    //     requires an out-of-scope caller change to pass `trace_from`.
+    #[test]
+    fn v18_residual_gap_transitive_without_tracer() {
+        let mut proc = ReferenceProcessor::new();
+        proc.discover_reference(ReferenceType::Finalizer, 0x100, 0x200, None);
+        // weak referent 0x500 is NOT a direct finalizer referent.
+        proc.discover_reference(ReferenceType::Weak, 0x300, 0x500, None);
+
+        // Legacy entry point (no tracer): only direct referents protected.
+        let result = proc.process_references(&always_dead, 64, 0);
+        assert_eq!(result.stats.weak_refs_cleared, 1);
+    }
+
+    // 53. Closure does not resurrect already-marked finalizers as roots, and
+    //     ordinary weak clearing of unrelated dead referents still happens.
+    #[test]
+    fn v18_unrelated_weak_ref_still_cleared() {
+        let mut proc = ReferenceProcessor::new();
+        proc.discover_reference(ReferenceType::Finalizer, 0x100, 0x200, None);
+        // weak ref to a totally unrelated dead object 0x999.
+        proc.discover_reference(ReferenceType::Weak, 0x300, 0x999, None);
+
+        let result = proc.process_references(&always_dead, 64, 0);
+        assert_eq!(result.stats.weak_refs_cleared, 1);
+        assert!(proc.weak_refs[0].cleared);
     }
 }

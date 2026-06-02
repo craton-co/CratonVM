@@ -38,31 +38,13 @@
 // TODO orchestrator: wire `spark_extras::register_spark_stubs(registry);`
 // into `register_essential_natives` in `lib.rs`.
 
-#![allow(clippy::needless_pass_by_value)]
+use cratonvm_native_api::NativeMethodRegistry;
 
-use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
-
-#[allow(dead_code)]
-const CN_SPARK_SUBMIT: &str = "org/apache/spark/deploy/SparkSubmit";
-#[allow(dead_code)]
-const CN_LAUNCHER_MAIN: &str = "org/apache/spark/launcher/Main";
-
-/// Generic `main([Ljava/lang/String;)V` no-op for Spark entry points.
-#[allow(dead_code)]
-fn spark_main_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    tracing::warn!("[spark-shim] main short-circuited (boot-test mode)");
-    Ok(None)
-}
-
-/// Generic `<clinit>()V` no-op for Spark entry-point classes. The real
-/// clinit triggers Scala static initializers which depend on
-/// `sun.misc.Unsafe` offsets CratonVM cannot populate.
-#[allow(dead_code)]
-fn spark_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    Ok(None)
-}
+// HYGIENE (audit): the dead `spark_main_noop` / `spark_clinit_noop`
+// fake-main / fake-<clinit> short-circuit helpers (and the
+// `CN_SPARK_SUBMIT` / `CN_LAUNCHER_MAIN` consts that only named them)
+// were deleted. They were `#[allow(dead_code)]` and unreferenced — a
+// latent re-introduction risk under the "no synthetic stubs" policy.
 
 /// Install every Spark boot-test short-circuit this module owns.
 ///
@@ -72,8 +54,6 @@ fn spark_clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 /// against real bytecode.
 pub fn register_spark_stubs(registry: &mut NativeMethodRegistry) {
     let _ = registry;
-    let _ = CN_SPARK_SUBMIT;
-    let _ = CN_LAUNCHER_MAIN;
 }
 
 #[cfg(test)]

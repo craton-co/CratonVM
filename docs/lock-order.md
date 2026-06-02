@@ -12,6 +12,19 @@ discriminants of `LockLevel` mirror the L0–L10 column in the table
 below exactly — if you change one, change the other in the same
 commit.
 
+> **Runtime enforcement status (V11).** The `OrderedMutex` /
+> `OrderedRwLock` wrappers maintain a per-thread set of currently-held
+> levels and, in **debug builds only**, `assert!` on every acquire that
+> the new level is *strictly less* than the lowest level already held
+> (the descending rule). In release builds the tracking module is
+> compiled out and the wrappers are zero-cost. **This check only sees a
+> lock once that lock is actually wrapped.** See
+> [Which locks are actually enforced](#which-locks-are-actually-enforced)
+> below for the precise, current list — most locks in the table are
+> still raw `parking_lot`/`std::sync` and are therefore **not** observed
+> by the runtime checker yet (they remain enforced only by review and
+> the `vm/tests/lock_order_tests.rs` fuzzer).
+
 ## Why this matters
 
 A JVM has many subsystems that occasionally need to coordinate:
@@ -82,6 +95,31 @@ held under `methods.read()`.
 - `JvmThread` (L1) state is per-thread and never contended; it can be
   read or mutated freely by the owning thread without affecting any
   global lock.
+
+## Which locks are actually enforced
+
+The hierarchy above is the *design*. The runtime checker in
+`lock_order.rs` only observes locks that have been physically wrapped
+in `OrderedMutex` / `OrderedRwLock`. The honest, current status:
+
+| Level | Lock | Runtime-checked? | Notes |
+|------:|------|------------------|-------|
+| L10 | `class_manager` (RwLock) | **No** — aspirational | `parking_lot::RwLock` read/written from ~19 modules incl. JNI/FFI surfaces. Wrapping it would change the guard API at every call site (incl. files outside this pass's ownership). Enforced only by review + fuzzer. |
+| L8 | `heap` interior locks | **No** — aspirational | Defined in the separate `gc` crate (`gc/src/vm_heap.rs`), which cannot depend on `vm::runtime::lock_order` without a circular crate dependency. |
+| L6 | `monitors` registry | **Yes (V11)** — debug builds | Both internal maps of `MonitorTable` (`monitors` and `cas_locks` in `vm/src/threading/monitor.rs`) are now `OrderedMutex` at `LockLevel::Monitors`. Acquiring either while holding *any* equal-or-lower-level wrapped lock trips a debug `assert!`. The inner per-object `Arc<Mutex<()>>` CAS locks stay raw `parking_lot` (L6-internal sub-locks, no global ordering constraint). |
+| L9, L7, L5–L0 | all others | **No** — aspirational | Not yet wrapped. |
+
+So today exactly **one** of the three top locks named for this pass is
+runtime-enforced: **`monitors` (L6)**. `class_manager` (L10) and
+`heap` (L8) remain aspirational for the reasons in the table — they
+could not be wired without either touching files owned by other agents
+or introducing a circular crate dependency.
+
+A side effect of wiring `monitors`: because both the `monitors` and
+`cas_locks` registries sit at the *same* level (L6), the checker forbids
+holding one while taking the other. `MonitorTable::remap_after_gc` was
+restructured to scope each registry guard into its own critical section
+(the two maps are independent, so this is behaviour-preserving).
 
 ## Concrete patterns
 
