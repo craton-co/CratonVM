@@ -4986,6 +4986,51 @@ fn native_arrays_as_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 const OPT_FIELD_VALUE: usize = 0;
 const OPT_NUM_FIELDS: usize = 1;
 
+// Primitive Optionals (`OptionalInt`/`OptionalLong`/`OptionalDouble`) do NOT
+// share the generic `Optional` layout. The real JDK classes declare
+// `boolean isPresent` first (field 0) and the primitive `value` second
+// (field 1); emptiness is the `isPresent` flag, not a null value. Our natives
+// previously stored the value at field 0 (the generic-Optional convention),
+// which is invisible-but-wrong while a *native* getter reads it back, but
+// breaks the moment the real JDK `getAsInt()/getAsLong()/getAsDouble()`
+// bytecode runs (it reads `value` at field 1) — e.g. `IntStream.average()
+// .getAsDouble()` returned 0.0. Use the real 2-field layout everywhere so both
+// native and real-bytecode consumers agree.
+const OPT_PRIM_FIELD_PRESENT: usize = 0;
+const OPT_PRIM_FIELD_VALUE: usize = 1;
+const OPT_PRIM_NUM_FIELDS: usize = 2;
+
+/// Build an `OptionalInt`/`OptionalLong`/`OptionalDouble` with the real JDK
+/// field layout. `value = Some(v)` → present; `None` → empty.
+fn make_opt_prim(ctx: &mut dyn NativeContext, class_name: &str, value: Option<Value>) -> ObjectRef {
+    let opt = alloc_synthetic(ctx, class_name, OPT_PRIM_NUM_FIELDS);
+    match value {
+        Some(v) => {
+            ctx.set_field(opt, OPT_PRIM_FIELD_PRESENT, Value::Int(1));
+            ctx.set_field(opt, OPT_PRIM_FIELD_VALUE, v);
+        }
+        None => {
+            ctx.set_field(opt, OPT_PRIM_FIELD_PRESENT, Value::Int(0));
+        }
+    }
+    opt
+}
+
+/// Mark a primitive Optional present and store its value (real layout).
+fn set_opt_prim_value(ctx: &mut dyn NativeContext, opt: ObjectRef, value: Value) {
+    ctx.set_field(opt, OPT_PRIM_FIELD_PRESENT, Value::Int(1));
+    ctx.set_field(opt, OPT_PRIM_FIELD_VALUE, value);
+}
+
+/// Read the value of a primitive Optional, honouring `isPresent` (field 0).
+fn opt_prim_value(ctx: &dyn NativeContext, this: ObjectRef) -> Option<Value> {
+    if matches!(ctx.get_field(this, OPT_PRIM_FIELD_PRESENT), Value::Int(1)) {
+        Some(ctx.get_field(this, OPT_PRIM_FIELD_VALUE))
+    } else {
+        None
+    }
+}
+
 fn register_optional_natives(r: &mut NativeMethodRegistry) {
     let o = "java/util/Optional";
     r.register(o, "empty", "()Ljava/util/Optional;", native_opt_empty);
@@ -9115,12 +9160,12 @@ fn native_int_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = int_stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
     if let Some(min) = elements
         .iter()
         .filter_map(|v| match v {
@@ -9129,7 +9174,7 @@ fn native_int_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         })
         .min()
     {
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Int(min));
+        set_opt_prim_value(ctx, opt, Value::Int(min));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9138,12 +9183,12 @@ fn native_int_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = int_stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
     if let Some(max) = elements
         .iter()
         .filter_map(|v| match v {
@@ -9152,7 +9197,7 @@ fn native_int_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         })
         .max()
     {
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Int(max));
+        set_opt_prim_value(ctx, opt, Value::Int(max));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9241,12 +9286,12 @@ fn native_int_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = int_stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
     if !elements.is_empty() {
         let sum: i64 = elements
             .iter()
@@ -9256,7 +9301,7 @@ fn native_int_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             })
             .sum();
         let avg = sum as f64 / elements.len() as f64;
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(avg));
+        set_opt_prim_value(ctx, opt, Value::Double(avg));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9416,12 +9461,12 @@ fn native_long_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalLong", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalLong", None);
     if let Some(min) = elements
         .iter()
         .filter_map(|v| match v {
@@ -9430,7 +9475,7 @@ fn native_long_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         })
         .min()
     {
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Long(min));
+        set_opt_prim_value(ctx, opt, Value::Long(min));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9439,12 +9484,12 @@ fn native_long_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalLong", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalLong", None);
     if let Some(max) = elements
         .iter()
         .filter_map(|v| match v {
@@ -9453,7 +9498,7 @@ fn native_long_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         })
         .max()
     {
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Long(max));
+        set_opt_prim_value(ctx, opt, Value::Long(max));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9462,12 +9507,12 @@ fn native_long_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
     if !elements.is_empty() {
         let sum: i64 = elements
             .iter()
@@ -9477,7 +9522,7 @@ fn native_long_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             })
             .sum();
         let avg = sum as f64 / elements.len() as f64;
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(avg));
+        set_opt_prim_value(ctx, opt, Value::Double(avg));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9693,12 +9738,12 @@ fn native_double_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
     if let Some(min) = elements
         .iter()
         .filter_map(|v| match v {
@@ -9707,7 +9752,7 @@ fn native_double_stream_min(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         })
         .reduce(f64::min)
     {
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(min));
+        set_opt_prim_value(ctx, opt, Value::Double(min));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9716,12 +9761,12 @@ fn native_double_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
     if let Some(max) = elements
         .iter()
         .filter_map(|v| match v {
@@ -9730,7 +9775,7 @@ fn native_double_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         })
         .reduce(f64::max)
     {
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(max));
+        set_opt_prim_value(ctx, opt, Value::Double(max));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -9739,12 +9784,12 @@ fn native_double_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => {
-            let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+            let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
             return Ok(Some(Value::Object(Some(opt))));
         }
     };
     let elements = stream_elements(ctx, this);
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
     if !elements.is_empty() {
         let sum: f64 = elements
             .iter()
@@ -9754,7 +9799,7 @@ fn native_double_stream_average(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             })
             .sum();
         let avg = sum / elements.len() as f64;
-        ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(avg));
+        set_opt_prim_value(ctx, opt, Value::Double(avg));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -11089,14 +11134,12 @@ fn native_opt_int_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
-    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Int(val));
+    let opt = make_opt_prim(ctx, "java/util/OptionalInt", Some(Value::Int(val)));
     Ok(Some(Value::Object(Some(opt))))
 }
 
 fn native_opt_int_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let opt = alloc_synthetic(ctx, "java/util/OptionalInt", OPT_NUM_FIELDS);
-    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Object(None));
+    let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
     Ok(Some(Value::Object(Some(opt))))
 }
 
@@ -11110,13 +11153,13 @@ fn native_opt_int_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .into())
         }
     };
-    match ctx.get_field(this, OPT_FIELD_VALUE) {
-        Value::Int(v) => Ok(Some(Value::Int(v))),
-        Value::Object(None) => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+    match opt_prim_value(ctx, this) {
+        Some(Value::Int(v)) => Ok(Some(Value::Int(v))),
+        Some(other) => Ok(Some(other)),
+        None => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No value present".to_string(),
         }
         .into()),
-        other => Ok(Some(other)),
     }
 }
 
@@ -11125,26 +11168,20 @@ fn native_opt_int_is_present(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let present = !matches!(ctx.get_field(this, OPT_FIELD_VALUE), Value::Object(None));
-    Ok(Some(Value::Int(if present { 1 } else { 0 })))
+    Ok(Some(Value::Int(if opt_prim_value(ctx, this).is_some() { 1 } else { 0 })))
 }
 
 fn native_opt_int_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => {
-            return match args.get(1) {
-                Some(Value::Int(v)) => Ok(Some(Value::Int(*v))),
-                _ => Ok(Some(Value::Int(0))),
-            }
-        }
-    };
     let default_val = match args.get(1) {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    match ctx.get_field(this, OPT_FIELD_VALUE) {
-        Value::Int(v) => Ok(Some(Value::Int(v))),
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(default_val))),
+    };
+    match opt_prim_value(ctx, this) {
+        Some(Value::Int(v)) => Ok(Some(Value::Int(v))),
         _ => Ok(Some(Value::Int(default_val))),
     }
 }
@@ -11158,7 +11195,7 @@ fn native_opt_int_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    if let Value::Int(v) = ctx.get_field(this, OPT_FIELD_VALUE) {
+    if let Some(Value::Int(v)) = opt_prim_value(ctx, this) {
         ctx.invoke_virtual(consumer, "accept", "(I)V", &[Value::Int(v)])?;
     }
     Ok(None)
@@ -11171,14 +11208,12 @@ fn native_opt_long_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
-    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Long(val));
+    let opt = make_opt_prim(ctx, "java/util/OptionalLong", Some(Value::Long(val)));
     Ok(Some(Value::Object(Some(opt))))
 }
 
 fn native_opt_long_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let opt = alloc_synthetic(ctx, "java/util/OptionalLong", OPT_NUM_FIELDS);
-    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Object(None));
+    let opt = make_opt_prim(ctx, "java/util/OptionalLong", None);
     Ok(Some(Value::Object(Some(opt))))
 }
 
@@ -11192,13 +11227,13 @@ fn native_opt_long_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             .into())
         }
     };
-    match ctx.get_field(this, OPT_FIELD_VALUE) {
-        Value::Long(v) => Ok(Some(Value::Long(v))),
-        Value::Object(None) => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+    match opt_prim_value(ctx, this) {
+        Some(Value::Long(v)) => Ok(Some(Value::Long(v))),
+        Some(other) => Ok(Some(other)),
+        None => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No value present".to_string(),
         }
         .into()),
-        other => Ok(Some(other)),
     }
 }
 
@@ -11207,26 +11242,20 @@ fn native_opt_long_is_present(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let present = !matches!(ctx.get_field(this, OPT_FIELD_VALUE), Value::Object(None));
-    Ok(Some(Value::Int(if present { 1 } else { 0 })))
+    Ok(Some(Value::Int(if opt_prim_value(ctx, this).is_some() { 1 } else { 0 })))
 }
 
 fn native_opt_long_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => {
-            return match args.get(1) {
-                Some(Value::Long(v)) => Ok(Some(Value::Long(*v))),
-                _ => Ok(Some(Value::Long(0))),
-            }
-        }
-    };
     let default_val = match args.get(1) {
         Some(Value::Long(v)) => *v,
         _ => 0,
     };
-    match ctx.get_field(this, OPT_FIELD_VALUE) {
-        Value::Long(v) => Ok(Some(Value::Long(v))),
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Long(default_val))),
+    };
+    match opt_prim_value(ctx, this) {
+        Some(Value::Long(v)) => Ok(Some(Value::Long(v))),
         _ => Ok(Some(Value::Long(default_val))),
     }
 }
@@ -11240,7 +11269,7 @@ fn native_opt_long_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    if let Value::Long(v) = ctx.get_field(this, OPT_FIELD_VALUE) {
+    if let Some(Value::Long(v)) = opt_prim_value(ctx, this) {
         ctx.invoke_virtual(consumer, "accept", "(J)V", &[Value::Long(v)])?;
     }
     Ok(None)
@@ -11253,14 +11282,12 @@ fn native_opt_double_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
-    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Double(val));
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", Some(Value::Double(val)));
     Ok(Some(Value::Object(Some(opt))))
 }
 
 fn native_opt_double_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let opt = alloc_synthetic(ctx, "java/util/OptionalDouble", OPT_NUM_FIELDS);
-    ctx.set_field(opt, OPT_FIELD_VALUE, Value::Object(None));
+    let opt = make_opt_prim(ctx, "java/util/OptionalDouble", None);
     Ok(Some(Value::Object(Some(opt))))
 }
 
@@ -11274,13 +11301,13 @@ fn native_opt_double_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             .into())
         }
     };
-    match ctx.get_field(this, OPT_FIELD_VALUE) {
-        Value::Double(v) => Ok(Some(Value::Double(v))),
-        Value::Object(None) => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+    match opt_prim_value(ctx, this) {
+        Some(Value::Double(v)) => Ok(Some(Value::Double(v))),
+        Some(other) => Ok(Some(other)),
+        None => Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
             message: "No value present".to_string(),
         }
         .into()),
-        other => Ok(Some(other)),
     }
 }
 
@@ -11289,26 +11316,20 @@ fn native_opt_double_is_present(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let present = !matches!(ctx.get_field(this, OPT_FIELD_VALUE), Value::Object(None));
-    Ok(Some(Value::Int(if present { 1 } else { 0 })))
+    Ok(Some(Value::Int(if opt_prim_value(ctx, this).is_some() { 1 } else { 0 })))
 }
 
 fn native_opt_double_or_else(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => {
-            return match args.get(1) {
-                Some(Value::Double(v)) => Ok(Some(Value::Double(*v))),
-                _ => Ok(Some(Value::Double(0.0))),
-            }
-        }
-    };
     let default_val = match args.get(1) {
         Some(Value::Double(v)) => *v,
         _ => 0.0,
     };
-    match ctx.get_field(this, OPT_FIELD_VALUE) {
-        Value::Double(v) => Ok(Some(Value::Double(v))),
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Double(default_val))),
+    };
+    match opt_prim_value(ctx, this) {
+        Some(Value::Double(v)) => Ok(Some(Value::Double(v))),
         _ => Ok(Some(Value::Double(default_val))),
     }
 }
@@ -11322,7 +11343,7 @@ fn native_opt_double_if_present(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    if let Value::Double(v) = ctx.get_field(this, OPT_FIELD_VALUE) {
+    if let Some(Value::Double(v)) = opt_prim_value(ctx, this) {
         ctx.invoke_virtual(consumer, "accept", "(D)V", &[Value::Double(v)])?;
     }
     Ok(None)
