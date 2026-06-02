@@ -1091,7 +1091,21 @@ impl Frame {
         for cv in &self.locals {
             if cv.is_object() {
                 if let Some(ptr) = cv.as_object_ptr() {
-                    if ptr != 0 && heap.is_object_address(ptr as usize).is_some() {
+                    // Gate on region-membership (`is_heap_addr`), NOT a header
+                    // probe (`is_object_address`). A freshly-allocated young /
+                    // mid-init object whose header `is_object_address` cannot yet
+                    // vouch for (kind not finalized / not in the "live" half) is
+                    // a GENUINE root held in a local — dropping it lets the
+                    // collector reclaim a still-referenced object, which then
+                    // surfaces as a stale all-zero-header receiver on the next
+                    // use (observed: BouncyCastle `EC5Util.getCurve` LOCAL[5]
+                    // holding a just-fetched `X9ECParameters` named-curve param
+                    // collected mid-method under GC pressure → "Cannot invoke
+                    // getCurve on null"). `is_heap_addr` still rejects long-bit
+                    // false positives whose payload isn't an aligned in-region
+                    // address. This mirrors the operand-stack root scan fix in
+                    // `ValueStack::scan_object_refs`.
+                    if ptr != 0 && heap.is_heap_addr(ptr as usize).is_some() {
                         roots.push(unsafe { ObjectRef::from_raw(ptr as *mut u8) });
                     }
                 }
