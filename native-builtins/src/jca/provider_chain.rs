@@ -1046,7 +1046,32 @@ fn resolve_service(
     type_str: &str,
     algo: &str,
 ) -> Option<ObjectRef> {
-    let entry = get_service_entry(provider, type_str, algo)?;
+    let entry = get_service_entry(provider, type_str, algo);
+    if std::env::var_os("CRATONVM_DIAG_JCA").is_some() {
+        match &entry {
+            Some(e) => eprintln!(
+                "[JCA-DIAG] getService({provider},{type_str},{algo}) -> entry algo={:?} class={:?}",
+                e.algorithm, e.class_name
+            ),
+            None => {
+                let svc = services().lock();
+                let count = svc.get(provider).map(|m| m.len()).unwrap_or(0);
+                let kpg: Vec<String> = svc
+                    .get(provider)
+                    .map(|m| {
+                        m.iter()
+                            .filter(|((t, _), _)| t == &normalize_engine(type_str))
+                            .map(|((_, a), e)| format!("{a}={}", e.class_name))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                eprintln!(
+                    "[JCA-DIAG] getService({provider},{type_str},{algo}) -> NONE; provider has {count} entries; {type_str} entries: {kpg:?}"
+                );
+            }
+        }
+    }
+    let entry = entry?;
     let (ver, coverage) = find(provider).unwrap_or((25.0, USER_PROVIDER_COVERAGE));
     let prov_obj = make_provider(ctx, provider, ver, coverage);
     Some(make_service(ctx, &entry, prov_obj))

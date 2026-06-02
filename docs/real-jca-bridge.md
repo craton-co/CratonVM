@@ -98,11 +98,38 @@ correct class and runs `<init>`; the returned `ObjectRef` is corrupted on the
 family (cf. commit `e08017d "kinds-aware long decode on field/invoke/return
 paths"`), surfacing here because the heavy BC ctor floods the long-collision band.
 
-**Conclusion:** the agent's value-stack/GC fix is necessary but **not complete** —
-residual long/object corruption on the return path (reflective newInstance) and
-on synchronized-method monitor objects, plus the JIT codegen SEGV, all remain.
-These are the concurrent agent's core value-representation/codegen domain (do not
-duplicate). The JCA bridge is correct and validated as far as the VM allows.
+**Conclusion:** the agent's value-stack/GC fix is necessary but **not complete**.
+
+### Additional moving-GC native bugs fixed on this branch (commit 0847afc)
+
+Root-caused with a `--Xmx 6g` proxy test (large heap = no GC = correct result):
+native code holding a raw `ObjectRef` across a re-entrant Java call that can
+allocate returns a **stale** pointer (resolves to a reused `java.lang.Object`)
+under the moving collector. Fixed by pinning in `thread.native_pin_roots` (which
+GC forwards in place):
+- `NativeContext::new_object_initialized` (alloc + `<init>` pinned) — used by
+  `Constructor.newInstance`, `Class.newInstance`, `Provider$Service.newInstance`.
+- `NativeContext::{pin_native_root,read_native_pin,unpin_native_roots}` — used by
+  `service_loader.rs` to keep the providers `ArrayList` live across the
+  forName/newInstance/add loop + `iterator()`.
+
+Verified: reflective `newInstance` of a heavy-ctor class now returns the correct
+type at default heap (was `java.lang.Object`); keycloak `CryptoIntegration` gets
+**past** "Not able to load any cryptoProvider" into real `KeyPairGenerator(
+"ECDSA","BC")` resolution via the bridge.
+
+### Remaining: non-deterministic core value-corruption (concurrent agent's domain)
+
+After the above, the EC test still fails — but the failure point **varies run to
+run** (`Provider$Service.newInstance with no className`; `NoSuchMethodError
+java/lang/Class.loadClass`; `ClassCastException Object cannot be cast to Locale`
+in JUnit's result listener; JIT-on SEGV). This non-determinism is the signature
+of the residual operand-stack `CompactValue` long/object NaN-tag corruption +
+synchronized-method monitor-object loss — the same core value-representation /
+JIT-codegen family the concurrent agent owns and has **not** fully closed. Do not
+duplicate (branch-integration rule). The JCA bridge + GC-safety fixes are correct
+and validated as far as the VM allows; end-to-end green needs that core fix
+completed.
 
 ## Integration plan
 
