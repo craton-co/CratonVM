@@ -545,15 +545,50 @@ impl ExecutableBuffer {
     }
 }
 
+/// Total bytes of JIT code retained (never freed) for the process lifetime.
+/// See [`ExecutableBuffer`]'s `Drop` for why code is retained rather than freed.
+pub static RETAINED_JIT_CODE_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl Drop for ExecutableBuffer {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            // Deregister this region from code pointer validation.
+        if self.ptr.is_null() {
+            return;
+        }
+        // JIT code is RETAINED for the process lifetime — it is never returned
+        // to the OS here.
+        //
+        // Why: a compiled method's code can be the target of *baked-in direct
+        // `CALL rel32` instructions* (and cached MIC/PIC entry pointers) emitted
+        // into OTHER compiled methods (see `direct_calls` / `try_jit_compile_callee`
+        // in the interpreter). When a method is deoptimised or evicted, its
+        // `CompiledMethod` is dropped from the JIT cache (e.g.
+        // `DeoptimizationController::deoptimize` → `jit_cache.remove`), which
+        // would run this `Drop` and `VirtualFree`/`munmap` the code. But there is
+        // currently NO back-reference mechanism to find and patch the inbound
+        // direct calls, so they would dangle and the next call through one of
+        // them faults (execute) at the now-unmapped 64KB-aligned buffer base.
+        // That was the real-bytecode RAF avrora SEGV (commit()→advance dispatch;
+        // see docs/real-raf-segv-root-cause.md, Part 3).
+        //
+        // Freeing is therefore unsafe until the JIT tracks inbound call sites and
+        // patches/invalidates them at a safepoint before reclamation (a code-cache
+        // sweeper — the proper long-term fix). Until then we keep the region
+        // mapped AND registered so any dangling direct call still lands on valid,
+        // semantically-correct-at-compile-time code instead of crashing.
+        //
+        // `CRATONVM_JIT_FREE_CODE=1` restores the old free-on-drop behaviour for
+        // A/B testing / measuring retained-code growth — do NOT set it in
+        // production; it reintroduces the use-after-free.
+        if std::env::var_os("CRATONVM_JIT_FREE_CODE").is_some() {
             if let Ok(mut regions) = jit_code_regions().lock() {
                 regions.deregister(self.ptr);
             }
             platform::free_executable(self.ptr, self.capacity);
+            return;
         }
+        RETAINED_JIT_CODE_BYTES.fetch_add(self.capacity, std::sync::atomic::Ordering::Relaxed);
+        // Intentionally leak: keep the mapping live and the region registered.
     }
 }
 

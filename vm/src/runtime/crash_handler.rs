@@ -313,6 +313,54 @@ mod windows_fault {
         fn GetCurrentProcess() -> *mut core::ffi::c_void;
         fn GetLastError() -> u32;
         fn GetModuleFileNameW(module: *mut core::ffi::c_void, filename: *mut u16, size: u32) -> u32;
+        fn VirtualQuery(
+            address: *const core::ffi::c_void,
+            buffer: *mut MemoryBasicInformation,
+            length: usize,
+        ) -> usize;
+    }
+
+    #[repr(C)]
+    struct MemoryBasicInformation {
+        base_address: *mut core::ffi::c_void,
+        allocation_base: *mut core::ffi::c_void,
+        allocation_protect: u32,
+        partition_id: u16,
+        _pad: u16,
+        region_size: usize,
+        state: u32,
+        protect: u32,
+        type_: u32,
+    }
+
+    const MEM_COMMIT: u32 = 0x1000;
+    // Page protections that permit reads (any of these ⇒ readable).
+    const PAGE_READABLE_MASK: u32 = 0x02  /* READONLY */
+        | 0x04  /* READWRITE */
+        | 0x08  /* WRITECOPY */
+        | 0x20  /* EXECUTE_READ */
+        | 0x40  /* EXECUTE_READWRITE */
+        | 0x80; /* EXECUTE_WRITECOPY */
+
+    /// True if `[addr, addr+len)` lies in a single committed, readable region.
+    /// Used to guard raw memory dumps in the crash handler so probing a wild
+    /// pointer cannot itself fault and abort the report.
+    unsafe fn is_readable(addr: usize, len: usize) -> bool {
+        if addr == 0 {
+            return false;
+        }
+        let mut mbi: MemoryBasicInformation = core::mem::zeroed();
+        let n = VirtualQuery(
+            addr as *const core::ffi::c_void,
+            &mut mbi,
+            core::mem::size_of::<MemoryBasicInformation>(),
+        );
+        if n == 0 || mbi.state != MEM_COMMIT || (mbi.protect & PAGE_READABLE_MASK) == 0 {
+            return false;
+        }
+        // Ensure the whole window stays inside this region.
+        let region_end = (mbi.base_address as usize).saturating_add(mbi.region_size);
+        addr.saturating_add(len) <= region_end
     }
 
     // dbghelp symbolization of a *known* address. Unlike a full stack walk
@@ -557,6 +605,93 @@ mod windows_fault {
                 let _ = writeln!(report, "  {:2}: 0x{:016X}  (external/jit)", i, a);
             }
         }
+        let _ = writeln!(report, "#");
+
+        // Register dump (x64 CONTEXT). The GPRs pinpoint which value was used
+        // as a bad pointer / branch target — for an `execute` fault, the
+        // register whose value == the faulting address is the corrupted call
+        // target, and rsp/rbp distinguish a corrupted-return-address `ret`
+        // from an indirect `call reg`.
+        let ctx = (*info).context_record as *const u8;
+        if !ctx.is_null() {
+            unsafe fn rd(ctx: *const u8, off: usize) -> u64 {
+                core::ptr::read_unaligned(ctx.add(off) as *const u64)
+            }
+            let _ = writeln!(report, "Registers:");
+            // x86-64 CONTEXT integer-register byte offsets (winnt.h).
+            let names_offs: [(&str, usize); 17] = [
+                ("rax", 0x78), ("rcx", 0x80), ("rdx", 0x88), ("rbx", 0x90),
+                ("rsp", 0x98), ("rbp", 0xA0), ("rsi", 0xA8), ("rdi", 0xB0),
+                ("r8", 0xB8), ("r9", 0xC0), ("r10", 0xC8), ("r11", 0xD0),
+                ("r12", 0xD8), ("r13", 0xE0), ("r14", 0xE8), ("r15", 0xF0),
+                ("rip", 0xF8),
+            ];
+            for chunk in names_offs.chunks(4) {
+                let mut line = String::new();
+                for (name, off) in chunk {
+                    let _ = write!(line, "  {:>3}=0x{:016X}", name, unsafe { rd(ctx, *off) });
+                }
+                let _ = writeln!(report, "{}", line);
+            }
+        }
+
+        // Name the JIT method whose body made the bad call, if recorded
+        // (requires CRATONVM_DBG_JIT_PUTFIELD=1 to populate the thread-local).
+        let callee = crate::jit::helpers::current_jit_callee_for_crash();
+        if !callee.is_empty() {
+            let _ = writeln!(report, "current_jit_callee = {}", callee);
+        }
+
+        // Disassembly aid: dump the instruction bytes immediately *before* each
+        // JIT-region return address (most-recent first). A return address points
+        // just past the CALL that pushed it, so the preceding ~32 bytes contain
+        // the faulting indirect call and whatever set up its target register —
+        // exactly what is needed to see why R10 held a bad pointer.
+        // VirtualQuery-guarded so a wild RA can't re-fault the handler.
+        let dump_before = |report: &mut String, ra: usize, label: &str| {
+            const PRE: usize = 32;
+            if ra <= PRE {
+                return;
+            }
+            let start = ra - PRE;
+            if !unsafe { is_readable(start, PRE) } {
+                let _ = writeln!(report, "  [{}] 0x{:016X}: <unreadable>", label, ra);
+                return;
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(start as *const u8, PRE) };
+            let mut hex = String::new();
+            for b in bytes {
+                let _ = write!(hex, "{:02X} ", b);
+            }
+            let _ = writeln!(report, "  [{}] bytes [RA-0x{:X}..RA] @0x{:016X}:\n    {}", label, PRE, start, hex);
+        };
+        if n >= 2 {
+            let _ = writeln!(report, "Code bytes preceding JIT return addresses:");
+            for (i, &a) in raw.iter().take(n).enumerate().skip(1).take(3) {
+                let a = a as usize;
+                if !(module_base != 0 && a >= module_base && a < module_base + 0x8000_0000) {
+                    dump_before(&mut report, a, &format!("frame{}", i));
+                }
+            }
+        }
+
+        // Dump the memory the bad call dereferenced through R10 (the MIC/PIC
+        // slot the dispatch used `CALL [R10+8]` on): [R10-0x10 .. R10+0x20].
+        if !ctx.is_null() {
+            let r10 = unsafe { core::ptr::read_unaligned(ctx.add(0xC8) as *const u64) } as usize;
+            let win_start = r10.wrapping_sub(0x10);
+            if unsafe { is_readable(win_start, 0x30) } {
+                let qs = unsafe { core::slice::from_raw_parts(win_start as *const u64, 6) };
+                let _ = writeln!(report, "Memory around R10 (0x{:016X}):", r10);
+                for (j, q) in qs.iter().enumerate() {
+                    let off = -0x10i64 + (j as i64) * 8;
+                    let _ = writeln!(report, "    [R10{:+#x}] = 0x{:016X}", off, q);
+                }
+            } else {
+                let _ = writeln!(report, "Memory around R10 (0x{:016X}): <unreadable>", r10);
+            }
+        }
+
         let _ = writeln!(report, "#");
         let _ = writeln!(
             report,

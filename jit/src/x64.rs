@@ -4336,10 +4336,35 @@ impl Compiler {
         }
     }
 
-    /// Reset spill state for a new basic block (stack should be empty at branch targets
-    /// in the patterns we compile).
+    /// Reset spill state for a new basic block.
+    ///
+    /// The operand stack is NOT always empty here. A boolean computed for a
+    /// `putfield`/`putstatic` via a conditional (`aload_0; <ifeq/iconst/goto>;
+    /// putfield flag:Z`) leaves the receiver (`this`) live on the stack at
+    /// `base_spill + 0` while the `ifeq`/`if_icmp`/`goto` runs through this
+    /// reset. Each live stack entry `i` owns the canonical frame slot
+    /// `base_spill + i*8` (that is exactly where `canonicalize_stack` and the
+    /// dead-code merge reconstruction place it), so the next free spill slot is
+    /// `base_spill + len*8` — NOT `base_spill`.
+    ///
+    /// Resetting all the way back to `base_spill` handed the receiver's own slot
+    /// (`base_spill + 0`) back to the next `push_stack`, which then stored the
+    /// computed boolean there and clobbered `this`. The subsequent `putfield`
+    /// read the receiver as `0x1` (the boolean) and wrote to
+    /// `0x1 + HEADER + field*SLOT` → SIGSEGV (the real-bytecode RAF avrora crash:
+    /// `obj_ptr=0x1`, see docs/real-raf-segv-root-cause.md).
     fn reset_spills(&mut self) {
-        self.next_spill_offset = self.base_spill_offset;
+        // Reclaim scratch slots ABOVE the live operand stack, but never hand
+        // back a slot a live stack value still occupies. The next free spill
+        // slot is just past the highest live frame slot (and at least
+        // `base_spill_offset` when the stack is empty / fully register-resident).
+        let mut next = self.base_spill_offset;
+        for &slot in &self.stack {
+            if let StackSlot::Frame(off) = slot {
+                next = next.max(off + 8);
+            }
+        }
+        self.next_spill_offset = next;
     }
 
     /// Flush the simulated stack to canonical spill offsets (base_spill + i*8).

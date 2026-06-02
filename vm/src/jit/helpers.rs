@@ -118,6 +118,17 @@ fn current_jit_callee() -> String {
     CURRENT_JIT_CALLEE.with(|c| c.borrow().clone())
 }
 
+/// DIAGNOSTIC: crash-handler-safe read of the current JIT callee name.
+/// Uses `try_with`/`try_borrow` so it never panics if the TLS is being
+/// destroyed or the `RefCell` is already borrowed when a fault lands here.
+/// Returns an empty string if unavailable. Only meaningful when
+/// `CRATONVM_DBG_JIT_PUTFIELD=1` (that gate is what populates the cell).
+pub fn current_jit_callee_for_crash() -> String {
+    CURRENT_JIT_CALLEE
+        .try_with(|c| c.try_borrow().map(|s| s.clone()).unwrap_or_default())
+        .unwrap_or_default()
+}
+
 /// DIAGNOSTIC RAII guard: records `info` as the current callee, and on drop
 /// restores the PREVIOUS value. This makes `current_jit_callee()` name the
 /// method whose body is *currently executing inline* (the one containing a

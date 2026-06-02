@@ -1,5 +1,22 @@
 # Real-bytecode RAF SEGV — precise root cause (2026-06-01)
 
+> **UPDATE 2026-06-02 — the documented bug is FIXED; a *second*, distinct bug is
+> now the blocker.** The "JIT branch/merge spill-slot codegen bug" this whole
+> document root-causes (the `visit(CPI)` putfield writing the boolean into the
+> receiver's slot → `obj_ptr=0x1`) was a single-line defect in `reset_spills`
+> (`jit/src/x64.rs`): after a conditional branch it reset `next_spill_offset`
+> all the way to `base_spill_offset`, ignoring the operand stack still holding
+> the `putfield`/`putstatic` receiver (`this`) at `base_spill+0`. The next
+> `push_stack` then handed that slot back and the computed boolean overwrote
+> `this`. Fix: reset only to just past the highest *live* stack slot. After the
+> fix the `JIT-PFI-BAD` diagnostic never fires, synthetic avrora still passes,
+> and all 686 jit unit tests pass.
+>
+> Real-RAF avrora now advances past `visit(CPI)` and SEGVs **elsewhere** — a
+> *different* crash the experiments below never reached because the deterministic
+> `obj_ptr=0x1` fault always fired first. See the new bottom section
+> "Part 3 — second blocker: corrupted MIC/PIC slot pointer in commit()→advance".
+
 This supersedes the earlier hypothesis in
 `system-out-redirect-and-fos-buffering-fix.md` (§"why real-bytecode RAF SEGVs
 avrora — the JIT re-entrancy UB"). **That hypothesis was wrong** and is
@@ -227,3 +244,91 @@ A real secondary defect was also found and should be fixed: the dead-code stack
 reconstruction (x64.rs ~9955) rebuilds `self.stack` but NOT
 `self.stack_oop_marks`, desyncing the oop map at every dead-merge (a GC/oop-map
 correctness gap, distinct from this SEGV).
+
+## Part 2 — FIXED (2026-06-02): the `reset_spills` receiver-slot clobber
+
+The "actual emitted slot WRITES" the deep dive predicted were wrong turned out
+to be exactly `reset_spills` in `jit/src/x64.rs`:
+
+```rust
+// BEFORE (buggy)
+fn reset_spills(&mut self) {
+    self.next_spill_offset = self.base_spill_offset;   // ignores live stack depth
+}
+```
+
+The flag-store pattern `aload_0; <bool via ifeq/iconst/goto>; putfield flag:Z`
+keeps the receiver (`this`) live on the operand stack at `base_spill+0` while the
+`ifeq`/`if_icmp`/`goto` runs. Those branch handlers call `reset_spills()`, which
+reset `next_spill_offset` back to `base_spill_offset`. The next `push_stack`
+(the `iconst_0/1`) was then handed `Frame(base_spill+0)` — the receiver's own
+slot — and stored the boolean there. At the `putfield` the receiver read back as
+`0x1` and the store targeted `0x1 + HEADER + 11*SLOT = 0xD9` → SIGSEGV. This
+matches the captured fault exactly (`obj_ptr=0x1`, `val=0x1`, `field_index=11`,
+write target `0xD9`).
+
+```rust
+// AFTER (fixed) — reset only to just past the highest *live* stack slot
+fn reset_spills(&mut self) {
+    let mut next = self.base_spill_offset;
+    for &slot in &self.stack {
+        if let StackSlot::Frame(off) = slot {
+            next = next.max(off + 8);
+        }
+    }
+    self.next_spill_offset = next;
+}
+```
+
+This is the same invariant `canonicalize_stack` (x64.rs ~4364) and the dead-merge
+reconstruction (~9904) already use: live stack entry `i` owns `base_spill + i*8`.
+Verified: `JIT-PFI-BAD` no longer fires under
+`CRATONVM_REAL_RAF=1 CRATONVM_DBG_JIT_PUTFIELD=1`; synthetic avrora still exits
+0; `cargo test -p cratonvm-jit --lib` = 686 passed.
+
+## Part 3 — second blocker: corrupted MIC/PIC slot pointer in commit()→advance
+
+With Part 2 applied, real-RAF avrora runs past `visit(CPI)` and then SEGVs with a
+**non-deterministic** `EXCEPTION_ACCESS_VIOLATION (execute)` — a distinct, older
+bug the prior experiments never reached.
+
+Captured via a new VEH register dump (`crash_handler.rs`) + the
+`current_jit_callee` thread-local (read with `CRATONVM_DBG_JIT_PUTFIELD=1`):
+
+```
+#  EXCEPTION_ACCESS_VIOLATION (execute) at pc=0x000000004F060000
+#  thread: "Thread-4"
+Registers:
+  rax=0x00007FF736710188 (exe+0xE60188)   rcx=rbx=rsi=0x40E67810 (heap obj)
+  rsp=0x000000004EE5DE08  rbp=0x000000004EE5DE90
+  r10=0x000000004F060000  rip=0x000000004F060000   ← r10 == faulting target
+current_jit_callee = avrora/arch/legacy/LegacyInterpreter.commit()V
+```
+
+Facts established:
+
+- **Not the documented bug, not GC, not a float.** Reproduces with `--Xmx 8000m`
+  and `CRATONVM_DBG_NO_CONC_GC=1`. The target `0x4F0X0000` is **64KB-aligned**
+  (varies by `0x10000`, the Windows allocation granularity) and is ~2 MB **above
+  `rsp`** — i.e. an address inside the *thread stack* region, NOT heap/code/float.
+- **The faulting site is `commit()`'s `invokevirtual MainClock.advance:(J)V`**
+  (bytecode pc 17; receiver `this.clock`, arg `(long)this.cyclesConsumed`).
+  `commit()` has no branches, so the Part-2 fix does not touch its codegen — this
+  crash is independent and pre-existing.
+- **R10 holds a stack address where a MIC/PIC slot-box pointer belongs.** The
+  inline monomorphic/polymorphic cache dispatch (x64.rs ~16187 / ~15912) emits
+  `MOV R10, <imm64 = &JitMICSlot/JitPICSlot>` then `CALL qword [R10 + entry_off]`.
+  There is **no** direct `call r10`/`jmp r10` anywhere in the codegen, yet the
+  fault has `r10 == rip == 0x4F060000`. So R10 — which should be a heap `Box`
+  address (~`0x40E…`, like rcx/rbx/rsi) — has been mis-loaded or clobbered to a
+  stack address before the indirect call. R10 is also the JIT's dedicated
+  bounds-check / SIMD scratch (x64.rs ~3492), and the IC imm64 is rewritten by
+  the unroll duplicator via `ic_patches` (x64.rs ~3678) — both are prime suspects.
+
+**Next step:** dump the emitted JIT bytes around the faulting caller (frame 1 raw
+RA, an `external/jit` address) to see the exact instruction sequence feeding R10,
+and check (a) whether `commit()` is inlined into a method that uses R10 as a
+bounds-check/SIMD scratch between the IC `MOV R10` and the `CALL [R10+off]`, and
+(b) whether the `ic_patches` unroll rewrite ever bakes a frame/stack address into
+the `MOV R10, imm64`. A standing VEH register dump + `current_jit_callee` readout
+are now wired in (`crash_handler.rs`) to make the next capture cheap.
