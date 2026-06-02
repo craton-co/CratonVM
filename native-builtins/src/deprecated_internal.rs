@@ -1557,6 +1557,7 @@ mod tests {
 
     #[test]
     fn test_unsafe_memory_allocate_free() {
+        let _arena_lock = crate::arena_test_lock(); // FIX(test-isolation): shared global arena
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
 
@@ -1599,6 +1600,7 @@ mod tests {
     // under real test coverage against the consolidated store.
     #[test]
     fn test_unsafe_memory_double_free() {
+        let _arena_lock = crate::arena_test_lock(); // FIX(test-isolation): shared global arena
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
 
@@ -1688,6 +1690,7 @@ mod tests {
     // NEW size, and realloc(NULL, size) behaves like a fresh allocation.
     #[test]
     fn test_unsafe_memory_realloc() {
+        let _arena_lock = crate::arena_test_lock(); // FIX(test-isolation): shared global arena
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
 
@@ -1777,6 +1780,7 @@ mod tests {
 
     #[test]
     fn test_unsafe_memory_negative_size() {
+        let _arena_lock = crate::arena_test_lock(); // FIX(test-isolation): shared global arena
         let reg = make_registry();
         let mut ctx = MockNativeContext::new();
 

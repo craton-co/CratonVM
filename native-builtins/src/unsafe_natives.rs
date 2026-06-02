@@ -1815,6 +1815,7 @@ mod tests {
 
     #[test]
     fn free_memory_evicts_arena() {
+        let _arena_lock = crate::arena_test_lock(); // FIX(test-isolation): shared global arena
         // FIX: this test previously asserted that a getInt after freeMemory
         // returned Some(Int(0)) — the obsolete "free is a no-op, reads return
         // 0" contract. Under the consolidated bounds-checked arena (SECURITY

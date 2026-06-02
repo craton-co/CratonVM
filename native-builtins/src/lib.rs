@@ -14828,6 +14828,18 @@ pub(crate) fn unsafe_arena_allocate(size: usize) -> i64 {
     unsafe_arena::store().allocate(size)
 }
 
+/// FIX(test-isolation): the `unsafe_arena` off-heap store is process-global and
+/// reuses freed addresses, so tests that allocate→free→assert-evicted race when
+/// a concurrent test reallocates the just-freed address mid-assertion. All
+/// arena-mutating tests (across `deprecated_internal` and `unsafe_natives`)
+/// serialize on this shared lock so each test's alloc/free/assert window is
+/// exclusive. Test-only; production paths are unaffected.
+#[cfg(test)]
+pub(crate) fn arena_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub(crate) fn unsafe_arena_reallocate(addr: i64, new_size: usize) -> i64 {
     unsafe_arena::store().reallocate(addr, new_size)
 }
