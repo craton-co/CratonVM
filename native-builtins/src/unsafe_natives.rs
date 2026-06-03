@@ -804,6 +804,8 @@ fn native_unsafe_copy_memory_consolidated(
 /// `register_unsafe_wp1_2` and `register_unsafe_define_class` so it wins as
 /// the last registration in essential-only AND synthetic-overrides modes.
 pub(crate) fn register_consolidated_off_heap_store(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let u = "sun/misc/Unsafe";
     let u2 = "jdk/internal/misc/Unsafe";
 
@@ -827,6 +829,7 @@ pub(crate) fn register_consolidated_off_heap_store(registry: &mut NativeMethodRe
     registry.register(u, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory_consolidated);
     registry.register(u2, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory_consolidated);
     registry.register(u2, "copyMemory0", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory_consolidated);
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,6 +1090,8 @@ fn native_unsafe_define_anonymous_class(
 /// (defineAnonymousClass) — calling `register` again with the same key
 /// simply replaces the stored fn pointer.
 pub fn register_unsafe_define_class(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let u = "sun/misc/Unsafe";
     let u2 = "jdk/internal/misc/Unsafe";
 
@@ -1135,6 +1140,7 @@ pub fn register_unsafe_define_class(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;[B[Ljava/lang/Object;)Ljava/lang/Class;",
         native_unsafe_define_anonymous_class,
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1363,6 +1369,8 @@ fn native_unsafe_cae_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 /// present and we only *add* the missing surface. Do not duplicate
 /// anything already there; see roadmap WP1.2 for the canonical list.
 pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let u = "sun/misc/Unsafe";
     let u2 = "jdk/internal/misc/Unsafe";
 
@@ -1696,6 +1704,7 @@ pub(crate) fn register_unsafe_wp1_2(registry: &mut NativeMethodRegistry) {
             registry.register(u, name, ref_desc, native_unsafe_cae_object);
         }
     }
+    registry.set_category(__prev_cat);
 }
 
 /// Delegate to the int `getAndAdd` for byte/short widths — in our

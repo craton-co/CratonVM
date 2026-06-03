@@ -559,6 +559,8 @@ const FIELD_STORE_ID: usize = 4;
 
 /// Public entry point — wave coordinator wires this from `lib.rs`.
 pub fn register_keystore_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_engine_surface(r, PKCS12_FQN);
     register_engine_surface(r, JKS_FQN);
     register_engine_surface(r, JKS_INNER_JKS_FQN);
@@ -571,9 +573,12 @@ pub fn register_keystore_real(r: &mut NativeMethodRegistry) {
     // wave coordinator wires this module.
 
     let _ = SUN_KEYSTORE_FQN;
+    r.set_category(__prev_cat);
 }
 
 fn register_engine_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // engineLoad(InputStream, char[])
     r.register(fqn, "engineLoad", "(Ljava/io/InputStream;[C)V", engine_load);
 
@@ -618,6 +623,7 @@ fn register_engine_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
         "(Ljava/lang/String;)Ljava/util/Date;",
         engine_get_creation_date,
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

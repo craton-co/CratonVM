@@ -529,6 +529,8 @@ const INET6_IMPL: &str = "java/net/Inet6AddressImpl";
 const INET_ADDRESS: &str = "java/net/InetAddress";
 
 pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ---- Inet4AddressImpl ----
     r.register(
         INET4_IMPL,
@@ -625,6 +627,7 @@ pub fn register_inet_address_real(r: &mut NativeMethodRegistry) {
     // Touch CString so the `use std::ffi::CString;` import isn't dead in the
     // (rare) builds that cull both `unix` and `windows`.
     let _: Option<CString> = None;
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

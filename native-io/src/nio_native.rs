@@ -760,6 +760,8 @@ fn native_iou_init_ids(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 /// registry's `register` replaces a previous entry at the same key,
 /// so it's safe to call after other NIO-related registrars.
 pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- FileDispatcherImpl (Unix class name; Windows uses
     // WindowsFileDispatcherImpl but the static natives are on the
     // parent class or in a companion). Register on all three names
@@ -824,6 +826,7 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
     r.register(iou, "iovMax", "()I", native_iou_iov_max);
     r.register(iou, "writevMax", "()J", native_iou_write_max_size);
     r.register(iou, "initIDs", "()V", native_iou_init_ids);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,6 +1200,8 @@ fn t16_lr_get_sequence_number(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 /// Register the T16.5 / T16.6 channel overrides. Idempotent: safe to call
 /// alongside `register_nio_natives_real` or phase-92's registrations.
 pub fn register_t16_channel_overrides(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // AsynchronousFileChannel
     let afc = "java/nio/channels/AsynchronousFileChannel";
     r.register(
@@ -1303,5 +1308,6 @@ pub fn register_t16_channel_overrides(r: &mut NativeMethodRegistry) {
     // plain ServerSocketChannel.open().bind(...)) can actually listen on a
     // port.
     crate::net::register_sun_nio_ch_net(r);
+    r.set_category(__prev_cat);
 }
 

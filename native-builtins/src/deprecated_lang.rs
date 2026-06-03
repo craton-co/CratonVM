@@ -360,6 +360,8 @@ fn native_compiler_noop(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn register_deprecated_lang_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let thread = "java/lang/Thread";
 
     // T8.1.1 — Thread.stop
@@ -416,6 +418,7 @@ pub(crate) fn register_deprecated_lang_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_compiler_command,
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

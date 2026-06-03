@@ -1180,6 +1180,8 @@ fn native_nel_submit(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 /// Register all T19.6 Vert.x / Netty natives.
 pub fn register_vertx_eventloop_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // VertxImpl
     registry.register(CLS_VERTX_IMPL, "init", "(I)V", native_vertx_init);
     registry.register(
@@ -1218,6 +1220,7 @@ pub fn register_vertx_eventloop_natives(registry: &mut NativeMethodRegistry) {
             native_nel_submit,
         );
     }
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================

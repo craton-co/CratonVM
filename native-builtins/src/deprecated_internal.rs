@@ -205,12 +205,15 @@ fn signal_number_to_name(num: i32) -> &'static str {
 // ===========================================================================
 
 pub fn register_deprecated_internal_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_beans_natives(r);
     register_rmi_natives(r);
     register_activation_natives(r);
     register_unsafe_deprecated_natives(r);
     register_reflection_natives(r);
     register_signal_natives(r);
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -218,6 +221,8 @@ pub fn register_deprecated_internal_natives(r: &mut NativeMethodRegistry) {
 // ===========================================================================
 
 fn register_beans_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let beans = "java/beans/Beans";
 
     // instantiate(ClassLoader, String) -> Object
@@ -274,6 +279,7 @@ fn register_beans_natives(r: &mut NativeMethodRegistry) {
     r.register(beans, "isGuiAvailable", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0))) // no GUI in headless JVM
     });
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -281,6 +287,8 @@ fn register_beans_natives(r: &mut NativeMethodRegistry) {
 // ===========================================================================
 
 fn register_rmi_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let remote_ref = "java/rmi/server/RemoteRef";
 
     // getRefClass(ObjectOutput) -> String
@@ -294,6 +302,7 @@ fn register_rmi_natives(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(empty))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -301,6 +310,8 @@ fn register_rmi_natives(r: &mut NativeMethodRegistry) {
 // ===========================================================================
 
 fn register_activation_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Activatable.<init>()V — no-op so the class can load
     r.register(
         "java/rmi/activation/Activatable",
@@ -349,6 +360,7 @@ fn register_activation_natives(r: &mut NativeMethodRegistry) {
         "()V",
         |_ctx, _args| Ok(None),
     );
+    r.set_category(__prev_cat);
 }
 
 /// Common handler for activation methods that should throw when called.
@@ -365,6 +377,8 @@ fn activation_throws(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 // ===========================================================================
 
 fn register_unsafe_deprecated_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let u = "sun/misc/Unsafe";
     let u2 = "jdk/internal/misc/Unsafe";
 
@@ -407,6 +421,7 @@ fn register_unsafe_deprecated_natives(r: &mut NativeMethodRegistry) {
     // per the V5 directive to keep the unused store's code if removing it is
     // risky. Nothing is wired to it any longer.
     crate::unsafe_natives::register_consolidated_off_heap_store(r);
+    r.set_category(__prev_cat);
 }
 
 fn native_unsafe_define_class(
@@ -715,6 +730,8 @@ fn native_tracked_copy_memory(
 // ===========================================================================
 
 fn register_reflection_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let refl = "sun/reflect/Reflection";
 
     // getCallerClass(int depth) -> Class — deprecated depth-based form
@@ -1192,6 +1209,7 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Lorg/jboss/modules/ModuleLoader;)Lorg/jboss/modules/ModuleSpec;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -1199,11 +1217,16 @@ fn register_reflection_natives(r: &mut NativeMethodRegistry) {
 // ===========================================================================
 
 fn register_signal_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_signal_class(r, "sun/misc/Signal");
     register_signal_class(r, "jdk/internal/misc/Signal");
+    r.set_category(__prev_cat);
 }
 
 fn register_signal_class(r: &mut NativeMethodRegistry, sig_class: &str) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Signal.<init>(String)V — create Signal from name
     // Signal object: field 0 = name (String), field 1 = number (Int)
     r.register(sig_class, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
@@ -1323,6 +1346,7 @@ fn register_signal_class(r: &mut NativeMethodRegistry, sig_class: &str) {
         let num = signal_name_to_number(&name).unwrap_or(-1);
         Ok(Some(Value::Int(num)))
     });
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================

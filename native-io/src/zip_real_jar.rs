@@ -809,6 +809,8 @@ fn _extract_string_arg_unused(_ctx: &dyn NativeContext, _v: Value) -> Option<Str
 // ---------------------------------------------------------------------------
 
 pub fn register_jar_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let jf = "java/util/jar/JarFile";
     let zf = "java/util/zip/ZipFile";
 
@@ -863,6 +865,7 @@ pub fn register_jar_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/jar/JarEntry;",
         native_jarfile_get_entry,
     );
+    r.set_category(__prev_cat);
 }
 
 #[cfg(test)]

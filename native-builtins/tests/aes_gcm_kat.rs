@@ -30,7 +30,12 @@
 //! `crypto_impl` so the legacy synthetic feature continues to be
 //! covered.
 
-use cratonvm_native_builtins::crypto::crypto_impl::{Aes, AesGcm, CryptoError};
+// `crypto_impl` is the always-compiled real RustCrypto-backed backend (a
+// top-level module since the `--no-default-features` fix); the legacy
+// `crate::crypto::crypto_impl` re-export only exists with
+// `legacy-synthetic-crypto`. Point the KAT at the unconditional path so it
+// runs in the default (synthetic-crypto-free) build.
+use cratonvm_native_builtins::crypto_impl::{Aes, AesGcm, CryptoError};
 
 /// Decode an ASCII hex string into a byte vector.
 fn hex(s: &str) -> Vec<u8> {

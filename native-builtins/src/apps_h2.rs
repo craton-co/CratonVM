@@ -40,6 +40,8 @@ use cratonvm_types::Value;
 /// constant — the correct answer for the current thread.
 #[allow(dead_code)]
 pub(crate) fn register_apps_h2_overrides(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let thread_state_runnable = |ctx: &mut dyn NativeContext, _args: &[Value]| {
         let class_name = "java/lang/Thread$State";
         let obj = match ctx.ensure_class_initialized(class_name) {
@@ -91,6 +93,7 @@ pub(crate) fn register_apps_h2_overrides(registry: &mut NativeMethodRegistry) {
         "(Z)V",
         |_ctx, _args| Ok(None),
     );
+    registry.set_category(__prev_cat);
 }
 
 /// C42: Register a corrective native for `org.h2.table.TableFilter.prepare()V`.
@@ -103,12 +106,15 @@ pub(crate) fn register_apps_h2_overrides(registry: &mut NativeMethodRegistry) {
 /// table's scan index first — which matches what real-JDK's Optimizer
 /// would have done via `setPlanItem`.
 pub fn register_h2_table_filter_prepare(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     registry.register(
         "org/h2/table/TableFilter",
         "prepare",
         "()V",
         table_filter_prepare,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn table_filter_prepare(

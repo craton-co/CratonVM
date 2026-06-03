@@ -379,6 +379,8 @@ fn implicit_classes_is_supported(
 // ===========================================================================
 
 pub(crate) fn register_jdk25_language_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mi = "jdk/internal/module/ModuleImports";
     r.register(mi, "resolveModuleImport", "(Ljava/lang/String;)Z", module_imports_resolve);
     r.register(mi, "getExportedPackages", "(Ljava/lang/String;)I", module_imports_get_exported_packages);
@@ -393,6 +395,7 @@ pub(crate) fn register_jdk25_language_natives(r: &mut NativeMethodRegistry) {
     r.register(ic, "selectMainMethod", "(I)I", implicit_classes_select_main);
     r.register(ic, "isInstanceMainAllowed", "()Z", implicit_classes_is_instance_main_allowed);
     r.register(ic, "isSupported", "()Z", implicit_classes_is_supported);
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================

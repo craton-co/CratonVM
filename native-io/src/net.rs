@@ -42,6 +42,8 @@ use rustc_hash::FxHashMap;
 /// so this wins for the signatures we implement. Other (non-overridden) methods
 /// continue to be served by the phase-72 impls.
 pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ms = "java/net/MulticastSocket";
 
     // `<init>(I port)` — populate the five fields; auto-bind to 0.0.0.0:<port>.
@@ -137,6 +139,7 @@ pub fn register_multicast_socket_overrides(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +895,8 @@ fn net_is_exclusive_bind_available(_ctx: &mut dyn NativeContext, _args: &[Value]
 /// Register the `sun/nio/ch/Net` TCP-native surface. Safe to call more than
 /// once — later registrations override earlier ones at the same signature.
 pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let net = "sun/nio/ch/Net";
 
     // Lifecycle
@@ -983,6 +988,7 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     r.register(net, "pollhupValue", "()S", |_c, _a| Ok(Some(Value::Int(16))));
     r.register(net, "pollnvalValue", "()S", |_c, _a| Ok(Some(Value::Int(32))));
     r.register(net, "pollconnValue", "()S", |_c, _a| Ok(Some(Value::Int(4))));
+    r.set_category(__prev_cat);
 }
 
 // Helper used in tests — expose a way to peek at the map without going through

@@ -923,6 +923,9 @@ impl SharedVm {
                 register_collections_natives(&mut native_methods);
                 // LinkedBlockingQueue.drainTo(Collection, int) - needed by SLF4J/Spring
                 // Register here to ensure it's available even when class is loaded from JAR
+                // [Bridge] real drainTo impl over the synthetic LBQ layout.
+                let __prev = native_methods.current_category();
+                native_methods.set_category(cratonvm_native_api::NativeKind::Bridge);
                 native_methods.register(
                     "java/util/concurrent/LinkedBlockingQueue",
                     "drainTo",
@@ -958,6 +961,7 @@ impl SharedVm {
                         Ok(Some(cratonvm_types::Value::Int(to_drain)))
                     },
                 );
+                native_methods.set_category(__prev);
             } else {
                 // Real-JDK mode: register essential natives only. Do NOT use
                 // register_builtins — synthetic overrides assume synthetic field
@@ -969,6 +973,12 @@ impl SharedVm {
                 // LinkedBlockingQueue.drainTo(Collection, int) - needed by SLF4J/Spring
                 // Override with native implementation to avoid ReentrantLock field layout mismatch
                 // between synthetic natives and real JDK classes
+                // [Bridge] This contiguous run of inline registers (drainTo x3,
+                // ScheduledThreadPoolExecutor.<init>, AtomicBoolean.<init>) all
+                // implement real behavior over the JDK/synthetic field layouts.
+                // Restored to __prev_bridge just before register_io_natives below.
+                let __prev_bridge = native_methods.current_category();
+                native_methods.set_category(cratonvm_native_api::NativeKind::Bridge);
                 native_methods.register(
                     "java/util/concurrent/LinkedBlockingQueue",
                     "drainTo",
@@ -1127,6 +1137,7 @@ impl SharedVm {
                         Ok(None)
                     },
                 );
+                native_methods.set_category(__prev_bridge);
                 register_io_natives(&mut native_methods);
                 // Mixed real-JDK mode still routes many collection call sites
                 // through synthetic wrappers; register collection natives so
@@ -1173,6 +1184,9 @@ impl SharedVm {
                 // KC26: RunnerClassLoader.close() — the real bytecode crashes on null
                 // map values (HashMap entries with null value field). Register a no-op
                 // until the underlying HashMap null-value issue is resolved.
+                // [SyntheticStub] no-op `Ok(None)` that suppresses the real close()
+                // logic to bypass the HashMap null-value bug. Left at the default
+                // (SyntheticStub) category intentionally — do NOT tag Bridge.
                 native_methods.register(
                     "io/quarkus/bootstrap/runner/RunnerClassLoader",
                     "close",
@@ -1328,6 +1342,12 @@ impl SharedVm {
                 ctx.monitor_exit(this);
                 Ok(Some(cratonvm_types::Value::Int(to_drain)))
             }
+            // [Bridge] This contiguous run of inline registers (drainTo x3,
+            // ScheduledThreadPoolExecutor.<init>, CopyOnWriteArrayList.addIfAbsent,
+            // AtomicBoolean.<init>) all implement real behavior. Restored to
+            // __prev_bridge just before register_io_natives below.
+            let __prev_bridge = native_methods.current_category();
+            native_methods.set_category(cratonvm_native_api::NativeKind::Bridge);
             native_methods.register(
                 "java/util/concurrent/LinkedBlockingQueue",
                 "drainTo",
@@ -1454,6 +1474,7 @@ impl SharedVm {
                     Ok(None)
                 },
             );
+            native_methods.set_category(__prev_bridge);
             register_io_natives(&mut native_methods);
             register_collections_natives(&mut native_methods);
             // Re-register the side-table-backed Properties natives AFTER
@@ -1621,6 +1642,11 @@ impl SharedVm {
                 }
                 Ok(Some(Value::Object(Some(target))))
             }
+            // [Bridge] real-JDK-aware toArray(T[]) over the real ArrayList/
+            // AbstractCollection field layout (reads elementData/size by name,
+            // iterator fallback). Restored to __prev_toarray after.
+            let __prev_toarray = native_methods.current_category();
+            native_methods.set_category(cratonvm_native_api::NativeKind::Bridge);
             native_methods.register(
                 "java/util/ArrayList",
                 "toArray",
@@ -1633,6 +1659,7 @@ impl SharedVm {
                 "([Ljava/lang/Object;)[Ljava/lang/Object;",
                 real_jdk_to_array_typed,
             );
+            native_methods.set_category(__prev_toarray);
             cratonvm_native_builtins::deprecated_io_util::register_deprecated_io_util_natives(&mut native_methods);
             cratonvm_native_builtins::register_charset_natives_pub(&mut native_methods);
             cratonvm_native_builtins::phases_late::register_p58_charset_coder(&mut native_methods);
@@ -1640,6 +1667,9 @@ impl SharedVm {
             cratonvm_native_builtins::deprecated_internal::register_deprecated_internal_natives(&mut native_methods);
             cratonvm_native_builtins::phases_early::register_arrays_support_natives(&mut native_methods);
             cratonvm_native_builtins::phases_early::register_string_latin1_natives(&mut native_methods);
+            // [SyntheticStub] no-op `Ok(None)` that suppresses the real close()
+            // logic to bypass the HashMap null-value bug. Left at the default
+            // (SyntheticStub) category intentionally — do NOT tag Bridge.
             native_methods.register(
                 "io/quarkus/bootstrap/runner/RunnerClassLoader",
                 "close",
@@ -2516,6 +2546,68 @@ impl SharedVm {
         file.write_all(out.as_bytes())?;
         file.sync_all()?;
         Ok(())
+    }
+
+    /// Synthetic-stub census: dump every registered native with its
+    /// [`NativeKind`](cratonvm_native_api::NativeKind) tag
+    /// (intrinsic / bridge / synthetic-stub) to a diff-stable JSON file.
+    ///
+    /// Schema: `{ "counts": {intrinsic, bridge, "synthetic-stub", total},
+    /// "natives": [{class, name, descriptor, kind}...] }`, sorted by
+    /// `(class, name, descriptor)` so the file is suitable as a committed
+    /// baseline. Returns the per-kind counts so the caller can report them.
+    /// Hand-serialized (no serde_json), mirroring `dump_missing_natives_json`.
+    pub fn dump_native_registry_json(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> std::io::Result<(usize, usize, usize)> {
+        use cratonvm_native_api::NativeKind;
+        let mut rows = self.native_methods.dump_registrations();
+        rows.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        let mut n_intrinsic = 0usize;
+        let mut n_bridge = 0usize;
+        let mut n_stub = 0usize;
+        for (_, _, _, kind) in &rows {
+            match kind {
+                NativeKind::Intrinsic => n_intrinsic += 1,
+                NativeKind::Bridge => n_bridge += 1,
+                NativeKind::SyntheticStub => n_stub += 1,
+            }
+        }
+        let mut out = String::with_capacity(256 + 96 * rows.len());
+        out.push_str("{\n  \"counts\": {\n");
+        out.push_str(&format!("    \"intrinsic\": {n_intrinsic},\n"));
+        out.push_str(&format!("    \"bridge\": {n_bridge},\n"));
+        out.push_str(&format!("    \"synthetic-stub\": {n_stub},\n"));
+        out.push_str(&format!("    \"total\": {}\n", rows.len()));
+        out.push_str("  },\n  \"natives\": [");
+        for (i, (class, name, desc, kind)) in rows.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            out.push_str("\n    {\n");
+            out.push_str(&format!("      \"class\": {},\n", json_escape(class)));
+            out.push_str(&format!("      \"name\": {},\n", json_escape(name)));
+            out.push_str(&format!(
+                "      \"descriptor\": {},\n",
+                json_escape(desc)
+            ));
+            out.push_str(&format!(
+                "      \"kind\": {}\n",
+                json_escape(kind.as_str())
+            ));
+            out.push_str("    }");
+        }
+        if !rows.is_empty() {
+            out.push_str("\n  ");
+        }
+        out.push_str("]\n}\n");
+
+        use std::io::Write;
+        let mut file = std::fs::File::create(path)?;
+        file.write_all(out.as_bytes())?;
+        file.sync_all()?;
+        Ok((n_intrinsic, n_bridge, n_stub))
     }
 
     /// NEW-10: append a missing-native entry to the audit log,

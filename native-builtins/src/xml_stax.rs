@@ -672,6 +672,8 @@ fn native_is_whitespace(ctx: &mut dyn NativeContext, a: &[Value]) -> MethodCallR
 // ---------------------------------------------------------------------------
 
 pub fn register(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Factory entry points.
     registry.register(
         "javax/xml/stream/XMLInputFactory",
@@ -963,6 +965,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     registry.register("javax/xml/stream/Location", "getCharacterOffset", "()I", zero_int);
     registry.register("javax/xml/stream/Location", "getPublicId", "()Ljava/lang/String;", null_str);
     registry.register("javax/xml/stream/Location", "getSystemId", "()Ljava/lang/String;", null_str);
+    registry.set_category(__prev_cat);
 }
 
 fn native_next_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

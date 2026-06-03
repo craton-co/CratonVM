@@ -161,6 +161,15 @@ struct Args {
     #[arg(long = "dump-missing-natives-grouped", value_name = "FILE")]
     dump_missing_natives_grouped: Option<String>,
 
+    /// Synthetic-stub census: dump every registered native with its
+    /// classification (intrinsic / bridge / synthetic-stub) to the given
+    /// JSON file on VM shutdown. Schema:
+    /// `{ "counts": {...}, "natives": [{class, name, descriptor, kind}...] }`,
+    /// sorted for byte-stable output. Use this to verify the default build is
+    /// synthetic-stub-free. See docs/synthetic-vs-real-explained.md.
+    #[arg(long = "dump-native-registry", value_name = "FILE")]
+    dump_native_registry: Option<String>,
+
     /// Enable JDWP debug server on the given port (e.g., 5005).
     /// Equivalent to -agentlib:jdwp=transport=dt_socket,server=y,address=PORT
     #[arg(long = "jdwp-port", value_name = "PORT")]
@@ -509,6 +518,7 @@ const VALUE_TAKING_OPTS: &[&str] = &[
     "--XX:AOTCacheOutput",
     "--dump-missing-natives",
     "--dump-missing-natives-grouped",
+    "--dump-native-registry",
     "--jdwp-port",
     "--add-reads",
     "--add-exports",
@@ -1969,6 +1979,24 @@ fn run() -> Result<()> {
             Err(e) => {
                 eprintln!(
                     "[cratonvm] warning: could not write missing-natives JSON to {path}: {e}"
+                );
+            }
+        }
+    }
+
+    // Synthetic-stub census: full native registry with kind tags.
+    if let Some(path) = &args.dump_native_registry {
+        match vm.shared.dump_native_registry_json(path) {
+            Ok((n_intrinsic, n_bridge, n_stub)) => {
+                eprintln!(
+                    "[cratonvm] wrote native registry census to {path} \
+                     (intrinsic={n_intrinsic}, bridge={n_bridge}, \
+                     synthetic-stub={n_stub})"
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[cratonvm] warning: could not write native registry JSON to {path}: {e}"
                 );
             }
         }

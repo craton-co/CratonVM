@@ -112,6 +112,8 @@ fn locale_variant(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallRes
 }
 
 pub fn register(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // java.util.Locale.getDefault() — bypass the adapter chain.
     registry.register(
         "java/util/Locale",
@@ -315,4 +317,5 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             ctx.invoke_virtual(this, "getCountry", "()Ljava/lang/String;", &[])
         },
     );
+    registry.set_category(__prev_cat);
 }

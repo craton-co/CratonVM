@@ -759,6 +759,8 @@ fn take_stashed_names(ws_id: i32, key: i32) -> Vec<String> {
 ///     (e.g. via `FileSystems.getFileSystem(URI)` for a custom FS) still
 ///     gets real OS-level notifications.
 pub fn register_watch_service_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let classes = [
         "sun/nio/fs/AbstractWatchService",
         "sun/nio/fs/UnixWatchService",
@@ -792,6 +794,7 @@ pub fn register_watch_service_real(r: &mut NativeMethodRegistry) {
             ws_poll_event_names0_native,
         );
     }
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

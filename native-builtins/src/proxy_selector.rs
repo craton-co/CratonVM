@@ -620,6 +620,8 @@ const DEFAULT_PROXY_SELECTOR: &str = "sun/net/spi/DefaultProxySelector";
 const PROXY_SELECTOR: &str = "java/net/ProxySelector";
 
 pub fn register_proxy_selector_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
         DEFAULT_PROXY_SELECTOR,
         "select",
@@ -665,6 +667,7 @@ pub fn register_proxy_selector_real(r: &mut NativeMethodRegistry) {
         "(Ljava/net/URI;Ljava/net/SocketAddress;Ljava/io/IOException;)V",
         connect_failed,
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

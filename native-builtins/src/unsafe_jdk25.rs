@@ -202,6 +202,8 @@ fn swap_value(val: Value, elem_size: usize) -> Value {
 /// `lib.rs`. Call this from the main registration function after
 /// `register_essential_natives`.
 pub fn register_t12_unsafe_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let class = "jdk/internal/misc/Unsafe";
 
     registry.register(class, "addressSize0", "()I", native_unsafe_address_size0);
@@ -211,6 +213,7 @@ pub fn register_t12_unsafe_natives(registry: &mut NativeMethodRegistry) {
     registry.register(class, "storeStoreFence", "()V", native_unsafe_store_store_fence);
     // copySwapMemory0 is registered in lib.rs (replacing the previous stub)
     // so we do NOT re-register it here to avoid double-registration.
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

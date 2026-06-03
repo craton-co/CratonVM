@@ -254,6 +254,8 @@ fn native_se_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 pub fn register_stream_encoder_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let se = "sun/nio/cs/StreamEncoder";
 
     registry.register(
@@ -307,4 +309,5 @@ pub fn register_stream_encoder_natives(registry: &mut NativeMethodRegistry) {
         let open = matches!(ctx.get_field(this, SE_OUTPUT), Value::Object(Some(_)));
         Ok(Some(Value::Int(if open { 1 } else { 0 })))
     });
+    registry.set_category(__prev_cat);
 }

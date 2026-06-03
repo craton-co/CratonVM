@@ -265,6 +265,8 @@ fn sc_key(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> u64 {
 /// Register every `io.quarkus.runtime.*` static-init native. Called from
 /// `register_essential_natives` in `lib.rs`.
 pub fn register_quarkus_staticinit_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     register_runtime_value(registry);
     register_startup_context(registry);
     register_application_config(registry);
@@ -272,6 +274,7 @@ pub fn register_quarkus_staticinit_natives(registry: &mut NativeMethodRegistry) 
     register_application_lifecycle(registry);
     register_timing(registry);
     register_bootstrap_runner(registry);
+    registry.set_category(__prev_cat);
 }
 
 /// T19.H3: register natives for `io.quarkus.bootstrap.runner.*` so
@@ -307,6 +310,8 @@ pub fn register_quarkus_staticinit_natives(registry: &mut NativeMethodRegistry) 
 ///   * No filesystem paths are decoded from the arguments — the
 ///     `InputStream` / `Path` args are silently discarded.
 fn register_bootstrap_runner(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     registry.register(
         CLS_SERIALIZED_APP,
         "read",
@@ -373,6 +378,7 @@ fn register_bootstrap_runner(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/lang/Class;",
         native_runner_class_loader_load_class,
     );
+    registry.set_category(__prev_cat);
 }
 
 /// Accept only input that could conceivably be a Java binary class name.
@@ -580,6 +586,8 @@ fn native_serialized_application_get_main_class(
 }
 
 fn register_runtime_value(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     registry.register(CLS_RUNTIME_VALUE, "<init>", "()V", native_rv_init_empty);
     registry.register(
         CLS_RUNTIME_VALUE,
@@ -610,9 +618,12 @@ fn register_runtime_value(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Object;",
         native_rv_get_value,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn register_startup_context(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     registry.register(CLS_STARTUP_CONTEXT, "<init>", "()V", native_sc_init);
     registry.register(
         CLS_STARTUP_CONTEXT,
@@ -644,9 +655,12 @@ fn register_startup_context(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/Object;)V",
         native_sc_put_value,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn register_application_config(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     registry.register(CLS_APPLICATION_CONFIG, "<init>", "()V", native_ac_init);
     registry.register(
         CLS_APPLICATION_CONFIG,
@@ -666,9 +680,12 @@ fn register_application_config(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_ac_version,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn register_datasource_runtime_config(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     registry.register(CLS_DATASOURCE_CONFIG, "<init>", "()V", native_dsrc_init);
     registry.register(
         CLS_DATASOURCE_CONFIG,
@@ -694,9 +711,12 @@ fn register_datasource_runtime_config(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_dsrc_driver,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn register_application_lifecycle(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // `Application.start(String[])` and `.stop()` can run their own Java
     // bytecode; we only register `safeStart`/`start0` style native hooks
     // that some versions emit when the replay plan can't be fully
@@ -719,9 +739,12 @@ fn register_application_lifecycle(registry: &mut NativeMethodRegistry) {
         "()V",
         native_app_no_op,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn register_timing(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     registry.register(CLS_TIMING, "staticInitStarted", "(Z)V", native_timing_static_init_started);
     registry.register(CLS_TIMING, "staticInitStarted", "(Ljava/lang/ClassLoader;Z)V", native_timing_static_init_started_cl);
     registry.register(CLS_TIMING, "staticInitStopped", "()V", native_timing_static_init_stopped);
@@ -733,6 +756,7 @@ fn register_timing(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;ZZ)V",
         native_timing_print_startup_time,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

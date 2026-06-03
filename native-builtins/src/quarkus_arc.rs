@@ -348,14 +348,19 @@ fn reset_container_state() {
 /// Register every `io.quarkus.arc.*` native we implement. Called from
 /// `register_essential_natives` in `lib.rs` after T19.3.
 pub fn register_quarkus_arc_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     register_arc_facade(registry);
     register_arc_container(registry);
     register_instance_handle(registry);
     register_bean_manager(registry);
     register_injectable_bean(registry);
+    registry.set_category(__prev_cat);
 }
 
 fn register_arc_facade(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // static Arc.initialize() - idempotent boot.
     registry.register(CLS_ARC, "initialize", "()V", native_arc_initialize);
     // static Arc.container() returns the singleton container.
@@ -370,9 +375,12 @@ fn register_arc_facade(registry: &mut NativeMethodRegistry) {
     registry.register(CLS_ARC, "shutdown", "()V", native_arc_shutdown);
     // static Arc.isRunning()
     registry.register(CLS_ARC, "isRunning", "()Z", native_arc_is_running);
+    registry.set_category(__prev_cat);
 }
 
 fn register_arc_container(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // Both interface + impl dispatch the same way.
     for cls in [CLS_ARC_CONTAINER, CLS_ARC_CONTAINER_IMPL] {
         registry.register(
@@ -425,9 +433,12 @@ fn register_arc_container(registry: &mut NativeMethodRegistry) {
             native_container_request_context,
         );
     }
+    registry.set_category(__prev_cat);
 }
 
 fn register_instance_handle(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     for cls in [
         CLS_INSTANCE_HANDLE,
         CLS_INSTANCE_HANDLE_IMPL,
@@ -445,9 +456,12 @@ fn register_instance_handle(registry: &mut NativeMethodRegistry) {
         registry.register(cls, "destroy", "()V", native_instance_handle_no_op);
         registry.register(cls, "close", "()V", native_instance_handle_no_op);
     }
+    registry.set_category(__prev_cat);
 }
 
 fn register_bean_manager(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     for cls in [CLS_BEAN_MANAGER_JAKARTA, CLS_BEAN_MANAGER_JAVAX] {
         registry.register(
             cls,
@@ -468,9 +482,12 @@ fn register_bean_manager(registry: &mut NativeMethodRegistry) {
             native_bean_manager_get_reference,
         );
     }
+    registry.set_category(__prev_cat);
 }
 
 fn register_injectable_bean(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     registry.register(
         CLS_INJECTABLE_BEAN,
         "get",
@@ -489,6 +506,7 @@ fn register_injectable_bean(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Class;",
         native_injectable_bean_get_bean_class,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

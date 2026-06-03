@@ -32,6 +32,8 @@ use crate::{REF_FIELD_QUEUE, REF_FIELD_REFERENT, RQ_FIELD_HEAD, RQ_FIELD_SIZE};
 /// Register every `java.lang.ref.*` native. Called from
 /// `register_essential_natives` in `lib.rs`.
 pub(crate) fn register_reference_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // =========================================================================
     // java/lang/ref/Reference (abstract base) and its subclasses
     // =========================================================================
@@ -150,6 +152,7 @@ pub(crate) fn register_reference_natives(registry: &mut NativeMethodRegistry) {
         "(J)Ljava/lang/ref/Reference;",
         native_rq_remove_timeout,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

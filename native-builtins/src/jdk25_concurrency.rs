@@ -1464,6 +1464,8 @@ fn native_sts_close_joiner(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // ===========================================================================
 
 pub(crate) fn register_jdk25_concurrency_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- ScopedValue ---
     r.register(CLS_SCOPED_VALUE, "<init>", "()V", native_sv_init);
     r.register(
@@ -1794,6 +1796,7 @@ pub(crate) fn register_jdk25_concurrency_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/ThreadFactory;",
         native_config_get_thread_factory,
     );
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================

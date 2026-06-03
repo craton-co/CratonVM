@@ -3627,6 +3627,8 @@ fn native_scanner_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 /// Register all I/O native methods.
 pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // SECURITY FIX (V12): apply the certified/untrusted deployment profile
     // before any I/O natives are registered, so a deployment that requests it
     // (CRATONVM_CONFINE_IO / CRATONVM_UNTRUSTED_CODE) fails closed — CWD
@@ -4231,6 +4233,7 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     //     phase-72 (`phases_late`) and phase-92 registrations for signatures
     //     we implement (see `nio_native::register_t16_channel_overrides`). ---
     nio_native::register_t16_channel_overrides(registry);
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -4375,6 +4378,8 @@ fn native_is_transfer_to(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/Scanner";
 
     // Constructors
@@ -4487,6 +4492,7 @@ fn register_scanner_natives(registry: &mut NativeMethodRegistry) {
         "()V",
         native_scanner_close,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -4624,6 +4630,8 @@ fn bb_state(ctx: &dyn NativeContext, this: ObjectRef) -> Result<(ObjectRef, i32,
 }
 
 fn register_nio_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Register under both ByteBuffer and HeapByteBuffer for dispatch
     for c in &["java/nio/ByteBuffer", "java/nio/HeapByteBuffer"] {
         // --- Factory methods ---
@@ -5023,6 +5031,7 @@ fn register_nio_natives(registry: &mut NativeMethodRegistry) {
         registry.register(c, "toString", "()Ljava/lang/String;", native_tb_to_string);
         registry.register(c, "compact", "()Ljava/nio/ShortBuffer;", native_tb_compact);
     }
+    registry.set_category(__prev_cat);
 }
 
 // --- ByteBuffer factory methods ---
@@ -5928,6 +5937,8 @@ const SW_FIELD_BUF: usize = 0;
 const SW_FIELD_COUNT: usize = 1;
 
 fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // RDR-MIGRATION 2026-06-01: the synthetic StringReader natives below use a
     // 3-field layout (content/pos/length) that does not match the real JDK
     // StringReader (str/length/next/mark). They shadowed the real bytecode and
@@ -6010,6 +6021,7 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/io/Writer", "write", "(I)V", native_sw_write_int);
     registry.register("java/io/Writer", "flush", "()V", native_noop_void);
     registry.register("java/io/Writer", "close", "()V", native_noop_void);
+    registry.set_category(__prev_cat);
 }
 
 /// RA.3 — `java.io.Reader.read(Ljava/nio/CharBuffer;)I`.
@@ -6443,6 +6455,8 @@ const DOS_FIELD_OUT: usize = 0;
 const DOS_FIELD_WRITTEN: usize = 1;
 
 fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let dis = "java/io/DataInputStream";
     registry.register(dis, "<init>", "(Ljava/io/InputStream;)V", native_dis_init);
     registry.register(dis, "read", "()I", native_dis_read);
@@ -6511,6 +6525,7 @@ fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
         "(J)V",
         native_dos_write_long,
     );
+    registry.set_category(__prev_cat);
 }
 
 /// Helper: read a single byte from the underlying stream of a DIS
@@ -7246,6 +7261,8 @@ fn native_dos_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 const PATH_FIELD_STR: usize = 0;
 
 fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let path = "java/nio/file/Path";
     let paths = "java/nio/file/Paths";
     let files = "java/nio/file/Files";
@@ -7463,6 +7480,7 @@ fn register_nio_file_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/nio/file/Path;",
         native_file_to_path,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn alloc_path(ctx: &mut dyn NativeContext, path_str: &str) -> ObjectRef {
@@ -8160,6 +8178,8 @@ pub(crate) fn real_raf_enabled() -> bool {
 }
 
 fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // RandomAccessFile = 2-field synthetic (fd=0, path=1).
     //
     // DIAGNOSTIC GATE (CRATONVM_REAL_RAF=1): skip these synthetic natives so
@@ -8263,6 +8283,7 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     registry.register(lnr, "setLineNumber", "(I)V", native_lnr_set_line_number);
     registry.register(lnr, "close", "()V", native_noop_void);
     }
+    registry.set_category(__prev_cat);
 }
 
 const RAF_FIELD_FD: usize = 0;
@@ -8968,6 +8989,8 @@ fn bos_slots(ctx: &dyn NativeContext) -> (usize, usize) {
 }
 
 fn register_buffered_stream_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // BufferedInputStream — Wave2 H2 fix:
     // The synthetic 4-field overrides (in/buf/pos/count) collide with the
     // real JDK 25 BIS field layout (initialSize/buf/count/pos/markpos/
@@ -9024,6 +9047,7 @@ fn register_buffered_stream_natives(registry: &mut NativeMethodRegistry) {
     registry.register(pos, "write", "(I)V", native_bos_write); // same buffered write
     registry.register(pos, "flush", "()V", native_bos_flush);
     registry.register(pos, "close", "()V", native_bos_flush);
+    registry.set_category(__prev_cat);
 }
 
 fn native_bis_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11422,6 +11446,8 @@ fn native_files_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // ---------------------------------------------------------------------------
 
 fn register_nio_channel_extras(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- java.nio.channels.FileLock ---
     let fl = "java/nio/channels/FileLock";
     registry.register(
@@ -11504,6 +11530,7 @@ fn register_nio_channel_extras(registry: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;)Ljava/util/stream/Stream;",
         native_files_list,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -11610,6 +11637,8 @@ fn obj_arg92(args: &[Value], index: usize) -> Result<ObjectRef, MethodCallFailed
 }
 
 fn register_phase92_io_completeness(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_async_file_channel(registry);
     register_watch_service(registry);
     register_datagram_channel(registry);
@@ -11620,6 +11649,7 @@ fn register_phase92_io_completeness(registry: &mut NativeMethodRegistry) {
     // implementation in `nio_selector.rs` (registered earlier via
     // `register_nio_selector`) is the source of truth; we no longer
     // re-register the legacy variant here.
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -11627,6 +11657,8 @@ fn register_phase92_io_completeness(registry: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_async_file_channel(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let afc = "java/nio/channels/AsynchronousFileChannel";
 
     // open(Path, OpenOption...) → AsynchronousFileChannel
@@ -11677,6 +11709,7 @@ fn register_async_file_channel(r: &mut NativeMethodRegistry) {
 
     // isOpen() → boolean
     r.register(afc, "isOpen", "()Z", native_afc_is_open);
+    r.set_category(__prev_cat);
 }
 
 fn native_afc_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -12036,6 +12069,8 @@ fn drain_into_queues(state: &mut WatchServiceState) {
 }
 
 fn register_watch_service(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ws = "java/nio/file/WatchService";
 
     // FileSystems.getDefault().newWatchService() → WatchService
@@ -12128,6 +12163,7 @@ fn register_watch_service(r: &mut NativeMethodRegistry) {
         ctx.set_field(k, 0, Value::Int(EVENT_MODIFY));
         Ok(Some(Value::Object(Some(k))))
     });
+    r.set_category(__prev_cat);
 }
 
 /// Create a real `notify::RecommendedWatcher` + sender→receiver pair and
@@ -12431,6 +12467,8 @@ fn native_we_context(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // ---------------------------------------------------------------------------
 
 fn register_datagram_channel(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let dc = "java/nio/channels/DatagramChannel";
 
     // open() → DatagramChannel
@@ -12493,6 +12531,7 @@ fn register_datagram_channel(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -12697,6 +12736,8 @@ fn native_dc_local_addr(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 // fd_table.poll_ready() which works everywhere.
 
 fn register_selector(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sel = "java/nio/channels/Selector";
 
     // Selector.open() → Selector
@@ -12790,6 +12831,7 @@ fn register_selector(r: &mut NativeMethodRegistry) {
     r.register(sk, "OP_WRITE", "()I", |_, _| Ok(Some(Value::Int(OP_WRITE))));
     r.register(sk, "OP_CONNECT", "()I", |_, _| Ok(Some(Value::Int(OP_CONNECT))));
     r.register(sk, "OP_ACCEPT", "()I", |_, _| Ok(Some(Value::Int(OP_ACCEPT))));
+    r.set_category(__prev_cat);
 }
 
 fn native_sel_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {

@@ -635,6 +635,8 @@ fn channel_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 /// Register the WP3.7 Pipe natives.  Idempotent.
 pub fn register_pipe_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let pipe = "java/nio/channels/Pipe";
     r.register(pipe, "open", "()Ljava/nio/channels/Pipe;", pipe_open);
     r.register(pipe, "source", "()Ljava/nio/channels/Pipe$SourceChannel;", pipe_source);
@@ -692,6 +694,7 @@ pub fn register_pipe_real(r: &mut NativeMethodRegistry) {
     );
     r.register(abstract_sink, "isOpen", "()Z", channel_is_open);
     r.register(abstract_sink, "close", "()V", channel_close);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

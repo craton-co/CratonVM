@@ -44,6 +44,33 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # Synthetic-stub census guard: the `synthetic-stub` native bucket must
+      # never GROW vs the committed baseline (it should only shrink as the
+      # audit sweep classifies/deletes stubs). A growth means a new fake-main
+      # shim or unclassified native entered the default build — fail CI.
+      #
+      # `cargo build --workspace` above already produced the cratonvm binary,
+      # so this step reuses it (no rebuild). Generating a fresh census needs a
+      # JDK runtime image (the command boots the VM and runs HelloWorld), which
+      # the existing CI does NOT provision. Until a JDK is wired into CI this
+      # step is ADVISORY: it is gated to Linux (one matrix leg, no duplication)
+      # and marked `continue-on-error` so a missing JDK / boot failure does not
+      # red-flag the build. Once a JDK is added here the gate becomes blocking
+      # by dropping `continue-on-error`. See
+      # docs/synthetic-vs-real-explained.md and
+      # test-infra/native-census/README.md.
+      - name: synthetic-stub census guard
+        if: matrix.os == 'ubuntu-latest'
+        continue-on-error: true
+        shell: bash
+        run: |
+          CENSUS="$(mktemp)"
+          cargo run --quiet -p cratonvm-cli --bin cratonvm -- \
+            --dump-native-registry "$CENSUS" \
+            -cp vm-cli/tests/resources HelloWorld
+          python3 test-infra/native-census/check_no_stub_growth.py \
+            "$CENSUS" test-infra/native-census/default-build-baseline.json
+
   # Future CI hardening — not yet enabled. Uncomment once the
   # corresponding gates are ready to be enforced.
   #

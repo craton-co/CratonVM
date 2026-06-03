@@ -644,6 +644,8 @@ fn native_mul_add(
 /// bytecode, eliminating the seconds-long spin KC16 saw inside
 /// `BigInteger.<clinit>` / `SunJCE` parameter validation.
 pub fn register_biginteger_intrinsics(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let bi = "java/math/BigInteger";
     // implSquareToLen — squareToLen's intrinsic body.
     registry.register(
@@ -668,6 +670,7 @@ pub fn register_biginteger_intrinsics(registry: &mut NativeMethodRegistry) {
     // implMulAdd / mulAdd — used inside implSquareToLen's pass 2.
     registry.register(bi, "implMulAdd", "([I[IIII)I", native_impl_mul_add);
     registry.register(bi, "mulAdd", "([I[IIII)I", native_mul_add);
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

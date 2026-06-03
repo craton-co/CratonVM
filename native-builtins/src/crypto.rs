@@ -11,8 +11,11 @@
 //!   Common key types: KeyPair, PublicKey, PrivateKey, SecretKey, NamedParameterSpec
 //!   Phase 19.2  – Real Crypto Primitives (AES, SHA-2, HMAC, HKDF, SecureRandom)
 
-#[path = "crypto_impl.rs"]
-pub mod crypto_impl;
+// `crypto_impl` now lives at the crate top level (`crate::crypto_impl`) so the
+// `--no-default-features` build (which drops this `crypto` module) still has the
+// real crypto primitives. Re-exported here for feature-on back-compat with the
+// historical `crate::crypto::crypto_impl` path.
+pub use crate::crypto_impl;
 
 use cratonvm_types::error::MethodCallResult;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};

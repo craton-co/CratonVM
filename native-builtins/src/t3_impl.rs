@@ -27,6 +27,8 @@ use crate::{obj_arg, alloc_concurrent_synthetic};
 /// This is a minimal but real implementation backed by a Rust HashMap for
 /// the in-memory binding store, with DNS lookups via std::net for the DNS provider.
 pub(crate) fn register_t38_jndi(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ic = "javax/naming/InitialContext";
 
     // <init>() — creates context with empty environment
@@ -226,6 +228,7 @@ pub(crate) fn register_t38_jndi(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(result))))
     });
+    r.set_category(__prev_cat);
 }
 
 /// Put a key-value pair into the JNDI binding store.
@@ -387,6 +390,8 @@ fn jndi_dns_lookup(ctx: &mut dyn NativeContext, url: &str) -> Result<Option<Valu
 
 /// Register StAX (Streaming API for XML) and Schema validation natives.
 pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- XMLInputFactory ---
     let xif = "javax/xml/stream/XMLInputFactory";
     r.register(xif, "newInstance", "()Ljavax/xml/stream/XMLInputFactory;", |ctx, _args| {
@@ -635,6 +640,7 @@ pub(crate) fn register_t39_stax(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string("http://www.w3.org/2001/XMLSchema");
         Ok(Some(Value::Object(Some(s))))
     });
+    r.set_category(__prev_cat);
 }
 
 /// StAX event type constants (matching javax.xml.stream.XMLStreamConstants)
@@ -844,6 +850,8 @@ fn stax_parse_events(xml: &str) -> Vec<StaxEvent> {
 /// Register ScriptEngineManager natives. Provides engine discovery and
 /// a minimal "cratonvm-eval" engine that evaluates simple numeric expressions.
 pub(crate) fn register_t310_scripting(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sem = "javax/script/ScriptEngineManager";
     // Fields: 0=engines_list
     r.register(sem, "<init>", "()V", |ctx, args| {
@@ -986,6 +994,7 @@ pub(crate) fn register_t310_scripting(r: &mut NativeMethodRegistry) {
         let key = args.get(1).copied().unwrap_or(Value::Object(None));
         Ok(Some(script_get_binding(ctx, this, key)))
     });
+    r.set_category(__prev_cat);
 }
 
 /// Put key-value into SimpleBindings store.
@@ -1157,6 +1166,8 @@ fn parse_primary(tokens: &[ExprToken], pos: &mut usize) -> Option<f64> {
 // =============================================================================
 
 pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Locale.getDefault() reads LANG/LC_ALL environment variables
     let loc = "java/util/Locale";
     r.register(loc, "getDefault", "()Ljava/util/Locale;", |ctx, _args| {
@@ -1211,6 +1222,7 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
     // String.getBytes(String charsetName) — extended encoding support
     // This is registered elsewhere for UTF-8/ISO-8859-1; we add Shift_JIS support
     // The encoding/decoding for exotic charsets is best-effort.
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -1221,6 +1233,12 @@ pub(crate) fn register_t311_i18n(r: &mut NativeMethodRegistry) {
 /// These enable bootstrapping / booting the tools on CratonVM without implementing
 /// the full tool functionality (which requires running JDK bytecode).
 pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: javac/JavaCompiler/JShell/jpackage/javadoc natives return
+    // placeholder objects and error/exit codes without performing any real
+    // compilation, packaging, or doc generation ("requires full JDK
+    // toolchain"). CompilationTask.call() always returns false.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // --- T3.12: javac ---
     let javac = "com/sun/tools/javac/Main";
     // compile(String[]) -> int (exit code)
@@ -1416,6 +1434,7 @@ pub(crate) fn register_t312_tooling(r: &mut NativeMethodRegistry) {
         // Doc generation requires the full JDK toolchain; return error 1
         Ok(Some(Value::Int(1)))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================

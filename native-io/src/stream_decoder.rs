@@ -446,6 +446,8 @@ fn utf8_complete_prefix(bytes: &[u8]) -> usize {
 
 /// Register the StreamDecoder natives on the registry.
 pub fn register_stream_decoder_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sd = "sun/nio/cs/StreamDecoder";
 
     // Public factory methods.
@@ -502,6 +504,7 @@ pub fn register_stream_decoder_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    registry.set_category(__prev_cat);
 }
 
 #[cfg(test)]

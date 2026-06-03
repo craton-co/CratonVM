@@ -1414,6 +1414,8 @@ pub fn bind_controller_id(
 // ---------------------------------------------------------------------------
 
 pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sn = "org/jboss/msc/service/ServiceName";
     r.register(
         sn,
@@ -1697,6 +1699,7 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
     );
 
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
+    r.set_category(__prev_cat);
 }
 
 /// Construct a `<intf>_$logger` instance natively, bypassing the

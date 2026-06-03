@@ -1360,6 +1360,8 @@ fn register_java_util_resource_bundle_access(registry: &mut NativeMethodRegistry
 /// native-builtins initialisation path (both synthetic-jdk and
 /// real-JDK modes).
 pub fn register_wp1_4_shared_secrets(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_factories(registry);
 
     register_java_lang_access(registry);
@@ -1377,6 +1379,7 @@ pub fn register_wp1_4_shared_secrets(registry: &mut NativeMethodRegistry) {
     register_java_net_http_cookie_access(registry);
     register_java_object_input_stream_access(registry);
     register_java_util_resource_bundle_access(registry);
+    registry.set_category(__prev_cat);
 }
 
 #[cfg(test)]

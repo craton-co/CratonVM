@@ -1038,6 +1038,8 @@ impl<T: NativeContext + ?Sized> ReadStringFieldExt for T {
 /// translation natives that unblock KC16 boot through
 /// `MBeanServer.registerMBean(MemoryMXBean)`.
 pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // T19_H14_OPENMBEAN — primary Object-method filter.
     registry.register(
         "com/sun/jmx/mbeanserver/MBeanIntrospector",
@@ -1112,6 +1114,7 @@ pub fn register_jmx_openmbean_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/reflect/Type;)Lcom/sun/jmx/mbeanserver/MappedMXBeanType;",
         native_mapped_mxbean_type,
     );
+    registry.set_category(__prev_cat);
 }
 
 /// T19.M1 — Native override for

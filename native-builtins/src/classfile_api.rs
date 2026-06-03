@@ -772,6 +772,14 @@ fn register_constant_pool(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn register_classfile_api_natives(r: &mut NativeMethodRegistry) {
+    // FLAGGED SyntheticStub: every JEP 484 Class-File API native registered
+    // below returns a STUB ClassFile / ClassModel / *Builder object rather
+    // than performing real class-file parsing or generation (e.g. `parse`
+    // fabricates a fixed ClassModel, `build`/`buildTo`/`transformClass`
+    // return empty byte[]). These are placeholders, so they stay tagged
+    // SyntheticStub.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     register_classfile(r);
     register_class_model(r);
     register_method_model(r);
@@ -783,6 +791,7 @@ pub(crate) fn register_classfile_api_natives(r: &mut NativeMethodRegistry) {
     register_code_transform(r);
     register_attribute(r);
     register_constant_pool(r);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

@@ -324,6 +324,12 @@ fn native_jboss_logger_log_unchecked(ctx: &mut dyn NativeContext, args: &[Value]
 /// previously-registered triple from `logmanager.rs`, since those don't
 /// register a Logger.log handler today.
 pub fn register_jboss_logmanager_natives(registry: &mut NativeMethodRegistry) {
+    // NOTE (borderline): the JBoss LogManager has no real JDK class — these
+    // natives fabricate a logger / route log lines to a boot-log sink rather
+    // than running real bytecode. Tagged Bridge (host log sink, no Java
+    // bytecode to defer to) per classification guidance.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     for cls in [CLS_JUL_LOGGER, CLS_JBOSS_LOGGER] {
         registry.register(cls, "info", "(Ljava/lang/String;)V", native_logger_info);
         registry.register(cls, "warning", "(Ljava/lang/String;)V", native_logger_warning);
@@ -367,6 +373,7 @@ pub fn register_jboss_logmanager_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/logging/LogRecord;)V",
         native_jboss_logger_log_unchecked,
     );
+    registry.set_category(__prev_cat);
 }
 
 /// Test-only: drop the cached file handle so a re-test against a

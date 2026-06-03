@@ -2298,6 +2298,8 @@ fn windows_reset_wakeup_socket0_native(
 /// at the JDK's canonical FQN strings. This is the single entry point
 /// `lib.rs` calls at boot.
 pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sel = "sun/nio/ch/SelectorImpl";
     r.register(
         "java/nio/channels/Selector",
@@ -2424,13 +2426,17 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "(I)V",
         windows_reset_wakeup_socket0_native,
     );
+    r.set_category(__prev_cat);
 }
 
 /// Backwards-compat shim — the existing wire-up in `lib.rs` calls this
 /// name. Keeping it as an alias of `register_nio_selector_real` so the
 /// integration step does not have to be touched.
 pub fn register_nio_selector(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_nio_selector_real(r);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

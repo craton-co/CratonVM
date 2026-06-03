@@ -449,6 +449,8 @@ fn rb_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 pub fn register(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let rb = "java/util/ResourceBundle";
 
     // All getBundle overloads dispatch to the same builder.  This bypasses
@@ -749,4 +751,5 @@ pub fn register(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    registry.set_category(__prev_cat);
 }

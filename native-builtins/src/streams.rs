@@ -45,8 +45,11 @@ fn flow_subscription_demand() -> &'static Mutex<HashMap<u64, i64>> {
 
 /// Register Stream-terminal / Flow.Subscriber overrides.
 pub(crate) fn register_stream_overrides(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_flow_subscription_overrides(registry);
     register_basestream_mode_overrides(registry);
+    registry.set_category(__prev_cat);
 }
 
 /// `BaseStream.sequential() / parallel() / unordered() / isParallel() / onClose(Runnable)`
@@ -60,6 +63,8 @@ pub(crate) fn register_stream_overrides(registry: &mut NativeMethodRegistry) {
 /// always operates in sequential mode for now). `isParallel()` returns false.
 /// `onClose(Runnable)` returns `this` (we don't track close handlers).
 fn register_basestream_mode_overrides(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Each stream type declares the return type of sequential/parallel/unordered
     // as its own interface, *not* BaseStream. The descriptor recorded in the
     // bytecode is what `invokeinterface` looks up, so we register all the
@@ -117,6 +122,7 @@ fn register_basestream_mode_overrides(registry: &mut NativeMethodRegistry) {
     ] {
         registry.register(cls, "iterator", "()Ljava/util/Iterator;", native_stream_empty_iterator);
     }
+    registry.set_category(__prev_cat);
 }
 
 /// Native helper: return a fresh empty `Collections$EmptyIterator`.
@@ -143,12 +149,15 @@ fn native_stream_return_false(_ctx: &mut dyn NativeContext, _args: &[Value]) -> 
 /// saturating-add demand counter, plus a companion cancel() that drops
 /// the tracked demand.
 fn register_flow_subscription_overrides(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let flow_sub = "java/util/concurrent/Flow$Subscription";
 
     registry.register(flow_sub, "request", "(J)V", native_flow_request);
     // `cancel()` is registered in lib.rs; re-register here so the demand
     // map is cleaned up when the subscription is cancelled.
     registry.register(flow_sub, "cancel", "()V", native_flow_cancel);
+    registry.set_category(__prev_cat);
 }
 
 /// `Flow.Subscription.request(long n)` — saturating-add the demand.

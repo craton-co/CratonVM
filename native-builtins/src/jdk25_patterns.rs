@@ -514,6 +514,8 @@ fn native_stable_value_map(
 
 /// Register all JDK 25 pattern-matching and stable-value native methods.
 pub(crate) fn register_jdk25_patterns_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // -- jdk/internal/misc/PatternSupport --
     let ps = "jdk/internal/misc/PatternSupport";
     r.register(ps, "exactConversionCheck", "(ID)Z", native_exact_conversion_check);
@@ -569,6 +571,7 @@ pub(crate) fn register_jdk25_patterns_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Set;)Ljava/util/Map;",
         native_stable_value_map,
     );
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================

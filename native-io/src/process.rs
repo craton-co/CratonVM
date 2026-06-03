@@ -775,6 +775,8 @@ fn native_process_pid(
 /// Register every WP1.12-owned subprocess native.  Called from
 /// `register_io_natives` at VM boot.
 pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Platform-specific spawn natives that the JDK invokes from inside
     // ProcessImpl / UNIXProcess.  Only the Windows one is registered on
     // non-Linux targets, and vice-versa, so we don't override each
@@ -905,6 +907,7 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Process;",
         native_process_builder_start,
     );
+    registry.set_category(__prev_cat);
 }
 
 /// `java.lang.ProcessBuilder.start()Ljava/lang/Process;`

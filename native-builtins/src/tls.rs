@@ -158,6 +158,11 @@ fn build_string_array(ctx: &mut dyn NativeContext, items: &[&str]) -> ObjectRef 
 // ---------------------------------------------------------------------------
 
 fn register_ssl_context(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: SSLContext here is a synthetic field-holder; getInstance/
+    // getDefault/init merely allocate an object and flip an "initialized" flag.
+    // No rustls config is built. The real engine lives in t27_tls.rs.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLContext";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -317,6 +322,7 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +330,11 @@ fn register_ssl_context(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_ssl_engine(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: wrap()/unwrap() do NO real TLS — they emit empty records
+    // and advance a fake handshake state machine with no rustls crypto. The
+    // genuine rustls-backed SSLEngine is t27_tls.rs::register_sslengine_real.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLEngine";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -548,6 +559,7 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ses))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +567,10 @@ fn register_ssl_engine(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_ssl_session(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: 6-field synthetic session; getId is derived from object
+    // identity, cipher/protocol read back synthetic fields. No real session.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLSession";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -659,6 +675,7 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
     r.register(cls, "getPacketBufferSize", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(16709))) // 16384 + header overhead
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +683,10 @@ fn register_ssl_session(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: 4-field synthetic parameter holder; getters return
+    // hardcoded protocol/cipher lists, setters are no-ops.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLParameters";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -816,6 +837,7 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
     // flag to SSLParameters' want-client-auth field. Stub retained for module
     // self-containment under experimental-tls feature.
     r.register(cls, "setWantClientAuth", "(Z)V", native_noop_with_this);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -823,6 +845,10 @@ fn register_ssl_parameters(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: 3-field synthetic factory; getTrustManagers() returns a
+    // placeholder X509TrustManager that does no real trust-store loading.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/TrustManagerFactory";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -890,6 +916,7 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -897,6 +924,10 @@ fn register_trust_manager_factory(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_key_manager_factory(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: 3-field synthetic factory; getKeyManagers() returns a
+    // placeholder X509KeyManager with no real key material loaded.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/KeyManagerFactory";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -965,6 +996,7 @@ fn register_key_manager_factory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -977,6 +1009,12 @@ fn register_key_manager_factory(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_key_store(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: 5-field synthetic KeyStore. The default build's load()
+    // merely flips a "loaded" flag; the legacy-synthetic-crypto path parses
+    // real bytes but emits placeholder Key/Certificate objects (hardcoded
+    // RSA-2048 etc.). The real JKS/PKCS12 engine is keystore.rs.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "java/security/KeyStore";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1369,6 +1407,7 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
         let _ = (ctx, args);
         Ok(Some(Value::Int(0)))
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1376,6 +1415,11 @@ fn register_key_store(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: createSocket() returns an unconnected synthetic
+    // java/net/Socket with no TLS wiring; getDefault() yields a placeholder
+    // factory. Cipher-suite getters return hardcoded lists.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLSocketFactory";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1436,6 +1480,7 @@ fn register_ssl_socket_factory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1498,7 +1543,7 @@ fn validate_cert_chain_crypto(
         .as_secs() as i64;
 
     // Collect parsed certificates for chain validation
-    let mut parsed_certs: Vec<Option<crate::crypto::crypto_impl::X509Cert>> = Vec::new();
+    let mut parsed_certs: Vec<Option<crate::crypto_impl::X509Cert>> = Vec::new();
 
     for i in 0..chain_len {
         if let Value::Object(Some(cert_ref)) = ctx.get_array_element(chain_arr, i) {
@@ -1509,7 +1554,7 @@ fn validate_cert_chain_crypto(
                     continue;
                 }
             };
-            if let Some(cert) = crate::crypto::crypto_impl::cert_get(cert_id) {
+            if let Some(cert) = crate::crypto_impl::cert_get(cert_id) {
                 // 1. Check validity dates (always — no feature gate)
                 if now < cert.not_before {
                     return Err(cratonvm_types::error::RuntimeError::IllegalStateException {
@@ -1577,6 +1622,10 @@ fn validate_cert_chain_crypto(
 }
 
 fn register_x509_trust_manager(r: &mut NativeMethodRegistry) {
+    // Bridge: checkClientTrusted/checkServerTrusted perform real X.509 chain
+    // validation (validity dates, signature verification, chain continuity).
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "javax/net/ssl/X509TrustManager";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1608,6 +1657,7 @@ fn register_x509_trust_manager(r: &mut NativeMethodRegistry) {
     // empty array and was shadowed in practice by t27_tls (which loads after
     // this function). Keeping only one registration removes the last
     // cross-file duplicate between tls.rs and t27_tls.rs.
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1615,6 +1665,10 @@ fn register_x509_trust_manager(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: alias of the synthetic SSLContext; createSSLEngine()
+    // returns the fake (non-rustls) engine, init just flips a flag.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "sun/security/ssl/SSLContextImpl";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1692,6 +1746,7 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1699,6 +1754,10 @@ fn register_ssl_context_impl(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_ssl_engine_result(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: accessors over the synthetic SSLEngineResult produced by
+    // the fake SSLEngine state machine — no real TLS result data.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/net/ssl/SSLEngineResult";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1747,6 +1806,7 @@ fn register_ssl_engine_result(r: &mut NativeMethodRegistry) {
     r.register(cls, "bytesProduced", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1785,6 +1845,14 @@ pub(crate) fn is_tls13_allowed_suite_name(name: &str) -> bool {
 /// `t19_9_consolidation_no_duplicate_registrations` test trivial to
 /// express.
 fn register_keycloak_tls_natives(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: SSLSessionImpl methods are synthetic placeholders
+    // (getId derived from pointer, getPeerCertificates returns empty, cipher/
+    // protocol hardcoded, isValid()=true) and engineInit just flips a flag.
+    // The setEnabledCipherSuitesStrict allowlist gate is the only real check,
+    // but the dominant surface here is placeholder. Real session data comes
+    // from the rustls path in t27_tls.rs / phases_late.rs.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // --- sun.security.ssl.SSLSessionImpl ------------------------------------
     //
     // Keycloak reads the session ID (for access log correlation) and the
@@ -1908,6 +1976,7 @@ fn register_keycloak_tls_natives(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1932,6 +2001,10 @@ pub fn engine_negotiated_alpn(engine_id: i32) -> Option<String> {
 }
 
 pub(crate) fn register_tls_natives(r: &mut NativeMethodRegistry) {
+    // Dispatcher: each sub-fn sets its own NativeKind (mostly SyntheticStub —
+    // this is the emulated TLS layer; the real rustls engine is t27_tls.rs).
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     register_ssl_context(r);
     register_ssl_engine(r);
     register_ssl_session(r);
@@ -1951,6 +2024,7 @@ pub(crate) fn register_tls_natives(r: &mut NativeMethodRegistry) {
     // permissive variants of a few, but the Sun-package shims are unique
     // to this block and never shadowed).
     register_keycloak_tls_natives(r);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -2746,6 +2820,10 @@ mod tls_tests {
             .is_some());
     }
 
+    // `tls_impl` only exists under `legacy-synthetic-crypto`; gate the tests
+    // that reach into it so the default (synthetic-crypto-free) test build
+    // compiles.
+    #[cfg(feature = "legacy-synthetic-crypto")]
     #[test]
     fn t19_9_consolidation_no_duplicate_registrations() {
         // Canonical-home map: register each file's natives once, in the
@@ -2818,6 +2896,7 @@ mod tls_tests {
         );
     }
 
+    #[cfg(feature = "legacy-synthetic-crypto")]
     #[test]
     fn t19_9_tls_orphan_registrations_removed() {
         // The two orphan registrations landed in sessions 86/87 and
@@ -2863,6 +2942,7 @@ mod tls_tests {
         );
     }
 
+    #[cfg(feature = "legacy-synthetic-crypto")]
     #[test]
     fn t19_9_handshake_still_green() {
         // Regression sentinel — if Session 87 Lambda's three server-handshake

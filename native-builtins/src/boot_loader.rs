@@ -85,6 +85,8 @@ fn native_vm_support_get_vm_temp_dir(
 
 /// Register all C4 boot-loader natives.
 pub fn register_boot_loader_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     registry.register(
         "jdk/internal/loader/BootLoader",
         "setBootLoaderUnnamedModule0",
@@ -119,4 +121,5 @@ pub fn register_boot_loader_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_vm_support_get_vm_temp_dir,
     );
+    registry.set_category(__prev_cat);
 }

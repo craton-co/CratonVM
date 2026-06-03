@@ -231,6 +231,8 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
 /// that just store the parent reference, and provide getParent() that reads
 /// it back.
 pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cl = "java/lang/ClassLoader";
     let ucl = "java/net/URLClassLoader";
 
@@ -549,6 +551,7 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
             cl_real_load_class(ctx, &trimmed)
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// `ClassLoader.loadClass(String)` for real-JDK mode.

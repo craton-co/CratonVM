@@ -1130,6 +1130,8 @@ fn native_method_invoke_boxed(
 /// AFTER the existing reflection registrations so these supplement (don't
 /// override) the historical layer.
 pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- Method.invoke return-boxing safety net (overrides the historical
     // registration in lib.rs::register_essential_natives because
     // register_wp2_1_natives is called AFTER it). See the comment on
@@ -1562,6 +1564,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
 
     let _ = create_field_object; // silence unused-import lint (used in tests)
     let _ = read_field_meta;
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

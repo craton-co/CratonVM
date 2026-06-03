@@ -499,6 +499,8 @@ fn alloc_body_handler(ctx: &mut dyn NativeContext, kind: i32) -> ObjectRef {
 // ---------------------------------------------------------------------------
 
 fn register_http_client(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpClient";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -762,6 +764,7 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
         ctx.set_field(bld, 2, Value::Int(0)); // header count
         Ok(Some(Value::Object(Some(bld))))
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -769,6 +772,8 @@ fn register_http_client(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_http_client_builder(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpClient$Builder";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -942,6 +947,7 @@ fn register_http_client_builder(r: &mut NativeMethodRegistry) {
         ctx.set_field(client, CLIENT_POOL_SIZE, Value::Int(DEFAULT_POOL_SIZE));
         Ok(Some(Value::Object(Some(client))))
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -949,6 +955,8 @@ fn register_http_client_builder(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_http_request(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpRequest";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1055,6 +1063,7 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
         ctx.set_field(opt, 1, Value::Int(if ver > 0 { ver - 1 } else { 0 }));
         Ok(Some(Value::Object(Some(opt))))
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,6 +1071,8 @@ fn register_http_request(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_http_request_builder(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpRequest$Builder";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1261,6 +1272,7 @@ fn register_http_request_builder(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(req))))
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1268,6 +1280,8 @@ fn register_http_request_builder(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_http_response(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpResponse";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1358,6 +1372,7 @@ fn register_http_response(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(opt))))
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1365,6 +1380,8 @@ fn register_http_response(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_http_headers(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpHeaders";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1459,6 +1476,7 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
         ctx.set_field(map, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(map))))
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1466,6 +1484,8 @@ fn register_http_headers(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_body_publisher(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/net/http/HttpRequest$BodyPublisher";
     let bps = "java/net/http/HttpRequest$BodyPublishers";
     r.register(cls, "<init>", "()V", native_noop_with_this);
@@ -1551,6 +1571,7 @@ fn register_body_publisher(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+    r.set_category(__prev_cat);
 }
 
 /// Process-wide map from BodySubscriber identity → downstream Flow.Subscriber.
@@ -1574,6 +1595,8 @@ fn body_subscriber_demand() -> &'static parking_lot::Mutex<std::collections::Has
 // ---------------------------------------------------------------------------
 
 fn register_body_handlers(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let bhs = "java/net/http/HttpResponse$BodyHandlers";
 
     // ofString() -> BodyHandler<String>
@@ -1621,6 +1644,7 @@ fn register_body_handlers(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(bh))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1628,6 +1652,11 @@ fn register_body_handlers(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_websocket(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: these send*/abort/request handlers fake success (return a
+    // pre-completed CompletableFuture, flip local close flags) without doing
+    // any real WebSocket framing or socket I/O; subprotocol() returns "unknown".
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "java/net/http/WebSocket";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1761,6 +1790,7 @@ fn register_websocket(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, WS_INPUT_CLOSED,  Value::Int(1));
         Ok(None)
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1786,6 +1816,8 @@ fn method_idx_to_name(idx: i32) -> &'static str {
 
 /// Register all HTTP/2 client native methods into the given registry.
 pub(crate) fn register_http2_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_http_client(r);
     register_http_client_builder(r);
     register_http_request(r);
@@ -1795,6 +1827,7 @@ pub(crate) fn register_http2_natives(r: &mut NativeMethodRegistry) {
     register_body_publisher(r);
     register_body_handlers(r);
     register_websocket(r);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

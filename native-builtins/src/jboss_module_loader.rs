@@ -2254,6 +2254,8 @@ pub(crate) fn native_boot_holder_priv_action_run(
 /// Install every `LocalModuleLoader` / `Module` / `ModuleClassLoader`
 /// native this module owns.
 pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // DefaultBootModuleLoaderHolder$1.run() overrides — both the
     // typed and erased signatures get the same implementation so the
     // JVM's bytecode dispatch resolves one or the other.
@@ -2474,6 +2476,7 @@ pub fn register_jboss_module_loader(registry: &mut NativeMethodRegistry) {
     // as `#[allow(dead_code)]` only so a future audit can confirm what
     // the shim looked like; it is no longer wired into the registry.
     let _ = native_wildfly_main_noop;
+    registry.set_category(__prev_cat);
 }
 
 /// RKC19/WF39 — synthetic no-op `main(String[])` for WildFly bootstrap

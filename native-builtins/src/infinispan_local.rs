@@ -1259,6 +1259,8 @@ fn native_global_cfg_build(_ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 /// Register all Infinispan local-mode native methods.
 pub fn register_infinispan_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // DefaultCacheManager
     registry.register(CLS_MANAGER, "<init>", "()V", native_dcm_init);
     registry.register(
@@ -1401,6 +1403,7 @@ pub fn register_infinispan_natives(registry: &mut NativeMethodRegistry) {
         "()Lorg/infinispan/configuration/global/GlobalConfiguration;",
         native_global_cfg_build,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================

@@ -65,6 +65,8 @@ use cratonvm_types::{ArrayElementType, Value};
 /// (no-feature) build this is a no-op.
 #[cfg(feature = "gpu-offload")]
 pub(crate) fn register(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     const KLASS: &str = "craton/gpu/internal/Native";
 
     registry.register(KLASS, "openExecutor", "(I)Lcraton/gpu/GpuExecutor;", builtin_open_executor);
@@ -106,6 +108,7 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
     registry.register(KLASS, "releaseFuture",   "(J)V", builtin_release_future);
     registry.register(KLASS, "releaseArray",    "(J)V", builtin_release_array);
     registry.register(KLASS, "releaseExecutor", "(J)V", builtin_release_executor);
+    registry.set_category(__prev_cat);
 }
 
 /// No-op registration when the `gpu-offload` feature is disabled.

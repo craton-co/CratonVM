@@ -565,6 +565,8 @@ fn native_close0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 // ---------------------------------------------------------------------------
 
 pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let raf = "java/io/RandomAccessFile";
     registry.register(raf, "initIDs", "()V", native_initIDs);
     registry.register(raf, "open0", "(Ljava/lang/String;I)V", native_open0);
@@ -577,6 +579,7 @@ pub fn register_random_access_file_natives(registry: &mut NativeMethodRegistry) 
     registry.register(raf, "length0", "()J", native_length0);
     registry.register(raf, "setLength0", "(J)V", native_setLength0);
     registry.register(raf, "close0", "()V", native_close0);
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

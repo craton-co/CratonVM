@@ -419,6 +419,8 @@ pub(crate) fn native_fetch_stack_frames(
 
 /// Register the StackStreamFactory private natives.
 pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // java/lang/StackStreamFactory$AbstractStackWalker.callStackWalk
     let asw = "java/lang/StackStreamFactory$AbstractStackWalker";
     registry.register(
@@ -848,6 +850,7 @@ pub fn register_lang_stackwalker(registry: &mut NativeMethodRegistry) {
         "()V",
         |_ctx, _args| Ok(None),
     );
+    registry.set_category(__prev_cat);
 }
 
 #[cfg(test)]

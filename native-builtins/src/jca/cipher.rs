@@ -467,6 +467,14 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
 /// identical, just overwrites).  Calling this from `lib.rs` after
 /// `register_phase53_natives` is therefore safe.
 pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
+    // SyntheticStub: this fn's own registrations are bypass shims — <clinit>
+    // no-ops for Security/JceSecurity/Providers, plus canUseProvider()=>true,
+    // isRestricted()=>false, getVerificationResult()=>null. They pretend JCE
+    // provider verification/policy setup succeeded without performing it. The
+    // nested register_cipher_dispatch/keygen/param_specs are real (Bridge) and
+    // set their own category.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // `javax/crypto/Cipher.<clinit>` itself.  Static fields (`debug`,
     // `pdebug`, `skipDebug`, `warnCount`) stay null/zero, which is fine
     // because every Cipher method we dispatch on is replaced by a
@@ -576,6 +584,7 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
     register_cipher_dispatch(r);
     register_keygen_dispatch(r);
     register_param_specs(r);
+    r.set_category(__prev_cat);
 }
 
 /// Register the missing 2-arg `KeyGenerator.getInstance` overloads
@@ -596,6 +605,8 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
 /// `generateKey()` (also registered in `phases_early.rs`) work
 /// unchanged on instances allocated here.
 fn register_keygen_dispatch(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let kg = "javax/crypto/KeyGenerator";
     r.register(
         kg,
@@ -621,6 +632,7 @@ fn register_keygen_dispatch(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// Register `Cipher.getInstance` / `init` / `update` / `updateAAD` /
@@ -630,6 +642,8 @@ fn register_keygen_dispatch(r: &mut NativeMethodRegistry) {
 /// crate's `crypto_impl` AES/GCM helpers — so it works in both
 /// real-JDK and synthetic-JDK modes.
 fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cipher = "javax/crypto/Cipher";
 
     r.register(
@@ -856,6 +870,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(arr))))
     });
+    r.set_category(__prev_cat);
 }
 
 /// Register the parameter-spec types the probe (and any AEAD client)
@@ -863,6 +878,8 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
 /// into synthetic-slot 0 so `register_cipher_dispatch::init` can pull
 /// the IV back out without depending on the real JDK field layout.
 fn register_param_specs(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ivps = "javax/crypto/spec/IvParameterSpec";
     r.register(ivps, "<clinit>", "()V", clinit_noop);
     r.register(ivps, "<init>", "([B)V", |ctx, args| {
@@ -931,6 +948,7 @@ fn register_param_specs(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string("RAW");
         Ok(Some(Value::Object(Some(s))))
     });
+    r.set_category(__prev_cat);
 }
 
 #[cfg(test)]

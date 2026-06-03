@@ -217,6 +217,8 @@ pub fn make_iterator_from_array(
 
 /// Register all collection native methods.
 pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_arraylist_natives(registry);
     register_hashmap_natives(registry);
     register_hashset_natives(registry);
@@ -276,6 +278,7 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     register_priority_blocking_queue_natives(registry);
     register_executors_scheduled_natives(registry);
     register_concurrent_completeness_natives(registry);
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -817,6 +820,8 @@ fn al_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usi
 }
 
 fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/ArrayList";
 
     r.register(c, "<init>", "()V", native_al_init);
@@ -921,6 +926,7 @@ fn register_arraylist_natives(r: &mut NativeMethodRegistry) {
         native_al_replace_all,
     );
     r.register(c, "stream", "()Ljava/util/stream/Stream;", native_al_stream);
+    r.set_category(__prev_cat);
 }
 
 pub fn native_al_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -2503,6 +2509,8 @@ fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, 
 }
 
 fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/HashMap";
 
     r.register(c, "<init>", "()V", native_map_init);
@@ -2596,6 +2604,7 @@ fn register_hashmap_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/BiFunction;)V",
         native_map_replace_all,
     );
+    r.set_category(__prev_cat);
 }
 
 pub fn native_map_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4133,6 +4142,8 @@ pub fn make_hashset_with_elements(
 }
 
 fn register_hashset_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // LETSGO_S1: Mirror HashSet's native surface onto the class names of
     // its real-JDK subclasses that share the same `field 0 = backing
     // map` layout. Without this mirroring, `LinkedHashSet.add(Object)Z`
@@ -4215,6 +4226,7 @@ fn register_hashset_natives(r: &mut NativeMethodRegistry) {
             native_hs_contains_all,
         );
     }
+    r.set_category(__prev_cat);
 }
 
 /// LETSGO_S1: HashSet(int initialCapacity, float loadFactor) — mirror of
@@ -4654,6 +4666,8 @@ const MAP_KEY_ITR_FIELD_LAST_RET: usize = 4;
 const MAP_KEY_ITR_NUM_FIELDS: usize = 5;
 
 fn register_iterator_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ArrayList$Itr
     r.register(
         "java/util/ArrayList$Itr",
@@ -4693,6 +4707,7 @@ fn register_iterator_natives(r: &mut NativeMethodRegistry) {
         "()V",
         native_map_key_itr_remove,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_al_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -4904,6 +4919,8 @@ fn native_map_key_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 // ===========================================================================
 
 fn register_arrays_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
         "java/util/Arrays",
         "copyOf",
@@ -4948,6 +4965,7 @@ fn register_arrays_natives(r: &mut NativeMethodRegistry) {
         "([I[I)Z",
         native_arrays_equals_int,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_arrays_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -5074,6 +5092,8 @@ fn opt_prim_value(ctx: &dyn NativeContext, this: ObjectRef) -> Option<Value> {
 }
 
 fn register_optional_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let o = "java/util/Optional";
     r.register(o, "empty", "()Ljava/util/Optional;", native_opt_empty);
     r.register(
@@ -5160,6 +5180,7 @@ fn register_optional_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Supplier;)Ljava/lang/Object;",
         native_opt_or_else_throw_supplier,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_opt_empty(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -5586,6 +5607,8 @@ fn native_arrays_equals_int(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // ===========================================================================
 
 fn register_collections_utility_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/Collections";
     r.register(c, "sort", "(Ljava/util/List;)V", native_collections_sort);
     r.register(
@@ -5618,6 +5641,7 @@ fn register_collections_utility_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/List;Ljava/util/Comparator;)V",
         native_collections_sort_comparator,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6064,6 +6088,8 @@ fn sort_with_comparator(
 // ===========================================================================
 
 fn register_map_entry_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/HashMap$Entry";
     r.register(c, "getKey", "()Ljava/lang/Object;", native_entry_get_key);
     r.register(
@@ -6078,6 +6104,7 @@ fn register_map_entry_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_entry_set_value,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_entry_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6393,6 +6420,8 @@ fn native_map_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 // ===========================================================================
 
 fn register_factory_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // List.of
     r.register(
         "java/util/List",
@@ -6500,6 +6529,7 @@ fn register_factory_natives(r: &mut NativeMethodRegistry) {
         "([Ljava/util/Map$Entry;)Ljava/util/Map;",
         native_map_of_entries,
     );
+    r.set_category(__prev_cat);
 }
 
 /// Generic `List.of` for fixed-arity overloads: every positional arg is an
@@ -6823,6 +6853,8 @@ fn stream_elements_mut(ctx: &mut dyn NativeContext, stream: ObjectRef) -> Vec<Va
 }
 
 fn register_stream_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/stream/Stream";
 
     // Source methods
@@ -7292,6 +7324,7 @@ fn register_stream_natives(r: &mut NativeMethodRegistry) {
             native_stream_spliterator,
         );
     }
+    r.set_category(__prev_cat);
 }
 
 /// `Stream.spliterator()` / `BaseStream.spliterator()` — build a synthetic
@@ -8014,6 +8047,8 @@ const COLLECTOR_TAG_COLLECTING_AND_THEN: i32 = 13;
 const COLLECTOR_TAG_TO_COLLECTION: i32 = 14;
 
 fn register_collectors_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/stream/Collectors";
 
     r.register(
@@ -8147,6 +8182,7 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Set;",
         native_collector_characteristics,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_collector_characteristics(
@@ -9022,6 +9058,8 @@ fn int_stream_elements(ctx: &dyn NativeContext, stream: ObjectRef) -> Vec<Value>
 }
 
 fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/stream/IntStream";
 
     r.register(
@@ -9077,6 +9115,7 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/OptionalDouble;",
         native_int_stream_average,
     );
+    r.set_category(__prev_cat);
 }
 
 /// Maximum number of stream elements that may be materialized eagerly. This
@@ -9353,6 +9392,8 @@ fn make_long_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> MethodCa
 }
 
 fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/stream/LongStream";
 
     r.register(
@@ -9424,6 +9465,7 @@ fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/stream/DoubleStream;",
         native_long_stream_as_double,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_long_stream_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9669,6 +9711,8 @@ fn make_double_stream(ctx: &mut dyn NativeContext, elements: &[Value]) -> Method
 }
 
 fn register_double_stream_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/stream/DoubleStream";
 
     r.register(
@@ -9734,6 +9778,7 @@ fn register_double_stream_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/DoubleToIntFunction;)Ljava/util/stream/IntStream;",
         native_double_stream_map_to_int,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_double_stream_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9970,6 +10015,8 @@ fn native_double_stream_map_to_int(
 // implementations (ArrayList / HashSet).
 
 fn register_interface_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- java/util/Collection ---
     registry.register(
         "java/util/Collection",
@@ -10159,6 +10206,7 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_entry_set_value,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -10166,6 +10214,8 @@ fn register_interface_natives(registry: &mut NativeMethodRegistry) {
 // ===========================================================================
 
 fn register_copy_constructor_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ArrayList(Collection)
     registry.register(
         "java/util/ArrayList",
@@ -10187,6 +10237,7 @@ fn register_copy_constructor_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/Map;)V",
         native_map_init_from_map,
     );
+    registry.set_category(__prev_cat);
 }
 
 /// ArrayList.<init>(Collection) — copy elements from source collection into this list.
@@ -10516,6 +10567,8 @@ fn native_comparator_compare_method(
 }
 
 fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     registry.register(
         "java/util/Comparator$Native",
         "compare",
@@ -10570,6 +10623,7 @@ fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/Comparator;)Ljava/util/Comparator;",
         native_comparator_then_comparing,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn native_comparator_natural_order(
@@ -10642,6 +10696,8 @@ const SJ_FIELD_SUFFIX: usize = 2;
 const SJ_FIELD_ELEMENTS: usize = 3;
 const SJ_FIELD_EMPTY_VALUE: usize = 4;
 fn register_string_joiner_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     registry.register(
         "java/util/StringJoiner",
         "<init>",
@@ -10679,6 +10735,7 @@ fn register_string_joiner_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/CharSequence;)Ljava/util/StringJoiner;",
         native_sj_set_empty_value,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn native_sj_init_delim(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10914,6 +10971,8 @@ fn native_sj_set_empty_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 const RND_FIELD_SEED: usize = 0;
 
 fn register_random_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/Random";
     registry.register(c, "<init>", "()V", native_random_init);
     registry.register(c, "<init>", "(J)V", native_random_init_seed);
@@ -10925,6 +10984,7 @@ fn register_random_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "nextBoolean", "()Z", native_random_next_boolean);
     registry.register(c, "setSeed", "(J)V", native_random_set_seed);
     registry.register(c, "nextGaussian", "()D", native_random_next_gaussian);
+    registry.set_category(__prev_cat);
 }
 
 /// Java LCG constants
@@ -11095,6 +11155,8 @@ fn native_random_next_gaussian(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 // ===========================================================================
 
 fn register_optional_int_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/OptionalInt";
     registry.register(c, "of", "(I)Ljava/util/OptionalInt;", native_opt_int_of);
     registry.register(
@@ -11112,9 +11174,12 @@ fn register_optional_int_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/function/IntConsumer;)V",
         native_opt_int_if_present,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn register_optional_long_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/OptionalLong";
     registry.register(c, "of", "(J)Ljava/util/OptionalLong;", native_opt_long_of);
     registry.register(
@@ -11132,9 +11197,12 @@ fn register_optional_long_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/function/LongConsumer;)V",
         native_opt_long_if_present,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn register_optional_double_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/OptionalDouble";
     registry.register(
         c,
@@ -11157,6 +11225,7 @@ fn register_optional_double_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/util/function/DoubleConsumer;)V",
         native_opt_double_if_present,
     );
+    registry.set_category(__prev_cat);
 }
 
 // --- OptionalInt ---
@@ -11446,6 +11515,8 @@ fn ll_size(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
 }
 
 fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/LinkedList";
     registry.register(c, "<init>", "()V", native_ll_init);
     registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ll_add);
@@ -11541,6 +11612,7 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(lit, "set", "(Ljava/lang/Object;)V", native_ll_listitr_set);
     registry.register(lit, "remove", "()V", native_ll_listitr_remove_noop);
     registry.register(lit, "add", "(Ljava/lang/Object;)V", native_ll_listitr_remove_noop);
+    registry.set_category(__prev_cat);
 }
 
 fn ll_snapshot_array(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
@@ -12646,6 +12718,8 @@ fn lhm_find_node(
 }
 
 fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/LinkedHashMap";
 
     registry.register(c, "<init>", "()V", native_lhm_init);
@@ -12727,6 +12801,7 @@ fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/util/function/Function;)Ljava/lang/Object;",
         native_lhm_compute_if_absent,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn native_lhm_compute_if_absent(
@@ -13404,6 +13479,8 @@ fn ad_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, min_cap: usi
 }
 
 fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/ArrayDeque";
 
     r.register(c, "<init>", "()V", native_ad_init);
@@ -13461,6 +13538,7 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Consumer;)V",
         native_ad_for_each,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_ad_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -13947,6 +14025,8 @@ fn pq_sift_down(
 }
 
 fn register_priority_queue_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/PriorityQueue";
 
     r.register(c, "<init>", "()V", native_pq_init);
@@ -13969,6 +14049,7 @@ fn register_priority_queue_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_pq_to_array);
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_pq_iterator);
     r.register(c, "toString", "()Ljava/lang/String;", native_pq_to_string);
+    r.set_category(__prev_cat);
 }
 
 fn native_pq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14212,6 +14293,8 @@ fn native_pq_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // ===========================================================================
 
 fn register_vector_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/Vector";
 
     r.register(c, "<init>", "()V", native_al_init);
@@ -14287,6 +14370,7 @@ fn register_vector_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Consumer;)V",
         native_al_for_each,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_vec_set_element_at(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14387,6 +14471,8 @@ fn native_vec_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // ===========================================================================
 
 fn register_stack_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/Stack";
 
     // Inherit all Vector methods
@@ -14420,6 +14506,7 @@ fn register_stack_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "peek", "()Ljava/lang/Object;", native_stack_peek);
     r.register(c, "empty", "()Z", native_al_is_empty);
     r.register(c, "search", "(Ljava/lang/Object;)I", native_stack_search);
+    r.set_category(__prev_cat);
 }
 
 fn native_stack_push(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14485,6 +14572,8 @@ fn native_stack_search(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // ===========================================================================
 
 fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ArrayList
     r.register(
         "java/util/ArrayList",
@@ -14542,6 +14631,7 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/Collection;)Z",
         native_ad_add_all,
     );
+    r.set_category(__prev_cat);
 }
 
 /// Collect elements from a Collection (ArrayList, HashSet, LinkedList, etc.)
@@ -14927,6 +15017,8 @@ fn native_ad_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // ===========================================================================
 
 fn register_queue_deque_interface_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- java/util/Queue interface ---
     registry.register(
         "java/util/Queue",
@@ -15030,6 +15122,7 @@ fn register_queue_deque_interface_natives(registry: &mut NativeMethodRegistry) {
             native_snapshot_itr_next,
         );
     }
+    registry.set_category(__prev_cat);
 }
 
 /// Generic snapshot-based iterator: field 0 = Object[] snapshot, field 1 = Int cursor.
@@ -17390,6 +17483,8 @@ fn native_ts_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 // ===========================================================================
 
 fn register_tree_map_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/TreeMap";
     registry.register(c, "<init>", "()V", native_tm_init);
     registry.register(
@@ -17629,9 +17724,12 @@ fn register_tree_map_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/util/Map$Entry;",
         native_tm_poll_last_entry,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/TreeSet";
     registry.register(c, "<init>", "()V", native_ts_init);
     registry.register(
@@ -17775,6 +17873,7 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_ts_lower,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -17924,6 +18023,8 @@ fn chm_init_segments(
 }
 
 fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/ConcurrentHashMap";
 
     // Constructors
@@ -18205,6 +18306,7 @@ fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Z",
         native_chm_contains_key,
     );
+    r.set_category(__prev_cat);
 }
 
 // --- ConcurrentHashMap segmented native functions (Phase 86.2) ---
@@ -19097,6 +19199,8 @@ fn native_set_from_map_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 fn register_set_from_map_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = SET_FROM_MAP_CLASS;
     r.register(c, "size", "()I", native_set_from_map_size);
     r.register(c, "isEmpty", "()Z", native_set_from_map_is_empty);
@@ -19113,6 +19217,7 @@ fn register_set_from_map_natives(r: &mut NativeMethodRegistry) {
         native_set_from_map_to_array,
     );
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_set_from_map_iterator);
+    r.set_category(__prev_cat);
 }
 
 
@@ -19126,6 +19231,8 @@ fn register_set_from_map_natives(r: &mut NativeMethodRegistry) {
 const PROPS_FIELD_DEFAULTS: usize = 3;
 
 fn register_properties_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let p = "java/util/Properties";
 
     // <init>()V — empty properties
@@ -19331,6 +19438,7 @@ fn register_properties_natives(registry: &mut NativeMethodRegistry) {
     // `AbstractX500NameStyle.copyHashTable(BCStyle.DefaultLookUp)` produced
     // an empty per-instance `defaultLookUp` and every
     // `BCStyle.attrNameToOID("cn"/...)` threw "Unknown object id".
+    registry.set_category(__prev_cat);
 }
 
 fn native_props_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -19915,6 +20023,8 @@ fn unmod_delegate(
 }
 
 fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ---- UnmodifiableCollection (also the shared base for List/Set) -------
     for c in [UNMOD_COLLECTION_CLASS, UNMOD_LIST_CLASS, UNMOD_SET_CLASS] {
         r.register(c, "size", "()I", native_unmod_size);
@@ -20162,6 +20272,7 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
         r.register(c, "add", "(Ljava/lang/Object;)V", native_unmod_throw);
         r.register(c, "remove", "()V", native_unmod_throw);
     }
+    r.set_category(__prev_cat);
 }
 
 /// Universal mutator: throws `UnsupportedOperationException`.
@@ -20547,6 +20658,8 @@ fn native_unmod_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // ===========================================================================
 
 fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/Collections";
     r.register(
         c,
@@ -20741,6 +20854,7 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/Object;",
         native_snapshot_itr_next,
     );
+    r.set_category(__prev_cat);
 }
 
 /// Identity — just returns the first argument (used for synchronized wrappers)
@@ -21077,6 +21191,8 @@ const LBQ_FIELD_CAPACITY: usize = 3;
 const _LBQ_NUM_FIELDS: usize = 4;
 
 fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // LinkedBlockingQueue
     let lbq = "java/util/concurrent/LinkedBlockingQueue";
     r.register(lbq, "<init>", "()V", native_lbq_init);
@@ -21212,6 +21328,7 @@ fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Iterator;",
         native_lbq_iterator,
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -21801,6 +21918,8 @@ fn native_lbq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // so code calling through Iterator<E> references works.
 
 fn register_iterator_protocol_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Generic java/util/Iterator interface — fallback to snapshot iterator
     let itr = "java/util/Iterator";
     r.register(itr, "hasNext", "()Z", native_snapshot_itr_has_next);
@@ -21899,6 +22018,7 @@ fn register_iterator_protocol_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Enumeration;",
         native_empty_enumeration,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_empty_enumeration(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -22164,6 +22284,8 @@ const STPE_FIELD_TASK_LIST: usize = 2;
 const STPE_NUM_FIELDS: usize = 3;
 
 fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/ScheduledThreadPoolExecutor";
     r.register(c, "<init>", "(I)V", native_stpe_init);
     r.register(
@@ -22246,6 +22368,7 @@ fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
         native_stpe_submit_callable,
     );
+    r.set_category(__prev_cat);
 }
 
 /// Allocate a completed ScheduledFuture that wraps a result value.
@@ -22434,6 +22557,8 @@ fn cslm_stripe_for(
 }
 
 fn register_concurrent_skip_list_map_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/ConcurrentSkipListMap";
     r.register(c, "<init>", "()V", native_cslm_init);
     r.register(
@@ -22465,6 +22590,7 @@ fn register_concurrent_skip_list_map_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "firstKey", "()Ljava/lang/Object;", native_cslm_first_key);
     r.register(c, "lastKey", "()Ljava/lang/Object;", native_cslm_last_key);
     r.register(c, "keySet", "()Ljava/util/Set;", native_cslm_key_set);
+    r.set_category(__prev_cat);
 }
 
 /// Binary search in the keys array using natural comparison.
@@ -22787,6 +22913,8 @@ const SL_FIELD_STAMP: usize = 1; // monotonic stamp counter
 const SL_NUM_FIELDS: usize = 2;
 
 fn register_stamped_lock_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/locks/StampedLock";
     r.register(c, "<init>", "()V", native_sl_init);
     r.register(c, "readLock", "()J", native_sl_read_lock);
@@ -22821,6 +22949,7 @@ fn register_stamped_lock_natives(r: &mut NativeMethodRegistry) {
         // state == 1 means write-locked
         Ok(Some(Value::Int(if state == 1 { 1 } else { 0 })))
     });
+    r.set_category(__prev_cat);
 }
 
 fn native_sl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -23032,6 +23161,8 @@ const PH_FIELD_PHASE: usize = 2;
 const PH_NUM_FIELDS: usize = 3;
 
 fn register_phaser_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/Phaser";
     r.register(c, "<init>", "()V", native_ph_init_empty);
     r.register(c, "<init>", "(I)V", native_ph_init_parties);
@@ -23042,6 +23173,7 @@ fn register_phaser_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "getPhase", "()I", native_ph_get_phase);
     r.register(c, "getRegisteredParties", "()I", native_ph_get_registered_parties);
     r.register(c, "getArrivedParties", "()I", native_ph_get_arrived_parties);
+    r.set_category(__prev_cat);
 }
 
 fn native_ph_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -23207,6 +23339,8 @@ const PBQ_NUM_FIELDS: usize = 2;
 const PBQ_DEFAULT_CAPACITY: usize = 16;
 
 fn register_priority_blocking_queue_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/PriorityBlockingQueue";
     r.register(c, "<init>", "()V", native_pbq_init);
     r.register(c, "offer", "(Ljava/lang/Object;)Z", native_pbq_offer);
@@ -23216,6 +23350,7 @@ fn register_priority_blocking_queue_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "take", "()Ljava/lang/Object;", native_pbq_take);
     r.register(c, "size", "()I", native_pbq_size);
     r.register(c, "isEmpty", "()Z", native_pbq_is_empty);
+    r.set_category(__prev_cat);
 }
 
 fn native_pbq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -23369,6 +23504,8 @@ fn native_pbq_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // ===========================================================================
 
 fn register_executors_scheduled_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Some runtimes resolve STPE constructors through this crate's registry,
     // so keep both ctor shapes available here (including ThreadFactory variant).
     r.register(
@@ -23461,6 +23598,7 @@ fn register_executors_scheduled_natives(r: &mut NativeMethodRegistry) {
         "(Z)V",
         native_stpe_ignore_policy_setter,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_executors_new_scheduled_pool(
@@ -23501,6 +23639,8 @@ const CF_FIELD_SOURCE: usize = 2;
 const CF_FIELD_HANDLER: usize = 3;
 
 fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
         "java/util/concurrent/CopyOnWriteArrayList",
         "addIfAbsent",
@@ -23744,6 +23884,7 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
     // --- RecursiveAction.invoke that calls compute ---
     let ra = "java/util/concurrent/RecursiveAction";
     r.register(ra, "invoke", "()Ljava/lang/Object;", native_ra_invoke);
+    r.set_category(__prev_cat);
 }
 
 const COWAL_CLASS: &str = "java/util/concurrent/CopyOnWriteArrayList";

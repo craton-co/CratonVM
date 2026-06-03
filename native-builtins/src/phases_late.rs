@@ -125,10 +125,13 @@ fn br_sidetable_read_one(_ctx: &mut dyn NativeContext, reader: ObjectRef) -> Opt
 }
 
 pub(crate) fn register_phase55_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_phase55_charset(registry);
     register_phase55_executors(registry);
     register_phase55_reflect(registry);
     register_phase55_collection_extras(registry);
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +187,8 @@ pub(crate) fn unsafe_wp1_2_natives(registry: &mut NativeMethodRegistry) {
 // java.nio.charset — Charset, StandardCharsets
 // ---------------------------------------------------------------------------
 pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Charset = 1-field synthetic (name=0)
     let cs = "java/nio/charset/Charset";
     r.register(
@@ -329,6 +334,7 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -346,6 +352,8 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
 // CompletableFuture = 3-field: result=0, done=1, exception=2
 // ---------------------------------------------------------------------------
 pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- Callable<V> interface ---
     let callable = "java/util/concurrent/Callable";
     r.register(callable, "call", "()Ljava/lang/Object;", |ctx, args| {
@@ -1094,12 +1102,15 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
 // java.lang.reflect extras: Parameter, Executable
 // ---------------------------------------------------------------------------
 pub(crate) fn register_phase55_reflect(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- java.lang.reflect.Parameter (3-field: name=0, modifiers=1, type=2) ---
     let param = "java/lang/reflect/Parameter";
     r.register(param, "getName", "()Ljava/lang/String;", |ctx, args| {
@@ -1218,12 +1229,15 @@ pub(crate) fn register_phase55_reflect(r: &mut NativeMethodRegistry) {
     );
 
     // --- Proxy --- (real implementation in lib.rs::register_reflect_proxy_natives)
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
 // Collection extras: IdentityHashMap, Collections.unmodifiableX, etc.
 // ---------------------------------------------------------------------------
 pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- IdentityHashMap (same 3-field layout as HashMap) ---
     let ihm = "java/util/IdentityHashMap";
     r.register(ihm, "<init>", "()V", native_al_init_default_for_map);
@@ -1388,6 +1402,7 @@ pub(crate) fn register_phase55_collection_extras(r: &mut NativeMethodRegistry) {
     // `java.util.Collections.disjoint` is a small pure-Java method (iterate one
     // collection, `contains` on the other, with the Set-size optimisation) and
     // runs correctly on CratonVM, so we let the real bytecode handle it.
+    r.set_category(__prev_cat);
 }
 
 /// Helper to init a map-like object with 3 fields (buckets, size, capacity)
@@ -1407,10 +1422,13 @@ fn native_al_init_default_for_map(ctx: &mut dyn NativeContext, args: &[Value]) -
 // ============================================================================
 
 pub(crate) fn register_phase56_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_phase56_stream_extras(registry);
     register_phase56_collectors_extras(registry);
     register_phase56_summary_stats(registry);
     register_phase56_function_extras(registry);
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,6 +1436,8 @@ pub(crate) fn register_phase56_natives(registry: &mut NativeMethodRegistry) {
 // concat, ofNullable, flatMapToInt/Long/Double, boxed, parallel/sequential
 // ---------------------------------------------------------------------------
 pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let stream = "java/util/stream/Stream";
 
     // --- Stream.peek(Consumer) → Stream ---
@@ -1792,6 +1812,7 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
         "()Ljava/util/DoubleSummaryStatistics;",
         p56_double_stream_summary_stats,
     );
+    r.set_category(__prev_cat);
 }
 
 // --- Helper: read stream elements from 1-field synthetic (field 0 = Object[]) ---
@@ -2452,6 +2473,8 @@ fn p56_double_stream_summary_stats(
 }
 
 pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- IntSummaryStatistics ---
     let iss = "java/util/IntSummaryStatistics";
     r.register(iss, "<init>", "()V", |_ctx, _args| Ok(None));
@@ -2737,6 +2760,7 @@ pub(crate) fn register_phase56_summary_stats(r: &mut NativeMethodRegistry) {
         let obj = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(obj))))
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -2766,6 +2790,8 @@ const P56_COLLECTOR_TO_UNMODIFIABLE_SET: i32 = 17;
 const P56_COLLECTOR_COLLECTING_AND_THEN: i32 = 18;
 
 pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let col = "java/util/stream/Collectors";
 
     // --- maxBy(Comparator) → Collector ---
@@ -2972,6 +2998,7 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(c))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -2979,6 +3006,8 @@ pub(crate) fn register_phase56_collectors_extras(r: &mut NativeMethodRegistry) {
 // BinaryOperator interface dispatch registrations
 // ---------------------------------------------------------------------------
 pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // BiFunction<T,U,R>.apply(T,U) → R — dispatched via invoke_virtual
     let bf = "java/util/function/BiFunction";
     r.register(
@@ -3559,6 +3588,7 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ============================================================================
@@ -3567,6 +3597,8 @@ pub(crate) fn register_phase56_function_extras(r: &mut NativeMethodRegistry) {
 // ============================================================================
 
 pub(crate) fn register_phase57_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_phase57_nio_file(registry);
     register_phase57_process(registry);
     register_phase57_text(registry);
@@ -3579,6 +3611,7 @@ pub(crate) fn register_phase57_natives(registry: &mut NativeMethodRegistry) {
     }
     register_phase57_file(registry);
     register_phase57_file_channel(registry);
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -3598,6 +3631,8 @@ const P57_PATH_FS_FIELD: usize = 1;
 const P57_FS_JAR_FIELD: usize = 1;
 
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let path = "java/nio/file/Path";
     let _paths = "java/nio/file/Paths";
     let files = "java/nio/file/Files";
@@ -6303,6 +6338,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             write_iterable_impl(ctx, &trimmed)
         },
     );
+    r.set_category(__prev_cat);
 }
 
 fn p57_read_path(ctx: &mut dyn NativeContext, path_obj: ObjectRef) -> String {
@@ -6727,6 +6763,8 @@ const PROC_FIELD_STDOUT: usize = 1;
 const PROC_FIELD_STDERR: usize = 2;
 
 pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let pb = "java/lang/ProcessBuilder";
     let proc = "java/lang/Process";
 
@@ -7148,6 +7186,7 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(1))),
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -7297,6 +7336,8 @@ fn raf_get_fd(ctx: &dyn NativeContext, this: ObjectRef) -> Option<u32> {
 }
 
 pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let raf = "java/io/RandomAccessFile";
 
     // <init>(String name, String mode)
@@ -7854,6 +7895,7 @@ pub(crate) fn register_phase57_random_access_file(r: &mut NativeMethodRegistry) 
         let _ = ctx.fd_table().rw_seek(fd_id as u32, std::io::SeekFrom::Current(skip as i64));
         Ok(Some(Value::Int(skip as i32)))
     });
+    r.set_category(__prev_cat);
 }
 
 /// Read exactly `buf.len()` bytes from a RAF fd, or error.
@@ -8034,6 +8076,8 @@ fn file_alloc(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
 }
 
 pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let file = "java/io/File";
 
     // <init>(String path)V
@@ -8828,6 +8872,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
         let sep = ':' as i32;
         Ok(Some(Value::Int(sep)))
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -8836,6 +8881,8 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let fc = "java/nio/channels/FileChannel";
 
     // position()J
@@ -9113,9 +9160,12 @@ pub(crate) fn register_phase57_file_channel(r: &mut NativeMethodRegistry) {
         let fd_id = ctx.get_field(this, 0).as_int().unwrap_or(-1);
         Ok(Some(Value::Int(if fd_id >= 0 { 1 } else { 0 })))
     });
+    r.set_category(__prev_cat);
 }
 
 pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let df = "java/text/DecimalFormat";
     let nf = "java/text/NumberFormat";
     let mf = "java/text/MessageFormat";
@@ -9376,6 +9426,7 @@ pub(crate) fn register_phase57_text(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;",
         p57_message_format,
     );
+    r.set_category(__prev_cat);
 }
 
 fn p57_message_format(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9434,6 +9485,8 @@ fn p57_message_format(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 // =============================================================================
 
 pub(crate) fn register_phase58_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p58_completable_future(registry);
     register_p58_nio_channels(registry);
     register_p58_gzip_streams(registry);
@@ -9441,6 +9494,7 @@ pub(crate) fn register_phase58_natives(registry: &mut NativeMethodRegistry) {
     register_p58_charset_coder(registry);
     register_p58_string_concat_factory(registry);
     register_p58_synchronous_queue(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -9450,6 +9504,8 @@ pub(crate) fn register_phase58_natives(registry: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cf = "java/util/concurrent/CompletableFuture";
 
     // thenCompose: apply Function that returns CompletableFuture, then flatten
@@ -9679,6 +9735,7 @@ pub(crate) fn register_p58_completable_future(r: &mut NativeMethodRegistry) {
         let _ = ctx.invoke_virtual(runnable, "run", "()V", &[]);
         Ok(None)
     });
+    r.set_category(__prev_cat);
 }
 
 pub(crate) fn p58_new_cf(ctx: &mut dyn NativeContext, result: Value, done: bool) -> ObjectRef {
@@ -9880,6 +9937,8 @@ fn p58_cf_is_completed_exceptionally(
 // =============================================================================
 
 pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sc = "java/nio/channels/SocketChannel";
     r.register(sc, "open", "()Ljava/nio/channels/SocketChannel;", |ctx, _args| {
         let sc = alloc_concurrent_synthetic(ctx, "java/nio/channels/SocketChannel", 4);
@@ -10312,6 +10371,7 @@ pub(crate) fn register_p58_nio_channels(r: &mut NativeMethodRegistry) {
     r.register(sac, "configureBlocking", "(Z)Ljava/nio/channels/SelectableChannel;", |_ctx, args| {
         Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
     });
+    r.set_category(__prev_cat);
 }
 
 /// Extract host:port from a SocketAddress synthetic object.
@@ -10452,6 +10512,8 @@ fn p98_do_select(ctx: &mut dyn NativeContext, selector: ObjectRef) -> MethodCall
 // =============================================================================
 
 pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // GZIPInputStream
     let gi = "java/util/zip/GZIPInputStream";
     r.register(gi, "<init>", "(Ljava/io/InputStream;)V", p58_gzip_in_init);
@@ -10784,6 +10846,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
         "()V",
         native_noop_with_this,
     );
+    r.set_category(__prev_cat);
 }
 
 // GZIPInputStream: field 0=decompressed byte[], field 1=read position (Int)
@@ -11107,6 +11170,8 @@ fn p58_gzip_out_finish(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // =============================================================================
 
 pub(crate) fn register_p58_pushback(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let pi = "java/io/PushbackInputStream";
     r.register(
         pi,
@@ -11154,6 +11219,7 @@ pub(crate) fn register_p58_pushback(r: &mut NativeMethodRegistry) {
         }
         Ok(None)
     });
+    r.set_category(__prev_cat);
 }
 
 fn p58_pushback_in_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11309,6 +11375,8 @@ fn p58_pushback_reader_unread(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // =============================================================================
 
 pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let enc = "java/nio/charset/CharsetEncoder";
     r.register(
         enc,
@@ -11470,6 +11538,7 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(dec_obj))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -11477,6 +11546,8 @@ pub fn register_p58_charset_coder(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p58_string_concat_factory(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let scf = "java/lang/invoke/StringConcatFactory";
     // makeConcatWithConstants — returns a CallSite stub
     r.register(scf, "makeConcatWithConstants",
@@ -11486,6 +11557,7 @@ pub(crate) fn register_p58_string_concat_factory(r: &mut NativeMethodRegistry) {
     r.register(scf, "makeConcat",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;",
         p58_make_concat_simple);
+    r.set_category(__prev_cat);
 }
 
 fn p58_make_concat(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11558,6 +11630,8 @@ fn p58_make_concat_simple(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 // =============================================================================
 
 pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sq = "java/util/concurrent/SynchronousQueue";
     r.register(sq, "<init>", "()V", p58_sq_init);
     r.register(sq, "<init>", "(Z)V", p58_sq_init_fair);
@@ -11600,6 +11674,7 @@ pub(crate) fn register_p58_synchronous_queue(r: &mut NativeMethodRegistry) {
     r.register(sq, "drainTo", "(Ljava/util/Collection;)I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+    r.set_category(__prev_cat);
 }
 
 fn p58_sq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11672,6 +11747,8 @@ fn p58_sq_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
 // =============================================================================
 
 pub(crate) fn register_phase59_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p59_management(registry);
     register_p59_jar(registry);
     register_p59_spliterator(registry);
@@ -11681,6 +11758,7 @@ pub(crate) fn register_phase59_natives(registry: &mut NativeMethodRegistry) {
     register_p59_file_attributes(registry);
     register_p59_module(registry);
     // register_javax_annotation removed (was Spring Boot stub)
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -11692,6 +11770,8 @@ pub(crate) fn register_phase59_natives(registry: &mut NativeMethodRegistry) {
 static MEMORY_MX_VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mf = "java/lang/management/ManagementFactory";
 
     // ManagementFactory static getters — each returns a synthetic MXBean
@@ -11923,6 +12003,7 @@ pub(crate) fn register_p59_management(r: &mut NativeMethodRegistry) {
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    r.set_category(__prev_cat);
 }
 
 fn p59_get_memory_mxbean(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -12056,6 +12137,8 @@ fn get_process_rss_bytes() -> i64 {
 // =============================================================================
 
 pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let jf = "java/util/jar/JarFile";
     r.register(jf, "<init>", "(Ljava/lang/String;)V", p59_jar_file_init);
     r.register(jf, "<init>", "(Ljava/io/File;)V", p59_jar_file_init_file);
@@ -12649,6 +12732,7 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     // r.register(dacf, "create",
     //     "(Lorg/springframework/boot/WebApplicationType;)Lorg/springframework/context/ConfigurableApplicationContext;",
     //     spring_default_app_ctx_factory_create);
+    r.set_category(__prev_cat);
 }
 
 /// S111r21 — native implementation of Spring's ClassUtils.forName(String, ClassLoader).
@@ -13798,6 +13882,8 @@ fn p59_attributes_put_value(
 // =============================================================================
 
 pub(crate) fn register_p59_spliterator(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let spl = "java/util/Spliterator";
 
     // Additional Spliterator methods
@@ -13911,6 +13997,7 @@ pub(crate) fn register_p59_spliterator(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Spliterator;",
         p59_hashset_spliterator,
     );
+    r.set_category(__prev_cat);
 }
 
 fn p59_stream_from_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14222,6 +14309,8 @@ fn vh_auto_box(ctx: &mut dyn NativeContext, val: Value) -> Value {
 }
 
 pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let vh = "java/lang/invoke/VarHandle";
 
     // get / getPlain / getOpaque — plain (relaxed) access
@@ -14635,6 +14724,7 @@ pub(crate) fn register_p59_varhandle(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(vh_obj))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// Deep equality for VarHandle CAS expected-value comparisons.
@@ -14655,6 +14745,8 @@ fn values_equal(a: &Value, b: &Value) -> bool {
 // =============================================================================
 
 pub(crate) fn register_p59_package(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let pkg = "java/lang/Package";
     r.register(pkg, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -14763,6 +14855,7 @@ pub(crate) fn register_p59_package(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(empty))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -14770,6 +14863,8 @@ pub(crate) fn register_p59_package(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sw = "java/lang/StackWalker";
     // walk(Function<Stream<StackFrame>, R>) → R
     r.register(
@@ -14902,6 +14997,7 @@ pub(crate) fn register_p59_stackwalker(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ste))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// Populate the 6-slot StackFrame synthetic from a `StackTraceEntry`.
@@ -14991,6 +15087,8 @@ fn p59_sw_get_caller_class(ctx: &mut dyn NativeContext, _args: &[Value]) -> Meth
 // =============================================================================
 
 pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let bfa = "java/nio/file/attribute/BasicFileAttributes";
     r.register(
         bfa,
@@ -15108,6 +15206,7 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ft))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// Extract path string from a Path argument (field 0 = String)
@@ -15213,6 +15312,8 @@ fn build_string_set(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectRe
 }
 
 pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // =================================================================
     // java.lang.ModuleLayer
     // =================================================================
@@ -15526,6 +15627,7 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(m_obj))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -15534,6 +15636,8 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase60_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p60_http_client(registry);
     register_p60_flow(registry);
     register_p60_match_result(registry);
@@ -15541,6 +15645,7 @@ pub(crate) fn register_phase60_natives(registry: &mut NativeMethodRegistry) {
     register_p60_record(registry);
     register_p60_process_handle(registry);
     register_p60_abstract_map(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -15551,6 +15656,8 @@ pub(crate) fn register_phase60_natives(registry: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p60_http_client(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let hc = "java/net/http/HttpClient";
     r.register(
         hc,
@@ -15797,6 +15904,7 @@ pub(crate) fn register_p60_http_client(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 fn p60_new_http_client(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -15866,6 +15974,8 @@ fn p60_http_send_async(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 // =============================================================================
 
 pub(crate) fn register_p60_flow(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Flow.Subscription = 2-field (cancelled=0, demand=1 Long)
     let sub = "java/util/concurrent/Flow$Subscription";
     r.register(sub, "request", "(J)V", |ctx, args| {
@@ -15938,6 +16048,7 @@ pub(crate) fn register_p60_flow(r: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Flow$Subscriber;)V",
         native_noop_with_this,
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -15945,6 +16056,8 @@ pub(crate) fn register_p60_flow(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p60_match_result(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mr = "java/util/regex/MatchResult";
     r.register(mr, "start", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -15978,6 +16091,7 @@ pub(crate) fn register_p60_match_result(r: &mut NativeMethodRegistry) {
     r.register(mr, "groupCount", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -15994,6 +16108,8 @@ pub(crate) fn register_p60_match_result(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ph = "java/lang/ProcessHandle";
     r.register(
         ph,
@@ -16076,6 +16192,7 @@ pub(crate) fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
         "()Ljava/util/Optional;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -16083,6 +16200,8 @@ pub(crate) fn register_p60_process_handle(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p60_abstract_map(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let am = "java/util/AbstractMap";
     r.register(am, "isEmpty", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -16122,6 +16241,7 @@ pub(crate) fn register_p60_abstract_map(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Int(0)))
         }
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -16129,6 +16249,8 @@ pub(crate) fn register_p60_abstract_map(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase61_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p61_text_formatting(registry);
     register_p61_logging(registry);
     register_p61_charset(registry);
@@ -16136,6 +16258,7 @@ pub(crate) fn register_phase61_natives(registry: &mut NativeMethodRegistry) {
     register_p61_reflect(registry);
     register_p61_files_path(registry);
     register_p61_net(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -16144,6 +16267,8 @@ pub(crate) fn register_phase61_natives(registry: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- ParsePosition = 1-field (index=0) ---
     let pp = "java/text/ParsePosition";
     r.register(pp, "<init>", "(I)V", |ctx, args| {
@@ -16479,6 +16604,7 @@ pub(crate) fn register_p61_text_formatting(r: &mut NativeMethodRegistry) {
     r.register(nf, "NFKD", "Ljava/text/Normalizer$Form;", |ctx, _args| {
         p57_alloc_enum(ctx, "java/text/Normalizer$Form", "NFKD", 3)
     });
+    r.set_category(__prev_cat);
 }
 
 fn p61_dfs_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -16589,6 +16715,8 @@ fn p61_dfsy_fill(ctx: &mut dyn NativeContext, this: ObjectRef) {
 // =============================================================================
 
 pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- Logger additions ---
     let log = "java/util/logging/Logger";
     r.register(
@@ -16840,6 +16968,7 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(e))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -16847,6 +16976,8 @@ pub(crate) fn register_p61_logging(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p61_charset(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cs = "java/nio/charset/Charset";
     r.register(cs, "name", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -16940,6 +17071,7 @@ pub(crate) fn register_p61_charset(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(tm))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -16947,6 +17079,8 @@ pub(crate) fn register_p61_charset(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cl = "java/lang/ClassLoader";
     r.register(
         cl,
@@ -17139,6 +17273,7 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
     r.register(cl, "isRegisteredAsParallelCapable", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -17146,6 +17281,8 @@ pub(crate) fn register_p61_classloader(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- Parameter = 3-field (name=0, modifiers=1, declaringExecutable=2) ---
     let param = "java/lang/reflect/Parameter";
     r.register(param, "getName", "()Ljava/lang/String;", |ctx, args| {
@@ -17291,6 +17428,7 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -17298,6 +17436,8 @@ pub(crate) fn register_p61_reflect(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let files = "java/nio/file/Files";
     r.register(
         files,
@@ -17591,10 +17731,13 @@ pub(crate) fn register_p61_files_path(r: &mut NativeMethodRegistry) {
         let count = std::path::Path::new(&entry).components().count() as i32;
         Ok(Some(Value::Int(count.max(0))))
     });
+    r.set_category(__prev_cat);
 }
 
 // URI/URL already fully implemented in earlier phases — no additions needed
 pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // NetworkInterface = 5-field synthetic (name=0, displayName=1, addresses=2, index=3, flags=4)
     // flags: bit 0 = up, bit 1 = loopback, bit 2 = supportsMulticast
     let ni = "java/net/NetworkInterface";
@@ -17750,6 +17893,7 @@ pub(crate) fn register_p61_net(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(&format!("name:{}", name));
         Ok(Some(Value::Object(Some(s))))
     });
+    r.set_category(__prev_cat);
 }
 
 /// Build the list of NetworkInterface synthetic objects for this host.
@@ -17811,6 +17955,8 @@ fn p61_build_network_interfaces(ctx: &mut dyn NativeContext) -> Vec<ObjectRef> {
 // =============================================================================
 
 pub(crate) fn register_phase62_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p62_char_buffer(registry);
     register_p62_time_expansion(registry);
     register_p62_format_factories(registry);
@@ -17818,6 +17964,7 @@ pub(crate) fn register_phase62_natives(registry: &mut NativeMethodRegistry) {
     register_p62_abstract_map_entries(registry);
     register_p62_stamped_lock(registry);
     register_p62_zip_entry(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -17877,6 +18024,8 @@ fn cb_read_hb(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
 }
 
 pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cb = "java/nio/CharBuffer";
     r.register(cb, "allocate", "(I)Ljava/nio/CharBuffer;", |ctx, args| {
         let cap = match args.first() {
@@ -18323,6 +18472,7 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 3)))
     });
+    r.set_category(__prev_cat);
 }
 
 fn p62_alloc_char_buffer(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
@@ -18337,6 +18487,8 @@ fn p62_alloc_char_buffer(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
 // =============================================================================
 
 pub(crate) fn register_p62_time_expansion(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- Year = 1-field (year=0 Int) ---
     let yr = "java/time/Year";
     r.register(yr, "of", "(I)Ljava/time/Year;", |ctx, args| {
@@ -18570,6 +18722,7 @@ pub(crate) fn register_p62_time_expansion(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(&format!("--{m:02}-{d:02}"));
         Ok(Some(Value::Object(Some(s))))
     });
+    r.set_category(__prev_cat);
 }
 
 fn p62_days_in_month(y: i32, m: i32) -> i32 {
@@ -18592,6 +18745,8 @@ fn p62_days_in_month(y: i32, m: i32) -> i32 {
 // =============================================================================
 
 pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let nf = "java/text/NumberFormat";
     // NumberFormat = 3-field synthetic (like DecimalFormat: pattern=0, groupingUsed=1, maxFrac=2)
     r.register(
@@ -18744,6 +18899,7 @@ pub(crate) fn register_p62_format_factories(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    r.set_category(__prev_cat);
 }
 
 fn p62_new_number_format(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -18760,6 +18916,8 @@ fn p62_new_number_format(ctx: &mut dyn NativeContext, _args: &[Value]) -> Method
 // =============================================================================
 
 pub(crate) fn register_p62_navigable_expansion(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let tm = "java/util/TreeMap";
     r.register(
         tm,
@@ -18863,6 +19021,7 @@ pub(crate) fn register_p62_navigable_expansion(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         p62_ts_higher,
     );
+    r.set_category(__prev_cat);
 }
 
 // TreeMap navigable helpers — operate on sorted interleaved array [k0,v0,k1,v1,...]
@@ -19082,6 +19241,8 @@ fn natural_compare_values(a: Value, b: Value) -> i32 {
 // =============================================================================
 
 pub(crate) fn register_p62_abstract_map_entries(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let se = "java/util/AbstractMap$SimpleEntry";
     r.register(
         se,
@@ -19156,6 +19317,7 @@ pub(crate) fn register_p62_abstract_map_entries(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(&format!("entry@{:x}", this.as_ptr() as usize));
         Ok(Some(Value::Object(Some(s))))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -19164,6 +19326,8 @@ pub(crate) fn register_p62_abstract_map_entries(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p62_stamped_lock(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sl = "java/util/concurrent/locks/StampedLock";
     r.register(sl, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -19377,6 +19541,7 @@ pub(crate) fn register_p62_stamped_lock(r: &mut NativeMethodRegistry) {
         let wl = ctx.get_field(this, 1).as_int().unwrap_or(0);
         Ok(Some(Value::Int(if wl == 0 && state > 0 { state as i32 } else { 0 })))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -19384,6 +19549,8 @@ pub(crate) fn register_p62_stamped_lock(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p62_zip_entry(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ze = "java/util/zip/ZipEntry";
     r.register(ze, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -19431,6 +19598,7 @@ pub(crate) fn register_p62_zip_entry(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -19439,6 +19607,8 @@ pub(crate) fn register_p62_zip_entry(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase63_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p63_weak_hash_map(registry);
     register_p63_resource_bundle(registry);
     register_p63_service_loader(registry);
@@ -19446,6 +19616,7 @@ pub(crate) fn register_phase63_natives(registry: &mut NativeMethodRegistry) {
     register_p63_scheduled_executor(registry);
     register_p63_formatter(registry);
     register_p63_enumeration(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -19454,6 +19625,8 @@ pub(crate) fn register_phase63_natives(registry: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p63_weak_hash_map(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let whm = "java/util/WeakHashMap";
     r.register(whm, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -19574,6 +19747,7 @@ pub(crate) fn register_p63_weak_hash_map(r: &mut NativeMethodRegistry) {
         ctx.set_field(al, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(al))))
     });
+    r.set_category(__prev_cat);
 }
 
 fn p63_simple_hash(key: Value) -> usize {
@@ -19591,6 +19765,8 @@ fn p63_simple_hash(key: Value) -> usize {
 // =============================================================================
 
 pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let rb = "java/util/ResourceBundle";
     r.register(
         rb,
@@ -19676,6 +19852,7 @@ pub(crate) fn register_p63_resource_bundle(r: &mut NativeMethodRegistry) {
         ctx.set_field(set, 2, Value::Int(16));
         Ok(Some(Value::Object(Some(set))))
     });
+    r.set_category(__prev_cat);
 }
 
 /// Build a Java String[] from a Rust slice of &str.
@@ -20029,6 +20206,8 @@ fn service_provider_registry() -> &'static std::collections::HashMap<&'static st
 }
 
 pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sl = "java/util/ServiceLoader";
     r.register(
         sl,
@@ -20160,6 +20339,7 @@ pub(crate) fn register_p63_service_loader(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string("ServiceLoader[]");
         Ok(Some(Value::Object(Some(s))))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -20195,6 +20375,8 @@ fn scheduled_convert_to_millis(ctx: &mut dyn NativeContext, value: i64, unit_arg
 }
 
 pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     fn stpe_ensure_work_queue(ctx: &mut dyn NativeContext, this: ObjectRef) {
         let has_queue = matches!(ctx.get_field_by_name(this, "workQueue"), Value::Object(Some(_)));
         if has_queue {
@@ -20498,6 +20680,7 @@ pub(crate) fn register_p63_scheduled_executor(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -20515,6 +20698,8 @@ pub(crate) fn register_p63_formatter(_r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p63_enumeration(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Empty enumeration
     let ee = "java/util/Collections$EmptyEnumeration";
     r.register(ee, "hasMoreElements", "()Z", |_ctx, _args| {
@@ -20595,6 +20780,7 @@ pub(crate) fn register_p63_enumeration(r: &mut NativeMethodRegistry) {
         ctx.set_field(itr, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(itr))))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -20604,6 +20790,8 @@ pub(crate) fn register_p63_enumeration(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase64_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p64_sequenced_collections(registry);
     register_p64_hex_format(registry);
     register_p64_stream_modern(registry);
@@ -20611,6 +20799,7 @@ pub(crate) fn register_phase64_natives(registry: &mut NativeMethodRegistry) {
     register_p64_random_generator(registry);
     register_p64_string_additions(registry);
     register_p64_math_clamp(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -20620,6 +20809,8 @@ pub(crate) fn register_phase64_natives(registry: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p64_sequenced_collections(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // SequencedCollection interface
     let sc = "java/util/SequencedCollection";
     r.register(
@@ -20835,6 +21026,7 @@ pub(crate) fn register_p64_sequenced_collections(r: &mut NativeMethodRegistry) {
         "()Ljava/util/SequencedMap;",
         native_p64_lhm_reversed,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_p64_seq_get_first(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -21143,6 +21335,8 @@ fn native_p64_lhm_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 // =============================================================================
 
 pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let hf = "java/util/HexFormat";
 
     r.register(hf, "of", "()Ljava/util/HexFormat;", |ctx, _args| {
@@ -21276,6 +21470,7 @@ pub(crate) fn register_p64_hex_format(r: &mut NativeMethodRegistry) {
             Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_p64_format_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -21348,6 +21543,8 @@ fn native_p64_parse_hex(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 // =============================================================================
 
 pub(crate) fn register_p64_stream_modern(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let s = "java/util/stream/Stream";
     // Stream.toList() — Java 16: returns unmodifiable list
     r.register(s, "toList", "()Ljava/util/List;", native_p64_stream_to_list);
@@ -21416,6 +21613,7 @@ pub(crate) fn register_p64_stream_modern(r: &mut NativeMethodRegistry) {
     );
 
     // dropWhile / takeWhile already registered in Phase 56 — do not override
+    r.set_category(__prev_cat);
 }
 
 fn p64_stream_elements(ctx: &dyn NativeContext, stream: Value) -> (Option<ObjectRef>, usize) {
@@ -21459,6 +21657,8 @@ fn native_p64_stream_to_list(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 // =============================================================================
 
 pub(crate) fn register_p64_collectors_teeing(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Collectors.teeing(Collector, Collector, BiFunction) -> Collector
     // Tag 9 for teeing: ARG1 = downstream1 Collector, ARG2 = downstream2 Collector
     // We store the merge function elsewhere (simplified)
@@ -21474,6 +21674,7 @@ pub(crate) fn register_p64_collectors_teeing(r: &mut NativeMethodRegistry) {
         });
 
     // flatMapping and filtering already registered in Phase 56 — do not override
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -21482,6 +21683,8 @@ pub(crate) fn register_p64_collectors_teeing(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p64_random_generator(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // RandomGenerator interface methods
     let rg = "java/util/random/RandomGenerator";
     r.register(rg, "nextInt", "()I", |_ctx, _args| {
@@ -21578,6 +21781,7 @@ pub(crate) fn register_p64_random_generator(r: &mut NativeMethodRegistry) {
             1
         })))
     });
+    r.set_category(__prev_cat);
 }
 
 fn p64_simple_random() -> u64 {
@@ -21599,6 +21803,8 @@ fn p64_simple_random() -> u64 {
 // =============================================================================
 
 pub(crate) fn register_p64_string_additions(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let s = "java/lang/String";
 
     // String.indexOf(String, int, int) — Java 21
@@ -21740,6 +21946,7 @@ pub(crate) fn register_p64_string_additions(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -21747,6 +21954,8 @@ pub(crate) fn register_p64_string_additions(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p64_math_clamp(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     // Math.clamp(long, int, int) -> int
     r.register("java/lang/Math", "clamp", "(JII)I", |_ctx, args| {
         let val = match args.first() {
@@ -21873,6 +22082,7 @@ pub(crate) fn register_p64_math_clamp(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Float(val.clamp(min, max))))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -21882,6 +22092,8 @@ pub(crate) fn register_p64_math_clamp(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase65_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p65_priority_blocking_queue(registry);
     register_p65_delay_queue(registry);
     register_p65_completion_service(registry);
@@ -21890,6 +22102,7 @@ pub(crate) fn register_phase65_natives(registry: &mut NativeMethodRegistry) {
     register_p65_pattern_additions(registry);
     register_p65_datetime_builder(registry);
     register_p65_checked_collections(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -21897,6 +22110,8 @@ pub(crate) fn register_phase65_natives(registry: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p65_priority_blocking_queue(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let pbq = "java/util/concurrent/PriorityBlockingQueue";
     r.register(pbq, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -21989,6 +22204,7 @@ pub(crate) fn register_p65_priority_blocking_queue(r: &mut NativeMethodRegistry)
         }
         Ok(Some(Value::Object(Some(result))))
     });
+    r.set_category(__prev_cat);
 }
 
 fn native_p65_pbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -22100,6 +22316,8 @@ fn p65_compare_values(a: Value, b: Value) -> i32 {
 // =============================================================================
 
 pub(crate) fn register_p65_delay_queue(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let dq = "java/util/concurrent/DelayQueue";
     r.register(dq, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -22176,6 +22394,7 @@ pub(crate) fn register_p65_delay_queue(r: &mut NativeMethodRegistry) {
     r.register(dq, "remainingCapacity", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(i32::MAX)))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -22183,6 +22402,8 @@ pub(crate) fn register_p65_delay_queue(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p65_completion_service(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ecs = "java/util/concurrent/ExecutorCompletionService";
     r.register(
         ecs,
@@ -22262,6 +22483,7 @@ pub(crate) fn register_p65_completion_service(r: &mut NativeMethodRegistry) {
         "()Ljava/util/concurrent/Future;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -22273,6 +22495,8 @@ pub(crate) fn register_p65_completion_service(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p65_stream_map_multi(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // IntStream.mapMulti
     r.register(
         "java/util/stream/IntStream",
@@ -22328,6 +22552,7 @@ pub(crate) fn register_p65_stream_map_multi(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(map))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -22335,6 +22560,8 @@ pub(crate) fn register_p65_stream_map_multi(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p65_pattern_additions(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let p = "java/util/regex/Pattern";
     // Pattern.asMatchPredicate() — Java 11
     r.register(
@@ -22396,6 +22623,7 @@ pub(crate) fn register_p65_pattern_additions(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(stream))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -22403,6 +22631,8 @@ pub(crate) fn register_p65_pattern_additions(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p65_datetime_builder(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let dtfb = "java/time/format/DateTimeFormatterBuilder";
     r.register(dtfb, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -22544,6 +22774,7 @@ pub(crate) fn register_p65_datetime_builder(r: &mut NativeMethodRegistry) {
             p57_alloc_enum(ctx, "java/time/format/FormatStyle", &name, ordinal)
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -22551,6 +22782,8 @@ pub(crate) fn register_p65_datetime_builder(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p65_checked_collections(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cols = "java/util/Collections";
     // checkedList — return the list itself (simplified, no runtime type checking)
     r.register(
@@ -22620,6 +22853,7 @@ pub(crate) fn register_p65_checked_collections(r: &mut NativeMethodRegistry) {
         "(Ljava/util/SequencedMap;)Ljava/util/SequencedMap;",
         |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -22629,6 +22863,8 @@ pub(crate) fn register_p65_checked_collections(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase66_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p66_collator(registry);
     register_p66_break_iterator(registry);
     register_p66_file_visitor(registry);
@@ -22636,6 +22872,7 @@ pub(crate) fn register_phase66_natives(registry: &mut NativeMethodRegistry) {
     register_p66_constant_desc(registry);
     register_p66_thread_builder(registry);
     register_p66_pushback_reader(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -22688,6 +22925,8 @@ fn strip_accent(c: char) -> char {
 }
 
 pub(crate) fn register_p66_collator(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/text/Collator";
     r.register(c, "getInstance", "()Ljava/text/Collator;", |ctx, _args| {
         let obj = alloc_concurrent_synthetic(ctx, "java/text/Collator", 1);
@@ -22827,6 +23066,7 @@ pub(crate) fn register_p66_collator(r: &mut NativeMethodRegistry) {
     r.register(c, "SECONDARY", "I", |_ctx, _args| Ok(Some(Value::Int(1))));
     r.register(c, "TERTIARY", "I", |_ctx, _args| Ok(Some(Value::Int(2))));
     r.register(c, "IDENTICAL", "I", |_ctx, _args| Ok(Some(Value::Int(3))));
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -22951,6 +23191,8 @@ fn bi_find_prev(text: &str, pos: usize, kind: i32) -> Option<usize> {
 }
 
 pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let bi = "java/text/BreakIterator";
     r.register(bi, "getWordInstance", "()Ljava/text/BreakIterator;", |ctx, _args| {
         Ok(Some(Value::Object(Some(bi_alloc_kind(ctx, BI_WORD)))))
@@ -23072,6 +23314,7 @@ pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) {
         ctx.set_field(ci, 1, Value::Int(0));
         Ok(Some(Value::Object(Some(ci))))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -23079,6 +23322,8 @@ pub(crate) fn register_p66_break_iterator(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sfv = "java/nio/file/SimpleFileVisitor";
     // SimpleFileVisitor has default methods that return CONTINUE
     r.register(sfv, "preVisitDirectory", "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;", |ctx, _args| {
@@ -23164,6 +23409,7 @@ pub(crate) fn register_p66_file_visitor(r: &mut NativeMethodRegistry) {
             p98_walk_file_tree(ctx, &[path_obj, visitor])
         },
     );
+    r.set_category(__prev_cat);
 }
 
 fn p98_walk_file_tree(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -23232,6 +23478,8 @@ fn p98_walk_dir(
 // =============================================================================
 
 pub(crate) fn register_p66_watch_service(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // WatchService = 2-field synthetic (dir_path=0 String, last_scan_time=1 Long)
     let ws = "java/nio/file/WatchService";
     r.register(ws, "close", "()V", |ctx, args| {
@@ -23354,6 +23602,7 @@ pub(crate) fn register_p66_watch_service(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, Value::Int(0));
         Ok(None)
     });
+    r.set_category(__prev_cat);
 }
 
 /// Poll a WatchService's registered directory for changes.
@@ -23421,6 +23670,8 @@ fn watch_service_poll(
 // =============================================================================
 
 pub(crate) fn register_p66_constant_desc(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Constable interface
     r.register(
         "java/lang/constant/Constable",
@@ -23522,6 +23773,7 @@ pub(crate) fn register_p66_constant_desc(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -23529,6 +23781,8 @@ pub(crate) fn register_p66_constant_desc(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let t = "java/lang/Thread";
     // Thread.ofVirtual() -> Thread.Builder
     r.register(
@@ -23726,6 +23980,7 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
     r.register(t, "threadId", "()J", |ctx, _args| {
         Ok(Some(Value::Long(ctx.thread_id() as i64)))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -23733,6 +23988,8 @@ pub(crate) fn register_p66_thread_builder(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let pr = "java/io/PushbackReader";
     r.register(pr, "<init>", "(Ljava/io/Reader;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -23818,6 +24075,7 @@ pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 1, Value::Object(None));
         Ok(None)
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -23827,6 +24085,8 @@ pub(crate) fn register_p66_pushback_reader(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase67_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p67_structured_task_scope(registry);
     register_p67_scoped_value(registry);
     register_p67_gatherer(registry);
@@ -23834,6 +24094,7 @@ pub(crate) fn register_phase67_natives(registry: &mut NativeMethodRegistry) {
     register_p67_foreign_memory(registry);
     register_p67_string_template(registry);
     register_p67_misc(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -23842,6 +24103,8 @@ pub(crate) fn register_phase67_natives(registry: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sts = "jdk/incubator/concurrent/StructuredTaskScope";
 
     r.register(sts, "<init>", "()V", |ctx, args| {
@@ -24151,6 +24414,7 @@ pub(crate) fn register_p67_structured_task_scope(r: &mut NativeMethodRegistry) {
 
     // Also register under Java 25 final package: java.util.concurrent.StructuredTaskScope
     register_p67_structured_task_scope_j25(r);
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -24476,6 +24740,8 @@ fn j25_register_scope_common(
 }
 
 pub(crate) fn register_p67_structured_task_scope_j25(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sts = "java/util/concurrent/StructuredTaskScope";
     j25_register_scope_common(
         r,
@@ -24594,6 +24860,7 @@ pub(crate) fn register_p67_structured_task_scope_j25(r: &mut NativeMethodRegistr
             Ok(None)
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -24602,6 +24869,8 @@ pub(crate) fn register_p67_structured_task_scope_j25(r: &mut NativeMethodRegistr
 // =============================================================================
 
 pub(crate) fn register_p67_scoped_value(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sv = "java/lang/ScopedValue";
     r.register(
         sv,
@@ -24772,6 +25041,7 @@ pub(crate) fn register_p67_scoped_value(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -24780,6 +25050,8 @@ pub(crate) fn register_p67_scoped_value(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let g = "java/util/stream/Gatherer";
     // Gatherer.of(integrator) → Gatherer
     r.register(
@@ -24915,6 +25187,7 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
             Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -24922,6 +25195,8 @@ pub(crate) fn register_p67_gatherer(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // AsynchronousFileChannel = 3-field (path_str=0, open=1, unused=2)
     let afc = "java/nio/channels/AsynchronousFileChannel";
     r.register(afc, "open", "(Ljava/nio/file/Path;[Ljava/nio/file/OpenOption;)Ljava/nio/channels/AsynchronousFileChannel;", |ctx, args| {
@@ -25509,6 +25784,7 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
             message: "Unix domain sockets are not supported on this platform".into(),
         }.into())
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -25517,6 +25793,8 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Arena = 1-field (open=0 Int)
     let arena = "java/lang/foreign/Arena";
     r.register(
@@ -25897,6 +26175,7 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/util/Optional;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -25905,6 +26184,8 @@ pub(crate) fn register_p67_foreign_memory(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let st = "java/lang/StringTemplate";
     // StringTemplate.of(String) → StringTemplate
     r.register(
@@ -25978,6 +26259,7 @@ pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -25985,6 +26267,8 @@ pub(crate) fn register_p67_string_template(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // java.lang.reflect — generic type stubs
     // ParameterizedType = 2-field (rawType=0 Class, actualTypeArgs=1 Type[])
     let pt = "java/lang/reflect/ParameterizedType";
@@ -26260,6 +26544,7 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         "Ljava/lang/System$Logger$Level;",
         |ctx, _args| p57_alloc_enum(ctx, "java/lang/System$Logger$Level", "OFF", 6),
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -26283,6 +26568,8 @@ fn out_copy_byte(
 }
 
 pub(crate) fn register_phase68_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p68_crypto_mac(registry);
     register_p68_ssl(registry);
     // T2.7 delta: server-side rustls (SSLServerSocket, SNI, ALPN),
@@ -26293,6 +26580,7 @@ pub(crate) fn register_phase68_natives(registry: &mut NativeMethodRegistry) {
     register_p68_jdbc(registry);
     register_p68_xml(registry);
     register_p68_invoke_extras(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -26344,6 +26632,8 @@ fn mac_append_data(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
 }
 
 pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mac = "javax/crypto/Mac";
     r.register(
         mac,
@@ -26537,6 +26827,7 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         ctx.set_field(clone, 3, data_copy);
         Ok(Some(Value::Object(Some(clone))))
     });
+    r.set_category(__prev_cat);
 }
 
 /// Compute HMAC using the appropriate hash based on the Java algorithm name.
@@ -26671,6 +26962,8 @@ fn new13_do_create_socket(
 }
 
 pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // NEW-13: SSLContext = 5-field synthetic — see field layout constants.
     let ctx_class = "javax/net/ssl/SSLContext";
     r.register(
@@ -27877,6 +28170,7 @@ pub(crate) fn register_p68_ssl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(session))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// Allocate a fresh SSLEngine with default field values.
@@ -28011,6 +28305,8 @@ pub(crate) fn basic_der_extract_names(data: &[u8]) -> Option<(String, String)> {
 // =============================================================================
 
 pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // CertificateFactory
     let cf = "java/security/cert/CertificateFactory";
     r.register(
@@ -28476,6 +28772,7 @@ pub(crate) fn register_p68_security_cert(r: &mut NativeMethodRegistry) {
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
         Ok(Some(Value::Object(Some(arr))))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -29354,6 +29651,8 @@ mod jdbc_registry {
 }
 
 pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // DriverManager — real SQLite connection via rusqlite
     let dm = "java/sql/DriverManager";
     r.register(
@@ -30600,6 +30899,7 @@ pub(crate) fn register_p68_jdbc(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;I)V",
         |_ctx, _args| Ok(None),
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -31047,6 +31347,8 @@ fn dom_get_text_content(ctx: &mut dyn NativeContext, node: ObjectRef) -> String 
 }
 
 pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // DocumentBuilderFactory = 3-field (namespaceAware=0, validating=1, features=2 HashMap)
     let dbf = "javax/xml/parsers/DocumentBuilderFactory";
     r.register(
@@ -31717,6 +32019,7 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/xml/xpath/XPathExpression;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    r.set_category(__prev_cat);
 }
 
 
@@ -31726,6 +32029,8 @@ pub(crate) fn register_p68_xml(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase69_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p69_cleaner(registry);
     register_p69_spliterator(registry);
     register_p69_websocket(registry);
@@ -31744,6 +32049,7 @@ pub(crate) fn register_phase69_natives(registry: &mut NativeMethodRegistry) {
     // for follow-up fix agents.
     // register_pbe_workaround(registry);
     // register_de4_demo_stubs(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -31777,6 +32083,8 @@ pub(crate) fn register_p69_cleaner(_r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Spliterator = 3-field (elements=0 Object[], pos=1 Int, fence=2 Int)
     let sp = "java/util/Spliterator";
     r.register(
@@ -32137,6 +32445,7 @@ pub(crate) fn register_p69_spliterator(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// Drain a (possibly real-JDK) Spliterator into a freshly-allocated
@@ -32215,6 +32524,8 @@ fn drain_spliterator(
 // the JVM caller-side bytecode performs the field assignments as usual.
 
 pub(crate) fn register_pbe_diagnostic(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let pbe = "org/springframework/beans/PropertyBatchUpdateException";
 
     // Constructor: PropertyBatchUpdateException(PropertyAccessException[])
@@ -32360,6 +32671,7 @@ pub(crate) fn register_pbe_diagnostic(r: &mut NativeMethodRegistry) {
     //     "(Ljava/lang/Class;Ljava/lang/String;)V",
     //     |_ctx, _args| Ok(None),
     // );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -32662,6 +32974,8 @@ const P69_WS_STATE: usize = 4;
 const P69_WS_DEMAND: usize = 5;
 
 pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // WebSocket.Builder — 3-field: uri=0, headers=1, subprotocol=2
     let wsb = "java/net/http/WebSocket$Builder";
     r.register(
@@ -33024,6 +33338,7 @@ pub(crate) fn register_p69_websocket(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -33186,6 +33501,8 @@ fn ws_send_frame(
 // =============================================================================
 
 pub(crate) fn register_p69_switch_bootstraps(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sb = "java/lang/runtime/SwitchBootstraps";
     r.register(sb, "typeSwitch",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
@@ -33199,6 +33516,7 @@ pub(crate) fn register_p69_switch_bootstraps(r: &mut NativeMethodRegistry) {
     r.register(om, "bootstrap",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/TypeDescriptor;Ljava/lang/Class;Ljava/lang/String;[Ljava/lang/invoke/MethodHandle;)Ljava/lang/Object;",
         |_ctx, _args| Ok(Some(Value::Object(None))));
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -33206,6 +33524,8 @@ pub(crate) fn register_p69_switch_bootstraps(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p69_compact_number_format(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cnf = "java/text/CompactNumberFormat";
     // CompactNumberFormat = 2-field (locale=0, style=1 Int: 0=SHORT, 1=LONG)
     r.register(
@@ -33302,6 +33622,7 @@ pub(crate) fn register_p69_compact_number_format(r: &mut NativeMethodRegistry) {
         "Ljava/text/NumberFormat$Style;",
         |ctx, _args| p57_alloc_enum(ctx, "java/text/NumberFormat$Style", "LONG", 1),
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -33310,6 +33631,8 @@ pub(crate) fn register_p69_compact_number_format(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p69_submission_publisher(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // SubmissionPublisher core methods already registered in Phase 60 (<init>, submit, offer, close, isClosed)
     // Only add new methods not present in Phase 60
     let sp = "java/util/concurrent/SubmissionPublisher";
@@ -33334,6 +33657,7 @@ pub(crate) fn register_p69_submission_publisher(r: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Flow$Subscriber;)V",
         native_noop_with_this,
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -33341,6 +33665,8 @@ pub(crate) fn register_p69_submission_publisher(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p69_misc(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // java.util.Objects — additional methods
     let obj = "java/util/Objects";
     r.register(obj, "checkIndex", "(II)I", |_ctx, args| {
@@ -33485,6 +33811,7 @@ pub(crate) fn register_p69_misc(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Float(a.mul_add(b, c))))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -33494,6 +33821,8 @@ pub(crate) fn register_p69_misc(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase70_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p70_file_attributes(registry);
     // register_p70_gzip removed — duplicate of real Phase 58 GZIP implementation
     // (register_p58_gzip_streams at line 7391+). The Phase 70 stubs were overriding
@@ -33503,6 +33832,7 @@ pub(crate) fn register_phase70_natives(registry: &mut NativeMethodRegistry) {
     register_p70_constant_bootstraps(registry);
     register_p70_atomic_accumulators(registry);
     register_p70_misc(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -33551,15 +33881,20 @@ fn posix_file_permission_stub_clinit(
 }
 
 pub(crate) fn register_posix_file_permission_stub_clinit(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
         "java/nio/file/attribute/PosixFilePermission",
         "<clinit>",
         "()V",
         posix_file_permission_stub_clinit,
     );
+    r.set_category(__prev_cat);
 }
 
 pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // FileTime = 1-field (millis=0 Long)
     let ft = "java/nio/file/attribute/FileTime";
     r.register(
@@ -33807,6 +34142,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
     // `asFileAttribute` — when real JDK bytecode is present, it builds an
     // anonymous `FileAttribute`; the native above is a fallback only.
     register_posix_file_permission_stub_clinit(r);
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -33847,6 +34183,8 @@ fn ois_read_n(ctx: &mut dyn NativeContext, stream: ObjectRef, n: usize) -> Vec<u
 
 #[cfg(not(feature = "experimental-serialization"))]
 pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ObjectOutputStream — field 0 = underlying OutputStream
     let oos = "java/io/ObjectOutputStream";
     r.register(oos, "<init>", "(Ljava/io/OutputStream;)V", |ctx, args| {
@@ -34175,6 +34513,7 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
     r.register(ois, "available", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(0)))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -34182,6 +34521,8 @@ pub(crate) fn register_p70_object_streams(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p70_constant_bootstraps(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cb = "java/lang/invoke/ConstantBootstraps";
 
     // nullConstant — returns null (correct as-is)
@@ -34358,6 +34699,7 @@ pub(crate) fn register_p70_constant_bootstraps(r: &mut NativeMethodRegistry) {
             ctx.set_field(vh, 3, args.get(3).copied().unwrap_or(Value::Object(None))); // component type
             Ok(Some(Value::Object(Some(vh))))
         });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -34365,6 +34707,8 @@ pub(crate) fn register_p70_constant_bootstraps(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p70_atomic_accumulators(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // LongAccumulator = 3-field (identity=0 Long, current=1 Long, operator=2 ObjectRef)
     let la = "java/util/concurrent/atomic/LongAccumulator";
     r.register(
@@ -34545,6 +34889,7 @@ pub(crate) fn register_p70_atomic_accumulators(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, Value::Double(0.0));
         Ok(Some(cur))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -34552,6 +34897,8 @@ pub(crate) fn register_p70_atomic_accumulators(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // EnumMap and EnumSet core methods already registered in earlier phases — only add NEW methods here
 
     // EnumSet: complementOf and range (not in earlier phases)
@@ -34612,6 +34959,7 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
         // via virtual dispatch on the concrete subclass.
         Ok(None)
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -34620,12 +34968,15 @@ pub(crate) fn register_p70_misc(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase71_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p71_wrapper_extras(registry);
     register_p71_biginteger_extras(registry);
     register_p71_files_bridge(registry);
     register_p71_thread_extras(registry);
     register_p71_zip_extras(registry);
     register_p71_logging_extras(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -34646,6 +34997,8 @@ fn p71_fmt_radix(mut v: u64, radix: u32) -> String {
 }
 
 pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let int = "java/lang/Integer";
     r.register(
         int,
@@ -35005,6 +35358,7 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
         };
         Ok(Some(Value::Int(if v.is_finite() { 1 } else { 0 })))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -35019,6 +35373,8 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let bi = "java/math/BigInteger";
 
     r.register(
@@ -35370,6 +35726,7 @@ pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     });
     let _ = bi_add_str; // keep import alive in case future ops want it
     let _ = bi_cmp_unsigned;
+    r.set_category(__prev_cat);
 }
 
 /// Divide an unsigned decimal string by 2^32, returning (quotient, remainder).
@@ -35402,6 +35759,8 @@ fn bi_div_mod_2_32(value: &str) -> (String, u32) {
 // =============================================================================
 
 pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let f = "java/nio/file/Files";
 
     // Files.newInputStream — read the entire file into a ByteArrayInputStream
@@ -35536,6 +35895,7 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/file/Path;)Ljava/nio/file/Path;",
         |_ctx, args| Ok(Some(args.first().copied().unwrap_or(Value::Object(None)))),
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -35544,6 +35904,8 @@ pub(crate) fn register_p71_files_bridge(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Thread$State enum
     let ts = "java/lang/Thread$State";
     r.register(
@@ -35807,6 +36169,7 @@ pub(crate) fn register_p71_thread_extras(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/Thread$UncaughtExceptionHandler;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -35832,6 +36195,8 @@ fn p71_init_infl(ctx: &mut dyn NativeContext, args: &[Value], nowrap: i32) -> Me
 }
 
 pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Adler32 = 1-field (sum=0 Long)
     let ad = "java/util/zip/Adler32";
     r.register(ad, "<init>", "()V", |ctx, args| {
@@ -36148,6 +36513,7 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
         ctx.set_field(obj_arg(args, 0)?, 2, Value::Int(1));
         Ok(None)
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -36155,6 +36521,8 @@ pub(crate) fn register_p71_zip_extras(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let log = "java/util/logging/Logger";
     r.register(
         log,
@@ -36334,6 +36702,7 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
         "()V",
         native_noop_with_this,
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -36341,6 +36710,8 @@ pub(crate) fn register_p71_logging_extras(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_phase72_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_p72_preferences(registry);
     register_p72_beans(registry);
     register_p72_naming(registry);
@@ -36353,6 +36724,7 @@ pub(crate) fn register_phase72_natives(registry: &mut NativeMethodRegistry) {
     // ServiceLoader-based CliToolProvider discovery so the JVM exits
     // cleanly instead of throwing "CliToolProvider [server] not found".
     register_es4_elasticsearch_stubs(registry);
+    registry.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -36382,6 +36754,8 @@ fn p72_prefs_map(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
 }
 
 pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let pref = "java/util/prefs/Preferences";
     let abs_pref = "java/util/prefs/AbstractPreferences";
 
@@ -36710,6 +37084,7 @@ pub(crate) fn register_p72_preferences(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         });
     }
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -36779,6 +37154,8 @@ fn pcs_dispatch(ctx: &mut dyn NativeContext, pcs_this: ObjectRef, event: ObjectR
 }
 
 pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // PropertyChangeEvent = 4-field (source=0, propertyName=1, oldValue=2, newValue=3)
     let pce = "java/beans/PropertyChangeEvent";
     r.register(
@@ -37399,6 +37776,7 @@ pub(crate) fn register_p72_beans(r: &mut NativeMethodRegistry) {
         let base = ctx.class_num_total_fields(cid);
         Ok(Some(ctx.get_field(this, base + 3)))
     });
+    r.set_category(__prev_cat);
 }
 
 /// Real Introspector.getBeanInfo() — discovers properties via getter/setter naming conventions.
@@ -37652,6 +38030,8 @@ fn decapitalize(s: &str) -> String {
 // =============================================================================
 
 pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // InitialContext = 2-field (bindings=0 HashMap, env=1 HashMap)
     let ic = "javax/naming/InitialContext";
     r.register(ic, "<init>", "()V", |ctx, args| {
@@ -37873,6 +38253,7 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
         // Default interface implementation — concrete classes override.
         Ok(None)
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -37880,6 +38261,8 @@ pub(crate) fn register_p72_naming(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // DatagramPacket = 4-field (data=0, length=1, address=2, port=3)
     let dp = "java/net/DatagramPacket";
     r.register(dp, "<init>", "([BI)V", |ctx, args| {
@@ -38427,6 +38810,7 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 0)))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -38434,6 +38818,8 @@ pub(crate) fn register_p72_datagram(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     use crate::servlet::{
         s2_alloc_dgram, s2_register_channel, SocketRegistry,
     };
@@ -38921,6 +39307,7 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 3)))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -38928,6 +39315,8 @@ pub(crate) fn register_datagram_channel(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Wave 3-B (RE.4): the real HttpServer/HttpExchange implementations live in
     // `net_phase_e::register_re10_http_server`, which actually binds a TcpListener
     // and dispatches HTTP/1.1 round-trips. Phase 72 used to register opaque stubs
@@ -39138,6 +39527,7 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -39145,6 +39535,8 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ServerSocket extras — add methods not registered in phase 53
     let ss = "java/net/ServerSocket";
     r.register(ss, "<init>", "(IILjava/net/InetAddress;)V", |ctx, args| {
@@ -39566,6 +39958,7 @@ pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Int(0)))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -40121,6 +40514,8 @@ fn json_str_to_value_depth(ctx: &mut dyn NativeContext, val_str: &str, descripto
 }
 
 pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // -----------------------------------------------------------------------
     // Jackson: com/fasterxml/jackson/databind/ObjectMapper
     // -----------------------------------------------------------------------
@@ -40681,6 +41076,7 @@ pub(crate) fn register_jackson_gson_natives(r: &mut NativeMethodRegistry) {
     // No-arg constructor: ObjectNode fields are initialised lazily
     // when entries are added. NEW-6: documented.
     r.register(on, "<init>", "()V", native_noop_with_this);
+    r.set_category(__prev_cat);
 }
 
 /// Allocate a JsonNode synthetic object with the given type.
@@ -41424,11 +41820,14 @@ const NEW15_FJP_PARALLELISM: usize = 0;
 const NEW15_FJP_ACTIVE: usize = 1;
 
 pub(crate) fn register_new15_loom(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_new15_continuation(r);
     register_new15_continuation_scope(r);
     register_new15_forkjoinpool_common(r);
     register_wp4_8_continuation_support(r);
     register_wp4_8_virtual_thread_natives(r);
+    r.set_category(__prev_cat);
 }
 
 /// T19_K3 — Public re-export of the ForkJoinPool common-pool natives
@@ -41439,7 +41838,10 @@ pub(crate) fn register_new15_loom(r: &mut NativeMethodRegistry) {
 /// non-null factory whose class name matches the configured system
 /// property.
 pub fn register_t19_k3_forkjoinpool_common(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_new15_forkjoinpool_common(r);
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -41471,6 +41873,8 @@ pub fn register_t19_k3_forkjoinpool_common(r: &mut NativeMethodRegistry) {
 // JDK code path observes a `VirtualThread` static reference.
 
 fn register_wp4_8_continuation_support(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // jdk.internal.vm.ContinuationSupport.isSupported0()Z
     //
     // Return false so newVirtualThread() falls back to BoundVirtualThread
@@ -41481,9 +41885,12 @@ fn register_wp4_8_continuation_support(r: &mut NativeMethodRegistry) {
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    r.set_category(__prev_cat);
 }
 
 fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let vt = "java/lang/VirtualThread";
 
     // registerNatives() — JDK 25 calls this from <clinit> of VirtualThread.
@@ -41550,9 +41957,12 @@ fn register_wp4_8_virtual_thread_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/VirtualThread;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    r.set_category(__prev_cat);
 }
 
 fn register_new15_continuation(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "jdk/internal/vm/Continuation";
 
     // Constructor: Continuation(ContinuationScope, Runnable)
@@ -41722,9 +42132,12 @@ fn register_new15_continuation(r: &mut NativeMethodRegistry) {
         "(Ljdk/internal/vm/ContinuationScope;)Ljdk/internal/vm/Continuation;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    r.set_category(__prev_cat);
 }
 
 fn register_new15_continuation_scope(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "jdk/internal/vm/ContinuationScope";
 
     // Constructor: ContinuationScope(String name)
@@ -41746,9 +42159,12 @@ fn register_new15_continuation_scope(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, NEW15_SCOPE_NAME)))
     });
+    r.set_category(__prev_cat);
 }
 
 fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/util/concurrent/ForkJoinPool";
 
     // static commonPool()Ljava/util/concurrent/ForkJoinPool;
@@ -41870,6 +42286,7 @@ fn register_new15_forkjoinpool_common(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(factory))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// T19_K3 — Whitelist for the

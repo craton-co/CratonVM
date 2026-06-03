@@ -90,6 +90,8 @@ fn clear_handler(thread: ObjectRef) {
 /// is overwritten because the `NativeMethodRegistry::register` call
 /// just `insert`s and last-write-wins per (class,method,desc) triple.
 pub fn register_uncaught_handler_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let th = "java/lang/Thread";
 
     // setUncaughtExceptionHandler(UncaughtExceptionHandler) — instance
@@ -166,4 +168,5 @@ pub fn register_uncaught_handler_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
+    r.set_category(__prev_cat);
 }

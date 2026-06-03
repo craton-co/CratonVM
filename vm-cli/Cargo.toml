@@ -85,6 +85,10 @@ mimalloc = ["dep:mimalloc"]
 java-bin-alias = []
 # Synthetic JDK mode (Rust stubs in place of real JDK bytecode).
 synthetic-jdk = ["cratonvm-vm/synthetic-jdk"]
+# Emergency fallback: re-enable app-specific "fake main" / framework stubs.
+app-stubs = ["cratonvm-vm/app-stubs"]
+# Re-enable legacy synthetic crypto (byte-identical-output tests only).
+legacy-synthetic-crypto = ["cratonvm-vm/legacy-synthetic-crypto"]
 # Expose --gpu* flags and link cuda-bridge in stub mode. Probing the
 # device returns DeviceError::NoDriver but the CLI surface exists.
 gpu = ["dep:cuda-bridge", "cratonvm-vm/gpu-offload"]

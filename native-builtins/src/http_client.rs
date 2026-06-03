@@ -1522,6 +1522,8 @@ fn http1_exchange_register(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 pub fn register_http_client_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "jdk/internal/net/http/HttpClientImpl";
     r.register(cls, "<init>", "()V", hci_init);
     r.register(
@@ -1553,6 +1555,7 @@ pub fn register_http_client_real(r: &mut NativeMethodRegistry) {
     hrq_status_helpers_register(r);
     http2_client_orchestrator_register(r);
     http1_exchange_register(r);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

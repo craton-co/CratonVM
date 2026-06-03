@@ -1,0 +1,340 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
+//! Differential test catching synthetic-overlay stubs that diverge from real
+//! JDK bytecode.
+//!
+//! ## What this verifies
+//!
+//! CratonVM ships hand-written native ("synthetic") implementations for a set
+//! of hot `java.util` / `java.lang` methods. Some of those stubs have
+//! historically returned values that DIVERGE from what the real JDK bytecode
+//! produces (e.g. `Collections.disjoint` returning wrong booleans,
+//! `Collectors.toMap` dropping a merged value, `String.format("%s", boxed)`
+//! returning `null`). See `SyntheticDiff.java` for the exact case matrix.
+//!
+//! The correctness argument mirrors `intrinsic_diff.rs`: run the **same** Java
+//! program two ways and assert byte-for-byte identical observable output. The
+//! two runs toggle the env var `CRATONVM_REAL`:
+//!   * the **synthetic** run sets NOTHING (the default overlay path);
+//!   * the **real** run sets `CRATONVM_REAL=all`, forcing the VM to execute the
+//!     real JDK bytecode instead of the synthetic native stub.
+//!
+//! `CRATONVM_REAL=all` is implemented by a sibling change in
+//! `vm/src/runtime/env_cache.rs` + `vm_exec.rs`; this test only sets the env
+//! var. If the sequence of `r:` observation lines differs between the two
+//! runs, a synthetic stub returned a different value than real bytecode — the
+//! failure message reports the first divergent case and both values.
+//!
+//! ## How the VM is launched (so the orchestrator can verify)
+//!
+//! `CRATONVM_REAL` is read once per process (an `OnceLock`-style cache in
+//! `env_cache.rs`), so an in-process `Vm::new` cannot test both modes in one
+//! test binary. We therefore launch the **`cratonvm` CLI binary as a
+//! subprocess**, exactly like `intrinsic_diff.rs`:
+//!
+//! ```text
+//!   <cratonvm-bin>  -c  <vm/tests/resources>  cratonvm.SyntheticDiff
+//! ```
+//!
+//! with `stdout`/`stderr` piped and `CRATONVM_REAL` set (or removed) for that
+//! one child process. The classpath `vm/tests/resources/` is the directory
+//! that `vm/build.rs` compiles the Java sources into.
+//!
+//! Binary resolution order (see `cratonvm_binary`):
+//!   1. `CRATONVM_BIN` env var, if it points to an existing file.
+//!   2. `target/release/cratonvm[.exe]`
+//!   3. `target/debug/cratonvm[.exe]`
+//!
+//! ## Skip / gate behavior (mirrors intrinsic_diff.rs EXACTLY)
+//!
+//! If `javac` did not compile the Java sources, or the `cratonvm` binary has
+//! not been built, the test prints a skip notice and returns (it does NOT
+//! fail). This matches `intrinsic_diff.rs` and every other subprocess test in
+//! `vm/tests/`, so CI without a JDK does not fail spuriously.
+//!
+//! Run with:
+//!     cargo test -p cratonvm-vm --test synthetic_diff -- --nocapture
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Hard per-subprocess timeout. The differential program is short.
+const RUN_TIMEOUT: Duration = Duration::from_secs(120);
+
+// ---------------------------------------------------------------------------
+// Path / binary resolution  (copied + adapted from intrinsic_diff.rs)
+// ---------------------------------------------------------------------------
+
+/// Workspace root (parent of the `vm` crate).
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("CARGO_MANIFEST_DIR has no parent")
+        .to_path_buf()
+}
+
+/// The classpath directory: `vm/tests/resources/`. `vm/build.rs` compiles
+/// `tests/resources/cratonvm/*.java` into this tree, so a class in package
+/// `cratonvm` resolves as `cratonvm/<Name>.class` underneath it.
+fn classpath_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("resources")
+}
+
+/// Resolve the `cratonvm` CLI binary. Mirrors the helper used by the other
+/// subprocess tests.
+fn cratonvm_binary() -> Option<PathBuf> {
+    if let Ok(bin) = std::env::var("CRATONVM_BIN") {
+        let p = PathBuf::from(&bin);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let target = workspace_root().join("target");
+    let exe = if cfg!(windows) { "cratonvm.exe" } else { "cratonvm" };
+    for profile in &["release", "debug"] {
+        let candidate = target.join(profile).join(exe);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// True if the compiled `.class` for `cratonvm/<simple_name>` exists.
+fn class_file_present(simple_name: &str) -> bool {
+    classpath_dir()
+        .join("cratonvm")
+        .join(format!("{simple_name}.class"))
+        .exists()
+}
+
+// ---------------------------------------------------------------------------
+// Subprocess runner
+// ---------------------------------------------------------------------------
+
+/// Outcome of one subprocess run of a Java class on the cratonvm CLI.
+#[derive(Debug, Clone)]
+struct Run {
+    stdout: String,
+    stderr: String,
+    exit_code: Option<i32>,
+}
+
+/// Run `cratonvm -c <classpath> cratonvm.<class_simple_name>` as a child
+/// process. `real` selects whether `CRATONVM_REAL` is set to `all` (force real
+/// JDK bytecode) or explicitly removed for that child (the synthetic overlay).
+///
+/// Returns `Some(Run)` on a clean spawn+wait, or `None` if a prerequisite is
+/// missing (binary not built / class not compiled) so callers can skip.
+fn run_class(class_simple_name: &str, real: bool) -> Option<Run> {
+    if !class_file_present(class_simple_name) {
+        eprintln!(
+            "[synthetic_diff] {class_simple_name}.class not found under \
+             {} — javac unavailable at build time? skipping.",
+            classpath_dir().display()
+        );
+        return None;
+    }
+    let bin = match cratonvm_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!(
+                "[synthetic_diff] cratonvm binary not found; build it with \
+                 `cargo build -p cratonvm-cli` (or set CRATONVM_BIN). skipping."
+            );
+            return None;
+        }
+    };
+
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-c")
+        .arg(classpath_dir())
+        .arg(format!("cratonvm.{class_simple_name}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // The differential switch. The synthetic run clears CRATONVM_REAL; the
+    // real run sets `CRATONVM_REAL=all`. We set OR clear the var explicitly so
+    // the child's environment is deterministic regardless of what the test
+    // harness inherited. The `=all` switch itself is implemented in the VM
+    // (env_cache.rs + vm_exec.rs) by a sibling change — we only toggle it.
+    if real {
+        cmd.env("CRATONVM_REAL", "all");
+    } else {
+        cmd.env_remove("CRATONVM_REAL");
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[synthetic_diff] failed to spawn cratonvm: {e}");
+            return None;
+        }
+    };
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > RUN_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "[synthetic_diff] {class_simple_name} timed out after \
+                         {RUN_TIMEOUT:?} (real={real})."
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                eprintln!("[synthetic_diff] try_wait failed: {e}");
+                return None;
+            }
+        }
+    }
+
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[synthetic_diff] wait_with_output failed: {e}");
+            return None;
+        }
+    };
+
+    Some(Run {
+        stdout: normalize(&String::from_utf8_lossy(&output.stdout)),
+        stderr: normalize(&String::from_utf8_lossy(&output.stderr)),
+        exit_code: output.status.code(),
+    })
+}
+
+/// Normalize line endings (CRLF -> LF) and strip a trailing newline so a
+/// stray platform `\r` cannot masquerade as a behavioral divergence.
+fn normalize(s: &str) -> String {
+    s.replace("\r\n", "\n").trim_end().to_string()
+}
+
+/// Extract the `r:` observation lines (the per-method results emitted by
+/// `SyntheticDiff.java`) from a stdout blob.
+fn observation_lines(stdout: &str) -> Vec<&str> {
+    stdout.lines().filter(|l| l.starts_with("r:")).collect()
+}
+
+/// Locate the first `r:` observation line on which two runs differ — used to
+/// localise (and name) a synthetic-vs-real divergence in the failure message.
+fn first_observation_diff(
+    syn: &str,
+    real: &str,
+) -> Option<(usize, String, String)> {
+    let a = observation_lines(syn);
+    let b = observation_lines(real);
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or("<missing>");
+        let y = b.get(i).copied().unwrap_or("<missing>");
+        if x != y {
+            return Some((i + 1, x.to_string(), y.to_string()));
+        }
+    }
+    None
+}
+
+// ===========================================================================
+// Test — synthetic_vs_real
+// ===========================================================================
+
+/// Run `SyntheticDiff` twice — synthetic overlay (CRATONVM_REAL unset), then
+/// real JDK bytecode (CRATONVM_REAL=all) — and assert that:
+///   (a) both runs reach the `SYNTHETIC_DIFF_OK` marker;
+///   (b) the sequence of `r:` observation lines is identical between them
+///       (a mismatch means a synthetic stub returned a different value than
+///       the real method — the first divergent case and both values are
+///       reported);
+///   (c) the exit codes match.
+#[test]
+fn synthetic_vs_real() {
+    let syn = match run_class("SyntheticDiff", false) {
+        Some(r) => r,
+        None => return, // prerequisite missing; skip (see module docs)
+    };
+    let real = match run_class("SyntheticDiff", true) {
+        Some(r) => r,
+        None => return,
+    };
+
+    // (a) Both runs must have completed (printed their marker).
+    assert!(
+        syn.stdout.contains("SYNTHETIC_DIFF_OK "),
+        "synthetic run did not reach the SYNTHETIC_DIFF_OK marker.\n\
+         stdout:\n{}\nstderr:\n{}",
+        syn.stdout,
+        syn.stderr,
+    );
+    assert!(
+        real.stdout.contains("SYNTHETIC_DIFF_OK "),
+        "real (CRATONVM_REAL=all) run did not reach the SYNTHETIC_DIFF_OK \
+         marker.\nstdout:\n{}\nstderr:\n{}",
+        real.stdout,
+        real.stderr,
+    );
+
+    // (b) The decisive check: identical sequence of r: observation lines.
+    let syn_obs = observation_lines(&syn.stdout);
+    let real_obs = observation_lines(&real.stdout);
+    if syn_obs != real_obs {
+        let where_ = first_observation_diff(&syn.stdout, &real.stdout)
+            .map(|(n, x, y)| {
+                format!(
+                    "first divergent case at r: line {n}:\n  \
+                     SYNTHETIC: {x}\n  REAL     : {y}"
+                )
+            })
+            .unwrap_or_else(|| {
+                "(divergence in observation-line count)".to_string()
+            });
+        panic!(
+            "SYNTHETIC DIVERGENCE: a synthetic stub returned a different value \
+             than real JDK bytecode.\n{where_}\n\
+             --- full SYNTHETIC stdout ---\n{}\n--- full REAL stdout ---\n{}",
+            syn.stdout, real.stdout,
+        );
+    }
+
+    // (c) Exit codes must match.
+    assert_eq!(
+        syn.exit_code, real.exit_code,
+        "exit code diverged: SYNTHETIC={:?} REAL={:?}",
+        syn.exit_code, real.exit_code,
+    );
+
+    // A clean main() return must not yield a nonzero exit.
+    assert!(
+        matches!(syn.exit_code, Some(0) | None),
+        "SyntheticDiff exited nonzero ({:?}) despite printing the OK marker.\n\
+         stderr:\n{}",
+        syn.exit_code,
+        syn.stderr,
+    );
+
+    // Sanity: the program must have emitted a meaningful number of cases.
+    assert!(
+        syn_obs.len() >= 20,
+        "expected the differential program to emit many 'r:' observation \
+         lines (one per case); got only {}. Did the program abort early? \
+         stdout:\n{}",
+        syn_obs.len(),
+        syn.stdout,
+    );
+
+    eprintln!(
+        "[synthetic_diff] synthetic_vs_real: {} observations identical between \
+         the synthetic overlay and real JDK bytecode; exit codes match ({:?}).",
+        syn_obs.len(),
+        syn.exit_code,
+    );
+}

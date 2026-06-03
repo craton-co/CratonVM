@@ -723,6 +723,8 @@ fn transfer_userspace_loop(
 /// replace the stub registrations there, since the registry's
 /// `register` overwrites duplicate keys.
 pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- modern JDK 25 dispatch surface ---
     for cls in [
         "sun/nio/ch/FileDispatcherImpl",
@@ -761,6 +763,7 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
     r.register(fci, "transferTo0", "(IJJIZ)J", native_fc_transfer_to0);
     r.register(fci, "transferTo0", "(IJJI)J", native_fc_transfer_to0);
     r.register(fci, "maxDirectTransferSize0", "()I", native_fc_max_direct_transfer_size0);
+    r.set_category(__prev_cat);
 }
 
 /// Variant of `map0` for legacy FileChannelImpl signatures where

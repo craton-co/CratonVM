@@ -108,7 +108,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PATH");
     println!("cargo:rerun-if-env-changed=JAVA_HOME");
 
-    // Collect all .java files
+    // Collect all .java files. Every plain (non-`// JAVA21+`) source here —
+    // including `IntrinsicDiff.java` and `SyntheticDiff.java` (the differential
+    // exercise programs for the intrinsic table and the synthetic native
+    // overlay respectively) — is picked up by this glob and compiled by the
+    // legacy pass below, landing at `tests/resources/cratonvm/<Name>.class`.
     let java_files: Vec<PathBuf> = std::fs::read_dir(&sources_dir)
         .into_iter()
         .flatten()

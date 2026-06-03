@@ -422,6 +422,8 @@ fn field_descriptor_from_mirror(ctx: &dyn NativeContext, type_mirror: ObjectRef)
 // java.lang.invoke — MethodHandle, MethodType, MethodHandles (stubs)
 // ---------------------------------------------------------------------------
 pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- MethodType (2-field: returnType=0, paramTypes=1) ---
     let mt = "java/lang/invoke/MethodType";
     r.register(
@@ -763,6 +765,7 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
     for name in &["getAndSetAcquire", "getAndSetRelease"] {
         r.register(vh, name, "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_get_and_set);
     }
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,6 +1331,8 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 // =============================================================================
 
 pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // CallSite base
     let cs = "java/lang/invoke/CallSite";
     r.register(
@@ -1450,6 +1455,7 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // java.lang.invoke.MethodHandles.Lookup — factory + lookup methods
@@ -1457,6 +1463,8 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandles";
     r.register(
         mh,
@@ -1630,6 +1638,7 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string("MethodHandles.Lookup");
         Ok(Some(Value::Object(Some(s))))
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -2125,6 +2134,8 @@ fn field_type_mirror_class(ctx: &mut dyn NativeContext, class_name: &str) -> Obj
 // =============================================================================
 
 pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandles";
     r.register(
         mh,
@@ -2217,6 +2228,7 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -2224,6 +2236,21 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
+    // FLAGGED SyntheticStub — lang_invoke.rs::register_p68_invoke_extras.
+    // This whole registration block is fake/placeholder plumbing to unblock
+    // reflective callers, not a faithful JDK implementation:
+    //   * MethodHandleProxies.asInterfaceInstance returns the MH itself as the
+    //     "proxy"; isWrapperInstance→0; wrapperInstance{Target,Type}→null.
+    //   * LambdaMetafactory.metafactory / altMetafactory: the original was "a
+    //     native stub that returns null so the JDK path is bypassed". It now
+    //     synthesises a non-null ConstantCallSite wrapping a no-op
+    //     `LambdaMetafactory$NoOp` MethodHandle (mh_dispatch returns null) when
+    //     no real implMethod is present — still a placeholder, NOT real
+    //     invokedynamic/lambda-proxy synthesis. NOT deleted: real
+    //     LambdaMetafactory needs working invokedynamic which may not exist.
+    //     Left for the orchestrator to evaluate.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // MethodHandleProxies
     let mhp = "java/lang/invoke/MethodHandleProxies";
     r.register(
@@ -2441,6 +2468,7 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     // object with field 0 = null array, field 1 = Int(0)).
 
     // StringConcatFactory — already registered in Phase 58 with full implementation
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -3214,6 +3242,8 @@ fn auto_box_return(ctx: &mut dyn NativeContext, result: MethodCallResult, desc: 
 }
 
 pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandle";
 
     // invoke(...) — polymorphic signature with automatic type adaptation.
@@ -3351,6 +3381,7 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
 
     // Lookup.find* are already registered in register_p63_method_handles_lookup
     // with full descriptor resolution. No duplicate registration needed here.
+    r.set_category(__prev_cat);
 }
 
 /// Build a MethodType object from a JVM method descriptor string.
@@ -3497,6 +3528,8 @@ fn parse_descriptor_types(desc: &str) -> Vec<Cow<'static, str>> {
 // =============================================================================
 
 pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // I2 follow-up: register `ClassLoader.{getDefinedPackage,
     // getDefinedPackages, getNamedPackage, definePackage}` overrides so
     // ByteBuddy + Mockito can complete `JavaDispatcher.<clinit>` without
@@ -3719,6 +3752,7 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(mh))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

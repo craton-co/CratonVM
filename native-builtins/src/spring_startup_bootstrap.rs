@@ -1001,6 +1001,8 @@ const STARTUP_IFACE: &str = "org/springframework/core/metrics/ApplicationStartup
 const STEP_IFACE: &str = "org/springframework/core/metrics/StartupStep";
 
 pub fn register(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // AbstractApplicationContext.getApplicationStartup() — always return the
     // global no-op singleton so applicationStartup null can never crash.
     registry.register(
@@ -1749,6 +1751,7 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // setter injection (environment / resourceLoader / beanClassLoader)
     // surfaces — the orchestrator dispatches a follow-up fix agent for that.
     let _ = ccpp_process_config_bean_definitions_noop;
+    registry.set_category(__prev_cat);
 }
 
 /// `AbstractBeanDefinition.getBeanClassName()` — return the canonical bean

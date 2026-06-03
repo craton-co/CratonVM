@@ -18,6 +18,8 @@ use crate::lang_string::{
 };
 
 pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: &str) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     registry.register(class, "abs", "(I)I", native_math_abs_int);
     registry.register(class, "abs", "(J)J", native_math_abs_long);
     registry.register(class, "abs", "(F)F", native_math_abs_float);
@@ -137,9 +139,12 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
         "(D)I",
         native_math_get_exponent_double,
     );
+    registry.set_category(__prev_cat);
 }
 
 pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     // Integer
     registry.register(
         "java/lang/Integer",
@@ -1096,6 +1101,7 @@ pub(crate) fn register_wrapper_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Z",
         native_boolean_get_boolean,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

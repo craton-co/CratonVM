@@ -905,6 +905,8 @@ fn cleaners_pending_count() -> usize {
 /// safe to call multiple times.  See module docs for FQN list and
 /// caveats around partial WP1.10 Cleaner integration.
 pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // java.nio.Bits accounting natives.
     r.register("java/nio/Bits", "reserveMemory", "(JJ)V", bits_reserve_memory);
     r.register(
@@ -1022,6 +1024,7 @@ pub fn register_direct_buffer_real(r: &mut NativeMethodRegistry) {
         "(JJ)V",
         dbb_free_explicit,
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

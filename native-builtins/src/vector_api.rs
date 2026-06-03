@@ -1378,6 +1378,8 @@ fn vo_is_associative(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 // ---------------------------------------------------------------------------
 
 pub(crate) fn register_vector_api_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_vector_species(r);
     register_int_vector(r);
     register_long_vector(r);
@@ -1388,9 +1390,12 @@ pub(crate) fn register_vector_api_natives(r: &mut NativeMethodRegistry) {
     register_vector_mask(r);
     register_vector_shuffle(r);
     register_vector_operators(r);
+    r.set_category(__prev_cat);
 }
 
 fn register_vector_species(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(VS, "ofInt", "()Ljdk/incubator/vector/VectorSpecies;", vs_of_int);
     r.register(VS, "ofLong", "()Ljdk/incubator/vector/VectorSpecies;", vs_of_long);
     r.register(VS, "ofFloat", "()Ljdk/incubator/vector/VectorSpecies;", vs_of_float);
@@ -1401,9 +1406,12 @@ fn register_vector_species(r: &mut NativeMethodRegistry) {
     r.register(VS, "vectorBitSize", "()I", vs_vector_bit_size);
     r.register(VS, "elementType", "()I", vs_element_type);
     r.register(VS, "elementSize", "()I", vs_element_size);
+    r.set_category(__prev_cat);
 }
 
 fn register_int_vector(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(IV, "zero", "(Ljdk/incubator/vector/VectorSpecies;)Ljdk/incubator/vector/IntVector;", iv_zero);
     r.register(IV, "broadcast", "(Ljdk/incubator/vector/VectorSpecies;I)Ljdk/incubator/vector/IntVector;", iv_broadcast);
     r.register(IV, "fromArray", "(Ljdk/incubator/vector/VectorSpecies;[II)Ljdk/incubator/vector/IntVector;", iv_from_array);
@@ -1431,9 +1439,12 @@ fn register_int_vector(r: &mut NativeMethodRegistry) {
     r.register(IV, "compare", "(ILjdk/incubator/vector/IntVector;)Ljdk/incubator/vector/VectorMask;", iv_compare);
     r.register(IV, "convertShape", "(ILjdk/incubator/vector/VectorSpecies;I)Ljdk/incubator/vector/Vector;", iv_convert_shape);
     r.register(IV, "castShape", "(Ljdk/incubator/vector/VectorSpecies;I)Ljdk/incubator/vector/Vector;", iv_cast_shape);
+    r.set_category(__prev_cat);
 }
 
 fn register_long_vector(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(LV, "zero", "(Ljdk/incubator/vector/VectorSpecies;)Ljdk/incubator/vector/LongVector;", lv_zero);
     r.register(LV, "broadcast", "(Ljdk/incubator/vector/VectorSpecies;J)Ljdk/incubator/vector/LongVector;", lv_broadcast);
     r.register(LV, "fromArray", "(Ljdk/incubator/vector/VectorSpecies;[JI)Ljdk/incubator/vector/LongVector;", lv_from_array);
@@ -1450,9 +1461,12 @@ fn register_long_vector(r: &mut NativeMethodRegistry) {
     r.register(LV, "withLane", "(IJ)Ljdk/incubator/vector/LongVector;", lv_with_lane);
     r.register(LV, "length", "()I", lv_length);
     r.register(LV, "species", "()Ljdk/incubator/vector/VectorSpecies;", lv_species);
+    r.set_category(__prev_cat);
 }
 
 fn register_float_vector(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(FV, "zero", "(Ljdk/incubator/vector/VectorSpecies;)Ljdk/incubator/vector/FloatVector;", fv_zero);
     r.register(FV, "broadcast", "(Ljdk/incubator/vector/VectorSpecies;F)Ljdk/incubator/vector/FloatVector;", fv_broadcast);
     r.register(FV, "fromArray", "(Ljdk/incubator/vector/VectorSpecies;[FI)Ljdk/incubator/vector/FloatVector;", fv_from_array);
@@ -1471,9 +1485,12 @@ fn register_float_vector(r: &mut NativeMethodRegistry) {
     r.register(FV, "species", "()Ljdk/incubator/vector/VectorSpecies;", fv_species);
     r.register(FV, "min", "(Ljdk/incubator/vector/FloatVector;)Ljdk/incubator/vector/FloatVector;", fv_min);
     r.register(FV, "max", "(Ljdk/incubator/vector/FloatVector;)Ljdk/incubator/vector/FloatVector;", fv_max);
+    r.set_category(__prev_cat);
 }
 
 fn register_double_vector(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(DV, "zero", "(Ljdk/incubator/vector/VectorSpecies;)Ljdk/incubator/vector/DoubleVector;", dv_zero);
     r.register(DV, "broadcast", "(Ljdk/incubator/vector/VectorSpecies;D)Ljdk/incubator/vector/DoubleVector;", dv_broadcast);
     r.register(DV, "fromArray", "(Ljdk/incubator/vector/VectorSpecies;[DI)Ljdk/incubator/vector/DoubleVector;", dv_from_array);
@@ -1492,9 +1509,12 @@ fn register_double_vector(r: &mut NativeMethodRegistry) {
     r.register(DV, "species", "()Ljdk/incubator/vector/VectorSpecies;", dv_species);
     r.register(DV, "min", "(Ljdk/incubator/vector/DoubleVector;)Ljdk/incubator/vector/DoubleVector;", dv_min);
     r.register(DV, "max", "(Ljdk/incubator/vector/DoubleVector;)Ljdk/incubator/vector/DoubleVector;", dv_max);
+    r.set_category(__prev_cat);
 }
 
 fn register_byte_vector(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(BV, "zero", "(Ljdk/incubator/vector/VectorSpecies;)Ljdk/incubator/vector/ByteVector;", bv_zero);
     r.register(BV, "broadcast", "(Ljdk/incubator/vector/VectorSpecies;B)Ljdk/incubator/vector/ByteVector;", bv_broadcast);
     r.register(BV, "fromArray", "(Ljdk/incubator/vector/VectorSpecies;[BI)Ljdk/incubator/vector/ByteVector;", bv_from_array);
@@ -1511,9 +1531,12 @@ fn register_byte_vector(r: &mut NativeMethodRegistry) {
     r.register(BV, "withLane", "(IB)Ljdk/incubator/vector/ByteVector;", bv_with_lane);
     r.register(BV, "length", "()I", bv_length);
     r.register(BV, "species", "()Ljdk/incubator/vector/VectorSpecies;", bv_species);
+    r.set_category(__prev_cat);
 }
 
 fn register_short_vector(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(SV_VEC, "zero", "(Ljdk/incubator/vector/VectorSpecies;)Ljdk/incubator/vector/ShortVector;", sv_vec_zero);
     r.register(SV_VEC, "broadcast", "(Ljdk/incubator/vector/VectorSpecies;S)Ljdk/incubator/vector/ShortVector;", sv_vec_broadcast);
     r.register(SV_VEC, "fromArray", "(Ljdk/incubator/vector/VectorSpecies;[SI)Ljdk/incubator/vector/ShortVector;", sv_vec_from_array);
@@ -1530,9 +1553,12 @@ fn register_short_vector(r: &mut NativeMethodRegistry) {
     r.register(SV_VEC, "withLane", "(IS)Ljdk/incubator/vector/ShortVector;", sv_vec_with_lane);
     r.register(SV_VEC, "length", "()I", sv_vec_length);
     r.register(SV_VEC, "species", "()Ljdk/incubator/vector/VectorSpecies;", sv_vec_species);
+    r.set_category(__prev_cat);
 }
 
 fn register_vector_mask(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(VM, "fromValues", "(II)Ljdk/incubator/vector/VectorMask;", vm_from_values);
     r.register(VM, "allTrue", "(I)Ljdk/incubator/vector/VectorMask;", vm_all_true);
     r.register(VM, "allFalse", "(I)Ljdk/incubator/vector/VectorMask;", vm_all_false);
@@ -1542,18 +1568,25 @@ fn register_vector_mask(r: &mut NativeMethodRegistry) {
     r.register(VM, "or", "(Ljdk/incubator/vector/VectorMask;)Ljdk/incubator/vector/VectorMask;", vm_or);
     r.register(VM, "not", "()Ljdk/incubator/vector/VectorMask;", vm_not);
     r.register(VM, "length", "()I", vm_length);
+    r.set_category(__prev_cat);
 }
 
 fn register_vector_shuffle(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(VSH, "fromValues", "(II)Ljdk/incubator/vector/VectorShuffle;", vsh_from_values);
     r.register(VSH, "iota", "(I)Ljdk/incubator/vector/VectorShuffle;", vsh_iota);
     r.register(VSH, "length", "()I", vsh_length);
     r.register(VSH, "laneSource", "(I)I", vsh_lane_source);
+    r.set_category(__prev_cat);
 }
 
 fn register_vector_operators(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(VO, "opName", "(I)Ljava/lang/String;", vo_op_name);
     r.register(VO, "isAssociative", "(I)Z", vo_is_associative);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

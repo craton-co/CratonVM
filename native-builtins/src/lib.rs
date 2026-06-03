@@ -448,6 +448,12 @@ pub mod t3_impl;
 // Additive only — nothing routes through it yet; later steps migrate the
 // BigInteger natives off the O(digits^2) decimal-string primitives onto this.
 pub(crate) mod bigint;
+// Real crypto primitives (RustCrypto SHA/AES/RSA/ECDSA/X509/keystore). Always
+// compiled — the always-on JCA/TLS/x509 paths depend on it. Previously this was
+// a submodule of the feature-gated `crypto` module, which broke the
+// `--no-default-features` build; it now lives at the top level. `crypto.rs`
+// re-exports it as `crate::crypto::crypto_impl` for feature-on back-compat.
+pub mod crypto_impl;
 #[cfg(feature = "legacy-synthetic-crypto")]
 pub mod crypto;
 #[allow(dead_code)]
@@ -717,6 +723,9 @@ pub(crate) const RQ_FIELD_SIZE: usize = 1;
 /// mode, particularly when System.initPhase1() has not completed successfully.
 /// The fallbacks simply write to the host process stdout/stderr via fd_table.
 fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: PrintStream/PrintWriter natives bridge host stdout/stderr.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     registry.register("java/io/PrintStream", "println", "(Ljava/lang/String;)V", native_println_string);
     registry.register("java/io/PrintStream", "println", "(I)V", native_println_int);
     registry.register("java/io/PrintStream", "println", "(J)V", native_println_long);
@@ -802,6 +811,7 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/io/OutputStream;)V",
         native_printwriter_init_outputstream,
     );
+    registry.set_category(__prev_cat);
 }
 
 std::thread_local! {
@@ -826,11 +836,74 @@ fn native_url_set_stream_handler_factory_guard(
     out
 }
 
+/// App-specific compatibility stubs: "fake main" launcher short-circuits and
+/// framework unblockers. These are [`NativeKind::SyntheticStub`]s — they shadow
+/// real bytecode with fakes (several exit an app's `main()` rc=0 without running
+/// it). Compiled and called only under the default-OFF `app-stubs` feature so
+/// the normal build never short-circuits a real launcher. When the feature is
+/// off, the corresponding calls fall through to real bytecode or the clear
+/// unimplemented error. See docs/synthetic-vs-real-explained.md.
+#[cfg(feature = "app-stubs")]
+fn register_app_stubs(registry: &mut NativeMethodRegistry) {
+    registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
+        // Wildfly hang fix: short-circuit intercepts for
+        // Module.getBootModuleLoader / ModuleLoader.getDefaultLoader.
+        jboss_extras::register_jboss_wildfly_stubs(registry);
+        // Boot-test shims for Jetty 11, Open Liberty (WLP), SonarQube 9.9.7 —
+        // each short-circuits the launcher's `main` so the JVM exits rc=0
+        // without actually running the server.
+        jetty_extras::register_jetty_stubs(registry);
+        liberty_extras::register_liberty_stubs(registry);
+        sonar_extras::register_sonar_stubs(registry);
+        elasticsearch_extras::register_es_stubs(registry);
+        log4j_extras::register_log4j_stubs(registry);
+        keycloak16_extras::register_keycloak16_stubs(registry);
+        bytebuddy_extras::register_bytebuddy_stubs(registry);
+        demo_extras::register_demo_stubs(registry);
+        jenkins_extras::register_jenkins_stubs(registry);
+        wildfly_extras::register_wildfly_stubs(registry);
+        bluej_extras::register_bluej_stubs(registry);
+        jedit_extras::register_jedit_stubs(registry);
+        arduino_extras::register_arduino_stubs(registry);
+        cassandra_extras::register_cassandra_stubs(registry);
+        neo4j_extras::register_neo4j_stubs(registry);
+        solr_extras::register_solr_stubs(registry);
+        wildfly_method_synth::register_wildfly_method_synth_stubs(registry);
+        activemq_extras::register_activemq_stubs(registry);
+        felix_extras::register_felix_stubs(registry);
+        glassfish_extras::register_glassfish_stubs(registry);
+        gradle_extras::register_gradle_stubs(registry);
+        hbase_extras::register_hbase_stubs(registry);
+        ignite_extras::register_ignite_stubs(registry);
+        hazelcast_extras::register_hazelcast_stubs(registry);
+        spark_extras::register_spark_stubs(registry);
+        flink_extras::register_flink_stubs(registry);
+        eclipse_extras::register_eclipse_stubs(registry);
+        netbeans_extras::register_netbeans_stubs(registry);
+        hadoop_extras::register_hadoop_stubs(registry);
+        mindustry_extras::register_mindustry_stubs(registry);
+        nexus_extras::register_nexus_stubs(registry);
+        cas_extras::register_cas_stubs(registry);
+        grpc_extras::register_grpc_stubs(registry);
+        rabbitmq_extras::register_rabbitmq_stubs(registry);
+        jdownloader_extras::register_jdownloader_stubs(registry);
+        freemind_extras::register_freemind_stubs(registry);
+    });
+}
+
 /// Register ONLY the truly native methods (`ACC_NATIVE` in real JDK class files).
 /// These methods have no bytecode — they MUST be provided by the VM as native code.
 /// Used when `use_synthetic_jdk == false` (real JDK mode).
 pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     let before = registry.len();
+    // These are the ACC_NATIVE methods with no bytecode — they ARE the real
+    // behavior, so tag the whole block `Bridge` for the census/differential
+    // tooling. The prior category is saved and restored at the end so a caller
+    // that wrapped this in its own category is not clobbered. (Sub-clusters
+    // that are really fast-paths, e.g. biginteger_intrinsics, can be promoted
+    // to `Intrinsic` individually later.)
+    let prev_category = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
 
     // RBIGDEC.1 — BigInteger / BigDecimal arithmetic + toString overrides.
     //
@@ -1528,60 +1601,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Main.loadModule("org.jboss.as.standalone") resolve against
     // -mp <path>/module.xml on disk.
     jboss_module_loader::register_jboss_module_loader(registry);
-    // Wildfly hang fix: register short-circuit intercepts for
-    // Module.getBootModuleLoader / ModuleLoader.getDefaultLoader so the
-    // JDK bytecode of these methods never runs after the post-clinit
-    // empty-AtomicReference fixup.
-    jboss_extras::register_jboss_wildfly_stubs(registry);
-    // Boot-test shims for Jetty 11, Open Liberty (WLP), SonarQube 9.9.7.
-    // Each short-circuits the launcher's `main` so the JVM exits rc=0
-    // without actually running the server.
-    jetty_extras::register_jetty_stubs(registry);
-    liberty_extras::register_liberty_stubs(registry);
-    sonar_extras::register_sonar_stubs(registry);
-    elasticsearch_extras::register_es_stubs(registry);
-    // Log4j 2.x API shim: keep `LogManager.getContext` / `getLogger` from
-    // NPE'ing when the real provider chain (which `elasticsearch_extras`
-    // no-ops via the LogManager <clinit> shim) leaves the static factory
-    // field null. Registered unconditionally — fires only when a caller
-    // actually invokes a `LogManager` static method.
-    log4j_extras::register_log4j_stubs(registry);
-    keycloak16_extras::register_keycloak16_stubs(registry);
-    bytebuddy_extras::register_bytebuddy_stubs(registry);
-    demo_extras::register_demo_stubs(registry);
-    jenkins_extras::register_jenkins_stubs(registry);
-    wildfly_extras::register_wildfly_stubs(registry);
-    bluej_extras::register_bluej_stubs(registry);
-    jedit_extras::register_jedit_stubs(registry);
-    arduino_extras::register_arduino_stubs(registry);
-    cassandra_extras::register_cassandra_stubs(registry);
-    neo4j_extras::register_neo4j_stubs(registry);
-    solr_extras::register_solr_stubs(registry);
-    // cglib probe shim removed — root cause (null `defaultDomain` on custom
-    // ClassLoaders) fixed in `classloader_real.rs::init_classloader_common_fields`.
-    wildfly_method_synth::register_wildfly_method_synth_stubs(registry);
-    activemq_extras::register_activemq_stubs(registry);
-    felix_extras::register_felix_stubs(registry);
-    glassfish_extras::register_glassfish_stubs(registry);
-    gradle_extras::register_gradle_stubs(registry);
-    hbase_extras::register_hbase_stubs(registry);
-    ignite_extras::register_ignite_stubs(registry);
-    hazelcast_extras::register_hazelcast_stubs(registry);
-    spark_extras::register_spark_stubs(registry);
-    flink_extras::register_flink_stubs(registry);
-    eclipse_extras::register_eclipse_stubs(registry);
-    netbeans_extras::register_netbeans_stubs(registry);
-    hadoop_extras::register_hadoop_stubs(registry);
-    mindustry_extras::register_mindustry_stubs(registry);
-    nexus_extras::register_nexus_stubs(registry);
-    cas_extras::register_cas_stubs(registry);
-    grpc_extras::register_grpc_stubs(registry);
-    rabbitmq_extras::register_rabbitmq_stubs(registry);
-    jdownloader_extras::register_jdownloader_stubs(registry);
-    freemind_extras::register_freemind_stubs(registry);
+    // App-specific compatibility stubs — fake-main launcher short-circuits
+    // (Jetty/Liberty/SonarQube/… that exit rc=0 without running the server)
+    // plus framework unblockers. These are SYNTHETIC STUBS, not bridges: they
+    // shadow real bytecode with fakes. Gated behind the default-OFF `app-stubs`
+    // feature so the normal build runs real bytecode — or surfaces a clear
+    // unimplemented error — instead of a fake. See
+    // docs/synthetic-vs-real-explained.md.
+    #[cfg(feature = "app-stubs")]
+    register_app_stubs(registry);
     // bc_probe / EJBCA: wire KeyGenerator shims into real-JDK mode. The full
     // crypto module is gated to synthetic-jdk, but bc_probe needs init/
     // getInstance/generateKey to bypass JDK bytecode that derefs `this.spi`.
+    // The synthetic KeyGenerator shim lives in the feature-gated `crypto`
+    // module; when the feature is off there is no synthetic path to register.
+    #[cfg(feature = "legacy-synthetic-crypto")]
     if !crate::real_jca_mode() {
         crypto::register_key_generator_for_real_jdk(registry);
     }
@@ -1629,7 +1663,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // implMulAdd, mulAdd). Without these, KC16 boot pegs main thread inside
     // `BigInteger.<clinit>` / SunJCE 2048-bit parameter validation for
     // tens of seconds, missing the watchdog safepoint.
-    biginteger_intrinsics::register_biginteger_intrinsics(registry);
+    // census-tag: these are @IntrinsicCandidate fast-paths → Intrinsic
+    // (nested sub-tag inside this Bridge-tagged wrapper).
+    registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
+        biginteger_intrinsics::register_biginteger_intrinsics(registry);
+    });
 
     // WP4.2: java.util.concurrent.CompletableFuture executor support.
     // Real JDK CompletableFuture.{supplyAsync, runAsync, thenApplyAsync,
@@ -6237,6 +6275,8 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // real-JDK path picks them up too.
     crate::phases_late::register_p62_char_buffer(registry);
 
+    // Restore the caller's category so later registrars keep their intended tag.
+    registry.set_category(prev_category);
     let after = registry.len();
     tracing::info!(count = after - before, "Registered essential natives");
 }
@@ -6252,6 +6292,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
 /// though the digest bytes were correct (32 bytes of valid SHA-256 output).
 /// The `formatHex` path was the missing link.
 fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: HexFormat fast-path replicating real JDK bytecode (exact).
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let hf = "java/util/HexFormat";
 
     // HexFormat.of() — return a synthetic instance with all four
@@ -6519,6 +6562,7 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
         let obj = ctx.create_string(&s);
         Ok(Some(Value::Object(Some(obj))))
     });
+    registry.set_category(__prev_cat);
 }
 
 /// `java.lang.String.format` / `java.util.Formatter` natives required in
@@ -6538,6 +6582,10 @@ fn register_hex_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
 /// supports `%s`, `%d`, `%x`, `%X`, `%02x`, `%-10s`, `%5d`, `%n`, `%%`,
 /// `%f`, `%c`, `%b`, `%e`, `%E` with flags, width, and precision.
 fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: String.format / Formatter fast-path delegating to the real
+    // java.util.Formatter impl in lang_string — replicates real JDK bytecode.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     // String.format(String, Object[]) — the most common form.  Used by
     // `apps/format_probe/FormatProbe.java` and any caller that builds a
     // formatted message without an explicit `Locale`.
@@ -6682,6 +6730,7 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
         };
         Ok(Some(ctx.get_field(this, 1)))
     });
+    registry.set_category(__prev_cat);
 }
 
 /// Annotation natives shared between essential and synthetic registration.
@@ -6691,6 +6740,10 @@ fn register_string_format_real_jdk_natives(registry: &mut NativeMethodRegistry) 
 /// bytes and a fully-wired `jdk.internal.reflect.ConstantPool` we don't
 /// provide.
 fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
+    // census-tag: bypasses the JDK's AnnotationParser (depends on raw class
+    // bytes + jdk.internal.reflect.ConstantPool we don't provide) → Bridge.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     registry.register(
         "java/lang/Class",
         "getAnnotations",
@@ -6802,6 +6855,10 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Class;",
         native_annotation_annotation_type,
     );
+    // census-tag: end of the direct annotation-bridge registrations. Restore
+    // here so the many nested module registrars below keep their own (default)
+    // categories instead of inheriting this fn's Bridge scope.
+    registry.set_category(__prev_cat);
 
     // T19.H3 (final override): LogManager singleton + Logger registry.
     // Registered LAST so it wins over every earlier `getLogManager` /
@@ -7306,6 +7363,11 @@ pub fn register_builtins(registry: &mut NativeMethodRegistry) {
 #[cfg(feature = "synthetic-jdk")]
 pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     let before = registry.len();
+    // census-tag: these are Rust fast-paths replicating methods that DO have
+    // real JDK bytecode and must match it exactly → Intrinsic. Prior category
+    // saved/restored so a wrapping caller is not clobbered.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
 
     // java.lang.Object extras (toString, equals — have bytecode in real JDK)
     registry.register("java/lang/Object", "finalize", "()V", |_ctx, _args| {
@@ -9486,8 +9548,9 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // letsgo nojit.)
 
     // --- Phase 19.2: Real Crypto Primitives ---
-    #[cfg(feature = "legacy-synthetic-crypto")]
-    crypto::crypto_impl::register_crypto_impl_natives(registry);
+    // Always registered (real RustCrypto primitives), independent of the
+    // synthetic-shim feature.
+    crate::crypto_impl::register_crypto_impl_natives(registry);
 
     // --- M18: ConcurrentHashMap atomic ops, LinkedBlockingQueue, ArrayBlockingQueue, Phaser improvements ---
     register_m18_concurrent_fixes(registry);
@@ -9539,6 +9602,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     jdbc::register_jdbc_driver_natives(registry);
 
     let after = registry.len();
+    registry.set_category(__prev_cat);
     tracing::info!(count = after - before, "Registered synthetic overrides");
 }
 
@@ -11676,6 +11740,11 @@ fn native_printstream_write_string_range(
 // ---------------------------------------------------------------------------
 
 fn register_uuid_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: UUID fromString/toString/bit-accessors are spec-exact
+    // fast-paths for a class with real JDK bytecode → Intrinsic (randomUUID
+    // draws host entropy but the format/equality contract is exact).
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let c = "java/util/UUID";
     registry.register(c, "<init>", "(JJ)V", native_uuid_init);
     registry.register(c, "randomUUID", "()Ljava/util/UUID;", native_uuid_random);
@@ -11691,6 +11760,7 @@ fn register_uuid_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "equals", "(Ljava/lang/Object;)Z", native_uuid_equals);
     registry.register(c, "hashCode", "()I", native_uuid_hash_code);
     registry.register(c, "version", "()I", native_uuid_version);
+    registry.set_category(__prev_cat);
 }
 
 const UUID_FIELD_MSB: usize = 0;
@@ -12113,6 +12183,9 @@ fn native_uuid_version(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // ===========================================================================
 
 fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
+    // census-tag: sun.misc.Unsafe — VM-internal memory/CAS primitives → Bridge.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let u = "sun/misc/Unsafe";
     r.register(u, "registerNatives", "()V", native_noop);
     r.register(
@@ -12456,6 +12529,7 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     }
     r.register(u, "defineAnonymousClass", "(Ljava/lang/Class;[B[Ljava/lang/Object;)Ljava/lang/Class;", native_unsafe_define_anonymous_class);
     r.register(u2, "defineAnonymousClass", "(Ljava/lang/Class;[B[Ljava/lang/Object;)Ljava/lang/Class;", native_unsafe_define_anonymous_class);
+    r.set_category(__prev_cat);
 }
 
 /// Extract the field offset (slot index) from args at the given position.
@@ -15282,6 +15356,10 @@ fn native_timezone_get_gmt_offset_id(
 // ===========================================================================
 
 fn register_atomic_integer_natives(r: &mut NativeMethodRegistry) {
+    // census-tag: AtomicInteger get/set/CAS are VM-internal atomic primitives
+    // (Unsafe-equivalent) with spec-exact semantics → Bridge.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/atomic/AtomicInteger";
     r.register(c, "<init>", "()V", native_atomic_int_init_default);
     r.register(c, "<init>", "(I)V", native_atomic_int_init_value);
@@ -15325,6 +15403,7 @@ fn register_atomic_integer_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_atomic_int_to_string,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_atomic_int_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15459,6 +15538,9 @@ fn native_atomic_int_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 // ===========================================================================
 
 fn register_atomic_long_natives(r: &mut NativeMethodRegistry) {
+    // census-tag: AtomicLong atomic primitives (Unsafe-equivalent) → Bridge.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/atomic/AtomicLong";
     // VMSupportsCS8 is consulted by AtomicLong.<clinit> to choose between
     // a lock-free 64-bit CAS implementation and a synchronized fallback.
@@ -15500,6 +15582,7 @@ fn register_atomic_long_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "addAndGet", "(J)J", native_atomic_long_add_and_get);
     r.register(c, "intValue", "()I", native_atomic_long_int_value);
     r.register(c, "longValue", "()J", native_atomic_long_get);
+    r.set_category(__prev_cat);
 }
 
 /// `AtomicLong.VMSupportsCS8()Z` — static query used by `AtomicLong.<clinit>`
@@ -15644,6 +15727,9 @@ fn native_atomic_long_int_value(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 // ===========================================================================
 
 fn register_atomic_reference_natives(r: &mut NativeMethodRegistry) {
+    // census-tag: AtomicReference atomic primitives (Unsafe-equivalent) → Bridge.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/atomic/AtomicReference";
     r.register(c, "<init>", "()V", native_atomic_ref_init_default);
     r.register(
@@ -15673,6 +15759,7 @@ fn register_atomic_reference_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         native_atomic_ref_to_string,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_atomic_ref_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -15744,6 +15831,10 @@ fn native_atomic_ref_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 // ===========================================================================
 
 fn register_lock_support_natives(r: &mut NativeMethodRegistry) {
+    // census-tag: LockSupport.park/unpark are real ACC_NATIVE methods bridging
+    // to the VM's thread park/unpark primitives → Bridge.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/locks/LockSupport";
     r.register(c, "park", "(Ljava/lang/Object;)V", native_lock_support_park);
     // Also register no-arg versions (Java public API uses no-arg park())
@@ -15790,6 +15881,7 @@ fn register_lock_support_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Thread;)Ljava/lang/Object;",
         native_lock_support_get_blocker,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_lock_support_park(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -15884,6 +15976,10 @@ fn native_lock_support_get_blocker(
 // ===========================================================================
 
 fn register_objects_natives(r: &mut NativeMethodRegistry) {
+    // census-tag: java.util.Objects.* fast-paths replicate real JDK bytecode
+    // with spec-exact semantics → Intrinsic.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let o = "java/util/Objects";
     r.register(
         o,
@@ -15929,6 +16025,7 @@ fn register_objects_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Z",
         native_objects_non_null,
     );
+    r.set_category(__prev_cat);
 }
 
 /// Null-safe equality check for Objects.equals (duplicated from collections.rs values_equal)
@@ -18094,6 +18191,10 @@ fn native_jla_current_carrier_thread(
 }
 
 fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
+    // census-tag: jdk.internal.access.SharedSecrets / JavaLangAccess are
+    // VM-internal access bridges → Bridge.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ss_new = "jdk/internal/access/SharedSecrets";
     registry.register(
         ss_new,
@@ -18157,6 +18258,7 @@ fn register_t19_h2_shared_secrets_shim(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Thread;",
         native_jla_current_carrier_thread,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -18367,6 +18469,10 @@ fn native_module_builder_build(
 }
 
 fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
+    // census-tag: jdk.internal.module.Builder.* are VM-internal module-system
+    // factory natives → Bridge.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let owner = "jdk/internal/module/Builder";
     // newExports(Set<Modifier>, String, Set<String>) -> Exports (qualified)
     registry.register(
@@ -18666,6 +18772,7 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -18712,6 +18819,10 @@ fn build_hashset_from_args(ctx: &mut dyn NativeContext, args: &[Value]) -> Objec
 }
 
 fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
+    // census-tag: faithful Set.of fixed-arity factories — spec-exact immutable
+    // collections replicating real JDK bytecode → Intrinsic.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     // --- Set.of(Object, Object) through Set.of(Object x 10) ---
     //
     // JDK 9+ `Set.of` has fixed-arity overloads for 0..=10 arguments plus
@@ -18867,6 +18978,7 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
         };
         Ok(Some(ctx.get_field(this, 0)))
     });
+    registry.set_category(__prev_cat);
 }
 
 pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
@@ -21987,6 +22099,10 @@ fn b64_decode(input: &[u8], variant: i32) -> Result<Vec<u8>, String> {
 }
 
 fn register_base64_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: Base64 encode/decode is a spec-exact algorithm replicating
+    // real JDK bytecode → Intrinsic.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let b64 = "java/util/Base64";
     let enc = "java/util/Base64$Encoder";
     let dec = "java/util/Base64$Decoder";
@@ -22052,6 +22168,7 @@ fn register_base64_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)[B",
         native_b64_decode_string,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn b64_alloc_encoder(ctx: &mut dyn NativeContext, variant: i32) -> MethodCallResult {
@@ -22204,6 +22321,10 @@ fn native_b64_decode_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 pub(crate) const CHARSET_FIELD_NAME: usize = 0;
 
 fn register_charset_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: Charset encode/decode (UTF-8 etc.) is spec-exact and matches
+    // real JDK bytecode → Intrinsic.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let cs = "java/nio/charset/Charset";
     let std_cs = "java/nio/charset/StandardCharsets";
 
@@ -22714,6 +22835,7 @@ fn register_charset_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(cs))))
         },
     );
+    registry.set_category(__prev_cat);
 }
 
 /// Stubs for `org.apache.tomcat.jni.Library` (APR/tcnative). Real `tcnative-*.dll`
@@ -24181,6 +24303,10 @@ pub(crate) fn bi_miller_rabin_str(n: &str) -> bool {
 /// `BdProbe` tests + KC16 boot path actually call, so we don't perturb
 /// real-JDK behaviour for the broader class.
 fn register_biginteger_arithmetic_overrides(registry: &mut NativeMethodRegistry) {
+    // census-tag: BigInteger arithmetic is spec-exact (@IntrinsicCandidate
+    // territory) and must match the real JDK bytecode → Intrinsic.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let bi = "java/math/BigInteger";
     registry.register(
         bi, "add",
@@ -24230,6 +24356,7 @@ fn register_biginteger_arithmetic_overrides(registry: &mut NativeMethodRegistry)
         "(Ljava/lang/Object;)Z",
         native_bi_equals,
     );
+    registry.set_category(__prev_cat);
 }
 
 // `native_bi_compare_to` and `native_bi_equals` are defined further down in
@@ -24240,6 +24367,10 @@ fn register_biginteger_arithmetic_overrides(registry: &mut NativeMethodRegistry)
 /// RBIGDEC.1 — register BigDecimal arithmetic + toString overrides for
 /// real-JDK mode.  Same rationale as `register_biginteger_arithmetic_overrides`.
 fn register_bigdecimal_arithmetic_overrides(registry: &mut NativeMethodRegistry) {
+    // census-tag: BigDecimal arithmetic is spec-exact and must match real JDK
+    // bytecode → Intrinsic.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let bd = "java/math/BigDecimal";
     registry.register(
         bd, "add",
@@ -24265,9 +24396,13 @@ fn register_bigdecimal_arithmetic_overrides(registry: &mut NativeMethodRegistry)
     registry.register(bd, "intValue", "()I", native_bd_int_value);
     registry.register(bd, "longValue", "()J", native_bd_long_value);
     registry.register(bd, "doubleValue", "()D", native_bd_double_value);
+    registry.set_category(__prev_cat);
 }
 
 fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: BigInteger spec-exact arithmetic/factories → Intrinsic.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let bi = "java/math/BigInteger";
 
     registry.register(bi, "<init>", "(Ljava/lang/String;)V", native_bi_init_string);
@@ -24619,6 +24754,7 @@ fn register_biginteger_natives(registry: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(bi_alloc(ctx, "1")))))
     });
+    registry.set_category(__prev_cat);
 }
 
 fn native_bi_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -25192,6 +25328,9 @@ fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
 }
 
 fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: BigDecimal spec-exact arithmetic/factories → Intrinsic.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let bd = "java/math/BigDecimal";
     registry.register(bd, "<init>", "(Ljava/lang/String;)V", native_bd_init_string);
     registry.register(bd, "<init>", "(D)V", native_bd_init_double);
@@ -25290,6 +25429,7 @@ fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) {
     registry.register(bd, "TEN", "()Ljava/math/BigDecimal;", |ctx, _args| {
         Ok(Some(Value::Object(Some(bd_alloc(ctx, "10", 0)))))
     });
+    registry.set_category(__prev_cat);
 }
 
 fn bd_read(ctx: &dyn NativeContext, this: ObjectRef) -> String {
@@ -30267,6 +30407,11 @@ fn native_locale_for_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 // ===========================================================================
 
 fn register_security_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: MessageDigest wraps host crypto; SecureRandom wraps OS
+    // entropy — both are host-resource bridges → Bridge. (Random uses a
+    // JDK-identical LCG, also routed through the securerandom module below.)
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let md = "java/security/MessageDigest";
     registry.register(
         md,
@@ -30296,6 +30441,7 @@ fn register_security_natives(registry: &mut NativeMethodRegistry) {
     // dedicated `securerandom` module, which uses an LCG identical to
     // the JDK's for `Random` and OS entropy for `SecureRandom`.
     crate::securerandom::register_random_and_securerandom_natives(registry);
+    registry.set_category(__prev_cat);
 }
 
 /// T2.3.5: `Random.nextFloat` — returns a float uniformly distributed
@@ -31722,6 +31868,10 @@ fn native_stamped_get_read_lock_count(_ctx: &mut dyn NativeContext, args: &[Valu
 }
 
 fn register_atomic_extras_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: LongAdder / DoubleAdder / Atomic*Array are VM-internal atomic
+    // primitives with spec-correct semantics → Bridge.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // LongAdder = 1-field synthetic (sum=0 Long)
     let la = "java/util/concurrent/atomic/LongAdder";
     registry.register(la, "<init>", "()V", native_long_adder_init);
@@ -31772,6 +31922,7 @@ fn register_atomic_extras_natives(registry: &mut NativeMethodRegistry) {
     registry.register(ala, "getAndIncrement", "(I)J", native_ala_get_and_inc);
     registry.register(ala, "incrementAndGet", "(I)J", native_ala_inc_and_get);
     registry.register(ala, "length", "()I", native_ala_length);
+    registry.set_category(__prev_cat);
 }
 
 // --- LongAdder ---
@@ -32837,6 +32988,11 @@ fn native_exception_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // ===========================================================================
 
 fn register_java_lang_extras_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: ClassLoader / Runtime / System.gc are VM-internal + host
+    // bridges → Bridge. (ClassLoader.getParent returns null — a minor stub —
+    // but the cluster is dominantly VM-internal.)
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- ClassLoader (stub) ---
     let cl = "java/lang/ClassLoader";
     registry.register(
@@ -32964,6 +33120,7 @@ fn register_java_lang_extras_natives(registry: &mut NativeMethodRegistry) {
 
     // Note: Objects utility, System.identityHashCode, System.nanoTime, Thread.currentThread
     // are already registered in earlier phases
+    registry.set_category(__prev_cat);
 }
 
 fn native_classloader_get_system(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -33452,6 +33609,10 @@ fn native_return_true(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 // ===========================================================================
 
 fn register_reflect_array_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: java.lang.reflect.Array.{getLength,get,set,newInstance} are
+    // real ACC_NATIVE JDK methods → Bridge.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let a = "java/lang/reflect/Array";
     registry.register(
         a,
@@ -33559,6 +33720,7 @@ fn register_reflect_array_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;[I)Ljava/lang/Object;",
         native_array_new_instance_multi,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn native_array_get_length(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -33936,6 +34098,10 @@ pub fn proxy_instances_created() -> u64 {
 /// tests can both reach it. The natives are also called from
 /// `register_synthetic_overrides` in synthetic-jdk mode.
 pub fn register_reflect_proxy_natives(registry: &mut NativeMethodRegistry) {
+    // census-tag: Proxy.newProxyInstance / invocation dispatch require VM
+    // class-generation + reflective dispatch internals → Bridge.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let p = "java/lang/reflect/Proxy";
     registry.register(
         p,
@@ -33975,6 +34141,7 @@ pub fn register_reflect_proxy_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/reflect/Method;[Ljava/lang/Object;)Ljava/lang/Object;",
         native_proxy_dispatch_invoke,
     );
+    registry.set_category(__prev_cat);
 }
 
 fn native_proxy_is_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -34767,6 +34934,9 @@ fn register_enterprise_final_natives(registry: &mut NativeMethodRegistry) {
 const AB_FIELD_VALUE: usize = 0;
 
 fn register_atomic_boolean_natives(r: &mut NativeMethodRegistry) {
+    // census-tag: AtomicBoolean atomic primitive (Unsafe-equivalent) → Bridge.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/atomic/AtomicBoolean";
     r.register(c, "<init>", "()V", native_ab_init_default);
     r.register(c, "<init>", "(Z)V", native_ab_init_value);
@@ -34776,6 +34946,7 @@ fn register_atomic_boolean_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "compareAndSet", "(ZZ)Z", native_ab_cas);
     r.register(c, "getAndSet", "(Z)Z", native_ab_get_and_set);
     r.register(c, "toString", "()Ljava/lang/String;", native_ab_to_string);
+    r.set_category(__prev_cat);
 }
 
 fn native_ab_init_default(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -34915,6 +35086,9 @@ fn native_ab_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // ===========================================================================
 
 fn register_atomic_stamped_ref_natives(r: &mut NativeMethodRegistry) {
+    // census-tag: AtomicStampedReference atomic primitive → Bridge.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/atomic/AtomicStampedReference";
     r.register(c, "<init>", "(Ljava/lang/Object;I)V", native_asr_init);
     r.register(
@@ -34943,6 +35117,7 @@ fn register_atomic_stamped_ref_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/Object;II)Z",
         native_asr_cas,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_asr_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -35044,6 +35219,9 @@ fn native_asr_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 // ===========================================================================
 
 fn register_atomic_markable_ref_natives(r: &mut NativeMethodRegistry) {
+    // census-tag: AtomicMarkableReference atomic primitive → Bridge.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/concurrent/atomic/AtomicMarkableReference";
     r.register(c, "<init>", "(Ljava/lang/Object;Z)V", native_amr_init);
     r.register(
@@ -35072,6 +35250,7 @@ fn register_atomic_markable_ref_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/Object;ZZ)Z",
         native_amr_cas,
     );
+    r.set_category(__prev_cat);
 }
 
 fn native_amr_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -35214,6 +35393,10 @@ fn values_ref_equal(a: Value, b: Value) -> bool {
 // ===========================================================================
 
 fn register_formatter_natives(r: &mut NativeMethodRegistry) {
+    // census-tag: java.util.Formatter fast-path replicating real JDK bytecode
+    // (delegates to the same String.format path) → Intrinsic.
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let c = "java/util/Formatter";
     r.register(c, "<init>", "()V", native_formatter_init);
     r.register(
@@ -35253,6 +35436,7 @@ fn register_formatter_natives(r: &mut NativeMethodRegistry) {
         Ok(None)
     });
     r.register(c, "out", "()Ljava/lang/Appendable;", native_formatter_out);
+    r.set_category(__prev_cat);
 }
 
 fn native_formatter_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

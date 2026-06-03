@@ -649,6 +649,8 @@ fn native_pool_handler_get_connection(ctx: &mut dyn NativeContext, args: &[Value
 /// Register all Agroal-related native methods. Called from
 /// `register_essential_natives` in `lib.rs`.
 pub fn register_agroal_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // AgroalDataSource
     registry.register(
         CLS_DS,
@@ -707,6 +709,7 @@ pub fn register_agroal_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/sql/Connection;",
         native_pool_handler_get_connection,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================

@@ -1137,6 +1137,8 @@ fn graalvm_dump_metadata(
 }
 
 pub(crate) fn register_graalvm_compat_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // Initialize global metadata on first registration
     init_graalvm_metadata();
 
@@ -1225,6 +1227,7 @@ pub(crate) fn register_graalvm_compat_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)I",
         graalvm_dump_metadata,
     );
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================

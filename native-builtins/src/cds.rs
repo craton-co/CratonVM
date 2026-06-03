@@ -695,6 +695,8 @@ fn native_cds_dump_dynamic_archive(
 
 /// Register all CDS / AppCDS native methods into `r`.
 pub(crate) fn register_cds_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // -- sun/management/ManagementFactoryHelper --
     {
         let cls = "sun/management/ManagementFactoryHelper";
@@ -826,6 +828,7 @@ pub(crate) fn register_cds_natives(r: &mut NativeMethodRegistry) {
             native_cds_dump_dynamic_archive,
         );
     }
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

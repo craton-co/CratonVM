@@ -2027,6 +2027,43 @@ pub struct StackTraceEntry {
 /// - `Err(MethodCallFailed)` — method threw an exception or had an internal error
 pub type NativeCallback = fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult;
 
+/// Classification of a registered native method.
+///
+/// The native overlay is three different things wearing one uniform; this tag
+/// records which is which so tooling (census dump, differential harness) and
+/// the dispatcher can treat them differently:
+///
+/// - [`NativeKind::Intrinsic`] — a correct fast-path for a hot method (e.g.
+///   `Math.abs`, `String.length`). Returns the same answer the real bytecode
+///   would, just faster. Always kept; never gated.
+/// - [`NativeKind::Bridge`] — a native the VM genuinely needs because it cannot
+///   run the real thing: OS syscalls, `sun.*` internals depending on VM state,
+///   classes with no real bytecode. It *is* the real behavior. Never gated.
+/// - [`NativeKind::SyntheticStub`] — a fake: placeholder/approximate/wrong
+///   return values, fabricated objects, or "fake main" launcher short-circuits.
+///   These shadow correct real bytecode and are the removal target. Gateable.
+///
+/// The registry's `current_category` defaults to `SyntheticStub` — the
+/// conservative choice, so anything an author forgets to tag stays visible to
+/// the audit and gateable, never silently trusted.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash)]
+pub enum NativeKind {
+    Intrinsic,
+    Bridge,
+    SyntheticStub,
+}
+
+impl NativeKind {
+    /// Stable lowercase name for JSON census output.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NativeKind::Intrinsic => "intrinsic",
+            NativeKind::Bridge => "bridge",
+            NativeKind::SyntheticStub => "synthetic-stub",
+        }
+    }
+}
+
 /// Registry of native method implementations.
 ///
 /// Maps (class, method, descriptor) triples to Rust function callbacks.
@@ -2050,6 +2087,17 @@ pub struct NativeMethodRegistry {
     /// `find_by_method_descriptor` to avoid the O(N) linear scan over
     /// `registrations`. Built incrementally on every `register()`.
     by_method_desc: FxHashMap<(u64, u64), NativeCallback>,
+    /// Category tag for each registration, keyed by the same 128-bit
+    /// `(class, method, descriptor)` hash as `methods`. Lets the dispatcher
+    /// and audit tooling ask `kind_of(...)` in O(1). Populated on every
+    /// `register()` from `current_category`.
+    category_by_key: FxHashMap<(u64, u64), NativeKind>,
+    /// Category aligned with `registrations` (index-parallel), for
+    /// `dump_registrations` / census output.
+    categories: Vec<NativeKind>,
+    /// The category applied to subsequent `register()` calls. Scoped via
+    /// `with_category`. Defaults to `SyntheticStub` (conservative).
+    current_category: NativeKind,
 }
 
 impl NativeMethodRegistry {
@@ -2067,7 +2115,60 @@ impl NativeMethodRegistry {
                 BOOT_REGISTRATION_HINT,
                 Default::default(),
             ),
+            category_by_key: FxHashMap::with_capacity_and_hasher(
+                BOOT_REGISTRATION_HINT,
+                Default::default(),
+            ),
+            categories: Vec::with_capacity(BOOT_REGISTRATION_HINT),
+            current_category: NativeKind::SyntheticStub,
         }
+    }
+
+    /// Set the category applied to all subsequent `register()` calls until
+    /// changed again. Prefer [`with_category`](Self::with_category) for a
+    /// scoped set/restore.
+    pub fn set_category(&mut self, kind: NativeKind) {
+        self.current_category = kind;
+    }
+
+    /// The category currently applied to new registrations. Useful for a
+    /// save/restore around a nested registrar.
+    pub fn current_category(&self) -> NativeKind {
+        self.current_category
+    }
+
+    /// Run `f` with `current_category` set to `kind`, restoring the previous
+    /// category afterwards. This is how a whole `register_*` function tags all
+    /// of its registrations without touching individual `register()` calls.
+    pub fn with_category(&mut self, kind: NativeKind, f: impl FnOnce(&mut Self)) {
+        let prev = self.current_category;
+        self.current_category = kind;
+        f(self);
+        self.current_category = prev;
+    }
+
+    /// The category a native was registered under, or `None` if no native is
+    /// registered for this exact triple. O(1).
+    #[inline]
+    pub fn kind_of(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        descriptor: &str,
+    ) -> Option<NativeKind> {
+        let key = native_method_hash(class_name, method_name, descriptor);
+        self.category_by_key.get(&key).copied()
+    }
+
+    /// Snapshot of every registration as `(class, method, descriptor, kind)`,
+    /// for the `--dump-native-registry` census. Order follows registration
+    /// order; callers sort for diff-stable output.
+    pub fn dump_registrations(&self) -> Vec<(&str, &str, &str, NativeKind)> {
+        self.registrations
+            .iter()
+            .zip(self.categories.iter())
+            .map(|((c, m, d), k)| (c.as_ref(), m.as_ref(), d.as_ref(), *k))
+            .collect()
     }
 
     /// Register a native method implementation.
@@ -2114,6 +2215,11 @@ impl NativeMethodRegistry {
             method_name.into(),
             descriptor.into(),
         ));
+        // Tag this registration with the current category (see `with_category`).
+        // `insert` (not `or_insert`) so a deliberate re-registration under a new
+        // category — e.g. promoting a fixed stub to `Intrinsic` — takes effect.
+        self.category_by_key.insert(key, self.current_category);
+        self.categories.push(self.current_category);
         // AUDIT 2026-05-17 (Fix 5): also populate the class-agnostic
         // (method, descriptor) index used by `find_by_method_descriptor`.
         // Reuse `native_method_hash` with an empty class string so the

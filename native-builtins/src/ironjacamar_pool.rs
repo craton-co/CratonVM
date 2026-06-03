@@ -338,6 +338,8 @@ fn native_mc_destroy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 /// Register every IronJacamar-related native. Called from
 /// `register_essential_natives` in `lib.rs`.
 pub fn register_ironjacamar_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // AbstractPool
     registry.register(
         CLS_ABSTRACT_POOL,
@@ -420,6 +422,7 @@ pub fn register_ironjacamar_natives(registry: &mut NativeMethodRegistry) {
     registry.register(CLS_MC, "destroy", "()V", native_mc_destroy);
     registry.register(CLS_JDBC_LOCAL_MC, "cleanup", "()V", native_mc_destroy);
     registry.register(CLS_JDBC_LOCAL_MC, "destroy", "()V", native_mc_destroy);
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================

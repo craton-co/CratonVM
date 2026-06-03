@@ -722,14 +722,19 @@ const SSS_SOCK_FIELDS: usize = 6;
 /// Register T2.7's server-side and HTTPS natives. Called from
 /// `register_phase68_natives` after `register_p68_ssl`.
 pub(crate) fn register_t27_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_sslserversocket(r);
     register_accepted_issuers(r);
     register_https_url_connection(r);
     register_self_test(r);
     register_alpn_accessor(r);
+    r.set_category(__prev_cat);
 }
 
 fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // T2.7.4: real X509TrustManager.getAcceptedIssuers — returns a Java
     // `java.security.cert.X509Certificate[]` whose element at index i carries
     // the DER-encoded subject DN of the i-th trusted root. Uses
@@ -769,9 +774,12 @@ fn register_accepted_issuers(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 fn register_sslserversocket(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // T2.7.9: SSLServerSocketFactory.createServerSocket(int port) —
     // binds a TcpListener on 0.0.0.0:port, builds a rustls ServerConfig
     // from the configured runtime TLS identity, and registers both in the
@@ -944,6 +952,7 @@ fn register_sslserversocket(r: &mut NativeMethodRegistry) {
     });
     r.register(sss, "setNeedClientAuth", "(Z)V", |_ctx, _args| Ok(None));
     r.register(sss, "setWantClientAuth", "(Z)V", |_ctx, _args| Ok(None));
+    r.set_category(__prev_cat);
 }
 
 /// Side-table storing ALPN protocols per SSLSocket objectref. Used so
@@ -981,6 +990,8 @@ fn objref_key(o: ObjectRef) -> u64 {
 }
 
 fn register_alpn_accessor(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // T2.7.11 — SSLSocket.getApplicationProtocol(): returns the ALPN protocol
     // the server picked during the handshake, or the empty string when ALPN
     // was not negotiated (matching the reference JDK). Falls back to the
@@ -1017,9 +1028,12 @@ fn register_alpn_accessor(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 fn register_https_url_connection(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // T2.7.14 — javax.net.ssl.HttpsURLConnection. Most of the work here is
     // bookkeeping: the real HTTPS request path lives in `http2.rs`'s
     // `http11_request_impl`, which already drives native-tls against the
@@ -1101,9 +1115,12 @@ fn register_https_url_connection(r: &mut NativeMethodRegistry) {
     // Cipher suite / peer principal accessors come from the underlying
     // SSLSession/SSLSocket registrations in phases_late; we do not duplicate
     // them here to avoid conflicting registrations.
+    r.set_category(__prev_cat);
 }
 
 fn register_self_test(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // A JVM-callable self-test that spins up a rustls server on a loopback
     // ephemeral port using the *configured runtime* TLS identity, connects
     // to it with a rustls client, exchanges a short ping/pong, verifies the
@@ -1141,6 +1158,7 @@ fn register_self_test(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// End-to-end loopback handshake using the caller-supplied PEM material.
@@ -2676,6 +2694,8 @@ pub fn engine_negotiated_alpn_internal(engine_id: i32) -> Option<String> {
 // -----------------------------------------------------------------------------
 
 fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls_impl = "sun/security/ssl/SSLEngineImpl";
 
     // Constructor — allocates an engine_id slot in the side-table.
@@ -3076,6 +3096,7 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // -- wrap/unwrap closures (split out for arity / arg shapes) -----------------
@@ -3465,6 +3486,8 @@ fn do_unwrap(
 // -----------------------------------------------------------------------------
 
 fn register_alpn_on_parameters(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "javax/net/ssl/SSLParameters";
 
     // setApplicationProtocols stores into a side-table keyed by SSLParameters
@@ -3512,9 +3535,12 @@ fn register_alpn_on_parameters(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 fn register_apply_parameters(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // SSLEngine.setSSLParameters propagates the ALPN list onto the engine.
     r.register(
         "sun/security/ssl/SSLEngineImpl",
@@ -3558,6 +3584,7 @@ fn register_apply_parameters(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(p))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 fn sslparams_alpn_table() -> &'static parking_lot::Mutex<HashMap<u64, Vec<String>>> {
@@ -3575,15 +3602,21 @@ fn sslparams_alpn_table() -> &'static parking_lot::Mutex<HashMap<u64, Vec<String
 /// abstract `javax.net.ssl.SSLEngine` defaults. Callers outside the impl
 /// class still hit the `phases_late.rs` 7-field stub paths.
 pub fn register_sslengine_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_engine_impl_natives(r);
     register_apply_parameters(r);
+    r.set_category(__prev_cat);
 }
 
 /// WP5.4 — register ALPN-related natives on SSLParameters. ALPN propagation
 /// from `SSLParameters` → `SSLEngineImpl` is wired in `register_apply_parameters`
 /// (see `register_sslengine_real`).
 pub fn register_alpn_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_alpn_on_parameters(r);
+    r.set_category(__prev_cat);
 }
 
 #[allow(dead_code)]

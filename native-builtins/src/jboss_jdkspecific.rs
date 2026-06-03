@@ -357,6 +357,8 @@ pub(crate) fn native_module_layer_configuration(
 
 /// Install every JDKSpecific boot-path native this module owns.
 pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let ml = "java/lang/ModuleLayer";
     // boot() already has a stub in phases_late; re-registering is safe
     // because the registry's insert is last-writer-wins, and this
@@ -492,6 +494,7 @@ pub fn register_jboss_jdkspecific(registry: &mut NativeMethodRegistry) {
         "(I)Ljava/lang/Class;",
         native_jdkspecific_get_caller_class,
     );
+    registry.set_category(__prev_cat);
 }
 
 #[cfg(test)]

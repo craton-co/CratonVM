@@ -237,6 +237,8 @@ pub(crate) fn native_get_caller_class(
 
 /// Install every StackWalker boot-path native this module owns.
 pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sw = "java/lang/StackWalker";
     registry.register(sw, "getInstance", "()Ljava/lang/StackWalker;", native_get_instance_default);
     registry.register(
@@ -303,6 +305,7 @@ pub fn register_stack_walker_boot(registry: &mut NativeMethodRegistry) {
         "()Z",
         native_check_stack_walk_modes,
     );
+    registry.set_category(__prev_cat);
 }
 
 /// `StackStreamFactory$AbstractStackWalker.checkStackWalkModes()Z` —

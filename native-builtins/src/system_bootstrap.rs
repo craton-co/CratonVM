@@ -327,6 +327,8 @@ fn native_win32_set_error_mode(
 /// Register all T14 System bootstrap natives needed for `initPhase1` to
 /// execute real JDK 25 bytecode successfully.
 pub fn register_t14_system_bootstrap(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // SystemProps$Raw — platform and VM properties
     registry.register(
         "jdk/internal/util/SystemProps$Raw",
@@ -370,6 +372,7 @@ pub fn register_t14_system_bootstrap(registry: &mut NativeMethodRegistry) {
         "(J)J",
         native_win32_set_error_mode,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

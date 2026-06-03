@@ -774,6 +774,8 @@ const NIO_SOCKET_IMPL: &str = "sun/nio/ch/NioSocketImpl";
 const PLAIN_SERVER_SOCKET_IMPL: &str = "java/net/PlainServerSocketImpl";
 
 fn register_impl_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(fqn, "socketCreate", "(Z)V", socket_create);
     // NioSocketImpl variant takes a (boolean) too; PlainSocketImpl historically
     // used (boolean) and PlainServerSocketImpl uses (boolean). All match.
@@ -858,6 +860,7 @@ fn register_impl_surface(r: &mut NativeMethodRegistry, fqn: &'static str) {
     // finds the symbol and doesn't UnsatisfiedLinkError.
     r.register(fqn, "initProto", "()V", |_ctx, _args| Ok(None));
     r.register(fqn, "init", "()V", |_ctx, _args| Ok(None));
+    r.set_category(__prev_cat);
 }
 
 /// Anchor for the roadmap-gate grep. Uses the fully-qualified
@@ -871,6 +874,8 @@ pub fn _anchor_socket2_new() {
 
 /// Public entry point — wave coordinator wires this from `lib.rs`.
 pub fn register_plain_socket_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_impl_surface(r, PLAIN_SOCKET_IMPL);
     register_impl_surface(r, NIO_SOCKET_IMPL);
     register_impl_surface(r, PLAIN_SERVER_SOCKET_IMPL);
@@ -884,6 +889,7 @@ pub fn register_plain_socket_real(r: &mut NativeMethodRegistry) {
     // surface in net_phase_e (forbidden file).
     r.register("java/net/Socket", "init", "()V", |_ctx, _args| Ok(None));
     r.register("java/net/ServerSocket", "init", "()V", |_ctx, _args| Ok(None));
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

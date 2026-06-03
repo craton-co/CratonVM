@@ -201,6 +201,8 @@ fn native_aclv_compute_if_absent(
 /// `ArchivedClassLoaders.RESOURCES_CACHE` etc.) inherit these methods, so
 /// dispatch on a subclass receiver still resolves up to the base.
 pub fn register_classloader_value_sidetable(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let class = "jdk/internal/loader/AbstractClassLoaderValue";
     registry.register(
         class,
@@ -226,4 +228,5 @@ pub fn register_classloader_value_sidetable(registry: &mut NativeMethodRegistry)
         "(Ljava/lang/ClassLoader;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
         native_aclv_compute_if_absent,
     );
+    registry.set_category(__prev_cat);
 }

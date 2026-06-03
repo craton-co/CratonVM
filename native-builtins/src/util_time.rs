@@ -195,6 +195,8 @@ fn day_of_week_from_epoch_day(epoch_day: i64) -> i32 {
 }
 
 pub(crate) fn register_time_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- LocalDate ---
     let ld = "java/time/LocalDate";
     registry.register(ld, "of", "(III)Ljava/time/LocalDate;", native_ld_of);
@@ -517,6 +519,7 @@ pub(crate) fn register_time_natives(registry: &mut NativeMethodRegistry) {
         "Ljava/time/LocalTime;",
         native_lt_max,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ---- LocalDate implementations ----
@@ -2050,6 +2053,8 @@ fn alloc_dtf(ctx: &mut dyn NativeContext, pattern: &str) -> ObjectRef {
 }
 
 pub(crate) fn register_time_extras_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- LocalDateTime ---
     let ldt = "java/time/LocalDateTime";
     registry.register(
@@ -2651,6 +2656,7 @@ pub(crate) fn register_time_extras_natives(registry: &mut NativeMethodRegistry) 
         "()Ljava/util/Set;",
         native_zone_id_get_available,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ---- LocalDateTime implementations ----
@@ -5564,6 +5570,8 @@ fn native_dow_from(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 // ---------------------------------------------------------------------------
 
 pub(crate) fn register_t25_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // T2.5.1 — java.time.Clock
     let clock = "java/time/Clock";
     registry.register(
@@ -5688,6 +5696,7 @@ pub(crate) fn register_t25_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/time/temporal/TemporalAccessor;)Ljava/time/DayOfWeek;",
         native_dow_from,
     );
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================

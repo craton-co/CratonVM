@@ -25,6 +25,7 @@
 //! plus the `OnceLock::get_or_init` CAS) is paid exactly once per flag,
 //! and steady-state cost collapses to a relaxed load of the `OnceLock`.
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 /// Build a boolean predicate that returns `true` iff the named env var is
@@ -140,5 +141,98 @@ pub fn strict_swallows() -> bool {
     *CACHE.get_or_init(|| match std::env::var("CRATONVM_STRICT_SWALLOWS") {
         Ok(v) => v == "1",
         Err(_) => false,
+    })
+}
+
+// ── `CRATONVM_REAL` — synthetic-stub differential switch ─────────────────
+
+/// Parsed, process-lifetime view of the `CRATONVM_REAL` (and legacy
+/// `CRATONVM_REAL_JCA`) selector. Decides, per class, whether a
+/// `NativeKind::SyntheticStub` registration should be bypassed in favour of
+/// running the class's real bytecode — so fakes can be differentially
+/// compared against the genuine implementation.
+///
+/// Parsed exactly once from the environment by [`real_bytecode_selector`].
+/// When neither env var is set, every field is empty/false and
+/// [`RealSelector::prefers_real`] returns `false` for all classes — so the
+/// dispatcher behaves byte-for-byte as it does today.
+pub struct RealSelector {
+    /// `CRATONVM_REAL` contained the `all` token — prefer real for every class.
+    all_flag: bool,
+    /// Exact internal-form class names listed in `CRATONVM_REAL`
+    /// (e.g. `java/util/stream/Collectors`).
+    exact_classes: HashSet<String>,
+    /// The `jca` group alias was requested (via the `jca` token in
+    /// `CRATONVM_REAL`, or the legacy `CRATONVM_REAL_JCA` var being set):
+    /// prefer real for the `java/security/`, `javax/crypto/`, and
+    /// `sun/security/` families.
+    jca_group: bool,
+}
+
+impl RealSelector {
+    /// Parse a `RealSelector` from the two env vars. `real` is the raw value
+    /// of `CRATONVM_REAL` (if present); `jca_legacy` is whether the legacy
+    /// `CRATONVM_REAL_JCA` var is set (non-empty).
+    fn parse(real: Option<&str>, jca_legacy: bool) -> Self {
+        let mut all_flag = false;
+        let mut exact_classes = HashSet::new();
+        let mut jca_group = jca_legacy;
+        if let Some(raw) = real {
+            for tok in raw.split(',') {
+                let tok = tok.trim();
+                if tok.is_empty() {
+                    continue;
+                }
+                match tok {
+                    "all" => all_flag = true,
+                    "jca" => jca_group = true,
+                    other => {
+                        exact_classes.insert(other.to_string());
+                    }
+                }
+            }
+        }
+        RealSelector {
+            all_flag,
+            exact_classes,
+            jca_group,
+        }
+    }
+
+    /// `true` iff real bytecode should be preferred over a synthetic-stub
+    /// native for `class_name` (internal form, e.g.
+    /// `java/util/stream/Collectors`). O(1)-ish: a bool, a hash-set membership
+    /// test, and at most three `starts_with` checks.
+    #[inline]
+    pub fn prefers_real(&self, class_name: &str) -> bool {
+        if self.all_flag {
+            return true;
+        }
+        if self.exact_classes.contains(class_name) {
+            return true;
+        }
+        if self.jca_group
+            && (class_name.starts_with("java/security/")
+                || class_name.starts_with("javax/crypto/")
+                || class_name.starts_with("sun/security/"))
+        {
+            return true;
+        }
+        false
+    }
+}
+
+/// Once-initialized accessor for the `CRATONVM_REAL` / `CRATONVM_REAL_JCA`
+/// differential switch. Parses the env vars exactly once; every subsequent
+/// call serves the cached [`RealSelector`].
+#[inline]
+pub fn real_bytecode_selector() -> &'static RealSelector {
+    static CACHE: OnceLock<RealSelector> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let real = std::env::var("CRATONVM_REAL").ok();
+        let jca_legacy = std::env::var_os("CRATONVM_REAL_JCA")
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        RealSelector::parse(real.as_deref(), jca_legacy)
     })
 }

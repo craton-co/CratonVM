@@ -25,6 +25,8 @@ fn alloc_letsgo_wrapper(ctx: &mut dyn NativeContext, cls: &str) -> Option<Object
 }
 
 pub fn register_letsgo_compat_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     register_wrapper_value_of(registry);
     register_wrapper_unbox(registry);
     register_security_fallbacks(registry);
@@ -37,6 +39,7 @@ pub fn register_letsgo_compat_natives(registry: &mut NativeMethodRegistry) {
     #[cfg(feature = "synthetic-jdk")]
     register_blocking_queue_drain_to(registry);
     register_atomic_compat(registry);
+    registry.set_category(__prev_cat);
 }
 
 /// `java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicLong}`
@@ -48,13 +51,18 @@ pub fn register_letsgo_compat_natives(registry: &mut NativeMethodRegistry) {
 /// `COWArrayList(_AtomicBoolean field)` and Spring's `AtomicInteger`
 /// counters without NSME.
 fn register_atomic_compat(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     register_atomic_boolean_compat(r);
     register_atomic_integer_compat(r);
     register_atomic_long_compat(r);
     register_atomic_reference_compat(r);
+    r.set_category(__prev_cat);
 }
 
 fn register_atomic_boolean_compat(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/concurrent/atomic/AtomicBoolean";
     r.register(c, "<init>", "()V", |ctx, args| {
         if let Some(Value::Object(Some(this))) = args.first() {
@@ -116,9 +124,12 @@ fn register_atomic_boolean_compat(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, Value::Int(new_val));
         Ok(Some(Value::Int(if current != 0 { 1 } else { 0 })))
     });
+    r.set_category(__prev_cat);
 }
 
 fn register_atomic_integer_compat(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/concurrent/atomic/AtomicInteger";
     r.register(c, "<init>", "()V", |ctx, args| {
         if let Some(Value::Object(Some(this))) = args.first() {
@@ -259,9 +270,12 @@ fn register_atomic_integer_compat(r: &mut NativeMethodRegistry) {
         let v = match ctx.get_field(this, 0) { Value::Int(n) => n, _ => 0 };
         Ok(Some(Value::Long(v as i64)))
     });
+    r.set_category(__prev_cat);
 }
 
 fn register_atomic_long_compat(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/concurrent/atomic/AtomicLong";
     r.register(c, "<init>", "()V", |ctx, args| {
         if let Some(Value::Object(Some(this))) = args.first() {
@@ -359,9 +373,12 @@ fn register_atomic_long_compat(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, Value::Long(v.wrapping_add(d)));
         Ok(Some(Value::Long(v)))
     });
+    r.set_category(__prev_cat);
 }
 
 fn register_atomic_reference_compat(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let c = "java/util/concurrent/atomic/AtomicReference";
     r.register(c, "<init>", "()V", |ctx, args| {
         if let Some(Value::Object(Some(this))) = args.first() {
@@ -419,6 +436,7 @@ fn register_atomic_reference_compat(r: &mut NativeMethodRegistry) {
         ctx.set_field(this, 0, new_val);
         Ok(Some(current))
     });
+    r.set_category(__prev_cat);
 }
 
 /// Wrapper unboxing methods (`Wrapper.primValue()`).  Logback's
@@ -428,6 +446,8 @@ fn register_atomic_reference_compat(r: &mut NativeMethodRegistry) {
 /// Provide layout-safe getters that read the boxed primitive from
 /// `field 0` (matching our wrapper convention).
 pub fn register_wrapper_unbox(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     r.register("java/lang/Boolean", "booleanValue", "()Z", unbox_int_field);
     r.register("java/lang/Byte", "byteValue", "()B", unbox_int_field);
     r.register("java/lang/Short", "shortValue", "()S", unbox_int_field);
@@ -436,6 +456,7 @@ pub fn register_wrapper_unbox(r: &mut NativeMethodRegistry) {
     r.register("java/lang/Long", "longValue", "()J", unbox_long_field);
     r.register("java/lang/Float", "floatValue", "()F", unbox_float_field);
     r.register("java/lang/Double", "doubleValue", "()D", unbox_double_field);
+    r.set_category(__prev_cat);
 }
 
 fn unbox_int_field(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -571,6 +592,8 @@ fn box_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 /// `Wrapper.valueOf(prim)` for every boxing static. Layout matches our
 /// wrapper convention (`field 0 = primitive value`).
 pub fn register_wrapper_value_of(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     r.register("java/lang/Integer", "valueOf", "(I)Ljava/lang/Integer;", box_integer);
     r.register("java/lang/Short", "valueOf", "(S)Ljava/lang/Short;", box_short);
     r.register("java/lang/Byte", "valueOf", "(B)Ljava/lang/Byte;", box_byte);
@@ -579,6 +602,7 @@ pub fn register_wrapper_value_of(r: &mut NativeMethodRegistry) {
     r.register("java/lang/Long", "valueOf", "(J)Ljava/lang/Long;", box_long);
     r.register("java/lang/Float", "valueOf", "(F)Ljava/lang/Float;", box_float);
     r.register("java/lang/Double", "valueOf", "(D)Ljava/lang/Double;", box_double);
+    r.set_category(__prev_cat);
 }
 
 fn no_op(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
@@ -589,6 +613,8 @@ fn no_op(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
 /// installed).  Matches HotSpot's behaviour since JDK 9 when the
 /// SecurityManager has been removed.
 pub fn register_security_fallbacks(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     r.register(
         "java/security/AccessController",
         "checkPermission",
@@ -659,12 +685,15 @@ pub fn register_security_fallbacks(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(set))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// `BlockingQueue.drainTo(Collection, int)` overload — required by SLF4J's
 /// `LoggerFactory.replayEvents` and by Spring's `TaskExecutor` pools.
 #[cfg(feature = "synthetic-jdk")]
 fn register_blocking_queue_drain_to(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let lbq = "java/util/concurrent/LinkedBlockingQueue";
     r.register(lbq, "drainTo", "(Ljava/util/Collection;I)I", drain_to_lbq_bounded);
 
@@ -674,6 +703,7 @@ fn register_blocking_queue_drain_to(r: &mut NativeMethodRegistry) {
     let bq = "java/util/concurrent/BlockingQueue";
     r.register(bq, "drainTo", "(Ljava/util/Collection;)I", drain_to_iface_unbounded);
     r.register(bq, "drainTo", "(Ljava/util/Collection;I)I", drain_to_iface_bounded);
+    r.set_category(__prev_cat);
 }
 
 #[cfg(feature = "synthetic-jdk")]

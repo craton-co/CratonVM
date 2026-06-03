@@ -1279,6 +1279,8 @@ fn ssc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 /// factories. Idempotent: callers may register multiple times — later
 /// registrations win at the same triple.
 pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sc = "java/nio/channels/SocketChannel";
     let scimpl = "sun/nio/ch/SocketChannelImpl";
     let ssc = "java/nio/channels/ServerSocketChannel";
@@ -1414,6 +1416,7 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
     r.register(server_socket, "isBound", "()Z", ss_wrapper_is_bound);
     r.register(server_socket, "isClosed", "()Z", ss_wrapper_is_closed);
     r.register(server_socket, "close", "()V", ss_wrapper_close);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

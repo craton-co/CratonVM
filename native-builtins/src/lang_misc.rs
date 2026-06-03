@@ -947,6 +947,8 @@ pub(crate) fn native_throwable_get_stack_trace_array(
 // ===========================================================================
 
 pub(crate) fn register_enum_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let e = "java/lang/Enum";
     r.register(e, "<init>", "(Ljava/lang/String;I)V", native_enum_init);
     r.register(e, "ordinal", "()I", native_enum_ordinal);
@@ -966,6 +968,7 @@ pub(crate) fn register_enum_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/Class;",
         native_enum_get_declaring_class,
     );
+    r.set_category(__prev_cat);
 }
 
 /// Enum.<init>(String name, int ordinal) — store name in field 0, ordinal in field 1
@@ -1189,6 +1192,8 @@ pub(crate) fn native_ste_to_string(ctx: &mut dyn NativeContext, args: &[Value]) 
 }
 
 pub(crate) fn register_phase53_record(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let rec = "java/lang/Record";
     // Records are just normal classes with some special semantics
     // We register equals/hashCode/toString stubs that work via fields.
@@ -1290,6 +1295,7 @@ pub(crate) fn register_phase53_record(r: &mut NativeMethodRegistry) {
         let s = ctx.create_string(&result);
         Ok(Some(Value::Object(Some(s))))
     });
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -1297,6 +1303,8 @@ pub(crate) fn register_phase53_record(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p60_record(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Record equals/hashCode/toString already registered in earlier phase with proper
     // field-by-field comparison — only add RecordComponent here.
 
@@ -1319,6 +1327,7 @@ pub(crate) fn register_p60_record(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 2)))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // =============================================================================
@@ -1345,6 +1354,8 @@ pub(crate) fn register_p60_record(r: &mut NativeMethodRegistry) {
 // and the new closure is a strict superset of the existing native (it
 // reads slot 0, validates it's a string, and falls back to null).
 pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // Subset that surfaces in jboss-modules / WildFly catch-blocks (per
     // bench/wildfly-boot/diagnostic.md §WP8.10.7) plus the broader
     // Error/Exception families that any defensive catch will see.
@@ -1468,6 +1479,7 @@ pub fn register_throwable_subclass_natives(r: &mut NativeMethodRegistry) {
             native_throwable_get_cause,
         );
     }
+    r.set_category(__prev_cat);
 }
 
 /// printStackTrace(Ljava/io/PrintStream;)V (and PrintWriter overload).

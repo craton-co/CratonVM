@@ -214,6 +214,8 @@ fn common_pool() -> &'static WorkStealingPool {
 /// single-thread semantics in place (those are driven by the interpreter
 /// via `invoke_virtual` which requires a JvmThread — see commentary above).
 fn register_forkjoin_extras(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let pool = "java/util/concurrent/ForkJoinPool";
 
     // WP4.2: ForkJoinPool.execute(Runnable) — eagerly invoke runnable.run()
@@ -300,6 +302,7 @@ fn register_forkjoin_extras(r: &mut NativeMethodRegistry) {
         let state = lock.lock();
         Ok(Some(Value::Int(if state.queue.is_empty() { 0 } else { 1 })))
     });
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -415,6 +418,8 @@ const SQ_BLOCK_CAP: Duration = Duration::from_millis(2000);
 /// Register hardened SynchronousQueue natives. These OVERRIDE the p58
 /// single-slot stubs in `phases_late::register_p58_synchronous_queue`.
 fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let sq = "java/util/concurrent/SynchronousQueue";
 
     // <init>()V — reset the per-instance slot so fresh queues don't
@@ -671,6 +676,7 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
             if empty_in_slot && empty_in_mirror { 1 } else { 0 },
         )))
     });
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================
@@ -681,8 +687,11 @@ fn register_synchronous_queue_extras(r: &mut NativeMethodRegistry) {
 /// phases-early/phases-late registrations so these callbacks override the
 /// earlier stubs for the same triples.
 pub fn register_concurrent_extras(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_forkjoin_extras(registry);
     register_synchronous_queue_extras(registry);
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================

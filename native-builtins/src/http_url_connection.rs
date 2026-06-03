@@ -958,6 +958,8 @@ fn huc_using_proxy(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallR
 // ---------------------------------------------------------------------------
 
 fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(cls, "<init>", "(Ljava/net/URL;)V", huc_init);
     r.register(cls, "<init>", "()V", huc_init);
     r.register(cls, "connect", "()V", huc_connect);
@@ -1053,9 +1055,12 @@ fn register_one(r: &mut NativeMethodRegistry, cls: &str) {
         huc_get_instance_follow_redirects,
     );
     r.register(cls, "usingProxy", "()Z", huc_using_proxy);
+    r.set_category(__prev_cat);
 }
 
 pub fn register_http_url_connection_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // The legacy `sun.net.www.protocol.http.HttpURLConnection` is the bulk of
     // the surface; the `https` variant subclasses it and overrides only TLS-
     // specific accessors. Both classes get the same native registrations so
@@ -1065,6 +1070,7 @@ pub fn register_http_url_connection_real(r: &mut NativeMethodRegistry) {
     // Some apps use the abstract base class directly via reflection.
     register_one(r, "java/net/HttpURLConnection");
     register_one(r, "javax/net/ssl/HttpsURLConnection");
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

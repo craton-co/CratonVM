@@ -1227,6 +1227,8 @@ fn iocp_drain(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult 
 /// natives plus the AsynchronousChannelGroup methods backed by a real
 /// worker-thread pool. Idempotent.
 pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let asc = "java/nio/channels/AsynchronousSocketChannel";
     let assc = "java/nio/channels/AsynchronousServerSocketChannel";
     let acg = "java/nio/channels/AsynchronousChannelGroup";
@@ -1327,6 +1329,7 @@ pub fn register_async_socket_real(r: &mut NativeMethodRegistry) {
         r.register(cls, "drain", "()V", iocp_drain);
         r.register(cls, "poll", "()V", iocp_drain);
     }
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

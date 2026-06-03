@@ -4778,6 +4778,15 @@ pub fn invoke_or_native(
 ) -> MethodCallResult {
     // Skip expensive class loading for obviously invalid class names (e.g. "<unknown class 0>").
     if class_name.contains('<') || class_name.contains(' ') {
+        // Optional operator diagnostic: surface exactly which call had no
+        // implementation. Gated on CRATONVM_TRACE_UNIMPLEMENTED so it never
+        // spams normal runs. Uses var_os directly (no new env_cache accessor).
+        if std::env::var_os("CRATONVM_TRACE_UNIMPLEMENTED").is_some() {
+            eprintln!(
+                "[cratonvm] unimplemented: {}.{}{} — no native implementation and no loadable bytecode (invalid class name)",
+                class_name, method_name, descriptor
+            );
+        }
         return Err(MethodCallFailed::InternalError(VmError::Linkage(
             LinkageError::NoSuchMethodError {
                 class_name: class_name.to_string(),
@@ -4900,8 +4909,36 @@ pub fn invoke_or_native(
         if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
             eprintln!("[invoke_or_native] direct native hit");
         }
-        return safe_native_call(shared, thread, callback, args)
-            .map(|v| coerce_native_return(v, descriptor));
+        // CRATONVM_REAL differential switch: when this native is tagged a
+        // SyntheticStub AND the selector prefers real bytecode for this class,
+        // skip the fake and fall through to the real-bytecode dispatch at the
+        // end of this function — provided real (non-synthetic, non-ACC_NATIVE)
+        // bytecode actually exists. When CRATONVM_REAL / CRATONVM_REAL_JCA are
+        // unset the selector matches nothing, so `gated` is always false and
+        // behaviour is byte-identical to before.
+        let gated = shared
+            .native_methods
+            .kind_of(effective_class, method_name, descriptor)
+            == Some(cratonvm_native_api::NativeKind::SyntheticStub)
+            && crate::runtime::env_cache::real_bytecode_selector()
+                .prefers_real(effective_class);
+        let has_real = gated && {
+            let cm = shared.class_manager.read();
+            cm.get_loaded_class_id(effective_class)
+                .and_then(|cid| cm.get_class(cid))
+                .map(|cls| {
+                    !cls.is_synthetic_stub
+                        && cls
+                            .find_method(method_name, descriptor)
+                            .map(|m| !m.is_native())
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        };
+        if !(gated && has_real) {
+            return safe_native_call(shared, thread, callback, args)
+                .map(|v| coerce_native_return(v, descriptor));
+        }
     }
     if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
         eprintln!("[invoke_or_native] no direct native; checking hierarchy walk");
@@ -9015,6 +9052,17 @@ fn invoke_on_class_shared_inner(
                     method = format!("{class_name}.{method_name}{descriptor}"),
                     "NoSuchMethodError"
                 );
+                // Optional operator diagnostic: at the terminal not-found point
+                // (no native and no loadable bytecode), emit one clear line so
+                // operators can see exactly what is missing. Gated on
+                // CRATONVM_TRACE_UNIMPLEMENTED to avoid spamming normal runs.
+                // Uses var_os directly (no new env_cache accessor required).
+                if std::env::var_os("CRATONVM_TRACE_UNIMPLEMENTED").is_some() {
+                    eprintln!(
+                        "[cratonvm] unimplemented: {}.{}{} — no native implementation and no loadable bytecode (CratonVM)",
+                        class_name, method_name, descriptor
+                    );
+                }
                 return Err(MethodCallFailed::InternalError(VmError::Linkage(
                     LinkageError::NoSuchMethodError {
                         class_name,

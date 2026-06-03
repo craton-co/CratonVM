@@ -1100,6 +1100,8 @@ fn native_mac_update(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
 }
 
 pub(crate) fn register_crypto_impl_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // SecureRandom — these remain because they wrap the OS CSPRNG
     // (BCryptGenRandom / getrandom) rather than a stub PRNG.
     r.register("java/security/SecureRandom", "nextBytes", "([B)V", native_secure_random_next_bytes);
@@ -1120,6 +1122,7 @@ pub(crate) fn register_crypto_impl_natives(r: &mut NativeMethodRegistry) {
         native_mac_do_final,
         native_mac_update,
     );
+    r.set_category(__prev_cat);
 }
 
 // ============================================================================

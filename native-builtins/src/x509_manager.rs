@@ -946,7 +946,7 @@ fn verify_one_signature(
     cert: &ParsedCert,
     issuer_spki: &[u8],
 ) -> Result<(), TrustError> {
-    use crate::crypto::crypto_impl::{
+    use crate::crypto_impl::{
         parse_ecdsa_public_key, parse_rsa_public_key, Ecdsa, Rsa, Sha256,
     };
 
@@ -2218,7 +2218,7 @@ mod tests {
     // them through the same primitives. No openssl / no fixtures.
     // ====================================================================
 
-    use crate::crypto::crypto_impl::{
+    use crate::crypto_impl::{
         Ecdsa, EcdsaPrivateKey, EcdsaPublicKey, Rsa, RsaPrivateKey, RsaPublicKey, Sha256,
     };
 

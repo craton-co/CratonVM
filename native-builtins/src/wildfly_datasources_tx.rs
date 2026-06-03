@@ -815,6 +815,8 @@ fn native_xa_rollback(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 /// Register every Datasources-subsystem + JTA native. Called from
 /// `register_essential_natives` in `lib.rs`.
 pub fn register_wildfly_datasources_tx_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     // DataSourceService
     registry.register(CLS_DS_SERVICE, "<init>", "(Ljava/lang/String;)V", native_ds_service_init);
     registry.register(
@@ -904,6 +906,7 @@ pub fn register_wildfly_datasources_tx_natives(registry: &mut NativeMethodRegist
     registry.register(CLS_XA_RES, "prepare", "(Ljavax/transaction/xa/Xid;)I", native_xa_prepare);
     registry.register(CLS_XA_RES, "commit", "(Ljavax/transaction/xa/Xid;Z)V", native_xa_commit);
     registry.register(CLS_XA_RES, "rollback", "(Ljavax/transaction/xa/Xid;)V", native_xa_rollback);
+    registry.set_category(__prev_cat);
 }
 
 // ===========================================================================

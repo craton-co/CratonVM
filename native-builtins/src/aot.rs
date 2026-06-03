@@ -1263,6 +1263,8 @@ fn reflect_method_is_annotation_present(
 // ===========================================================================
 
 pub(crate) fn register_aot_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // --- Leyden AOT query methods ---
     r.register(LEYDEN, "isAOTEnabled", "()Z", leyden_is_aot_enabled);
     r.register(LEYDEN, "isTrainingMode", "()Z", leyden_is_training_mode);
@@ -1332,6 +1334,7 @@ pub(crate) fn register_aot_natives(r: &mut NativeMethodRegistry) {
     // Leyden helper class — synthetic object with no backing state; the
     // constructor is an intentional no-op. NEW-6: documented.
     r.register(LEYDEN, "<init>", "()V", native_noop_with_this);
+    r.set_category(__prev_cat);
 }
 
 // ===========================================================================

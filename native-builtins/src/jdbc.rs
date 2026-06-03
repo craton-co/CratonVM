@@ -61,8 +61,11 @@ use cratonvm_types::Value;
 /// Also registers the WP7.1 fixture-side helpers used by
 /// `vm/tests/wp7_1_jdbc_driver_loader.rs`.
 pub fn register_jdbc_driver_natives(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_jdbc_service_loader(registry);
     register_jdbc_driver_helpers(registry);
+    registry.set_category(__prev_cat);
 }
 
 /// Wire the WP1.8 classpath-walking ServiceLoader natives. Split out
@@ -70,7 +73,10 @@ pub fn register_jdbc_driver_natives(registry: &mut NativeMethodRegistry) {
 /// file, and so a future WP can audit the SPI surface separately from
 /// the rest of WP7.1.
 fn register_jdbc_service_loader(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     crate::service_loader::register_service_loader_natives(registry);
+    registry.set_category(__prev_cat);
 }
 
 /// Register the WP7.1 fixture-side driver-discovery helpers. These
@@ -82,6 +88,8 @@ fn register_jdbc_service_loader(registry: &mut NativeMethodRegistry) {
 /// roadmap). When those gaps close, this helper becomes redundant
 /// and the fixture can switch to plain `ServiceLoader.load`.
 fn register_jdbc_driver_helpers(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "cratonvm/Wp71JdbcSpi";
     registry.register(
         cls,
@@ -101,6 +109,7 @@ fn register_jdbc_driver_helpers(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)I",
         native_find_driver_provider,
     );
+    registry.set_category(__prev_cat);
 }
 
 /// Read every `META-INF/services/java.sql.Driver` resource on the

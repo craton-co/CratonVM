@@ -407,10 +407,13 @@ fn cce_enhance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 /// registration. Registry semantics: re-register under the same triple
 /// silently overwrites (`native-api/src/registry.rs:1336-1338`).
 pub fn register_cglib_enhancer(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     registry.register(
         "org/springframework/context/annotation/ConfigurationClassEnhancer",
         "enhance",
         "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/lang/Class;",
         cce_enhance,
     );
+    registry.set_category(__prev_cat);
 }

@@ -49,6 +49,8 @@ fn uptime_ms() -> u64 {
 // ---------------------------------------------------------------------------
 
 pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_management_factory(r);
     register_runtime_mxbean(r);
     register_memory_mxbean(r);
@@ -60,6 +62,7 @@ pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
     register_gc_mxbean(r);
     register_mbean_server(r);
     register_vm_management_impl(r);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -83,6 +86,8 @@ pub fn register_jmx_natives(r: &mut NativeMethodRegistry) {
 /// reachable from `register_synthetic_overrides`, which is skipped in
 /// real-JDK mode (synthetic-mode-only field layouts).
 pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // (probe eprintln removed — registration confirmed working)
     let cls = "sun/management/VMManagementImpl";
 
@@ -408,6 +413,7 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     );
 
     register_jmx_connector_factory(r);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -447,6 +453,8 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
 // protocol: rmi" error during boot.
 // ---------------------------------------------------------------------------
 fn register_jmx_connector_factory(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // Static `newJMXConnector(JMXServiceURL, Map) -> JMXConnector` — the
     // private chain `connect -> newJMXConnector -> ServiceLoader` ends
     // here on the real JDK. Overriding the public factory method shorts
@@ -480,6 +488,7 @@ fn register_jmx_connector_factory(r: &mut NativeMethodRegistry) {
             )))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -507,6 +516,8 @@ fn register_jmx_connector_factory(r: &mut NativeMethodRegistry) {
 /// they are here — `VMManagementImpl.isThreadCpuTimeSupported` etc. all
 /// return `false`).
 pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "sun/management/ThreadImpl";
 
     // No-op population helpers ([JI..., [J[J...) — all leave their output
@@ -556,11 +567,14 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
         "()[J",
         |_ctx, _args| Ok(Some(Value::Object(None))),
     );
+    r.set_category(__prev_cat);
 }
 
 /// `sun.management.ClassLoadingImpl` — most info comes via
 /// `ManagementFactoryHelper`, so this is intentionally minimal.
 pub fn register_class_loading_impl(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "sun/management/ClassLoadingImpl";
 
     // setVerboseClass(Z)V — accept and ignore (synthetic verbose flag is
@@ -576,6 +590,7 @@ pub fn register_class_loading_impl(r: &mut NativeMethodRegistry) {
         "(Lsun/management/VMManagement;)V",
         native_noop_with_this,
     );
+    r.set_category(__prev_cat);
 }
 
 /// `sun.management.GarbageCollectorImpl` — per-collector counters.
@@ -584,6 +599,8 @@ pub fn register_class_loading_impl(r: &mut NativeMethodRegistry) {
 /// what OpenJDK reports when GC notification is disabled (and our
 /// `VMManagementImpl.isGcNotificationSupported` returns `false`).
 pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "sun/management/GarbageCollectorImpl";
 
     let zero_long: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
@@ -621,6 +638,7 @@ pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
     // mirroring MemoryMXBean.gc(). No-op is fine; we don't proxy through
     // to the real GC here (MemoryMXBean.gc() does that elsewhere).
     r.register(cls, "gc", "()V", |_ctx, _args| Ok(None));
+    r.set_category(__prev_cat);
 }
 
 /// `sun.management.MemoryManagerImpl` — base class for memory managers.
@@ -631,6 +649,8 @@ pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
 /// the synthetic field initialisation; we override it to `true` so
 /// `ManagementFactoryHelper` doesn't filter the bean out.)
 pub fn register_memory_manager_impl(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "sun/management/MemoryManagerImpl";
 
     r.register(cls, "<init>", "(Ljava/lang/String;)V", native_noop_with_this);
@@ -656,6 +676,7 @@ pub fn register_memory_manager_impl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// `sun.management.MemoryPoolImpl` — per-pool metadata + usage.
@@ -666,6 +687,8 @@ pub fn register_memory_manager_impl(r: &mut NativeMethodRegistry) {
 /// short-circuit the bytecode so the probe sees the right values
 /// regardless of field-layout drift.
 pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "sun/management/MemoryPoolImpl";
 
     r.register(
@@ -732,6 +755,7 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
             undefined_usage,
         );
     }
+    r.set_category(__prev_cat);
 }
 
 /// Allocate a synthetic `sun.management.MemoryPoolImpl` with `name` +
@@ -774,6 +798,8 @@ pub fn alloc_garbage_collector_impl(
 /// underlying metric is unavailable). All doubles return -1.0 per the
 /// `OperatingSystemMXBean` spec for "load not available".
 pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "sun/management/OperatingSystemImpl";
 
     let neg_one_long: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
@@ -799,6 +825,7 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
 
     // initialize0()V — sets up native counters; nothing to do here.
     r.register(cls, "initialize0", "()V", |_ctx, _args| Ok(None));
+    r.set_category(__prev_cat);
 }
 
 /// `com.sun.management.HotSpotDiagnostic` (internally
@@ -806,6 +833,8 @@ pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
 pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
     // OpenJDK's HotSpotDiagnostic class is in `sun.management` (the public
     // facade lives in `com.sun.management.HotSpotDiagnosticMXBean`).
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "sun/management/HotSpotDiagnostic";
 
     // dumpHeap0(String, Z)V — heap dumping is a major separate effort;
@@ -832,6 +861,7 @@ pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(list))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 /// `sun.management.Flag` — VM flag enumeration.
@@ -839,6 +869,8 @@ pub fn register_hotspot_diagnostic(r: &mut NativeMethodRegistry) {
 /// We don't expose any VM-level manageable flags through JMM, so all
 /// queries return zero / empty.
 pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "sun/management/Flag";
 
     r.register(cls, "getInternalFlagCount", "()I", |_ctx, _args| {
@@ -867,6 +899,7 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +907,8 @@ pub fn register_flag_impl(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_management_factory(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "java/lang/management/ManagementFactory";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -998,6 +1033,7 @@ fn register_management_factory(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(list))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1033,6 +1069,8 @@ fn alloc_runtime_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
 }
 
 fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/RuntimeMXBean";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1107,6 +1145,7 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1144,6 +1183,8 @@ fn alloc_memory_usage(
 }
 
 fn register_memory_mxbean(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/MemoryMXBean";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1200,6 +1241,7 @@ fn register_memory_mxbean(r: &mut NativeMethodRegistry) {
         ctx.force_gc();
         Ok(None)
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1207,6 +1249,8 @@ fn register_memory_mxbean(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_memory_usage(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/MemoryUsage";
     r.register(cls, "<init>", "()V", native_noop_with_this);
     r.register(cls, "<init>", "(JJJJ)V", |ctx, args| {
@@ -1282,6 +1326,7 @@ fn register_memory_usage(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(s))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1301,6 +1346,8 @@ fn alloc_thread_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
 }
 
 fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/ThreadMXBean";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1417,6 +1464,7 @@ fn register_thread_mxbean(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(arr))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1437,6 +1485,8 @@ fn alloc_class_loading_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
 }
 
 fn register_class_loading_mxbean(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/ClassLoadingMXBean";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1461,6 +1511,7 @@ fn register_class_loading_mxbean(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(0)))
     });
     r.register(cls, "setVerbose", "(Z)V", native_noop_with_this);
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1488,6 +1539,8 @@ fn alloc_os_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
 }
 
 fn register_operating_system_mxbean(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/OperatingSystemMXBean";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1528,6 +1581,7 @@ fn register_operating_system_mxbean(r: &mut NativeMethodRegistry) {
         "()D",
         |_ctx, _args| Ok(Some(Value::Double(-1.0))),
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1548,6 +1602,8 @@ fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
 }
 
 fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "java/lang/management/CompilationMXBean";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1570,6 +1626,7 @@ fn register_compilation_mxbean(r: &mut NativeMethodRegistry) {
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1600,6 +1657,8 @@ fn alloc_gc_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
 }
 
 fn register_gc_mxbean(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let cls = "java/lang/management/GarbageCollectorMXBean";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1637,6 +1696,7 @@ fn register_gc_mxbean(r: &mut NativeMethodRegistry) {
     r.register(cls, "isValid", "()Z", |_ctx, _args| {
         Ok(Some(Value::Int(1)))
     });
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
@@ -1644,6 +1704,8 @@ fn register_gc_mxbean(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 
 fn register_mbean_server(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/management/MBeanServer";
     r.register(cls, "<init>", "()V", native_noop_with_this);
 
@@ -1715,6 +1777,7 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(ctx.create_string(response)))))
         },
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

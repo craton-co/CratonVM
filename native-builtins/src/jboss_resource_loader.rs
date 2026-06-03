@@ -175,6 +175,8 @@ fn path_from_string(
 }
 
 pub fn register_resource_loader_natives(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     r.register(
         "org/jboss/modules/xml/ModuleXmlParser$ResourceRootFactory",
         "createResourceLoader",
@@ -188,6 +190,7 @@ pub fn register_resource_loader_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/io/File;Ljava/lang/String;Ljava/lang/String;)Lorg/jboss/modules/ResourceLoader;",
         native_create_resource_loader,
     );
+    r.set_category(__prev_cat);
 }
 
 #[cfg(test)]

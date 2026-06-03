@@ -614,6 +614,8 @@ fn dgram_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 /// Register the WP3.7 DatagramChannel extensions.  Idempotent.
 pub fn register_datagram_real(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let dci = "sun/nio/ch/DatagramChannelImpl";
 
     // open / bind — these use OUR registry; existing t16_dc_* in
@@ -705,6 +707,7 @@ pub fn register_datagram_real(r: &mut NativeMethodRegistry) {
         "()Ljava/net/SocketAddress;",
         dgram_local_address,
     );
+    r.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------
