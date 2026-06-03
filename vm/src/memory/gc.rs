@@ -259,8 +259,119 @@ pub fn update_all_roots(
     //     the stored ObjectRefs to their relocated addresses here.
     cratonvm_native_collections::gc_update_collection_overlay_refs(pointer_map);
 
+    // 18. Singleton built-in class loaders (app / platform) cached in
+    //     process-global mutexes in `native-builtins/src/classloader.rs`.
+    //     Scanned as roots in `roots.rs` step 18; repoint the stored ObjectRefs
+    //     to their relocated addresses here so `getClassLoader()` keeps
+    //     returning the live loader after a moving GC (fixes the intermittent
+    //     stale-ClassLoader → `String.loadClass` cryptoProvider failure).
+    cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(pointer_map);
+
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);
+    // Opt-in (CRATONVM_DBG_HEAP_STALE=1) deep heap-walk: catch un-forwarded /
+    // reclaimed reference fields in OTHER objects (not just this thread's
+    // frames) — where the residual ClassLoader/Locale stale-ref actually lives.
+    verify_heap_object_fields(shared, pointer_map);
+}
+
+/// Opt-in deep heap-stale verifier (`CRATONVM_DBG_HEAP_STALE=1`). After a
+/// moving GC, walks EVERY live plain object and checks each reference field for
+/// a dangling target — the proven method for pinning the residual intermittent
+/// stale-ref (e.g. a `ClassLoader` field that later derefs as a `String`,
+/// surfacing as `String.loadClass` / "Not able to load any cryptoProvider").
+///
+/// Flags three signatures:
+///   (a) target address still a KEY in `pointer_map` → the field was NOT
+///       forwarded (the copier / old→young remembered-set missed this referrer
+///       edge) — the most actionable signal;
+///   (b) target is not a live heap address (points into the reset young
+///       from-space) → the target was reclaimed and its slot freed;
+///   (c) target has an all-zero (reclaimed) header.
+///
+/// Reports the referrer class + field index so the missing barrier/root edge
+/// can be pinned. Output is capped per GC to avoid flooding. Reference arrays
+/// are intentionally skipped here (already covered by the resurrection-drain
+/// remembered-set fix); this pass targets plain object fields.
+fn verify_heap_object_fields(
+    shared: &crate::vm::SharedVm,
+    pointer_map: &HashMap<usize, usize>,
+) {
+    use crate::types::Value;
+    use cratonvm_types::{ObjectHeader, ObjectKind};
+
+    if std::env::var_os("CRATONVM_DBG_HEAP_STALE").is_none() {
+        return;
+    }
+    let heap = &shared.heap;
+    let class_name = |cid: cratonvm_types::ClassId| -> String {
+        shared
+            .class_manager
+            .read()
+            .get_class(cid)
+            .map(|c| c.name.to_string())
+            .unwrap_or_else(|| format!("cid#{}", cid.as_u32()))
+    };
+    let mut reported = 0usize;
+    const CAP: usize = 40;
+    for (ptr, _size) in heap.walk_objects() {
+        if reported >= CAP {
+            break;
+        }
+        // Only plain objects: primitive arrays store raw bytes (reading them as
+        // Value slots would be garbage); reference arrays are covered elsewhere.
+        let hdr = unsafe { &*(ptr as *const ObjectHeader) };
+        if hdr.kind != ObjectKind::Object {
+            continue;
+        }
+        let r_cid = hdr.class_id;
+        let referrer = unsafe { ObjectRef::from_raw(ptr) };
+        let nf = heap.num_fields(referrer);
+        for i in 0..nf {
+            if let Value::Object(Some(target)) = heap.get_field(referrer, i) {
+                let addr = target.as_ptr() as usize;
+                if addr == 0 {
+                    continue;
+                }
+                if let Some(&fwd) = pointer_map.get(&addr) {
+                    eprintln!(
+                        "[heap-stale] UN-FORWARDED: {} field[{}] -> 0x{:x} (should be 0x{:x})",
+                        class_name(r_cid), i, addr, fwd,
+                    );
+                    reported += 1;
+                } else if heap.is_heap_addr(addr).is_none() {
+                    eprintln!(
+                        "[heap-stale] OFF-HEAP target: {} field[{}] -> 0x{:x} (reclaimed/reused-freed)",
+                        class_name(r_cid), i, addr,
+                    );
+                    reported += 1;
+                } else {
+                    let h = unsafe { &*(addr as *const ObjectHeader) };
+                    if h.class_id.as_u32() == 0
+                        && h.identity_hash_code == 0
+                        && h.num_slots == 0
+                        && h.array_length == 0
+                    {
+                        eprintln!(
+                            "[heap-stale] ZEROED target: {} field[{}] -> 0x{:x}",
+                            class_name(r_cid), i, addr,
+                        );
+                        reported += 1;
+                    }
+                }
+                if reported >= CAP {
+                    break;
+                }
+            }
+        }
+    }
+    if reported > 0 {
+        eprintln!(
+            "[heap-stale] ^ {} stale field(s) this GC (pointer_map size={})",
+            reported,
+            pointer_map.len(),
+        );
+    }
 }
 
 /// Post-GC verification: warns if any thread frame local or operand stack value

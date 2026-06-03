@@ -47,6 +47,51 @@ pub fn reset_loader_singletons() {
     class_data_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
+/// GC root scan for the singleton built-in class loaders.
+///
+/// The app + platform `ClassLoader` synthetics live ONLY in the process-global
+/// `app_loader_store` / `platform_loader_store` mutexes (a Rust side-table, not
+/// a Java field or VM root table), so they are invisible to the frame / static
+/// / heap-object root scans. Without this, a moving young GC can reclaim or
+/// relocate the cached loader while `get_or_create_app_loader` keeps returning
+/// the stale `ObjectRef`; the freed slot is then reused by another allocation
+/// and a later `loader.loadClass(...)` dispatches on the wrong object — observed
+/// as BouncyCastle `ClassUtil.loadClass`'s receiver decaying to a String OID,
+/// surfacing intermittently (heap-size dependent) as
+/// "Not able to load any cryptoProvider". Mirrors the `lang_math` /
+/// `lang_invoke` process-global cache root scans (`roots.rs` steps 15–17).
+pub fn gc_scan_loader_singleton_roots(out: &mut Vec<ObjectRef>) {
+    if let Some(o) = *app_loader_store().lock().unwrap_or_else(|e| e.into_inner()) {
+        out.push(o);
+    }
+    if let Some(o) = *platform_loader_store().lock().unwrap_or_else(|e| e.into_inner()) {
+        out.push(o);
+    }
+}
+
+/// Post-GC remap for the singleton built-in class loaders (companion to
+/// [`gc_scan_loader_singleton_roots`]). After a moving collection the cached
+/// loader objects relocate; repoint the stored `ObjectRef`s to their new
+/// addresses so subsequent `getClassLoader()` calls return the live object.
+pub fn gc_update_loader_singleton_refs(
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let remap = |slot: &mut Option<ObjectRef>| {
+        if let Some(obj_ref) = slot.as_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    };
+    remap(&mut app_loader_store().lock().unwrap_or_else(|e| e.into_inner()));
+    remap(&mut platform_loader_store().lock().unwrap_or_else(|e| e.into_inner()));
+}
+
 // ---------------------------------------------------------------------------
 // WP2.3-C — `classData` side-table for `MethodHandles.classData(...)`.
 //
