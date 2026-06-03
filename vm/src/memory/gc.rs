@@ -275,6 +275,74 @@ pub fn update_all_roots(
     verify_heap_object_fields(shared, pointer_map);
 }
 
+/// Opt-in young-object size validator (`CRATONVM_DBG_VALIDATE_NEW=1`). Walks
+/// every live plain object and compares its header `num_slots` (and
+/// `array_length`) against the authoritative `num_total_fields` for its class
+/// (what the interpreter allocates with). A mismatch is the smoking gun for a
+/// JIT `new` that wrote a wrong-size/typed header (the JUnitCore.main miscompile
+/// → heap-walk desync). Reports the FIRST offenders in address order (the
+/// earliest is the root; later entries may be walk-desync garbage). Call after
+/// each GC so it fires on the non-moving (JIT-active) sweep path too.
+pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
+    use cratonvm_types::{ObjectHeader, ObjectKind};
+
+    if std::env::var_os("CRATONVM_DBG_VALIDATE_NEW").is_none() {
+        return;
+    }
+    let heap = &shared.heap;
+    let cm = shared.class_manager.read();
+    // One-shot: dump the class_id -> (name, num_total_fields) table for the
+    // low class_ids that show up in the JUnitCore-corruption walks (6, 12, 34,
+    // 36, ...), so the corrupted object types can be identified by name.
+    {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DUMPED: AtomicBool = AtomicBool::new(false);
+        if !DUMPED.swap(true, Ordering::Relaxed) {
+            for raw in 0u32..64 {
+                let id = cratonvm_types::ClassId::new(raw);
+                if let Some(c) = cm.get_class(id) {
+                    eprintln!(
+                        "[classid] {} -> {} (num_total_fields={})",
+                        raw, c.name, c.num_total_fields,
+                    );
+                }
+            }
+        }
+    }
+    let mut reported = 0usize;
+    const CAP: usize = 25;
+    for (ptr, _size) in heap.walk_objects() {
+        if reported >= CAP {
+            break;
+        }
+        let hdr = unsafe { &*(ptr as *const ObjectHeader) };
+        if hdr.kind != ObjectKind::Object {
+            continue;
+        }
+        let cid = hdr.class_id;
+        let actual = hdr.num_slots as usize;
+        let arrlen = hdr.array_length;
+        match cm.get_class(cid) {
+            Some(c) => {
+                if actual != c.num_total_fields || arrlen != 0 {
+                    eprintln!(
+                        "[young-validate] BAD {} (cid={}) num_slots={} EXPECTED={} array_length={} @0x{:x}",
+                        c.name, cid.as_u32(), actual, c.num_total_fields, arrlen, ptr as usize,
+                    );
+                    reported += 1;
+                }
+            }
+            None => {
+                eprintln!(
+                    "[young-validate] BAD <unknown class> cid={} num_slots={} array_length={} @0x{:x}",
+                    cid.as_u32(), actual, arrlen, ptr as usize,
+                );
+                reported += 1;
+            }
+        }
+    }
+}
+
 /// Opt-in deep heap-stale verifier (`CRATONVM_DBG_HEAP_STALE=1`). After a
 /// moving GC, walks EVERY live plain object and checks each reference field for
 /// a dangling target — the proven method for pinning the residual intermittent
