@@ -402,28 +402,27 @@ pub enum DispatchOutcome {
     FallThrough,
 }
 
-/// Interpreter hook entry point. **Today this is a thin wiring stub:**
-/// it looks the method up in the `OffloadCache` (which analyzes,
-/// lowers, and loads the PTX module on first reach) and currently
-/// returns `FallThrough` on every path. The actual marshal + kernel
-/// launch + write-back + deopt-on-failure dance is a tightly-scoped
-/// follow-up that requires real GPU hardware to validate.
+/// Interpreter hook entry point for transparent GPU offload.
 ///
-/// This signature is final. When the launch glue lands, only the
-/// `LookupOutcome::Hit` branch grows; the call sites in
-/// `interpreter.rs` and the `DispatchOutcome` contract do not change.
+/// Looks the invokestatic target up in the `OffloadCache` (which
+/// analyzes, lowers, and loads the PTX module on first reach). On a
+/// cache `Hit` for an eligible **void** kernel whose largest array
+/// argument clears `--gpu-min-work`, it marshals the arguments to the
+/// device, launches the kernel, synchronizes, and writes the
+/// kernel-written arrays back into the Java heap — returning
+/// `Handled` so the interpreter skips the CPU body. Every other path
+/// (non-void return, work below threshold, marshal/launch failure,
+/// ineligible/blacklisted method) returns `FallThrough`, leaving the
+/// operand stack and locals untouched so the CPU body runs normally.
 ///
-/// # Why we stub instead of skipping the wiring entirely
+/// Non-void kernels (reductions) currently fall through: a `Handled`
+/// outcome would require pushing the kernel's scalar result onto the
+/// operand stack as the call's return value, which the array-writeback
+/// path does not do. Wiring scalar-return-on-stack is the next step.
 ///
-/// 1. The cfg-gated field on `SharedVm`, the cache construction in
-///    `SharedVm::new`, the feature plumbing through `vm-cli`, and the
-///    insertion point in `execute_invokestatic` all need to be
-///    exercised by the compiler today so a future agent on a GPU box
-///    only touches the lookup-and-launch code path.
-/// 2. On a no-GPU machine `cache.has_device()` is false and we never
-///    reach this function at all — the early-return in
-///    `execute_invokestatic` short-circuits. So the stub doesn't
-///    actually run anywhere in this codebase yet.
+/// On a no-GPU machine `cache.has_device()` is false and the
+/// early-return in `execute_invokestatic` short-circuits before this
+/// function is reached.
 pub fn try_dispatch(
     shared: &crate::vm::SharedVm,
     _thread: &mut crate::threading::JvmThread,
@@ -431,7 +430,7 @@ pub fn try_dispatch(
     class_name: &str,
     method_name: &str,
     method_descriptor: &str,
-    _args: &[cratonvm_types::Value],
+    args: &[cratonvm_types::Value],
 ) -> Result<DispatchOutcome, crate::error::MethodCallFailed> {
     // Resolve the class. Cheap when already loaded; the interpreter
     // path always pre-loads + initializes static-target classes
@@ -476,19 +475,99 @@ pub fn try_dispatch(
 
     match outcome {
         LookupOutcome::Hit(_kernel) => {
-            // Launch glue follow-up. Today: fall through to CPU.
-            tracing::debug!(
-                "gpu offload: cache hit for {}.{}{} — launch glue pending; CPU path runs",
+            // Transparent synchronous offload. Two gates first:
+            //
+            // 1. VOID return only. A `Handled` outcome tells the
+            //    interpreter the invokestatic is complete with the
+            //    operand stack already in its post-call shape. For a
+            //    void map (`out[i] = f(a[i])`) that's correct — the
+            //    args were popped and nothing is pushed; the result
+            //    reaches Java via the D→H writeback into the `out`
+            //    array. A NON-void kernel (a reduction) would need its
+            //    scalar result pushed as the return value, which the
+            //    writeback path does not do — so those fall through to
+            //    the CPU. (The analyzer still classifies them; only the
+            //    launch is skipped.)
+            if !method_descriptor.ends_with(")V") {
+                return Ok(DispatchOutcome::FallThrough);
+            }
+            // 2. Real per-element work must clear `--gpu-min-work`. The
+            //    analyzer's `estimated_work` is a fixed 1<<20 placeholder
+            //    for every counted loop, so it cannot gate small inputs;
+            //    use the largest array argument's actual length. Below
+            //    the threshold the host↔device round-trip dominates, so
+            //    run on the CPU.
+            let runtime_work = largest_primitive_array_len(shared, args);
+            if (runtime_work as u32) < shared.config.gpu_min_work {
+                return Ok(DispatchOutcome::FallThrough);
+            }
+            // Marshal args → device, launch the kernel, synchronize, and
+            // write kernel-written arrays back into the Java heap. This
+            // reuses the explicit-path machinery (`dispatch_method_from_native`
+            // registers a submission; we finalize it synchronously here).
+            // Any failure leaves the operand stack + locals untouched, so
+            // falling through to the CPU body is always safe.
+            let handle = dispatch_method_from_native(
+                shared,
                 class_name,
                 method_name,
-                method_descriptor
+                method_descriptor,
+                args,
             );
-            Ok(DispatchOutcome::FallThrough)
+            let result = match lookup_submission(handle) {
+                Some(sub) => finalize_submission(shared, &sub),
+                None => Err("offload submission was not registered".to_string()),
+            };
+            release_submission(handle);
+            match result {
+                Ok(()) => {
+                    tracing::debug!(
+                        "gpu offload: {}.{}{} ran on device (n={})",
+                        class_name,
+                        method_name,
+                        method_descriptor,
+                        runtime_work,
+                    );
+                    Ok(DispatchOutcome::Handled)
+                }
+                Err(msg) => {
+                    tracing::debug!(
+                        "gpu offload: {}.{}{} fell back to CPU: {}",
+                        class_name,
+                        method_name,
+                        method_descriptor,
+                        msg,
+                    );
+                    Ok(DispatchOutcome::FallThrough)
+                }
+            }
         }
         LookupOutcome::Skip | LookupOutcome::Blacklisted => {
             Ok(DispatchOutcome::FallThrough)
         }
     }
+}
+
+/// Largest primitive-array argument length among `args`, or 0 if none.
+/// Used to gate the transparent offload on real per-element work (the
+/// analyzer's `estimated_work` is a fixed placeholder and cannot).
+#[cfg(feature = "gpu-offload")]
+fn largest_primitive_array_len(
+    shared: &crate::vm::SharedVm,
+    args: &[cratonvm_types::Value],
+) -> usize {
+    let mut max_len = 0usize;
+    for arg in args {
+        if let cratonvm_types::Value::Object(Some(r)) = arg {
+            if shared.heap.array_element_type(*r).is_some() {
+                let len = shared.heap.array_length(*r);
+                if len > max_len {
+                    max_len = len;
+                }
+            }
+        }
+    }
+    max_len
 }
 
 #[cfg(test)]
@@ -521,8 +600,9 @@ mod tests {
             .unwrap_or_else(|e| panic!("failed to read fixture {}: {e}", path.display()));
         let cf = read_class(&bytes)
             .unwrap_or_else(|e| panic!("failed to parse fixture {}: {e:?}", path.display()));
-        // `this_class` is already resolved to a String by the reader.
-        (cf.methods, cf.this_class, cf.constant_pool)
+        // `this_class` is resolved to an `Arc<str>` by the reader; this
+        // test helper hands back an owned `String`.
+        (cf.methods, cf.this_class.to_string(), cf.constant_pool)
     }
 
     fn find_method_index(methods: &[ClassFileMethod], name: &str, descriptor: &str) -> u16 {

@@ -411,6 +411,16 @@ fn should_skip_jit_internal(
     // aggressive policy (set via `jit_aggressive_compilation` or
     // `CRATONVM_JIT_ALLOW_PACKAGES`) lifts even the targeted list so
     // developers can surface new miscompiles.
+    // DBG bypass: force-compile JUnitCore.main despite the JUNIT.1 stopgap ban,
+    // so its emitted code can be dumped/diagnosed. Default-off; the ban holds in
+    // normal runs.
+    if class_name == "org/junit/runner/JUnitCore"
+        && method_name == "main"
+        && std::env::var_os("CRATONVM_JIT_UNBAN_JUNITCORE").is_some()
+    {
+        return None;
+    }
+
     if policy == SkipPolicy::Conservative {
         if is_known_miscompile(class_name, method_name)
             && !package_allowed("java/util/", allow_packages)

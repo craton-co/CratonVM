@@ -3586,6 +3586,11 @@ struct Compiler {
     /// Per-local register assignment from graph-coloring allocator.
     /// `local_assignments[i] = Some(reg)` means local i is in that register.
     local_assignments: Vec<Option<u8>>,
+    /// Per-basic-block live-in local sets `(block_start_pc, live_in_bitset)`
+    /// from the allocator — used to build per-OSR-entry-PC dead-local masks so
+    /// the OSR trampoline skips loading locals dead at the entry (a dead local
+    /// would otherwise clobber a live one that shares its coalesced register).
+    osr_block_live_in: Vec<(usize, u64)>,
     /// Callee-saved GPR registers actually used (for prologue/epilogue).
     alloc_used_regs: Vec<u8>,
     /// Per-local XMM register assignment. `None` means the local spills to the frame.
@@ -3975,6 +3980,7 @@ impl Compiler {
 
         // Use graph-coloring allocator results
         let local_assignments = alloc_result.assignments;
+        let osr_block_live_in = alloc_result.block_live_in;
         let alloc_used_regs = alloc_result.used_callee_saved;
         let xmm_assignments = alloc_result.xmm_assignments;
         let alloc_used_xmms = alloc_result.used_xmm_regs;
@@ -4035,6 +4041,7 @@ impl Compiler {
             num_params,
             num_reg_locals,
             local_assignments,
+            osr_block_live_in,
             alloc_used_regs,
             xmm_assignments,
             alloc_used_xmms,
@@ -17619,6 +17626,31 @@ pub fn compile_with_param_slots(
             }
         }
     }
+    // Per-OSR-entry-PC "dead local" mask. The OSR trampoline loads locals into
+    // their (graph-colouring-coalesced) registers in index order; a local that
+    // is DEAD at the entry PC but shares a register with a LIVE local would
+    // clobber the live one when loaded (e.g. an `int[]` arg and a later-loop
+    // accumulator colour to the same callee-saved register because their live
+    // ranges don't overlap — entering the first loop then reading the array
+    // gets the accumulator's value, a null/garbage pointer → spurious NPE →
+    // OSR deopt → back-off → the loops never sustain JIT). The previously-fixed
+    // category-2 high-half clobber is one instance; this generalises it to any
+    // pair of real locals. For each basic-block start PC (OSR entries are
+    // loop-header block starts), mark the register-resident locals NOT live
+    // there so the trampoline skips loading them, leaving each shared register
+    // to its live owner.
+    let reg_resident: u64 = osr_local_assignments
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a.is_some())
+        .fold(0u64, |m, (i, _)| if i < 64 { m | (1u64 << i) } else { m });
+    let mut osr_dead_mask = vec![0u64; code_len + 1];
+    for &(pc, live_in) in &compiler.osr_block_live_in {
+        if pc < osr_dead_mask.len() {
+            osr_dead_mask[pc] = reg_resident & !live_in;
+        }
+    }
+    cm.osr_dead_mask = Some(osr_dead_mask);
     cm.osr_local_assignments = Some(osr_local_assignments);
     cm.osr_xmm_assignments = Some(compiler.xmm_assignments);
     cm.osr_frame_size = compiler.frame_size;
