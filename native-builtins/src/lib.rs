@@ -7353,6 +7353,31 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // is not compiled. Register common exception constructors/getters here so
     // reflective / Spring bootstrap paths do not die on missing natives.
     register_exception_extras_natives(registry);
+
+    // LOCALE / BREAKITER (real-JDK mode): `java.text.BreakIterator`'s static
+    // factories (`getLineInstance` / `getWordInstance` / `getSentenceInstance`
+    // / `getCharacterInstance`) route through
+    //   BreakIterator.createBreakInstance
+    //     -> sun.util.locale.provider.BreakIteratorProviderImpl.getBreakInstance
+    //       -> LocaleResources.getBreakIteratorInfo("BreakIteratorClasses")
+    // which returns `null` on CratonVM because jdk.localedata's class-based
+    // resource bundles are not surfaced through our jimage path. The bytecode
+    // at `BreakIteratorProviderImpl.getBreakInstance` (JDK 25 line 170) then
+    // does `switch (classNames[type])` on the null `classNames` array, throwing
+    //   java.lang.NullPointerException: Cannot load from null array
+    // and aborting JUnit Platform console `--help` text wrapping
+    // (picocli `TextTable.copy` calls `BreakIterator.getLineInstance()` for
+    // line-break boundaries).
+    //
+    // These BreakIterator factory + instance natives (a REAL, working
+    // boundary-analysis iterator — see `register_p66_break_iterator` in
+    // `phases_late.rs`) historically only shipped via
+    // `register_synthetic_overrides`, which is compiled out in real-JDK CLI
+    // builds (no `synthetic-jdk` feature). Register them here so the real-JDK
+    // path also has a functioning iterator and never reaches the broken
+    // null-resource JDK provider path. The allow-list entry at
+    // `vm/src/vm/vm_exec.rs` (BREAKITER) promotes these over the JDK bytecode.
+    crate::phases_late::register_p66_break_iterator(registry);
 }
 
 #[cfg(feature = "synthetic-jdk")]

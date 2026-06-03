@@ -8100,8 +8100,11 @@ impl Compiler {
     ///   LEA  RAX, [R11 + total_size]         ; RAX = new cursor
     ///   CMP  RAX, [R10 + tlab_end_off]
     ///   JA   slow_path                       ; TLAB full
-    ///   MOV  [R10 + tlab_cursor_off], RAX    ; commit
-    ///   MOV  DWORD [R11 + 0], class_id_imm   ; write class_id
+    ///   MOV  DWORD [R11 + 0], class_id_imm   ; write class_id  (header FIRST)
+    ///   MOV  DWORD [R11 + 4], 0              ; kind=Object/elem=Ref/pad
+    ///   MOV  DWORD [R11 + 12], 0             ; array_length=0
+    ///   MOV  DWORD [R11 + 16], num_fields    ; num_slots (walker stride)
+    ///   MOV  [R10 + tlab_cursor_off], RAX    ; commit LAST (publish object)
     ///   ; Hand off to post-init helper which finishes header + primitive
     ///   ; defaults + finalizer registration.
     ///   MOV  ARG0, [RBP - heap_local_off]    ; vm_ptr
@@ -8193,32 +8196,47 @@ impl Compiler {
         self.emit_cmp_r64_mem_disp32(RAX, R10, end_off);
         let tlab_full_patch = self.emit_jcc_rel32_patch(0x87); // JA slow_path
 
-        // Commit the bump: [R10 + cursor_off] = RAX.
-        self.emit_mov_mem_disp32_r64(R10, RAX, cursor_off);
-
-        // Write class_id (4 bytes) at obj_ptr + class_id_off and num_slots
-        // (4 bytes) at offset 16 IMMEDIATELY after the bump-commit. Both
-        // writes must happen before any subsequent safepoint poll or GC
-        // trigger, so the heap walker sees a fully-typed Object header:
+        // BinTrees-18 heap-corruption fix (jit/gc audit, 2026-06):
+        // *** Write the full object header BEFORE committing the TLAB
+        // cursor. ***
         //
-        //   class_id  → identifies the object's class
-        //   num_slots → tells the walker how to advance to the next object
-        //               (size = HEADER_SIZE + num_slots * SLOT_SIZE)
+        // The previous order committed the bump (published the object's
+        // address into `thread.tlab.cursor`) and only THEN wrote the
+        // header fields. That left a window in which the object region was
+        // already part of the "used" portion of the TLAB / young arena but
+        // its header was still the TLAB-zeroed pattern (class_id=0,
+        // kind=Object, num_slots=0). Any heap walk that observed the object
+        // during that window — the non-moving young sweep that runs while
+        // JIT frames are active (`gc_quiescence`), the Cheney to-space
+        // scan, or a background-thread STW collection that parks this
+        // mutator at a poll inside the in-between helper — computed
+        // `size = HEADER_SIZE + 0*SLOT_SIZE = HEADER_SIZE` and stepped 40
+        // bytes into the object's own field region. There it decoded the
+        // first `Value` field cell (discriminant word = 4 = `Object`) as a
+        // bogus header: `class_id=4`, `array_length=1` (upper half of the
+        // 8-byte object-pointer payload), `num_slots=384` (the next cell's
+        // discriminant region) — exactly the
+        // "kind=Object but array_length=1 (num_slots=384, class_id=4)"
+        // inconsistency reported by `gen_object_total_size`, after which
+        // the walker desynced / looped (rc=124 timeout on `bintrees18`).
         //
-        // CRIT (jit/gc audit, 2026-05): a previous incarnation deferred the
-        // num_slots write into the `jit_post_tlab_init` helper. Between the
-        // bump-commit and the helper call, num_slots was 0 (TLAB-zeroed),
-        // which made the walker treat every in-flight object as a 40-byte
-        // empty header and step into the middle of the very next real
-        // object's payload — decoding String char[] bytes as a header and
-        // tripping the "implausible object size" abort during a JIT-
-        // triggered minor GC. Writing num_slots inline closes that race.
+        // Writing the header first means the object is fully walker-coherent
+        // at the instant its address becomes reachable via the committed
+        // cursor: the store to `cursor` below is the single linearization
+        // point, and on x86-64 it is not reordered ahead of the header
+        // stores (TSO: stores are not reordered with older stores). So no
+        // walker can ever see a committed-but-unheadered object.
+        //
+        //   class_id  → identifies the object's class (offset 0)
+        //   off 4     → kind=Object(0) / elem=Reference(0) / padding(0)
+        //   off 12    → array_length=0 (Object kind never sets this)
+        //   num_slots → walker's stride: size = HEADER_SIZE + n*SLOT_SIZE
         //
         // identity_hash_code (offset 8) stays 0 (TLAB-zeroed); the lazy-
         // mint contract in `System.identityHashCode()` handles it on
-        // demand. The helper call below still runs for the
-        // primitive-init / finalizer paths but the header is already
-        // walker-coherent when GC runs inside that helper.
+        // demand. The `jit_post_tlab_init` helper below still runs for the
+        // primitive-init / finalizer paths, but the header is already
+        // walker-coherent before the object is ever published.
         self.emit_mov_dword_mem_disp32_imm32(
             R11,
             class_id_off,
@@ -8244,6 +8262,14 @@ impl Compiler {
             16,
             num_fields as i32, // Cast: x86-64 immediate encoding
         );
+
+        // Commit the bump LAST: [R10 + cursor_off] = RAX. This publishes the
+        // object's end as the new cursor (and, transitively, the object's
+        // address as a live allocation). Every header store above has
+        // already retired in program order; on x86-64's TSO memory model the
+        // commit store cannot be reordered ahead of them, so the object is
+        // fully typed the instant it becomes reachable.
+        self.emit_mov_mem_disp32_r64(R10, RAX, cursor_off);
 
         if skip_post_init_helper {
             // CRIT-2 fast path — no primitive defaults to apply and no
