@@ -32682,107 +32682,18 @@ pub(crate) fn register_pbe_diagnostic(r: &mut NativeMethodRegistry) {
 // No-oping the setter leaves the field null but prevents the throw chain.
 // =============================================================================
 
-pub(crate) fn register_pbe_workaround(registry: &mut NativeMethodRegistry) {
-    // Spring's ConfigurationClassPostProcessor.setMetadataReaderFactory —
-    // bytecode does `Assert.notNull(factory, "...")` which throws when
-    // CratonVM's incomplete BeanFactory passes null at autowire time.
-    // No-op the setter; the field stays null but no exception is thrown.
-    registry.register(
-        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
-        "setMetadataReaderFactory",
-        "(Lorg/springframework/core/type/classreading/MetadataReaderFactory;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // Similar setters that may be called with null during partial bootstrap.
-    registry.register(
-        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
-        "setEnvironment",
-        "(Lorg/springframework/core/env/Environment;)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
-        "setResourceLoader",
-        "(Lorg/springframework/core/io/ResourceLoader;)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        "org/springframework/context/annotation/ConfigurationClassPostProcessor",
-        "setBeanClassLoader",
-        "(Ljava/lang/ClassLoader;)V",
-        |_ctx, _args| Ok(None),
-    );
-
-    // ----- Targeted applyPropertyValues no-op ---------------------------------
+pub(crate) fn register_pbe_workaround(_registry: &mut NativeMethodRegistry) {
+    // synthetic-stub removed: app's real bytecode runs (or clear error if jar absent)
     //
-    // Spring's `AbstractAutowireCapableBeanFactory.applyPropertyValues` is the
-    // method that collects per-property setter exceptions into a single
-    // `PropertyBatchUpdateException` (PBE) at end-of-method. Even after all of
-    // the explicit setter no-ops above and the `NotWritablePropertyException`
-    // suppression added in `register_pbe_diagnostic`, the Spring Boot 4 demo
-    // still throws PBE during creation of the internal infrastructure beans
-    // (`internalConfigurationAnnotationProcessor`,
-    // `internalAutowiredAnnotationProcessor`,
-    // `internalCommonAnnotationProcessor`). These three beans participate in
-    // CratonVM's partial bootstrap path where the surrounding bean factory is
-    // not fully wired — property application has no real work to perform and
-    // the only practical failure mode is the spurious PBE we are trying to
-    // silence.
-    //
-    // We register a handler that intercepts `applyPropertyValues` and, ONLY
-    // for the well-known infrastructure bean names listed above, short-
-    // circuits the method to a no-op so no per-setter exception is ever
-    // captured and no PBE is constructed. For every OTHER bean name, the
-    // handler returns `Ok(None)` as well — there is no fall-through to
-    // bytecode in CratonVM's native registry, so registering this intercept
-    // unconditionally would skip property injection for every bean in the
-    // application.
-    //
-    // CONSEQUENCE / REGRESSION RISK: this is a UNIVERSAL no-op at the dispatch
-    // level. Insurance and letsgo demos which previously relied on
-    // `applyPropertyValues` running real bytecode WILL lose property injection
-    // for their beans. The expectation expressed in the surrounding prompt is
-    // that this trade-off is accepted (better to ship demo than to regress
-    // nothing); orchestrator decides whether to keep it. To disable, comment
-    // out the `registry.register(...)` block below.
-    //
-    // The bean-name conditional logging is kept so that if/when orchestrator
-    // decides to gate this more tightly (e.g. via a check_override-style
-    // allowlist), the diagnostic surface is already in place.
-    registry.register(
-        "org/springframework/beans/factory/support/AbstractAutowireCapableBeanFactory",
-        "applyPropertyValues",
-        "(Ljava/lang/String;Lorg/springframework/beans/factory/support/RootBeanDefinition;Lorg/springframework/beans/BeanWrapper;Lorg/springframework/beans/PropertyValues;)V",
-        |ctx, args| {
-            let bean_name = match args.get(1) {
-                Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
-                _ => String::new(),
-            };
-            if bean_name.contains("internalConfigurationAnnotationProcessor")
-                || bean_name.contains("internalAutowiredAnnotationProcessor")
-                || bean_name.contains("internalCommonAnnotationProcessor")
-            {
-                if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
-                    eprintln!(
-                        "[applyPropertyValues] skipping {} (CratonVM partial-bootstrap recovery)",
-                        bean_name
-                    );
-                }
-            }
-            // Universal no-op — see CONSEQUENCE note above. Returning Ok(None)
-            // is equivalent to "void method, no exception" and matches the
-            // declared `()V` return.
-            Ok(None)
-        },
-    );
-
-    // NOTE: prior iterations registered universal no-ops on
-    // BeanWrapperImpl.setPropertyValue{,s} and AbstractPropertyAccessor's
-    // setPropertyValue{,s} (with every descriptor variant). They DIDN'T fix
-    // demo's PBE (PBE forms via a path not covered) AND regressed insurance
-    // (rc=0 → rc=124 hang because Spring's bean property injection got
-    // silently skipped). Removed. Demo's PBE remains unresolved until a more
-    // targeted shim is found.
+    // Previously this registered no-op setters on Spring's
+    // ConfigurationClassPostProcessor (setMetadataReaderFactory, setEnvironment,
+    // setResourceLoader, setBeanClassLoader) plus a UNIVERSAL no-op on
+    // AbstractAutowireCapableBeanFactory.applyPropertyValues to suppress a
+    // spurious PropertyBatchUpdateException. Those short-circuited the app's
+    // real Spring bytecode (and the universal applyPropertyValues no-op
+    // skipped property injection for every bean). Removed so the application's
+    // own jar bytecode runs; if the jar is absent, callers get a clear
+    // NoSuchMethodError instead of silently-wrong behavior.
 }
 
 // =============================================================================
@@ -32820,144 +32731,20 @@ pub(crate) fn register_pbe_workaround(registry: &mut NativeMethodRegistry) {
 // the stub) but is a UNIVERSAL skip — keep gated by orchestrator.
 // =============================================================================
 
-pub(crate) fn register_de4_demo_stubs(registry: &mut NativeMethodRegistry) {
-    // Two-arg overload: (BeanDefinitionRegistry, Object source) -> Set
-    registry.register(
-        "org/springframework/context/annotation/AnnotationConfigUtils",
-        "registerAnnotationConfigProcessors",
-        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;Ljava/lang/Object;)Ljava/util/Set;",
-        |ctx, _args| {
-            if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
-                eprintln!("[demo-shim] skipping registerAnnotationConfigProcessors(reg,src)");
-            }
-            // Synthesize an empty java/util/HashSet (2-field layout: backing
-            // Object[] at field 0, size Int at field 1). Matches the rest of
-            // phases_late.rs HashSet allocations.
-            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            ctx.set_field(set, 0, Value::Object(Some(arr)));
-            ctx.set_field(set, 1, Value::Int(0));
-            Ok(Some(Value::Object(Some(set))))
-        },
-    );
-    // One-arg overload: (BeanDefinitionRegistry) -> Set
-    registry.register(
-        "org/springframework/context/annotation/AnnotationConfigUtils",
-        "registerAnnotationConfigProcessors",
-        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)Ljava/util/Set;",
-        |ctx, _args| {
-            if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
-                eprintln!("[demo-shim] skipping registerAnnotationConfigProcessors(reg)");
-            }
-            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-            ctx.set_field(set, 0, Value::Object(Some(arr)));
-            ctx.set_field(set, 1, Value::Int(0));
-            Ok(Some(Value::Object(Some(set))))
-        },
-    );
-
-    // --- DE5: defang ConfigurationClassPostProcessor (CCPP) ----------------
-    // The bean "internalConfigurationAnnotationProcessor" is an instance of
-    // org.springframework.context.annotation.ConfigurationClassPostProcessor.
-    // Even if AnnotationConfigUtils.registerAnnotationConfigProcessors is
-    // shimmed, the bean is still autoregistered by AnnotationConfigApplicationContext.<init>
-    // (and other code paths in Spring Boot 4). Once it's created, BeanWrapperImpl
-    // tries to populate properties (setBeanClassLoader, setEnvironment,
-    // setResourceLoader, setBeanFactory, etc.) and throws PropertyBatchUpdateException
-    // when those setters fail. Make the constructor + setters no-ops so the
-    // bean is harmless even if instantiated.
-    let ccpp = "org/springframework/context/annotation/ConfigurationClassPostProcessor";
-    registry.register(ccpp, "<init>", "()V", |_ctx, _args| {
-        if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
-            eprintln!("[demo-shim] CCPP.<init> no-op");
-        }
-        Ok(None)
-    });
-    registry.register(
-        ccpp,
-        "setBeanFactory",
-        "(Lorg/springframework/beans/factory/BeanFactory;)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        ccpp,
-        "setBeanClassLoader",
-        "(Ljava/lang/ClassLoader;)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        ccpp,
-        "setEnvironment",
-        "(Lorg/springframework/core/env/Environment;)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        ccpp,
-        "setResourceLoader",
-        "(Lorg/springframework/core/io/ResourceLoader;)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        ccpp,
-        "setMetadataReaderFactory",
-        "(Lorg/springframework/core/type/classreading/MetadataReaderFactory;)V",
-        |_ctx, _args| Ok(None),
-    );
-    registry.register(
-        ccpp,
-        "setApplicationStartup",
-        "(Lorg/springframework/core/metrics/ApplicationStartup;)V",
-        |_ctx, _args| Ok(None),
-    );
-    // The two PBFP/BDR-PP methods that drive @Configuration class processing.
-    registry.register(
-        ccpp,
-        "postProcessBeanDefinitionRegistry",
-        "(Lorg/springframework/beans/factory/support/BeanDefinitionRegistry;)V",
-        |_ctx, _args| {
-            if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
-                eprintln!("[demo-shim] CCPP.postProcessBeanDefinitionRegistry no-op");
-            }
-            Ok(None)
-        },
-    );
-    registry.register(
-        ccpp,
-        "postProcessBeanFactory",
-        "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
-        |_ctx, _args| {
-            if std::env::var_os("CRATONVM_DBG_PBE").is_some() {
-                eprintln!("[demo-shim] CCPP.postProcessBeanFactory no-op");
-            }
-            Ok(None)
-        },
-    );
-
-    // --- DE5: opt-in escape hatch — skip ALL BFPP invocation --------------
-    // If CRATONVM_DEMO_SKIP_BFPP=1 is set in the environment AT REGISTRATION
-    // TIME, intercept AbstractApplicationContext.invokeBeanFactoryPostProcessors
-    // entirely (no-op return). This loses @Configuration scanning for the
-    // whole app but guarantees the PBE-throwing wiring path never runs.
+pub(crate) fn register_de4_demo_stubs(_registry: &mut NativeMethodRegistry) {
+    // synthetic-stub removed: app's real bytecode runs (or clear error if jar absent)
     //
-    // The native-method registry has no "fall through to JVM" sentinel, so
-    // we MUST NOT register the shim unconditionally — doing so would break
-    // every other Spring app that runs after the demo. Gating registration
-    // on the env var means the real Java method runs whenever the flag is
-    // unset, preserving normal Spring behavior for all non-demo workloads.
-    if std::env::var_os("CRATONVM_DEMO_SKIP_BFPP").is_some() {
-        registry.register(
-            "org/springframework/context/support/AbstractApplicationContext",
-            "invokeBeanFactoryPostProcessors",
-            "(Lorg/springframework/beans/factory/config/ConfigurableListableBeanFactory;)V",
-            |_ctx, _args| {
-                tracing::warn!(
-                    "[demo-shim] invokeBeanFactoryPostProcessors skipped (CRATONVM_DEMO_SKIP_BFPP=1)"
-                );
-                Ok(None)
-            },
-        );
-    }
+    // Previously this registered:
+    //   - AnnotationConfigUtils.registerAnnotationConfigProcessors (both
+    //     overloads) returning an empty synthetic java/util/HashSet,
+    //   - ConfigurationClassPostProcessor.<init> + every setter + the two
+    //     postProcessBeanDefinitionRegistry/postProcessBeanFactory methods as
+    //     no-ops,
+    //   - an env-gated no-op on
+    //     AbstractApplicationContext.invokeBeanFactoryPostProcessors.
+    // All of these short-circuited Spring's real @Configuration / bean
+    // post-processing bytecode. Removed so the application's own jar bytecode
+    // runs; if the jar is absent, callers get a clear NoSuchMethodError.
 }
 
 // =============================================================================
@@ -41286,6 +41073,9 @@ fn json_node_to_string(ctx: &mut dyn NativeContext, node: ObjectRef) -> String {
 /// Falls back to `Value::Object(None)` if the call fails for any reason
 /// (which still lets a `.findFirst().orElseThrow(...)` consumer crash, but
 /// at least doesn't double-fault inside the native bridge).
+// Retained helper (no longer wired after the ES4 synthetic-stub removal);
+// kept for potential reuse, silenced to avoid an unused-fn warning.
+#[allow(dead_code)]
 fn es4_empty_stream(ctx: &mut dyn NativeContext) -> MethodCallResult {
     match ctx.invoke(
         "java/util/stream/Stream",
@@ -41299,49 +41089,18 @@ fn es4_empty_stream(ctx: &mut dyn NativeContext) -> MethodCallResult {
     }
 }
 
-pub(crate) fn register_es4_elasticsearch_stubs(r: &mut NativeMethodRegistry) {
-    // (1) CliToolLauncher.main — turn the whole CLI bootstrap into a no-op.
-    // When ES's main returns, the JVM finishes naturally with rc=0; the
-    // server isn't really running, but the boot path is exercised.
-    r.register(
-        "org/elasticsearch/launcher/CliToolLauncher",
-        "main",
-        "([Ljava/lang/String;)V",
-        |_ctx, _args| Ok(None),
-    );
-
-    // (2) CliToolProvider.load(ClassLoader) -> Stream<CliToolProvider>.
-    // Returning an empty Stream short-circuits the .toList() / .filter()
-    // chain in CliToolLauncher.  If (1) above is hit first this never
-    // runs, but registering it defends against alternate entry points
-    // (e.g. tests, embeds) that bypass CliToolLauncher.main.
-    r.register(
-        "org/elasticsearch/cli/CliToolProvider",
-        "load",
-        "(Ljava/lang/ClassLoader;)Ljava/util/stream/Stream;",
-        |ctx, _args| es4_empty_stream(ctx),
-    );
-
-    // (3) Log4j ServiceLoaderUtil.loadClassloaderServices — drives Log4j's
-    // own provider discovery.  Returning an empty Stream forces Log4j onto
-    // its no-op fallback path rather than tripping the same lambda no-op
-    // dispatch issue inside its Stream pipeline.
-    r.register(
-        "org/apache/logging/log4j/util/ServiceLoaderUtil",
-        "loadClassloaderServices",
-        "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/ClassLoader;Z)Ljava/util/stream/Stream;",
-        |ctx, _args| es4_empty_stream(ctx),
-    );
-    // Defensive: register against the simpler 3-arg overload too — Log4j's
-    // descriptor varies across minor versions, and the registry is
-    // last-writer-wins so a missing signature simply means this entry is
-    // never consulted.
-    r.register(
-        "org/apache/logging/log4j/util/ServiceLoaderUtil",
-        "loadClassloaderServices",
-        "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/ClassLoader;)Ljava/util/stream/Stream;",
-        |ctx, _args| es4_empty_stream(ctx),
-    );
+pub(crate) fn register_es4_elasticsearch_stubs(_r: &mut NativeMethodRegistry) {
+    // synthetic-stub removed: app's real bytecode runs (or clear error if jar absent)
+    //
+    // Previously this registered:
+    //   - org.elasticsearch.launcher.CliToolLauncher.main as a no-op (fake
+    //     rc=0 boot without actually running ES),
+    //   - org.elasticsearch.cli.CliToolProvider.load returning an empty Stream,
+    //   - org.apache.logging.log4j.util.ServiceLoaderUtil.loadClassloaderServices
+    //     (both overloads) returning an empty Stream.
+    // These short-circuited Elasticsearch / Log4j real provider-discovery and
+    // CLI bytecode. Removed so the application's own jar bytecode runs; if the
+    // jar is absent, callers get a clear NoSuchMethodError.
 }
 
 // =============================================================================
