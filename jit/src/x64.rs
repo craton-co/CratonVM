@@ -3191,6 +3191,190 @@ fn analyze_loop_bound(
     None
 }
 
+/// Soundly identify the `(array_local, index_local)` operands consumed by each
+/// array load/store in a counted loop, via operand-stack *producer* tracking.
+///
+/// The legacy positional heuristics (`find_store_index_pc` /
+/// `find_preceding_iload` / `find_preceding_aload`) guessed the index/array by
+/// counting bytecode instructions backward from the access ("the index is the
+/// load 2 instructions before the store"). That is unsound the moment the
+/// value or index expression spans more than one instruction. The canonical
+/// scatter store `result[off + i] = src[i]` is the textbook break: the inner
+/// `iload i` (the *src* index) sits exactly two instructions before `iastore`,
+/// so the heuristic decided `index == i` (the IV) and elided the store's bounds
+/// check — while the real index `off + i` runs past `result.length`, turning
+/// the store into an out-of-bounds heap write that overwrites a neighbouring
+/// object's header (the "kind=Object but array_length set" corruption seen
+/// across the BC / Spring / JUnit JIT crashes). The array heuristic was
+/// likewise wrong: it would guard `src.length` while the store targeted
+/// `result`.
+///
+/// This pass simulates the operand stack as a vector of *producer PCs*, started
+/// empty at the loop header (the stack-empty point for javac counted loops). At
+/// each array access the array and index operands are read from their exact
+/// stack positions, so an access is reported only when its index is genuinely
+/// produced by a bare `iload` and its array by a bare `aload`. Anything the
+/// simulator cannot model precisely — method calls, `dup2`/`swap`/`dup_x*`,
+/// switches, `wide`, or a control-flow join where the linear stack is no longer
+/// authoritative — makes it STOP, after which no further access in the loop is
+/// reported. STOP/underflow is always conservative: the per-element bounds
+/// check is kept.
+fn analyze_array_access_operands(
+    code: &[u8],
+    header: usize,
+    back_edge_end: usize,
+) -> FxHashMap<usize, (usize, usize)> {
+    let mut out: FxHashMap<usize, (usize, usize)> = FxHashMap::default();
+    let code_len = code.len();
+    if header >= back_edge_end || back_edge_end > code_len {
+        return out;
+    }
+
+    // Precompute forward conditional-branch targets that land inside the loop.
+    // These are control-flow *join* points where the linearly-simulated
+    // producer stack is no longer guaranteed to match every predecessor, so the
+    // walk must stop before analysing them. (Backward targets re-enter at the
+    // same stack height by the JVM's structural constraint and need no special
+    // handling; goto/switch/return are not modelled and stop the walk anyway.)
+    let mut join_targets: FxHashSet<usize> = FxHashSet::default();
+    {
+        let mut pc = header;
+        while pc < back_edge_end {
+            let op = code[pc];
+            if matches!(op, 0x99..=0xa6 | 0xc6 | 0xc7) && pc + 2 < code_len {
+                let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+                let target = pc as i32 + off;
+                if target > pc as i32 && (target as usize) < back_edge_end {
+                    join_targets.insert(target as usize);
+                }
+            }
+            pc += bytecode_len_at(code, pc);
+        }
+    }
+
+    let mut producers: Vec<usize> = Vec::new();
+    let mut pc = header;
+    while pc < back_edge_end {
+        // A join: the operand stack here may differ per predecessor path.
+        if pc != header && join_targets.contains(&pc) {
+            break;
+        }
+        let op = code[pc];
+        match op {
+            // Array loads: [.., array, index] -> [.., value].
+            0x2e..=0x35 => {
+                let n = producers.len();
+                if n < 2 {
+                    break;
+                }
+                let array_pc = producers[n - 2];
+                let index_pc = producers[n - 1];
+                if let (Some(al), Some(il)) = (
+                    extract_aload_local(code, array_pc),
+                    extract_iload_local(code, index_pc),
+                ) {
+                    out.insert(pc, (al, il));
+                }
+                producers.truncate(n - 2);
+                producers.push(pc);
+            }
+            // Array stores: [.., array, index, value] -> [..].
+            0x4f..=0x56 => {
+                let n = producers.len();
+                if n < 3 {
+                    break;
+                }
+                let array_pc = producers[n - 3];
+                let index_pc = producers[n - 2];
+                if let (Some(al), Some(il)) = (
+                    extract_aload_local(code, array_pc),
+                    extract_iload_local(code, index_pc),
+                ) {
+                    out.insert(pc, (al, il));
+                }
+                producers.truncate(n - 3);
+            }
+            // Pure pushes — consume 0, produce exactly 1 value (one entry,
+            // category-1 or -2 alike: a long/double is a single producer here).
+            0x01..=0x14    // aconst_null..ldc2_w
+            | 0x15..=0x19  // iload/lload/fload/dload/aload (wide index)
+            | 0x1a..=0x2d  // *load_0.._3
+            | 0xb2         // getstatic — pushes exactly one value
+            | 0xbb         // new
+            => {
+                producers.push(pc);
+            }
+            // Consume 1, produce 1.
+            0x74..=0x77    // ineg/lneg/fneg/dneg
+            | 0x85..=0x93  // i2l..i2s conversions
+            | 0xb4         // getfield  (objref -> value)
+            | 0xbc | 0xbd  // newarray/anewarray  (count -> arrayref)
+            | 0xbe         // arraylength
+            | 0xc0 | 0xc1  // checkcast/instanceof
+            => {
+                let n = producers.len();
+                if n < 1 {
+                    break;
+                }
+                producers.truncate(n - 1);
+                producers.push(pc);
+            }
+            // Consume 2, produce 1.
+            0x60..=0x73    // i/l/f/d add/sub/mul/div/rem
+            | 0x78..=0x83  // shifts + and/or/xor (int & long)
+            | 0x94..=0x98  // lcmp / fcmp* / dcmp*
+            => {
+                let n = producers.len();
+                if n < 2 {
+                    break;
+                }
+                producers.truncate(n - 2);
+                producers.push(pc);
+            }
+            // Consume 1, produce 0.
+            0x36..=0x3a    // istore/lstore/fstore/dstore/astore (wide index)
+            | 0x3b..=0x4e  // *store_0.._3
+            | 0x57         // pop
+            | 0xb3         // putstatic
+            | 0xc2 | 0xc3  // monitorenter/monitorexit
+            // Conditional single-operand branches — fall-through continues.
+            | 0x99..=0x9e  // if<cond>
+            | 0xc6 | 0xc7  // ifnull/ifnonnull
+            => {
+                let n = producers.len();
+                if n < 1 {
+                    break;
+                }
+                producers.truncate(n - 1);
+            }
+            // Consume 2, produce 0.
+            0xb5           // putfield  (objref + value)
+            | 0x9f..=0xa6  // if_icmp<cond> / if_acmp<cond>
+            => {
+                let n = producers.len();
+                if n < 2 {
+                    break;
+                }
+                producers.truncate(n - 2);
+            }
+            // dup — duplicate the top producer.
+            0x59 => match producers.last().copied() {
+                Some(t) => producers.push(t),
+                None => break,
+            },
+            // iinc / nop — no stack effect.
+            0x84 | 0x00 => {}
+            // Everything else (goto, switches, returns, athrow, invoke*,
+            // dup2/swap/dup_x*, pop2, wide, multianewarray, jsr/ret, ...) is not
+            // modelled: stop so no access is reported on a desynchronised stack.
+            _ => break,
+        }
+        pc += bytecode_len_at(code, pc);
+    }
+
+    out
+}
+
 /// Find array accesses in a loop that use the induction variable as index
 /// and an unmodified local as the array reference. Returns the set of
 /// bytecode PCs that are provably safe (index < bound ≤ array.length).
@@ -3198,142 +3382,42 @@ fn analyze_loop_bound(
 /// The key insight: if the loop bound comes from arraylength (or a local
 /// that holds arraylength), and the index is the induction variable that
 /// starts at 0 and increments by 1 up to bound, all accesses are safe.
+///
+/// Operand identification is delegated to `analyze_array_access_operands`
+/// (sound producer-stack tracking); `operands` maps each analysable array
+/// access PC to its `(array_local, index_local)`.
 fn find_safe_array_accesses(
     code: &[u8],
     header: usize,
     back_edge_end: usize,
     bounds: &LoopBoundsInfo,
     modified: u64,
+    operands: &FxHashMap<usize, (usize, usize)>,
 ) -> FxHashSet<usize> {
     let mut safe_pcs = FxHashSet::default();
 
-    let mut pc = header;
-    while pc < back_edge_end {
-        let op = code[pc];
-        // Array load/store opcodes: 0x2e-0x35 (loads), 0x4f-0x56 (stores)
-        if matches!(op, 0x2e..=0x35 | 0x4f..=0x56) {
-            // For loads: stack has [array, index] before this opcode
-            // For stores: stack has [array, index, value] before this opcode
-            // We need to trace back to find which locals provided array and index.
-            //
-            // Simple approach: look at the 2-3 instructions before this opcode.
-            // Pattern for loads: aload/iload <array_local>; iload <index_local>; xaload
-            // Pattern for stores: aload/iload <array_local>; iload <index_local>; xload <val>; xastore
+    // The header range guard (emitted in `compile`) proves `array.length >=
+    // bound` ONCE at entry, so the BOUND local must itself be loop-invariant:
+    // if the body raised `bound` afterwards, the per-iteration exit test
+    // `iv < bound` could admit `iv >= array.length` on a later trip — an
+    // out-of-bounds access past the stale guard (SECURITY FIX V16).
+    match bounds.bound_local {
+        Some(bl) if bl < 64 && (modified & (1u64 << bl)) == 0 => {}
+        _ => return safe_pcs,
+    }
 
-            // Check if the index is the induction variable
-            // For loads, the instruction before is the index load
-            // For stores, we need to look further back
-
-            let index_check_pc = if matches!(op, 0x4f..=0x56) {
-                // Store: skip back past value load to find index load
-                // This is harder statically — we'd need to track the stack.
-                // Simple heuristic: look for the pattern aload; iload iv; load val; xastore
-                find_store_index_pc(code, header, pc)
-            } else {
-                // Load: the instruction right before is the index load
-                find_preceding_iload(code, header, pc)
-            };
-
-            if let Some(idx_pc) = index_check_pc {
-                let idx_local = extract_iload_local(code, idx_pc);
-                if let Some(idx) = idx_local {
-                    if idx == bounds.induction_var {
-                        // The index is the induction variable.
-                        // Check that the array ref is from an unmodified local
-                        let arr_pc = find_preceding_aload(code, header, idx_pc);
-                        if let Some(a_pc) = arr_pc {
-                            let arr_local = extract_aload_local(code, a_pc);
-                            if let Some(al) = arr_local {
-                                if al < 64 && (modified & (1u64 << al)) == 0 {
-                                    // Array ref is invariant in this loop.
-                                    // Mark this access as safe if bound_local exists
-                                    // (meaning the loop is bounded by some local).
-                                    //
-                                    // SECURITY FIX (V16): the access is only
-                                    // safe to elide if the BOUND local is also
-                                    // loop-invariant. The header range guard
-                                    // (emitted in `compile`) proves
-                                    // `array.length >= bound` ONCE at entry. If
-                                    // the loop body raises `bound` afterwards,
-                                    // the per-iteration exit test `iv < bound`
-                                    // can admit `iv >= array.length` on a later
-                                    // trip — an out-of-bounds access past the
-                                    // stale guard. Requiring `bound` ∉ modified
-                                    // ties the guarded value to the value the
-                                    // exit test reads every iteration, closing
-                                    // the gap. (Array-ref and IV invariance are
-                                    // already enforced above and in
-                                    // `find_induction_variable` respectively.)
-                                    if let Some(bl) = bounds.bound_local {
-                                        let bound_invariant =
-                                            bl < 64 && (modified & (1u64 << bl)) == 0;
-                                        if bound_invariant {
-                                            safe_pcs.insert(pc);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    for (&pc, &(arr_local, idx_local)) in operands {
+        // Index must be the induction variable; array ref must be a
+        // loop-invariant local (so the single header guard stays valid).
+        if idx_local == bounds.induction_var
+            && arr_local < 64
+            && (modified & (1u64 << arr_local)) == 0
+        {
+            safe_pcs.insert(pc);
         }
-        pc += bytecode_len_at(code, pc);
     }
 
     safe_pcs
-}
-
-/// Find the bytecode PC of the iload that provides the index for an array load at `target_pc`.
-/// Scans backward from target_pc looking for an iload-family instruction.
-fn find_preceding_iload(code: &[u8], start: usize, target_pc: usize) -> Option<usize> {
-    // Simple: walk forward from start, track last iload PC before target_pc
-    let mut last_iload_pc = None;
-    let mut pc = start;
-    while pc < target_pc {
-        if matches!(code[pc], 0x1a..=0x1d | 0x15) {
-            last_iload_pc = Some(pc);
-        }
-        pc += bytecode_len_at(code, pc);
-    }
-    // The last iload before the array opcode is the index
-    last_iload_pc
-}
-
-/// Find the bytecode PC of the aload that provides the array ref before `target_pc`.
-/// Scans backward looking for an aload-family instruction.
-fn find_preceding_aload(code: &[u8], start: usize, target_pc: usize) -> Option<usize> {
-    let mut last_aload_pc = None;
-    let mut pc = start;
-    while pc < target_pc {
-        if matches!(code[pc], 0x2a..=0x2d | 0x19) {
-            last_aload_pc = Some(pc);
-        }
-        // Also track iload (could be array index) to reset aload tracking
-        pc += bytecode_len_at(code, pc);
-    }
-    last_aload_pc
-}
-
-/// For array stores, find the iload that provides the index.
-/// Pattern: aload arr; iload idx; <value_load>; xastore
-fn find_store_index_pc(code: &[u8], start: usize, store_pc: usize) -> Option<usize> {
-    // Walk forward tracking the last 3 instructions before store_pc
-    let mut prev3 = [0usize; 3]; // circular: [arr_load, idx_load, val_load]
-    let mut count = 0usize;
-    let mut pc = start;
-    while pc < store_pc {
-        prev3[count % 3] = pc;
-        count += 1;
-        pc += bytecode_len_at(code, pc);
-    }
-    if count >= 2 {
-        // The index load is 2 instructions before the store
-        let idx_slot = if count >= 3 { (count - 2) % 3 } else { 0 };
-        Some(prev3[idx_slot])
-    } else {
-        None
-    }
 }
 
 /// Extract the local variable index from an iload instruction at `pc`.
@@ -3393,8 +3477,15 @@ fn analyze_bounds_elimination(
         // Step 3: Find modified locals in loop body
         let modified = find_modified_locals(code, header, back_edge_end);
 
+        // Step 3b: Soundly identify the (array_local, index_local) consumed by
+        // each analysable array access via operand-stack producer tracking.
+        // Both the static and speculative passes below consult this map instead
+        // of the old positional heuristics that mis-identified scatter stores.
+        let operands = analyze_array_access_operands(code, header, back_edge_end);
+
         // Step 4: Find safe array accesses (statically proven)
-        let loop_safe = find_safe_array_accesses(code, header, back_edge_end, &bounds, modified);
+        let loop_safe =
+            find_safe_array_accesses(code, header, back_edge_end, &bounds, modified, &operands);
         safe_pcs.extend(&loop_safe);
 
         // Step 5: Speculative BCE — for counted loops with IV from 0..N step 1,
@@ -3421,14 +3512,16 @@ fn analyze_bounds_elimination(
             .bound_local
             .map(|bl| bl < 64 && (modified & (1u64 << bl)) == 0)
             .unwrap_or(false);
-        if let Some(bound_local) = bounds.bound_local.filter(|_| bound_invariant) {
+        // DBG (env-gated): CRATONVM_JIT_NO_SPEC_BCE disables ONLY the speculative
+        // (runtime-guarded) BCE, keeping the statically-proven elisions — to
+        // isolate whether the speculative guard is the unsound corruptor.
+        let no_spec_bce = std::env::var_os("CRATONVM_JIT_NO_SPEC_BCE").is_some();
+        if let Some(bound_local) = bounds.bound_local.filter(|_| bound_invariant && !no_spec_bce) {
             let speculative_accesses = find_speculative_array_accesses(
-                code,
-                header,
-                back_edge_end,
                 &bounds,
                 modified,
                 &loop_safe,
+                &operands,
             );
             if !speculative_accesses.is_empty() {
                 let mut guard_arrays: Vec<usize> = Vec::new();
@@ -3457,57 +3550,36 @@ fn analyze_bounds_elimination(
 /// speculative BCE with a deopt guard at the loop header.
 ///
 /// Returns vec of (bytecode_pc_of_access, array_local).
+///
+/// Operand identification comes from `analyze_array_access_operands` via the
+/// `operands` map (sound producer-stack tracking) — the old positional
+/// heuristics mis-identified scatter stores and elided the wrong array's
+/// bounds check.
 fn find_speculative_array_accesses(
-    code: &[u8],
-    header: usize,
-    back_edge_end: usize,
     bounds: &LoopBoundsInfo,
     modified: u64,
     already_safe: &FxHashSet<usize>,
+    operands: &FxHashMap<usize, (usize, usize)>,
 ) -> Vec<(usize, usize)> {
     let mut result = Vec::new();
-    let mut pc = header;
-    while pc < back_edge_end {
-        let op = code[pc];
-        if matches!(op, 0x2e..=0x35 | 0x4f..=0x56) && !already_safe.contains(&pc) {
-            let index_check_pc = if matches!(op, 0x4f..=0x56) {
-                find_store_index_pc(code, header, pc)
-            } else {
-                find_preceding_iload(code, header, pc)
-            };
-
-            if let Some(idx_pc) = index_check_pc {
-                let idx_local = extract_iload_local(code, idx_pc);
-                if let Some(idx) = idx_local {
-                    if idx == bounds.induction_var {
-                        let arr_pc = find_preceding_aload(code, header, idx_pc);
-                        if let Some(a_pc) = arr_pc {
-                            let arr_local = extract_aload_local(code, a_pc);
-                            if let Some(al) = arr_local {
-                                // SECURITY FIX (V16): array-local invariance.
-                                // `al < 64` is load-bearing, not just a bitmask
-                                // bound: locals >= 64 cannot be represented in
-                                // the `modified` u64, so we conservatively
-                                // refuse to elide their checks (the `&&`
-                                // short-circuits and the access is not marked
-                                // safe). A modified array local is likewise
-                                // rejected, so the header guard's
-                                // `array.length` cannot go stale via
-                                // reassignment. IV invariance is guaranteed by
-                                // `find_induction_variable`; bound-local
-                                // invariance is enforced by the caller
-                                // (`analyze_bounds_elimination`) before this
-                                // function is invoked.
-                                if al < 64 && (modified & (1u64 << al)) == 0 {
-                                    result.push((pc, al));
-                                }
-                            }
-                        }
-                    }
-                }
+    for (&pc, &(arr_local, idx_local)) in operands {
+        if already_safe.contains(&pc) {
+            continue;
+        }
+        if idx_local == bounds.induction_var {
+            // SECURITY FIX (V16): array-local invariance. `al < 64` is
+            // load-bearing, not just a bitmask bound: locals >= 64 cannot be
+            // represented in the `modified` u64, so we conservatively refuse to
+            // elide their checks. A modified array local is likewise rejected,
+            // so the header guard's `array.length` cannot go stale via
+            // reassignment. IV invariance is guaranteed by
+            // `find_induction_variable`; bound-local invariance is enforced by
+            // the caller (`analyze_bounds_elimination`) before this function is
+            // invoked.
+            if arr_local < 64 && (modified & (1u64 << arr_local)) == 0 {
+                result.push((pc, arr_local));
             }
         }
-        pc += bytecode_len_at(code, pc);
     }
     result
 }
@@ -17292,11 +17364,19 @@ pub fn compile_with_param_slots(
     let null_check_info = crate::null_check_elim::analyze(code, code_len);
 
     // BCE: analyze loops for bounds check elimination
-    let (bounds_safe_pcs, speculative_bce_guards) =
-        analyze_bounds_elimination(code, code_len, &loops);
+    // DBG (env-gated): CRATONVM_JIT_NO_BCE disables bounds-check elimination
+    // (and SIMD, which also elides per-element checks) so every array access is
+    // bounds-checked — to test whether an elided check causes the out-of-bounds
+    // array-store heap corruption.
+    let no_bce = std::env::var_os("CRATONVM_JIT_NO_BCE").is_some();
+    let (bounds_safe_pcs, speculative_bce_guards) = if no_bce {
+        (FxHashSet::default(), Vec::new())
+    } else {
+        analyze_bounds_elimination(code, code_len, &loops)
+    };
 
     // SIMD: detect vectorizable int-array-sum loops (requires AVX2)
-    let simd_loops = if has_avx2() {
+    let simd_loops = if has_avx2() && !no_bce {
         let mut simd = Vec::new();
         for &(header, back_edge) in &loops {
             let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
