@@ -1,7 +1,35 @@
-# JIT heap corruption — the `main()` corruptor is an OSR bug (open)
+# JIT heap corruption — the `main()` corruptor (OSR is the trigger; the non-moving young sweep is the root cause)
 
 This is the second member of the JIT young-gen heap-corruption family (the first,
 the scatter-store BCE elision, is fixed — see `jit-bce-scatter-store-fix.md`).
+
+## RESOLVED root cause (reconciled with the concurrent GC session, commit `caf8451`)
+
+The corruptor is the **non-moving young sweep** (`gc/src/gen_heap.rs`
+`sweep_young_non_moving`), which the GC uses whenever quiescence is active (live
+JIT frames present) instead of the moving Cheney collector. Commit `caf8451`
+proved it with `CRATONVM_DBG_FORCE_MOVING=1` (force the moving GC even when
+active): the corruption goes **211 → 0**. A leaked `JitEntryGuard` (enter/leave
+imbalance, e.g. on the BC EC `LongArray.modMultiply` path) keeps quiescence
+wedged active so the non-moving sweep runs; full evidence is in memory
+`reference_jit_junitcore_corruption` round 7. Fix follow-up there: guard
+Drop-bypass in `execute_jit_call` / harden the non-moving sweep.
+
+**The OSR analysis below is the *trigger*, not a separate bug, and it independently
+confirms the root cause.** OSR is simply what makes a once-called `main`'s JIT
+frame *live during its allocating loop*, so the young GC takes the buggy
+non-moving sweep path. This is why `BISECT_SKIP …/main` → 0 (no live JIT frame →
+moving GC), `--nojit` → 0, and now **`CRATONVM_DBG_FORCE_MOVING=1` → 0 on the
+BC-free `AllocLoop` repro too** (verified: `sink=0`, rc=0, 0 corruption). The
+`AllocLoop` repro is therefore a minimal, BC-free reproducer of the same
+non-moving-sweep bug.
+
+Everything below was the OSR-trigger investigation; keep it for the repro and the
+ruled-out list, but the "leading open hypotheses (oop maps)" section is
+SUPERSEDED by the non-moving-sweep root cause above.
+
+---
+
 This one is **not yet fixed**; this doc records what is firmly established so the
 next attempt doesn't re-tread it.
 
