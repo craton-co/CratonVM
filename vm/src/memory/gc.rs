@@ -361,12 +361,12 @@ pub fn validate_object_sizes(shared: &crate::vm::SharedVm) {
 /// can be pinned. Output is capped per GC to avoid flooding. Reference arrays
 /// are intentionally skipped here (already covered by the resurrection-drain
 /// remembered-set fix); this pass targets plain object fields.
-fn verify_heap_object_fields(
+pub fn verify_heap_object_fields(
     shared: &crate::vm::SharedVm,
     pointer_map: &HashMap<usize, usize>,
 ) {
     use crate::types::Value;
-    use cratonvm_types::{ObjectHeader, ObjectKind};
+    use cratonvm_types::{ArrayElementType, ObjectHeader, ObjectKind, HEADER_SIZE, REF_ELEMENT_SIZE};
 
     if std::env::var_os("CRATONVM_DBG_HEAP_STALE").is_none() {
         return;
@@ -382,53 +382,67 @@ fn verify_heap_object_fields(
     };
     let mut reported = 0usize;
     const CAP: usize = 40;
+    // Classify a reference target. Returns Some(reason) if it is dangling
+    // (un-forwarded / off-heap / zeroed = wrongly reclaimed by the sweep).
+    let classify = |addr: usize| -> Option<&'static str> {
+        if addr == 0 {
+            return None;
+        }
+        if pointer_map.contains_key(&addr) {
+            return Some("UN-FORWARDED");
+        }
+        if heap.is_heap_addr(addr).is_none() {
+            return Some("OFF-HEAP(reclaimed)");
+        }
+        let h = unsafe { &*(addr as *const ObjectHeader) };
+        if h.class_id.as_u32() == 0
+            && h.identity_hash_code == 0
+            && h.num_slots == 0
+            && h.array_length == 0
+        {
+            return Some("ZEROED(reclaimed)");
+        }
+        None
+    };
     for (ptr, _size) in heap.walk_objects() {
         if reported >= CAP {
             break;
         }
-        // Only plain objects: primitive arrays store raw bytes (reading them as
-        // Value slots would be garbage); reference arrays are covered elsewhere.
         let hdr = unsafe { &*(ptr as *const ObjectHeader) };
-        if hdr.kind != ObjectKind::Object {
-            continue;
-        }
         let r_cid = hdr.class_id;
-        let referrer = unsafe { ObjectRef::from_raw(ptr) };
-        let nf = heap.num_fields(referrer);
-        for i in 0..nf {
-            if let Value::Object(Some(target)) = heap.get_field(referrer, i) {
-                let addr = target.as_ptr() as usize;
-                if addr == 0 {
-                    continue;
-                }
-                if let Some(&fwd) = pointer_map.get(&addr) {
-                    eprintln!(
-                        "[heap-stale] UN-FORWARDED: {} field[{}] -> 0x{:x} (should be 0x{:x})",
-                        class_name(r_cid), i, addr, fwd,
-                    );
-                    reported += 1;
-                } else if heap.is_heap_addr(addr).is_none() {
-                    eprintln!(
-                        "[heap-stale] OFF-HEAP target: {} field[{}] -> 0x{:x} (reclaimed/reused-freed)",
-                        class_name(r_cid), i, addr,
-                    );
-                    reported += 1;
-                } else {
-                    let h = unsafe { &*(addr as *const ObjectHeader) };
-                    if h.class_id.as_u32() == 0
-                        && h.identity_hash_code == 0
-                        && h.num_slots == 0
-                        && h.array_length == 0
-                    {
+        if hdr.kind == ObjectKind::Object {
+            let referrer = unsafe { ObjectRef::from_raw(ptr) };
+            let nf = heap.num_fields(referrer);
+            for i in 0..nf {
+                if let Value::Object(Some(target)) = heap.get_field(referrer, i) {
+                    if let Some(reason) = classify(target.as_ptr() as usize) {
                         eprintln!(
-                            "[heap-stale] ZEROED target: {} field[{}] -> 0x{:x}",
-                            class_name(r_cid), i, addr,
+                            "[heap-stale] {} OBJ {} field[{}] -> 0x{:x}",
+                            reason, class_name(r_cid), i, target.as_ptr() as usize,
                         );
                         reported += 1;
+                        if reported >= CAP {
+                            break;
+                        }
                     }
                 }
-                if reported >= CAP {
-                    break;
+            }
+        } else if hdr.kind == ObjectKind::Array && hdr.element_type == ArrayElementType::Reference {
+            // Reference array (Object[]): elements are 8-byte compact pointers.
+            let len = hdr.array_length as usize;
+            for i in 0..len {
+                let s_ptr =
+                    unsafe { (ptr as *const u8).add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                let raw = unsafe { std::ptr::read(s_ptr as *const u64) } as usize;
+                if let Some(reason) = classify(raw) {
+                    eprintln!(
+                        "[heap-stale] {} ARR {}[{}] -> 0x{:x}",
+                        reason, class_name(r_cid), i, raw,
+                    );
+                    reported += 1;
+                    if reported >= CAP {
+                        break;
+                    }
                 }
             }
         }

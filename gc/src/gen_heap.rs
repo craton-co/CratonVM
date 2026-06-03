@@ -115,6 +115,24 @@ const GC_PROMOTE_PRESSURE_PERCENT: usize = 25;
 /// hardening-only addition so tests can assert that allocation pressure
 /// does not corrupt promotion bookkeeping (every object is accounted
 /// for exactly once).
+/// DBG: count of corrupt headers the non-moving sweep has detected. The VM's
+/// `maybe_gc` reads this and, under `CRATONVM_DBG_CORRUPT_FRAMES`, dumps the
+/// mutator's Java stack the first time it increases — close to the corruptor
+/// when run with a tiny young gen (frequent GC).
+pub static SWEEP_CORRUPTION_HITS: AtomicU64 = AtomicU64::new(0);
+
+/// DBG: optional young-GC stress threshold (bytes) from CRATONVM_DBG_GC_STRESS.
+fn gc_stress_threshold() -> Option<usize> {
+    use std::sync::OnceLock;
+    static S: OnceLock<Option<usize>> = OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("CRATONVM_DBG_GC_STRESS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+    })
+}
+
 #[derive(Default, Debug)]
 pub struct HeapStats {
     /// Number of minor GC cycles completed.
@@ -1587,7 +1605,15 @@ impl GenerationalHeap {
 
     /// Returns true when the young generation should be collected.
     pub fn needs_gc(&self) -> bool {
-        self.young_from.lock().used() >= *self.young_gc_threshold.lock()
+        let used = self.young_from.lock().used();
+        // DBG: CRATONVM_DBG_GC_STRESS=<bytes> forces a young GC every <bytes>
+        // of allocation, so the non-moving sweep's corruption detection fires
+        // right after the corrupting write (the corruptor's interpreted caller
+        // is then on the mutator stack dumped by CRATONVM_DBG_CORRUPT_FRAMES).
+        if let Some(t) = gc_stress_threshold() {
+            return used >= t;
+        }
+        used >= *self.young_gc_threshold.lock()
     }
 
     /// Total bytes currently allocated across young and old generations.
@@ -1680,7 +1706,13 @@ impl GenerationalHeap {
         // OOM. A precise compacting collection still runs once every JIT
         // call has returned (quiescence ends), so fragmentation introduced
         // by the non-moving sweep is transient.
-        if crate::gc_quiescence::is_active() {
+        // DBG: CRATONVM_DBG_FORCE_MOVING forces the moving (Cheney) collection
+        // even when quiescence says JIT frames are active — to test whether the
+        // non-moving sweep (wedged on by a leaked JitEntryGuard) is the
+        // heap-corruption source. UNSAFE if a JIT frame is genuinely live
+        // (relocates JIT-held raw pointers); diagnostic only.
+        let force_moving = std::env::var_os("CRATONVM_DBG_FORCE_MOVING").is_some();
+        if crate::gc_quiescence::is_active() && !force_moving {
             tracing::debug!(
                 "JIT frames are active (depth={}) — running non-moving \
                  young-gen mark-sweep (compaction deferred until quiescence \
@@ -2661,6 +2693,14 @@ impl GenerationalHeap {
                 // miscompile of `JUnitCore.main` under real-JCA). Same for the
                 // re-sync probe below.
                 let raw_kind = header.kind as u8;
+                if SWEEP_CORRUPTION_HITS.fetch_add(1, Ordering::Relaxed) == 0 {
+                    eprintln!(
+                        "[quiesce] FIRST corruption: quiescence depth={} enter_count={} leave_count={}",
+                        crate::gc_quiescence::depth(),
+                        crate::gc_quiescence::ENTER_COUNT.load(Ordering::Relaxed),
+                        crate::gc_quiescence::LEAVE_COUNT.load(Ordering::Relaxed),
+                    );
+                }
                 tracing::warn!(
                     "non-moving sweep: stopping walk at offset {} — implausible \
                      object size {} (kind=0x{:02x}, num_slots={}, array_len={}, class_id={})",

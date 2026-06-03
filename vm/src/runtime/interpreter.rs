@@ -126,6 +126,37 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // DBG (env-gated): validate every young object's header size against
             // its class — pins a JIT `new` that wrote a wrong-size header.
             crate::memory::gc::validate_object_sizes(shared);
+            // DBG: run the heap-stale verifier after EVERY GC (incl. the
+            // non-moving JIT-active sweep, where update_all_roots early-returns
+            // on the empty pointer_map). It flags any LIVE object whose field
+            // points to a ZEROED/reclaimed object — i.e. a live object the sweep
+            // wrongly reclaimed (missing root). The referrer names the bug.
+            crate::memory::gc::verify_heap_object_fields(shared, &result.pointer_map);
+            // DBG (CRATONVM_DBG_CORRUPT_FRAMES): on the FIRST GC that detects
+            // sweep corruption, dump the mutator's Java stack. With a tiny young
+            // gen (frequent GC) this fires close to the JIT corruptor — the
+            // interpreted frame on top is the BC method that called the
+            // JIT-compiled corruptor.
+            if std::env::var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some()
+                && cratonvm_gc::gen_heap::SWEEP_CORRUPTION_HITS
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > 0
+            {
+                use std::sync::atomic::{AtomicBool, Ordering as DbgO};
+                static DUMPED: AtomicBool = AtomicBool::new(false);
+                if !DUMPED.swap(true, DbgO::Relaxed) {
+                    eprintln!(
+                        "[corrupt-frames] FIRST sweep corruption — mutator Java stack ({} frames, top first):",
+                        thread.frames.len()
+                    );
+                    for (i, f) in thread.frames.iter().enumerate().rev().take(60) {
+                        eprintln!(
+                            "  [{}] {}.{}{} pc={}",
+                            i, f.class_name(), f.method_name(), f.method_descriptor(), f.pc
+                        );
+                    }
+                }
+            }
             // Truncation-checked: as_millis returns u128 but GC duration fits u64
             let gc_duration_ms = u64::try_from(gc_start.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::debug!(
@@ -12749,6 +12780,7 @@ fn try_osr(
     // NEW-1.5 + T1.1.a: record native stack pointer for GC root scan.
     // Uses the precise-oop-map path when the compiled method has
     // populated maps; falls back to conservative otherwise.
+    let _qd0 = cratonvm_gc::gc_quiescence::depth();
     let _jit_root_guard =
         crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
 
@@ -12757,6 +12789,18 @@ fn try_osr(
         // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; jit_locals match the method's local variable layout at the OSR entry point.
         unsafe { compiled.osr_enter(vm_ptr, &jit_locals, entry_pc) }
     }));
+    // DBG: detect a quiescence LEAK across the OSR call (a nested JIT entry
+    // that did not pop). After osr_enter returns, depth should be back to
+    // _qd0 + 1 (this site's own still-held guard). Anything higher leaked.
+    {
+        let now = cratonvm_gc::gc_quiescence::depth();
+        if now > _qd0 + 1 && std::env::var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some() {
+            eprintln!(
+                "[quiesce-leak] OSR site leaked: depth before={} after={} (expected {})",
+                _qd0, now, _qd0 + 1
+            );
+        }
+    }
 
     crate::jit::helpers::restore_jit_thread(saved_jit_thread);
     // Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): the previous OSR

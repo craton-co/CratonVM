@@ -29,6 +29,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static JIT_ACTIVE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 
+/// DBG: total enter()/leave() calls — an imbalance means a leaked JIT entry
+/// that keeps the non-moving sweep wedged on after JIT calls have returned.
+pub static ENTER_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub static LEAVE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
 /// Increment the global JIT-active counter. Called from the VM crate's
 /// `JitEntryGuard::enter` immediately before transferring control to JIT
 /// code. Returns the new depth (1-based).
@@ -58,6 +63,7 @@ static JIT_ACTIVE_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// use-after-free). `AcqRel` does not weaken the existing release
 /// visibility — it only adds the missing acquire half.
 pub fn enter() -> usize {
+    ENTER_COUNT.fetch_add(1, Ordering::Relaxed);
     JIT_ACTIVE_DEPTH.fetch_add(1, Ordering::AcqRel) + 1
 }
 
@@ -66,6 +72,7 @@ pub fn enter() -> usize {
 /// debug-assert error to call this when the counter is already 0; the
 /// release version saturates at 0 so a stray pop never wraps the counter.
 pub fn leave() -> usize {
+    LEAVE_COUNT.fetch_add(1, Ordering::Relaxed);
     let prev = JIT_ACTIVE_DEPTH.fetch_update(
         Ordering::Release,
         Ordering::Acquire,
