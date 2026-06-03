@@ -193,6 +193,24 @@ pub fn current_stack_pointer() -> usize {
     &probe as *const u8 as usize
 }
 
+/// DBG helper: the current thread's stack HIGH limit (one past the highest
+/// usable stack address) via the Win32 `GetCurrentThreadStackLimits`. Used
+/// only by the `CRATONVM_DBG_FULLSTACK_SCAN` diagnostic to bound a full-stack
+/// conservative scan.
+#[cfg(target_os = "windows")]
+fn current_thread_stack_high() -> usize {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThreadStackLimits(low_limit: *mut usize, high_limit: *mut usize);
+    }
+    let mut low: usize = 0;
+    let mut high: usize = 0;
+    // SAFETY: passes two valid out-pointers to a well-known Win32 API that
+    // only writes the thread's stack bounds; no other effect.
+    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    high
+}
+
 /// Record that JIT execution is about to begin on the current thread.
 ///
 /// Captures the current stack pointer at the instant of the call and pushes
@@ -446,6 +464,20 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // target). We use `current_stack_pointer` rather than reading `RSP`
     // directly so the implementation is portable across architectures.
     let scanner_sp = current_stack_pointer();
+    // DBG (CRATONVM_DBG_FULLSTACK_SCAN): scan the ENTIRE native stack
+    // [scanner_sp, stack_high] as conservative roots, not just the per-entry
+    // [scanner_sp, entry_sp] ranges. Decisive experiment for the bintrees18
+    // non-moving-sweep corruption: if this makes a live object visible (and
+    // stops the sweep zeroing it), the missed root WAS on the stack but
+    // outside the JIT chain's bounds (a range bug); if corruption persists,
+    // the missed root is not on the stack at all. Validated by is_object_address.
+    #[cfg(target_os = "windows")]
+    if std::env::var_os("CRATONVM_DBG_FULLSTACK_SCAN").is_some() {
+        let high = current_thread_stack_high();
+        if high > scanner_sp {
+            scan_one_frame(scanner_sp, high, heap, out);
+        }
+    }
     // Round-7 corruption fix: before scanning, reclaim any LEAKED JIT
     // entry (a returned frame whose guard Drop was bypassed) so the GC's
     // `gc_quiescence` flag reflects only genuinely-live JIT frames. A
