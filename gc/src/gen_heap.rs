@@ -2652,12 +2652,21 @@ impl GenerationalHeap {
             // Defensive: a corrupt / zero-size header would desynchronise
             // the linear walk. Stop rather than risk freeing live data.
             if total_size < HEADER_SIZE || cursor + total_size > used {
+                // NOTE: format the RAW kind byte, not `header.kind` via Debug.
+                // A corrupt header can hold an out-of-range discriminant; the
+                // derived `Debug` for `ObjectKind` indexes a static name table
+                // by discriminant, so `{:?}` on an invalid value reads past the
+                // table into rodata and SIGSEGVs — turning a recoverable
+                // corrupt-header detection into a hard crash (observed: JIT
+                // miscompile of `JUnitCore.main` under real-JCA). Same for the
+                // re-sync probe below.
+                let raw_kind = header.kind as u8;
                 tracing::warn!(
                     "non-moving sweep: stopping walk at offset {} — implausible \
-                     object size {} (kind={:?}, num_slots={}, array_len={}, class_id={})",
+                     object size {} (kind=0x{:02x}, num_slots={}, array_len={}, class_id={})",
                     cursor,
                     total_size,
-                    header.kind,
+                    raw_kind,
                     header.num_slots,
                     header.array_length,
                     header.class_id.as_u32(),
@@ -2676,16 +2685,16 @@ impl GenerationalHeap {
                     for i in start..=idx {
                         let (off, sz, cid, kind, ns, al) = walked[i];
                         tracing::warn!(
-                            "  PRE-corruption idx {} @off={} size={} class_id={} kind={:?} num_slots={} array_length={}",
-                            i, off, sz, cid, kind, ns, al,
+                            "  PRE-corruption idx {} @off={} size={} class_id={} kind=0x{:02x} num_slots={} array_length={}",
+                            i, off, sz, cid, kind as u8, ns, al,
                         );
                     }
                 }
                 let recent: Vec<_> = walked.iter().rev().take(8).rev().cloned().collect();
                 for (off, sz, cid, kind, ns, al) in &recent {
                     tracing::warn!(
-                        "  prior obj @off={} size={} class_id={} kind={:?} num_slots={} array_length={}",
-                        off, sz, cid, kind, ns, al,
+                        "  prior obj @off={} size={} class_id={} kind=0x{:02x} num_slots={} array_length={}",
+                        off, sz, cid, *kind as u8, ns, al,
                     );
                 }
                 // Dump 64 bytes of context starting 16 bytes before the bad
@@ -2728,10 +2737,10 @@ impl GenerationalHeap {
                     {
                         tracing::warn!(
                             "non-moving sweep: RE-SYNCED at offset {} (skipped {} bytes) — \
-                             class_id={} kind={:?} size={}; abandoned region treated as live, \
+                             class_id={} kind=0x{:02x} size={}; abandoned region treated as live, \
                              will be recovered by next major GC",
                             probe, probe - cursor,
-                            probe_hdr.class_id.as_u32(), probe_hdr.kind, probe_size,
+                            probe_hdr.class_id.as_u32(), probe_hdr.kind as u8, probe_size,
                         );
                         cursor = probe;
                         found = true;
