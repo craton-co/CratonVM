@@ -2128,6 +2128,28 @@ pub fn execute(
                 // Skip compilation for methods with String ldc (fall through to interpreter)
                 if has_string_ldc { return None; }
 
+                // Category-2 (long/double) PARAMETER guard.
+                //
+                // This early-compile path passes `param_slots = args.len()` to the
+                // bare `x64::compile`, which lays parameters out sequentially by
+                // argument index (one JVM slot each). That is wrong whenever a
+                // parameter is a long/double: those occupy TWO JVM local slots, so
+                // every parameter after the first category-2 one is read from the
+                // wrong (un-populated) slot. Concrete symptom: a `(long,long)long`
+                // lambda body (`lload_0; lload_2; ladd`) read its 2nd argument from
+                // the empty `locals[2]`, so e.g. `Long::sum(100,23)` returned 100.
+                //
+                // The hot-path `jit::try_compile` handles this correctly via
+                // `compute_param_jvm_slots` + `compile_with_param_slots`. Bail here
+                // (fall through to the interpreter); the method still JIT-compiles
+                // later through the correct path once it goes hot. We do NOT add it
+                // to `jit_skip_set` so that path remains available.
+                if crate::jit::count_param_slots_jvm_spec(method_descriptor)
+                    != crate::jit::count_param_slots(method_descriptor)
+                {
+                    return None;
+                }
+
                 // Try to compile
                 let param_slots = args.len();
                 let helpers = crate::jit::helpers::build_helpers();
