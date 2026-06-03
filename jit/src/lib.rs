@@ -3492,7 +3492,12 @@ pub fn try_compile(
     if let Ok(target) = std::env::var("CRATONVM_DBG_DUMP_JIT") {
         if let Some(ref cm) = result {
             let sig = format!("{}.{}", cached.class_name, cached.method_name);
-            if sig == target {
+            // LIST mode: print every compiled method's sig (reveals exact
+            // class-name format + whether the target is compiled here at all).
+            if target == "LIST" {
+                eprintln!("[JIT_COMPILED] {}{}", sig, cached.method_descriptor);
+            }
+            if sig.contains(&target) || &*cached.method_name == target.as_str() {
                 let bytes = cm.code_bytes();
                 eprintln!(
                     "[JIT_DUMP] {}{} len={} entry={:p}",
