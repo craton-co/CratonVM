@@ -2210,9 +2210,25 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // Fast path: check thread-local dispatch cache for a previously-compiled callee.
     // This avoids the JIT cache lock on every call.
     let info_key = info_ptr as usize;
-    let cached_entry = DISPATCH_CACHE.with(|dc| {
-        dc.borrow().get(&info_key).map(|c| (c.entry, c.needs_context))
-    });
+    // Virtual/interface dispatch (invoke_kind 0/2) must resolve on the RUNTIME
+    // receiver type. The callsite-keyed entry cache below and the
+    // `info.class_name` (static CP class) JIT-cache lookup both assume static
+    // binding, so reusing them at a polymorphic call site dispatches a
+    // SUPERTYPE method — e.g. `Object.equals` (identity `==`) run on boxed
+    // `Integer` receivers, so two equal Integers compare unequal and junit
+    // `assertEquals` fails on identical values. Only the statically-bound kinds
+    // (invokespecial=1, invokestatic=3) may use these fast paths; virtual /
+    // interface fall through to the receiver-resolving slow path
+    // (`ctx.invoke_virtual`). Hot monomorphic virtual sites are already served
+    // by the receiver-guarded MIC helper (`jit_invoke_virtual_mic`).
+    let statically_bound = matches!(info.invoke_kind, 1 | 3);
+    let cached_entry = if statically_bound {
+        DISPATCH_CACHE.with(|dc| {
+            dc.borrow().get(&info_key).map(|c| (c.entry, c.needs_context))
+        })
+    } else {
+        None
+    };
     if let Some((entry, needs_ctx)) = cached_entry {
         // SAFETY: entry is a JIT-compiled function pointer cached from a previous successful
         // compilation. `try_call_compiled_entry` selects the correct extern "C" fn signature
@@ -2243,7 +2259,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // `info` directly. Earlier code wrapped each in `Arc::from(...)` which
     // allocated a fresh heap buffer + atomic header on every dispatch — three
     // wasted allocations per hot call. Deref coercion handles the conversion.
-    {
+    // Gated on `statically_bound`: the lookup key is the static CP class, which
+    // is only the correct dispatch target for invokespecial/invokestatic.
+    if statically_bound {
         let jit_cache = vm.jit_cache.read();
         if let Some(compiled) = jit_cache.get(info.class_name, info.method_name, info.descriptor) {
             let entry = compiled.entry_ptr() as usize;
@@ -2276,8 +2294,11 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         }
     }
 
-    // Invocation counting — trigger compilation for hot callees
-    let should_compile = DISPATCH_COUNTER.with(|dc| {
+    // Invocation counting — trigger compilation for hot callees. Gated on
+    // `statically_bound`: compiling `info` (the static CP-class method) and
+    // caching it under the callsite key would re-introduce the supertype
+    // miscompile for a virtual/interface site.
+    let should_compile = statically_bound && DISPATCH_COUNTER.with(|dc| {
         let mut map = dc.borrow_mut();
         let count = map.entry(info_key).or_insert(0);
         *count += 1;
