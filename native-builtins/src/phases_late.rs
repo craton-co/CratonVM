@@ -20722,16 +20722,13 @@ pub(crate) fn register_p63_enumeration(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(e))))
         },
     );
-    r.register(
-        cols,
-        "enumeration",
-        "(Ljava/util/Collection;)Ljava/util/Enumeration;",
-        |ctx, _args| {
-            // Return empty enumeration stub
-            let e = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0);
-            Ok(Some(Value::Object(Some(e))))
-        },
-    );
+    // synthetic-stub removed: defers to real JDK bytecode
+    // removed — VERIFY real bytecode covers it
+    // Collections.enumeration(Collection) was a divergent fake: it ignored its
+    // Collection argument and returned an EMPTY enumeration regardless of input.
+    // Real java/util/Collections.enumeration is plain bytecode that wraps the
+    // collection's iterator (hasMoreElements/nextElement delegate to it), and
+    // CratonVM already models Collection/Iterator, so the real bytecode runs.
 
     // Enumeration interface
     //
