@@ -2241,9 +2241,16 @@ impl GenerationalHeap {
         // Re-mark cards for promoted objects that still reference young gen.
         // These old→young cross-gen references were established during the
         // Phase 2 promoted-object scan and must be visible to the next GC.
-        // Use the bulk API so the card-table lock is acquired once for the
-        // entire batch rather than once per deferred address.
-        card_table.mark_dirty_bulk(&deferred_dirty_cards);
+        //
+        // The actual `mark_dirty_bulk` is DEFERRED until after the possible
+        // major GC below: a major GC mark-compacts the old gen, relocating the
+        // very referrer objects whose cards we are about to dirty. Marking here
+        // (pre-compaction) would leave the remembered-set cards pointing at the
+        // stale pre-compaction addresses; the next minor GC's dirty-card scan
+        // would then look in the wrong place, miss the old→young edge, and free
+        // a still-live young referent (intermittent stale Locale/ClassLoader
+        // corruption). We remap each referrer address through `compact_map`
+        // first when a major GC runs (see below).
         young_from.reset();
 
         // CRIT-P2 fix: convert the internal FxHashMap to the std HashMap
@@ -2287,6 +2294,18 @@ impl GenerationalHeap {
                     *new_addr = final_addr;
                 }
             }
+            // Remembered-set fixup across compaction: the deferred old→young
+            // referrer addresses were recorded pre-compaction. Remap each
+            // through `compact_map` to its post-compaction location before
+            // dirtying its card, so the next minor GC's dirty-card scan finds
+            // the relocated referrer (and therefore its old→young edge).
+            // Referrers that did not move are absent from `compact_map` and
+            // keep their original address.
+            let remapped_cards: Vec<usize> = deferred_dirty_cards
+                .iter()
+                .map(|addr| *compact_map.get(addr).unwrap_or(addr))
+                .collect();
+            card_table.mark_dirty_bulk(&remapped_cards);
             // Merge old-gen compaction relocations into the overall pointer map
             // so the VM can update external roots (statics, JNI, string pool, etc.)
             pointer_map.extend(compact_map);
@@ -2298,6 +2317,9 @@ impl GenerationalHeap {
                 .fetch_add(old_used_before.saturating_sub(old_used_after) as u64, Ordering::Relaxed);
             true
         } else {
+            // No major GC: old-gen referrers did not move, so dirty their
+            // cards at the addresses recorded during this cycle.
+            card_table.mark_dirty_bulk(&deferred_dirty_cards);
             false
         };
 
