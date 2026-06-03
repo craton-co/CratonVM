@@ -270,3 +270,67 @@ fn contains_key_distinguishes_present_from_absent() {
     assert_eq!(has_absent, Some(Value::Int(0)));
 }
 
+
+const BIFUNC: &str =
+    "(Ljava/lang/Object;Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;";
+
+// Regression: `native_map_merge` used to call `normalize_for_compare` on the
+// BiFunction result, UNBOXING the returned Integer to a raw `Value::Int` before
+// storing it. A raw primitive cannot live in the map's object-reference storage,
+// so the value read back as `null` — `chm.merge("a",10,Integer::sum)` returned
+// null instead of 11. The result must be stored BOXED, exactly as the remap
+// function returned it (TreeMap's native already did this correctly).
+#[test]
+fn merge_present_key_stores_boxed_result_not_unboxed() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let hm = new_hashmap(&reg, &mut ctx);
+
+    let key = boxed_int(&mut ctx, 1);
+    let one = boxed_int(&mut ctx, 1);
+    call(&reg, &mut ctx, HM, "put", PUT,
+         &[Value::Object(Some(hm)), key, one]).unwrap();
+
+    // The remap BiFunction returns a BOXED Integer(11).
+    let eleven = boxed_int(&mut ctx, 11);
+    ctx.set_invoke_virtual_result(Ok(Some(eleven)));
+
+    let value = boxed_int(&mut ctx, 10);
+    let bifn = boxed_int(&mut ctx, 0); // dummy non-null function receiver
+    let ret = call(&reg, &mut ctx, HM, "merge", BIFUNC,
+                   &[Value::Object(Some(hm)), key, value, bifn]).unwrap();
+    assert_eq!(ret, Some(eleven), "merge returns the boxed remap result");
+
+    // The stored value must be retrievable as the boxed Integer — NOT null.
+    let got = call(&reg, &mut ctx, HM, "get", GET,
+                   &[Value::Object(Some(hm)), key]).unwrap();
+    assert_eq!(got, Some(eleven),
+        "merge must store the BOXED result; unboxing made get() return null");
+}
+
+// Same regression for `compute` (shared the `normalize_for_compare` bug).
+#[test]
+fn compute_present_key_stores_boxed_result_not_unboxed() {
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let hm = new_hashmap(&reg, &mut ctx);
+
+    let key = boxed_int(&mut ctx, 1);
+    let one = boxed_int(&mut ctx, 1);
+    call(&reg, &mut ctx, HM, "put", PUT,
+         &[Value::Object(Some(hm)), key, one]).unwrap();
+
+    let twelve = boxed_int(&mut ctx, 12);
+    ctx.set_invoke_virtual_result(Ok(Some(twelve)));
+
+    let bifn = boxed_int(&mut ctx, 0);
+    let ret = call(&reg, &mut ctx, HM, "compute",
+                   "(Ljava/lang/Object;Ljava/util/function/BiFunction;)Ljava/lang/Object;",
+                   &[Value::Object(Some(hm)), key, bifn]).unwrap();
+    assert_eq!(ret, Some(twelve), "compute returns the boxed remap result");
+
+    let got = call(&reg, &mut ctx, HM, "get", GET,
+                   &[Value::Object(Some(hm)), key]).unwrap();
+    assert_eq!(got, Some(twelve),
+        "compute must store the BOXED result; unboxing made get() return null");
+}

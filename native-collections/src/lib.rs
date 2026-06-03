@@ -6223,10 +6223,10 @@ fn native_al_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             "(Ljava/lang/Object;)Ljava/lang/Object;",
             &[elem],
         )?;
-        let raw = result.unwrap_or(Value::Object(None));
-        // Unbox wrapper returns so the list stores the primitive the
-        // lambda produced, not a boxed Integer/Long/etc.
-        let new_val = normalize_for_compare(ctx, &raw);
+        // Store the boxed result as-is. Collections hold Object references;
+        // unboxing to a raw primitive here corrupts array storage (the value
+        // reads back as null). Matches the JDK and the TreeMap natives.
+        let new_val = result.unwrap_or(Value::Object(None));
         ctx.set_array_element(data, i, new_val);
     }
 
@@ -6261,10 +6261,10 @@ fn native_map_compute_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         &[key],
     )?;
-    let raw = result.unwrap_or(Value::Object(None));
-    // Unbox wrapper returns (Integer/Long/etc.) so callers see the primitive
-    // variant produced by the lambda impl, matching javac's autoboxing view.
-    let new_val = normalize_for_compare(ctx, &raw);
+    // Keep the result boxed — maps store Object references; unboxing here makes
+    // the value read back as null (TreeMap's native_tm_compute_if_absent stores
+    // it boxed and is correct). The boxed wrapper is what the JDK stores/returns.
+    let new_val = result.unwrap_or(Value::Object(None));
 
     if let Value::Object(None) = new_val {
         return Ok(Some(Value::Object(None)));
@@ -6294,9 +6294,8 @@ fn native_map_compute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
         &[key, old_val],
     )?;
-    let raw = result.unwrap_or(Value::Object(None));
-    // Unbox wrapper returns so callers see the primitive the lambda produced.
-    let new_val = normalize_for_compare(ctx, &raw);
+    // Keep boxed — maps store Object references (unboxing reads back as null).
+    let new_val = result.unwrap_or(Value::Object(None));
 
     if let Value::Object(None) = new_val {
         // Remove mapping if new value is null.
@@ -6335,8 +6334,8 @@ fn native_map_compute_if_present(ctx: &mut dyn NativeContext, args: &[Value]) ->
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
         &[key, old_val],
     )?;
-    let raw = result.unwrap_or(Value::Object(None));
-    let new_val = normalize_for_compare(ctx, &raw);
+    // Keep boxed — maps store Object references (unboxing reads back as null).
+    let new_val = result.unwrap_or(Value::Object(None));
 
     if let Value::Object(None) = new_val {
         native_map_remove(ctx, &[Value::Object(Some(this)), key])?;
@@ -6370,9 +6369,8 @@ fn native_map_merge(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             &[old_val, value],
         )?;
-        let raw = result.unwrap_or(Value::Object(None));
-        // Unbox wrapper returns so callers see the primitive variant.
-        normalize_for_compare(ctx, &raw)
+        // Keep boxed — maps store Object references (unboxing reads back as null).
+        result.unwrap_or(Value::Object(None))
     } else {
         // Key absent — use value directly.
         value
@@ -6405,10 +6403,8 @@ fn native_map_replace_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             &[*key, *value],
         )?;
-        let raw = result.unwrap_or(Value::Object(None));
-        // Unbox wrapper returns so stored values reflect the primitive
-        // produced by the lambda impl.
-        let new_val = normalize_for_compare(ctx, &raw);
+        // Keep boxed — maps store Object references (unboxing reads back as null).
+        let new_val = result.unwrap_or(Value::Object(None));
         native_map_put(ctx, &[Value::Object(Some(this)), *key, new_val])?;
     }
 
