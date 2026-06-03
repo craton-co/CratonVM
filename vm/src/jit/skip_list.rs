@@ -1078,6 +1078,23 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // Other `java/util/Arrays` methods (sort, copyOf, hashCode) don't
         // exhibit this counted-loop shape and stay JIT-eligible.
         | ("java/util/Arrays", "fill")
+        // JUNIT.1 (current session) — STOPGAP. JIT-compiling
+        // `org/junit/runner/JUnitCore.main` under real-JCA produces severe
+        // young-gen heap corruption: out-of-bounds heap writes overwrite live
+        // object headers with garbage (class_ids decay to interface ids like
+        // java/io/Serializable / java/lang/Appendable), desyncing the
+        // non-moving young sweep and crashing (rc=139), or — once the sweep's
+        // diagnostic was hardened to re-sync — dying downstream in BC EC
+        // `precompute` on a monitor abort. Isolated via
+        // `CRATONVM_JIT_BISECT_SKIP=org/junit/runner/JUnitCore.main` (→ no
+        // crash); JIT-only-JUnitCore still crashes. Allocations are correctly
+        // sized (validated), and putfield is bounds-checked, so the leading
+        // suspect is `emit_inline_tlab_new` writing the header at a wrong
+        // R11/TLAB-cursor. Real crypto apps work JIT-on; only the JUnit test
+        // harness crashes. This ban unblocks JUnit-under-JIT until the
+        // inline-new/TLAB root cause is fixed. See
+        // docs/.. / memory `reference_jit_junitcore_corruption`.
+        | ("org/junit/runner/JUnitCore", "main")
         // NEW-1.4 — regalloc parameter-mapping bug, surfaces as
         // `test_s46_exc_hierarchy` returning Int(0) instead of Int(1).
         // Tracked by the committed reproducer in
