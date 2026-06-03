@@ -82,6 +82,12 @@ struct StaxEvent {
     text: String,
     /// Attribute table for START_ELEMENT events.
     attributes: Vec<StaxAttr>,
+    /// 1-based source line of the event start (StAX `Location.getLineNumber`).
+    line: i32,
+    /// 1-based source column of the event start (StAX `Location.getColumnNumber`).
+    column: i32,
+    /// 0-based byte offset of the event start (StAX `Location.getCharacterOffset`).
+    char_offset: i32,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +122,17 @@ impl ReaderState {
 
 fn reader_table() -> &'static Mutex<HashMap<i32, ReaderState>> {
     static T: OnceLock<Mutex<HashMap<i32, ReaderState>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// (line, column, char_offset) captured for a `javax/xml/stream/Location`
+/// object at the moment `XMLStreamReader.getLocation()` produced it. `Location`
+/// is a bare interface with no instance fields, so we cannot stash the position
+/// on the object itself; instead we key a side-table by the Location object's
+/// GC-stable identity hash, mirroring the reader-state table above. The three
+/// int accessors (getLineNumber/getColumnNumber/getCharacterOffset) read it back.
+fn location_table() -> &'static Mutex<HashMap<i32, (i32, i32, i32)>> {
+    static T: OnceLock<Mutex<HashMap<i32, (i32, i32, i32)>>> = OnceLock::new();
     T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -172,9 +189,33 @@ fn require_state(ctx: &dyn NativeContext, reader: ObjectRef) -> Result<(), Metho
 // otherwise awkward to thread through a `fn(...)`-typed callback).
 // ---------------------------------------------------------------------------
 
+/// Compute the 1-based (line, column) and 0-based byte offset for a position
+/// `byte_pos` in the original source `bytes`. Newlines are counted as `\n`
+/// (a `\r\n` pair advances the line on the `\n`, matching how StAX reference
+/// readers report positions). Column is in bytes-since-line-start + 1, which
+/// matches ASCII/Latin XML; for multibyte UTF-8 it is a best-effort byte
+/// column (the JDK readers themselves report char columns, but byte columns
+/// are a faithful-enough approximation for the diagnostic use of Location).
+fn line_col_of(bytes: &[u8], byte_pos: usize) -> (i32, i32) {
+    let end = byte_pos.min(bytes.len());
+    let mut line: i32 = 1;
+    let mut col: i32 = 1;
+    for &b in &bytes[..end] {
+        if b == b'\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
 fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
     let mut events: Vec<StaxEvent> = Vec::new();
-    events.push(StaxEvent { kind: START_DOCUMENT, ..Default::default() });
+    // START_DOCUMENT sits at the very start of the source (line 1, col 1, offset 0).
+    let (l0, c0) = line_col_of(bytes, 0);
+    events.push(StaxEvent { kind: START_DOCUMENT, line: l0, column: c0, char_offset: 0, ..Default::default() });
 
     let mut reader = Reader::from_reader(bytes);
     reader.trim_text(false);
@@ -183,6 +224,14 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
 
     let mut buf: Vec<u8> = Vec::new();
     loop {
+        // `buffer_position()` after the previous read is the byte offset where
+        // the *next* event begins — i.e. the start of the event we are about to
+        // read. quick-xml exposes byte offset only (no native line/column), so
+        // we derive line/column from the source bytes.
+        let start_pos = reader.buffer_position();
+        // Index of the first event produced by this iteration; used to stamp
+        // position onto every event pushed below (Empty produces two).
+        let first_new = events.len();
         buf.clear();
         match reader.read_event_into(&mut buf) {
             Ok(QXmlEvent::Start(e)) => {
@@ -236,9 +285,20 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
             Ok(QXmlEvent::Eof) => break,
             Err(_) => break,
         }
+        // Stamp real position (line/column/byte offset) onto every event this
+        // iteration produced. quick-xml's byte offset is the load-bearing datum;
+        // line/column are derived from it against the original source bytes.
+        let (line, column) = line_col_of(bytes, start_pos);
+        for ev in &mut events[first_new..] {
+            ev.line = line;
+            ev.column = column;
+            ev.char_offset = start_pos as i32;
+        }
     }
 
-    events.push(StaxEvent { kind: END_DOCUMENT, ..Default::default() });
+    let end_off = bytes.len() as i32;
+    let (le, ce) = line_col_of(bytes, bytes.len());
+    events.push(StaxEvent { kind: END_DOCUMENT, line: le, column: ce, char_offset: end_off, ..Default::default() });
     events
 }
 
@@ -946,26 +1006,79 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "javax/xml/stream/XMLStreamReader",
         "getLocation",
         "()Ljavax/xml/stream/Location;",
-        |ctx, _args| {
-            let loc = crate::alloc_concurrent_synthetic(ctx, "javax/xml/stream/Location", 4);
-            Ok(Some(Value::Object(Some(loc))))
-        },
+        native_get_location,
     );
     // Location is an interface — XMLStreamException.<init>(message, Location)
     // (WildFly's ParseUtils.unexpectedElement et al.) reads getLineNumber /
     // getColumnNumber off it for the formatted message. Without these
     // natives the constructor throws AbstractMethodError before the user's
     // exception even propagates, masking the real parsing failure.
-    let zero_int: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
-        |_ctx, _args| Ok(Some(Value::Int(-1)));
+    //
+    // synthetic-stub reimplemented: getLineNumber/getColumnNumber/getCharacterOffset
+    // previously returned a fixed -1 (placeholder). The StAX cursor is real
+    // (quick-xml), and quick-xml exposes the byte offset of each event via
+    // `Reader::buffer_position()`; we now capture that offset in `parse_to_events`
+    // and derive 1-based line/column from the source bytes. `getLocation()` stamps
+    // the current event's (line, column, offset) into a side-table keyed by the
+    // Location object, and these accessors read it back — real position data.
+    registry.register("javax/xml/stream/Location", "getLineNumber", "()I", native_loc_line);
+    registry.register("javax/xml/stream/Location", "getColumnNumber", "()I", native_loc_column);
+    registry.register("javax/xml/stream/Location", "getCharacterOffset", "()I", native_loc_offset);
+    // FLAG: getPublicId/getSystemId remain null. quick-xml does NOT track a
+    // public/system identifier for the source, and our reader is fed from raw
+    // bytes / an InputStream with no associated SYSTEM URI, so there is no real
+    // data to surface here. Per spec, returning null for an unknown public/system
+    // id is permitted. Left as null deliberately (not a fabricated value).
     let null_str: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(Some(Value::Object(None)));
-    registry.register("javax/xml/stream/Location", "getLineNumber", "()I", zero_int);
-    registry.register("javax/xml/stream/Location", "getColumnNumber", "()I", zero_int);
-    registry.register("javax/xml/stream/Location", "getCharacterOffset", "()I", zero_int);
     registry.register("javax/xml/stream/Location", "getPublicId", "()Ljava/lang/String;", null_str);
     registry.register("javax/xml/stream/Location", "getSystemId", "()Ljava/lang/String;", null_str);
     registry.set_category(__prev_cat);
+}
+
+/// `XMLStreamReader.getLocation()` — allocate a Location object and record the
+/// current event's real (line, column, byte-offset) in the Location side-table,
+/// keyed by the Location object's GC-stable identity hash. The receiver
+/// (`args[0]`) is the reader, whose current event carries the position captured
+/// during `parse_to_events`.
+fn native_get_location(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let reader = this_obj(args)?;
+    // Best-effort: if the reader has no state (never initialized), fall back to
+    // (-1,-1,-1) which matches the "unknown location" convention.
+    let pos = with_state(ctx, reader, |s| {
+        s.current()
+            .map(|e| (e.line, e.column, e.char_offset))
+            .unwrap_or((-1, -1, -1))
+    })
+    .unwrap_or((-1, -1, -1));
+    let loc = crate::alloc_concurrent_synthetic(ctx, "javax/xml/stream/Location", 4);
+    location_table().lock().insert(obj_key(ctx, loc), pos);
+    Ok(Some(Value::Object(Some(loc))))
+}
+
+/// Look up the (line, column, offset) recorded for a Location object; returns
+/// (-1,-1,-1) for a Location we did not produce (StAX "unknown" convention).
+fn location_pos(ctx: &dyn NativeContext, loc: ObjectRef) -> (i32, i32, i32) {
+    location_table()
+        .lock()
+        .get(&obj_key(ctx, loc))
+        .copied()
+        .unwrap_or((-1, -1, -1))
+}
+
+fn native_loc_line(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    Ok(Some(Value::Int(location_pos(ctx, this).0)))
+}
+
+fn native_loc_column(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    Ok(Some(Value::Int(location_pos(ctx, this).1)))
+}
+
+fn native_loc_offset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = this_obj(args)?;
+    Ok(Some(Value::Int(location_pos(ctx, this).2)))
 }
 
 fn native_next_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

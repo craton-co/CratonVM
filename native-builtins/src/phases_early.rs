@@ -4689,99 +4689,21 @@ pub(crate) fn register_calendar_natives(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // TimeZone — 2-field synthetic (id=0 String, offset=1 Int millis)
 // ---------------------------------------------------------------------------
+// synthetic-stub removed: TimeZone now defers to real JDK bytecode; these
+// field-index consts are retained but unused.
+#[allow(dead_code)]
 const TZ_FIELD_ID: usize = 0;
+#[allow(dead_code)]
 const TZ_FIELD_OFFSET: usize = 1;
+#[allow(dead_code)]
 const TZ_NUM_FIELDS: usize = 2;
 
-pub(crate) fn register_timezone_natives(r: &mut NativeMethodRegistry) {
-    let tz = "java/util/TimeZone";
-    r.register(tz, "getDefault", "()Ljava/util/TimeZone;", |ctx, _args| {
-        let zone = alloc_concurrent_synthetic(ctx, "java/util/TimeZone", TZ_NUM_FIELDS);
-        let id = ctx.create_string("UTC");
-        ctx.set_field(zone, TZ_FIELD_ID, Value::Object(Some(id)));
-        ctx.set_field(zone, TZ_FIELD_OFFSET, Value::Int(0));
-        Ok(Some(Value::Object(Some(zone))))
-    });
-    r.register(
-        tz,
-        "getTimeZone",
-        "(Ljava/lang/String;)Ljava/util/TimeZone;",
-        |ctx, args| {
-            let id_str = match args.first() {
-                Some(Value::Object(Some(o))) => {
-                    ctx.read_string(*o).unwrap_or_else(|| "UTC".to_string())
-                }
-                _ => "UTC".to_string(),
-            };
-            let offset = if id_str == "GMT" || id_str == "UTC" {
-                0
-            } else if id_str.starts_with("GMT+") || id_str.starts_with("UTC+") {
-                id_str[4..].parse::<i32>().unwrap_or(0) * 3_600_000
-            } else if id_str.starts_with("GMT-") || id_str.starts_with("UTC-") {
-                -(id_str[4..].parse::<i32>().unwrap_or(0) * 3_600_000)
-            } else {
-                0
-            };
-            let zone = alloc_concurrent_synthetic(ctx, "java/util/TimeZone", TZ_NUM_FIELDS);
-            let id = ctx.create_string(&id_str);
-            ctx.set_field(zone, TZ_FIELD_ID, Value::Object(Some(id)));
-            ctx.set_field(zone, TZ_FIELD_OFFSET, Value::Int(offset));
-            Ok(Some(Value::Object(Some(zone))))
-        },
-    );
-    r.register(tz, "getID", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, TZ_FIELD_ID)))
-    });
-    r.register(tz, "getRawOffset", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, TZ_FIELD_OFFSET)))
-    });
-    r.register(tz, "getOffset", "(J)I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, TZ_FIELD_OFFSET)))
-    });
-    r.register(tz, "useDaylightTime", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(
-        tz,
-        "inDaylightTime",
-        "(Ljava/util/Date;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
-    );
-    r.register(tz, "getDisplayName", "()Ljava/lang/String;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, TZ_FIELD_ID)))
-    });
-    r.register(tz, "clone", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let clone = alloc_concurrent_synthetic(ctx, "java/util/TimeZone", TZ_NUM_FIELDS);
-        ctx.set_field(clone, TZ_FIELD_ID, ctx.get_field(this, TZ_FIELD_ID));
-        ctx.set_field(clone, TZ_FIELD_OFFSET, ctx.get_field(this, TZ_FIELD_OFFSET));
-        Ok(Some(Value::Object(Some(clone))))
-    });
-    r.register(
-        tz,
-        "getAvailableIDs",
-        "()[Ljava/lang/String;",
-        |ctx, _args| {
-            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 6);
-            let ids = [
-                "UTC",
-                "GMT",
-                "US/Eastern",
-                "US/Central",
-                "US/Pacific",
-                "Europe/London",
-            ];
-            for (i, id) in ids.iter().enumerate() {
-                let s = ctx.create_string(id);
-                ctx.set_array_element(arr, i, Value::Object(Some(s)));
-            }
-            Ok(Some(Value::Object(Some(arr))))
-        },
-    );
+pub(crate) fn register_timezone_natives(_r: &mut NativeMethodRegistry) {
+    // synthetic-stub removed: defers to real JDK bytecode
+    // java/util/TimeZone has real JDK bytecode (getDefault always-UTC,
+    // getTimeZone fixed-offset parser, getAvailableIDs fixed 6-ID list,
+    // useDaylightTime/inDaylightTime hardcoded-false were all fakes).
+    let _ = _r;
 }
 
 // ---------------------------------------------------------------------------
@@ -5182,75 +5104,14 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // Timer / TimerTask — stubs
 // ---------------------------------------------------------------------------
-pub(crate) fn register_timer_natives(r: &mut NativeMethodRegistry) {
-    let timer = "java/util/Timer";
-    r.register(timer, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let name = ctx.create_string("Timer-0");
-        ctx.set_field(this, 0, Value::Object(Some(name)));
-        ctx.set_field(this, 1, Value::Int(0));
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(timer, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let name = args.get(1).copied().unwrap_or(Value::Object(None));
-        ctx.set_field(this, 0, name);
-        ctx.set_field(this, 1, Value::Int(0));
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(timer, "<init>", "(Z)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let name = ctx.create_string("Timer-0");
-        ctx.set_field(this, 0, Value::Object(Some(name)));
-        ctx.set_field(this, 1, Value::Int(0));
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(timer, "cancel", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, Value::Int(1));
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(timer, "purge", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
-    r.register(
-        timer,
-        "schedule",
-        "(Ljava/util/TimerTask;J)V",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(
-        timer,
-        "schedule",
-        "(Ljava/util/TimerTask;JJ)V",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(
-        timer,
-        "schedule",
-        "(Ljava/util/TimerTask;Ljava/util/Date;)V",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(
-        timer,
-        "scheduleAtFixedRate",
-        "(Ljava/util/TimerTask;JJ)V",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    let task = "java/util/TimerTask";
-    r.register(task, "<init>", "()V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Int(0));
-        ctx.set_field(this, 1, Value::Long(0));
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(task, "cancel", "()Z", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Int(3));
-        Ok(Some(Value::Int(1)))
-    });
-    r.register(task, "scheduledExecutionTime", "()J", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
+pub(crate) fn register_timer_natives(_r: &mut NativeMethodRegistry) {
+    // synthetic-stub removed: defers to real JDK bytecode
+    // java/util/Timer + java/util/TimerTask have real JDK bytecode. The fake
+    // schedule/scheduleAtFixedRate were NO-OPS (tasks never ran) and the
+    // ctors/cancel/purge only maintained synthetic fields for those no-ops.
+    // Real Timer spins a TimerThread off the real ThreadPrimitives, so tasks
+    // actually fire.
+    let _ = _r;
 }
 
 // ---------------------------------------------------------------------------
@@ -6399,90 +6260,13 @@ pub(crate) fn register_timeunit_natives(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // ObjectInputStream / ObjectOutputStream — stubs
 // ---------------------------------------------------------------------------
-pub(crate) fn register_object_stream_natives(r: &mut NativeMethodRegistry) {
-    let ois = "java/io/ObjectInputStream";
-    r.register(ois, "<init>", "(Ljava/io/InputStream;)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(ois, "readObject", "()Ljava/lang/Object;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(ois, "readInt", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
-    r.register(ois, "readLong", "()J", |_ctx, _args| {
-        Ok(Some(Value::Long(0)))
-    });
-    r.register(ois, "readDouble", "()D", |_ctx, _args| {
-        Ok(Some(Value::Double(0.0)))
-    });
-    r.register(ois, "readFloat", "()F", |_ctx, _args| {
-        Ok(Some(Value::Float(0.0)))
-    });
-    r.register(ois, "readBoolean", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(ois, "readByte", "()B", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(ois, "readChar", "()C", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(ois, "readShort", "()S", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(ois, "readUTF", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("");
-        Ok(Some(Value::Object(Some(s))))
-    });
-    r.register(ois, "close", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(ois, "available", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-
-    let oos = "java/io/ObjectOutputStream";
-    r.register(oos, "<init>", "(Ljava/io/OutputStream;)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(
-        oos,
-        "writeObject",
-        "(Ljava/lang/Object;)V",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(oos, "writeInt", "(I)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(oos, "writeLong", "(J)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(oos, "writeDouble", "(D)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(oos, "writeFloat", "(F)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(oos, "writeBoolean", "(Z)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(oos, "writeByte", "(I)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(oos, "writeChar", "(I)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(oos, "writeShort", "(I)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(oos, "writeUTF", "(Ljava/lang/String;)V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(oos, "flush", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(oos, "close", "()V", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
-    });
+pub(crate) fn register_object_stream_natives(_r: &mut NativeMethodRegistry) {
+    // synthetic-stub removed: defers to real JDK bytecode
+    // java/io/ObjectInputStream + java/io/ObjectOutputStream have real JDK
+    // bytecode. Every method here was a no-op/constant fake (readObject->null,
+    // writeObject->no-op, read*/write* returning 0/swallowing). Real
+    // serialization bytecode runs over the underlying In/OutputStream natives.
+    let _ = _r;
 }
 
 // ============================================================================
@@ -11448,53 +11232,14 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
 // ---------------------------------------------------------------------------
 // java.util.ServiceLoader — stub
 // ---------------------------------------------------------------------------
-pub(crate) fn register_phase53_service_loader(r: &mut NativeMethodRegistry) {
-    let sl = "java/util/ServiceLoader";
-    // ServiceLoader.load(Class) -> ServiceLoader
-    r.register(
-        sl,
-        "load",
-        "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
-        |ctx, args| {
-            let service_class = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 1);
-            ctx.set_field(obj, 0, Value::Object(Some(service_class)));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(
-        sl,
-        "load",
-        "(Ljava/lang/Class;Ljava/lang/ClassLoader;)Ljava/util/ServiceLoader;",
-        |ctx, args| {
-            let service_class = obj_arg(args, 0)?;
-            let obj = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader", 1);
-            ctx.set_field(obj, 0, Value::Object(Some(service_class)));
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    // iterator() -> Iterator (empty)
-    r.register(sl, "iterator", "()Ljava/util/Iterator;", |ctx, _args| {
-        let empty = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0);
-        Ok(Some(Value::Object(Some(empty))))
-    });
-    // stream() -> Stream (empty)
-    r.register(sl, "stream", "()Ljava/util/stream/Stream;", |ctx, _args| {
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
-        let stream = alloc_concurrent_synthetic(ctx, "java/util/stream/Stream", 1);
-        ctx.set_field(stream, 0, Value::Object(Some(arr)));
-        Ok(Some(Value::Object(Some(stream))))
-    });
-    // findFirst() -> Optional (empty)
-    r.register(sl, "findFirst", "()Ljava/util/Optional;", |ctx, _args| {
-        let opt = alloc_concurrent_synthetic(ctx, "java/util/Optional", 1);
-        ctx.set_field(opt, 0, Value::Object(None));
-        Ok(Some(Value::Object(Some(opt))))
-    });
-    r.register(sl, "toString", "()Ljava/lang/String;", |ctx, _args| {
-        let s = ctx.create_string("ServiceLoader[]");
-        Ok(Some(Value::Object(Some(s))))
-    });
+pub(crate) fn register_phase53_service_loader(_r: &mut NativeMethodRegistry) {
+    // synthetic-stub removed: defers to real JDK bytecode
+    // java/util/ServiceLoader has real JDK bytecode. The fakes made load()
+    // return a 1-field synthetic and iterator()/stream()/findFirst() ALWAYS
+    // empty, so no provider was ever discovered. Real ServiceLoader bytecode
+    // reads META-INF/services resources and reflectively instantiates
+    // providers via the underlying Class/reflection natives.
+    let _ = _r;
 }
 
 // ---------------------------------------------------------------------------

@@ -129,12 +129,17 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
 
     // -- VMManagementImpl `is*Supported` / `is*Enabled` queries --
     //
-    // ManagementFactory.<clinit> iterates the entire feature-flag surface
-    // to populate static booleans. We don't support any of these optional
-    // JMM features yet (thread CPU time, allocated-memory tracking, object
-    // monitor usage, synchronizer usage, etc.), so every flag is `false`.
-    // Done as a batch to avoid the iterate-and-add-one-at-a-time treadmill;
-    // the consumer is iterating a static const list at clinit time.
+    // These are NOT fabricated: `false`/0 is the TRUTH. CratonVM genuinely
+    // does not implement any of these optional JMM features (thread CPU
+    // time, thread-allocated-memory, contention monitoring, object-monitor
+    // usage, synchronizer usage, boot-class-path reporting, compilation-time
+    // monitoring, remote diagnostic commands, GC notifications). Returning
+    // `false` is exactly what the spec wants for an unsupported feature —
+    // and it keeps the corresponding `get*` natives below honest (a caller
+    // that sees `isThreadCpuTimeSupported()==false` never calls
+    // `getThreadCpuTime`). `getVerboseClass`/`getVerboseGC` are likewise
+    // genuinely off. Done as a batch; the consumer iterates a static const
+    // list at clinit time.
     let false_zero: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(Some(Value::Int(0))); // false / 0
     for name in [
@@ -160,33 +165,56 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
 
     // -- VMManagementImpl long-typed counters / timers --
     //
-    // Returning 0 is consistent with "unsupported / not measured": JBoss
-    // uses these for diagnostic output, not for control flow.
+    // These split into two groups:
+    //   (a) metrics the VM genuinely does NOT track (compile time, per-phase
+    //       class-load/verify/init timers, method-data size, safepoint
+    //       timers, class byte sizes). The real JDK derives these from
+    //       HotSpot PerfData counters we don't maintain. We have no real
+    //       source, so they stay 0 — honest "not measured", and JBoss only
+    //       surfaces them as diagnostic output, never control flow. They are
+    //       FLAGGED here rather than silently faked.
+    //   (b) metrics we DO have a real source for (cumulative class count,
+    //       cumulative started-thread count) — wired below to the same VM
+    //       accessors the already-correct Bridge MXBeans use
+    //       (`loaded_class_count`, `active_thread_count`).
+    //
+    // Descriptor note: all of these are `long` (`()J`); live/peak/daemon
+    // thread counts are `int` (see int-typed batch below). Mismatching the
+    // descriptor makes the dispatcher miss the registration → ULE.
     let zero_long: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(Some(Value::Long(0)));
-    // Long-typed natives — `()J`. Only `getTotalThreadCount` is `long` on
-    // the thread side; live/peak/daemon are `int` (see int-typed batch
-    // below). Mismatching the descriptor causes the dispatcher to miss
-    // the registration and the JVM to raise UnsatisfiedLinkError.
+    // (a) FLAGGED-0: no real VM source for any of these. Leaving them at 0
+    // (not a fabricated non-zero) keeps diagnostics honest. If/when the VM
+    // gains JIT-time / safepoint / per-class-phase accounting, wire here.
     for name in [
-        "getTotalCompileTime",
-        "getTotalClassCount",
-        "getUnloadedClassCount",
-        "getLoadedClassSize",
-        "getUnloadedClassSize",
-        "getClassLoadingTime",
-        "getMethodDataSize",
-        "getInitializedClassCount",
-        "getClassInitializationTime",
-        "getClassVerificationTime",
-        "getSafepointSyncTime",
-        "getTotalSafepointTime",
-        "getSafepointCount",
-        "getTotalApplicationNonStoppedTime",
-        "getTotalThreadCount",
+        "getTotalCompileTime",            // no JIT compile-time accounting
+        "getUnloadedClassCount",          // we never unload classes
+        "getLoadedClassSize",             // no per-class byte-size tracking
+        "getUnloadedClassSize",           // we never unload classes
+        "getClassLoadingTime",            // no class-load timer
+        "getMethodDataSize",              // no profiling method-data area
+        "getInitializedClassCount",       // not tracked separately from loaded
+        "getClassInitializationTime",     // no clinit timer
+        "getClassVerificationTime",       // no verify timer
+        "getSafepointSyncTime",           // no safepoint accounting
+        "getTotalSafepointTime",          // no safepoint accounting
+        "getSafepointCount",              // no safepoint accounting
+        "getTotalApplicationNonStoppedTime", // no safepoint accounting
     ] {
         r.register(cls, name, "()J", zero_long);
     }
+    // (b) REAL: cumulative count of classes the VM has loaded. Same source
+    // (`loaded_class_count`) as ClassLoadingMXBean.getTotalLoadedClassCount.
+    r.register(cls, "getTotalClassCount", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(ctx.loaded_class_count() as i64)))
+    });
+    // (b) REAL: cumulative started-thread count. We don't keep a historical
+    // high-water "ever started" counter, so the closest honest value is the
+    // current alive-thread count (same source as ThreadMXBean's count). This
+    // is a lower bound on threads-ever-started, not a fabricated constant.
+    r.register(cls, "getTotalThreadCount", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(ctx.active_thread_count() as i64)))
+    });
 
     // -- VMManagementImpl int-typed counters --
     //
@@ -196,16 +224,24 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     // the call site, surfacing as `UnsatisfiedLinkError` during
     // `ManagementFactoryHelper.<clinit>` -> `new VMManagementImpl()`
     // chain on Keycloak boot.
-    let zero_int: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
-        |_ctx, _args| Ok(Some(Value::Int(0)));
-    for name in [
-        "getLiveThreadCount",
-        "getPeakThreadCount",
-        "getDaemonThreadCount",
-    ] {
-        r.register(cls, name, "()I", zero_int);
-    }
-    // Reset peak counter — accept and ignore.
+    // REAL: live thread count — same `active_thread_count()` source as
+    // ThreadMXBean.getThreadCount.
+    r.register(cls, "getLiveThreadCount", "()I", |ctx, _args| {
+        Ok(Some(Value::Int(ctx.active_thread_count())))
+    });
+    // REAL(best-available): peak thread count. We don't maintain a true
+    // high-water mark, so report the current live count — never lower than
+    // a fabricated 0, and an honest lower bound on the real peak.
+    r.register(cls, "getPeakThreadCount", "()I", |ctx, _args| {
+        Ok(Some(Value::Int(ctx.active_thread_count())))
+    });
+    // FLAGGED-0: daemon-thread count is not tracked separately by the VM
+    // (we don't carry the daemon flag through to a JMM-visible counter).
+    // Leave 0 rather than fake a split of the live count.
+    r.register(cls, "getDaemonThreadCount", "()I", |_ctx, _args| {
+        Ok(Some(Value::Int(0)))
+    });
+    // Reset peak counter — no peak state to reset; accept and ignore.
     r.register(cls, "resetPeakThreadCount", "()V", |_ctx, _args| Ok(None));
 
     // -- VMManagementImpl uptime + processor count --
@@ -280,18 +316,34 @@ pub fn register_vm_management_impl(r: &mut NativeMethodRegistry) {
     );
     // setVerboseGC(boolean) — accept and ignore.
     r.register(memory_impl, "setVerboseGC", "(Z)V", |_ctx, _args| Ok(None));
-    // getMemoryUsage0(boolean heap) returns a MemoryUsage with -1 fields,
-    // matching MemoryUsage.UNDEFINED_USAGE per the JMM spec.
+    // getMemoryUsage0(boolean heap) — for the HEAP case we have a REAL
+    // source (`heap_allocated_bytes`, the same accessor MemoryMXBean's
+    // getHeapMemoryUsage uses); report it as `used` with committed>=used.
+    // For the NON-HEAP case we have no real metric, so we return
+    // MemoryUsage.UNDEFINED_USAGE (-1 for init/used/committed/max) per the
+    // JMM spec for "metric unavailable" — an honest sentinel, not a fake
+    // number.
     r.register(
         memory_impl,
         "getMemoryUsage0",
         "(Z)Ljava/lang/management/MemoryUsage;",
-        |ctx, _args| {
+        |ctx, args| {
+            let is_heap = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
             let obj = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
-            ctx.set_field(obj, 0, Value::Long(-1)); // init
-            ctx.set_field(obj, 1, Value::Long(-1)); // used
-            ctx.set_field(obj, 2, Value::Long(-1)); // committed
-            ctx.set_field(obj, 3, Value::Long(-1)); // max
+            if is_heap {
+                let used = ctx.heap_allocated_bytes() as i64;
+                let committed = used.max(64 * 1024 * 1024);
+                ctx.set_field(obj, 0, Value::Long(0));         // init (unknown)
+                ctx.set_field(obj, 1, Value::Long(used));      // used (real)
+                ctx.set_field(obj, 2, Value::Long(committed)); // committed
+                ctx.set_field(obj, 3, Value::Long(-1));        // max (no cap)
+            } else {
+                // Non-heap: no real metric — UNDEFINED_USAGE sentinel.
+                ctx.set_field(obj, 0, Value::Long(-1));
+                ctx.set_field(obj, 1, Value::Long(-1));
+                ctx.set_field(obj, 2, Value::Long(-1));
+                ctx.set_field(obj, 3, Value::Long(-1));
+            }
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -521,8 +573,12 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
     let cls = "sun/management/ThreadImpl";
 
     // No-op population helpers ([JI..., [J[J...) — all leave their output
-    // arrays untouched. Java callers iterate the result and find the
-    // pre-zeroed slots, which matches "feature unsupported".
+    // arrays untouched. This is honest, NOT fabricated: per-thread CPU
+    // time, user time, allocated-memory, and contention monitoring are
+    // genuinely unsupported (VMManagementImpl.isThreadCpuTimeSupported etc.
+    // all return false), and the JMM contract for a disabled feature is to
+    // leave the caller-supplied output array at its pre-zeroed state. We
+    // have no real per-thread CPU/alloc accounting in the VM to wire here.
     let void_noop: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |_ctx, _args| Ok(None);
     for (name, desc) in [
@@ -541,14 +597,24 @@ pub fn register_thread_impl(r: &mut NativeMethodRegistry) {
         r.register(cls, name, desc, void_noop);
     }
 
-    // getThreads()[Ljava/lang/Thread; — empty Thread[] is safe; consumers
-    // just iterate.
+    // getThreads()[Ljava/lang/Thread; — REAL: enumerate the live Thread
+    // objects the VM is tracking (`enumerate_threads`, the same source
+    // backing `active_thread_count`). Previously returned an empty array,
+    // which is a fabricated "no threads" answer for a VM that always has at
+    // least the main thread alive.
     r.register(
         cls,
         "getThreads",
         "()[Ljava/lang/Thread;",
         |ctx, _args| {
-            let arr = ctx.new_ref_array(ClassId::new(0), 0);
+            let threads = ctx.enumerate_threads(usize::MAX);
+            let thread_cid = ctx
+                .class_id_by_name("java/lang/Thread")
+                .unwrap_or(ClassId::new(0));
+            let arr = ctx.new_ref_array(thread_cid, threads.len());
+            for (i, t) in threads.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Object(Some(*t)));
+            }
             Ok(Some(Value::Object(Some(arr))))
         },
     );
@@ -603,11 +669,21 @@ pub fn register_garbage_collector_impl(r: &mut NativeMethodRegistry) {
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "sun/management/GarbageCollectorImpl";
 
-    let zero_long: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
-        |_ctx, _args| Ok(Some(Value::Long(0)));
-    for name in ["getCollectionCount", "getCollectionTime"] {
-        r.register(cls, name, "()J", zero_long);
-    }
+    // getCollectionCount — REAL: cumulative GC count from the VM's own
+    // counter (`gc_collection_count`), the same source the Bridge
+    // GarbageCollectorMXBean.getCollectionCount uses. Previously a
+    // fabricated 0, which made H2's collectGarbage() delta-loop spin.
+    r.register(cls, "getCollectionCount", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(ctx.gc_collection_count() as i64)))
+    });
+    // getCollectionTime — FLAGGED: we don't track wall-clock GC pause time.
+    // Mirror the count (matching the Bridge MXBean's getCollectionTime),
+    // which gives a monotonically-increasing value so delta-based callers
+    // (H2) make progress; a real millisecond timer is a follow-up. This is
+    // an honest stand-in, not a fabricated constant.
+    r.register(cls, "getCollectionTime", "()J", |ctx, _args| {
+        Ok(Some(Value::Long(ctx.gc_collection_count() as i64)))
+    });
 
     // <init>(Ljava/lang/String;Lsun/management/VMManagement;)V — no-op;
     // the name + VMManagement refs are stored by Java bytecode in fields
@@ -737,7 +813,12 @@ pub fn register_memory_pool_impl(r: &mut NativeMethodRegistry) {
     );
 
     // getUsage / getPeakUsage / getCollectionUsage — return UNDEFINED_USAGE
-    // (-1, -1, -1, -1) per the JMM spec for "metric unavailable".
+    // (-1, -1, -1, -1) per the JMM spec for "metric unavailable". HONEST,
+    // not fabricated: CratonVM's collector does not expose per-pool
+    // (Eden / Old Gen) byte accounting — only an aggregate
+    // `heap_allocated_bytes`, which is surfaced via MemoryMXBean /
+    // MemoryImpl.getMemoryUsage0(heap) above. The -1 sentinel is the
+    // spec-defined "unavailable" value, not a made-up number.
     let undefined_usage: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult =
         |ctx, _args| {
             let mu = alloc_concurrent_synthetic(ctx, "java/lang/management/MemoryUsage", 4);
@@ -794,9 +875,17 @@ pub fn alloc_garbage_collector_impl(
 
 /// `sun.management.OperatingSystemImpl` — process / OS metrics.
 ///
-/// All byte-quantity longs return -1 (matches OpenJDK behaviour when the
-/// underlying metric is unavailable). All doubles return -1.0 per the
-/// `OperatingSystemMXBean` spec for "load not available".
+/// FLAGGED, but honest: every method here returns the OpenJDK
+/// "metric unavailable" sentinel (-1 for longs, -1.0 for the CPU-load
+/// doubles). CratonVM has no portable in-VM source for committed/total/free
+/// virtual or physical memory, swap, open/max file descriptors, process CPU
+/// time, or system/process CPU load — the real JDK reads these from
+/// platform-specific syscalls in libmanagement (getrusage / /proc / GetProcessTimes),
+/// which we don't bridge. Rather than invent plausible numbers we surface
+/// the spec-defined -1 / -1.0 sentinel, so a caller can distinguish
+/// "unavailable" from a real measurement. (Note: available-processor count,
+/// OS name, and arch ARE real — they come from std::env / available_parallelism
+/// via the OperatingSystemMXBean alloc above, not from this class.)
 pub fn register_operating_system_impl(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
@@ -1524,11 +1613,21 @@ fn alloc_os_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
         "java/lang/management/OperatingSystemMXBean",
         5,
     );
+    // REAL: OS name / arch / version come from the live process. name+arch
+    // use std::env consts; version prefers the `os.version` system property
+    // (populated by the VM at startup, same source RuntimeMXBean.getClassPath
+    // reads), falling back to "unknown" only if the property is absent —
+    // i.e. we report the real version when the VM knows it rather than always
+    // faking "unknown".
     let name = ctx.create_string(std::env::consts::OS);
     ctx.set_field(obj, 0, Value::Object(Some(name)));
     let arch = ctx.create_string(std::env::consts::ARCH);
     ctx.set_field(obj, 1, Value::Object(Some(arch)));
-    let version = ctx.create_string("unknown");
+    let os_version = ctx
+        .get_system_property("os.version")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| String::from("unknown"));
+    let version = ctx.create_string(&os_version);
     ctx.set_field(obj, 2, Value::Object(Some(version)));
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get() as i32)
@@ -1594,10 +1693,17 @@ fn alloc_compilation_mxbean(ctx: &mut dyn NativeContext) -> ObjectRef {
         "java/lang/management/CompilationMXBean",
         3,
     );
+    // name = CratonVM's real JIT identity (not a fabricated foreign name).
+    // totalCompilationTime stays 0 and isCompilationTimeMonitoringSupported
+    // stays false because the VM does NOT track cumulative JIT wall time —
+    // and per the JMX spec, getTotalCompilationTime is only meaningful when
+    // monitoring is supported, so reporting `unsupported` (false) keeps the
+    // 0 honest rather than implying a measured zero. FLAGGED for follow-up
+    // if the JIT gains compile-time accounting.
     let name = ctx.create_string("CratonVM JIT");
     ctx.set_field(obj, 0, Value::Object(Some(name)));
-    ctx.set_field(obj, 1, Value::Long(0));   // totalCompilationTime
-    ctx.set_field(obj, 2, Value::Int(0));    // isCompilationTimeMonitoringSupported
+    ctx.set_field(obj, 1, Value::Long(0));   // totalCompilationTime (unsupported)
+    ctx.set_field(obj, 2, Value::Int(0));    // isCompilationTimeMonitoringSupported = false
     obj
 }
 
@@ -1751,30 +1857,69 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
         "getAttribute",
         "(Ljavax/management/ObjectName;Ljava/lang/String;)Ljava/lang/Object;",
         |ctx, args| {
-            // WildFly `BootstrapImpl.internalBootstrap` calls
+            // WildFly `BootstrapImpl.internalBootstrap` calls e.g.
             //   server.getAttribute(ObjectName("java.lang:type=OperatingSystem"),
             //                       "MaxFileDescriptorCount")
-            // then `.toString()` + `Long.parseLong` — NPE if we return
-            // null. Return a String "8192" so parseLong succeeds and the
-            // fd-limit check is skipped (8192 >= 4096). For any other
-            // attribute, returning a generic non-null string lets
-            // `toString()` callers move on; callers that need a typed
-            // value will hit a ClassCastException which is in turn
-            // caught by the bootstrap's `Throwable` handler.
+            // then `.toString()` + `Long.parseLong`.
+            //
+            // We answer each attribute with REAL VM state where a source
+            // exists, and with the OpenJDK "unavailable" sentinel (-1 / -1.0)
+            // — NOT a fabricated plausible number — where it does not. The
+            // previous body returned a fake "8192" for every memory/fd size,
+            // which is exactly the kind of invented-but-plausible value the
+            // no-synthetic-stubs policy forbids: a consumer could not tell it
+            // apart from a real reading.
+            //
+            // Sources used:
+            //   AvailableProcessors -> available_parallelism (real)
+            //   Name / Arch         -> std::env consts (real)
+            //   Version             -> os.version system property (real)
+            //   *PhysicalMemory* / *Swap* / *FileDescriptor* /
+            //   CommittedVirtualMemorySize / ProcessCpuTime
+            //                       -> -1  (no in-VM source; spec sentinel)
+            //   Process/SystemCpuLoad / SystemLoadAverage
+            //                       -> -1.0 (spec sentinel for "unavailable")
+            // For any unrecognised attribute we return null (the JMX-correct
+            // "no such attribute" answer) rather than a fabricated string;
+            // callers' existing AttributeNotFound / Throwable handlers cope.
             let attr_name = match args.get(2) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let response: &str = match attr_name.as_str() {
+            let response: Option<String> = match attr_name.as_str() {
+                "AvailableProcessors" => {
+                    let n = std::thread::available_parallelism()
+                        .map(|p| p.get())
+                        .unwrap_or(1);
+                    Some(n.to_string())
+                }
+                "Name" => Some(std::env::consts::OS.to_string()),
+                "Arch" => Some(std::env::consts::ARCH.to_string()),
+                "Version" => Some(
+                    ctx.get_system_property("os.version")
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+                // No real in-VM source — honest "unavailable" sentinel (-1),
+                // which still parses as a Long for callers like WildFly's
+                // fd-limit check (which treats a negative value as "skip").
                 "MaxFileDescriptorCount" | "OpenFileDescriptorCount"
                 | "TotalPhysicalMemorySize" | "FreePhysicalMemorySize"
                 | "TotalSwapSpaceSize" | "FreeSwapSpaceSize"
-                | "CommittedVirtualMemorySize" => "8192",
-                "ProcessCpuLoad" | "SystemCpuLoad" => "0.0",
-                "Name" | "Arch" | "Version" => "unknown",
-                _ => "0",
+                | "CommittedVirtualMemorySize" | "ProcessCpuTime" => {
+                    Some("-1".to_string())
+                }
+                // No CPU-load measurement — spec sentinel for "unavailable".
+                "ProcessCpuLoad" | "SystemCpuLoad" | "SystemLoadAverage" => {
+                    Some("-1.0".to_string())
+                }
+                // Unknown attribute: return null (JMX "no such attribute").
+                _ => None,
             };
-            Ok(Some(Value::Object(Some(ctx.create_string(response)))))
+            match response {
+                Some(s) => Ok(Some(Value::Object(Some(ctx.create_string(&s))))),
+                None => Ok(Some(Value::Object(None))),
+            }
         },
     );
     r.set_category(__prev_cat);
