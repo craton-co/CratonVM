@@ -262,6 +262,57 @@ pub fn pop_jit_entry() -> Option<usize> {
     }
 }
 
+/// Round-7 corruption fix: self-heal a LEAKED `JitEntryGuard`.
+///
+/// When a JIT call's RAII `Drop`/[`pop_jit_entry`] is bypassed (an
+/// abandoned compiled-callee frame — e.g. a non-local exit through the
+/// JIT return path), a stale entry is left on the chain **and** the
+/// `gc_quiescence` counter stays permanently elevated. A wedged
+/// quiescence forces the GC onto the *non-moving* young sweep on every
+/// collection, which is the heap corruptor (verified round 7:
+/// `CRATONVM_DBG_FORCE_MOVING=1` → 0 corruption vs a deterministic 211
+/// under `CRATONVM_DBG_GC_STRESS`).
+///
+/// This prunes every chain entry that has *provably returned*. The
+/// conservative scanner's invariant (see [`scan_active_jit_frames`]) is
+/// that a **live** JIT spill region lies at or above the scanner's
+/// current SP — the native stack grows downward, so a live ancestor
+/// frame's `entry_sp` is always `>= scanner_sp`. An entry whose captured
+/// `entry_sp` is strictly **below** `scanner_sp` therefore cannot belong
+/// to any live frame: its call has returned without popping. Removing
+/// such entries (and matching each one with a `GLOBAL_JIT_DEPTH`
+/// decrement + `gc_quiescence::leave()`) lets quiescence fall back to the
+/// true live count, so the moving collector resumes the moment no JIT
+/// frame is genuinely live.
+///
+/// Soundness: the predicate **never** removes a live frame (a live frame
+/// always satisfies `entry_sp >= scanner_sp`), so genuine JIT activity
+/// still correctly keeps quiescence active and the non-moving sweep
+/// engaged. Returns the number of stale entries reclaimed.
+pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
+    let pruned = JIT_ENTRY_CHAIN.with(|c| {
+        let mut v = c.borrow_mut();
+        let before = v.len();
+        // Keep only entries that could still be live (spill region at or
+        // above the scanner SP). Entries below it have provably returned.
+        v.retain(|e| e.entry_sp >= scanner_sp);
+        before - v.len()
+    });
+    for _ in 0..pruned {
+        GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
+        cratonvm_gc::gc_quiescence::leave();
+    }
+    if pruned > 0 {
+        tracing::debug!(
+            "pruned {} leaked JIT entry/entries (returned frames below scanner \
+             SP {:#x}); quiescence healed to live count",
+            pruned,
+            scanner_sp,
+        );
+    }
+    pruned
+}
+
 /// RAII guard that pairs `push_jit_entry` with `pop_jit_entry` on drop.
 ///
 /// Use this at every JIT call site so a panic unwinding through the
@@ -395,6 +446,18 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // target). We use `current_stack_pointer` rather than reading `RSP`
     // directly so the implementation is portable across architectures.
     let scanner_sp = current_stack_pointer();
+    // Round-7 corruption fix: before scanning, reclaim any LEAKED JIT
+    // entry (a returned frame whose guard Drop was bypassed) so the GC's
+    // `gc_quiescence` flag reflects only genuinely-live JIT frames. A
+    // wedged flag forces the heap-corrupting non-moving young sweep on
+    // every GC; healing it here lets the moving collector resume. Sound:
+    // only entries strictly below the scanner SP (provably returned) are
+    // pruned — live frames (entry_sp >= scanner_sp) are always retained.
+    // DBG: CRATONVM_DBG_NO_PRUNE disables the self-heal so the leak (and its
+    // non-moving-sweep corruption) can be A/B-reproduced in the same binary.
+    if std::env::var_os("CRATONVM_DBG_NO_PRUNE").is_none() {
+        let _ = prune_returned_jit_entries(scanner_sp);
+    }
     scan_active_jit_frames_with_sp(scanner_sp, heap, out);
 }
 
@@ -615,6 +678,64 @@ mod tests {
             depth_before,
             "guard must pop the chain even on panic unwind"
         );
+    }
+
+    #[test]
+    fn prune_reclaims_returned_entries_keeps_live() {
+        // Round-7 corruption fix: self-heal a LEAKED JitEntryGuard. Build a
+        // chain with one genuinely-live frame (entry_sp ABOVE a chosen scanner
+        // SP) and one provably-returned/leaked frame (entry_sp BELOW it).
+        // Pruning at the scanner SP must reclaim exactly the returned one and
+        // retain the live one. Assertions are on the THREAD-LOCAL chain only
+        // (race-free), never the shared global counter.
+        let depth_before = current_thread_jit_depth();
+        let scanner_sp: usize = 0x10_0000;
+        // leaked / already-returned frame: entry_sp strictly below scanner SP.
+        push_jit_entry_at(scanner_sp - 0x1000);
+        // genuinely-live frame: entry_sp at/above scanner SP.
+        push_jit_entry_at(scanner_sp + 0x1000);
+        assert_eq!(current_thread_jit_depth(), depth_before + 2);
+
+        let pruned = prune_returned_jit_entries(scanner_sp);
+        assert_eq!(
+            pruned, 1,
+            "exactly the returned (below-scanner) entry is reclaimed"
+        );
+        assert_eq!(
+            current_thread_jit_depth(),
+            depth_before + 1,
+            "the genuinely-live entry is retained"
+        );
+        JIT_ENTRY_CHAIN.with(|c| {
+            assert!(
+                c.borrow().iter().all(|e| e.entry_sp >= scanner_sp),
+                "no entry below the scanner SP survives the prune"
+            );
+        });
+        // Restore balance (pop the live entry) so the global counters and the
+        // chain return to their pre-test state for any sibling test.
+        let _ = pop_jit_entry();
+        assert_eq!(current_thread_jit_depth(), depth_before);
+    }
+
+    #[test]
+    fn prune_never_removes_live_frames() {
+        // Soundness guard: a chain where every entry is at/above the scanner
+        // SP must be left completely untouched — a live frame is never a
+        // false-positive prune target.
+        let depth_before = current_thread_jit_depth();
+        let scanner_sp: usize = 0x10_0000;
+        push_jit_entry_at(scanner_sp); // exactly at SP counts as live (>=)
+        push_jit_entry_at(scanner_sp + 0x2000); // above = live
+        let pruned = prune_returned_jit_entries(scanner_sp);
+        assert_eq!(
+            pruned, 0,
+            "live frames (entry_sp >= scanner_sp) are never pruned"
+        );
+        assert_eq!(current_thread_jit_depth(), depth_before + 2);
+        let _ = pop_jit_entry();
+        let _ = pop_jit_entry();
+        assert_eq!(current_thread_jit_depth(), depth_before);
     }
 
     #[test]

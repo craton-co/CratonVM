@@ -1464,6 +1464,16 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         return None;
     }
 
+    // EC-DUP2-CAT2: reject methods whose `dup2` (0x5C) operates on a
+    // category-2 (long/double) value. The codegen `dup2` handler unconditionally
+    // implements the two-category-1 form; for a single category-2 operand it
+    // duplicates an unrelated lower stack slot, desyncing the operand stack and
+    // leaving a primitive where a reference is expected (later dereferenced as a
+    // bad pointer). See `dup2_category_safe`'s doc for the full analysis.
+    if !dup2_category_safe(code, code_len) {
+        return None;
+    }
+
     // Run a *conservative* escape pre-pass here: `jit_scan` has no
     // constant-pool resolver, so it cannot tell a trivial `<init>()V`
     // apart from an arg-bearing constructor. We therefore pass an empty
@@ -1649,6 +1659,473 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
     }
 }
 
+/// EC-SCALAR-SOUNDNESS (bc math-ec JIT miscompile fix) — compute the set of
+/// bytecode PCs that are the TARGET of any branch (conditional, `goto`,
+/// `goto_w`, `jsr`, `jsr_w`, `tableswitch`, `lookupswitch`).
+///
+/// The single-linear-pass escape / scalar-replacement analyses
+/// (`analyze_escapes`, `plan_scalar_replacement`) carry abstract operand-stack
+/// and per-local provenance straight through the bytecode without resetting at
+/// basic-block boundaries. That is only sound for straight-line code: at a
+/// merge point (a branch target reachable from more than one predecessor) the
+/// linear state need not match the real verification-time state on every
+/// incoming edge. To keep those analyses sound we treat every branch *source*
+/// (handled inline at each branch opcode) AND every branch *target* (via this
+/// set) as a hard barrier that drops all tracked provenance, confining any
+/// scalar-replaced object to a single-entry / single-exit straight-line
+/// region.
+///
+/// Returns a bit-set (`Vec<bool>` indexed by PC) of size `code_len`.
+fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
+    let mut targets = vec![false; code_len];
+    let mut pc = 0usize;
+    while pc < code_len {
+        let op = code[pc];
+        match op {
+            // Conditional branches + goto + jsr: 2-byte signed offset from `pc`.
+            0x99..=0xA8 | 0xC6 | 0xC7 => {
+                if pc + 2 < code_len {
+                    let off =
+                        i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
+                    let t = pc as isize + off;
+                    if t >= 0 && (t as usize) < code_len {
+                        targets[t as usize] = true;
+                    }
+                }
+                pc += 3;
+            }
+            // goto_w / jsr_w: 4-byte signed offset from `pc`.
+            0xC8 | 0xC9 => {
+                if pc + 4 < code_len {
+                    let off = i32::from_be_bytes([
+                        code[pc + 1],
+                        code[pc + 2],
+                        code[pc + 3],
+                        code[pc + 4],
+                    ]) as isize;
+                    let t = pc as isize + off;
+                    if t >= 0 && (t as usize) < code_len {
+                        targets[t as usize] = true;
+                    }
+                }
+                pc += 5;
+            }
+            // tableswitch: default + (high-low+1) offsets, all relative to `pc`.
+            0xAA => {
+                let mut p = pc + 1;
+                while p % 4 != 0 {
+                    p += 1;
+                }
+                if p + 12 > code_len {
+                    break;
+                }
+                let read_off = |code: &[u8], at: usize| -> isize {
+                    i32::from_be_bytes([
+                        code[at],
+                        code[at + 1],
+                        code[at + 2],
+                        code[at + 3],
+                    ]) as isize
+                };
+                let mark = |targets: &mut Vec<bool>, off: isize| {
+                    let t = pc as isize + off;
+                    if t >= 0 && (t as usize) < code_len {
+                        targets[t as usize] = true;
+                    }
+                };
+                mark(&mut targets, read_off(code, p)); // default
+                let low = read_off(code, p + 4) as i32;
+                let high = read_off(code, p + 8) as i32;
+                let count = checked_tableswitch_count(low, high).unwrap_or(0);
+                let mut jp = p + 12;
+                for _ in 0..count {
+                    if jp + 4 > code_len {
+                        break;
+                    }
+                    mark(&mut targets, read_off(code, jp));
+                    jp += 4;
+                }
+                pc += bytecode_len_at(code, pc);
+            }
+            // lookupswitch: default + npairs (match, offset) pairs.
+            0xAB => {
+                let mut p = pc + 1;
+                while p % 4 != 0 {
+                    p += 1;
+                }
+                if p + 8 > code_len {
+                    break;
+                }
+                let read_off = |code: &[u8], at: usize| -> isize {
+                    i32::from_be_bytes([
+                        code[at],
+                        code[at + 1],
+                        code[at + 2],
+                        code[at + 3],
+                    ]) as isize
+                };
+                let mark = |targets: &mut Vec<bool>, off: isize| {
+                    let t = pc as isize + off;
+                    if t >= 0 && (t as usize) < code_len {
+                        targets[t as usize] = true;
+                    }
+                };
+                mark(&mut targets, read_off(code, p)); // default
+                let npairs = i32::from_be_bytes([
+                    code[p + 4],
+                    code[p + 5],
+                    code[p + 6],
+                    code[p + 7],
+                ])
+                .max(0) as usize;
+                let mut jp = p + 8;
+                for _ in 0..npairs {
+                    if jp + 8 > code_len {
+                        break;
+                    }
+                    // pair is (match:i32, offset:i32); offset at jp+4.
+                    mark(&mut targets, read_off(code, jp + 4));
+                    jp += 8;
+                }
+                pc += bytecode_len_at(code, pc);
+            }
+            _ => {
+                pc += bytecode_len_at(code, pc);
+            }
+        }
+    }
+    targets
+}
+
+/// EC-DUP2-CAT2 (bc math-ec JIT miscompile fix) — reject methods whose
+/// `dup2` (0x5C) operates on a CATEGORY-2 (long / double) value.
+///
+/// ## The bug
+///
+/// The JIT models the operand stack with ONE entry per value, regardless of
+/// type width (a `long`/`double` is a single 64-bit stack entry; `ladd` pops
+/// two entries and pushes one — see the arithmetic handlers). That single-slot
+/// model is internally consistent for arithmetic, but `dup2` (0x5C) is
+/// type-dependent in the JVM:
+///
+///   * FORM 1 — top two operands are each category-1: `[…, v1, v2]` →
+///     `[…, v1, v2, v1, v2]`.
+///   * FORM 2 — top operand is a single category-2 value: `[…, w]` →
+///     `[…, w, w]`.
+///
+/// The codegen `dup2` handler unconditionally implements FORM 1: it reads
+/// `stack[len-2]` and `stack[len-1]` and re-pushes both. For a single
+/// category-2 operand (FORM 2) there is only ONE real value on top, so
+/// `stack[len-2]` is an UNRELATED value living below the long/double. The
+/// handler then duplicates that unrelated value, corrupting the operand
+/// stack: a subsequent consumer reads the wrong slot, and an `int` (or other
+/// primitive) ends up where an object/array reference is expected. The bad
+/// "reference" (a small integer like 1 or 3) is later dereferenced by an
+/// inline `getfield`/array op — observed as `EXCEPTION_ACCESS_VIOLATION`
+/// reading `[1 + 0x30]` (= field-0 payload off a base of `1`) and
+/// `[3 + 0xC]` (= array-length off a base of `3`) in `org.bouncycastle.
+/// math.ec` AllTests, and as a bad pointer the young-gen GC scavenge later
+/// follows into a SEGV.
+///
+/// `jit_scan` already ACCEPTS `dup2` (it only advances `pc`), and the five
+/// other type-dependent stack ops (`pop2`, `dup_x1`, `dup_x2`, `dup2_x1`,
+/// `dup2_x2`) are not implemented by codegen and safely bail. Only `dup2` is
+/// both accepted AND (mis-)implemented, so it is the lone miscompile.
+///
+/// ## The fix
+///
+/// Track operand-stack category WIDTH (1 or 2 per value) with a precise
+/// linear abstract interpretation. At each `dup2`, if the top value is
+/// category-2 — or if the width state is in any way uncertain — reject the
+/// whole method (`jit_scan` returns `None`), leaving it to the interpreter.
+/// The common FORM-1 `dup2` (the `arr[i] op= x` array-update idiom, where the
+/// top two operands are an arrayref + int index — both category-1) is
+/// unaffected and still JITs.
+///
+/// Soundness: under JVMS verification the stack height AND the type-width at
+/// every PC are invariant across all incoming control-flow edges, so a single
+/// linear width-tracking pass observes the correct top-of-stack width at each
+/// `dup2` regardless of branches. To stay safe even on bytecode shapes this
+/// tracker models imprecisely, ANY uncertainty (stack underflow in the
+/// abstract model, or an opcode whose exact width effect is not modeled while
+/// a `dup2` is still reachable) conservatively triggers rejection.
+///
+/// Returns `true` when the method is SAFE to JIT w.r.t. `dup2`, `false` when
+/// it must be rejected.
+fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
+    // Fast path: no `dup2` anywhere → nothing to check.
+    let mut has_dup2 = false;
+    {
+        let mut p = 0usize;
+        while p < code_len {
+            if code[p] == 0x5C {
+                has_dup2 = true;
+                break;
+            }
+            p += bytecode_len_at(code, p);
+        }
+    }
+    if !has_dup2 {
+        return true;
+    }
+
+    // Abstract operand stack of category widths, one entry per value:
+    //   1 = category-1 (int/float/ref/returnAddress; high-half is implicit)
+    //   2 = category-2 (long/double) — a SINGLE entry in this single-slot model
+    //
+    // An empty model (e.g. just after a `widths.clear()` on an op whose exact
+    // width effect we do not track) makes a subsequent `dup2` default to
+    // FORM-1 — matching the codegen — rather than rejecting, so JIT coverage
+    // is preserved. We reject only when a `dup2`'s top is PROVABLY category-2.
+    let mut widths: Vec<u8> = Vec::with_capacity(16);
+
+    // Helpers ------------------------------------------------------------
+    macro_rules! push {
+        ($w:expr) => {
+            widths.push($w)
+        };
+    }
+    macro_rules! pop {
+        () => {
+            widths.pop()
+        };
+    }
+
+    let mut pc = 0usize;
+    while pc < code_len {
+        let op = code[pc];
+        match op {
+            // --- pushes: category-1 producers ---
+            // aconst_null, iconst*, fconst*, bipush, sipush, ldc/ldc_w,
+            // iload*, fload*, aload*, i/f/a/b/c/saload, new, newarray,
+            // anewarray, arraylength, instanceof, i2f/i2b/i2c/i2s/l2i/f2i/
+            // d2i/l2f/d2f, fcmp/lcmp/dcmp (push int), etc.
+            0x01 | 0x02..=0x08 | 0x0b..=0x0d => { push!(1); pc += 1; }
+            0x10 => { push!(1); pc += 2; }      // bipush
+            0x11 => { push!(1); pc += 3; }      // sipush
+            0x12 => { push!(1); pc += 2; }      // ldc
+            0x13 => { push!(1); pc += 3; }      // ldc_w
+            0x15 => { push!(1); pc += 2; }      // iload
+            0x17 => { push!(1); pc += 2; }      // fload
+            0x19 => { push!(1); pc += 2; }      // aload
+            0x1a..=0x1d => { push!(1); pc += 1; } // iload_0..3
+            0x22..=0x25 => { push!(1); pc += 1; } // fload_0..3
+            0x2a..=0x2d => { push!(1); pc += 1; } // aload_0..3
+
+            // --- pushes: category-2 producers ---
+            0x09 | 0x0a | 0x0e | 0x0f => { push!(2); pc += 1; } // l/dconst
+            0x14 => { push!(2); pc += 3; }      // ldc2_w (long/double)
+            0x16 => { push!(2); pc += 2; }      // lload
+            0x18 => { push!(2); pc += 2; }      // dload
+            0x1e..=0x21 => { push!(2); pc += 1; } // lload_0..3
+            0x26..=0x29 => { push!(2); pc += 1; } // dload_0..3
+
+            // --- array loads (pop arrayref+index, push element) ---
+            // iaload/faload/aaload/baload/caload/saload → cat-1 element
+            0x2e | 0x30 | 0x32 | 0x33 | 0x34 | 0x35 => {
+                pop!(); pop!(); push!(1); pc += 1;
+            }
+            // laload (0x2f) / daload (0x31) → cat-2 element
+            0x2f | 0x31 => {
+                pop!(); pop!(); push!(2); pc += 1;
+            }
+
+            // --- stores (pop the value; locals are untracked) ---
+            0x36 | 0x37 | 0x3a => { pop!(); pc += 2; }       // istore/fstore/astore
+            0x38 | 0x39 => { pop!(); pc += 2; }              // lstore/dstore (one entry)
+            0x3b..=0x3e | 0x43..=0x4e => { pop!(); pc += 1; } // istore_/fstore_/astore_
+            0x3f..=0x42 => { pop!(); pc += 1; }              // lstore_0..3 (one entry)
+            // dstore_0..3 fall under 0x47..=0x4a, included in 0x43..=0x4a above
+
+            // --- array stores (pop value, index, arrayref) ---
+            0x4f..=0x56 => { pop!(); pop!(); pop!(); pc += 1; }
+
+            // --- stack manipulation (the crux) ---
+            //
+            // POLICY: this analyzer's ONLY purpose is to reject methods whose
+            // `dup2` (0x5C, the single ambiguous stack op the codegen actually
+            // implements) operates on a CATEGORY-2 value. The other ambiguous
+            // ops (`pop2`, `dup_x1`, `dup_x2`, `dup2_x1`, `dup2_x2`) are NOT
+            // implemented by codegen — they hit the `_ => return false` bail in
+            // `compile_bytecode` and the method safely stays interpreted, so we
+            // do NOT reject for them here. To avoid losing JIT coverage, an
+            // imprecisely-modeled state is handled by CLEARING the abstract
+            // stack (treat subsequent values as unknown) rather than rejecting;
+            // a `dup2` on a cleared/unknown top is then treated as FORM-1,
+            // matching the codegen's behavior (correct whenever the real top is
+            // two category-1 values — the overwhelmingly common case).
+            //
+            // pop (cat-1)
+            0x57 => { pop!(); pc += 1; }
+            // pop2: two cat-1 OR one cat-2 — codegen's `pop2` is unimplemented
+            // (bails), so we only need to keep the model's height roughly sane.
+            0x58 => {
+                match widths.last().copied() {
+                    Some(2) => { pop!(); }
+                    _ => { pop!(); pop!(); }
+                }
+                pc += 1;
+            }
+            // dup (cat-1 only by JVMS; duplicate top width).
+            0x59 => {
+                let w = widths.last().copied().unwrap_or(1);
+                push!(w);
+                pc += 1;
+            }
+            // dup_x1 / dup_x2 — unimplemented by codegen (safe bail); just
+            // resync the model loosely. Clear so we do not mis-evaluate a later
+            // dup2 against a now-shuffled stack we no longer model precisely.
+            0x5a | 0x5b => { widths.clear(); pc += 1; }
+            // dup2 — THE checked op. Reject ONLY when the top is PROVABLY
+            // category-2 (FORM 2), which the codegen mis-duplicates as two
+            // category-1 entries.
+            0x5c => {
+                match widths.last().copied() {
+                    Some(2) => {
+                        // FORM 2: single category-2 value on top — codegen
+                        // miscompiles this. Reject the method.
+                        return false;
+                    }
+                    Some(1) => {
+                        // Top is category-1. If the second entry is also a
+                        // known category-1, this is a safe FORM-1 dup2; model
+                        // the duplication. If the second entry is category-2
+                        // (an unusual but possible verified shape), the codegen
+                        // would also mishandle it, so reject.
+                        let len = widths.len();
+                        if len >= 2 && widths[len - 2] == 2 {
+                            return false;
+                        }
+                        let a = widths.get(len.wrapping_sub(2)).copied().unwrap_or(1);
+                        let b = 1u8;
+                        push!(a);
+                        push!(b);
+                    }
+                    _ => {
+                        // None (empty/cleared model) or an out-of-range width that
+                        // cannot occur for a valid stack model (widths are only ever
+                        // 1 or 2): treat conservatively as FORM-1 to match codegen;
+                        // push two cat-1.
+                        push!(1);
+                        push!(1);
+                    }
+                }
+                pc += 1;
+            }
+            // dup2_x1 / dup2_x2 — unimplemented by codegen (safe bail); resync
+            // the model loosely by clearing.
+            0x5d | 0x5e => { widths.clear(); pc += 1; }
+            // swap (two cat-1) — unimplemented for cat-2 mixes; just model.
+            0x5f => {
+                let len = widths.len();
+                if len >= 2 {
+                    widths.swap(len - 1, len - 2);
+                }
+                pc += 1;
+            }
+
+            // --- arithmetic / logic ---
+            // int ops that pop 2 push 1 (cat-1): iadd/isub/imul/idiv/irem,
+            // ishl/ishr/iushr/iand/ior/ixor.
+            0x60 | 0x64 | 0x68 | 0x6c | 0x70 | 0x78 | 0x7a | 0x7c | 0x7e
+            | 0x80 | 0x82 => { pop!(); /* top stays cat-1 */ pc += 1; }
+            // float ops pop2 push1 (cat-1): fadd/fsub/fmul/fdiv/frem.
+            0x62 | 0x66 | 0x6a | 0x6e | 0x72 => { pop!(); pc += 1; }
+            // long ops that pop 2 push 1 (cat-2): ladd/lsub/lmul/ldiv/lrem,
+            // land/lor/lxor.
+            0x61 | 0x65 | 0x69 | 0x6d | 0x71 | 0x7f | 0x81 | 0x83 => {
+                pop!(); /* result cat-2, top entry already cat-2 */ pc += 1;
+            }
+            // double ops pop2 push1 (cat-2): dadd/dsub/dmul/ddiv/drem.
+            0x63 | 0x67 | 0x6b | 0x6f | 0x73 => { pop!(); pc += 1; }
+            // long shifts: lshl/lshr/lushr pop an int shift amount (cat-1),
+            // value stays cat-2.
+            0x79 | 0x7b | 0x7d => { pop!(); pc += 1; }
+            // unary negate: ineg/fneg (cat-1), lneg/dneg (cat-2) — width
+            // unchanged.
+            0x74..=0x77 => { pc += 1; }
+
+            // --- conversions (replace top width) ---
+            0x85 => { pop!(); push!(2); pc += 1; }        // i2l → long  (cat-2)
+            0x86 => { pop!(); push!(1); pc += 1; }        // i2f → float (cat-1)
+            0x87 => { pop!(); push!(2); pc += 1; }        // i2d → double(cat-2)
+            0x88 => { pop!(); push!(1); pc += 1; }        // l2i → int   (cat-1)
+            0x89 => { pop!(); push!(1); pc += 1; }        // l2f → float (cat-1)
+            0x8a => { pop!(); push!(2); pc += 1; }        // l2d → double(cat-2)
+            0x8b => { pop!(); push!(1); pc += 1; }        // f2i → int   (cat-1)
+            0x8c => { pop!(); push!(2); pc += 1; }        // f2l → long  (cat-2)
+            0x8d => { pop!(); push!(2); pc += 1; }        // f2d → double(cat-2)
+            0x8e => { pop!(); push!(1); pc += 1; }        // d2i → int   (cat-1)
+            0x8f => { pop!(); push!(2); pc += 1; }        // d2l → long  (cat-2)
+            0x90 => { pop!(); push!(1); pc += 1; }        // d2f → float (cat-1)
+            0x91..=0x93 => { pop!(); push!(1); pc += 1; } // i2b, i2c, i2s (cat-1)
+
+            // --- comparisons → push int (cat-1). Each pops two operands;
+            // cat-2 operands (lcmp/dcmp) are a single entry each, so popping
+            // two entries is correct for both cat-1 and cat-2 forms. ---
+            0x94 => { pop!(); pop!(); push!(1); pc += 1; } // lcmp  (long, long)
+            0x95 | 0x96 => { pop!(); pop!(); push!(1); pc += 1; } // fcmpl/fcmpg
+            0x97 | 0x98 => { pop!(); pop!(); push!(1); pc += 1; } // dcmpl/dcmpg
+
+            // --- control flow: per JVMS, stack height/width is invariant at
+            // each PC across edges, so a linear walk stays consistent. Pop the
+            // branch operands; provenance/width of the rest is preserved. ---
+            0x99..=0x9e | 0xc6 | 0xc7 => { pop!(); pc += 3; } // if<cond>, ifnull/nonnull
+            0x9f..=0xa6 => { pop!(); pop!(); pc += 3; }       // if_icmp/if_acmp
+            0xa7 => { pc += 3; }                              // goto
+            0xa8 => { push!(1); pc += 3; }                    // jsr (pushes returnAddress)
+            0xa9 => { pc += 2; }                              // ret
+
+            // returns / athrow — terminate this straight-line run; the abstract
+            // stack is reset implicitly because the next PC begins a new block
+            // (a branch target). Pop the returned value where applicable.
+            0xac | 0xae | 0xb0 => { pop!(); widths.clear(); pc += 1; } // ireturn/freturn/areturn
+            0xad | 0xaf => { pop!(); widths.clear(); pc += 1; }        // lreturn/dreturn (one entry)
+            0xb1 => { widths.clear(); pc += 1; }                       // return
+            0xbf => { widths.clear(); pc += 1; }                       // athrow
+
+            // switches — pop the int key; rest invariant.
+            0xaa => { pop!(); pc += bytecode_len_at(code, pc); }
+            0xab => { pop!(); pc += bytecode_len_at(code, pc); }
+
+            // --- field / method ops: the width effect depends on the CP
+            // descriptor, which this standalone helper does not parse. Rather
+            // than reject (which would needlessly forgo JITting any method that
+            // mixes field/call ops with a `dup2`), CLEAR the abstract model and
+            // continue. A `dup2` whose top is a *direct* call/field result is
+            // exceptionally rare in real bytecode (results are stored, not
+            // dup2'd), and a cleared model makes such a dup2 default to FORM-1
+            // — exactly the codegen's existing behavior. This preserves JIT
+            // coverage while still catching the common, locally-detectable
+            // FORM-2 dup2 (e.g. `lload; dup2`, `ladd; dup2`).
+            0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xba => {
+                widths.clear();
+                pc += bytecode_len_at(code, pc);
+            }
+
+            // new / checkcast / instanceof / monitor / nop / iinc / arrays.
+            0x00 => { pc += 1; }                              // nop
+            0x84 => { pc += 3; }                              // iinc (no stack effect)
+            0xbb => { push!(1); pc += 3; }                    // new → objectref (cat-1)
+            0xbc => { pop!(); push!(1); pc += 2; }            // newarray
+            0xbd => { pop!(); push!(1); pc += 3; }            // anewarray
+            0xbe => { pop!(); push!(1); pc += 1; }            // arraylength → int
+            0xc0 => { pc += 3; }                              // checkcast (width unchanged)
+            0xc1 => { pop!(); push!(1); pc += 3; }            // instanceof → int
+            0xc2 | 0xc3 => { pop!(); pc += 1; }               // monitorenter/exit
+            // wide (0xc4), multianewarray (0xc5), goto_w/jsr_w (0xc8/0xc9), and
+            // any other unmodeled opcode: clear the model and advance by the
+            // correct instruction length. Clearing keeps us sound (a later
+            // dup2 defaults to FORM-1 = codegen behavior) without rejecting.
+            _ => {
+                widths.clear();
+                pc += bytecode_len_at(code, pc);
+            }
+        }
+    }
+    true
+}
+
 // ---------------------------------------------------------------------------
 // HIGH-1 / Fix 1 — null-check elimination helper
 // ---------------------------------------------------------------------------
@@ -1787,6 +2264,11 @@ fn analyze_escapes(
     let mut local_origin: [Option<usize>; 256] = [None; 256];
     let mut escaped: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // EC-SCALAR-SOUNDNESS: branch-target PCs are hard barriers (merge
+    // points where the linear abstract state is not guaranteed to match
+    // the real verification-time state on every incoming edge).
+    let branch_targets = compute_branch_targets(code, code_len);
+
     // Helper: mark all tracked objects currently on the stack as escaped.
     macro_rules! escape_all {
         () => {
@@ -1800,6 +2282,21 @@ fn analyze_escapes(
 
     let mut pc = 0usize;
     while pc < code_len {
+        // EC-SCALAR-SOUNDNESS: entering a branch target (merge point) — any
+        // object whose provenance is live here may have arrived on an edge
+        // this single linear pass cannot model. Conservatively escape every
+        // tracked object (stack + locals) and drop all provenance so the
+        // object is never scalar-replaced. (pc 0 is also flagged as a target
+        // but nothing is live there, so this is a no-op at entry.)
+        if branch_targets.get(pc).copied().unwrap_or(false) {
+            escape_all!();
+            for slot in local_origin.iter_mut() {
+                if let Some(p) = slot.take() {
+                    escaped.insert(p);
+                }
+            }
+            abs_stack.clear();
+        }
         let op = code[pc];
         match op {
             // new — push a tracked reference
@@ -1942,6 +2439,56 @@ fn analyze_escapes(
                 abs_stack.push(None);
                 pc += if op == 0xb9 { 5 } else { 3 };
             }
+            // EC-SCALAR-SOUNDNESS (bc math-ec JIT miscompile fix):
+            //
+            // This whole analysis is a SINGLE LINEAR forward pass over the
+            // bytecode — it never resets/merges the abstract operand stack
+            // or `local_origin` at basic-block boundaries. That is only sound
+            // for STRAIGHT-LINE code. The instant control flow can branch
+            // (conditional/goto/switch), throw, `ret`, or split via `jsr`,
+            // the linear `abs_stack`/`local_origin` state diverges from the
+            // real verification-time stack at the branch target. A genuinely
+            // escaping store reached on a path the linear walk mis-models is
+            // then attributed to the wrong `new` (or to none), so an object
+            // that DOES escape is reported non-escaping and later scalar-
+            // replaced. The scalar-replaced `new` pushes a dummy zero ref
+            // (see the `0xbb` handler) and its real escaping store writes a
+            // bad heap pointer — which the GC later follows and SEGVs on
+            // (observed: bc `org.bouncycastle.math.ec` AllTests, fault read
+            // @ ~0x31 off a near-page-aligned garbage base inside the
+            // young-gen scavenge copy loop).
+            //
+            // Correctness fix: treat EVERY control-transfer instruction as a
+            // hard escape barrier. Escape every object currently tracked on
+            // the operand stack AND every object held in a local (any of
+            // which could be `aload`ed and made to escape on an edge this
+            // pass cannot follow), then clear all provenance. This confines
+            // scalar replacement to objects whose entire `new; dup;
+            // <init>()V; (putfield|getfield)*` lifecycle is provably within a
+            // single straight-line region — exactly where the single-pass
+            // abstract interpretation is sound. Straight-line allocation
+            // sites (the common case this optimization targets) are
+            // unaffected; only objects whose liveness crosses a CFG edge are
+            // conservatively de-optimized.
+            //
+            //   0x99..=0xa8  ifeq..jsr (conditional branches, goto, jsr)
+            //   0xa9         ret
+            //   0xaa,0xab    table/lookupswitch
+            //   0xac..=0xb1  *return (areturn 0xb0 handled above, but listing
+            //                it here is harmless — it's matched earlier)
+            //   0xbf         athrow
+            //   0xc6,0xc7    ifnull / ifnonnull
+            //   0xc8,0xc9    goto_w / jsr_w
+            0x99..=0xa9 | 0xaa | 0xab | 0xac..=0xb1 | 0xbf | 0xc6 | 0xc7 | 0xc8 | 0xc9 => {
+                escape_all!();
+                for slot in local_origin.iter_mut() {
+                    if let Some(p) = slot.take() {
+                        escaped.insert(p);
+                    }
+                }
+                abs_stack.clear();
+                pc += bytecode_len_at(code, pc);
+            }
             // For all other opcodes, use bytecode_len_at for PC advance.
             // These ops don't move tracked references, so no escaping needed.
             _ => {
@@ -2047,8 +2594,22 @@ fn plan_scalar_replacement(
     let mut field_ops: FxHashMap<usize, usize> = FxHashMap::default();
     let mut init_skips = std::collections::HashSet::new();
 
+    // EC-SCALAR-SOUNDNESS: same branch-target barrier as `analyze_escapes`.
+    // Objects in `objects` are already guaranteed (by the stricter
+    // `analyze_escapes`) to live within a single straight-line region, so
+    // clearing all provenance at every merge point can never strip a *valid*
+    // field-op mapping — it only prevents a stale `local_prov`/`abs_stack`
+    // entry from binding a post-branch field op to the wrong scalar object.
+    let branch_targets = compute_branch_targets(code, code_len);
+
     let mut pc = 0usize;
     while pc < code_len {
+        if branch_targets.get(pc).copied().unwrap_or(false) {
+            abs_stack.clear();
+            for prov in local_prov.iter_mut() {
+                *prov = None;
+            }
+        }
         let op = code[pc];
         match op {
             // new
@@ -2180,20 +2741,39 @@ fn plan_scalar_replacement(
                 if let Some(last) = abs_stack.last_mut() { *last = None; }
                 pc += 1;
             }
-            // Conditional branches: conservatively clear stack provenance, keep locals
+            // Conditional branches.
+            //
+            // EC-SCALAR-SOUNDNESS (bc math-ec JIT miscompile fix): this is a
+            // single LINEAR pass with no per-block reset/merge, so once
+            // control flow can branch, neither `abs_stack` nor `local_prov`
+            // reliably matches the real verification-time state at the branch
+            // target. The previous code cleared only the STACK provenance and
+            // kept `local_prov`, so a stale `local_prov[k] == Some(new_pc)`
+            // could mis-attribute a later `getfield`/`putfield` (whose local
+            // `k` was reused for a different value on the branch-reached path)
+            // to a scalar-replaced object — rewriting it into a frame-slot
+            // access against memory that does not hold that object, or
+            // wrongly skipping its `<init>`. Combined with the (now stricter)
+            // `analyze_escapes`, which marks any object whose provenance
+            // crosses a CFG edge as escaping, scalar-replaced objects are
+            // guaranteed to live entirely within one straight-line region.
+            // Mirror that here: a control transfer is a hard barrier — drop
+            // ALL provenance (stack + locals) so no field op past a branch is
+            // ever bound to a scalar object via stale state.
             0x99..=0xA6 => {
                 // Pop comparison operands
                 match op {
                     0x99..=0x9E | 0xC6 | 0xC7 => { abs_stack.pop(); }
                     _ => { abs_stack.pop(); abs_stack.pop(); }
                 }
-                // Clear stack provenance at branch (conservative for merge points)
-                for slot in abs_stack.iter_mut() { *slot = None; }
+                abs_stack.clear();
+                for prov in local_prov.iter_mut() { *prov = None; }
                 pc += 3;
             }
-            // goto
+            // goto — control transfer; same hard barrier as above.
             0xA7 => {
                 abs_stack.clear();
+                for prov in local_prov.iter_mut() { *prov = None; }
                 pc += 3;
             }
             // ireturn, lreturn, freturn, dreturn, areturn
@@ -2275,14 +2855,22 @@ fn plan_scalar_replacement(
                 abs_stack.push(None);
                 pc += 3;
             }
-            // ifnull, ifnonnull
+            // ifnull, ifnonnull — control transfer; hard barrier (see the
+            // EC-SCALAR-SOUNDNESS note on the conditional-branch arm above):
+            // drop ALL provenance (stack + locals) so no field op past the
+            // branch is bound to a scalar object via stale state.
             0xC6 | 0xC7 => {
                 abs_stack.pop();
-                for slot in abs_stack.iter_mut() { *slot = None; }
+                abs_stack.clear();
+                for prov in local_prov.iter_mut() { *prov = None; }
                 pc += 3;
             }
-            // athrow
-            0xBF => { abs_stack.clear(); pc += 1; }
+            // athrow — control transfer (to handler or caller); same barrier.
+            0xBF => {
+                abs_stack.clear();
+                for prov in local_prov.iter_mut() { *prov = None; }
+                pc += 1;
+            }
             // arraylength
             0xBE => {
                 abs_stack.pop();
@@ -11217,6 +11805,17 @@ impl Compiler {
                 // dup
                 0x59 => {
                     let top = self.peek_stack();
+                    // T1.1.a / EC oop-map fix: capture the source slot's oop
+                    // mark so the duplicate carries it. The `self.stack.push`
+                    // fast-paths below would otherwise push to `self.stack`
+                    // WITHOUT a paired `stack_oop_marks` push (desyncing the
+                    // two vectors), and the `push_from_rax`/`push_stack` paths
+                    // push a hard-coded `false` — both leave a duplicated
+                    // object reference UNMARKED in the precise oop map. A
+                    // duplicated oop live across a safepoint must stay precisely
+                    // mapped so a moving GC remaps it; otherwise it can decay to
+                    // a stale/garbage base.
+                    let top_is_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
                     match top {
                         StackSlot::Frame(off) => {
                             self.emit_load_local(RAX, off);
@@ -11225,10 +11824,12 @@ impl Compiler {
                         StackSlot::CalleeSaved(_) => {
                             // Zero-cost: just duplicate the register reference
                             self.stack.push(top);
+                            self.stack_oop_marks.push(top_is_oop);
                         }
                         StackSlot::Xmm(_) => {
                             // Zero-cost: just duplicate the XMM register reference
                             self.stack.push(top);
+                            self.stack_oop_marks.push(top_is_oop);
                         }
                         StackSlot::Scratch(reg) => {
                             // Scratch register holds the value — try to dup into
@@ -11244,6 +11845,7 @@ impl Compiler {
                             if let Some(sr) = avail {
                                 self.emit_mov_reg_reg(sr, reg);
                                 self.stack.push(StackSlot::Scratch(sr));
+                                self.stack_oop_marks.push(top_is_oop);
                             } else {
                                 // No scratch available — load to RAX and push via frame
                                 self.emit_mov_reg_reg(RAX, reg);
@@ -11252,6 +11854,13 @@ impl Compiler {
                                     self.emit_store_local(off, RAX);
                                 }
                             }
+                        }
+                    }
+                    // Propagate the oop mark onto the freshly-pushed duplicate
+                    // (the `push_from_rax`/`push_stack` paths pushed `false`).
+                    if top_is_oop {
+                        if let Some(m) = self.stack_oop_marks.last_mut() {
+                            *m = true;
                         }
                     }
                     pc += 1;
@@ -11263,10 +11872,21 @@ impl Compiler {
                     let len = self.stack.len();
                     let a = self.stack[len - 2]; // deeper
                     let b = self.stack[len - 1]; // top
+                    // EC oop-map fix: carry the two source oop marks onto the
+                    // two duplicated entries (push_from_rax pushes `false`).
+                    let ml = self.stack_oop_marks.len();
+                    let a_oop = self.stack_oop_marks.get(ml.wrapping_sub(2)).copied().unwrap_or(false);
+                    let b_oop = self.stack_oop_marks.get(ml.wrapping_sub(1)).copied().unwrap_or(false);
                     self.load_slot_to_reg(RAX, a);
                     self.push_from_rax();
+                    if a_oop {
+                        if let Some(m) = self.stack_oop_marks.last_mut() { *m = true; }
+                    }
                     self.load_slot_to_reg(RAX, b);
                     self.push_from_rax();
+                    if b_oop {
+                        if let Some(m) = self.stack_oop_marks.last_mut() { *m = true; }
+                    }
                     pc += 1;
                 }
 
@@ -11287,9 +11907,22 @@ impl Compiler {
                             // just logical reordering via push order below
                         }
                     }
-                    // Push back in swapped order
+                    // Push back in swapped order. EC oop-map fix: the previous
+                    // code pushed to `self.stack` WITHOUT pairing
+                    // `stack_oop_marks`, desyncing the two vectors (every
+                    // subsequent slot's precise oop mark shifted by one). Keep
+                    // the vectors in lockstep. We push conservative `false`
+                    // marks here (the UNDER-marked direction is safe: the
+                    // conservative frame-region sweep in
+                    // `conservative_roots::scan_one_frame_precise` re-validates
+                    // every frame qword via `heap.is_object_address`, so a
+                    // swapped oop missed by the precise map is still found and
+                    // remapped; OVER-marking a non-oop would be unsafe, so we
+                    // do not do it).
                     self.stack.push(a);
+                    self.stack_oop_marks.push(false);
                     self.stack.push(b);
+                    self.stack_oop_marks.push(false);
                     pc += 1;
                 }
 

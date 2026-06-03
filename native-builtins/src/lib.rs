@@ -11133,6 +11133,53 @@ fn stream_fd(ctx: &dyn NativeContext, args: &[Value]) -> Option<u32> {
     None
 }
 
+/// Classify a print-sink object (`PrintStream.out` / `PrintWriter` backing)
+/// as a CHAR `java/io/Writer` vs a byte `java/io/OutputStream`.
+///
+/// This is the crux of the picocli/JUnit-console `NoSuchMethodError:
+/// java/io/BufferedWriter.write([BII)V` fix.  A `PrintWriter`'s `out` field
+/// (and a `PrintWriter`'s own backing) is a CHAR `Writer` — the JDK
+/// `PrintWriter(OutputStream)` ctor wraps the sink as
+/// `new BufferedWriter(new OutputStreamWriter(out))`.  `BufferedWriter`
+/// only has `write([CII)V` / `write(Ljava/lang/String;)V`, NOT the byte
+/// `write([BII)V` that our native print intercept previously assumed.  A
+/// `PrintStream`'s `out`, by contrast, is a byte `OutputStream`.
+///
+/// Returns `Some(true)` when `out` is (a subclass of) `java/io/Writer`,
+/// `Some(false)` when it is (a subclass of) `java/io/OutputStream`, and
+/// `None` when it is neither / unresolvable (caller keeps prior behaviour).
+fn sink_is_writer(ctx: &mut dyn NativeContext, out: ObjectRef) -> Option<bool> {
+    let cid = ctx.class_id_of_object(out);
+    if let Some(writer_cid) = ctx.class_id_by_name("java/io/Writer") {
+        if cid == writer_cid || ctx.is_subclass(cid, writer_cid) {
+            return Some(true);
+        }
+    }
+    if let Some(os_cid) = ctx.class_id_by_name("java/io/OutputStream") {
+        if cid == os_cid || ctx.is_subclass(cid, os_cid) {
+            return Some(false);
+        }
+    }
+    None
+}
+
+/// Write `text` to a CHAR `java/io/Writer` sink via the real JDK
+/// `Writer.write(Ljava/lang/String;)V` method.  In real-JDK mode no
+/// synthetic Writer/BufferedWriter natives are registered, so this
+/// correctly dispatches to the JDK's own
+/// `BufferedWriter`/`OutputStreamWriter`/`StreamEncoder` bytecode — no
+/// stub is added.  Returns `true` on a successful invoke.
+fn write_string_to_writer(ctx: &mut dyn NativeContext, out: ObjectRef, text: &str) -> bool {
+    let s = ctx.create_string(text);
+    ctx.invoke_virtual(
+        out,
+        "write",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(s))],
+    )
+    .is_ok()
+}
+
 /// Write text to real stdout/stderr if this is a system stream (dual-mode).
 /// When the receiver `PrintStream` wraps a real underlying `OutputStream`
 /// (its `FilterOutputStream.out` field is non-null — i.e. a user
@@ -11174,6 +11221,18 @@ fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &
         Value::Object(Some(o)) => o,
         _ => return false,
     };
+    // Branch on the runtime class of `out`.  A `PrintWriter` wraps its sink
+    // as a CHAR `BufferedWriter`/`OutputStreamWriter` (only `write([CII)V` /
+    // `write(String)`), so the byte `write([BII)V` below would raise
+    // `NoSuchMethodError: java/io/BufferedWriter.write([BII)V` (the picocli /
+    // JUnit-console help-text crash).  Write chars for a `Writer`, bytes for
+    // an `OutputStream`.
+    if let Some(true) = sink_is_writer(ctx, out) {
+        // Reconstruct the text from the UTF-8 bytes the caller built (callers
+        // pass UTF-8 of the original String / println buffer).
+        let text = String::from_utf8_lossy(bytes);
+        return write_string_to_writer(ctx, out, &text);
+    }
     let _ = ctx.invoke_virtual(
         out,
         "write",
@@ -11529,6 +11588,13 @@ fn native_printwriter_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         // Synthetic PrintWriter layout: field 0 = backing Writer/OutputStream.
         if let Some(this) = this_opt {
             if let Value::Object(Some(backing)) = ctx.get_field(this, 0) {
+                // If `backing` is a CHAR `java/io/Writer` (the JDK
+                // `PrintWriter` sink, e.g. BufferedWriter/OutputStreamWriter)
+                // it has NO byte `write([BII)V` — only `write(String)` /
+                // `write([CII)V`.  Never fall through to the byte path for a
+                // Writer, or it raises `NoSuchMethodError:
+                // java/io/BufferedWriter.write([BII)V`.
+                let backing_is_writer = matches!(sink_is_writer(ctx, backing), Some(true));
                 let s = ctx.create_string(&text);
                 // Prefer Writer.write(String) which is the canonical PrintWriter
                 // sink. If that isn't registered we fall through to the
@@ -11541,7 +11607,7 @@ fn native_printwriter_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                         &[Value::Object(Some(s))],
                     )
                     .is_ok();
-                if !wrote_string {
+                if !wrote_string && !backing_is_writer {
                     let bytes = text.as_bytes();
                     let arr =
                         ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());

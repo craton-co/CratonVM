@@ -1324,6 +1324,40 @@ fn derive_exec_depth_ceiling(native_stack_bytes: usize) -> u32 {
     levels.max(MIN_EXEC_DEPTH_CEILING)
 }
 
+/// Conservative estimate of how many bytes of native stack a single
+/// re-entrant JIT *dispatch* level can consume. Unlike the interpreter's
+/// `execute` level (≈8 KiB), a JIT→JIT recursion level stacks a much larger
+/// Rust frame: `jit_invoke_dispatch` / `jit_invoke_virtual_mic` hold sizeable
+/// locals (arg-decode `Vec`s, `JitInvokeInfo` views, MIC/PIC handling, the
+/// SATB flush, the transmuted compiled-entry trampoline) AND the compiled Java
+/// frame itself runs on the native stack between dispatch calls. We budget a
+/// deliberately pessimistic 32 KiB/level so the JIT-dispatch ceiling trips with
+/// generous head-room before the OS guard page — the JIT path has no cheap way
+/// to query remaining stack, and overshooting here is an uncatchable process
+/// abort whereas undershooting merely throws SOE slightly early.
+const NATIVE_STACK_BYTES_PER_JIT_DISPATCH_LEVEL: usize = 32 * 1024;
+
+/// Absolute floor for the derived JIT-dispatch ceiling. Distinct from (and
+/// lower than) [`MIN_EXEC_DEPTH_CEILING`] because the JIT per-level budget is
+/// 4× larger: applying the 256-level exec floor here would imply 256·32 KiB =
+/// 8 MiB of recursion, which on an 8 MiB worker carrier stack could exceed the
+/// stack the floor was meant to protect. 64 levels (≤ 2 MiB at the pessimistic
+/// budget) keeps ordinary non-pathological compiled recursion safe even on the
+/// smallest carrier while never floating the ceiling above stack capacity.
+const MIN_JIT_DISPATCH_DEPTH_CEILING: u32 = 64;
+
+/// Compute the re-entrant JIT-dispatch depth ceiling for a thread whose native
+/// stack is `native_stack_bytes` large. Mirrors [`derive_exec_depth_ceiling`]
+/// but uses the larger per-level JIT-dispatch frame estimate and a lower floor
+/// (see [`MIN_JIT_DISPATCH_DEPTH_CEILING`]).
+#[inline]
+fn derive_jit_dispatch_depth_ceiling(native_stack_bytes: usize) -> u32 {
+    let usable = native_stack_bytes / NATIVE_STACK_SAFETY_DIVISOR;
+    let levels = usable / NATIVE_STACK_BYTES_PER_JIT_DISPATCH_LEVEL;
+    let levels = levels.min(u32::MAX as usize) as u32;
+    levels.max(MIN_JIT_DISPATCH_DEPTH_CEILING)
+}
+
 thread_local! {
     /// Per-thread re-entrant `execute` depth ceiling, derived from the
     /// thread's native stack size. Defaults to the main-VM-thread value
@@ -1331,6 +1365,34 @@ thread_local! {
     /// [`init_thread_exec_depth_ceiling`] still gets a safe (high) ceiling.
     static EXEC_DEPTH_CEILING: std::cell::Cell<u32> =
         std::cell::Cell::new(derive_exec_depth_ceiling(DEFAULT_NATIVE_STACK_BYTES));
+
+    /// Per-thread re-entrant JIT-dispatch depth ceiling, derived from the same
+    /// native stack size as [`EXEC_DEPTH_CEILING`] but with the larger
+    /// per-level JIT-dispatch frame budget. Read by the JIT dispatch helpers
+    /// (`jit_invoke_dispatch` / `jit_invoke_virtual_mic` in `jit/helpers.rs`)
+    /// via [`jit_dispatch_depth_ceiling`] so a JIT→JIT recursion (e.g.
+    /// `binaryTrees(18)` deep `make()` recursion) throws a *catchable*
+    /// `StackOverflowError` before the OS native stack overflows.
+    static JIT_DISPATCH_DEPTH_CEILING: std::cell::Cell<u32> =
+        std::cell::Cell::new(derive_jit_dispatch_depth_ceiling(DEFAULT_NATIVE_STACK_BYTES));
+}
+
+/// Per-thread re-entrant JIT-dispatch depth ceiling.
+///
+/// The JIT→JIT call path (`jit_invoke_dispatch` → compiled entry → … and
+/// `jit_invoke_virtual_mic` → compiled entry → …) bypasses
+/// [`execute`] entirely, so the interpreter's `EXEC_DEPTH` guard never fires
+/// for purely-compiled recursion. The JIT dispatch helpers therefore maintain
+/// their OWN depth counter and trip it against this ceiling, throwing a
+/// catchable `java/lang/StackOverflowError` instead of letting deep compiled
+/// recursion blow the OS native stack (an uncatchable rc=127 abort).
+///
+/// Derived per-thread from the same native stack size recorded by
+/// [`init_thread_exec_depth_ceiling`]; defaults to the safe 128 MiB-derived
+/// value for threads that never called it.
+#[inline]
+pub fn jit_dispatch_depth_ceiling() -> u32 {
+    JIT_DISPATCH_DEPTH_CEILING.with(|c| c.get())
 }
 
 /// Record the calling thread's native stack size so the re-entrant `execute`
@@ -1347,6 +1409,13 @@ thread_local! {
 pub fn init_thread_exec_depth_ceiling(native_stack_bytes: usize) {
     let ceiling = derive_exec_depth_ceiling(native_stack_bytes);
     EXEC_DEPTH_CEILING.with(|c| c.set(ceiling));
+    // Derive the companion JIT-dispatch ceiling from the SAME native stack
+    // size so the JIT→JIT recursion guard (see `jit_dispatch_depth_ceiling`)
+    // is calibrated for this thread's real stack too. Worker carriers (8 MiB)
+    // get a correspondingly lower ceiling; the main 128 MiB thread keeps deep
+    // head-room for legitimate recursion like `binaryTrees`.
+    let jit_ceiling = derive_jit_dispatch_depth_ceiling(native_stack_bytes);
+    JIT_DISPATCH_DEPTH_CEILING.with(|c| c.set(jit_ceiling));
 }
 
 // ---------------------------------------------------------------------------
@@ -12138,9 +12207,47 @@ fn execute_invokestatic_cached(
                 }
                 ((cached.declaring_class_id.as_u32() as u64) << 32) | (h as u64) // Widening: class ID to u64 for hash key
             };
-            const JIT_INVOCATION_THRESHOLD: u32 = 2000;
+            // BUG-2: hot-method promotion for short-but-very-hot methods.
+            //
+            // The old gate `invoc_count >= T && invoc_count % T == 0` fired
+            // ONLY at exact multiples of the threshold. Two failure modes hit
+            // the all-interpreted call trees in BC's PQC RegressionTest
+            // (`Permute.permute`, `ChaChaEngine.chachaCore`,
+            // `HashFunctions.hash_n_n`, `Salsa20Engine.processBytes`):
+            //   (a) a *single* transient upgrade-gate failure at count T pushed
+            //       the next attempt out another whole T calls (2000 → 4000),
+            //       multiplying interpreter time; and
+            //   (b) these methods never OSR-compile because their per-call
+            //       back-edge count is tiny (OSR's `backward_count` resets every
+            //       invocation), so the invocation counter is their ONLY path
+            //       to the JIT — and the exact-multiple gate made it fragile.
+            //
+            // Fix: (1) lower the warmup threshold so astronomically-hot short
+            // methods promote sooner, and (2) once past the threshold, RETRY on
+            // a short stride instead of only at the next full multiple — so a
+            // transient compile failure recovers within `JIT_RETRY_STRIDE`
+            // calls, not another full threshold. The persistent
+            // `increment_invocation` count means the bar is crossed even from
+            // the interpreted-call-tree case, and a successful upgrade rewrites
+            // the invoke cache to `Jit`, so this counting block stops being
+            // reached and there is no ongoing re-spam. Normal warmup is
+            // preserved: cold methods still wait for `JIT_INVOCATION_THRESHOLD`
+            // calls before any compile attempt.
+            const JIT_INVOCATION_THRESHOLD: u32 = 500;
+            /// Re-attempt stride once a method is past the warmup threshold but
+            /// not yet successfully compiled. Small so a transient upgrade-gate
+            /// failure is retried within a few hundred calls rather than after
+            /// another full `JIT_INVOCATION_THRESHOLD`.
+            const JIT_RETRY_STRIDE: u32 = 64;
             let invoc_count = shared.profile_store.increment_invocation(invoc_key);
-            if invoc_count >= JIT_INVOCATION_THRESHOLD && invoc_count % JIT_INVOCATION_THRESHOLD == 0 {
+            // Fire on the first crossing of the threshold, then re-attempt every
+            // `JIT_RETRY_STRIDE` calls until the upgrade succeeds (after which
+            // the invoke cache routes through JIT and this block is bypassed).
+            let past_threshold = invoc_count >= JIT_INVOCATION_THRESHOLD;
+            let should_attempt = past_threshold
+                && (invoc_count == JIT_INVOCATION_THRESHOLD
+                    || (invoc_count - JIT_INVOCATION_THRESHOLD) % JIT_RETRY_STRIDE == 0);
+            if should_attempt {
             // Consult tiered compilation manager for recommended tier
             let tiered_key = crate::jit::tiered::MethodKey::new(
                 cached.class_name.as_ref(),

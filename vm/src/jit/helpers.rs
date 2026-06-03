@@ -1911,6 +1911,99 @@ thread_local! {
 /// Invocation threshold for triggering JIT compilation from the dispatch helper.
 const DISPATCH_JIT_THRESHOLD: u32 = 500;
 
+// ===========================================================================
+// BUG-1 fix: native-stack recursion guard for the JIT→JIT dispatch path.
+//
+// A recursive Java method that has been JIT-compiled (e.g. `binaryTrees(18)`'s
+// deep `make(int)` self-recursion) never re-enters `interpreter::execute`, so
+// the interpreter's `EXEC_DEPTH` / `EXEC_DEPTH_CEILING` guard (which throws a
+// *catchable* `StackOverflowError`) never fires. Each compiled recursion level
+// instead stacks a large native Rust frame through
+// `jit_invoke_dispatch` / `jit_invoke_virtual_mic` → compiled entry → … with
+// nothing checking remaining OS stack, so deep recursion overflows the guard
+// page → uncatchable rc=127 abort.
+//
+// We mirror the interpreter's guard with a dedicated thread-local JIT-dispatch
+// depth counter, incremented at the top of BOTH dispatch helpers under an RAII
+// Drop-decrement, compared against the per-thread ceiling
+// `interpreter::jit_dispatch_depth_ceiling()` (derived from the thread's REAL
+// native stack size, using a generous per-level budget because the JIT
+// dispatch frame is much larger than an interpreter level). On overflow we do
+// NOT recurse: we stash a catchable `java/lang/StackOverflowError` in
+// `JIT_PENDING_EXCEPTION` and return the `i64::MIN` deopt sentinel, exactly
+// like the array-NPE / AIOOBE helpers, so the interpreter's post-JIT drain
+// routes it through the method's exception table.
+// ===========================================================================
+thread_local! {
+    /// Re-entrant JIT-dispatch depth for the current thread. Incremented on
+    /// entry to `jit_invoke_dispatch` / `jit_invoke_virtual_mic` and
+    /// decremented (RAII) on return. Compared against
+    /// `interpreter::jit_dispatch_depth_ceiling()`.
+    static JIT_DISPATCH_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII guard that decrements [`JIT_DISPATCH_DEPTH`] when dropped. Constructed
+/// by [`enter_jit_dispatch`] only AFTER the depth has been incremented and the
+/// ceiling check passed, so every successful entry has exactly one matching
+/// decrement on every return path (including the compiled callee unwinding).
+struct JitDispatchDepthGuard;
+impl Drop for JitDispatchDepthGuard {
+    fn drop(&mut self) {
+        JIT_DISPATCH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Enter a JIT dispatch level: bump the thread-local depth and check it against
+/// the per-thread native-stack ceiling.
+///
+/// On success returns `Ok(guard)` — the caller binds it (e.g. `let _g = ...`)
+/// so the level is released on return. On overflow returns `Err(sentinel)`:
+/// the depth has already been rolled back, a catchable
+/// `java/lang/StackOverflowError` has been stashed in `JIT_PENDING_EXCEPTION`
+/// (when constructible), and the caller must immediately `return` the contained
+/// `i64::MIN` deopt sentinel WITHOUT recursing further. If the throwable cannot
+/// be constructed (heap too exhausted) the sentinel is still `i64::MIN` so the
+/// JIT caller deopts rather than continuing with corrupt state.
+#[must_use]
+fn enter_jit_dispatch(vm: &SharedVm) -> Result<JitDispatchDepthGuard, i64> {
+    let ceiling = crate::runtime::interpreter::jit_dispatch_depth_ceiling();
+    let depth = JIT_DISPATCH_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v + 1
+    });
+    if depth > ceiling {
+        // Roll back the increment we just made — we are NOT entering a level.
+        JIT_DISPATCH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        return Err(raise_jit_stack_overflow(vm));
+    }
+    Ok(JitDispatchDepthGuard)
+}
+
+/// Stash a catchable `java/lang/StackOverflowError` for the JIT caller to route
+/// through its exception table, and return the `i64::MIN` deopt sentinel.
+///
+/// Mirrors `jit_newarray_oom`: obtain the current `&mut JvmThread`, construct
+/// the throwable via `create_exception_object`, and `set_jit_pending_exception`.
+/// Cold path — only hit at pathological recursion depth.
+#[cold]
+fn raise_jit_stack_overflow(vm: &SharedVm) -> i64 {
+    // SAFETY: called from inside a JIT dispatch helper, on the thread that set
+    // the JIT thread pointer; no other `&mut JvmThread` is live at this point
+    // (we are above any compiled-callee invocation).
+    if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
+        if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+            vm,
+            thread,
+            "java/lang/StackOverflowError",
+            None,
+        ) {
+            set_jit_pending_exception(exc);
+        }
+    }
+    i64::MIN
+}
+
 /// S112r9 — JIT dispatch error handler. When a JIT-dispatched callee returns
 /// an error, route it through `JIT_PENDING_EXCEPTION` so the interpreter's
 /// post-JIT exception-routing path can find a handler (or propagate to the
@@ -2101,6 +2194,17 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         &[] as &[i64]
     } else {
         std::slice::from_raw_parts(args_ptr as *const i64, num_args as usize)
+    };
+
+    // BUG-1: native-stack recursion guard for the JIT→JIT dispatch path. Bump
+    // the per-thread JIT-dispatch depth and check it against the native-stack
+    // ceiling BEFORE we recurse into any compiled callee. On overflow this
+    // stashes a catchable `StackOverflowError` and returns the `i64::MIN`
+    // deopt sentinel instead of overflowing the OS stack. The guard is held
+    // for the rest of this call so the level is released on every return path.
+    let _jit_dispatch_depth_guard = match enter_jit_dispatch(vm) {
+        Ok(g) => g,
+        Err(sentinel) => return sentinel,
     };
 
     // Fast path: check thread-local dispatch cache for a previously-compiled callee.
@@ -2409,6 +2513,17 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         &[] as &[i64]
     } else {
         std::slice::from_raw_parts(args_ptr as *const i64, num_args as usize)
+    };
+
+    // BUG-1: native-stack recursion guard for the JIT→JIT virtual dispatch
+    // path (the `invokevirtual` sibling of `jit_invoke_dispatch`). Same
+    // contract: bump the per-thread JIT-dispatch depth, and on overflow stash
+    // a catchable `StackOverflowError` + return the `i64::MIN` deopt sentinel
+    // rather than recursing into a compiled callee and blowing the OS stack.
+    // Held for the rest of the call so the level releases on every return.
+    let _jit_dispatch_depth_guard = match enter_jit_dispatch(vm) {
+        Ok(g) => g,
+        Err(sentinel) => return sentinel,
     };
 
     let (thread, _jit_thread_guard) = match jit_thread_mut() {
