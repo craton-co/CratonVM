@@ -90,8 +90,13 @@ with a parallel fake type.
    (synthetic crypto, app unblockers) behind a default-OFF feature flag so the
    normal build is fake-free.
 4. **Clear error**: when nothing real can run, throw a descriptive
-   "unimplemented" exception naming the method — never a placeholder value.
-5. **CI gate**: fail the build if a new synthetic stub sneaks back into the
+   "unimplemented" exception naming the method — never a placeholder value
+   (`CRATONVM_TRACE_UNIMPLEMENTED=1` prints each one).
+5. **Remove them all at once**: `CRATONVM_NO_STUBS=1` puts the registry in strict
+   mode — every synthetic-stub registration is dropped, so calls hit real
+   bytecode or a clear error, never a fake. Opt-in (off by default) because some
+   apps still limp on the fakes. Per-class: `CRATONVM_REAL=<class>|all|jca`.
+6. **CI gate**: fail the build if a new synthetic stub sneaks back into the
    default path.
 
 ---

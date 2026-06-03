@@ -28,6 +28,28 @@ Driving that bucket down — classifying each cluster `bridge`/`intrinsic` or
 deleting the fake — is the ongoing audit sweep. See
 [../../docs/synthetic-vs-real-explained.md](../../docs/synthetic-vs-real-explained.md).
 
+## Removing the remaining stubs: `CRATONVM_NO_STUBS`
+
+Setting `CRATONVM_NO_STUBS=1` puts the registry in **strict mode**: every
+`synthetic-stub` registration is *dropped* (never registered), so a call to a
+fake falls through to real JDK bytecode if present, or a clear
+`NoSuchMethodError`/unimplemented diagnostic (with `CRATONVM_TRACE_UNIMPLEMENTED=1`)
+— never a fake. Bridges and intrinsics are unaffected. This is the comprehensive
+"remove synthetic stubs completely" switch; it is opt-in (off by default) because
+some apps currently limp on these fakes.
+
+Verified: with `CRATONVM_NO_STUBS=1` the census drops to `synthetic-stub=0`
+(total 7653 → 6665), and `HelloWorld` plus probes of dropped JDK-class clusters
+(java.util.Date / Properties / Scanner) still run correctly on real bytecode —
+i.e. those fakes were redundant. App-library clusters (logback/netty/slf4j/
+spring/quarkus/tomcat) run real bytecode when the app's jars are on the
+classpath, else surface a clear error. `sun.management` fakes drop to a clear
+error (their real bytecode needs VM natives we don't yet provide — a clear gap
+beats fabricated metrics).
+
+Per-class granularity is also available via `CRATONVM_REAL=<class>|all|jca`,
+which skips a synthetic-stub native only when real bytecode exists for it.
+
 ## What this build already guarantees
 
 The app-specific **"fake main" launcher shims** (Jetty/SonarQube/Liberty/… that

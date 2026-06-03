@@ -2098,6 +2098,18 @@ pub struct NativeMethodRegistry {
     /// The category applied to subsequent `register()` calls. Scoped via
     /// `with_category`. Defaults to `SyntheticStub` (conservative).
     current_category: NativeKind,
+    /// Strict "no synthetic stubs" mode. When true, `register()` DROPS any
+    /// registration whose `current_category` is `SyntheticStub` — it is never
+    /// inserted, so a call to that method falls through to real JDK bytecode
+    /// (if present) or a clear `NoSuchMethodError`/unimplemented diagnostic,
+    /// never to a fake. This is the comprehensive "remove synthetic stubs
+    /// completely" switch: it makes the entire SyntheticStub bucket vanish from
+    /// the build at once. Enabled via the `CRATONVM_NO_STUBS` env var (read
+    /// once in `new()`). Off by default — opt-in, because some apps currently
+    /// limp on these fakes and dropping them surfaces real gaps as clear
+    /// errors. `Intrinsic` and `Bridge` registrations are never affected.
+    /// See docs/synthetic-vs-real-explained.md.
+    drop_synthetic_stubs: bool,
 }
 
 impl NativeMethodRegistry {
@@ -2121,7 +2133,25 @@ impl NativeMethodRegistry {
             ),
             categories: Vec::with_capacity(BOOT_REGISTRATION_HINT),
             current_category: NativeKind::SyntheticStub,
+            // Read once at construction. `CRATONVM_NO_STUBS` (any non-empty
+            // value) enables strict mode: synthetic-stub registrations are
+            // dropped so calls hit real bytecode or a clear error.
+            drop_synthetic_stubs: std::env::var_os("CRATONVM_NO_STUBS")
+                .is_some_and(|v| !v.is_empty()),
         }
+    }
+
+    /// Override the strict no-stubs mode programmatically (e.g. for tests or a
+    /// CLI flag), independent of the `CRATONVM_NO_STUBS` env var. Call before
+    /// the `register_*` population pass. See [`drop_synthetic_stubs`](Self).
+    pub fn set_drop_synthetic_stubs(&mut self, drop: bool) {
+        self.drop_synthetic_stubs = drop;
+    }
+
+    /// Whether strict no-stubs mode is active (synthetic-stub registrations are
+    /// being dropped).
+    pub fn drops_synthetic_stubs(&self) -> bool {
+        self.drop_synthetic_stubs
     }
 
     /// Set the category applied to all subsequent `register()` calls until
@@ -2179,6 +2209,15 @@ impl NativeMethodRegistry {
         descriptor: &str,
         callback: NativeCallback,
     ) {
+        // Strict no-stubs mode: drop synthetic-stub registrations entirely so
+        // the call falls through to real bytecode or a clear error instead of a
+        // fake. Bridges and intrinsics are always registered. (See the
+        // `drop_synthetic_stubs` field doc.)
+        if self.drop_synthetic_stubs
+            && self.current_category == NativeKind::SyntheticStub
+        {
+            return;
+        }
         let key = native_method_hash(class_name, method_name, descriptor);
         // With 128-bit composite keys, collisions on our keyspace are
         // vanishingly unlikely. We keep a cheap `debug_assert!` as
