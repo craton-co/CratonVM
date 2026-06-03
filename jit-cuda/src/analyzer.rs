@@ -248,6 +248,13 @@ pub fn analyze_with_annotations(
             Ok(t) => t,
             Err(reason) => return OffloadVerdict::Rejected(reason),
         };
+    // A reduction accumulates into a scalar that becomes the return value,
+    // so the shape is only meaningful for a scalar-returning method. A
+    // void-returning counted loop (e.g. a `map` writing `out[i]`) is never
+    // a reduction regardless of its body opcodes; clamp the flag here so
+    // `is_reduction` in the emitted signature stays false and the kernel
+    // lowers as a per-element map.
+    let is_dot_reduction = is_dot_reduction && return_kind.is_scalar();
 
     // AUDIT 2026-05-22: dot-product / sum reductions are now a
     // supported kernel shape. The `lowering::emit` layer has explicit
@@ -357,6 +364,12 @@ fn scan_bytecode(
     // arithmetic `*add` (`iadd`/`ladd`/`fadd`/`dadd`, 0x60..=0x63).
     let mut body_has_array_load = false;
     let mut body_has_add = false;
+    // A per-element array *store* (`iastore`..`sastore`, 0x4F..=0x56 minus
+    // `aastore` 0x53 which `classify` already rejects) is the signature of
+    // a MAP (`out[i] = f(a[i], …)`), not a reduction. A genuine dot-product
+    // / sum reduction accumulates into a scalar local and never writes an
+    // array, so an array store disqualifies the reduction shape.
+    let mut body_has_array_store = false;
     // Literal loop-bound recovery for the work estimate. The canonical
     // counted loop compares the induction variable against its bound with
     // a forward `if_icmp*` (`iload iv; <bound>; if_icmpge exit`). When the
@@ -376,6 +389,9 @@ fn scan_bytecode(
         }
         if (0x60..=0x63).contains(&op) {
             body_has_add = true;
+        }
+        if (0x4F..=0x56).contains(&op) && op != 0x53 {
+            body_has_array_store = true;
         }
 
         // Track literal integer pushes so a forward exit-comparison can
@@ -474,7 +490,16 @@ fn scan_bytecode(
     // the exact shape `lowering::emit` lowers (counted loop + scalar
     // return); recognising it here lets `analyze` admit it instead of
     // rejecting via the conservative reduction shape guards.
-    let is_dot_product_reduction = has_backward && body_has_array_load && body_has_add;
+    // A per-element array *store* in the body means the loop writes its
+    // result element-by-element into an array — that is a MAP
+    // (`out[i] = a[i] + b[i]`), not a reduction. Such a method must NOT be
+    // flagged `is_reduction`: doing so makes the lowering emit an atomic
+    // accumulate into a single scalar slot instead of the per-element
+    // store, and the dispatcher declines to launch it (it silently falls
+    // back to the CPU). The `!body_has_array_store` guard keeps maps out of
+    // the reduction shape; `analyze` additionally gates on a scalar return.
+    let is_dot_product_reduction =
+        has_backward && body_has_array_load && body_has_add && !body_has_array_store;
     Ok((
         this_field_cps,
         estimated_work,
@@ -664,6 +689,15 @@ mod tests {
                     vec![ParamKind::I32Array, ParamKind::I32Array, ParamKind::I32Array]
                 );
                 assert_eq!(sig.return_kind, ParamKind::Void);
+                // A void-returning per-element map (`out[i] = a[i] + b[i]`)
+                // must NOT be flagged as a reduction. If it is, lowering
+                // emits an atomic accumulate into a single scalar slot and
+                // the dispatcher silently falls back to the CPU instead of
+                // launching the per-element kernel.
+                assert!(
+                    !sig.is_reduction,
+                    "void array-writing map misclassified as a reduction"
+                );
             }
             v => panic!("expected Eligible, got {v:?}"),
         }
@@ -679,6 +713,8 @@ mod tests {
                     vec![ParamKind::F32, ParamKind::F32Array, ParamKind::F32Array, ParamKind::F32Array]
                 );
                 assert_eq!(sig.return_kind, ParamKind::Void);
+                // saxpy (`out[i] = a*x[i] + y[i]`) is a map, not a reduction.
+                assert!(!sig.is_reduction, "saxpy map misclassified as a reduction");
             }
             v => panic!("expected Eligible, got {v:?}"),
         }
@@ -690,6 +726,15 @@ mod tests {
         match analyze(&method) {
             OffloadVerdict::Eligible(sig) => {
                 assert_eq!(sig.return_kind, ParamKind::I64);
+                // A genuine dot-product / sum reduction (scalar return,
+                // accumulates, no array store) must STILL be recognised so
+                // lowering emits the atomic-accumulate path. Guards against
+                // the `!body_has_array_store` / scalar-return gate
+                // over-tightening and dropping real reductions.
+                assert!(
+                    sig.is_reduction,
+                    "genuine scalar-return dot-product reduction no longer recognised"
+                );
             }
             v => panic!("expected Eligible, got {v:?}"),
         }

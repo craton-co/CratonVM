@@ -62,6 +62,14 @@ pub struct RegAllocResult {
     pub used_callee_saved: Vec<u8>,
     /// XMM/FP registers actually used for float/double locals (for save/restore).
     pub used_xmm_regs: Vec<u8>,
+    /// Per-basic-block live-in local set, as `(block_start_pc, live_in_bitset)`.
+    /// Bit `i` set means local `i` is live on entry to the block at that PC.
+    /// OSR entry PCs are loop-header block starts, so this lets the OSR
+    /// trampoline skip loading locals that are *dead* at the entry — which is
+    /// required for correctness: the graph-colouring allocator coalesces two
+    /// non-interfering locals onto one register, and loading the dead one in
+    /// index order would clobber the live one that shares the register.
+    pub block_live_in: Vec<(usize, u64)>,
 }
 
 /// A basic block in the bytecode CFG.
@@ -780,6 +788,7 @@ fn allocate_registers_with(
             xmm_assignments: Vec::new(),
             used_callee_saved: Vec::new(),
             used_xmm_regs: Vec::new(),
+            block_live_in: Vec::new(),
         };
     }
 
@@ -930,14 +939,18 @@ fn allocate_registers_with(
             xmm_assignments: vec![None; num_locals],
             used_callee_saved: Vec::new(),
             used_xmm_regs: Vec::new(),
+            block_live_in: Vec::new(),
         };
     }
 
+    let block_live_in: Vec<(usize, u64)> =
+        blocks.iter().map(|b| (b.start_pc, b.live_in)).collect();
     RegAllocResult {
         assignments,
         xmm_assignments,
         used_callee_saved,
         used_xmm_regs,
+        block_live_in,
     }
 }
 

@@ -1,0 +1,3 @@
+n=268435456 iters=5 warmup=2
+best_ns=172370200 mean_ns=187777660 out[0]=0 out[n-1]=268435640
+correctness=OK

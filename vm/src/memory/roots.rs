@@ -199,6 +199,17 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     (`gc_update_collection_overlay_refs`).
     cratonvm_native_collections::gc_scan_collection_overlay_roots(&mut roots);
 
+    // 18. Singleton built-in class loaders (app / platform). These synthetic
+    //     `ClassLoader` objects live ONLY in process-global mutexes in
+    //     `native-builtins/src/classloader.rs`, invisible to every scan above.
+    //     Without rooting them, a moving young GC reclaims/relocates the cached
+    //     loader and `getClassLoader()` returns a stale `ObjectRef` whose slot
+    //     was reused — BouncyCastle `ClassUtil.loadClass`'s receiver then reads
+    //     as a String OID ("Not able to load any cryptoProvider", intermittent
+    //     / heap-size dependent). Remap companion in `gc.rs`
+    //     (`gc_update_loader_singleton_refs`).
+    cratonvm_native_builtins::classloader::gc_scan_loader_singleton_roots(&mut roots);
+
     roots
 }
 

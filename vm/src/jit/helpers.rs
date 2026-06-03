@@ -1339,6 +1339,28 @@ pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
     result
 }
 
+/// Bounds-check a JIT putfield slot against the receiver's declared
+/// `num_slots` (read directly from the object header at offset 16 — the same
+/// `num_slots` field `VmHeap::num_fields` returns; see the header layout in
+/// `types/src/heap_types.rs` and the existing offset-16 read at the array
+/// diagnostics above). Mirrors the guard in `jit_putfield_object`: under
+/// synthetic/real-JDK layout drift a stale `field_index` would otherwise
+/// overflow the raw `obj + HEADER + index*SLOT` write into the *neighbouring*
+/// heap object — silent corruption surfacing as a delayed SIGSEGV far from the
+/// offending putfield. The interpreter (`set_field`) silently drops such
+/// writes; match it. `obj_ptr` must be non-null and canonical (the caller's
+/// null check + the JIT's receiver discipline guarantee this — a non-canonical
+/// receiver would fault on the header read exactly as the raw write would).
+#[inline]
+unsafe fn jit_putfield_slot_in_bounds(obj_ptr: i64, field_index: i64) -> bool {
+    if field_index < 0 {
+        return false;
+    }
+    // off 16: num_slots (u32).
+    let num_slots = std::ptr::read((obj_ptr as *const u8).add(16) as *const u32);
+    (field_index as u64) < num_slots as u64
+}
+
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i64) {
@@ -1365,6 +1387,7 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
             }
         }
     }
+    if !jit_putfield_slot_in_bounds(obj_ptr, field_index) { return; }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
     if std::env::var_os("CRATON_JIT_PFI_TRACE").is_some() {
@@ -1382,6 +1405,7 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: i64) {
     if obj_ptr == 0 { return; }
+    if !jit_putfield_slot_in_bounds(obj_ptr, field_index) { return; }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
     std::ptr::write(ptr as *mut Value, Value::Long(val));
@@ -1391,6 +1415,7 @@ pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: 
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val: i64) {
     if obj_ptr == 0 { return; }
+    if !jit_putfield_slot_in_bounds(obj_ptr, field_index) { return; }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
     std::ptr::write(ptr as *mut Value, Value::Float(f32::from_bits(val as u32)));
@@ -1400,6 +1425,7 @@ pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val:
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val: i64) {
     if obj_ptr == 0 { return; }
+    if !jit_putfield_slot_in_bounds(obj_ptr, field_index) { return; }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
     std::ptr::write(ptr as *mut Value, Value::Double(f64::from_bits(val as u64)));

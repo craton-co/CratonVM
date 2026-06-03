@@ -2241,9 +2241,16 @@ impl GenerationalHeap {
         // Re-mark cards for promoted objects that still reference young gen.
         // These old→young cross-gen references were established during the
         // Phase 2 promoted-object scan and must be visible to the next GC.
-        // Use the bulk API so the card-table lock is acquired once for the
-        // entire batch rather than once per deferred address.
-        card_table.mark_dirty_bulk(&deferred_dirty_cards);
+        //
+        // The actual `mark_dirty_bulk` is DEFERRED until after the possible
+        // major GC below: a major GC mark-compacts the old gen, relocating the
+        // very referrer objects whose cards we are about to dirty. Marking here
+        // (pre-compaction) would leave the remembered-set cards pointing at the
+        // stale pre-compaction addresses; the next minor GC's dirty-card scan
+        // would then look in the wrong place, miss the old→young edge, and free
+        // a still-live young referent (intermittent stale Locale/ClassLoader
+        // corruption). We remap each referrer address through `compact_map`
+        // first when a major GC runs (see below).
         young_from.reset();
 
         // CRIT-P2 fix: convert the internal FxHashMap to the std HashMap
@@ -2287,6 +2294,18 @@ impl GenerationalHeap {
                     *new_addr = final_addr;
                 }
             }
+            // Remembered-set fixup across compaction: the deferred old→young
+            // referrer addresses were recorded pre-compaction. Remap each
+            // through `compact_map` to its post-compaction location before
+            // dirtying its card, so the next minor GC's dirty-card scan finds
+            // the relocated referrer (and therefore its old→young edge).
+            // Referrers that did not move are absent from `compact_map` and
+            // keep their original address.
+            let remapped_cards: Vec<usize> = deferred_dirty_cards
+                .iter()
+                .map(|addr| *compact_map.get(addr).unwrap_or(addr))
+                .collect();
+            card_table.mark_dirty_bulk(&remapped_cards);
             // Merge old-gen compaction relocations into the overall pointer map
             // so the VM can update external roots (statics, JNI, string pool, etc.)
             pointer_map.extend(compact_map);
@@ -2298,6 +2317,9 @@ impl GenerationalHeap {
                 .fetch_add(old_used_before.saturating_sub(old_used_after) as u64, Ordering::Relaxed);
             true
         } else {
+            // No major GC: old-gen referrers did not move, so dirty their
+            // cards at the addresses recorded during this cycle.
+            card_table.mark_dirty_bulk(&deferred_dirty_cards);
             false
         };
 
@@ -2630,12 +2652,21 @@ impl GenerationalHeap {
             // Defensive: a corrupt / zero-size header would desynchronise
             // the linear walk. Stop rather than risk freeing live data.
             if total_size < HEADER_SIZE || cursor + total_size > used {
+                // NOTE: format the RAW kind byte, not `header.kind` via Debug.
+                // A corrupt header can hold an out-of-range discriminant; the
+                // derived `Debug` for `ObjectKind` indexes a static name table
+                // by discriminant, so `{:?}` on an invalid value reads past the
+                // table into rodata and SIGSEGVs — turning a recoverable
+                // corrupt-header detection into a hard crash (observed: JIT
+                // miscompile of `JUnitCore.main` under real-JCA). Same for the
+                // re-sync probe below.
+                let raw_kind = header.kind as u8;
                 tracing::warn!(
                     "non-moving sweep: stopping walk at offset {} — implausible \
-                     object size {} (kind={:?}, num_slots={}, array_len={}, class_id={})",
+                     object size {} (kind=0x{:02x}, num_slots={}, array_len={}, class_id={})",
                     cursor,
                     total_size,
-                    header.kind,
+                    raw_kind,
                     header.num_slots,
                     header.array_length,
                     header.class_id.as_u32(),
@@ -2654,16 +2685,16 @@ impl GenerationalHeap {
                     for i in start..=idx {
                         let (off, sz, cid, kind, ns, al) = walked[i];
                         tracing::warn!(
-                            "  PRE-corruption idx {} @off={} size={} class_id={} kind={:?} num_slots={} array_length={}",
-                            i, off, sz, cid, kind, ns, al,
+                            "  PRE-corruption idx {} @off={} size={} class_id={} kind=0x{:02x} num_slots={} array_length={}",
+                            i, off, sz, cid, kind as u8, ns, al,
                         );
                     }
                 }
                 let recent: Vec<_> = walked.iter().rev().take(8).rev().cloned().collect();
                 for (off, sz, cid, kind, ns, al) in &recent {
                     tracing::warn!(
-                        "  prior obj @off={} size={} class_id={} kind={:?} num_slots={} array_length={}",
-                        off, sz, cid, kind, ns, al,
+                        "  prior obj @off={} size={} class_id={} kind=0x{:02x} num_slots={} array_length={}",
+                        off, sz, cid, *kind as u8, ns, al,
                     );
                 }
                 // Dump 64 bytes of context starting 16 bytes before the bad
@@ -2706,10 +2737,10 @@ impl GenerationalHeap {
                     {
                         tracing::warn!(
                             "non-moving sweep: RE-SYNCED at offset {} (skipped {} bytes) — \
-                             class_id={} kind={:?} size={}; abandoned region treated as live, \
+                             class_id={} kind=0x{:02x} size={}; abandoned region treated as live, \
                              will be recovered by next major GC",
                             probe, probe - cursor,
-                            probe_hdr.class_id.as_u32(), probe_hdr.kind, probe_size,
+                            probe_hdr.class_id.as_u32(), probe_hdr.kind as u8, probe_size,
                         );
                         cursor = probe;
                         found = true;

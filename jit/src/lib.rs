@@ -688,6 +688,11 @@ pub struct CompiledMethod {
     pub osr_num_reg_locals: usize,
     /// OSR metadata: per-local GPR register assignments from graph-coloring allocator.
     pub osr_local_assignments: Option<Vec<Option<u8>>>,
+    /// OSR metadata: per-bytecode-PC "dead local" mask. `osr_dead_mask[pc]` bit
+    /// `i` set means local `i` is dead at that OSR entry PC and must NOT be
+    /// loaded into its register by the trampoline (it would clobber a live
+    /// local that shares the coalesced register). Indexed like `osr_pc_to_native`.
+    pub osr_dead_mask: Option<Vec<u64>>,
     /// OSR metadata: per-local XMM register assignments for float/double locals.
     pub osr_xmm_assignments: Option<Vec<Option<u8>>>,
     /// OSR metadata: frame size (for SUB RSP).
@@ -789,6 +794,12 @@ impl Drop for CompiledMethod {
 impl CompiledMethod {
     /// Create from a completed executable buffer (pure method, no context needed).
     ///
+    /// Raw machine-code bytes of this compiled method (for diagnostics /
+    /// disassembly). The slice is the full executable buffer.
+    pub fn code_bytes(&self) -> &[u8] {
+        self._buffer.as_slice()
+    }
+
     /// Finalizes the buffer (transitions from writable to executable).
     pub fn new(buffer: ExecutableBuffer) -> Self {
         buffer.finalize();
@@ -805,6 +816,7 @@ impl CompiledMethod {
             osr_num_locals: 0,
             osr_num_reg_locals: 0,
             osr_local_assignments: None,
+            osr_dead_mask: None,
             osr_xmm_assignments: None,
             osr_frame_size: 0,
             osr_callee_saved_base: 0,
@@ -840,6 +852,7 @@ impl CompiledMethod {
             osr_num_locals: 0,
             osr_num_reg_locals: 0,
             osr_local_assignments: None,
+            osr_dead_mask: None,
             osr_xmm_assignments: None,
             osr_frame_size: 0,
             osr_callee_saved_base: 0,
@@ -1130,6 +1143,15 @@ impl CompiledMethod {
         }
         let target_addr = self.entry as usize + native_offset as usize;
 
+        // Locals dead at this entry PC must not be loaded into their (possibly
+        // shared) registers — loading a dead local clobbers the live local that
+        // colours to the same register. See `osr_dead_mask`.
+        let dead_mask = self
+            .osr_dead_mask
+            .as_ref()
+            .and_then(|m| m.get(entry_pc).copied())
+            .unwrap_or(0);
+
         osr_trampoline(
             target_addr,
             vm_ptr,
@@ -1142,6 +1164,7 @@ impl CompiledMethod {
             self.osr_callee_saved_base,
             self.osr_heap_local_offset,
             self.needs_context,
+            dead_mask,
         )
     }
 }
@@ -1193,6 +1216,7 @@ unsafe fn emit_osr_trampoline(
     callee_saved_base: i32,
     heap_local_offset: i32,
     needs_context: bool,
+    dead_mask: u64,
 ) -> Option<ExecutableBuffer> {
     use crate::x64::LOCAL_REGS;
 
@@ -1284,6 +1308,14 @@ unsafe fn emit_osr_trampoline(
 
     #[allow(clippy::needless_range_loop)]
     for i in 0..num_locals {
+        // Skip locals dead at this OSR entry PC: they are register-resident and
+        // their register may be shared (graph-colouring coalescing) with a live
+        // local. Loading the dead local here would overwrite the live owner's
+        // value. The dead local needs no value (it is dead until its own loop
+        // re-defines it), so skipping the load entirely is correct.
+        if i < 64 && (dead_mask >> i) & 1 == 1 {
+            continue;
+        }
         let src_disp = (i as i32) * 8;
         if src_disp == 0 {
             tramp.emit(&[0x49, 0x8B, 0x02]);
@@ -1370,8 +1402,11 @@ unsafe fn osr_trampoline(
     callee_saved_base: i32,
     heap_local_offset: i32,
     needs_context: bool,
+    dead_mask: u64,
 ) -> Option<i64> {
     // Look up (or emit and insert) the cached trampoline body for this target.
+    // `dead_mask` is a deterministic function of `target_addr` (both encode the
+    // OSR PC), so the cached body for a `target_addr` is unique and correct.
     // `target_addr` already encodes (compiled-method, OSR PC): it is
     // `CompiledMethod.entry + native_offset`, both stable for the method's life.
     // All other parameters except `vm_ptr` and `locals_ptr` are functions of
@@ -1401,6 +1436,7 @@ unsafe fn osr_trampoline(
                 callee_saved_base,
                 heap_local_offset,
                 needs_context,
+                dead_mask,
             )?;
             let fresh_arc = Arc::new(fresh);
             let mut guard = cache.lock();
@@ -3449,6 +3485,32 @@ pub fn try_compile(
             &cached.method_name,
             &cached.method_descriptor,
         );
+    }
+    // DBG (env-gated): dump the emitted machine code for a specific method so
+    // its prologue/epilogue + body can be disassembled offline. Set
+    // CRATONVM_DBG_DUMP_JIT="Class.method" (slash-separated class) to target.
+    if let Ok(target) = std::env::var("CRATONVM_DBG_DUMP_JIT") {
+        if let Some(ref cm) = result {
+            let sig = format!("{}.{}", cached.class_name, cached.method_name);
+            if sig == target {
+                let bytes = cm.code_bytes();
+                eprintln!(
+                    "[JIT_DUMP] {}{} len={} entry={:p}",
+                    sig, cached.method_descriptor, bytes.len(), bytes.as_ptr(),
+                );
+                let mut line = String::new();
+                for (i, b) in bytes.iter().enumerate() {
+                    line.push_str(&format!("{:02x}", b));
+                    if (i + 1) % 32 == 0 {
+                        eprintln!("[JIT_DUMP] {}", line);
+                        line.clear();
+                    }
+                }
+                if !line.is_empty() {
+                    eprintln!("[JIT_DUMP] {}", line);
+                }
+            }
+        }
     }
     result
 }

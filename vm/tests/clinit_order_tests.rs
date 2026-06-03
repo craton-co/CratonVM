@@ -6,6 +6,19 @@
 //! Tests cover: superclass-before-subclass ordering, re-entrant clinit,
 //! diamond dependencies, ExceptionInInitializerError / NoClassDefFoundError,
 //! initialization chains, and constant-field interface init skipping.
+//!
+//! These tests drive the `cratonvm/ClinitOrder` fixture, whose `<clinit>`
+//! bodies call `cratonvm/Util.tempPrint(int)` to record an ordered marker
+//! sequence into the test-only `JvmThread::printed` buffer that the
+//! assertions below read back. `Util.tempPrint` is a test-harness native
+//! registered only by `register_builtins`, i.e. only in the `synthetic-jdk`
+//! build (see `native-builtins/src/lib.rs`). In the default real-JDK build
+//! it is absent, so the markers are never captured and every assertion
+//! fails. The whole module is therefore gated on `synthetic-jdk`, matching
+//! the convention used by the other fixture-driven suites such as
+//! `wp2_1_class_modern.rs`. The clinit-ordering assertions themselves
+//! (e.g. `vec![1, 2, 3]`) are unchanged.
+#![cfg(feature = "synthetic-jdk")]
 
 use cratonvm_vm::config::VmConfig;
 use cratonvm_vm::vm::Vm;

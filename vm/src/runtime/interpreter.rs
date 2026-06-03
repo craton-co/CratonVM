@@ -123,6 +123,9 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             let result = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
+            // DBG (env-gated): validate every young object's header size against
+            // its class — pins a JIT `new` that wrote a wrong-size header.
+            crate::memory::gc::validate_object_sizes(shared);
             // Truncation-checked: as_millis returns u128 but GC duration fits u64
             let gc_duration_ms = u64::try_from(gc_start.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::debug!(
@@ -12776,6 +12779,19 @@ fn try_osr(
     // OSR→interpreter handoff without expanding the OSR signature
     // (`Option<Option<Value>>`, no error channel).
     if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+        if std::env::var_os("CRATONVM_DBG_OSR").is_some() {
+            let cid = shared.heap.class_id_of(exc);
+            let cname = shared
+                .class_manager
+                .read()
+                .get_class(cid)
+                .map(|c| c.name.to_string())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            eprintln!(
+                "[cratonvm-osr] BAIL pending_exception {}.{}{} entry_pc={} exc_class={}",
+                &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc, cname
+            );
+        }
         crate::jit::helpers::stash_jit_pending_exception(exc);
         return None;
     }
