@@ -1790,10 +1790,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Object", "clone", "()Ljava/lang/Object;", native_object_clone);
     registry.register("java/lang/Object", "notify", "()V", native_object_notify);
     registry.register("java/lang/Object", "notifyAll", "()V", native_object_notify_all);
-    registry.register("java/lang/Object", "wait", "(J)V", native_object_wait);
+    // BUG FIX: `wait(J)` / `wait0(J)` must honor the millisecond timeout.
+    // These were wired to `native_object_wait` (which passes `None` = wait
+    // forever), so `Object.wait(100)` blocked indefinitely with no notify —
+    // which made every timed-wait framework hang: Timer/ScheduledExecutor
+    // threads `queue.wait(delay)` and never wake, so their tasks never fire.
+    // Route to `native_object_wait_timeout`, which reads the millis arg.
+    registry.register("java/lang/Object", "wait", "(J)V", native_object_wait_timeout);
     // JDK 19+: wait(long) is a Java method that delegates to wait0(long),
     // which is the actual private native method.
-    registry.register("java/lang/Object", "wait0", "(J)V", native_object_wait);
+    registry.register("java/lang/Object", "wait0", "(J)V", native_object_wait_timeout);
     registry.register("java/lang/Object", "finalize", "()V", |_ctx, _args| {
         // Object.finalize() is deprecated for removal since JDK 9 and was removed from
         // Object's method table in JDK 18+. Our GC does not invoke finalizers — objects
