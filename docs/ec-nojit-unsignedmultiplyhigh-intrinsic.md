@@ -123,10 +123,41 @@ found it is **not safe to do cleanly** — two hard blockers (don't re-attempt w
    ~hundreds of bytecodes of `MontgomeryIntegerPolynomialP256.reduce`), verified against JDK output
    over the full reachable input range.
 
-**Conclusion.** The table is a *one-time* per-process cost and steady-state per-op is already
-sub-second, so this is low-value/high-risk. The only sound ways forward, both larger efforts:
-(a) add a native fall-through path, then intercept the shared wrappers P-256-only; or (b) replicate
-`reduce` (and the carry helpers) bytecode-exactly with full-range differential verification; or
-(c) a coarse native `pointMultiply` backed by the `p256` crate (replaces the point engine, not the
-key/SPI objects) — biggest win, biggest surface. None attempted; recommend leaving the amortized
-one-time cost as-is unless a fall-through mechanism lands first.
+**Conclusion (field-op natives).** Confirmed empirically: a byte-exact native `reduce` (244 JDK
+vectors verified) gave **zero** table speedup — `reduce` is a light op whose native dispatch overhead
+≈ the work it replaces; the table cost is the *number* of interpreter dispatches in the shared
+wrapper glue. Native-izing those wrappers needs a VM fall-through (no `MethodCallResult` decline
+variant) honored across the labyrinthine invoke-dispatch (static/virtual × `Native`/`VirtualNative`
+× cache populate/consume) — high blast radius. Abandoned in favour of (c) below.
+
+## Follow-up 3 — coarse native EC scalar-multiply (LANDED, gated default-OFF)
+`native-builtins/src/sunec_point.rs` intercepts `sun.security.ec.ECOperations.multiply(AffinePoint,
+byte[])` and computes the whole scalar multiply with the `p256` crate, **bypassing the one-time
+generator-table precompute entirely** (the table is built lazily *inside* the first `multiply`, so
+replacing `multiply` upstream means it never triggers).
+
+**Gated** behind `CRATONVM_NATIVE_EC_MULTIPLY` (registration skipped unless set) → zero risk by
+default. No VM dispatch changes and **no decline mechanism needed**: `ECOperations.multiply` is only
+ever called for the curves SunEC's intpoly path supports (P-256/384/521; `forParameters` returns
+empty otherwise), so a fully-handled curve set never has to fall back. Currently implements **P-256
+only** — other curves throw a clear error under the gate (so flipping the gate default-ON requires
+adding P-384/P-521, or a fall-through — see below).
+
+**Representation (cracked + verified, `ecprobe_tmp/MulGT2..4`, `EcCross`):** base coords are read via
+the public `asBigInteger()` accessor (internal limb layout is opaque); scalar is **little-endian**;
+the result is returned as a homogeneous projective point with `Z=1`, `X=rx`, `Y=ry` built through the
+JDK's own `AffinePoint.fromECPoint` + `ProjectivePoint$Mutable.setValue`, so all montgomery encoding
+is delegated to the JDK. The ~12 re-entrant `ctx.invoke`/`new_object_initialized` calls pin every
+live `ObjectRef` across each call (moving-GC safety).
+
+**Result (P-256, gate ON):**
+- One-time generator table: **~14 s → ~40 ms** (keygen#1, EcProbe2). The table is gone.
+- `EcSign2` (keygen + 2 signs): **~14 s → ~3 s** (mostly JVM startup now).
+- **Cross-VM verified both directions** (`ecprobe_tmp/EcCross`, `EcVerifyArg`): CratonVM-sign →
+  HotSpot-verify = true AND HotSpot-sign → CratonVM-verify = true — the gold standard for the
+  scalar-mult + GC-pinned construction. Gate-OFF behaviour byte-unchanged.
+
+**To flip default-ON:** add P-384 (`p384`, already in-tree) and P-521 (`p521`, new dep) branches in
+`p256_scalar_mul` + curve detection (reading/construction are already curve-agnostic), and handle the
+point-at-infinity result (currently errors; never occurs for valid keygen/sign scalars). Then the
+native covers every `ECOperations.multiply` curve and the gate can default ON.
