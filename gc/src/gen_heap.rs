@@ -1605,7 +1605,8 @@ impl GenerationalHeap {
 
     /// Returns true when the young generation should be collected.
     pub fn needs_gc(&self) -> bool {
-        let used = self.young_from.lock().used();
+        let from = self.young_from.lock();
+        let used = from.used();
         // DBG: CRATONVM_DBG_GC_STRESS=<bytes> forces a young GC every <bytes>
         // of allocation, so the non-moving sweep's corruption detection fires
         // right after the corrupting write (the corruptor's interpreted caller
@@ -1613,7 +1614,24 @@ impl GenerationalHeap {
         if let Some(t) = gc_stress_threshold() {
             return used >= t;
         }
-        used >= *self.young_gc_threshold.lock()
+        // Trigger on LIVE occupancy, not the raw bump cursor. The non-moving,
+        // JIT-frame-safe sweep (`sweep_young_non_moving`) reclaims dead objects
+        // into the arena's free list WITHOUT retreating the cursor — it cannot
+        // relocate survivors while conservative JIT roots are live — so `used()`
+        // (== cursor, the high-water mark) stays pinned near capacity after such
+        // a sweep even though most of that span is reusable free-list space that
+        // `Arena::alloc` hands straight back out. Keying the trigger off the raw
+        // cursor leaves `needs_gc` permanently true once the high-water mark
+        // passes the threshold, so a young GC fires on essentially every
+        // subsequent allocation: the bintrees18 / AllocLoop thrash (live set
+        // fills young, ~150 no-progress sweeps reclaiming nothing, rc=124
+        // timeout — `CRATONVM_DBG_SWEEP_EDGES` shows unmarked=0, edges=0 each
+        // sweep). Subtracting the free-list bytes makes the metric reflect
+        // genuinely-occupied space; the moving collector resets the cursor
+        // itself, so this is a no-op there. The alloc-failure→GC-and-retry path
+        // remains the hard backstop against fragmentation under-collection.
+        let live = used.saturating_sub(from.free_list_bytes());
+        live >= *self.young_gc_threshold.lock()
     }
 
     /// Total bytes currently allocated across young and old generations.
@@ -2639,6 +2657,190 @@ impl GenerationalHeap {
                     }
                 }
             }
+        }
+
+        // ----- Diagnostic: inbound-edge search (CRATONVM_DBG_SWEEP_EDGES) --
+        //
+        // Marking is complete; nothing has been zeroed yet. This answers the
+        // decisive question for the bintrees18 / AllocLoop non-moving-sweep
+        // corruption: every object the sweep is about to zero is UNMARKED —
+        // but is any of them actually still REACHABLE? We look for an inbound
+        // edge from something that survives, classified by source:
+        //
+        //   (1) a passed-in ROOT/finalizer points straight at an unmarked
+        //       young object  => `mark_young`'s plausibility filter rejected a
+        //       live root (header looked corrupt at mark time).
+        //   (2) a young SURVIVOR's reference field points at an unmarked young
+        //       object  => intra-young BFS desync (survivor marked, but its
+        //       field-scan didn't propagate: wrong num_slots at mark time, a
+        //       post-mark SATB write, or a filter false-reject of the target).
+        //   (3) an OLD-GEN object's reference field points at an unmarked young
+        //       object  => card-table / write-barrier miss (the old->young edge
+        //       was never seeded because its card wasn't dirty).
+        //
+        // ANY of (1)/(2)/(3) firing proves the swept node is reachable => the
+        // bug is in marking/seeding (case "b"), not a register/native root gap.
+        // If NONE fire across the whole run yet corruption still occurs, the
+        // only live reference is outside roots+cards+finalizers+heap — i.e. a
+        // register/native-stack root the sweep cannot see (case "a"), or a
+        // sweep-walk/sizing defect. Routine dead garbage has no inbound edge,
+        // so a clean (no-edge) sweep is NORMAL — only edge hits are bugs.
+        if std::env::var_os("CRATONVM_DBG_SWEEP_EDGES").is_some() {
+            use std::collections::HashSet;
+            // Local young-membership test (the `in_young` closure above is
+            // borrowed by `mark_young` for the rest of the fn; use a fresh one).
+            let is_young = |a: usize| -> bool {
+                a >= from_base && a < from_end && (a & 0x7) == 0
+            };
+            let is_unmarked_young = |a: usize| -> bool {
+                if !is_young(a) {
+                    return false;
+                }
+                // SAFETY: `is_young` confirmed an 8-aligned addr inside live
+                // from-space; reading its header is valid.
+                let h = unsafe { &*(a as *const ObjectHeader) };
+                h.gc_flags & GC_FLAG_MARKED == 0
+            };
+
+            let root_set: HashSet<usize> =
+                roots.iter().map(|r| r.as_ptr() as usize).collect();
+
+            // (1) roots / finalizers that landed on an unmarked young object.
+            let mut root_to_unmarked = 0usize;
+            for &addr in root_set.iter() {
+                if is_unmarked_young(addr) {
+                    root_to_unmarked += 1;
+                    if root_to_unmarked <= 8 {
+                        let h = unsafe { &*(addr as *const ObjectHeader) };
+                        tracing::warn!(
+                            "[sweep-edges] (1) ROOT @{:#x} -> UNMARKED young obj \
+                             (class_id={} kind=0x{:02x} num_slots={} array_len={}) — \
+                             mark filter rejected a live root?",
+                            addr, h.class_id.as_u32(), h.kind as u8,
+                            h.num_slots, h.array_length,
+                        );
+                    }
+                }
+            }
+            for &addr in finalizer_addrs.iter() {
+                if is_unmarked_young(addr) {
+                    root_to_unmarked += 1;
+                }
+            }
+
+            // Helper: scan one object's reference fields for unmarked-young
+            // targets, invoking `report(slot_idx, target_addr)` for each.
+            let scan_refs = |obj_ptr: *mut u8, report: &mut dyn FnMut(usize, usize)| {
+                // SAFETY: caller guarantees obj_ptr is a valid object header.
+                let h = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                if h.kind == ObjectKind::Array {
+                    if h.element_type == ArrayElementType::Reference {
+                        for i in 0..h.array_length as usize {
+                            let sp = unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                            let raw: u64 = unsafe { std::ptr::read(sp as *const u64) };
+                            if raw != 0 && is_unmarked_young(raw as usize) {
+                                report(i, raw as usize);
+                            }
+                        }
+                    }
+                } else {
+                    for si in 0..h.num_slots as usize {
+                        let sp = unsafe { obj_ptr.add(HEADER_SIZE + si * SLOT_SIZE) };
+                        let v = unsafe { std::ptr::read(sp as *const Value) };
+                        if let Value::Object(Some(rf)) = v {
+                            let ta = rf.as_ptr() as usize;
+                            if is_unmarked_young(ta) {
+                                report(si, ta);
+                            }
+                        }
+                    }
+                }
+            };
+
+            // (2) young survivors referencing an unmarked young object.
+            let mut survivor_to_unmarked = 0usize;
+            let mut unmarked_total = 0usize;
+            let mut marked_total = 0usize;
+            {
+                let existing_free_dbg = young_from.free_blocks_sorted();
+                let mut free_it = existing_free_dbg.iter().peekable();
+                let used_dbg = young_from.used();
+                let mut c = 0usize;
+                while c < used_dbg {
+                    if let Some(&&(off, sz)) = free_it.peek() {
+                        if c == off {
+                            c += sz;
+                            free_it.next();
+                            continue;
+                        }
+                    }
+                    let optr = (from_base + c) as *mut u8;
+                    let h = unsafe { &*(optr as *const ObjectHeader) };
+                    let tot = gen_object_total_size(h);
+                    if tot < HEADER_SIZE || c + tot > used_dbg {
+                        tracing::warn!(
+                            "[sweep-edges] diagnostic walk desynced at off={} \
+                             (size={}, used={}) — arena already corrupt before this sweep",
+                            c, tot, used_dbg,
+                        );
+                        break;
+                    }
+                    if h.gc_flags & GC_FLAG_MARKED != 0 {
+                        marked_total += 1;
+                        let cid = h.class_id.as_u32();
+                        let oaddr = optr as usize;
+                        scan_refs(optr, &mut |si, ta| {
+                            survivor_to_unmarked += 1;
+                            if survivor_to_unmarked <= 16 {
+                                let th = unsafe { &*(ta as *const ObjectHeader) };
+                                tracing::warn!(
+                                    "[sweep-edges] (2) SURVIVOR @{:#x} (class_id={}) field[{}] \
+                                     -> UNMARKED @{:#x} (class_id={} num_slots={} kind=0x{:02x}) \
+                                     in_roots={}",
+                                    oaddr, cid, si, ta, th.class_id.as_u32(),
+                                    th.num_slots, th.kind as u8, root_set.contains(&ta),
+                                );
+                            }
+                        });
+                    } else {
+                        unmarked_total += 1;
+                    }
+                    c += tot;
+                }
+            }
+
+            // (3) old-gen objects referencing an unmarked young object
+            // (card-table / write-barrier miss). Walks the whole old gen — the
+            // dirty-card seed above only covers cards that were marked dirty,
+            // so this is exactly the set the seeding could have missed.
+            let mut old_to_unmarked = 0usize;
+            for (optr, _sz) in old_gen.walk_objects() {
+                let oaddr = optr as usize;
+                let cid = unsafe { (*(optr as *const ObjectHeader)).class_id.as_u32() };
+                scan_refs(optr, &mut |si, ta| {
+                    old_to_unmarked += 1;
+                    if old_to_unmarked <= 16 {
+                        let th = unsafe { &*(ta as *const ObjectHeader) };
+                        tracing::warn!(
+                            "[sweep-edges] (3) OLD-GEN @{:#x} (class_id={}) field[{}] \
+                             -> UNMARKED young @{:#x} (class_id={} num_slots={}) — \
+                             card/write-barrier MISS",
+                            oaddr, cid, si, ta, th.class_id.as_u32(), th.num_slots,
+                        );
+                    }
+                });
+            }
+
+            let verdict = if root_to_unmarked > 0 || survivor_to_unmarked > 0 || old_to_unmarked > 0 {
+                "REACHABLE NODE WILL BE SWEPT — case (b) marking/seeding bug"
+            } else {
+                "no inbound heap edge to any swept node — case (a) register/native root gap or sweep-walk defect"
+            };
+            tracing::warn!(
+                "[sweep-edges] SUMMARY marked={} unmarked={} | edges: root={} young-survivor={} old-gen={} => {}",
+                marked_total, unmarked_total,
+                root_to_unmarked, survivor_to_unmarked, old_to_unmarked, verdict,
+            );
         }
 
         // ----- Sweep phase ------------------------------------------------
