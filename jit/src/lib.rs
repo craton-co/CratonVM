@@ -701,6 +701,11 @@ pub fn unregister_jit_code_range(entry: usize) {
     }
 }
 
+/// Number of registered code ranges (Stage 5 diagnostic).
+pub fn jit_code_range_count() -> usize {
+    jit_code_ranges().lock().map(|v| v.len()).unwrap_or(0)
+}
+
 /// Resolve the `CompiledMethod` pointer whose code range contains `addr`, or
 /// `None`. Linear scan (method counts are modest; only hit at GC time on the
 /// gated precise path). Stage 5.

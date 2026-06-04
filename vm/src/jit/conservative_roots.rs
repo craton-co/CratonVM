@@ -569,10 +569,20 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
         return;
     }
     let scanner_sp = current_stack_pointer();
+    // Stage 5 diagnostic (CRATONVM_DBG_PRECISE): count frames walked / slots
+    // rewritten / chain entries so we can see whether the RBP-chain walk
+    // actually engages. Printed once per remap call (grep-friendly).
+    let dbg = std::env::var_os("CRATONVM_DBG_PRECISE").is_some();
+    let mut dbg_entries = 0usize;
+    let mut dbg_precise = 0usize;
+    let mut dbg_frames = 0usize;
+    let dbg_slots = std::cell::Cell::new(0usize);
     JIT_ENTRY_CHAIN.with(|c| {
         let chain = c.borrow();
         for entry in chain.iter() {
+            dbg_entries += 1;
             let Some(info) = entry.precise else { continue };
+            dbg_precise += 1;
             let entry_sp = entry.entry_sp;
             // Stage 5 — walk the JIT RBP chain from the innermost frame
             // (`info.frame_base`, the EXACT RBP recorded by the deepest
@@ -617,7 +627,9 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
                         // the registry is evicted before a cm is dropped.
                         let cm: &cratonvm_jit::CompiledMethod =
                             unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
-                        remap_one_jit_frame(parent_rbp, cm, pointer_map);
+                        let n = remap_one_jit_frame(parent_rbp, cm, pointer_map);
+                        dbg_frames += 1;
+                        dbg_slots.set(dbg_slots.get() + n);
                     }
                     None => break, // parent is the interpreter / Rust boundary
                 }
@@ -628,6 +640,16 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
             }
         }
     });
+    if dbg {
+        eprintln!(
+            "[PRECISE] remap: chain_entries={} precise={} frames_walked={} slots_rewritten={} reg_size={}",
+            dbg_entries,
+            dbg_precise,
+            dbg_frames,
+            dbg_slots.get(),
+            cratonvm_jit::jit_code_range_count(),
+        );
+    }
 }
 
 /// Stage 5 — rewrite one JIT frame's oop slots via `pointer_map`.
@@ -640,20 +662,21 @@ fn remap_one_jit_frame(
     rbp: usize,
     cm: &cratonvm_jit::CompiledMethod,
     pointer_map: &std::collections::HashMap<usize, usize>,
-) {
+) -> usize {
     let sp_id_off = cm.sp_id_slot_off;
     if sp_id_off == 0 {
-        return;
+        return 0;
     }
     let id_addr = rbp.wrapping_sub(sp_id_off as usize);
     if id_addr & 0x7 != 0 {
-        return;
+        return 0;
     }
     // SAFETY: aligned frame slot of a live JIT frame on this thread.
     let sp_id = (unsafe { (id_addr as *const usize).read() }) as u32;
     let Some(map) = cm.oop_maps.iter().find(|m| m.bytecode_pc == sp_id) else {
-        return;
+        return 0;
     };
+    let mut rewritten = 0usize;
     for &off in &map.frame_slot_offsets {
         // Slots are positive offsets; the value lives at `[rbp - off]`.
         let slot_addr = rbp.wrapping_sub(off as usize);
@@ -665,8 +688,10 @@ fn remap_one_jit_frame(
         if let Some(&new) = pointer_map.get(&old) {
             // SAFETY: same slot, rewriting the relocated reference.
             unsafe { (slot_addr as *mut usize).write(new) };
+            rewritten += 1;
         }
     }
+    rewritten
 }
 
 /// NEW-12: enumerate exact oops in a JIT frame using the compiled
