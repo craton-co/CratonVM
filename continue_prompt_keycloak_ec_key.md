@@ -1,8 +1,9 @@
 # RESOLVED: Keycloak SD-JWT EC key — real SunEC via route 1, DER encoder subclass bug fixed
 
-**Status:** FIXED on branch `ec-key-fix` (worktree `C:\craton\CratonVM-ec`).
-`DefaultCryptoSdJwsTest` **0/14 → 14/14**. Full 8-class SD-JWT sweep shows no real failures
-(only the expected negative-test `VerificationException`s); see "Perf caveat".
+**Status:** PRIMARY BUG FIXED on branch `ec-key-fix` (worktree `C:\craton\CratonVM-ec`).
+`DefaultCryptoSdJwsTest` **0/14 → 14/14** (the original CCE + DER-signing failure). The wider 8-class
+SD-JWT sweep is **~89/95**: a *separate* verify-side issue remains — see "Remaining: EC verify in the
+presentation/multi-key path".
 
 ## Root cause & fix (three changes)
 Route 1 was chosen: run real JDK-25 SunEC bytecode (it's pure Java — no native methods) instead of the
@@ -44,6 +45,20 @@ Run with `CRATONVM_REAL_JCA=1 CRATONVM_DISABLE_JIT=1`.
 - Fast EC-free DER check (`ecprobe_tmp/DerProbe`, seconds): `DerOutputStream.toByteArray=22`,
   `DerValue.toByteArray=24`, `ECUtil.encodeSignature=70` (match HotSpot). `DerProbe2`: `size=1` after one write.
 - `DefaultCryptoSdJwsTest` → **OK (14)**.
+
+## Remaining: EC verify in the presentation/multi-key path (separate bug, NOT the EC-key/DER fix)
+The 8-class sweep has **6 failures** (3 distinct methods), all `VerificationException: Invalid jws signature`:
+`SdJwtPresentationConsumerTest.shouldVerifySdJwtPresentation` (positive — should succeed but verify is
+rejected), plus the negatives `…shouldFail_IfPresentationRequirementsNotMet` and
+`SdJwtVerificationTest.sdJwtVerificationShouldFail_WithWrongVerifier` (which now fail because verification
+errors with "Invalid jws signature" before reaching their intended assertion). This is verify-side: basic
+sign→verify round-trips fine (`DefaultCryptoSdJwsTest.testVerifySignature_Positive` passes), so the issuer
+JWT in the presentation-consumer path is being verified against a public key that doesn't match — likely the
+key reconstructed from JWK x/y coords via `KeyFactory.generatePublic(ECPublicKeySpec)` or
+`BCECDSACryptoProvider.getPublicFromPrivate` (BC `getG().multiply(getD())` EC point mult). Next step:
+isolate whether `KeyFactory("EC").generatePublic(ECPublicKeySpec(point, p256spec))` yields a key whose
+`getEncoded()`/`getW()` match HotSpot, and whether `Signature("SHA256withECDSA").verify` of a known-good
+external signature succeeds. Distinct from this fix; track separately.
 
 ## Perf caveat (not a correctness issue)
 The first EC op pays a one-time ~108 s `Secp256R1GeneratorMontgomeryMultiplier.<clinit>` generator-table
