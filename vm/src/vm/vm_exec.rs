@@ -2775,6 +2775,52 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         .set_field(thread_obj, slot, Value::Object(Some(loader)));
                 }
             }
+            // INTERRUPTLOCK: real `java.lang.Thread` declares
+            // `final Object interruptLock = new Object();` as an instance-field
+            // initializer run by `Thread.<init>`. A VM-synthesized Thread object
+            // (the main thread, and any native-spawned thread that first
+            // observes its Thread via this method) never runs `<init>`, so the
+            // slot keeps its zero default (`Int(0)` here — `alloc_object` zeroes
+            // every slot regardless of declared type, so an unset reference
+            // field reads back as `Int(0)`, NOT `Object(None)`).
+            // `Thread.blockedOn(Interruptible)` —
+            // `synchronized (interruptLock) { nioBlocker = b; }` — is invoked by
+            // `AbstractInterruptibleChannel.begin/end` on EVERY FileChannel /
+            // SocketChannel operation; a non-reference lock value makes
+            // `monitorenter` throw NPE and takes down the entire
+            // interruptible-channel subsystem before any I/O native runs. Seed
+            // it with a fresh `Object` unless a real `<init>` already populated
+            // it (threads created by `new Thread(...)` in bytecode run the real
+            // ctor and carry their own lock; this only fills the VM-created gap).
+            let interrupt_lock_slot = {
+                let cm = self.shared.class_manager.read();
+                resolve_field_index_in_hierarchy(class_id, "interruptLock", &cm.class_store)
+            };
+            if let Some(slot) = interrupt_lock_slot {
+                let already_set = matches!(
+                    self.shared.heap.get_field(thread_obj, slot),
+                    Value::Object(Some(_))
+                );
+                if !already_set {
+                    let obj_class = {
+                        let cm = self.shared.class_manager.read();
+                        cm.get_loaded_class_id("java/lang/Object")
+                    }
+                    .or_else(|| {
+                        self.shared
+                            .class_manager
+                            .write()
+                            .load_class("java/lang/Object")
+                            .ok()
+                    });
+                    if let Some(obj_class) = obj_class {
+                        let lock = self.shared.heap.alloc_object(obj_class, 0);
+                        self.shared
+                            .heap
+                            .set_field(thread_obj, slot, Value::Object(Some(lock)));
+                    }
+                }
+            }
             return thread_obj;
         }
 

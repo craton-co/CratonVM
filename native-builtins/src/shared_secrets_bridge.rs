@@ -982,6 +982,30 @@ fn jnio_acquire_session(
     Ok(Some(Value::Object(None)))
 }
 
+/// JDK-25 `JavaNioAccess.acquireSession(Buffer)` / `releaseSession(Buffer)`
+/// are `void` (the older overload above returned a `MemorySegment$Scope`).
+/// They pin/unpin the buffer's `MemorySessionImpl` for the duration of a
+/// native I/O so the backing memory can't be freed concurrently. Every
+/// `FileChannel`/`SocketChannel` op on a direct buffer (including the temp
+/// direct buffer the heap-buffer path substitutes) calls them via
+/// `IOUtil.acquireScope`. CratonVM's direct/arena memory is never freed
+/// underneath an in-flight native, so pinning is unnecessary: no-op.
+fn jnio_session_noop(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
+/// JDK-25 `JavaNioAccess.hasSession(Buffer)` — whether the buffer is backed
+/// by a non-global memory session. CratonVM tracks none, so always false.
+fn jnio_has_session(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
 /// RKC16N.11 — return a synthetic `jdk.internal.misc.VM$BufferPool`
 /// instance (rather than the previous null) so that the caller — typically
 /// `ManagementFactoryHelper.getBufferPoolMXBeans` and friends, which
@@ -1064,6 +1088,14 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/nio/Buffer;)Ljava/lang/foreign/MemorySegment$Scope;",
         jnio_acquire_session,
     );
+    // JDK-25 signatures: `void acquireSession(Buffer)` /
+    // `void releaseSession(Buffer)` / `boolean hasSession(Buffer)`. These are
+    // what `IOUtil.acquireScope`/`releaseScope` call on every channel I/O of a
+    // (temp) direct buffer; without them every FileChannel/SocketChannel op
+    // hits a linkage error after the interruptible-channel begin/end runs.
+    registry.register(owner, "acquireSession", "(Ljava/nio/Buffer;)V", jnio_session_noop);
+    registry.register(owner, "releaseSession", "(Ljava/nio/Buffer;)V", jnio_session_noop);
+    registry.register(owner, "hasSession", "(Ljava/nio/Buffer;)Z", jnio_has_session);
     // RKC16N.10 follow-on / RKC16N.11: legacy JDK 8/9 SharedSecrets
     // accessor still referenced by ManagementFactory.<clinit> in some
     // JDK 25 builds. Originally returned null, which downstream NPE'd
