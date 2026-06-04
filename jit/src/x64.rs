@@ -5424,16 +5424,58 @@ impl Compiler {
                 }
             }
         }
-        if slots.is_empty() {
+        if !slots.is_empty() {
+            self.oop_maps.push(crate::OopMapEntry {
+                native_pc_offset: native_pc,
+                // Stage 3 — tag with the safepoint's bytecode PC so the GC root
+                // walker can match the value the JIT stored into the sp-id slot.
+                bytecode_pc: self.cur_bc_pc as u32, // Cast: bytecode PC fits u32
+                frame_slot_offsets: slots,
+            });
+        }
+        // Stage 4 (precise oop maps) — reload oop register-locals from their
+        // (GC-updated) canonical slots after the safepoint. `native_pc` above
+        // is the call's return PC and equals the position of the first reload
+        // instruction (the `push` emits no code), so the GC walker rewrites the
+        // frame slots at the return PC and control then falls into the reload,
+        // which propagates each moved object's new address back into its
+        // callee-saved register. Without this, Stage 3 updates the slot but the
+        // code keeps reading the stale register → register-invisibility
+        // persists. Gated off by default (no reload → byte-identical codegen).
+        if self.precise_maps {
+            self.emit_post_safepoint_reload();
+        }
+    }
+
+    /// Stage 4 (precise oop maps) — reload every oop register-local live at the
+    /// current safepoint from its canonical frame slot `[rbp - local_offset(k)]`
+    /// into its assigned callee-saved register.
+    ///
+    /// Pairs with [`Self::emit_pre_safepoint_spill`] (which flushed the live
+    /// values to those slots before the call) and the GC's
+    /// `remap_active_jit_frames` (which rewrote the moved ones in place during
+    /// the call). Only oop locals are reloaded — primitives don't move, so
+    /// their spilled slot still matches the register. RAX is never a local
+    /// register, so the call's return value survives this sequence.
+    fn emit_post_safepoint_reload(&mut self) {
+        if self.failed || self.local_oop_masks.is_empty() {
             return;
         }
-        self.oop_maps.push(crate::OopMapEntry {
-            native_pc_offset: native_pc,
-            // Stage 3 — tag with the safepoint's bytecode PC so the GC root
-            // walker can match the value the JIT stored into the sp-id slot.
-            bytecode_pc: self.cur_bc_pc as u32, // Cast: bytecode PC fits u32
-            frame_slot_offsets: slots,
-        });
+        let pc = self.cur_bc_pc;
+        if pc >= self.local_oop_masks.len()
+            || !self.local_oop_reached.get(pc).copied().unwrap_or(false)
+        {
+            return;
+        }
+        let mut mask = self.local_oop_masks[pc];
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1; // clear lowest set bit
+            if let Some(Some(reg)) = self.local_assignments.get(k).copied() {
+                let off = self.local_offset(k);
+                self.emit_load_local(reg, off); // reg <- [rbp - off]
+            }
+        }
     }
 
     /// Peek at the top of the simulated stack.
