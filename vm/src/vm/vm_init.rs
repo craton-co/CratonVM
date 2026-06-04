@@ -1579,6 +1579,16 @@ impl SharedVm {
                     };
                     let target = match template {
                         Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+                        // Template too small: `Collection.toArray(T[])` must return
+                        // a NEW array of the template's RUNTIME type, not a bare
+                        // `Object[]`. An array's heap header stores its component
+                        // class id, so `class_id_of_object(arr)` IS the component
+                        // id `new_ref_array` wants — preserving multi-dimensional
+                        // element types (`Value[][]` for H2 SortOrder.sort).
+                        Value::Object(Some(arr)) => {
+                            let comp = ctx.class_id_of_object(arr);
+                            ctx.new_ref_array(comp, size)
+                        }
                         _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
                     };
                     let it_v = ctx.invoke(
@@ -1627,6 +1637,14 @@ impl SharedVm {
                 };
                 let target = match template {
                     Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+                    // Template too small: allocate a NEW array of the template's
+                    // runtime component type (see the iterator-path comment above),
+                    // not a bare `Object[]`. Fixes the H2 `SortOrder.sort`
+                    // `rows.toArray(new Value[0][])` CCE (`Object -> [[Value`).
+                    Value::Object(Some(arr)) => {
+                        let comp = ctx.class_id_of_object(arr);
+                        ctx.new_ref_array(comp, size)
+                    }
                     _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
                 };
                 if let Some(d) = data {

@@ -4336,7 +4336,18 @@ fn native_hs_to_array_typed(
             return Ok(Some(Value::Object(Some(arr))));
         }
     }
-    let arr = alloc_ref_array(ctx, keys.len());
+    // Template too small (or absent): allocate a NEW array of the template's
+    // runtime component type (JDK contract), not a bare `Object[]`. The array
+    // header stores its component class id, so `class_id_of_object(t)` is the
+    // component id `new_ref_array` wants — keeps `Set<String>.toArray(new
+    // String[0])` typed `String[]` instead of `Object[]`.
+    let arr = match target {
+        Some(t) => {
+            let comp = ctx.class_id_of_object(t);
+            ctx.new_ref_array(comp, keys.len())
+        }
+        None => alloc_ref_array(ctx, keys.len()),
+    };
     for (i, k) in keys.iter().enumerate() {
         ctx.set_array_element(arr, i, *k);
     }

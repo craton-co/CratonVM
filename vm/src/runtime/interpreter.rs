@@ -4967,6 +4967,35 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
 
         let exec_result = execute_instruction(shared, thread, frame_idx, &instruction, saved_pc);
 
+        // DIAG (gated `CRATONVM_DBG_UNDERFLOW=1`): pinpoint an operand-stack
+        // underflow — log the offending method/bci/opcode + the Java frame chain
+        // the first time one surfaces, so a mis-modelled bytecode path can be
+        // minimized without a full TestAll run. (The H2 TestAll underflow is no
+        // longer reproducible after the toArray(T[]) template-type fix; this is
+        // a low-cost tripwire — it only runs on the rare IllegalState error path.)
+        if let Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::IllegalStateException { message },
+        ))) = &exec_result
+        {
+            if message == "operand stack underflow"
+                && std::env::var("CRATONVM_DBG_UNDERFLOW").is_ok()
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static FIRED: AtomicBool = AtomicBool::new(false);
+                if !FIRED.swap(true, Ordering::Relaxed) {
+                    let f = &thread.frames[frame_idx];
+                    eprintln!(
+                        "[DBG_UNDERFLOW] at {}.{}{} bci={} opcode={:?} stack_len={}",
+                        f.class_name(), f.method_name(), f.method_descriptor(),
+                        saved_pc, instruction, f.stack.len(),
+                    );
+                    for (i, fr) in thread.frames.iter().enumerate().rev() {
+                        eprintln!("    [{}] {}.{}{} pc={}", i, fr.class_name(), fr.method_name(), fr.method_descriptor(), fr.pc);
+                    }
+                }
+            }
+        }
+
         // Convert RuntimeErrors from native methods into catchable Java exceptions.
         let exec_result = match exec_result {
             Err(MethodCallFailed::InternalError(VmError::Runtime(runtime_err)))
