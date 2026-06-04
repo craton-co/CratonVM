@@ -4862,6 +4862,11 @@ impl ClassManager {
     /// previous layout must not be left with too few slots.
     fn recompute_subclass_layouts(&mut self, changed_id: ClassId) {
         let class_count = self.class_store.len();
+        // Descendants whose `first_field_index` actually shifts: their
+        // previously-resolved `(referring-class, cp-index) -> ResolvedField`
+        // cache entries are baked against the stale offset and must be evicted
+        // (see the post-loop invalidation below).
+        let mut changed_descendants: Vec<u32> = Vec::new();
         for idx in 0..class_count {
             let cid = ClassId::new(idx as u32);
             // The changed class itself is already up to date.
@@ -4912,11 +4917,31 @@ impl ClassManager {
                 }
             }
             if let Some(class) = self.class_store.get_mut(cid) {
+                let old_first = class.first_field_index;
+                let old_total = class.num_total_fields;
                 class.first_field_index = new_first;
                 // Grow-only: never shrink below the count an existing
                 // object was allocated with.
                 class.num_total_fields = class.num_total_fields.max(new_total);
+                if old_first != class.first_field_index || old_total != class.num_total_fields {
+                    changed_descendants.push(cid.as_u32());
+                }
             }
+        }
+
+        // A descendant whose field layout shifted may hold previously-resolved
+        // `(referring-class, cp-index) -> ResolvedField` cache entries baked
+        // against the STALE `first_field_index`. The parent invalidation in
+        // `upgrade_synthetic_class` (`fire_resolution_invalidate_hook(id)`) does
+        // NOT evict them — `invalidate_class` keys on `key_class` /
+        // `declaring_class_id`, both of which are the descendant itself, not the
+        // parent. Without this, the descendant's getfield/putfield keeps reading
+        // the old slot, which is out of bounds on the new layout — the
+        // BC `:core:test` gradle-worker `EncodedStream$EncodedInput.delegate`
+        // "slot 1 vs num_slots 1" hang. Evict them now (also drives JIT
+        // recompilation of any method that baked the stale offset).
+        for cid in changed_descendants {
+            fire_resolution_invalidate_hook(cid);
         }
     }
 }
