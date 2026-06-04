@@ -1881,6 +1881,58 @@ mod tests {
         );
     }
 
+    /// R1 (silent-corruption fix): a *real* OS pointer must never be
+    /// mis-classified as an arena handle, even when it falls numerically
+    /// inside a live arena block's `[base, base+len)` range. Before the
+    /// fix, `contains` was pure range membership and a real `allocateDirect`
+    /// pointer ≥ 64 GiB landing inside a block would be silently routed to
+    /// the off-heap store. Tagging every handle with bit 62 — which no real
+    /// Windows/Linux user-mode pointer can have set — makes the two spaces
+    /// provably disjoint.
+    #[test]
+    fn real_pointer_in_arena_numeric_range_is_not_misrouted() {
+        let _arena_lock = crate::arena_test_lock(); // shared global arena
+        let addr = crate::unsafe_arena_allocate(4096);
+
+        // The handle itself is in-arena.
+        assert!(
+            crate::unsafe_arena_contains(addr),
+            "freshly allocated handle {addr:#x} must be in-arena",
+        );
+        // Every handle carries the high tag bit (bit 62).
+        assert_ne!(
+            addr & (1i64 << 62),
+            0,
+            "arena handle {addr:#x} must carry the reserved tag bit",
+        );
+
+        // Synthesize a "real-looking" pointer with the SAME low bits as the
+        // handle but the tag bit cleared — i.e. an address in the historical
+        // 2^36-based numeric range a real OS pointer could occupy. It must NOT
+        // be classified as in-arena, so `copy_*_native_memory` would take the
+        // raw path instead of corrupting the off-heap store.
+        let real_like = addr & !(1i64 << 62);
+        assert!(
+            real_like >= 0x10_0000_0000,
+            "sanity: stripped address {real_like:#x} is in the dangerous low range",
+        );
+        assert!(
+            !crate::unsafe_arena_contains(real_like),
+            "real pointer {real_like:#x} (handle with tag stripped) must NOT be \
+             mis-classified as an arena handle",
+        );
+
+        // A range read at the real-looking address must also be refused so the
+        // NIO routing falls through to the raw pointer path.
+        let mut out = [0u8; 8];
+        assert!(
+            !crate::unsafe_arena_copy_out(real_like, &mut out),
+            "copy_out at a non-handle address must fail (forces raw path)",
+        );
+
+        crate::unsafe_arena_free(addr);
+    }
+
     #[test]
     fn define_class_null_byte_array_rejects() {
         let mut ctx = MockNativeContext::new();
