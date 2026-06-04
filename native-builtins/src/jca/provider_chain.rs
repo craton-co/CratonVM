@@ -1573,9 +1573,16 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
 
     // Real-JCA bring-up: bridge `sun.security.jca.GetInstance.getService` to our
     // provider service map, and instantiate real provider SPIs reflectively.
-    // Only wired in real-JCA mode — in synthetic mode the key_factory/signature
-    // short-circuits handle getInstance and these would never be reached.
-    if crate::real_jca_mode() {
+    // Wired whenever the real SunEC path is reachable — either full real-JCA
+    // mode (`CRATONVM_REAL_JCA`) or EC-scoped default routing
+    // (`route_ec_to_real`, default ON). In pure-synthetic mode (kill-switch
+    // `CRATONVM_SYNTHETIC_EC=1`) the key_factory/signature short-circuits handle
+    // every `getInstance` and these bridges are never reached.  Even when wired
+    // in default mode the bridges are EC-only in practice: every non-EC engine
+    // (`MessageDigest`/RSA/AES/…) keeps its always-on synthetic native, so only
+    // real EC bytecode ever falls through to here.
+    let ec_real = crate::real_jca_mode() || crate::route_ec_to_real();
+    if ec_real {
         // Mirror SunEC's EC service table into our map so the no-provider
         // `getInstance("EC")` search resolves the real pure-Java SunEC SPIs.
         seed_sunec_services();
@@ -1629,6 +1636,15 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
             "(Ljava/lang/String;Ljava/lang/String;)Ljava/util/Iterator;",
             getinstance_get_services,
         );
+    }
+
+    // BouncyCastle X509/cert-parsing extras — only the full real-JCA path
+    // (`CRATONVM_REAL_JCA`) drives real BC providers that need these. The SunEC
+    // keygen/sign/verify path used by EC-scoped default routing never touches
+    // `Provider.getProperty` or the JFR security-event helper, so leave these
+    // wired to full real-JCA mode to avoid shadowing real `Provider.getProperty`
+    // for unrelated default-mode apps.
+    if crate::real_jca_mode() {
         // Provider.getProperty — return captured put/alias values, bypassing the
         // real getProperty's checkInitialized() (which NPEs on our synthetic
         // providers). Used by BC's X509SignatureUtil.lookupAlg to map signature

@@ -386,6 +386,7 @@ pub mod lang_misc;
 pub mod util_time;
 pub mod phases_early;
 pub mod phases_late;
+pub(crate) mod bc_aes;
 // T19_K3_PROPS_SIDETABLE — robust java.util.Properties storage so
 // KeycloakMain.<clinit>'s Version.<clinit> path
 // (Class.getResourceAsStream → Properties.load → getProperty) returns
@@ -533,6 +534,32 @@ pub mod jca;
 /// `ECPrivateKey`/`RSAPublicKey` instances instead of bare-interface synthetics.
 pub fn real_jca_mode() -> bool {
     std::env::var_os("CRATONVM_REAL_JCA").is_some()
+}
+
+/// EC-scoped real-JCA routing (default ON). Unlike [`real_jca_mode`] — which
+/// turns the synthetic JCA layer OFF wholesale and only works for EC (no real
+/// SunRsaSign/SunJCE seeder, so RSA/AES break) — this keeps the synthetic
+/// RSA/AES/digest shims in place but routes the **EC** family
+/// (`KeyPairGenerator`/`KeyFactory`/`AlgorithmParameters`/`Signature` for `EC`
+/// and `*withECDSA`) to the real, pure-Java JDK-25 SunEC SPIs.
+///
+/// Why: the synthetic EC keygen returns a bare `java/security/PublicKey`
+/// *interface* object, so `(java.security.interfaces.ECPublicKey) pub` throws
+/// `ClassCastException` (keycloak surfaces this as "Error obtaining
+/// ECParameterSpec for P-256 curve"). The real SunEC path yields concrete
+/// `sun.security.ec.ECPublicKeyImpl`/`ECPrivateKeyImpl` with a working
+/// `getParams()`. The provider machinery the real path needs
+/// (`seed_sunec_services` + the `sun/security/jca/GetInstance` bridges +
+/// `Security.<clinit>` `spiMap`) is reached **only** by real EC bytecode —
+/// every non-EC `getInstance` is still shadowed by its always-on synthetic
+/// native — so the blast radius is EC-only.
+///
+/// Kill-switch `CRATONVM_SYNTHETIC_EC=1` restores the legacy synthetic EC
+/// stubs (and leaves the bridges unwired) for debugging / regression bisecting.
+pub fn route_ec_to_real() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_EC").is_none())
 }
 
 pub mod deprecated_lang;
@@ -973,6 +1000,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // `Primes.implHasAnySmallFactors` otherwise runs interpreted and dominates
     // RSA key generation. Faithful single-word-mod reimplementation; see the fn doc.
     crate::phases_late::register_bc_primes_small_factors(registry);
+    // BouncyCastle AESEngine single-block transform fast-path (Intrinsic). Same
+    // JIT-ban rationale: the interpreted T-table AES otherwise dominates AESTest's
+    // Monte-Carlo stress. Verbatim FIPS-197-validated port of encrypt/decryptBlock.
+    crate::phases_late::register_bc_aes_engine(registry);
+    // BouncyCastle Strings UTF-8 transcode fast-path (Intrinsic) — dominates
+    // AESTest.testCounter's growing-string round-trips once AES is native.
+    crate::phases_late::register_bc_strings_utf8(registry);
 
     // Spring Boot loader in real-JDK mode can resolve Pattern natives through
     // synthetic-stub dispatch paths before/without usable JDK bytecode

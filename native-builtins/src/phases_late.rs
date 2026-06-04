@@ -35408,6 +35408,181 @@ pub(crate) fn register_bc_primes_small_factors(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// Read BouncyCastle's expanded AES key schedule (`int[][] KW`) into
+/// `Vec<[u32; 4]>` — `KW[round][col]`.
+fn read_aes_kw(ctx: &dyn NativeContext, outer: ObjectRef) -> Vec<[u32; 4]> {
+    let rows = ctx.array_length(outer);
+    let mut kw = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let row = match ctx.get_array_element(outer, r) {
+            Value::Object(Some(o)) => o,
+            _ => return Vec::new(),
+        };
+        let mut cols = [0u32; 4];
+        for (c, slot) in cols.iter_mut().enumerate() {
+            *slot = match ctx.get_array_element(row, c) {
+                Value::Int(v) => v as u32,
+                _ => 0,
+            };
+        }
+        kw.push(cols);
+    }
+    kw
+}
+
+/// Native fast-path for `org.bouncycastle.crypto.engines.AESEngine`'s private
+/// single-block transforms. With `org/bouncycastle/*` JIT-banned, the
+/// interpreted T-table AES dominates `AESTest`'s block-cipher Monte-Carlo
+/// stress (the documented AES non-finish). These intercept the private
+/// `encryptBlock`/`decryptBlock(byte[] in, int inOff, byte[] out, int outOff,
+/// int[][] KW)` — which already receive the expanded key schedule and run with
+/// all the public `processBlock` checks done — and apply a verbatim,
+/// FIPS-197-validated port (see [`crate::bc_aes`]). A registered native fully
+/// replaces the body (no decline-to-bytecode path), and `processBlock` has
+/// already validated the buffers and non-null key, so the defensive
+/// "can't happen" cases surface as an `IllegalStateException` rather than
+/// silently no-op'ing the void method.
+pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    let aes = "org/bouncycastle/crypto/engines/AESEngine";
+    let desc = "([BI[BI[[I)V";
+
+    fn block_args(
+        ctx: &dyn NativeContext,
+        args: &[Value],
+    ) -> Option<([u8; 16], usize, ObjectRef, usize, Vec<[u32; 4]>)> {
+        let in_arr = obj_arg(args, 1).ok()?;
+        let in_off = match args.get(2) {
+            Some(Value::Int(v)) => *v as usize,
+            _ => return None,
+        };
+        let out_arr = obj_arg(args, 3).ok()?;
+        let out_off = match args.get(4) {
+            Some(Value::Int(v)) => *v as usize,
+            _ => return None,
+        };
+        let kw = read_aes_kw(ctx, obj_arg(args, 5).ok()?);
+        if kw.len() < 2 {
+            return None; // malformed schedule (can't happen post-init)
+        }
+        let mut inb = [0u8; 16];
+        if ctx.read_byte_array_into(in_arr, in_off, &mut inb) != 16 {
+            return None; // input shorter than a block (processBlock pre-checks this)
+        }
+        Some((inb, in_off, out_arr, out_off, kw))
+    }
+
+    fn bad_state() -> MethodCallFailed {
+        RuntimeError::IllegalStateException {
+            message: "AESEngine native: malformed block/key state".into(),
+        }
+        .into()
+    }
+
+    r.register(aes, "encryptBlock", desc, |ctx, args| {
+        let (inb, _in_off, out_arr, out_off, kw) = block_args(ctx, args).ok_or_else(bad_state)?;
+        let mut outb = [0u8; 16];
+        crate::bc_aes::encrypt_block(&kw, &inb, &mut outb);
+        ctx.write_byte_array_from(out_arr, out_off, &outb);
+        Ok(None)
+    });
+    r.register(aes, "decryptBlock", desc, |ctx, args| {
+        let (inb, _in_off, out_arr, out_off, kw) = block_args(ctx, args).ok_or_else(bad_state)?;
+        let mut outb = [0u8; 16];
+        crate::bc_aes::decrypt_block(&kw, &inb, &mut outb);
+        ctx.write_byte_array_from(out_arr, out_off, &outb);
+        Ok(None)
+    });
+
+    // generateWorkingKey(byte[] key, boolean forEncryption) -> int[][]. The
+    // private key-schedule expansion; `AESTest.testCounter` churns it via
+    // repeated `newCipher()`/`init`, so it became the hot frame once the block
+    // transforms above went native. Also sets `this.ROUNDS` (the field's only
+    // other readers are the now-native encrypt/decryptBlock).
+    r.register(aes, "generateWorkingKey", "([BZ)[[I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let key_arr = obj_arg(args, 1)?;
+        let for_enc = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+
+        let klen = ctx.array_length(key_arr);
+        let mut kbuf = [0u8; 32];
+        let key: &[u8] = if klen <= 32 {
+            let n = ctx.read_byte_array_into(key_arr, 0, &mut kbuf[..klen]);
+            &kbuf[..n]
+        } else {
+            &[]
+        };
+
+        let w = match crate::bc_aes::generate_working_key(key, for_enc) {
+            Some(w) => w,
+            None => {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Key length not 128/192/256 bits.".into(),
+                }
+                .into())
+            }
+        };
+
+        // ROUNDS side effect (KC + 6 == rows - 1), matching BC.
+        ctx.set_field_by_name(this, "ROUNDS", Value::Int((w.len() - 1) as i32));
+
+        // Build the int[][] schedule. Holding `outer` across the inner
+        // `new_array` calls is the same allocate-while-holding pattern as
+        // `bi_alloc_int` — safe because GC here is stop-the-world-coordinated
+        // and never fires mid-native-call.
+        let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, w.len());
+        for (r_idx, cols) in w.iter().enumerate() {
+            let row = ctx.new_array(cratonvm_types::ArrayElementType::Int, 4);
+            for (c, &word) in cols.iter().enumerate() {
+                ctx.set_array_element(row, c, Value::Int(word as i32));
+            }
+            ctx.set_array_element(outer, r_idx, Value::Object(Some(row)));
+        }
+        Ok(Some(Value::Object(Some(outer))))
+    });
+
+    r.set_category(__prev_cat);
+}
+
+/// Intrinsics for `org.bouncycastle.util.Strings` UTF-8 transcode. With BC
+/// JIT-banned these otherwise run interpreted through `UTF8.transcodeToUTF16`
+/// and the slow `new String(char[])` / `StringUTF16.compress` path, which
+/// dominates `AESTest.testCounter` (255k growing-string round-trips) once the
+/// AES engine is native. Strict UTF-8 (RFC 3629) matches BC's decoder for valid
+/// input and raises the same `IllegalArgumentException("Invalid UTF-8 input")`
+/// for invalid input; encoding a (valid) Java String yields standard UTF-8.
+pub(crate) fn register_bc_strings_utf8(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    let s = "org/bouncycastle/util/Strings";
+
+    r.register(s, "fromUTF8ByteArray", "([B)Ljava/lang/String;", |ctx, args| {
+        let arr = obj_arg(args, 0)?;
+        let len = ctx.array_length(arr);
+        let mut buf = vec![0u8; len];
+        ctx.read_byte_array_into(arr, 0, &mut buf);
+        match std::str::from_utf8(&buf) {
+            Ok(text) => Ok(Some(Value::Object(Some(ctx.create_string(text))))),
+            Err(_) => Err(RuntimeError::IllegalArgumentException {
+                message: "Invalid UTF-8 input".into(),
+            }
+            .into()),
+        }
+    });
+
+    r.register(s, "toUTF8ByteArray", "(Ljava/lang/String;)[B", |ctx, args| {
+        let str_obj = obj_arg(args, 0)?;
+        let text = ctx.read_string(str_obj).unwrap_or_default();
+        let bytes = text.as_bytes();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+        ctx.write_byte_array_from(arr, 0, bytes);
+        Ok(Some(Value::Object(Some(arr))))
+    });
+
+    r.set_category(__prev_cat);
+}
+
 pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);

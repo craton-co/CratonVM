@@ -519,7 +519,12 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
     // `getSpiClass`, which reads the static `spiMap`.  The plain no-op
     // leaves it null and NPEs.  Use a variant that sets `spiMap` to an
     // empty map (still skipping the failing `initialize()`).
-    if crate::real_jca_mode() {
+    // Also needed for EC-scoped default routing (`route_ec_to_real`): real
+    // `AlgorithmParameters.getInstance("EC")` (driven by the real
+    // `ECKeyPairGenerator.initialize`) reads `spiMap`. Setting it to an empty
+    // map is harmless for the synthetic RSA/AES/digest paths (which never read
+    // it). Only the pure-synthetic kill-switch keeps the bare no-op.
+    if crate::real_jca_mode() || crate::route_ec_to_real() {
         r.register("java/security/Security", "<clinit>", "()V", security_clinit_spimap);
     } else {
         r.register("java/security/Security", "<clinit>", "()V", clinit_noop);
