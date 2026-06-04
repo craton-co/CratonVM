@@ -1,6 +1,34 @@
 # Precise JIT stack maps — design & staged implementation plan
 
-## DECISIVE RESULT (Stages 1–4 landed): mechanism proven, residual root-caused
+## ⚠ CORRECTED FINDING (supersedes the "mechanism proven" claim below)
+
+Instrumentation (`CRATONVM_DBG_PRECISE`, `CRATONVM_SP_VERIFY`) showed the
+precise RELOCATION path is **never exercised** under the gate:
+- `remap_active_jit_frames` is **never called with a non-empty pointer_map**
+  (0 `[PRECISE]` lines) on bt16 *or* bt18.
+- selective promotion's evac telemetry prints **0 `[sp-verify]` lines** under
+  the precise gate → `evac_map` is **empty** → it evacuates **nothing** when
+  `CRATONVM_PRECISE_JIT_MAPS` is on.
+
+So the `68332206 → 68199090` change is **NOT** from precise relocation. Since
+"no evacuation" ≈ pure non-moving sweep (which is golden 67674804), bt18
+precise+selective = 68199090 (wrong) is an **unresolved interaction** of the
+precise-gate codegen / pin behavior with the selective-promote path — **not a
+demonstrated fix**. bt16 is golden in every gate config (codegen sound there).
+
+Open questions (need a quiet machine — bt18 currently OOMs under a parallel
+session): (1) is `evac_map` truly empty, or non-empty-but-not-routed to
+`remap`? — print `pointer_map.len()` at the top of `update_all_roots`. (2) Why
+does the precise gate suppress evacuation? Leading theory: Stage-2 precise
+local-slot map entries are read by `scan_one_frame_precise` via the **still-
+imprecise `frame_base`** (the conservative backstop uses the guard SP, not the
+exact RBP that only `remap` uses) and over-pin everything. (3) Does precise-ONLY
+bt18 (no selective) stay golden? The relocation machinery (Stages 3–5) is
+implemented and bt16-sound but **unproven on bt18 because it isn't engaging**.
+
+---
+
+## (earlier) RESULT (Stages 1–4 landed): mechanism *appeared* proven
 
 bt18 A/B (8g, deterministic, reproduced):
 - golden = **67674804**
