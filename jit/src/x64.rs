@@ -1812,6 +1812,255 @@ fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
     targets
 }
 
+/// Stage 2 (precise oop maps) — enumerate the control-flow successors of the
+/// instruction at `pc` (normal flow only; exception-handler edges are not
+/// available to the JIT and are handled conservatively by leaving handler-only
+/// PCs `unreached`). Mirrors the branch/switch decoding in
+/// [`compute_branch_targets`] and the per-opcode length in [`bytecode_len_at`].
+fn oop_dataflow_successors(code: &[u8], code_len: usize, pc: usize) -> Vec<usize> {
+    let op = code[pc];
+    let fallthrough = pc + bytecode_len_at(code, pc);
+    let read_i16 = |at: usize| -> isize {
+        if at + 1 < code_len {
+            i16::from_be_bytes([code[at], code[at + 1]]) as isize
+        } else {
+            0
+        }
+    };
+    let read_i32 = |at: usize| -> isize {
+        if at + 3 < code_len {
+            i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
+        } else {
+            0
+        }
+    };
+    let target = |off: isize| -> Option<usize> {
+        let t = pc as isize + off;
+        if t >= 0 && (t as usize) < code_len {
+            Some(t as usize)
+        } else {
+            None
+        }
+    };
+    match op {
+        // ireturn/lreturn/freturn/dreturn/areturn/return, athrow, ret:
+        // no normal successor.
+        0xAC..=0xB1 | 0xBF | 0xA9 => Vec::new(),
+        // goto / goto_w: unconditional, target only.
+        0xA7 => target(read_i16(pc + 1)).into_iter().collect(),
+        0xC8 => target(read_i32(pc + 1)).into_iter().collect(),
+        // jsr / jsr_w: target + fall-through (return address pushed).
+        0xA8 => {
+            let mut v: Vec<usize> = target(read_i16(pc + 1)).into_iter().collect();
+            if fallthrough < code_len {
+                v.push(fallthrough);
+            }
+            v
+        }
+        0xC9 => {
+            let mut v: Vec<usize> = target(read_i32(pc + 1)).into_iter().collect();
+            if fallthrough < code_len {
+                v.push(fallthrough);
+            }
+            v
+        }
+        // Conditional branches (if<cond>, if_icmp<cond>, if_acmp<cond>) and
+        // ifnull/ifnonnull: target + fall-through.
+        0x99..=0xA6 | 0xC6 | 0xC7 => {
+            let mut v: Vec<usize> = target(read_i16(pc + 1)).into_iter().collect();
+            if fallthrough < code_len {
+                v.push(fallthrough);
+            }
+            v
+        }
+        // tableswitch: default + each table entry; no fall-through.
+        0xAA => {
+            let mut p = pc + 1;
+            while p % 4 != 0 {
+                p += 1;
+            }
+            let mut v = Vec::new();
+            if p + 12 <= code_len {
+                if let Some(t) = target(read_i32(p)) {
+                    v.push(t);
+                }
+                let low = read_i32(p + 4) as i32;
+                let high = read_i32(p + 8) as i32;
+                let count = checked_tableswitch_count(low, high).unwrap_or(0);
+                let mut jp = p + 12;
+                for _ in 0..count {
+                    if jp + 4 > code_len {
+                        break;
+                    }
+                    if let Some(t) = target(read_i32(jp)) {
+                        v.push(t);
+                    }
+                    jp += 4;
+                }
+            }
+            v
+        }
+        // lookupswitch: default + each pair offset; no fall-through.
+        0xAB => {
+            let mut p = pc + 1;
+            while p % 4 != 0 {
+                p += 1;
+            }
+            let mut v = Vec::new();
+            if p + 8 <= code_len {
+                if let Some(t) = target(read_i32(p)) {
+                    v.push(t);
+                }
+                let npairs = read_i32(p + 4).max(0) as usize;
+                let mut jp = p + 8;
+                for _ in 0..npairs {
+                    if jp + 8 > code_len {
+                        break;
+                    }
+                    if let Some(t) = target(read_i32(jp + 4)) {
+                        v.push(t);
+                    }
+                    jp += 8;
+                }
+            }
+            v
+        }
+        // Everything else: fall-through only.
+        _ => {
+            if fallthrough < code_len {
+                vec![fallthrough]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Stage 2 (precise oop maps) — transfer function for the per-local "must be
+/// oop" dataflow: apply the store at `pc` to `mask`. `astore*` makes a local
+/// definitely-oop; primitive stores (`istore`/`lstore`/`fstore`/`dstore`/
+/// `iinc`) make it definitely-non-oop; long/double stores also clear the
+/// category-2 high half. All other opcodes leave the local types unchanged.
+fn oop_dataflow_transfer(code: &[u8], pc: usize, mask: u64, max_locals: usize) -> u64 {
+    let set_oop = |m: u64, k: usize| -> u64 {
+        if k < 64 && k < max_locals {
+            m | (1u64 << k)
+        } else {
+            m
+        }
+    };
+    let clr = |m: u64, k: usize, span: usize| -> u64 {
+        let mut m = m;
+        for j in k..k + span {
+            if j < 64 {
+                m &= !(1u64 << j);
+            }
+        }
+        m
+    };
+    let op = code[pc];
+    match op {
+        0x3A => set_oop(mask, code.get(pc + 1).copied().unwrap_or(0) as usize), // astore
+        0x4B..=0x4E => set_oop(mask, (op - 0x4B) as usize),                     // astore_0..3
+        0x36 | 0x38 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 1), // istore/fstore
+        0x37 | 0x39 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 2), // lstore/dstore
+        0x3B..=0x3E => clr(mask, (op - 0x3B) as usize, 1),                      // istore_0..3
+        0x43..=0x46 => clr(mask, (op - 0x43) as usize, 1),                      // fstore_0..3
+        0x3F..=0x42 => clr(mask, (op - 0x3F) as usize, 2),                      // lstore_0..3
+        0x47..=0x4A => clr(mask, (op - 0x47) as usize, 2),                      // dstore_0..3
+        0x84 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 1),  // iinc
+        0xC4 => {
+            // wide <store>/<iinc>: 2-byte index.
+            let wop = code.get(pc + 1).copied().unwrap_or(0);
+            let idx = if pc + 3 < code.len() {
+                u16::from_be_bytes([code[pc + 2], code[pc + 3]]) as usize
+            } else {
+                0
+            };
+            match wop {
+                0x3A => set_oop(mask, idx),
+                0x36 | 0x38 => clr(mask, idx, 1),
+                0x37 | 0x39 => clr(mask, idx, 2),
+                0x84 => clr(mask, idx, 1),
+                _ => mask,
+            }
+        }
+        _ => mask,
+    }
+}
+
+/// Stage 2 (precise oop maps) — forward "must be oop" dataflow over local
+/// variable slots. Returns `(in_mask, reached)` each of length `code_len`:
+/// `in_mask[pc] & (1<<k) != 0` iff local `k` holds an object reference on
+/// EVERY normal-control-flow path reaching `pc`, and `reached[pc]` is true iff
+/// the forward analysis visited `pc`.
+///
+/// Soundness for the *moving* GC consumer (Stage 5): a bit is set only when
+/// the slot was `astore`d on every reaching path, so the slot genuinely holds
+/// an oop — never a primitive (no false positive → no int rewritten). A live
+/// oop that is conditionally a primitive on another path merges to "not
+/// definitely oop" and is omitted; such a slot is necessarily dead-as-oop at
+/// that PC (the verifier forbids reading a slot with conflicting types), so the
+/// omission is safe. PCs reachable only via exception handlers (whose edges are
+/// not visible here) stay `unreached`; the caller emits no precise local
+/// entries there and the GC falls back to the conservative frame sweep.
+///
+/// `> 64` locals → empty result (caller falls back to conservative). Parameter
+/// slots are seeded conservatively as non-oop for now (TODO before the Stage 5
+/// gate flip: first-execution-use param typing so oop params live at an early
+/// safepoint are precisely covered rather than left to the conservative sweep).
+fn compute_local_oop_masks(
+    code: &[u8],
+    code_len: usize,
+    max_locals: usize,
+) -> (Vec<u64>, Vec<bool>) {
+    if max_locals == 0 || max_locals > 64 || code_len == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    const TOP: u64 = u64::MAX;
+    let mut in_mask = vec![TOP; code_len];
+    let mut reached = vec![false; code_len];
+    // Entry: conservative (no params assumed oop). See doc comment TODO.
+    in_mask[0] = 0;
+    reached[0] = true;
+    let mut work: Vec<usize> = vec![0];
+    // Bound iterations defensively against any decoding pathology.
+    let mut guard = code_len.saturating_mul(64).saturating_add(64);
+    while let Some(pc) = work.pop() {
+        if pc >= code_len {
+            continue;
+        }
+        guard = guard.saturating_sub(1);
+        if guard == 0 {
+            break;
+        }
+        let out = oop_dataflow_transfer(code, pc, in_mask[pc], max_locals);
+        for succ in oop_dataflow_successors(code, code_len, pc) {
+            if succ >= code_len {
+                continue;
+            }
+            // First real predecessor seeds; later ones intersect (AND).
+            let new_in = if reached[succ] { in_mask[succ] & out } else { out };
+            if !reached[succ] || new_in != in_mask[succ] {
+                in_mask[succ] = new_in;
+                reached[succ] = true;
+                work.push(succ);
+            }
+        }
+    }
+    // Mask off bits beyond max_locals (TOP-init residue on any unreached PC is
+    // irrelevant — callers gate on `reached`).
+    let valid_bits = if max_locals >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << max_locals) - 1
+    };
+    for m in in_mask.iter_mut() {
+        *m &= valid_bits;
+    }
+    (in_mask, reached)
+}
+
 /// EC-DUP2-CAT2 (bc math-ec JIT miscompile fix) — reject methods whose
 /// `dup2` (0x5C) operates on a CATEGORY-2 (long / double) value.
 ///
@@ -4512,6 +4761,24 @@ struct Compiler {
     /// instruction *after* the safepoint call. Transferred to
     /// `CompiledMethod::oop_maps` at finalize time.
     oop_maps: Vec<crate::OopMapEntry>,
+    /// Stage 2 (precise oop maps) — per-bytecode-PC "must be oop" local
+    /// bitmask. `local_oop_masks[pc] & (1 << k) != 0` means local slot `k`
+    /// holds an object reference on EVERY path reaching `pc` (so a safepoint
+    /// at `pc` can record local `k`'s canonical frame slot as a precise oop).
+    /// Empty when unsupported (>64 locals); `local_oop_reached[pc]` is false
+    /// for PCs the forward dataflow never reached (e.g. exception-handler-only
+    /// entries), where no precise local marking is emitted and the GC falls
+    /// back to the conservative frame sweep. See
+    /// `docs/precise-jit-stack-maps-design.md` (Stage 2).
+    local_oop_masks: Vec<u64>,
+    /// Stage 2 — companion to `local_oop_masks`: whether the forward local-oop
+    /// dataflow reached each PC. Only `reached` PCs get precise local entries.
+    local_oop_reached: Vec<bool>,
+    /// Stage 2 — the bytecode PC of the instruction currently being emitted,
+    /// updated at the top of the `compile_bytecode` loop so
+    /// `emit_oop_map_for_safepoint` can look up the local-oop mask without
+    /// threading `pc` through every safepoint call site.
+    cur_bc_pc: usize,
     /// T5.2.1 — induction variables detected in each loop.
     ///
     /// One entry per detected counted loop. Consumed by downstream
@@ -4777,6 +5044,9 @@ impl Compiler {
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),
             oop_maps: Vec::new(),
+            local_oop_masks: Vec::new(),
+            local_oop_reached: Vec::new(),
+            cur_bc_pc: 0,
             induction_vars: Vec::new(),
             null_check_info: crate::null_check_elim::NullCheckInfo::default(),
             simd_element_wise_loops: Vec::new(),
@@ -5076,6 +5346,33 @@ impl Compiler {
             if let StackSlot::Frame(off) = self.stack[i] {
                 if let Ok(i16_off) = i16::try_from(off) {
                     slots.push(i16_off);
+                }
+            }
+        }
+        // Stage 2 (precise oop maps) — add the canonical frame slots of local
+        // variables that hold object references at this safepoint, per the
+        // forward "must be oop" dataflow. For register-resident locals this is
+        // exactly the slot `emit_pre_safepoint_spill` flushed the live value to
+        // just before the call; for memory-resident locals it is where the
+        // value always lives. The GC root walker then has precise, updatable
+        // coverage of every live oop local (not just operand-stack temporaries).
+        // Sound on the default path regardless of dataflow precision: the
+        // consumer re-validates each slot via `heap.is_object_address`.
+        if !self.local_oop_masks.is_empty() {
+            let pc = self.cur_bc_pc;
+            if pc < self.local_oop_masks.len()
+                && self.local_oop_reached.get(pc).copied().unwrap_or(false)
+            {
+                let mut mask = self.local_oop_masks[pc];
+                while mask != 0 {
+                    let k = mask.trailing_zeros() as usize;
+                    mask &= mask - 1; // clear lowest set bit
+                    let off = self.local_offset(k);
+                    if let Ok(i16_off) = i16::try_from(off) {
+                        if !slots.contains(&i16_off) {
+                            slots.push(i16_off);
+                        }
+                    }
                 }
             }
         }
@@ -10669,6 +10966,11 @@ impl Compiler {
 
         let mut pc = 0;
         while pc < code_len {
+            // Stage 2 (precise oop maps) — track the bytecode PC being emitted
+            // so `emit_oop_map_for_safepoint` can look up the live oop-local
+            // mask for this instruction without threading `pc` through every
+            // safepoint call site.
+            self.cur_bc_pc = pc;
             // DCE: if we're in dead code and this PC isn't a branch target, skip it
             if dead {
                 if branch_targets[pc] {
@@ -18389,6 +18691,18 @@ pub fn compile_with_param_slots(
     // codegen sites (getfield/putfield/invoke*/new/anewarray/ldc/…)
     // so each query is O(1) rather than scanning the Vec.
     compiler.build_pc_indices();
+
+    // Stage 2 (precise oop maps) — forward "must be oop" local-variable
+    // dataflow. Lets `emit_oop_map_for_safepoint` record the canonical frame
+    // slots of register/memory locals that hold object references at each
+    // safepoint (in addition to the operand-stack slots), so a moving GC has
+    // precise, updatable coverage of every live oop. Behaviour-neutral on the
+    // default (non-moving) path: `conservative_roots::scan_one_frame_precise`
+    // already sweeps the whole frame region, so the extra precise entries are
+    // redundant there and re-validated via `heap.is_object_address`.
+    let (lo_masks, lo_reached) = compute_local_oop_masks(code, code_len, max_locals);
+    compiler.local_oop_masks = lo_masks;
+    compiler.local_oop_reached = lo_reached;
 
     // Emit prologue
     compiler.emit_prologue();

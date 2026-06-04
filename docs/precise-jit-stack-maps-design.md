@@ -1,6 +1,40 @@
 # Precise JIT stack maps — design & staged implementation plan
 
-Status: **design + Stage 1 in progress** on branch `feat/precise-jit-stack-maps`.
+Status: **Stage 1 landed + validated; Stage 2 implemented** on branch
+`feat/precise-jit-stack-maps`.
+
+Progress log:
+- Stage 1 (`427b474`): operand-stack `stack_oop_marks` desync eliminated +
+  lockstep debug assertion. Validated: bt16=14985902, sieve250k=22044 (rc=0),
+  behaviour-neutral.
+- Stage 2 (implemented): forward "must be oop" local-variable dataflow
+  (`compute_local_oop_masks` / `oop_dataflow_{successors,transfer}`) feeds
+  `emit_oop_map_for_safepoint`, which now records the canonical frame slots of
+  oop register/memory locals (e.g. bt18's `n` in local 1) in addition to
+  operand-stack temporaries. Behaviour-neutral on the default path
+  (`scan_one_frame_precise` already sweeps the whole frame and re-validates via
+  `is_object_address`, so the extra precise entries are redundant there).
+  Params seeded conservatively non-oop for now (TODO before Stage 5).
+
+### Correctness items discovered, deferred to Stage 3 (exact relocation)
+
+The current precise path is *non-load-bearing* (a pure additive optimisation on
+top of the conservative sweep), which masks two issues that MUST be fixed before
+the map can drive relocation:
+
+1. **Offset sign convention.** `OopMapEntry::frame_slot_offsets` are documented
+   as RBP-relative with *negative* = below RBP, but `emit_oop_map_for_safepoint`
+   stores `StackSlot::Frame(off)`/`local_offset(k)` as *positive* values (the
+   slot is physically at `[rbp - off]`). `scan_oop_slots` does `frame_base +
+   offset`. Today this resolves to wrong addresses that `is_object_address`
+   filters out — harmless only because the conservative sweep finds the real
+   oops. Stage 3 must make the stored offset + walker arithmetic agree on
+   `[rbp - off]`.
+2. **Imprecise `frame_base`.** `PreciseFrameInfo::frame_base` is the Rust-side
+   guard SP, not the JIT frame's real RBP (release builds omit frame pointers,
+   so it can't be recovered by walking). Stage 3 must register the real RBP via
+   the prologue/epilogue (explicit frame registration) so slot addresses are
+   exact.
 
 ## Why
 
