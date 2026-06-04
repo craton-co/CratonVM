@@ -6876,6 +6876,45 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         "()[[Ljava/lang/annotation/Annotation;",
         lang_class::native_method_get_parameter_annotations,
     );
+    // Constructor annotation methods. CratonVM builds Constructor reflective
+    // objects (create_constructor_object) WITHOUT the raw `annotations` /
+    // `parameterAnnotations` byte[] fields the real JDK bytecode parses, so
+    // without these native overrides Constructor.getDeclaredAnnotations() /
+    // getParameterAnnotations() fell through to that bytecode and returned
+    // empty — Jackson then reported "no Creators" for an `@JsonCreator`
+    // constructor (keycloak CredentialModelTest / PasswordCredentialData).
+    // The shared Method natives work because `method_class_name_desc` now
+    // resolves a Constructor receiver to its `<init>` metadata.
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getAnnotations",
+        "()[Ljava/lang/annotation/Annotation;",
+        native_method_get_annotations,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getDeclaredAnnotations",
+        "()[Ljava/lang/annotation/Annotation;",
+        native_method_get_annotations,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getAnnotation",
+        "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+        native_method_get_annotation,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "isAnnotationPresent",
+        "(Ljava/lang/Class;)Z",
+        native_method_is_annotation_present,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getParameterAnnotations",
+        "()[[Ljava/lang/annotation/Annotation;",
+        lang_class::native_method_get_parameter_annotations,
+    );
     // Annotation proxy: annotationType() returns the Class mirror
     registry.register(
         "java/lang/annotation/Annotation",
