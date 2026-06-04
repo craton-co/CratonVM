@@ -311,6 +311,32 @@ fn read_inet_address_text(ctx: &mut dyn NativeContext, ia: Option<ObjectRef>) ->
     let Some(o) = ia else {
         return "0.0.0.0".to_string();
     };
+    // NIO-SERVER-SOCKET (IPv6): real-JDK `Inet6Address` keeps its 16-byte
+    // address in a SEPARATE holder `this.holder6`
+    // (`Inet6Address$Inet6AddressHolder`) with a `byte[16] ipaddress` field
+    // (+ `int scope_id`). The IPv4 `holder.address` int is ~0 for a v6 address,
+    // so without reading holder6 first a v6 InetAddress falls through to the
+    // text fallback below and bind0/connect0 target the wildcard. Read holder6
+    // before the IPv4 holder so genuine v6 addresses resolve correctly.
+    if let Value::Object(Some(holder6)) = ctx.get_field_by_name(o, "holder6") {
+        if let Value::Object(Some(arr)) = ctx.get_field_by_name(holder6, "ipaddress") {
+            if ctx.array_length(arr) >= 16 {
+                let mut bytes = [0u8; 16];
+                if ctx.read_byte_array_into(arr, 0, &mut bytes) == 16 {
+                    let v6 = std::net::Ipv6Addr::from(bytes);
+                    // Link-local addresses need a %scope suffix to bind/connect
+                    // on Windows; scope_id == 0 means "no scope" (loopback,
+                    // global) and is omitted.
+                    let scoped = match ctx.get_field_by_name(holder6, "scope_id") {
+                        Value::Int(s) if s != 0 => format!("{v6}%{s}"),
+                        _ => v6.to_string(),
+                    };
+                    dbgnet!("read_inet_address_text v6 -> {scoped}");
+                    return scoped;
+                }
+            }
+        }
+    }
     // NIO-SERVER-SOCKET: real-JDK `Inet4Address` stores the IPv4 address as an
     // int in `this.holder.address` (host byte order — 127.0.0.1 == 0x7F000001),
     // NOT as a text field. When `java.net.Socket` runs real bytecode (route 1)
@@ -352,6 +378,19 @@ fn read_inet_address_text(ctx: &mut dyn NativeContext, ia: Option<ObjectRef>) ->
     "0.0.0.0".to_string()
 }
 
+/// Join an address text and port into a Rust `ToSocketAddrs` string. IPv6
+/// literals MUST be bracketed (`[::1]:port`) — std's `SocketAddr` parser
+/// rejects `::1:port` (it reads the whole thing as a v6 address with no port).
+/// A bare IPv4/hostname is joined with a plain colon. An already-bracketed
+/// host is passed through unchanged.
+fn join_host_port(addr_text: &str, port: i32) -> String {
+    if addr_text.contains(':') && !addr_text.starts_with('[') {
+        format!("[{addr_text}]:{port}")
+    } else {
+        format!("{addr_text}:{port}")
+    }
+}
+
 // ---------- socket lifecycle ----------
 
 /// `socket0(boolean preferIPv6, boolean stream, boolean reuseAddr,
@@ -383,7 +422,7 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let port = int_arg(args, 4);
 
     let addr_text = read_inet_address_text(ctx, inet_addr);
-    let bind_addr = format!("{addr_text}:{port}");
+    let bind_addr = join_host_port(&addr_text, port);
 
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("bind0: FileDescriptor has no fd id"))?;
@@ -519,7 +558,7 @@ fn net_connect0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     let port = int_arg(args, 3);
 
     let addr_text = read_inet_address_text(ctx, remote);
-    let conn_addr = format!("{addr_text}:{port}");
+    let conn_addr = join_host_port(&addr_text, port);
 
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("connect0: FileDescriptor has no fd id"))?;
