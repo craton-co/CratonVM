@@ -88,6 +88,11 @@ const FACTORIES: &[(&str, &str, &str)] = &[
         "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1",
     ),
     (
+        "getJavaIOFileDescriptorAccess",
+        "Ljdk/internal/access/JavaIOFileDescriptorAccess;",
+        "java/io/FileDescriptor$1",
+    ),
+    (
         "getJavaNetInetAddressAccess",
         "Ljdk/internal/access/JavaNetInetAddressAccess;",
         "java/net/InetAddress$1",
@@ -135,7 +140,7 @@ const FACTORIES: &[(&str, &str, &str)] = &[
 ];
 
 /// Registry of interface owner-class names.  Used to iterate all
-/// 15 singletons from tests and from the VM-boot hook that
+/// singletons from tests and from the VM-boot hook that
 /// pre-allocates the synthetic stubs so `SharedSecrets.getXxx()`
 /// can return them without a bytecode `<clinit>` pass.
 pub fn owner_classes() -> impl Iterator<Item = &'static str> {
@@ -169,7 +174,7 @@ fn alloc_singleton(ctx: &mut dyn NativeContext, owner_class: &str) -> ObjectRef 
     }
 }
 
-/// Register the 15 `SharedSecrets.getJavaXxxAccess()` factories.
+/// Register the `SharedSecrets.getJavaXxxAccess()` factories.
 ///
 /// Each factory returns a synthetic object of the matching owner
 /// class.  We register on both `jdk/internal/access/SharedSecrets`
@@ -230,6 +235,7 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
         f_jiorafa,
         "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1"
     );
+    gen_factory!(f_jiofd, "java/io/FileDescriptor$1");
     gen_factory!(f_jniaa, "java/net/InetAddress$1");
     gen_factory!(f_jnuri, "cratonvm/internal/ss/JavaNetUriAccess$1");
     gen_factory!(f_jnio, "java/nio/Buffer$1");
@@ -250,6 +256,7 @@ fn make_factory_callback(owner_class: &'static str) -> cratonvm_native_api::Nati
         "java/lang/reflect/ReflectAccess" => f_jlrefa,
         "java/io/Console$1" => f_jioa,
         "cratonvm/internal/ss/JavaIORandomAccessFileAccess$1" => f_jiorafa,
+        "java/io/FileDescriptor$1" => f_jiofd,
         "java/net/InetAddress$1" => f_jniaa,
         "cratonvm/internal/ss/JavaNetUriAccess$1" => f_jnuri,
         "java/nio/Buffer$1" => f_jnio,
@@ -826,6 +833,103 @@ fn jiorafa_open_as_channel(
     } else {
         Ok(Some(Value::Object(None)))
     }
+}
+
+// JavaIOFileDescriptorAccess --------------------------------------------------
+//
+// `SharedSecrets.getJavaIOFileDescriptorAccess()` backs the real
+// `sun.nio.ch.FileChannelImpl` constructor (which reads `getAppend(fd)`),
+// `FileOutputStream`/`RandomAccessFile`, and the NIO file path. The accessor
+// just reads/writes the FileDescriptor's `fd`/`handle`/`append` fields, so the
+// methods are thin field accessors; cleanup hooks are no-ops (CratonVM closes
+// via the fd_table, not a PhantomCleanable). args[0] is the accessor receiver,
+// args[1] the FileDescriptor, args[2] the value (setters).
+fn jiofd_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let v = match args.get(1) {
+        Some(Value::Object(Some(fd))) => match ctx.get_field_by_name(*fd, "fd") {
+            Value::Int(i) => i,
+            _ => -1,
+        },
+        _ => -1,
+    };
+    Ok(Some(Value::Int(v)))
+}
+
+fn jiofd_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(fd))) = args.get(1) {
+        let v = args.get(2).and_then(|v| v.as_int()).unwrap_or(-1);
+        ctx.set_field_by_name(*fd, "fd", Value::Int(v));
+    }
+    Ok(None)
+}
+
+fn jiofd_get_append(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let v = match args.get(1) {
+        Some(Value::Object(Some(fd))) => match ctx.get_field_by_name(*fd, "append") {
+            Value::Int(i) => i,
+            _ => 0,
+        },
+        _ => 0,
+    };
+    Ok(Some(Value::Int(v)))
+}
+
+fn jiofd_set_append(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(fd))) = args.get(1) {
+        let v = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
+        ctx.set_field_by_name(*fd, "append", Value::Int(v));
+    }
+    Ok(None)
+}
+
+fn jiofd_get_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let v = match args.get(1) {
+        Some(Value::Object(Some(fd))) => match ctx.get_field_by_name(*fd, "handle") {
+            Value::Long(l) => l,
+            Value::Int(i) => i as i64,
+            _ => -1,
+        },
+        _ => -1,
+    };
+    Ok(Some(Value::Long(v)))
+}
+
+fn jiofd_set_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(fd))) = args.get(1) {
+        let v = match args.get(2) {
+            Some(Value::Long(l)) => *l,
+            Some(Value::Int(i)) => *i as i64,
+            _ => -1,
+        };
+        ctx.set_field_by_name(*fd, "handle", Value::Long(v));
+    }
+    Ok(None)
+}
+
+fn jiofd_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    // close / registerCleanup / unregisterCleanup — CratonVM owns fd lifetime
+    // through the fd_table + explicit channel close natives, so these
+    // SharedSecrets hooks are no-ops.
+    Ok(None)
+}
+
+fn register_java_io_fd_access(registry: &mut NativeMethodRegistry) {
+    let owner = "java/io/FileDescriptor$1";
+    registry.register(owner, "get", "(Ljava/io/FileDescriptor;)I", jiofd_get);
+    registry.register(owner, "set", "(Ljava/io/FileDescriptor;I)V", jiofd_set);
+    registry.register(owner, "getAppend", "(Ljava/io/FileDescriptor;)Z", jiofd_get_append);
+    registry.register(owner, "setAppend", "(Ljava/io/FileDescriptor;Z)V", jiofd_set_append);
+    registry.register(owner, "getHandle", "(Ljava/io/FileDescriptor;)J", jiofd_get_handle);
+    registry.register(owner, "setHandle", "(Ljava/io/FileDescriptor;J)V", jiofd_set_handle);
+    registry.register(owner, "close", "(Ljava/io/FileDescriptor;)V", jiofd_noop);
+    registry.register(owner, "registerCleanup", "(Ljava/io/FileDescriptor;)V", jiofd_noop);
+    registry.register(
+        owner,
+        "registerCleanup",
+        "(Ljava/io/FileDescriptor;Ljdk/internal/ref/PhantomCleanable;)V",
+        jiofd_noop,
+    );
+    registry.register(owner, "unregisterCleanup", "(Ljava/io/FileDescriptor;)V", jiofd_noop);
 }
 
 fn register_java_io_raf_access(registry: &mut NativeMethodRegistry) {
@@ -1501,6 +1605,7 @@ pub fn register_wp1_4_shared_secrets(registry: &mut NativeMethodRegistry) {
     register_java_lang_reflect_access(registry);
     register_java_io_access(registry);
     register_java_io_raf_access(registry);
+    register_java_io_fd_access(registry);
     register_java_net_inet_address_access(registry);
     register_java_net_uri_access(registry);
     register_java_nio_access(registry);
@@ -1518,8 +1623,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_15_factories_listed() {
-        assert_eq!(FACTORIES.len(), 15);
+    fn all_factories_listed() {
+        // 16th added: getJavaIOFileDescriptorAccess (real FileChannelImpl path).
+        assert_eq!(FACTORIES.len(), 16);
     }
 
     #[test]
@@ -1537,7 +1643,7 @@ mod tests {
         for owner in owner_classes() {
             assert!(seen.insert(owner), "duplicate owner class: {owner}");
         }
-        assert_eq!(seen.len(), 15);
+        assert_eq!(seen.len(), 16);
     }
 
     #[test]

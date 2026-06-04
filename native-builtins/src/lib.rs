@@ -1624,7 +1624,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // the current thread. Fixes "Cannot invoke currentCarrierThread on null"
     // on KC16 boot after ConcurrentHashMap / Lookup clinit B6-swallows.
     register_t19_h2_shared_secrets_shim(registry);
-    // WP1.4: SharedSecrets.getJavaXxxAccess() factories for all 15
+    // WP1.4: SharedSecrets.getJavaXxxAccess() factories for the
     // JDK Access interfaces plus the per-interface method natives
     // (currentCarrierThread, doIntersectionPrivilege, copyMethod,
     // parseCookie, …).  Registered after the T19.H2 shim so the
