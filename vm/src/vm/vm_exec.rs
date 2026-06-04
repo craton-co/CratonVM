@@ -1834,19 +1834,31 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
+        let class_id = self.shared.heap.class_id_of(obj);
+        // Guard by class identity BEFORE the structural reader. `read_java_string`
+        // below duck-types a String from the char[]/byte[] in field 0, but a
+        // CratonVM synthetic `StringBuilder`/`StringBuffer` is *also* char[]-backed
+        // (field 0 = char[] buffer, field 1 = int count) with an OVER-allocated
+        // buffer. The structural reader's char[] path has no length field, so it
+        // decodes the buffer's full *capacity* instead of its `count`, appending
+        // the unused trailing slots as NUL/space padding — the `"x" + sb`
+        // string-concatenation padding bug. A real String is always allocated with
+        // the java/lang/String class id (see `create_java_string`), so reject any
+        // object whose class is known and is not java/lang/String. Only when the
+        // class is genuinely unresolvable (early bootstrap, before String itself
+        // is loaded) do we fall through to the best-effort structural reader.
+        {
+            let cm = self.shared.class_manager.read();
+            if let Some(cls) = cm.get_class(class_id) {
+                if &*cls.name != "java/lang/String" {
+                    return None;
+                }
+            }
+        }
         if let Some(s) = super::read_java_string(&self.shared.heap, obj) {
             return Some(s);
         }
-        let class_id = self.shared.heap.class_id_of(obj);
         let cm = self.shared.class_manager.read();
-        if cm
-            .get_class(class_id)
-            .map(|c| &*c.name != "java/lang/String")
-            .unwrap_or(true)
-        {
-            drop(cm);
-            return None;
-        }
         let vidx = resolve_field_index_in_hierarchy(class_id, "value", &cm.class_store)?;
         let cidx = resolve_field_index_in_hierarchy(class_id, "coder", &cm.class_store);
         drop(cm);

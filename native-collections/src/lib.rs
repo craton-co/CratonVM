@@ -3855,36 +3855,39 @@ fn collect_keys_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<Value
 /// Snapshot a HashSet's elements in *iteration order* for the order-sensitive
 /// read paths (iterator / toArray / forEach / stream / toString / addAll-source).
 ///
-/// An ordinary HashSet — and a keySet/entrySet *view* of a plain `HashMap` —
-/// iterates in the backing map's bucket order, which already matches HotSpot,
-/// so we read straight from `backing`. But when the view's source is an
-/// insertion-ordered `LinkedHashMap` (or a sorted `TreeMap`), routing through
-/// the HashMap backing would re-bucket the elements and destroy that order
-/// (the SD-JWT `objectNode.properties().forEach(...)` claim-ordering bug). For
-/// those sources we collect directly from the source in its native order:
+/// An ordinary (non-view) HashSet has no source map, so we read its elements
+/// straight from `backing` in bucket order. But a keySet/entrySet/values *view*
+/// must iterate in its **source map's** encounter order: insertion order for a
+/// `LinkedHashMap`, sorted order for a `TreeMap`, and HotSpot-faithful bucket
+/// order for a plain `HashMap`. We therefore collect directly from the source
+/// whenever one is present.
+///
+/// Walking the view's own HashSet backing instead is wrong for an `entrySet`:
+/// that backing buckets each freshly-built `Map.Entry` by the entry object's
+/// *identity hash* (a keySet backing buckets by the key's hash, which happens
+/// to reproduce the source's layout), so an entrySet walk re-orders entries by
+/// entry-hash and diverges from both `keySet()` and HotSpot. That surfaced as
+/// the SD-JWT claim-ordering bug and, more broadly, any code that compares
+/// `entrySet()`/`values()` encounter order against HotSpot. Collecting from the
+/// source keeps `entrySet()` order identical to `keySet()` for every map type.
+///
 /// keySet → the source keys; entrySet → freshly built `Map.Entry` objects over
 /// the source's ordered `(key,value)` pairs (slot 0 = key, slot 1 = value, the
 /// layout `native_lhm_entry_set` and `native_hs_remove`'s key-extraction use).
 fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef) -> Vec<Value> {
     if let Some(source) = view_backing_source(ctx, backing) {
-        let cls = ctx
-            .class_name_of_id(ctx.class_id_of_object(source))
-            .unwrap_or_default();
-        let ordered = cls == "java/util/LinkedHashMap" || is_tree_map_receiver(ctx, source);
-        if ordered {
-            if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
-                return collect_entries_any(ctx, source)
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
-                        ctx.set_field(entry, 0, k);
-                        ctx.set_field(entry, 1, v);
-                        Value::Object(Some(entry))
-                    })
-                    .collect();
-            }
-            return collect_keys_any(ctx, source);
+        if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
+            return collect_entries_any(ctx, source)
+                .into_iter()
+                .map(|(k, v)| {
+                    let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
+                    ctx.set_field(entry, 0, k);
+                    ctx.set_field(entry, 1, v);
+                    Value::Object(Some(entry))
+                })
+                .collect();
         }
+        return collect_keys_any(ctx, source);
     }
     map_collect_keys(ctx, backing)
 }
@@ -4583,6 +4586,49 @@ fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),
     };
+    // entrySet() view: `contains(e)` must follow `AbstractMap`'s contract —
+    // `getNode(e.getKey()) != null && node.value.equals(e.getValue())` — i.e.
+    // compare by Map.Entry equality against the SOURCE map. Looking the entry
+    // object itself up in the view's HashSet backing (as the keySet path below
+    // does) buckets it by the entry's identity hash, so an entry produced by a
+    // different `entrySet()` call (or any foreign Map.Entry) never matches and
+    // `contains` wrongly returns false.
+    if let Some(source) = view_backing_source(ctx, backing) {
+        if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
+            // Non-object / null arg is never a Map.Entry → not contained.
+            let entry = match elem {
+                Value::Object(Some(e)) => e,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            // Synthetic Map.Entry layout: slot 0 = key, slot 1 = value (matches
+            // the entrySet builders and `native_hs_remove`'s key extraction).
+            let key = ctx.get_field(entry, 0);
+            let want_val = ctx.get_field(entry, 1);
+            // Resolve via the source map's own `containsKey`/`get` so this works
+            // for every backing map type (HashMap / LinkedHashMap / TreeMap).
+            // `containsKey` distinguishes "absent" from "present with null value".
+            let has_key = ctx.invoke_virtual(
+                source,
+                "containsKey",
+                "(Ljava/lang/Object;)Z",
+                &[key],
+            )?;
+            if !matches!(has_key, Some(Value::Int(1))) {
+                return Ok(Some(Value::Int(0)));
+            }
+            let got = ctx
+                .invoke_virtual(source, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[key])?
+                .unwrap_or(Value::Object(None));
+            let eq = values_equal(ctx, &got, &want_val)
+                || match (got, want_val) {
+                    (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                        map_keys_equal(ctx, a, b)?
+                    }
+                    _ => false,
+                };
+            return Ok(Some(Value::Int(if eq { 1 } else { 0 })));
+        }
+    }
     let ck_args = [Value::Object(Some(backing)), elem];
     native_map_contains_key(ctx, &ck_args)
 }
