@@ -10412,6 +10412,23 @@ pub(crate) fn try_lambda_dispatch(
         );
     }
 
+    // A functional interface may declare same-named OVERLOADS of the SAM —
+    // typically `default` methods whose body delegates to the real SAM. JUnit5's
+    // `TestInstancesProvider` has a 2-arg
+    // `getTestInstances(MutableExtensionRegistry, ThrowableCollector)` default
+    // that calls the 3-arg abstract SAM
+    // `getTestInstances(ExtensionRegistry, ExtensionRegistrar, ThrowableCollector)`.
+    // Matching the SAM by name alone would intercept the 2-arg default and route
+    // it to the lambda body one argument short (trailing param left
+    // uninitialised). Only intercept when the supplied arg count matches the
+    // SAM's; otherwise fall through so the real default method runs and then
+    // re-invokes the SAM with the right arity.
+    if method_name == &*call_site.sam_method_name
+        && split_method_descriptor(&call_site.sam_descriptor).0.len() != call_args.len()
+    {
+        return Ok(None);
+    }
+
     // Only intercept calls to the SAM (single abstract method). Default
     // methods on the functional interface (e.g. Function.andThen,
     // Predicate.and) are dispatched directly via the native registry on
