@@ -1,51 +1,51 @@
-# Bug: JUnit5 jupiter discovery finds 0 tests on CratonVM (HIGH VALUE)
+# RESOLVED: JUnit discovery finds 0 tests on CratonVM → now 4/4 (was framed as "JUnit5 jupiter")
 
-Fixing this unblocks running **every JUnit5 suite** on CratonVM (Apache Commons Math,
-and any modern `@Test` suite). Independent of the other `continue_prompt_*` bugs.
+## Outcome
+FIXED + VERIFIED (2026-06-04). `JUnitProbe` (programmatic `LauncherFactory.discover/execute`)
+on CratonVM now reports **`DISCOVER_FOUND=4`, `EXEC_FOUND=4 SUCCEEDED=4 FAILED=0`** —
+identical to HotSpot — for `org.apache.commons.math4.transform.TransformUtilsTest`.
 
-## State (corrected)
-With a CORRECT *absolute* classpath, CratonVM runs the JUnit5 console launcher to **rc=0
-with no crashes** — BufferedWriter, BreakIterator, and the `ParameterProvider$2.add`
-NoSuchMethodError are all gone (earlier "crash/blocked" reports were a relative-classpath /
-wrong-cwd repro artifact). ServiceLoader finds all 3 engines; `Method.getAnnotations()`
-returns `[Test]`. All match HotSpot.
+## What the bug actually was (the "jupiter" framing was a misdirection)
+`TransformUtilsTest` imports `org.junit.Test` (JUnit **4**), so it is discovered by the
+**junit-VINTAGE** engine, not jupiter (jupiter correctly finds 0 on both VMs — it's a JUnit4
+test). Probe chain that localised it:
+- `JUnitProbe` → DISCOVER_FOUND 0 (CratonVM) vs 4 (HotSpot).
+- `VintageProbe2` → JUnit4 `Runner.getDescription().getChildren()` = 0 on CratonVM (testCount=4).
+- `CollProbe`/`CollProbe2` → **minimal repro**: `new ArrayList<>(concurrentLinkedQueue_with_4)`
+  returns size **0** on CratonVM (4 on HotSpot), although `clq.size()/toArray()/iterator()`
+  all return 4. JUnit 4.13 `Description.fChildren` is a `ConcurrentLinkedQueue`; its
+  `getChildren()` = `new ArrayList<>(fChildren)` → dropped every test method → vintage FOUND=0.
 
-## The gap
-A programmatic launch that bypasses picocli entirely —
-`LauncherFactory.create().execute(request(selectClass("org.apache.commons.math4.transform.TransformUtilsTest")))`
-— finds **FOUND=0 on CratonVM vs 4 on HotSpot**, *silently* (rc=0, no warning/exception).
-The jupiter engine's `isTestMethod`/`isTestClass` predicate returns false on CratonVM.
+Root cause: in the DEFAULT build (synthetic-jdk OFF) JDK collections run **real bytecode**.
+A real ConcurrentLinkedQueue (and LinkedList, LinkedBlockingQueue, …) stores elements in
+head/tail Node chains, so the field-layout heuristics in `collect_collection_elements`
+(native-collections/src/lib.rs) can't read them → empty. `CollProbe2` confirmed the same bug
+hit `new ArrayList<>(linkedList)`, `addAll(clq)`, and `new HashSet<>(clq)` — every
+real-bytecode collection source (only `List.of`/ImmutableCollections worked).
 
-Ruled out as causes (verified equal to HotSpot): ServiceLoader (3 engines),
-`Method.getAnnotations()`, `Class.getModifiers()`.
+## The fix (native-collections/src/lib.rs)
+New helper `collect_collection_elements_or_real`: when `collect_collection_elements` returns
+empty AND the collection's real `size()` > 0, materialise via its real `toArray()` bytecode.
+Recursion-safe (toArray only reaches `native_al_to_array` → `collect_collection_elements`,
+never back to `_or_real`; the `size() > 0` guard avoids extra virtual calls on empty
+collections). Wired into 4 entry points: `native_al_init_from_collection`,
+`native_al_add_all`, `native_hs_init_from_collection`, `native_hs_add_all`.
 
-## Confound to avoid
-An ad-hoc *flat* classpath can pull TWO `org.junit.jupiter.api.Test` classes (the
-console-standalone jar bundles jupiter-api; a separate `junit-jupiter-api` jar adds
-another), so `getAnnotation(Test.class)` / `AnnotationSupport.findAnnotatedMethods(Test.class)`
-read 0 on BOTH VMs — a probe artifact, not a CratonVM signal.
+## Verified
+- `CollProbe2`: clq/linkedlist/lbq ctor, `addAll`, `HashSet` ctor — all match HotSpot.
+- `JUnitProbe`: discover + execute 4/4, identical to HotSpot.
 
-## Next steps
-1. Build a **single-jupiter-api** classpath (exactly one `Test.class` on the path) so the
-   reflection probes become meaningful.
-2. Trace jupiter's discovery on CratonVM — instrument / step through
-   `org.junit.platform.commons.util.ReflectionUtils.findMethods(testClass, predicate, TOP_DOWN)`
-   and `AnnotationUtils.findAnnotation(method, Test.class)`. Suspects:
-   - method enumeration **order/dedup** in `ReflectionUtils.findMethods` (merges declared +
-     inherited, de-dups by signature),
-   - annotation **type-identity** comparison (`annotationType() == Test.class`),
-   - the **meta-annotation** walk (`@Test` is meta-annotated `@Testable`).
-3. Probes (programmatic, bypass picocli): `JUnitProbe` (LauncherFactory FOUND/SUCCEEDED),
-   `EngineProbe` (`ServiceLoader<TestEngine>`), `AnnProbe3` (modifiers +
-   `AnnotationSupport.findAnnotatedMethods`). Compile against the standalone jar; run
-   `-cp "bench;<abs cp>"`.
+## Build notes (for re-verification)
+- native-builtins is huge; rustc crashes (exit 0xffffffff, no diagnostic) optimizing it at
+  opt-level=3/cgu=1 → build with `RUST_MIN_STACK=536870912`.
+- A concurrent agent continuously rebuilds native-builtins (holds cargo locks, relinks
+  target/release/cratonvm.exe with stale rlibs) → verify with an isolated
+  `--target-dir target-verify` build. Verified binary: `target-verify/release/cratonvm.exe`.
+- Repro cp (single jupiter-api): /tmp/cm_abs_cp.txt (standalone jar + commons-math
+  transform/core target/{classes,test-classes} + numbers/rng/math3 jars). Probes in `bench/`.
 
-## Repro essentials
-- VM: `target/release/cratonvm.exe --java-home "C:/Program Files/Java/jdk-25"`.
-  HotSpot ref: `C:/Program Files/Java/jdk-25/bin/java.exe`.
-- Standalone jar: `.bench-cache/junit-platform-console-standalone-1.10.2.jar`.
-- Absolute test cp (build it; do NOT use the relative `cm_transform_cp.txt`):
-  standalone jar `;` `apps/_test-suites/commons-math/commons-math-{transform,core}/target/{classes,test-classes}`
-  `;` commons-numbers-{core,complex,arrays,angle}-1.3 + commons-rng-{simple,core,client-api}-1.7 +
-  commons-math3-3.6.1 jars from `~/.m2`.
-- Memory: `reference_junit5_console_launcher`.
+## Out of scope (separate bug)
+The picocli **console launcher** (`org.junit.platform.console.ConsoleLauncher`) still throws
+`ArrayIndexOutOfBoundsException`/NPE in `ConsoleLauncher.run` — the picocli getTerminalWidth /
+arraylength issue tracked in `continue_prompt_picocli_arraylength.md`. The programmatic
+`LauncherFactory` path (which bypasses picocli) is the authoritative discovery test and passes.

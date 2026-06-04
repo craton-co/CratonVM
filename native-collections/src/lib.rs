@@ -1504,7 +1504,10 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // `Collections.unmodifiableList` parent address) — without it the
     // appended PathAddress comes out empty and resource-tree
     // registration NPEs in `ConcreteResourceRegistration.registerSubModel`.
-    let elems = collect_collection_elements(ctx, other);
+    // `_or_real` adds the real-`toArray()` fallback so a real-bytecode source
+    // (ConcurrentLinkedQueue, LinkedList, …) the layout heuristics can't read
+    // still contributes its elements.
+    let elems = collect_collection_elements_or_real(ctx, other);
     if elems.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
@@ -10253,7 +10256,8 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
     };
 
-    // Try to read source as an ArrayList (field 0 = data array, field 1 = size)
+    // Fast path: a genuine ArrayList-shaped source (field-layout match) with
+    // elements — copy the backing array directly.
     let (src_data, src_size) = al_state(ctx, source);
     if let (Some(arr), size) = (src_data, src_size) {
         if size > 0 {
@@ -10265,25 +10269,30 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
             }
             al_set_data(ctx, this, buf);
             al_set_size(ctx, this, size);
-        } else {
-            let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
-            al_set_data(ctx, this, buf);
-            al_set_size(ctx, this, 0);
+            return Ok(None);
         }
-    } else {
-        // Source is not an ArrayList-shaped object (e.g. an unmodifiable
-        // view, HashSet, LinkedList, ...). Walk it generically so
-        // `new ArrayList<>(List.of(...))` / `new ArrayList<>(unmodList)`
-        // copy the real elements instead of producing an empty list.
-        let elems = collect_collection_elements(ctx, source);
-        let cap = std::cmp::max(elems.len(), AL_DEFAULT_CAPACITY);
-        let buf = alloc_ref_array(ctx, cap);
-        for (i, val) in elems.iter().enumerate() {
-            ctx.set_array_element(buf, i, *val);
-        }
-        al_set_data(ctx, this, buf);
-        al_set_size(ctx, this, elems.len() as i32);
+        // `al_state` reported a 0-size ArrayList layout. That is either a
+        // genuinely empty ArrayList OR a non-ArrayList whose slots merely
+        // aliased an `elementData`/`size` pair (e.g. ConcurrentLinkedQueue's
+        // real `head`/`tail` Node fields read as (Object, 0)). Fall through to
+        // the generic collector, which double-checks the real `size()` and,
+        // when non-zero, materialises via the collection's own `toArray()`.
     }
+
+    // Source is not an ArrayList-shaped object (an unmodifiable view, HashSet,
+    // LinkedList, ConcurrentLinkedQueue, a third-party Collection, …). Walk it
+    // generically so `new ArrayList<>(...)` copies the real elements instead of
+    // producing an empty list — the JUnit-Vintage `new ArrayList<>(
+    // Description.fChildren)` bug, where `fChildren` is a real-bytecode
+    // ConcurrentLinkedQueue, hid every `@org.junit.Test` method from discovery.
+    let elems = collect_collection_elements_or_real(ctx, source);
+    let cap = std::cmp::max(elems.len(), AL_DEFAULT_CAPACITY);
+    let buf = alloc_ref_array(ctx, cap);
+    for (i, val) in elems.iter().enumerate() {
+        ctx.set_array_element(buf, i, *val);
+    }
+    al_set_data(ctx, this, buf);
+    al_set_size(ctx, this, elems.len() as i32);
 
     Ok(None)
 }
@@ -10331,7 +10340,7 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     // `Collections.unmodifiableList(arrayList)`) silently produced an
     // empty set — wiping every auto-configuration before filtering and
     // surfacing as `MissingWebServerFactoryBeanException` at boot.
-    let elems = collect_collection_elements(ctx, source);
+    let elems = collect_collection_elements_or_real(ctx, source);
     let sentinel = Value::Int(1);
     for val in elems {
         native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel])?;
@@ -14630,6 +14639,51 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// Collect a collection's elements, falling back to its real `toArray()`
+/// bytecode when the layout heuristics in [`collect_collection_elements`] do
+/// not recognise it.
+///
+/// In the default build the JDK collection classes run real bytecode rather
+/// than a synthetic array backing, so a real `ConcurrentLinkedQueue` /
+/// `LinkedList` stores its elements in `head`/`tail` Node chains that the
+/// field-layout heuristics can't read — `collect_collection_elements` returns
+/// empty. The collection's own `size()`/`toArray()` *do* work (real bytecode),
+/// so when the heuristics come up empty we ask the collection directly. This
+/// is what makes `new ArrayList<>(concurrentLinkedQueue)` /
+/// `new HashSet<>(linkedList)` / `addAll(realCollection)` copy the real
+/// elements — and, in particular, fixes JUnit 4.13's `Description.getChildren()`
+/// (`new ArrayList<>(fChildren)` over a `ConcurrentLinkedQueue` of test
+/// methods), which the vintage engine relies on for discovery.
+///
+/// Driving `toArray()` (not `iterator()`) keeps this recursion-safe: the only
+/// native `toArray()` can reach is `native_al_to_array`, which calls
+/// `collect_collection_elements` — NOT this wrapper — so there is no cycle.
+/// The `size() > 0` guard means a genuinely empty (or unrecognised-and-empty)
+/// collection never triggers the extra virtual calls.
+fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
+    let elems = collect_collection_elements(ctx, coll);
+    if !elems.is_empty() {
+        return elems;
+    }
+    let real_size = match ctx.invoke_virtual(coll, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) => n,
+        _ => 0,
+    };
+    if real_size <= 0 {
+        return elems;
+    }
+    let arr = match ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(a)))) if ctx.heap_kind_of(a) == ObjectKind::Array => a,
+        _ => return elems,
+    };
+    let len = ctx.array_length(arr);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        out.push(ctx.get_array_element(arr, i));
+    }
+    out
+}
+
 /// Collect elements from a Collection (ArrayList, HashSet, LinkedList, etc.)
 fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
     // Round 49 fix: Collections$UnmodifiableCollection / $UnmodifiableList
@@ -14913,7 +14967,7 @@ fn native_hs_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let elems = collect_collection_elements(ctx, coll);
+    let elems = collect_collection_elements_or_real(ctx, coll);
     let mut modified = false;
     for e in &elems {
         let result = native_hs_add(ctx, &[Value::Object(Some(this)), *e])?;
