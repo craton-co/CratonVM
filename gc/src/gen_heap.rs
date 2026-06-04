@@ -3028,6 +3028,29 @@ impl GenerationalHeap {
             cursor += total_size;
         }
 
+        // Publish reclaimed regions to the arena's free list FIRST. Subsequent
+        // `try_alloc_young` calls will satisfy allocations from these holes
+        // before bumping the cursor — reclaiming memory without moving a
+        // survivor.
+        //
+        // ORDER MATTERS (bintrees18 Bug B fix): this must run BEFORE
+        // `clear_all_mark_bits_in_arena` below. The main sweep loop zeroed each
+        // dead object in place but only *collected* the spans in `dead_regions`
+        // — it had not yet added them to the free list. `clear_all_mark_bits_in_arena`
+        // re-walks the whole from-space and skips only the regions on the free
+        // list; if the just-zeroed dead spans are not yet published, it strides
+        // INTO a zeroed (num_slots=0) span, decodes it as a 40-byte object, and
+        // — when the span isn't a multiple of HEADER_SIZE — overshoots off the
+        // object grid into a live Node's interior `Value::Object` field cell.
+        // That produced the non-deterministic "inconsistent header
+        // (class_id=4, array_length=1)" warnings on bintrees18 (a false
+        // positive: the Nodes are valid; the *walk* desynced). The main sweep
+        // loop never desynced because it knew each object's size before zeroing
+        // it; publishing the holes first makes the re-walk hole-aware too.
+        for (off, sz) in dead_regions {
+            young_from.add_free_block(off, sz);
+        }
+
         // Defence-in-depth: unconditionally clear `GC_FLAG_MARKED` on every
         // object header in the from-space. The survivor branch above already
         // clears the bit for objects it visited, but if the walk broke out
@@ -3037,16 +3060,9 @@ impl GenerationalHeap {
         // retain garbage indefinitely (bug C5). Re-walk and clear all marks
         // — cheap (one byte per header) and idempotent on this path. Runs on
         // both the normal-completion and the `break` arm because it sits
-        // after the `while` loop.
+        // after the `while` loop. Now hole-aware: the dead spans are on the
+        // free list (published above), so the re-walk skips them.
         clear_all_mark_bits_in_arena(&mut young_from);
-
-        // Publish reclaimed regions to the arena's free list. Subsequent
-        // `try_alloc_young` calls will satisfy allocations from these
-        // holes before bumping the cursor — reclaiming memory without
-        // moving a single survivor.
-        for (off, sz) in dead_regions {
-            young_from.add_free_block(off, sz);
-        }
 
         let live_bytes = bytes_before.saturating_sub(bytes_swept);
         tracing::debug!(
@@ -3145,8 +3161,27 @@ impl GenerationalHeap {
         old_gen: &OldGen,
         worklist: &mut Vec<*mut u8>,
     ) {
+        // Skip the zeroed holes the non-moving sweep leaves in from-space.
+        // Without this, this linear walk strides into a reclaimed hole, decodes
+        // its zeroed bytes as a `num_slots=0` (40-byte) object, and desyncs off
+        // the true object grid — landing on a live object's interior field cell
+        // (the bintrees18 "inconsistent header class_id=4" false positive) and
+        // `break`ing early, which abandons the rest of the young→old mark scan
+        // (a real correctness bug: old objects referenced past the hole go
+        // unmarked). The non-moving sweep itself skips holes the same way; every
+        // linear from-space walker must too. (Cheney is immune: it resets
+        // from-space each cycle, so holes never accumulate there.)
+        let free_blocks = young_from.free_blocks_sorted();
+        let mut free_iter = free_blocks.iter().peekable();
         let mut cursor: usize = 0;
         while cursor < young_from.used() {
+            if let Some(&&(off, sz)) = free_iter.peek() {
+                if cursor == off {
+                    cursor += sz;
+                    free_iter.next();
+                    continue;
+                }
+            }
             // SAFETY: `cursor` is within `young_from.used()`; pointer arithmetic stays in the arena.
             let obj_ptr = unsafe { young_from.base_ptr().add(cursor) as *mut u8 };
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
@@ -3248,8 +3283,22 @@ impl GenerationalHeap {
     /// After old-gen compaction, update references in young from-space that
     /// pointed to old-gen objects which have been relocated.
     fn fixup_young_old_refs(young_from: &Arena, compact_map: &HashMap<usize, usize>) {
+        // Skip non-moving-sweep holes — same rationale as `mark_young_to_old_refs`:
+        // a linear from-space walk must not stride into a reclaimed zeroed hole
+        // (it would desync off the object grid and misread a live object's
+        // interior cell, then `break` and leave the rest of from-space's
+        // old-gen refs un-fixed-up after a compaction → dangling pointers).
+        let free_blocks = young_from.free_blocks_sorted();
+        let mut free_iter = free_blocks.iter().peekable();
         let mut cursor: usize = 0;
         while cursor < young_from.used() {
+            if let Some(&&(off, sz)) = free_iter.peek() {
+                if cursor == off {
+                    cursor += sz;
+                    free_iter.next();
+                    continue;
+                }
+            }
             // SAFETY: `cursor` is within `young_from.used()`; pointer arithmetic stays in the arena.
             let obj_ptr = unsafe { young_from.base_ptr().add(cursor) as *mut u8 };
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
