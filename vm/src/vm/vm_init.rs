@@ -1477,6 +1477,21 @@ impl SharedVm {
             native_methods.set_category(__prev_bridge);
             register_io_natives(&mut native_methods);
             register_collections_natives(&mut native_methods);
+            // Re-register the side-table-backed `java.util.Random` /
+            // `SecureRandom` natives AFTER `register_collections_natives`:
+            // that earlier call (native-collections `register_random_natives`)
+            // re-registers every `java/util/Random` method with a SYNTHETIC
+            // 2-field layout that reads the LCG seed from instance field 0.
+            // In real-JDK mode field 0 is the `AtomicLong seed` reference, not
+            // a long, so that version reads 0 and every `nextInt/nextLong/
+            // nextDouble/...` returns 0 (a seeded `Random` produced all-zero
+            // output). The `securerandom` module's handlers are layout-
+            // independent (seed in an identity-hash-keyed side table) and
+            // spec-exact, so they must win — same "re-register after
+            // collections clobbers essentials" pattern as Properties below.
+            cratonvm_native_builtins::securerandom::register_random_and_securerandom_natives(
+                &mut native_methods,
+            );
             // Re-register the side-table-backed Properties natives AFTER
             // `register_collections_natives` because that earlier call
             // re-registers `Properties.load`, `getProperty`, `setProperty`,
