@@ -1,5 +1,38 @@
 # Precise JIT stack maps — design & staged implementation plan
 
+## DECISIVE RESULT (Stages 1–4 landed): mechanism proven, residual root-caused
+
+bt18 A/B (8g, deterministic, reproduced):
+- golden = **67674804**
+- selective-promote ALONE (the bug) = **68332206** (error 657402)
+- selective-promote + `CRATONVM_PRECISE_JIT_MAPS=1` (Stages 1–4) = **68199090**
+  (error 524286)
+
+The precise maps **deterministically reduce the register-invisibility error
+~20%** → the mechanism (Stages 1–4: oop maps, exact RBP, sp-id, slot-rewrite,
+register reload) demonstrably engages and relocates real oops. bt16 stays
+14985902 in every config (gate-off, gate-on, gate-on+selective) → no
+regression / no corruption.
+
+**Residual root cause — innermost-frame-only remap.** Recursive `make()→make()`
+is a JIT→JIT (direct machine-code) call, so it does NOT go through the
+interpreter's `enter_with_compiled` → **no new `JIT_ENTRY_CHAIN` entry per
+recursion**. There is ONE chain entry for the whole JIT call tree. Each nested
+prologue's `set_top_frame_base` overwrites `frame_base` to the *deepest* RBP
+(and leaves `info.cm` as the *outermost* method — a cm/RBP mismatch). So
+`remap_active_jit_frames` rewrites only one frame; every ancestor `make()`
+frame's `n` stays stale → partial fix.
+
+**Stage 5 core fix — walk the RBP chain.** JIT frames use `push rbp; mov
+rbp,rsp`, so within the contiguous JIT region `[frame_base, entry_sp)` the
+saved-RBP chain (`[rbp]` = caller rbp, `[rbp+8]` = return addr) is walkable.
+`remap_active_jit_frames` (and the reload/coverage logic) must walk it and
+remap EVERY frame, resolving each frame's `CompiledMethod` from its code
+address (a code-addr→cm interval lookup; or store the cm/sp-id per frame). Also
+covers the entry-method frame (e.g. `binaryTrees`'s `longLived` local).
+
+---
+
 Status: **Stages 1–3 landed (gated-OFF), Stages 1–2 validated** on branch
 `feat/precise-jit-stack-maps`. Work continues in an isolated git worktree
 (`C:\craton\CratonVM-pjsm`) after a shared-checkout collision (a parallel
