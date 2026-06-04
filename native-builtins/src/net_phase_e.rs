@@ -1103,16 +1103,45 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 2)))
     });
 
-    // getQuery() → query field (4)
+    // getQuery() → `query` field by name (slot-order safe), else parse the
+    // raw string between '?' and '#'. Reading raw slot 4 was wrong for a
+    // real-JDK-constructed URI (the 5-arg ctor runs bytecode whose field
+    // layout differs from the synthetic one), the same flaw that made
+    // `getFragment` emit a spurious "null".
     r.register(uri, "getQuery", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 4)))
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "query") {
+            if let Some(v) = ctx.read_string(s) {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+            }
+        }
+        let raw = uri_raw_string(ctx, this);
+        if let Some(q) = raw.find('?') {
+            let after = &raw[q + 1..];
+            let end = after.find('#').unwrap_or(after.len());
+            return Ok(Some(Value::Object(Some(ctx.create_string(&after[..end])))));
+        }
+        Ok(Some(Value::Object(None)))
     });
 
-    // getFragment() → fragment field (5)
+    // getFragment() → `fragment` field by name (slot-order safe), else parse
+    // the raw string after '#'. Reading raw slot 5 returned the wrong field
+    // for a real-JDK-constructed URI (the unregistered 5-arg ctor runs
+    // bytecode with a different field layout than the synthetic `make_uri`
+    // one), so a null fragment surfaced as the string "null" — Hadoop's
+    // `Path.toString()` then emitted a spurious trailing "#null".
     r.register(uri, "getFragment", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 5)))
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "fragment") {
+            if let Some(v) = ctx.read_string(s) {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+            }
+        }
+        let raw = uri_raw_string(ctx, this);
+        match raw.find('#') {
+            Some(i) => Ok(Some(Value::Object(Some(ctx.create_string(&raw[i + 1..]))))),
+            None => Ok(Some(Value::Object(None))),
+        }
     });
 
     // isAbsolute() → true if scheme is non-null
