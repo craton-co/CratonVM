@@ -565,6 +565,21 @@ fn process_references_after_gc(
         // SAFETY: actual_ref and actual_q were produced by process_references (with pointer_map relocation) and point at valid object headers within the heap arena.
         let ref_obj = unsafe { ObjectRef::from_raw(actual_ref as *mut u8) };
         let q_obj = unsafe { ObjectRef::from_raw(actual_q as *mut u8) }; // Cast: GC object pointer conversion
+        // avrora `get_field` OOB fix (residual): `pending_queues` is keyed on
+        // addresses and is re-emitted every GC. A `ReferenceQueue` reachable
+        // only through this pending-enqueue record (no live Java reference) is
+        // reclaimed by the sweep and its slot reused for a bare
+        // `java.lang.Object`; the synthetic head/size writes below would then
+        // trip the `gen_heap` out-of-bounds guard. Checking the POST-relocation
+        // (`actual_q`) layout distinguishes a genuinely-dead queue (reused as a
+        // 0-field `Object`) from a live one (still `>= 2` fields) — a live
+        // queue, even one relocated this cycle, is remapped through
+        // `pointer_map` and keeps its real layout, so legitimate enqueues are
+        // unaffected. A dead queue has no consumer to `poll()` the reference
+        // back out, so dropping the enqueue is correct.
+        if shared.heap.num_fields(q_obj) < 2 {
+            continue;
+        }
         // Push onto queue's linked list head (field 0 = head, field 1 = size)
         let old_head = shared.heap.get_field(q_obj, 0); // RQ_FIELD_HEAD
         shared.heap.set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
