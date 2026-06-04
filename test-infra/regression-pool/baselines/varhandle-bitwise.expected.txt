@@ -1,0 +1,7 @@
+or old=12 now=15
+and old=15 now=6
+xor old=6 now=3
+add old=3 now=8
+cas1=true now=100
+cas2=false now=100
+OK

@@ -1,0 +1,8 @@
+direct=true
+cap=32
+pos0=0
+posAfterPut=3
+limAfterFlip=3
+get=10,20,30
+sliceCap=2 slice0=20
+OK
