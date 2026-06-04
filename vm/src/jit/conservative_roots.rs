@@ -568,50 +568,105 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
     if pointer_map.is_empty() {
         return;
     }
+    let scanner_sp = current_stack_pointer();
     JIT_ENTRY_CHAIN.with(|c| {
         let chain = c.borrow();
         for entry in chain.iter() {
             let Some(info) = entry.precise else { continue };
-            // SAFETY: `info.compiled_method` is Arc-owned by the JIT cache for
-            // the duration of this call (see `scan_one_frame_precise`).
-            let cm: &cratonvm_jit::CompiledMethod = unsafe { &*info.compiled_method };
-            let sp_id_off = cm.sp_id_slot_off;
-            if sp_id_off == 0 {
-                // Compiled without the precise gate → no exact frame base / id
-                // slot. Such frames keep their conservative pin (they are not
-                // relocated), so leave them untouched.
-                continue;
-            }
-            let rbp = info.frame_base;
-            // Read the active safepoint's bytecode PC from the id slot.
-            let id_addr = rbp.wrapping_sub(sp_id_off as usize);
-            if id_addr & 0x7 != 0 {
-                continue;
-            }
-            // SAFETY: `id_addr` is a frame slot of a live JIT frame on this
-            // thread (rbp is the exact recorded frame base, sp_id_off a
-            // compile-time frame offset).
-            let sp_id = (unsafe { (id_addr as *const usize).read() }) as u32;
-            // Find the exact map for this safepoint.
-            let Some(map) = cm.oop_maps.iter().find(|m| m.bytecode_pc == sp_id) else {
-                continue;
-            };
-            for &off in &map.frame_slot_offsets {
-                // Slots are stored as positive offsets; the value lives at
-                // `[rbp - off]` (Stage 3 sign convention).
-                let slot_addr = rbp.wrapping_sub(off as usize);
-                if slot_addr & 0x7 != 0 {
-                    continue;
+            let entry_sp = entry.entry_sp;
+            // Stage 5 — walk the JIT RBP chain from the innermost frame
+            // (`info.frame_base`, the EXACT RBP recorded by the deepest
+            // prologue's `set_top_frame_base`) outward to the interpreter
+            // boundary, remapping EVERY ancestor frame.
+            //
+            // Recursive/nested JIT→JIT calls do not push `JIT_ENTRY_CHAIN`
+            // entries (only the interpreter→JIT boundary does), so without this
+            // walk only the innermost frame would be covered — the root cause
+            // of the partial bt18 fix. JIT frames use `push rbp; mov rbp,rsp`,
+            // so within `[scanner_sp, entry_sp)` the saved-RBP chain
+            // (`[rbp]` = caller rbp, `[rbp+8]` = return address into the
+            // caller) is walkable.
+            //
+            // `child_rbp`'s saved-rbp/return-address identify its PARENT, which
+            // is the frame we remap each step. The innermost frame itself is
+            // skipped: its child is a Rust helper (not in the JIT code
+            // registry) and its safepoint's live oops are conservatively
+            // pinned (so never relocated).
+            let mut child_rbp = info.frame_base;
+            let mut guard = 0usize;
+            while guard < 4096 {
+                guard += 1;
+                if child_rbp == 0 || child_rbp & 0x7 != 0 {
+                    break;
                 }
-                // SAFETY: aligned frame slot of a live JIT frame on this thread.
-                let old = unsafe { (slot_addr as *const usize).read() };
-                if let Some(&new) = pointer_map.get(&old) {
-                    // SAFETY: same slot, rewriting the relocated reference.
-                    unsafe { (slot_addr as *mut usize).write(new) };
+                if child_rbp < scanner_sp || child_rbp >= entry_sp {
+                    break;
                 }
+                // SAFETY: `child_rbp` is an aligned address inside the calling
+                // thread's own live JIT stack region (bounded by scanner_sp /
+                // entry_sp). `[child_rbp]` is the saved caller RBP, `[child_rbp
+                // + 8]` the return address into the caller.
+                let parent_rbp = unsafe { (child_rbp as *const usize).read() };
+                let ret_addr = unsafe { ((child_rbp + 8) as *const usize).read() };
+                // Resolve the PARENT frame's CompiledMethod from the return
+                // address that points into it.
+                match cratonvm_jit::lookup_jit_code_range(ret_addr) {
+                    Some(cm_ptr) => {
+                        // SAFETY: the cm is Arc-owned by the JIT cache while any
+                        // of its frames is live (a live frame keeps it cached);
+                        // the registry is evicted before a cm is dropped.
+                        let cm: &cratonvm_jit::CompiledMethod =
+                            unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+                        remap_one_jit_frame(parent_rbp, cm, pointer_map);
+                    }
+                    None => break, // parent is the interpreter / Rust boundary
+                }
+                if parent_rbp <= child_rbp {
+                    break; // stack must ascend (grows downward); else garbage
+                }
+                child_rbp = parent_rbp;
             }
         }
     });
+}
+
+/// Stage 5 — rewrite one JIT frame's oop slots via `pointer_map`.
+///
+/// Reads the active safepoint's bytecode PC from `[rbp - sp_id_slot_off]`,
+/// finds the matching [`cratonvm_jit::OopMapEntry`], and for each recorded
+/// slot at `[rbp - off]` rewrites a relocated reference in place. No-op when
+/// the method was compiled without the precise gate (`sp_id_slot_off == 0`).
+fn remap_one_jit_frame(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) {
+    let sp_id_off = cm.sp_id_slot_off;
+    if sp_id_off == 0 {
+        return;
+    }
+    let id_addr = rbp.wrapping_sub(sp_id_off as usize);
+    if id_addr & 0x7 != 0 {
+        return;
+    }
+    // SAFETY: aligned frame slot of a live JIT frame on this thread.
+    let sp_id = (unsafe { (id_addr as *const usize).read() }) as u32;
+    let Some(map) = cm.oop_maps.iter().find(|m| m.bytecode_pc == sp_id) else {
+        return;
+    };
+    for &off in &map.frame_slot_offsets {
+        // Slots are positive offsets; the value lives at `[rbp - off]`.
+        let slot_addr = rbp.wrapping_sub(off as usize);
+        if slot_addr & 0x7 != 0 {
+            continue;
+        }
+        // SAFETY: aligned frame slot of a live JIT frame on this thread.
+        let old = unsafe { (slot_addr as *const usize).read() };
+        if let Some(&new) = pointer_map.get(&old) {
+            // SAFETY: same slot, rewriting the relocated reference.
+            unsafe { (slot_addr as *mut usize).write(new) };
+        }
+    }
 }
 
 /// NEW-12: enumerate exact oops in a JIT frame using the compiled

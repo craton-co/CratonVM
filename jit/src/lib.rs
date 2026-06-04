@@ -659,6 +659,58 @@ impl OopMapEntry {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Stage 5 (precise oop maps) — JIT code-range registry
+// ---------------------------------------------------------------------------
+//
+// Maps each compiled method's native code range `[entry, entry+len)` to its
+// (Arc-stable) `CompiledMethod` pointer. The GC root walker uses it to resolve
+// which method a return address belongs to while walking the JIT RBP chain, so
+// it can remap EVERY active JIT frame (not just the innermost). Populated at
+// `JitCache::put`, evicted at `JitCache::remove`. The stored pointer is the
+// `Arc<CompiledMethod>` inner address, which is stable for the cm's cache
+// lifetime; a live JIT frame keeps its cm in the cache (hence alive).
+
+/// One registered code range: `(entry, end, cm_ptr)`.
+static JIT_CODE_RANGES: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, usize, usize)>>> =
+    std::sync::OnceLock::new();
+
+fn jit_code_ranges() -> &'static std::sync::Mutex<Vec<(usize, usize, usize)>> {
+    JIT_CODE_RANGES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Register `[entry, entry+len)` → `cm_ptr` (the `Arc<CompiledMethod>` inner
+/// address). No-op for empty/zero ranges. Stage 5.
+pub fn register_jit_code_range(entry: usize, len: usize, cm_ptr: usize) {
+    if entry == 0 || len == 0 || cm_ptr == 0 {
+        return;
+    }
+    if let Ok(mut v) = jit_code_ranges().lock() {
+        v.push((entry, entry + len, cm_ptr));
+    }
+}
+
+/// Remove every range with the given `entry` start (called on cache eviction
+/// so the GC walker never resolves a return address to a freed method). Stage 5.
+pub fn unregister_jit_code_range(entry: usize) {
+    if entry == 0 {
+        return;
+    }
+    if let Ok(mut v) = jit_code_ranges().lock() {
+        v.retain(|&(e, _, _)| e != entry);
+    }
+}
+
+/// Resolve the `CompiledMethod` pointer whose code range contains `addr`, or
+/// `None`. Linear scan (method counts are modest; only hit at GC time on the
+/// gated precise path). Stage 5.
+pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
+    let v = jit_code_ranges().lock().ok()?;
+    v.iter()
+        .find(|&&(e, end, _)| addr >= e && addr < end)
+        .map(|&(_, _, cm)| cm)
+}
+
 /// A compiled native-code method.
 pub struct CompiledMethod {
     /// The executable buffer holding the machine code.
@@ -973,6 +1025,14 @@ impl CompiledMethod {
     /// Return the raw entry point pointer for direct calls from JIT code.
     pub fn entry_ptr(&self) -> *const u8 {
         self.entry
+    }
+
+    /// Stage 5 (precise oop maps) — length in bytes of this method's emitted
+    /// machine code, so the GC code-range registry can record `[entry,
+    /// entry+code_len())` for return-address → CompiledMethod resolution while
+    /// walking the JIT RBP chain.
+    pub fn code_len(&self) -> usize {
+        self._buffer.pos()
     }
 
     /// Debug-only: raw emitted machine code bytes.
@@ -3086,7 +3146,19 @@ impl JitCache {
             method_name,
             descriptor,
         };
-        self.methods.insert(h, (key, Arc::new(compiled)));
+        let arc = Arc::new(compiled);
+        // Stage 5 — register this method's code range for the GC RBP-chain
+        // walker. Only when the precise gate is on (the registry is consulted
+        // solely by `remap_active_jit_frames`, which is inert otherwise), so
+        // the default path keeps zero bookkeeping overhead.
+        if crate::x64::precise_jit_maps_enabled() {
+            register_jit_code_range(
+                arc.entry_ptr() as usize,
+                arc.code_len(),
+                Arc::as_ptr(&arc) as usize,
+            );
+        }
+        self.methods.insert(h, (key, arc));
     }
 
     pub fn len(&self) -> usize {
@@ -3109,11 +3181,15 @@ impl JitCache {
         descriptor: &str,
     ) {
         let h = compute_jit_key_hash(class_name, method_name, descriptor);
-        if let Some((key, _)) = self.methods.get(&h) {
+        if let Some((key, cm)) = self.methods.get(&h) {
             if &*key.class_name == class_name
                 && &*key.method_name == method_name
                 && &*key.descriptor == descriptor
             {
+                // Stage 5 — drop this method's GC code-range registration
+                // before evicting, so the RBP-chain walker can never resolve a
+                // return address to a freed CompiledMethod.
+                unregister_jit_code_range(cm.entry_ptr() as usize);
                 self.methods.remove(&h);
             }
         }
@@ -3132,9 +3208,15 @@ impl JitCache {
         let before = self.methods.len();
         self.methods.retain(|_h, (_key, cm)| {
             // Keep the entry iff it does NOT inline from the changed class.
-            !cm.inlined_methods
+            let keep = !cm
+                .inlined_methods
                 .iter()
-                .any(|(cls, _, _)| cls == changed_class)
+                .any(|(cls, _, _)| cls == changed_class);
+            // Stage 5 — drop the GC code-range registration for evicted methods.
+            if !keep {
+                unregister_jit_code_range(cm.entry_ptr() as usize);
+            }
+            keep
         });
         before - self.methods.len()
     }
@@ -3155,6 +3237,10 @@ impl JitCache {
             .collect();
         let count = hashes_to_remove.len();
         for h in hashes_to_remove {
+            // Stage 5 — drop the GC code-range registration before evicting.
+            if let Some((_key, cm)) = self.methods.get(&h) {
+                unregister_jit_code_range(cm.entry_ptr() as usize);
+            }
             self.methods.remove(&h);
         }
         count
