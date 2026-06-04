@@ -64,9 +64,41 @@ That path is **conclusively dead**:
   bytecode); they either bail `jit_scan` or run no faster. Inlining the leaf cannot help when the
   enclosing method never becomes fast JIT code.
 
-## What's left — the ONLY remaining lever (larger surface, unattempted)
-A native `MontgomeryIntegerPolynomialP256.mult`/`reduce`/`square` intrinsic backed by a Rust P-256
-field implementation. Well-defined `long[]` in/out, but it **must replicate the JDK's exact
-Montgomery limb layout byte-for-byte** (radix, limb count, reduction constant) — a mismatch yields
-silently-wrong crypto. Verify by cross-checking a CratonVM-produced signature against **HotSpot**
-verify (self-consistent sign→verify on CratonVM is NOT sufficient). High risk; not done here.
+## Follow-up 2 — native `MontgomeryIntegerPolynomialP256.{mult,square}` intrinsic (LANDED)
+`native-builtins/src/sunec_intpoly.rs` intercepts the two dominant SunEC P-256 field operations
+with a byte-identical Rust implementation.
+
+**Representation (reverse-engineered + verified vs JDK 25, `ecprobe_tmp/MontGT2.java`):** a field
+element is `NUM_LIMBS=5` little-endian limbs of `BITS_PER_LIMB=52` bits holding
+`X = Σ limb[i]·2^(52i) ≡ value·R (mod p)` — Montgomery form, `R = 2^260`, `p` = P-256 prime.
+`MAX_ADDS=0` ⇒ every element is fully reduced (each limb `< 2^52`, `X < p`). `mult(a,b,r)` writes
+`decode(r) ≡ decode(a)·decode(b)·R⁻¹ (mod p)`; the JDK's output is itself canonical, so
+decode→Montgomery-mult→canonical-encode yields a **byte-identical** limb array (not merely
+value-equivalent). `square(a)==mult(a,a)` (verified) so square delegates to mult. Modular arithmetic
+uses `num-bigint` for auditability.
+
+**Correctness (crypto — verified four ways):**
+1. 9 limb vectors (`mult` ×6, `square` ×3) captured from the real JDK, asserted byte-identical in
+   `sunec_intpoly::tests` (incl. 0, 1, p−1, randoms).
+2. **Cross-VM, both directions:** CratonVM signs → **HotSpot verifies = true**; HotSpot signs →
+   CratonVM verifies = true (`ecprobe_tmp/EcCross.java`, `EcVerifyArg.java`). An independent JVM
+   accepting CratonVM's EC signature is the gold standard.
+3. EC sign→verify roundtrip + tamper-rejects (`UmhVerify`); valid DER/P1363 signature lengths.
+4. Output canonicality asserted (`output_is_canonical`).
+
+**Speedup (under `CRATONVM_REAL_JCA=1 CRATONVM_DISABLE_JIT=1`):**
+- **Per EC op: ~135 ms** (EcProbe2 keygen#2 with the table cached) — *sub-second*, down from the
+  "~1–16 s/op" the interpreter paid. **This is the suite-relevant number.**
+- `EcSign2` (keygen + 2 signs): **~15 s, down from ~47–60 s** (~4×). The ~14 s is now **entirely**
+  the one-time `Secp256R1GeneratorMontgomeryMultiplier` generator-table precompute (keygen#1),
+  amortized once per JVM process. A ~95-op SD-JWT suite → ~14 s + 95×0.135 s ≈ **27 s** vs tens of
+  minutes.
+
+## What's left (optional — diminishing returns, broader surface)
+The residual ~14 s one-time table precompute is now dominated by the **base-class**
+`IntegerPolynomial` field ops still interpreted during point doubling/addition — `add`/`subtract`
+(via `MutableElement.setSum`/`setDifference`), `multByInt` (`setProduct(SmallValue)`), and `setValue`.
+These live in the shared base class (used by P-384/P-521/Curve25519 too, with different limb
+params), so a native intercept needs runtime field-type dispatch and per-curve verification — larger
+surface, real silent-wrong-crypto risk, and only attacks a *one-time* cost. Not done. The mult/square
+intrinsic already makes every steady-state EC op sub-second.

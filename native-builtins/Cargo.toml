@@ -99,6 +99,10 @@ sha3 = "0.10"
 # SHA-2 family (notably SHA-224, which the hand-rolled `crypto_impl` SHA-256
 # code does not cover) for `MessageDigest.getInstance("SHA-224")`.
 sha2 = "0.10"
+# Auditable big-integer modular arithmetic for the byte-identical SunEC P-256
+# Montgomery field-multiply intrinsic (sunec_intpoly.rs). Reuses the
+# num-integer/num-traits already in the tree.
+num-bigint = "0.4"
 aes-gcm = "0.10"
 aes = "0.8"
 cbc = { version = "0.1", features = ["std"] }
