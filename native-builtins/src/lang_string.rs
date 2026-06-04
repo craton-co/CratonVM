@@ -167,6 +167,12 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         "(Ljava/lang/String;)V",
         native_sb_init_string,
     );
+    registry.register(
+        class,
+        "<init>",
+        "(Ljava/lang/CharSequence;)V",
+        native_sb_init_charsequence,
+    );
     registry.register(class, "<init>", "(I)V", native_sb_init_capacity);
     registry.register(
         class,
@@ -1131,6 +1137,44 @@ pub(crate) fn native_sb_init_string(ctx: &mut dyn NativeContext, args: &[Value])
     };
     let text = match args.get(1) {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    let chars: Vec<u16> = text.encode_utf16().collect();
+    let cap = chars.len() + 16;
+    let buf = ctx.new_array(ArrayElementType::Char, cap);
+    for (i, &ch) in chars.iter().enumerate() {
+        ctx.set_array_element(buf, i, Value::Int(ch as i32));
+    }
+    ctx.set_field(this, 0, Value::Object(Some(buf)));
+    ctx.set_field(this, 1, Value::Int(chars.len() as i32));
+    Ok(None)
+}
+
+/// `StringBuilder(CharSequence)` / `StringBuffer(CharSequence)`.
+///
+/// Without this native the real JDK `StringBuilder(CharSequence)` ctor runs
+/// bytecode that delegates to `AbstractStringBuilder.<init>(CharSequence)`,
+/// which populates the *real* JDK field layout (`value`/`coder`/`count`).
+/// CratonVM's StringBuilder uses a synthetic layout (char[] at slot 0, count
+/// at slot 1), so the real ctor leaves the object inconsistent: subsequent
+/// synthetic `append`/`toString` natives misread the slots, prepending
+/// `seq.length()` NUL chars (picocli's `Help.Ansi.Text` copy-ctor —
+/// `new StringBuilder(other.plain)` — was the visible symptom: blank
+/// `--help` output). Intercept it so the synthetic layout stays consistent,
+/// mirroring `native_sb_init_string` but coercing any CharSequence to text.
+pub(crate) fn native_sb_init_charsequence(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    use cratonvm_types::ArrayElementType;
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    // Real JDK `AbstractStringBuilder(CharSequence)` calls `seq.length()`, so a
+    // null sequence throws NPE; coerce any non-null CharSequence to its text.
+    let text = match args.get(1) {
+        Some(Value::Object(Some(o))) => invoke_to_string(ctx, *o).unwrap_or_default(),
         _ => String::new(),
     };
     let chars: Vec<u16> = text.encode_utf16().collect();
@@ -3839,6 +3883,7 @@ pub(crate) fn register_phase52_string_buffer(r: &mut NativeMethodRegistry) {
     r.register(sb, "<init>", "()V", native_sb_init_default);
     r.register(sb, "<init>", "(I)V", native_sb_init_capacity);
     r.register(sb, "<init>", "(Ljava/lang/String;)V", native_sb_init_string);
+    r.register(sb, "<init>", "(Ljava/lang/CharSequence;)V", native_sb_init_charsequence);
     r.register(
         sb,
         "append",

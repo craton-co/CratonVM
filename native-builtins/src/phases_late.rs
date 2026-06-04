@@ -3630,6 +3630,26 @@ const P57_PATH_FS_FIELD: usize = 1;
 /// the OS path of a mounted JAR (see `newFileSystem`). Field 0 is the separator.
 const P57_FS_JAR_FIELD: usize = 1;
 
+/// Distinguish a *real* `java/io/BufferedWriter` (built from JDK bytecode via
+/// `new BufferedWriter(writer)`) from the synthetic, fd-backed object that
+/// `Files.newBufferedWriter` allocates. The synthetic object stores its file
+/// descriptor as an `Int` in slot 0; a real BufferedWriter's slot 0 holds an
+/// object reference (the `lock`/`out` Writer set by the JDK constructor).
+///
+/// Returns `Some(out)` — the wrapped `Writer` — for a real BufferedWriter, so
+/// the `BufferedWriter` natives can forward the I/O to real bytecode instead
+/// of misreading slot 0 as an fd and dropping the write. Returns `None` for
+/// the synthetic fd-backed object, leaving the slot-0 fd fast-path in place.
+fn bw_delegate_out(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Int(_) = ctx.get_field(this, 0) {
+        return None; // synthetic fd-backed BufferedWriter (Files.newBufferedWriter)
+    }
+    match ctx.get_field_by_name(this, "out") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -5698,6 +5718,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // These are also registered in synthetic-jdk mode by phases_late, but
     // the registry dedups on (class, name, desc) so re-registering is
     // safe and keeps the contract explicit for Files.newBufferedWriter.
+    //
+    // These natives are registered on the REAL `java/io/BufferedWriter`
+    // class, so in real-JDK mode they shadow EVERY BufferedWriter — not
+    // just the synthetic fd-backed object that `Files.newBufferedWriter`
+    // returns. A real `new BufferedWriter(new OutputStreamWriter(System.out))`
+    // (the picocli / JUnit-console help-text writer) stores the wrapped
+    // `Writer` in slot 0, not an `Int` fd, so the old `_ => Ok(None)` arms
+    // silently DROPPED its output → empty `--help`. `bw_delegate_out`
+    // distinguishes the two: when slot 0 is not an `Int`, the object is a
+    // real BufferedWriter and the native forwards to its wrapped `out`
+    // Writer so the genuine OutputStreamWriter/StreamEncoder bytecode runs.
     let bw_class = "java/io/BufferedWriter";
     r.register(
         bw_class,
@@ -5705,6 +5736,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;II)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if let Some(out) = bw_delegate_out(ctx, this) {
+                let s = args.get(1).cloned().unwrap_or(Value::Object(None));
+                let off = args.get(2).cloned().unwrap_or(Value::Int(0));
+                let len = args.get(3).cloned().unwrap_or(Value::Int(0));
+                let _ = ctx.invoke_virtual(out, "write", "(Ljava/lang/String;II)V", &[s, off, len]);
+                return Ok(None);
+            }
             let text = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
@@ -5723,6 +5761,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
     r.register(bw_class, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(out) = bw_delegate_out(ctx, this) {
+            let c = args.get(1).cloned().unwrap_or(Value::Int(0));
+            let _ = ctx.invoke_virtual(out, "write", "(I)V", &[c]);
+            return Ok(None);
+        }
         let c = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u32;
         let fd = match ctx.get_field(this, 0) {
             Value::Int(fd) => fd as u32,
@@ -5737,6 +5780,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     });
     r.register(bw_class, "write", "([CII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(out) = bw_delegate_out(ctx, this) {
+            let arr = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let off = args.get(2).cloned().unwrap_or(Value::Int(0));
+            let len = args.get(3).cloned().unwrap_or(Value::Int(0));
+            let _ = ctx.invoke_virtual(out, "write", "([CII)V", &[arr, off, len]);
+            return Ok(None);
+        }
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(None),
@@ -5761,18 +5811,27 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     });
     r.register(bw_class, "newLine", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let sep = ctx
+            .get_system_property("line.separator")
+            .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
+        if let Some(out) = bw_delegate_out(ctx, this) {
+            let s = ctx.create_string(&sep);
+            let _ = ctx.invoke_virtual(out, "write", "(Ljava/lang/String;)V", &[Value::Object(Some(s))]);
+            return Ok(None);
+        }
         let fd = match ctx.get_field(this, 0) {
             Value::Int(fd) => fd as u32,
             _ => return Ok(None),
         };
-        let sep = ctx
-            .get_system_property("line.separator")
-            .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
         let _ = ctx.fd_table().write_string(fd, &sep);
         Ok(None)
     });
     r.register(bw_class, "flush", "()V", |ctx, args| {
-        let _this = obj_arg(args, 0)?;
+        let this = obj_arg(args, 0)?;
+        if let Some(out) = bw_delegate_out(ctx, this) {
+            let _ = ctx.invoke_virtual(out, "flush", "()V", &[]);
+            return Ok(None);
+        }
         // BufWriter<File> flushes automatically on drop; explicit
         // flush is a no-op in the direct-fd mode since each write
         // already hits the buffered writer inside fd_table.
@@ -5780,6 +5839,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     });
     r.register(bw_class, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(out) = bw_delegate_out(ctx, this) {
+            let _ = ctx.invoke_virtual(out, "flush", "()V", &[]);
+            let _ = ctx.invoke_virtual(out, "close", "()V", &[]);
+            return Ok(None);
+        }
         let fd = match ctx.get_field(this, 0) {
             Value::Int(fd) => fd as u32,
             _ => return Ok(None),
