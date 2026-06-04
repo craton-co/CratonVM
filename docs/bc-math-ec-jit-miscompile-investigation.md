@@ -5,6 +5,54 @@ Status: **PARTIAL**. Two genuine, sound codegen correctness fixes landed in
 SEGV is **not yet fixed**; the blanket `org/bouncycastle/` JIT ban in
 `vm/src/jit/skip_list.rs` is therefore **kept in place** (not removed).
 
+> ## ⚠️ RE-DIAGNOSIS 2026-06-04 (session "take it on") — the framing below is WRONG
+> Two prior conclusions in this doc are **refuted** by fresh measurement (dev,
+> uniquely-named binary `cratonvm_ecjit.exe` to dodge the cross-session
+> `taskkill /F /IM cratonvm.exe` artifact; repro `-Xmx256m` forces GC and surfaces
+> corruption in ~14 s):
+>
+> 1. **"needs many BC packages JIT-compiled together" is FALSE.** JIT-ing ONLY
+>    `org/bouncycastle/math/ec/` (`CRATONVM_JIT_ALLOW_PACKAGES=org/bouncycastle/`
+>    `CRATONVM_JIT_BISECT_ONLY=org/bouncycastle/math/ec/`) reproduces the heap
+>    corruption / SEGV in 14 s. The prior round's "single-package bisection only
+>    times out" was the taskkill artifact masking the corruption as a timeout.
+>
+> 2. **It is NOT (only) a JIT codegen miscompile.** `FixedPointTest` in isolation
+>    FAILS **with JIT fully disabled** (`CRATONVM_DISABLE_JIT=1`): a flood of
+>    `gen_heap::set_field: out-of-bounds field write dropped` (putfield index 0
+>    into a bare `java/lang/Object`, `num_slots=0`, some with garbage `class_id`s
+>    like 2121213 / 3114129) followed by a fatal
+>    `expected object reference, got long(-844424930131964)` — i.e. a
+>    **CompactValue long↔object NaN-box collision** reaching a *context-free
+>    decoder* (`types/src/compact_value.rs`, `note_object_degradation` /
+>    `object_degradation_count`). `-844424930131964 = 0xFFFD000000000004`: the top
+>    bits are the quiet-NaN `SUB_OBJECT` tag, the payload is `4` (an invalid
+>    pointer). Sometimes the bogus pointer (~4) passes a recovery path and is
+>    dereferenced → `EXCEPTION_ACCESS_VIOLATION read at address 0x14` (= 4 + 0x10),
+>    SEGV even with JIT off. The outcome (clean error / SEGV / heap-walker desync)
+>    is nondeterministic, decided by whether the collided long happens to look like
+>    a live heap address.
+>
+> **Real root cause:** a value-representation / operand-slot type-confusion in BC's
+> EC arithmetic path. BC F2m `LongArray` (GF(2^m): `lxor`/`lshl`/`lushr` over
+> `long[]`) produces 64-bit values whose bits land in the `SUB_OBJECT` NaN-box
+> space (`0xFFFD…`); one such long ends up in a *reference-typed* slot and a
+> context-free `to_value()` decode classifies it as an object (then degrades /
+> derefs). The JIT ban only suppresses the JIT face of this; the interpreter face
+> (`FixedPointTest` wrong result, `NISTECC: Exception`) is the same bug. The
+> ongoing dated patches (`Round-8`, `BC SM2 2026-05-28 verbatim-long encode`) are
+> in this same fight. cf. memory `reference_jca_synthetic_crypto_layers`
+> ("interpreter long/float operand-stack bug").
+>
+> **Implication for the JIT ban:** lifting it is NOT the gating prerequisite the
+> handoff assumed — the value-model collision must be fixed first (it breaks the
+> interpreter too). And the RSA/AES native-accel lever is INDEPENDENT of this (those
+> are pure interpreter *slowness*, not the EC collision) — it does not need the ban
+> lifted or this bug fixed.
+>
+> Fast repro harnesses left in `/tmp`: `ecrun2.sh` (ALLOW/ONLY/SKIP/heap/timeout,
+> classifies CORRUPT/SEGV/WATCHDOG/OK), `ectoggle.sh` (per-feature toggle).
+
 ## Reproduction (existing release binary, no rebuild needed)
 
 ```

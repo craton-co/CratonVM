@@ -35268,6 +35268,146 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
 // layout or the real-JDK signum/mag[I] layout).
 // =============================================================================
 
+/// Native fast-path for BouncyCastle's RSA-keygen small-factor prime
+/// pre-screen `org.bouncycastle.math.Primes.implHasAnySmallFactors`.
+///
+/// The Java method computes `x mod m` — via `BigInteger.valueOf(m)`,
+/// `BigInteger.mod`, then `intValue()` — for ten ~32-bit moduli, each a
+/// product of consecutive small primes, and tests the remainder against every
+/// prime in the group. With `org/bouncycastle/*` JIT-banned this runs
+/// interpreted: ~10 BigInteger allocations + 10 limb-division calls per
+/// candidate, over hundreds of candidates per RSA prime, which dominates
+/// `RSAKeyPairGenerator.chooseRandomPrime` (see `RSATest.test_CVE_2017_15361`,
+/// the documented RSA non-finish — `docs/comparison-handoff/bug-bc-crypto-
+/// regression-timeout.md`). This intrinsic reads the candidate's magnitude
+/// once and computes each `x mod m` with a single Horner pass over the limbs
+/// (zero allocation), returning the method's exact boolean result.
+///
+/// Byte-exact with the BC source: `m` is recomputed as the product of each
+/// group's primes (all products < 2^32), so the trial-divisor set is
+/// identical. Only the private, pure `implHasAnySmallFactors` leaf is replaced;
+/// the public `hasAnySmallFactors` wrapper (and its `checkCandidate`, which
+/// guarantees a positive candidate ≥ 2) still runs as real bytecode. Tagged
+/// `Intrinsic`, not a stub.
+/// Consecutive small-prime groups, identical to the moduli in
+/// org.bouncycastle.math.Primes.implHasAnySmallFactors (primes 2..211). Each
+/// group's modulus `m` = product of its primes (every product < 2^32).
+const BC_SMALL_FACTOR_GROUPS: [&[u32]; 10] = [
+    &[2, 3, 5, 7, 11, 13, 17, 19, 23],
+    &[29, 31, 37, 41, 43],
+    &[47, 53, 59, 61, 67],
+    &[71, 73, 79, 83],
+    &[89, 97, 101, 103],
+    &[107, 109, 113, 127],
+    &[131, 137, 139, 149],
+    &[151, 157, 163, 167],
+    &[173, 179, 181, 191],
+    &[193, 197, 199, 211],
+];
+
+/// Core of `Primes.implHasAnySmallFactors`: true iff the integer with
+/// little-endian base-2^32 magnitude `mag` (sign `negative`) is divisible by
+/// any prime in [2, 211]. Pure / allocation-free; see
+/// [`register_bc_primes_small_factors`].
+fn bc_has_any_small_factors(mag: &[u32], negative: bool) -> bool {
+    for primes in BC_SMALL_FACTOR_GROUPS {
+        // Product of the group's primes == the Java `int m`.
+        let m: u64 = primes.iter().map(|&p| p as u64).product();
+        // x mod m via Horner over the limbs, most-significant first.
+        // rem < m <= ~1.6e9 and limb < 2^32, so (rem<<32)|limb < 2^63.
+        let mut rem: u64 = 0;
+        for &limb in mag.iter().rev() {
+            rem = ((rem << 32) | limb as u64) % m;
+        }
+        let mut r32 = rem as u32;
+        // BigInteger.mod returns a non-negative remainder; for the
+        // (contract-guaranteed-absent but defensively handled) negative
+        // candidate, fold |x| mod m into [0, m). r32 < m here.
+        if negative && r32 != 0 {
+            r32 = (m as u32) - r32;
+        }
+        if primes.iter().any(|&p| r32 % p == 0) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The odd primes 3..=743 — the exact prime factors of
+/// `org.bouncycastle.util.BigIntegers.SMALL_PRIMES_PRODUCT` (verified: their
+/// product equals the class's hex literal; 2 is excluded because the candidate
+/// is forced odd first). Used by [`register_bc_util_small_factors`].
+const BC_ODD_SMALL_PRIMES: [u32; 131] = [
+    3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41,
+    43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
+    101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157,
+    163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227,
+    229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283,
+    293, 307, 311, 313, 317, 331, 337, 347, 349, 353, 359, 367,
+    373, 379, 383, 389, 397, 401, 409, 419, 421, 431, 433, 439,
+    443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503, 509,
+    521, 523, 541, 547, 557, 563, 569, 571, 577, 587, 593, 599,
+    601, 607, 613, 617, 619, 631, 641, 643, 647, 653, 659, 661,
+    673, 677, 683, 691, 701, 709, 719, 727, 733, 739, 743,
+];
+
+/// `x mod p` for a single 32-bit prime `p`, via Horner over little-endian
+/// base-2^32 magnitude limbs. Returns the non-negative remainder of |x| mod p.
+#[inline]
+fn mag_mod_u32(mag: &[u32], p: u32) -> u32 {
+    let p = p as u64;
+    let mut rem: u64 = 0;
+    for &limb in mag.iter().rev() {
+        rem = ((rem << 32) | limb as u64) % p;
+    }
+    rem as u32
+}
+
+/// Core of `util.BigIntegers.hasAnySmallFactors`: true iff `x` is divisible by
+/// any prime ≤ 743 (i.e. shares a factor with `SMALL_PRIMES_PRODUCT`, or is
+/// even). Divisibility is sign-invariant, so the magnitude suffices.
+fn bc_util_has_any_small_factors(mag: &[u32]) -> bool {
+    // x even? (low limb's bit 0; empty magnitude == 0 == even)
+    if mag.first().copied().unwrap_or(0) & 1 == 0 {
+        return true;
+    }
+    BC_ODD_SMALL_PRIMES.iter().any(|&p| mag_mod_u32(mag, p) == 0)
+}
+
+pub(crate) fn register_bc_primes_small_factors(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+
+    // BC's RSA-keygen primality pre-screen (`Primes.isProbablePrime` path).
+    r.register(
+        "org/bouncycastle/math/Primes",
+        "implHasAnySmallFactors",
+        "(Ljava/math/BigInteger;)Z",
+        |ctx, args| {
+            let x = bi_read_int(ctx, obj_arg(args, 0)?);
+            let has = bc_has_any_small_factors(x.mag_le(), x.is_neg());
+            Ok(Some(Value::Int(i32::from(has))))
+        },
+    );
+
+    // BC's `BigIntegers.createRandomPrime` initial-candidate sieve, which
+    // otherwise runs the interpreted safegcd `Mod.modOddIsCoprimeVar /
+    // updateFG30` against SMALL_PRIMES_PRODUCT — the dominant cost once
+    // implHasAnySmallFactors above is native. Equivalent single-word-mod sieve.
+    r.register(
+        "org/bouncycastle/util/BigIntegers",
+        "hasAnySmallFactors",
+        "(Ljava/math/BigInteger;)Z",
+        |ctx, args| {
+            let x = bi_read_int(ctx, obj_arg(args, 0)?);
+            let has = bc_util_has_any_small_factors(x.mag_le());
+            Ok(Some(Value::Int(i32::from(has))))
+        },
+    );
+
+    r.set_category(__prev_cat);
+}
+
 pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -42917,3 +43057,99 @@ mod zip_2x_api_tests {
     }
 }
 
+
+#[cfg(test)]
+mod bc_small_factors_tests {
+    use super::{bc_has_any_small_factors, BC_SMALL_FACTOR_GROUPS};
+
+    fn mag_le(mut v: u128) -> Vec<u32> {
+        let mut w = Vec::new();
+        while v != 0 {
+            w.push((v & 0xFFFF_FFFF) as u32);
+            v >>= 32;
+        }
+        w
+    }
+
+    #[test]
+    fn group_products_fit_signed_int() {
+        // Each group's modulus must equal the Java `int m` (positive, no overflow).
+        for g in BC_SMALL_FACTOR_GROUPS {
+            let m: u64 = g.iter().map(|&p| p as u64).product();
+            assert!(m < (1u64 << 31), "group product {m} must fit a positive i32");
+        }
+    }
+
+    #[test]
+    fn detects_small_factors() {
+        for &n in &[0u128, 4, 9, 15, 21, 211, 211 * 211, 2 * 1_000_003] {
+            assert!(
+                bc_has_any_small_factors(&mag_le(n), false),
+                "n={n} should report a small factor"
+            );
+        }
+    }
+
+    #[test]
+    fn passes_values_with_no_small_factor() {
+        assert!(!bc_has_any_small_factors(&mag_le(223), false)); // smallest prime > 211
+        assert!(!bc_has_any_small_factors(&mag_le(1_000_003), false)); // prime
+        assert!(!bc_has_any_small_factors(&mag_le((1u128 << 61) - 1), false)); // M61, prime
+    }
+
+    #[test]
+    fn empty_mag_is_zero_divisible() {
+        assert!(bc_has_any_small_factors(&[], false)); // x == 0
+    }
+
+    #[test]
+    fn negative_fold_matches_nonneg_mod() {
+        // BigInteger.mod is non-negative; divisibility by p is sign-invariant.
+        assert!(bc_has_any_small_factors(&mag_le(15), true)); // -15 → factors 3,5
+        assert!(bc_has_any_small_factors(&mag_le(211), true)); // -211 → factor 211
+        assert!(!bc_has_any_small_factors(&mag_le(223), true)); // -223 → prime
+    }
+
+    // ---- util.BigIntegers.hasAnySmallFactors (odd primes 3..=743) ----
+    use super::{bc_util_has_any_small_factors, BC_ODD_SMALL_PRIMES};
+
+    fn sieve_odd_primes(limit: u32) -> Vec<u32> {
+        let n = limit as usize;
+        let mut s = vec![true; n + 1];
+        (2..=n).for_each(|i| {
+            if s[i] {
+                let mut j = i * i;
+                while j <= n {
+                    s[j] = false;
+                    j += i;
+                }
+            }
+        });
+        (3..=n).filter(|&i| s[i] && i % 2 == 1).map(|i| i as u32).collect()
+    }
+
+    #[test]
+    fn odd_small_primes_set_is_exactly_3_to_743() {
+        // The array must be the prime factors of SMALL_PRIMES_PRODUCT (odd
+        // primes 3..=743; verified out-of-band that their product == the BC
+        // hex literal). Lock it against an independent sieve.
+        assert_eq!(BC_ODD_SMALL_PRIMES.to_vec(), sieve_odd_primes(743));
+    }
+
+    #[test]
+    fn util_detects_small_factors() {
+        assert!(bc_util_has_any_small_factors(&mag_le(0))); // even (zero)
+        assert!(bc_util_has_any_small_factors(&mag_le(2))); // even
+        assert!(bc_util_has_any_small_factors(&mag_le(100))); // even
+        assert!(bc_util_has_any_small_factors(&mag_le(743))); // factor 743
+        assert!(bc_util_has_any_small_factors(&mag_le(743 * 1009))); // factor 743
+        assert!(bc_util_has_any_small_factors(&mag_le(3 * 999_983))); // factor 3
+    }
+
+    #[test]
+    fn util_passes_values_with_no_small_factor() {
+        assert!(!bc_util_has_any_small_factors(&mag_le(751))); // smallest prime > 743
+        assert!(!bc_util_has_any_small_factors(&mag_le(999_983))); // prime
+        assert!(!bc_util_has_any_small_factors(&mag_le((1u128 << 61) - 1))); // M61
+    }
+}

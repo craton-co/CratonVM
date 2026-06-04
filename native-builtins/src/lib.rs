@@ -968,6 +968,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // and X9 curves. Our string-decimal helpers (sweep landed alongside
     // this commit, follow-up to 958baae) preserve full precision.
     crate::phases_late::register_p71_biginteger_extras(registry);
+    // BouncyCastle RSA-keygen small-factor prime pre-screen fast-path (Intrinsic).
+    // BC is JIT-banned (value-model collision in its F2m EC path, unrelated), so
+    // `Primes.implHasAnySmallFactors` otherwise runs interpreted and dominates
+    // RSA key generation. Faithful single-word-mod reimplementation; see the fn doc.
+    crate::phases_late::register_bc_primes_small_factors(registry);
 
     // Spring Boot loader in real-JDK mode can resolve Pattern natives through
     // synthetic-stub dispatch paths before/without usable JDK bytecode
