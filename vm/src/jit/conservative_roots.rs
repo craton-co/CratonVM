@@ -141,6 +141,17 @@ pub(crate) struct PreciseFrameInfo {
     /// the walker can compute `current_pc - entry_ptr = offset` and
     /// look up the matching oop map entry.
     pub entry_ptr: *const u8,
+    /// Stage 3/5 (precise relocation) — the EXACT RBP of the *innermost*
+    /// active JIT frame, recorded by [`set_top_frame_base`] from the deepest
+    /// prologue's `frame_record` helper. Used ONLY as the start of the
+    /// `remap_active_jit_frames` RBP-chain walk. It is kept SEPARATE from
+    /// `frame_base` (the Rust-guard SP captured at entry) because the marking
+    /// path [`scan_one_frame_precise`] uses `frame_base` as the UPPER bound of
+    /// its conservative sweep `[scanner_sp, frame_base)`: clobbering it with
+    /// the (low) innermost RBP shrank that sweep to just the innermost frame,
+    /// dropping every ancestor frame's spilled oops → live objects reclaimed →
+    /// heap corruption. `0` until the prologue records it (gate off).
+    pub exact_rbp: usize,
 }
 
 // SAFETY: the raw pointers in JitFrameChainEntry are not dereferenced
@@ -393,6 +404,7 @@ impl JitEntryGuard {
                 compiled_method: cm as *const cratonvm_jit::CompiledMethod,
                 frame_base: sp,
                 entry_ptr: cm.entry_ptr(),
+                exact_rbp: 0,
             }),
         };
         let depth_at_push = push_entry_full(entry);
@@ -538,7 +550,12 @@ pub fn set_top_frame_base(rbp: usize) {
     JIT_ENTRY_CHAIN.with(|c| {
         if let Some(entry) = c.borrow_mut().last_mut() {
             if let Some(info) = entry.precise.as_mut() {
-                info.frame_base = rbp;
+                // Record the EXACT innermost RBP for the relocation walk.
+                // Do NOT touch `frame_base` — the marking path
+                // `scan_one_frame_precise` uses it as the upper bound of its
+                // conservative sweep; shrinking it to this (low) RBP would
+                // drop every ancestor frame's spilled oops.
+                info.exact_rbp = rbp;
             }
         }
     });
@@ -602,7 +619,14 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
             // skipped: its child is a Rust helper (not in the JIT code
             // registry) and its safepoint's live oops are conservatively
             // pinned (so never relocated).
-            let mut child_rbp = info.frame_base;
+            //
+            // Start from `exact_rbp` (the precise innermost RBP from the
+            // prologue), NOT `frame_base` (the Rust-guard SP). Skip if it was
+            // never recorded (gate off / no precise prologue).
+            if info.exact_rbp == 0 {
+                continue;
+            }
+            let mut child_rbp = info.exact_rbp;
             let mut guard = 0usize;
             while guard < 4096 {
                 guard += 1;
