@@ -58,9 +58,11 @@ still match HotSpot checksums (no regression). NOTE: this only manifests when an
 immediately before a branch AND the operand byte's opcode-length realignment skips that branch
 — rare, which is why most `for(i;i<CONST;…)` loops are unaffected.
 
-REMAINING (separate, NOT this bug): with the overrun fixed, `Sphincs256` now runs the full
-(very heavy) signing and still ends in a deeper failure (rc=1, output buffered/lost) around
-~80s — a further BC-JIT issue and/or throughput limit, to be chased next with the build loop.
+REMAINING (separate, NOT this bug): with the overrun fixed, `Sphincs256` runs the full (very
+heavy) signing and still does not complete. **RESOLVED — see section C: this is a throughput
+wall, not a further miscompile.** `chachaCore` (and the hash primitives) are byte-correct; the
+JIT is just far too slow on BC crypto, so SPHINCS-256 signing cannot finish in a practical
+timeout and the `org/bouncycastle/` ban stays.
 Repro (≈45s): `CRATONVM_JIT_ALLOW_PACKAGES=org/bouncycastle/ CRATONVM_DBG_AIOOBE2=1 cratonvm …
 org.bouncycastle.pqc.crypto.test.Sphincs256Test`.
 
@@ -76,3 +78,101 @@ already set flags) so `execute_jit_call`, on `result == i64::MIN` with NO flag s
 npe/aioobe/exception helpers, nested-call propagation); a missed path → a genuine deopt read
 as a value → silent corruption. Only observable once A is fixed (ban stays until then), so
 sequence after A.
+
+### B — UPDATED audit (branch `fix/bc-jit-sphincs`): the original design is UNSAFE as written
+
+The flag set covers more than the handoff implies, and one path the design overlooked makes
+the naive "push the value at the top level when no flag is set" rule **corrupting**:
+
+- `jit_uncommon_trap` (`vm/src/jit/helpers.rs:3085`) sets **no** flag today — it records the
+  deopt and returns an action code the stub ignores. So the generic deopt stub
+  (`emit_deopt_stubs`, `x64.rs:10302`, incl. div-by-zero reason 3) returns `i64::MIN` with no
+  flag. ⇒ B step 1 (set a `JIT_PENDING_DEOPT` in `jit_uncommon_trap`) is correct and necessary.
+- NPE / AIOOBE / exception stubs DO set their flags and are drained ABOVE / INSIDE the `i64::MIN`
+  arm in `execute_jit_call`, so those never reach the "no flag" branch.
+- **The overlooked path:** `emit_post_invoke_exception_check` (`x64.rs:10255`) emits an inline
+  `CMP RAX, i64::MIN; JE` after EVERY nested dispatch call, and the shared
+  `emit_exception_check_stub` (`x64.rs:10272`) re-loads `i64::MIN` and returns it up the call
+  chain **without setting any flag** — it relies entirely on the top-level "`i64::MIN` ⇒ deopt
+  ⇒ re-execute" contract. When a *nested* callee legitimately returns `Long.MIN_VALUE` (or
+  `double -0.0`, same bit pattern `0x8000_0000_0000_0000`), this guard fires as a FALSE POSITIVE
+  and the caller bails early returning `i64::MIN`. Under the current code that surfaces at the
+  top level as a deopt → the caller is re-executed in the interpreter → **correct result**
+  (just slow + double side effects). Under the naive B rule, the top level would instead PUSH
+  `i64::MIN` as the caller's return value WITHOUT running the caller's post-call bytecode →
+  **silently wrong result**. This is strictly worse than the bug B set out to fix.
+
+⇒ A safe B must ALSO make `emit_exception_check_stub` set `JIT_PENDING_DEOPT` (cheap: it is a
+single shared out-of-line stub, so add a `CALL set_jit_pending_deopt` before the `MOV RAX,
+i64::MIN`; the exception case already sets `JIT_PENDING_EXCEPTION`, which the top level checks
+first, so over-setting deopt there is harmless). Only then is "`i64::MIN` + no flag + `b'J'`/`b'D'`
+return ⇒ push the value" sound. Note the genuine-value producers that legitimately yield
+`i64::MIN` and must keep flowing through as values: `d2l`/`f2l` overflow (`x64.rs:5436` /
+`9993`, which push `0x8000_0000_0000_0000` as the saturated long) and any method returning
+`Long.MIN_VALUE` / `-0.0`.
+
+**Decision (this branch): B left unimplemented.** Its original BC motivation (`Pack.bigEndianToLong`)
+is moot because the ban stays (see C). Its general value — a JIT leaf returning `Long.MIN_VALUE`
+or `double -0.0` with side effects double-executing — is real but rare, and the blast radius of a
+missed path is the whole JIT. Not worth shipping without the full audit + targeted tests
+(leaf returning `Long.MIN_VALUE`/`-0.0` with a side effect must NOT double-execute; nested call
+returning `Long.MIN_VALUE` must still produce the right caller result; div-by-zero / BCE deopts
+must still re-execute).
+
+## C — "A-remaining deeper failure" ROOT-CAUSED: it is a THROUGHPUT wall, not a miscompile
+
+Reproduced on `fix/bc-jit-sphincs` (binary built via `build-wt.bat`). Hard data:
+
+- **HotSpot runs the whole `Sphincs256Test` in ~1s** (`Sphincs256: Okay`).
+- **CratonVM cannot finish even one subtest** of `performTest()` in 400s, JIT-on or JIT-off.
+  The 40s watchdog (`--stack-dump-on-timeout 40`) catches it grinding in
+  `ChaChaEngine.chachaCore` (via `Seed.prg → Salsa20Engine.processBytes →
+  ChaChaEngine.generateKeyStream`) inside `Horst.horst_sign` — i.e. the 2^16-iteration HORST
+  signing hashing loop. The earlier "rc=1 ~80s" was just the buffered-stdout loss on a slow
+  run; both interpreter (`rc=1` at <600s) and JIT (`rc=124` at 400s) fail to complete.
+- **`chachaCore` is byte-correct.** `ChaProbe` (calls `ChaChaEngine.chachaCore` directly,
+  `public static`) gives the SAME checksum as HotSpot under both interpreter and JIT — there is
+  NO miscompile here. It is purely slow: at N=100k, HotSpot 40ms vs CratonVM interpreter
+  ~35000ms (~875×) and JIT ~18000ms (~450×). **The JIT is only ~2× faster than the interpreter**
+  on this code, where it should be near-native for a tight int loop.
+- **Why the JIT barely helps:** `chachaCore` makes ~64 `org.bouncycastle.util.Integers.rotateLeft`
+  calls per invocation. That wrapper just delegates to `Integer.rotateLeft`, but
+  `resolve_inline_site` (`interpreter.rs:14107`) rejects ANY callee whose body contains an invoke,
+  so the wrapper is **never inlined** — each rotate is a full JIT-dispatch call. The per-call
+  dispatch overhead, ×64 ×(millions of hash blocks), is the wall.
+
+⇒ **The `org/bouncycastle/` JIT ban stays.** It was never going to be lifted by fixing one
+miscompile; SPHINCS-256 signing needs near-HotSpot throughput across all of BC's crypto
+(ChaCha + BLAKE + SHA-512), which CratonVM's JIT does not deliver. There is no further
+"BC-JIT miscompile" to chase for SPHINCS — A (the AIOOBE loop overrun) was the only real
+miscompile and it is fixed on `dev`.
+
+### Throughput levers identified (future work, NOT required for correctness)
+
+1. **`Integer`/`Long.rotateLeft`/`rotateRight` JIT intrinsic — DONE on this branch.** Added
+   `IntRotateLeft`/`IntRotateRight` (`ROL`/`ROR r32, CL` + `MOVSXD`) and
+   `LongRotateLeft`/`LongRotateRight` (`ROL`/`ROR r64, CL`) to the INT_BITS / LONG_BITS intrinsic
+   regions (matcher in `jit/src/lib.rs`, codegen in `jit/src/x64.rs`). x86's `CL & 0x1f` (32-bit)
+   / `CL & 0x3f` (64-bit) masking is byte-identical to the JDK rotate-mod-width definition, so no
+   distance masking is needed. VERIFIED byte-identical to HotSpot via `RotProbe` (all edge
+   distances 0/32/33/64/65/negative, plus `MIN_VALUE`/high-bit values); Sieve/Matrix/IntrinsicBench
+   checksums unchanged (no regression). **Caveat:** this helps code that calls
+   `Integer/Long.rotate*` DIRECTLY (e.g. JDK `sun.security.provider.SHA2` uses
+   `Integer.rotateRight`). It does NOT speed up BC's `chachaCore` (`ChaProbe` timing unchanged),
+   because BC funnels through the non-inlinable `Integers` wrapper — the rotate intrinsic only
+   optimises the wrapper's BODY, not the per-call dispatch overhead that dominates.
+2. **The real BC lever: inline single-invoke delegating wrappers when the inner call is an
+   intrinsic.** Relaxing `resolve_inline_site` to permit a callee whose only invoke resolves to a
+   recognised intrinsic would let `Integers.rotateLeft` inline into `chachaCore` as a bare `ROL`.
+   This is the change that would actually move BC crypto throughput — but it is risky (deopt
+   frame reconstruction across an inlined-call-turned-intrinsic) and only worth it if lifting the
+   `org/bouncycastle/` ban becomes a goal. Not attempted here.
+
+### Repro tooling added (this branch)
+
+- `build-wt.bat` — the isolated worktree build (vcvars64 + unset `VCINSTALLDIR`/`VSCMD_ARG_TGT_ARCH`).
+- `repro-sphincs.sh` — runs `Sphincs256Test` ban-lifted with full output capture.
+- `ChaProbe.java` — direct `chachaCore` correctness + throughput probe (byte-identical check).
+- `RotProbe.java` — rotate-intrinsic byte-identical verification (edge distances + negatives).
+- `SphinxDriver.java` — drives `performTest()` with explicit flush + `Throwable` capture (defeats
+  the buffered-stdout loss that hid the failure as "rc=1, output lost").

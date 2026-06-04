@@ -1690,6 +1690,12 @@ pub enum JitIntrinsic {
     IntLowestOneBit,
     IntReverse,
     IntCompare,
+    /// `Integer.rotateLeft(II)I` / `rotateRight(II)I` — `ROL`/`ROR r32, CL`.
+    /// x86 masks `CL & 0x1f` for a 32-bit rotate, which is byte-identical to
+    /// the JDK definition (rotation is mod 32), so no distance masking is
+    /// needed. Hot in ChaCha/Salsa/Blake/SHA inner loops (e.g. BC SPHINCS).
+    IntRotateLeft,
+    IntRotateRight,
     // ===== INTRINSIC REGION END: INT_BITS =====
 
     // ===== INTRINSIC REGION BEGIN: LONG_BITS =====
@@ -1703,6 +1709,12 @@ pub enum JitIntrinsic {
     LongHighestOneBit,
     LongLowestOneBit,
     LongCompare,
+    /// `Long.rotateLeft(JI)J` / `rotateRight(JI)J` — `ROL`/`ROR r64, CL`.
+    /// x86 masks `CL & 0x3f` for a 64-bit rotate, byte-identical to the JDK
+    /// definition (rotation is mod 64). Note the descriptor takes a `long`
+    /// value and an `int` distance.
+    LongRotateLeft,
+    LongRotateRight,
     // ===== INTRINSIC REGION END: LONG_BITS =====
 
     // ===== INTRINSIC REGION BEGIN: ARRAYCOPY =====
@@ -1990,6 +2002,8 @@ pub fn try_resolve_intrinsic(
             ("lowestOneBit", "(I)I") => Some((JitIntrinsic::IntLowestOneBit, 1, b'I')),
             ("reverse", "(I)I") => Some((JitIntrinsic::IntReverse, 1, b'I')),
             ("compare", "(II)I") => Some((JitIntrinsic::IntCompare, 2, b'I')),
+            ("rotateLeft", "(II)I") => Some((JitIntrinsic::IntRotateLeft, 2, b'I')),
+            ("rotateRight", "(II)I") => Some((JitIntrinsic::IntRotateRight, 2, b'I')),
             _ => None,
         };
         if let Some((intrinsic, num_params, ret)) = hit {
@@ -2029,6 +2043,8 @@ pub fn try_resolve_intrinsic(
             ("highestOneBit", "(J)J") => Some((JitIntrinsic::LongHighestOneBit, 1, b'J')),
             ("lowestOneBit", "(J)J") => Some((JitIntrinsic::LongLowestOneBit, 1, b'J')),
             ("compare", "(JJ)I") => Some((JitIntrinsic::LongCompare, 2, b'I')),
+            ("rotateLeft", "(JI)J") => Some((JitIntrinsic::LongRotateLeft, 2, b'J')),
+            ("rotateRight", "(JI)J") => Some((JitIntrinsic::LongRotateRight, 2, b'J')),
             _ => None,
         };
         if let Some((intrinsic, num_params, ret)) = hit {
