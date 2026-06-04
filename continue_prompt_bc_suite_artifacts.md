@@ -76,3 +76,36 @@ So `pqc-crypto-regression` and `crypto-regression`-on-cratonvm are the **same cl
 issue**: BC crypto kernels are too slow under the interpreter / JIT isn't accelerating them
 — a performance problem for a separate JIT/throughput effort, **distinct from a correctness
 failure**, and now correctly surfaced by the harness rather than masked as a heap fault.
+
+## Throughput root-cause + partial fix — 2026-06-04 (branch `fix/bc-suite-artifacts`)
+
+The interpreter-speed is the `org/bouncycastle/` JIT ban (RBC.1 in
+`vm/src/jit/skip_list.rs`) — it forces every BC method into the interpreter. Lifting it
+(`CRATONVM_JIT_ALLOW_PACKAGES=org/bouncycastle/`) makes the hot crypto kernels JIT, but
+exposes BC JIT miscompiles. Findings:
+
+- **FIXED (commit `249ebb8` on the branch): cached-JIT deopt double-pop → value-stack
+  underflow.** `execute_jit_call` (`vm/src/runtime/interpreter.rs`) pops the callee args,
+  runs the compiled method, and treats a return of `i64::MIN` as the deopt sentinel →
+  returns `CacheMiss` → the slow path re-pops the args → operand stack underflows. The
+  in-band `i64::MIN` sentinel **collides with a legitimate `i64::MIN` `long` return**:
+  `Pack.bigEndianToLong` (SHA-512 byte→long, per-word under SPHINCS-256) returns
+  `0x8000_0000_0000_0000` for some words → false deopt → double-pop → panic at
+  `value_stack.rs` `pop_int_unchecked` ("len 24, index 18446744073709551615") in
+  `LongDigest.processWord`'s `lastore`. Isolated via `CRATONVM_JIT_BISECT_SKIP=org/
+  bouncycastle/util/Pack.bigEndianToLong` (skipping just that method removes the crash).
+  Fix = save the popped slots and restore them before `CacheMiss`. Verified: with the ban
+  lifted, pqc no longer underflows.
+- **STILL OPEN (keeps the ban in place):**
+  1. A **wrong-result** miscompile — with the ban lifted, `Sphincs256` throws
+     `Exception` (bad value, not a crash). Separate BC JIT codegen bug, not yet isolated.
+  2. **Deopt-thrash perf** — the `i64::MIN`-as-deopt sentinel collision means an
+     `i64::MIN`-returning hot method deopts+re-executes on every such return. The proper
+     fix is an out-of-band deopt flag (genuine deopts set it; a real `i64::MIN` return does
+     not) so `b'J'`/`b'D'` returns aren't misread — more invasive, deferred since the ban
+     stays anyway.
+
+So the underflow CRASH is fixed, but the `org/bouncycastle/` ban is **NOT lifted** — full
+BC-JIT throughput needs the wrong-result miscompile fixed too. The branch fix is a genuine
+latent-crash fix (any `long`/`double`-returning JIT method that returns `i64::MIN` would
+double-pop), independent of BC.
