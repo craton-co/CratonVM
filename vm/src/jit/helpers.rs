@@ -3647,7 +3647,29 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         class_id_offset_in_obj: 0,
         get_current_thread: jit_get_current_thread as *const () as usize,
         tlab_post_init: jit_post_tlab_init as *const () as usize,
+        // Stage 3 (precise oop maps) — only wire the frame-record helper when
+        // the precise gate is on; otherwise leave it 0 so the prologue emits
+        // nothing extra. The JIT also gates emission on its own cached flag,
+        // but keying the pointer on the same env keeps the default build inert.
+        frame_record: if cratonvm_jit::x64::precise_jit_maps_enabled() {
+            jit_frame_record as *const () as usize
+        } else {
+            0
+        },
     }
+}
+
+/// Stage 3 (precise oop maps) — record the EXACT RBP of the JIT frame that is
+/// about to run, called once from the JIT prologue (gated on
+/// `CRATONVM_PRECISE_JIT_MAPS`). The Rust-side `JitEntryGuard` pushed a chain
+/// entry just before transferring control to compiled code, but it could only
+/// capture an approximate stack pointer; this fills in the precise frame base
+/// so the GC root walker can address oop-map slots as `[rbp - offset]`.
+///
+/// `extern "C"` with the single `rbp` argument in the platform's first
+/// integer-argument register, matching the JIT's `ARG_REGS[0]` load.
+extern "C" fn jit_frame_record(rbp: usize) {
+    crate::jit::conservative_roots::set_top_frame_base(rbp);
 }
 
 /// T1.1.28 — Math.fma(double, double, double) runtime helper.

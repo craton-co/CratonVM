@@ -627,6 +627,13 @@ pub struct OopMapEntry {
     /// on this offset directly (not via ranges) because the safepoint
     /// is emitted *immediately* before the call.
     pub native_pc_offset: u32,
+    /// Stage 3 (precise oop maps) — bytecode PC of the safepoint
+    /// instruction. The JIT stores this into the frame's safepoint-id
+    /// slot before each GC-capable call so the GC root walker can match
+    /// it back to the *exact* map for the active safepoint (not the
+    /// union-of-all-maps, which is unsafe for relocation). 0 / unused
+    /// when the precise gate is off.
+    pub bytecode_pc: u32,
     /// Frame slot offsets relative to RBP that hold live oops at this
     /// safepoint. `i16` is sufficient because frame sizes are capped
     /// well below 32 KiB in the current JIT; a larger frame would fail
@@ -641,6 +648,7 @@ impl OopMapEntry {
     pub fn new(native_pc_offset: u32) -> Self {
         Self {
             native_pc_offset,
+            bytecode_pc: 0,
             frame_slot_offsets: Vec::new(),
         }
     }
@@ -745,6 +753,14 @@ pub struct CompiledMethod {
     /// `push_oop_map`); any `push_oop_map` likewise clears it so the next
     /// lookup re-verifies.
     oop_maps_sorted: bool,
+    /// Stage 3 (precise oop maps) — frame offset (positive; slot at
+    /// `[rbp - sp_id_slot_off]`) where the JIT stored the active
+    /// safepoint's bytecode PC before each GC-capable call. The GC root
+    /// walker reads this slot to recover the exact `OopMapEntry`. `0`
+    /// means the precise gate (`CRATONVM_PRECISE_JIT_MAPS`) was off at
+    /// compile time, so no safepoint-id slot exists and the walker uses
+    /// the conservative path for this method.
+    pub sp_id_slot_off: i32,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -831,6 +847,7 @@ impl CompiledMethod {
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
             oop_maps_sorted: false,
+            sp_id_slot_off: 0,
         }
     }
 
@@ -867,6 +884,7 @@ impl CompiledMethod {
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
             oop_maps_sorted: false,
+            sp_id_slot_off: 0,
         }
     }
 

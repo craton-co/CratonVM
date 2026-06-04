@@ -162,6 +162,13 @@ pub struct JitRuntimeHelpers {
     /// from class metadata, and register finalizable classes. Returns
     /// the object pointer unchanged.
     pub tlab_post_init: usize,
+    /// Stage 3 (precise oop maps) — address of
+    /// `extern "C" fn(rbp: usize)`, called once in the JIT prologue when
+    /// `CRATONVM_PRECISE_JIT_MAPS` is on to register this frame's EXACT
+    /// RBP with the GC root walker (the Rust-side `JitEntryGuard` only
+    /// captures an approximate SP). `0` = not wired → the prologue skips
+    /// the call and the walker uses the conservative path. Optional.
+    pub frame_record: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -289,6 +296,7 @@ helper_fields! {
     (class_id_offset_in_obj,         FieldKind::Offset),
     (get_current_thread,             FieldKind::OptionalPtr),
     (tlab_post_init,                 FieldKind::OptionalPtr),
+    (frame_record,                   FieldKind::OptionalPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -314,7 +322,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 38,
+    JitRuntimeHelpers::NUM_FIELDS == 39,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -457,6 +465,7 @@ mod tests {
             class_id_offset_in_obj: 0,
             get_current_thread: 0x1100,
             tlab_post_init: 0x1108,
+            frame_record: 0x1110,
         }
     }
 
@@ -648,6 +657,7 @@ mod tests {
             class_id_offset_in_obj: 0,
             get_current_thread: 0,
             tlab_post_init: 0,
+            frame_record: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -809,7 +819,7 @@ mod tests {
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
         // And the macro-driven count is the canonical 38.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 38);
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 39);
     }
 
     #[test]
@@ -857,6 +867,7 @@ mod tests {
             (35, "class_id_offset_in_obj",       std::mem::offset_of!(JitRuntimeHelpers, class_id_offset_in_obj)),
             (36, "get_current_thread",           std::mem::offset_of!(JitRuntimeHelpers, get_current_thread)),
             (37, "tlab_post_init",               std::mem::offset_of!(JitRuntimeHelpers, tlab_post_init)),
+            (38, "frame_record",                 std::mem::offset_of!(JitRuntimeHelpers, frame_record)),
         ];
 
         // (a) Each field is at its documented sequential byte offset.

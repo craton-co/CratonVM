@@ -1691,6 +1691,21 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
 /// region.
 ///
 /// Returns a bit-set (`Vec<bool>` indexed by PC) of size `code_len`.
+/// Stage 3 (precise oop maps) — process-wide gate for the *moving*-safe
+/// precise-stack-map machinery (exact RBP frame registration, safepoint-id
+/// slot, precise relocation). Read once from `CRATONVM_PRECISE_JIT_MAPS`.
+///
+/// Default OFF: when off, none of the Stage 3 codegen (prologue frame-record
+/// call, per-safepoint id store, extra frame slot) is emitted, so the default
+/// path is byte-identical. The precise *maps* themselves (Stages 1–2) are
+/// still produced — they are consumed only as additive roots by the
+/// conservative walker until this gate turns the relocation path on (Stage 5).
+pub fn precise_jit_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_PRECISE_JIT_MAPS").is_some())
+}
+
 fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
     let mut targets = vec![false; code_len];
     let mut pc = 0usize;
@@ -4779,6 +4794,13 @@ struct Compiler {
     /// `emit_oop_map_for_safepoint` can look up the local-oop mask without
     /// threading `pc` through every safepoint call site.
     cur_bc_pc: usize,
+    /// Stage 3 — whether the moving-safe precise-stack-map machinery is on
+    /// (gate `CRATONVM_PRECISE_JIT_MAPS`). Gates the prologue frame-record
+    /// call and the per-safepoint id store. Off → byte-identical default path.
+    precise_maps: bool,
+    /// Stage 3 — frame offset (positive; slot at `[rbp - sp_id_slot_off]`) of
+    /// the reserved safepoint-id slot. 0 when `precise_maps` is off.
+    sp_id_slot_off: i32,
     /// T5.2.1 — induction variables detected in each loop.
     ///
     /// One entry per detected counted loop. Consumed by downstream
@@ -4893,12 +4915,26 @@ impl Compiler {
             .map(|h| arith_expr_max_depth(&h.steps))
             .max()
             .unwrap_or(0);
+        // Stage 3 — when precise maps are enabled, reserve ONE extra frame
+        // slot (the last local slot) to hold the active safepoint's bytecode
+        // PC, written by `emit_pre_safepoint_spill` before each GC-capable
+        // call so the GC root walker can recover the exact oop map. Off by
+        // default → no slot reserved → frame layout byte-identical.
+        let precise_maps = precise_jit_maps_enabled();
         let extra_slots = (if needs_heap { 1 } else { 0 })
             + num_hoists
             + num_arith_hoists
             + arith_scratch_depth
-            + num_scalar_slots;
+            + num_scalar_slots
+            + (if precise_maps { 1 } else { 0 });
         let total_locals = num_locals.saturating_add(extra_slots);
+        // The safepoint-id slot is the LAST local slot; its value is at
+        // `[rbp - sp_id_slot_off]`. 0 when the gate is off (disabled).
+        let sp_id_slot_off: i32 = if precise_maps {
+            (total_locals as i32).saturating_mul(8) // = (last_index+1)*8
+        } else {
+            0
+        };
         let locals_size = (total_locals.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let spill_size = (max_stack.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let shadow_space = 32i32; // Windows x64 shadow space for helper calls
@@ -5047,6 +5083,8 @@ impl Compiler {
             local_oop_masks: Vec::new(),
             local_oop_reached: Vec::new(),
             cur_bc_pc: 0,
+            precise_maps,
+            sp_id_slot_off,
             induction_vars: Vec::new(),
             null_check_info: crate::null_check_elim::NullCheckInfo::default(),
             simd_element_wise_loops: Vec::new(),
@@ -5283,6 +5321,16 @@ impl Compiler {
                 self.emit_store_local(off, reg);
             }
         }
+        // Stage 3 — record WHICH safepoint is active by storing the current
+        // bytecode PC into the reserved safepoint-id slot. The GC root walker
+        // reads `[rbp - sp_id_slot_off]` to recover the exact oop map (matched
+        // on `OopMapEntry::bytecode_pc`). RAX is caller-saved and not an
+        // argument register, and args are already staged in ARG_REGS before
+        // this call, so clobbering RAX here is safe. Gated off by default.
+        if self.precise_maps && self.sp_id_slot_off != 0 {
+            self.emit_mov_imm32_sx(RAX, self.cur_bc_pc as i32); // Cast: bytecode PC fits i32
+            self.emit_store_local(self.sp_id_slot_off, RAX);
+        }
     }
 
     /// T1.1.a — record an oop map at the current native PC for the
@@ -5381,6 +5429,9 @@ impl Compiler {
         }
         self.oop_maps.push(crate::OopMapEntry {
             native_pc_offset: native_pc,
+            // Stage 3 — tag with the safepoint's bytecode PC so the GC root
+            // walker can match the value the JIT stored into the sp-id slot.
+            bytecode_pc: self.cur_bc_pc as u32, // Cast: bytecode PC fits u32
             frame_slot_offsets: slots,
         });
     }
@@ -7981,6 +8032,18 @@ impl Compiler {
                 self.emit_xor_reg_self(RAX);
                 self.emit_store_local(offset, RAX);
             }
+        }
+        // Stage 3 — register this JIT frame's EXACT RBP with the GC so the
+        // root walker can address oop-map slots precisely (the Rust-side
+        // JitEntryGuard only captures an approximate SP; release builds omit
+        // frame pointers so the real RBP can't be recovered by walking). Done
+        // once per invocation, after params are saved so the call doesn't lose
+        // them. RBP → ABI arg0; the helper records it into the top JIT chain
+        // entry. Gated off by default (zero default-path cost), and skipped if
+        // the helper pointer isn't wired.
+        if self.precise_maps && self.helpers.frame_record != 0 {
+            self.emit_mov_reg_reg(ARG_REGS[0], RBP);
+            self.emit_call_absolute(self.helpers.frame_record);
         }
     }
 
@@ -18844,6 +18907,9 @@ pub fn compile_with_param_slots(
     // to the conservative stack scan for that frame — always a
     // correct super-set of the precise coverage.
     cm.oop_maps = compiler.oop_maps;
+    // Stage 3 — the frame offset where this method stores the active
+    // safepoint's bytecode PC (0 when the precise gate was off at compile).
+    cm.sp_id_slot_off = compiler.sp_id_slot_off;
 
     // Task #60 — attach unroll-cloned MIC/PIC slots to the
     // CompiledMethod so they outlive the compiled code. The imm64
@@ -19174,6 +19240,7 @@ mod tests {
             class_id_offset_in_obj: 0,
             get_current_thread: 0,
             tlab_post_init: 0,
+            frame_record: 0,
         }
     }
 

@@ -53,6 +53,13 @@ pub fn update_all_roots(
         }
     }
 
+    // Stage 3 (precise oop maps) — relocate oop slots of active JIT frames on
+    // this thread, the JIT analogue of the interpreter-frame remap above. Inert
+    // unless CRATONVM_PRECISE_JIT_MAPS compiled the frame (sp_id_slot_off != 0);
+    // it is the piece that lets a moving collector run while JIT frames are live
+    // (see docs/precise-jit-stack-maps-design.md, Stage 3).
+    crate::jit::conservative_roots::remap_active_jit_frames(pointer_map);
+
     for obj_ref in &mut thread.native_pin_roots {
         let old_addr = obj_ref.as_ptr() as usize;
         if let Some(&new_addr) = pointer_map.get(&old_addr) {
