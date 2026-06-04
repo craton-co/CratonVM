@@ -3672,12 +3672,22 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         .write()
                         .load_class(&lcs.impl_handle.class_name)?;
                     super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
+                    // Use `num_total_fields` (inherited + declared instance
+                    // fields), matching the `New` opcode and the sibling
+                    // NewInvokeSpecial path in `interpreter.rs`. `c.fields.len()`
+                    // is wrong here: it counts this class's declared fields
+                    // *including statics* while omitting inherited instance
+                    // fields, so a subclass constructor reference (e.g. JUnit5's
+                    // `DefaultClassDescriptor::new`, whose 2 fields are all
+                    // inherited from `AbstractAnnotatedDescriptorWrapper`)
+                    // under-allocates to 0 slots and trips the GC `get_field`
+                    // bounds guard on every inherited-field access.
                     let num_fields = self
                         .shared
                         .class_manager
                         .read()
                         .get_class(class_id)
-                        .map(|c| c.fields.len())
+                        .map(|c| c.num_total_fields)
                         .unwrap_or(0);
                     let new_obj = match self.shared.heap.try_alloc_object(class_id, num_fields) {
                         Some(obj) => obj,
