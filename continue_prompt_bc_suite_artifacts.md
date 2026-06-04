@@ -97,13 +97,35 @@ exposes BC JIT miscompiles. Findings:
   Fix = save the popped slots and restore them before `CacheMiss`. Verified: with the ban
   lifted, pqc no longer underflows.
 - **STILL OPEN (keeps the ban in place):**
-  1. A **wrong-result** miscompile — with the ban lifted, `Sphincs256` throws
-     `Exception` (bad value, not a crash). Separate BC JIT codegen bug, not yet isolated.
+  1. A **wrong-result** miscompile. With the ban lifted, `Sphincs256` throws a real
+     `java.lang.ArrayIndexOutOfBoundsException` (a JIT-compiled method computes a **wrong
+     int index**), stack:
+     `Sphincs256Test.doSHA2KatTest → SPHINCS256Signer.crypto_sign → Horst.horst_sign →
+     HashFunctions.hash_n_n`. Isolation so far (on `/tmp/cv_fixed.exe` via
+     `CRATONVM_JIT_BISECT_SKIP`/`_ONLY` — no rebuild): the AIOOBE is thrown *in* `hash_n_n`
+     but **skipping `HashFunctions.hash_n_n` does NOT fix it** ⇒ the bad index value comes
+     from a JIT-compiled **callee** of `hash_n_n` (SHA-256 digest / arithmetic), not
+     `hash_n_n` itself. `BISECT_ONLY=…/sphincs/` (interpret digests) times out (digests too
+     slow interpreted) — inconclusive. Next: bisect the digest path
+     (`org/bouncycastle/crypto/digests/*`) — likely a long/int codegen bug producing a wrong
+     index. NOT yet root-caused; needs a working build/test loop (see below).
   2. **Deopt-thrash perf** — the `i64::MIN`-as-deopt sentinel collision means an
-     `i64::MIN`-returning hot method deopts+re-executes on every such return. The proper
-     fix is an out-of-band deopt flag (genuine deopts set it; a real `i64::MIN` return does
-     not) so `b'J'`/`b'D'` returns aren't misread — more invasive, deferred since the ban
-     stays anyway.
+     `i64::MIN`-returning hot method deopts+re-executes on every such return. Proper fix =
+     an out-of-band deopt-pending flag set by `jit_uncommon_trap` (the npe/aioobe/exception
+     deopts already set flags) so a flagless `i64::MIN` `b'J'`/`b'D'` return is recognized as
+     a real value (push directly, no re-exec). **Risk:** must be comprehensive — any deopt
+     path that returns `i64::MIN` without setting a flag would be misread as a value (silent
+     corruption). The current args-restore fix is the safe fallback. Deferred: it's only
+     observable with the ban lifted (needs item 1 fixed), and it's unsafe to land without a
+     build/test loop to validate flag comprehensiveness.
+
+**BUILD/TEST BLOCKER for items 1–2:** this checkout can't run a clean isolated build —
+`libffi-sys` needs MSVC (vcvars) **and** MSYS `sh`/`awk` (`C:\Program Files\Git\usr\bin`) to
+generate `fficonfig.h`, and a fresh `target` rebuilds it and fails; the MSYS `link.exe` also
+shadows MSVC's. The only working builder is the concurrent main-checkout build process;
+validation here was done by catching that build's output binary. Items 1–2 each need
+iterative codegen build+test, so a stable local build (a `vcvars + Git\usr\bin` dev shell, or
+caching the libffi `OUT_DIR`) is the prerequisite for finishing them.
 
 So the underflow CRASH is fixed, but the `org/bouncycastle/` ban is **NOT lifted** — full
 BC-JIT throughput needs the wrong-result miscompile fixed too. The branch fix is a genuine
