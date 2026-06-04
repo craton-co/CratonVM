@@ -2785,6 +2785,49 @@ impl GenerationalHeap {
                 }
             }
 
+            // DBG (CRATONVM_SP_TRACE): directly test the wrong-address/aliasing
+            // hypothesis for the bintrees18 bug. Two young objects copied to
+            // OVERLAPPING old-gen destinations (an old_gen.alloc collision) would
+            // corrupt one copy's field data → a child reference reads the wrong
+            // subtree → inflated check() count. Detect overlapping dst ranges and
+            // duplicate dst values among this GC's evacuations.
+            if std::env::var_os("CRATONVM_SP_TRACE").is_some() && !evacuated.is_empty() {
+                let mut ranges: Vec<(usize, usize)> = evacuated
+                    .iter()
+                    .map(|&d| {
+                        // SAFETY: d is a live old-gen object just written.
+                        let sz = gen_object_total_size(unsafe { &*(d as *const ObjectHeader) });
+                        (d as usize, sz)
+                    })
+                    .collect();
+                ranges.sort_by_key(|&(d, _)| d);
+                let mut overlaps = 0usize;
+                for w in ranges.windows(2) {
+                    let (d0, s0) = w[0];
+                    let (d1, _) = w[1];
+                    if d0 + s0 > d1 {
+                        overlaps += 1;
+                        if overlaps <= 8 {
+                            eprintln!(
+                                "[sp-trace] DST OVERLAP #{}: {:#x}+{} > {:#x}",
+                                overlaps, d0, s0, d1
+                            );
+                        }
+                    }
+                }
+                let uniq: FxHashSet<usize> = evacuated.iter().map(|&d| d as usize).collect();
+                let dups = evacuated.len() - uniq.len();
+                eprintln!(
+                    "[sp-trace] evac={} dst_overlaps={} dst_dups={} dst_min={:#x} dst_max={:#x} oldused={}M",
+                    evacuated.len(),
+                    overlaps,
+                    dups,
+                    ranges.first().map(|r| r.0).unwrap_or(0),
+                    ranges.last().map(|r| r.0).unwrap_or(0),
+                    old_gen.used() / 1_048_576,
+                );
+            }
+
             // (3) Fix up every reference to an evacuated object (follow the
             // forwarding pointers installed above), then dirty cards for the new
             // old→young edges the evacuated copies introduce.
