@@ -54,11 +54,13 @@ rejected), plus the negatives `…shouldFail_IfPresentationRequirementsNotMet` a
 errors with "Invalid jws signature" before reaching their intended assertion). This is verify-side: basic
 sign→verify round-trips fine (`DefaultCryptoSdJwsTest.testVerifySignature_Positive` passes), so the issuer
 JWT in the presentation-consumer path is being verified against a public key that doesn't match — likely the
-key reconstructed from JWK x/y coords via `KeyFactory.generatePublic(ECPublicKeySpec)` or
-`BCECDSACryptoProvider.getPublicFromPrivate` (BC `getG().multiply(getD())` EC point mult). Next step:
-isolate whether `KeyFactory("EC").generatePublic(ECPublicKeySpec(point, p256spec))` yields a key whose
-`getEncoded()`/`getW()` match HotSpot, and whether `Signature("SHA256withECDSA").verify` of a known-good
-external signature succeeds. Distinct from this fix; track separately.
+key-binding / JWK-coordinate path. RULED OUT via `ecprobe_tmp/EcVerifyProbe` (runs on CratonVM): basic
+`Signature("SHA256withECDSA").verify` is true for both the original public key AND a key reconstructed via
+`KeyFactory("EC").generatePublic(new ECPublicKeySpec(W, p256params))` — so neither basic verify nor
+`KeyFactory.generatePublic` is the culprit. Next step: instrument `SdJwtVerificationContext`/the
+presentation-consumer path — likely the issuer/holder key is built from base64url JWK `x`/`y` strings (not a
+ready `ECPoint`), or a key-binding JWT is verified, or the algorithm/hash differs. Distinct from this fix;
+track separately.
 
 ## Perf caveat (not a correctness issue)
 The first EC op pays a one-time ~108 s `Secp256R1GeneratorMontgomeryMultiplier.<clinit>` generator-table
