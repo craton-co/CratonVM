@@ -3630,7 +3630,22 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let other_val = native_map_get(ctx, &get_args)?;
         match other_val {
             Some(ref ov) => {
-                if !values_equal(ctx, value, ov) {
+                // Compare values per the `Map.equals` contract: `v.equals(ov)`.
+                // For two object values this must dispatch the value's Java
+                // `equals(Object)` — `values_equal` only knows identity,
+                // String contents and enum identity, so it wrongly reported
+                // unequal for List/bean/etc. values (e.g. two HashMaps whose
+                // values are equal `List`s compared `false`). `map_keys_equal`
+                // already honours the contract (it falls back to the Java
+                // `equals`), so reuse it for object/object pairs and keep
+                // `values_equal` for the primitive / null / mixed cases.
+                let eq = match (value, ov) {
+                    (Value::Object(Some(va)), Value::Object(Some(vb))) => {
+                        map_keys_equal(ctx, *va, *vb)?
+                    }
+                    _ => values_equal(ctx, value, ov),
+                };
+                if !eq {
                     return Ok(Some(Value::Int(0)));
                 }
             }
@@ -8158,6 +8173,16 @@ const COLLECTOR_TAG_COLLECTING_AND_THEN: i32 = 13;
 /// `AutoConfigurationImportSelector.AutoConfigurationGroup.selectImports` which
 /// collects entries into a user-supplied LinkedHashSet.
 const COLLECTOR_TAG_TO_COLLECTION: i32 = 14;
+/// `Collectors.mapping(Function, Collector)` — ARG1=mapper Function applied to
+/// each element, ARG2=downstream Collector that accumulates the mapped values.
+/// Registered synthetic so the real `Collectors.mapping` bytecode never runs:
+/// that bytecode eagerly calls `downstream.accumulator()`, and our synthetic
+/// downstream collectors (whose runtime class is the bare `java/util/stream/
+/// Collector` interface) have no concrete `accumulator()` body → the JDK throws
+/// `AbstractMethodError: Collector.accumulator() has no Code attribute`. Keeping
+/// `mapping` synthetic lets it compose with our tagged downstream collectors via
+/// the same recursive sub-stream protocol used by groupingBy(downstream).
+const COLLECTOR_TAG_MAPPING: i32 = 15;
 
 fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -8282,6 +8307,17 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "toCollection",
         "(Ljava/util/function/Supplier;)Ljava/util/stream/Collector;",
         native_collectors_to_collection,
+    );
+    // mapping(Function, Collector) — adapts a downstream collector by mapping
+    // each element first. Must be synthetic: the real bytecode calls
+    // `downstream.accumulator()`, which AbstractMethodErrors on our tagged
+    // synthetic downstream collectors. Exercised by keycloak MapperTypeSerializer
+    // (groupingBy(key, mapping(value, toUnmodifiableList()))).
+    r.register(
+        c,
+        "mapping",
+        "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
+        native_collectors_mapping,
     );
     // Our synthetic Collector objects need a `characteristics()` method that
     // returns a non-null Set — JDK stream internals (e.g.
@@ -8416,6 +8452,16 @@ fn native_collectors_grouping_by_downstream(
     let classifier = args.first().copied().unwrap_or(Value::Object(None));
     let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field(c, COLLECTOR_FIELD_ARG1, classifier);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, downstream);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+/// `Collectors.mapping(mapper, downstream)` — ARG1=mapper, ARG2=downstream.
+fn native_collectors_mapping(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_MAPPING);
+    let mapper = args.first().copied().unwrap_or(Value::Object(None));
+    let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, mapper);
     ctx.set_field(c, COLLECTOR_FIELD_ARG2, downstream);
     Ok(Some(Value::Object(Some(c))))
 }
@@ -8809,6 +8855,36 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 )?
                 .unwrap_or(Value::Object(None));
             Ok(Some(finished))
+        }
+        COLLECTOR_TAG_MAPPING => {
+            // mapping(mapper, downstream): apply `mapper` to every element, then
+            // feed the mapped values into the downstream collector via the same
+            // recursive sub-stream protocol the other downstream-aware arms use.
+            let mapper = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+            let mut mapped = Vec::with_capacity(elements.len());
+            for elem in &elements {
+                let m = ctx
+                    .invoke_virtual(
+                        mapper,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                mapped.push(m);
+            }
+            let inner_stream =
+                alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+            let arr = alloc_ref_array(ctx, mapped.len());
+            for (i, v) in mapped.iter().enumerate() {
+                ctx.set_array_element(arr, i, *v);
+            }
+            ctx.set_field(inner_stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+            native_stream_collect(ctx, &[Value::Object(Some(inner_stream)), downstream])
         }
         COLLECTOR_TAG_GROUPING_BY => {
             let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
