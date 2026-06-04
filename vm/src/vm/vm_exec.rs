@@ -3578,7 +3578,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             proxies.get(&receiver_class_id).cloned()
         };
 
-        if let Some(lcs) = call_site.filter(|lcs| method_name == &*lcs.sam_method_name) {
+        if let Some(lcs) = call_site.filter(|lcs| {
+            // Match the SAM by name AND parameter count. A functional
+            // interface may declare OTHER same-named methods (overloaded
+            // `default` methods) whose body delegates to the real SAM — e.g.
+            // JUnit5's `TestInstancesProvider` has a 2-arg
+            // `getTestInstances(MutableExtensionRegistry, ThrowableCollector)`
+            // default that calls the 3-arg abstract SAM
+            // `getTestInstances(ExtensionRegistry, ExtensionRegistrar,
+            // ThrowableCollector)`. Intercepting the 2-arg default as if it
+            // were the SAM routes it to the lambda body with one argument
+            // short, leaving the trailing param uninitialised. Only intercept
+            // when the supplied arg count matches the SAM's so the real
+            // default method runs and then re-invokes the SAM correctly.
+            method_name == &*lcs.sam_method_name
+                && crate::runtime::interpreter::split_method_descriptor(&lcs.sam_descriptor)
+                    .0
+                    .len()
+                    == args.len()
+        }) {
             // Lambda dispatch: read captured values from proxy fields, then
             // prepend them to the invocation args.
             let num_captures = lcs.capture_types.len();
