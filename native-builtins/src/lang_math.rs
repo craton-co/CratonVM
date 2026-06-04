@@ -118,6 +118,7 @@ pub(crate) fn register_math_natives(registry: &mut NativeMethodRegistry, class: 
     registry.register(class, "floorMod", "(JJ)J", native_math_floor_mod_long);
     registry.register(class, "toIntExact", "(J)I", native_math_to_int_exact);
     registry.register(class, "multiplyHigh", "(JJ)J", native_math_multiply_high);
+    registry.register(class, "unsignedMultiplyHigh", "(JJ)J", native_math_unsigned_multiply_high);
 
     // --- Advanced functions (Phase 13 Step 3) ---
     registry.register(class, "hypot", "(DD)D", native_math_hypot);
@@ -1933,6 +1934,27 @@ pub(crate) fn native_math_multiply_high(_ctx: &mut dyn NativeContext, args: &[Va
     };
     let result = ((a as i128) * (b as i128)) >> 64;
     Ok(Some(Value::Long(result as i64)))
+}
+
+/// `Math.unsignedMultiplyHigh(long, long)` — high 64 bits of the *unsigned*
+/// 128-bit product (added in JDK 18). HotSpot intrinsifies this to a single
+/// `mulx`; the JDK fallback bytecode is a multi-op Hacker's-Delight routine.
+/// It is the single hottest leaf in the SunEC P-256 Montgomery field multiply
+/// (`MontgomeryIntegerPolynomialP256.mult` calls it once per limb pair), so
+/// interpreting it dominates EC keygen/sign/verify time. Byte-identical to the
+/// JDK by construction: both compute `(a·b mod 2^128) >> 64` over unsigned a,b.
+#[inline]
+pub(crate) fn native_math_unsigned_multiply_high(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let a = match args.first() {
+        Some(Value::Long(v)) => *v as u64,
+        _ => 0,
+    };
+    let b = match args.get(1) {
+        Some(Value::Long(v)) => *v as u64,
+        _ => 0,
+    };
+    let result = ((a as u128) * (b as u128)) >> 64;
+    Ok(Some(Value::Long(result as u64 as i64)))
 }
 
 // ---------------------------------------------------------------------------
@@ -4003,6 +4025,45 @@ mod tests {
             Some(Value::Float(v)) => assert!(v.is_nan()),
             other => panic!("expected NaN Float, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // unsignedMultiplyHigh — high 64 bits of the *unsigned* 128-bit product.
+    // Hottest leaf in the SunEC P-256 Montgomery field multiply. Reference
+    // values cross-checked against HotSpot JDK 25 (ecprobe_tmp/UmhVerify); the
+    // cases below are exactly the ones where the unsigned high product differs
+    // from the signed `multiplyHigh`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn math_unsigned_multiply_high() {
+        let umh = |a: i64, b: i64| {
+            native_math_unsigned_multiply_high(&mut mock_ctx(), &[Value::Long(a), Value::Long(b)])
+                .unwrap()
+                .unwrap()
+        };
+        // Small product fits below the high word.
+        assert_eq!(umh(2, 3), Value::Long(0));
+        // u64::MAX * u64::MAX → high word 0xFFFF_FFFF_FFFF_FFFE.
+        assert_eq!(umh(-1, -1), Value::Long(-2));
+        // u64::MAX * 2 → high word 1 (signed multiplyHigh would give -1).
+        assert_eq!(umh(-1, 2), Value::Long(1));
+        // 2^63 * 2^63 = 2^126 → high word 2^62.
+        assert_eq!(umh(i64::MIN, i64::MIN), Value::Long(0x4000_0000_0000_0000));
+        // 2^63 * 3 → high word 1 (signed would give -2).
+        assert_eq!(umh(i64::MIN, 3), Value::Long(1));
+        // Arbitrary pair — closed form, with the HotSpot reference value.
+        let a = 0xDEAD_BEEF_CAFE_BABEu64;
+        let b = 0x0123_4567_89AB_CDEFu64;
+        let expected = ((a as u128) * (b as u128) >> 64) as u64 as i64;
+        assert_eq!(expected, 0x00fd_5bde_eeb2_a01d);
+        assert_eq!(umh(a as i64, b as i64), Value::Long(expected));
+        // It must differ from signed multiplyHigh on these high-bit operands.
+        let signed = native_math_multiply_high(&mut mock_ctx(), &[Value::Long(-1), Value::Long(2)])
+            .unwrap()
+            .unwrap();
+        assert_eq!(signed, Value::Long(-1));
+        assert_ne!(signed, umh(-1, 2));
     }
 
     // -----------------------------------------------------------------------
