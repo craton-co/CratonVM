@@ -391,22 +391,219 @@ fn native_sl_iterator(
 /// effect: `ServiceLoader.load(X).stream().count()` returned 0 even
 /// though `iterator()` produced the providers correctly.
 ///
-/// Fix: drain the iterator directly into an `Object[]` and build a
-/// synthetic `java/util/stream/Stream` (field 0 = array) — the layout
-/// every `Stream.*` native (`count`, `map`, `filter`, `toList`,
-/// `forEach`, ...) already understands. No JDK Spliterator middleman.
+/// Fix (session 95): the synthetic stream backing is an `Object[]` in
+/// field 0 — the layout every `Stream.*` native (`count`, `map`,
+/// `filter`, `toList`, `forEach`, ...) already understands. No JDK
+/// Spliterator middleman.
+///
+/// Element-type fix (this change): `ServiceLoader.stream()` must yield
+/// `Stream<Provider<S>>` — i.e. each element is a
+/// `java.util.ServiceLoader$Provider` *wrapper*, NOT an instantiated
+/// service object. The prior body drained `iterator()` (which correctly
+/// yields service *instances* `S`) straight into the stream, so callers
+/// doing the canonical `.map(Provider::type)` / `.map(Provider::get)` /
+/// `.filter(p -> p.type()...)` (JUnit5's `LauncherFactory`, Elasticsearch's
+/// `CliToolProvider.load`, every SPI-stream framework) hit
+/// `AbstractMethodError: Provider.type() has no Code attribute` — the
+/// raw service instance has no `type()`/`get()` method. We now build a
+/// real `ServiceLoader$ProviderImpl(service, type, ctor)` per provider so
+/// `type()`/`get()` run real JDK bytecode and `instanceof Provider` holds.
 fn native_sl_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let sl = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        // Null receiver → empty stream (not null) so downstream
+        // `.count()` / `.filter()` natives have a valid receiver.
+        _ => return alloc_synthetic_stream(ctx, &[]),
+    };
+    let diag = matches!(
+        std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    );
+
+    // Pin the ServiceLoader receiver — every `invoke` below can trigger a
+    // moving GC that relocates it.
+    let sl_pin = ctx.pin_native_root(sl);
+    let sl_for_discover = ctx.read_native_pin(sl_pin, sl);
+    let providers = discover_providers(ctx, sl_for_discover)?;
+    if providers.is_empty() {
+        ctx.unpin_native_roots(sl_pin);
+        return alloc_synthetic_stream(ctx, &[]);
+    }
+
+    // Resolve the JDK-internal wrapper class. If it is unavailable (e.g. a
+    // stripped runtime), fall back to draining service instances so the
+    // stream is at least non-empty rather than crashing.
+    const PROVIDER_IMPL: &str = "java/util/ServiceLoader$ProviderImpl";
+    let pi_cid = match ctx.ensure_class_initialized(PROVIDER_IMPL) {
+        Ok(cid) => cid,
+        Err(_) => {
+            ctx.unpin_native_roots(sl_pin);
+            if diag {
+                eprintln!("[SL-DBG] stream(): ProviderImpl unavailable, draining instances");
+            }
+            return drain_instances_to_stream(ctx, args);
+        }
+    };
+    let pi_fields = ctx.class_num_total_fields(pi_cid).max(4);
+
+    // Accumulate the wrappers in a pinned ArrayList so each is a GC root
+    // while the loop keeps re-entering Java (forName / getDeclaredConstructor
+    // / <init> all can collect). Mirrors `native_sl_iterator`'s discipline.
+    let al_cls = "java/util/ArrayList";
+    let al_cid = ctx
+        .ensure_class_initialized(al_cls)
+        .map_err(|_| MethodCallFailed::InternalError(VmError::Internal {
+            message: "ArrayList: not loaded".to_string(),
+        }))?;
+    let mut list = ctx.alloc_object(al_cid, ctx.class_num_total_fields(al_cid).max(4));
+    ctx.invoke(al_cls, "<init>", "()V", &[Value::Object(Some(list))])?;
+    let list_pin = ctx.pin_native_root(list);
+
+    for fqn in &providers {
+        // forName(<impl>) → the concrete provider Class (the `type`).
+        let name = ctx.create_string(fqn);
+        let type_class = match ctx.invoke(
+            "java/lang/Class",
+            "forName",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(name))],
+        ) {
+            Ok(Some(Value::Object(Some(c)))) => c,
+            other => {
+                if diag {
+                    eprintln!("[SL-DBG]   stream skip (forName {fqn} → {other:?})");
+                }
+                continue;
+            }
+        };
+        // Pin `type` — it must survive getDeclaredConstructor + setAccessible
+        // before being stored into the wrapper.
+        let type_pin = ctx.pin_native_root(type_class);
+
+        // type.getDeclaredConstructor() → the no-arg ctor used by get().
+        let empty_types = ctx.new_ref_array(
+            ctx.class_id_by_name("java/lang/Class")
+                .unwrap_or(cratonvm_types::ClassId::new(0)),
+            0,
+        );
+        let type_now = ctx.read_native_pin(type_pin, type_class);
+        let ctor = match ctx.invoke(
+            "java/lang/Class",
+            "getDeclaredConstructor",
+            "([Ljava/lang/Class;)Ljava/lang/reflect/Constructor;",
+            &[Value::Object(Some(type_now)), Value::Object(Some(empty_types))],
+        ) {
+            Ok(Some(Value::Object(Some(c)))) => c,
+            other => {
+                if diag {
+                    eprintln!("[SL-DBG]   stream skip (no no-arg ctor for {fqn} → {other:?})");
+                }
+                // Release this iteration's pins, keep sl + list.
+                ctx.unpin_native_roots(type_pin);
+                continue;
+            }
+        };
+        let ctor_pin = ctx.pin_native_root(ctor);
+        // setAccessible(true) so ProviderImpl.get()'s reflective newInstance
+        // succeeds for non-public providers.
+        let ctor_now = ctx.read_native_pin(ctor_pin, ctor);
+        let _ = ctx.invoke(
+            "java/lang/reflect/AccessibleObject",
+            "setAccessible",
+            "(Z)V",
+            &[Value::Object(Some(ctor_now)), Value::Int(1)],
+        );
+
+        // Read everything back post-GC for the wrapper construction.
+        let sl_now = ctx.read_native_pin(sl_pin, sl);
+        let service = match ctx.get_field_by_name(sl_now, "service") {
+            v @ Value::Object(Some(_)) => v,
+            _ => ctx.get_field(sl_now, 0),
+        };
+        let type_final = ctx.read_native_pin(type_pin, type_class);
+        let ctor_final = ctx.read_native_pin(ctor_pin, ctor);
+
+        // new ServiceLoader$ProviderImpl(service, type, ctor) — the
+        // classpath-flavour constructor (factoryMethod = null).
+        let provider = ctx.alloc_object(pi_cid, pi_fields);
+        let provider_pin = ctx.pin_native_root(provider);
+        if let Err(e) = ctx.invoke(
+            PROVIDER_IMPL,
+            "<init>",
+            "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/reflect/Constructor;)V",
+            &[
+                Value::Object(Some(provider)),
+                service,
+                Value::Object(Some(type_final)),
+                Value::Object(Some(ctor_final)),
+            ],
+        ) {
+            if diag {
+                eprintln!("[SL-DBG]   stream skip (ProviderImpl <init> {fqn} → {e:?})");
+            }
+            ctx.unpin_native_roots(type_pin);
+            continue;
+        }
+        let provider = ctx.read_native_pin(provider_pin, provider);
+
+        let list_now = ctx.read_native_pin(list_pin, list);
+        ctx.invoke(
+            al_cls,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(list_now)), Value::Object(Some(provider))],
+        )?;
+        // Release the per-iteration pins (type/ctor/provider); sl + list stay.
+        ctx.unpin_native_roots(type_pin);
+    }
+
+    // Materialise the wrappers as an `Object[]` (the synthetic stream
+    // backing). `toArray()` returns an exactly-sized array.
+    list = ctx.read_native_pin(list_pin, list);
+    let arr_val = ctx.invoke(
+        al_cls,
+        "toArray",
+        "()[Ljava/lang/Object;",
+        &[Value::Object(Some(list))],
+    )?;
+    let stream = match arr_val {
+        Some(Value::Object(Some(arr))) => {
+            let cid = ctx
+                .ensure_class_initialized("java/util/stream/Stream")
+                .unwrap_or(cratonvm_types::ClassId::new(0));
+            let nfields = ctx.class_num_total_fields(cid).max(1);
+            let s = ctx.alloc_object(cid, nfields);
+            ctx.set_field(s, 0, Value::Object(Some(arr)));
+            Some(Value::Object(Some(s)))
+        }
+        _ => Some(alloc_synthetic_stream(ctx, &[])?.unwrap()),
+    };
+    if diag {
+        eprintln!(
+            "[SL-DBG] stream() built Provider wrappers for {} providers",
+            providers.len()
+        );
+    }
+    ctx.unpin_native_roots(sl_pin);
+    Ok(stream)
+}
+
+/// Fallback used only when `ServiceLoader$ProviderImpl` cannot be
+/// resolved: drain `iterator()` (service instances) straight into the
+/// synthetic stream. This loses the `Provider` wrapper semantics but
+/// keeps a non-empty stream rather than crashing.
+fn drain_instances_to_stream(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let it = native_sl_iterator(ctx, args)?;
     let iter_obj = match it {
         Some(Value::Object(Some(o))) => o,
-        // Null iterator → empty stream (not null) so downstream
-        // `.count()` / `.filter()` natives have a valid receiver.
         _ => return alloc_synthetic_stream(ctx, &[]),
     };
-    // Drain the iterator into a Vec<Value>.
     let mut collected: Vec<Value> = Vec::new();
     const SAFETY_CAP: usize = 1_000_000;
     loop {
@@ -422,15 +619,6 @@ fn native_sl_stream(
         if collected.len() >= SAFETY_CAP {
             break;
         }
-    }
-    if matches!(
-        std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    ) {
-        eprintln!(
-            "[SL-DBG] stream() drained {} providers into synthetic stream",
-            collected.len()
-        );
     }
     alloc_synthetic_stream(ctx, &collected)
 }
