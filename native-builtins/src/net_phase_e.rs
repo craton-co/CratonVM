@@ -810,6 +810,34 @@ fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String {
     }
 }
 
+/// Percent-decode a URI component the way `java.net.URI` getters do: each
+/// `%XX` triplet is one byte, the byte sequence is interpreted as UTF-8, and
+/// every other character (INCLUDING `+`, which URI leaves literal — unlike
+/// `application/x-www-form-urlencoded`) is copied verbatim. A malformed `%`
+/// escape (missing/non-hex digits) is copied through unchanged.
+fn uri_percent_decode(input: &str) -> String {
+    if !input.contains('%') {
+        return input.to_string();
+    }
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// RFC 3986 §5.3 path-merge: combine a base hierarchical path with a
 /// relative reference path.
 fn uri_merge_paths(base_path: &str, ref_path: &str, base_has_authority: bool) -> String {
@@ -1054,14 +1082,21 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
     });
 
-    // getPath() → path field (by name) if set, else parse from raw
+    // getPath() → path field (by name) if set, else parse from raw. Unlike
+    // getRawPath(), `getPath` returns the DECODED path: java.net.URI stores the
+    // raw (percent-encoded) path in the `path` field (and make_uri likewise
+    // stores the raw split component), so we must percent-decode before
+    // returning. Without this, a URI like `otpauth://totp/Test%20Realm:tester`
+    // yielded `/Test%20Realm:tester` from getPath() where the JDK returns the
+    // decoded `/Test Realm:tester` (keycloak OtpPolicyTest label assertions).
     r.register(uri, "getPath", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // Real-JDK URI `path` field, read by name (slot-order safe).
         if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "path") {
             if let Some(v) = ctx.read_string(s) {
                 if !v.is_empty() {
-                    return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+                    let decoded = uri_percent_decode(&v);
+                    return Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))));
                 }
             }
         }
@@ -1084,7 +1119,8 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         if path.is_empty() {
             Ok(Some(Value::Object(None)))
         } else {
-            Ok(Some(Value::Object(Some(ctx.create_string(&path)))))
+            let decoded = uri_percent_decode(&path);
+            Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))))
         }
     });
 
@@ -1135,19 +1171,23 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
     // raw string between '?' and '#'. Reading raw slot 4 was wrong for a
     // real-JDK-constructed URI (the 5-arg ctor runs bytecode whose field
     // layout differs from the synthetic one), the same flaw that made
-    // `getFragment` emit a spurious "null".
+    // `getFragment` emit a spurious "null". Like getPath (and unlike the
+    // raw `query` field / getRawQuery), `getQuery()` returns the DECODED
+    // query, so percent-decode before returning.
     r.register(uri, "getQuery", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "query") {
             if let Some(v) = ctx.read_string(s) {
-                return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+                let decoded = uri_percent_decode(&v);
+                return Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))));
             }
         }
         let raw = uri_raw_string(ctx, this);
         if let Some(q) = raw.find('?') {
             let after = &raw[q + 1..];
             let end = after.find('#').unwrap_or(after.len());
-            return Ok(Some(Value::Object(Some(ctx.create_string(&after[..end])))));
+            let decoded = uri_percent_decode(&after[..end]);
+            return Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))));
         }
         Ok(Some(Value::Object(None)))
     });
