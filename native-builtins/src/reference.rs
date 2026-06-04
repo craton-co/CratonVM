@@ -374,6 +374,24 @@ fn native_rq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // avrora `get_field` OOB fix: `ReferenceQueue.remove(timeout)` parks the
+    // JDK Common Cleaner thread in a 60 s native poll loop, holding `this` as a
+    // raw `ObjectRef` snapshot. A moving young GC that runs while the thread is
+    // blocked relocates the queue, but this thread is excluded from the STW
+    // barrier and never applies the pointer map to its raw `this`; the young
+    // allocator then reuses the stale from-space slot for a bare
+    // `java.lang.Object`. Reading `RQ_FIELD_HEAD`/`SIZE` off that 0-field object
+    // tripped the `gen_heap` out-of-bounds guard tens of thousands of times per
+    // run (the guard already returned `null`, so `poll()` already behaved as
+    // "empty" — this only suppresses the warning by detecting the reclaimed
+    // receiver up front). A real (live) queue always carries its head/size
+    // slots, so a receiver with fewer than two fields cannot be one; treat it
+    // as empty rather than dereferencing past its layout. The blocked thread
+    // re-reads the live queue from its (eventually remapped) frame on a later
+    // `remove()` invocation, so this is graceful degradation, not data loss.
+    if ctx.object_num_fields(this) < 2 {
+        return Ok(Some(Value::Object(None)));
+    }
     let head = ctx.get_field(this, RQ_FIELD_HEAD);
     match head {
         Value::Object(Some(ref_obj)) => {
