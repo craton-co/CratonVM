@@ -1,9 +1,13 @@
 # RESOLVED: Keycloak SD-JWT EC key — real SunEC via route 1, DER encoder subclass bug fixed
 
-**Status:** PRIMARY BUG FIXED on branch `ec-key-fix` (worktree `C:\craton\CratonVM-ec`).
-`DefaultCryptoSdJwsTest` **0/14 → 14/14** (the original CCE + DER-signing failure). The wider 8-class
-SD-JWT sweep is **~89/95**: a *separate* verify-side issue remains — see "Remaining: EC verify in the
-presentation/multi-key path".
+**Status:** EC-KEY BUG **RESOLVED and merged to `dev`** (merge `4f6d138`; `receiver_is_baos` is on dev).
+`DefaultCryptoSdJwsTest` **0/14 → 14/14** (the original CCE + DER-signing failure).
+Follow-ups discovered while sweeping the wider cluster:
+- **SHA-224 MessageDigest** was missing → committed on `ec-key-fix` (`b331624`), **NOT yet on dev** (touches
+  `native-builtins/src/lib.rs`, which a parallel agent has uncommitted in the shared tree — merge when quiet).
+- The 8-class sweep's other "failures" were either **JVM-state leakage** (the presentation-consumer test
+  passes 2/2 in isolation — NOT a real bug) or **HashMap-iteration-order** mismatches vs HotSpot. Tracked
+  separately in **`continue_prompt_sdjwt_verify_ordering.md`**.
 
 ## Root cause & fix (three changes)
 Route 1 was chosen: run real JDK-25 SunEC bytecode (it's pure Java — no native methods) instead of the
@@ -46,21 +50,17 @@ Run with `CRATONVM_REAL_JCA=1 CRATONVM_DISABLE_JIT=1`.
   `DerValue.toByteArray=24`, `ECUtil.encodeSignature=70` (match HotSpot). `DerProbe2`: `size=1` after one write.
 - `DefaultCryptoSdJwsTest` → **OK (14)**.
 
-## Remaining: EC verify in the presentation/multi-key path (separate bug, NOT the EC-key/DER fix)
-The 8-class sweep has **6 failures** (3 distinct methods), all `VerificationException: Invalid jws signature`:
-`SdJwtPresentationConsumerTest.shouldVerifySdJwtPresentation` (positive — should succeed but verify is
-rejected), plus the negatives `…shouldFail_IfPresentationRequirementsNotMet` and
-`SdJwtVerificationTest.sdJwtVerificationShouldFail_WithWrongVerifier` (which now fail because verification
-errors with "Invalid jws signature" before reaching their intended assertion). This is verify-side: basic
-sign→verify round-trips fine (`DefaultCryptoSdJwsTest.testVerifySignature_Positive` passes), so the issuer
-JWT in the presentation-consumer path is being verified against a public key that doesn't match — likely the
-key-binding / JWK-coordinate path. RULED OUT via `ecprobe_tmp/EcVerifyProbe` (runs on CratonVM): basic
-`Signature("SHA256withECDSA").verify` is true for both the original public key AND a key reconstructed via
-`KeyFactory("EC").generatePublic(new ECPublicKeySpec(W, p256params))` — so neither basic verify nor
-`KeyFactory.generatePublic` is the culprit. Next step: instrument `SdJwtVerificationContext`/the
-presentation-consumer path — likely the issuer/holder key is built from base64url JWK `x`/`y` strings (not a
-ready `ECPoint`), or a key-binding JWT is verified, or the algorithm/hash differs. Distinct from this fix;
-track separately.
+## Wider-sweep triage (the "6 sweep failures" were NOT all real — corrected)
+Running the 8 classes together gave 6 errors, but per-class isolation showed the EC verify path is fine:
+- **`DefaultCryptoSdJwtPresentationConsumerTest` passes 2/2 alone.** The sweep failure was JVM-state leakage
+  across ~95 EC ops in one process — NOT a verify bug. (The "verification failed against one potential
+  verifying key" DEBUG is expected: the consumer tries the holder key first, then the issuer key.)
+- Ruled out, all true on CratonVM (`ecprobe_tmp/EcVerifyProbe`, `ConcatDerProbe`, `VerifyVector`): basic
+  `Signature("SHA256withECDSA").verify`, `KeyFactory.generatePublic(ECPublicKeySpec)`, verifying an
+  external HotSpot signature, and the full keycloak `concat→DER→verify` path.
+- The genuinely-failing class in isolation is **`DefaultCryptoSdJwtVerificationTest` (was 13/16)**:
+  `OnInsecureHashAlg` (SHA-224 — FIXED above), and 2 that are **HashMap-iteration-order** mismatches vs
+  HotSpot (NOT crypto). All tracked in **`continue_prompt_sdjwt_verify_ordering.md`**.
 
 ## Perf caveat (not a correctness issue)
 The first EC op pays a one-time ~108 s `Secp256R1GeneratorMontgomeryMultiplier.<clinit>` generator-table
