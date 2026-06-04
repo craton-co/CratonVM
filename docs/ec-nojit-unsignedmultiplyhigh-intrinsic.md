@@ -42,14 +42,31 @@ against HotSpot JDK-25 reference values.
 - Timing A/B (same box, interleaved to cancel parallel-agent load): intrinsic wins every round
   (unloaded ~60 s → ~47 s; under heavy contention 123 s→96 s and 231 s→109 s).
 
-## What's left (out of scope here)
-A JIT-allow-crypto experiment (gate `sun/security/util/math/intpoly/` + `sun/security/ec/` past the
-`CRATONVM_DISABLE_JIT` kill-switch) was tried and **reverted** — it gave *no* measurable speedup,
-even with `CRATONVM_JIT_ALLOW_PACKAGES` also lifting the per-package skip list. The giant unrolled
-`mult` compiles, but every `unsignedMultiplyHigh` leaf still dispatches **out-of-line** through
-`jit_invoke_dispatch`, so JIT buys nothing without a **JIT inline-intrinsic** that emits `mulx`
-inline (none exists today for `multiplyHigh` either). The remaining levers, both larger surface:
-1. JIT inline-intrinsics for `Math.(unsigned)multiplyHigh` (+ ensure the intpoly methods compile),
-   so the unrolled Montgomery multiply runs as native code with the multiply-high inlined.
-2. A native `MontgomeryIntegerPolynomialP256.mult`/`reduce` intrinsic (well-defined `long[]` in/out,
-   but must replicate the exact limb layout byte-for-byte) — or replacing the SunEC SPI wholesale.
+## Follow-up 1 — JIT inline-intrinsic for `Math.(unsigned)multiplyHigh` (LANDED)
+The signed/unsigned high-multiply is now also a **JIT call-site intrinsic**: an
+`invokestatic java/lang/Math.multiplyHigh(JJ)J` / `unsignedMultiplyHigh(JJ)J` in JIT-compiled
+code emits a one-operand `IMUL r64` / `MUL r64` (RDX:RAX = RAX·r, high half in RDX) inline — no
+out-of-line dispatch — mirroring HotSpot. Implemented in `jit/src/lib.rs`
+(`JitIntrinsic::Math{,Unsigned}MultiplyHigh` + matcher) and `jit/src/x64.rs` (codegen ladder, next
+to the `Math.min/max` long path). Verified byte-identical to HotSpot under JIT via a hot-loop probe
+(`ecprobe_tmp/UmhMin`: signed `S` and unsigned `U` both match). This benefits **any** JIT-on
+multiply-high user; it is a general optimization, independent of EC.
+
+## JIT is a DEAD END for the EC suites — do not re-attempt
+The whole point was to make EC fast under `--nojit` by JIT-compiling the SunEC field arithmetic.
+That path is **conclusively dead**:
+- A JIT-allow-crypto gate (let `sun/security/util/math/intpoly/`+`sun/security/ec/` compile past the
+  `CRATONVM_DISABLE_JIT` kill-switch) was implemented and **reverted** — *zero* measurable speedup,
+  even combined with the inline-intrinsic above and `CRATONVM_JIT_ALLOW_PACKAGES`.
+- The decisive test: running `EcSign2` under **full JIT** (no kill-switch at all) takes **~92 s** —
+  no faster than the interpreter+native-intrinsic (~46–65 s). So the JIT does **not** beneficially
+  compile the fully-unrolled intpoly methods (`MontgomeryIntegerPolynomialP256.mult` is ~2.4 kB of
+  bytecode); they either bail `jit_scan` or run no faster. Inlining the leaf cannot help when the
+  enclosing method never becomes fast JIT code.
+
+## What's left — the ONLY remaining lever (larger surface, unattempted)
+A native `MontgomeryIntegerPolynomialP256.mult`/`reduce`/`square` intrinsic backed by a Rust P-256
+field implementation. Well-defined `long[]` in/out, but it **must replicate the JDK's exact
+Montgomery limb layout byte-for-byte** (radix, limb count, reduction constant) — a mismatch yields
+silently-wrong crypto. Verify by cross-checking a CratonVM-produced signature against **HotSpot**
+verify (self-consistent sign→verify on CratonVM is NOT sufficient). High risk; not done here.
