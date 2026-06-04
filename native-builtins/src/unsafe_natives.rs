@@ -730,12 +730,11 @@ fn native_unsafe_copy_memory_consolidated(
     let src_null = matches!(args.get(1), Some(Value::Object(None)) | None);
     let dst_null = matches!(args.get(3), Some(Value::Object(None)) | None);
 
-    // Any heap-object side → keep lib.rs's bounds-checked array/field copy.
-    if !(src_null && dst_null) {
+    // Heap↔heap: keep lib.rs's bounds-checked array/field copy.
+    if !src_null && !dst_null {
         return crate::native_unsafe_copy_memory(ctx, args);
     }
 
-    // Fully off-heap copy: route through the arena store.
     let src_addr = match args.get(2) {
         Some(Value::Long(a)) => *a,
         Some(Value::Int(a)) => *a as i64,
@@ -761,6 +760,61 @@ fn native_unsafe_copy_memory_consolidated(
             ),
         }
         .into());
+    }
+
+    // MIXED heap↔off-heap copies. The fully-off-heap loop below only handles
+    // arena↔arena, and `native_unsafe_copy_memory` only handles heap↔heap, so
+    // without this a heap↔off-heap copy was silently DROPPED. This is the path
+    // `DirectByteBuffer.put(heapBuffer)` / `get(heapBuffer)` takes (via
+    // `ScopedMemoryAccess.copyMemory` → `Unsafe.copyMemory`), which is exactly
+    // how `IOUtil` fills/drains the temp direct buffer in the FileChannel /
+    // SocketChannel heap-buffer path. The off-heap side is routed through
+    // `copy_*_native_memory` so an `Unsafe.allocateMemory` arena handle lands
+    // in the off-heap store (and a real pointer falls through to a raw copy).
+    if !src_null && dst_null {
+        // heap src → off-heap dst
+        let src_obj = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let buf = crate::unsafe_array_read_bytes(ctx, src_obj, src_addr as usize, bytes)
+            .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException {
+                index: src_addr as i32,
+            })?;
+        if !ctx.copy_to_native_memory(dst_addr, &buf) {
+            invalidate_arena_cache();
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!(
+                    "Unsafe.copyMemory: dst address 0x{dst_addr:x} is not addressable"
+                ),
+            }
+            .into());
+        }
+        invalidate_arena_cache();
+        return Ok(None);
+    }
+    if src_null && !dst_null {
+        // off-heap src → heap dst
+        let dst_obj = match args.get(3) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let mut buf = vec![0u8; bytes];
+        if !ctx.copy_from_native_memory(src_addr, &mut buf) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!(
+                    "Unsafe.copyMemory: src address 0x{src_addr:x} is not addressable"
+                ),
+            }
+            .into());
+        }
+        if !crate::unsafe_array_write_bytes(ctx, dst_obj, dst_addr as usize, &buf) {
+            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                index: dst_addr as i32,
+            }
+            .into());
+        }
+        return Ok(None);
     }
 
     // Read the source bytes first (handles overlapping ranges within the

@@ -1006,6 +1006,75 @@ fn jnio_has_session(
     Ok(Some(Value::Int(0)))
 }
 
+/// JDK-25 `JavaNioAccess.getBufferAddress(Buffer)J` — the native `address`
+/// field of the buffer (0 for a pure heap buffer; the direct/arena handle for
+/// a direct buffer). Used by the heap→direct copy and the channel I/O path
+/// to locate the off-heap bytes. Read the field by name so it works under the
+/// real `java.nio.Buffer` layout.
+fn jnio_get_buffer_address(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let addr = match args.get(1) {
+        Some(Value::Object(Some(buf))) => match ctx.get_field_by_name(*buf, "address") {
+            Value::Long(a) => a,
+            Value::Int(a) => a as i64,
+            _ => 0,
+        },
+        _ => 0,
+    };
+    Ok(Some(Value::Long(addr)))
+}
+
+/// JDK-25 `JavaNioAccess.getBufferBase(Buffer)Ljava/lang/Object;` — the heap
+/// backing array (`hb`) of the buffer, or null for a direct buffer. Together
+/// with `getBufferAddress` this gives `ScopedMemoryAccess` the (base,offset)
+/// pair for a bulk copy.
+fn jnio_get_buffer_base(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let base = match args.get(1) {
+        Some(Value::Object(Some(buf))) => ctx.get_field_by_name(*buf, "hb"),
+        _ => Value::Object(None),
+    };
+    // Normalize any non-reference (e.g. zero-default `Int(0)`) to null.
+    Ok(Some(match base {
+        Value::Object(o) => Value::Object(o),
+        _ => Value::Object(None),
+    }))
+}
+
+/// JDK-25 `JavaNioAccess.isThreadConfined(Buffer)Z` — whether the buffer's
+/// session is confined to the current thread. CratonVM has no sessions, so
+/// the buffer is never confined.
+fn jnio_is_thread_confined(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(0)))
+}
+
+/// JDK-25 `JavaNioAccess.reserveMemory(long size, long cap)V` /
+/// `unreserveMemory(...)V` — `java.nio.Bits` direct-memory accounting. The
+/// real DirectByteBuffer accounting already runs in `direct_buffer.rs`
+/// (`try_reserve`/`release`); these SharedSecrets hooks are a no-op so the
+/// JDK's parallel `Bits` counters don't double-count or block.
+fn jnio_reserve_memory_noop(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(None)
+}
+
+/// JDK-25 `JavaNioAccess.pageSize()I` — OS page size. 4 KiB on every target.
+fn jnio_page_size(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(4096)))
+}
+
 /// RKC16N.11 — return a synthetic `jdk.internal.misc.VM$BufferPool`
 /// instance (rather than the previous null) so that the caller — typically
 /// `ManagementFactoryHelper.getBufferPoolMXBeans` and friends, which
@@ -1096,6 +1165,17 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
     registry.register(owner, "acquireSession", "(Ljava/nio/Buffer;)V", jnio_session_noop);
     registry.register(owner, "releaseSession", "(Ljava/nio/Buffer;)V", jnio_session_noop);
     registry.register(owner, "hasSession", "(Ljava/nio/Buffer;)Z", jnio_has_session);
+    registry.register(owner, "isThreadConfined", "(Ljava/nio/Buffer;)Z", jnio_is_thread_confined);
+    registry.register(owner, "getBufferAddress", "(Ljava/nio/Buffer;)J", jnio_get_buffer_address);
+    registry.register(
+        owner,
+        "getBufferBase",
+        "(Ljava/nio/Buffer;)Ljava/lang/Object;",
+        jnio_get_buffer_base,
+    );
+    registry.register(owner, "reserveMemory", "(JJ)V", jnio_reserve_memory_noop);
+    registry.register(owner, "unreserveMemory", "(JJ)V", jnio_reserve_memory_noop);
+    registry.register(owner, "pageSize", "()I", jnio_page_size);
     // RKC16N.10 follow-on / RKC16N.11: legacy JDK 8/9 SharedSecrets
     // accessor still referenced by ManagementFactory.<clinit> in some
     // JDK 25 builds. Originally returned null, which downstream NPE'd
