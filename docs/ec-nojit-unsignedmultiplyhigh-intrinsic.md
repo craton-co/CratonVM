@@ -94,11 +94,39 @@ uses `num-bigint` for auditability.
   amortized once per JVM process. A ~95-op SD-JWT suite → ~14 s + 95×0.135 s ≈ **27 s** vs tens of
   minutes.
 
-## What's left (optional — diminishing returns, broader surface)
-The residual ~14 s one-time table precompute is now dominated by the **base-class**
-`IntegerPolynomial` field ops still interpreted during point doubling/addition — `add`/`subtract`
-(via `MutableElement.setSum`/`setDifference`), `multByInt` (`setProduct(SmallValue)`), and `setValue`.
-These live in the shared base class (used by P-384/P-521/Curve25519 too, with different limb
-params), so a native intercept needs runtime field-type dispatch and per-curve verification — larger
-surface, real silent-wrong-crypto risk, and only attacks a *one-time* cost. Not done. The mult/square
-intrinsic already makes every steady-state EC op sub-second.
+## What's left — the one-time table, and why field-op natives DON'T safely cut it (investigated)
+The residual ~14 s one-time table precompute is now dominated by the **shared** field-op machinery
+still interpreted during point doubling/addition — `MutableElement.setSum`/`setDifference`/`setValue`
+and the base `IntegerPolynomial.addLimbs`/`multByInt`. A follow-up tried to native-ize these and
+found it is **not safe to do cleanly** — two hard blockers (don't re-attempt without addressing them):
+
+1. **No native fall-through.** `MethodCallResult = Result<Option<Value>, MethodCallFailed>` has no
+   "not-handled, run the bytecode" variant, and a registered native unconditionally shadows the
+   method for **every** receiver. `mult`/`square`/`reduce` are *per-curve overrides* in
+   `MontgomeryIntegerPolynomialP256`, so registering against that class is P-256-only-safe (that is
+   why the landed intrinsics are safe). But the hot wrappers `setSum`/`setDifference`/`setValue` live
+   in the shared `IntegerPolynomial$MutableElement` inner class, and `addLimbs`/`multByInt` in base
+   `IntegerPolynomial` — registering a native there shadows P-384/P-521/Curve25519/X25519 too. A
+   mixed-curve workload (keycloak uses several) would then hit a P-256-only native with a foreign
+   receiver. Safe interception of the shared wrappers therefore needs a **VM fall-through mechanism**
+   first (a `MethodCallFailed::NotHandled`-style decline path in `invoke_or_native`).
+
+2. **`reduce` is NOT a clean `mod p` function.** Ground truth (`ecprobe_tmp/ReduceGT.java`): for
+   in-range realistic/negative limb inputs `reduce` returns `(X mod p)` in canonical form, but for
+   some *loose* inputs that are reachable in principle after an add (e.g. all limbs ≈ `2^53`) it
+   returns a **non-canonical** array whose value is **not** `X mod p`. `reduce` is a *bounded
+   partial-reduction* (carry-propagate + high-limb fold + one conditional subtract) that is only
+   correct within the field's `numAdds`/`maxAdds` range invariants. Replacing it with
+   "decode→`mod p`→canonical-encode" would diverge from the JDK on reachable loose inputs and is
+   therefore **not byte-identical** — exactly the silent-wrong-crypto hazard this whole effort
+   avoids. A correct native `reduce` must replicate the exact unrolled per-curve carry/fold (the
+   ~hundreds of bytecodes of `MontgomeryIntegerPolynomialP256.reduce`), verified against JDK output
+   over the full reachable input range.
+
+**Conclusion.** The table is a *one-time* per-process cost and steady-state per-op is already
+sub-second, so this is low-value/high-risk. The only sound ways forward, both larger efforts:
+(a) add a native fall-through path, then intercept the shared wrappers P-256-only; or (b) replicate
+`reduce` (and the carry helpers) bytecode-exactly with full-range differential verification; or
+(c) a coarse native `pointMultiply` backed by the `p256` crate (replaces the point engine, not the
+key/SPI objects) — biggest win, biggest surface. None attempted; recommend leaving the amortized
+one-time cost as-is unless a fall-through mechanism lands first.
