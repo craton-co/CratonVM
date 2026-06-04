@@ -1,5 +1,26 @@
 # Continue: real SunEC EC is correct but slow under `--nojit` (108s one-time + ~16s/op)
 
+> **RESOLVED — merged to `dev`** (merges `27e2b33` + `cdab8f7`). Per-op EC cost ~1–16s → **~135ms
+> (sub-second)** via a byte-identical native `MontgomeryIntegerPolynomialP256.{mult,square}` intrinsic
+> (`native-builtins/src/sunec_intpoly.rs`), plus native + JIT-inline `Math.(unsigned)multiplyHigh`.
+> Cross-VM verified (CratonVM-sign ↔ HotSpot-verify both directions) + 9 byte-identical JDK limb
+> vectors. `EcSign2` ~47–60s → ~15s; residual ~14s is the one-time generator table (amortized).
+> JIT path is a proven dead end (don't re-try). Full writeup:
+> `docs/ec-nojit-unsignedmultiplyhigh-intrinsic.md`. Original partial-fix note below (superseded).
+
+> **PARTIAL FIX (branch `fix/ec-nojit-jit-crypto`, worktree `C:\craton\CratonVM-ecjit`):**
+> Added the missing `Math/StrictMath.unsignedMultiplyHigh(JJ)J` native intrinsic
+> (`native-builtins/src/lang_math.rs`) — the single hottest leaf in the P-256 Montgomery field
+> multiply (`MontgomeryIntegerPolynomialP256.mult`). ~22 % faster (unloaded ~60 s → ~47 s for
+> EcSign2 keygen+2sign), byte-identical to HotSpot (verified 8 edge cases + sign→verify roundtrip,
+> `ecprobe_tmp/UmhVerify`). Mirrors HotSpot, which intrinsifies it too. NOT yet sub-second — the
+> bulk is the one-time generator-table `<clinit>`, dominated by interpreted intpoly arithmetic.
+> A JIT-allow-crypto experiment was tried and reverted (no measurable gain — leaf calls still
+> dispatch out-of-line). Remaining levers (both larger surface) documented in
+> `docs/ec-nojit-unsignedmultiplyhigh-intrinsic.md`: JIT inline-intrinsic for (unsigned)multiplyHigh,
+> or a native `MontgomeryIntegerPolynomialP256.mult` intrinsic / SPI replacement.
+
+
 **Severity:** medium (perf, not correctness). After the EC-key fix (`continue_prompt_keycloak_ec_key.md`,
 RESOLVED), real JDK-25 SunEC EC runs correctly under CratonVM in real-JCA mode, but it's slow enough that
 EC-heavy suites are impractical under the interpreter.
