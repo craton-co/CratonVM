@@ -114,37 +114,58 @@ pins the faulting site:
   **generic** `LongArray` `named/sect193r2 coord=6` (same curve, non-custom)
   succeeds, so it is specific to the **custom `SecT*Field`** implementation, not
   binary-field math in general.
-- **Operation:** isolated with `ECMin` op-modes — `mul` alone (1251 iters OK),
-  `add` alone (2000 OK), `twice` alone on the base point (2000 OK), and
-  `mul`-then-`add` (`muladd`, 872 OK) **all survive**; only **`mul`-then-`twice`**
-  (`multwice` = `g.multiply(k).normalize().twice().normalize()`) crashes. So the
-  fault is **point doubling (`.twice()`) applied to a scalar-multiply-result
-  point** on this curve/coord.
+- **Operation:** *without* GC stress, op-mode runs suggested `mul` alone survived
+  1251 iters while `mul`-then-`twice` crashed — but that is an **allocation-rate
+  artifact, not a real op distinction**: under `CRATONVM_DBG_GC_STRESS` even `mul`
+  alone crashes at i=0 (it just allocates less, so natural GC fired later). The
+  corruption is **general to the interpreted EC scalar-multiply path** under GC
+  pressure; the higher-allocation ops (`multwice`) merely trip it sooner.
 - **Mechanism:** hard VM exit `rc=1`. A `try { … } catch (Throwable)` around the op
   **never fires** (so not a Java exception/Error, incl. not a catchable
   `StackOverflowError`/`OutOfMemoryError`); the VEH handler prints nothing (not a
   Windows hardware fault); no Rust panic/`overflowed its stack` message.
 - **Nondeterministic despite fixed input seed:** crashes at i≈371 / i≈473 across
-  runs, and one run (`RUST_BACKTRACE=full`) survived to i≈1550. Fixed inputs +
-  layout-dependent timing + delayed silent death is the signature of **native-side
-  memory corruption** (a buggy native helper writing OOB, manifesting later via the
-  allocator/GC) rather than a deterministic logic fault.
+  runs, and one run (`RUST_BACKTRACE=full`) survived to i≈1550 — input-fixed but
+  layout/timing-dependent, the signature of **GC-driven memory corruption** (below).
 
-**Where it is NOT:** `native-builtins`/`vm` register **no** native intrinsic for
-`math/ec/custom/sec/SecT*`, `math/raw/Nat*`, or `math/raw/Interleave` (only
-`java.math.BigInteger` has array intrinsics, and those are unused by the `SecT*`
-`long[]` field ops). So the corruption is in the **interpreter itself or a generic
-native** (e.g. `System.arraycopy`, array clone) exercised by the `SecT*` lambda-
-doubling bytecode — *not* an EC-specific native. (Compare the JIT miscompile, which
-lands in the same family — `Interleave.expand64To128` under the JIT.)
+### ROOT CAUSE: GC stale-reference corruption (a write-barrier / root-remap gap)
+Running the repro under **`CRATONVM_DBG_GC_STRESS=1048576`** (force a young GC every
+1 MiB) makes it **deterministic and immediate** — `ECMin sect233r1 6 multwice`
+crashes at **i=0–13 every run**. With a flushing subscriber (`CRATONVM_DBG_EXIT=1`)
+the real signature is exposed — a flood of:
 
-**Next step for whoever takes it:** a fixed-input deterministic reduce is blocked by
-the layout-dependent manifestation, so instrument the interpreter to log the last
-method/bytecode before the silent exit (or bisect generic array natives / GC-
-barrier paths). Repro: `ECMin <curve> 6 multwice` for any `SecT*` custom curve
-(`sect163r1`/`sect193r2`/`sect233r1`) — crashes within a few hundred iterations
-most runs (`g.multiply(k).normalize().twice().normalize()`). Its own task; see the
-spawned task chip.
+```
+WARN cratonvm::gc::guard: gen_heap::set_field: out-of-bounds field write dropped
+  obj=0x1a9b06f8 index=0 num_slots=0 class_id=ClassId(0)
+  class_name=java/lang/Object real_field_count=Some(0) value=Object(None)
+```
+
+i.e. references that **should** point to a `SecT*FieldElement`/`long[]` intermediate
+now resolve to a **0-slot `java/lang/Object`** (the same recurring addresses, e.g.
+`0x1a9b06f8`/`0xc5ff06f8`). That is a **stale reference**: a young GC moved/collected
+the EC intermediate, but a root/field holding it was not remapped (or the object was
+collected because a holding root was not scanned). The interpreter's `putfield` then
+writes field 0 of what is now a bare `Object` → `gen_heap::set_field` drops the write
+(index 0 ≥ num_slots 0) → the field element silently keeps its old/garbage value →
+BC computes a wrong point and its own check throws **`IllegalStateException: Invalid
+result`** (caught by the driver at i=13). When the stale slot instead lands somewhere
+the dropped write isn't a clean miss, the same corruption is the **silent `rc=1`**.
+
+So the secondary bug is a **GC bug**, not an EC bug: the heavily-allocating SecT
+lambda-doubling holds references across many short-lived allocations, and under GC
+pressure one of those references is not kept-alive/remapped across a young
+collection. This is the **same family** as previously-fixed CratonVM corruptions —
+a process-global cache that wasn't a GC root/remap target (the classloader-GC-root-
+gap fix in `roots.rs`+`gc.rs`), and register-invisible roots under moving GC — i.e.
+a missing root or a missing write-barrier on an old→young store.
+
+**Next step for whoever takes it (deterministic now):** repro is
+`CRATONVM_DBG_GC_STRESS=1048576 CRATONVM_DBG_EXIT=1 cratonvm … ECMin sect233r1 6
+multwice` → crashes at i≤13 with the `set_field … num_slots=0` warnings. Add a
+backtrace at the `gen_heap::set_field` drop site (or at the young-GC evacuation that
+fails to scan/remap the holder) to identify which root/field is stale, then fix that
+root scan / write-barrier — mirroring the `roots.rs` + `gc.rs` cache remap fix used
+for the classloader-GC-root-gap. Its own task; see the spawned chip.
 
 **The JIT ban genuinely cannot be lifted — the miscompile is IN the leaf F2m
 arithmetic.** Running `ECBench` with `CRATONVM_JIT_ALLOW_PACKAGES=org/bouncycastle/`
