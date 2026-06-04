@@ -68,13 +68,24 @@ let effective_flags = (effective_flags as i32) & !0x0020;
 Ok(Some(Value::Int(effective_flags)))
 ```
 
-## C. picocli `arraylength`-on-`ArrayList` (non-fatal / cosmetic)
-CratonVM executes `arraylength` on a `java.util.ArrayList` in picocli's
-`ProcessBuilder`-based `getTerminalWidth()`; the `array_length` helper guard
-(`vm/src/vm/vm_exec.rs:1409`) returns 0 → terminal width 0 → empty console help/summary
-(XML reports still write fine). Find which native (`ProcessBuilder.command/start`) calls
-the array_length helper with a List receiver and fix the type/receiver, or make
-`getTerminalWidth()` fail gracefully. Low priority — gap A is the real blocker.
+## C. picocli `arraylength`-on-`ArrayList` (non-fatal / cosmetic) — NARROWED, not yet pinned
+A native calls the `array_length` helper (`vm/src/vm/vm_exec.rs:1409`) on a
+`java.util.ArrayList` during picocli's `getTerminalWidth()` (caller frame
+`...picocli.CommandLine$Model$UsageMessageSpec$1.run()V pc=94`, the `astore_1` right after
+`ProcessBuilder.start()`); the guard returns 0 → terminal width 0 → empty console output
+(XML reports still write). RULED OUT this session: it is NOT either ProcessBuilder.start
+native — `native_pb_start` (lang_system.rs) is dead (`PB-START-OLD` never prints) and was
+hardened anyway (now reads the command List by field name, only `array_length`s a genuine
+array); the active `phases_late.rs::register_phase57_process` `start` (`PB-START-ENTRY`)
+isn't even called here AND already handles Lists by name. So the `array_length` comes from
+some OTHER native on the `getTerminalWidth` path (the reflective
+`redirectError`/`Class.forName`/`Method.invoke` dance, or a real-bytecode
+`ProcessImpl`/env path).
+**Blocker to identifying it:** the guard prints a Rust backtrace to name the source native,
+but it is unsymbolizable garbage (a recursive `core::net::socket_addr::impl$6::fmt` — the
+`Backtrace::force_capture` symbolizer is itself broken). FIX THAT first (or add a
+`#[track_caller]` / explicit native-name tag at the `array_length` helper), then the
+offending native is obvious. Cosmetic; gap A is the real Commons-Math blocker.
 
 ## D. Bouncy Castle suite — separate real fails from harness artifacts
 - `crypto-prng-regression`: now **PASSES** (rc=0, ~59s).
