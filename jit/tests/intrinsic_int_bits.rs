@@ -292,3 +292,36 @@ fn int_compare_matches_reference() {
         }
     }
 }
+
+/// Distances exercised by the rotate intrinsics: 0, sub-width, exactly the
+/// width, > width (x86 masks CL & 0x1f for 32-bit), and negative (the JDK
+/// rotates by `distance mod 32`, which x86's CL masking reproduces).
+fn rotate_distances() -> Vec<i32> {
+    vec![0, 1, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, -1, -7, -32, -33, i32::MIN, i32::MAX]
+}
+
+#[test]
+fn int_rotate_left_matches_reference() {
+    let entry = resolve("rotateLeft", "(II)I").expect("rotateLeft must register");
+    let f = compile_binary(entry);
+    for &v in &edge_values() {
+        for &d in &rotate_distances() {
+            // i32::rotate_left masks the distance mod 32, exactly matching
+            // Integer.rotateLeft and x86 ROL r32,CL (CL & 0x1f).
+            let reference = v.rotate_left((d as u32) & 31);
+            assert_eq!(f(v, d), reference, "rotateLeft({v}, {d}) mismatch");
+        }
+    }
+}
+
+#[test]
+fn int_rotate_right_matches_reference() {
+    let entry = resolve("rotateRight", "(II)I").expect("rotateRight must register");
+    let f = compile_binary(entry);
+    for &v in &edge_values() {
+        for &d in &rotate_distances() {
+            let reference = v.rotate_right((d as u32) & 31);
+            assert_eq!(f(v, d), reference, "rotateRight({v}, {d}) mismatch");
+        }
+    }
+}

@@ -3029,6 +3029,15 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
 
         // Handle any pending runtime error from the previous iteration's fast path.
         if let Some((re, invoke_pc)) = pending_runtime_error.take() {
+            if std::env::var_os("CRATONVM_DBG_AIOOBE2").is_some() {
+                if let RuntimeError::ArrayIndexOutOfBoundsException { index } = &re {
+                    let f = &thread.frames[frame_idx];
+                    eprintln!(
+                        "[AIOOBE2] index={} class={} method={}{} pc={}",
+                        index, f.class_name(), f.method_name(), f.method_descriptor(), invoke_pc
+                    );
+                }
+            }
             let exc_result =
                 super::exceptions::throw_runtime_error(shared, thread, re);
             match exc_result {
