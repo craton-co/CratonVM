@@ -24911,9 +24911,13 @@ fn native_bi_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a = bi_read(ctx, this);
-    let b = bi_read(ctx, other);
-    let result = bi_alloc(ctx, &bi_add_str(&a, &b));
+    // Word-based limb arithmetic (bigint::BigInt) — O(words), no decimal
+    // round-trip. The decimal bi_add_str path this replaces paid an O(n^2)
+    // words->decimal->words conversion on every op, which dominated BC EC
+    // field arithmetic over generic Fp curves (~136ms/scalar-mult interpreted).
+    let a = bi_read_int(ctx, this);
+    let b = bi_read_int(ctx, other);
+    let result = bi_alloc_int(ctx, &a.add(&b));
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -24926,9 +24930,10 @@ fn native_bi_subtract(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a = bi_read(ctx, this);
-    let b = bi_read(ctx, other);
-    let result = bi_alloc(ctx, &bi_sub_str(&a, &b));
+    // Word-based limb arithmetic — see native_bi_add.
+    let a = bi_read_int(ctx, this);
+    let b = bi_read_int(ctx, other);
+    let result = bi_alloc_int(ctx, &a.sub(&b));
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -24941,9 +24946,12 @@ fn native_bi_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a = bi_read(ctx, this);
-    let b = bi_read(ctx, other);
-    let result = bi_alloc(ctx, &bi_mul_str(&a, &b));
+    // Word-based limb multiply (bigint::BigInt::mul, schoolbook O(words^2)) —
+    // replaces the O(digits^2) decimal bi_mul_str plus two O(n^2) decimal
+    // conversions. This is the hot field-multiply for generic Fp EC curves.
+    let a = bi_read_int(ctx, this);
+    let b = bi_read_int(ctx, other);
+    let result = bi_alloc_int(ctx, &a.mul(&b));
     Ok(Some(Value::Object(Some(result))))
 }
 
