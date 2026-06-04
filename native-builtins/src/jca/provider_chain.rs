@@ -826,6 +826,51 @@ fn put_service(provider: &str, type_str: &str, algorithm: &str, value: &str) {
         .insert((type_n, algo_n), entry);
 }
 
+/// Real-JCA bring-up: seed the `SunEC` provider's EC service entries into the
+/// global service map.  SunEC registers these via `putService(Provider$Service)`
+/// (not the legacy `put`/`parseLegacyPut` we intercept), so constructing the
+/// real `sun.security.ec.SunEC` provider would populate the *real* Hashtable our
+/// bridge never reads.  Instead we mirror SunEC's `putEntries()` table here so
+/// the no-provider `getInstance("EC")` search (`getinstance_instance_search`)
+/// resolves SunEC and `build_jca_instance` instantiates the real, pure-Java
+/// JDK 25 SPIs (`ECKeyPairGenerator`/`ECKeyFactory`/`ECParameters`/
+/// `ECDSASignature$*` — none use native methods, verified via `javap`).
+///
+/// Class names captured from `javap -c sun.security.ec.SunEC` on JDK 25.0.1.
+fn seed_sunec_services() {
+    const P: &str = "SunEC";
+    put_service(P, "KeyFactory", "EC", "sun.security.ec.ECKeyFactory");
+    put_service(P, "AlgorithmParameters", "EC", "sun.security.util.ECParameters");
+    put_service(P, "KeyPairGenerator", "EC", "sun.security.ec.ECKeyPairGenerator");
+    // ECDSA Signature family (DER output) + IEEE-P1363 (raw R||S) variants.
+    let sigs: &[(&str, &str)] = &[
+        ("NONEwithECDSA", "sun.security.ec.ECDSASignature$Raw"),
+        ("SHA1withECDSA", "sun.security.ec.ECDSASignature$SHA1"),
+        ("SHA224withECDSA", "sun.security.ec.ECDSASignature$SHA224"),
+        ("SHA256withECDSA", "sun.security.ec.ECDSASignature$SHA256"),
+        ("SHA384withECDSA", "sun.security.ec.ECDSASignature$SHA384"),
+        ("SHA512withECDSA", "sun.security.ec.ECDSASignature$SHA512"),
+        ("SHA3-224withECDSA", "sun.security.ec.ECDSASignature$SHA3_224"),
+        ("SHA3-256withECDSA", "sun.security.ec.ECDSASignature$SHA3_256"),
+        ("SHA3-384withECDSA", "sun.security.ec.ECDSASignature$SHA3_384"),
+        ("SHA3-512withECDSA", "sun.security.ec.ECDSASignature$SHA3_512"),
+        ("NONEwithECDSAinP1363Format", "sun.security.ec.ECDSASignature$RawinP1363Format"),
+        ("SHA1withECDSAinP1363Format", "sun.security.ec.ECDSASignature$SHA1inP1363Format"),
+        ("SHA224withECDSAinP1363Format", "sun.security.ec.ECDSASignature$SHA224inP1363Format"),
+        ("SHA256withECDSAinP1363Format", "sun.security.ec.ECDSASignature$SHA256inP1363Format"),
+        ("SHA384withECDSAinP1363Format", "sun.security.ec.ECDSASignature$SHA384inP1363Format"),
+        ("SHA512withECDSAinP1363Format", "sun.security.ec.ECDSASignature$SHA512inP1363Format"),
+    ];
+    for (algo, cls) in sigs {
+        put_service(P, "Signature", algo, cls);
+    }
+    // EC name aliases consumed by getInstance("EC")/key-spec resolution.
+    for ty in ["KeyFactory", "KeyPairGenerator", "AlgorithmParameters"] {
+        put_alias(P, ty, "1.2.840.10045.2.1", "EC"); // X9.62 id-ecPublicKey OID
+        put_alias(P, ty, "EllipticCurve", "EC");
+    }
+}
+
 /// Internal API: register an alias (Alg.Alias.<type>.<alias> → canonical).
 fn put_alias(provider: &str, type_str: &str, alias: &str, canonical: &str) {
     let type_n = normalize_engine(type_str);
@@ -1531,6 +1576,9 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     // Only wired in real-JCA mode — in synthetic mode the key_factory/signature
     // short-circuits handle getInstance and these would never be reached.
     if crate::real_jca_mode() {
+        // Mirror SunEC's EC service table into our map so the no-provider
+        // `getInstance("EC")` search resolves the real pure-Java SunEC SPIs.
+        seed_sunec_services();
         let gi = "sun/security/jca/GetInstance";
         r.register(
             gi,
