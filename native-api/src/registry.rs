@@ -431,6 +431,17 @@ pub trait NativeContext {
     /// Allocate a reference array for the given component class.
     fn new_ref_array(&mut self, class_id: ClassId, length: usize) -> ObjectRef;
 
+    /// Component (element) class id of an array class `class_id`, or `None` if
+    /// it is not an array class. Lets natives allocate a typed array matching a
+    /// given array `Class` — e.g. `Arrays.copyOf(T[], n, a.getClass())` /
+    /// `Collection.toArray(T[])`, where the result must be `a.getClass()` (e.g.
+    /// `String[][]`), not a bare `Object[]`. The result is the `component_class_id`
+    /// the caller feeds back into `new_ref_array`. Default `None` (callers fall
+    /// back to `Object[]`).
+    fn array_component_class_id(&self, _class_id: ClassId) -> Option<ClassId> {
+        None
+    }
+
     /// Get the length of an array object.
     fn array_length(&self, obj: ObjectRef) -> usize;
 

@@ -1406,6 +1406,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .alloc_array(class_id, ArrayElementType::Reference, length)
     }
 
+    fn array_component_class_id(&self, class_id: ClassId) -> Option<ClassId> {
+        // `array_info` is `Some` only for array classes; its `component_class_id`
+        // is the immediate element type (e.g. `String[]` for `String[][]`).
+        self.shared
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .and_then(|c| c.array_info.as_ref().map(|ai| ai.component_class_id))
+    }
+
     fn array_length(&self, obj: ObjectRef) -> usize {
         let kind = self.shared.heap.kind_of(obj);
         if kind != ObjectKind::Array {

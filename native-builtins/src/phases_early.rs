@@ -461,7 +461,22 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
                 _ => 0,
             };
             let src_len = ctx.array_length(src);
-            let dst = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_len);
+            // Honor the 3rd `Class` arg (the target array type, e.g.
+            // `String[][].class`): allocate a typed array preserving the
+            // component type so the caller's `(String[][])` / `(Value[][])`
+            // checkcast succeeds. Fall back to `Object[]` only if it can't be
+            // resolved.
+            let comp_cid = match args.get(2) {
+                Some(Value::Object(Some(mirror))) => {
+                    crate::lang_class::mirror_class_id(ctx, *mirror)
+                        .and_then(|arr_cid| ctx.array_component_class_id(arr_cid))
+                }
+                _ => None,
+            };
+            let dst = match comp_cid {
+                Some(cid) => ctx.new_ref_array(cid, new_len),
+                None => ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_len),
+            };
             let copy_len = src_len.min(new_len);
             for i in 0..copy_len {
                 ctx.set_array_element(dst, i, ctx.get_array_element(src, i));
@@ -10257,6 +10272,14 @@ pub(crate) fn register_phase53_socket_stubs(r: &mut NativeMethodRegistry) {
     use std::net::TcpListener;
     use std::io::{Read as StdRead, Write as StdWrite};
     use crate::servlet::{s2_registry, s2_alloc_stream, s2_alloc_listener, s2_blocking_accept};
+    // NIO-SERVER-SOCKET (route 1): skip this synthetic TCP surface so real
+    // java.net.Socket/ServerSocket bytecode drives sun/nio/ch/Net (native-io::net).
+    // A registered native shadows the class's real bytecode at every interpreter
+    // dispatch site (WP0.1 native-override-priority), so the registry must be
+    // empty for these classes. See `reference_server_socket_gap`.
+    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+        return;
+    }
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
 
