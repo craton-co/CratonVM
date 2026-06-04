@@ -2616,6 +2616,31 @@ const BAOS_FIELD_DATA: usize = 0; // byte[] backing array
 const BAOS_FIELD_COUNT: usize = 1; // Int bytes written
 const BAOS_DEFAULT_CAPACITY: usize = 32;
 
+/// True when `this` is a `java.io.ByteArrayOutputStream` **or a subclass of it**
+/// (walking the superclass chain by name). The BAOS write/accumulate fast path
+/// stores into the inherited `buf`/`count` fields, which — because inherited
+/// fields are laid out first — always sit at slots 0/1 for any BAOS subclass.
+///
+/// The previous guard compared the *exact* class name, which made
+/// `native_baos_write` silently no-op for real BAOS subclasses such as
+/// `sun.security.util.DerOutputStream`: every byte was dropped, so DER
+/// signature encoding (`ECUtil.encodeSignature`) returned an empty array and
+/// ECDSA signing failed under real JCA. A subclass that genuinely needs
+/// different `write` behaviour declares its own `write` (which wins dispatch and
+/// never reaches this base-class native), so the instanceof check is safe and
+/// still rejects unrelated `OutputStream` subclasses reaching the
+/// `java/io/OutputStream`-registered fallback.
+fn receiver_is_baos(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let mut cid = Some(ctx.class_id_of_object(this));
+    while let Some(c) = cid {
+        if ctx.class_name_of_id(c).as_deref() == Some("java/io/ByteArrayOutputStream") {
+            return true;
+        }
+        cid = ctx.superclass_of(c);
+    }
+    false
+}
+
 fn native_baos_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -2686,10 +2711,7 @@ fn native_baos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // dispatch over this base-class fallback, so reaching here on a
     // non-BAOS receiver indicates a subclass with no `write(I)V`
     // implementation — the safe answer is a no-op, NOT corrupting slot 0.
-    let cls_name = ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
-        .unwrap_or_default();
-    if cls_name != "java/io/ByteArrayOutputStream" {
+    if !receiver_is_baos(ctx, this) {
         return Ok(None);
     }
     let count = match ctx.get_field(this, BAOS_FIELD_COUNT) {
@@ -2737,10 +2759,7 @@ fn native_baos_write_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // impl — loop over `write(b[off+i])` via `invoke_virtual` so the
     // subclass's overridden `write(int)` runs. Matches the parallel guard
     // in `native_bais_read_bytes` (committed in 840160d).
-    let cls_name = ctx
-        .class_name_of_id(ctx.class_id_of_object(this))
-        .unwrap_or_default();
-    if cls_name != "java/io/ByteArrayOutputStream" {
+    if !receiver_is_baos(ctx, this) {
         for i in 0..len {
             let v = match ctx.get_array_element(buf, off + i) {
                 Value::Int(b) => b & 0xFF,

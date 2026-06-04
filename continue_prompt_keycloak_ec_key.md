@@ -1,44 +1,63 @@
-# Continue: Keycloak SD-JWT — EC public key is a bare interface → ClassCastException (~95 tests)
+# RESOLVED: Keycloak SD-JWT EC key — real SunEC via route 1, DER encoder subclass bug fixed
 
-**Severity:** high — a single `<clinit>` cause zeroes the entire Keycloak SD-JWT test cluster (~95 methods across 8 classes, all green on HotSpot). Self-contained session.
+**Status:** FIXED on branch `ec-key-fix` (worktree `C:\craton\CratonVM-ec`).
+`DefaultCryptoSdJwsTest` **0/14 → 14/14**. Full 8-class SD-JWT sweep shows no real failures
+(only the expected negative-test `VerificationException`s); see "Perf caveat".
 
-## Symptom / repro
-Keycloak `core` is JUnit-4; run a concrete SD-JWT test under `--nojit` (a known JIT-only `LambdaForm.<clinit>` bug blocks JUnit-4 under JIT — use `CRATONVM_DISABLE_JIT=1`). The abstract base classes (`org.keycloak.sdjwt.SdJwsTest`, etc.) can't be instantiated by JUnitCore — run the **concrete `org.keycloak.crypto.def.test.sdjwt.DefaultCrypto*Test`** subclasses, and the supplied `apps/keycloak/core/cratonvm-core-cp.txt` is **missing the crypto provider**, so build the classpath as:
-```
-DEPS=$(cat apps/keycloak/crypto/default/cratonvm-crypto-cp.txt)   # has BouncyCastle/provider
-CP="apps/keycloak/core/target/classes;apps/keycloak/core/target/test-classes;apps/keycloak/crypto/default/target/classes;apps/keycloak/crypto/default/target/test-classes;$DEPS"
-CRATONVM_DISABLE_JIT=1 MSYS_NO_PATHCONV=1 target/release/cratonvm.exe --java-home "C:/Program Files/Java/jdk-25" --stack-dump-on-timeout 0 -Xmx1g -cp "$CP" org.junit.runner.JUnitCore org.keycloak.crypto.def.test.sdjwt.DefaultCryptoSdJwsTest
-```
-HotSpot: `OK (14 tests)`. CratonVM: 0/14 — every class dies at `<clinit>`:
-```
-ClassCastException (TestSettings.generateEcdsaKeySpec, TestSettings.java:195)
-  -> RuntimeException: Error obtaining ECParameterSpec for P-256 curve
-  -> ExceptionInInitializerError on SdJwsTest.<clinit>
-```
+## Root cause & fix (three changes)
+Route 1 was chosen: run real JDK-25 SunEC bytecode (it's pure Java — no native methods) instead of the
+synthetic `KeyPairGenerator` stub that returned a bare `java/security/PublicKey` (the original CCE).
+Run with `CRATONVM_REAL_JCA=1 CRATONVM_DISABLE_JIT=1`.
 
-## Root cause (fully traced)
-`TestSettings.generateEcdsaKeySpec` casts `keyPair.getPublic()` to `java.security.interfaces.ECPublicKey` and calls `.getParams()`. Under CratonVM:
+1. **`native-builtins/src/jca/cipher.rs`** — in `real_jca_mode()`, `java/security/Security.<clinit>` now runs
+   `security_clinit_spimap`, setting the static `spiMap` to an empty `ConcurrentHashMap`. The real `<clinit>`
+   can't run (its `initialize()` fails reading the java.security file), and the plain no-op left `spiMap`
+   null, NPEing `AlgorithmParameters.getInstance("EC")` → `Security.getImpl` → `getSpiClass`.
+2. **`native-builtins/src/jca/provider_chain.rs`** — `seed_sunec_services()` (called in the `real_jca_mode()`
+   block) mirrors SunEC's `putEntries()` table (KeyPairGenerator/KeyFactory/AlgorithmParameters EC +
+   `ECDSASignature$*` family + EC OID aliases; class names from `javap -c sun.security.ec.SunEC` on JDK 25.0.1)
+   into the service map, so the existing GetInstance bridge instantiates the real pure-Java SPIs.
+3. **`native-io/src/lib.rs`** — THE actual blocker for the last 3 (signing) tests. `native_baos_write` /
+   `native_baos_write_bytes` (the always-on real-JDK `ByteArrayOutputStream` intrinsics) guarded their
+   fast path with `if cls_name != "java/io/ByteArrayOutputStream" { return Ok(None); }` — an **exact-class**
+   check that silently **no-ops for every BAOS subclass**, including `sun.security.util.DerOutputStream`.
+   So `DerOutputStream.write` dropped every byte → `ECUtil.encodeSignature` produced an empty DER →
+   `Signature("SHA256withECDSA").sign()` returned `byte[0]` → `BCECDSACryptoProvider.asn1derToConcatenatedRS`
+   NPE'd (`getObjectAt on null`). Fix: replaced the exact-class guard with `receiver_is_baos()`, which walks
+   the superclass chain by name and accepts BAOS **or any subclass**. The inherited `buf`/`count` fields are
+   always at slots 0/1 (superclass fields laid out first), so the raw-slot fast path is correct for subclasses;
+   a subclass that needs different `write` behaviour declares its own `write` (wins dispatch, never reaches
+   this base-class native), so the change stays safe for unrelated `OutputStream` subclasses hitting the
+   `java/io/OutputStream`-registered fallback.
 
-| | HotSpot | CratonVM |
-|---|---|---|
-| keyGen.getProvider() | `SunEC` | **null** (synthetic) |
-| public key class | `sun.security.ec.ECPublicKeyImpl` | **`java.security.PublicKey`** (bare interface!) |
-| `pub instanceof ECPublicKey` | true | **false** → CCE |
-
-CratonVM intercepts `KeyPairGenerator.getInstance("EC")`/`generateKeyPair()` with a synthetic native that allocates the public key as the **bare interface class** `"java/security/PublicKey"` (which implements only `AsymmetricKey`, never `ECPublicKey`):
-- `native-builtins/src/crypto.rs:855-882` — EC `generateKeyPair` (`alg_idx==7`); the defect is **`crypto.rs:866`**: `alloc_concurrent_synthetic(ctx, "java/security/PublicKey", 4)`. Same anti-pattern for RSA (`:837`) and Ed25519 (`:888`).
-- `native-builtins/src/lib.rs:17857` `alloc_concurrent_synthetic` — allocates with the literal class name, so runtime type is the interface.
-
-The whole `crypto` module is gated behind feature `legacy-synthetic-crypto` (`native-builtins/Cargo.toml:32`, registered at `crypto.rs:1936`/`lib.rs:457`), default `[]` (OFF) in source — **but the shipped binary was built WITH it** (970 synthetic stubs per `--dump-native-registry`). See memory `reference_jca_synthetic_crypto_layers`, `feedback_no_synthetic_stubs`.
-
-## Two fix routes
-1. **Clean / project-direction (preferred long-term).** Build the binary **without** `legacy-synthetic-crypto` (+ `app-stubs`) so real SunEC bytecode runs and returns a true `ECPublicKeyImpl`. SunEC is in the JDK image (`sun/security/ec/ECPublicKeyImpl.class` verified in `lib/modules`). **Caveat:** flipping the feature off changes the whole binary — must re-validate the regression pool + all apps for stub-dependence (some apps may currently lean on the stubs; that's exactly what the synthetic-stub-removal project is working through). This is a binary-wide decision, not a local fix.
-2. **Narrow (user-selected; bigger than it sounds).** Keep stubs on, but make the synthetic EC keypair return a *real* `ECPublicKey`. At `crypto.rs:866`, allocate the **concrete** `sun/security/ec/ECPublicKeyImpl` (so `instanceof ECPublicKey` is true) **and** make `getParams()` return a fully-built P-256 `java.security.spec.ECParameterSpec` and `getW()` the public `ECPoint`. Building `ECParameterSpec` from a native means constructing `EllipticCurve` (`ECFieldFp` over the P-256 prime, `a`, `b`), the generator `ECPoint(gx,gy)`, the order `n`, and cofactor `h` — i.e. several JCA value objects via natives, or a Java-side helper invoked from the native. Do the same for RSA (`RSAPublicKeyImpl` + `getModulus`/`getPublicExponent`) and Ed25519 if those clusters matter. Verify `instanceof` and `getParams()` round-trip against HotSpot.
+## How the root cause was found (notes for similar bugs)
+- The two BAOS registrars in `native-builtins` (`serialization.rs::register_byte_array_output_stream`,
+  `tests_extracted.rs::register_s4_baos`) are RED HERRINGS: the former is only registered from
+  `register_synthetic_overrides`, which is `#[cfg(feature = "synthetic-jdk")]` and **not compiled** in the
+  real-JDK / `legacy-synthetic-crypto` CLI; the latter's module isn't declared at all (dead code).
+- The ACTIVE BAOS intrinsic is in the `native-io` crate (`native-io/src/lib.rs`, `native_baos_*`), registered
+  unconditionally via `register_essential_natives`. `--dump-native-registry` confirms the 12 BAOS methods.
+- An `Unsafe` probe (`Unsafe.objectFieldOffset` + `putInt`) confirmed `buf@0, count@1` and that slot 1 is
+  writable for a `DerOutputStream` — proving the object layout is fine and the bug was a no-op, not a bad slot.
 
 ## Verification
-- `DefaultCryptoSdJwsTest` → `OK (14)`, then sweep the 8 `DefaultCrypto*` SD-JWT classes (`SdJwtVerificationTest` 16, `SdJwtVPVerificationTest` 24, `JwtVcMetadataTrustedSdJwtIssuerTest` 16, `SdJwtVPTest` 14, `SdJwtKeyBindingTest` 7, `SdJwtCreationAndSigningTest` 2, `SdJwtPresentationConsumerTest` 2) — target ~95 green, matching HotSpot.
-- Regression pool stays green; for route 1, re-run the full app gauntlet to catch stub-dependence regressions.
-- NOTE separate, smaller bug: `org.keycloak.SkeletonKeyTokenTest` 4/5 fail with `cannot assign instance of java.lang.Object to field KeycloakPrincipal.context` — a Java object-**deserialization** typing gap, NOT fixed by the EC-key change.
+- Fast EC-free DER check (`ecprobe_tmp/DerProbe`, seconds): `DerOutputStream.toByteArray=22`,
+  `DerValue.toByteArray=24`, `ECUtil.encodeSignature=70` (match HotSpot). `DerProbe2`: `size=1` after one write.
+- `DefaultCryptoSdJwsTest` → **OK (14)**.
+
+## Perf caveat (not a correctness issue)
+The first EC op pays a one-time ~108 s `Secp256R1GeneratorMontgomeryMultiplier.<clinit>` generator-table
+precompute under the no-JIT interpreter; subsequent EC ops are ~1–16 s each. The full 8-class SD-JWT sweep
+(~95 tests, lots of EC verify/sign) therefore takes tens of minutes under `--nojit` and may need a long
+timeout. (JIT-on or a native EC intrinsic is a separate optimization; JUnit-4 under JIT is blocked by a
+separate `LambdaForm.<clinit>` bug.)
+
+## Build/run caveat in this environment
+A parallel agent runs `taskkill //F //IM cargo.exe|rustc.exe|cratonvm.exe` in a loop in the shared tree,
+killing builds/processes by image name. Work was done in worktree `C:\craton\CratonVM-ec`; builds/tests must
+use **renamed** binaries to dodge the kill — copies in the toolchain bin dir (`ecbuild.exe`/`ecrustc.exe`,
+`RUSTC=...ecrustc.exe`) and a renamed `eccvm.exe` for running tests.
 
 ## Key files
-`native-builtins/src/crypto.rs:740` (getInstance), `:820-904` (RSA/EC/Ed25519 generateKeyPair; defects at `:837/:866/:888`), `native-builtins/src/lib.rs:17857` (alloc_concurrent_synthetic), feature gate `native-builtins/Cargo.toml:32` + `lib.rs:457`. Test trigger `apps/keycloak/core/src/test/java/org/keycloak/sdjwt/TestSettings.java:188,195`; JCA call site `apps/keycloak/common/src/main/java/org/keycloak/common/util/KeyUtils.java:86`.
+`native-builtins/src/jca/cipher.rs`, `native-builtins/src/jca/provider_chain.rs`, `native-io/src/lib.rs`
+(`receiver_is_baos` + the two guard sites ~`native_baos_write`/`native_baos_write_bytes`).
