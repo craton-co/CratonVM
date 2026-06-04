@@ -4915,6 +4915,25 @@ impl Compiler {
         slot
     }
 
+    /// Stage 1 (precise oop maps) — push a *given* slot onto the simulated
+    /// operand stack while keeping the parallel `stack_oop_marks` vector in
+    /// lockstep. `is_oop` records whether the value is an object reference.
+    ///
+    /// This is the ONLY sanctioned way to grow `self.stack` with a
+    /// register/XMM-resident value: a bare `self.stack.push(slot)` desyncs
+    /// the two vectors (marks shorter than stack), which historically shifted
+    /// every later slot's oop bit and produced false-positive / false-negative
+    /// precise oop map entries (see `docs/jit-safepoint-revert.md` and
+    /// `docs/precise-jit-stack-maps-design.md`). The desync was previously
+    /// papered over by a lazy `false`-pad in `emit_oop_map_for_safepoint`;
+    /// with this helper the lockstep invariant `stack.len() == marks.len()`
+    /// holds continuously, which is the load-bearing prerequisite for a
+    /// *moving* GC that rewrites precisely-mapped slots.
+    fn stack_push(&mut self, slot: StackSlot, is_oop: bool) {
+        self.stack.push(slot);
+        self.stack_oop_marks.push(is_oop);
+    }
+
     /// T1.1.a — mark the top-of-stack slot as an object reference. Called
     /// by opcode handlers for every push that produces an oop
     /// (`new`, `anewarray`, `aload*`, `aaload`, `getfield` on reference
@@ -5022,16 +5041,25 @@ impl Compiler {
         if self.failed {
             return;
         }
-        // T1.1.a — lazy resync. Non-instrumented `self.stack.push`
-        // sites (aload local-to-CalleeSaved, inlined-callee pushes,
-        // LICM hoists, XMM intermediate pushes) leave
-        // `stack_oop_marks` shorter than `stack`. Pad with `false`
-        // (non-oop). This is SAFE because
-        // `conservative_roots::scan_one_frame_precise` also performs a
-        // full conservative sweep of the frame region on every GC
-        // visit — any oop our precise map misses is caught by the
-        // sweep's `heap.is_object_address` validation. Precise maps
-        // remain a pure optimization on top of the conservative path.
+        // Stage 1 (precise oop maps) — the lockstep invariant
+        // `stack.len() == stack_oop_marks.len()` now holds continuously:
+        // every push goes through `stack_push`/`push_stack` (which pair
+        // both vectors) and the dup/swap/merge-reconstruct paths rebuild
+        // marks in step. Assert it in debug builds. The release-mode pad
+        // below is retained purely as a defensive backstop: should any
+        // future un-instrumented `self.stack.push` re-introduce a desync,
+        // padding with `false` (non-oop) stays SOUND because
+        // `conservative_roots::scan_one_frame_precise` also conservatively
+        // sweeps the frame region — but a desync would silently degrade
+        // precision (and is unsafe for the *moving* path), so the assert
+        // is the real guard.
+        debug_assert_eq!(
+            self.stack.len(),
+            self.stack_oop_marks.len(),
+            "stack/oop-marks desync at safepoint (native_pc={}): every \
+             self.stack growth must go through stack_push/push_stack",
+            self.buf.pos(),
+        );
         while self.stack_oop_marks.len() < self.stack.len() {
             self.stack_oop_marks.push(false);
         }
@@ -8379,7 +8407,7 @@ impl Compiler {
         self.flush_xmm0_slots();
         // MOVQ XMM0, RAX
         self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
-        self.stack.push(StackSlot::Xmm(0));
+        self.stack_push(StackSlot::Xmm(0), false);
     }
 
     /// Return the GPR holding the slot value. For CalleeSaved/Scratch, returns
@@ -11266,17 +11294,17 @@ impl Compiler {
                     // fload (0x17) and dload (0x18) may have XMM-allocated locals
                     if matches!(op, 0x17 | 0x18) {
                         if let Some(xmm) = self.xmm_for_local(idx) {
-                            self.stack.push(StackSlot::Xmm(xmm));
+                            // FP value — never an oop.
+                            self.stack_push(StackSlot::Xmm(xmm), false);
                             pc += 2;
                             continue;
                         }
                     }
                     let is_aload = op == 0x19;
                     if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
                         // T1.1.a — only aload pushes oops; iload/lload/fload/dload
-                        // push primitives. Mark parity with the stack.
-                        self.stack_oop_marks.push(is_aload);
+                        // push primitives. Stage 1 — keep marks in lockstep.
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), is_aload);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -11292,8 +11320,9 @@ impl Compiler {
                 0x1a..=0x1d => {
                     let idx = (op - 0x1a) as usize; // Widening: always safe
                     if let Some(local_reg) = self.reg_for_local(idx) {
-                        // Zero-cost: just record register reference on simulated stack
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
+                        // Zero-cost: just record register reference on simulated
+                        // stack. iload pushes a primitive — never an oop.
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), false);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -11306,7 +11335,7 @@ impl Compiler {
                 0x1e..=0x21 => {
                     let idx = (op - 0x1e) as usize; // Widening: always safe
                     if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), false);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -11319,9 +11348,9 @@ impl Compiler {
                 0x22..=0x25 => {
                     let idx = (op - 0x22) as usize; // Widening: always safe
                     if let Some(xmm) = self.xmm_for_local(idx) {
-                        self.stack.push(StackSlot::Xmm(xmm));
+                        self.stack_push(StackSlot::Xmm(xmm), false);
                     } else if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), false);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -11336,9 +11365,9 @@ impl Compiler {
                     if let Some(xmm) = self.xmm_for_local(idx) {
                         // Zero-cost push: just reference the XMM register.
                         // No code emitted until the value is consumed.
-                        self.stack.push(StackSlot::Xmm(xmm));
+                        self.stack_push(StackSlot::Xmm(xmm), false);
                     } else if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), false);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -11351,14 +11380,12 @@ impl Compiler {
                 0x2a..=0x2d => {
                     let idx = (op - 0x2a) as usize; // Widening: always safe
                     if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
-                        // T1.1.a — keep oop-mark vector in lock-step
-                        // and tag the entry. CalleeSaved slots don't
-                        // have a frame offset, so the oop-map walker
-                        // skips them (they're preserved by the ABI
-                        // across calls and cached by the JIT's frame
-                        // save/restore prologue).
-                        self.stack_oop_marks.push(true);
+                        // aload* always pushes an object ref. Stage 1 — keep
+                        // marks in lockstep and tag the entry. CalleeSaved slots
+                        // don't have a frame offset, so the oop-map walker skips
+                        // them (preserved by the ABI across calls and cached by
+                        // the JIT's frame save/restore prologue).
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), true);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -12087,7 +12114,7 @@ impl Compiler {
                         }
                         // ADDSD XMM0, XMM0 — doubles the value
                         self.buf.emit(&[0xF2, 0x0F, 0x58, 0xC0]);
-                        self.stack.push(StackSlot::Xmm(0));
+                        self.stack_push(StackSlot::Xmm(0), false);
                     } else {
                         self.emit_double_binop(0x59); // MULSD
                     }
@@ -12370,7 +12397,7 @@ impl Compiler {
                     self.pop_to_rax();
                     // CVTSI2SS XMM0, EAX: F3 0F 2A C0
                     self.buf.emit(&[0xF3, 0x0F, 0x2A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -12380,7 +12407,7 @@ impl Compiler {
                     self.pop_to_rax();
                     // CVTSI2SD XMM0, EAX: F2 0F 2A C0
                     self.buf.emit(&[0xF2, 0x0F, 0x2A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -12400,7 +12427,7 @@ impl Compiler {
                     self.pop_to_rax();
                     // CVTSI2SS XMM0, RAX: F3 48 0F 2A C0
                     self.buf.emit(&[0xF3, 0x48, 0x0F, 0x2A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -12410,7 +12437,7 @@ impl Compiler {
                     self.pop_to_rax();
                     // CVTSI2SD XMM0, RAX: F2 48 0F 2A C0
                     self.buf.emit(&[0xF2, 0x48, 0x0F, 0x2A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -12449,7 +12476,7 @@ impl Compiler {
                     self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC0]);
                     // CVTSS2SD XMM0, XMM0: F3 0F 5A C0
                     self.buf.emit(&[0xF3, 0x0F, 0x5A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -12488,7 +12515,7 @@ impl Compiler {
                     self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
                     // CVTSD2SS XMM0, XMM0: F2 0F 5A C0
                     self.buf.emit(&[0xF2, 0x0F, 0x5A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -13676,7 +13703,7 @@ impl Compiler {
                                 }
                             }
                             self.emit_sqrtsd_xmm0();
-                            self.stack.push(StackSlot::Xmm(0));
+                            self.stack_push(StackSlot::Xmm(0), false);
                         } else if callee_entry == super::MATH_FLOOR_INTRINSIC
                             || callee_entry == super::MATH_CEIL_INTRINSIC
                             || callee_entry == super::MATH_RINT_INTRINSIC
@@ -13710,7 +13737,7 @@ impl Compiler {
                                 0x08u8 // round to nearest even, inexact suppress
                             };
                             self.buf.emit(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, imm8]);
-                            self.stack.push(StackSlot::Xmm(0));
+                            self.stack_push(StackSlot::Xmm(0), false);
                         } else if callee_entry == super::MATH_ABS_DOUBLE_INTRINSIC {
                             // Math.abs(double): clear sign bit (bit 63)
                             let arg_slot = self.pop_stack();
@@ -13740,7 +13767,7 @@ impl Compiler {
                             self.emit_movq_xmm_from_gpr(1, RCX);
                             // ANDPD XMM0, XMM1: 66 0F 54 C1
                             self.buf.emit(&[0x66, 0x0F, 0x54, 0xC1]);
-                            self.stack.push(StackSlot::Xmm(0));
+                            self.stack_push(StackSlot::Xmm(0), false);
                         } else if callee_entry == super::MATH_ABS_FLOAT_INTRINSIC {
                             // Math.abs(float): clear sign bit (bit 31)
                             let arg_slot = self.pop_stack();
@@ -13770,7 +13797,7 @@ impl Compiler {
                             self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC9]);
                             // ANDPS XMM0, XMM1: 0F 54 C1
                             self.buf.emit(&[0x0F, 0x54, 0xC1]);
-                            self.stack.push(StackSlot::Xmm(0));
+                            self.stack_push(StackSlot::Xmm(0), false);
                         } else if callee_entry == super::MATH_ABS_INT_INTRINSIC {
                             // Math.abs(int): branchless absolute value
                             let arg_slot = self.pop_stack();

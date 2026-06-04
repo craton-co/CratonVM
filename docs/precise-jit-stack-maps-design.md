@@ -1,0 +1,149 @@
+# Precise JIT stack maps — design & staged implementation plan
+
+Status: **design + Stage 1 in progress** on branch `feat/precise-jit-stack-maps`.
+
+## Why
+
+`docs/bintrees18-selective-promotion-investigation.md` proved that
+`bintrees18`'s remaining wrong checksum (selective promotion: `68332206` vs
+golden `67674804`) is **register-invisibility**: under CratonVM's *conservative*
+JIT root scan, an object whose only live reference lives in a JIT register that
+isn't reloaded after a move goes stale when a moving collector (selective
+promotion) relocates it. The verdict was "unfixable without precise JIT stack
+maps." This document is the plan to build exactly that.
+
+The user explicitly chose this path (the hard root-cause fix) over the
+alternatives (Cheney-style non-reuse; re-challenging the verdict; quarantining
+the dead path).
+
+## The current architecture (as-is)
+
+Three mechanisms exist; the moving path is missing one whole half.
+
+1. **Marking (liveness).** `vm/src/memory/roots.rs::collect_roots` →
+   `jit::conservative_roots::scan_active_jit_frames` walks each active JIT
+   frame's native-stack spill region `[scanner_sp, entry_sp)` in 8-byte strides
+   and reports every qword that `heap.is_object_address` validates as a root.
+   It **copies values** into a `Vec<ObjectRef>`. Good enough for liveness; a
+   value copy can never be used to *rewrite* the slot.
+
+2. **Relocation update (remap).** `vm/src/memory/gc.rs::update_all_roots`
+   rewrites roots **in place** via the `pointer_map: {old_addr → new_addr}`
+   produced by the moving collector. It covers interpreter frames, statics,
+   mirrors, caches, overlays, etc. — but has **no JIT-frame branch**. JIT frame
+   slots are never remapped.
+
+3. **Defer.** Because conservative roots can't be safely rewritten (a non-oop
+   qword that coincidentally equals an object address must not be clobbered),
+   the moving collector **defers compaction** whenever any thread is in JIT
+   (`gc_quiescence` / `any_thread_in_jit`). This is why the *non-moving* young
+   sweep is the only collector that runs while JIT frames are live — and why
+   `bintrees18` can't drain young.
+
+Partial precise infra already present (NEW-12, T1.1.a):
+- `cratonvm_jit::OopMapEntry { native_pc_offset, frame_slot_offsets: Vec<i16> }`
+  and `CompiledMethod::{oop_maps, push_oop_map, find_oop_map_for_pc,
+  has_precise_oop_maps}`.
+- `JitEntryGuard::enter_with_compiled` + `PreciseFrameInfo` +
+  `scan_one_frame_precise` (currently **additive/union** with a conservative
+  backstop — produces a *superset*, never used for rewriting).
+- In `jit/src/x64.rs`: `stack_oop_marks` (parallel oop-typing of the operand
+  stack), `emit_oop_map_for_safepoint` (records **operand-stack** oop Frame
+  slots only), `emit_pre_safepoint_spill` (spills **all** register-locals to
+  canonical frame slots before every GC-capable call — conservative, not typed).
+
+## The gap (what a *moving*-safe precise GC additionally needs)
+
+At every GC-capable safepoint, for the moving path to be correct:
+
+- **G1. Exact per-slot oop typing, incl. locals.** The map must list *exactly*
+  the oop slots (no false positives → we'd rewrite an int; no false negatives →
+  we'd miss an oop → stale). Today only operand-stack slots are mapped, and the
+  `stack_oop_marks` vec **desyncs** from `self.stack` (the documented
+  load-bearing bug, `docs/jit-safepoint-revert.md`).
+- **G2. Exact-PC map recovery.** At GC time we must find the *exact* map for
+  each frame's current PC. The union-of-all-maps over-approximation is unsafe
+  for *rewriting* (a slot that's an oop at PC-A but a live int at PC-B).
+- **G3. Exact frame base (RBP).** Slot offsets are RBP-relative; the GC must
+  know each active JIT frame's RBP to address its slots. Rust release builds
+  omit frame pointers, so the RBP chain can't be walked through helper frames.
+  → **explicit frame registration** in the prologue/epilogue.
+- **G4. JIT-frame slot rewrite.** `update_all_roots` must rewrite each mapped
+  oop slot via `pointer_map`.
+- **G5. Register reload after safepoint.** A callee-saved register holding an
+  oop **local** survives the call in the register; GC updates the *frame slot*
+  but not the register. The JIT must **reload** oop register-locals from their
+  (GC-updated) canonical slots after the call. This is the missing half of
+  `emit_pre_safepoint_spill` and the direct closer of register-invisibility.
+- **G6. Coverage-gated defer-lift.** Only lift the compaction defer for a frame
+  once it is *totally* precisely covered. A single un-mapped safepoint, inlined
+  callee, or OSR frame breaks relocation → pin its referents conservatively
+  instead of moving them.
+
+## bt18 grounding
+
+```java
+static Node make(int depth) {
+    Node n = new Node();                                   // n → local 1 (callee-saved reg)
+    if (depth > 0) { n.l = make(depth-1); n.r = make(depth-1); }   // recursive call = safepoint
+    return n;
+}
+```
+The live oop across the recursive `make()` safepoint is **`n` in local 1** (a
+callee-saved register). `emit_pre_safepoint_spill` writes it to its frame slot
+(so the conservative scan pins it under the non-moving path), but there is **no
+reload-after** and the **map omits the local slot**, so under selective
+promotion the moving path has no precise, updatable record of it. G5 is the
+crux for bt18.
+
+## Staged plan (each stage builds + runs; default behavior byte-identical until Stage 5)
+
+- **Stage 1 — eliminate the `stack_oop_marks`/`stack` desync (G1, operand
+  stack).** Route every `self.stack.push` through a `stack_push(slot, is_oop)`
+  helper that keeps both vecs in lockstep; oop-ness is opcode-driven
+  (`aload`/`aaload`/`aconst_null`/`new`/`anewarray`/`newarray`/`multianewarray`/
+  ldc-String/ldc-Class/`checkcast`/`getfield`-L/`getstatic`-L/invoke-returning-L
+  → oop; all else → non-oop; `dup*` propagate). `debug_assert_eq!(stack.len(),
+  marks.len())` at every safepoint. Pure metadata; no codegen change.
+- **Stage 2 — per-local oop typing + locals in the map (G1, locals).** JIT-
+  internal forward dataflow over store opcodes (`astore`→oop,
+  `istore`/`lstore`/`fstore`/`dstore`/`iinc`→non-oop; merge conservatively, the
+  verifier guarantees per-PC consistency). `emit_oop_map_for_safepoint` also
+  emits the canonical slots of oop register-locals spilled by
+  `emit_pre_safepoint_spill`. Verifier gate `CRATONVM_DBG_VERIFY_OOP_MAPS`: at
+  each GC, assert the precise map covers every conservatively-found oop in the
+  frame (proves completeness with moving still deferred — zero behavior change).
+- **Stage 3 — exact frame base + exact PC + slot rewrite (G2, G3, G4).**
+  Prologue stores `(rbp, compiled_method_id)` into a thread-local JIT frame
+  shadow-stack; epilogue pops (gated emission). Before each safepoint call,
+  store a `safepoint_id` (map index) into a fixed frame slot so the GC recovers
+  the exact map. Add `conservative_roots::remap_active_jit_frames(pointer_map)`
+  and call it from `update_all_roots`.
+- **Stage 4 — reload register-locals after safepoint (G5).** After each GC-
+  capable call, reload oop register-locals from their canonical slots. Pairs
+  with `emit_pre_safepoint_spill`; only oop-typed locals (Stage 2) reload.
+- **Stage 5 — gate + coverage-gated defer-lift + validate (G6).** Gate
+  `CRATONVM_PRECISE_JIT_MAPS` (default-OFF). When on + selective promotion,
+  evacuate objects rooted only in precisely-covered JIT frames; pin
+  conservatively-covered referents. Validate bt18 golden `67674804`, then
+  bt10/14/16, regression pool, perf. Default path stays byte-identical.
+
+## Key risks (from prior reverts — `docs/jit-safepoint-revert.md`)
+
+- **Perf.** The reverted putfield spill cost +40% on JVM-boot probes. Mitigation:
+  spill/reload only *oop* register-locals (Stage 2 typing), and only at real
+  GC-capable safepoints; keep maps off the default path.
+- **Desync false positives.** The prior "free" metadata fixes SEGV'd because
+  the marks vec was shorter than the stack. Stage 1's lockstep invariant +
+  debug assertion is the explicit precondition for everything after.
+- **Shared-checkout / `.exe`-lock build traps.** Verify binary mtime + a unique
+  string literal after every `Finished`; kill stray `cratonvm.exe` first.
+
+## Reproducer / measurement
+
+```
+target/release/cratonvm.exe --java-home "C:/Program Files/Java/jdk-25" \
+  --stack-dump-on-timeout 0 --Xmx 8g -cp bench BenchSuite bintrees18
+```
+Default → `67674804` (~33s). `CRATONVM_SELECTIVE_PROMOTE=1` → `68332206` (wrong).
+Golden checksums: bt10=135854, bt14=3222190, bt16=14985902, bt18=67674804.
