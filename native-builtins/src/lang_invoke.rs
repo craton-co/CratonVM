@@ -1270,9 +1270,26 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return Ok(Some(old));
     }
 
-    let kind = match ctx.get_field(this, VH_KIND) {
-        Value::Int(k) => k,
-        _ => return Ok(Some(Value::Int(0))),
+    // Resolve kind + field via the meta side-table FIRST (real-JDK VarHandles —
+    // e.g. one built by `MethodHandles.lookup().findVarHandle(...)` — do NOT
+    // carry our synthetic 6-field layout, so reading `VH_KIND` off the object
+    // yields garbage and `getAndAdd` silently returned 0 without updating the
+    // field). Fall back to the synthetic fields. Mirrors
+    // `varhandle_get_and_bitwise` / `varhandle_compare_and_set`.
+    let meta = vh_meta_get(ctx, this);
+    let (kind, field_idx) = match meta.as_deref() {
+        Some(m) => (m.kind, m.field_index),
+        None => {
+            let k = match ctx.get_field(this, VH_KIND) {
+                Value::Int(k) => k,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let i = match ctx.get_field(this, VH_FIELD_INDEX) {
+                Value::Int(i) => i,
+                _ => -1,
+            };
+            (k, i)
+        }
     };
 
     match kind {
@@ -1297,15 +1314,16 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 _ => return Ok(Some(Value::Int(0))),
             };
             let delta = args.get(2).cloned().unwrap_or(Value::Int(0));
-            let field_idx = match ctx.get_field(this, VH_FIELD_INDEX) {
-                Value::Int(i) => i,
-                _ => -1,
-            };
             let idx = if field_idx >= 0 {
                 field_idx as usize
             } else {
-                let class = vh_read_string(ctx, this, VH_CLASS).unwrap_or_default();
-                let field = vh_read_string(ctx, this, VH_FIELD).unwrap_or_default();
+                let (class, field) = match meta.as_deref() {
+                    Some(m) => (m.class_name.clone(), m.field_name.clone()),
+                    None => (
+                        vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
+                        vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
+                    ),
+                };
                 match ctx.resolve_field_index(&class, &field) {
                     Some(i) => {
                         ctx.set_field(this, VH_FIELD_INDEX, Value::Int(i as i32));
@@ -1321,8 +1339,13 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
         VH_KIND_STATIC => {
             let delta = args.get(1).cloned().unwrap_or(Value::Int(0));
-            let class = vh_read_string(ctx, this, VH_CLASS).unwrap_or_default();
-            let field = vh_read_string(ctx, this, VH_FIELD).unwrap_or_default();
+            let (class, field) = match meta.as_deref() {
+                Some(m) => (m.class_name.clone(), m.field_name.clone()),
+                None => (
+                    vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
+                    vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
+                ),
+            };
             if let Some(cid) = ctx.class_id_by_name(&class) {
                 let mirror = ctx.get_class_mirror(cid);
                 let old = ctx.get_field_by_name(mirror, &field);
