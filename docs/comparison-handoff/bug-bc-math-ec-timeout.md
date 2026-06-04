@@ -159,6 +159,21 @@ a process-global cache that wasn't a GC root/remap target (the classloader-GC-ro
 gap fix in `roots.rs`+`gc.rs`), and register-invisible roots under moving GC — i.e.
 a missing root or a missing write-barrier on an old→young store.
 
+**Discriminator — it is NOT a blanket interpreter/GC bug (EC-pattern-specific).**
+A generic allocation-heavy probe (`bc-math-ec-probes/GCStress.java`) that mirrors the
+SecT pattern with no EC code — objects carrying a small `long[]` field, kept across
+allocations so they promote to old gen, with old→young field stores and heavy
+short-lived `long[]` garbage — run **interpreted** (`CRATONVM_DISABLE_JIT=1`) under
+the same `CRATONVM_DBG_GC_STRESS=1048576` produces **0 corruption warnings and a sum
+byte-identical to HotSpot** (deterministic fill, so the sum is a true oracle). So the
+basic write-barrier + `long[]` fields + young-GC-under-stress all work; the
+corruption is specific to **something in the BC custom-`SecT` EC reference pattern**
+(e.g. field-element `long[]`s held only transiently on the operand stack / as
+arguments deep in the nested static `SecT*Field` call chain across an allocation),
+not a general GC fault. (Side note: the generic probe also surfaced a *separate*
+minor bug — `java.util.Random.nextLong()` on CratonVM diverges from HotSpot; an
+earlier non-deterministic version of the probe got a wrong sum purely from that.)
+
 **Next step for whoever takes it (deterministic now):** repro is
 `CRATONVM_DBG_GC_STRESS=1048576 CRATONVM_DBG_EXIT=1 cratonvm … ECMin sect233r1 6
 multwice` → crashes at i≤13 with the `set_field … num_slots=0` warnings. Add a
