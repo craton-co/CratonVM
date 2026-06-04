@@ -1457,39 +1457,34 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .and_then(|c| c.array_info.as_ref().map(|ai| ai.component_class_id))
     }
 
+    #[track_caller]
     fn array_length(&self, obj: ObjectRef) -> usize {
         let kind = self.shared.heap.kind_of(obj);
         if kind != ObjectKind::Array {
-            let class_id = self.shared.heap.class_id_of(obj);
-            let class_name = self
-                .shared
-                .class_manager
-                .read()
-                .get_class(class_id)
-                .map(|c| c.name.to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let top = self
-                .thread
-                .frames
-                .last()
-                .map(|f| format!("{}.{}{} pc={}", f.class_name(), f.method_name(), f.method_descriptor(), f.pc))
-                .unwrap_or_else(|| "<no-frame>".to_string());
-            eprintln!(
-                "[ARRAY-LEN-GUARD] non-array object class={} kind={:?} caller={} obj={:?}",
-                class_name, kind, top, obj
-            );
-            for (i, f) in self.thread.frames.iter().enumerate().rev().take(8) {
+            // Only emit the (noisy) diagnostic when explicitly requested — the
+            // `#[track_caller]` location pinpoints the offending native/opcode
+            // far more reliably than the previously-broken symbolized backtrace.
+            if std::env::var("CRATONVM_DBG_ARRLEN").is_ok() {
+                let class_id = self.shared.heap.class_id_of(obj);
+                let class_name = self
+                    .shared
+                    .class_manager
+                    .read()
+                    .get_class(class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let top = self
+                    .thread
+                    .frames
+                    .last()
+                    .map(|f| format!("{}.{}{} pc={}", f.class_name(), f.method_name(), f.method_descriptor(), f.pc))
+                    .unwrap_or_else(|| "<no-frame>".to_string());
+                let loc = std::panic::Location::caller();
                 eprintln!(
-                    "[ARRAY-LEN-GUARD]   stack[{i}] {}.{}{} pc={}",
-                    f.class_name(),
-                    f.method_name(),
-                    f.method_descriptor(),
-                    f.pc,
+                    "[ARRAY-LEN-GUARD] non-array object class={} kind={:?} caller={} rust-caller={}:{} obj={:?}",
+                    class_name, kind, top, loc.file(), loc.line(), obj
                 );
             }
-            // Print Rust backtrace to identify the source native.
-            let bt = std::backtrace::Backtrace::force_capture();
-            eprintln!("[ARRAY-LEN-GUARD] rust-bt:\n{}", bt);
             return 0;
         }
         self.shared.heap.array_length(obj)

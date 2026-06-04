@@ -1,5 +1,20 @@
 # Bug: `arraylength` executed on a java.util.ArrayList (picocli getTerminalWidth)
 
+> **RESOLVED.** Root cause was `native_process_builder_start` in
+> `native-io/src/process.rs`: it read the ProcessBuilder command field's
+> `size` from slot 1 (synthetic-ArrayList guess) and, when that wasn't a
+> positive Int (real-JDK ArrayList carries `modCount`/`elementData`/`size`),
+> fell through to `array_length(list)` — illegal on a non-array. Fixed by
+> reading `size`/`elementData` BY NAME (synthetic slot-0/1 fallback) and only
+> calling `array_length` on a confirmed array. The `[ARRAY-LEN-GUARD]`
+> diagnostic in `vm/src/vm/vm_exec.rs` is now gated behind `CRATONVM_DBG_ARRLEN`
+> (it still returns 0 as a backstop, but no longer spams stderr; the
+> `#[track_caller]` location prints when the gate is on). junit-console
+> `--help` now emits zero guard lines and the probe process spawns cleanly.
+> (The previously-suspected `native_pb_start`/phase57 `start` natives were
+> red herrings — neither is registered in the real-JDK arm; native-io's
+> `start` wins.)
+
 Cosmetic / non-fatal (the guard returns 0 and execution continues), but it pollutes
 stderr and zeroes the console terminal width → empty console help/summary (XML reports
 still write fine). Independent of the other `continue_prompt_*` bugs.
