@@ -117,11 +117,14 @@ fn native_fd_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
-    // SAFETY: addr is a native pointer allocated by `Unsafe.allocateMemory`
-    // (or by a DirectByteBuffer) and the caller asserts at least `len` bytes
-    // are valid. We bound by `n <= len`.
-    unsafe {
-        std::ptr::copy_nonoverlapping(buf.as_ptr(), addr as *mut u8, n);
+    // `addr` may be a real OS pointer OR an `Unsafe.allocateMemory` arena
+    // handle: `FileChannel.read(heapBuffer)` routes through
+    // `Util.getTemporaryDirectBuffer`, whose `DirectByteBuffer.address()` is a
+    // synthetic arena handle (not dereferenceable). Route through the context
+    // so a handle lands in the off-heap store instead of being memcpy'd raw
+    // (which SIGSEGVs, same as the socket path did). `n <= len` bounds it.
+    if !ctx.copy_to_native_memory(addr, &buf[..n]) {
+        return Err(io_error(format!("read0: invalid destination address {addr:#x}")));
     }
     Ok(Some(Value::Int(n as i32)))
 }
@@ -149,8 +152,9 @@ fn native_fd_pread0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
-    unsafe {
-        std::ptr::copy_nonoverlapping(buf.as_ptr(), addr as *mut u8, n);
+    // Route through the context — `addr` may be an arena handle (see read0).
+    if !ctx.copy_to_native_memory(addr, &buf[..n]) {
+        return Err(io_error(format!("pread0: invalid destination address {addr:#x}")));
     }
     Ok(Some(Value::Int(n as i32)))
 }
@@ -169,8 +173,13 @@ fn native_fd_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // Clamp the allocation; a short write is legal (the caller loops).
     let len = (len as usize).min(FD_MAX_TRANSFER);
     let mut buf = vec![0u8; len];
-    unsafe {
-        std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
+    // `addr` may be a real OS pointer OR an `Unsafe.allocateMemory` arena
+    // handle (`FileChannel.write(heapBuffer)` → `Util.getTemporaryDirectBuffer`
+    // → arena-backed `DirectByteBuffer.address()`). Route through the context
+    // so a handle is read from the off-heap store instead of dereferenced raw
+    // (a raw memcpy from the synthetic handle SIGSEGVs).
+    if !ctx.copy_from_native_memory(addr, &mut buf) {
+        return Err(io_error(format!("write0: invalid source address {addr:#x}")));
     }
     ctx.fd_table()
         .write_bytes(fd, &buf)
@@ -193,8 +202,9 @@ fn native_fd_pwrite0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // Clamp the allocation; a short write is legal (the caller loops).
     let len = (len as usize).min(FD_MAX_TRANSFER);
     let mut buf = vec![0u8; len];
-    unsafe {
-        std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len);
+    // Route through the context — `addr` may be an arena handle (see write0).
+    if !ctx.copy_from_native_memory(addr, &mut buf) {
+        return Err(io_error(format!("pwrite0: invalid source address {addr:#x}")));
     }
     let n = ctx
         .fd_table()

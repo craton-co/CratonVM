@@ -5226,12 +5226,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
-            // Inspect option set: look for WRITE/APPEND/CREATE/CREATE_NEW via toString
+            // Inspect option set: look for WRITE/APPEND/CREATE/CREATE_NEW/READ/
+            // TRUNCATE_EXISTING via toString.
             let set_obj = match args.get(2) {
                 Some(Value::Object(Some(o))) => Some(*o),
                 _ => None,
             };
-            let (mut writable, mut create, mut append) = (false, false, false);
+            let (mut writable, mut create, mut append, mut read_opt, mut truncate) =
+                (false, false, false, false, false);
             if let Some(set) = set_obj {
                 // Try to iterate by calling toString() on the Set first (cheap & robust)
                 if let Ok(Some(Value::Object(Some(s)))) =
@@ -5239,11 +5241,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 {
                     let s = ctx.read_string(s).unwrap_or_default();
                     writable = s.contains("WRITE") || s.contains("APPEND");
-                    create = s.contains("CREATE");
+                    create = s.contains("CREATE"); // matches CREATE and CREATE_NEW
                     append = s.contains("APPEND");
+                    read_opt = s.contains("READ");
+                    truncate = s.contains("TRUNCATE_EXISTING");
                 }
             }
-            let _ = append; // append handled by seek-to-end below
+            // JDK FileChannel.open contract: a channel with neither READ nor
+            // WRITE is read-only; WRITE without READ is write-only.
+            let readable = read_opt || !writable;
             let fd_id = if writable {
                 ctx.fd_table().open_read_write(&p, create)
             } else {
@@ -5253,11 +5259,64 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             .map_err(|e| RuntimeError::IOException {
                 message: format!("Cannot open {}: {}", p, e),
             })?;
+            if truncate && writable {
+                let _ = ctx.fd_table().rw_set_length(fd_id, 0);
+            }
             if append {
                 if let Ok(sz) = ctx.fd_table().file_size(fd_id) {
                     let _ = ctx.fd_table().rw_seek(fd_id, std::io::SeekFrom::Start(sz));
                 }
             }
+
+            // RECONCILE-WITH-REAL: build a REAL `sun.nio.ch.FileChannelImpl`
+            // over the fd (FileDescriptor.handle = fd_table id, exactly how
+            // FileInputStream/FileOutputStream back their channels) and return
+            // it. `read/write/size/position/truncate` then resolve to
+            // FileChannelImpl's CONCRETE bytecode → the working
+            // IOUtil→FileDispatcherImpl native path (which now routes the temp
+            // direct-buffer arena handle correctly). Native dispatch is keyed
+            // on the resolved method's declaring class, so a concrete-class
+            // receiver never hits the abstract-`FileChannel` synthetic shims —
+            // unlike the legacy synthetic channel below, whose shims assume a
+            // synthetic ByteBuffer layout and corrupt real heap buffers.
+            //
+            // FileChannelImpl.open(fd, path, readable, writable, sync, direct,
+            //   parent) — mirrors FileOutputStream.getChannel's call shape.
+            let real_channel = (|| -> Option<Value> {
+                let fd_obj = match ctx.new_object("java/io/FileDescriptor").ok()?? {
+                    Value::Object(Some(o)) => o,
+                    _ => return None,
+                };
+                // `handle` is the Windows fd slot fd_from_descriptor prefers;
+                // also set `fd` for the POSIX read path.
+                ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
+                ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd_id as i32));
+                let path_str = ctx.create_string(&p);
+                ctx.ensure_class_initialized("sun/nio/ch/FileChannelImpl").ok()?;
+                match ctx.invoke(
+                    "sun/nio/ch/FileChannelImpl",
+                    "open",
+                    "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;",
+                    &[
+                        Value::Object(Some(fd_obj)),
+                        Value::Object(Some(path_str)),
+                        Value::Int(readable as i32),
+                        Value::Int(writable as i32),
+                        Value::Int(0), // sync
+                        Value::Int(0), // direct
+                        Value::Object(None), // parent
+                    ],
+                ) {
+                    Ok(Some(v @ Value::Object(Some(_)))) => Some(v),
+                    _ => None,
+                }
+            })();
+            if let Some(v) = real_channel {
+                return Ok(Some(v));
+            }
+
+            // Legacy synthetic fallback (only if the real FileChannelImpl
+            // construction is unavailable — keeps prior behavior intact).
             let fc = alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", 1);
             ctx.set_field(fc, 0, Value::Int(fd_id as i32));
             Ok(Some(Value::Object(Some(fc))))

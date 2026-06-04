@@ -35,8 +35,10 @@ solr-doc	solr-9.5.0	SolrProbe	test-infra/probes/solr_probe	$APPS_ROOT/solr-9.5.0
 directbuffer-nio	jdk-only	DirectBufferProbe	test-infra/probes/directbuffer_probe	$PROBE_DIR	-	15	directbuffer-nio.expected.txt
 varhandle-bitwise	jdk-only	VarHandleBitwiseProbe	test-infra/probes/varhandle_probe	$PROBE_DIR	-	15	varhandle-bitwise.expected.txt
 unsafe-mem	jdk-only	UnsafeMemProbe	test-infra/probes/unsafemem_probe	$PROBE_DIR	-	15	unsafe-mem.expected.txt
-# filechannel-rt: PENDING continue_prompt_arena_native_memory_routing.md (R2).
-# FileChannel.write of a heap buffer routes through Util.getTemporaryDirectBuffer
-# (an Unsafe arena handle) → FileDispatcherImpl.write0; today that fails with
-# "IOException: Channel closed". Uncomment once R2 lands and record the baseline.
-# filechannel-rt	jdk-only	FileChannelProbe	test-infra/probes/filechannel_probe	$PROBE_DIR	-	15	filechannel-rt.expected.txt
+# filechannel-rt: FileChannel.open(WRITE).write(heapBuffer) then .open(READ).read —
+# routes through Util.getTemporaryDirectBuffer (an Unsafe arena handle) →
+# FileDispatcherImpl.write0/read0, plus the real FileChannelImpl path
+# (newFileChannel → real FileChannelImpl, JavaIOFileDescriptorAccess,
+# FileReadWrite fd_table I/O). Enabled once R2 + the FileChannel.open
+# reconciliation landed.
+filechannel-rt	jdk-only	FileChannelProbe	test-infra/probes/filechannel_probe	$PROBE_DIR	-	15	filechannel-rt.expected.txt

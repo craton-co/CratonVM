@@ -525,9 +525,14 @@ fn buffer_read_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<Vec<u
     match buffer_access(ctx, bb)? {
         BufferAccess::Direct { addr, length } if addr != 0 && length > 0 => {
             let mut v = vec![0u8; length as usize];
-            // SAFETY: the JDK guarantees `length` bytes are mapped.
-            unsafe {
-                std::ptr::copy_nonoverlapping(addr as *const u8, v.as_mut_ptr(), length as usize);
+            // `addr` is normally a real `allocateDirect` pointer, but a
+            // temp-direct buffer from `Util.getTemporaryDirectBuffer` is an
+            // `Unsafe.allocateMemory` arena handle (not dereferenceable).
+            // Route through the context so a handle reads from the off-heap
+            // store instead of a raw memcpy that would SIGSEGV; for a real
+            // pointer this is the same `copy_nonoverlapping`.
+            if !ctx.copy_from_native_memory(addr, &mut v) {
+                return Some(Vec::new());
             }
             Some(v)
         }
@@ -557,9 +562,11 @@ fn buffer_write_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef, data: &[u8]) -
     match access {
         BufferAccess::Direct { addr, length } if addr != 0 && length > 0 => {
             let n = (data.len() as i32).min(length).max(0);
-            // SAFETY: caller guarantees `length` bytes are addressable.
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, n as usize);
+            // Route through the context: `addr` may be a temp-direct arena
+            // handle (see buffer_read_bytes). A handle writes to the off-heap
+            // store; a real pointer falls through to a raw copy.
+            if !ctx.copy_to_native_memory(addr, &data[..n as usize]) {
+                return 0;
             }
             n
         }

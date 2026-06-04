@@ -1627,7 +1627,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // the current thread. Fixes "Cannot invoke currentCarrierThread on null"
     // on KC16 boot after ConcurrentHashMap / Lookup clinit B6-swallows.
     register_t19_h2_shared_secrets_shim(registry);
-    // WP1.4: SharedSecrets.getJavaXxxAccess() factories for all 15
+    // WP1.4: SharedSecrets.getJavaXxxAccess() factories for the
     // JDK Access interfaces plus the per-interface method natives
     // (currentCarrierThread, doIntersectionPrivilege, copyMethod,
     // parseCookie, …).  Registered after the T19.H2 shim so the
@@ -14893,6 +14893,27 @@ mod unsafe_arena {
     use std::collections::{HashMap, HashSet};
     use parking_lot::{Mutex, RwLock};
 
+    /// R1 (silent-corruption fix): reserved high tag bit OR-ed into every
+    /// arena handle. Real OS pointers on every platform CratonVM targets live
+    /// in the low address space — Windows x64 user mode is capped at 2^47-1
+    /// (128 TiB) and even Linux 5-level paging tops user space at 2^56-1 — so
+    /// bit 62 is NEVER set on a real pointer (e.g. a `ByteBuffer.allocateDirect`
+    /// address from `dbb_allocate`). Setting it on every handle makes arena
+    /// handles *provably disjoint* from real pointers, so the range-membership
+    /// scan in `locate`/`contains` can never mis-classify a real pointer that
+    /// happens to fall numerically inside a live block's `[base, base+len)` as
+    /// an arena handle and silently corrupt it.
+    ///
+    /// The tag is part of the address value end-to-end — it is NEVER stripped.
+    /// Handles flow opaquely through Java as `long` (`DirectByteBuffer.address()`,
+    /// `Unsafe.get/put/copy/free`) and come back to `locate` unchanged, so every
+    /// consumer round-trips the tagged value. We deliberately avoid bit 63 so
+    /// handles stay positive `i64`.
+    pub(super) const ARENA_TAG: i64 = 1 << 62; // 0x4000_0000_0000_0000
+    /// First handle handed out: the tag OR-ed onto the historical 2^36 base, so
+    /// the low bits (and existing reasoning/logs about them) are unchanged.
+    const ARENA_BASE: i64 = ARENA_TAG | 0x10_0000_0000;
+
     struct Arena {
         bytes: Vec<u8>,
     }
@@ -14906,7 +14927,7 @@ mod unsafe_arena {
         fn new() -> Self {
             Self {
                 inner: RwLock::new(HashMap::new()),
-                next_addr: Mutex::new(0x10_0000_0000),
+                next_addr: Mutex::new(ARENA_BASE),
             }
         }
 
@@ -15043,7 +15064,18 @@ mod unsafe_arena {
         /// True if `addr` falls inside any live arena block. Exact membership
         /// (not a range heuristic) — used by native I/O to decide whether a
         /// pointer is an Unsafe-arena handle vs a real OS address.
+        ///
+        /// R1: every handle carries [`ARENA_TAG`], which no real pointer can
+        /// have set, so an untagged `addr` (a real OS pointer) is rejected
+        /// up front without taking the lock — this is what makes the
+        /// arena/real-pointer classification *provably* unambiguous rather
+        /// than relying on the two ranges happening not to overlap. A tagged
+        /// `addr` still goes through the exact live-block membership check, so
+        /// a freed handle correctly reports `false`.
         pub(super) fn contains(&self, addr: i64) -> bool {
+            if addr & ARENA_TAG == 0 {
+                return false;
+            }
             let inner = self.inner.read();
             Self::locate(&inner, addr).is_some()
         }
@@ -15134,7 +15166,11 @@ pub(crate) fn unsafe_arena_allocate(size: usize) -> i64 {
 /// which live in the `native-io` crate) uses this — via the `NativeContext`
 /// bridge — to read/write `DirectByteBuffer` memory that `Util`'s temp-buffer
 /// path backs with arena handles instead of raw pointers. Without it,
-/// `net_write0` would `memcpy` from a 2^36-based handle and SIGSEGV.
+/// `net_write0` would `memcpy` from a tagged synthetic handle and SIGSEGV.
+///
+/// R1: handles carry [`unsafe_arena::ARENA_TAG`] (bit 62), which is never set
+/// on a real OS pointer, so this is an exact classifier — a real
+/// `allocateDirect` pointer can never be mistaken for a handle.
 pub fn unsafe_arena_contains(addr: i64) -> bool {
     unsafe_arena::store().contains(addr)
 }
