@@ -7624,11 +7624,41 @@ pub(crate) fn method_class_name_desc(
     let class_id = mirror_class_id(ctx, mirror)?;
     let name = match ctx.get_field_by_name(method_obj, "name") {
         Value::Object(Some(s)) => ctx.read_string(s)?,
-        _ => return None,
+        _ => {
+            // `java.lang.reflect.Constructor` has no `name` field (its
+            // getName() returns the declaring-class name); the method it
+            // describes is always `<init>`. Detect by the receiver's runtime
+            // class so a genuinely malformed `Method` still returns `None`.
+            // This lets the shared Method annotation natives
+            // (getDeclaredAnnotations / getParameterAnnotations / …), when
+            // registered for Constructor too, resolve the `<init>` metadata —
+            // otherwise constructor annotations fall through to real JDK
+            // bytecode that reads raw `annotations`/`parameterAnnotations`
+            // byte[] fields CratonVM never populates (Jackson "no Creators").
+            let cls = ctx.class_name_of_id(ctx.class_id_of_object(method_obj));
+            if cls.as_deref() == Some("java/lang/reflect/Constructor") {
+                "<init>".to_string()
+            } else {
+                return None;
+            }
+        }
     };
-    let desc = method_descriptor_for_invoke(ctx, method_obj);
+    let mut desc = method_descriptor_for_invoke(ctx, method_obj);
     if desc.is_empty() {
         return None;
+    }
+    // Constructors always return void. The mirror-based descriptor composer
+    // defaults a missing `returnType` to `Ljava/lang/Object;` (a Constructor
+    // reflective object has no `returnType` field), and
+    // `method_descriptor_for_invoke` then prefers that mismatched composed
+    // descriptor — so the `<init>` lookup below would key on `(…)Ljava/lang/
+    // Object;` and never match the real `(…)V` method metadata. Coerce the
+    // return to `V` so annotation/param-annotation lookups for `<init>` hit.
+    if name == "<init>" {
+        if let Some(close) = desc.find(')') {
+            desc.truncate(close + 1);
+            desc.push('V');
+        }
     }
     Some((class_id, name, desc))
 }
