@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
-use cratonvm_types::{ObjectKind, ObjectRef, Value};
+use cratonvm_types::{ClassId, ObjectKind, ObjectRef, Value};
 use cratonvm_types::error::MethodCallResult;
 
 use crate::{obj_arg, alloc_concurrent_synthetic};
@@ -845,6 +845,59 @@ pub(crate) fn alloc_static_var_handle(
     vh
 }
 
+/// Resolve a STATIC VarHandle's storage slot: `(class_id, static-block index)`.
+///
+/// The value of a static field lives in the class's static-field storage, NOT
+/// in the `Class` mirror object's instance slots. The earlier STATIC branches
+/// used `get_field_by_name(mirror, field)` / `set_field_by_name(mirror, field)`,
+/// which read/write the *mirror object* — so the lookup found no such field and
+/// silently returned the default (0) / dropped the write. Callers must instead
+/// go through `get_static_field` / `set_static_field` with the index this
+/// resolves. Returns `None` if the class isn't loaded or has no such static
+/// field.
+fn vh_static_slot(
+    ctx: &mut dyn NativeContext,
+    class: &str,
+    field: &str,
+) -> Option<(ClassId, usize)> {
+    let cid = ctx.class_id_by_name(class)?;
+    let idx = ctx.static_field_index_by_name(cid, field)?;
+    Some((cid, idx))
+}
+
+/// Witness comparison used by VarHandle `compareAndSet` / `compareAndExchange`:
+/// objects by identity (pointer), primitives by bit pattern.
+fn vh_values_match(current: &Value, expected: &Value) -> bool {
+    match (current, expected) {
+        (Value::Int(a), Value::Int(b)) => a == b,
+        (Value::Long(a), Value::Long(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a.to_bits() == b.to_bits(),
+        (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
+        (Value::Object(a), Value::Object(b)) => match (a, b) {
+            (Some(ra), Some(rb)) => ra.as_ptr() == rb.as_ptr(),
+            (None, None) => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Read class+field names for a STATIC VarHandle: prefer the meta side table,
+/// fall back to the synthetic VH_CLASS / VH_FIELD string slots.
+fn vh_static_class_field(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    meta: Option<&VarHandleMeta>,
+) -> (String, String) {
+    match meta {
+        Some(m) => (m.class_name.clone(), m.field_name.clone()),
+        None => (
+            vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
+            vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
+        ),
+    }
+}
+
 /// Read VarHandle metadata helpers.
 fn vh_read_string(ctx: &mut dyn NativeContext, vh: ObjectRef, field: usize) -> Option<String> {
     match ctx.get_field(vh, field) {
@@ -926,11 +979,10 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                     vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
                 ),
             };
-            let mirror = match ctx.class_id_by_name(&class) {
-                Some(cid) => ctx.get_class_mirror(cid),
+            let val = match vh_static_slot(ctx, &class, &field) {
+                Some((cid, sidx)) => ctx.get_static_field(cid, sidx),
                 None => return Ok(Some(Value::Object(None))),
             };
-            let val = ctx.get_field_by_name(mirror, &field);
             let td = match meta.as_deref() {
                 Some(m) => vh_type_desc_from_meta(m),
                 None => vh_type_desc(ctx, this),
@@ -1014,9 +1066,8 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
                     vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
                 ),
             };
-            if let Some(cid) = ctx.class_id_by_name(&class) {
-                let mirror = ctx.get_class_mirror(cid);
-                ctx.set_field_by_name(mirror, &field, value);
+            if let Some((cid, sidx)) = vh_static_slot(ctx, &class, &field) {
+                ctx.set_static_field(cid, sidx, value);
             }
             Ok(None)
         }
@@ -1064,9 +1115,26 @@ fn varhandle_compare_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
     };
 
+    if kind == VH_KIND_STATIC {
+        // Static CAS — args = [vh, expected, new_value]. (Array CAS was already
+        // routed above via `vh_array_call`.)
+        let expected = args.get(1).cloned().unwrap_or(Value::Int(0));
+        let new_val = args.get(2).cloned().unwrap_or(Value::Int(0));
+        let (class, field) = vh_static_class_field(ctx, this, meta.as_deref());
+        let Some((cid, sidx)) = vh_static_slot(ctx, &class, &field) else {
+            return Ok(Some(Value::Int(0)));
+        };
+        let current = ctx.get_static_field(cid, sidx);
+        if vh_values_match(&current, &expected) {
+            ctx.set_static_field(cid, sidx, new_val);
+            return Ok(Some(Value::Int(1)));
+        }
+        return Ok(Some(Value::Int(0)));
+    }
     if kind != VH_KIND_INSTANCE {
-        // Static CAS or array CAS — simplified implementation
-        return Ok(Some(Value::Int(1)));
+        // Unsupported VarHandle kind — report CAS failure rather than a
+        // false success.
+        return Ok(Some(Value::Int(0)));
     }
 
     // args[1] = receiver, args[2] = expected, args[3] = new_value
@@ -1147,9 +1215,33 @@ fn varhandle_compare_and_exchange(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
         return Ok(Some(current));
     }
-    let kind = match ctx.get_field(this, VH_KIND) { Value::Int(k) => k, _ => return Ok(Some(Value::Object(None))) };
-    let field_idx = match ctx.get_field(this, VH_FIELD_INDEX) { Value::Int(i) => i, _ => -1 };
+    // Meta side-table FIRST — real-JDK VarHandles don't carry our synthetic
+    // 6-field layout (see `varhandle_get_and_bitwise`).
+    let meta = vh_meta_get(ctx, this);
+    let (kind, field_idx) = match meta.as_deref() {
+        Some(m) => (m.kind, m.field_index),
+        None => {
+            let k = match ctx.get_field(this, VH_KIND) { Value::Int(k) => k, _ => return Ok(Some(Value::Object(None))) };
+            let i = match ctx.get_field(this, VH_FIELD_INDEX) { Value::Int(i) => i, _ => -1 };
+            (k, i)
+        }
+    };
 
+    if kind == VH_KIND_STATIC {
+        // Static compareAndExchange — args = [vh, expected, new_value]; returns
+        // the witness (value found), updated iff it equalled `expected`.
+        let expected = args.get(1).cloned().unwrap_or(Value::Int(0));
+        let new_val = args.get(2).cloned().unwrap_or(Value::Int(0));
+        let (class, field) = vh_static_class_field(ctx, this, meta.as_deref());
+        let Some((cid, sidx)) = vh_static_slot(ctx, &class, &field) else {
+            return Ok(Some(Value::Object(None)));
+        };
+        let current = ctx.get_static_field(cid, sidx);
+        if vh_values_match(&current, &expected) {
+            ctx.set_static_field(cid, sidx, new_val);
+        }
+        return Ok(Some(current));
+    }
     if kind != VH_KIND_INSTANCE {
         return Ok(Some(Value::Object(None)));
     }
@@ -1164,8 +1256,13 @@ fn varhandle_compare_and_exchange(ctx: &mut dyn NativeContext, args: &[Value]) -
     let idx = if field_idx >= 0 {
         field_idx as usize
     } else {
-        let class = vh_read_string(ctx, this, VH_CLASS).unwrap_or_default();
-        let field = vh_read_string(ctx, this, VH_FIELD).unwrap_or_default();
+        let (class, field) = match meta.as_deref() {
+            Some(m) => (m.class_name.clone(), m.field_name.clone()),
+            None => (
+                vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
+                vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
+            ),
+        };
         match ctx.resolve_field_index(&class, &field) {
             Some(i) => {
                 ctx.set_field(this, VH_FIELD_INDEX, Value::Int(i as i32));
@@ -1202,9 +1299,29 @@ fn varhandle_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         ctx.set_array_element(arr, idx, new_val);
         return Ok(Some(old));
     }
-    let kind = match ctx.get_field(this, VH_KIND) { Value::Int(k) => k, _ => return Ok(Some(Value::Object(None))) };
-    let field_idx = match ctx.get_field(this, VH_FIELD_INDEX) { Value::Int(i) => i, _ => -1 };
+    // Meta side-table FIRST — real-JDK VarHandles don't carry our synthetic
+    // 6-field layout (see `varhandle_get_and_bitwise`).
+    let meta = vh_meta_get(ctx, this);
+    let (kind, field_idx) = match meta.as_deref() {
+        Some(m) => (m.kind, m.field_index),
+        None => {
+            let k = match ctx.get_field(this, VH_KIND) { Value::Int(k) => k, _ => return Ok(Some(Value::Object(None))) };
+            let i = match ctx.get_field(this, VH_FIELD_INDEX) { Value::Int(i) => i, _ => -1 };
+            (k, i)
+        }
+    };
 
+    if kind == VH_KIND_STATIC {
+        // Static getAndSet — args = [vh, new_value]; returns the old value.
+        let new_val = args.get(1).cloned().unwrap_or(Value::Int(0));
+        let (class, field) = vh_static_class_field(ctx, this, meta.as_deref());
+        let Some((cid, sidx)) = vh_static_slot(ctx, &class, &field) else {
+            return Ok(Some(Value::Object(None)));
+        };
+        let old = ctx.get_static_field(cid, sidx);
+        ctx.set_static_field(cid, sidx, new_val);
+        return Ok(Some(old));
+    }
     if kind != VH_KIND_INSTANCE {
         return Ok(Some(Value::Object(None)));
     }
@@ -1218,8 +1335,13 @@ fn varhandle_get_and_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let idx = if field_idx >= 0 {
         field_idx as usize
     } else {
-        let class = vh_read_string(ctx, this, VH_CLASS).unwrap_or_default();
-        let field = vh_read_string(ctx, this, VH_FIELD).unwrap_or_default();
+        let (class, field) = match meta.as_deref() {
+            Some(m) => (m.class_name.clone(), m.field_name.clone()),
+            None => (
+                vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
+                vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
+            ),
+        };
         match ctx.resolve_field_index(&class, &field) {
             Some(i) => {
                 ctx.set_field(this, VH_FIELD_INDEX, Value::Int(i as i32));
@@ -1270,9 +1392,25 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return Ok(Some(old));
     }
 
-    let kind = match ctx.get_field(this, VH_KIND) {
-        Value::Int(k) => k,
-        _ => return Ok(Some(Value::Int(0))),
+    // Resolve kind + field via the meta side-table FIRST (real-JDK VarHandles —
+    // e.g. `java.net.Socket.STATE` — do NOT carry our synthetic 6-field layout,
+    // so reading `VH_KIND` off the object yields garbage and the update silently
+    // no-ops returning 0). Fall back to the synthetic fields. Mirrors
+    // `varhandle_get_and_bitwise` / `varhandle_compare_and_set`.
+    let meta = vh_meta_get(ctx, this);
+    let (kind, field_idx) = match meta.as_deref() {
+        Some(m) => (m.kind, m.field_index),
+        None => {
+            let k = match ctx.get_field(this, VH_KIND) {
+                Value::Int(k) => k,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let i = match ctx.get_field(this, VH_FIELD_INDEX) {
+                Value::Int(i) => i,
+                _ => -1,
+            };
+            (k, i)
+        }
     };
 
     match kind {
@@ -1297,15 +1435,16 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 _ => return Ok(Some(Value::Int(0))),
             };
             let delta = args.get(2).cloned().unwrap_or(Value::Int(0));
-            let field_idx = match ctx.get_field(this, VH_FIELD_INDEX) {
-                Value::Int(i) => i,
-                _ => -1,
-            };
             let idx = if field_idx >= 0 {
                 field_idx as usize
             } else {
-                let class = vh_read_string(ctx, this, VH_CLASS).unwrap_or_default();
-                let field = vh_read_string(ctx, this, VH_FIELD).unwrap_or_default();
+                let (class, field) = match meta.as_deref() {
+                    Some(m) => (m.class_name.clone(), m.field_name.clone()),
+                    None => (
+                        vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
+                        vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
+                    ),
+                };
                 match ctx.resolve_field_index(&class, &field) {
                     Some(i) => {
                         ctx.set_field(this, VH_FIELD_INDEX, Value::Int(i as i32));
@@ -1321,13 +1460,17 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
         VH_KIND_STATIC => {
             let delta = args.get(1).cloned().unwrap_or(Value::Int(0));
-            let class = vh_read_string(ctx, this, VH_CLASS).unwrap_or_default();
-            let field = vh_read_string(ctx, this, VH_FIELD).unwrap_or_default();
-            if let Some(cid) = ctx.class_id_by_name(&class) {
-                let mirror = ctx.get_class_mirror(cid);
-                let old = ctx.get_field_by_name(mirror, &field);
+            let (class, field) = match meta.as_deref() {
+                Some(m) => (m.class_name.clone(), m.field_name.clone()),
+                None => (
+                    vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
+                    vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
+                ),
+            };
+            if let Some((cid, sidx)) = vh_static_slot(ctx, &class, &field) {
+                let old = ctx.get_static_field(cid, sidx);
                 let new_val = add_values(&old, &delta);
-                ctx.set_field_by_name(mirror, &field, new_val);
+                ctx.set_static_field(cid, sidx, new_val);
                 Ok(Some(old))
             } else {
                 Ok(Some(Value::Int(0)))
@@ -1457,11 +1600,10 @@ fn varhandle_get_and_bitwise(
                     vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
                 ),
             };
-            if let Some(cid) = ctx.class_id_by_name(&class) {
-                let mirror = ctx.get_class_mirror(cid);
-                let old = ctx.get_field_by_name(mirror, &field);
+            if let Some((cid, sidx)) = vh_static_slot(ctx, &class, &field) {
+                let old = ctx.get_static_field(cid, sidx);
                 let new_val = apply(&old, &mask, op);
-                ctx.set_field_by_name(mirror, &field, new_val);
+                ctx.set_static_field(cid, sidx, new_val);
                 Ok(Some(old))
             } else {
                 Ok(Some(Value::Int(0)))
@@ -4849,6 +4991,120 @@ mod tests {
             Ok(Some(Value::Object(Some(_)))) => {}
             other => panic!("expected non-null MemberName, got {:?}", other),
         }
+    }
+
+    // Regression: `varhandle_get_and_add` (and getAndSet / compareAndExchange)
+    // must resolve kind + field from the `vh_meta` side table, NOT the synthetic
+    // VH_KIND slot — real-JDK VarHandles (findVarHandle) carry no synthetic
+    // layout, so a raw slot read mis-resolves and the update silently no-ops
+    // returning 0. Here the synthetic VH_KIND slot is deliberately garbage; only
+    // the meta makes the instance update succeed.
+    fn vh_with_garbage_kind(ctx: &mut MockNativeContext) -> ObjectRef {
+        let vh = match ctx.new_object("java/lang/invoke/VarHandle").unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            _ => unreachable!(),
+        };
+        ctx.set_field(vh, VH_KIND, Value::Int(99)); // not INSTANCE/STATIC/ARRAY
+        vh
+    }
+
+    #[test]
+    fn get_and_add_resolves_via_meta_not_synthetic_kind() {
+        let mut ctx = MockNativeContext::new();
+        let vh = vh_with_garbage_kind(&mut ctx);
+        let recv = match ctx.new_object("Counter").unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            _ => unreachable!(),
+        };
+        ctx.set_field(recv, 0, Value::Int(10));
+        let cid = ctx.class_id_of_object(recv).as_u32();
+        vh_meta_put(
+            &mut ctx,
+            vh,
+            VarHandleMeta {
+                kind: VH_KIND_INSTANCE,
+                class_name: "Counter".to_string(),
+                field_name: "n".to_string(),
+                field_desc: "I".to_string(),
+                field_index: 0,
+                class_id: cid,
+            },
+        );
+        let old = varhandle_get_and_add(
+            &mut ctx,
+            &[Value::Object(Some(vh)), Value::Object(Some(recv)), Value::Int(5)],
+        )
+        .unwrap();
+        assert_eq!(old, Some(Value::Int(10)), "must return old value via meta, not 0");
+        assert_eq!(ctx.get_field(recv, 0), Value::Int(15), "field must be old + delta");
+    }
+
+    #[test]
+    fn get_and_set_resolves_via_meta_not_synthetic_kind() {
+        let mut ctx = MockNativeContext::new();
+        let vh = vh_with_garbage_kind(&mut ctx);
+        let recv = match ctx.new_object("Holder").unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            _ => unreachable!(),
+        };
+        ctx.set_field(recv, 0, Value::Int(20));
+        let cid = ctx.class_id_of_object(recv).as_u32();
+        vh_meta_put(
+            &mut ctx,
+            vh,
+            VarHandleMeta {
+                kind: VH_KIND_INSTANCE,
+                class_name: "Holder".to_string(),
+                field_name: "v".to_string(),
+                field_desc: "I".to_string(),
+                field_index: 0,
+                class_id: cid,
+            },
+        );
+        let old = varhandle_get_and_set(
+            &mut ctx,
+            &[Value::Object(Some(vh)), Value::Object(Some(recv)), Value::Int(99)],
+        )
+        .unwrap();
+        assert_eq!(old, Some(Value::Int(20)), "must return old value via meta, not null");
+        assert_eq!(ctx.get_field(recv, 0), Value::Int(99), "field must be the new value");
+    }
+
+    #[test]
+    fn compare_and_exchange_resolves_via_meta_not_synthetic_kind() {
+        let mut ctx = MockNativeContext::new();
+        let vh = vh_with_garbage_kind(&mut ctx);
+        let recv = match ctx.new_object("Cell").unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            _ => unreachable!(),
+        };
+        ctx.set_field(recv, 0, Value::Int(30));
+        let cid = ctx.class_id_of_object(recv).as_u32();
+        vh_meta_put(
+            &mut ctx,
+            vh,
+            VarHandleMeta {
+                kind: VH_KIND_INSTANCE,
+                class_name: "Cell".to_string(),
+                field_name: "x".to_string(),
+                field_desc: "I".to_string(),
+                field_index: 0,
+                class_id: cid,
+            },
+        );
+        // Matching expected → updates and returns the witness (old value).
+        let witness = varhandle_compare_and_exchange(
+            &mut ctx,
+            &[
+                Value::Object(Some(vh)),
+                Value::Object(Some(recv)),
+                Value::Int(30),
+                Value::Int(77),
+            ],
+        )
+        .unwrap();
+        assert_eq!(witness, Some(Value::Int(30)), "witness must be old value via meta");
+        assert_eq!(ctx.get_field(recv, 0), Value::Int(77), "field must be updated on match");
     }
 }
 

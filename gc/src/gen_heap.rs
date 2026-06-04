@@ -2910,6 +2910,68 @@ impl GenerationalHeap {
                 if !new_old_young.is_empty() {
                     self.card_table.mark_dirty_bulk(&new_old_young);
                 }
+
+                // DBG (CRATONVM_SP_VERIFY): after ALL fixup, does any surviving
+                // object still reference a forwarded (evacuated) young object? A
+                // nonzero count is a MISSED fixup (dangling ref into a reclaimed
+                // slot). Splits old-gen vs surviving-young so we know which path
+                // (3a/3b/3c) has the gap. Zero on both ⇒ the corruption is a
+                // WRONG-address rewrite, not a missed one.
+                if std::env::var_os("CRATONVM_SP_VERIFY").is_some() {
+                    // Incoming-reference count to each evacuated destination. In a
+                    // forest of trees every node has exactly ONE parent, so any
+                    // evacuated object with >=2 incoming heap refs is ALIASING — a
+                    // child reference rewritten to a valid-but-wrong old object
+                    // (passes the missed-fixup check, but inflates check()).
+                    let dsts: FxHashSet<usize> = evac_map.values().copied().collect();
+                    let mut incoming: FxHashMap<usize, u32> = FxHashMap::default();
+                    let mut missed_old = 0usize;
+                    let mut bump = |t: usize| {
+                        if dsts.contains(&t) {
+                            *incoming.entry(t).or_insert(0) += 1;
+                        }
+                    };
+                    for (oaddr, _sz) in old_gen.walk_objects() {
+                        let h = unsafe { &*(oaddr as *const ObjectHeader) };
+                        missed_old += forwarded_ref_count(oaddr, h, &is_y);
+                        for_each_ref(oaddr, h, &mut bump);
+                    }
+                    let mut missed_young = 0usize;
+                    let fb = young_from.free_blocks_sorted();
+                    let mut fi = fb.iter().peekable();
+                    let used = young_from.used();
+                    let mut c = 0usize;
+                    while c < used {
+                        if let Some(&&(off, sz)) = fi.peek() {
+                            if c == off {
+                                c += sz;
+                                fi.next();
+                                continue;
+                            }
+                        }
+                        let o = (from_base + c) as *mut u8;
+                        let h = unsafe { &*(o as *const ObjectHeader) };
+                        let ts = gen_object_total_size(h);
+                        if ts < HEADER_SIZE || c + ts > used {
+                            break;
+                        }
+                        if h.gc_flags & GC_FLAG_MARKED != 0 && !h.is_forwarded() {
+                            missed_young += forwarded_ref_count(o, h, &is_y);
+                            for_each_ref(o, h, &mut bump);
+                        }
+                        c += ts;
+                    }
+                    let aliased = incoming.values().filter(|&&n| n >= 2).count();
+                    let max_in = incoming.values().copied().max().unwrap_or(0);
+                    eprintln!(
+                        "[sp-verify] evac={} MISSED fwd refs old={} young={} | evac-objs with >=2 incoming (ALIASING)={} max_incoming={}",
+                        evac_map.len(),
+                        missed_old,
+                        missed_young,
+                        aliased,
+                        max_in,
+                    );
+                }
             }
         }
 
@@ -4354,6 +4416,72 @@ fn fixup_object_fields(
                         *p = true;
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Selective-promotion verify (CRATONVM_SP_VERIFY): count reference fields of
+/// `obj` that still point at a forwarded (evacuated) young object after the
+/// fixup pass. A nonzero count is a MISSED fixup — a dangling reference into a
+/// reclaimed young slot, the bintrees18 wrong-checksum smoking gun.
+fn forwarded_ref_count(
+    obj: *mut u8,
+    header: &ObjectHeader,
+    is_y: &dyn Fn(usize) -> bool,
+) -> usize {
+    let mut n = 0usize;
+    if header.kind == ObjectKind::Array {
+        if header.element_type == ArrayElementType::Reference {
+            for i in 0..header.array_length as usize {
+                let slot = unsafe { obj.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
+                if raw != 0 && is_y(raw as usize) {
+                    let h = unsafe { &*(raw as usize as *const ObjectHeader) };
+                    if h.is_forwarded() {
+                        n += 1;
+                    }
+                }
+            }
+        }
+    } else {
+        for si in 0..header.num_slots as usize {
+            let slot = unsafe { obj.add(HEADER_SIZE + si * SLOT_SIZE) };
+            let v = unsafe { std::ptr::read(slot as *const Value) };
+            if let Value::Object(Some(rf)) = v {
+                let t = rf.as_ptr() as usize;
+                if is_y(t) {
+                    let h = unsafe { &*(t as *const ObjectHeader) };
+                    if h.is_forwarded() {
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+    n
+}
+
+/// Invoke `f` with each non-null reference target address held by `obj`'s
+/// reference fields (object Value slots or reference-array elements). Used by
+/// the CRATONVM_SP_VERIFY aliasing detector.
+fn for_each_ref(obj: *mut u8, header: &ObjectHeader, mut f: impl FnMut(usize)) {
+    if header.kind == ObjectKind::Array {
+        if header.element_type == ArrayElementType::Reference {
+            for i in 0..header.array_length as usize {
+                let slot = unsafe { obj.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
+                if raw != 0 {
+                    f(raw as usize);
+                }
+            }
+        }
+    } else {
+        for si in 0..header.num_slots as usize {
+            let slot = unsafe { obj.add(HEADER_SIZE + si * SLOT_SIZE) };
+            let v = unsafe { std::ptr::read(slot as *const Value) };
+            if let Value::Object(Some(rf)) = v {
+                f(rf.as_ptr() as usize);
             }
         }
     }

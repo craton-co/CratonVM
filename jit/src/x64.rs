@@ -13892,6 +13892,38 @@ impl Compiler {
                             // CMOVcc RAX, RCX (REX.W): 48 0F 4c C1
                             self.buf.emit(&[0x48, 0x0F, cc, 0xC1]);
                             self.push_from_rax();
+                        } else if callee_entry == super::MATH_MULTIPLY_HIGH_INTRINSIC
+                            || callee_entry == super::MATH_UNSIGNED_MULTIPLY_HIGH_INTRINSIC
+                        {
+                            // Math.multiplyHigh(JJ)J / unsignedMultiplyHigh(JJ)J —
+                            // high 64 bits of the 128-bit product. The hottest leaf
+                            // in the SunEC P-256 Montgomery field multiply, called
+                            // once per limb pair. One-operand `IMUL r64` (signed) /
+                            // `MUL r64` (unsigned) compute RDX:RAX = RAX * r64; the
+                            // high half lands in RDX. Multiplication is commutative,
+                            // so operand order is irrelevant to the result.
+                            //
+                            // flush_scratch_registers() above already spilled every
+                            // value-stack slot out of RAX/RCX/RDX (locals live only
+                            // in callee-saved R12-R15/RBX/RSI/RDI, deferred-spill
+                            // slots only in R8/R9), so clobbering RAX/RCX/RDX here is
+                            // safe — same contract the Math.min/max long path relies
+                            // on, extended to RDX.
+                            let b_slot = self.pop_stack();
+                            let a_slot = self.pop_stack();
+                            self.load_slot_to_reg(RAX, a_slot);
+                            self.load_slot_to_reg(RCX, b_slot);
+                            // IMUL RCX (48 F7 E9) signed / MUL RCX (48 F7 E1) unsigned.
+                            let modrm =
+                                if callee_entry == super::MATH_MULTIPLY_HIGH_INTRINSIC {
+                                    0xE9u8 // /5 IMUL
+                                } else {
+                                    0xE1u8 // /4 MUL
+                                };
+                            self.buf.emit(&[0x48, 0xF7, modrm]);
+                            // MOV RAX, RDX (48 89 D0) — high half is the result.
+                            self.buf.emit(&[0x48, 0x89, 0xD0]);
+                            self.push_from_rax();
                         }
                         // --- invokestatic intrinsic family regions ---
                         // A follow-up agent for family <TAG> appends its

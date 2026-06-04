@@ -96,6 +96,9 @@ libffi = "3.2"
 # hand-rolled software primitives used under the legacy synthetic path
 # with audited, constant-time implementations.
 sha3 = "0.10"
+# SHA-2 family (notably SHA-224, which the hand-rolled `crypto_impl` SHA-256
+# code does not cover) for `MessageDigest.getInstance("SHA-224")`.
+sha2 = "0.10"
 aes-gcm = "0.10"
 aes = "0.8"
 cbc = { version = "0.1", features = ["std"] }

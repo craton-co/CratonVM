@@ -358,7 +358,8 @@ fn populate_inet_holder(ctx: &mut dyn NativeContext, ia: ObjectRef, host: &str, 
     ctx.set_field_by_name(holder, "hostName", Value::Object(Some(host_str)));
     // `address` is the IPv4 address packed big-endian into an int; for IPv6
     // it stays 0 (the bytes live in the separate `Inet6Address` holder).
-    let (packed, family) = match ip.parse::<std::net::IpAddr>() {
+    let parsed = ip.parse::<std::net::IpAddr>();
+    let (packed, family) = match parsed {
         Ok(std::net::IpAddr::V4(v4)) => {
             (i32::from_be_bytes(v4.octets()), IA_FAMILY_V4)
         }
@@ -368,6 +369,33 @@ fn populate_inet_holder(ctx: &mut dyn NativeContext, ia: ObjectRef, host: &str, 
     ctx.set_field_by_name(holder, "address", Value::Int(packed));
     ctx.set_field_by_name(holder, "family", Value::Int(family));
     ctx.set_field_by_name(ia, "holder", Value::Object(Some(holder)));
+
+    // NIO-SERVER-SOCKET (IPv6): a real-JDK `Inet6Address` stores its 16-byte
+    // address in a SEPARATE `holder6` field
+    // (`Inet6Address$Inet6AddressHolder { byte[16] ipaddress; int scope_id; …}`),
+    // NOT in the base `holder` (whose `address` int is 0 for v6). Un-overridden
+    // real-JDK Inet6Address bytecode — `isLinkLocalAddress()`, `getScopeId()`,
+    // and the address checks `NioSocketImpl.bind`/`connect` run on the real
+    // socket path — dereferences `holder6`; leaving it null NPEs before bind0
+    // is ever reached. Populate it so the real path resolves v6 correctly.
+    if let Ok(std::net::IpAddr::V6(v6)) = parsed {
+        let h6 = alloc_concurrent_synthetic(
+            ctx,
+            "java/net/Inet6Address$Inet6AddressHolder",
+            5,
+        );
+        let octets = v6.octets();
+        let arr = ctx.new_array(ArrayElementType::Byte, octets.len());
+        for (i, b) in octets.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*b as i32));
+        }
+        ctx.set_field_by_name(h6, "ipaddress", Value::Object(Some(arr)));
+        // Loopback / global addresses carry no scope; link-local scope ids are
+        // not recoverable from a bare `Ipv6Addr`, so leave scope_id unset (0).
+        ctx.set_field_by_name(h6, "scope_id", Value::Int(0));
+        ctx.set_field_by_name(h6, "scope_id_set", Value::Int(0));
+        ctx.set_field_by_name(ia, "holder6", Value::Object(Some(h6)));
+    }
 }
 
 /// Read one logical InetAddress field (`IA_HOST` or `IA_ADDR`) — side table

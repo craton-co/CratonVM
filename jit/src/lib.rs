@@ -1670,6 +1670,13 @@ pub enum JitIntrinsic {
     MathMaxInt = 11,
     MathMinLong = 12,
     MathMaxLong = 13,
+    /// `Math/StrictMath.multiplyHigh(JJ)J` — high 64 bits of the SIGNED
+    /// 128-bit product, emitted as a one-operand `IMUL r64` (RDX:RAX = RAX*r),
+    /// result taken from RDX. Hottest leaf in the SunEC P-256 field multiply.
+    MathMultiplyHigh = 14,
+    /// `Math/StrictMath.unsignedMultiplyHigh(JJ)J` — high 64 bits of the
+    /// UNSIGNED 128-bit product, emitted as a one-operand `MUL r64`.
+    MathUnsignedMultiplyHigh = 15,
 
     // ===== INTRINSIC REGION BEGIN: INT_BITS =====
     // java.lang.Integer bit-manipulation intrinsics (Phase 1a). Variant
@@ -1895,6 +1902,9 @@ mod math_intrinsic_aliases {
     pub const MATH_MAX_INT_INTRINSIC: usize = JitIntrinsic::MathMaxInt.as_entry();
     pub const MATH_MIN_LONG_INTRINSIC: usize = JitIntrinsic::MathMinLong.as_entry();
     pub const MATH_MAX_LONG_INTRINSIC: usize = JitIntrinsic::MathMaxLong.as_entry();
+    pub const MATH_MULTIPLY_HIGH_INTRINSIC: usize = JitIntrinsic::MathMultiplyHigh.as_entry();
+    pub const MATH_UNSIGNED_MULTIPLY_HIGH_INTRINSIC: usize =
+        JitIntrinsic::MathUnsignedMultiplyHigh.as_entry();
 }
 pub use math_intrinsic_aliases::*;
 
@@ -1941,6 +1951,12 @@ pub fn try_resolve_intrinsic(
             ("max", "(II)I") => Some((JitIntrinsic::MathMaxInt, 2, b'I')),
             ("min", "(JJ)J") => Some((JitIntrinsic::MathMinLong, 2, b'J')),
             ("max", "(JJ)J") => Some((JitIntrinsic::MathMaxLong, 2, b'J')),
+            // High 64 bits of the 128-bit product — one `IMUL`/`MUL r64`.
+            // Hottest leaf in SunEC P-256 Montgomery field arithmetic.
+            ("multiplyHigh", "(JJ)J") => Some((JitIntrinsic::MathMultiplyHigh, 2, b'J')),
+            ("unsignedMultiplyHigh", "(JJ)J") => {
+                Some((JitIntrinsic::MathUnsignedMultiplyHigh, 2, b'J'))
+            }
             _ => None,
         };
         if let Some((intrinsic, num_params, ret)) = hit {

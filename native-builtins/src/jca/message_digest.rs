@@ -353,9 +353,11 @@ fn algorithm_supported(algo: &str) -> bool {
         "MD5"
             | "SHA"
             | "SHA1"
+            | "SHA224"
             | "SHA256"
             | "SHA384"
             | "SHA512"
+            | "SHA3224"
             | "SHA3256"
             | "SHA3384"
             | "SHA3512"
@@ -371,6 +373,7 @@ fn digest_length_bytes(algo: &str) -> usize {
     match normalised.as_str() {
         "MD5" => 16,
         "SHA" | "SHA1" => 20,
+        "SHA224" | "SHA3224" => 28,
         "SHA256" | "SHA3256" => 32,
         "SHA384" | "SHA3384" => 48,
         "SHA512" | "SHA3512" => 64,
@@ -408,8 +411,8 @@ mod tests {
     #[test]
     fn algorithm_supported_accepts_known_set() {
         for algo in [
-            "MD5", "md5", "SHA-1", "SHA1", "SHA-256", "SHA256", "SHA-384", "SHA-512", "SHA3-256",
-            "SHA3-384", "SHA3-512",
+            "MD5", "md5", "SHA-1", "SHA1", "SHA-224", "sha-224", "SHA224", "SHA-256", "SHA256",
+            "SHA-384", "SHA-512", "SHA3-224", "SHA3-256", "SHA3-384", "SHA3-512",
         ] {
             assert!(algorithm_supported(algo), "{algo} should be supported");
         }
@@ -426,6 +429,8 @@ mod tests {
     fn digest_lengths_match_jdk25() {
         assert_eq!(digest_length_bytes("MD5"), 16);
         assert_eq!(digest_length_bytes("SHA-1"), 20);
+        assert_eq!(digest_length_bytes("SHA-224"), 28);
+        assert_eq!(digest_length_bytes("SHA3-224"), 28);
         assert_eq!(digest_length_bytes("SHA-256"), 32);
         assert_eq!(digest_length_bytes("SHA-384"), 48);
         assert_eq!(digest_length_bytes("SHA-512"), 64);
@@ -441,6 +446,22 @@ mod tests {
         let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex, "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9"
+        );
+    }
+
+    #[test]
+    fn compute_digest_sha224_matches_reference() {
+        // SHA-224 / SHA3-224 of "hello world" — Python hashlib reference.
+        // Lowercase + dashed spelling exercises the alphanumeric-uppercase
+        // normalisation (the `sha-224` Keycloak SD-JWT path).
+        let hex = |h: Vec<u8>| -> String { h.iter().map(|b| format!("{b:02x}")).collect() };
+        assert_eq!(
+            hex(compute_digest("sha-224", b"hello world")),
+            "2f05477fc24bb4faefd86517156dafdecec45b8ad3cf2522a563582b"
+        );
+        assert_eq!(
+            hex(compute_digest("SHA3-224", b"hello world")),
+            "dfb7f18c77e928bb56faeb2da27291bd790bc1045cde45f3210bb6c5"
         );
     }
 }

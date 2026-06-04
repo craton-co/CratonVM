@@ -27,3 +27,16 @@ hbase-conf	apache-hbase-2.5.10	HBaseProbe	test-infra/probes/hbase_probe	$APPS_RO
 jenkins-load	jenkins-2.452.3	ClassLoadProbe	test-infra/probes/classload_probe	$APPS_ROOT/jenkins-core.jar	jenkins.ClassLoaderReflectionToolkit	15	jenkins-load.expected.txt
 tomcat-server-info	apache-tomcat-10.1.31	TomcatProbe	test-infra/probes/tomcat_probe	$APPS_ROOT/apache-tomcat-10.1.31/lib/*.jar;$APPS_ROOT/apache-tomcat-10.1.31/bin/*.jar	-	15	tomcat-server-info.expected.txt
 solr-doc	solr-9.5.0	SolrProbe	test-infra/probes/solr_probe	$APPS_ROOT/solr-9.5.0/server/solr-webapp/webapp/WEB-INF/lib/*.jar	-	15	solr-doc.expected.txt
+#
+# NIO / buffer / VarHandle coverage (JDK-only, hermetic). These exercise the
+# non-gated changes from commit d6cefc7 (DirectByteBuffer layout, VarHandle
+# meta ops, Unsafe arena routing). classpath_glob is just $PROBE_DIR — no app
+# distro needed.
+directbuffer-nio	jdk-only	DirectBufferProbe	test-infra/probes/directbuffer_probe	$PROBE_DIR	-	15	directbuffer-nio.expected.txt
+varhandle-bitwise	jdk-only	VarHandleBitwiseProbe	test-infra/probes/varhandle_probe	$PROBE_DIR	-	15	varhandle-bitwise.expected.txt
+unsafe-mem	jdk-only	UnsafeMemProbe	test-infra/probes/unsafemem_probe	$PROBE_DIR	-	15	unsafe-mem.expected.txt
+# filechannel-rt: PENDING continue_prompt_arena_native_memory_routing.md (R2).
+# FileChannel.write of a heap buffer routes through Util.getTemporaryDirectBuffer
+# (an Unsafe arena handle) → FileDispatcherImpl.write0; today that fails with
+# "IOException: Channel closed". Uncomment once R2 lands and record the baseline.
+# filechannel-rt	jdk-only	FileChannelProbe	test-infra/probes/filechannel_probe	$PROBE_DIR	-	15	filechannel-rt.expected.txt
