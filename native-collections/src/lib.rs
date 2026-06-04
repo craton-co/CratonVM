@@ -4586,6 +4586,49 @@ fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),
     };
+    // entrySet() view: `contains(e)` must follow `AbstractMap`'s contract —
+    // `getNode(e.getKey()) != null && node.value.equals(e.getValue())` — i.e.
+    // compare by Map.Entry equality against the SOURCE map. Looking the entry
+    // object itself up in the view's HashSet backing (as the keySet path below
+    // does) buckets it by the entry's identity hash, so an entry produced by a
+    // different `entrySet()` call (or any foreign Map.Entry) never matches and
+    // `contains` wrongly returns false.
+    if let Some(source) = view_backing_source(ctx, backing) {
+        if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
+            // Non-object / null arg is never a Map.Entry → not contained.
+            let entry = match elem {
+                Value::Object(Some(e)) => e,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            // Synthetic Map.Entry layout: slot 0 = key, slot 1 = value (matches
+            // the entrySet builders and `native_hs_remove`'s key extraction).
+            let key = ctx.get_field(entry, 0);
+            let want_val = ctx.get_field(entry, 1);
+            // Resolve via the source map's own `containsKey`/`get` so this works
+            // for every backing map type (HashMap / LinkedHashMap / TreeMap).
+            // `containsKey` distinguishes "absent" from "present with null value".
+            let has_key = ctx.invoke_virtual(
+                source,
+                "containsKey",
+                "(Ljava/lang/Object;)Z",
+                &[key],
+            )?;
+            if !matches!(has_key, Some(Value::Int(1))) {
+                return Ok(Some(Value::Int(0)));
+            }
+            let got = ctx
+                .invoke_virtual(source, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[key])?
+                .unwrap_or(Value::Object(None));
+            let eq = values_equal(ctx, &got, &want_val)
+                || match (got, want_val) {
+                    (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                        map_keys_equal(ctx, a, b)?
+                    }
+                    _ => false,
+                };
+            return Ok(Some(Value::Int(if eq { 1 } else { 0 })));
+        }
+    }
     let ck_args = [Value::Object(Some(backing)), elem];
     native_map_contains_key(ctx, &ck_args)
 }
