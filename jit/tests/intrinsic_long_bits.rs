@@ -277,3 +277,44 @@ fn long_compare_matches_reference() {
         }
     }
 }
+
+/// Distances for the 64-bit rotate intrinsics: 0, sub-width, exactly width,
+/// > width (x86 masks CL & 0x3f), and negative. Passed as the int distance.
+fn long_rotate_distances() -> Vec<i32> {
+    vec![0, 1, 7, 31, 32, 33, 63, 64, 65, 127, 128, -1, -7, -64, -65, i32::MIN, i32::MAX]
+}
+
+#[test]
+fn long_rotate_left_matches_reference() {
+    // Verify the (JI)J matcher registers this entry too.
+    assert!(
+        cratonvm_jit::try_resolve_intrinsic("java/lang/Long", "rotateLeft", "(JI)J").is_some(),
+        "Long.rotateLeft must register"
+    );
+    for &v in &long_edge_values() {
+        for &d in &long_rotate_distances() {
+            // i64::rotate_left masks the distance mod 64, matching
+            // Long.rotateLeft and x86 ROL r64,CL (CL & 0x3f).
+            let reference = v.rotate_left((d as u32) & 63);
+            // SAFETY: see run_binary. Distance rides in the low byte (→ CL).
+            let got = unsafe { run_binary(JitIntrinsic::LongRotateLeft, b'J', v, d as i64) };
+            assert_eq!(got, reference, "Long.rotateLeft({v:#018x}, {d})");
+        }
+    }
+}
+
+#[test]
+fn long_rotate_right_matches_reference() {
+    assert!(
+        cratonvm_jit::try_resolve_intrinsic("java/lang/Long", "rotateRight", "(JI)J").is_some(),
+        "Long.rotateRight must register"
+    );
+    for &v in &long_edge_values() {
+        for &d in &long_rotate_distances() {
+            let reference = v.rotate_right((d as u32) & 63);
+            // SAFETY: see run_binary.
+            let got = unsafe { run_binary(JitIntrinsic::LongRotateRight, b'J', v, d as i64) };
+            assert_eq!(got, reference, "Long.rotateRight({v:#018x}, {d})");
+        }
+    }
+}

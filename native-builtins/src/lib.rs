@@ -626,6 +626,9 @@ pub mod atomic_updater;
 // tens of seconds, missing the watchdog safepoint. Real HotSpot replaces
 // these with hand-rolled C2 — we provide spec-correct Rust equivalents.
 pub mod biginteger_intrinsics;
+// Byte-identical native intrinsic for the SunEC P-256 Montgomery field
+// multiply/square (dominant cost of EC keygen/sign/verify).
+pub mod sunec_intpoly;
 
 // WP1.4 — `jdk.internal.access.SharedSecrets` bridge: 15 *Access
 // interface singletons + every per-interface method.  Unblocks
@@ -1667,6 +1670,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // (nested sub-tag inside this Bridge-tagged wrapper).
     registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
         biginteger_intrinsics::register_biginteger_intrinsics(registry);
+    });
+
+    // SunEC P-256 Montgomery field multiply/square. The pure-Java
+    // MontgomeryIntegerPolynomialP256.{mult,square} is the dominant cost of EC
+    // keygen/sign/verify (a one-time generator-table precompute calls it
+    // ~10^5–10^6 times); HotSpot intrinsifies the same field arithmetic. The
+    // Rust impl is byte-identical to the JDK (decode→Montgomery-mult→canonical
+    // re-encode; verified vs JDK 25 limb vectors in sunec_intpoly::tests).
+    registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
+        sunec_intpoly::register_sunec_intpoly_intrinsics(registry);
     });
 
     // WP4.2: java.util.concurrent.CompletableFuture executor support.

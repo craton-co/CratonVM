@@ -64,9 +64,69 @@ That path is **conclusively dead**:
   bytecode); they either bail `jit_scan` or run no faster. Inlining the leaf cannot help when the
   enclosing method never becomes fast JIT code.
 
-## What's left — the ONLY remaining lever (larger surface, unattempted)
-A native `MontgomeryIntegerPolynomialP256.mult`/`reduce`/`square` intrinsic backed by a Rust P-256
-field implementation. Well-defined `long[]` in/out, but it **must replicate the JDK's exact
-Montgomery limb layout byte-for-byte** (radix, limb count, reduction constant) — a mismatch yields
-silently-wrong crypto. Verify by cross-checking a CratonVM-produced signature against **HotSpot**
-verify (self-consistent sign→verify on CratonVM is NOT sufficient). High risk; not done here.
+## Follow-up 2 — native `MontgomeryIntegerPolynomialP256.{mult,square}` intrinsic (LANDED)
+`native-builtins/src/sunec_intpoly.rs` intercepts the two dominant SunEC P-256 field operations
+with a byte-identical Rust implementation.
+
+**Representation (reverse-engineered + verified vs JDK 25, `ecprobe_tmp/MontGT2.java`):** a field
+element is `NUM_LIMBS=5` little-endian limbs of `BITS_PER_LIMB=52` bits holding
+`X = Σ limb[i]·2^(52i) ≡ value·R (mod p)` — Montgomery form, `R = 2^260`, `p` = P-256 prime.
+`MAX_ADDS=0` ⇒ every element is fully reduced (each limb `< 2^52`, `X < p`). `mult(a,b,r)` writes
+`decode(r) ≡ decode(a)·decode(b)·R⁻¹ (mod p)`; the JDK's output is itself canonical, so
+decode→Montgomery-mult→canonical-encode yields a **byte-identical** limb array (not merely
+value-equivalent). `square(a)==mult(a,a)` (verified) so square delegates to mult. Modular arithmetic
+uses `num-bigint` for auditability.
+
+**Correctness (crypto — verified four ways):**
+1. 9 limb vectors (`mult` ×6, `square` ×3) captured from the real JDK, asserted byte-identical in
+   `sunec_intpoly::tests` (incl. 0, 1, p−1, randoms).
+2. **Cross-VM, both directions:** CratonVM signs → **HotSpot verifies = true**; HotSpot signs →
+   CratonVM verifies = true (`ecprobe_tmp/EcCross.java`, `EcVerifyArg.java`). An independent JVM
+   accepting CratonVM's EC signature is the gold standard.
+3. EC sign→verify roundtrip + tamper-rejects (`UmhVerify`); valid DER/P1363 signature lengths.
+4. Output canonicality asserted (`output_is_canonical`).
+
+**Speedup (under `CRATONVM_REAL_JCA=1 CRATONVM_DISABLE_JIT=1`):**
+- **Per EC op: ~135 ms** (EcProbe2 keygen#2 with the table cached) — *sub-second*, down from the
+  "~1–16 s/op" the interpreter paid. **This is the suite-relevant number.**
+- `EcSign2` (keygen + 2 signs): **~15 s, down from ~47–60 s** (~4×). The ~14 s is now **entirely**
+  the one-time `Secp256R1GeneratorMontgomeryMultiplier` generator-table precompute (keygen#1),
+  amortized once per JVM process. A ~95-op SD-JWT suite → ~14 s + 95×0.135 s ≈ **27 s** vs tens of
+  minutes.
+
+## What's left — the one-time table, and why field-op natives DON'T safely cut it (investigated)
+The residual ~14 s one-time table precompute is now dominated by the **shared** field-op machinery
+still interpreted during point doubling/addition — `MutableElement.setSum`/`setDifference`/`setValue`
+and the base `IntegerPolynomial.addLimbs`/`multByInt`. A follow-up tried to native-ize these and
+found it is **not safe to do cleanly** — two hard blockers (don't re-attempt without addressing them):
+
+1. **No native fall-through.** `MethodCallResult = Result<Option<Value>, MethodCallFailed>` has no
+   "not-handled, run the bytecode" variant, and a registered native unconditionally shadows the
+   method for **every** receiver. `mult`/`square`/`reduce` are *per-curve overrides* in
+   `MontgomeryIntegerPolynomialP256`, so registering against that class is P-256-only-safe (that is
+   why the landed intrinsics are safe). But the hot wrappers `setSum`/`setDifference`/`setValue` live
+   in the shared `IntegerPolynomial$MutableElement` inner class, and `addLimbs`/`multByInt` in base
+   `IntegerPolynomial` — registering a native there shadows P-384/P-521/Curve25519/X25519 too. A
+   mixed-curve workload (keycloak uses several) would then hit a P-256-only native with a foreign
+   receiver. Safe interception of the shared wrappers therefore needs a **VM fall-through mechanism**
+   first (a `MethodCallFailed::NotHandled`-style decline path in `invoke_or_native`).
+
+2. **`reduce` is NOT a clean `mod p` function.** Ground truth (`ecprobe_tmp/ReduceGT.java`): for
+   in-range realistic/negative limb inputs `reduce` returns `(X mod p)` in canonical form, but for
+   some *loose* inputs that are reachable in principle after an add (e.g. all limbs ≈ `2^53`) it
+   returns a **non-canonical** array whose value is **not** `X mod p`. `reduce` is a *bounded
+   partial-reduction* (carry-propagate + high-limb fold + one conditional subtract) that is only
+   correct within the field's `numAdds`/`maxAdds` range invariants. Replacing it with
+   "decode→`mod p`→canonical-encode" would diverge from the JDK on reachable loose inputs and is
+   therefore **not byte-identical** — exactly the silent-wrong-crypto hazard this whole effort
+   avoids. A correct native `reduce` must replicate the exact unrolled per-curve carry/fold (the
+   ~hundreds of bytecodes of `MontgomeryIntegerPolynomialP256.reduce`), verified against JDK output
+   over the full reachable input range.
+
+**Conclusion.** The table is a *one-time* per-process cost and steady-state per-op is already
+sub-second, so this is low-value/high-risk. The only sound ways forward, both larger efforts:
+(a) add a native fall-through path, then intercept the shared wrappers P-256-only; or (b) replicate
+`reduce` (and the carry helpers) bytecode-exactly with full-range differential verification; or
+(c) a coarse native `pointMultiply` backed by the `p256` crate (replaces the point engine, not the
+key/SPI objects) — biggest win, biggest surface. None attempted; recommend leaving the amortized
+one-time cost as-is unless a fall-through mechanism lands first.

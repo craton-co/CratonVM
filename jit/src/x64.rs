@@ -1598,9 +1598,24 @@ struct SimdFpArraySum {
 /// Get the byte length of a bytecode instruction at `pc`.
 fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
     match code[pc] {
-        0x10 | 0x15..=0x19 | 0x36..=0x3a | 0xbc => 2,
+        // 2-byte: bipush(0x10), ldc(0x12), iload..aload(0x15..0x19),
+        // istore..astore(0x36..0x3a), ret(0xa9), newarray(0xbc).
+        // `ldc` (0x12) was previously absent and fell through to the `_ => 1`
+        // arm — a 1-byte under-count that misaligned every PC-stepping consumer
+        // (branch-target precompute, DCE, OSR/unroll). When an `ldc` sat
+        // immediately before a branch (e.g. `ldc 65536; if_icmpge exit` — the
+        // standard `for (i; i<CONST; …)` header), the scan skipped the branch,
+        // never marked its exit target, DCE-killed that target, and left the
+        // loop-exit `if_icmpge` unpatched (rel32=0) → the loop overran its bound
+        // (BC SPHINCS-256 Horst.horst_sign AIOOBE).
+        0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => 2,
+        // 3-byte: sipush(0x11), ldc_w(0x13), ldc2_w(0x14), iinc(0x84), jsr(0xa8),
+        // the if_* family, field/invoke ops, etc. ldc_w/ldc2_w were also absent.
         0x11
+        | 0x13
+        | 0x14
         | 0x84
+        | 0xa8
         | 0x99..=0xa6
         | 0xa7
         | 0xb2
@@ -14111,6 +14126,35 @@ impl Compiler {
                             // SUB EAX, EDX: 29 D0 → -1, 0 or 1.
                             self.buf.emit(&[0x29, 0xD0]);
                             self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::IntRotateLeft.as_entry()
+                            || callee_entry
+                                == super::JitIntrinsic::IntRotateRight.as_entry()
+                        {
+                            // Integer.rotateLeft(i, distance) / rotateRight:
+                            // ROL/ROR EAX, CL. x86 masks CL & 0x1f for a 32-bit
+                            // rotate, byte-identical to the JDK (rotation mod 32),
+                            // so no explicit distance masking is needed. Stack:
+                            // i (deeper), distance (top).
+                            let dist = self.pop_stack();
+                            let val = self.pop_stack();
+                            self.load_slot_to_reg(RAX, val);
+                            self.load_slot_to_reg(RCX, dist);
+                            // ROL EAX, CL: D3 /0 = D3 C0 ; ROR EAX, CL: D3 /1 = D3 C8
+                            let modrm = if callee_entry
+                                == super::JitIntrinsic::IntRotateLeft.as_entry()
+                            {
+                                0xC0u8
+                            } else {
+                                0xC8u8
+                            };
+                            self.buf.emit(&[0xD3, modrm]);
+                            // MOVSXD RAX, EAX (48 63 C0): a 32-bit rotate may set
+                            // the high bit (negative int); re-extend to the
+                            // canonical sign-extended 64-bit int form the value
+                            // ABI expects (mirrors the Math.min int path).
+                            self.buf.emit(&[0x48, 0x63, 0xC0]);
+                            self.push_from_rax();
                         }
                         // ===== INTRINSIC REGION END: INT_BITS =====
 
@@ -14269,6 +14313,30 @@ impl Compiler {
                             self.buf.emit(&[0x0F, 0xB6, 0xD2]);
                             // SUB EAX, EDX: 29 D0 → -1, 0 or 1.
                             self.buf.emit(&[0x29, 0xD0]);
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::LongRotateLeft.as_entry()
+                            || callee_entry
+                                == super::JitIntrinsic::LongRotateRight.as_entry()
+                        {
+                            // Long.rotateLeft(i, distance) / rotateRight:
+                            // ROL/ROR RAX, CL. x86 masks CL & 0x3f for a 64-bit
+                            // rotate, byte-identical to the JDK (rotation mod 64).
+                            // Descriptor is (JI)J: the long value (deeper) then
+                            // the int distance (top), each one JIT stack slot.
+                            let dist = self.pop_stack();
+                            let val = self.pop_stack();
+                            self.load_slot_to_reg(RAX, val);
+                            self.load_slot_to_reg(RCX, dist);
+                            // ROL RAX, CL: 48 D3 C0 ; ROR RAX, CL: 48 D3 C8.
+                            let modrm = if callee_entry
+                                == super::JitIntrinsic::LongRotateLeft.as_entry()
+                            {
+                                0xC0u8
+                            } else {
+                                0xC8u8
+                            };
+                            self.buf.emit(&[0x48, 0xD3, modrm]);
                             self.push_from_rax();
                         }
                         // ===== INTRINSIC REGION END: LONG_BITS =====
