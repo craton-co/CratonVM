@@ -14272,8 +14272,14 @@ fn execute_jit_call(
     //     i64 bit-exact. See docs/bc-ec-mod-mododdinverse-investigation.md.
     let (param_descs, _) = split_method_descriptor(&cached.method_descriptor);
     let is_static = cached.is_static;
+    // Save the raw popped slots (bit-exact + long mark) so the i64::MIN deopt
+    // arm below can restore them before the slow path re-pops the args. See
+    // that arm for the underflow this prevents.
+    let mut saved_args: [(CompactValue, bool); JIT_ABI_REG_SLOTS] =
+        [(CompactValue::zero(), false); JIT_ABI_REG_SLOTS];
     for i in (0..np).rev() {
         let (cv, is_long) = thread.frames[frame_idx].stack.pop_compact_with_long_mark_unchecked();
+        saved_args[i] = (cv, is_long);
         let desc_byte = if is_static {
             param_descs
                 .get(i)
@@ -14460,6 +14466,27 @@ fn execute_jit_call(
         // NPE. The previous in-arm drain is intentionally removed —
         // moving it above means the i64::MIN arm runs with NPE already
         // taken, so we just fall through to deopt re-execution.
+        //
+        // CRIT (BC SPHINCS-256 / SHA-512 underflow): the args were popped
+        // off the caller's operand stack at the top of this function, but
+        // CacheMiss makes the invoke handler re-run the call via the slow
+        // path (execute_invokestatic{,virtual,...}), which pops the args
+        // AGAIN. Restore them here so the operand stack is exactly as the
+        // slow path expects. This matters even for a *correct* method: the
+        // in-band i64::MIN deopt sentinel collides with a legitimate
+        // i64::MIN `long`/`double` return (e.g. `Pack.bigEndianToLong` on a
+        // SHA-512 word == 0x8000_0000_0000_0000), so a non-deopting method
+        // can land here. Without the restore the next bytecode (`lastore`,
+        // etc.) pops a now-missing slot and panics with a value_stack
+        // underflow (len 0 → usize::MAX index).
+        for i in 0..np {
+            let (cv, is_long) = saved_args[i];
+            if is_long {
+                thread.frames[frame_idx].stack.push_compact_long(cv);
+            } else {
+                thread.frames[frame_idx].stack.push_compact(cv);
+            }
+        }
         return Ok(CachedCallResult::CacheMiss);
     }
 
