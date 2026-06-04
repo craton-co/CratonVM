@@ -3855,36 +3855,39 @@ fn collect_keys_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<Value
 /// Snapshot a HashSet's elements in *iteration order* for the order-sensitive
 /// read paths (iterator / toArray / forEach / stream / toString / addAll-source).
 ///
-/// An ordinary HashSet — and a keySet/entrySet *view* of a plain `HashMap` —
-/// iterates in the backing map's bucket order, which already matches HotSpot,
-/// so we read straight from `backing`. But when the view's source is an
-/// insertion-ordered `LinkedHashMap` (or a sorted `TreeMap`), routing through
-/// the HashMap backing would re-bucket the elements and destroy that order
-/// (the SD-JWT `objectNode.properties().forEach(...)` claim-ordering bug). For
-/// those sources we collect directly from the source in its native order:
+/// An ordinary (non-view) HashSet has no source map, so we read its elements
+/// straight from `backing` in bucket order. But a keySet/entrySet/values *view*
+/// must iterate in its **source map's** encounter order: insertion order for a
+/// `LinkedHashMap`, sorted order for a `TreeMap`, and HotSpot-faithful bucket
+/// order for a plain `HashMap`. We therefore collect directly from the source
+/// whenever one is present.
+///
+/// Walking the view's own HashSet backing instead is wrong for an `entrySet`:
+/// that backing buckets each freshly-built `Map.Entry` by the entry object's
+/// *identity hash* (a keySet backing buckets by the key's hash, which happens
+/// to reproduce the source's layout), so an entrySet walk re-orders entries by
+/// entry-hash and diverges from both `keySet()` and HotSpot. That surfaced as
+/// the SD-JWT claim-ordering bug and, more broadly, any code that compares
+/// `entrySet()`/`values()` encounter order against HotSpot. Collecting from the
+/// source keeps `entrySet()` order identical to `keySet()` for every map type.
+///
 /// keySet → the source keys; entrySet → freshly built `Map.Entry` objects over
 /// the source's ordered `(key,value)` pairs (slot 0 = key, slot 1 = value, the
 /// layout `native_lhm_entry_set` and `native_hs_remove`'s key-extraction use).
 fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef) -> Vec<Value> {
     if let Some(source) = view_backing_source(ctx, backing) {
-        let cls = ctx
-            .class_name_of_id(ctx.class_id_of_object(source))
-            .unwrap_or_default();
-        let ordered = cls == "java/util/LinkedHashMap" || is_tree_map_receiver(ctx, source);
-        if ordered {
-            if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
-                return collect_entries_any(ctx, source)
-                    .into_iter()
-                    .map(|(k, v)| {
-                        let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
-                        ctx.set_field(entry, 0, k);
-                        ctx.set_field(entry, 1, v);
-                        Value::Object(Some(entry))
-                    })
-                    .collect();
-            }
-            return collect_keys_any(ctx, source);
+        if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
+            return collect_entries_any(ctx, source)
+                .into_iter()
+                .map(|(k, v)| {
+                    let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
+                    ctx.set_field(entry, 0, k);
+                    ctx.set_field(entry, 1, v);
+                    Value::Object(Some(entry))
+                })
+                .collect();
         }
+        return collect_keys_any(ctx, source);
     }
     map_collect_keys(ctx, backing)
 }
