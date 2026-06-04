@@ -629,6 +629,9 @@ pub mod biginteger_intrinsics;
 // Byte-identical native intrinsic for the SunEC P-256 Montgomery field
 // multiply/square (dominant cost of EC keygen/sign/verify).
 pub mod sunec_intpoly;
+// Gated (default-off) coarse native EC scalar-multiply via the p256 crate,
+// bypassing the one-time generator-table precompute.
+pub mod sunec_point;
 
 // WP1.4 — `jdk.internal.access.SharedSecrets` bridge: 15 *Access
 // interface singletons + every per-interface method.  Unblocks
@@ -1680,6 +1683,12 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // re-encode; verified vs JDK 25 limb vectors in sunec_intpoly::tests).
     registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
         sunec_intpoly::register_sunec_intpoly_intrinsics(registry);
+    });
+
+    // Gated default-off (CRATONVM_NATIVE_EC_MULTIPLY): coarse native EC
+    // scalar-multiply that bypasses the one-time ~14 s generator-table precompute.
+    registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
+        sunec_point::register_sunec_point_intrinsics(registry);
     });
 
     // WP4.2: java.util.concurrent.CompletableFuture executor support.
