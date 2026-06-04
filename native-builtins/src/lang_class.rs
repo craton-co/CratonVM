@@ -5833,6 +5833,58 @@ pub(crate) fn native_constructor_new_instance(
         }
     };
 
+    // Serialization constructor: allocate the real target type.
+    //
+    // `ReflectionFactory.newConstructorForSerialization(cl)` returns a
+    // `Constructor` whose declaring class (`clazz`) is `cl`'s first
+    // non-Serializable ancestor (usually `java.lang.Object`), but whose
+    // `constructorAccessor` is a `DirectConstructorHandleAccessor` whose
+    // MethodHandle `target` is a `DirectMethodHandle$Constructor` that allocates
+    // `cl` itself (its `instanceClass` field) and runs only the ancestor `<init>`.
+    // Allocating `clazz` here would produce a bare `java.lang.Object`, so the JDK
+    // field-setter then throws `cannot assign … in instance of java.lang.Object`
+    // (keycloak SkeletonKeyTokenTest.testSerialization). We can't invoke the
+    // MethodHandle directly (`DirectMethodHandle$Constructor.invokeExact` is
+    // unimplemented), so we read `instanceClass` off the target handle, allocate
+    // that type without running its own ctor, and run the ancestor `<init>`
+    // (`clazz`) — exactly the serialization contract. Ordinary CratonVM reflective
+    // constructors have no accessor object installed (the field holds a non-object
+    // sentinel), so they fall through to the native allocation path below.
+    if let Value::Object(Some(acc)) = ctx.get_field_by_name(this, "constructorAccessor") {
+        let acc_class = ctx.class_name_of_id(ctx.class_id_of_object(acc));
+        if acc_class.as_deref() == Some("jdk/internal/reflect/DirectConstructorHandleAccessor") {
+            if let Value::Object(Some(target_mh)) = ctx.get_field_by_name(acc, "target") {
+                if let Value::Object(Some(inst_mirror)) =
+                    ctx.get_field_by_name(target_mh, "instanceClass")
+                {
+                    if let Some(inst_cid) = ctx.class_id_from_mirror(inst_mirror) {
+                        if let Some(inst_name) = ctx.class_name_of_id(inst_cid) {
+                            if let Some(obj) = ctx.allocate_instance(&inst_name) {
+                                // Run the ancestor's no-arg `<init>` (`clazz`);
+                                // `java.lang.Object.<init>` is a no-op.
+                                if let Value::Object(Some(anc_mirror)) =
+                                    ctx.get_field_by_name(this, "clazz")
+                                {
+                                    if let Some(anc_cid) = ctx.class_id_from_mirror(anc_mirror) {
+                                        if let Some(anc_name) = ctx.class_name_of_id(anc_cid) {
+                                            let _ = ctx.invoke_special(
+                                                &anc_name,
+                                                "<init>",
+                                                "()V",
+                                                &[Value::Object(Some(obj))],
+                                            );
+                                        }
+                                    }
+                                }
+                                return Ok(Some(Value::Object(Some(obj))));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Get declaring class name (C6: real-JDK field name)
     let declaring_mirror = match ctx.get_field_by_name(this, "clazz") {
         Value::Object(Some(m)) => m,
