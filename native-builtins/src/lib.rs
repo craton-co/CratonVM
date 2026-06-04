@@ -9552,6 +9552,17 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     #[cfg(feature = "experimental-serialization")]
     serialization::register_serialization_natives(registry);
 
+    // `ByteArrayOutputStream` intrinsic is registered unconditionally (NOT
+    // gated behind `experimental-serialization`). It must always win over the
+    // real bytecode: the interpreter mis-resolves inherited `getfield`/
+    // `putfield` slots for `ByteArrayOutputStream` *subclasses* (e.g.
+    // `sun.security.util.DerOutputStream`), so real `write`/`toByteArray`
+    // bytecode silently drops bytes — which produced empty DER output and broke
+    // ECDSA signature encoding under real JCA. The intrinsic addresses `buf`/
+    // `count` by name (consistent with reflection), so it is correct for any
+    // subclass.
+    serialization::register_byte_array_output_stream(registry);
+
     // --- Phase 14.1: CDS/AppCDS ---
     #[cfg(feature = "experimental-aot")]
     cds::register_cds_natives(registry);
@@ -10652,6 +10663,14 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
 
+    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+        eprintln!(
+            "[DBG_TOARRAY] native_object_get_class ENTER kind={:?} cid={:?} len={}",
+            ctx.heap_kind_of(this),
+            ctx.class_id_of_object(this),
+            if ctx.heap_kind_of(this) == cratonvm_types::ObjectKind::Array { ctx.array_length(this) as i64 } else { -1 }
+        );
+    }
     // For array objects, build a class mirror with the correct array type name
     // (e.g., "[I" for int[], "[Ljava/lang/String;" for String[]).
     // Primitive arrays use ClassId(0) + element_type; reference arrays store
@@ -10705,6 +10724,12 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // `isPrimitive()==true` for an `Object[]` mirror produced here and
         // returns `null`, surfacing as `NPE: Cannot invoke isInstance on
         // null` inside `GenericConversionService.convert`.
+        if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+            eprintln!(
+                "[DBG_TOARRAY] getClass array_class_name={:?} comp_cid={:?} arr_len={}",
+                array_class_name, class_id, ctx.array_length(this)
+            );
+        }
         if let Some(arr_cid) = ctx.class_id_by_name(&array_class_name) {
             let mirror = ctx.get_class_mirror(arr_cid);
             return Ok(Some(Value::Object(Some(mirror))));
@@ -15001,6 +15026,61 @@ mod unsafe_arena {
             arena.bytes[offset..end].copy_from_slice(data);
             true
         }
+
+        /// True if `addr` falls inside any live arena block. Exact membership
+        /// (not a range heuristic) — used by native I/O to decide whether a
+        /// pointer is an Unsafe-arena handle vs a real OS address.
+        pub(super) fn contains(&self, addr: i64) -> bool {
+            let inner = self.inner.read();
+            Self::locate(&inner, addr).is_some()
+        }
+
+        /// Copy `out.len()` bytes OUT of the arena (arena → `out`). Returns
+        /// false if the `[addr, addr+len)` range is not fully inside one live
+        /// arena block.
+        pub(super) fn copy_out(&self, addr: i64, out: &mut [u8]) -> bool {
+            let inner = self.inner.read();
+            let (base, offset) = match Self::locate(&inner, addr) {
+                Some(v) => v,
+                None => return false,
+            };
+            let arena = match inner.get(&base) {
+                Some(a) => a,
+                None => return false,
+            };
+            let end = match offset.checked_add(out.len()) {
+                Some(e) => e,
+                None => return false,
+            };
+            if end > arena.bytes.len() {
+                return false;
+            }
+            out.copy_from_slice(&arena.bytes[offset..end]);
+            true
+        }
+
+        /// Copy `data` INTO the arena (`data` → arena). Symmetric to
+        /// [`Self::copy_out`].
+        pub(super) fn copy_in(&self, addr: i64, data: &[u8]) -> bool {
+            let mut inner = self.inner.write();
+            let (base, offset) = match Self::locate(&inner, addr) {
+                Some(v) => v,
+                None => return false,
+            };
+            let arena = match inner.get_mut(&base) {
+                Some(a) => a,
+                None => return false,
+            };
+            let end = match offset.checked_add(data.len()) {
+                Some(e) => e,
+                None => return false,
+            };
+            if end > arena.bytes.len() {
+                return false;
+            }
+            arena.bytes[offset..end].copy_from_slice(data);
+            true
+        }
     }
 
     pub(super) fn store() -> &'static ArenaStore {
@@ -15034,6 +15114,28 @@ mod unsafe_arena {
 
 pub(crate) fn unsafe_arena_allocate(size: usize) -> i64 {
     unsafe_arena::store().allocate(size)
+}
+
+/// True if `addr` is a live `Unsafe.allocateMemory` arena handle (as opposed
+/// to a real OS pointer). NIO native I/O (e.g. `sun/nio/ch/Net.read0/write0`,
+/// which live in the `native-io` crate) uses this — via the `NativeContext`
+/// bridge — to read/write `DirectByteBuffer` memory that `Util`'s temp-buffer
+/// path backs with arena handles instead of raw pointers. Without it,
+/// `net_write0` would `memcpy` from a 2^36-based handle and SIGSEGV.
+pub fn unsafe_arena_contains(addr: i64) -> bool {
+    unsafe_arena::store().contains(addr)
+}
+
+/// Copy bytes out of the Unsafe arena (arena → `out`). Returns false if the
+/// range isn't fully inside one live arena block. See [`unsafe_arena_contains`].
+pub fn unsafe_arena_copy_out(addr: i64, out: &mut [u8]) -> bool {
+    unsafe_arena::store().copy_out(addr, out)
+}
+
+/// Copy bytes into the Unsafe arena (`data` → arena). Symmetric to
+/// [`unsafe_arena_copy_out`].
+pub fn unsafe_arena_copy_in(addr: i64, data: &[u8]) -> bool {
+    unsafe_arena::store().copy_in(addr, data)
 }
 
 /// FIX(test-isolation): the `unsafe_arena` off-heap store is process-global and
@@ -33100,14 +33202,23 @@ fn array_new_instance_component_name(
     mirror_arg: Option<&Value>,
 ) -> String {
     match mirror_arg {
-        Some(Value::Object(Some(mirror))) => ctx
-            .read_string(*mirror)
-            .or_else(|| match ctx.get_field(*mirror, 1) {
-                Value::Object(Some(name_obj)) => ctx.read_string(name_obj),
-                _ => None,
-            })
-            .map(|s| s.replace('.', "/"))
-            .unwrap_or_else(|| "java/lang/Object".to_string()),
+        Some(Value::Object(Some(mirror))) => {
+            // Use the canonical mirror-name reader. It consults the VM
+            // reverse-map (`class_id_from_mirror` -> `class_name_of_id`), which
+            // is the ONLY thing that resolves the name of a *synthesized
+            // array-class mirror* such as the `[Ljava/lang/String;` returned by
+            // `Class.getComponentType()` on a `String[][]`. The previous ad-hoc
+            // `read_string`/slot-1 read returned nothing for those mirrors and
+            // fell back to `java/lang/Object`, so `Arrays.copyOf(.., String[][]
+            // .class)` (and H2's `SortOrder.sort` `rows.toArray(new Value[0][])`)
+            // allocated a bare `Object[]` and CCE'd on the caller's
+            // `(Value[][])` / `(String[][])` checkcast.
+            crate::lang_class::mirror_class_name(&*ctx, *mirror)
+                .filter(|s| !s.is_empty())
+                .or_else(|| ctx.read_string(*mirror))
+                .map(|s| s.replace('.', "/"))
+                .unwrap_or_else(|| "java/lang/Object".to_string())
+        }
         _ => "java/lang/Object".to_string(),
     }
 }
@@ -33131,6 +33242,12 @@ fn array_new_instance_for_component(
             let comp_id = ctx
                 .ensure_class_initialized(comp_name)
                 .unwrap_or(cratonvm_types::ClassId::new(0));
+            if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+                eprintln!(
+                    "[DBG_TOARRAY] Array.newInstance comp_name={:?} comp_id={:?} len={}",
+                    comp_name, comp_id, length
+                );
+            }
             ctx.new_ref_array(comp_id, length)
         }
     }

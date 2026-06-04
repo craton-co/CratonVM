@@ -6883,6 +6883,22 @@ fn execute_instruction(
                     );
                 }
             }
+            if std::env::var_os("CRATON_BAOS_DBG").is_some()
+                && matches!(field_name.as_deref(), Some("buf") | Some("count"))
+            {
+                let cm = shared.class_manager.read();
+                let recv_cid = shared.heap.class_id_of(obj_ref);
+                let rn = cm.get_class(recv_cid).map(|c| c.name.to_string()).unwrap_or_default();
+                let rnf = cm.get_class(recv_cid).map(|c| c.num_total_fields).unwrap_or(0);
+                let rffi = cm.get_class(recv_cid).map(|c| c.first_field_index).unwrap_or(0);
+                let dn = cm.get_class(field.declaring_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+                let dnf = cm.get_class(field.declaring_class_id).map(|c| c.num_total_fields).unwrap_or(0);
+                let dffi = cm.get_class(field.declaring_class_id).map(|c| c.first_field_index).unwrap_or(0);
+                eprintln!(
+                    "[BAOS-DBG] putfield {fld:?} recv={rn}(nf={rnf},ffi={rffi}) decl={dn}(nf={dnf},ffi={dffi}) field_index={fi} value={v:?}",
+                    fld = field_name, fi = field.field_index, v = value,
+                );
+            }
             // T17.Δ.4 — JVMTI FieldModification watchpoint.
             {
                 let method_id = synth_method_id(&thread.frames[frame_idx]);
@@ -8337,6 +8353,9 @@ fn execute_ldc(
             thread.frames[frame_idx].stack.push(Value::Object(Some(obj_ref)))?;
         }
         LdcValue::ClassRef(class_name) => {
+            if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+                eprintln!("[DBG_TOARRAY] LDC class={:?} in {}", class_name, thread.frames[frame_idx].class_name());
+            }
             let class_id = shared
                 .load_class_concurrent(&class_name)
                 .map_err(|e| convert_class_not_found(shared, thread, &class_name, e.into()))?;

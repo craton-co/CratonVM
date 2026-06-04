@@ -1399,6 +1399,11 @@ fn re1_connect_socket(
 }
 
 fn register_re1_socket(r: &mut NativeMethodRegistry) {
+    // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket surface so
+    // real bytecode drives sun/nio/ch/Net. See register_phase53_socket_stubs.
+    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+        return;
+    }
     let sock = "java/net/Socket";
 
     r.register(sock, "<init>", "()V", |ctx, args| {
@@ -1778,6 +1783,12 @@ fn re2_bind_listener(
 }
 
 fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
+    // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.ServerSocket
+    // surface so real bytecode drives sun/nio/ch/Net. See
+    // register_phase53_socket_stubs.
+    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+        return;
+    }
     let ss = "java/net/ServerSocket";
 
     r.register(ss, "<init>", "()V", |_ctx, args| {

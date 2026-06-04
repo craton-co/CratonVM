@@ -364,6 +364,10 @@ pub fn class_id_from_mirror(shared: &SharedVm, mirror: ObjectRef) -> Option<Clas
 /// `mirror_class_id` recover the ClassId without encoding it in the mirror's
 /// Java-visible fields.
 pub fn get_or_create_class_mirror(shared: &SharedVm, class_id: ClassId) -> ObjectRef {
+    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+        let nm = shared.class_manager.read().get_class(class_id).map(|c| c.name.to_string());
+        eprintln!("[DBG_TOARRAY] get_or_create_class_mirror cid={:?} name={:?}", class_id, nm);
+    }
     // Fast path: check cache
     if let Some(&mirror) = shared.class_mirrors.read().get(&class_id) {
         return mirror;

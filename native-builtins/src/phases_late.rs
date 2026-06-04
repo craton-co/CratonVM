@@ -15063,21 +15063,10 @@ fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(None)
 }
 
-fn p59_sw_get_caller_class(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Walk the stack and return the Class mirror of the first non-StackWalker frame
-    let trace = ctx.capture_stack_trace(0);
-    for entry in &trace {
-        let name: &str = &entry.class_name;
-        if name == "java/lang/StackWalker" || name.starts_with("java/lang/StackWalker$") {
-            continue;
-        }
-        // Return the Class mirror for this class
-        if let Some(cid) = ctx.class_id_by_name(name) {
-            let mirror = ctx.get_class_mirror(cid);
-            return Ok(Some(Value::Object(Some(mirror))));
-        }
-    }
-    Ok(Some(Value::Object(None)))
+fn p59_sw_get_caller_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Delegate to the canonical implementation in `stack_walker` so the
+    // `@CallerSensitive` off-by-one logic lives in exactly one place.
+    crate::stack_walker::native_get_caller_class(ctx, args)
 }
 
 // =============================================================================
@@ -39319,6 +39308,14 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
+    // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket/ServerSocket
+    // surface so real bytecode drives sun/nio/ch/Net. Third of three registrars
+    // (with phases_early::register_phase53_socket_stubs and
+    // net_phase_e::register_re1_socket/register_re2_server_socket). See
+    // `reference_server_socket_gap`.
+    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+        return;
+    }
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ServerSocket extras — add methods not registered in phase 53

@@ -13,6 +13,7 @@
 mod common;
 
 use common::{boxed_int, build_registry, call, new_hashmap, MockCtx};
+use cratonvm_native_api::NativeContext;
 use cratonvm_types::Value;
 
 const HM: &str = "java/util/HashMap";
@@ -222,6 +223,67 @@ fn keyset_iterator_visits_all_keys() {
     }
     assert_eq!(visited, 10,
                "iterator should visit each of the 10 keys exactly once, got {visited}");
+}
+
+#[test]
+fn colliding_keys_iterate_in_tail_append_order_like_hotspot() {
+    // HotSpot HashMap.putVal (JDK 8+) appends a new colliding key at the TAIL
+    // of its bin, so iterating a single bucket yields *insertion* order. Keys
+    // 0, 16, 32 all hash to bucket 0 (cap 16; Integer.hashCode == value, so the
+    // low 4 bits are all zero). Inserting in that order must iterate in that
+    // order — the old head-prepend reversed it to 32, 16, 0, which was the
+    // dominant source of HashMap iteration-order divergence vs HotSpot.
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let hm = new_hashmap(&reg, &mut ctx);
+
+    for &k in &[0i32, 16, 32] {
+        let key = boxed_int(&mut ctx, k);
+        let val = boxed_int(&mut ctx, k);
+        call(&reg, &mut ctx, HM, "put", PUT,
+             &[Value::Object(Some(hm)), key, val]).unwrap();
+    }
+
+    let key_set = call(&reg, &mut ctx, HM, "keySet", "()Ljava/util/Set;",
+                       &[Value::Object(Some(hm))]).unwrap();
+    let key_set_obj = match key_set {
+        Some(Value::Object(Some(o))) => o,
+        other => panic!("keySet returned {:?}", other),
+    };
+    let iter = call(&reg, &mut ctx, "java/util/HashSet", "iterator",
+                    "()Ljava/util/Iterator;",
+                    &[Value::Object(Some(key_set_obj))]).unwrap();
+    let iter_obj = match iter {
+        Some(Value::Object(Some(o))) => o,
+        other => panic!("HashSet.iterator returned {:?}", other),
+    };
+
+    let mut order = Vec::new();
+    loop {
+        let has_next = call(&reg, &mut ctx, "java/util/HashMap$KeyItr",
+                            "hasNext", "()Z",
+                            &[Value::Object(Some(iter_obj))]).unwrap();
+        match has_next {
+            Some(Value::Int(n)) if n != 0 => {}
+            _ => break,
+        }
+        let n = call(&reg, &mut ctx, "java/util/HashMap$KeyItr", "next",
+                     "()Ljava/lang/Object;",
+                     &[Value::Object(Some(iter_obj))]).unwrap();
+        match n {
+            Some(Value::Object(Some(o))) => match ctx.get_field(o, 0) {
+                Value::Int(v) => order.push(v),
+                other => panic!("key wrapper slot 0 not Int: {:?}", other),
+            },
+            _ => break,
+        }
+        if order.len() > 100 {
+            panic!("iterator runaway");
+        }
+    }
+
+    assert_eq!(order, vec![0, 16, 32],
+        "colliding keys must iterate in insertion (tail-append) order, got {:?}", order);
 }
 
 #[test]

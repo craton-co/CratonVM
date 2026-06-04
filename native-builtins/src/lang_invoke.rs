@@ -751,6 +751,18 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         r.register(vh, name, "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_get_and_add);
     }
 
+    // VarHandle.getAndBitwise{Or,And,Xor} (+ ordering variants). java.net.Socket
+    // updates its `state` int field via `STATE.getAndBitwiseOr(this, flag)`.
+    for name in &["getAndBitwiseOr", "getAndBitwiseOrAcquire", "getAndBitwiseOrRelease"] {
+        r.register(vh, name, "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_get_and_bitwise_or);
+    }
+    for name in &["getAndBitwiseAnd", "getAndBitwiseAndAcquire", "getAndBitwiseAndRelease"] {
+        r.register(vh, name, "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_get_and_bitwise_and);
+    }
+    for name in &["getAndBitwiseXor", "getAndBitwiseXorAcquire", "getAndBitwiseXorRelease"] {
+        r.register(vh, name, "([Ljava/lang/Object;)Ljava/lang/Object;", varhandle_get_and_bitwise_xor);
+    }
+
     // C38: Ordering variants of compareAndSet / compareAndExchange / getAndSet.
     // The real JDK maps each to a distinct native; we use the same underlying
     // CAS / CAX / xchg implementation (we don't emit hardware fences). Needed
@@ -1323,6 +1335,150 @@ fn varhandle_get_and_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         }
         _ => Ok(Some(Value::Int(0))),
     }
+}
+
+/// Bitwise atomic op selector for `VarHandle.getAndBitwise{Or,And,Xor}`.
+#[derive(Copy, Clone)]
+enum VhBitOp {
+    Or,
+    And,
+    Xor,
+}
+
+/// `VarHandle.getAndBitwise{Or,And,Xor}(receiver, mask) -> old value`.
+///
+/// Signature-polymorphic, same arg shapes as [`varhandle_get_and_add`]
+/// (array / instance / static). Needed by `java.net.Socket`, whose `state`
+/// field is updated with `STATE.getAndBitwiseOr(this, flag)` during
+/// connect/accept; without it the real-JDK Socket path throws
+/// `NoSuchMethodError`. See `reference_server_socket_gap`.
+fn varhandle_get_and_bitwise(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    op: VhBitOp,
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+
+    fn apply(current: &Value, mask: &Value, op: VhBitOp) -> Value {
+        let f = |a: i64, b: i64| match op {
+            VhBitOp::Or => a | b,
+            VhBitOp::And => a & b,
+            VhBitOp::Xor => a ^ b,
+        };
+        match (current, mask) {
+            (Value::Int(a), Value::Int(b)) => Value::Int(f(*a as i64, *b as i64) as i32),
+            (Value::Long(a), Value::Long(b)) => Value::Long(f(*a, *b)),
+            (Value::Long(a), Value::Int(b)) => Value::Long(f(*a, *b as i64)),
+            (Value::Int(a), Value::Long(b)) => Value::Int(f(*a as i64, *b) as i32),
+            _ => current.clone(),
+        }
+    }
+
+    // Array-element form — args = [vh, array, idx, mask].
+    if let Some((arr, idx)) = vh_array_call(ctx, args) {
+        let mask = args.get(3).cloned().unwrap_or(Value::Int(0));
+        let old = ctx.get_array_element(arr, idx);
+        let new_val = apply(&old, &mask, op);
+        ctx.set_array_element(arr, idx, new_val);
+        return Ok(Some(old));
+    }
+
+    // Resolve kind + field via the meta side-table FIRST (real-JDK VarHandles —
+    // e.g. `java.net.Socket.STATE` — do NOT carry our synthetic 6-field layout,
+    // so reading `VH_KIND` off the object yields garbage). Fall back to the
+    // synthetic fields. Mirrors `varhandle_compare_and_set`.
+    let meta = vh_meta_get(ctx, this);
+    let (kind, field_idx) = match meta.as_deref() {
+        Some(m) => (m.kind, m.field_index),
+        None => {
+            let k = match ctx.get_field(this, VH_KIND) {
+                Value::Int(k) => k,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let i = match ctx.get_field(this, VH_FIELD_INDEX) {
+                Value::Int(i) => i,
+                _ => -1,
+            };
+            (k, i)
+        }
+    };
+
+    match kind {
+        VH_KIND_ARRAY => {
+            let arr = match args.get(1) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let idx = match args.get(2) {
+                Some(Value::Int(i)) => *i as usize,
+                _ => 0,
+            };
+            let mask = args.get(3).cloned().unwrap_or(Value::Int(0));
+            let old = ctx.get_array_element(arr, idx);
+            let new_val = apply(&old, &mask, op);
+            ctx.set_array_element(arr, idx, new_val);
+            Ok(Some(old))
+        }
+        VH_KIND_INSTANCE => {
+            let receiver = match args.get(1) {
+                Some(Value::Object(Some(r))) => *r,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let mask = args.get(2).cloned().unwrap_or(Value::Int(0));
+            let idx = if field_idx >= 0 {
+                field_idx as usize
+            } else {
+                let (class, field) = match meta.as_deref() {
+                    Some(m) => (m.class_name.clone(), m.field_name.clone()),
+                    None => (
+                        vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
+                        vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
+                    ),
+                };
+                match ctx.resolve_field_index(&class, &field) {
+                    Some(i) => {
+                        ctx.set_field(this, VH_FIELD_INDEX, Value::Int(i as i32));
+                        i
+                    }
+                    None => return Ok(Some(Value::Int(0))),
+                }
+            };
+            let old = ctx.get_field(receiver, idx);
+            let new_val = apply(&old, &mask, op);
+            ctx.set_field(receiver, idx, new_val);
+            Ok(Some(old))
+        }
+        VH_KIND_STATIC => {
+            let mask = args.get(1).cloned().unwrap_or(Value::Int(0));
+            let (class, field) = match meta.as_deref() {
+                Some(m) => (m.class_name.clone(), m.field_name.clone()),
+                None => (
+                    vh_read_string(ctx, this, VH_CLASS).unwrap_or_default(),
+                    vh_read_string(ctx, this, VH_FIELD).unwrap_or_default(),
+                ),
+            };
+            if let Some(cid) = ctx.class_id_by_name(&class) {
+                let mirror = ctx.get_class_mirror(cid);
+                let old = ctx.get_field_by_name(mirror, &field);
+                let new_val = apply(&old, &mask, op);
+                ctx.set_field_by_name(mirror, &field, new_val);
+                Ok(Some(old))
+            } else {
+                Ok(Some(Value::Int(0)))
+            }
+        }
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+fn varhandle_get_and_bitwise_or(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    varhandle_get_and_bitwise(ctx, args, VhBitOp::Or)
+}
+fn varhandle_get_and_bitwise_and(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    varhandle_get_and_bitwise(ctx, args, VhBitOp::And)
+}
+fn varhandle_get_and_bitwise_xor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    varhandle_get_and_bitwise(ctx, args, VhBitOp::Xor)
 }
 
 // =============================================================================

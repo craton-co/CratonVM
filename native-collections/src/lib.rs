@@ -1233,6 +1233,9 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+        eprintln!("[DBG_TOARRAY] native_al_to_array (0-arg) HIT nargs={}", args.len());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -1272,15 +1275,24 @@ pub fn native_al_to_array_typed(
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
     let elems = al_or_collection_elements(ctx, this);
     let size = elems.len();
-    if dbg_sbload() {
+    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
         eprintln!(
-            "[DBG_SBLOAD] AL.toArray(T[]) size={} template_some={}",
-            size,
-            matches!(template, Value::Object(Some(_)))
+            "[DBG_TOARRAY] native_al_to_array_typed HIT nargs={} size={} template_some={}",
+            args.len(), size, matches!(template, Value::Object(Some(_)))
         );
     }
     let target = match template {
         Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+        // Template too small: allocate a NEW array of the template's runtime
+        // component type (JDK contract `Arrays.copyOf(elementData, size,
+        // a.getClass())`), NOT a bare `Object[]`. For an array object the heap
+        // header stores its component class id, so `class_id_of_object(arr)` IS
+        // the component class id `new_ref_array` wants — preserving multi-dim
+        // types (`Value[][]` for H2 SortOrder.sort, not `Object[]`).
+        Value::Object(Some(arr)) => {
+            let comp = ctx.class_id_of_object(arr);
+            ctx.new_ref_array(comp, size)
+        }
         _ => alloc_ref_array(ctx, size),
     };
     for (i, val) in elems.iter().enumerate() {
@@ -1879,7 +1891,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
             h = h.wrapping_mul(31).wrapping_add(cu as i32);
         }
         // Spread bits (like HashMap.hash in JDK)
-        return Ok(h ^ (h >> 16));
+        return Ok(h ^ ((h as u32) >> 16) as i32);
     }
     // Enum constants: hash by (declaring class name, constant name) — the
     // JLS-canonical identity of an enum constant — so an enum-keyed map's
@@ -1896,7 +1908,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
         for b in const_name.bytes() {
             h = h.wrapping_mul(31).wrapping_add(b as i32);
         }
-        return Ok(h ^ (h >> 16));
+        return Ok(h ^ ((h as u32) >> 16) as i32);
     }
     if let Some(prim) = unbox_wrapper(ctx, key) {
         // Wrapper types: hash by their primitive value (matches JDK Integer.hashCode etc.)
@@ -1910,7 +1922,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
             }
             _ => ctx.identity_hash_code(key),
         };
-        return Ok(h ^ (h >> 16));
+        return Ok(h ^ ((h as u32) >> 16) as i32);
     }
     // S111r-bug-fix (peaceful-sammet): for arbitrary user-defined objects we
     // MUST call their `hashCode()` so HashMap honours the equals/hashCode
@@ -1926,7 +1938,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
         Some(Value::Int(v)) => v,
         _ => ctx.identity_hash_code(key),
     };
-    Ok(h ^ (h >> 16))
+    Ok(h ^ ((h as u32) >> 16) as i32)
 }
 
 /// Compute the *raw* Java `hashCode()` of an element `Value` — i.e. the value
@@ -3018,9 +3030,13 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // attack/corruption to the caller rather than silently producing
     // wrong data.
     let mut walk_count: usize = 0;
+    // Track the last node visited so a not-found key can be appended at the
+    // tail of the chain (HotSpot HashMap.putVal semantics), not prepended.
+    let mut tail_node: Option<ObjectRef> = None;
     const CHAIN_WALK_LIMIT: usize = 4096;
     while let Value::Object(Some(node)) = node_val {
         walk_count += 1;
+        tail_node = Some(node);
         if walk_count > CHAIN_WALK_LIMIT {
             eprintln!(
                 "[HM-PUT-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
@@ -3075,23 +3091,25 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         node_val = next;
     }
 
-    // Key not found — insert at head of chain
-    let existing_head = ctx.get_array_element(buckets, idx);
-    let head_ref = match existing_head {
-        Value::Object(obj_opt) => obj_opt,
-        _ => None,
-    };
+    // Key not found — append at the TAIL of the chain. This matches HotSpot
+    // HashMap.putVal (JDK 8+), which links the new node after the last bin
+    // entry rather than prepending it. Tail-append makes within-bucket
+    // iteration order equal to insertion order, reproducing HotSpot's
+    // encounter order for keys that collide into the same bucket (the prior
+    // head-prepend reversed them, the dominant source of HashMap iteration-
+    // order divergence vs HotSpot across the gauntlet).
     // Create node — for null keys, store Value::Object(None) in key field
     let new_node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
     ctx.set_field(new_node, NODE_FIELD_HASH, Value::Int(hash));
     ctx.set_field(new_node, NODE_FIELD_KEY, key_val);
     ctx.set_field(new_node, NODE_FIELD_VALUE, value);
-    ctx.set_field(
-        new_node,
-        NODE_FIELD_NEXT,
-        head_ref.map_or(Value::Object(None), |r| Value::Object(Some(r))),
-    );
-    ctx.set_array_element(buckets, idx, Value::Object(Some(new_node)));
+    ctx.set_field(new_node, NODE_FIELD_NEXT, Value::Object(None));
+    match tail_node {
+        // Non-empty chain: link after the last node walked above.
+        Some(t) => ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(Some(new_node))),
+        // Empty bucket: the new node becomes the chain head.
+        None => ctx.set_array_element(buckets, idx, Value::Object(Some(new_node))),
+    }
     set_map_size(ctx, this, size + 1);
 
     Ok(Some(Value::Object(None))) // no old value
@@ -3834,6 +3852,43 @@ fn collect_keys_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<Value
     map_collect_keys(ctx, source)
 }
 
+/// Snapshot a HashSet's elements in *iteration order* for the order-sensitive
+/// read paths (iterator / toArray / forEach / stream / toString / addAll-source).
+///
+/// An ordinary HashSet — and a keySet/entrySet *view* of a plain `HashMap` —
+/// iterates in the backing map's bucket order, which already matches HotSpot,
+/// so we read straight from `backing`. But when the view's source is an
+/// insertion-ordered `LinkedHashMap` (or a sorted `TreeMap`), routing through
+/// the HashMap backing would re-bucket the elements and destroy that order
+/// (the SD-JWT `objectNode.properties().forEach(...)` claim-ordering bug). For
+/// those sources we collect directly from the source in its native order:
+/// keySet → the source keys; entrySet → freshly built `Map.Entry` objects over
+/// the source's ordered `(key,value)` pairs (slot 0 = key, slot 1 = value, the
+/// layout `native_lhm_entry_set` and `native_hs_remove`'s key-extraction use).
+fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef) -> Vec<Value> {
+    if let Some(source) = view_backing_source(ctx, backing) {
+        let cls = ctx
+            .class_name_of_id(ctx.class_id_of_object(source))
+            .unwrap_or_default();
+        let ordered = cls == "java/util/LinkedHashMap" || is_tree_map_receiver(ctx, source);
+        if ordered {
+            if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
+                return collect_entries_any(ctx, source)
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
+                        ctx.set_field(entry, 0, k);
+                        ctx.set_field(entry, 1, v);
+                        Value::Object(Some(entry))
+                    })
+                    .collect();
+            }
+            return collect_keys_any(ctx, source);
+        }
+    }
+    map_collect_keys(ctx, backing)
+}
+
 /// Refresh an ArrayList-backed map view (`values()` OR TreeMap `entrySet()`)
 /// from its live source map, preserving the trailing source-marker slot.
 /// Mirrors `resync_view_set`. The element kind is inferred from the list's
@@ -4268,7 +4323,7 @@ fn native_hs_to_array_typed(
         Some(m) => m,
         None => return Ok(Some(Value::Object(None))),
     };
-    let keys = map_collect_keys(ctx, backing);
+    let keys = collect_view_snapshot_ordered(ctx, backing);
     if let Some(arr) = target {
         let len = ctx.array_length(arr);
         if len >= keys.len() {
@@ -4554,8 +4609,10 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             return Ok(Some(Value::Object(None)));
         }
     };
-    // Collect keys into a snapshot array
-    let keys = map_collect_keys(ctx, backing);
+    // Collect keys into a snapshot array (source iteration order for an
+    // insertion-ordered LinkedHashMap / sorted TreeMap view; bucket order
+    // otherwise).
+    let keys = collect_view_snapshot_ordered(ctx, backing);
     if dbg_hs_itr() {
         eprintln!("[HS-ITR-DBG] native_hs_iterator: collected {} keys from backing map {:?}", keys.len(), backing);
     }
@@ -4586,7 +4643,7 @@ fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(m) => m,
         None => return Ok(Some(Value::Object(None))),
     };
-    let keys = map_collect_keys(ctx, backing);
+    let keys = collect_view_snapshot_ordered(ctx, backing);
     let arr = alloc_ref_array(ctx, keys.len());
     for (i, k) in keys.iter().enumerate() {
         ctx.set_array_element(arr, i, *k);
@@ -4607,7 +4664,7 @@ fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             return Ok(Some(Value::Object(Some(s))));
         }
     };
-    let keys = map_collect_keys(ctx, backing);
+    let keys = collect_view_snapshot_ordered(ctx, backing);
     let mut parts = Vec::with_capacity(keys.len());
     for k in &keys {
         parts.push(obj_to_display_string(ctx, k));
@@ -5796,7 +5853,7 @@ fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(m) => m,
         None => return Ok(None),
     };
-    let keys = map_collect_keys(ctx, backing);
+    let keys = collect_view_snapshot_ordered(ctx, backing);
     for key in &keys {
         ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[*key])?;
     }
@@ -7420,7 +7477,7 @@ fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(m) => m,
         None => return make_stream(ctx, &[]),
     };
-    let keys = map_collect_keys(ctx, backing);
+    let keys = collect_view_snapshot_ordered(ctx, backing);
     make_stream(ctx, &keys)
 }
 
@@ -14876,7 +14933,7 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
                 let s0 = ctx.get_field(backing, MAP_FIELD_BUCKETS);
                 if let Value::Object(Some(arr)) = s0 {
                     if ctx.heap_kind_of(arr) == ObjectKind::Array {
-                        return map_collect_keys(ctx, backing);
+                        return collect_view_snapshot_ordered(ctx, backing);
                     }
                 }
             }

@@ -953,14 +953,24 @@ fn jnio_new_direct_byte_buffer(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // (long addr, int cap) -> DirectByteBuffer
-    ctx.invoke(
+    // JavaNioAccess.newDirectByteBuffer(long addr, int cap[, Object att,
+    // MemorySegment seg]) -> a DirectByteBuffer wrapping the native address.
+    // args = [this(Buffer$1), addr, cap, ...]. JDK-25 has no `DirectByteBuffer(long,int)`
+    // ctor; the real `Buffer$1` does `new DirectByteBuffer(addr, cap, att, seg)`
+    // via the 4-arg `(JILjava/lang/Object;Ljava/lang/foreign/MemorySegment;)V`
+    // constructor. (The old handler invoked a non-existent `(JI)V` ctor on the
+    // wrong receiver and returned an uninitialized buffer.)
+    let addr = args.get(1).cloned().unwrap_or(Value::Long(0));
+    let cap = args.get(2).cloned().unwrap_or(Value::Int(0));
+    let att = args.get(3).cloned().unwrap_or(Value::Object(None));
+    if std::env::var_os("CRATONVM_DBG_NET").is_some() {
+        eprintln!("[NET] newDirectByteBuffer addr={:?} cap={:?}", addr, cap);
+    }
+    ctx.new_object_initialized(
         "java/nio/DirectByteBuffer",
-        "<init>",
-        "(JI)V",
-        args,
-    )?;
-    ctx.new_object("java/nio/DirectByteBuffer")
+        "(JILjava/lang/Object;Ljava/lang/foreign/MemorySegment;)V",
+        &[addr, cap, att, Value::Object(None)],
+    )
 }
 
 fn jnio_acquire_session(
@@ -1033,10 +1043,19 @@ fn register_java_nio_access(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/management/BufferPoolMXBean;",
         jnio_get_buffer_pool,
     );
+    // JDK-25 JavaNioAccess overloads: 2-arg `(JI)` (used by the NIO socket
+    // read/write path via SocketDispatcher) and 4-arg
+    // `(JILjava/lang/Object;Ljava/lang/foreign/MemorySegment;)`.
     registry.register(
         owner,
         "newDirectByteBuffer",
-        "(JILjava/lang/Object;)Ljava/nio/ByteBuffer;",
+        "(JI)Ljava/nio/ByteBuffer;",
+        jnio_new_direct_byte_buffer,
+    );
+    registry.register(
+        owner,
+        "newDirectByteBuffer",
+        "(JILjava/lang/Object;Ljava/lang/foreign/MemorySegment;)Ljava/nio/ByteBuffer;",
         jnio_new_direct_byte_buffer,
     );
     registry.register(

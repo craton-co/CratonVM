@@ -425,6 +425,9 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
 
     // Arrays.copyOf(Object[], int) → Object[]
     r.register(arrays, "copyOf", "([Ljava/lang/Object;I)[Ljava/lang/Object;", |ctx, args| {
+        if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+            eprintln!("[DBG_TOARRAY] copyOf2 (Object[],int) HIT nargs={}", args.len());
+        }
         let src = match args.first() {
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(Some(Value::Object(None))),
@@ -452,6 +455,9 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
         "copyOf",
         "([Ljava/lang/Object;ILjava/lang/Class;)[Ljava/lang/Object;",
         |ctx, args| {
+            if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+                eprintln!("[DBG_TOARRAY] copyOf3 (Object[],int,Class) HIT nargs={}", args.len());
+            }
             let src = match args.first() {
                 Some(Value::Object(Some(a))) => *a,
                 _ => return Ok(Some(Value::Object(None))),

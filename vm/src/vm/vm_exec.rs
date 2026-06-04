@@ -1367,6 +1367,41 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
 
+    fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
+        // NIO-SERVER-SOCKET: `Unsafe.allocateMemory` returns synthetic arena
+        // handles (base 0x10_0000_0000), not real pointers. A
+        // `DirectByteBuffer.address()` from `Util.getTemporaryDirectBuffer`
+        // reaching `Net.read0`/`SocketDispatcher` is such a handle — route it
+        // through the off-heap store. Real OS pointers fall through to raw.
+        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
+            return cratonvm_native_builtins::unsafe_arena_copy_out(addr, out);
+        }
+        if addr <= 0 {
+            return false;
+        }
+        // SAFETY: `addr` is a real, readable native pointer (not an arena
+        // handle); `out.len()` bytes are copied from it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
+        }
+        true
+    }
+
+    fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
+        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
+            return cratonvm_native_builtins::unsafe_arena_copy_in(addr, data);
+        }
+        if addr <= 0 {
+            return false;
+        }
+        // SAFETY: `addr` is a real, writable native pointer (not an arena
+        // handle); `data.len()` bytes are copied to it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
+        }
+        true
+    }
+
     fn method_exists(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool {
         let cm = self.shared.class_manager.read();
         let class_id = match cm.get_loaded_class_id(class_name) {
@@ -1401,6 +1436,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn new_ref_array(&mut self, class_id: ClassId, length: usize) -> ObjectRef {
+        if class_id.as_u32() == 0 && std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+            let frame = self.thread.frames.last().map(|f| {
+                format!("{}.{}", f.class_name(), f.method_name())
+            }).unwrap_or_default();
+            eprintln!("[DBG_TOARRAY] new_ref_array(Object[],len={}) from frame={}", length, frame);
+        }
         self.shared
             .heap
             .alloc_array(class_id, ArrayElementType::Reference, length)
@@ -7894,16 +7935,18 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "socket" | "getLocalAddress"
                             ))
-                        // Wave 3 Task C: ServerSocket adapter — when the
-                        // ServerSocket is the channel-backed wrapper its
-                        // bind / getLocalPort must reach our overrides
-                        // ahead of the real-JDK bytecode (which would
-                        // try to allocate a SocketImpl etc.).
-                        || (class_name == "java/net/ServerSocket"
-                            && matches!(
-                                method_name,
-                                "bind" | "getLocalPort" | "isBound" | "isClosed" | "getLocalSocketAddress" | "close"
-                            ))
+                        // NIO-SERVER-SOCKET (2026-06-03): the `java/net/ServerSocket`
+                        // override was removed so the REAL JDK bytecode runs and
+                        // flows through `NioSocketImpl` → `sun/nio/ch/Net`
+                        // (native-io::net), which binds a real `TcpListener` and
+                        // reports the OS-chosen port. The old synthetic override
+                        // intercepted `bind`/`getLocalPort` and wrote the port into
+                        // `ServerSocket.impl@0` — a reference slot — where the
+                        // descriptor-aware field-write coerces the Int to null
+                        // (gc::coerce_field_value_by_descriptor), so `getLocalPort`
+                        // always returned 0. See `reference_server_socket_gap`.
+                        // The channel-backed `ServerSocketChannel.socket()` wrapper
+                        // (Wave 3 Task C) likewise now runs real bytecode.
                         // Wave 3 Task C: SocketChannel/ServerSocketChannel
                         // factories + connect/accept/configureBlocking — JDK
                         // bytecode for these reaches into the SelectorProvider
@@ -8532,6 +8575,24 @@ fn invoke_on_class_shared_inner(
                         // allocation path never populates.
                         || (class_name == "java/security/KeyPair"
                             && matches!(method_name, "getPublic" | "getPrivate"))
+                        // BAOS-SUBCLASS: `java.io.ByteArrayOutputStream` is
+                        // subclassed by `sun.security.util.DerOutputStream`
+                        // (and others). The interpreter mis-resolves the
+                        // inherited `count` `putfield` slot for such subclasses,
+                        // so the *real* `write`/`toByteArray` bytecode silently
+                        // drops every byte — DER signature encoding produced an
+                        // empty array and broke ECDSA signing under real JCA.
+                        // Force our `serialization.rs` intrinsic (which addresses
+                        // `buf`/`count` by NAME, consistent with reflection) to
+                        // win over the bytecode for these mutator/reader methods.
+                        // `<init>` stays real (it sets `buf` correctly). The
+                        // `.is_some()` guard below means unregistered overloads
+                        // (e.g. `toString(Charset)`) still fall through to bytecode.
+                        || (class_name == "java/io/ByteArrayOutputStream"
+                            && matches!(
+                                method_name,
+                                "write" | "toByteArray" | "size" | "reset" | "toString"
+                            ))
                         // SigProbe WP6.6: `javax.security.auth.x500.X500Principal`
                         // string / DER round-trip. JDK 25 routes through
                         // `sun.security.x509.X500Name` whose parser depends
@@ -8674,6 +8735,12 @@ fn invoke_on_class_shared_inner(
                     || method_name == "getAndSetAcquire" || method_name == "getAndSetRelease"
                     || method_name == "getAndAdd"
                     || method_name == "getAndAddAcquire" || method_name == "getAndAddRelease"
+                    || method_name == "getAndBitwiseOr"
+                    || method_name == "getAndBitwiseOrAcquire" || method_name == "getAndBitwiseOrRelease"
+                    || method_name == "getAndBitwiseAnd"
+                    || method_name == "getAndBitwiseAndAcquire" || method_name == "getAndBitwiseAndRelease"
+                    || method_name == "getAndBitwiseXor"
+                    || method_name == "getAndBitwiseXorAcquire" || method_name == "getAndBitwiseXorRelease"
                 {
                     // Check if receiver is a MethodHandle or VarHandle
                     let is_mh = class_name == "java/lang/invoke/MethodHandle"

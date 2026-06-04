@@ -2511,7 +2511,7 @@ impl GenerationalHeap {
         finalizer_addrs: &[usize],
     ) -> (GcResult, Vec<usize>) {
         let mut young_from = self.young_from.lock();
-        let old_gen = self.old_gen.lock();
+        let mut old_gen = self.old_gen.lock();
 
         // Fold every mutator's thread-local card buffer into the bitmap
         // before scanning dirty cards (same protocol as the moving path).
@@ -2655,6 +2655,204 @@ impl GenerationalHeap {
                     if let Value::Object(Some(ref_obj)) = value {
                         mark_young(ref_obj.as_ptr(), &mut worklist);
                     }
+                }
+            }
+        }
+
+        // ----- Selective promotion (CRATONVM_SELECTIVE_PROMOTE) -----------
+        //
+        // The non-moving sweep keeps every survivor in young in place, so a
+        // workload whose live young set approaches young capacity (bintrees18's
+        // long-lived tree) cannot drain young — the sweep reclaims ~nothing and
+        // the VM thrashes or exhausts young. The moving collector avoids this by
+        // tenuring survivors to old gen, but it cannot run while conservative
+        // JIT roots are live (it would relocate a JIT-held pointer it cannot
+        // safely rewrite).
+        //
+        // Selective promotion threads the needle: evacuate to OLD GEN exactly
+        // those marked survivors NOT pinned by any root value. PIN = every young
+        // address that appears as a root or finalizer value — which INCLUDES
+        // conservative JIT false-positives, because we pin by the raw slot
+        // value. An evacuated object's address can therefore never equal any
+        // conservative slot value, so neither this fixup nor the VM-level
+        // pointer_map remap (which conservatively rescans JIT slots) can rewrite
+        // a non-pointer slot. Objects reachable only via precise heap edges (the
+        // tree's interior nodes) are movable and get tenured, draining young
+        // while the few pinned objects stay put.
+        let mut evac_map: HashMap<usize, usize> = HashMap::new();
+        if std::env::var_os("CRATONVM_SELECTIVE_PROMOTE").is_some() {
+            let is_y = |a: usize| -> bool { a >= from_base && a < from_end && (a & 0x7) == 0 };
+
+            // (1) Pin set: every root / finalizer value that lands in young.
+            let mut pinned: FxHashSet<usize> = FxHashSet::default();
+            for r in roots.iter() {
+                let a = r.as_ptr() as usize;
+                if is_y(a) {
+                    pinned.insert(a);
+                }
+            }
+            for &a in finalizer_addrs.iter() {
+                if is_y(a) {
+                    pinned.insert(a);
+                }
+            }
+
+            // (2) Evacuate non-pinned marked survivors to old gen. Install a
+            // forwarding pointer in each young source; record young→old in
+            // `evac_map` (returned for the VM-level remap). Stop if old gen
+            // fills (leave the remainder in young — correctness over completeness).
+            let mut evacuated: Vec<*mut u8> = Vec::new();
+            {
+                let free_blocks = young_from.free_blocks_sorted();
+                let mut free_iter = free_blocks.iter().peekable();
+                let used = young_from.used();
+                let mut cursor = 0usize;
+                let mut old_full = false;
+                while cursor < used && !old_full {
+                    if let Some(&&(off, sz)) = free_iter.peek() {
+                        if cursor == off {
+                            cursor += sz;
+                            free_iter.next();
+                            continue;
+                        }
+                    }
+                    let src = (from_base + cursor) as *mut u8;
+                    // SAFETY: `cursor` within `used`; from-space is mapped.
+                    let header = unsafe { &*(src as *const ObjectHeader) };
+                    let total_size = gen_object_total_size(header);
+                    if total_size < HEADER_SIZE || cursor + total_size > used {
+                        break;
+                    }
+                    let addr = src as usize;
+                    // Only tenure objects that have survived enough GCs
+                    // (gc_age+1 >= PROMOTION_AGE), exactly like the moving
+                    // collector. Promoting on the first survival would flood old
+                    // gen with objects that die almost immediately (bintrees'
+                    // short-lived trees), defeating the drain and starving old
+                    // gen. Short-lived survivors stay in young and are reclaimed
+                    // normally; only the genuinely long-lived set (the
+                    // persistent tree) ages out and promotes.
+                    let aged = header.gc_age + 1 >= PROMOTION_AGE;
+                    if header.gc_flags & GC_FLAG_MARKED != 0 && aged && !pinned.contains(&addr) {
+                        match old_gen.alloc(total_size, 8) {
+                            Some(dst) => {
+                                // SAFETY: src/dst are valid, non-overlapping, total_size bytes.
+                                unsafe { std::ptr::copy_nonoverlapping(src, dst, total_size) };
+                                // Replicate the atomic mark_word through atomic ops
+                                // (the bulk copy of an AtomicU64 is otherwise UB).
+                                // SAFETY: both headers are fully written.
+                                unsafe {
+                                    let m = (*(src as *const ObjectHeader))
+                                        .mark_word
+                                        .load(Ordering::Relaxed);
+                                    (*(dst as *mut ObjectHeader))
+                                        .mark_word
+                                        .store(m, Ordering::Relaxed);
+                                }
+                                // SAFETY: dst is a freshly written object header.
+                                let dhdr = unsafe { &mut *(dst as *mut ObjectHeader) };
+                                dhdr.forwarding_ptr = std::ptr::null_mut();
+                                dhdr.gc_flags |= GC_FLAG_OLD_GEN;
+                                dhdr.gc_flags &= !GC_FLAG_MARKED;
+                                // Install forwarding pointer in the young source.
+                                // SAFETY: src is a live young object header.
+                                unsafe {
+                                    std::ptr::addr_of_mut!(
+                                        (*(src as *mut ObjectHeader)).forwarding_ptr
+                                    )
+                                    .write(dst);
+                                }
+                                evac_map.insert(addr, dst as usize);
+                                evacuated.push(dst);
+                            }
+                            None => old_full = true,
+                        }
+                    }
+                    cursor += total_size;
+                }
+            }
+
+            // (3) Fix up every reference to an evacuated object (follow the
+            // forwarding pointers installed above), then dirty cards for the new
+            // old→young edges the evacuated copies introduce.
+            if !evac_map.is_empty() {
+                let fwd_of = |target: usize| -> Option<usize> {
+                    if !is_y(target) {
+                        return None;
+                    }
+                    // SAFETY: `is_y` confirmed an 8-aligned young address.
+                    let h = unsafe { &*(target as *const ObjectHeader) };
+                    if h.is_forwarded() {
+                        Some(h.forwarding_address() as usize)
+                    } else {
+                        None
+                    }
+                };
+
+                // (3a) References inside surviving (pinned / non-evacuated) young
+                // objects → rewrite to the evacuated copies in old gen.
+                {
+                    let free_blocks = young_from.free_blocks_sorted();
+                    let mut free_iter = free_blocks.iter().peekable();
+                    let used = young_from.used();
+                    let mut cursor = 0usize;
+                    while cursor < used {
+                        if let Some(&&(off, sz)) = free_iter.peek() {
+                            if cursor == off {
+                                cursor += sz;
+                                free_iter.next();
+                                continue;
+                            }
+                        }
+                        let obj = (from_base + cursor) as *mut u8;
+                        // SAFETY: cursor within used; from-space mapped.
+                        let header = unsafe { &*(obj as *const ObjectHeader) };
+                        let total_size = gen_object_total_size(header);
+                        if total_size < HEADER_SIZE || cursor + total_size > used {
+                            break;
+                        }
+                        if header.gc_flags & GC_FLAG_MARKED != 0 && !header.is_forwarded() {
+                            fixup_object_fields(obj, header, &fwd_of, &is_y, None);
+                        }
+                        cursor += total_size;
+                    }
+                }
+
+                // (3b) References inside the evacuated (now old-gen) copies. Any
+                // field still pointing at a (pinned) young object is a new
+                // old→young edge whose card must be dirtied.
+                let mut new_old_young: Vec<usize> = Vec::new();
+                for &dst in &evacuated {
+                    // SAFETY: dst is a live old-gen object just written.
+                    let dhdr = unsafe { &*(dst as *const ObjectHeader) };
+                    let mut pts = false;
+                    fixup_object_fields(dst, dhdr, &fwd_of, &is_y, Some(&mut pts));
+                    if pts {
+                        new_old_young.push(dst as usize);
+                    }
+                }
+
+                // (3c) Existing old→young edges (dirty-card seeds): rewrite any
+                // whose young target was evacuated (now old→old). NOTE: a full
+                // old-gen walk here did NOT fix the bintrees18 wrong-checksum, so
+                // the missed reference is not a clean-card old→young edge — the
+                // residual corruption is a register-invisible reference to an
+                // evacuated object (see memory reference_osr_main_corruptor).
+                {
+                    let mut seen: FxHashSet<usize> = FxHashSet::default();
+                    for &(old_obj, _, _) in &extra_roots {
+                        let oaddr = old_obj.as_ptr() as usize;
+                        if !seen.insert(oaddr) {
+                            continue;
+                        }
+                        // SAFETY: dirty-card scan yielded a live old-gen object.
+                        let ohdr = unsafe { &*(oaddr as *const ObjectHeader) };
+                        fixup_object_fields(oaddr as *mut u8, ohdr, &fwd_of, &is_y, None);
+                    }
+                }
+
+                if !new_old_young.is_empty() {
+                    self.card_table.mark_dirty_bulk(&new_old_young);
                 }
             }
         }
@@ -3010,9 +3208,26 @@ impl GenerationalHeap {
                 header.array_length,
             ));
 
-            if header.gc_flags & GC_FLAG_MARKED != 0 {
-                // Survivor: clear the mark, keep in place.
+            if header.is_forwarded() {
+                // Evacuated to old gen by selective promotion. EXPERIMENT
+                // (register-invisibility test): do NOT zero the young slot —
+                // leave the stale-but-intact copy (with its forwarding header)
+                // so a JIT register reference the conservative stack scan could
+                // not pin still reads valid data, mirroring how Cheney leaves
+                // un-copied from-space intact. If bintrees18's checksum becomes
+                // golden with this, the residual corruption was a register-only
+                // dangling reference to an evacuated object.
+                // SAFETY: span within from-space (checked above).
+                dead_regions.push((cursor, total_size));
+                bytes_swept += total_size;
+                objects_swept += 1;
+            } else if header.gc_flags & GC_FLAG_MARKED != 0 {
+                // Survivor: clear the mark, keep in place, and age it so the
+                // next sweep can tenure it once it reaches PROMOTION_AGE
+                // (selective promotion). Saturating so a long-lived pinned
+                // object never wraps its age.
                 header.gc_flags &= !GC_FLAG_MARKED;
+                header.gc_age = header.gc_age.saturating_add(1);
                 objects_live += 1;
             } else {
                 // Dead: zero the whole object span so a later conservative
@@ -3051,6 +3266,36 @@ impl GenerationalHeap {
             young_from.add_free_block(off, sz);
         }
 
+        // Coalesce adjacent free blocks into maximal spans. Selective promotion
+        // evacuates the long-lived set and the sweep reclaims the short-lived
+        // churn, leaving a large CONTIGUOUS free region carved into hundreds of
+        // thousands of Node-sized holes. `Arena::alloc` scans the free list
+        // LINEARLY, so an un-coalesced 500k-entry free list makes every
+        // subsequent allocation O(n) — the bintrees18 allocation cliff (young
+        // drains correctly but throughput collapses). Merging adjacent holes
+        // collapses that region to a handful of spans, restoring near-O(1) bump
+        // allocation out of a free block. Gated with the selective-promotion
+        // feature so the verified default path is byte-identical.
+        if std::env::var_os("CRATONVM_SELECTIVE_PROMOTE").is_some() {
+            let sorted = young_from.free_blocks_sorted();
+            if sorted.len() > 1 {
+                young_from.clear_free_list();
+                let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+                for (off, sz) in sorted {
+                    if let Some(last) = merged.last_mut() {
+                        if last.0 + last.1 == off {
+                            last.1 += sz;
+                            continue;
+                        }
+                    }
+                    merged.push((off, sz));
+                }
+                for (off, sz) in merged {
+                    young_from.add_free_block(off, sz);
+                }
+            }
+        }
+
         // Defence-in-depth: unconditionally clear `GC_FLAG_MARKED` on every
         // object header in the from-space. The survivor branch above already
         // clears the bit for objects it visited, but if the walk broke out
@@ -3083,8 +3328,11 @@ impl GenerationalHeap {
                     bytes_copied: live_bytes,
                     bytes_freed: bytes_swept,
                 },
-                // Nothing moved — no roots need rewriting.
-                pointer_map: HashMap::new(),
+                // Selective promotion may have evacuated some survivors to old
+                // gen; `evac_map` (young→old) lets the VM-level remap update any
+                // reference the conservative sweep could not. Empty when the
+                // CRATONVM_SELECTIVE_PROMOTE gate is off (true non-moving).
+                pointer_map: evac_map,
             },
             // Resurrected finalizers keep their addresses (non-moving).
             finalizer_addrs.to_vec(),
@@ -3383,11 +3631,35 @@ impl GenerationalHeap {
 
     /// Check if an allocation of `size` bytes would succeed in the young from-space.
     /// Does NOT allocate — just probes available space.
+    ///
+    /// Mirrors what [`Arena::alloc`] would actually do: it can satisfy a request
+    /// from the bump tail OR from a single free-list block. Checking ONLY the
+    /// bump cursor (`used()` vs `capacity()`) is wrong after a non-moving sweep:
+    /// that sweep reclaims dead objects into the free list but cannot retreat the
+    /// cursor (it can't relocate survivors while conservative JIT roots are
+    /// live), so once the cursor reaches capacity a cursor-only probe reports OOM
+    /// even with gigabytes free. The JIT slow path (`jit_new_object`) treats that
+    /// false OOM as "retire TLAB + force GC", so EVERY slow-path allocation
+    /// forces a young GC — the bintrees18 allocation-failure thrash (~840 GCs/s,
+    /// each reclaiming nothing). Falling back to the free list here lets the
+    /// allocation proceed from reclaimed space without a spurious GC.
     pub fn try_alloc_young_probe(&self, size: usize) -> Option<()> {
         let from = self.young_from.lock();
-        let aligned = from.used().checked_add(7).map(|v| v & !7)?;
-        let end = aligned.checked_add(size)?;
-        if end <= from.capacity() { Some(()) } else { None }
+        // Bump tail.
+        if let Some(aligned) = from.used().checked_add(7).map(|v| v & !7) {
+            if let Some(end) = aligned.checked_add(size) {
+                if end <= from.capacity() {
+                    return Some(());
+                }
+            }
+        }
+        // Reclaimed free-list space (only reached when the bump tail can't
+        // satisfy the request — keeps the common path a single cursor compare).
+        if from.largest_free_block() >= size {
+            Some(())
+        } else {
+            None
+        }
     }
 
     /// Carve out a TLAB-sized chunk from the young from-space.
@@ -3978,6 +4250,59 @@ impl std::fmt::Debug for GenerationalHeap {
 // ---------------------------------------------------------------------------
 // Size / slot access helpers
 // ---------------------------------------------------------------------------
+
+/// Selective-promotion fixup: rewrite every reference field of `obj` that
+/// points at an evacuated (forwarded) young object to its new old-gen address,
+/// via `fwd_of` (returns `Some(new_addr)` for an evacuated young target, else
+/// `None`). When `points_young` is `Some`, it is set `true` if any field still
+/// points at a *non-evacuated* young object after fixup — the caller uses that
+/// to maintain the old→young card invariant when `obj` itself now lives in old
+/// gen. `in_young` classifies an address as young-from-space.
+///
+/// SAFETY: `obj` is a valid object header; its reference slots lie within the
+/// object's body. No mutator runs (STW).
+fn fixup_object_fields(
+    obj: *mut u8,
+    header: &ObjectHeader,
+    fwd_of: &dyn Fn(usize) -> Option<usize>,
+    in_young: &dyn Fn(usize) -> bool,
+    mut points_young: Option<&mut bool>,
+) {
+    if header.kind == ObjectKind::Array {
+        if header.element_type == ArrayElementType::Reference {
+            for i in 0..header.array_length as usize {
+                let slot = unsafe { obj.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                let raw: u64 = unsafe { std::ptr::read(slot as *const u64) };
+                if raw != 0 {
+                    if let Some(nw) = fwd_of(raw as usize) {
+                        unsafe { std::ptr::write(slot as *mut u64, nw as u64) };
+                    } else if let Some(p) = points_young.as_deref_mut() {
+                        if in_young(raw as usize) {
+                            *p = true;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        for si in 0..header.num_slots as usize {
+            let slot = unsafe { obj.add(HEADER_SIZE + si * SLOT_SIZE) };
+            let value = unsafe { std::ptr::read(slot as *const Value) };
+            if let Value::Object(Some(ref_obj)) = value {
+                let target = ref_obj.as_ptr() as usize;
+                if let Some(nw) = fwd_of(target) {
+                    let new_value =
+                        Value::Object(Some(unsafe { ObjectRef::from_raw(nw as *mut u8) }));
+                    unsafe { std::ptr::write(slot as *mut Value, new_value) };
+                } else if let Some(p) = points_young.as_deref_mut() {
+                    if in_young(target) {
+                        *p = true;
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Compute total size of a heap object (for GC cursor advancement).
 /// Objects use SLOT_SIZE per field. Arrays use compact element sizes.

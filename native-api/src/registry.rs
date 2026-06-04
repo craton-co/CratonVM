@@ -10,6 +10,17 @@
 // migrated to rustc_hash::FxHashMap (T10.9.B). Import removed.
 use std::sync::Arc;
 
+/// NIO-SERVER-SOCKET (route 1): cached check of the `CRATONVM_REAL_NET_SOCKETS`
+/// env var. When set, the native registry drops all synthetic
+/// `java/net/Socket` / `java/net/ServerSocket` registrations so real JDK
+/// bytecode drives the `sun/nio/ch/Net` path. Cached in a `OnceLock` because
+/// `register()` is called thousands of times at startup.
+fn real_net_sockets_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some())
+}
+
 use rustc_hash::FxHashMap;
 
 use cratonvm_types::ClassId;
@@ -420,6 +431,43 @@ pub trait NativeContext {
     /// Resolve a field name to its slot index for a given class.
     /// Returns `None` if the field is not found in the class hierarchy.
     fn resolve_field_index(&self, class_name: &str, field_name: &str) -> Option<usize>;
+
+    /// Read `out.len()` bytes of native memory at `addr` into `out`.
+    ///
+    /// `addr` may be either a real OS pointer (e.g. a mapped buffer) OR one of
+    /// the VM's `Unsafe.allocateMemory` arena handles (a synthetic high
+    /// address, base `0x10_0000_0000`, NOT a dereferenceable pointer). NIO
+    /// native dispatchers (`sun/nio/ch/Net.read0`, `SocketDispatcher` …) that
+    /// receive a `DirectByteBuffer.address()` MUST go through this instead of a
+    /// raw `copy_nonoverlapping`, because `Util.getTemporaryDirectBuffer` backs
+    /// its temp buffers with arena handles — dereferencing one raw SIGSEGVs.
+    ///
+    /// The default implementation does a raw read (sufficient for test mocks /
+    /// real pointers); the real VM overrides it to route arena handles through
+    /// the off-heap store. Returns false if the range is invalid.
+    fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
+        if addr <= 0 {
+            return false;
+        }
+        // SAFETY: default path assumes `addr` is a real, readable pointer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
+        }
+        true
+    }
+
+    /// Write `data` to native memory at `addr`. See [`Self::copy_from_native_memory`]
+    /// for the arena-handle vs raw-pointer distinction.
+    fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
+        if addr <= 0 {
+            return false;
+        }
+        // SAFETY: default path assumes `addr` is a real, writable pointer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
+        }
+        true
+    }
 
     /// Check if a method exists in a class (searches the class hierarchy).
     /// Returns `true` if the method is found.
@@ -2226,6 +2274,20 @@ impl NativeMethodRegistry {
         // `drop_synthetic_stubs` field doc.)
         if self.drop_synthetic_stubs
             && self.current_category == NativeKind::SyntheticStub
+        {
+            return;
+        }
+        // NIO-SERVER-SOCKET (route 1): when `CRATONVM_REAL_NET_SOCKETS` is set,
+        // drop EVERY synthetic native registered on `java/net/Socket` /
+        // `java/net/ServerSocket` so the real JDK bytecode runs and drives the
+        // real `sun/nio/ch/Net` path (native-io::net). A single registered
+        // native shadows the class's bytecode at every interpreter dispatch
+        // site (WP0.1 native-override-priority), and the synthetic surface is
+        // registered from ~6 different functions (phases_early phase53,
+        // phases_late p72, net_phase_e re1/re2, socket_channel, …) — filtering
+        // here catches them all in one place. See `reference_server_socket_gap`.
+        if real_net_sockets_enabled()
+            && (class_name == "java/net/Socket" || class_name == "java/net/ServerSocket")
         {
             return;
         }

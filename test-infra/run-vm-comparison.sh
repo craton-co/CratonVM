@@ -247,17 +247,34 @@ run_extras() {
       local rc=$?; local t1=$(date +%s%N)
       local wall_s=$(awk -v ms=$(( (t1-t0)/1000000 )) 'BEGIN{printf "%.1f", ms/1000}')
       local state=OK; [ "$rc" -eq 124 ] && state=TIMEOUT
-      # a NoSuchMethodError / System.exit(-1) crash still prints partial output;
-      # require BOTH a clean rc AND a success marker before calling it OK.
-      local good="" bad=""
-      bad=$(grep -aoiE "NoSuchMethodError|System.exit\(-1\)|SIGSEGV|panic|FAILED" "$log" | head -1)
+      # ANSI-stripped view of the log — the JUnit console launcher colourises its
+      # help banner, so the "Usage:" line is NOT at column 0 in the raw bytes.
+      local clean=$(sed 's/\x1b\[[0-9;]*m//g' "$log")
       case "$item" in
-        junit-help)    good=$(grep -aoiE "^Usage: junit|ConsoleLauncher \[" "$log" | head -1);;
-        dacapo-avrora) good=$(grep -aoiE "PASSED in [0-9]+ msec" "$log" | head -1);;
+        junit-help)
+          # a NoSuchMethodError / System.exit(-1) crash still prints partial
+          # output; require BOTH a clean rc AND the help banner before calling OK.
+          # Match "Usage: junit" anywhere on the line (no ^ anchor) post-ANSI-strip.
+          local good bad
+          bad=$(printf '%s' "$clean" | grep -aoiE "NoSuchMethodError|System.exit\(-1\)|SIGSEGV|panic" | head -1)
+          good=$(printf '%s' "$clean" | grep -aoiE "Usage: junit|ConsoleLauncher \[|Thanks for using JUnit" | head -1)
+          if [ "$state" = "OK" ] && { [ -n "$bad" ] || [ -z "$good" ]; }; then state=FAIL; fi
+          ;;
+        dacapo-avrora)
+          # KNOWN NON-SIGNAL. DaCapo-9.12 validates a run by SHA-1-digesting
+          # stderr.log and comparing it to da39a3ee…0709 (the digest of the EMPTY
+          # string). JDK 25 writes warnings to stderr, so "Validation FAILED"
+          # fires on HotSpot AND TornadoVM too — it is a DaCapo-vs-JDK25 artifact,
+          # not a VM signal (and CratonVM's occasional PASS is luck: its stderr
+          # happened to be empty). Don't score it pass/fail; only surface a
+          # genuine VM crash. State "N/S" = non-signal.
+          if [ "$state" = "OK" ]; then
+            local crash
+            crash=$(printf '%s' "$clean" | grep -aoiE "SIGSEGV|panic|abort|fatal error|NoSuchMethodError" | head -1)
+            if [ -n "$crash" ]; then state=FAIL; else state="N/S"; fi
+          fi
+          ;;
       esac
-      if [ "$state" = "OK" ]; then
-        if [ -n "$bad" ] || [ -z "$good" ]; then state=FAIL; fi
-      fi
       local summary=$(grep -aiE "PASSED|FAILED|Usage:|SEGV|panic|stack overflow|OutOfMemory|charset|index out of|Exception|fatal|Error" "$log" | grep -avE "^\s*at " | sed 's/\x1b\[[0-9;]*m//g' | tail -1 | head -c 150)
       printf "  %-15s rc=%-3s %-8s %6ss  %s\n" "$v" "$rc" "$state" "$wall_s" "$summary"
       printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$item" "$v" "$rc" "$state" "$wall_s" "$summary" >>"$EX_TSV"
