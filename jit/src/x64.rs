@@ -1598,9 +1598,24 @@ struct SimdFpArraySum {
 /// Get the byte length of a bytecode instruction at `pc`.
 fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
     match code[pc] {
-        0x10 | 0x15..=0x19 | 0x36..=0x3a | 0xbc => 2,
+        // 2-byte: bipush(0x10), ldc(0x12), iload..aload(0x15..0x19),
+        // istore..astore(0x36..0x3a), ret(0xa9), newarray(0xbc).
+        // `ldc` (0x12) was previously absent and fell through to the `_ => 1`
+        // arm — a 1-byte under-count that misaligned every PC-stepping consumer
+        // (branch-target precompute, DCE, OSR/unroll). When an `ldc` sat
+        // immediately before a branch (e.g. `ldc 65536; if_icmpge exit` — the
+        // standard `for (i; i<CONST; …)` header), the scan skipped the branch,
+        // never marked its exit target, DCE-killed that target, and left the
+        // loop-exit `if_icmpge` unpatched (rel32=0) → the loop overran its bound
+        // (BC SPHINCS-256 Horst.horst_sign AIOOBE).
+        0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => 2,
+        // 3-byte: sipush(0x11), ldc_w(0x13), ldc2_w(0x14), iinc(0x84), jsr(0xa8),
+        // the if_* family, field/invoke ops, etc. ldc_w/ldc2_w were also absent.
         0x11
+        | 0x13
+        | 0x14
         | 0x84
+        | 0xa8
         | 0x99..=0xa6
         | 0xa7
         | 0xb2
