@@ -1,7 +1,17 @@
 # Precise JIT stack maps — design & staged implementation plan
 
-Status: **Stage 1 landed + validated; Stage 2 implemented** on branch
-`feat/precise-jit-stack-maps`.
+Status: **Stages 1–3 landed (gated-OFF), Stages 1–2 validated** on branch
+`feat/precise-jit-stack-maps`. Work continues in an isolated git worktree
+(`C:\craton\CratonVM-pjsm`) after a shared-checkout collision (a parallel
+session `git checkout dev`-ed the shared tree mid-edit; commits were safe).
+
+Stage 3 (`d6bf810`) — exact-RBP frame registration + safepoint-id + precise
+JIT-frame relocation, gated `CRATONVM_PRECISE_JIT_MAPS` (default-OFF →
+byte-identical default path). Compiles clean. Gate-ON moving validation is
+Stage 5 (needs a quiet machine for bt18). It resolves the two correctness
+items below: `frame_record` records the EXACT RBP (item #2), and
+`remap_active_jit_frames` rewrites slots at `[rbp - off]` (correct sign, item
+#1). Inert by default (`sp_id_slot_off == 0` for every method).
 
 Progress log:
 - Stage 1 (`427b474`): operand-stack `stack_oop_marks` desync eliminated +
