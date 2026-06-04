@@ -3438,6 +3438,10 @@ impl GenerationalHeap {
 
         self.stats.minor_gc_count.fetch_add(1, Ordering::Relaxed);
 
+        if std::env::var_os("CRATONVM_DBG_PRECISE").is_some() && !evac_map.is_empty() {
+            eprintln!("[PRECISE] sweep_young_non_moving returning evac_map.len()={}", evac_map.len());
+        }
+
         (
             GcResult {
                 stats: crate::gc::GcStats {

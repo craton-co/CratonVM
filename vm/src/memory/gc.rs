@@ -26,6 +26,9 @@ pub fn update_all_roots(
     thread: &mut crate::threading::jvm_thread::JvmThread,
     pointer_map: &HashMap<usize, usize>,
 ) {
+    if std::env::var_os("CRATONVM_DBG_PRECISE").is_some() {
+        eprintln!("[PRECISE] update_all_roots called, pointer_map.len()={}", pointer_map.len());
+    }
     if pointer_map.is_empty() {
         return;
     }
