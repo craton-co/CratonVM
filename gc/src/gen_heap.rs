@@ -2661,6 +2661,19 @@ impl GenerationalHeap {
 
         // ----- Selective promotion (CRATONVM_SELECTIVE_PROMOTE) -----------
         //
+        // ⚠ EXPERIMENTAL — DEFAULT OFF, KNOWN-BUGGY. Correct on small workloads
+        // (bintrees10/14/16 hit golden checksums) and it DOES eliminate young-gen
+        // exhaustion (bintrees18 completes in ~33s with the probe fix below
+        // instead of timing out), but at bintrees18 scale it produces a WRONG
+        // checksum (68332206 vs golden 67674804) — a deterministic, heap-size-
+        // independent STRUCTURAL fixup error (a child reference rewritten to the
+        // wrong old address → aliasing → inflated node count). Ruled out: clean-
+        // card old→young (full old-gen fixup didn't fix it) and register-only
+        // dangling reads (a "don't zero evacuated slots" variant didn't fix it).
+        // Root cause not yet isolated — likely an old_gen.alloc reuse/collision
+        // or a fixup edge case. DO NOT enable in production until resolved. See
+        // memory reference_osr_main_corruptor.
+        //
         // The non-moving sweep keeps every survivor in young in place, so a
         // workload whose live young set approaches young capacity (bintrees18's
         // long-lived tree) cannot drain young — the sweep reclaims ~nothing and
@@ -3209,15 +3222,14 @@ impl GenerationalHeap {
             ));
 
             if header.is_forwarded() {
-                // Evacuated to old gen by selective promotion. EXPERIMENT
-                // (register-invisibility test): do NOT zero the young slot —
-                // leave the stale-but-intact copy (with its forwarding header)
-                // so a JIT register reference the conservative stack scan could
-                // not pin still reads valid data, mirroring how Cheney leaves
-                // un-copied from-space intact. If bintrees18's checksum becomes
-                // golden with this, the residual corruption was a register-only
-                // dangling reference to an evacuated object.
+                // Evacuated to old gen by selective promotion: the live copy is
+                // in old gen and references were redirected in the fixup pass;
+                // reclaim (and zero) the young slot. (A "don't zero" variant was
+                // tested to rule out a register-only dangling read — it did NOT
+                // fix bintrees18's wrong checksum, so the residual corruption is
+                // a structural wrong-address fixup, not a dangling read.)
                 // SAFETY: span within from-space (checked above).
+                unsafe { std::ptr::write_bytes(obj_ptr, 0, total_size) };
                 dead_regions.push((cursor, total_size));
                 bytes_swept += total_size;
                 objects_swept += 1;
