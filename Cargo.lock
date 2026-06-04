@@ -606,6 +606,7 @@ dependencies = [
  "rustls-pemfile",
  "rustls-pki-types",
  "sha1",
+ "sha2",
  "sha3",
  "socket2",
  "tempfile",

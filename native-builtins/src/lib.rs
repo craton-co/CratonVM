@@ -30033,9 +30033,21 @@ pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Vec<u8> {
     match upper.as_str() {
         "MD5" => real_md5(data),
         "SHA1" | "SHA" => real_sha1(data),
+        "SHA224" => {
+            // SHA-224: the hand-rolled `crypto_impl` SHA-256 code does not
+            // cover the 224-bit variant, so use the `sha2` crate.
+            let mut h = sha2::Sha224::new();
+            h.update(data);
+            h.finalize().to_vec()
+        }
         "SHA256" => real_sha256(data),
         "SHA384" => real_sha384(data),
         "SHA512" => real_sha512(data),
+        "SHA3224" => {
+            let mut h = sha3::Sha3_224::new();
+            h.update(data);
+            h.finalize().to_vec()
+        }
         "SHA3256" => {
             let mut h = sha3::Sha3_256::new();
             h.update(data);
