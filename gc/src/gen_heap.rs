@@ -953,6 +953,19 @@ impl GenerationalHeap {
                     Some((name, n)) => (name, Some(n)),
                     None => ("<unresolved>".to_string(), None),
                 };
+            // CRATONVM_DBG_OOBFIELD=<substr>: dump a backtrace for OOB field
+            // reads whose class name contains <substr>, to localize the reader.
+            if let Ok(want) = std::env::var("CRATONVM_DBG_OOBFIELD") {
+                if !want.is_empty() && class_name.contains(&want) {
+                    eprintln!(
+                        "[OOBFIELD_ASRTAG_V1 READ] class={} index={} num_slots={}\n{}",
+                        class_name,
+                        index,
+                        num_slots,
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
             let is_true_undersized = real_fields.is_some_and(|n| n > num_slots);
             if is_true_undersized {
                 tracing::error!(
@@ -986,7 +999,7 @@ impl GenerationalHeap {
             }
             if std::env::var("CRATONVM_DBG_OOBFIELD").is_ok() {
                 eprintln!(
-                    "[OOBFIELD-READ] class={class_name} index={index} num_slots={num_slots}\n{}",
+                    "[OOBFIELD_ASRTAG_V1 READ] class={class_name} index={index} num_slots={num_slots}\n{}",
                     std::backtrace::Backtrace::force_capture()
                 );
             }
@@ -1057,6 +1070,20 @@ impl GenerationalHeap {
                     Some((name, n)) => (name, Some(n)),
                     None => ("<unresolved>".to_string(), None),
                 };
+            // CRATONVM_DBG_OOBFIELD=<substr>: dump a backtrace for OOB field
+            // accesses whose class name contains <substr>, to localize the writer.
+            if let Ok(want) = std::env::var("CRATONVM_DBG_OOBFIELD") {
+                if !want.is_empty() && class_name.contains(&want) {
+                    eprintln!(
+                        "[OOBFIELD_ASRTAG_V1 WRITE] class={} index={} num_slots={} value={:?}\n{}",
+                        class_name,
+                        index,
+                        num_slots,
+                        value,
+                        std::backtrace::Backtrace::force_capture()
+                    );
+                }
+            }
             let is_true_undersized = real_fields.is_some_and(|n| n > num_slots);
             if is_true_undersized {
                 tracing::error!(

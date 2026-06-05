@@ -12320,61 +12320,13 @@ pub(crate) fn register_atomic_reference_array_natives(r: &mut NativeMethodRegist
         },
     );
 
-    // --- AtomicStampedReference (2-field: ref=0, stamp=1) ---
-    let asr = "java/util/concurrent/atomic/AtomicStampedReference";
-    r.register(asr, "<init>", "(Ljava/lang/Object;I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args[1]);
-        ctx.set_field(this, 1, args[2]);
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(asr, "getReference", "()Ljava/lang/Object;", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
-    });
-    r.register(asr, "getStamp", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
-    });
-    r.register(asr, "set", "(Ljava/lang/Object;I)V", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args[1]);
-        ctx.set_field(this, 1, args[2]);
-        Ok(Some(Value::Object(None)))
-    });
-    r.register(
-        asr,
-        "compareAndSet",
-        "(Ljava/lang/Object;Ljava/lang/Object;II)Z",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let current_ref = ctx.get_field(this, 0);
-            let current_stamp = ctx.get_field(this, 1).as_int().unwrap_or(0);
-            let expected_stamp = args[3].as_int().unwrap_or(0);
-            if current_ref == args[1] && current_stamp == expected_stamp {
-                ctx.set_field(this, 0, args[2]);
-                ctx.set_field(this, 1, args[4]);
-                Ok(Some(Value::Int(1)))
-            } else {
-                Ok(Some(Value::Int(0)))
-            }
-        },
-    );
-    r.register(
-        asr,
-        "attemptStamp",
-        "(Ljava/lang/Object;I)Z",
-        |ctx, args| {
-            let this = obj_arg(args, 0)?;
-            let current_ref = ctx.get_field(this, 0);
-            if current_ref == args[1] {
-                ctx.set_field(this, 1, args[2]);
-                Ok(Some(Value::Int(1)))
-            } else {
-                Ok(Some(Value::Int(0)))
-            }
-        },
-    );
+    // NOTE: `AtomicStampedReference` registrations used to live here with a
+    // buggy 2-field (ref@0, stamp@1) layout that wrote stamp out-of-bounds on
+    // the real 1-slot ASR object. They have been removed and replaced by the
+    // JDK-faithful single-`pair`-field intrinsic in
+    // `register_atomic_stamped_ref_natives` (lib.rs), which is registered later
+    // (and previously already overwrote these). Keeping a single source of
+    // truth avoids the registration-order fragility.
     r.set_category(__prev_cat);
 }
 

@@ -4815,12 +4815,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // --- java.util.concurrent.atomic.AtomicReference (Session 13) ---
     register_atomic_reference_natives(registry);
 
-    // --- C23: AtomicReferenceArray (also AtomicStampedReference /
-    //      AtomicMarkableReference) ---  required in real-JDK mode because
-    //      the JDK bytecode path for these classes routes writes through a
-    //      VarHandle on the inner Object[], which our VarHandle machinery
-    //      cannot honour for array element CAS.  The registrations also
-    //      cover the get/set/getAndSet/length fast paths.
+    // --- C23: AtomicReferenceArray ---  required in real-JDK mode because the
+    //      JDK bytecode path routes writes through a VarHandle on the inner
+    //      Object[], which our VarHandle machinery cannot honour for array
+    //      element CAS.  The registrations also cover the get/set/getAndSet/
+    //      length fast paths.  (AtomicStampedReference / AtomicMarkableReference
+    //      are handled by register_atomic_stamped_ref_natives /
+    //      register_atomic_markable_ref_natives, registered later.)
     phases_early::register_atomic_reference_array_natives(registry);
 
     // --- SecurityManager / AccessController (T8.1.8) ---
@@ -34108,8 +34109,55 @@ fn native_ab_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 // ===========================================================================
-// AtomicStampedReference — 2-field (ref=0, stamp=1 Int)
+// AtomicStampedReference — JDK-faithful single `pair` field (slot 0) that
+// holds an `AtomicStampedReference$Pair { reference@0, stamp@1 }`.
+//
+// The real class declares exactly ONE instance field (`private volatile
+// Pair<V> pair`) plus a static `PAIR` VarHandle, so the allocated object has
+// num_slots==1. The old intrinsic stored `stamp` directly at slot 1, which is
+// out-of-bounds on a 1-slot object → the GC guard dropped the write and
+// `getStamp` read garbage. Worse, every public ASR method (`getReference`,
+// `getStamp`, `get`, `compareAndSet`, `set`, `attemptStamp`) reads
+// `this.pair.reference` / `this.pair.stamp`, so any of these methods that the
+// intrinsic does NOT intercept (e.g. `casPair`, or a future method) runs real
+// bytecode against slot 0 expecting a Pair — finding a bare reference instead
+// and reading bogus interior fields (the source of the stray `index=3`
+// out-of-bounds writes during boot). Modelling the real Pair object keeps the
+// intrinsic and any real bytecode perfectly consistent.
 // ===========================================================================
+
+const ASR_PAIR_CLASS: &str = "java/util/concurrent/atomic/AtomicStampedReference$Pair";
+
+/// Allocate a real-layout `AtomicStampedReference$Pair` holding
+/// `(reference, stamp)`. Slot 0 = reference (Object), slot 1 = stamp (int),
+/// matching the JDK field order so real ASR bytecode reading `pair.reference`
+/// / `pair.stamp` stays consistent with the intrinsic.
+fn asr_alloc_pair(ctx: &mut dyn NativeContext, reference: Value, stamp: i32) -> ObjectRef {
+    // `alloc_concurrent_synthetic` resolves the real Pair class (2 fields) when
+    // loadable and falls back to a 2-field synthetic class otherwise, so the
+    // header's declared field count always matches the 2 slots we write.
+    let pair = alloc_concurrent_synthetic(ctx, ASR_PAIR_CLASS, 2);
+    ctx.set_field(pair, 0, reference);
+    ctx.set_field(pair, 1, Value::Int(stamp));
+    pair
+}
+
+/// Read `(reference, stamp)` out of the `pair` stored in `this.field(0)`.
+/// Returns `(Value::Object(None), 0)` if the pair slot is null or somehow not
+/// a 2-field object (defensive — should not happen after construction).
+fn asr_read_pair(ctx: &mut dyn NativeContext, this: ObjectRef) -> (Value, i32) {
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(pair)) => {
+            let reference = ctx.get_field(pair, 0);
+            let stamp = match ctx.get_field(pair, 1) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            (reference, stamp)
+        }
+        _ => (Value::Object(None), 0),
+    }
+}
 
 fn register_atomic_stamped_ref_natives(r: &mut NativeMethodRegistry) {
     // census-tag: AtomicStampedReference atomic primitive → Bridge.
@@ -34124,6 +34172,9 @@ fn register_atomic_stamped_ref_natives(r: &mut NativeMethodRegistry) {
         native_asr_get_ref,
     );
     r.register(c, "getStamp", "()I", native_asr_get_stamp);
+    // get([I)Ljava/lang/Object; — reads stamp into stampHolder[0] and
+    // returns the reference. Faithful to the JDK two-result accessor.
+    r.register(c, "get", "([I)Ljava/lang/Object;", native_asr_get_with_holder);
     r.register(c, "set", "(Ljava/lang/Object;I)V", native_asr_set);
     r.register(
         c,
@@ -34156,8 +34207,10 @@ fn native_asr_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    ctx.set_field(this, 0, r);
-    ctx.set_field(this, 1, Value::Int(stamp));
+    // Store a real Pair object in the single `pair` field (slot 0). No write to
+    // slot 1 — the ASR object itself has only one slot.
+    let pair = asr_alloc_pair(ctx, r, stamp);
+    ctx.set_field(this, 0, Value::Object(Some(pair)));
     Ok(None)
 }
 
@@ -34166,7 +34219,8 @@ fn native_asr_get_ref(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, 0)))
+    let (reference, _stamp) = asr_read_pair(ctx, this);
+    Ok(Some(reference))
 }
 
 fn native_asr_get_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -34174,7 +34228,22 @@ fn native_asr_get_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(ctx.get_field(this, 1)))
+    let (_reference, stamp) = asr_read_pair(ctx, this);
+    Ok(Some(Value::Int(stamp)))
+}
+
+/// `V get(int[] stampHolder)` — store the current stamp into `stampHolder[0]`
+/// and return the current reference (matches JDK semantics).
+fn native_asr_get_with_holder(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (reference, stamp) = asr_read_pair(ctx, this);
+    if let Some(Value::Object(Some(holder))) = args.get(1) {
+        ctx.set_array_element(*holder, 0, Value::Int(stamp));
+    }
+    Ok(Some(reference))
 }
 
 fn native_asr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -34187,8 +34256,10 @@ fn native_asr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    ctx.set_field(this, 0, r);
-    ctx.set_field(this, 1, Value::Int(stamp));
+    // JDK `set` allocates a fresh Pair only when reference or stamp differ; we
+    // always install a fresh Pair (semantically identical, slightly simpler).
+    let pair = asr_alloc_pair(ctx, r, stamp);
+    ctx.set_field(this, 0, Value::Object(Some(pair)));
     Ok(None)
 }
 
@@ -34202,9 +34273,11 @@ fn native_asr_attempt_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let current_ref = ctx.get_field(this, 0);
+    let (current_ref, _current_stamp) = asr_read_pair(ctx, this);
     if values_ref_equal(current_ref, expected_ref) {
-        ctx.set_field(this, 1, Value::Int(new_stamp));
+        // Swap in a new Pair carrying the (unchanged) reference + new stamp.
+        let pair = asr_alloc_pair(ctx, current_ref, new_stamp);
+        ctx.set_field(this, 0, Value::Object(Some(pair)));
         Ok(Some(Value::Int(1)))
     } else {
         Ok(Some(Value::Int(0)))
@@ -34226,14 +34299,14 @@ fn native_asr_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let current_ref = ctx.get_field(this, 0);
-    let current_stamp = match ctx.get_field(this, 1) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let (current_ref, current_stamp) = asr_read_pair(ctx, this);
     if values_ref_equal(current_ref, expected_ref) && current_stamp == expected_stamp {
-        ctx.set_field(this, 0, new_ref);
-        ctx.set_field(this, 1, Value::Int(new_stamp));
+        // Install a new Pair only if reference or stamp actually changes (the
+        // JDK fast-path: when both are identical it skips the casPair entirely).
+        if !values_ref_equal(current_ref, new_ref) || current_stamp != new_stamp {
+            let pair = asr_alloc_pair(ctx, new_ref, new_stamp);
+            ctx.set_field(this, 0, Value::Object(Some(pair)));
+        }
         Ok(Some(Value::Int(1)))
     } else {
         Ok(Some(Value::Int(0)))
