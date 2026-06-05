@@ -723,7 +723,7 @@ fn native_unsafe_set_memory_consolidated(
 /// off-heap form (both objects null) copies through the single arena store
 /// with per-byte bounds checks; any form touching a heap object delegates to
 /// the existing bounds-checked lib.rs handler.
-fn native_unsafe_copy_memory_consolidated(
+pub(crate) fn native_unsafe_copy_memory_consolidated(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {

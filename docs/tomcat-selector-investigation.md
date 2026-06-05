@@ -2,7 +2,25 @@
 
 ## Status
 
-**Open.** After `cdcf159` (real-JDK `InetSocketAddress` holder layout
+**RESOLVED 2026-06-05 (branch `fix/tomcat-nio-selector`).** Apache Tomcat
+10.1.31 now **serves real HTTP** under CratonVM: `GET /` returns
+`HTTP/1.1 404` (chunked) — a genuine response from Coyote/Catalina (404
+because no ROOT context is mapped to `/`; the HTTP request/response cycle
+itself works end-to-end). Boot is clean: **0** `ClosedSelectorException`
+(was 23,622 per boot), **0** "server channel not bound", no error storm.
+
+This took NINE distinct fixes, each exposed by fixing the previous one
+(the NIO path never reached the next stage before). See
+"## RESOLUTION" at the bottom for the full chain. The original
+speculation below (WindowsSelectorImpl native surface) was the WRONG
+root cause — the real bugs were a synthetic-object field-layout collision
+plus a memory-model divergence and a reentrant mutex deadlock.
+
+---
+
+<details><summary>Original (2026-05-28) investigation — superseded</summary>
+
+After `cdcf159` (real-JDK `InetSocketAddress` holder layout
 in NIO bind), Tomcat 10.1.31 reaches `Server startup in [156-361] ms`
 with the server socket successfully bound to port 8080. However, the
 NioEndpoint poller's selector loop fires continuously with:
@@ -140,3 +158,124 @@ bypassed.
   failure documented in `bc-ec-mod-mododdinverse-investigation.md` and
   this Tomcat Selector issue likely share the same dispatch-layer root
   cause; whichever is investigated first will unblock the other.
+
+</details>
+
+---
+
+## RESOLUTION (2026-06-05) — Tomcat serves HTTP
+
+The 2028-05-28 theory (missing `WindowsSelectorImpl` natives) was wrong.
+CratonVM has a real platform-backed selector (`native-io/src/nio_selector.rs`,
+WSAPoll on Windows). The actual blockers, in the order they surfaced
+(each fix exposed the next — the NIO path simply never reached the next
+stage before):
+
+**Root cause class 1 — synthetic-object field-layout collision.** CratonVM
+now loads the REAL JDK abstract classes (`sun.nio.ch.SelectorImpl`,
+`java.nio.channels.ServerSocketChannel/SocketChannel`). The synthetic NIO
+natives stored int state (selector id/open flag, channel registry id,
+local port, …) in low object slots that collide with real reference-typed
+fields (`selectorOpen`, `closeLock`, `provider`, `keyLock`, …). Writing an
+`Int` into an `L…;`-typed slot is descriptor-coerced to `null` on BOTH read
+and write (`gc::coerce_field_value_by_descriptor`), so the state never
+persisted.
+
+1. **Selector (Bug B — the `ClosedSelectorException` storm).**
+   `selector_open_native` allocated a real `SelectorImpl` and wrote
+   `SI_OPEN_FLAG`(slot 4)/`SI_ID`(slot 0) → coerced to null → `open_flag`
+   read false → every `select()` threw `ClosedSelectorException` (23,622×).
+   FIX: key the selector object to its native id by GC-stable identity hash
+   (`sel_obj_ids` side-table, the existing C27 pattern); openness lives in
+   the native `SelectorState.open`.
+2. **ServerSocketChannel/SocketChannel (Bug A — "server channel not bound").**
+   Same collision for `F_REG_ID`(2)/`F_LOCAL_PORT`(4)/… → bind never
+   recorded the listener id → `accept()` threw "server channel not bound";
+   `getLocalAddress()` was null. FIX: an identity-hash `chan_fields`
+   side-table (`cf_get`/`cf_set`); remote host kept as a Rust `String` so no
+   un-rooted Java ref goes stale under a moving GC. `channel_net_fd` exposes
+   the id to the selector's register path.
+
+**Downstream natives (exposed once accept worked):**
+
+3. **`SocketChannel.socket()` (Bug C)** — abstract method, no native →
+   `AbstractMethodError` in `NioEndpoint.setSocketOptions`. Added an
+   `sc_socket` adapter returning a bare `java.net.Socket`.
+4. **Non-blocking accept clone mode (Bug D)** — `ssc_accept` cloned the
+   listener but the clone didn't inherit non-blocking mode on Windows →
+   `accept()` blocked forever. Set the clone's mode explicitly.
+5. **`register` on concrete channel classes (Bug E)** — native dispatch
+   (WP0.1) keys on the receiver's concrete class; the public 3-arg
+   `register(sel, ops, att)` lives on `AbstractSelectableChannel` and its
+   real bytecode touches uninitialized `regLock`/`validOps`. Registered the
+   override on `SocketChannel`/`ServerSocketChannel`(+Impl).
+6. **Socket option setters (Bug F)** — `SocketProperties.setProperties`
+   calls `setReceiveBufferSize`/`setKeepAlive`/`setTcpNoDelay`/… on the
+   adapter; the real bytecode calls `getImpl()` → NPE (no impl). No-op'd
+   them on `java/net/Socket` (gate-aware: dropped under
+   `CRATONVM_REAL_NET_SOCKETS`).
+7. **`getRemoteAddress`/`getLocalAddress` (Bug G)** — needed by
+   `NioSocketWrapper.populateRemoteAddr`. Built a real `InetSocketAddress`
+   via `new_object_initialized`.
+
+**Root cause class 2 — off-heap memory-model divergence (Bug H, GENERAL).**
+A `DirectByteBuffer` from `ByteBuffer.allocateDirect` is backed by a real
+`dbb_allocate` pointer. But CratonVM's `Unsafe` accessed it inconsistently:
+   - The 5-arg `Unsafe.copyMemory` (used by `DirectByteBuffer.put/get(byte[])`)
+     had TWO registrations; the **heap↔heap-only** `native_unsafe_copy_memory`
+     won and silently **dropped** mixed heap↔off-heap copies. FIX: point all
+     5-arg `copyMemory`/`copyMemory0` at `native_unsafe_copy_memory_consolidated`
+     (a strict superset that routes the off-heap side through
+     `copy_*_native_memory`).
+   - The 3-arg `Unsafe.getByte/putByte(Object,long)` with a **null base**
+     (byte-wise `DirectByteBuffer` access — the HTTP parser) stashed bytes in
+     a `static_int_store` HashMap, diverging from the raw/arena memory the
+     socket layer reads. FIX: dedicated `native_unsafe_get/put_byte_mb`
+     handlers that route a null base through `copy_*_native_memory` (same
+     arena-or-raw path the socket/FileChannel I/O uses).
+
+   This was a PRE-EXISTING general bug (any NIO direct-buffer socket I/O
+   round-tripped as zeros); it only surfaced now that the NIO path reached
+   read/write. Verified: `NioEcho`/`NioEchoMT` (single- + multi-threaded
+   Poller pattern, direct buffers) round-trip PING/PONG; `DbbProbe` byte-wise
+   still passes.
+
+**Root cause class 3 — reentrant mutex deadlock (Bug I — the final one).**
+`sk_set_interest_ops` (public `SelectionKey.interestOps(int)`) held the
+per-selector `parking_lot::Mutex` (`sel.lock()`) and then called
+`selector_set_interest`, which re-locks the SAME mutex (non-reentrant) →
+the Poller thread wedged forever inside `NioEndpoint.unreg()`. The trace
+showed `select → n=1`, `selectedKeys → 1`, `readyOps` (×2, isReadable +
+unreg mask), then silence — no `sc_read`, no error, client read-timeout.
+FIX: resolve `(selector id, net fd)` and set `interest_ops` under the lock,
+then DROP it before the OS-level `selector_set_interest` update.
+
+### How it was diagnosed
+
+- Isolated Java probes against the live binary (no rebuilds) reproduced each
+  bug: `NioTomcatProbe`/`NioStep` (selector + bind/accept), `NioEcho`/
+  `NioEchoMT` (full Poller pattern, single + multi thread), `DbbProbe`
+  (direct-buffer address scheme), `TcExec` (Tomcat's custom
+  `ThreadPoolExecutor` — confirmed working, ruling the executor out).
+- `CRATONVM_DBG_SCBUF` traces proved `copy_*` wrote PING to raw memory while
+  Java read zeros → the `static_int_store` divergence.
+- `CRATONVM_DBG_NIO` traces (register/select/selectedKeys/attachment/readyOps/
+  sc_read/sc_write) localized the deadlock: everything worked up to `readyOps`
+  in `unreg`, then the Poller hung. (Traces were removed after diagnosis.)
+
+### Verified
+
+- `GET /` → `HTTP/1.1 404` (chunked) — real response, request read + response
+  written (sc_read "GET / HTTP/1.1", sc_write "HTTP/1.1 404").
+- Boot: 0 ClosedSelectorException, 0 "not bound", clean.
+- Regression pool: see commit (the `Unsafe` byte/copyMemory changes are
+  general — the pool's `directbuffer-nio`/`unsafe-mem`/`filechannel-rt`
+  probes gate them).
+
+### Still open (separate, NOT NIO)
+
+- ROOT webapp returns 404 (no context mapped to `/`) — webapp deployment /
+  JSP is a separate concern, not the NIO connector.
+- `CRATONVM_REAL_NET_SOCKETS` stays default-OFF (the synthetic
+  `java.net.Socket`/NIO-channel surface is what serves; the real
+  `sun/nio/ch/Net` migration is a separate effort).
