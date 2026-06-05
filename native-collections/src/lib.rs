@@ -12962,6 +12962,45 @@ fn lhm_find_node(
     Ok(None)
 }
 
+/// Allocate + initialise a fresh synthetic `java/util/LinkedHashMap`.
+/// Mirrors `alloc_backing_map` but produces an insertion-ordered LinkedHashMap
+/// (so `collect_entries_any` / iteration honour put order).
+fn alloc_linked_hash_map(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let cid = match ctx.ensure_class_initialized("java/util/LinkedHashMap") {
+        Ok(id) => id,
+        Err(_) => ctx
+            .class_id_by_name("java/util/LinkedHashMap")
+            .unwrap_or(ClassId::new(0)),
+    };
+    let total = ctx.class_num_total_fields(cid);
+    let n = std::cmp::max(total, MAP_NUM_FIELDS);
+    let m = ctx.alloc_object(cid, n);
+    lhm_init_with_cap(ctx, m, MAP_DEFAULT_CAPACITY);
+    m
+}
+
+/// Build a NEW `LinkedHashMap` holding `source`'s entries in REVERSE encounter
+/// order — the backing for `SequencedMap.reversed()` on synthetic LinkedHashMap
+/// and unmodifiable-map wrappers (Java 21 `SequencedMap`).
+///
+/// This is a snapshot (later mutations of `source` do not propagate), which is
+/// sufficient for the read/iterate use that dominates `reversed()` callers
+/// (Log4j2 / Elasticsearch config walking). A fully live reverse-view would need
+/// a dedicated synthetic view class; this keeps the common case correct without
+/// `NoSuchMethodError` / an empty result.
+fn build_reversed_map_snapshot(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+) -> Result<ObjectRef, cratonvm_types::error::MethodCallFailed> {
+    let mut entries = collect_entries_any(ctx, source);
+    entries.reverse();
+    let m = alloc_linked_hash_map(ctx);
+    for (k, v) in entries {
+        native_lhm_put(ctx, &[Value::Object(Some(m)), k, v])?;
+    }
+    Ok(m)
+}
+
 fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -13015,6 +13054,17 @@ fn register_linked_hashmap_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "keySet", "()Ljava/util/Set;", native_lhm_key_set);
     registry.register(c, "values", "()Ljava/util/Collection;", native_lhm_values);
     registry.register(c, "entrySet", "()Ljava/util/Set;", native_lhm_entry_set);
+    // SequencedMap.reversed() (Java 21). The synthetic LinkedHashMap has no real
+    // head/tail entry chain for the JDK reverse-view bytecode to walk, so an
+    // unintercepted reversed() yielded an empty map. Build a reverse-ordered
+    // snapshot from the live insertion order instead.
+    registry.register(c, "reversed", "()Ljava/util/SequencedMap;", |ctx, args| {
+        let this = match args.first() {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        Ok(Some(Value::Object(Some(build_reversed_map_snapshot(ctx, this)?))))
+    });
     registry.register(c, "toString", "()Ljava/lang/String;", native_lhm_to_string);
     registry.register(
         c,
@@ -20577,6 +20627,23 @@ fn register_unmodifiable_natives(r: &mut NativeMethodRegistry) {
         r.register(c, "toString", "()Ljava/lang/String;", native_unmod_to_string);
         r.register(c, "hashCode", "()I", native_unmod_hash_code);
         r.register(c, "equals", "(Ljava/lang/Object;)Z", native_unmod_equals);
+        // SequencedMap.reversed() (Java 21) — an unmodifiable reverse-ordered
+        // view over the backing's entries. The synthetic wrapper does not
+        // implement SequencedMap, so an unintercepted call raised
+        // NoSuchMethodError (blocked ES `Version`/Log4j config walking). Build a
+        // reverse snapshot of the backing and re-wrap it read-only.
+        r.register(c, "reversed", "()Ljava/util/SequencedMap;", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let backing = match unmod_backing(ctx, this) {
+                Some(b) => b,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            let rev = build_reversed_map_snapshot(ctx, backing)?;
+            Ok(Some(Value::Object(Some(alloc_unmod_wrapper(ctx, UNMOD_MAP_CLASS, rev)))))
+        });
         r.register(
             c,
             "forEach",
