@@ -23699,22 +23699,35 @@ pub(crate) fn bi_read_int(ctx: &dyn NativeContext, this: ObjectRef) -> crate::bi
 /// Fast write boundary for the limb rewrite.
 pub(crate) fn bi_alloc_int(ctx: &mut dyn NativeContext, v: &crate::bigint::BigInt) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/math/BigInteger", 2);
+    // GC-SAFETY (bc math-ec use-after-move, 2026-06-05): `obj` is freshly
+    // allocated and NOT yet reachable from any Java root. The `new_array` /
+    // `create_string` allocations below can trigger a minor GC that relocates
+    // `obj`; the bare local `obj` ObjectRef would then be STALE and the
+    // subsequent `set_field(obj, …)` would write through a dangling pointer
+    // into whatever object now occupies the old address (the FixedPointTest
+    // heap corruption — pinned via the CRATONVM_DBG_ECWATCH watchpoint to the
+    // BigInteger-multiply allocation path). Pin `obj` so the moving collector
+    // forwards it in place, and re-read the forwarded ref after each allocation.
+    let h = ctx.pin_native_root(obj);
     let signum = v.signum();
     if let Some((sig_i, mag_i)) = bi_layout(ctx) {
         let le = v.mag_le(); // little-endian limbs
         let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, le.len());
+        let obj = ctx.read_native_pin(h, obj);
         // little-endian limbs → big-endian array.
         for (i, &w) in le.iter().rev().enumerate() {
             ctx.set_array_element(mag_arr, i, Value::Int(w as i32));
         }
         ctx.set_field(obj, sig_i, Value::Int(signum));
         ctx.set_field(obj, mag_i, Value::Object(Some(mag_arr)));
+        obj
     } else {
         let s = ctx.create_string(&v.to_decimal());
+        let obj = ctx.read_native_pin(h, obj);
         ctx.set_field(obj, BI_FIELD_VALUE, Value::Object(Some(s)));
         ctx.set_field(obj, BI_FIELD_SIGNUM, Value::Int(signum));
+        obj
     }
-    obj
 }
 
 /// Simple big integer addition using string-based decimal arithmetic.
