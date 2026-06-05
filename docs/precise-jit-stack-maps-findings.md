@@ -45,7 +45,30 @@ Date: 2026-06-04.
 - `set_jit_thread` lazily `ensure_allocated()`s the shadow stack.
 - Gate `CRATONVM_SHADOW_STACK`; gate-off path is byte-identical.
 
-### Stage B — codegen written, COMPILES, but crashes when enabled
+### ✅ RESULT (commit d69edda): bt10/16/18 ALL GOLDEN under the shadow stack
+- `bt10=135854`, `bt16=14985902`, `bt18=67674804` with `CRATONVM_SHADOW_STACK=1`;
+  bt18 ~21.5 s (drains young — throughput wall solved). `DBG_SHADOW` shows the
+  moving-GC remap precisely relocating JIT-held oops (`rewritten=38`, `=57`).
+  Gate-OFF is byte-identical (default unbroken). The two push/reload bugs below
+  were found and fixed:
+  1. **Unbalanced-push leak** — `make()`'s `invokespecial <init>` safepoint
+     pushes a live oop with no paired reload (home-dump: `pc4 homes=[Frame(40)]`),
+     leaking the shadow `top` one slot per `make` call → buffer overflow → OOB
+     write. Fixed by the **per-method watermark**: prologue saves `top`, epilogue
+     restores it (null-guarded) — unwinds the leak on return, correct under
+     recursion. (`Node.<init>` is NOT inlined — the earlier assumption was wrong.)
+  2. **OSR entry** bypasses the prologue thread-fetch → garbage (non-null) thread
+     slot the null-guards can't reject → crash. Fixed VM-side: the OSR trampoline
+     (`emit_osr_trampoline`) zeroes the thread slot (clobber-free
+     `MOV qword [rbp-off],0`) so OSR-entered frames cleanly SKIP shadow tracking;
+     `CompiledMethod.shadow_thread_slot_off` threads the offset through
+     `osr_enter → osr_trampoline`.
+- Remaining for full generality (not blocking bt18): OSR-frame *tracking* (store
+  the real thread ptr at OSR instead of zeroing) so OSR'd methods' oops are
+  remapped under GC rather than relying on the from-space staleness window;
+  regression pool + perf; multi-thread shadow scan; then default-on.
+
+### Stage B — (historical) codegen written; crash bisected and fixed (see above)
 - `jit/src/x64.rs`: `emit_shadow_push` / `emit_shadow_reload` (push live oop
   values via `[thread+shadow_off+TOP]` using R10/R11/RAX scratch; reload writes
   back to home reg/frame slot). Thread pointer cached in a prologue-set frame
