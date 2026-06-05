@@ -70,7 +70,11 @@ const SIG_OFF_STATE: usize = 1;
 const SIG_OFF_PROVIDER: usize = 2;
 const SIG_OFF_PENDING: usize = 3;
 const SIG_OFF_KEYID: usize = 4;
-const SIG_PRIVATE_SLOTS: usize = 5;
+// Slot 5 holds the real EC key object (ECPrivateKeyImpl / ECPublicKeyImpl) for
+// the SunEC ECDSA drive path (`crate::route_ec_to_real`); the GC scans synthetic
+// object slots, so the ref stays live/forwarded across init→update→sign.
+const SIG_OFF_KEYOBJ: usize = 5;
+const SIG_PRIVATE_SLOTS: usize = 6;
 
 // ---------------------------------------------------------------------------
 // SigProbe fix: process-wide side tables for Signature algorithm / state /
@@ -331,6 +335,101 @@ fn verify_dispatch(alg: i32, key_id: u64, data: &[u8], sig: &[u8]) -> Option<boo
 }
 
 // ---------------------------------------------------------------------------
+// EC-scoped real-SunEC ECDSA routing (crate::route_ec_to_real, default ON)
+// ---------------------------------------------------------------------------
+//
+// The synthetic ECDSA sign/verify reads a synthetic `key_id` (slot 3) that a
+// real `sun.security.ec.ECPrivateKeyImpl` (produced by the real KeyFactory/KPG
+// path) does not carry. When EC routing is on we instead DRIVE the real SunEC
+// `ECDSASignature$*` SPI over the buffered payload + the real key (stored at
+// `SIG_OFF_KEYOBJ`), yielding/verifying real DER signatures. RSA/Ed25519 keep
+// the synthetic dispatch above.
+
+/// Real-SunEC `ECDSASignature$*` SPI class for an algo index, or `None` when EC
+/// routing is off or the algo is not ECDSA.
+fn ecdsa_real_spi_class(alg: i32) -> Option<&'static str> {
+    if !crate::route_ec_to_real() {
+        return None;
+    }
+    match alg {
+        SIG_SHA256_ECDSA => Some("sun/security/ec/ECDSASignature$SHA256"),
+        SIG_SHA384_ECDSA => Some("sun/security/ec/ECDSASignature$SHA384"),
+        _ => None,
+    }
+}
+
+/// Drive the real SunEC `ECDSASignature$*` SPI: `new` → `engineInitSign/Verify(key)`
+/// → `engineUpdate(buffer)` → `engineSign()`/`engineVerify(sig)`. `verify_sig`
+/// `None` → sign (returns the DER `byte[]`); `Some(sig)` → verify (returns
+/// `Int(0/1)`). The real key is read from `SIG_OFF_KEYOBJ`; the payload from the
+/// identity-hash-keyed side table via `take_data`.
+fn drive_real_ecdsa(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    spi_class: &'static str,
+    verify_sig: Option<Vec<u8>>,
+) -> MethodCallResult {
+    let base = synthetic_base_offset(ctx, "java/security/Signature");
+    let key = match ctx.get_field(this, base + SIG_OFF_KEYOBJ) {
+        Value::Object(Some(o)) => o,
+        _ => {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Signature not initialized (no EC key)".into(),
+            }
+            .into())
+        }
+    };
+    let data = take_data(ctx, this)?;
+    let verifying = verify_sig.is_some();
+    // Pin the EC key across the (allocating) SPI construction + calls.
+    let key_pin = ctx.pin_native_root(key);
+    let result = (|| {
+        let spi = match ctx.new_object_initialized(spi_class, "()V", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(RuntimeError::NotImplemented {
+                    feature: spi_class.into(),
+                }
+                .into())
+            }
+        };
+        let spi_pin = ctx.pin_native_root(spi);
+        let key = ctx.read_native_pin(key_pin, key);
+        let (init_m, init_desc) = if verifying {
+            ("engineInitVerify", "(Ljava/security/PublicKey;)V")
+        } else {
+            ("engineInitSign", "(Ljava/security/PrivateKey;)V")
+        };
+        ctx.invoke_virtual(spi, init_m, init_desc, &[Value::Object(Some(key))])?;
+        let spi = ctx.read_native_pin(spi_pin, spi);
+        let arr = alloc_byte_array(ctx, &data);
+        let spi = ctx.read_native_pin(spi_pin, spi);
+        ctx.invoke_virtual(
+            spi,
+            "engineUpdate",
+            "([BII)V",
+            &[Value::Object(Some(arr)), Value::Int(0), Value::Int(data.len() as i32)],
+        )?;
+        let spi = ctx.read_native_pin(spi_pin, spi);
+        match verify_sig {
+            Some(sig_bytes) => {
+                let sigarr = alloc_byte_array(ctx, &sig_bytes);
+                let spi = ctx.read_native_pin(spi_pin, spi);
+                let ok = ctx.invoke_virtual(spi, "engineVerify", "([B)Z", &[Value::Object(Some(sigarr))])?;
+                // Normalize to Int(0/1) so the caller's Z return is well-formed.
+                Ok(match ok {
+                    Some(Value::Int(n)) => Some(Value::Int(if n != 0 { 1 } else { 0 })),
+                    _ => Some(Value::Int(0)),
+                })
+            }
+            None => ctx.invoke_virtual(spi, "engineSign", "()[B", &[]),
+        }
+    })();
+    ctx.unpin_native_roots(key_pin);
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Native methods
 // ---------------------------------------------------------------------------
 
@@ -370,6 +469,9 @@ fn sig_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         let kid = extract_key_id_from_key(ctx, *k);
         set_sig_keyid(ctx, this, kid);
         ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
+        // Stash the real key object for the SunEC ECDSA drive path (slot is
+        // GC-scanned, so the ref survives init→update→sign relocations).
+        ctx.set_field(this, base + SIG_OFF_KEYOBJ, Value::Object(Some(*k)));
     }
     clear_data(ctx, this);
     Ok(None)
@@ -385,6 +487,9 @@ fn sig_init_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         let kid = extract_key_id_from_key(ctx, *k);
         set_sig_keyid(ctx, this, kid);
         ctx.set_field(this, base + SIG_OFF_KEYID, Value::Long(kid as i64));
+        // Stash the real key object for the SunEC ECDSA drive path (slot is
+        // GC-scanned, so the ref survives init→update→sign relocations).
+        ctx.set_field(this, base + SIG_OFF_KEYOBJ, Value::Object(Some(*k)));
     }
     clear_data(ctx, this);
     Ok(None)
@@ -474,6 +579,10 @@ fn sig_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         .into());
     }
     let alg = require_sig_algo(ctx, this)?;
+    // EC: drive the real SunEC ECDSASignature SPI (real key, real DER output).
+    if let Some(spi_class) = ecdsa_real_spi_class(alg) {
+        return drive_real_ecdsa(ctx, this, spi_class, None);
+    }
     let key_id = key_id_of(ctx, this);
     // C18: surface a missing payload as IllegalStateException rather than
     // silently signing/verifying `b""` (the pre-fix raw-pointer keying
@@ -531,6 +640,14 @@ fn sig_verify(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         .into());
     }
     let alg = require_sig_algo(ctx, this)?;
+    // EC: drive the real SunEC ECDSASignature SPI (real key, real DER verify).
+    if let Some(spi_class) = ecdsa_real_spi_class(alg) {
+        let provided = match args.get(1) {
+            Some(Value::Object(Some(arr))) => read_byte_array_full(ctx, *arr),
+            _ => Vec::new(),
+        };
+        return drive_real_ecdsa(ctx, this, spi_class, Some(provided));
+    }
     let key_id = key_id_of(ctx, this);
     // C18: surface a missing payload as IllegalStateException rather than
     // silently signing/verifying `b""` (the pre-fix raw-pointer keying

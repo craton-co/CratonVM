@@ -137,6 +137,101 @@ fn get_kpg_keysize(this: ObjectRef) -> Option<i32> {
     kpg_keysize_table().lock().get(&this).copied()
 }
 
+// ---------------------------------------------------------------------------
+// EC-scoped real-SunEC routing (crate::route_ec_to_real, default ON)
+// ---------------------------------------------------------------------------
+//
+// The synthetic EC keygen returns a bare `java/security/PublicKey` *interface*
+// object, so keycloak's `(java.security.interfaces.ECPublicKey) pub` cast throws
+// ClassCastException ("Error obtaining ECParameterSpec for P-256 curve"). When
+// `crate::route_ec_to_real()` is set (default), the EC family instead DRIVES the
+// real, pure-Java JDK-25 SunEC SPIs (`sun.security.ec.*`) and returns concrete
+// `ECPublicKeyImpl`/`ECPrivateKeyImpl` keys + a real `KeyPair`. This runs real,
+// JIT-eligible SunEC bytecode; the `AlgorithmParameters.getInstance("EC")` it
+// needs is served by the provider-machinery bridge wired (also under
+// `route_ec_to_real`) in `provider_chain.rs`/`cipher.rs`. RSA/AES stay synthetic
+// (kill-switch `CRATONVM_SYNTHETIC_EC=1` restores the legacy synthetic EC).
+
+/// Class name of an object (`internal/slash/form`), or empty if unknown.
+fn obj_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
+    ctx.class_name_of_id(ctx.class_id_of_object(obj))
+        .unwrap_or_default()
+}
+
+/// True if `v` is one of our synthetic bare-interface key objects whose class is
+/// exactly `class_name` (`java/security/PublicKey` or `java/security/PrivateKey`).
+fn is_synthetic_key_obj(ctx: &dyn NativeContext, v: &Value, class_name: &str) -> bool {
+    matches!(v, Value::Object(Some(o)) if obj_class_name(ctx, *o) == class_name)
+}
+
+/// Drive the real `sun.security.ec.ECKeyPairGenerator` SPI: `new` → `initialize(256,
+/// SecureRandom)` (P-256) → `generateKeyPair()`. Returns a real `java.security.KeyPair`
+/// (`privateKey`@0, `publicKey`@1) of concrete `ECPrivateKeyImpl`/`ECPublicKeyImpl`.
+fn drive_real_ec_keypair(ctx: &mut dyn NativeContext) -> MethodCallResult {
+    let spi = match ctx.new_object_initialized("sun/security/ec/ECKeyPairGenerator", "()V", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::NotImplemented {
+                feature: "sun.security.ec.ECKeyPairGenerator".into(),
+            }
+            .into())
+        }
+    };
+    // Pin the SPI across the SecureRandom alloc + the (allocating) SPI calls.
+    let pin = ctx.pin_native_root(spi);
+    let result = (|| {
+        let rnd = match ctx.new_object_initialized("java/security/SecureRandom", "()V", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(RuntimeError::NotImplemented {
+                    feature: "java.security.SecureRandom".into(),
+                }
+                .into())
+            }
+        };
+        let spi = ctx.read_native_pin(pin, spi);
+        ctx.invoke_virtual(
+            spi,
+            "initialize",
+            "(ILjava/security/SecureRandom;)V",
+            &[Value::Int(256), Value::Object(Some(rnd))],
+        )?;
+        let spi = ctx.read_native_pin(pin, spi);
+        ctx.invoke_virtual(spi, "generateKeyPair", "()Ljava/security/KeyPair;", &[])
+    })();
+    ctx.unpin_native_roots(pin);
+    result
+}
+
+/// Drive the real `sun.security.ec.ECKeyFactory` SPI's `engineGeneratePublic` /
+/// `engineGeneratePrivate` over the supplied `EC{Public,Private}KeySpec`, yielding
+/// a concrete `sun.security.ec.EC{Public,Private}KeyImpl`.
+fn drive_real_ec_keyfactory(
+    ctx: &mut dyn NativeContext,
+    spec: ObjectRef,
+    engine: &'static str,
+    ret_desc: &'static str,
+) -> MethodCallResult {
+    // Pin the KeySpec across the ECKeyFactory alloc.
+    let pin = ctx.pin_native_root(spec);
+    let result = (|| {
+        let kf = match ctx.new_object_initialized("sun/security/ec/ECKeyFactory", "()V", &[])? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(RuntimeError::NotImplemented {
+                    feature: "sun.security.ec.ECKeyFactory".into(),
+                }
+                .into())
+            }
+        };
+        let spec = ctx.read_native_pin(pin, spec);
+        let desc = format!("(Ljava/security/spec/KeySpec;){ret_desc}");
+        ctx.invoke_virtual(kf, engine, &desc, &[Value::Object(Some(spec))])
+    })();
+    ctx.unpin_native_roots(pin);
+    result
+}
+
 // Synthetic-slot offsets relative to `synthetic_base_offset(...)`.
 const KPG_OFF_ALGO: usize = 0;
 const KPG_OFF_KEYSIZE: usize = 1;
@@ -388,6 +483,12 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
 
     if algo == ALGO_EC {
+        // Route EC to the real SunEC SPI → concrete ECPublicKey/ECPrivateKey in a
+        // real KeyPair (fixes the bare-interface CCE). RSA/AES keep the synthetic
+        // path below; CRATONVM_SYNTHETIC_EC=1 restores the legacy synthetic EC.
+        if crate::route_ec_to_real() {
+            return drive_real_ec_keypair(ctx);
+        }
         let (pk, sk) = crypto_impl::Ecdsa::generate_keypair();
         let pk_der = crypto_impl::Ecdsa::public_key_to_der(&pk);
         let sk_bytes = crypto_impl::Ecdsa::private_key_to_bytes(&sk);
@@ -451,6 +552,18 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Int(i) => i,
         _ => -1,
     };
+    // EC: drive the real SunEC KeyFactory over the ECPublicKeySpec → real
+    // ECPublicKeyImpl (the synthetic path can't honour an ECPublicKeySpec).
+    if algo == ALGO_EC && crate::route_ec_to_real() {
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            return drive_real_ec_keyfactory(
+                ctx,
+                *spec,
+                "engineGeneratePublic",
+                "Ljava/security/PublicKey;",
+            );
+        }
+    }
     let der = if let Some(Value::Object(Some(spec))) = args.get(1) {
         // X509EncodedKeySpec.encoded[B is at field 0 in the synthetic
         // KeySpec shape; for real-JDK KeySpec we read field 0 too —
@@ -527,6 +640,18 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Value::Int(i) => i,
         _ => -1,
     };
+    // EC: drive the real SunEC KeyFactory over the ECPrivateKeySpec → real
+    // ECPrivateKeyImpl (the synthetic path emits a key_id=0 unusable key).
+    if algo == ALGO_EC && crate::route_ec_to_real() {
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            return drive_real_ec_keyfactory(
+                ctx,
+                *spec,
+                "engineGeneratePrivate",
+                "Ljava/security/PrivateKey;",
+            );
+        }
+    }
     let der = if let Some(Value::Object(Some(spec))) = args.get(1) {
         match ctx.get_field(*spec, 0) {
             Value::Object(Some(arr)) => read_byte_array(ctx, arr),
@@ -556,12 +681,25 @@ fn kf_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn keypair_get_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    Ok(Some(ctx.get_field(this, 0)))
+    let slot0 = ctx.get_field(this, 0);
+    // Our synthetic KeyPair stores publicKey@0 (a synthetic java/security/PublicKey).
+    // A *real* java.security.KeyPair (from real EC keygen or `new KeyPair(pub,priv)`)
+    // lays out privateKey@0, publicKey@1 — so for it the public key is at slot 1.
+    if crate::route_ec_to_real() && !is_synthetic_key_obj(ctx, &slot0, "java/security/PublicKey") {
+        return Ok(Some(ctx.get_field(this, 1)));
+    }
+    Ok(Some(slot0))
 }
 
 fn keypair_get_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    Ok(Some(ctx.get_field(this, 1)))
+    let slot1 = ctx.get_field(this, 1);
+    // Synthetic KeyPair: privateKey@1 (synthetic java/security/PrivateKey). A real
+    // java.security.KeyPair has publicKey@1, privateKey@0.
+    if crate::route_ec_to_real() && !is_synthetic_key_obj(ctx, &slot1, "java/security/PrivateKey") {
+        return Ok(Some(ctx.get_field(this, 0)));
+    }
+    Ok(Some(slot1))
 }
 
 fn key_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

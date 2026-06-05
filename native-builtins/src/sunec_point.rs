@@ -47,7 +47,16 @@ const EC_OPS: &str = "sun/security/ec/ECOperations";
 fn gate_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_NATIVE_EC_MULTIPLY").is_some())
+    // Default-ON whenever EC is routed to the real SunEC path
+    // (`crate::route_ec_to_real`, default): the pure-Java P-256 scalar multiply
+    // pays a one-time ~14 s generator-table precompute that this `p256`-crate
+    // bypass eliminates (SdJwtTest 52 s → 10 s). This native is only ever reached
+    // by real SunEC `ECOperations.multiply`, which only runs once EC is routed
+    // real — so it stays inert under the `CRATONVM_SYNTHETIC_EC=1` kill-switch.
+    // The explicit `CRATONVM_NATIVE_EC_MULTIPLY` env still force-enables it.
+    *G.get_or_init(|| {
+        std::env::var_os("CRATONVM_NATIVE_EC_MULTIPLY").is_some() || crate::route_ec_to_real()
+    })
 }
 
 fn obj(v: Option<Value>) -> Option<ObjectRef> {
