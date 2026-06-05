@@ -25726,7 +25726,12 @@ fn bd_precision_of(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
 /// arithmetic, not pretty-printing, so we keep it simple and round-trip-able
 /// through `f64::parse`).
 fn apply_scale(unscaled: &str, scale: i32) -> String {
-    if scale == 0 || unscaled == "0" {
+    // A zero value with a POSITIVE scale still renders its fractional zeros:
+    // `new BigDecimal("0").setScale(2)` is "0.00", and H2 DECIMAL(p,2) columns
+    // surface 0 as "0.00" (testScript.sql). Only short-circuit `unscaled == "0"`
+    // for scale <= 0 (the pad branch below already produces "0.00" for scale>0);
+    // `scale == 0` short-circuits for any unscaled value.
+    if scale == 0 || (unscaled == "0" && scale < 0) {
         return unscaled.to_string();
     }
     let (neg, abs) = if let Some(stripped) = unscaled.strip_prefix('-') {
