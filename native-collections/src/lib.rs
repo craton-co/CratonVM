@@ -3915,20 +3915,40 @@ fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef
 /// values). Inferring avoids a separate kind marker and keeps TreeMap
 /// entrySet's Entry elements from being clobbered with bare values (which
 /// caused `ClassCastException: Integer cannot be cast to Map$Entry`).
+/// True only for the JDK-internal synthetic `Map.Entry` classes we materialise
+/// for `entrySet()` views (`java/util/HashMap$Entry` via `tm_make_entry`,
+/// `java/util/Map$Entry`, `java/util/LinkedHashMap$Entry`, ...).
+///
+/// Used to tell an `entrySet()` view (elements are entries) apart from a
+/// `values()` view (elements are values) when both are ArrayList-backed views
+/// sharing the trailing-source-slot marker. The previous test —
+/// `class_name.contains("Entry")` — misfired on application VALUE types whose
+/// simple name merely ends in "Entry": a `Map<String, PathEntry>.values()`
+/// view (WildFly `org/jboss/as/controller/services/path/PathEntry`) was
+/// rebuilt as `HashMap$Entry` objects, so `values().iterator().next()` yielded
+/// an entry and `PathManagerService.addPathManagerResources`'s
+/// `checkcast PathEntry` threw `ClassCastException`. Applications cannot define
+/// classes in the sealed `java/util` package, so the prefix+suffix test is
+/// exact and cannot match an app type.
+fn is_synthetic_map_entry_class(name: &str) -> bool {
+    name.starts_with("java/util/") && name.ends_with("$Entry")
+}
+
 fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) {
     let source = match values_view_source(ctx, list) {
         Some(s) => s,
         None => return,
     };
     // Determine whether elements are Map.Entry (entrySet) by inspecting the
-    // current head element's class.
+    // current head element's class — restricted to our synthetic entry classes
+    // so an app value type named `*Entry` is not misread as an entry.
     let is_entry_view = {
         let (data, size) = al_state(ctx, list);
         match data {
             Some(d) if size > 0 => match ctx.get_array_element(d, 0) {
                 Value::Object(Some(e)) => ctx
                     .class_name_of_id(ctx.class_id_of_object(e))
-                    .map(|n| n.contains("Entry"))
+                    .map(|n| is_synthetic_map_entry_class(&n))
                     .unwrap_or(false),
                 _ => false,
             },
@@ -4005,7 +4025,11 @@ fn propagate_list_removal(
         let cls = ctx
             .class_name_of_id(ctx.class_id_of_object(e))
             .unwrap_or_default();
-        if cls.contains("Entry") {
+        // Only treat the element as a Map.Entry (delete by its key) when it is
+        // one of our synthetic entry classes — not merely any class whose name
+        // ends in "Entry" (an app value type like PathEntry must delete by
+        // value, not by `field(0)`).
+        if is_synthetic_map_entry_class(&cls) {
             let key = ctx.get_field(e, 0);
             return source_map_remove(ctx, source, key);
         }
