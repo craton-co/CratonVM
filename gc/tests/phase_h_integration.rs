@@ -348,10 +348,12 @@ fn rh7_oopmap_scaffolding_retains_references() {
     assert!(!cm.has_precise_oop_maps());
 
     cm.push_oop_map(OopMapEntry {
+        bytecode_pc: 0,
         native_pc_offset: 0x40,
         frame_slot_offsets: vec![-16, -24],
     });
     cm.push_oop_map(OopMapEntry {
+        bytecode_pc: 0,
         native_pc_offset: 0x80,
         frame_slot_offsets: vec![-16],
     });

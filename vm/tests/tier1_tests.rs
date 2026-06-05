@@ -245,10 +245,12 @@ fn t1_oop_map_round_trip_in_compiled_method() {
     // Minimum: build two entries with different pc offsets, verify the
     // find_oop_map_for_pc binary search returns the right one.
     let entry_a = OopMapEntry {
+        bytecode_pc: 0,
         native_pc_offset: 0x40,
         frame_slot_offsets: vec![-8i16, -16],
     };
     let entry_b = OopMapEntry {
+        bytecode_pc: 0,
         native_pc_offset: 0x80,
         frame_slot_offsets: vec![-8i16, -24, -32],
     };
@@ -337,14 +339,17 @@ fn t1_oop_map_end_to_end_push_and_find() {
     // records monotonically increasing native_pc_offsets.
     let entries = vec![
         OopMapEntry {
+        bytecode_pc: 0,
             native_pc_offset: 0x10,
             frame_slot_offsets: vec![-8, -16],
         },
         OopMapEntry {
+        bytecode_pc: 0,
             native_pc_offset: 0x20,
             frame_slot_offsets: vec![-8, -24],
         },
         OopMapEntry {
+        bytecode_pc: 0,
             native_pc_offset: 0x40,
             frame_slot_offsets: vec![-16, -32, -40],
         },
@@ -373,14 +378,17 @@ fn t1_oop_map_handles_inlined_callee_pattern() {
     // Each has a different set of live oops.
     let maps = vec![
         OopMapEntry {
+        bytecode_pc: 0,
             native_pc_offset: 0x10,
             frame_slot_offsets: vec![-8], // caller's `this`
         },
         OopMapEntry {
+        bytecode_pc: 0,
             native_pc_offset: 0x30,
             frame_slot_offsets: vec![-8, -24], // caller's this + callee's arg
         },
         OopMapEntry {
+        bytecode_pc: 0,
             native_pc_offset: 0x50,
             frame_slot_offsets: vec![-8, -48], // caller's this + return value
         },
@@ -420,6 +428,7 @@ fn t1_oop_map_property_random_slot_sets_round_trip() {
             slots.push(raw as i16);
         }
         entries.push(OopMapEntry {
+        bytecode_pc: 0,
             native_pc_offset: pc,
             frame_slot_offsets: slots,
         });
@@ -937,6 +946,7 @@ fn t1_aarch64_oop_map_data_shape() {
     // Representative entry matching what the ARM64 backend emits at
     // a safepoint in a method with one oop at [fp - 16].
     let entry = OopMapEntry {
+        bytecode_pc: 0,
         native_pc_offset: 0x14, // 5 instructions × 4 bytes
         frame_slot_offsets: vec![-16],
     };
