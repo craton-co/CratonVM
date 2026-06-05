@@ -31,10 +31,32 @@ header below and `findings.md`):
   corruption** — it's GC reclamation, the project's long-standing register-
   invisibility problem, now correctly *targeted at 68332206*.
 
-**Open:** make the young moving GC retain all live nodes → bt18 = 68332206 with
-the shadow stack (complete rooting and/or remembered-set fix), or adopt
-selective-promote as the moving-under-JIT policy. Until then NO shadow config is
-*correct* for bt18 (all under-count); they only differ in how much.
+**✅ RESOLVED (Fix A, commit 4527228):** adopted selective promotion as the
+JIT-active young-GC policy and made it **default-on**. The DEFAULT now gives the
+true value: **bt10=135854 bt14=3222190 bt16=14985902 bt18=68332206** (all =
+HotSpot), and the regression pool is **18/18, regress=0**. Mechanism: under live
+JIT frames the non-moving sweep + selective promotion is the *correct* collector
+(it over-marks safely, PINS conservative roots so no JIT-held oop is ever lost,
+and tenures only heap-interior nodes to drain young). The moving collectors
+(shadow Cheney / `DBG_FORCE_MOVING`) under-count because a semispace cannot pin a
+conservative root nor rewrite a register-resident one. Key gotcha fixed: the
+selective evacuation and the free-block **coalescing** were two separate env
+gates; default-on the evacuation while the coalescing stayed off left a 500k-entry
+free list → O(n) alloc → bt18 throughput collapse (rc=127 cliff). Both now share
+one `selective_on` flag. Opt out with `CRATONVM_NO_SELECTIVE_PROMOTE`.
+
+**Consequences for the shadow stack:** `CRATONVM_SHADOW_STACK` (the moving Cheney
+path) is now the **inferior, opt-in** path — it under-counts (67674804) and its
+push/reload codegen is incompatible with the non-moving sweep, so it was NOT
+rerouted. The shadow-stack moving approach (this whole project, §1–§5) is thus
+**superseded for bt18 correctness** by selective promotion — the design doc's own
+"non-moving sweep is the only safe collector under JIT" conclusion, now completed
+with promotion to drain. §1–§4 remain valid infrastructure for the moving path if
+it is ever completed; they are not the correctness path.
+
+**Remaining (perf, not correctness):** selective-promote bt18 ≈ 55–61 s vs the
+(wrong) moving Cheney's ~24 s. Correctness-over-speed for now; tuning the
+promotion age / old-gen sizing / coalescing is a follow-up.
 
 ---
 
