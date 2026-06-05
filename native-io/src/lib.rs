@@ -11467,20 +11467,36 @@ fn native_files_list(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 fn register_nio_channel_extras(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // --- java.nio.channels.FileLock ---
-    let fl = "java/nio/channels/FileLock";
-    registry.register(
-        fl,
-        "<init>",
-        "(Ljava/nio/channels/FileChannel;JJZ)V",
-        native_file_lock_init,
-    );
-    registry.register(fl, "position", "()J", native_file_lock_position);
-    registry.register(fl, "size", "()J", native_file_lock_size);
-    registry.register(fl, "isShared", "()Z", native_file_lock_is_shared);
-    registry.register(fl, "isValid", "()Z", native_file_lock_is_valid);
-    registry.register(fl, "release", "()V", native_file_lock_release);
-    registry.register(fl, "close", "()V", native_file_lock_close);
+    // --- java.nio.channels.FileLock (synthetic-jdk ONLY) ---
+    // These natives target the ABSTRACT `java/nio/channels/FileLock`, but
+    // cratonvm's native-override priority makes them SHADOW the concrete
+    // `sun/nio/ch/FileLockImpl` methods. In real-JDK mode that breaks file
+    // locking: `<init>` runs on the real FileLockImpl (proven by the
+    // out-of-bounds write to slot 5 = our synthetic FL_FIELD_TOKEN, which the
+    // 5-field real layout drops), and the synthetic `release` only clears our
+    // in-process token registry — it never runs the real
+    // `FileChannelImpl.release` -> `FileLockTable.remove`. So a closed lock
+    // lingers in the JDK's per-file FileLockTable and the next `tryLock` on the
+    // same file throws `OverlappingFileLockException` ("the file is locked";
+    // H2 SingleFileStore reconnect / close+reopen). Real-JDK must use the
+    // genuine FileLockImpl bytecode together with our lock0/release0/FileKey
+    // natives, which keep the FileLockTable consistent across close/reopen.
+    #[cfg(feature = "synthetic-jdk")]
+    {
+        let fl = "java/nio/channels/FileLock";
+        registry.register(
+            fl,
+            "<init>",
+            "(Ljava/nio/channels/FileChannel;JJZ)V",
+            native_file_lock_init,
+        );
+        registry.register(fl, "position", "()J", native_file_lock_position);
+        registry.register(fl, "size", "()J", native_file_lock_size);
+        registry.register(fl, "isShared", "()Z", native_file_lock_is_shared);
+        registry.register(fl, "isValid", "()Z", native_file_lock_is_valid);
+        registry.register(fl, "release", "()V", native_file_lock_release);
+        registry.register(fl, "close", "()V", native_file_lock_close);
+    }
 
     // --- java.nio.MappedByteBuffer ---
     let mbb = "java/nio/MappedByteBuffer";
@@ -11500,18 +11516,25 @@ fn register_nio_channel_extras(registry: &mut NativeMethodRegistry) {
 
     // --- FileChannel additions ---
     let fc = "java/nio/channels/FileChannel";
-    registry.register(
-        fc,
-        "lock",
-        "()Ljava/nio/channels/FileLock;",
-        native_fc_lock,
-    );
-    registry.register(
-        fc,
-        "tryLock",
-        "()Ljava/nio/channels/FileLock;",
-        native_fc_try_lock,
-    );
+    // No-arg lock()/tryLock() build a SYNTHETIC FileLock — synthetic-jdk ONLY
+    // (paired with the synthetic FileLock natives above). Real-JDK uses the
+    // final FileChannel.lock()/tryLock(), which delegate to the 3-arg
+    // FileChannelImpl path and a genuine FileLockImpl.
+    #[cfg(feature = "synthetic-jdk")]
+    {
+        registry.register(
+            fc,
+            "lock",
+            "()Ljava/nio/channels/FileLock;",
+            native_fc_lock,
+        );
+        registry.register(
+            fc,
+            "tryLock",
+            "()Ljava/nio/channels/FileLock;",
+            native_fc_try_lock,
+        );
+    }
     registry.register(
         fc,
         "map",
