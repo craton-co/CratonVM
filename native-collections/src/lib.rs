@@ -5828,7 +5828,33 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(None)
 }
 
+/// Return the process-wide `Collections.EMPTY_LIST` / `EMPTY_MAP` / `EMPTY_SET`
+/// singleton — the real `Collections$Empty*` instance that `Collections.<clinit>`
+/// already populated into the named static field.
+///
+/// In the JDK, `Collections.emptyList()` is literally `(List<T>) EMPTY_LIST`, so
+/// `emptyList() == EMPTY_LIST` and `emptyList() == emptyList()` hold by identity.
+/// Code relies on that: WildFly's `ModelTestBootOperationsBuilder` initialises
+/// its `bootOperations` field with `emptyList()` and later guards with
+/// `bootOperations != Collections.EMPTY_LIST` ("Boot operations are already
+/// set"). Allocating a fresh list per `emptyList()` call broke that identity and
+/// made the guard throw on every `setXml`/`setXmlResource`. Returning the field
+/// value keeps us identity-consistent with the (correctly populated) singleton.
+fn collections_empty_singleton(ctx: &mut dyn NativeContext, field: &str) -> Option<Value> {
+    let cid = ctx.class_id_by_name("java/util/Collections")?;
+    let _ = ctx.ensure_class_initialized("java/util/Collections");
+    let idx = ctx.static_field_index_by_name(cid, field)?;
+    match ctx.get_static_field(cid, idx) {
+        v @ Value::Object(Some(_)) => Some(v),
+        _ => None,
+    }
+}
+
 fn native_collections_empty_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    if let Some(v) = collections_empty_singleton(ctx, "EMPTY_LIST") {
+        return Ok(Some(v));
+    }
+    // Fallback (field not yet initialised): fresh synthetic empty list.
     let __al_n_fields = al_slots(ctx).2;
     let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let arr = alloc_ref_array(ctx, 0);
@@ -21170,12 +21196,20 @@ fn native_collections_unmodifiable_collection(
 }
 
 fn native_collections_empty_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    if let Some(v) = collections_empty_singleton(ctx, "EMPTY_MAP") {
+        return Ok(Some(v));
+    }
+    // Fallback (field not yet initialised): fresh synthetic empty map.
     let map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(map))])?;
     Ok(Some(Value::Object(Some(map))))
 }
 
 fn native_collections_empty_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    if let Some(v) = collections_empty_singleton(ctx, "EMPTY_SET") {
+        return Ok(Some(v));
+    }
+    // Fallback (field not yet initialised): fresh synthetic empty set.
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
     let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;
