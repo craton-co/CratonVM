@@ -2958,7 +2958,6 @@ pub(crate) fn create_field_object(
     ctx.set_field(obj, base + FIELD_EXTRA_OFFSET_RJ_SLOT, Value::Int(meta.slot_index as i32));
     ctx.set_field(obj, base + FIELD_EXTRA_OFFSET_ACCESSIBLE, Value::Int(0));
 
-
     obj
 }
 
@@ -3665,9 +3664,22 @@ pub(crate) fn native_class_get_declared_fields(
         }
     };
 
+    // `getDeclaredFields0(boolean publicOnly)` (JVMS-internal). The real JDK
+    // `Class.getFields()` → `privateGetPublicFields()` calls this with
+    // publicOnly=true and TRUSTS it to return only public fields (it does not
+    // re-filter by access). Honour the flag, else private fields leak into
+    // `getFields()` — e.g. ES `Version.<clinit>` iterates `getFields()` and
+    // does `field.get(null)` on every Version-typed field, which NPEs in
+    // `Field.checkAccess` (`obj.getClass()`) on the private instance field
+    // `minCompatVersion`. `getDeclaredFields()` passes publicOnly=false.
+    let public_only = matches!(args.get(1), Some(Value::Int(v)) if *v != 0);
     let fields = ctx.declared_fields(class_id);
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), fields.len());
-    for (i, meta) in fields.iter().enumerate() {
+    let selected: Vec<&FieldMetadata> = fields
+        .iter()
+        .filter(|m| !public_only || (m.access_flags & (ACC_PUBLIC as u16)) != 0)
+        .collect();
+    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), selected.len());
+    for (i, meta) in selected.iter().enumerate() {
         let field_obj = create_field_object(ctx, meta);
         ctx.set_array_element(arr, i, Value::Object(Some(field_obj)));
     }
