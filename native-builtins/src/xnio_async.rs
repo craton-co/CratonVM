@@ -87,10 +87,19 @@ const OPT_NAME: usize = 1; // String — name e.g. "WORKER_IO_THREADS"
 const OPT_TYPE_CLASS: usize = 2; // Class<?> — the T bound
 
 /// `org.xnio.OptionMap` — 1 field.
-const OM_ENTRIES_HANDLE: usize = 0; // long id → `Arc<OptionMapInner>` in registry
+// TRAILING extra slot (slot 1, beyond the real fields). In real-JDK mode
+// `org.xnio.OptionMap` is the loaded class whose slot 0 is the Object field
+// `value` (a Map); a Long written there does not round-trip (read back as an
+// Object → as_long() None → handle 0 → "stale handle"). Mirrors the
+// ServiceController `_mscId` trailing-slot pattern. Allocate with 2 slots.
+const OM_ENTRIES_HANDLE: usize = 1; // long id → `Arc<OptionMapInner>` in registry
 
 /// `org.xnio.OptionMap$Builder` — 1 field.
-const OMB_PENDING_HANDLE: usize = 0; // long id → `Arc<BuilderInner>` in registry
+// TRAILING extra slot (slot 1, beyond the real fields). Real `OptionMap$Builder`
+// slot 0 is the Object field `list`; a Long there reads back as Object →
+// as_long() None → handle 0 → "stale or unknown handle" at the first
+// `Builder.set` (WildFly `ManagementWorkerService.installService`). Allocate 2 slots.
+const OMB_PENDING_HANDLE: usize = 1; // long id → `Arc<BuilderInner>` in registry
 
 /// `org.xnio.IoFuture` — 3 fields.
 const IOF_STATUS: usize = 0; // int snapshot of the atomic status (for debug)
@@ -553,7 +562,7 @@ fn native_option_parse_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 // ---------------------------------------------------------------------------
 
 fn alloc_option_map(ctx: &mut dyn NativeContext, inner: Arc<OptionMapInner>) -> ObjectRef {
-    let obj = alloc_concurrent_synthetic(ctx, "org/xnio/OptionMap", 1);
+    let obj = alloc_concurrent_synthetic(ctx, "org/xnio/OptionMap", 2);
     let h = register_map(inner);
     ctx.set_field(obj, OM_ENTRIES_HANDLE, Value::Long(h));
     obj
@@ -584,7 +593,7 @@ fn native_option_map_empty_get(ctx: &mut dyn NativeContext, _args: &[Value]) -> 
 /// `OptionMap.builder()Lorg/xnio/OptionMap$Builder;`
 fn native_option_map_builder(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let inner = Arc::new(BuilderInner::default());
-    let obj = alloc_concurrent_synthetic(ctx, "org/xnio/OptionMap$Builder", 1);
+    let obj = alloc_concurrent_synthetic(ctx, "org/xnio/OptionMap$Builder", 2);
     let h = register_builder(inner);
     ctx.set_field(obj, OMB_PENDING_HANDLE, Value::Long(h));
     Ok(Some(Value::Object(Some(obj))))
@@ -612,7 +621,16 @@ fn check_builder_live(b: &BuilderInner) -> Result<(), MethodCallFailed> {
 /// (plus the primitive-overload variants.)
 fn native_builder_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let opt = obj_arg(args, 1)?;
+    // Tolerate a null Option: we only populate a well-known SUBSET of the
+    // `Options.*` statics (see `ensure_options_initialized`), so a `getstatic`
+    // of any other option yields null. The synthetic XnioWorker defaults every
+    // option it doesn't explicitly read, so silently skip an unknown/null
+    // option (return `this` for chaining) instead of NPEing the whole install
+    // (e.g. WildFly `ManagementWorkerService.installService` sets `Options.CORK`).
+    let opt = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
     let b = builder_from_this(ctx, this)?;
@@ -654,7 +672,11 @@ fn native_builder_set_bool(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     // The storage layer stores Bool only when we know it's a Boolean
     // option — do that check here.
     let this = obj_arg(&mapped, 0)?;
-    let opt = obj_arg(&mapped, 1)?;
+    // Tolerate a null Option (unpopulated well-known static) — skip + chain.
+    let opt = match mapped.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(Some(this)))),
+    };
     let b = builder_from_this(ctx, this)?;
     check_builder_live(&b)?;
     let (decl, name) = read_option_coords(ctx, opt)
@@ -773,6 +795,7 @@ fn ensure_options_initialized(ctx: &mut dyn NativeContext) -> MethodCallResult {
         ("BACKLOG", "java/lang/Integer"),
         ("KEEP_ALIVE", "java/lang/Boolean"),
         ("TCP_NODELAY", "java/lang/Boolean"),
+        ("CORK", "java/lang/Boolean"),
         ("REUSE_ADDRESSES", "java/lang/Boolean"),
         ("READ_TIMEOUT", "java/lang/Integer"),
         ("WRITE_TIMEOUT", "java/lang/Integer"),
@@ -786,8 +809,18 @@ fn ensure_options_initialized(ctx: &mut dyn NativeContext) -> MethodCallResult {
         ctx.set_field(opt, OPT_NAME, Value::Object(Some(name_s)));
         let ty_s = ctx.create_string(ty);
         ctx.set_field(opt, OPT_TYPE_CLASS, Value::Object(Some(ty_s)));
-        // Store in a global map for retrieval.
+        // Store in a global map for retrieval (reflective getField + the
+        // synthetic getXXX accessors below read from here).
         options_store().lock().insert(name.to_string(), opt);
+        // Also write the REAL Java static field. We shim `Options.<clinit>`
+        // (so the stock clinit's `Option.simple(...)` cascade never runs), which
+        // means the `public static final Option` fields stay null unless we set
+        // them here. WildFly reads them with `getstatic Options.<NAME>` (e.g.
+        // `ManagementWorkerService.installService` → `OptionMap.Builder.set`),
+        // NOT via the accessors — so without this the option arrives null and
+        // `Builder.set` throws NPE. set_static_field_by_name resolves the field
+        // on the loaded org/xnio/Options class.
+        ctx.set_static_field_by_name("org/xnio/Options", name, Value::Object(Some(opt)));
     }
     let _ = DONE.set(());
     Ok(None)
