@@ -20,8 +20,8 @@
 //! - `ECOperations.multiply(affineP, s)` is only ever called for the curves the
 //!   SunEC intpoly path supports (P-256/384/521), so no per-receiver decline is
 //!   needed — a fully-handled curve set means the native never has to fall back.
-//!   (This file currently implements **P-256 only**; other curves throw a clear
-//!   error under the gate — see TODO.)
+//!   All three (P-256/384/521) are implemented via the RustCrypto `p256`/`p384`/
+//!   `p521` crates; the curve is detected from the field implementation class.
 //! - Base-point coordinates are read via the public `asBigInteger()` accessor
 //!   (the internal limb encoding is opaque); the scalar `s` is **little-endian**.
 //! - The result is returned as a homogeneous projective point with `Z = 1`,
@@ -87,12 +87,45 @@ fn invoke_virtual_obj(
     Ok(obj(r))
 }
 
-/// Read a `java.math.BigInteger`'s value as a big-endian unsigned 32-byte array
-/// (left-zero-padded), via `toByteArray()`. Errors if the value exceeds 32 bytes.
-fn read_bigint_be32(
+/// One of the SunEC weierstrass prime curves we accelerate, with its field/
+/// coordinate byte length (P-256=32, P-384=48, P-521=66).
+#[derive(Copy, Clone)]
+enum Curve {
+    P256,
+    P384,
+    P521,
+}
+
+impl Curve {
+    /// Detect from the `IntegerFieldModuloP` implementation class name
+    /// (`sun.security.util.math.intpoly.IntegerPolynomialP256` etc.).
+    fn from_field_class(cls: &str) -> Option<Curve> {
+        if cls.contains("P256") {
+            Some(Curve::P256)
+        } else if cls.contains("P384") {
+            Some(Curve::P384)
+        } else if cls.contains("P521") {
+            Some(Curve::P521)
+        } else {
+            None
+        }
+    }
+    fn byte_len(self) -> usize {
+        match self {
+            Curve::P256 => 32,
+            Curve::P384 => 48,
+            Curve::P521 => 66,
+        }
+    }
+}
+
+/// Read a `java.math.BigInteger`'s value as a big-endian unsigned `len`-byte
+/// magnitude (left-zero-padded), via `toByteArray()`. Errors if it exceeds `len`.
+fn read_bigint_be(
     ctx: &mut dyn NativeContext,
     bigint: ObjectRef,
-) -> Result<[u8; 32], MethodCallFailed> {
+    len: usize,
+) -> Result<Vec<u8>, MethodCallFailed> {
     let arr = invoke_virtual_obj(ctx, bigint, "toByteArray", "()[B")?
         .ok_or_else(|| internal_err("toByteArray returned null"))?;
     let n = ctx.array_length(arr);
@@ -104,34 +137,28 @@ fn read_bigint_be32(
         }
     }
     // toByteArray is signed big-endian two's complement; coordinates are
-    // positive, so strip any leading 0x00 sign byte, then left-pad to 32.
+    // positive, so strip any leading 0x00 sign byte, then left-pad to `len`.
     let start = if signed.len() > 1 && signed[0] == 0 { 1 } else { 0 };
     let mag = &signed[start..];
-    if mag.len() > 32 {
-        return Err(internal_err("coordinate exceeds 32 bytes"));
+    if mag.len() > len {
+        return Err(internal_err("coordinate exceeds field byte length"));
     }
-    let mut out = [0u8; 32];
-    out[32 - mag.len()..].copy_from_slice(mag);
+    let mut out = vec![0u8; len];
+    out[len - mag.len()..].copy_from_slice(mag);
     Ok(out)
 }
 
-/// Build a Java `byte[]` of length 32 from `bytes`.
-fn make_byte_array(
-    ctx: &mut dyn NativeContext,
-    bytes: &[u8; 32],
-) -> Result<ObjectRef, MethodCallFailed> {
-    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
+/// Build a Java `byte[]` from `bytes`.
+fn make_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Result<ObjectRef, MethodCallFailed> {
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
     for (i, b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
     }
     Ok(arr)
 }
 
-/// Construct a positive `java.math.BigInteger` from a 32-byte big-endian magnitude.
-fn make_bigint(
-    ctx: &mut dyn NativeContext,
-    bytes: &[u8; 32],
-) -> Result<ObjectRef, MethodCallFailed> {
+/// Construct a positive `java.math.BigInteger` from a big-endian magnitude.
+fn make_bigint(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Result<ObjectRef, MethodCallFailed> {
     let arr = make_byte_array(ctx, bytes)?;
     let r = ctx.new_object_initialized(
         "java/math/BigInteger",
@@ -177,17 +204,20 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     let affine_p = ctx.read_native_pin(p_affine, affine_p);
     let p_field = ctx.pin_native_root(field);
 
-    // Curve detection from the field's class. P-256 only for now.
+    // Curve detection from the field's implementation class (P-256/384/521).
     let field_cls = ctx
         .class_name_of_id(ctx.class_id_of_object(field))
         .unwrap_or_default();
-    let is_p256 = field_cls.contains("P256");
-    if !is_p256 {
-        ctx.unpin_native_roots(pin_base);
-        return Err(internal_err(&format!(
-            "native EC multiply: curve {field_cls} not yet implemented (P-256 only)"
-        )));
-    }
+    let curve = match Curve::from_field_class(&field_cls) {
+        Some(c) => c,
+        None => {
+            ctx.unpin_native_roots(pin_base);
+            return Err(internal_err(&format!(
+                "native EC multiply: unsupported curve field {field_cls}"
+            )));
+        }
+    };
+    let n = curve.byte_len();
 
     // Read base point coordinates via the public asBigInteger() accessor.
     let affine_p = ctx.read_native_pin(p_affine, affine_p);
@@ -195,17 +225,21 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         .ok_or_else(|| internal_err("getX null"))?;
     let bx_bi = invoke_virtual_obj(ctx, ex, "asBigInteger", "()Ljava/math/BigInteger;")?
         .ok_or_else(|| internal_err("x.asBigInteger null"))?;
-    let bx = read_bigint_be32(ctx, bx_bi)?;
+    let bx = read_bigint_be(ctx, bx_bi, n)?;
     let affine_p = ctx.read_native_pin(p_affine, affine_p);
     let ey = invoke_virtual_obj(ctx, affine_p, "getY", "()Lsun/security/util/math/ImmutableIntegerModuloP;")?
         .ok_or_else(|| internal_err("getY null"))?;
     let by_bi = invoke_virtual_obj(ctx, ey, "asBigInteger", "()Ljava/math/BigInteger;")?
         .ok_or_else(|| internal_err("y.asBigInteger null"))?;
-    let by = read_bigint_be32(ctx, by_bi)?;
+    let by = read_bigint_be(ctx, by_bi, n)?;
 
-    // ---- pure p256 math (no Java refs held) ----
-    let (rx, ry) = p256_scalar_mul(&bx, &by, &scalar_le)
-        .ok_or_else(|| internal_err("p256 scalar multiply failed (bad point/scalar)"))?;
+    // ---- pure Rust EC math (no Java refs held) ----
+    let (rx, ry) = match curve {
+        Curve::P256 => scalar_mul_p256(&bx, &by, &scalar_le),
+        Curve::P384 => scalar_mul_p384(&bx, &by, &scalar_le),
+        Curve::P521 => scalar_mul_p521(&bx, &by, &scalar_le),
+    }
+    .ok_or_else(|| internal_err("native EC scalar multiply failed (bad point/scalar)"))?;
 
     // ---- construct result: ProjectivePoint$Mutable from AffinePoint(rx,ry) ----
     let field = ctx.read_native_pin(p_field, field);
@@ -258,56 +292,59 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     Ok(Some(Value::Object(Some(result))))
 }
 
-/// P-256 scalar multiply `s · (x, y)` → result affine `(rx, ry)` as big-endian
-/// 32-byte arrays. Inputs: `x`/`y` big-endian 32-byte affine coords, `s_le`
-/// little-endian scalar. Returns `None` on an invalid point, or if the result
-/// is the identity (point at infinity) — which the caller surfaces as an error
-/// (it does not occur for valid keygen/sign scalars).
-fn p256_scalar_mul(x: &[u8; 32], y: &[u8; 32], s_le: &[u8]) -> Option<([u8; 32], [u8; 32])> {
-    use p256::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar};
-    use p256::elliptic_curve::generic_array::GenericArray;
+/// Generate a curve `scalar_mul` over the RustCrypto curve crate `$krate` with
+/// field/scalar byte length `$nbytes`: `s · (x, y)` → affine `(rx, ry)` as
+/// big-endian `$nbytes`-byte vectors. `x`/`y` are big-endian affine coords
+/// (`$nbytes` bytes), `s_le` the little-endian scalar. Returns `None` on an
+/// invalid point or an identity (point-at-infinity) result — which the caller
+/// surfaces as an error (it does not occur for valid keygen/sign scalars, which
+/// are always in `[1, n)`).
+macro_rules! impl_curve_scalar_mul {
+    ($name:ident, $krate:ident, $nbytes:literal) => {
+        fn $name(x: &[u8], y: &[u8], s_le: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+            use $krate::elliptic_curve::ff::PrimeField;
+            use $krate::elliptic_curve::generic_array::GenericArray;
+            use $krate::elliptic_curve::group::prime::PrimeCurveAffine;
+            use $krate::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+            use $krate::{AffinePoint, EncodedPoint, ProjectivePoint, Scalar};
 
-    let ep = EncodedPoint::from_affine_coordinates(
-        GenericArray::from_slice(x),
-        GenericArray::from_slice(y),
-        false,
-    );
-    let affine = AffinePoint::from_encoded_point(&ep);
-    let affine = if affine.is_some().into() { affine.unwrap() } else { return None };
+            if x.len() != $nbytes || y.len() != $nbytes {
+                return None;
+            }
+            let ep = EncodedPoint::from_affine_coordinates(
+                GenericArray::from_slice(x),
+                GenericArray::from_slice(y),
+                false,
+            );
+            let affine = AffinePoint::from_encoded_point(&ep);
+            let affine = if affine.is_some().into() { affine.unwrap() } else { return None };
 
-    // scalar: little-endian → big-endian, reduced mod n.
-    let mut be = [0u8; 32];
-    for (i, b) in s_le.iter().take(32).enumerate() {
-        be[31 - i] = *b;
-    }
-    let scalar = {
-        let ct = Scalar::from_repr(GenericArray::clone_from_slice(&be));
-        if ct.is_some().into() {
-            ct.unwrap()
-        } else {
-            // s >= n: reduce. (Rare; SunEC scalars are < n.)
-            use p256::elliptic_curve::ops::Reduce;
-            use p256::U256;
-            <Scalar as Reduce<U256>>::reduce_bytes(GenericArray::from_slice(&be))
+            // scalar: little-endian → big-endian (n bytes). SunEC scalars are < n,
+            // so from_repr always succeeds for valid inputs.
+            let mut be = [0u8; $nbytes];
+            for (i, b) in s_le.iter().take($nbytes).enumerate() {
+                be[$nbytes - 1 - i] = *b;
+            }
+            let ct = Scalar::from_repr(GenericArray::clone_from_slice(&be));
+            let scalar = if ct.is_some().into() { ct.unwrap() } else { return None };
+
+            let prod = (ProjectivePoint::from(affine) * scalar).to_affine();
+            if prod.is_identity().into() {
+                return None;
+            }
+            let enc = prod.to_encoded_point(false);
+            Some((enc.x()?.to_vec(), enc.y()?.to_vec()))
         }
     };
-
-    let prod = (ProjectivePoint::from(affine) * scalar).to_affine();
-    if prod.is_identity().into() {
-        return None;
-    }
-    let enc = prod.to_encoded_point(false);
-    let rx = enc.x()?;
-    let ry = enc.y()?;
-    let mut ox = [0u8; 32];
-    let mut oy = [0u8; 32];
-    ox.copy_from_slice(rx);
-    oy.copy_from_slice(ry);
-    Some((ox, oy))
 }
 
-/// Register the gated coarse native EC scalar-multiply. No-op unless
-/// `CRATONVM_NATIVE_EC_MULTIPLY` is set.
+impl_curve_scalar_mul!(scalar_mul_p256, p256, 32);
+impl_curve_scalar_mul!(scalar_mul_p384, p384, 48);
+impl_curve_scalar_mul!(scalar_mul_p521, p521, 66);
+
+/// Register the coarse native EC scalar-multiply (P-256/384/521). Active when
+/// EC is routed real (`gate_enabled`: `route_ec_to_real` default, or the
+/// `CRATONVM_NATIVE_EC_MULTIPLY` env force-on).
 pub fn register_sunec_point_intrinsics(registry: &mut NativeMethodRegistry) {
     if !gate_enabled() {
         return;

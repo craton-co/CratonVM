@@ -160,6 +160,9 @@ const SIG_SHA256_ECDSA: i32 = 7;
 const SIG_SHA384_RSA: i32 = 8;
 const SIG_SHA512_RSA: i32 = 9;
 const SIG_SHA1_RSA: i32 = 10;
+// SHA512withECDSA (ES512, typically P-521). Real SunEC drive only — there is no
+// synthetic crypto_impl fallback for it.
+const SIG_SHA512_ECDSA: i32 = 11;
 
 fn algo_idx(name: &str) -> i32 {
     let upper = name.to_ascii_uppercase();
@@ -170,6 +173,7 @@ fn algo_idx(name: &str) -> i32 {
         "SHA1WITHRSA" | "SHA-1WITHRSA" => SIG_SHA1_RSA,
         "SHA256WITHECDSA" | "SHA-256WITHECDSA" => SIG_SHA256_ECDSA,
         "SHA384WITHECDSA" | "SHA-384WITHECDSA" => SIG_SHA384_ECDSA,
+        "SHA512WITHECDSA" | "SHA-512WITHECDSA" => SIG_SHA512_ECDSA,
         "ED25519" | "EDDSA" => SIG_ED25519,
         "SHA256WITHDSA" => SIG_SHA256_DSA,
         _ => -1,
@@ -184,6 +188,7 @@ fn algo_name(idx: i32) -> &'static str {
         SIG_SHA1_RSA => "SHA1withRSA",
         SIG_SHA384_ECDSA => "SHA384withECDSA",
         SIG_SHA256_ECDSA => "SHA256withECDSA",
+        SIG_SHA512_ECDSA => "SHA512withECDSA",
         SIG_ED25519 => "Ed25519",
         SIG_SHA256_DSA => "SHA256withDSA",
         _ => "Unknown",
@@ -354,6 +359,7 @@ fn ecdsa_real_spi_class(alg: i32) -> Option<&'static str> {
     match alg {
         SIG_SHA256_ECDSA => Some("sun/security/ec/ECDSASignature$SHA256"),
         SIG_SHA384_ECDSA => Some("sun/security/ec/ECDSASignature$SHA384"),
+        SIG_SHA512_ECDSA => Some("sun/security/ec/ECDSASignature$SHA512"),
         _ => None,
     }
 }

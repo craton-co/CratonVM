@@ -164,21 +164,44 @@ fn is_synthetic_key_obj(ctx: &dyn NativeContext, v: &Value, class_name: &str) ->
     matches!(v, Value::Object(Some(o)) if obj_class_name(ctx, *o) == class_name)
 }
 
-/// Drive the real `sun.security.ec.ECKeyPairGenerator` SPI: `new` → `initialize(256,
-/// SecureRandom)` (P-256) → `generateKeyPair()`. Returns a real `java.security.KeyPair`
-/// (`privateKey`@0, `publicKey`@1) of concrete `ECPrivateKeyImpl`/`ECPublicKeyImpl`.
-fn drive_real_ec_keypair(ctx: &mut dyn NativeContext) -> MethodCallResult {
-    let spi = match ctx.new_object_initialized("sun/security/ec/ECKeyPairGenerator", "()V", &[])? {
-        Some(Value::Object(Some(o))) => o,
-        _ => {
+/// Drive the real `sun.security.ec.ECKeyPairGenerator` SPI: `new` →
+/// `initialize(spec|keysize, SecureRandom)` → `generateKeyPair()`. Returns a real
+/// `java.security.KeyPair` (`privateKey`@0, `publicKey`@1) of concrete
+/// `ECPrivateKeyImpl`/`ECPublicKeyImpl`. Honours the requested curve: when an
+/// `AlgorithmParameterSpec` (e.g. `ECGenParameterSpec("secp384r1")`) was supplied
+/// via `initialize`, it is forwarded so the real SunEC code resolves the curve
+/// (P-256/384/521); otherwise the stored keysize (default 256 → P-256) is used.
+fn drive_real_ec_keypair(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    // Read the requested keysize + spec (curve) BEFORE any allocation.
+    let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
+    let keysize = get_kpg_keysize(this)
+        .filter(|n| *n > 0)
+        .or_else(|| match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
+            Value::Int(n) if n > 0 => Some(n),
+            _ => None,
+        })
+        .unwrap_or(256);
+    let spec0 = match ctx.get_field(this, base + KPG_OFF_SPEC) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    // Pin the spec (if any) FIRST so it survives the SPI allocation below.
+    let spec_pin = spec0.map(|s| ctx.pin_native_root(s));
+    let spi = match ctx.new_object_initialized("sun/security/ec/ECKeyPairGenerator", "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        other => {
+            if let Some(p) = spec_pin {
+                ctx.unpin_native_roots(p);
+            }
+            other?;
             return Err(RuntimeError::NotImplemented {
                 feature: "sun.security.ec.ECKeyPairGenerator".into(),
             }
-            .into())
+            .into());
         }
     };
-    // Pin the SPI across the SecureRandom alloc + the (allocating) SPI calls.
-    let pin = ctx.pin_native_root(spi);
+    let spi_pin = ctx.pin_native_root(spi);
+    let unpin_base = spec_pin.unwrap_or(spi_pin);
     let result = (|| {
         let rnd = match ctx.new_object_initialized("java/security/SecureRandom", "()V", &[])? {
             Some(Value::Object(Some(o))) => o,
@@ -189,17 +212,30 @@ fn drive_real_ec_keypair(ctx: &mut dyn NativeContext) -> MethodCallResult {
                 .into())
             }
         };
-        let spi = ctx.read_native_pin(pin, spi);
-        ctx.invoke_virtual(
-            spi,
-            "initialize",
-            "(ILjava/security/SecureRandom;)V",
-            &[Value::Int(256), Value::Object(Some(rnd))],
-        )?;
-        let spi = ctx.read_native_pin(pin, spi);
+        let spi = ctx.read_native_pin(spi_pin, spi);
+        match (spec0, spec_pin) {
+            (Some(s0), Some(sp)) => {
+                let s = ctx.read_native_pin(sp, s0);
+                ctx.invoke_virtual(
+                    spi,
+                    "initialize",
+                    "(Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+                    &[Value::Object(Some(s)), Value::Object(Some(rnd))],
+                )?;
+            }
+            _ => {
+                ctx.invoke_virtual(
+                    spi,
+                    "initialize",
+                    "(ILjava/security/SecureRandom;)V",
+                    &[Value::Int(keysize), Value::Object(Some(rnd))],
+                )?;
+            }
+        }
+        let spi = ctx.read_native_pin(spi_pin, spi);
         ctx.invoke_virtual(spi, "generateKeyPair", "()Ljava/security/KeyPair;", &[])
     })();
-    ctx.unpin_native_roots(pin);
+    ctx.unpin_native_roots(unpin_base);
     result
 }
 
@@ -236,7 +272,11 @@ fn drive_real_ec_keyfactory(
 const KPG_OFF_ALGO: usize = 0;
 const KPG_OFF_KEYSIZE: usize = 1;
 const KPG_OFF_STATE: usize = 2;
-const KPG_PRIVATE_SLOTS: usize = 3;
+// Slot 3 holds the `AlgorithmParameterSpec` passed to `initialize(spec[,random])`
+// (e.g. ECGenParameterSpec) so the real EC keygen drive can honour the requested
+// curve (P-256/384/521) instead of assuming P-256. GC-scanned synthetic slot.
+const KPG_OFF_SPEC: usize = 3;
+const KPG_PRIVATE_SLOTS: usize = 4;
 
 const KF_OFF_ALGO: usize = 0;
 const KF_PRIVATE_SLOTS: usize = 1;
@@ -416,9 +456,9 @@ fn kpg_initialize_int_random(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 }
 
 fn kpg_initialize_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // ECGenParameterSpec / RSAKeyGenParameterSpec — for EC we only support
-    // P-256, so any spec sets bits=256.  RSA spec keysize is preserved
-    // from the previous value / the default.
+    // ECGenParameterSpec / RSAKeyGenParameterSpec. RSA spec keysize is preserved
+    // from the previous value / the default. For EC, stash the spec so the real
+    // keygen drive (`drive_real_ec_keypair`) honours the requested curve.
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let cur = get_kpg_keysize(this).unwrap_or_else(|| match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
@@ -429,6 +469,9 @@ fn kpg_initialize_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Value::Int(i) => i,
         _ => -1,
     });
+    if let Some(Value::Object(Some(spec))) = args.get(1) {
+        ctx.set_field(this, base + KPG_OFF_SPEC, Value::Object(Some(*spec)));
+    }
     let bits = if algo == ALGO_EC { 256 } else if cur == 0 { 2048 } else { cur };
     set_kpg_keysize(this, bits);
     ctx.set_field(this, base + KPG_OFF_KEYSIZE, Value::Int(bits));
@@ -487,7 +530,7 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         // real KeyPair (fixes the bare-interface CCE). RSA/AES keep the synthetic
         // path below; CRATONVM_SYNTHETIC_EC=1 restores the legacy synthetic EC.
         if crate::route_ec_to_real() {
-            return drive_real_ec_keypair(ctx);
+            return drive_real_ec_keypair(ctx, this);
         }
         let (pk, sk) = crypto_impl::Ecdsa::generate_keypair();
         let pk_der = crypto_impl::Ecdsa::public_key_to_der(&pk);

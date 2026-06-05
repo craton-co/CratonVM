@@ -104,9 +104,12 @@ sha2 = "0.10"
 # num-integer/num-traits already in the tree.
 num-bigint = "0.4"
 # Coarse native EC scalar-multiply for the SunEC point engine (sunec_point.rs,
-# gated default-off behind CRATONVM_NATIVE_EC_MULTIPLY). Bypasses the ~14 s
-# one-time P-256 generator-table precompute. Already in the dependency tree.
+# default-on under route_ec_to_real). Bypasses the ~14 s one-time per-curve
+# generator-table precompute. P-256/384/521 (RustCrypto 0.13 family, aligned
+# elliptic-curve version).
 p256 = "0.13"
+p384 = "0.13"
+p521 = "0.13"
 aes-gcm = "0.10"
 aes = "0.8"
 cbc = { version = "0.1", features = ["std"] }
