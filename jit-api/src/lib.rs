@@ -472,6 +472,7 @@ mod tests {
             get_current_thread: 0x1100,
             tlab_post_init: 0x1108,
             frame_record: 0x1110,
+            shadow_stack_offset_in_thread: 0,
         }
     }
 
@@ -664,6 +665,7 @@ mod tests {
             get_current_thread: 0,
             tlab_post_init: 0,
             frame_record: 0,
+            shadow_stack_offset_in_thread: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);

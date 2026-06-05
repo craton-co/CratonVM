@@ -90,6 +90,8 @@ fn helpers() -> JitRuntimeHelpers {
         class_id_offset_in_obj: 0,
         get_current_thread: 0,
         tlab_post_init: 0,
+        frame_record: 0,
+        shadow_stack_offset_in_thread: 0,
     }
 }
 
