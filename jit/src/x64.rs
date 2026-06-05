@@ -6340,18 +6340,6 @@ impl Compiler {
         self.modrm_rbp_disp(reg, offset);
     }
 
-    /// Store an immediate 0 (8 bytes) into the frame slot `[rbp - offset]`
-    /// WITHOUT clobbering any register (`MOV r/m64, imm32`, REX.W C7 /0).
-    /// Used to zero the shadow thread/watermark slots at OSR entries, where the
-    /// prologue (which would set them) was bypassed and no scratch register is
-    /// safely free at the loop header.
-    fn emit_zero_local(&mut self, offset: i32) {
-        self.rex_w();
-        self.buf.emit_byte(0xC7); // MOV r/m64, imm32 (sign-extended)
-        self.modrm_rbp_disp(0, offset); // /0
-        self.buf.emit(&0i32.to_le_bytes());
-    }
-
     // ── CMOV helpers (round-8 perf, round-7 jit #7) ──────────────────
     //
     // CMOVcc r64, r/m64 lets us implement small-value selects (Math.min,

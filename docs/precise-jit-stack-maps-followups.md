@@ -132,28 +132,56 @@ path, so single-threaded workloads (bintrees) are unchanged. A dedicated
 multi-threaded-JIT-under-moving-GC stress test is still wanted to exercise it
 directly (the regression pool §2 is the first cross-thread smoke test).
 
-## 5. Push only at balanced safepoints / perf (efficiency)
+## 5. Push only at balanced safepoints / perf (efficiency) — MEASURED
 
-- The per-safepoint push/reload + prologue/epilogue watermark add instructions
-  to every JIT method. Measure overhead: bt18 was ~21.5 s with the gate on vs
-  ~31.5 s under `FORCE_MOVING` earlier, but the box was under heavy multi-session
-  load — re-measure on a quiet machine against the default build and against
-  `FORCE_MOVING`.
-- The 3 *unpaired* spill sites (tail-call ~15783, `invokespecial` ~17030, MIC
-  ~17656 in `jit/src/x64.rs`) push without an adjacent reload; the per-method
-  watermark cleans them, but pushing there is wasted work for sites whose oops
-  never need rewriting. Consider gating the push to balanced sites, or skipping
-  the push for provably-no-GC callees (e.g. empty `<init>`).
+**Re-measured 2026-06-05 on a quieter box** (8g, bt18, 2 reps; killed stray
+`cratonvm*` first). All three runs are deterministic on checksum:
 
-## 6. Default-on + cleanup
+| Config | bt18 | checksum |
+|---|---|---|
+| default (non-moving sweep) | rc=1 / **empty** at ~43–136 s (throughput wall) | — (fails/walls) |
+| `CRATONVM_SHADOW_STACK=1` | **~24 s** | 67674804 (golden) |
+| `CRATONVM_DBG_FORCE_MOVING=1` | **~21 s** | 67674804 (golden) |
 
-- After §1–§4, flip `CRATONVM_SHADOW_STACK` default-on (and decide whether the
-  non-moving young sweep / selective-promote paths can be retired).
-- Remove the now-unused `emit_zero_local` helper in `jit/src/x64.rs` (dead code,
-  harmless), and the debug/bisect toggles (`CRATONVM_DBG_SHADOW2`,
-  `CRATONVM_SHADOW_NOPUSH`, `CRATONVM_SHADOW_NORELOAD`) once no longer needed.
-- The OSR-entry x64-side note in `x64.rs` (a comment-only no-op where the
-  abandoned JIT-side fetch was) can be tidied once §1 lands.
+Takeaways:
+- The shadow stack **solves** the bt18 throughput wall — the default non-moving
+  sweep cannot drain the depth-18 young set (rc=1/empty here; ~33 s marginal in
+  earlier sessions), while the gate completes golden in ~24 s.
+- The earlier "21.5 vs 31.5" (gate vs FORCE_MOVING) was load noise; on a quiet
+  box **FORCE_MOVING (~21 s) is ~14 % faster than the gate (~24 s)** — the
+  per-safepoint push/reload codegen has a real cost. That ~14 % is the price of
+  *safe, precise* relocation (FORCE_MOVING moves conservatively and is not
+  provably safe in general). On the JIT-light regression pool (§2) the push/reload
+  added **no** measurable slowdown (no `slow` flags).
+
+**Optimisation (not yet done):** the 3 *unpaired* spill sites (tail-call ~15783,
+`invokespecial` ~17030, MIC ~17656 in `jit/src/x64.rs`) push without an adjacent
+reload; the per-method watermark cleans them, but pushing there is wasted work
+for oops that never need rewriting. Gating the push to balanced sites, or skipping
+the push for provably-no-GC callees (empty `<init>`), would trim the ~14 %. Left
+for later since the gate is default-OFF; the bisect toggles below stay in for it.
+
+## 6. Default-on + cleanup — partial
+
+**Cleanup done:** removed the now-unused `emit_zero_local` helper in
+`jit/src/x64.rs` (it was never wired — the OSR zeroing is emitted inline in
+`emit_osr_trampoline`). The debug/bisect toggles (`CRATONVM_DBG_SHADOW2`,
+`CRATONVM_SHADOW_NOPUSH`, `CRATONVM_SHADOW_NORELOAD`) are **kept** — they are the
+instrument for the §1 deeper-bug investigation and the §5 push-gating work.
+
+**Default-on: NOT recommended yet.** `CRATONVM_SHADOW_STACK` is now pool-validated
+(§2: 18/18) with §3 + §4 landed, and it fixes bt18 — but two things argue for
+keeping it default-OFF (byte-identical default) for now:
+1. **§1's deeper bug.** OSR-frame tracking (the robustness completion) exposes a
+   shadow×conservative-pin evacuation inconsistency on bt18; until that is
+   root-caused in the collector, the shadow mechanism still leans on the
+   from-space window for OSR-frame oops (golden but not robust).
+2. **~14 % push/reload overhead** on GC-heavy code (§5), unoptimised.
+
+Path to default-on: root-cause §1's collector bug → land the §5 push-gating →
+wider soak (longer-running multi-threaded apps to exercise §4's remap under a
+real move) → then flip, and decide whether the non-moving young sweep /
+selective-promote paths can retire.
 
 ## Quick repro / debug handles
 - Run: `CRATONVM_SHADOW_STACK=1 cratonvm … BenchSuite bintrees18` (golden
