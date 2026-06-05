@@ -61,40 +61,76 @@ shadow×conservative mix (compare a TRACK-mode GC's to-space `longLivedTree` aga
 the from-space original; instrument evac of an object that is also conservatively
 pinned). Until then `CRATONVM_SHADOW_OSR_TRACK` stays default-OFF.
 
-## 2. Regression pool (correctness, before default-on)
+## 2. Regression pool (correctness, before default-on) — DONE (18/18 PASS)
 
 The shadow codegen touches **every** JIT-compiled method's prologue/epilogue and
-every GC-capable safepoint, so run the full pool with the gate ON and compare to
-golden:
-- `test-infra/run-vm-comparison.sh` / the 14-app regression pool with
-  `CRATONVM_SHADOW_STACK=1`, looking for checksum/behaviour diffs vs the default
-  build (see `reference_cross_vm_comparison_harness`).
-- Pay special attention to methods with: many locals (frame-slot offsets >
-  disp8), long/double operand entries near safepoints, exception-heavy paths,
-  and `invokeinterface`/MIC dispatch (the unpaired spill sites — see §5).
+every GC-capable safepoint, so the full pool was run with the gate ON and
+compared to the committed baselines (recorded gate-OFF).
 
-## 3. Exception / deopt unwind safety (correctness)
+**Result (2026-06-05, `feat/shadow-stack-followups` binary, gate ON):**
+`test-infra/regression-pool/run.sh` with `RJVM=<pjsm binary>
+CRATONVM_SHADOW_STACK=1` →
+**`total=18 pass=18 regress=0 slow=0 no_base=0 no_stage=0`**.
+Every probe matches its gate-OFF baseline — the shadow push/reload codegen +
+prologue/epilogue watermark + §3 boundary reset + §4 multi-thread publish/remap
+do not perturb any app's behaviour. Notably the multi-threaded apps (cassandra,
+activemq, felix, spring-boot, jenkins, tomcat, wildfly, keycloak) all PASS,
+which is the first cross-thread exercise of §4 (no corruption from the
+multi-thread shadow publish/remap). gate-ON passing the whole pool (strictly more
+code than gate-OFF) implies the default path is unperturbed too.
 
-The watermark `top` restore lives in `emit_epilogue` (normal returns). An
-exception unwind or deopt that leaves a JIT frame **without** running its
+Caveat: the app probes are short and JIT-light — they exercise the push/reload
+**codegen** broadly but rarely the moving-GC-under-JIT relocation path (bt18
+covers that). Things to keep watching as coverage grows: methods with many locals
+(frame-slot offsets > disp8), long/double operand entries near safepoints,
+exception-heavy paths, and `invokeinterface`/MIC dispatch (the unpaired spill
+sites — see §5).
+
+## 3. Exception / deopt unwind safety (correctness) — DONE
+
+The per-method watermark `top` restore lives in `emit_epilogue` (normal returns).
+An exception unwind or deopt that leaves a JIT frame **without** running its
 epilogue won't restore `top` → a transient leak until control returns to the
 interpreter boundary.
-- **Do:** reset the shadow `top` to a boundary watermark in the
-  interpreter→JIT `JitEntryGuard` (save `top` on enter, restore on `Drop`),
-  covering all abnormal exits. `set_jit_thread` (vm/src/jit/helpers.rs) is the
-  natural place to capture/restore the watermark.
-- bintrees has no exceptions on the hot path, so this is untested today.
 
-## 4. Multi-thread shadow scan (correctness for concurrent apps)
+**Done (commit on `feat/shadow-stack-followups`):** `set_jit_thread`
+(`vm/src/jit/helpers.rs`) snapshots `thread.shadow_stack.top` into the returned
+`JitThreadScope` (`saved_shadow_top: Option<usize>`, `None` when the gate is off);
+the matching `restore_jit_thread` resets `top` to that watermark via
+`ShadowStack::set_top` (clamped to `[base,end]`). This heals any unbalanced push
+at **every** interpreter↔JIT boundary, including abnormal exits — the entry
+paths wrap JIT execution in `catch_unwind` and always call `restore_jit_thread`,
+so a Rust-panic unwind is covered too. On a normal exit the per-method epilogues
+already restored `top`, so the reset is an idempotent no-op (verified bt18 still
+golden under `CRATONVM_SHADOW_STACK`). bintrees has no exceptions on the hot
+path, so the abnormal-exit path itself is exercised only by the regression pool
+(§2) / future exception-heavy workloads.
 
-`roots.rs` (marking) and `gc.rs` (post-move remap) currently scan/remap only the
-**current** thread's shadow stack — matching the existing conservative JIT scan's
-single-thread limitation. A STW moving GC in a multi-threaded app must
-scan+remap **every** thread's shadow stack.
-- **Do:** at the STW safepoint, iterate all threads' `JvmThread.shadow_stack`
-  (via the thread registry) for both the marking fold-in and the pointer_map
-  remap. Each thread's shadow stack is only valid for ranges pushed by that
-  thread (it's per-thread by construction), so this is a straight iteration.
+## 4. Multi-thread shadow scan (correctness for concurrent apps) — DONE
+
+`roots.rs` (marking) and `gc.rs` (post-move remap) scan/remap only the
+**current** thread's shadow stack. A STW moving GC in a multi-threaded app
+(allowed under JIT by `CRATONVM_SHADOW_STACK`) must cover **every** thread's
+shadow stack.
+
+**Done (commit on `feat/shadow-stack-followups`):** realised through the existing
+per-thread publish/resume protocol rather than the initiator iterating the
+registry (the registry holds per-thread `root_snapshot` value-copies, not live
+`JvmThread`s, so it cannot reach another thread's shadow buffer to *rewrite* it):
+- **Marking:** `update_root_snapshot` (interpreter.rs) now folds this thread's
+  shadow values into its `root_snapshot` (right after the existing conservative
+  `scan_active_jit_frames` publish), so the cross-thread initiator's
+  `collect_all_root_snapshots` marks a parked worker's shadow oops. Mirrors the
+  current-thread fold-in in `roots.rs`.
+- **Remap:** `apply_pointer_map_to_thread` (interpreter.rs) — which each worker
+  runs on resume from the STW barrier with the broadcast `pointer_map` — now
+  remaps its own `shadow_stack` in place (the initiator's own is remapped by
+  `update_all_roots`). Mirrors the current-thread remap in `gc.rs`.
+
+Both are gated on `shadow_stack_enabled()` and only affect the multi-thread GC
+path, so single-threaded workloads (bintrees) are unchanged. A dedicated
+multi-threaded-JIT-under-moving-GC stress test is still wanted to exercise it
+directly (the regression pool §2 is the first cross-thread smoke test).
 
 ## 5. Push only at balanced safepoints / perf (efficiency)
 

@@ -996,6 +996,23 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
     // roots and with the concurrent old-gen collector disabled). See
     // docs/real-raf-segv-root-cause.md.
     crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut snapshot);
+
+    // §4 (multi-thread shadow scan, marking half). Also publish THIS thread's
+    // shadow-stack precise roots into the snapshot. With `CRATONVM_SHADOW_STACK`
+    // the moving collector is allowed to run while threads are in JIT, so a
+    // cross-thread STW cycle (which marks from each parked thread's
+    // `root_snapshot`, never `collect_roots`) must see a parked worker's
+    // shadow-held oops or they are reclaimed. Mirrors the current-thread fold-in
+    // in `roots.rs`; every slot is an oop by construction (re-validated via
+    // `is_object_address`). The matching remap is in `apply_pointer_map_to_thread`.
+    // No-op when the gate is off or the shadow stack is empty/unallocated.
+    if crate::jit::conservative_roots::shadow_stack_enabled() {
+        thread.shadow_stack.for_each_value(|v| {
+            if let Some(obj_ref) = shared.heap.is_object_address(v) {
+                snapshot.push(obj_ref);
+            }
+        });
+    }
 }
 
 /// Check if a stop-the-world pause is requested and participate if so.
@@ -1069,6 +1086,16 @@ pub(crate) fn apply_pointer_map_to_thread(
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, heap);
         frame.stack.update_object_refs(pointer_map, heap);
+    }
+    // §4 (multi-thread shadow scan, remap half). Remap THIS thread's shadow-stack
+    // precise roots in place, so a worker resuming from the STW barrier sees the
+    // relocated addresses in the JIT registers/slots it reloads from its shadow
+    // stack. (The GC initiator's own shadow stack is remapped by `update_all_roots`
+    // in `gc.rs`; a non-initiator reaches here instead.) Every shadow slot is a
+    // known oop, so the rewrite is unconditionally safe. No-op when the gate is
+    // off or the shadow stack is empty.
+    if crate::jit::conservative_roots::shadow_stack_enabled() {
+        thread.shadow_stack.remap(pointer_map);
     }
     // Also update printed values and java_thread_obj
     for val in &mut thread.printed {
