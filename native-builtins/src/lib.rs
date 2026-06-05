@@ -32597,11 +32597,24 @@ fn native_exception_get_message(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     if matches!(by_name, Value::Object(Some(_))) {
         return Ok(Some(by_name));
     }
+    // Slot-0 fallback is ONLY valid for synthetic-stub exceptions (message at
+    // slot 0). In the real-JDK Throwable layout slot 0 is `backtrace`, which
+    // `capture_throwable_trace` sets to the self-reference marker — returning
+    // that made a no-arg `new IllegalStateException()` report getMessage() ==
+    // the exception itself (stringified to "Exception"). Only return slot 0
+    // when it actually holds a `java/lang/String`.
     if ctx.object_num_fields(this) >= 1 {
-        Ok(Some(ctx.get_field(this, 0)))
-    } else {
-        Ok(Some(Value::Object(None)))
+        if let v @ Value::Object(Some(o)) = ctx.get_field(this, 0) {
+            if ctx
+                .class_name_of_id(ctx.class_id_of_object(o))
+                .as_deref()
+                == Some("java/lang/String")
+            {
+                return Ok(Some(v));
+            }
+        }
     }
+    Ok(Some(Value::Object(None)))
 }
 
 fn native_exception_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -32609,18 +32622,23 @@ fn native_exception_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let msg = if ctx.object_num_fields(this) >= 1 {
-        match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        }
-    } else {
-        String::new()
+    // Mirror real `Throwable.toString()`:
+    //   s = getClass().getName();  msg = getLocalizedMessage();
+    //   return (msg != null) ? s + ": " + msg : s;
+    // The previous body hardcoded the class as "Exception" (wrong for every
+    // subclass) and read the message from raw slot 0 (which is `backtrace` in
+    // the real-JDK layout, not the message).
+    let class_name = ctx
+        .class_name_of_id(ctx.class_id_of_object(this))
+        .map(|n| n.replace('/', "."))
+        .unwrap_or_else(|| "java.lang.Throwable".to_string());
+    let msg = match ctx.get_field_by_name(this, "detailMessage") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
     };
-    let text = if msg.is_empty() {
-        "Exception".to_string()
-    } else {
-        format!("Exception: {}", msg)
+    let text = match msg {
+        Some(m) => format!("{class_name}: {m}"),
+        None => class_name,
     };
     Ok(Some(Value::Object(Some(ctx.create_string(&text)))))
 }
