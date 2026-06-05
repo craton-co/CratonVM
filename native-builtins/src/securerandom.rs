@@ -748,6 +748,86 @@ pub(crate) fn native_secure_random_generate_seed(
 }
 
 // ---------------------------------------------------------------------------
+// java.security.SecureRandom.getInstance(...) — static-factory interception
+// ---------------------------------------------------------------------------
+//
+// The real-JDK `SecureRandom.getInstance(algorithm)` body routes through
+// `sun.security.jca.GetInstance.getInstance("SecureRandom", SecureRandomSpi
+// .class, algorithm)` → the provider service map.  We deliberately never
+// register a `SecureRandom` service entry (the whole module bypasses the
+// provider machinery — see the header and `register_random_and_securerandom_
+// natives`), so that path dead-ends in `provider_chain::getinstance_instance_
+// search` with `not implemented: no SecureRandom SHA1PRNG implementation in any
+// provider`, which hard-stops apps such as H2's `org.h2.test.TestAll`.
+//
+// Mirror `jca::message_digest::md_get_instance`: intercept the static factory
+// directly and hand back a genuine `java.security.SecureRandom` whose instance
+// methods are already overridden onto the OS CSPRNG.  The requested algorithm
+// name is recorded in the real `algorithm` field so `getAlgorithm()` reports it
+// faithfully; the byte stream itself is OS-CSPRNG (strictly stronger than
+// SHA1PRNG), consistent with this module's "always select the strongest source"
+// policy.  Allocating without running the real `<init>` also avoids the
+// `getDefaultPRNG` → `Providers.getProviderList()` NPE that the no-arg ctor
+// native already sidesteps.
+
+/// Allocate a `java.security.SecureRandom` and record `algorithm` by name.
+/// The String is created and pinned *before* the object allocation so a moving
+/// GC during `alloc_concurrent_synthetic` cannot leave us writing through a
+/// stale reference.
+fn make_secure_random(ctx: &mut dyn NativeContext, algorithm: &str) -> ObjectRef {
+    let algo_str = ctx.create_string(algorithm);
+    let pin = ctx.pin_native_root(algo_str);
+    let sr = crate::alloc_concurrent_synthetic(ctx, "java/security/SecureRandom", 4);
+    let algo_str = ctx.read_native_pin(pin, algo_str);
+    // Resolve `algorithm:String` by name so the slot matches the real layout
+    // regardless of synthetic vs real-JDK field ordering.
+    ctx.set_field_by_name(sr, "algorithm", Value::Object(Some(algo_str)));
+    ctx.unpin_native_roots(pin);
+    sr
+}
+
+/// `SecureRandom.getInstance(String algorithm)` — static factory.  `algorithm`
+/// is the first parameter (static method: no `this` in `args`).
+pub(crate) fn native_secure_random_get_instance(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let algo = match args.first() {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if algo.is_empty() {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: "null algorithm name".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(Value::Object(Some(make_secure_random(ctx, &algo)))))
+}
+
+/// `SecureRandom.getInstance(String algorithm, String provider)` and
+/// `SecureRandom.getInstance(String algorithm, Provider provider)` — the
+/// provider argument is ignored (every algorithm resolves to the OS CSPRNG),
+/// so both overloads read `algorithm` from slot 0 exactly like the 1-arg form.
+pub(crate) fn native_secure_random_get_instance_with_provider(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    native_secure_random_get_instance(ctx, args)
+}
+
+/// `SecureRandom.getInstanceStrong()` — the JDK consults the
+/// `securerandom.strongAlgorithms` security property and tries each entry. Our
+/// OS CSPRNG is already the strongest source, so return it directly instead of
+/// driving the (bypassed) provider machinery.
+pub(crate) fn native_secure_random_get_instance_strong(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Object(Some(make_secure_random(ctx, "OS-CSPRNG")))))
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -807,6 +887,36 @@ pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegis
     registry.register(sr, "nextBoolean", "()Z", native_secure_random_next_boolean);
     registry.register(sr, "nextFloat", "()F", native_secure_random_next_float);
     registry.register(sr, "generateSeed", "(I)[B", native_secure_random_generate_seed);
+    // Static factories — `getInstance(...)` / `getInstanceStrong()`.  Without
+    // these the real-JDK body falls through to the JCA provider chain, which has
+    // no `SecureRandom` service entry and dead-ends in "no SecureRandom <algo>
+    // implementation in any provider" (the H2 `TestAll` hard stop).  Intercept
+    // them so any requested algorithm (SHA1PRNG, DRBG, NativePRNG, …) yields an
+    // OS-CSPRNG-backed instance.
+    registry.register(
+        sr,
+        "getInstance",
+        "(Ljava/lang/String;)Ljava/security/SecureRandom;",
+        native_secure_random_get_instance,
+    );
+    registry.register(
+        sr,
+        "getInstance",
+        "(Ljava/lang/String;Ljava/lang/String;)Ljava/security/SecureRandom;",
+        native_secure_random_get_instance_with_provider,
+    );
+    registry.register(
+        sr,
+        "getInstance",
+        "(Ljava/lang/String;Ljava/security/Provider;)Ljava/security/SecureRandom;",
+        native_secure_random_get_instance_with_provider,
+    );
+    registry.register(
+        sr,
+        "getInstanceStrong",
+        "()Ljava/security/SecureRandom;",
+        native_secure_random_get_instance_strong,
+    );
     registry.set_category(__prev_cat);
 }
 
