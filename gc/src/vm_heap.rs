@@ -241,6 +241,15 @@ impl VmHeap {
         }
     }
 
+    /// DBG (bc math-ec `0x4`): scan young from-space for the first `0x4` seed
+    /// slot. See [`GenerationalHeap::dbg_first_young_small_ref`]. G1 unsupported.
+    pub fn dbg_first_young_small_ref(&self) -> Option<(usize, u32, usize, usize, u64)> {
+        match self {
+            VmHeap::Generational(h) => h.dbg_first_young_small_ref(),
+            VmHeap::G1(_) => None,
+        }
+    }
+
     /// Allocate a new Java object and initialize primitive-typed slots to
     /// their spec-mandated typed zero based on JVM field descriptor bytes.
     ///

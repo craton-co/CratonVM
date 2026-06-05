@@ -1,5 +1,75 @@
 # bc-math-ec `0x4` heap corruption — full handoff (2026-06-05)
 
+> ## ⚡⚡ SESSION UPDATE 2026-06-05 ("take on this job", worktree `CratonVM-ecgc`,
+> branch `fix/bc-math-ec-gc-0x4`) — **THE "GC WRITES THE 0x4" FRAMING (this
+> doc's headline + fact 4) IS WRONG. The `0x4` is a MUTATOR write to a YOUNG
+> object; the GC merely PROMOTES the already-corrupt object** (which is why
+> `ec_watch`'s GC-EXIT *saw* it — a promotion/post-GC-step artifact, not a
+> collector write). The earlier sessions' "mutator raw write / BADREF-silent"
+> conclusion was RIGHT; the "breakthrough" overturned it on bad evidence.
+>
+> ### PROVEN this session (new gated tools `CRATONVM_DBG_SEEDHUNT`,
+> `..._YOUNGSCAN`, `..._STRAYSTACK` — all default-OFF, in the tree):
+> 1. **`0x4` is present in YOUNG at GC ENTRY** (`CRATONVM_DBG_RSET_AUDIT`'s
+>    `[small4] PRE-GC YOUNG … fld[i] -> 0x4`: HexFormat fld[1], cid724 fld[8],
+>    **ECFieldElement$F2m fld[3]** — victim spans Fp AND F2m, varies per run).
+> 2. **`CRATONVM_DBG_SEEDHUNT`** (phase-bisect in `collect_garbage_inner`): the
+>    seeding GC is always `major_ran=false`, no old-gen jump, no `[gcfwd]` → it
+>    is NOT major-GC `update_refs_in_object` (§6.1 REFUTED) and NOT any minor
+>    collector write. The promoted-out victim just carries a pre-existing young
+>    `0x4` (Cheney copy is verbatim — fact 6).
+> 3. **value `4` == the `Value::Object` discriminant.** The OOB-flood objects
+>    read `class_id ∈ {0,1,4}` (== Int/Long/Object discs) with `num_slots=0` —
+>    a header read at a relocated-but-unremapped / interior address.
+> 4. **`set_field` is EXONERATED for the `0x4`**: its guards DROP a stray target
+>    (num_slots=0 → OOB-drop; forwarded real+8 → num_slots=fwd_low>1<<24 →
+>    suspect-header drop). The `0x4` victim has an INTACT header → it's a RAW
+>    write to a VALID object's field PAYLOAD (off-by-8 within the 16-byte cell,
+>    disc-of-victim untouched), bypassing set_field, BADREF, AND the write
+>    barrier. `Unsafe.putObject` (→ ctx.set_field), natives (no raw Value
+>    writes), GC (pre-GC), reference-processing — ALL exonerated for the `0x4`.
+>
+> ### FIXED this session (real, verified bug — but NOT the `0x4`):
+> **Reference-processing stale-ref writes** (`interpreter.rs`
+> `process_references_after_gc`, ~637-680). It remaps `cleared`/`to_enqueue`
+> Reference addrs via `pointer_map.get(a).unwrap_or(*a)`; a Reference RECLAIMED
+> this cycle keeps its stale PRE-GC addr and `set_field`s stray into the reusing
+> object — the `set_field out-of-bounds` flood. `q_obj` was liveness-guarded
+> (avrora fix); **`ref_obj` (671/672/679) and cleared `obj_ref` (642) were
+> NOT.** Added `num_fields(x) < 2 → skip` guards (mirror q_obj). Verified:
+> `[refproc] SKIP` fires 12×, OOB-flood `1-13 → 0`. EC corruption PERSISTS, so
+> this is a distinct (now-fixed) bug, NOT the `0x4`.
+>
+> ### NEW LEAD for the `0x4` (chase FIRST next session):
+> **A remembered-set MISS** appeared (`[rset-audit] … MISSES=1`, contradicting
+> this doc's fact 3 of MISSES=0): `OLD X9ECParameters@0x1aa0e488 fld[0] -> young
+> 0x24981000 CLEAN(card)` — an old→young edge with an undirtied card, in the
+> SAME young region (0x24981xxx) as that run's `0x4` victim (F2m@0x24981470).
+> A CLEAN card on a real old→young edge == the field was written by a path that
+> **bypassed the write barrier** — i.e. the SAME raw-write that produces the
+> `0x4` (off-by-8) produces the rset-miss (old→young, no card). Find the raw
+> heap-cell write that skips `set_field`/`write_slot`'s barrier. Candidates not
+> yet instrumented: object-construction field-init for OLD-gen/humongous allocs;
+> `alloc_object_with_descriptors`; any `write_slot`/`ptr::write::<Value>` caller
+> outside `set_field`. A **hardware watchpoint** on a young victim's payload
+> (re-arm on recurrence, since it persists+recurs) remains the definitive tool —
+> the software youngscan RACES the SEGV (rc=139) and the promotion.
+>
+> Tools added (gated, default-OFF): `CRATONVM_DBG_SEEDHUNT` (gen_heap),
+> `CRATONVM_DBG_YOUNGSCAN` (vm_exec safe_native_call, brute-force young
+> `{disc=4,payload<0x1000}` + back-validate), `CRATONVM_DBG_STRAYSTACK`
+> (interpreter putfield + NativeContextImpl::set_field stray-receiver Java
+> stack + the `[refproc] SKIP` log), `[gcfwd]` (old_gen §6.1 check). Repro
+> scripts in `ecprobe/`. Build traps: vm crate (lto=fat) compile is
+> intermittently OOM/load-killed → exit 1 w/ no error after the gc warning;
+> just RETRY. Verify relink by binary MTIME (comments are stripped).
+>
+> **Everything BELOW this block predates the reframe — its "GC writes it" /
+> §6.1 / fact-4 conclusions are SUPERSEDED. Read it for the ruled-out list and
+> the repro only.**
+
+---
+
 **Status: ROOT CAUSE LOCALIZED to the moving collector, exact write-line still open.**
 This is a complete brain-dump for the next agent. Read it before touching anything —
 it captures what is PROVEN, what is RULED OUT (don't redo), the diagnostic tools

@@ -35,6 +35,18 @@ use crate::heap::{
 };
 use cratonvm_types::{ObjectRef, Value};
 
+/// Cached `CRATONVM_DBG_SEEDHUNT` gate (bc math-ec `0x4`). When on,
+/// `update_refs_in_object` logs any referent whose `forwarding_ptr` is
+/// non-null but `< 0x1000` — the §6.1 suspect that would write
+/// `Object(Some(0x4))` into a live referrer's field during major-GC
+/// compaction. See docs/bc-math-ec-gc-0x4-handoff.md §6.1.
+#[inline]
+fn seedhunt_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_SEEDHUNT").is_some())
+}
+
 /// A contiguous free block in the old generation.
 #[derive(Debug, Clone, Copy)]
 struct FreeBlock {
@@ -602,6 +614,18 @@ impl OldGen {
                             let ref_header =
                                 unsafe { &*(ref_ptr as *const ObjectHeader) };
                             if !ref_header.forwarding_ptr.is_null() {
+                                if seedhunt_enabled()
+                                    && (ref_header.forwarding_ptr as usize) < 0x1000
+                                {
+                                    eprintln!(
+                                        "[gcfwd] ARR write small fwd: holder@0x{:x} cid={} arr[{}] \
+                                         referent@0x{:x} cid={} marked={} fwd=0x{:x}",
+                                        obj_ptr as usize, header.class_id.as_u32(), i,
+                                        ref_ptr, ref_header.class_id.as_u32(),
+                                        ref_header.gc_flags & GC_FLAG_MARKED != 0,
+                                        ref_header.forwarding_ptr as usize,
+                                    );
+                                }
                                 unsafe {
                                     std::ptr::write(
                                         slot as *mut u64,
@@ -623,6 +647,18 @@ impl OldGen {
                         let ref_header =
                             unsafe { &*(ref_ptr as *const ObjectHeader) };
                         if !ref_header.forwarding_ptr.is_null() {
+                            if seedhunt_enabled()
+                                && (ref_header.forwarding_ptr as usize) < 0x1000
+                            {
+                                eprintln!(
+                                    "[gcfwd] OBJ write small fwd: holder@0x{:x} cid={} fld[{}] \
+                                     referent@0x{:x} cid={} marked={} fwd=0x{:x}",
+                                    obj_ptr as usize, header.class_id.as_u32(), slot_idx,
+                                    ref_ptr, ref_header.class_id.as_u32(),
+                                    ref_header.gc_flags & GC_FLAG_MARKED != 0,
+                                    ref_header.forwarding_ptr as usize,
+                                );
+                            }
                             let new_value = Value::Object(Some(unsafe {
                                 ObjectRef::from_raw(ref_header.forwarding_ptr)
                             }));
