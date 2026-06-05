@@ -580,8 +580,26 @@ pub(crate) fn native_throwable_get_message(ctx: &mut dyn NativeContext, args: &[
         // slot 0 (it is `backtrace` in the real-JDK layout).
         _ if has_named_detail_message => Value::Object(None),
         // Synthetic-stub layout: no named `detailMessage` field at all; the
-        // canonical slot really is index 0.
-        _ => ctx.get_field(this, 0),
+        // canonical slot really is index 0 — BUT only when it actually holds a
+        // `java/lang/String`. `capture_throwable_trace` parks the Throwable
+        // itself in slot 0 (the `backtrace` non-null marker) for real-JDK-layout
+        // exceptions whose inherited `detailMessage` our `resolve_field_index`
+        // failed to find by name (it does not walk to `Throwable`). Returning
+        // that self-reference made a no-arg `new IllegalStateException()` report
+        // `getMessage() == "Exception"` instead of `null`, and
+        // `getMessage().contains(...)` would `NoSuchMethodError` on the
+        // exception class. Gate the fallback on the slot actually being a String.
+        _ => match ctx.get_field(this, 0) {
+            v @ Value::Object(Some(o))
+                if ctx
+                    .class_name_of_id(ctx.class_id_of_object(o))
+                    .as_deref()
+                    == Some("java/lang/String") =>
+            {
+                v
+            }
+            _ => Value::Object(None),
+        },
     };
     // Return the field value directly. The previous `read_string` validation
     // dropped legitimate JDK String references whose internal layout
