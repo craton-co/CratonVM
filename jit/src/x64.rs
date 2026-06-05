@@ -2784,18 +2784,39 @@ fn analyze_escapes(
             //   0x99..=0xa8  ifeq..jsr (conditional branches, goto, jsr)
             //   0xa9         ret
             //   0xaa,0xab    table/lookupswitch
-            //   0xac..=0xb1  *return (areturn 0xb0 handled above, but listing
-            //                it here is harmless — it's matched earlier)
             //   0xbf         athrow
             //   0xc6,0xc7    ifnull / ifnonnull
             //   0xc8,0xc9    goto_w / jsr_w
-            0x99..=0xa9 | 0xaa | 0xab | 0xac..=0xb1 | 0xbf | 0xc6 | 0xc7 | 0xc8 | 0xc9 => {
+            //
+            // Plain *return (0xac/0xad/0xae/0xaf/0xb1) is deliberately NOT in
+            // this list — it has its own arm below. (areturn 0xb0 is matched
+            // earlier and escapes the returned object.)
+            0x99..=0xa9 | 0xaa | 0xab | 0xbf | 0xc6 | 0xc7 | 0xc8 | 0xc9 => {
                 escape_all!();
                 for slot in local_origin.iter_mut() {
                     if let Some(p) = slot.take() {
                         escaped.insert(p);
                     }
                 }
+                abs_stack.clear();
+                pc += bytecode_len_at(code, pc);
+            }
+            // Plain (non-areturn) returns: ireturn/lreturn/freturn/dreturn/
+            // return. A method-exit return ENDS the current path — it is NOT a
+            // CFG-divergence point, so unlike the branch barrier above it must
+            // NOT escape locals: an object held in a local here dies with the
+            // frame, it does not escape. Any object that IS live into reachable
+            // post-return code arrives there via a branch, and the
+            // branch-target barrier at the top of the loop escapes it at that
+            // target. Escaping locals here too (as the prior over-broad barrier
+            // that lumped returns in with branches did) falsely de-optimises
+            // the straight-line `new X(); use; return <primitive|void>` idiom —
+            // contradicting this pass's "straight-line allocation sites are
+            // unaffected" contract. Operand-stack objects (rare at a non-object
+            // return — the return value is a primitive/void) are escaped
+            // defensively; locals are left intact.
+            0xac | 0xad | 0xae | 0xaf | 0xb1 => {
+                escape_all!();
                 abs_stack.clear();
                 pc += bytecode_len_at(code, pc);
             }
