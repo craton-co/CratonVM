@@ -382,12 +382,22 @@ fn native_fd_release0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         // Nothing to release if the fd is already gone.
         return Ok(None);
     };
-    let file = ctx
-        .fd_table()
-        .clone_file(fd)
-        .map_err(|e| io_error(format!("release0: {e}")))?;
-
-    os_lock::unlock_range(&file, pos as u64, size).map_err(|e| io_error(format!("release0: {e}")))?;
+    // Best-effort unlock. cratonvm's `lock0` places the OS lock through a
+    // transient duplicated handle (`clone_file`) that the kernel releases as
+    // soon as that handle is dropped at the end of `lock0` — notably Windows
+    // `LockFileEx`, whose locks are per-HANDLE — so by the time `release0` runs
+    // there is usually no live OS lock left, and a fresh clone here cannot
+    // unlock a range it never locked. The real JDK calls `nd.release()` BEFORE
+    // `fileLockTable.remove(fli)` in `FileChannelImpl.release`, so propagating
+    // an IOException from a failed unlock would ABORT that table removal,
+    // leaving a phantom in-JVM lock that makes the next `tryLock` on the same
+    // file throw `OverlappingFileLockException` (H2 reopen: "the file is
+    // locked"). Swallow the unlock result so the JDK's FileLockTable
+    // bookkeeping always completes; the kernel has already dropped any real
+    // lock with the lock0 clone handle.
+    if let Ok(file) = ctx.fd_table().clone_file(fd) {
+        let _ = os_lock::unlock_range(&file, pos as u64, size);
+    }
     Ok(None)
 }
 
