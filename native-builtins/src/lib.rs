@@ -388,6 +388,8 @@ pub mod phases_early;
 pub mod phases_late;
 pub(crate) mod bc_aes;
 pub(crate) mod bc_chacha;
+pub(crate) mod bc_newhope;
+pub(crate) mod bc_newhope_tables;
 // T19_K3_PROPS_SIDETABLE — robust java.util.Properties storage so
 // KeycloakMain.<clinit>'s Version.<clinit> path
 // (Class.getResourceAsStream → Properties.load → getProperty) returns
@@ -1014,9 +1016,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // BouncyCastle ChaCha permutation fast-path (Intrinsic). Same JIT-ban
     // rationale: the interpreted ChaCha core (dozens of Integers.rotateLeft
     // calls per block) dominates the SPHINCS-256 PQC RegressionTest (PRG via
-    // ChaChaEngine.chachaCore + hash via Permute.permute). Verbatim port,
-    // RFC 8439-validated.
+    // ChaChaEngine.chachaCore + hash via Permute.permute/HashFunctions).
+    // Verbatim port, RFC 8439- and HotSpot-validated.
     crate::phases_late::register_bc_chacha(registry);
+    // BouncyCastle NewHope lattice fast-path (Intrinsic). The NTT
+    // (Poly.toNTT/fromNTT) + SHAKE128 sampler (Poly.uniform) dominate the PQC
+    // RegressionTest's NewHopeTest once ChaCha is native. Verbatim port of
+    // NTT/Reduce + the `sha3` crate's SHAKE128, validated against HotSpot.
+    crate::phases_late::register_bc_newhope(registry);
 
     // Spring Boot loader in real-JDK mode can resolve Pattern natives through
     // synthetic-stub dispatch paths before/without usable JDK bytecode

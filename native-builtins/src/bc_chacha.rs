@@ -112,6 +112,70 @@ pub(crate) fn permute(rounds: i32, x: &mut [i32; 16]) {
     }
 }
 
+/// The fixed round count of `Permute.chacha_permute` (BC's
+/// `Permute.CHACHA_ROUNDS`).
+pub(crate) const SPHINCS_CHACHA_ROUNDS: i32 = 12;
+
+/// `org.bouncycastle.pqc.crypto.sphincs.Permute.chacha_permute(byte[] out,
+/// byte[] in)` — the SPHINCS hash leaf (`HashFunctions.hash_n_n`/`hash_2n_n`),
+/// by far the hottest frame in tree/WOTS signing. Reads 16 little-endian words
+/// from `input`, runs the 12-round permutation, and writes them back
+/// little-endian to `out`. Folds in the per-call `new int[16]` allocation and
+/// the 32 `Pack.littleEndianToInt`/`intToLittleEndian` conversions that the
+/// bytecode does around `permute`. `out` and `input` may alias — the callers
+/// pass `chacha_permute(x, x)` — so all input is consumed before any output is
+/// written. Byte-identical to the bytecode (`Pack` little-endian == LE bytes).
+pub(crate) fn chacha_permute_bytes(out: &mut [u8; 64], input: &[u8; 64]) {
+    let mut s = [0u32; 16];
+    for k in 0..16 {
+        s[k] = u32::from_le_bytes([
+            input[4 * k],
+            input[4 * k + 1],
+            input[4 * k + 2],
+            input[4 * k + 3],
+        ]);
+    }
+    chacha_rounds(&mut s, SPHINCS_CHACHA_ROUNDS);
+    for k in 0..16 {
+        out[4 * k..4 * k + 4].copy_from_slice(&s[k].to_le_bytes());
+    }
+}
+
+/// `HashFunctions.hashc` — the 32-byte ChaCha state suffix.
+pub(crate) const SPHINCS_HASHC: [u8; 32] = *b"expand 32-byte to 64-byte state!";
+
+/// `HashFunctions.hash_n_n`: `out = chacha_permute(in32 || hashc)[0..32]`.
+/// (The SPHINCS one-block hash; `HASH_BYTES == 32`.)
+pub(crate) fn sphincs_hash_n_n(in32: &[u8; 32]) -> [u8; 32] {
+    let mut x = [0u8; 64];
+    x[..32].copy_from_slice(in32);
+    x[32..].copy_from_slice(&SPHINCS_HASHC);
+    let mut y = [0u8; 64];
+    chacha_permute_bytes(&mut y, &x);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&y[..32]);
+    out
+}
+
+/// `HashFunctions.hash_2n_n`: two-block compression `in64 -> out32`.
+/// `x = in[0..32] || hashc; permute(x); x[0..32] ^= in[32..64]; permute(x);
+///  out = x[0..32]`.
+pub(crate) fn sphincs_hash_2n_n(in64: &[u8; 64]) -> [u8; 32] {
+    let mut x = [0u8; 64];
+    x[..32].copy_from_slice(&in64[..32]);
+    x[32..].copy_from_slice(&SPHINCS_HASHC);
+    let mut y = [0u8; 64];
+    chacha_permute_bytes(&mut y, &x); // first permute
+    for i in 0..32 {
+        y[i] ^= in64[32 + i];
+    }
+    let mut z = [0u8; 64];
+    chacha_permute_bytes(&mut z, &y); // second permute
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&z[..32]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +255,68 @@ mod tests {
         let mut perm = input;
         permute(0, &mut perm);
         assert_eq!(perm, input);
+    }
+
+    /// `chacha_permute_bytes` must equal: LE-decode 64 bytes -> `permute(12)` ->
+    /// LE-encode. Ties the byte wrapper to the RFC-validated `permute`/
+    /// `chacha_rounds`. Uses an in==out aliasing check too (the real callers
+    /// pass `chacha_permute(x, x)`).
+    #[test]
+    fn chacha_permute_bytes_matches_permute() {
+        // Arbitrary but fixed 64-byte input (0,1,2,...,63).
+        let mut input = [0u8; 64];
+        for (i, b) in input.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        // Reference: decode LE -> permute(12) -> encode LE.
+        let mut ref_words = [0i32; 16];
+        for k in 0..16 {
+            ref_words[k] = u32::from_le_bytes([
+                input[4 * k],
+                input[4 * k + 1],
+                input[4 * k + 2],
+                input[4 * k + 3],
+            ]) as i32;
+        }
+        permute(SPHINCS_CHACHA_ROUNDS, &mut ref_words);
+        let mut expected = [0u8; 64];
+        for k in 0..16 {
+            expected[4 * k..4 * k + 4].copy_from_slice(&(ref_words[k] as u32).to_le_bytes());
+        }
+
+        let mut out = [0u8; 64];
+        chacha_permute_bytes(&mut out, &input);
+        assert_eq!(out, expected, "chacha_permute_bytes vs permute mismatch");
+        // (The in==out aliasing case the real callers use is handled at the
+        // native layer, which reads `in` fully into a Rust local before writing
+        // `out`; the pure fn here takes disjoint &mut/& refs by construction.)
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// SPHINCS `hash_n_n` / `hash_2n_n` validated against HotSpot ground truth
+    /// (BC's real `HashFunctions`), pinning the `hashc` constant + the XOR /
+    /// double-permute structure.
+    #[test]
+    fn sphincs_hash_matches_hotspot() {
+        let mut in32 = [0u8; 32];
+        for (i, b) in in32.iter_mut().enumerate() {
+            *b = (i * 3 + 1) as u8;
+        }
+        assert_eq!(
+            hex(&sphincs_hash_n_n(&in32)),
+            "1970575d27d8a7a2c802327bd6c0bd1984589fb7f1dfeb24b41ef58a2c20ffb6"
+        );
+
+        let mut in64 = [0u8; 64];
+        for (i, b) in in64.iter_mut().enumerate() {
+            *b = (i * 5 + 2) as u8;
+        }
+        assert_eq!(
+            hex(&sphincs_hash_2n_n(&in64)),
+            "a2a7d5c917bd9f691b1eff4da7deb7d31125e572d9bad40900d8a6fdbaf2f578"
+        );
     }
 }

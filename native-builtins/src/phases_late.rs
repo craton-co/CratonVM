@@ -35638,6 +35638,195 @@ pub(crate) fn register_bc_chacha(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // Permute.chacha_permute(byte[] out, byte[] in): the SPHINCS hash leaf
+    // (HashFunctions.hash_n_n/hash_2n_n), the dominant frame in tree/WOTS
+    // signing. Folds in the per-call int[16] allocation + 32 Pack conversions
+    // that the bytecode wraps around `permute`. Instance method (invokevirtual,
+    // dispatched via the native-override check in execute_invokevirtual_cached):
+    // args = [this (Permute), out, in]. `in` and `out` alias in the callers
+    // (`chacha_permute(x, x)`); we read `in` fully before writing `out`.
+    r.register(
+        "org/bouncycastle/pqc/crypto/sphincs/Permute",
+        "chacha_permute",
+        "([B[B)V",
+        |ctx, args| {
+            let out_arr = obj_arg(args, 1)?;
+            let in_arr = obj_arg(args, 2)?;
+            // The bytecode reads in[0..64) and writes out[0..64); a buffer
+            // shorter than 64 would AIOOBE in Pack — mirror that.
+            let in_len = ctx.array_length(in_arr);
+            let out_len = ctx.array_length(out_arr);
+            if in_len < 64 || out_len < 64 {
+                let index = if in_len < 64 { in_len } else { out_len } as i32;
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+            }
+            let mut inb = [0u8; 64];
+            if ctx.read_byte_array_into(in_arr, 0, &mut inb) != 64 {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: 0 }.into());
+            }
+            let mut outb = [0u8; 64];
+            crate::bc_chacha::chacha_permute_bytes(&mut outb, &inb);
+            ctx.write_byte_array_from(out_arr, 0, &outb);
+            Ok(None)
+        },
+    );
+
+    // SPHINCS hash layer (HashFunctions instance methods, invokevirtual). Once
+    // chacha_permute is native, the per-hash byte[64]/byte[32] allocations +
+    // copy/XOR loops in hash_n_n/hash_2n_n dominate tree/WOTS signing (millions
+    // of calls). Folding them native eliminates that glue. All return int 0
+    // (BC). The byte-level logic lives in `crate::bc_chacha` (HotSpot-validated).
+    fn ioff(args: &[Value], i: usize) -> usize {
+        match args.get(i) {
+            Some(Value::Int(v)) => *v as usize,
+            _ => 0,
+        }
+    }
+    let hf = "org/bouncycastle/pqc/crypto/sphincs/HashFunctions";
+
+    r.register(hf, "hash_n_n", "([BI[BI)I", |ctx, args| {
+        let out = obj_arg(args, 1)?;
+        let out_off = ioff(args, 2);
+        let inp = obj_arg(args, 3)?;
+        let in_off = ioff(args, 4);
+        let mut in32 = [0u8; 32];
+        if ctx.read_byte_array_into(inp, in_off, &mut in32) != 32 {
+            return Err(iae(""));
+        }
+        let res = crate::bc_chacha::sphincs_hash_n_n(&in32);
+        ctx.write_byte_array_from(out, out_off, &res);
+        Ok(Some(Value::Int(0)))
+    });
+
+    r.register(hf, "hash_2n_n", "([BI[BI)I", |ctx, args| {
+        let out = obj_arg(args, 1)?;
+        let out_off = ioff(args, 2);
+        let inp = obj_arg(args, 3)?;
+        let in_off = ioff(args, 4);
+        let mut in64 = [0u8; 64];
+        if ctx.read_byte_array_into(inp, in_off, &mut in64) != 64 {
+            return Err(iae(""));
+        }
+        let res = crate::bc_chacha::sphincs_hash_2n_n(&in64);
+        ctx.write_byte_array_from(out, out_off, &res);
+        Ok(Some(Value::Int(0)))
+    });
+
+    r.register(hf, "hash_n_n_mask", "([BI[BI[BI)I", |ctx, args| {
+        let out = obj_arg(args, 1)?;
+        let out_off = ioff(args, 2);
+        let inp = obj_arg(args, 3)?;
+        let in_off = ioff(args, 4);
+        let mask = obj_arg(args, 5)?;
+        let mask_off = ioff(args, 6);
+        let mut in32 = [0u8; 32];
+        let mut m32 = [0u8; 32];
+        if ctx.read_byte_array_into(inp, in_off, &mut in32) != 32
+            || ctx.read_byte_array_into(mask, mask_off, &mut m32) != 32
+        {
+            return Err(iae(""));
+        }
+        for i in 0..32 {
+            in32[i] ^= m32[i];
+        }
+        let res = crate::bc_chacha::sphincs_hash_n_n(&in32);
+        ctx.write_byte_array_from(out, out_off, &res);
+        Ok(Some(Value::Int(0)))
+    });
+
+    r.register(hf, "hash_2n_n_mask", "([BI[BI[BI)I", |ctx, args| {
+        let out = obj_arg(args, 1)?;
+        let out_off = ioff(args, 2);
+        let inp = obj_arg(args, 3)?;
+        let in_off = ioff(args, 4);
+        let mask = obj_arg(args, 5)?;
+        let mask_off = ioff(args, 6);
+        let mut in64 = [0u8; 64];
+        let mut m64 = [0u8; 64];
+        if ctx.read_byte_array_into(inp, in_off, &mut in64) != 64
+            || ctx.read_byte_array_into(mask, mask_off, &mut m64) != 64
+        {
+            return Err(iae(""));
+        }
+        for i in 0..64 {
+            in64[i] ^= m64[i];
+        }
+        let res = crate::bc_chacha::sphincs_hash_2n_n(&in64);
+        ctx.write_byte_array_from(out, out_off, &res);
+        Ok(Some(Value::Int(0)))
+    });
+
+    r.set_category(__prev_cat);
+}
+
+/// Native fast-path for the BouncyCastle NewHope (post-quantum) lattice kernels
+/// that dominate `NewHopeTest` (1000 key-exchange rounds) once the ChaCha cores
+/// are native: the number-theoretic transform `Poly.toNTT`/`fromNTT` (the
+/// profiled hot frame — interpreted `short[]` Montgomery butterflies) and the
+/// SHAKE128 rejection sampler `Poly.uniform` (interpreted Keccak). All are
+/// `public static` over `short[1024]`; the bodies in `crate::bc_newhope` are
+/// verbatim ports validated element-for-element against HotSpot. Invoked via
+/// invokestatic (registry-shadowed). `short[]` reads/writes go through
+/// `get/set_array_element` (sign-extended `Value::Int` <-> i16).
+pub(crate) fn register_bc_newhope(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+
+    fn read_poly(ctx: &dyn NativeContext, arr: ObjectRef) -> Option<[i16; 1024]> {
+        if ctx.array_length(arr) != 1024 {
+            return None;
+        }
+        let mut out = [0i16; 1024];
+        for (k, slot) in out.iter_mut().enumerate() {
+            match ctx.get_array_element(arr, k) {
+                Value::Int(v) => *slot = v as i16,
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+    fn write_poly(ctx: &dyn NativeContext, arr: ObjectRef, vals: &[i16; 1024]) {
+        for (k, &v) in vals.iter().enumerate() {
+            ctx.set_array_element(arr, k, Value::Int(v as i32));
+        }
+    }
+    fn bad() -> MethodCallFailed {
+        RuntimeError::ArrayIndexOutOfBoundsException { index: 1024 }.into()
+    }
+
+    let poly = "org/bouncycastle/pqc/crypto/newhope/Poly";
+
+    r.register(poly, "toNTT", "([S)V", |ctx, args| {
+        let arr = obj_arg(args, 0)?;
+        let mut r = read_poly(ctx, arr).ok_or_else(bad)?;
+        crate::bc_newhope::to_ntt(&mut r);
+        write_poly(ctx, arr, &r);
+        Ok(None)
+    });
+
+    r.register(poly, "fromNTT", "([S)V", |ctx, args| {
+        let arr = obj_arg(args, 0)?;
+        let mut r = read_poly(ctx, arr).ok_or_else(bad)?;
+        crate::bc_newhope::from_ntt(&mut r);
+        write_poly(ctx, arr, &r);
+        Ok(None)
+    });
+
+    r.register(poly, "uniform", "([S[B)V", |ctx, args| {
+        let a_arr = obj_arg(args, 0)?;
+        if ctx.array_length(a_arr) != 1024 {
+            return Err(bad());
+        }
+        let seed_arr = obj_arg(args, 1)?;
+        let slen = ctx.array_length(seed_arr);
+        let mut seed = vec![0u8; slen];
+        ctx.read_byte_array_into(seed_arr, 0, &mut seed);
+        let mut a = [0i16; 1024];
+        crate::bc_newhope::uniform(&mut a, &seed);
+        write_poly(ctx, a_arr, &a);
+        Ok(None)
+    });
+
     r.set_category(__prev_cat);
 }
 
