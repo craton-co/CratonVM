@@ -1757,14 +1757,20 @@ impl GenerationalHeap {
         // heap-corruption source. UNSAFE if a JIT frame is genuinely live
         // (relocates JIT-held raw pointers); diagnostic only.
         let force_moving = std::env::var_os("CRATONVM_DBG_FORCE_MOVING").is_some();
-        // Shadow-stack precise roots (CRATONVM_SHADOW_STACK): when on, JIT code
-        // maintains a precise, *rewritable* set of all its live oops (operand
-        // stack + locals) on each thread's shadow stack, scanned by the marking
-        // root collector and rewritten by the post-move remap. That removes the
-        // reason the collector must avoid relocation under JIT (a conservatively-
-        // discovered slot that can't be safely rewritten), so the moving Cheney
-        // cycle is allowed to run — and only it can drain a large long-lived
-        // young set (the bintrees18 throughput wall).
+        // Fix A (2026-06-05): under live JIT frames the CORRECT young collector is
+        // the NON-MOVING sweep + selective promotion — now DEFAULT-ON (see
+        // `selective_on` in `sweep_young_non_moving`), giving bt18 = 68332206 =
+        // HotSpot. It marks conservatively (over-marking is safe) and drains by
+        // PINNING conservative roots + tenuring only heap-interior nodes, so no
+        // live make/check node is ever lost. The moving Cheney UNDER-COUNTS bt18
+        // (the long-mislabelled "golden" 67674804): a semispace cannot pin a
+        // conservative JIT root nor rewrite a register-resident one, so some live
+        // nodes go stale after the swap. `CRATONVM_SHADOW_STACK` tried to make
+        // moving safe via precise rewritable roots but is incomplete (68199090)
+        // AND its push/reload codegen is incompatible with the non-moving sweep,
+        // so it still routes to the moving Cheney here — it is the INFERIOR path;
+        // the DEFAULT (no gate) is now the correct one. `CRATONVM_DBG_FORCE_MOVING`
+        // also forces the (under-counting) moving cycle for diagnostics.
         let shadow_roots = std::env::var_os("CRATONVM_SHADOW_STACK").is_some();
         if crate::gc_quiescence::is_active() && !force_moving && !shadow_roots {
             tracing::debug!(
@@ -2695,20 +2701,19 @@ impl GenerationalHeap {
             }
         }
 
-        // ----- Selective promotion (CRATONVM_SELECTIVE_PROMOTE) -----------
+        // ----- Selective promotion -----------------------------------------
         //
-        // ⚠ EXPERIMENTAL — DEFAULT OFF, KNOWN-BUGGY. Correct on small workloads
-        // (bintrees10/14/16 hit golden checksums) and it DOES eliminate young-gen
-        // exhaustion (bintrees18 completes in ~33s with the probe fix below
-        // instead of timing out), but at bintrees18 scale it produces a WRONG
-        // checksum (68332206 vs golden 67674804) — a deterministic, heap-size-
-        // independent STRUCTURAL fixup error (a child reference rewritten to the
-        // wrong old address → aliasing → inflated node count). Ruled out: clean-
-        // card old→young (full old-gen fixup didn't fix it) and register-only
-        // dangling reads (a "don't zero evacuated slots" variant didn't fix it).
-        // Root cause not yet isolated — likely an old_gen.alloc reuse/collision
-        // or a fixup edge case. DO NOT enable in production until resolved. See
-        // memory reference_osr_main_corruptor.
+        // ✅ CORRECT (Fix A, 2026-06-05). Enabled under `CRATONVM_SELECTIVE_PROMOTE`
+        // OR `CRATONVM_SHADOW_STACK` (see `selective_on` below); opt out with
+        // `CRATONVM_NO_SELECTIVE_PROMOTE`. It hits the HotSpot-verified checksums on
+        // bintrees10/14/16/18 — including **bt18 = 68332206**, which is the TRUE
+        // value (`java -cp bench BenchSuite bintrees18`). The old "golden 67674804"
+        // was a CratonVM UNDER-COUNT bug, so the earlier "EXPERIMENTAL/KNOWN-BUGGY —
+        // 68332206 is WRONG" verdict here was INVERTED: this path is the *correct*
+        // one and the moving Cheney (67674804) is the buggy one. `SP_VERIFY` already
+        // showed MISSED=0 + ALIASING=0 — the fixup was always correct; only the
+        // reference value was wrong. It also eliminates young-gen exhaustion (the
+        // non-moving sweep alone walls on bt18's long-lived set).
         //
         // The non-moving sweep keeps every survivor in young in place, so a
         // workload whose live young set approaches young capacity (bintrees18's
@@ -2729,7 +2734,15 @@ impl GenerationalHeap {
         // tree's interior nodes) are movable and get tenured, draining young
         // while the few pinned objects stay put.
         let mut evac_map: HashMap<usize, usize> = HashMap::new();
-        if std::env::var_os("CRATONVM_SELECTIVE_PROMOTE").is_some() {
+        // Fix A: selective promotion is the proven-correct drain for the
+        // JIT-active non-moving sweep (bt18 = 68332206 = HotSpot), so it is now
+        // DEFAULT-ON. Opt out with `CRATONVM_NO_SELECTIVE_PROMOTE` to get the pure
+        // (walling, under-counting) non-moving sweep for debugging. The legacy
+        // `CRATONVM_SELECTIVE_PROMOTE` gate is now redundant (always-on) but kept
+        // accepted for compatibility. This path runs only here, in the JIT-active
+        // non-moving sweep, so it never affects the no-JIT moving Cheney.
+        let selective_on = std::env::var_os("CRATONVM_NO_SELECTIVE_PROMOTE").is_none();
+        if selective_on {
             let is_y = |a: usize| -> bool { a >= from_base && a < from_end && (a & 0x7) == 0 };
 
             // (1) Pin set: every root / finalizer value that lands in young.
@@ -3440,11 +3453,11 @@ impl GenerationalHeap {
         // subsequent allocation O(n) — the bintrees18 allocation cliff (young
         // drains correctly but throughput collapses). Merging adjacent holes
         // collapses that region to a handful of spans, restoring near-O(1) bump
-        // allocation out of a free block. Gated with the selective-promotion
-        // feature so the verified default path is byte-identical.
-        if std::env::var_os("CRATONVM_SELECTIVE_PROMOTE").is_some()
-            && std::env::var_os("CRATONVM_SP_NO_COALESCE").is_none()
-        {
+        // allocation out of a free block. Tied to `selective_on` (Fix A): it is
+        // the necessary partner of the evacuation above — without it the default-on
+        // selective sweep drains young but leaves a 500k-entry free list, so
+        // allocation goes O(n) and bt18 throughput collapses (the rc=127 cliff).
+        if selective_on && std::env::var_os("CRATONVM_SP_NO_COALESCE").is_none() {
             let sorted = young_from.free_blocks_sorted();
             if sorted.len() > 1 {
                 young_from.clear_free_list();

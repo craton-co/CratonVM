@@ -109,6 +109,13 @@ impl Drop for JitThreadGuard {
 /// frozen on the call stack for the nested call's duration.
 pub struct JitThreadScope {
     prev_ptr: *mut JvmThread,
+    /// Shadow-stack `top` watermark captured at JIT entry (follow-up §3). On exit
+    /// [`restore_jit_thread`] resets `top` to this value, healing any push an
+    /// abnormal JIT exit (exception/deopt that skipped a method epilogue) left
+    /// unbalanced. `None` when the shadow-stack gate is off (no-op). On a normal
+    /// exit the per-method epilogues already restored `top`, so the reset is a
+    /// no-op there.
+    saved_shadow_top: Option<usize>,
     #[cfg(debug_assertions)]
     prev_borrow: bool,
 }
@@ -177,8 +184,14 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
     // Cheap `base != 0` check after the first entry; gated, no-op otherwise.
     // Done here (with a legitimate `&mut JvmThread`) rather than in the extern-C
     // `jit_get_current_thread` getter to avoid deriving an aliasing `&mut`.
+    let mut saved_shadow_top: Option<usize> = None;
     if crate::jit::conservative_roots::shadow_stack_enabled() {
         thread.shadow_stack.ensure_allocated();
+        // §3 (unwind safety): snapshot the boundary `top` watermark so
+        // `restore_jit_thread` can reset it on exit, healing any push that an
+        // abnormal JIT exit (exception/deopt skipping a method epilogue) left
+        // unbalanced. Captured after `ensure_allocated` so `top` is valid.
+        saved_shadow_top = Some(thread.shadow_stack.top);
         if std::env::var_os("CRATONVM_DBG_SHADOW").is_some() {
             use std::sync::atomic::{AtomicBool, Ordering};
             static ONCE: AtomicBool = AtomicBool::new(false);
@@ -208,6 +221,7 @@ pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
     let prev_borrow = suspend_jit_borrow();
     JitThreadScope {
         prev_ptr,
+        saved_shadow_top,
         #[cfg(debug_assertions)]
         prev_borrow,
     }
@@ -224,6 +238,24 @@ pub fn is_jit_thread_set() -> bool {
 /// which may JIT-compile hash() and call set_jit_thread again). Re-installs the
 /// prior thread pointer and un-suspends the outer level's debug borrow flag.
 pub fn restore_jit_thread(scope: JitThreadScope) {
+    // §3 (unwind safety): reset the shadow `top` to the watermark captured at the
+    // matching `set_jit_thread`, healing any push that an abnormal JIT exit
+    // (exception/deopt that skipped a method epilogue) left unbalanced. On a
+    // normal return the per-method epilogues already restored `top`, so this is a
+    // no-op (`set_top` is idempotent at the boundary value). `JIT_THREAD` still
+    // names the thread whose JIT call just returned — it is reset to `prev_ptr`
+    // just below — so it identifies the correct shadow stack to heal.
+    if let Some(saved_top) = scope.saved_shadow_top {
+        let cur = JIT_THREAD.with(|t| t.get());
+        if !cur.is_null() {
+            // SAFETY: execution is back on `cur`'s own thread and its JIT call has
+            // returned, so no aliasing `&mut` to its shadow stack is live; the
+            // backing buffer address is stable for the thread's lifetime, and
+            // `set_top` clamps into `[base, end]` so a stale value can't widen the
+            // scan range.
+            unsafe { (*cur).shadow_stack.set_top(saved_top) };
+        }
+    }
     JIT_THREAD.with(|t| t.set(scope.prev_ptr));
     #[cfg(debug_assertions)]
     restore_jit_borrow(scope.prev_borrow);

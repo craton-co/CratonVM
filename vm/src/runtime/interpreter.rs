@@ -996,6 +996,23 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
     // roots and with the concurrent old-gen collector disabled). See
     // docs/real-raf-segv-root-cause.md.
     crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut snapshot);
+
+    // §4 (multi-thread shadow scan, marking half). Also publish THIS thread's
+    // shadow-stack precise roots into the snapshot. With `CRATONVM_SHADOW_STACK`
+    // the moving collector is allowed to run while threads are in JIT, so a
+    // cross-thread STW cycle (which marks from each parked thread's
+    // `root_snapshot`, never `collect_roots`) must see a parked worker's
+    // shadow-held oops or they are reclaimed. Mirrors the current-thread fold-in
+    // in `roots.rs`; every slot is an oop by construction (re-validated via
+    // `is_object_address`). The matching remap is in `apply_pointer_map_to_thread`.
+    // No-op when the gate is off or the shadow stack is empty/unallocated.
+    if crate::jit::conservative_roots::shadow_stack_enabled() {
+        thread.shadow_stack.for_each_value(|v| {
+            if let Some(obj_ref) = shared.heap.is_object_address(v) {
+                snapshot.push(obj_ref);
+            }
+        });
+    }
 }
 
 /// Check if a stop-the-world pause is requested and participate if so.
@@ -1069,6 +1086,16 @@ pub(crate) fn apply_pointer_map_to_thread(
     for frame in &mut thread.frames {
         frame.update_local_refs(pointer_map, heap);
         frame.stack.update_object_refs(pointer_map, heap);
+    }
+    // §4 (multi-thread shadow scan, remap half). Remap THIS thread's shadow-stack
+    // precise roots in place, so a worker resuming from the STW barrier sees the
+    // relocated addresses in the JIT registers/slots it reloads from its shadow
+    // stack. (The GC initiator's own shadow stack is remapped by `update_all_roots`
+    // in `gc.rs`; a non-initiator reaches here instead.) Every shadow slot is a
+    // known oop, so the rewrite is unconditionally safe. No-op when the gate is
+    // off or the shadow stack is empty.
+    if crate::jit::conservative_roots::shadow_stack_enabled() {
+        thread.shadow_stack.remap(pointer_map);
     }
     // Also update printed values and java_thread_obj
     for val in &mut thread.printed {
@@ -12983,6 +13010,13 @@ fn try_osr(
 
     // Set JIT thread for invoke dispatch callbacks (save/restore for re-entrancy)
     let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
+    // Shadow-stack (follow-up §1): capture this `*mut JvmThread` so the OSR
+    // trampoline can cache it and the OSR-entered frame's safepoints push/reload
+    // precisely (instead of skipping shadow tracking). `set_jit_thread` just
+    // allocated this thread's shadow stack — it's the same thread. The value is a
+    // raw address (Copy `i64`, holds no borrow), so the closure below captures it
+    // by value and `thread` stays free for later use.
+    let thread_ptr = thread as *mut JvmThread as i64;
     // NEW-1.5 + T1.1.a: record native stack pointer for GC root scan.
     // Uses the precise-oop-map path when the compiled method has
     // populated maps; falls back to conservative otherwise.
@@ -12993,7 +13027,7 @@ fn try_osr(
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
     let result_i64 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; jit_locals match the method's local variable layout at the OSR entry point.
-        unsafe { compiled.osr_enter(vm_ptr, &jit_locals, entry_pc) }
+        unsafe { compiled.osr_enter(vm_ptr, &jit_locals, entry_pc, thread_ptr) }
     }));
     // DBG: detect a quiescence LEAK across the OSR call (a nested JIT entry
     // that did not pop). After osr_enter returns, depth should be back to
