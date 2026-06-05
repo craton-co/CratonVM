@@ -1411,7 +1411,26 @@ pub fn take_any_pending_accepted(listener_fd: i32) -> Option<TcpStream> {
 // Object-field helpers
 // ---------------------------------------------------------------------------
 
+/// GC-stable identity-hash → native selector id.
+///
+/// `selector_open_native` allocates a REAL `sun.nio.ch.SelectorImpl`, whose
+/// slots `SI_ID` (0) and `SI_OPEN_FLAG` (4) are reference-typed JDK fields
+/// (`selectorOpen`, `selectedKeys`). Writing our int id/open-flag there is
+/// silently descriptor-coerced to null, so `open_flag` read back false and
+/// every `select` threw `ClosedSelectorException`. We key the selector
+/// object to its native id by identity hash instead (the same pattern as the
+/// SelectionKey `sk_table`); openness lives in the native `SelectorState`.
+fn sel_obj_ids() -> &'static RwLock<HashMap<i32, i32>> {
+    static T: OnceLock<RwLock<HashMap<i32, i32>>> = OnceLock::new();
+    T.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
 fn selector_id_from_obj(ctx: &mut dyn NativeContext, obj: ObjectRef) -> i32 {
+    let hash = ctx.identity_hash_code(obj);
+    if let Some(id) = sel_obj_ids().read().get(&hash).copied() {
+        return id;
+    }
+    // Legacy fallback for any synthetic-layout selector object.
     if ctx.object_num_fields(obj) <= SI_ID {
         return 0;
     }
@@ -1419,6 +1438,13 @@ fn selector_id_from_obj(ctx: &mut dyn NativeContext, obj: ObjectRef) -> i32 {
 }
 
 fn open_flag(ctx: &mut dyn NativeContext, obj: ObjectRef) -> bool {
+    let id = selector_id_from_obj(ctx, obj);
+    if id != 0 {
+        if let Some(open) = selectors().read().get(&id).map(|s| s.lock().open) {
+            return open;
+        }
+    }
+    // Legacy fallback (synthetic-layout selector object).
     if ctx.object_num_fields(obj) <= SI_OPEN_FLAG {
         return false;
     }
@@ -1433,22 +1459,9 @@ fn key_fd(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
         .read()
         .get(&key)
         .map(|s| s.channel)?;
-    let nf = ctx.object_num_fields(channel);
-    if nf == 0 {
-        return None;
-    }
-    // WP3.4 layout: channel id lives at field 2 (F_REG_ID).
-    if nf > 2 {
-        if let Value::Int(v) = ctx.get_field(channel, 2) {
-            if v != 0 && v != -1 {
-                return Some(v);
-            }
-        }
-    }
-    match ctx.get_field(channel, 0) {
-        Value::Int(v) if v != 0 && v != -1 => Some(v),
-        _ => None,
-    }
+    // The channel's registry id lives in the socket_channel side-table now
+    // (its F_REG_ID object slot collides with a real-JDK reference field).
+    crate::socket_channel::channel_net_fd(ctx, channel)
 }
 
 fn key_selector_id(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Option<i32> {
@@ -1476,6 +1489,11 @@ fn selector_open_native(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
         })
         .ok_or_else(|| ioex("Selector.open: could not allocate SelectorImpl"))?;
     let id = selector_open();
+    // Bind the (real-JDK-layout) selector object to its native id by GC-stable
+    // identity hash — its int slots are reference-typed and would coerce to
+    // null (see `sel_obj_ids`). The field writes below are kept as a
+    // best-effort legacy path but are not relied upon.
+    sel_obj_ids().write().insert(ctx.identity_hash_code(obj), id);
     let n = ctx.object_num_fields(obj);
     if n > SI_ID {
         ctx.set_field(obj, SI_ID, Value::Int(id));
@@ -1495,6 +1513,7 @@ fn selector_close_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     if id != 0 {
         selector_close(id);
     }
+    sel_obj_ids().write().remove(&ctx.identity_hash_code(obj));
     if ctx.object_num_fields(obj) > SI_OPEN_FLAG {
         ctx.set_field(obj, SI_OPEN_FLAG, Value::Int(0));
     }
@@ -1726,21 +1745,11 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         return Err(closed_selector());
     }
 
-    // Channel layout (WP3.4): field 0 = open flag, field 2 = registry id
-    // into `tcp_registry()`. Older synthetic shims placed the fd at field 0 —
-    // try field 2 first and fall back so both worlds keep working.
-    let nf = ctx.object_num_fields(channel);
-    let mut net_fd = if nf > 2 {
-        ctx.get_field(channel, 2).as_int().unwrap_or(-1)
-    } else if nf > 0 {
-        ctx.get_field(channel, 0).as_int().unwrap_or(-1)
-    } else {
-        return Err(ioex("register: channel has no fields"));
-    };
-    if net_fd < 0 && nf > 0 {
-        // Last-resort: read field 0 (synthetic-mode fd_table id).
-        net_fd = ctx.get_field(channel, 0).as_int().unwrap_or(-1);
-    }
+    // The channel's `tcp_registry` id lives in the socket_channel side-table
+    // (its F_REG_ID object slot collides with a real-JDK reference field and
+    // would coerce to null). A negative fd means the channel is not bound /
+    // connected; selector_register still records the key (interest only).
+    let net_fd = crate::socket_channel::channel_net_fd(ctx, channel).unwrap_or(-1);
 
     // If the registered channel is backed by an entry in the WP3.4
     // tcp_registry, hand the selector a clone of the live socket so
@@ -1888,17 +1897,36 @@ fn sk_set_interest_ops(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // Mirror to native KeyState so the next select() picks up the
     // change. C27: cross-match on the GC-stable identity hash code
     // rather than the raw pointer (which can drift under compaction).
+    //
+    // DEADLOCK FIX: `selector_set_interest` re-acquires the per-selector
+    // mutex, so we must NOT hold `sel.lock()` across the call (parking_lot
+    // mutexes are non-reentrant — Tomcat's NioEndpoint.unreg → interestOps()
+    // would otherwise wedge the Poller thread forever, and the request never
+    // gets read). Resolve the (selector id, net fd) under the lock, set the
+    // interest there, then drop the lock before the OS-level update.
     if known {
-        let regs = selectors().read();
-        for (sel_id, sel) in regs.iter() {
-            let mut st = sel.lock();
-            for k in st.keys.values_mut() {
-                if k.key_hash == key_hash {
-                    k.interest_ops = ops;
-                    let _ = selector_set_interest(*sel_id, k.net_fd, ops);
+        let target: Option<(i32, i32)> = {
+            let regs = selectors().read();
+            let mut found = None;
+            for (sel_id, sel) in regs.iter() {
+                let mut st = sel.lock();
+                let net_fd = st
+                    .keys
+                    .values_mut()
+                    .find(|k| k.key_hash == key_hash)
+                    .map(|k| {
+                        k.interest_ops = ops;
+                        k.net_fd
+                    });
+                if let Some(fd) = net_fd {
+                    found = Some((*sel_id, fd));
                     break;
                 }
             }
+            found
+        };
+        if let Some((sel_id, net_fd)) = target {
+            let _ = selector_set_interest(sel_id, net_fd, ops);
         }
     }
     Ok(Some(Value::Object(Some(this))))
@@ -2331,6 +2359,31 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
         "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
         channel_register_native,
     );
+    // Native dispatch (WP0.1) keys on the receiver's concrete class, and the
+    // public `register` methods live on `AbstractSelectableChannel` whose real
+    // bytecode touches uninitialized `regLock`/`keyLock` + abstract `validOps`.
+    // Tomcat's Poller calls the 3-arg `register(sel, OP_READ, wrapper)` on the
+    // accepted `SocketChannel`, so override both arities on every concrete
+    // channel class our synthetic factories return.
+    for c in [
+        "java/nio/channels/SocketChannel",
+        "sun/nio/ch/SocketChannelImpl",
+        "java/nio/channels/ServerSocketChannel",
+        "sun/nio/ch/ServerSocketChannelImpl",
+    ] {
+        r.register(
+            c,
+            "register",
+            "(Ljava/nio/channels/Selector;I)Ljava/nio/channels/SelectionKey;",
+            channel_register_native,
+        );
+        r.register(
+            c,
+            "register",
+            "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
+            channel_register_native,
+        );
+    }
 
     // SelectionKeyImpl.
     let ski = "sun/nio/ch/SelectionKeyImpl";

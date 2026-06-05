@@ -4468,17 +4468,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register(u2, "arrayBaseOffset0", "(Ljava/lang/Class;)I", native_unsafe_array_base_offset);
     registry.register(u2, "arrayIndexScale0", "(Ljava/lang/Class;)I", native_unsafe_array_index_scale);
     registry.register(u2, "ensureClassInitialized0", "(Ljava/lang/Class;)V", native_noop_with_this);
-    registry.register(u2, "copyMemory0", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory);
+    registry.register(u2, "copyMemory0", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", unsafe_natives::native_unsafe_copy_memory_consolidated);
     registry.register(u2, "setMemory0", "(Ljava/lang/Object;JJB)V", native_unsafe_set_memory);
     // compareAndExchange variants (return old value instead of boolean)
     registry.register(u2, "compareAndExchangeInt", "(Ljava/lang/Object;JII)I", native_unsafe_compare_and_exchange_int);
     registry.register(u2, "compareAndExchangeLong", "(Ljava/lang/Object;JJJ)J", native_unsafe_compare_and_exchange_long);
     registry.register(u2, "compareAndExchangeReference", "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", native_unsafe_compare_and_exchange_reference);
     // Remaining primitive get/put for jdk/internal/misc/Unsafe (JDK 25 declares them directly)
-    registry.register(u2, "getBoolean", "(Ljava/lang/Object;J)Z", native_unsafe_get_int);
-    registry.register(u2, "putBoolean", "(Ljava/lang/Object;JZ)V", native_unsafe_put_int);
-    registry.register(u2, "getByte", "(Ljava/lang/Object;J)B", native_unsafe_get_int);
-    registry.register(u2, "putByte", "(Ljava/lang/Object;JB)V", native_unsafe_put_int);
+    registry.register(u2, "getBoolean", "(Ljava/lang/Object;J)Z", native_unsafe_get_byte_mb);
+    registry.register(u2, "putBoolean", "(Ljava/lang/Object;JZ)V", native_unsafe_put_byte_mb);
+    registry.register(u2, "getByte", "(Ljava/lang/Object;J)B", native_unsafe_get_byte_mb);
+    registry.register(u2, "putByte", "(Ljava/lang/Object;JB)V", native_unsafe_put_byte_mb);
     registry.register(u2, "getShort", "(Ljava/lang/Object;J)S", native_unsafe_get_short_mb);
     registry.register(u2, "putShort", "(Ljava/lang/Object;JS)V", native_unsafe_put_short_mb);
     registry.register(u2, "getChar", "(Ljava/lang/Object;J)C", native_unsafe_get_char_mb);
@@ -12589,10 +12589,10 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         native_unsafe_get_and_set_object,
     );
     // Primitive field access (boolean, byte, short, float, double, char)
-    r.register(u, "getBoolean", "(Ljava/lang/Object;J)Z", native_unsafe_get_int);
-    r.register(u, "putBoolean", "(Ljava/lang/Object;JZ)V", native_unsafe_put_int);
-    r.register(u, "getByte", "(Ljava/lang/Object;J)B", native_unsafe_get_int);
-    r.register(u, "putByte", "(Ljava/lang/Object;JB)V", native_unsafe_put_int);
+    r.register(u, "getBoolean", "(Ljava/lang/Object;J)Z", native_unsafe_get_byte_mb);
+    r.register(u, "putBoolean", "(Ljava/lang/Object;JZ)V", native_unsafe_put_byte_mb);
+    r.register(u, "getByte", "(Ljava/lang/Object;J)B", native_unsafe_get_byte_mb);
+    r.register(u, "putByte", "(Ljava/lang/Object;JB)V", native_unsafe_put_byte_mb);
     r.register(u, "getShort", "(Ljava/lang/Object;J)S", native_unsafe_get_short_mb);
     r.register(u, "putShort", "(Ljava/lang/Object;JS)V", native_unsafe_put_short_mb);
     r.register(u, "getFloat", "(Ljava/lang/Object;J)F", native_unsafe_get_float);
@@ -12614,8 +12614,14 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     r.register(u, "putDoubleVolatile", "(Ljava/lang/Object;JD)V", native_unsafe_put_long_volatile);
     r.register(u, "getCharVolatile", "(Ljava/lang/Object;J)C", native_unsafe_get_int_volatile);
     r.register(u, "putCharVolatile", "(Ljava/lang/Object;JC)V", native_unsafe_put_int_volatile);
-    // copyMemory
-    r.register(u, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory);
+    // copyMemory — use the consolidated handler (superset of the heap↔heap
+    // `native_unsafe_copy_memory`) so MIXED heap↔off-heap copies are NOT
+    // dropped. This is the path `DirectByteBuffer.put/get(byte[])` takes via
+    // `ScopedMemoryAccess.copyMemory`; with the bare heap↔heap handler the
+    // off-heap side was silently lost, so a direct ByteBuffer used for NIO
+    // socket I/O round-tripped as zeros (Tomcat http-nio never saw the
+    // request/response bytes). See `unsafe_natives::native_unsafe_copy_memory_consolidated`.
+    r.register(u, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", unsafe_natives::native_unsafe_copy_memory_consolidated);
     r.register(u, "setMemory", "(Ljava/lang/Object;JJB)V", native_unsafe_set_memory);
     // pageSize
     r.register(u, "pageSize", "()I", |_ctx, _args| Ok(Some(Value::Int(4096))));
@@ -12694,7 +12700,7 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     r.register(u2, "getAndAddLong", "(Ljava/lang/Object;JJ)J", native_unsafe_get_and_add_long);
     r.register(u2, "getAndSetLong", "(Ljava/lang/Object;JJ)J", native_unsafe_get_and_set_long);
     r.register(u2, "getAndSetReference", "(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;", native_unsafe_get_and_set_object);
-    r.register(u2, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory);
+    r.register(u2, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", unsafe_natives::native_unsafe_copy_memory_consolidated);
     r.register(u2, "pageSize", "()I", |_ctx, _args| Ok(Some(Value::Int(4096))));
     r.register(u2, "addressSize", "()I", |_ctx, _args| Ok(Some(Value::Int(8))));
 
@@ -14252,6 +14258,46 @@ pub(crate) fn native_unsafe_put_int(ctx: &mut dyn NativeContext, args: &[Value])
         ctx.set_field(obj, offset, val);
     }
     Ok(None)
+}
+
+/// `Unsafe.getByte(Object, long)` / `getBoolean` — width-correct 1-byte read.
+///
+/// A NULL base means an off-heap absolute address: route it through the SAME
+/// arena-or-raw path the NIO socket / FileChannel I/O uses
+/// (`copy_from_native_memory`) so a `DirectByteBuffer` round-trips byte-wise
+/// with native reads/writes. The previous handler (`native_unsafe_get_int`)
+/// stashed null-base bytes in a separate `static_int_store`, which diverged
+/// from the raw/arena memory the socket layer reads — so Tomcat's http-nio
+/// byte-wise request parsing saw zeros. A heap base falls back to the generic
+/// field/array accessor.
+pub(crate) fn native_unsafe_get_byte_mb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match unsafe_obj(args, 1) {
+        None => {
+            let addr = unsafe_offset(args, 2) as i64;
+            let mut b = [0u8; 1];
+            ctx.copy_from_native_memory(addr, &mut b);
+            // getByte returns a (sign-extended) byte; getBoolean coerces 0/non-0.
+            Ok(Some(Value::Int(b[0] as i8 as i32)))
+        }
+        Some(_) => native_unsafe_get_int(ctx, args),
+    }
+}
+
+/// `Unsafe.putByte(Object, long, byte)` / `putBoolean` — width-correct 1-byte
+/// write. See [`native_unsafe_get_byte_mb`] for the null-base routing rationale.
+pub(crate) fn native_unsafe_put_byte_mb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match unsafe_obj(args, 1) {
+        None => {
+            let addr = unsafe_offset(args, 2) as i64;
+            let v = match args.get(3) {
+                Some(Value::Int(i)) => *i as u8,
+                _ => 0,
+            };
+            ctx.copy_to_native_memory(addr, &[v]);
+            Ok(None)
+        }
+        Some(_) => native_unsafe_put_int(ctx, args),
+    }
 }
 
 pub(crate) fn native_unsafe_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
