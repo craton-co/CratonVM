@@ -65,6 +65,10 @@ fn br_sidetable() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<usize, (V
     T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
 }
 
+// Retained for the `BufferedReader.read([CII)I` / `read()I` side-table path
+// (used by any caller that still registers a synthetic side-table reader);
+// `Files.newBufferedReader` now builds a real BufferedReader instead.
+#[allow(dead_code)]
 fn br_sidetable_register(reader: ObjectRef, content: String) {
     let key = reader.as_ptr() as usize;
     // Encode as UTF-16 code units (Java char semantics).
@@ -122,6 +126,33 @@ fn br_sidetable_read_one(_ctx: &mut dyn NativeContext, reader: ObjectRef) -> Opt
     let c = buf[*pos] as i32;
     *pos += 1;
     Some(c)
+}
+
+/// Build `new BufferedReader(new StringReader(content))` from native code.
+///
+/// `Files.newBufferedReader` previously returned a *synthetic* BufferedReader
+/// (content in slot 0 + a `BR_SIDETABLE` entry) and never set the real JDK
+/// `in`/`cb` fields, so unintercepted methods that run real bytecode — notably
+/// `readLine()` via `ensureOpen()` — threw `IOException("Stream closed")`
+/// (Elasticsearch `InternalSettingsPreparer.loadConfigWithSubstitutions` reads
+/// `elasticsearch.yml` this way). Routing through the same construction that
+/// `new BufferedReader(reader)` uses makes readLine()/read()/lines() all work
+/// via the already-functioning machinery, with no special-casing.
+fn files_make_buffered_reader_over_string(
+    ctx: &mut dyn NativeContext,
+    content: &str,
+) -> MethodCallResult {
+    let s = ctx.create_string(content);
+    let sr = ctx.new_object_initialized(
+        "java/io/StringReader",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(s))],
+    )?;
+    let sr = match sr {
+        Some(v @ Value::Object(Some(_))) => v,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    ctx.new_object_initialized("java/io/BufferedReader", "(Ljava/io/Reader;)V", &[sr])
 }
 
 pub(crate) fn register_phase55_natives(registry: &mut NativeMethodRegistry) {
@@ -5535,14 +5566,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
             match p57_read_to_string(&p) {
-                Ok(content) => {
-                    let reader = alloc_concurrent_synthetic(ctx, "java/io/BufferedReader", 2);
-                    let s = ctx.create_string(&content);
-                    ctx.set_field(reader, 0, Value::Object(Some(s)));
-                    ctx.set_field(reader, 1, Value::Int(0)); // position
-                    br_sidetable_register(reader, content);
-                    Ok(Some(Value::Object(Some(reader))))
-                }
+                Ok(content) => files_make_buffered_reader_over_string(ctx, &content),
                 Err(e) => Err(p57_io_error(&e)),
             }
         },
@@ -5556,14 +5580,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let path_obj = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, path_obj);
             match p57_read_to_string(&p) {
-                Ok(content) => {
-                    let reader = alloc_concurrent_synthetic(ctx, "java/io/BufferedReader", 2);
-                    let s = ctx.create_string(&content);
-                    ctx.set_field(reader, 0, Value::Object(Some(s)));
-                    ctx.set_field(reader, 1, Value::Int(0));
-                    br_sidetable_register(reader, content);
-                    Ok(Some(Value::Object(Some(reader))))
-                }
+                Ok(content) => files_make_buffered_reader_over_string(ctx, &content),
                 Err(e) => Err(p57_io_error(&e)),
             }
         },
