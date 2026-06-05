@@ -1464,15 +1464,17 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         return None;
     }
 
-    // EC-DUP2-CAT2: reject methods whose `dup2` (0x5C) operates on a
-    // category-2 (long/double) value. The codegen `dup2` handler unconditionally
-    // implements the two-category-1 form; for a single category-2 operand it
-    // duplicates an unrelated lower stack slot, desyncing the operand stack and
-    // leaving a primitive where a reference is expected (later dereferenced as a
-    // bad pointer). See `dup2_category_safe`'s doc for the full analysis.
-    if !dup2_category_safe(code, code_len) {
-        return None;
-    }
+    // DUP2 category handling now lives in the codegen (`compile_bytecode`'s
+    // 0x5C arm via `dup2_top_cat2`). Unlike this CP-less scan, the codegen
+    // resolves `getfield`/`getstatic`/`invoke*` descriptors, so it can tell a
+    // FORM-2 (single category-2 long/double) `dup2` from a FORM-1 (two
+    // category-1) one and emit each correctly — bailing to the interpreter only
+    // when the top width is genuinely unprovable. The old `dup2_category_safe`
+    // reject gate that sat here over-rejected FORM-1 methods (any
+    // `<getfield/invoke>; dup2` whose result is category-1, which the CP-less
+    // scan could not prove), de-JITing a bintrees18-hot method and regressing
+    // it to a heap-walker desync + throughput cliff — so the blanket reject is
+    // removed in favour of the precise codegen handling.
 
     // Run a *conservative* escape pre-pass here: `jit_scan` has no
     // constant-pool resolver, so it cannot tell a trivial `<init>()V`
@@ -2162,6 +2164,12 @@ fn compute_local_oop_masks(
 ///
 /// Returns `true` when the method is SAFE to JIT w.r.t. `dup2`, `false` when
 /// it must be rejected.
+///
+/// NOTE: no longer wired into `jit_scan` — the live `dup2` category decision
+/// now happens in the codegen (`Compiler::dup2_top_cat2`), which (unlike this
+/// CP-less scan) resolves field/invoke descriptors and so distinguishes FORM-1
+/// from FORM-2 instead of rejecting the whole method. Retained for reference.
+#[allow(dead_code)]
 fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
     // Fast path: no `dup2` anywhere → nothing to check.
     let mut has_dup2 = false;
@@ -5414,6 +5422,151 @@ impl Compiler {
             }
         }
         slot
+    }
+
+    /// Duplicate the single top-of-stack slot. Shared by `dup` (0x59) and the
+    /// FORM-2 case of `dup2` (0x5C) — a single category-2 long/double is ONE
+    /// 64-bit slot in this model, so `[…, w] → […, w, w]` is exactly a `dup`.
+    /// Carries the source slot's precise oop mark onto the copy so a duplicated
+    /// reference stays mapped across safepoints (the `push_from_rax` /
+    /// `push_stack` paths push a default `false`).
+    fn emit_dup_top_slot(&mut self) {
+        let top = self.peek_stack();
+        let top_is_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
+        match top {
+            StackSlot::Frame(off) => {
+                self.emit_load_local(RAX, off);
+                self.push_from_rax();
+            }
+            StackSlot::CalleeSaved(_) => {
+                self.stack.push(top);
+                self.stack_oop_marks.push(top_is_oop);
+            }
+            StackSlot::Xmm(_) => {
+                self.stack.push(top);
+                self.stack_oop_marks.push(top_is_oop);
+            }
+            StackSlot::Scratch(reg) => {
+                let avail = SCRATCH_REGS.iter().copied().find(|&sr| {
+                    sr != reg
+                        && !self
+                            .stack
+                            .iter()
+                            .any(|s| matches!(s, StackSlot::Scratch(r) if *r == sr))
+                });
+                if let Some(sr) = avail {
+                    self.emit_mov_reg_reg(sr, reg);
+                    self.stack.push(StackSlot::Scratch(sr));
+                    self.stack_oop_marks.push(top_is_oop);
+                } else {
+                    self.emit_mov_reg_reg(RAX, reg);
+                    let slot = self.push_stack();
+                    if let StackSlot::Frame(off) = slot {
+                        self.emit_store_local(off, RAX);
+                    }
+                }
+            }
+        }
+        if top_is_oop {
+            if let Some(m) = self.stack_oop_marks.last_mut() {
+                *m = true;
+            }
+        }
+    }
+
+    /// Classify a `dup2` (0x5C) at `dup2_pc`: `Some(true)` = FORM-2 (the top is
+    /// a single category-2 long/double — one slot here — to be duplicated like
+    /// `dup`), `Some(false)` = FORM-1 (two category-1 values), `None` = the top
+    /// width cannot be proven locally and the caller must bail to the
+    /// interpreter.
+    ///
+    /// In verified bytecode the instruction immediately preceding a `dup2`
+    /// produces its top operand, so the form equals that instruction's result
+    /// width: opcode-decodable for loads/consts/arithmetic/conversions, and
+    /// resolved from the compiler's PC-keyed field/invoke metadata
+    /// (`field_info` / `static_field_info` / `invoke_info`) for
+    /// `getfield`/`getstatic`/`invoke*`. Any other preceding op — a stack
+    /// shuffle, a branch/return block boundary, `invokedynamic`, `wide`,
+    /// `checkcast`, `iinc`, … — leaves the width unprovable (`None`). This is
+    /// why the analysis lives in the codegen and not in the CP-less
+    /// `dup2_category_safe` scan: only here are field/invoke descriptors
+    /// resolved.
+    fn dup2_top_cat2(&self, code: &[u8], dup2_pc: usize) -> Option<bool> {
+        // Find the instruction boundary immediately before `dup2_pc`.
+        let mut p = 0usize;
+        let mut prev: Option<usize> = None;
+        while p < dup2_pc {
+            prev = Some(p);
+            let len = bytecode_len_at(code, p);
+            if len == 0 {
+                return None;
+            }
+            p += len;
+        }
+        if p != dup2_pc {
+            return None; // dup2_pc is not on an instruction boundary
+        }
+        let prev = prev?;
+        let cat2 = match code[prev] {
+            // --- category-2 producers (result is long or double) ---
+            0x09 | 0x0a | 0x0e | 0x0f          // lconst_*/dconst_*
+            | 0x14                              // ldc2_w
+            | 0x16 | 0x18                       // lload / dload
+            | 0x1e..=0x21 | 0x26..=0x29         // lload_0..3 / dload_0..3
+            | 0x2f | 0x31                       // laload / daload
+            | 0x61 | 0x63 | 0x65 | 0x67 | 0x69 | 0x6b | 0x6d | 0x6f | 0x71 | 0x73 // l/d add..rem
+            | 0x75 | 0x77                       // lneg / dneg
+            | 0x79 | 0x7b | 0x7d                // lshl / lshr / lushr
+            | 0x7f | 0x81 | 0x83                // land / lor / lxor
+            | 0x85 | 0x87 | 0x8a | 0x8c | 0x8d | 0x8f => true, // i2l,i2d,l2d,f2l,f2d,d2l
+            // --- category-1 producers ---
+            0x01 | 0x02..=0x08 | 0x0b..=0x0d   // aconst_null, iconst_*, fconst_*
+            | 0x10 | 0x11 | 0x12 | 0x13         // bipush / sipush / ldc / ldc_w
+            | 0x15 | 0x17 | 0x19                // iload / fload / aload
+            | 0x1a..=0x1d | 0x22..=0x25 | 0x2a..=0x2d // i/f/a load_0..3
+            | 0x2e | 0x30 | 0x32 | 0x33 | 0x34 | 0x35 // iaload,faload,aaload,baload,caload,saload
+            | 0x59                              // dup (category-1 only by JVMS)
+            | 0x60 | 0x62 | 0x64 | 0x66 | 0x68 | 0x6a | 0x6c | 0x6e | 0x70 | 0x72 // i/f add..rem
+            | 0x74 | 0x76                       // ineg / fneg
+            | 0x78 | 0x7a | 0x7c | 0x7e | 0x80 | 0x82 // ishl..ixor (int)
+            | 0x86 | 0x88 | 0x89 | 0x8b | 0x8e | 0x90 | 0x91 | 0x92 | 0x93 // i2f,l2i,l2f,f2i,d2i,d2f,i2b,i2c,i2s
+            | 0x94 | 0x95 | 0x96 | 0x97 | 0x98  // lcmp, fcmpl/g, dcmpl/g (push int)
+            | 0xbb | 0xbc | 0xbd | 0xbe         // new, newarray, anewarray, arraylength
+            | 0xc1 => false,                    // instanceof
+            // --- getfield / getstatic / invoke*: resolve via PC-keyed metadata ---
+            0xb4 => {
+                // getfield: field_info = (pc, field_index, type_tag)
+                let tag = self.field_info.iter().find(|e| e.0 == prev).map(|e| e.2)?;
+                matches!(tag, b'J' | b'D')
+            }
+            0xb2 => {
+                // getstatic: static_field_info = (pc, class_id, field_index, type_tag, is_volatile)
+                let tag = self
+                    .static_field_info
+                    .iter()
+                    .find(|e| e.0 == prev)
+                    .map(|e| e.3)?;
+                matches!(tag, b'J' | b'D')
+            }
+            0xb6 | 0xb7 | 0xb8 | 0xb9 => {
+                // invoke*: invoke_info = (pc, *const JitInvokeInfo)
+                let rt = self
+                    .invoke_info
+                    .iter()
+                    .find(|e| e.0 == prev)
+                    .map(|e| unsafe { (*e.1).return_type })?;
+                if rt == b'V' {
+                    return None; // void leaves nothing on top — not a dup2 producer
+                }
+                matches!(rt, b'J' | b'D')
+            }
+            // Stores, branches, goto/return, pop/pop2, swap, dup_x*/dup2*,
+            // invokedynamic, wide, checkcast, monitor, athrow, jsr/ret, iinc,
+            // nop, multianewarray, putfield/putstatic — top width not locally
+            // provable; bail to the interpreter.
+            _ => return None,
+        };
+        Some(cat2)
     }
 
     /// Round-8 wave-3 HIGH fix (round-4 #15 / round-5 #9 / round-7 #5):
@@ -12788,26 +12941,56 @@ impl Compiler {
                     pc += 1;
                 }
 
-                // dup2 — duplicate top two 64-bit stack slots
-                // [..., a, b] → [..., a, b, a, b]
+                // dup2 — FORM-1 (`[…, a, b] → […, a, b, a, b]`, two category-1
+                // values) or FORM-2 (`[…, w] → […, w, w]`, one category-2
+                // long/double = a single slot in this model). The form is
+                // decided by the top operand's width = the result width of the
+                // instruction producing it (`dup2_top_cat2`, which reads the
+                // immediately-preceding op + resolved field/invoke metadata).
+                // FORM-2 is exactly `dup` of the one slot. If the width can't be
+                // proven locally, bail to the interpreter rather than risk a
+                // category miscompile (the historic FORM-1-on-cat-2 hard abort).
+                // This is the codegen-side replacement for the
+                // `dup2_category_safe` reject gate, which over-rejected FORM-1
+                // methods (regressing bintrees18) because the CP-less scan could
+                // not resolve a `<getfield/invoke>; dup2` top to category-1.
                 0x5c => {
-                    let len = self.stack.len();
-                    let a = self.stack[len - 2]; // deeper
-                    let b = self.stack[len - 1]; // top
-                    // EC oop-map fix: carry the two source oop marks onto the
-                    // two duplicated entries (push_from_rax pushes `false`).
-                    let ml = self.stack_oop_marks.len();
-                    let a_oop = self.stack_oop_marks.get(ml.wrapping_sub(2)).copied().unwrap_or(false);
-                    let b_oop = self.stack_oop_marks.get(ml.wrapping_sub(1)).copied().unwrap_or(false);
-                    self.load_slot_to_reg(RAX, a);
-                    self.push_from_rax();
-                    if a_oop {
-                        if let Some(m) = self.stack_oop_marks.last_mut() { *m = true; }
-                    }
-                    self.load_slot_to_reg(RAX, b);
-                    self.push_from_rax();
-                    if b_oop {
-                        if let Some(m) = self.stack_oop_marks.last_mut() { *m = true; }
+                    match self.dup2_top_cat2(code, pc) {
+                        Some(true) => {
+                            // FORM-2: duplicate the single category-2 top slot.
+                            self.emit_dup_top_slot();
+                        }
+                        Some(false) if self.stack.len() >= 2 => {
+                            // FORM-1: duplicate the top two (category-1) slots.
+                            let len = self.stack.len();
+                            let a = self.stack[len - 2]; // deeper
+                            let b = self.stack[len - 1]; // top
+                            // EC oop-map fix: carry the two source oop marks onto
+                            // the two duplicated entries (push_from_rax pushes `false`).
+                            let ml = self.stack_oop_marks.len();
+                            let a_oop = self.stack_oop_marks.get(ml.wrapping_sub(2)).copied().unwrap_or(false);
+                            let b_oop = self.stack_oop_marks.get(ml.wrapping_sub(1)).copied().unwrap_or(false);
+                            self.load_slot_to_reg(RAX, a);
+                            self.push_from_rax();
+                            if a_oop {
+                                if let Some(m) = self.stack_oop_marks.last_mut() { *m = true; }
+                            }
+                            self.load_slot_to_reg(RAX, b);
+                            self.push_from_rax();
+                            if b_oop {
+                                if let Some(m) = self.stack_oop_marks.last_mut() { *m = true; }
+                            }
+                        }
+                        _ => {
+                            // Unprovable top width (or a malformed FORM-1 with
+                            // height < 2) — stay interpreted. Push two
+                            // placeholders so downstream opcode handlers keep a
+                            // plausible stack height until the post-loop `failed`
+                            // check discards this compilation.
+                            self.failed = true;
+                            let _ = self.push_stack();
+                            let _ = self.push_stack();
+                        }
                     }
                     pc += 1;
                 }
@@ -20794,6 +20977,36 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[10, 7]).expect("test JIT call") };
         assert_eq!(result, 34);
+    }
+
+    #[test]
+    fn test_compile_dup2_form2_long() {
+        // long f(long a) { return a + a; }  — FORM-2 dup2: the top is a single
+        // category-2 long (ONE slot in this single-slot model), so `dup2` must
+        // duplicate ONE slot (`[…, a] → […, a, a]`), not two. Pre-fix the
+        // codegen always did FORM-1 (indexing `stack[len-2]` with height 1 →
+        // underflow/desync); the `dup2_category_safe` gate masked it by
+        // de-JITing such methods (which regressed bintrees18). `dup2_top_cat2`
+        // now classifies the `lload_0`-produced top as category-2 and emits the
+        // single-slot duplication.
+        // lload_0 (0x1e), dup2 (0x5c), ladd (0x61), lreturn (0xad)
+        let code: Vec<u8> = vec![0x1e, 0x5c, 0x61, 0xad, 0, 0];
+        let code_len = 4;
+        let compiled = compile(
+            &code, code_len, 1, 1, false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .expect("FORM-2 dup2 method must JIT-compile (not bail/reject)");
+        // f(5) = 10, f(-7) = -14
+        // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
+        assert_eq!(unsafe { compiled.try_call(&[5]).expect("test JIT call") }, 10);
+        assert_eq!(unsafe { compiled.try_call(&[-7]).expect("test JIT call") }, -14);
     }
 
     #[test]
