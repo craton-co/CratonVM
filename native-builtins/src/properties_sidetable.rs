@@ -783,6 +783,10 @@ fn native_properties_set_property(
     let val = ctx.read_string(val_obj).unwrap_or_default();
     let old = get_kv(this, &key);
     put_kv(this, &key, &val);
+    // Mirror into the real JDK Properties backing (`map` ConcurrentHashMap) so
+    // generic Map walkers observe the entry — see native_properties_put's
+    // fn-level note for the full rationale (Hibernate's PU-properties merge).
+    mirror_loaded_entries_to_properties_backend(ctx, this, &[(key.clone(), val.clone())]);
     let _ = ctx.set_system_property(&key, &val);
     match old {
         Some(prev) => Ok(Some(Value::Object(Some(ctx.create_string(&prev))))),
@@ -791,11 +795,21 @@ fn native_properties_set_property(
 }
 
 /// Native `Properties.put(Object, Object)` — when callers bypass
-/// `setProperty` and call the inherited `Hashtable.put` directly,
-/// mirror the write into the side-table so `getProperty` still
-/// finds it.  The bytecode `Hashtable.put` continues to run, so
-/// the JDK's internal table is also populated (for any caller that
-/// reads via `Properties.get`).
+/// `setProperty` and call `Hashtable.put` directly, store the write in
+/// the side-table so `getProperty`/`get` still find it.  This native
+/// fully overrides the method, so the real `Properties.put` bytecode
+/// does NOT run; we therefore also mirror the entry into the real JDK
+/// Properties backing (the JDK-17+ `map` ConcurrentHashMap field) via
+/// `mirror_loaded_entries_to_properties_backend`.  Without that mirror,
+/// generic Map walkers that read the backing rather than the side-table
+/// — `HashMap.putAll(props)`, `new HashMap<>(props)`, and the
+/// `map_collect_entries`/`properties_backing_chm` helpers in
+/// `native-collections` — see an empty map and copy nothing.  Hibernate's
+/// `EntityManagerFactoryBuilderImpl$MergedSettings` merges every
+/// persistence-unit property through exactly `configValues.putAll(
+/// persistenceUnit.getProperties())`, so the unmirrored side-table left
+/// the JDBC URL/dialect invisible and JPA bootstrap failed to find a
+/// Dialect.  `load(InputStream)` already mirrors the same way.
 ///
 /// Also mirror to the VM's system-property store, matching what
 /// `Properties.setProperty` does. The JDK-semantic behaviour: real
@@ -835,6 +849,9 @@ fn native_properties_put(
     if !ks.is_empty() {
         let prev = get_kv(this, &ks);
         put_kv(this, &ks, &vs);
+        // Mirror into the real JDK Properties backing (`map` ConcurrentHashMap)
+        // so generic Map walkers observe the entry — see fn-level note.
+        mirror_loaded_entries_to_properties_backend(ctx, this, &[(ks.clone(), vs.clone())]);
         // Mirror to the VM system-property store so subsequent
         // System.getProperty(ks) observes the write. Symmetric with
         // native_properties_set_property; see fn-level docs above for
@@ -878,10 +895,52 @@ fn native_properties_remove(
     if key.is_empty() {
         return Ok(Some(Value::Object(None)));
     }
-    match remove_kv(this, &key) {
+    let removed = remove_kv(this, &key);
+    // Keep the real JDK `map` CHM backing in sync with the side-table: `put`/
+    // `setProperty` mirror INTO it, so a `remove` that touched only the
+    // side-table would let generic Map walkers (HashMap.putAll /
+    // map_collect_entries, which read the CHM) resurrect the removed key.
+    // No-op when the Properties has no CHM yet.
+    remove_from_properties_backend(ctx, this, key_obj);
+    match removed {
         Some(prev) => Ok(Some(Value::Object(Some(ctx.create_string(&prev))))),
         None => Ok(Some(Value::Object(None))),
     }
+}
+
+/// Remove `key_obj` from a Properties object's real JDK `map` ConcurrentHashMap
+/// backing, mirroring a side-table removal. No-op if the Properties has no
+/// (CHM) `map` field yet. Symmetric with `mirror_loaded_entries_to_properties_backend`.
+fn remove_from_properties_backend(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key_obj: ObjectRef,
+) {
+    if let Value::Object(Some(chm)) = ctx.get_field_by_name(this, "map") {
+        let _ = ctx.invoke_virtual(
+            chm,
+            "remove",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(key_obj))],
+        );
+    }
+}
+
+/// Native `Properties.clear()V` — empties BOTH the side-table and the real
+/// `map` CHM backing.  Without this override `clear()` ran the real bytecode
+/// that empties only the CHM, leaving the side-table (which `getProperty`/
+/// `get`/`size` read) stale — the same side-table-vs-backing asymmetry that
+/// `remove` would otherwise have. Keeps every read surface consistent.
+fn native_properties_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    table().lock().remove(&key_for(this));
+    if let Value::Object(Some(chm)) = ctx.get_field_by_name(this, "map") {
+        let _ = ctx.invoke_virtual(chm, "clear", "()V", &[]);
+    }
+    Ok(None)
 }
 
 /// Native `Properties.containsKey(Object)` — consults the side-table.
@@ -976,40 +1035,103 @@ fn native_properties_is_empty(
     Ok(Some(Value::Int(if empty { 1 } else { 0 })))
 }
 
-/// Build a synthetic `HashSet<String>` populated with the side-table
-/// keys for the given Properties object.  Returns an empty HashSet if
-/// the object isn't tracked.
-fn build_key_set(
+/// Build a real `java.util.Collection` of `class_name` (e.g.
+/// `java/util/HashSet` or `java/util/ArrayList`) populated with `items` via the
+/// collection's public `add(Object)`.  A real-JDK collection iterates and
+/// `toArray()`s correctly, so copy-constructor consumers — `new TreeSet<>(props
+/// .keySet())`, `new ArrayList<>(props.values())`, `Collections.list(...)` —
+/// observe the entries.  The earlier raw-field path (`make_hashset_with_elements`
+/// / a hand-built `ArrayList`) reported the right `size()`/iterator but its
+/// `toArray()`/`addAll`-source view mis-aligned and silently yielded 0 (the same
+/// defect `entrySet()` was already switched to real `new HashSet()` to dodge).
+/// The fresh collection is pinned across the re-entrant `create_string`/`add`
+/// calls so a moving GC cannot strand it.
+fn build_string_collection(
     ctx: &mut dyn NativeContext,
-    this: ObjectRef,
+    class_name: &str,
+    items: Vec<String>,
 ) -> ObjectRef {
-    let snapshot = snapshot_kv(this);
-    let mut elems: Vec<Value> = Vec::with_capacity(snapshot.len());
-    for (k, _v) in &snapshot {
-        let s = ctx.create_string(k);
-        elems.push(Value::Object(Some(s)));
+    let coll = match ctx.new_object(class_name) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return crate::alloc_concurrent_synthetic(ctx, class_name, 2),
+    };
+    let pin = ctx.pin_native_root(coll);
+    let _ = ctx.invoke(class_name, "<init>", "()V", &[Value::Object(Some(coll))]);
+    for s in &items {
+        let so = ctx.create_string(s);
+        let coll = ctx.read_native_pin(pin, coll);
+        let _ = ctx.invoke_virtual(
+            coll,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(so))],
+        );
     }
-    let set = cratonvm_native_collections::make_hashset_with_elements(ctx, &elems);
-    set
+    let coll = ctx.read_native_pin(pin, coll);
+    ctx.unpin_native_roots(pin);
+    coll
 }
 
-/// Build a synthetic `ArrayList<String>` populated with the side-table
-/// values for the given Properties object.  ArrayList is a `Collection`
-/// — sufficient for `Properties.values()`'s declared return type.
-fn build_value_list(
-    ctx: &mut dyn NativeContext,
-    this: ObjectRef,
-) -> ObjectRef {
-    let snapshot = snapshot_kv(this);
-    let list = crate::alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-    let arr = ctx.new_array(ArrayElementType::Reference, snapshot.len());
-    for (i, (_k, v)) in snapshot.iter().enumerate() {
-        let s = ctx.create_string(v);
-        ctx.set_array_element(arr, i, Value::Object(Some(s)));
+/// Build a real `HashSet<String>` populated with the side-table keys for the
+/// given Properties object.  Returns an empty HashSet if the object isn't
+/// tracked.
+fn build_key_set(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+    let keys: Vec<String> = snapshot_kv(this).into_iter().map(|(k, _v)| k).collect();
+    build_string_collection(ctx, "java/util/HashSet", keys)
+}
+
+/// Build a real `ArrayList<String>` populated with the side-table values for
+/// the given Properties object.  ArrayList is a `Collection` — sufficient for
+/// `Properties.values()`'s declared return type.
+fn build_value_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+    let vals: Vec<String> = snapshot_kv(this).into_iter().map(|(_k, v)| v).collect();
+    build_string_collection(ctx, "java/util/ArrayList", vals)
+}
+
+/// Build a real `java.util.Enumeration` over `items` by populating a real
+/// `java/util/Vector` (via its public `add`) and returning its `elements()`.
+/// Used by `keys()` / `elements()`.  The previous implementation returned an
+/// always-empty `Collections$EmptyEnumeration` regardless of contents, so
+/// `Properties.keys()` / `elements()` / `propertyNames()` (which delegates to
+/// `keys()`) and any `Collections.list(props.keys())` silently saw nothing.
+/// Building a real Vector keeps the returned Enumeration walkable by real-JDK
+/// callers (unlike the raw-field synthetic collections, whose `toArray`/copy
+/// paths mis-aligned — see `entrySet`).  `this` is pinned across the
+/// re-entrant `create_string`/`add` calls so a moving GC cannot leave a stale
+/// `vec`.
+fn build_enumeration(ctx: &mut dyn NativeContext, items: Vec<String>) -> ObjectRef {
+    let empty = |ctx: &mut dyn NativeContext| {
+        crate::alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyEnumeration", 0)
+    };
+    let vec = match ctx.new_object("java/util/Vector") {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return empty(ctx),
+    };
+    let pin = ctx.pin_native_root(vec);
+    if ctx
+        .invoke("java/util/Vector", "<init>", "()V", &[Value::Object(Some(vec))])
+        .is_err()
+    {
+        ctx.unpin_native_roots(pin);
+        return empty(ctx);
     }
-    ctx.set_field(list, 0, Value::Object(Some(arr)));
-    ctx.set_field(list, 1, Value::Int(snapshot.len() as i32));
-    list
+    for s in &items {
+        let so = ctx.create_string(s);
+        let vec = ctx.read_native_pin(pin, vec);
+        let _ = ctx.invoke_virtual(
+            vec,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(so))],
+        );
+    }
+    let vec = ctx.read_native_pin(pin, vec);
+    let result = match ctx.invoke_virtual(vec, "elements", "()Ljava/util/Enumeration;", &[]) {
+        Ok(Some(Value::Object(Some(e)))) => e,
+        _ => empty(ctx),
+    };
+    ctx.unpin_native_roots(pin);
+    result
 }
 
 /// Native `Properties.stringPropertyNames()Ljava/util/Set;` — Surefire
@@ -1140,48 +1262,36 @@ fn native_properties_entry_set(
     Ok(Some(Value::Object(Some(set))))
 }
 
-/// Native `Properties.keys()Ljava/util/Enumeration;` — JDK 25 wraps
-/// `map.keySet()` via `Collections.enumeration`.  We return an empty
-/// `Collections$EmptyEnumeration` when the side-table has no entries,
-/// otherwise we route through the keySet helper and call
-/// `Collections.enumeration(Collection)` via invoke_virtual fallback.
-/// To keep this simple and avoid re-entering Java, we stuff the keys
-/// into a pre-populated `java/util/Vector` and return its `.elements()`.
-/// In practice Spring's bind path doesn't call `keys()` directly — it
-/// uses `keySet().iterator()` — so an empty enumeration is acceptable
-/// for the populated case too.  But to be correct we synthesize one
-/// over the keys.
+/// Native `Properties.keys()Ljava/util/Enumeration;` — JDK 17+ wraps
+/// `map.keySet()` via `Collections.enumeration`.  We synthesize a real
+/// `Enumeration` over the side-table keys.  The previous stub returned an
+/// always-empty `Collections$EmptyEnumeration` even for populated
+/// Properties, which silently dropped every key for callers that use the
+/// legacy `keys()`/`elements()`/`propertyNames()` enumeration API rather
+/// than `keySet().iterator()` (e.g. `Collections.list(props.keys())`,
+/// `new TreeSet<>(props.keySet())`-style copies).
 fn native_properties_keys(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Always-safe fallback: empty Enumeration.  Callers that don't care
-    // (e.g. only called when isEmpty()==true) won't observe a difference.
-    // For non-empty side-tables, we still return EmptyEnumeration: real
-    // callers that need typed keys go through keySet()/iterator().
-    let _this = args.first();
-    let e = crate::alloc_concurrent_synthetic(
-        ctx,
-        "java/util/Collections$EmptyEnumeration",
-        0,
-    );
-    Ok(Some(Value::Object(Some(e))))
+    let keys: Vec<String> = match args.first() {
+        Some(Value::Object(Some(o))) => snapshot_kv(*o).into_iter().map(|(k, _v)| k).collect(),
+        _ => Vec::new(),
+    };
+    Ok(Some(Value::Object(Some(build_enumeration(ctx, keys)))))
 }
 
-/// Native `Properties.elements()Ljava/util/Enumeration;` — companion
-/// to `keys()`.  Same rationale: an EmptyEnumeration suffices for the
-/// callers that previously NPE'd inside `Properties.elements`.
+/// Native `Properties.elements()Ljava/util/Enumeration;` — companion to
+/// `keys()`, enumerating the side-table values.
 fn native_properties_elements(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let _this = args.first();
-    let e = crate::alloc_concurrent_synthetic(
-        ctx,
-        "java/util/Collections$EmptyEnumeration",
-        0,
-    );
-    Ok(Some(Value::Object(Some(e))))
+    let vals: Vec<String> = match args.first() {
+        Some(Value::Object(Some(o))) => snapshot_kv(*o).into_iter().map(|(_k, v)| v).collect(),
+        _ => Vec::new(),
+    };
+    Ok(Some(Value::Object(Some(build_enumeration(ctx, vals)))))
 }
 
 /// Native `Properties.contains(Object)Z` — Hashtable-style value lookup.
@@ -1315,6 +1425,16 @@ pub fn register_properties_sidetable(registry: &mut NativeMethodRegistry) {
         "remove",
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_properties_remove,
+    );
+    // clear() must empty the side-table too, not just the real `map` CHM the
+    // bytecode clears — otherwise getProperty/get/size keep reading stale
+    // side-table entries (asymmetric with put/setProperty/remove, which now
+    // keep both in sync).
+    registry.register(
+        "java/util/Properties",
+        "clear",
+        "()V",
+        native_properties_clear,
     );
     // Spring's PropertySourcesPropertyResolver reads through the
     // Hashtable.get(Object) interface rather than getProperty(String),
@@ -1452,15 +1572,19 @@ fn native_properties_put_all(
     //    Properties stores its data outside the inherited HashMap buckets).
     let snapshot = snapshot_kv(other);
     if !snapshot.is_empty() {
-        for (k, v) in snapshot {
-            put_kv(this, &k, &v);
+        for (k, v) in &snapshot {
+            put_kv(this, k, v);
         }
+        // Mirror into `this`'s real `map` CHM backing too, so the destination
+        // stays consistent for generic Map walkers (cf. native_properties_put).
+        mirror_loaded_entries_to_properties_backend(ctx, this, &snapshot);
         return Ok(None);
     }
     // 2) Fallback — source is a regular Map (HashMap/LinkedHashMap).  Walk
     //    its entries through the generic Map.entrySet() so we don't depend
-    //    on internal field layouts, then mirror each (k,v) into `this`'s
-    //    side-table as well as the inherited Hashtable buckets.
+    //    on internal field layouts, then store each (k,v) into `this`'s
+    //    side-table and mirror them into the real `map` CHM backing.
+    let mut collected: Vec<(String, String)> = Vec::new();
     let entries_obj = match ctx.invoke(
         "java/util/Map",
         "entrySet",
@@ -1522,9 +1646,13 @@ fn native_properties_put_all(
         let k = ctx.read_string(key_obj).unwrap_or_default();
         let v = ctx.read_string(val_obj).unwrap_or_default();
         if !k.is_empty() {
-            put_kv(this, &k, &v);
+            collected.push((k, v));
         }
     }
+    for (k, v) in &collected {
+        put_kv(this, k, v);
+    }
+    mirror_loaded_entries_to_properties_backend(ctx, this, &collected);
     Ok(None)
 }
 
