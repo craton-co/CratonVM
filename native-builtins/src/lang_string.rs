@@ -3032,6 +3032,9 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
     let chars: Vec<char> = fmt_str.chars().collect();
     let mut i = 0;
     let mut arg_idx = 0;
+    // Index used by the most recent conversion, for the `%<` relative-index
+    // flag ("reuse the previous argument").
+    let mut last_used_index: Option<usize> = None;
 
     while i < chars.len() {
         if chars[i] == '%' {
@@ -3058,7 +3061,34 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
                 continue;
             }
 
-            // Parse optional flags: -, +, 0, ' ', #, (, and ',' (grouping).
+            // Parse the optional argument-index prefix: a run of digits
+            // immediately followed by '$' selects an explicit 1-based argument
+            // (e.g. `%2$d` → args[1]). Digits NOT followed by '$' are a width,
+            // so only consume them here when the '$' is present (look ahead
+            // before committing `i`). Without this, `%2$d` parsed the `2` as a
+            // width and the `$` as an unknown conversion, so the spec was
+            // emitted literally and consumed no argument — e.g. WildFly's
+            // `String.format(Locale.ROOT, "subsystem_%2$d_%3$d.xml", …)` came
+            // back unformatted and the test resource URL resolved to null.
+            let mut explicit_index: Option<usize> = None;
+            {
+                let mut j = i;
+                while chars.get(j).is_some_and(|c| c.is_ascii_digit()) {
+                    j += 1;
+                }
+                if j > i && chars.get(j) == Some(&'$') {
+                    if let Ok(n) = chars[i..j].iter().collect::<String>().parse::<usize>() {
+                        if n >= 1 {
+                            explicit_index = Some(n - 1);
+                        }
+                    }
+                    i = j + 1; // consume the digits and the '$'
+                }
+            }
+
+            // Parse optional flags: -, +, 0, ' ', #, (, ',' (grouping), and
+            // '<' (relative argument index — reuse the previous conversion's
+            // argument).
             // ',' was previously missing, so `%,d` failed to parse and the
             // whole spec was emitted literally ("%,d") — and worse, the arg it
             // should have consumed shifted onto the next conversion.
@@ -3066,7 +3096,7 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
             // chars.get(i) — a format specifier that runs off the end of the
             // string must throw, not panic.
             let mut flags = String::new();
-            while chars.get(i).is_some_and(|c| "-+0 #(,".contains(*c)) {
+            while chars.get(i).is_some_and(|c| "-+0 #(,<".contains(*c)) {
                 flags.push(chars[i]);
                 i += 1;
             }
@@ -3106,15 +3136,30 @@ pub(crate) fn native_string_format(ctx: &mut dyn NativeContext, args: &[Value]) 
                 match spec {
                     's' | 'd' | 'f' | 'x' | 'X' | 'c' | 'b' | 'e' | 'E' | 'g' | 'G' | 'o' | 'h'
                     | 'H' | 'a' | 'A' => {
-                        if arg_idx < arr_len {
+                        // Select the argument this conversion consumes:
+                        //   `%<x`  → reuse the previous conversion's index
+                        //   `%N$x` → explicit 1-based index N
+                        //   `%x`   → next ordinary index (advances the counter)
+                        // Only ordinary conversions advance `arg_idx`, matching
+                        // java.util.Formatter (explicit/relative specs do not).
+                        let use_idx = if flags.contains('<') {
+                            last_used_index.unwrap_or(0)
+                        } else if let Some(ei) = explicit_index {
+                            ei
+                        } else {
+                            let cur = arg_idx;
+                            arg_idx += 1;
+                            cur
+                        };
+                        last_used_index = Some(use_idx);
+                        if use_idx < arr_len {
                             if let Some(a) = arr_ref {
-                                let elem = ctx.get_array_element(a, arg_idx);
+                                let elem = ctx.get_array_element(a, use_idx);
                                 let text =
                                     format_arg_full(ctx, &elem, spec, &flags, width, precision);
                                 result.push_str(&text);
                             }
                         }
-                        arg_idx += 1;
                     }
                     _ => {
                         result.push('%');
