@@ -295,6 +295,15 @@ pub fn update_all_roots(
     //     stale-ClassLoader → `String.loadClass` cryptoProvider failure).
     cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(pointer_map);
 
+    // 19. JBoss MSC container-held service objects (the `Service` instance,
+    //     synthetic `ServiceController` mirror, child `ServiceTarget`, in-flight
+    //     `StartContext`) cached in a process-global side-table in
+    //     `native-builtins/src/jboss_msc.rs`. Scanned as roots in `roots.rs`
+    //     step 19; repoint the stored ObjectRefs to their relocated addresses
+    //     here so the container can safely invoke `start()`/`stop()` on the held
+    //     service after a moving GC.
+    cratonvm_native_builtins::jboss_msc::gc_update_msc_service_refs(pointer_map);
+
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);
     // Opt-in (CRATONVM_DBG_HEAP_STALE=1) deep heap-walk: catch un-forwarded /
