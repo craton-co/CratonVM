@@ -2258,12 +2258,15 @@ fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
             // ops (`pop2`, `dup_x1`, `dup_x2`, `dup2_x1`, `dup2_x2`) are NOT
             // implemented by codegen — they hit the `_ => return false` bail in
             // `compile_bytecode` and the method safely stays interpreted, so we
-            // do NOT reject for them here. To avoid losing JIT coverage, an
-            // imprecisely-modeled state is handled by CLEARING the abstract
-            // stack (treat subsequent values as unknown) rather than rejecting;
-            // a `dup2` on a cleared/unknown top is then treated as FORM-1,
-            // matching the codegen's behavior (correct whenever the real top is
-            // two category-1 values — the overwhelmingly common case).
+            // do NOT reject for them here. An imprecisely-modeled state is
+            // handled by CLEARING the abstract stack (treat subsequent values
+            // as unknown) rather than rejecting outright, preserving JIT
+            // coverage up to the next ambiguity. A `dup2` reached against a
+            // cleared/unknown top, however, is REJECTED (stay interpreted): we
+            // cannot prove the top is category-1, and the codegen's FORM-1-only
+            // `dup2` hard-aborts / desyncs on a category-2 top (the common
+            // `getfield <J/D>; dup2` BigDecimal shape). Soundness beats the
+            // small JIT-coverage loss — see the `_` arm under opcode 0x5c.
             //
             // pop (cat-1)
             0x57 => { pop!(); pc += 1; }
@@ -2312,12 +2315,26 @@ fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
                         push!(b);
                     }
                     _ => {
-                        // None (empty/cleared model) or an out-of-range width that
-                        // cannot occur for a valid stack model (widths are only ever
-                        // 1 or 2): treat conservatively as FORM-1 to match codegen;
-                        // push two cat-1.
-                        push!(1);
-                        push!(1);
+                        // None — the abstract model is empty/cleared at this `dup2`
+                        // (the top operand was produced by a preceding field/method
+                        // op, branch target, or other op whose width this
+                        // descriptor-less helper cannot determine, so it CLEARED the
+                        // model). We cannot prove the top is category-1, so we cannot
+                        // rule out FORM-2: a single category-2 long/double, the very
+                        // common `getfield <J/D>; dup2` / `invokevirtual ()J; dup2`
+                        // shape in BigDecimal/decimal bytecode. The codegen `dup2`
+                        // implements only FORM-1 and would index `self.stack[len - 2]`
+                        // with `len == 1` (a `usize` underflow → index-out-of-bounds
+                        // panic / hard VM abort) or, when the real height is ≥2,
+                        // duplicate an unrelated lower slot (operand-stack desync →
+                        // primitive-as-reference → bad-pointer deref). Both are far
+                        // worse than forgoing JIT, so reject and stay interpreted.
+                        //
+                        // Previously this arm optimistically assumed FORM-1, which is
+                        // what let decimal/sort/rownum methods JIT-compile and then
+                        // crash (deterministically on the decimal path, flakily
+                        // elsewhere depending on JIT timing).
+                        return false;
                     }
                 }
                 pc += 1;
