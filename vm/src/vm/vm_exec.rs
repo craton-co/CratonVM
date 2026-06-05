@@ -1367,6 +1367,41 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         resolve_field_index_in_hierarchy(class_id, field_name, &cm.class_store)
     }
 
+    fn copy_from_native_memory(&self, addr: i64, out: &mut [u8]) -> bool {
+        // NIO-SERVER-SOCKET: `Unsafe.allocateMemory` returns synthetic arena
+        // handles (base 0x10_0000_0000), not real pointers. A
+        // `DirectByteBuffer.address()` from `Util.getTemporaryDirectBuffer`
+        // reaching `Net.read0`/`SocketDispatcher` is such a handle — route it
+        // through the off-heap store. Real OS pointers fall through to raw.
+        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
+            return cratonvm_native_builtins::unsafe_arena_copy_out(addr, out);
+        }
+        if addr <= 0 {
+            return false;
+        }
+        // SAFETY: `addr` is a real, readable native pointer (not an arena
+        // handle); `out.len()` bytes are copied from it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(addr as *const u8, out.as_mut_ptr(), out.len());
+        }
+        true
+    }
+
+    fn copy_to_native_memory(&mut self, addr: i64, data: &[u8]) -> bool {
+        if cratonvm_native_builtins::unsafe_arena_contains(addr) {
+            return cratonvm_native_builtins::unsafe_arena_copy_in(addr, data);
+        }
+        if addr <= 0 {
+            return false;
+        }
+        // SAFETY: `addr` is a real, writable native pointer (not an arena
+        // handle); `data.len()` bytes are copied to it.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, data.len());
+        }
+        true
+    }
+
     fn method_exists(&self, class_name: &str, method_name: &str, descriptor: &str) -> bool {
         let cm = self.shared.class_manager.read();
         let class_id = match cm.get_loaded_class_id(class_name) {
@@ -1401,44 +1436,55 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn new_ref_array(&mut self, class_id: ClassId, length: usize) -> ObjectRef {
+        if class_id.as_u32() == 0 && std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+            let frame = self.thread.frames.last().map(|f| {
+                format!("{}.{}", f.class_name(), f.method_name())
+            }).unwrap_or_default();
+            eprintln!("[DBG_TOARRAY] new_ref_array(Object[],len={}) from frame={}", length, frame);
+        }
         self.shared
             .heap
             .alloc_array(class_id, ArrayElementType::Reference, length)
     }
 
+    fn array_component_class_id(&self, class_id: ClassId) -> Option<ClassId> {
+        // `array_info` is `Some` only for array classes; its `component_class_id`
+        // is the immediate element type (e.g. `String[]` for `String[][]`).
+        self.shared
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .and_then(|c| c.array_info.as_ref().map(|ai| ai.component_class_id))
+    }
+
+    #[track_caller]
     fn array_length(&self, obj: ObjectRef) -> usize {
         let kind = self.shared.heap.kind_of(obj);
         if kind != ObjectKind::Array {
-            let class_id = self.shared.heap.class_id_of(obj);
-            let class_name = self
-                .shared
-                .class_manager
-                .read()
-                .get_class(class_id)
-                .map(|c| c.name.to_string())
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let top = self
-                .thread
-                .frames
-                .last()
-                .map(|f| format!("{}.{}{} pc={}", f.class_name(), f.method_name(), f.method_descriptor(), f.pc))
-                .unwrap_or_else(|| "<no-frame>".to_string());
-            eprintln!(
-                "[ARRAY-LEN-GUARD] non-array object class={} kind={:?} caller={} obj={:?}",
-                class_name, kind, top, obj
-            );
-            for (i, f) in self.thread.frames.iter().enumerate().rev().take(8) {
+            // Only emit the (noisy) diagnostic when explicitly requested — the
+            // `#[track_caller]` location pinpoints the offending native/opcode
+            // far more reliably than the previously-broken symbolized backtrace.
+            if std::env::var("CRATONVM_DBG_ARRLEN").is_ok() {
+                let class_id = self.shared.heap.class_id_of(obj);
+                let class_name = self
+                    .shared
+                    .class_manager
+                    .read()
+                    .get_class(class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                let top = self
+                    .thread
+                    .frames
+                    .last()
+                    .map(|f| format!("{}.{}{} pc={}", f.class_name(), f.method_name(), f.method_descriptor(), f.pc))
+                    .unwrap_or_else(|| "<no-frame>".to_string());
+                let loc = std::panic::Location::caller();
                 eprintln!(
-                    "[ARRAY-LEN-GUARD]   stack[{i}] {}.{}{} pc={}",
-                    f.class_name(),
-                    f.method_name(),
-                    f.method_descriptor(),
-                    f.pc,
+                    "[ARRAY-LEN-GUARD] non-array object class={} kind={:?} caller={} rust-caller={}:{} obj={:?}",
+                    class_name, kind, top, loc.file(), loc.line(), obj
                 );
             }
-            // Print Rust backtrace to identify the source native.
-            let bt = std::backtrace::Backtrace::force_capture();
-            eprintln!("[ARRAY-LEN-GUARD] rust-bt:\n{}", bt);
             return 0;
         }
         self.shared.heap.array_length(obj)
@@ -1783,19 +1829,31 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn read_string(&self, obj: ObjectRef) -> Option<String> {
+        let class_id = self.shared.heap.class_id_of(obj);
+        // Guard by class identity BEFORE the structural reader. `read_java_string`
+        // below duck-types a String from the char[]/byte[] in field 0, but a
+        // CratonVM synthetic `StringBuilder`/`StringBuffer` is *also* char[]-backed
+        // (field 0 = char[] buffer, field 1 = int count) with an OVER-allocated
+        // buffer. The structural reader's char[] path has no length field, so it
+        // decodes the buffer's full *capacity* instead of its `count`, appending
+        // the unused trailing slots as NUL/space padding — the `"x" + sb`
+        // string-concatenation padding bug. A real String is always allocated with
+        // the java/lang/String class id (see `create_java_string`), so reject any
+        // object whose class is known and is not java/lang/String. Only when the
+        // class is genuinely unresolvable (early bootstrap, before String itself
+        // is loaded) do we fall through to the best-effort structural reader.
+        {
+            let cm = self.shared.class_manager.read();
+            if let Some(cls) = cm.get_class(class_id) {
+                if &*cls.name != "java/lang/String" {
+                    return None;
+                }
+            }
+        }
         if let Some(s) = super::read_java_string(&self.shared.heap, obj) {
             return Some(s);
         }
-        let class_id = self.shared.heap.class_id_of(obj);
         let cm = self.shared.class_manager.read();
-        if cm
-            .get_class(class_id)
-            .map(|c| &*c.name != "java/lang/String")
-            .unwrap_or(true)
-        {
-            drop(cm);
-            return None;
-        }
         let vidx = resolve_field_index_in_hierarchy(class_id, "value", &cm.class_store)?;
         let cidx = resolve_field_index_in_hierarchy(class_id, "coder", &cm.class_store);
         drop(cm);
@@ -2724,6 +2782,52 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         .set_field(thread_obj, slot, Value::Object(Some(loader)));
                 }
             }
+            // INTERRUPTLOCK: real `java.lang.Thread` declares
+            // `final Object interruptLock = new Object();` as an instance-field
+            // initializer run by `Thread.<init>`. A VM-synthesized Thread object
+            // (the main thread, and any native-spawned thread that first
+            // observes its Thread via this method) never runs `<init>`, so the
+            // slot keeps its zero default (`Int(0)` here — `alloc_object` zeroes
+            // every slot regardless of declared type, so an unset reference
+            // field reads back as `Int(0)`, NOT `Object(None)`).
+            // `Thread.blockedOn(Interruptible)` —
+            // `synchronized (interruptLock) { nioBlocker = b; }` — is invoked by
+            // `AbstractInterruptibleChannel.begin/end` on EVERY FileChannel /
+            // SocketChannel operation; a non-reference lock value makes
+            // `monitorenter` throw NPE and takes down the entire
+            // interruptible-channel subsystem before any I/O native runs. Seed
+            // it with a fresh `Object` unless a real `<init>` already populated
+            // it (threads created by `new Thread(...)` in bytecode run the real
+            // ctor and carry their own lock; this only fills the VM-created gap).
+            let interrupt_lock_slot = {
+                let cm = self.shared.class_manager.read();
+                resolve_field_index_in_hierarchy(class_id, "interruptLock", &cm.class_store)
+            };
+            if let Some(slot) = interrupt_lock_slot {
+                let already_set = matches!(
+                    self.shared.heap.get_field(thread_obj, slot),
+                    Value::Object(Some(_))
+                );
+                if !already_set {
+                    let obj_class = {
+                        let cm = self.shared.class_manager.read();
+                        cm.get_loaded_class_id("java/lang/Object")
+                    }
+                    .or_else(|| {
+                        self.shared
+                            .class_manager
+                            .write()
+                            .load_class("java/lang/Object")
+                            .ok()
+                    });
+                    if let Some(obj_class) = obj_class {
+                        let lock = self.shared.heap.alloc_object(obj_class, 0);
+                        self.shared
+                            .heap
+                            .set_field(thread_obj, slot, Value::Object(Some(lock)));
+                    }
+                }
+            }
             return thread_obj;
         }
 
@@ -3474,7 +3578,25 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             proxies.get(&receiver_class_id).cloned()
         };
 
-        if let Some(lcs) = call_site.filter(|lcs| method_name == &*lcs.sam_method_name) {
+        if let Some(lcs) = call_site.filter(|lcs| {
+            // Match the SAM by name AND parameter count. A functional
+            // interface may declare OTHER same-named methods (overloaded
+            // `default` methods) whose body delegates to the real SAM — e.g.
+            // JUnit5's `TestInstancesProvider` has a 2-arg
+            // `getTestInstances(MutableExtensionRegistry, ThrowableCollector)`
+            // default that calls the 3-arg abstract SAM
+            // `getTestInstances(ExtensionRegistry, ExtensionRegistrar,
+            // ThrowableCollector)`. Intercepting the 2-arg default as if it
+            // were the SAM routes it to the lambda body with one argument
+            // short, leaving the trailing param uninitialised. Only intercept
+            // when the supplied arg count matches the SAM's so the real
+            // default method runs and then re-invokes the SAM correctly.
+            method_name == &*lcs.sam_method_name
+                && crate::runtime::interpreter::split_method_descriptor(&lcs.sam_descriptor)
+                    .0
+                    .len()
+                    == args.len()
+        }) {
             // Lambda dispatch: read captured values from proxy fields, then
             // prepend them to the invocation args.
             let num_captures = lcs.capture_types.len();
@@ -3568,12 +3690,22 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         .write()
                         .load_class(&lcs.impl_handle.class_name)?;
                     super::ensure_class_initialized_shared(self.shared, self.thread, class_id)?;
+                    // Use `num_total_fields` (inherited + declared instance
+                    // fields), matching the `New` opcode and the sibling
+                    // NewInvokeSpecial path in `interpreter.rs`. `c.fields.len()`
+                    // is wrong here: it counts this class's declared fields
+                    // *including statics* while omitting inherited instance
+                    // fields, so a subclass constructor reference (e.g. JUnit5's
+                    // `DefaultClassDescriptor::new`, whose 2 fields are all
+                    // inherited from `AbstractAnnotatedDescriptorWrapper`)
+                    // under-allocates to 0 slots and trips the GC `get_field`
+                    // bounds guard on every inherited-field access.
                     let num_fields = self
                         .shared
                         .class_manager
                         .read()
                         .get_class(class_id)
-                        .map(|c| c.fields.len())
+                        .map(|c| c.num_total_fields)
                         .unwrap_or(0);
                     let new_obj = match self.shared.heap.try_alloc_object(class_id, num_fields) {
                         Some(obj) => obj,
@@ -7884,16 +8016,18 @@ fn invoke_on_class_shared_inner(
                                 method_name,
                                 "socket" | "getLocalAddress"
                             ))
-                        // Wave 3 Task C: ServerSocket adapter — when the
-                        // ServerSocket is the channel-backed wrapper its
-                        // bind / getLocalPort must reach our overrides
-                        // ahead of the real-JDK bytecode (which would
-                        // try to allocate a SocketImpl etc.).
-                        || (class_name == "java/net/ServerSocket"
-                            && matches!(
-                                method_name,
-                                "bind" | "getLocalPort" | "isBound" | "isClosed" | "getLocalSocketAddress" | "close"
-                            ))
+                        // NIO-SERVER-SOCKET (2026-06-03): the `java/net/ServerSocket`
+                        // override was removed so the REAL JDK bytecode runs and
+                        // flows through `NioSocketImpl` → `sun/nio/ch/Net`
+                        // (native-io::net), which binds a real `TcpListener` and
+                        // reports the OS-chosen port. The old synthetic override
+                        // intercepted `bind`/`getLocalPort` and wrote the port into
+                        // `ServerSocket.impl@0` — a reference slot — where the
+                        // descriptor-aware field-write coerces the Int to null
+                        // (gc::coerce_field_value_by_descriptor), so `getLocalPort`
+                        // always returned 0. See `reference_server_socket_gap`.
+                        // The channel-backed `ServerSocketChannel.socket()` wrapper
+                        // (Wave 3 Task C) likewise now runs real bytecode.
                         // Wave 3 Task C: SocketChannel/ServerSocketChannel
                         // factories + connect/accept/configureBlocking — JDK
                         // bytecode for these reaches into the SelectorProvider
@@ -8522,6 +8656,24 @@ fn invoke_on_class_shared_inner(
                         // allocation path never populates.
                         || (class_name == "java/security/KeyPair"
                             && matches!(method_name, "getPublic" | "getPrivate"))
+                        // BAOS-SUBCLASS: `java.io.ByteArrayOutputStream` is
+                        // subclassed by `sun.security.util.DerOutputStream`
+                        // (and others). The interpreter mis-resolves the
+                        // inherited `count` `putfield` slot for such subclasses,
+                        // so the *real* `write`/`toByteArray` bytecode silently
+                        // drops every byte — DER signature encoding produced an
+                        // empty array and broke ECDSA signing under real JCA.
+                        // Force our `serialization.rs` intrinsic (which addresses
+                        // `buf`/`count` by NAME, consistent with reflection) to
+                        // win over the bytecode for these mutator/reader methods.
+                        // `<init>` stays real (it sets `buf` correctly). The
+                        // `.is_some()` guard below means unregistered overloads
+                        // (e.g. `toString(Charset)`) still fall through to bytecode.
+                        || (class_name == "java/io/ByteArrayOutputStream"
+                            && matches!(
+                                method_name,
+                                "write" | "toByteArray" | "size" | "reset" | "toString"
+                            ))
                         // SigProbe WP6.6: `javax.security.auth.x500.X500Principal`
                         // string / DER round-trip. JDK 25 routes through
                         // `sun.security.x509.X500Name` whose parser depends
@@ -8664,6 +8816,12 @@ fn invoke_on_class_shared_inner(
                     || method_name == "getAndSetAcquire" || method_name == "getAndSetRelease"
                     || method_name == "getAndAdd"
                     || method_name == "getAndAddAcquire" || method_name == "getAndAddRelease"
+                    || method_name == "getAndBitwiseOr"
+                    || method_name == "getAndBitwiseOrAcquire" || method_name == "getAndBitwiseOrRelease"
+                    || method_name == "getAndBitwiseAnd"
+                    || method_name == "getAndBitwiseAndAcquire" || method_name == "getAndBitwiseAndRelease"
+                    || method_name == "getAndBitwiseXor"
+                    || method_name == "getAndBitwiseXorAcquire" || method_name == "getAndBitwiseXorRelease"
                 {
                     // Check if receiver is a MethodHandle or VarHandle
                     let is_mh = class_name == "java/lang/invoke/MethodHandle"

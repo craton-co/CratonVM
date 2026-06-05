@@ -610,6 +610,9 @@ impl Arm64Backend {
         }
         self.oop_maps.push(crate::OopMapEntry {
             native_pc_offset: native_pc,
+            // Stage 3 precise relocation is x86-64 only for now; aarch64
+            // records no safepoint-id, so leave the bytecode PC unset.
+            bytecode_pc: 0,
             frame_slot_offsets: slots,
         });
     }

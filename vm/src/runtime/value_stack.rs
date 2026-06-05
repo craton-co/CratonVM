@@ -423,6 +423,67 @@ impl ValueStack {
         Ok(())
     }
 
+    // ── Kind-preserving shuffle primitives (dup*/swap/pop2) ───────────────
+    //
+    // `pop_compact_checked` + `push_compact_checked` LOSE the kind mark (the
+    // re-push always lands `KIND_UNKNOWN`). For an int/ref/float that is
+    // harmless. But a collision-shaped `long` (SUB_OBJECT bit pattern, e.g.
+    // BouncyCastle F2m `LongArray` `0xfffd_…`) shuffled through `dup2`/
+    // `dup_x2`/`swap` would then sit `KIND_UNKNOWN` with reference-looking
+    // bits — and the GC root scan would mistake it for a live pointer,
+    // relocate the object it aliases, and corrupt the long. These primitives
+    // carry the exact kind byte across the shuffle so a long stays a long.
+
+    /// Pop the top slot returning its `CompactValue` AND kind byte.
+    #[inline]
+    pub fn pop_with_kind(&mut self) -> Result<(CompactValue, u8), RuntimeError> {
+        if self.len == 0 {
+            return Err(RuntimeError::IllegalStateException {
+                message: "operand stack underflow".to_string(),
+            });
+        }
+        self.len -= 1;
+        Ok((self.slots[self.len], self.kinds[self.len]))
+    }
+
+    /// Peek the top slot's `CompactValue` + kind byte (non-popping).
+    #[inline]
+    pub fn peek_with_kind(&self) -> Result<(CompactValue, u8), RuntimeError> {
+        if self.len == 0 {
+            return Err(RuntimeError::IllegalStateException {
+                message: "operand stack underflow".to_string(),
+            });
+        }
+        Ok((self.slots[self.len - 1], self.kinds[self.len - 1]))
+    }
+
+    /// Push a `CompactValue` with an explicit kind byte (inverse of
+    /// [`pop_with_kind`]).
+    #[inline]
+    pub fn push_with_kind(&mut self, cv: CompactValue, kind: u8) -> Result<(), RuntimeError> {
+        if self.len >= self.max_size {
+            return Err(RuntimeError::IllegalStateException {
+                message: "operand stack overflow".to_string(),
+            });
+        }
+        self.slots[self.len] = cv;
+        self.kinds[self.len] = kind;
+        self.len += 1;
+        Ok(())
+    }
+
+    /// Category-2 (long/double) test that honors the slot's kind mark. A
+    /// collision-shaped long is `CompactValue::is_category2() == false` by
+    /// bits (its NaN-box sub-tag reads as `SUB_OBJECT`), but it IS a genuine
+    /// category-2 long per its `KIND_LONG` mark — so `dup2`/`pop2`/`dup_x2`
+    /// must treat it as occupying one logical slot pair. Unmarked slots fall
+    /// back to the bit-level test (an unmarked numeric long/double is still
+    /// untagged → `is_category2() == true`).
+    #[inline]
+    pub fn is_cat2_kind(kind: u8, cv: CompactValue) -> bool {
+        matches!(kind, KIND_LONG | KIND_DOUBLE) || cv.is_category2()
+    }
+
     /// Push an int directly as a CompactValue (T10.9.D hot-path).
     ///
     /// Returns `Err` on overflow so the signature mirrors `push(Value)`.
@@ -1042,13 +1103,18 @@ impl ValueStack {
                         // kind mark); reconstructing the ObjectRef from its
                         // 47-bit payload is the inverse of that encode.
                         roots.push(unsafe { ObjectRef::from_raw(ptr as *mut u8) });
-                    } else if ptr != 0 && heap.is_heap_addr(ptr as usize).is_some() {
-                        // KIND_LONG slot whose bits look like SUB_OBJECT: only a
-                        // live heap address is rooted (JNI long-as-jobject
-                        // smuggle); a numeric long is filtered out, preserving
-                        // the letsgo-segv safety guarantee.
-                        roots.push(unsafe { ObjectRef::from_raw(ptr as *mut u8) });
                     }
+                    // A `KIND_LONG` / `KIND_DOUBLE` slot whose bits collide
+                    // with the SUB_OBJECT pattern (BC F2m `LongArray`
+                    // `0xfffd_…`) is a primitive — NEVER root it, even when its
+                    // low 47 bits land on a live object. The previous
+                    // `else if … is_heap_addr` branch rooted exactly those
+                    // collisions and the post-GC update then rewrote them,
+                    // corrupting the long. The genuine JNI long-as-jobject
+                    // smuggle uses canonical *low* heap addresses (bits 63-50
+                    // clear), so it is NOT `is_object()` and is rooted by the
+                    // untagged `CompactTag::Long | Double` branch below — this
+                    // removal does not affect it.
                 }
             } else if matches!(cv.tag(), CompactTag::Long | CompactTag::Double) {
                 // O1 hybrid: tagged Long OR untagged Double bits — both
@@ -1082,6 +1148,17 @@ impl ValueStack {
         for i in 0..self.len {
             let cv = self.slots[i];
             if cv.is_object() {
+                // A primitive long/double whose bits collide with SUB_OBJECT is
+                // a value, not a pointer — never remap it. The `pointer_map` is
+                // the *global* relocation record, so a collision long's payload
+                // can match an unrelated moved object's from-space address; the
+                // old comment's "a false positive was never rooted so it can't
+                // be a key" is incorrect (rooting and remapping key off
+                // *different* objects). The rooting scan no longer roots these,
+                // and this guard keeps the post-GC rewrite from corrupting them.
+                if self.kinds[i] == KIND_LONG || self.kinds[i] == KIND_DOUBLE {
+                    continue;
+                }
                 if let Some(old_ptr) = cv.as_object_ptr() {
                     // Gate on `pointer_map` membership, NOT a live-header /
                     // arena probe of `old_ptr`. Post-GC, `old_ptr` is the
@@ -1091,10 +1168,7 @@ impl ValueStack {
                     // remapping — the operand-stack half of the H2 `TestAll`
                     // POST-GC STALE STACK crash. The `pointer_map` is the
                     // authoritative relocation record (and the exact criterion
-                    // `verify_no_stale_refs` checks): a long bit-pattern false
-                    // positive (BC SM2 `SUB_OBJECT`) was never rooted, so it
-                    // cannot be a key and is left untouched — identical to the
-                    // rooting scan's treatment.
+                    // `verify_no_stale_refs` checks).
                     if let Some(&new_addr) = pointer_map.get(&(old_ptr as usize)) {
                         // SAFETY: `new_addr` comes from a `HashMap<usize,
                         // usize>` of live-heap pointers populated by the GC
@@ -2036,6 +2110,85 @@ mod tests {
         let mut roots = Vec::new();
         stack.scan_object_refs(&mut roots, &heap);
         assert!(roots.is_empty());
+    }
+
+    /// REGRESSION (bc math-ec collision-long corruption): a primitive `long`
+    /// pushed via `push_long` (⇒ `KIND_LONG`) whose bits collide with the
+    /// SUB_OBJECT pattern AND whose payload aliases a *live* heap object must
+    /// be treated as a value, not a reference — neither rooted by
+    /// `scan_object_refs` nor remapped by `update_object_refs`. Before the fix
+    /// the `else if … is_heap_addr` rooting branch (scan) and the unconditional
+    /// `is_object()` remap (update) corrupted such a long under moving GC.
+    #[test]
+    fn t10_gc_scan_and_update_skip_collision_long_aliasing_live_object() {
+        use crate::classloading::ClassId;
+        use crate::memory::vm_heap::{GcBackend, VmHeap};
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let addr = obj.as_ptr() as u64;
+
+        // Bit-identical to `CompactValue::object(addr)`, but a primitive long.
+        let collision_bits = CompactValue::object(addr).raw_bits();
+
+        let mut stack = ValueStack::new(4);
+        stack.push_long(collision_bits as i64).unwrap(); // marks KIND_LONG
+        assert!(
+            stack.get_compact(0).unwrap().is_object(),
+            "collision long must carry SUB_OBJECT bits for this test to bite",
+        );
+
+        // scan: a KIND_LONG slot is never a root, even aliasing a live object.
+        let mut roots = Vec::new();
+        stack.scan_object_refs(&mut roots, &heap);
+        assert!(
+            roots.is_empty(),
+            "a KIND_LONG collision long must not be rooted",
+        );
+
+        // update: a pointer_map keyed off the collision payload must not rewrite it.
+        let mut map = HashMap::new();
+        map.insert(addr as usize, (addr as usize) + 64);
+        stack.update_object_refs(&map, &heap);
+        assert_eq!(
+            stack.get_compact(0).unwrap().to_bits(),
+            collision_bits,
+            "primitive long must be preserved bit-exact across GC update",
+        );
+    }
+
+    /// REGRESSION (bc math-ec): the kind-preserving shuffle primitives keep a
+    /// collision-shaped long's `KIND_LONG` mark across a `dup`, so the GC root
+    /// scan still skips it. With the old `push_compact_checked` path the
+    /// duplicate landed `KIND_UNKNOWN` and — sharing the genuine-reference bit
+    /// pattern — was rooted and relocated, corrupting the long.
+    #[test]
+    fn kind_preserving_dup_keeps_collision_long_unrooted() {
+        use crate::classloading::ClassId;
+        use crate::memory::vm_heap::{GcBackend, VmHeap};
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let addr = obj.as_ptr() as u64;
+        let collision_bits = CompactValue::object(addr).raw_bits();
+
+        let mut stack = ValueStack::new(8);
+        stack.push_long(collision_bits as i64).unwrap(); // KIND_LONG
+
+        // Simulate `dup` via the kind-preserving primitives (what the
+        // interpreter's Dup/Dup2/Swap handlers now use).
+        let (cv, kind) = stack.peek_with_kind().unwrap();
+        stack.push_with_kind(cv, kind).unwrap();
+
+        // The duplicate is a category-2 long by its kind (not its bits)…
+        assert!(ValueStack::is_cat2_kind(kind, cv));
+        // …and neither copy is a GC root.
+        let mut roots = Vec::new();
+        stack.scan_object_refs(&mut roots, &heap);
+        assert!(
+            roots.is_empty(),
+            "a kind-preserved collision long (and its dup) must not be rooted",
+        );
     }
 
     /// `update_object_refs` must NOT touch `CompactTag::Long` slots — they are

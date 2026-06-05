@@ -175,6 +175,32 @@ fn clinit_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResul
     Ok(None)
 }
 
+/// Real-JCA `java/security/Security.<clinit>` replacement.
+///
+/// The real `<clinit>` fails in `initialize()` (it tries to read the
+/// `java.security` config file and dies with "Is a directory"), which is why
+/// the default build no-ops it.  But the real EC keygen path
+/// (`AlgorithmParameters.getInstance("EC")` → `Security.getImpl` →
+/// `Security.getSpiClass`) dereferences the static `spiMap` field, which the
+/// no-op leaves null → "Cannot invoke get on null".  Here we set `spiMap` to a
+/// fresh empty `ConcurrentHashMap` (exactly what the real `<clinit>` assigns to
+/// it) and skip the failing `initialize()`.  With a non-null but empty map,
+/// `getSpiClass(type)` finds no entry and falls through to building the SPI
+/// class name (`"java.security." + type + "Spi"`) by reflection — the correct
+/// result for AlgorithmParameters/KeyFactory/KeyPairGenerator/Signature.
+fn security_clinit_spimap(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(m))) =
+        ctx.new_object_initialized("java/util/concurrent/ConcurrentHashMap", "()V", &[])?
+    {
+        ctx.set_static_field_by_name(
+            "java/security/Security",
+            "spiMap",
+            Value::Object(Some(m)),
+        );
+    }
+    Ok(None)
+}
+
 /// `Provider.getEngineName(String)` override — bypasses the `knownEngines`
 /// HashMap lookup that real-JDK `Provider.<clinit>` populates.  Because we
 /// no-op the clinit (see `register_cipher_clinit_shim`), the static field
@@ -487,7 +513,22 @@ pub fn register_cipher_clinit_shim(r: &mut NativeMethodRegistry) {
     // native shim for `getProviders` / `getProvider` /
     // `addProvider` / `removeProvider` in `phases_early.rs` (lines
     // 8917-8999) that bypasses `props` entirely.
-    r.register("java/security/Security", "<clinit>", "()V", clinit_noop);
+    //
+    // Real-JCA bring-up: the real EC keygen path resolves
+    // `AlgorithmParameters.getInstance("EC")` via `Security.getImpl` →
+    // `getSpiClass`, which reads the static `spiMap`.  The plain no-op
+    // leaves it null and NPEs.  Use a variant that sets `spiMap` to an
+    // empty map (still skipping the failing `initialize()`).
+    // Also needed for EC-scoped default routing (`route_ec_to_real`): real
+    // `AlgorithmParameters.getInstance("EC")` (driven by the real
+    // `ECKeyPairGenerator.initialize`) reads `spiMap`. Setting it to an empty
+    // map is harmless for the synthetic RSA/AES/digest paths (which never read
+    // it). Only the pure-synthetic kill-switch keeps the bare no-op.
+    if crate::real_jca_mode() || crate::route_ec_to_real() {
+        r.register("java/security/Security", "<clinit>", "()V", security_clinit_spimap);
+    } else {
+        r.register("java/security/Security", "<clinit>", "()V", clinit_noop);
+    }
 
     // `java/security/Provider.<clinit>` — DO NOT no-op. The real clinit
     // populates the static `knownEngines: HashMap<String,EngineDescription>`

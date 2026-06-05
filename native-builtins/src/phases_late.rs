@@ -3630,6 +3630,26 @@ const P57_PATH_FS_FIELD: usize = 1;
 /// the OS path of a mounted JAR (see `newFileSystem`). Field 0 is the separator.
 const P57_FS_JAR_FIELD: usize = 1;
 
+/// Distinguish a *real* `java/io/BufferedWriter` (built from JDK bytecode via
+/// `new BufferedWriter(writer)`) from the synthetic, fd-backed object that
+/// `Files.newBufferedWriter` allocates. The synthetic object stores its file
+/// descriptor as an `Int` in slot 0; a real BufferedWriter's slot 0 holds an
+/// object reference (the `lock`/`out` Writer set by the JDK constructor).
+///
+/// Returns `Some(out)` — the wrapped `Writer` — for a real BufferedWriter, so
+/// the `BufferedWriter` natives can forward the I/O to real bytecode instead
+/// of misreading slot 0 as an fd and dropping the write. Returns `None` for
+/// the synthetic fd-backed object, leaving the slot-0 fd fast-path in place.
+fn bw_delegate_out(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    if let Value::Int(_) = ctx.get_field(this, 0) {
+        return None; // synthetic fd-backed BufferedWriter (Files.newBufferedWriter)
+    }
+    match ctx.get_field_by_name(this, "out") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
 pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -5226,12 +5246,14 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let path_obj = obj_arg(args, 1)?;
             let p = p57_read_path(ctx, path_obj);
-            // Inspect option set: look for WRITE/APPEND/CREATE/CREATE_NEW via toString
+            // Inspect option set: look for WRITE/APPEND/CREATE/CREATE_NEW/READ/
+            // TRUNCATE_EXISTING via toString.
             let set_obj = match args.get(2) {
                 Some(Value::Object(Some(o))) => Some(*o),
                 _ => None,
             };
-            let (mut writable, mut create, mut append) = (false, false, false);
+            let (mut writable, mut create, mut append, mut read_opt, mut truncate) =
+                (false, false, false, false, false);
             if let Some(set) = set_obj {
                 // Try to iterate by calling toString() on the Set first (cheap & robust)
                 if let Ok(Some(Value::Object(Some(s)))) =
@@ -5239,11 +5261,15 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 {
                     let s = ctx.read_string(s).unwrap_or_default();
                     writable = s.contains("WRITE") || s.contains("APPEND");
-                    create = s.contains("CREATE");
+                    create = s.contains("CREATE"); // matches CREATE and CREATE_NEW
                     append = s.contains("APPEND");
+                    read_opt = s.contains("READ");
+                    truncate = s.contains("TRUNCATE_EXISTING");
                 }
             }
-            let _ = append; // append handled by seek-to-end below
+            // JDK FileChannel.open contract: a channel with neither READ nor
+            // WRITE is read-only; WRITE without READ is write-only.
+            let readable = read_opt || !writable;
             let fd_id = if writable {
                 ctx.fd_table().open_read_write(&p, create)
             } else {
@@ -5253,11 +5279,64 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             .map_err(|e| RuntimeError::IOException {
                 message: format!("Cannot open {}: {}", p, e),
             })?;
+            if truncate && writable {
+                let _ = ctx.fd_table().rw_set_length(fd_id, 0);
+            }
             if append {
                 if let Ok(sz) = ctx.fd_table().file_size(fd_id) {
                     let _ = ctx.fd_table().rw_seek(fd_id, std::io::SeekFrom::Start(sz));
                 }
             }
+
+            // RECONCILE-WITH-REAL: build a REAL `sun.nio.ch.FileChannelImpl`
+            // over the fd (FileDescriptor.handle = fd_table id, exactly how
+            // FileInputStream/FileOutputStream back their channels) and return
+            // it. `read/write/size/position/truncate` then resolve to
+            // FileChannelImpl's CONCRETE bytecode → the working
+            // IOUtil→FileDispatcherImpl native path (which now routes the temp
+            // direct-buffer arena handle correctly). Native dispatch is keyed
+            // on the resolved method's declaring class, so a concrete-class
+            // receiver never hits the abstract-`FileChannel` synthetic shims —
+            // unlike the legacy synthetic channel below, whose shims assume a
+            // synthetic ByteBuffer layout and corrupt real heap buffers.
+            //
+            // FileChannelImpl.open(fd, path, readable, writable, sync, direct,
+            //   parent) — mirrors FileOutputStream.getChannel's call shape.
+            let real_channel = (|| -> Option<Value> {
+                let fd_obj = match ctx.new_object("java/io/FileDescriptor").ok()?? {
+                    Value::Object(Some(o)) => o,
+                    _ => return None,
+                };
+                // `handle` is the Windows fd slot fd_from_descriptor prefers;
+                // also set `fd` for the POSIX read path.
+                ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
+                ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd_id as i32));
+                let path_str = ctx.create_string(&p);
+                ctx.ensure_class_initialized("sun/nio/ch/FileChannelImpl").ok()?;
+                match ctx.invoke(
+                    "sun/nio/ch/FileChannelImpl",
+                    "open",
+                    "(Ljava/io/FileDescriptor;Ljava/lang/String;ZZZZLjava/io/Closeable;)Ljava/nio/channels/FileChannel;",
+                    &[
+                        Value::Object(Some(fd_obj)),
+                        Value::Object(Some(path_str)),
+                        Value::Int(readable as i32),
+                        Value::Int(writable as i32),
+                        Value::Int(0), // sync
+                        Value::Int(0), // direct
+                        Value::Object(None), // parent
+                    ],
+                ) {
+                    Ok(Some(v @ Value::Object(Some(_)))) => Some(v),
+                    _ => None,
+                }
+            })();
+            if let Some(v) = real_channel {
+                return Ok(Some(v));
+            }
+
+            // Legacy synthetic fallback (only if the real FileChannelImpl
+            // construction is unavailable — keeps prior behavior intact).
             let fc = alloc_concurrent_synthetic(ctx, "java/nio/channels/FileChannel", 1);
             ctx.set_field(fc, 0, Value::Int(fd_id as i32));
             Ok(Some(Value::Object(Some(fc))))
@@ -5639,6 +5718,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // These are also registered in synthetic-jdk mode by phases_late, but
     // the registry dedups on (class, name, desc) so re-registering is
     // safe and keeps the contract explicit for Files.newBufferedWriter.
+    //
+    // These natives are registered on the REAL `java/io/BufferedWriter`
+    // class, so in real-JDK mode they shadow EVERY BufferedWriter — not
+    // just the synthetic fd-backed object that `Files.newBufferedWriter`
+    // returns. A real `new BufferedWriter(new OutputStreamWriter(System.out))`
+    // (the picocli / JUnit-console help-text writer) stores the wrapped
+    // `Writer` in slot 0, not an `Int` fd, so the old `_ => Ok(None)` arms
+    // silently DROPPED its output → empty `--help`. `bw_delegate_out`
+    // distinguishes the two: when slot 0 is not an `Int`, the object is a
+    // real BufferedWriter and the native forwards to its wrapped `out`
+    // Writer so the genuine OutputStreamWriter/StreamEncoder bytecode runs.
     let bw_class = "java/io/BufferedWriter";
     r.register(
         bw_class,
@@ -5646,6 +5736,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;II)V",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
+            if let Some(out) = bw_delegate_out(ctx, this) {
+                let s = args.get(1).cloned().unwrap_or(Value::Object(None));
+                let off = args.get(2).cloned().unwrap_or(Value::Int(0));
+                let len = args.get(3).cloned().unwrap_or(Value::Int(0));
+                let _ = ctx.invoke_virtual(out, "write", "(Ljava/lang/String;II)V", &[s, off, len]);
+                return Ok(None);
+            }
             let text = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
@@ -5664,6 +5761,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     );
     r.register(bw_class, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(out) = bw_delegate_out(ctx, this) {
+            let c = args.get(1).cloned().unwrap_or(Value::Int(0));
+            let _ = ctx.invoke_virtual(out, "write", "(I)V", &[c]);
+            return Ok(None);
+        }
         let c = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u32;
         let fd = match ctx.get_field(this, 0) {
             Value::Int(fd) => fd as u32,
@@ -5678,6 +5780,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     });
     r.register(bw_class, "write", "([CII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(out) = bw_delegate_out(ctx, this) {
+            let arr = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let off = args.get(2).cloned().unwrap_or(Value::Int(0));
+            let len = args.get(3).cloned().unwrap_or(Value::Int(0));
+            let _ = ctx.invoke_virtual(out, "write", "([CII)V", &[arr, off, len]);
+            return Ok(None);
+        }
         let arr = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
             _ => return Ok(None),
@@ -5702,18 +5811,27 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     });
     r.register(bw_class, "newLine", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let sep = ctx
+            .get_system_property("line.separator")
+            .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
+        if let Some(out) = bw_delegate_out(ctx, this) {
+            let s = ctx.create_string(&sep);
+            let _ = ctx.invoke_virtual(out, "write", "(Ljava/lang/String;)V", &[Value::Object(Some(s))]);
+            return Ok(None);
+        }
         let fd = match ctx.get_field(this, 0) {
             Value::Int(fd) => fd as u32,
             _ => return Ok(None),
         };
-        let sep = ctx
-            .get_system_property("line.separator")
-            .unwrap_or_else(|| if cfg!(windows) { "\r\n" } else { "\n" }.to_string());
         let _ = ctx.fd_table().write_string(fd, &sep);
         Ok(None)
     });
     r.register(bw_class, "flush", "()V", |ctx, args| {
-        let _this = obj_arg(args, 0)?;
+        let this = obj_arg(args, 0)?;
+        if let Some(out) = bw_delegate_out(ctx, this) {
+            let _ = ctx.invoke_virtual(out, "flush", "()V", &[]);
+            return Ok(None);
+        }
         // BufWriter<File> flushes automatically on drop; explicit
         // flush is a no-op in the direct-fd mode since each write
         // already hits the buffered writer inside fd_table.
@@ -5721,6 +5839,11 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     });
     r.register(bw_class, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if let Some(out) = bw_delegate_out(ctx, this) {
+            let _ = ctx.invoke_virtual(out, "flush", "()V", &[]);
+            let _ = ctx.invoke_virtual(out, "close", "()V", &[]);
+            return Ok(None);
+        }
         let fd = match ctx.get_field(this, 0) {
             Value::Int(fd) => fd as u32,
             _ => return Ok(None),
@@ -15063,21 +15186,10 @@ fn p59_sw_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     Ok(None)
 }
 
-fn p59_sw_get_caller_class(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Walk the stack and return the Class mirror of the first non-StackWalker frame
-    let trace = ctx.capture_stack_trace(0);
-    for entry in &trace {
-        let name: &str = &entry.class_name;
-        if name == "java/lang/StackWalker" || name.starts_with("java/lang/StackWalker$") {
-            continue;
-        }
-        // Return the Class mirror for this class
-        if let Some(cid) = ctx.class_id_by_name(name) {
-            let mirror = ctx.get_class_mirror(cid);
-            return Ok(Some(Value::Object(Some(mirror))));
-        }
-    }
-    Ok(Some(Value::Object(None)))
+fn p59_sw_get_caller_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Delegate to the canonical implementation in `stack_walker` so the
+    // `@CallerSensitive` off-by-one logic lives in exactly one place.
+    crate::stack_walker::native_get_caller_class(ctx, args)
 }
 
 // =============================================================================
@@ -35156,6 +35268,769 @@ pub(crate) fn register_p71_wrapper_extras(r: &mut NativeMethodRegistry) {
 // layout or the real-JDK signum/mag[I] layout).
 // =============================================================================
 
+/// Native fast-path for BouncyCastle's RSA-keygen small-factor prime
+/// pre-screen `org.bouncycastle.math.Primes.implHasAnySmallFactors`.
+///
+/// The Java method computes `x mod m` — via `BigInteger.valueOf(m)`,
+/// `BigInteger.mod`, then `intValue()` — for ten ~32-bit moduli, each a
+/// product of consecutive small primes, and tests the remainder against every
+/// prime in the group. With `org/bouncycastle/*` JIT-banned this runs
+/// interpreted: ~10 BigInteger allocations + 10 limb-division calls per
+/// candidate, over hundreds of candidates per RSA prime, which dominates
+/// `RSAKeyPairGenerator.chooseRandomPrime` (see `RSATest.test_CVE_2017_15361`,
+/// the documented RSA non-finish — `docs/comparison-handoff/bug-bc-crypto-
+/// regression-timeout.md`). This intrinsic reads the candidate's magnitude
+/// once and computes each `x mod m` with a single Horner pass over the limbs
+/// (zero allocation), returning the method's exact boolean result.
+///
+/// Byte-exact with the BC source: `m` is recomputed as the product of each
+/// group's primes (all products < 2^32), so the trial-divisor set is
+/// identical. Only the private, pure `implHasAnySmallFactors` leaf is replaced;
+/// the public `hasAnySmallFactors` wrapper (and its `checkCandidate`, which
+/// guarantees a positive candidate ≥ 2) still runs as real bytecode. Tagged
+/// `Intrinsic`, not a stub.
+/// Consecutive small-prime groups, identical to the moduli in
+/// org.bouncycastle.math.Primes.implHasAnySmallFactors (primes 2..211). Each
+/// group's modulus `m` = product of its primes (every product < 2^32).
+const BC_SMALL_FACTOR_GROUPS: [&[u32]; 10] = [
+    &[2, 3, 5, 7, 11, 13, 17, 19, 23],
+    &[29, 31, 37, 41, 43],
+    &[47, 53, 59, 61, 67],
+    &[71, 73, 79, 83],
+    &[89, 97, 101, 103],
+    &[107, 109, 113, 127],
+    &[131, 137, 139, 149],
+    &[151, 157, 163, 167],
+    &[173, 179, 181, 191],
+    &[193, 197, 199, 211],
+];
+
+/// Core of `Primes.implHasAnySmallFactors`: true iff the integer with
+/// little-endian base-2^32 magnitude `mag` (sign `negative`) is divisible by
+/// any prime in [2, 211]. Pure / allocation-free; see
+/// [`register_bc_primes_small_factors`].
+fn bc_has_any_small_factors(mag: &[u32], negative: bool) -> bool {
+    for primes in BC_SMALL_FACTOR_GROUPS {
+        // Product of the group's primes == the Java `int m`.
+        let m: u64 = primes.iter().map(|&p| p as u64).product();
+        // x mod m via Horner over the limbs, most-significant first.
+        // rem < m <= ~1.6e9 and limb < 2^32, so (rem<<32)|limb < 2^63.
+        let mut rem: u64 = 0;
+        for &limb in mag.iter().rev() {
+            rem = ((rem << 32) | limb as u64) % m;
+        }
+        let mut r32 = rem as u32;
+        // BigInteger.mod returns a non-negative remainder; for the
+        // (contract-guaranteed-absent but defensively handled) negative
+        // candidate, fold |x| mod m into [0, m). r32 < m here.
+        if negative && r32 != 0 {
+            r32 = (m as u32) - r32;
+        }
+        if primes.iter().any(|&p| r32 % p == 0) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The odd primes 3..=743 — the exact prime factors of
+/// `org.bouncycastle.util.BigIntegers.SMALL_PRIMES_PRODUCT` (verified: their
+/// product equals the class's hex literal; 2 is excluded because the candidate
+/// is forced odd first). Used by [`register_bc_util_small_factors`].
+const BC_ODD_SMALL_PRIMES: [u32; 131] = [
+    3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41,
+    43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97,
+    101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151, 157,
+    163, 167, 173, 179, 181, 191, 193, 197, 199, 211, 223, 227,
+    229, 233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283,
+    293, 307, 311, 313, 317, 331, 337, 347, 349, 353, 359, 367,
+    373, 379, 383, 389, 397, 401, 409, 419, 421, 431, 433, 439,
+    443, 449, 457, 461, 463, 467, 479, 487, 491, 499, 503, 509,
+    521, 523, 541, 547, 557, 563, 569, 571, 577, 587, 593, 599,
+    601, 607, 613, 617, 619, 631, 641, 643, 647, 653, 659, 661,
+    673, 677, 683, 691, 701, 709, 719, 727, 733, 739, 743,
+];
+
+/// `x mod p` for a single 32-bit prime `p`, via Horner over little-endian
+/// base-2^32 magnitude limbs. Returns the non-negative remainder of |x| mod p.
+#[inline]
+fn mag_mod_u32(mag: &[u32], p: u32) -> u32 {
+    let p = p as u64;
+    let mut rem: u64 = 0;
+    for &limb in mag.iter().rev() {
+        rem = ((rem << 32) | limb as u64) % p;
+    }
+    rem as u32
+}
+
+/// Core of `util.BigIntegers.hasAnySmallFactors`: true iff `x` is divisible by
+/// any prime ≤ 743 (i.e. shares a factor with `SMALL_PRIMES_PRODUCT`, or is
+/// even). Divisibility is sign-invariant, so the magnitude suffices.
+fn bc_util_has_any_small_factors(mag: &[u32]) -> bool {
+    // x even? (low limb's bit 0; empty magnitude == 0 == even)
+    if mag.first().copied().unwrap_or(0) & 1 == 0 {
+        return true;
+    }
+    BC_ODD_SMALL_PRIMES.iter().any(|&p| mag_mod_u32(mag, p) == 0)
+}
+
+pub(crate) fn register_bc_primes_small_factors(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+
+    // BC's RSA-keygen primality pre-screen (`Primes.isProbablePrime` path).
+    r.register(
+        "org/bouncycastle/math/Primes",
+        "implHasAnySmallFactors",
+        "(Ljava/math/BigInteger;)Z",
+        |ctx, args| {
+            let x = bi_read_int(ctx, obj_arg(args, 0)?);
+            let has = bc_has_any_small_factors(x.mag_le(), x.is_neg());
+            Ok(Some(Value::Int(i32::from(has))))
+        },
+    );
+
+    // BC's `BigIntegers.createRandomPrime` initial-candidate sieve, which
+    // otherwise runs the interpreted safegcd `Mod.modOddIsCoprimeVar /
+    // updateFG30` against SMALL_PRIMES_PRODUCT — the dominant cost once
+    // implHasAnySmallFactors above is native. Equivalent single-word-mod sieve.
+    r.register(
+        "org/bouncycastle/util/BigIntegers",
+        "hasAnySmallFactors",
+        "(Ljava/math/BigInteger;)Z",
+        |ctx, args| {
+            let x = bi_read_int(ctx, obj_arg(args, 0)?);
+            let has = bc_util_has_any_small_factors(x.mag_le());
+            Ok(Some(Value::Int(i32::from(has))))
+        },
+    );
+
+    r.set_category(__prev_cat);
+}
+
+/// Read BouncyCastle's expanded AES key schedule (`int[][] KW`) into
+/// `Vec<[u32; 4]>` — `KW[round][col]`.
+fn read_aes_kw(ctx: &dyn NativeContext, outer: ObjectRef) -> Vec<[u32; 4]> {
+    let rows = ctx.array_length(outer);
+    let mut kw = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let row = match ctx.get_array_element(outer, r) {
+            Value::Object(Some(o)) => o,
+            _ => return Vec::new(),
+        };
+        let mut cols = [0u32; 4];
+        for (c, slot) in cols.iter_mut().enumerate() {
+            *slot = match ctx.get_array_element(row, c) {
+                Value::Int(v) => v as u32,
+                _ => 0,
+            };
+        }
+        kw.push(cols);
+    }
+    kw
+}
+
+/// Native fast-path for `org.bouncycastle.crypto.engines.AESEngine`'s private
+/// single-block transforms. With `org/bouncycastle/*` JIT-banned, the
+/// interpreted T-table AES dominates `AESTest`'s block-cipher Monte-Carlo
+/// stress (the documented AES non-finish). These intercept the private
+/// `encryptBlock`/`decryptBlock(byte[] in, int inOff, byte[] out, int outOff,
+/// int[][] KW)` — which already receive the expanded key schedule and run with
+/// all the public `processBlock` checks done — and apply a verbatim,
+/// FIPS-197-validated port (see [`crate::bc_aes`]). A registered native fully
+/// replaces the body (no decline-to-bytecode path), and `processBlock` has
+/// already validated the buffers and non-null key, so the defensive
+/// "can't happen" cases surface as an `IllegalStateException` rather than
+/// silently no-op'ing the void method.
+pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    let aes = "org/bouncycastle/crypto/engines/AESEngine";
+    let desc = "([BI[BI[[I)V";
+
+    fn block_args(
+        ctx: &dyn NativeContext,
+        args: &[Value],
+    ) -> Option<([u8; 16], usize, ObjectRef, usize, Vec<[u32; 4]>)> {
+        let in_arr = obj_arg(args, 1).ok()?;
+        let in_off = match args.get(2) {
+            Some(Value::Int(v)) => *v as usize,
+            _ => return None,
+        };
+        let out_arr = obj_arg(args, 3).ok()?;
+        let out_off = match args.get(4) {
+            Some(Value::Int(v)) => *v as usize,
+            _ => return None,
+        };
+        let kw = read_aes_kw(ctx, obj_arg(args, 5).ok()?);
+        if kw.len() < 2 {
+            return None; // malformed schedule (can't happen post-init)
+        }
+        let mut inb = [0u8; 16];
+        if ctx.read_byte_array_into(in_arr, in_off, &mut inb) != 16 {
+            return None; // input shorter than a block (processBlock pre-checks this)
+        }
+        Some((inb, in_off, out_arr, out_off, kw))
+    }
+
+    fn bad_state() -> MethodCallFailed {
+        RuntimeError::IllegalStateException {
+            message: "AESEngine native: malformed block/key state".into(),
+        }
+        .into()
+    }
+
+    r.register(aes, "encryptBlock", desc, |ctx, args| {
+        let (inb, _in_off, out_arr, out_off, kw) = block_args(ctx, args).ok_or_else(bad_state)?;
+        let mut outb = [0u8; 16];
+        crate::bc_aes::encrypt_block(&kw, &inb, &mut outb);
+        ctx.write_byte_array_from(out_arr, out_off, &outb);
+        Ok(None)
+    });
+    r.register(aes, "decryptBlock", desc, |ctx, args| {
+        let (inb, _in_off, out_arr, out_off, kw) = block_args(ctx, args).ok_or_else(bad_state)?;
+        let mut outb = [0u8; 16];
+        crate::bc_aes::decrypt_block(&kw, &inb, &mut outb);
+        ctx.write_byte_array_from(out_arr, out_off, &outb);
+        Ok(None)
+    });
+
+    // generateWorkingKey(byte[] key, boolean forEncryption) -> int[][]. The
+    // private key-schedule expansion; `AESTest.testCounter` churns it via
+    // repeated `newCipher()`/`init`, so it became the hot frame once the block
+    // transforms above went native. Also sets `this.ROUNDS` (the field's only
+    // other readers are the now-native encrypt/decryptBlock).
+    r.register(aes, "generateWorkingKey", "([BZ)[[I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let key_arr = obj_arg(args, 1)?;
+        let for_enc = matches!(args.get(2), Some(Value::Int(v)) if *v != 0);
+
+        let klen = ctx.array_length(key_arr);
+        let mut kbuf = [0u8; 32];
+        let key: &[u8] = if klen <= 32 {
+            let n = ctx.read_byte_array_into(key_arr, 0, &mut kbuf[..klen]);
+            &kbuf[..n]
+        } else {
+            &[]
+        };
+
+        let w = match crate::bc_aes::generate_working_key(key, for_enc) {
+            Some(w) => w,
+            None => {
+                return Err(RuntimeError::IllegalArgumentException {
+                    message: "Key length not 128/192/256 bits.".into(),
+                }
+                .into())
+            }
+        };
+
+        // ROUNDS side effect (KC + 6 == rows - 1), matching BC.
+        ctx.set_field_by_name(this, "ROUNDS", Value::Int((w.len() - 1) as i32));
+
+        // Build the int[][] schedule. Holding `outer` across the inner
+        // `new_array` calls is the same allocate-while-holding pattern as
+        // `bi_alloc_int` — safe because GC here is stop-the-world-coordinated
+        // and never fires mid-native-call.
+        let outer = ctx.new_array(cratonvm_types::ArrayElementType::Reference, w.len());
+        for (r_idx, cols) in w.iter().enumerate() {
+            let row = ctx.new_array(cratonvm_types::ArrayElementType::Int, 4);
+            for (c, &word) in cols.iter().enumerate() {
+                ctx.set_array_element(row, c, Value::Int(word as i32));
+            }
+            ctx.set_array_element(outer, r_idx, Value::Object(Some(row)));
+        }
+        Ok(Some(Value::Object(Some(outer))))
+    });
+
+    r.set_category(__prev_cat);
+}
+
+/// Native fast-path for the BouncyCastle ChaCha permutation kernels that
+/// dominate SPHINCS-256 (`org.bouncycastle.pqc.crypto.test.RegressionTest`,
+/// which otherwise times out >360 s vs HotSpot ~1.3 s). Intercepts the two
+/// `public static` pure ChaCha cores:
+///   * `ChaChaEngine.chachaCore(int rounds, int[] input, int[] x)` — the PRG
+///     block function (`Seed.prg` → `Salsa20Engine.processBytes` →
+///     `generateKeyStream`), the profiled hot leaf.
+///   * `Permute.permute(int rounds, int[] x)` — the SPHINCS hash permutation
+///     (`HashFunctions.hash_2n_n`/`hash_n_n`).
+/// With `org/bouncycastle/*` JIT-banned, both run interpreted and their dozens
+/// of per-block `Integers.rotateLeft` *method calls* crush the interpreter. The
+/// Rust bodies (`crate::bc_chacha`) are verbatim, RFC 8439-validated ports.
+/// Both are invoked via invokestatic, so the native registry shadows the
+/// bytecode (`execute_invokestatic` `direct_native`). Length/odd-rounds guards
+/// mirror BC's `IllegalArgumentException`s (defensive — never fire in the real
+/// callers, which always pass length-16 arrays and even rounds).
+pub(crate) fn register_bc_chacha(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+
+    // Read a Java int[16] into a Rust array; None when the length isn't 16
+    // (→ caller raises IAE, matching BC's `x.length != 16` guard).
+    fn read16(ctx: &dyn NativeContext, arr: ObjectRef) -> Option<[i32; 16]> {
+        if ctx.array_length(arr) != 16 {
+            return None;
+        }
+        let mut out = [0i32; 16];
+        for k in 0..16 {
+            match ctx.get_array_element(arr, k) {
+                Value::Int(v) => out[k] = v,
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    fn iae(msg: &str) -> MethodCallFailed {
+        RuntimeError::IllegalArgumentException { message: msg.into() }.into()
+    }
+
+    // ChaChaEngine.chachaCore: x[i] = permute(input)_i + input[i]. `input` and
+    // `x` are distinct arrays (engine state vs keystream buffer).
+    r.register(
+        "org/bouncycastle/crypto/engines/ChaChaEngine",
+        "chachaCore",
+        "(I[I[I)V",
+        |ctx, args| {
+            let rounds = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => return Err(iae("chachaCore: missing rounds")),
+            };
+            let input_arr = obj_arg(args, 1)?;
+            let x_arr = obj_arg(args, 2)?;
+            // BC checks input.length, then x.length, then rounds parity.
+            let input = read16(ctx, input_arr).ok_or_else(|| iae(""))?;
+            if ctx.array_length(x_arr) != 16 {
+                return Err(iae(""));
+            }
+            if rounds % 2 != 0 {
+                return Err(iae("Number of rounds must be even"));
+            }
+            let mut x = [0i32; 16];
+            crate::bc_chacha::chacha_core(rounds, &input, &mut x);
+            for k in 0..16 {
+                ctx.set_array_element(x_arr, k, Value::Int(x[k]));
+            }
+            Ok(None)
+        },
+    );
+
+    // Permute.permute: in-place permutation of x, no final input-add.
+    r.register(
+        "org/bouncycastle/pqc/crypto/sphincs/Permute",
+        "permute",
+        "(I[I)V",
+        |ctx, args| {
+            let rounds = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => return Err(iae("permute: missing rounds")),
+            };
+            let x_arr = obj_arg(args, 1)?;
+            let mut x = read16(ctx, x_arr).ok_or_else(|| iae(""))?;
+            if rounds % 2 != 0 {
+                return Err(iae("Number of rounds must be even"));
+            }
+            crate::bc_chacha::permute(rounds, &mut x);
+            for k in 0..16 {
+                ctx.set_array_element(x_arr, k, Value::Int(x[k]));
+            }
+            Ok(None)
+        },
+    );
+
+    // Permute.chacha_permute(byte[] out, byte[] in): the SPHINCS hash leaf
+    // (HashFunctions.hash_n_n/hash_2n_n), the dominant frame in tree/WOTS
+    // signing. Folds in the per-call int[16] allocation + 32 Pack conversions
+    // that the bytecode wraps around `permute`. Instance method (invokevirtual,
+    // dispatched via the native-override check in execute_invokevirtual_cached):
+    // args = [this (Permute), out, in]. `in` and `out` alias in the callers
+    // (`chacha_permute(x, x)`); we read `in` fully before writing `out`.
+    r.register(
+        "org/bouncycastle/pqc/crypto/sphincs/Permute",
+        "chacha_permute",
+        "([B[B)V",
+        |ctx, args| {
+            let out_arr = obj_arg(args, 1)?;
+            let in_arr = obj_arg(args, 2)?;
+            // The bytecode reads in[0..64) and writes out[0..64); a buffer
+            // shorter than 64 would AIOOBE in Pack — mirror that.
+            let in_len = ctx.array_length(in_arr);
+            let out_len = ctx.array_length(out_arr);
+            if in_len < 64 || out_len < 64 {
+                let index = if in_len < 64 { in_len } else { out_len } as i32;
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException { index }.into());
+            }
+            let mut inb = [0u8; 64];
+            if ctx.read_byte_array_into(in_arr, 0, &mut inb) != 64 {
+                return Err(RuntimeError::ArrayIndexOutOfBoundsException { index: 0 }.into());
+            }
+            let mut outb = [0u8; 64];
+            crate::bc_chacha::chacha_permute_bytes(&mut outb, &inb);
+            ctx.write_byte_array_from(out_arr, 0, &outb);
+            Ok(None)
+        },
+    );
+
+    // SPHINCS hash layer (HashFunctions instance methods, invokevirtual). Once
+    // chacha_permute is native, the per-hash byte[64]/byte[32] allocations +
+    // copy/XOR loops in hash_n_n/hash_2n_n dominate tree/WOTS signing (millions
+    // of calls). Folding them native eliminates that glue. All return int 0
+    // (BC). The byte-level logic lives in `crate::bc_chacha` (HotSpot-validated).
+    fn ioff(args: &[Value], i: usize) -> usize {
+        match args.get(i) {
+            Some(Value::Int(v)) => *v as usize,
+            _ => 0,
+        }
+    }
+    let hf = "org/bouncycastle/pqc/crypto/sphincs/HashFunctions";
+
+    r.register(hf, "hash_n_n", "([BI[BI)I", |ctx, args| {
+        let out = obj_arg(args, 1)?;
+        let out_off = ioff(args, 2);
+        let inp = obj_arg(args, 3)?;
+        let in_off = ioff(args, 4);
+        let mut in32 = [0u8; 32];
+        if ctx.read_byte_array_into(inp, in_off, &mut in32) != 32 {
+            return Err(iae(""));
+        }
+        let res = crate::bc_chacha::sphincs_hash_n_n(&in32);
+        ctx.write_byte_array_from(out, out_off, &res);
+        Ok(Some(Value::Int(0)))
+    });
+
+    r.register(hf, "hash_2n_n", "([BI[BI)I", |ctx, args| {
+        let out = obj_arg(args, 1)?;
+        let out_off = ioff(args, 2);
+        let inp = obj_arg(args, 3)?;
+        let in_off = ioff(args, 4);
+        let mut in64 = [0u8; 64];
+        if ctx.read_byte_array_into(inp, in_off, &mut in64) != 64 {
+            return Err(iae(""));
+        }
+        let res = crate::bc_chacha::sphincs_hash_2n_n(&in64);
+        ctx.write_byte_array_from(out, out_off, &res);
+        Ok(Some(Value::Int(0)))
+    });
+
+    r.register(hf, "hash_n_n_mask", "([BI[BI[BI)I", |ctx, args| {
+        let out = obj_arg(args, 1)?;
+        let out_off = ioff(args, 2);
+        let inp = obj_arg(args, 3)?;
+        let in_off = ioff(args, 4);
+        let mask = obj_arg(args, 5)?;
+        let mask_off = ioff(args, 6);
+        let mut in32 = [0u8; 32];
+        let mut m32 = [0u8; 32];
+        if ctx.read_byte_array_into(inp, in_off, &mut in32) != 32
+            || ctx.read_byte_array_into(mask, mask_off, &mut m32) != 32
+        {
+            return Err(iae(""));
+        }
+        for i in 0..32 {
+            in32[i] ^= m32[i];
+        }
+        let res = crate::bc_chacha::sphincs_hash_n_n(&in32);
+        ctx.write_byte_array_from(out, out_off, &res);
+        Ok(Some(Value::Int(0)))
+    });
+
+    r.register(hf, "hash_2n_n_mask", "([BI[BI[BI)I", |ctx, args| {
+        let out = obj_arg(args, 1)?;
+        let out_off = ioff(args, 2);
+        let inp = obj_arg(args, 3)?;
+        let in_off = ioff(args, 4);
+        let mask = obj_arg(args, 5)?;
+        let mask_off = ioff(args, 6);
+        let mut in64 = [0u8; 64];
+        let mut m64 = [0u8; 64];
+        if ctx.read_byte_array_into(inp, in_off, &mut in64) != 64
+            || ctx.read_byte_array_into(mask, mask_off, &mut m64) != 64
+        {
+            return Err(iae(""));
+        }
+        for i in 0..64 {
+            in64[i] ^= m64[i];
+        }
+        let res = crate::bc_chacha::sphincs_hash_2n_n(&in64);
+        ctx.write_byte_array_from(out, out_off, &res);
+        Ok(Some(Value::Int(0)))
+    });
+
+    r.set_category(__prev_cat);
+}
+
+/// Native fast-path for the BouncyCastle NewHope (post-quantum) lattice kernels
+/// that dominate `NewHopeTest` (1000 key-exchange rounds) once the ChaCha cores
+/// are native: the number-theoretic transform `Poly.toNTT`/`fromNTT` (the
+/// profiled hot frame — interpreted `short[]` Montgomery butterflies) and the
+/// SHAKE128 rejection sampler `Poly.uniform` (interpreted Keccak). All are
+/// `public static` over `short[1024]`; the bodies in `crate::bc_newhope` are
+/// verbatim ports validated element-for-element against HotSpot. Invoked via
+/// invokestatic (registry-shadowed). `short[]` reads/writes go through
+/// `get/set_array_element` (sign-extended `Value::Int` <-> i16).
+pub(crate) fn register_bc_newhope(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+
+    fn read_poly(ctx: &dyn NativeContext, arr: ObjectRef) -> Option<[i16; 1024]> {
+        if ctx.array_length(arr) != 1024 {
+            return None;
+        }
+        let mut out = [0i16; 1024];
+        for (k, slot) in out.iter_mut().enumerate() {
+            match ctx.get_array_element(arr, k) {
+                Value::Int(v) => *slot = v as i16,
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+    fn write_poly(ctx: &dyn NativeContext, arr: ObjectRef, vals: &[i16; 1024]) {
+        for (k, &v) in vals.iter().enumerate() {
+            ctx.set_array_element(arr, k, Value::Int(v as i32));
+        }
+    }
+    fn bad() -> MethodCallFailed {
+        RuntimeError::ArrayIndexOutOfBoundsException { index: 1024 }.into()
+    }
+
+    let poly = "org/bouncycastle/pqc/crypto/newhope/Poly";
+
+    r.register(poly, "toNTT", "([S)V", |ctx, args| {
+        let arr = obj_arg(args, 0)?;
+        let mut r = read_poly(ctx, arr).ok_or_else(bad)?;
+        crate::bc_newhope::to_ntt(&mut r);
+        write_poly(ctx, arr, &r);
+        Ok(None)
+    });
+
+    r.register(poly, "fromNTT", "([S)V", |ctx, args| {
+        let arr = obj_arg(args, 0)?;
+        let mut r = read_poly(ctx, arr).ok_or_else(bad)?;
+        crate::bc_newhope::from_ntt(&mut r);
+        write_poly(ctx, arr, &r);
+        Ok(None)
+    });
+
+    r.register(poly, "uniform", "([S[B)V", |ctx, args| {
+        let a_arr = obj_arg(args, 0)?;
+        if ctx.array_length(a_arr) != 1024 {
+            return Err(bad());
+        }
+        let seed_arr = obj_arg(args, 1)?;
+        let slen = ctx.array_length(seed_arr);
+        let mut seed = vec![0u8; slen];
+        ctx.read_byte_array_into(seed_arr, 0, &mut seed);
+        let mut a = [0i16; 1024];
+        crate::bc_newhope::uniform(&mut a, &seed);
+        write_poly(ctx, a_arr, &a);
+        Ok(None)
+    });
+
+    r.set_category(__prev_cat);
+}
+
+/// Native fast-path for `org.bouncycastle.crypto.modes.SICBlockCipher.processBytes`
+/// (CTR mode). Once the AES engine is native, this per-byte XOR loop is the sole
+/// remaining hot frame in `AESTest.testCounter` (profiled: ~112s vs ~0.4s for the
+/// String half). Faithful reimplementation of the bytecode loop:
+///   if byteCount==0 { checkLastIncrement(); cipher.processBlock(counter,counterOut);
+///                     next = in ^ counterOut[byteCount++]; }
+///   else { next = in ^ counterOut[byteCount++];
+///          if byteCount==counter.length { byteCount=0; incrementCounter(); } }
+/// For AES (the common case) the keystream block is produced natively from the
+/// engine's `WorkingKey` (no per-block invoke, GC-safe — all loop state is in Rust
+/// locals). For any other underlying cipher it falls back to invoking
+/// `cipher.processBlock` per block (handles held across the invoke, matching the
+/// apps_h2.rs convention; the default young GC is non-moving). `checkLastIncrement`
+/// is a no-op when the IV fills the block (AESTest's case).
+pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+
+    r.register(
+        "org/bouncycastle/crypto/modes/SICBlockCipher",
+        "processBytes",
+        "([BII[BI)I",
+        |ctx, args| {
+            let arg_i32 = |i: usize| -> i32 {
+                match args.get(i) {
+                    Some(Value::Int(v)) => *v,
+                    _ => 0,
+                }
+            };
+            let ise = |m: &str| -> MethodCallFailed {
+                RuntimeError::IllegalStateException { message: m.into() }.into()
+            };
+            let this = obj_arg(args, 0)?;
+            let in_arr = obj_arg(args, 1)?;
+            let in_off = arg_i32(2);
+            let len_i = arg_i32(3);
+            let out_arr = obj_arg(args, 4)?;
+            let out_off = arg_i32(5);
+
+            let obj_field = |name: &str| match ctx.get_field_by_name(this, name) {
+                Value::Object(Some(o)) => Some(o),
+                _ => None,
+            };
+            let cipher = obj_field("cipher").ok_or_else(|| ise("SIC: null cipher"))?;
+            let counter_arr = obj_field("counter").ok_or_else(|| ise("SIC: null counter"))?;
+            let counter_out_arr = obj_field("counterOut").ok_or_else(|| ise("SIC: null counterOut"))?;
+            let iv_arr = obj_field("IV").ok_or_else(|| ise("SIC: null IV"))?;
+            let mut byte_count = match ctx.get_field_by_name(this, "byteCount") {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+
+            let bs = ctx.array_length(counter_arr);
+            if bs == 0 {
+                return Err(ise("SIC: zero block size"));
+            }
+            // CTR misuse guard (BC throws DataLength/OutputLengthException; both
+            // are RuntimeExceptions and this is a can't-happen path for valid use).
+            if in_off < 0
+                || len_i < 0
+                || out_off < 0
+                || (in_off as usize) + (len_i as usize) > ctx.array_length(in_arr)
+                || (out_off as usize) + (len_i as usize) > ctx.array_length(out_arr)
+            {
+                return Err(ise("CTR/SIC buffer length out of range"));
+            }
+            let len = len_i as usize;
+
+            let mut counter = vec![0u8; bs];
+            ctx.read_byte_array_into(counter_arr, 0, &mut counter);
+            let mut keystream = vec![0u8; bs];
+            ctx.read_byte_array_into(counter_out_arr, 0, &mut keystream);
+            let iv_len = ctx.array_length(iv_arr);
+            let iv_last = if iv_len >= 1 && iv_len <= bs {
+                match ctx.get_array_element(iv_arr, iv_len - 1) {
+                    Value::Int(v) => v as u8,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+
+            let mut in_buf = vec![0u8; len];
+            ctx.read_byte_array_into(in_arr, in_off as usize, &mut in_buf);
+            let mut out_buf = vec![0u8; len];
+
+            // AES fast path: produce the keystream block natively from WorkingKey.
+            let is_aes = ctx
+                .class_name_of_id(ctx.class_id_of_object(cipher))
+                .as_deref()
+                == Some("org/bouncycastle/crypto/engines/AESEngine");
+            let kw: Vec<[u32; 4]> = if is_aes {
+                match ctx.get_field_by_name(cipher, "WorkingKey") {
+                    Value::Object(Some(wk)) => read_aes_kw(ctx, wk),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let use_aes = kw.len() >= 2;
+
+            for i in 0..len {
+                let next;
+                if byte_count == 0 {
+                    // checkLastIncrement (no-op when IV fills the block)
+                    if iv_len < bs && counter[iv_len - 1] != iv_last {
+                        return Err(ise("Counter in CTR/SIC mode out of range."));
+                    }
+                    if use_aes {
+                        crate::bc_aes::encrypt_block(&kw, &counter, &mut keystream);
+                    } else {
+                        ctx.write_byte_array_from(counter_arr, 0, &counter);
+                        ctx.invoke_virtual(
+                            cipher,
+                            "processBlock",
+                            "([BI[BI)I",
+                            &[
+                                Value::Object(Some(counter_arr)),
+                                Value::Int(0),
+                                Value::Object(Some(counter_out_arr)),
+                                Value::Int(0),
+                            ],
+                        )?;
+                        ctx.read_byte_array_into(counter_out_arr, 0, &mut keystream);
+                    }
+                    next = in_buf[i] ^ keystream[byte_count as usize];
+                    byte_count += 1;
+                } else {
+                    next = in_buf[i] ^ keystream[byte_count as usize];
+                    byte_count += 1;
+                    if byte_count as usize == bs {
+                        byte_count = 0;
+                        // incrementCounter (big-endian, from the last byte)
+                        let mut j = bs;
+                        while j > 0 {
+                            j -= 1;
+                            counter[j] = counter[j].wrapping_add(1);
+                            if counter[j] != 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                out_buf[i] = next;
+            }
+
+            // Persist mutated state + output.
+            ctx.write_byte_array_from(counter_arr, 0, &counter);
+            ctx.write_byte_array_from(counter_out_arr, 0, &keystream);
+            ctx.set_field_by_name(this, "byteCount", Value::Int(byte_count));
+            ctx.write_byte_array_from(out_arr, out_off as usize, &out_buf);
+            Ok(Some(Value::Int(len as i32)))
+        },
+    );
+
+    r.set_category(__prev_cat);
+}
+
+/// Intrinsics for `org.bouncycastle.util.Strings` UTF-8 transcode. With BC
+/// JIT-banned these otherwise run interpreted through `UTF8.transcodeToUTF16`
+/// and the slow `new String(char[])` / `StringUTF16.compress` path, which
+/// dominates `AESTest.testCounter` (255k growing-string round-trips) once the
+/// AES engine is native. Strict UTF-8 (RFC 3629) matches BC's decoder for valid
+/// input and raises the same `IllegalArgumentException("Invalid UTF-8 input")`
+/// for invalid input; encoding a (valid) Java String yields standard UTF-8.
+pub(crate) fn register_bc_strings_utf8(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+    let s = "org/bouncycastle/util/Strings";
+
+    r.register(s, "fromUTF8ByteArray", "([B)Ljava/lang/String;", |ctx, args| {
+        let arr = obj_arg(args, 0)?;
+        let len = ctx.array_length(arr);
+        let mut buf = vec![0u8; len];
+        ctx.read_byte_array_into(arr, 0, &mut buf);
+        match std::str::from_utf8(&buf) {
+            // BC's `new String(chars, 0, len)` is a fresh, DISTINCT, un-interned
+            // object — must NOT go through the pooling `create_string`, which
+            // would (a) leak every dynamically-decoded string into the intern
+            // pool (testCounter decodes 255k unique growing strings → heap
+            // exhaustion) and (b) give wrong `==` identity semantics.
+            Ok(text) => Ok(Some(Value::Object(Some(ctx.create_string_uninterned(text))))),
+            Err(_) => Err(RuntimeError::IllegalArgumentException {
+                message: "Invalid UTF-8 input".into(),
+            }
+            .into()),
+        }
+    });
+
+    r.register(s, "toUTF8ByteArray", "(Ljava/lang/String;)[B", |ctx, args| {
+        let str_obj = obj_arg(args, 0)?;
+        let text = ctx.read_string(str_obj).unwrap_or_default();
+        let bytes = text.as_bytes();
+        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+        ctx.write_byte_array_from(arr, 0, bytes);
+        Ok(Some(Value::Object(Some(arr))))
+    });
+
+    r.set_category(__prev_cat);
+}
+
 pub(crate) fn register_p71_biginteger_extras(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -39319,6 +40194,14 @@ pub(crate) fn register_p72_http_server(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub(crate) fn register_p72_server_socket(r: &mut NativeMethodRegistry) {
+    // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket/ServerSocket
+    // surface so real bytecode drives sun/nio/ch/Net. Third of three registrars
+    // (with phases_early::register_phase53_socket_stubs and
+    // net_phase_e::register_re1_socket/register_re2_server_socket). See
+    // `reference_server_socket_gap`.
+    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+        return;
+    }
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     // ServerSocket extras — add methods not registered in phase 53
@@ -42797,3 +43680,99 @@ mod zip_2x_api_tests {
     }
 }
 
+
+#[cfg(test)]
+mod bc_small_factors_tests {
+    use super::{bc_has_any_small_factors, BC_SMALL_FACTOR_GROUPS};
+
+    fn mag_le(mut v: u128) -> Vec<u32> {
+        let mut w = Vec::new();
+        while v != 0 {
+            w.push((v & 0xFFFF_FFFF) as u32);
+            v >>= 32;
+        }
+        w
+    }
+
+    #[test]
+    fn group_products_fit_signed_int() {
+        // Each group's modulus must equal the Java `int m` (positive, no overflow).
+        for g in BC_SMALL_FACTOR_GROUPS {
+            let m: u64 = g.iter().map(|&p| p as u64).product();
+            assert!(m < (1u64 << 31), "group product {m} must fit a positive i32");
+        }
+    }
+
+    #[test]
+    fn detects_small_factors() {
+        for &n in &[0u128, 4, 9, 15, 21, 211, 211 * 211, 2 * 1_000_003] {
+            assert!(
+                bc_has_any_small_factors(&mag_le(n), false),
+                "n={n} should report a small factor"
+            );
+        }
+    }
+
+    #[test]
+    fn passes_values_with_no_small_factor() {
+        assert!(!bc_has_any_small_factors(&mag_le(223), false)); // smallest prime > 211
+        assert!(!bc_has_any_small_factors(&mag_le(1_000_003), false)); // prime
+        assert!(!bc_has_any_small_factors(&mag_le((1u128 << 61) - 1), false)); // M61, prime
+    }
+
+    #[test]
+    fn empty_mag_is_zero_divisible() {
+        assert!(bc_has_any_small_factors(&[], false)); // x == 0
+    }
+
+    #[test]
+    fn negative_fold_matches_nonneg_mod() {
+        // BigInteger.mod is non-negative; divisibility by p is sign-invariant.
+        assert!(bc_has_any_small_factors(&mag_le(15), true)); // -15 → factors 3,5
+        assert!(bc_has_any_small_factors(&mag_le(211), true)); // -211 → factor 211
+        assert!(!bc_has_any_small_factors(&mag_le(223), true)); // -223 → prime
+    }
+
+    // ---- util.BigIntegers.hasAnySmallFactors (odd primes 3..=743) ----
+    use super::{bc_util_has_any_small_factors, BC_ODD_SMALL_PRIMES};
+
+    fn sieve_odd_primes(limit: u32) -> Vec<u32> {
+        let n = limit as usize;
+        let mut s = vec![true; n + 1];
+        (2..=n).for_each(|i| {
+            if s[i] {
+                let mut j = i * i;
+                while j <= n {
+                    s[j] = false;
+                    j += i;
+                }
+            }
+        });
+        (3..=n).filter(|&i| s[i] && i % 2 == 1).map(|i| i as u32).collect()
+    }
+
+    #[test]
+    fn odd_small_primes_set_is_exactly_3_to_743() {
+        // The array must be the prime factors of SMALL_PRIMES_PRODUCT (odd
+        // primes 3..=743; verified out-of-band that their product == the BC
+        // hex literal). Lock it against an independent sieve.
+        assert_eq!(BC_ODD_SMALL_PRIMES.to_vec(), sieve_odd_primes(743));
+    }
+
+    #[test]
+    fn util_detects_small_factors() {
+        assert!(bc_util_has_any_small_factors(&mag_le(0))); // even (zero)
+        assert!(bc_util_has_any_small_factors(&mag_le(2))); // even
+        assert!(bc_util_has_any_small_factors(&mag_le(100))); // even
+        assert!(bc_util_has_any_small_factors(&mag_le(743))); // factor 743
+        assert!(bc_util_has_any_small_factors(&mag_le(743 * 1009))); // factor 743
+        assert!(bc_util_has_any_small_factors(&mag_le(3 * 999_983))); // factor 3
+    }
+
+    #[test]
+    fn util_passes_values_with_no_small_factor() {
+        assert!(!bc_util_has_any_small_factors(&mag_le(751))); // smallest prime > 743
+        assert!(!bc_util_has_any_small_factors(&mag_le(999_983))); // prime
+        assert!(!bc_util_has_any_small_factors(&mag_le((1u128 << 61) - 1))); // M61
+    }
+}

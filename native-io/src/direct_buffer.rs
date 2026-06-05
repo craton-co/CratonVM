@@ -478,22 +478,41 @@ fn dbb_allocate_direct0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let cid = ctx
         .ensure_class_initialized("java/nio/DirectByteBuffer")
         .unwrap_or_else(|_| cratonvm_types::ClassId::new(0));
-    // 8 fields covers position/limit/capacity/mark/address/_native_size/_cleaner_id/_pad.
-    let buf = ctx.alloc_object(cid, 8);
+    // Allocate with the real total field count when available so real-JDK
+    // DirectByteBuffer bytecode (put/get reaching ByteBuffer.hb/offset,
+    // DirectByteBuffer.att, …) does not read past the object. Falls back to 8
+    // slots for pure-synthetic-jdk mode.
+    let real_n = ctx.class_num_total_fields(cid);
+    let buf = ctx.alloc_object(cid, real_n.max(8));
     ctx.set_field_by_name(buf, "address", Value::Long(addr as i64));
     ctx.set_field_by_name(buf, "capacity", Value::Int(cap as i32));
     ctx.set_field_by_name(buf, "limit", Value::Int(cap as i32));
     ctx.set_field_by_name(buf, "position", Value::Int(0));
     ctx.set_field_by_name(buf, "mark", Value::Int(-1));
-    // Synthetic-mode fallbacks (slots are stable across mock heaps).
-    ctx.set_field(buf, 0, Value::Int(0));            // position
-    ctx.set_field(buf, 1, Value::Int(cap as i32));   // limit
-    ctx.set_field(buf, 2, Value::Int(cap as i32));   // capacity
-    ctx.set_field(buf, 3, Value::Int(-1));           // mark
-    ctx.set_field(buf, 4, Value::Long(addr as i64)); // address
-    ctx.set_field(buf, 5, Value::Long(cap));         // native_size
-    ctx.set_field(buf, 6, Value::Int(cleaner_id));   // cleaner id
-    ctx.set_field(buf, 7, Value::Int(0));            // padding / direct flag
+    // NIO-DIRECTBUFFER FIX (2026-06-04): the fixed-slot writes below assume a
+    // layout (position@0/limit@1/capacity@2/mark@3) that does NOT match the real
+    // `java.nio.Buffer` layout (mark@0/position@1/limit@2/capacity@3/address@4/
+    // segment@5). In real-JDK mode they CLOBBER the correct by-name writes above
+    // — `set_field(buf,3,-1)` overwrote `capacity`→-1 and `set_field(buf,1,cap)`
+    // overwrote `position`→cap — so `allocateDirect(n)` returned a buffer with
+    // capacity=-1/position=n, throwing BufferOverflow on put() and (down the NIO
+    // socket dispatcher) a native-write SIGSEGV. Only apply the synthetic-layout
+    // fallback when the real named fields are NOT present (guard on a capacity
+    // read-back). See `reference_server_socket_gap`.
+    let named_ok = matches!(
+        ctx.get_field_by_name(buf, "capacity"),
+        Value::Int(c) if c == cap as i32
+    );
+    if !named_ok {
+        ctx.set_field(buf, 0, Value::Int(0));            // position
+        ctx.set_field(buf, 1, Value::Int(cap as i32));   // limit
+        ctx.set_field(buf, 2, Value::Int(cap as i32));   // capacity
+        ctx.set_field(buf, 3, Value::Int(-1));           // mark
+        ctx.set_field(buf, 4, Value::Long(addr as i64)); // address
+        ctx.set_field(buf, 5, Value::Long(cap));         // native_size
+        ctx.set_field(buf, 6, Value::Int(cleaner_id));   // cleaner id
+        ctx.set_field(buf, 7, Value::Int(0));            // padding / direct flag
+    }
 
     // Round-5 Fix 6 (HIGH): wire a real PhantomReference / Cleaner so the
     // backing native memory is released when the DirectByteBuffer is

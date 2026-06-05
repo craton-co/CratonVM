@@ -126,6 +126,37 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             // DBG (env-gated): validate every young object's header size against
             // its class — pins a JIT `new` that wrote a wrong-size header.
             crate::memory::gc::validate_object_sizes(shared);
+            // DBG: run the heap-stale verifier after EVERY GC (incl. the
+            // non-moving JIT-active sweep, where update_all_roots early-returns
+            // on the empty pointer_map). It flags any LIVE object whose field
+            // points to a ZEROED/reclaimed object — i.e. a live object the sweep
+            // wrongly reclaimed (missing root). The referrer names the bug.
+            crate::memory::gc::verify_heap_object_fields(shared, &result.pointer_map);
+            // DBG (CRATONVM_DBG_CORRUPT_FRAMES): on the FIRST GC that detects
+            // sweep corruption, dump the mutator's Java stack. With a tiny young
+            // gen (frequent GC) this fires close to the JIT corruptor — the
+            // interpreted frame on top is the BC method that called the
+            // JIT-compiled corruptor.
+            if std::env::var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some()
+                && cratonvm_gc::gen_heap::SWEEP_CORRUPTION_HITS
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    > 0
+            {
+                use std::sync::atomic::{AtomicBool, Ordering as DbgO};
+                static DUMPED: AtomicBool = AtomicBool::new(false);
+                if !DUMPED.swap(true, DbgO::Relaxed) {
+                    eprintln!(
+                        "[corrupt-frames] FIRST sweep corruption — mutator Java stack ({} frames, top first):",
+                        thread.frames.len()
+                    );
+                    for (i, f) in thread.frames.iter().enumerate().rev().take(60) {
+                        eprintln!(
+                            "  [{}] {}.{}{} pc={}",
+                            i, f.class_name(), f.method_name(), f.method_descriptor(), f.pc
+                        );
+                    }
+                }
+            }
             // Truncation-checked: as_millis returns u128 but GC duration fits u64
             let gc_duration_ms = u64::try_from(gc_start.elapsed().as_millis()).unwrap_or(u64::MAX);
             tracing::debug!(
@@ -534,6 +565,21 @@ fn process_references_after_gc(
         // SAFETY: actual_ref and actual_q were produced by process_references (with pointer_map relocation) and point at valid object headers within the heap arena.
         let ref_obj = unsafe { ObjectRef::from_raw(actual_ref as *mut u8) };
         let q_obj = unsafe { ObjectRef::from_raw(actual_q as *mut u8) }; // Cast: GC object pointer conversion
+        // avrora `get_field` OOB fix (residual): `pending_queues` is keyed on
+        // addresses and is re-emitted every GC. A `ReferenceQueue` reachable
+        // only through this pending-enqueue record (no live Java reference) is
+        // reclaimed by the sweep and its slot reused for a bare
+        // `java.lang.Object`; the synthetic head/size writes below would then
+        // trip the `gen_heap` out-of-bounds guard. Checking the POST-relocation
+        // (`actual_q`) layout distinguishes a genuinely-dead queue (reused as a
+        // 0-field `Object`) from a live one (still `>= 2` fields) — a live
+        // queue, even one relocated this cycle, is remapped through
+        // `pointer_map` and keeps its real layout, so legitimate enqueues are
+        // unaffected. A dead queue has no consumer to `poll()` the reference
+        // back out, so dropping the enqueue is correct.
+        if shared.heap.num_fields(q_obj) < 2 {
+            continue;
+        }
         // Push onto queue's linked list head (field 0 = head, field 1 = size)
         let old_head = shared.heap.get_field(q_obj, 0); // RQ_FIELD_HEAD
         shared.heap.set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
@@ -1293,6 +1339,40 @@ fn derive_exec_depth_ceiling(native_stack_bytes: usize) -> u32 {
     levels.max(MIN_EXEC_DEPTH_CEILING)
 }
 
+/// Conservative estimate of how many bytes of native stack a single
+/// re-entrant JIT *dispatch* level can consume. Unlike the interpreter's
+/// `execute` level (≈8 KiB), a JIT→JIT recursion level stacks a much larger
+/// Rust frame: `jit_invoke_dispatch` / `jit_invoke_virtual_mic` hold sizeable
+/// locals (arg-decode `Vec`s, `JitInvokeInfo` views, MIC/PIC handling, the
+/// SATB flush, the transmuted compiled-entry trampoline) AND the compiled Java
+/// frame itself runs on the native stack between dispatch calls. We budget a
+/// deliberately pessimistic 32 KiB/level so the JIT-dispatch ceiling trips with
+/// generous head-room before the OS guard page — the JIT path has no cheap way
+/// to query remaining stack, and overshooting here is an uncatchable process
+/// abort whereas undershooting merely throws SOE slightly early.
+const NATIVE_STACK_BYTES_PER_JIT_DISPATCH_LEVEL: usize = 32 * 1024;
+
+/// Absolute floor for the derived JIT-dispatch ceiling. Distinct from (and
+/// lower than) [`MIN_EXEC_DEPTH_CEILING`] because the JIT per-level budget is
+/// 4× larger: applying the 256-level exec floor here would imply 256·32 KiB =
+/// 8 MiB of recursion, which on an 8 MiB worker carrier stack could exceed the
+/// stack the floor was meant to protect. 64 levels (≤ 2 MiB at the pessimistic
+/// budget) keeps ordinary non-pathological compiled recursion safe even on the
+/// smallest carrier while never floating the ceiling above stack capacity.
+const MIN_JIT_DISPATCH_DEPTH_CEILING: u32 = 64;
+
+/// Compute the re-entrant JIT-dispatch depth ceiling for a thread whose native
+/// stack is `native_stack_bytes` large. Mirrors [`derive_exec_depth_ceiling`]
+/// but uses the larger per-level JIT-dispatch frame estimate and a lower floor
+/// (see [`MIN_JIT_DISPATCH_DEPTH_CEILING`]).
+#[inline]
+fn derive_jit_dispatch_depth_ceiling(native_stack_bytes: usize) -> u32 {
+    let usable = native_stack_bytes / NATIVE_STACK_SAFETY_DIVISOR;
+    let levels = usable / NATIVE_STACK_BYTES_PER_JIT_DISPATCH_LEVEL;
+    let levels = levels.min(u32::MAX as usize) as u32;
+    levels.max(MIN_JIT_DISPATCH_DEPTH_CEILING)
+}
+
 thread_local! {
     /// Per-thread re-entrant `execute` depth ceiling, derived from the
     /// thread's native stack size. Defaults to the main-VM-thread value
@@ -1300,6 +1380,34 @@ thread_local! {
     /// [`init_thread_exec_depth_ceiling`] still gets a safe (high) ceiling.
     static EXEC_DEPTH_CEILING: std::cell::Cell<u32> =
         std::cell::Cell::new(derive_exec_depth_ceiling(DEFAULT_NATIVE_STACK_BYTES));
+
+    /// Per-thread re-entrant JIT-dispatch depth ceiling, derived from the same
+    /// native stack size as [`EXEC_DEPTH_CEILING`] but with the larger
+    /// per-level JIT-dispatch frame budget. Read by the JIT dispatch helpers
+    /// (`jit_invoke_dispatch` / `jit_invoke_virtual_mic` in `jit/helpers.rs`)
+    /// via [`jit_dispatch_depth_ceiling`] so a JIT→JIT recursion (e.g.
+    /// `binaryTrees(18)` deep `make()` recursion) throws a *catchable*
+    /// `StackOverflowError` before the OS native stack overflows.
+    static JIT_DISPATCH_DEPTH_CEILING: std::cell::Cell<u32> =
+        std::cell::Cell::new(derive_jit_dispatch_depth_ceiling(DEFAULT_NATIVE_STACK_BYTES));
+}
+
+/// Per-thread re-entrant JIT-dispatch depth ceiling.
+///
+/// The JIT→JIT call path (`jit_invoke_dispatch` → compiled entry → … and
+/// `jit_invoke_virtual_mic` → compiled entry → …) bypasses
+/// [`execute`] entirely, so the interpreter's `EXEC_DEPTH` guard never fires
+/// for purely-compiled recursion. The JIT dispatch helpers therefore maintain
+/// their OWN depth counter and trip it against this ceiling, throwing a
+/// catchable `java/lang/StackOverflowError` instead of letting deep compiled
+/// recursion blow the OS native stack (an uncatchable rc=127 abort).
+///
+/// Derived per-thread from the same native stack size recorded by
+/// [`init_thread_exec_depth_ceiling`]; defaults to the safe 128 MiB-derived
+/// value for threads that never called it.
+#[inline]
+pub fn jit_dispatch_depth_ceiling() -> u32 {
+    JIT_DISPATCH_DEPTH_CEILING.with(|c| c.get())
 }
 
 /// Record the calling thread's native stack size so the re-entrant `execute`
@@ -1316,6 +1424,13 @@ thread_local! {
 pub fn init_thread_exec_depth_ceiling(native_stack_bytes: usize) {
     let ceiling = derive_exec_depth_ceiling(native_stack_bytes);
     EXEC_DEPTH_CEILING.with(|c| c.set(ceiling));
+    // Derive the companion JIT-dispatch ceiling from the SAME native stack
+    // size so the JIT→JIT recursion guard (see `jit_dispatch_depth_ceiling`)
+    // is calibrated for this thread's real stack too. Worker carriers (8 MiB)
+    // get a correspondingly lower ceiling; the main 128 MiB thread keeps deep
+    // head-room for legitimate recursion like `binaryTrees`.
+    let jit_ceiling = derive_jit_dispatch_depth_ceiling(native_stack_bytes);
+    JIT_DISPATCH_DEPTH_CEILING.with(|c| c.set(jit_ceiling));
 }
 
 // ---------------------------------------------------------------------------
@@ -2929,6 +3044,15 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
 
         // Handle any pending runtime error from the previous iteration's fast path.
         if let Some((re, invoke_pc)) = pending_runtime_error.take() {
+            if std::env::var_os("CRATONVM_DBG_AIOOBE2").is_some() {
+                if let RuntimeError::ArrayIndexOutOfBoundsException { index } = &re {
+                    let f = &thread.frames[frame_idx];
+                    eprintln!(
+                        "[AIOOBE2] index={} class={} method={}{} pc={}",
+                        index, f.class_name(), f.method_name(), f.method_descriptor(), invoke_pc
+                    );
+                }
+            }
             let exc_result =
                 super::exceptions::throw_runtime_error(shared, thread, re);
             match exc_result {
@@ -4867,6 +4991,35 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
 
         let exec_result = execute_instruction(shared, thread, frame_idx, &instruction, saved_pc);
 
+        // DIAG (gated `CRATONVM_DBG_UNDERFLOW=1`): pinpoint an operand-stack
+        // underflow — log the offending method/bci/opcode + the Java frame chain
+        // the first time one surfaces, so a mis-modelled bytecode path can be
+        // minimized without a full TestAll run. (The H2 TestAll underflow is no
+        // longer reproducible after the toArray(T[]) template-type fix; this is
+        // a low-cost tripwire — it only runs on the rare IllegalState error path.)
+        if let Err(MethodCallFailed::InternalError(VmError::Runtime(
+            RuntimeError::IllegalStateException { message },
+        ))) = &exec_result
+        {
+            if message == "operand stack underflow"
+                && std::env::var("CRATONVM_DBG_UNDERFLOW").is_ok()
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static FIRED: AtomicBool = AtomicBool::new(false);
+                if !FIRED.swap(true, Ordering::Relaxed) {
+                    let f = &thread.frames[frame_idx];
+                    eprintln!(
+                        "[DBG_UNDERFLOW] at {}.{}{} bci={} opcode={:?} stack_len={}",
+                        f.class_name(), f.method_name(), f.method_descriptor(),
+                        saved_pc, instruction, f.stack.len(),
+                    );
+                    for (i, fr) in thread.frames.iter().enumerate().rev() {
+                        eprintln!("    [{}] {}.{}{} pc={}", i, fr.class_name(), fr.method_name(), fr.method_descriptor(), fr.pc);
+                    }
+                }
+            }
+        }
+
         // Convert RuntimeErrors from native methods into catchable Java exceptions.
         let exec_result = match exec_result {
             Err(MethodCallFailed::InternalError(VmError::Runtime(runtime_err)))
@@ -5775,100 +5928,105 @@ fn execute_instruction(
             thread.frames[frame_idx].stack.pop_compact_checked()?;
         }
         Instruction::Pop2 => {
-            let val = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            if !val.is_category2() {
-                thread.frames[frame_idx].stack.pop_compact_checked()?;
+            // Kind-aware: a collision-shaped long is one logical cat-2 value.
+            let (val, kind) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            if !crate::runtime::ValueStack::is_cat2_kind(kind, val) {
+                thread.frames[frame_idx].stack.pop_with_kind()?;
             }
         }
         Instruction::Dup => {
-            let val = thread.frames[frame_idx].stack.peek_compact_checked()?;
-            thread.frames[frame_idx].stack.push_compact_checked(val)?;
+            // Preserve the kind so a duplicated collision-long stays KIND_LONG
+            // (otherwise the copy lands KIND_UNKNOWN and the GC mis-roots it).
+            let (val, kind) = thread.frames[frame_idx].stack.peek_with_kind()?;
+            thread.frames[frame_idx].stack.push_with_kind(val, kind)?;
         }
         Instruction::DupX1 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-            thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-            thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+            let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+            thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+            thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
         }
         Instruction::DupX2 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            if val2.is_category2() {
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+            let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            if crate::runtime::ValueStack::is_cat2_kind(k2, val2) {
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             } else {
-                let val3 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val3)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                let (val3, k3) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val3, k3)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             }
         }
         Instruction::Dup2 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            if val1.is_category2() {
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+            let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            if crate::runtime::ValueStack::is_cat2_kind(k1, val1) {
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             } else {
-                let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             }
         }
         Instruction::Dup2X1 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            if val1.is_category2() {
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+            let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            if crate::runtime::ValueStack::is_cat2_kind(k1, val1) {
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             } else {
-                let val3 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val3)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                let (val3, k3) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val3, k3)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             }
         }
         Instruction::Dup2X2 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            if val1.is_category2() && val2.is_category2() {
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-            } else if val1.is_category2() {
-                let val3 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val3)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-            } else if val2.is_category2() {
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+            let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            let v1c2 = crate::runtime::ValueStack::is_cat2_kind(k1, val1);
+            let v2c2 = crate::runtime::ValueStack::is_cat2_kind(k2, val2);
+            if v1c2 && v2c2 {
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+            } else if v1c2 {
+                let (val3, k3) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val3, k3)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+            } else if v2c2 {
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             } else {
-                let val3 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                let val4 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val4)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val3)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                let (val3, k3) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                let (val4, k4) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val4, k4)?;
+                thread.frames[frame_idx].stack.push_with_kind(val3, k3)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             }
         }
         Instruction::Swap => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-            thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+            let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+            thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
         }
 
         // -- Integer arithmetic --
@@ -6782,6 +6940,22 @@ fn execute_instruction(
                         v = value,
                     );
                 }
+            }
+            if std::env::var_os("CRATON_BAOS_DBG").is_some()
+                && matches!(field_name.as_deref(), Some("buf") | Some("count"))
+            {
+                let cm = shared.class_manager.read();
+                let recv_cid = shared.heap.class_id_of(obj_ref);
+                let rn = cm.get_class(recv_cid).map(|c| c.name.to_string()).unwrap_or_default();
+                let rnf = cm.get_class(recv_cid).map(|c| c.num_total_fields).unwrap_or(0);
+                let rffi = cm.get_class(recv_cid).map(|c| c.first_field_index).unwrap_or(0);
+                let dn = cm.get_class(field.declaring_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+                let dnf = cm.get_class(field.declaring_class_id).map(|c| c.num_total_fields).unwrap_or(0);
+                let dffi = cm.get_class(field.declaring_class_id).map(|c| c.first_field_index).unwrap_or(0);
+                eprintln!(
+                    "[BAOS-DBG] putfield {fld:?} recv={rn}(nf={rnf},ffi={rffi}) decl={dn}(nf={dnf},ffi={dffi}) field_index={fi} value={v:?}",
+                    fld = field_name, fi = field.field_index, v = value,
+                );
             }
             // T17.Δ.4 — JVMTI FieldModification watchpoint.
             {
@@ -8237,6 +8411,9 @@ fn execute_ldc(
             thread.frames[frame_idx].stack.push(Value::Object(Some(obj_ref)))?;
         }
         LdcValue::ClassRef(class_name) => {
+            if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+                eprintln!("[DBG_TOARRAY] LDC class={:?} in {}", class_name, thread.frames[frame_idx].class_name());
+            }
             let class_id = shared
                 .load_class_concurrent(&class_name)
                 .map_err(|e| convert_class_not_found(shared, thread, &class_name, e.into()))?;
@@ -10240,6 +10417,23 @@ pub(crate) fn try_lambda_dispatch(
         );
     }
 
+    // A functional interface may declare same-named OVERLOADS of the SAM —
+    // typically `default` methods whose body delegates to the real SAM. JUnit5's
+    // `TestInstancesProvider` has a 2-arg
+    // `getTestInstances(MutableExtensionRegistry, ThrowableCollector)` default
+    // that calls the 3-arg abstract SAM
+    // `getTestInstances(ExtensionRegistry, ExtensionRegistrar, ThrowableCollector)`.
+    // Matching the SAM by name alone would intercept the 2-arg default and route
+    // it to the lambda body one argument short (trailing param left
+    // uninitialised). Only intercept when the supplied arg count matches the
+    // SAM's; otherwise fall through so the real default method runs and then
+    // re-invokes the SAM with the right arity.
+    if method_name == &*call_site.sam_method_name
+        && split_method_descriptor(&call_site.sam_descriptor).0.len() != call_args.len()
+    {
+        return Ok(None);
+    }
+
     // Only intercept calls to the SAM (single abstract method). Default
     // methods on the functional interface (e.g. Function.andThen,
     // Predicate.and) are dispatched directly via the native registry on
@@ -12107,9 +12301,47 @@ fn execute_invokestatic_cached(
                 }
                 ((cached.declaring_class_id.as_u32() as u64) << 32) | (h as u64) // Widening: class ID to u64 for hash key
             };
-            const JIT_INVOCATION_THRESHOLD: u32 = 2000;
+            // BUG-2: hot-method promotion for short-but-very-hot methods.
+            //
+            // The old gate `invoc_count >= T && invoc_count % T == 0` fired
+            // ONLY at exact multiples of the threshold. Two failure modes hit
+            // the all-interpreted call trees in BC's PQC RegressionTest
+            // (`Permute.permute`, `ChaChaEngine.chachaCore`,
+            // `HashFunctions.hash_n_n`, `Salsa20Engine.processBytes`):
+            //   (a) a *single* transient upgrade-gate failure at count T pushed
+            //       the next attempt out another whole T calls (2000 → 4000),
+            //       multiplying interpreter time; and
+            //   (b) these methods never OSR-compile because their per-call
+            //       back-edge count is tiny (OSR's `backward_count` resets every
+            //       invocation), so the invocation counter is their ONLY path
+            //       to the JIT — and the exact-multiple gate made it fragile.
+            //
+            // Fix: (1) lower the warmup threshold so astronomically-hot short
+            // methods promote sooner, and (2) once past the threshold, RETRY on
+            // a short stride instead of only at the next full multiple — so a
+            // transient compile failure recovers within `JIT_RETRY_STRIDE`
+            // calls, not another full threshold. The persistent
+            // `increment_invocation` count means the bar is crossed even from
+            // the interpreted-call-tree case, and a successful upgrade rewrites
+            // the invoke cache to `Jit`, so this counting block stops being
+            // reached and there is no ongoing re-spam. Normal warmup is
+            // preserved: cold methods still wait for `JIT_INVOCATION_THRESHOLD`
+            // calls before any compile attempt.
+            const JIT_INVOCATION_THRESHOLD: u32 = 500;
+            /// Re-attempt stride once a method is past the warmup threshold but
+            /// not yet successfully compiled. Small so a transient upgrade-gate
+            /// failure is retried within a few hundred calls rather than after
+            /// another full `JIT_INVOCATION_THRESHOLD`.
+            const JIT_RETRY_STRIDE: u32 = 64;
             let invoc_count = shared.profile_store.increment_invocation(invoc_key);
-            if invoc_count >= JIT_INVOCATION_THRESHOLD && invoc_count % JIT_INVOCATION_THRESHOLD == 0 {
+            // Fire on the first crossing of the threshold, then re-attempt every
+            // `JIT_RETRY_STRIDE` calls until the upgrade succeeds (after which
+            // the invoke cache routes through JIT and this block is bypassed).
+            let past_threshold = invoc_count >= JIT_INVOCATION_THRESHOLD;
+            let should_attempt = past_threshold
+                && (invoc_count == JIT_INVOCATION_THRESHOLD
+                    || (invoc_count - JIT_INVOCATION_THRESHOLD) % JIT_RETRY_STRIDE == 0);
+            if should_attempt {
             // Consult tiered compilation manager for recommended tier
             let tiered_key = crate::jit::tiered::MethodKey::new(
                 cached.class_name.as_ref(),
@@ -12749,6 +12981,7 @@ fn try_osr(
     // NEW-1.5 + T1.1.a: record native stack pointer for GC root scan.
     // Uses the precise-oop-map path when the compiled method has
     // populated maps; falls back to conservative otherwise.
+    let _qd0 = cratonvm_gc::gc_quiescence::depth();
     let _jit_root_guard =
         crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
 
@@ -12757,6 +12990,18 @@ fn try_osr(
         // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; jit_locals match the method's local variable layout at the OSR entry point.
         unsafe { compiled.osr_enter(vm_ptr, &jit_locals, entry_pc) }
     }));
+    // DBG: detect a quiescence LEAK across the OSR call (a nested JIT entry
+    // that did not pop). After osr_enter returns, depth should be back to
+    // _qd0 + 1 (this site's own still-held guard). Anything higher leaked.
+    {
+        let now = cratonvm_gc::gc_quiescence::depth();
+        if now > _qd0 + 1 && std::env::var_os("CRATONVM_DBG_CORRUPT_FRAMES").is_some() {
+            eprintln!(
+                "[quiesce-leak] OSR site leaked: depth before={} after={} (expected {})",
+                _qd0, now, _qd0 + 1
+            );
+        }
+    }
 
     crate::jit::helpers::restore_jit_thread(saved_jit_thread);
     // Round-9 vm CRIT fix (audit `round9-vm.md` CRIT-2): the previous OSR
@@ -14121,8 +14366,14 @@ fn execute_jit_call(
     //     i64 bit-exact. See docs/bc-ec-mod-mododdinverse-investigation.md.
     let (param_descs, _) = split_method_descriptor(&cached.method_descriptor);
     let is_static = cached.is_static;
+    // Save the raw popped slots (bit-exact + long mark) so the i64::MIN deopt
+    // arm below can restore them before the slow path re-pops the args. See
+    // that arm for the underflow this prevents.
+    let mut saved_args: [(CompactValue, bool); JIT_ABI_REG_SLOTS] =
+        [(CompactValue::zero(), false); JIT_ABI_REG_SLOTS];
     for i in (0..np).rev() {
         let (cv, is_long) = thread.frames[frame_idx].stack.pop_compact_with_long_mark_unchecked();
+        saved_args[i] = (cv, is_long);
         let desc_byte = if is_static {
             param_descs
                 .get(i)
@@ -14309,6 +14560,27 @@ fn execute_jit_call(
         // NPE. The previous in-arm drain is intentionally removed —
         // moving it above means the i64::MIN arm runs with NPE already
         // taken, so we just fall through to deopt re-execution.
+        //
+        // CRIT (BC SPHINCS-256 / SHA-512 underflow): the args were popped
+        // off the caller's operand stack at the top of this function, but
+        // CacheMiss makes the invoke handler re-run the call via the slow
+        // path (execute_invokestatic{,virtual,...}), which pops the args
+        // AGAIN. Restore them here so the operand stack is exactly as the
+        // slow path expects. This matters even for a *correct* method: the
+        // in-band i64::MIN deopt sentinel collides with a legitimate
+        // i64::MIN `long`/`double` return (e.g. `Pack.bigEndianToLong` on a
+        // SHA-512 word == 0x8000_0000_0000_0000), so a non-deopting method
+        // can land here. Without the restore the next bytecode (`lastore`,
+        // etc.) pops a now-missing slot and panics with a value_stack
+        // underflow (len 0 → usize::MAX index).
+        for i in 0..np {
+            let (cv, is_long) = saved_args[i];
+            if is_long {
+                thread.frames[frame_idx].stack.push_compact_long(cv);
+            } else {
+                thread.frames[frame_idx].stack.push_compact(cv);
+            }
+        }
         return Ok(CachedCallResult::CacheMiss);
     }
 

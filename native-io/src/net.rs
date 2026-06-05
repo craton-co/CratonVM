@@ -227,6 +227,16 @@ fn ioex(msg: impl Into<String>) -> MethodCallFailed {
     RuntimeError::IOException { message: msg.into() }.into()
 }
 
+/// Temporary diagnostic gate: `CRATONVM_DBG_NET=1` prints each Net native as
+/// it fires, to localize where the blocking ServerSocket/Socket path breaks.
+macro_rules! dbgnet {
+    ($($arg:tt)*) => {
+        if std::env::var_os("CRATONVM_DBG_NET").is_some() {
+            eprintln!("[NET] {}", format!($($arg)*));
+        }
+    };
+}
+
 /// Upper bound on a single read0/write0 transfer. The JDK's NIO socket
 /// paths chunk I/O well below this; any `len` larger than this from Java
 /// is treated as corrupt input rather than honored. 1 GiB is comfortably
@@ -301,6 +311,52 @@ fn read_inet_address_text(ctx: &mut dyn NativeContext, ia: Option<ObjectRef>) ->
     let Some(o) = ia else {
         return "0.0.0.0".to_string();
     };
+    // NIO-SERVER-SOCKET (IPv6): real-JDK `Inet6Address` keeps its 16-byte
+    // address in a SEPARATE holder `this.holder6`
+    // (`Inet6Address$Inet6AddressHolder`) with a `byte[16] ipaddress` field
+    // (+ `int scope_id`). The IPv4 `holder.address` int is ~0 for a v6 address,
+    // so without reading holder6 first a v6 InetAddress falls through to the
+    // text fallback below and bind0/connect0 target the wildcard. Read holder6
+    // before the IPv4 holder so genuine v6 addresses resolve correctly.
+    if let Value::Object(Some(holder6)) = ctx.get_field_by_name(o, "holder6") {
+        if let Value::Object(Some(arr)) = ctx.get_field_by_name(holder6, "ipaddress") {
+            if ctx.array_length(arr) >= 16 {
+                let mut bytes = [0u8; 16];
+                if ctx.read_byte_array_into(arr, 0, &mut bytes) == 16 {
+                    let v6 = std::net::Ipv6Addr::from(bytes);
+                    // Link-local addresses need a %scope suffix to bind/connect
+                    // on Windows; scope_id == 0 means "no scope" (loopback,
+                    // global) and is omitted.
+                    let scoped = match ctx.get_field_by_name(holder6, "scope_id") {
+                        Value::Int(s) if s != 0 => format!("{v6}%{s}"),
+                        _ => v6.to_string(),
+                    };
+                    dbgnet!("read_inet_address_text v6 -> {scoped}");
+                    return scoped;
+                }
+            }
+        }
+    }
+    // NIO-SERVER-SOCKET: real-JDK `Inet4Address` stores the IPv4 address as an
+    // int in `this.holder.address` (host byte order — 127.0.0.1 == 0x7F000001),
+    // NOT as a text field. When `java.net.Socket` runs real bytecode (route 1)
+    // the `InetAddress` reaching `bind0`/`connect0` is the real object, so read
+    // the holder first; without this, connect0 saw 0.0.0.0 and never reached
+    // the listener. Synthetic InetAddress objects have no `holder` field, so
+    // this is skipped and the text-field path below runs.
+    if let Value::Object(Some(holder)) = ctx.get_field_by_name(o, "holder") {
+        if let Value::Int(a) = ctx.get_field_by_name(holder, "address") {
+            if a != 0 {
+                return format!(
+                    "{}.{}.{}.{}",
+                    (a >> 24) & 0xff,
+                    (a >> 16) & 0xff,
+                    (a >> 8) & 0xff,
+                    a & 0xff
+                );
+            }
+        }
+    }
     // Preferred: field 1 is the canonical numeric IP text.
     if let Value::Object(Some(s)) = ctx.get_field(o, 1) {
         if let Some(text) = ctx.read_string(s) {
@@ -322,6 +378,19 @@ fn read_inet_address_text(ctx: &mut dyn NativeContext, ia: Option<ObjectRef>) ->
     "0.0.0.0".to_string()
 }
 
+/// Join an address text and port into a Rust `ToSocketAddrs` string. IPv6
+/// literals MUST be bracketed (`[::1]:port`) — std's `SocketAddr` parser
+/// rejects `::1:port` (it reads the whole thing as a v6 address with no port).
+/// A bare IPv4/hostname is joined with a plain colon. An already-bracketed
+/// host is passed through unchanged.
+fn join_host_port(addr_text: &str, port: i32) -> String {
+    if addr_text.contains(':') && !addr_text.starts_with('[') {
+        format!("[{addr_text}]:{port}")
+    } else {
+        format!("{addr_text}:{port}")
+    }
+}
+
 // ---------- socket lifecycle ----------
 
 /// `socket0(boolean preferIPv6, boolean stream, boolean reuseAddr,
@@ -332,6 +401,7 @@ fn read_inet_address_text(ctx: &mut dyn NativeContext, ia: Option<ObjectRef>) ->
 /// how the JDK uses `socket()` syscalls (create → bind/listen or connect).
 fn net_socket0(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let fd = register_handle(NetSocketHandle::Unbound);
+    dbgnet!("socket0 -> fd={fd:#x}");
     Ok(Some(Value::Int(fd)))
 }
 
@@ -352,10 +422,11 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let port = int_arg(args, 4);
 
     let addr_text = read_inet_address_text(ctx, inet_addr);
-    let bind_addr = format!("{addr_text}:{port}");
+    let bind_addr = join_host_port(&addr_text, port);
 
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("bind0: FileDescriptor has no fd id"))?;
+    dbgnet!("bind0 fd={fd:#x} addr={bind_addr}");
 
     // The JDK semantics allow bind0 on a Net fd even without a prior socket0
     // (the JDK's SocketChannelImpl creates sockets via its own path). If the
@@ -377,9 +448,11 @@ fn net_bind0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // path (lines 446-469), which similarly does not write back the local
     // port.
 
+    let bound_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     net_sockets()
         .write()
         .insert(fd, NetSocketHandle::Listener(Arc::new(Mutex::new(listener))));
+    dbgnet!("bind0 OK fd={fd:#x} bound_port={bound_port}");
     Ok(None)
 }
 
@@ -407,6 +480,7 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("accept: FileDescriptor has no fd id"))?;
+    dbgnet!("accept fd={fd:#x} (blocking)");
 
     // AUDIT 2026-05-17: take the map read-lock briefly to clone the
     // per-listener `Arc<Mutex<_>>`, drop the map lock, then perform the
@@ -427,31 +501,46 @@ fn net_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         listener.accept().map_err(|e| net_err("accept", e))?
     };
 
-    // C26 fix: do NOT clobber the new FileDescriptor's `handle` slot with
-    // the peer port — `handle` is the fd-id sentinel that
-    // `net_fd_from_descriptor` falls back to (lines 262-266). The new fd
-    // id is returned to the caller via the Int return value below and
-    // the caller is expected to write it into the FileDescriptor.fd
-    // slot. The peer port is reachable via `peer_addr()` on the
-    // underlying TcpStream (see `net_remote_port` at lines 762-779) and
-    // is also delivered to the caller through `isaa[0]` below.
+    let new_fd = register_handle(NetSocketHandle::Stream(Arc::new(Mutex::new(stream))));
+    dbgnet!("accept fd={fd:#x} -> newfd={new_fd:#x} peer={peer}");
 
-    // Populate isaa[0] if the caller supplied an array. Synthetic
-    // InetSocketAddress = 2 fields (host, port).
+    // NIO-SERVER-SOCKET: mirror the JDK `Net.accept` native contract for the
+    // real `NioSocketImpl.accept` path (route 1):
+    //   1. Write the accepted socket's fd into the caller-supplied `newfd`
+    //      FileDescriptor — `NioSocketImpl.accept` then does
+    //      `Net.localAddress(newfd)` and `nsi.fd = newfd`. Without this the
+    //      accepted Socket has an unbound fd and read/write fail.
+    //   2. Fill `isaa[0]` with a *real* `InetSocketAddress(peerAddr, peerPort)`
+    //      so `isaa[0].getAddress()` / `getPort()` return the right types
+    //      (the old synthetic 2-field object made `getAddress()` return a
+    //      String → `NoSuchMethodError: String.getAddress()`).
+    //   3. Return 1 (IOStatus: one connection accepted), not the fd id.
+    if let Some(Value::Object(Some(newfd_obj))) = args.get(1).copied() {
+        ctx.set_field_by_name(newfd_obj, "fd", Value::Int(new_fd));
+    }
+
     if let Some(Value::Object(Some(arr))) = isaa {
         if ctx.array_length(arr) >= 1 {
-            let isa = ctx.new_object("java/net/InetSocketAddress")?;
+            let peer_ip = peer.ip().to_string();
+            let peer_port = peer.port() as i32;
+            // Pin the array across the re-entrant InetSocketAddress
+            // construction (which runs Java bytecode that may move the heap).
+            let arr_pin = ctx.pin_native_root(arr);
+            let host = ctx.create_string(&peer_ip);
+            let isa = ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[Value::Object(Some(host)), Value::Int(peer_port)],
+            )?;
+            let arr = ctx.read_native_pin(arr_pin, arr);
             if let Some(Value::Object(Some(isa_obj))) = isa {
-                let host = ctx.create_string(&peer.ip().to_string());
-                ctx.set_field(isa_obj, 0, Value::Object(Some(host)));
-                ctx.set_field(isa_obj, 1, Value::Int(peer.port() as i32));
                 ctx.set_array_element(arr, 0, Value::Object(Some(isa_obj)));
             }
+            ctx.unpin_native_roots(arr_pin);
         }
     }
 
-    let new_fd = register_handle(NetSocketHandle::Stream(Arc::new(Mutex::new(stream))));
-    Ok(Some(Value::Int(new_fd)))
+    Ok(Some(Value::Int(1)))
 }
 
 /// `connect0(boolean preferIPv6, FileDescriptor fd, InetAddress remote,
@@ -469,10 +558,11 @@ fn net_connect0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult
     let port = int_arg(args, 3);
 
     let addr_text = read_inet_address_text(ctx, remote);
-    let conn_addr = format!("{addr_text}:{port}");
+    let conn_addr = join_host_port(&addr_text, port);
 
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("connect0: FileDescriptor has no fd id"))?;
+    dbgnet!("connect0 fd={fd:#x} addr={conn_addr}");
 
     // Task #16: SSRF hardening. Apply the outbound-host policy + configured
     // connect timeout (default 30 s) before dialing. Without this, guest
@@ -562,6 +652,7 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let len_usize = validate_native_range("read0", addr, len)?;
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("read0: FileDescriptor has no fd id"))?;
+    dbgnet!("read0 fd={fd:#x} len={len} addr={addr:#x}");
 
     let mut buf = vec![0u8; len_usize];
     // AUDIT 2026-05-17: clone the per-stream Arc out of the map under a
@@ -585,13 +676,13 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
-    // SAFETY: `addr` is a native pointer allocated by the JDK's Unsafe /
-    // DirectByteBuffer. `validate_native_range` rejected a null/negative
-    // address and an out-of-range `len`; we copy at most `n <= len`. The
-    // caller is still trusted that `len` bytes at `addr` are writable
-    // (see `validate_native_range` for the residual trust assumption).
-    unsafe {
-        std::ptr::copy_nonoverlapping(buf.as_ptr(), addr as *mut u8, n);
+    // Store the bytes into the caller's native buffer. `addr` may be a real
+    // OS pointer OR an `Unsafe.allocateMemory` arena handle (DirectByteBuffer
+    // from `Util.getTemporaryDirectBuffer`) — route through the context so an
+    // arena handle lands in the off-heap store instead of being dereferenced
+    // raw (which SIGSEGVs on the synthetic 2^36-based handle).
+    if !ctx.copy_to_native_memory(addr, &buf[..n]) {
+        return Err(ioex(format!("read0: invalid destination address {addr:#x}")));
     }
     Ok(Some(Value::Int(n as i32)))
 }
@@ -607,13 +698,16 @@ fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let len_usize = validate_native_range("write0", addr, len)?;
     let fd = net_fd_from_descriptor(ctx, fd_obj)
         .ok_or_else(|| ioex("write0: FileDescriptor has no fd id"))?;
+    dbgnet!("write0 fd={fd:#x} len={len} addr={addr:#x}");
 
     let mut buf = vec![0u8; len_usize];
-    // SAFETY: `addr` is a native buffer allocated by the JDK; `validate_native_range`
-    // has rejected a null/negative address and an out-of-range `len`. We still
-    // trust the caller that `len` bytes at `addr` are live (see that fn's doc).
-    unsafe {
-        std::ptr::copy_nonoverlapping(addr as *const u8, buf.as_mut_ptr(), len_usize);
+    // Load the bytes from the caller's native buffer. `addr` may be a real OS
+    // pointer OR an `Unsafe.allocateMemory` arena handle (DirectByteBuffer from
+    // `Util.getTemporaryDirectBuffer`) — route through the context so an arena
+    // handle is read from the off-heap store instead of dereferenced raw (a
+    // raw memcpy from the synthetic 2^36-based handle SIGSEGVs).
+    if !ctx.copy_from_native_memory(addr, &mut buf) {
+        return Err(ioex(format!("write0: invalid source address {addr:#x}")));
     }
     // AUDIT 2026-05-17: clone the per-stream Arc out of the map under a
     // brief read-lock, drop the map lock, then perform the blocking write
@@ -759,6 +853,7 @@ fn net_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Handle::S(s) => s.lock().local_addr().map(|a| a.port() as i32).unwrap_or(0),
         Handle::None => 0,
     };
+    dbgnet!("localPort fd={fd:#x} -> {port}");
     Ok(Some(Value::Int(port)))
 }
 
@@ -929,10 +1024,30 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // in case JDK dispatch reaches them directly).
     r.register(net, "read0", "(Ljava/io/FileDescriptor;JI)I", net_read0);
     r.register(net, "write0", "(Ljava/io/FileDescriptor;JI)I", net_write0);
-    for cls in ["sun/nio/ch/SocketChannelImpl", "sun/nio/ch/ServerSocketChannelImpl"] {
+    // NIO-SERVER-SOCKET: the blocking `NioSocketImpl` read/write path goes
+    // through `sun/nio/ch/SocketDispatcher.read0/write0` (nd.read/nd.write),
+    // NOT `Net.read0`. Wire those to the same handlers so a real
+    // java.net.Socket round-trips bytes through our `TcpStream`. `close0`
+    // takes a raw int fd (the dispatcher's NativeDispatcher.close path).
+    for cls in [
+        "sun/nio/ch/SocketChannelImpl",
+        "sun/nio/ch/ServerSocketChannelImpl",
+        "sun/nio/ch/SocketDispatcher",
+    ] {
         r.register(cls, "read0", "(Ljava/io/FileDescriptor;JI)I", net_read0);
         r.register(cls, "write0", "(Ljava/io/FileDescriptor;JI)I", net_write0);
     }
+    r.register(
+        "sun/nio/ch/SocketDispatcher",
+        "close0",
+        "(I)V",
+        |_ctx, args| {
+            if let Some(Value::Int(fd)) = args.first().copied() {
+                net_sockets().write().insert(fd, NetSocketHandle::Closed);
+            }
+            Ok(None)
+        },
+    );
 
     // Options
     r.register(
@@ -982,6 +1097,72 @@ pub fn register_sun_nio_ch_net(r: &mut NativeMethodRegistry) {
     // initIDs() — the JDK calls this once in <clinit> to populate cached field
     // offsets; for us it's a no-op since we use name-based field lookup.
     r.register(net, "initIDs", "()V", |_c, _a| Ok(None));
+
+    // NIO-SERVER-SOCKET (2026-06-03): `IOUtil.configureBlocking(fd, blocking)`.
+    // The real JDK `NioSocketImpl` flips the OS fd to non-blocking when an
+    // operation has a timeout (or runs on a virtual thread), then parks on the
+    // `Poller`. Our `Net` natives back each fd with a `std::net` socket that is
+    // always OS-blocking and whose `accept`/`read0`/`write0` block until they
+    // complete, so `Net.accept`/`read0` never return `IOStatus.UNAVAILABLE` and
+    // the park/Poller path is never taken. A no-op here keeps the fd blocking,
+    // which is exactly what we want — implementing it for real (set the
+    // synthetic fd non-blocking) would force us to also implement the Windows
+    // `Poller`, which we deliberately avoid. Registered on `IOUtil` (where the
+    // JDK declares it).
+    r.register(
+        "sun/nio/ch/IOUtil",
+        "configureBlocking",
+        "(Ljava/io/FileDescriptor;Z)V",
+        |_c, _a| Ok(None),
+    );
+
+    // NIO-SERVER-SOCKET: `jdk/net/WindowsSocketOptions` natives. Without these,
+    // `jdk.net.ExtendedSocketOptions.<clinit>` throws UnsatisfiedLinkError on
+    // `keepAliveOptionsSupported0`, which is swallowed — leaving
+    // `sun.nio.ch.Net.EXTENDED_OPTIONS` null. `NioSocketImpl.close()` then calls
+    // `Net.getSocketOption(fd, SO_LINGER)` → `EXTENDED_OPTIONS.isOptionSupported(..)`
+    // → NPE, so a real java.net.Socket cannot be closed cleanly. Report "no
+    // extended keepalive options" (false) so the clinit succeeds and the
+    // keepalive getters/setters below are never exercised; the IP_DONTFRAGMENT
+    // pair returns safe defaults.
+    {
+        let wso = "jdk/net/WindowsSocketOptions";
+        r.register(wso, "keepAliveOptionsSupported0", "()Z", |_c, _a| Ok(Some(Value::Int(0))));
+        r.register(wso, "getIpDontFragment0", "(IZ)Z", |_c, _a| Ok(Some(Value::Int(0))));
+        r.register(wso, "setIpDontFragment0", "(IZZ)V", |_c, _a| Ok(None));
+        for (name, desc) in [
+            ("getTcpKeepAliveProbes0", "(I)I"),
+            ("getTcpKeepAliveTime0", "(I)I"),
+            ("getTcpKeepAliveIntvl0", "(I)I"),
+        ] {
+            r.register(wso, name, desc, |_c, _a| Ok(Some(Value::Int(0))));
+        }
+        for (name, desc) in [
+            ("setTcpKeepAliveProbes0", "(II)V"),
+            ("setTcpKeepAliveTime0", "(II)V"),
+            ("setTcpKeepAliveIntvl0", "(II)V"),
+        ] {
+            r.register(wso, name, desc, |_c, _a| Ok(None));
+        }
+    }
+
+    // NIO-SERVER-SOCKET: `IOUtil.newFD(int)` calls `setfdVal(fd, value)` to
+    // stash the OS fd integer into `FileDescriptor.fd`. JDK-25 implements this
+    // as a native; without it the real `NioSocketImpl.create()` path throws
+    // `UnsatisfiedLinkError` right after `Net.socket0`. We write the value into
+    // the descriptor's `fd` field (slot 0), matching `IOUtil.fdVal`'s reader
+    // and `net_fd_from_descriptor`.
+    r.register(
+        "sun/nio/ch/IOUtil",
+        "setfdVal",
+        "(Ljava/io/FileDescriptor;I)V",
+        |ctx, args| {
+            let fd_obj = obj_arg(args, 0)?;
+            let val = int_arg(args, 1);
+            ctx.set_field_by_name(fd_obj, "fd", Value::Int(val));
+            Ok(None)
+        },
+    );
     r.register(net, "pollinValue", "()S", |_c, _a| Ok(Some(Value::Int(1))));
     r.register(net, "polloutValue", "()S", |_c, _a| Ok(Some(Value::Int(4))));
     r.register(net, "pollerrValue", "()S", |_c, _a| Ok(Some(Value::Int(8))));

@@ -410,6 +410,15 @@ fn handle_job(job: Job) -> Result<(), String> {
                     // `&mut dyn NativeContext` — so we park the bytes in
                     // a side table the dispatch path drains.
                     if bb_addr != 0 {
+                        // R2 audit: this raw memcpy runs on the worker thread
+                        // (no `NativeContext`), so it cannot route through
+                        // `copy_to_native_memory`. That is safe because
+                        // `bb_addr` here can only be a *real* direct-buffer
+                        // pointer: we intercept at the public
+                        // `AsynchronousSocketChannel.read` level, where a heap
+                        // buffer is taken via `bb_arr` (parked above) and we
+                        // never substitute a `Util.getTemporaryDirectBuffer`
+                        // arena handle. So an arena handle never reaches here.
                         // SAFETY: caller-allocated direct buffer; the
                         // address is valid for `len` bytes.
                         unsafe {
@@ -1023,9 +1032,13 @@ fn read_buffer_bytes(
     }
     if addr != 0 {
         let mut v = vec![0u8; len as usize];
-        // SAFETY: address is JDK-allocated direct buffer memory.
-        unsafe {
-            std::ptr::copy_nonoverlapping(addr as *const u8, v.as_mut_ptr(), len as usize);
+        // `addr` is a direct-buffer address. Route through the context so an
+        // `Unsafe.allocateMemory` arena handle reads from the off-heap store
+        // rather than being dereferenced raw; a real pointer falls through to
+        // a raw copy. (The worker-thread write-back path below only ever sees
+        // a real pointer or a parked heap array — see the Job::Read handler.)
+        if !ctx.copy_from_native_memory(addr, &mut v) {
+            return Vec::new();
         }
         v
     } else if let Some(a) = arr {

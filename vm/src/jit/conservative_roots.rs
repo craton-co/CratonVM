@@ -141,6 +141,17 @@ pub(crate) struct PreciseFrameInfo {
     /// the walker can compute `current_pc - entry_ptr = offset` and
     /// look up the matching oop map entry.
     pub entry_ptr: *const u8,
+    /// Stage 3/5 (precise relocation) — the EXACT RBP of the *innermost*
+    /// active JIT frame, recorded by [`set_top_frame_base`] from the deepest
+    /// prologue's `frame_record` helper. Used ONLY as the start of the
+    /// `remap_active_jit_frames` RBP-chain walk. It is kept SEPARATE from
+    /// `frame_base` (the Rust-guard SP captured at entry) because the marking
+    /// path [`scan_one_frame_precise`] uses `frame_base` as the UPPER bound of
+    /// its conservative sweep `[scanner_sp, frame_base)`: clobbering it with
+    /// the (low) innermost RBP shrank that sweep to just the innermost frame,
+    /// dropping every ancestor frame's spilled oops → live objects reclaimed →
+    /// heap corruption. `0` until the prologue records it (gate off).
+    pub exact_rbp: usize,
 }
 
 // SAFETY: the raw pointers in JitFrameChainEntry are not dereferenced
@@ -175,6 +186,23 @@ static GLOBAL_JIT_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// lived in the vm crate.
 pub use cratonvm_gc::gc_quiescence::is_active as gc_must_defer;
 
+/// Whether the JIT **shadow-stack** precise-roots mechanism is enabled
+/// (`CRATONVM_SHADOW_STACK`). Cached on first read.
+///
+/// When on, JIT codegen pushes live oops onto each thread's
+/// [`cratonvm_gc::shadow_stack::ShadowStack`] around GC-capable safepoints, the
+/// marking root scan folds those values into the root set, the post-move remap
+/// rewrites them in place, and the young-gen collector is permitted to run the
+/// *moving* (Cheney) cycle even while JIT frames are live (see
+/// `gen_heap.rs` quiescence gate). Off by default: zero codegen change, the
+/// collector keeps deferring to the non-moving sweep under JIT.
+#[inline]
+pub fn shadow_stack_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some())
+}
+
 /// Capture the current native stack pointer.
 ///
 /// Implemented as the address of a probe variable that **must** live in the
@@ -191,6 +219,24 @@ pub fn current_stack_pointer() -> usize {
     // `&probe` forces `probe` to take an address, which forces it onto the
     // (caller's, after inlining) stack rather than living in a register.
     &probe as *const u8 as usize
+}
+
+/// DBG helper: the current thread's stack HIGH limit (one past the highest
+/// usable stack address) via the Win32 `GetCurrentThreadStackLimits`. Used
+/// only by the `CRATONVM_DBG_FULLSTACK_SCAN` diagnostic to bound a full-stack
+/// conservative scan.
+#[cfg(target_os = "windows")]
+fn current_thread_stack_high() -> usize {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThreadStackLimits(low_limit: *mut usize, high_limit: *mut usize);
+    }
+    let mut low: usize = 0;
+    let mut high: usize = 0;
+    // SAFETY: passes two valid out-pointers to a well-known Win32 API that
+    // only writes the thread's stack bounds; no other effect.
+    unsafe { GetCurrentThreadStackLimits(&mut low, &mut high) };
+    high
 }
 
 /// Record that JIT execution is about to begin on the current thread.
@@ -262,6 +308,57 @@ pub fn pop_jit_entry() -> Option<usize> {
     }
 }
 
+/// Round-7 corruption fix: self-heal a LEAKED `JitEntryGuard`.
+///
+/// When a JIT call's RAII `Drop`/[`pop_jit_entry`] is bypassed (an
+/// abandoned compiled-callee frame — e.g. a non-local exit through the
+/// JIT return path), a stale entry is left on the chain **and** the
+/// `gc_quiescence` counter stays permanently elevated. A wedged
+/// quiescence forces the GC onto the *non-moving* young sweep on every
+/// collection, which is the heap corruptor (verified round 7:
+/// `CRATONVM_DBG_FORCE_MOVING=1` → 0 corruption vs a deterministic 211
+/// under `CRATONVM_DBG_GC_STRESS`).
+///
+/// This prunes every chain entry that has *provably returned*. The
+/// conservative scanner's invariant (see [`scan_active_jit_frames`]) is
+/// that a **live** JIT spill region lies at or above the scanner's
+/// current SP — the native stack grows downward, so a live ancestor
+/// frame's `entry_sp` is always `>= scanner_sp`. An entry whose captured
+/// `entry_sp` is strictly **below** `scanner_sp` therefore cannot belong
+/// to any live frame: its call has returned without popping. Removing
+/// such entries (and matching each one with a `GLOBAL_JIT_DEPTH`
+/// decrement + `gc_quiescence::leave()`) lets quiescence fall back to the
+/// true live count, so the moving collector resumes the moment no JIT
+/// frame is genuinely live.
+///
+/// Soundness: the predicate **never** removes a live frame (a live frame
+/// always satisfies `entry_sp >= scanner_sp`), so genuine JIT activity
+/// still correctly keeps quiescence active and the non-moving sweep
+/// engaged. Returns the number of stale entries reclaimed.
+pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
+    let pruned = JIT_ENTRY_CHAIN.with(|c| {
+        let mut v = c.borrow_mut();
+        let before = v.len();
+        // Keep only entries that could still be live (spill region at or
+        // above the scanner SP). Entries below it have provably returned.
+        v.retain(|e| e.entry_sp >= scanner_sp);
+        before - v.len()
+    });
+    for _ in 0..pruned {
+        GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
+        cratonvm_gc::gc_quiescence::leave();
+    }
+    if pruned > 0 {
+        tracing::debug!(
+            "pruned {} leaked JIT entry/entries (returned frames below scanner \
+             SP {:#x}); quiescence healed to live count",
+            pruned,
+            scanner_sp,
+        );
+    }
+    pruned
+}
+
 /// RAII guard that pairs `push_jit_entry` with `pop_jit_entry` on drop.
 ///
 /// Use this at every JIT call site so a panic unwinding through the
@@ -324,6 +421,7 @@ impl JitEntryGuard {
                 compiled_method: cm as *const cratonvm_jit::CompiledMethod,
                 frame_base: sp,
                 entry_ptr: cm.entry_ptr(),
+                exact_rbp: 0,
             }),
         };
         let depth_at_push = push_entry_full(entry);
@@ -395,6 +493,32 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // target). We use `current_stack_pointer` rather than reading `RSP`
     // directly so the implementation is portable across architectures.
     let scanner_sp = current_stack_pointer();
+    // DBG (CRATONVM_DBG_FULLSTACK_SCAN): scan the ENTIRE native stack
+    // [scanner_sp, stack_high] as conservative roots, not just the per-entry
+    // [scanner_sp, entry_sp] ranges. Decisive experiment for the bintrees18
+    // non-moving-sweep corruption: if this makes a live object visible (and
+    // stops the sweep zeroing it), the missed root WAS on the stack but
+    // outside the JIT chain's bounds (a range bug); if corruption persists,
+    // the missed root is not on the stack at all. Validated by is_object_address.
+    #[cfg(target_os = "windows")]
+    if std::env::var_os("CRATONVM_DBG_FULLSTACK_SCAN").is_some() {
+        let high = current_thread_stack_high();
+        if high > scanner_sp {
+            scan_one_frame(scanner_sp, high, heap, out);
+        }
+    }
+    // Round-7 corruption fix: before scanning, reclaim any LEAKED JIT
+    // entry (a returned frame whose guard Drop was bypassed) so the GC's
+    // `gc_quiescence` flag reflects only genuinely-live JIT frames. A
+    // wedged flag forces the heap-corrupting non-moving young sweep on
+    // every GC; healing it here lets the moving collector resume. Sound:
+    // only entries strictly below the scanner SP (provably returned) are
+    // pruned — live frames (entry_sp >= scanner_sp) are always retained.
+    // DBG: CRATONVM_DBG_NO_PRUNE disables the self-heal so the leak (and its
+    // non-moving-sweep corruption) can be A/B-reproduced in the same binary.
+    if std::env::var_os("CRATONVM_DBG_NO_PRUNE").is_none() {
+        let _ = prune_returned_jit_entries(scanner_sp);
+    }
     scan_active_jit_frames_with_sp(scanner_sp, heap, out);
 }
 
@@ -421,6 +545,207 @@ pub fn scan_active_jit_frames_with_sp(
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3 (precise oop maps) — exact RBP recording + precise relocation
+// ---------------------------------------------------------------------------
+
+/// Stage 3 — record the EXACT RBP of the *innermost* active JIT frame.
+///
+/// Called from the JIT prologue (via the `frame_record` helper) immediately
+/// after `mov rbp, rsp`, when `CRATONVM_PRECISE_JIT_MAPS` is on. The matching
+/// chain entry was pushed by [`JitEntryGuard::enter_with_compiled`] just before
+/// control transferred to compiled code, but it could only capture an
+/// approximate Rust-side SP as `frame_base`. This overwrites it with the
+/// precise value so the relocation walker can address oop-map slots as
+/// `[rbp - offset]`.
+///
+/// No-op if the top entry is conservative (`precise == None`): such methods
+/// have no oop maps and are never relocated through this path.
+pub fn set_top_frame_base(rbp: usize) {
+    JIT_ENTRY_CHAIN.with(|c| {
+        if let Some(entry) = c.borrow_mut().last_mut() {
+            if let Some(info) = entry.precise.as_mut() {
+                // Record the EXACT innermost RBP for the relocation walk.
+                // Do NOT touch `frame_base` — the marking path
+                // `scan_one_frame_precise` uses it as the upper bound of its
+                // conservative sweep; shrinking it to this (low) RBP would
+                // drop every ancestor frame's spilled oops.
+                info.exact_rbp = rbp;
+            }
+        }
+    });
+}
+
+/// Stage 3 — precisely relocate the oop slots of every active JIT frame on
+/// the current thread after a moving collection.
+///
+/// For each frame compiled with the precise gate on (`cm.sp_id_slot_off != 0`,
+/// which also guarantees `frame_base` is the EXACT RBP recorded by
+/// [`set_top_frame_base`]):
+///   1. read the active safepoint's bytecode PC from `[rbp - sp_id_slot_off]`;
+///   2. look up the matching [`OopMapEntry`] (`bytecode_pc == sp_id`);
+///   3. for each recorded slot at `[rbp - offset]`, if the stored address moved
+///      (`pointer_map[old] = new`), rewrite the slot in place.
+///
+/// This is the JIT-frame analogue of `update_all_roots` for interpreter
+/// frames — the piece that makes a *moving* collector safe while JIT frames
+/// are live. Inert by default: when the gate is off every method has
+/// `sp_id_slot_off == 0`, so the walk skips all frames and touches nothing.
+///
+/// # Safety
+/// Reads and writes aligned qwords on the calling thread's own stack between
+/// known-valid frame slots. The CompiledMethod is kept alive by the JIT cache
+/// for the duration of the call (same contract as [`scan_one_frame_precise`]).
+pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let scanner_sp = current_stack_pointer();
+    // Stage 5 diagnostic (CRATONVM_DBG_PRECISE): count frames walked / slots
+    // rewritten / chain entries so we can see whether the RBP-chain walk
+    // actually engages. Printed once per remap call (grep-friendly).
+    let dbg = std::env::var_os("CRATONVM_DBG_PRECISE").is_some();
+    let mut dbg_entries = 0usize;
+    let mut dbg_precise = 0usize;
+    let mut dbg_frames = 0usize;
+    let dbg_slots = std::cell::Cell::new(0usize);
+    let dbg_maps_found = std::cell::Cell::new(0usize);
+    let dbg_examined = std::cell::Cell::new(0usize);
+    JIT_ENTRY_CHAIN.with(|c| {
+        let chain = c.borrow();
+        for entry in chain.iter() {
+            dbg_entries += 1;
+            let Some(info) = entry.precise else { continue };
+            dbg_precise += 1;
+            let entry_sp = entry.entry_sp;
+            // Stage 5 — walk the JIT RBP chain from the innermost frame
+            // (`info.frame_base`, the EXACT RBP recorded by the deepest
+            // prologue's `set_top_frame_base`) outward to the interpreter
+            // boundary, remapping EVERY ancestor frame.
+            //
+            // Recursive/nested JIT→JIT calls do not push `JIT_ENTRY_CHAIN`
+            // entries (only the interpreter→JIT boundary does), so without this
+            // walk only the innermost frame would be covered — the root cause
+            // of the partial bt18 fix. JIT frames use `push rbp; mov rbp,rsp`,
+            // so within `[scanner_sp, entry_sp)` the saved-RBP chain
+            // (`[rbp]` = caller rbp, `[rbp+8]` = return address into the
+            // caller) is walkable.
+            //
+            // `child_rbp`'s saved-rbp/return-address identify its PARENT, which
+            // is the frame we remap each step. The innermost frame itself is
+            // skipped: its child is a Rust helper (not in the JIT code
+            // registry) and its safepoint's live oops are conservatively
+            // pinned (so never relocated).
+            //
+            // Start from `exact_rbp` (the precise innermost RBP from the
+            // prologue), NOT `frame_base` (the Rust-guard SP). Skip if it was
+            // never recorded (gate off / no precise prologue).
+            if info.exact_rbp == 0 {
+                continue;
+            }
+            let mut child_rbp = info.exact_rbp;
+            let mut guard = 0usize;
+            while guard < 4096 {
+                guard += 1;
+                if child_rbp == 0 || child_rbp & 0x7 != 0 {
+                    break;
+                }
+                if child_rbp < scanner_sp || child_rbp >= entry_sp {
+                    break;
+                }
+                // SAFETY: `child_rbp` is an aligned address inside the calling
+                // thread's own live JIT stack region (bounded by scanner_sp /
+                // entry_sp). `[child_rbp]` is the saved caller RBP, `[child_rbp
+                // + 8]` the return address into the caller.
+                let parent_rbp = unsafe { (child_rbp as *const usize).read() };
+                let ret_addr = unsafe { ((child_rbp + 8) as *const usize).read() };
+                // Resolve the PARENT frame's CompiledMethod from the return
+                // address that points into it.
+                match cratonvm_jit::lookup_jit_code_range(ret_addr) {
+                    Some(cm_ptr) => {
+                        // SAFETY: the cm is Arc-owned by the JIT cache while any
+                        // of its frames is live (a live frame keeps it cached);
+                        // the registry is evicted before a cm is dropped.
+                        let cm: &cratonvm_jit::CompiledMethod =
+                            unsafe { &*(cm_ptr as *const cratonvm_jit::CompiledMethod) };
+                        let (found, examined, n) =
+                            remap_one_jit_frame(parent_rbp, cm, pointer_map);
+                        dbg_frames += 1;
+                        dbg_slots.set(dbg_slots.get() + n);
+                        if found {
+                            dbg_maps_found.set(dbg_maps_found.get() + 1);
+                        }
+                        dbg_examined.set(dbg_examined.get() + examined);
+                    }
+                    None => break, // parent is the interpreter / Rust boundary
+                }
+                if parent_rbp <= child_rbp {
+                    break; // stack must ascend (grows downward); else garbage
+                }
+                child_rbp = parent_rbp;
+            }
+        }
+    });
+    if dbg {
+        eprintln!(
+            "[PRECISE] remap: chain_entries={} precise={} frames_walked={} maps_found={} slots_examined={} slots_rewritten={} reg_size={}",
+            dbg_entries,
+            dbg_precise,
+            dbg_frames,
+            dbg_maps_found.get(),
+            dbg_examined.get(),
+            dbg_slots.get(),
+            cratonvm_jit::jit_code_range_count(),
+        );
+    }
+}
+
+/// Stage 5 — rewrite one JIT frame's oop slots via `pointer_map`.
+///
+/// Reads the active safepoint's bytecode PC from `[rbp - sp_id_slot_off]`,
+/// finds the matching [`cratonvm_jit::OopMapEntry`], and for each recorded
+/// slot at `[rbp - off]` rewrites a relocated reference in place. No-op when
+/// the method was compiled without the precise gate (`sp_id_slot_off == 0`).
+/// Returns (map_found, slots_examined, slots_rewritten) — the extra counts are
+/// for the CRATONVM_DBG_PRECISE diagnostic (distinguish "sp-id lookup miss"
+/// from "mapped slots hold only pinned oops").
+fn remap_one_jit_frame(
+    rbp: usize,
+    cm: &cratonvm_jit::CompiledMethod,
+    pointer_map: &std::collections::HashMap<usize, usize>,
+) -> (bool, usize, usize) {
+    let sp_id_off = cm.sp_id_slot_off;
+    if sp_id_off == 0 {
+        return (false, 0, 0);
+    }
+    let id_addr = rbp.wrapping_sub(sp_id_off as usize);
+    if id_addr & 0x7 != 0 {
+        return (false, 0, 0);
+    }
+    // SAFETY: aligned frame slot of a live JIT frame on this thread.
+    let sp_id = (unsafe { (id_addr as *const usize).read() }) as u32;
+    let Some(map) = cm.oop_maps.iter().find(|m| m.bytecode_pc == sp_id) else {
+        return (false, 0, 0);
+    };
+    let examined = map.frame_slot_offsets.len();
+    let mut rewritten = 0usize;
+    for &off in &map.frame_slot_offsets {
+        // Slots are positive offsets; the value lives at `[rbp - off]`.
+        let slot_addr = rbp.wrapping_sub(off as usize);
+        if slot_addr & 0x7 != 0 {
+            continue;
+        }
+        // SAFETY: aligned frame slot of a live JIT frame on this thread.
+        let old = unsafe { (slot_addr as *const usize).read() };
+        if let Some(&new) = pointer_map.get(&old) {
+            // SAFETY: same slot, rewriting the relocated reference.
+            unsafe { (slot_addr as *mut usize).write(new) };
+            rewritten += 1;
+        }
+    }
+    (true, examined, rewritten)
 }
 
 /// NEW-12: enumerate exact oops in a JIT frame using the compiled
@@ -618,6 +943,64 @@ mod tests {
     }
 
     #[test]
+    fn prune_reclaims_returned_entries_keeps_live() {
+        // Round-7 corruption fix: self-heal a LEAKED JitEntryGuard. Build a
+        // chain with one genuinely-live frame (entry_sp ABOVE a chosen scanner
+        // SP) and one provably-returned/leaked frame (entry_sp BELOW it).
+        // Pruning at the scanner SP must reclaim exactly the returned one and
+        // retain the live one. Assertions are on the THREAD-LOCAL chain only
+        // (race-free), never the shared global counter.
+        let depth_before = current_thread_jit_depth();
+        let scanner_sp: usize = 0x10_0000;
+        // leaked / already-returned frame: entry_sp strictly below scanner SP.
+        push_jit_entry_at(scanner_sp - 0x1000);
+        // genuinely-live frame: entry_sp at/above scanner SP.
+        push_jit_entry_at(scanner_sp + 0x1000);
+        assert_eq!(current_thread_jit_depth(), depth_before + 2);
+
+        let pruned = prune_returned_jit_entries(scanner_sp);
+        assert_eq!(
+            pruned, 1,
+            "exactly the returned (below-scanner) entry is reclaimed"
+        );
+        assert_eq!(
+            current_thread_jit_depth(),
+            depth_before + 1,
+            "the genuinely-live entry is retained"
+        );
+        JIT_ENTRY_CHAIN.with(|c| {
+            assert!(
+                c.borrow().iter().all(|e| e.entry_sp >= scanner_sp),
+                "no entry below the scanner SP survives the prune"
+            );
+        });
+        // Restore balance (pop the live entry) so the global counters and the
+        // chain return to their pre-test state for any sibling test.
+        let _ = pop_jit_entry();
+        assert_eq!(current_thread_jit_depth(), depth_before);
+    }
+
+    #[test]
+    fn prune_never_removes_live_frames() {
+        // Soundness guard: a chain where every entry is at/above the scanner
+        // SP must be left completely untouched — a live frame is never a
+        // false-positive prune target.
+        let depth_before = current_thread_jit_depth();
+        let scanner_sp: usize = 0x10_0000;
+        push_jit_entry_at(scanner_sp); // exactly at SP counts as live (>=)
+        push_jit_entry_at(scanner_sp + 0x2000); // above = live
+        let pruned = prune_returned_jit_entries(scanner_sp);
+        assert_eq!(
+            pruned, 0,
+            "live frames (entry_sp >= scanner_sp) are never pruned"
+        );
+        assert_eq!(current_thread_jit_depth(), depth_before + 2);
+        let _ = pop_jit_entry();
+        let _ = pop_jit_entry();
+        assert_eq!(current_thread_jit_depth(), depth_before);
+    }
+
+    #[test]
     fn current_sp_is_in_caller_frame() {
         // After `#[inline(always)]`, `current_stack_pointer` is inlined
         // into this test function, so the probe variable lives in this
@@ -696,14 +1079,17 @@ mod tests {
         // Push out-of-order entries.
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x40,
+            bytecode_pc: 0,
             frame_slot_offsets: vec![-8],
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x10,
+            bytecode_pc: 0,
             frame_slot_offsets: vec![-16, -24],
         });
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0x20,
+            bytecode_pc: 0,
             frame_slot_offsets: vec![],
         });
 
@@ -759,6 +1145,7 @@ mod tests {
         let mut cm = cratonvm_jit::CompiledMethod::new(buf);
         cm.push_oop_map(cratonvm_jit::OopMapEntry {
             native_pc_offset: 0,
+            bytecode_pc: 0,
             frame_slot_offsets: vec![-16],
         });
         assert!(cm.has_precise_oop_maps());

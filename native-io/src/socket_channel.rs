@@ -328,24 +328,116 @@ const F_REMOTE: usize = 5;
 const F_REMOTE_PORT: usize = 6;
 const N_FIELDS: usize = 7;
 
-fn read_reg_id(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
-    if ctx.object_num_fields(this) <= F_REG_ID {
-        return None;
+// ---------------------------------------------------------------------------
+// Synthetic channel state — identity-hash side-table
+// ---------------------------------------------------------------------------
+//
+// CratonVM now loads the REAL JDK `java.nio.channels.ServerSocketChannel` /
+// `sun.nio.ch.SocketChannelImpl` classes. Their low instance slots are
+// reference-typed (closeLock, provider, keys, keyLock, ...), so writing our
+// synthetic int state (F_REG_ID etc.) into slots 0..6 is silently
+// descriptor-coerced to null (`gc::coerce_field_value_by_descriptor`) on both
+// read and write — the ids never persisted, surfacing as Tomcat's
+// "server channel not bound" (accept) and `getLocalAddress()==null` (bind).
+//
+// We therefore key the synthetic F_* state to the channel object's GC-stable
+// identity hash code instead of its object fields — the same C27 pattern the
+// NIO selector key table already uses. The remote host is kept as a Rust
+// String so no un-rooted Java ref can go stale under a moving GC.
+#[derive(Clone)]
+enum Syn {
+    I(i32),
+    #[allow(dead_code)] // F_REMOTE is write-only today; kept for completeness.
+    S(String),
+    Null,
+}
+
+fn chan_fields() -> &'static RwLock<HashMap<i32, [Syn; N_FIELDS]>> {
+    static T: OnceLock<RwLock<HashMap<i32, [Syn; N_FIELDS]>>> = OnceLock::new();
+    T.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Store a synthetic field. Java String refs are read out to a Rust String
+/// (GC-safe); everything else is an int or null.
+fn cf_set(ctx: &mut dyn NativeContext, obj: ObjectRef, idx: usize, v: Value) {
+    if idx >= N_FIELDS {
+        return;
     }
-    match ctx.get_field(this, F_REG_ID) {
+    let slot = match v {
+        Value::Int(i) => Syn::I(i),
+        Value::Object(Some(s)) => match ctx.read_string(s) {
+            Some(rs) => Syn::S(rs),
+            None => Syn::Null,
+        },
+        _ => Syn::Null,
+    };
+    let key = ctx.identity_hash_code(obj);
+    let mut t = chan_fields().write();
+    let arr = t.entry(key).or_insert_with(default_syn);
+    arr[idx] = slot;
+}
+
+/// Default synthetic state for a channel object before its `open()`/`accept()`
+/// native has populated it: closed, blocking (the JDK default), unbound.
+fn default_syn() -> [Syn; N_FIELDS] {
+    let mut a: [Syn; N_FIELDS] = std::array::from_fn(|_| Syn::I(0));
+    a[F_BLOCKING] = Syn::I(1);
+    a
+}
+
+/// Read a synthetic int field. Missing / non-int slots read back as `Int(0)`
+/// (matching the old absent-field default); `F_REMOTE` is never read.
+fn cf_get(ctx: &dyn NativeContext, obj: ObjectRef, idx: usize) -> Value {
+    if idx >= N_FIELDS {
+        return Value::Int(0);
+    }
+    let key = ctx.identity_hash_code(obj);
+    match chan_fields().read().get(&key).map(|a| &a[idx]) {
+        Some(Syn::I(i)) => Value::Int(*i),
+        _ => Value::Int(0),
+    }
+}
+
+/// Drop a channel object's synthetic state (called on close) so the table
+/// does not grow without bound across short-lived connections.
+fn cf_clear(ctx: &dyn NativeContext, obj: ObjectRef) {
+    let key = ctx.identity_hash_code(obj);
+    chan_fields().write().remove(&key);
+}
+
+/// Cross-module accessor: the `tcp_registry` id backing a synthetic
+/// Server/SocketChannel object, or `None` when unbound/unconnected. Used by
+/// the NIO selector's register path (`nio_selector::channel_register_native`).
+pub fn channel_net_fd(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<i32> {
+    match cf_get(ctx, obj, F_REG_ID) {
         Value::Int(v) if v != 0 && v != -1 => Some(v),
         _ => None,
     }
 }
 
+/// Read the stored remote `(host, port)` of a connected synthetic channel
+/// (the only `Syn::S` slot). `None` when unset.
+fn cf_remote(ctx: &dyn NativeContext, obj: ObjectRef) -> Option<(String, i32)> {
+    let key = ctx.identity_hash_code(obj);
+    let t = chan_fields().read();
+    let arr = t.get(&key)?;
+    let host = match &arr[F_REMOTE] {
+        Syn::S(s) => s.clone(),
+        _ => return None,
+    };
+    let port = match arr[F_REMOTE_PORT] {
+        Syn::I(p) => p,
+        _ => 0,
+    };
+    Some((host, port))
+}
+
+fn read_reg_id(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    channel_net_fd(ctx, this)
+}
+
 fn read_blocking_flag(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    if ctx.object_num_fields(this) <= F_BLOCKING {
-        return true;
-    }
-    match ctx.get_field(this, F_BLOCKING) {
-        Value::Int(0) => false,
-        _ => true,
-    }
+    !matches!(cf_get(ctx, this, F_BLOCKING), Value::Int(0))
 }
 
 // ---------------------------------------------------------------------------
@@ -525,9 +617,14 @@ fn buffer_read_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef) -> Option<Vec<u
     match buffer_access(ctx, bb)? {
         BufferAccess::Direct { addr, length } if addr != 0 && length > 0 => {
             let mut v = vec![0u8; length as usize];
-            // SAFETY: the JDK guarantees `length` bytes are mapped.
-            unsafe {
-                std::ptr::copy_nonoverlapping(addr as *const u8, v.as_mut_ptr(), length as usize);
+            // `addr` is normally a real `allocateDirect` pointer, but a
+            // temp-direct buffer from `Util.getTemporaryDirectBuffer` is an
+            // `Unsafe.allocateMemory` arena handle (not dereferenceable).
+            // Route through the context so a handle reads from the off-heap
+            // store instead of a raw memcpy that would SIGSEGV; for a real
+            // pointer this is the same `copy_nonoverlapping`.
+            if !ctx.copy_from_native_memory(addr, &mut v) {
+                return Some(Vec::new());
             }
             Some(v)
         }
@@ -557,9 +654,11 @@ fn buffer_write_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef, data: &[u8]) -
     match access {
         BufferAccess::Direct { addr, length } if addr != 0 && length > 0 => {
             let n = (data.len() as i32).min(length).max(0);
-            // SAFETY: caller guarantees `length` bytes are addressable.
-            unsafe {
-                std::ptr::copy_nonoverlapping(data.as_ptr(), addr as *mut u8, n as usize);
+            // Route through the context: `addr` may be a temp-direct arena
+            // handle (see buffer_read_bytes). A handle writes to the off-heap
+            // store; a real pointer falls through to a raw copy.
+            if !ctx.copy_to_native_memory(addr, &data[..n as usize]) {
+                return 0;
             }
             n
         }
@@ -589,13 +688,13 @@ fn buffer_write_bytes(ctx: &mut dyn NativeContext, bb: ObjectRef, data: &[u8]) -
 /// or connect yet; that happens on `connect`.
 fn sc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let ch = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
-    ctx.set_field(ch, F_OPEN, Value::Int(1));
-    ctx.set_field(ch, F_BLOCKING, Value::Int(1));
-    ctx.set_field(ch, F_REG_ID, Value::Int(-1));
-    ctx.set_field(ch, F_CONNECTED, Value::Int(0));
-    ctx.set_field(ch, F_LOCAL_PORT, Value::Int(0));
-    ctx.set_field(ch, F_REMOTE, Value::Object(None));
-    ctx.set_field(ch, F_REMOTE_PORT, Value::Int(0));
+    cf_set(ctx, ch, F_OPEN, Value::Int(1));
+    cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
+    cf_set(ctx, ch, F_REG_ID, Value::Int(-1));
+    cf_set(ctx, ch, F_CONNECTED, Value::Int(0));
+    cf_set(ctx, ch, F_LOCAL_PORT, Value::Int(0));
+    cf_set(ctx, ch, F_REMOTE, Value::Object(None));
+    cf_set(ctx, ch, F_REMOTE_PORT, Value::Int(0));
     Ok(Some(Value::Object(Some(ch))))
 }
 
@@ -617,25 +716,21 @@ fn sc_open_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn sc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
-        Some(o) if ctx.object_num_fields(o) > F_OPEN => Ok(Some(ctx.get_field(o, F_OPEN))),
+        Some(o) => Ok(Some(cf_get(ctx, o, F_OPEN))),
         _ => Ok(Some(Value::Int(0))),
     }
 }
 
 fn sc_is_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
-        Some(o) if ctx.object_num_fields(o) > F_BLOCKING => {
-            Ok(Some(ctx.get_field(o, F_BLOCKING)))
-        }
+        Some(o) => Ok(Some(Value::Int(if read_blocking_flag(ctx, o) { 1 } else { 0 }))),
         _ => Ok(Some(Value::Int(1))),
     }
 }
 
 fn sc_is_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
-        Some(o) if ctx.object_num_fields(o) > F_CONNECTED => {
-            Ok(Some(ctx.get_field(o, F_CONNECTED)))
-        }
+        Some(o) => Ok(Some(cf_get(ctx, o, F_CONNECTED))),
         _ => Ok(Some(Value::Int(0))),
     }
 }
@@ -646,9 +741,7 @@ fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         None => return Ok(Some(Value::Object(None))),
     };
     let blocking = bool_arg(args, 1);
-    if ctx.object_num_fields(this) > F_BLOCKING {
-        ctx.set_field(this, F_BLOCKING, Value::Int(if blocking { 1 } else { 0 }));
-    }
+    cf_set(ctx, this, F_BLOCKING, Value::Int(if blocking { 1 } else { 0 }));
     if let Some(id) = read_reg_id(ctx, this) {
         // Apply to the live socket — both stream and listener support it.
         let map = tcp_registry().read();
@@ -668,19 +761,99 @@ fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(this) = obj_or_none(args, 0) {
-        let nf = ctx.object_num_fields(this);
-        if nf > F_OPEN {
-            ctx.set_field(this, F_OPEN, Value::Int(0));
-        }
-        if nf > F_CONNECTED {
-            ctx.set_field(this, F_CONNECTED, Value::Int(0));
-        }
         if let Some(id) = read_reg_id(ctx, this) {
             tcp_remove(id);
-            ctx.set_field(this, F_REG_ID, Value::Int(-1));
         }
+        // Drop the synthetic state entirely: a later isOpen()/isConnected()
+        // then reads the default Int(0) (== closed/not-connected), and the
+        // side-table does not grow across many short-lived connections.
+        cf_clear(ctx, this);
     }
     Ok(None)
+}
+
+/// `SocketChannel.socket()` — return a `java.net.Socket` adapter. This is an
+/// abstract method on `java.nio.channels.SocketChannel` (no Code attribute),
+/// so without this native Tomcat's `NioEndpoint.setSocketOptions` hits an
+/// `AbstractMethodError`. The adapter is only used by callers to set socket
+/// options (`socketProperties.setProperties(socket)`); those setters dispatch
+/// to the synthetic `java/net/Socket` natives and no-op gracefully (their
+/// stream id slot reads -1). Real I/O keeps flowing through the channel.
+fn sc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let _this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Err(ioex("socket: null channel")),
+    };
+    let sock = ctx
+        .new_object("java/net/Socket")
+        .ok()
+        .and_then(|v| match v {
+            Some(Value::Object(Some(o))) => Some(o),
+            _ => None,
+        })
+        .ok_or_else(|| ioex("socket: could not allocate Socket"))?;
+    Ok(Some(Value::Object(Some(sock))))
+}
+
+/// No-op override for `java.net.Socket` option setters. The `Socket` returned
+/// by `SocketChannel.socket()` is a bare adapter with no real `SocketImpl`, so
+/// the real setter bytecode would call `getImpl()` and NPE. These options are
+/// best-effort (the channel carries the live socket), so swallow them. When
+/// `CRATONVM_REAL_NET_SOCKETS` is set the central registry filter drops every
+/// `java/net/Socket` registration, so the real java.net path is used instead.
+fn socket_opt_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+/// `SocketChannel.getRemoteAddress()` — build a real `InetSocketAddress` from
+/// the stored peer host/port (Tomcat's `NioSocketWrapper.populateRemoteAddr`
+/// calls this then `getAddress().getHostAddress()`, so a synthetic 2-field
+/// object would not do). Returns null when not connected.
+fn sc_remote_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    if let Some((host, port)) = cf_remote(ctx, this) {
+        if port > 0 {
+            let h = ctx.create_string(&host);
+            return ctx.new_object_initialized(
+                "java/net/InetSocketAddress",
+                "(Ljava/lang/String;I)V",
+                &[Value::Object(Some(h)), Value::Int(port)],
+            );
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+/// `SocketChannel.getLocalAddress()` — build a real `InetSocketAddress` from
+/// the live stream's local end. Returns null when not connected.
+fn sc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let id = match read_reg_id(ctx, this) {
+        Some(i) => i,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let local = {
+        let map = tcp_registry().read();
+        match map.get(&id) {
+            Some(TcpHandle::Stream(s)) => s.local_addr().ok(),
+            _ => None,
+        }
+    };
+    let Some(addr) = local else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let h = ctx.create_string(&addr.ip().to_string());
+    ctx.new_object_initialized(
+        "java/net/InetSocketAddress",
+        "(Ljava/lang/String;I)V",
+        &[Value::Object(Some(h)), Value::Int(addr.port() as i32)],
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -776,14 +949,12 @@ fn sc_connect_inner(
         let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
         let id = tcp_register(TcpHandle::Stream(stream));
         tcp_blocking_state().write().insert(id, blocking);
-        if ctx.object_num_fields(this) >= N_FIELDS {
-            ctx.set_field(this, F_REG_ID, Value::Int(id));
-            ctx.set_field(this, F_CONNECTED, Value::Int(1));
-            ctx.set_field(this, F_LOCAL_PORT, Value::Int(local_port));
-            let host_str = ctx.create_string(&host);
-            ctx.set_field(this, F_REMOTE, Value::Object(Some(host_str)));
-            ctx.set_field(this, F_REMOTE_PORT, Value::Int(port as i32));
-        }
+        cf_set(ctx, this, F_REG_ID, Value::Int(id));
+        cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+        cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
+        let host_str = ctx.create_string(&host);
+        cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+        cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
         ipc_dbg(format!("connect success(blocking) id={id} local_port={local_port}"));
         return Ok(true);
     }
@@ -830,14 +1001,12 @@ fn sc_connect_inner(
         let local_port = stream.local_addr().map(|a| a.port() as i32).unwrap_or(0);
         let id = tcp_register(TcpHandle::Stream(stream));
         tcp_blocking_state().write().insert(id, false);
-        if ctx.object_num_fields(this) >= N_FIELDS {
-            ctx.set_field(this, F_REG_ID, Value::Int(id));
-            ctx.set_field(this, F_CONNECTED, Value::Int(1));
-            ctx.set_field(this, F_LOCAL_PORT, Value::Int(local_port));
-            let host_str = ctx.create_string(&host);
-            ctx.set_field(this, F_REMOTE, Value::Object(Some(host_str)));
-            ctx.set_field(this, F_REMOTE_PORT, Value::Int(port as i32));
-        }
+        cf_set(ctx, this, F_REG_ID, Value::Int(id));
+        cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+        cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
+        let host_str = ctx.create_string(&host);
+        cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+        cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
         ipc_dbg(format!(
             "connect success(nonblocking-fastpath) id={id} local_port={local_port}"
         ));
@@ -866,12 +1035,10 @@ fn sc_connect_inner(
         .unwrap_or_else(|| target.clone());
     connect_pool_submit(ConnectJob { id, target: job_target });
 
-    if ctx.object_num_fields(this) >= N_FIELDS {
-        ctx.set_field(this, F_REG_ID, Value::Int(id));
-        let host_str = ctx.create_string(&host);
-        ctx.set_field(this, F_REMOTE, Value::Object(Some(host_str)));
-        ctx.set_field(this, F_REMOTE_PORT, Value::Int(port as i32));
-    }
+    cf_set(ctx, this, F_REG_ID, Value::Int(id));
+    let host_str = ctx.create_string(&host);
+    cf_set(ctx, this, F_REMOTE, Value::Object(Some(host_str)));
+    cf_set(ctx, this, F_REMOTE_PORT, Value::Int(port as i32));
     ipc_dbg(format!("connect pending id={id}"));
     Ok(false)
 }
@@ -919,9 +1086,7 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     match res_kind {
         1 => {
             // Was connected synchronously already.
-            if ctx.object_num_fields(this) > F_CONNECTED {
-                ctx.set_field(this, F_CONNECTED, Value::Int(1));
-            }
+            cf_set(ctx, this, F_CONNECTED, Value::Int(1));
             Ok(Some(Value::Int(1)))
         }
         2 => {
@@ -949,10 +1114,8 @@ fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
                     }
                     map.insert(id, TcpHandle::Stream(stream));
                     drop(map);
-                    if ctx.object_num_fields(this) >= N_FIELDS {
-                        ctx.set_field(this, F_CONNECTED, Value::Int(1));
-                        ctx.set_field(this, F_LOCAL_PORT, Value::Int(local_port));
-                    }
+                    cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+                    cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
                     Ok(Some(Value::Int(1)))
                 }
                 Some(Err(e)) => {
@@ -1154,13 +1317,13 @@ fn sc_get_option(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 fn ssc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let ch = alloc_obj(ctx, "java/nio/channels/ServerSocketChannel", N_FIELDS);
-    ctx.set_field(ch, F_OPEN, Value::Int(1));
-    ctx.set_field(ch, F_BLOCKING, Value::Int(1));
-    ctx.set_field(ch, F_REG_ID, Value::Int(-1));
-    ctx.set_field(ch, F_CONNECTED, Value::Int(0));
-    ctx.set_field(ch, F_LOCAL_PORT, Value::Int(0));
-    ctx.set_field(ch, F_REMOTE, Value::Object(None));
-    ctx.set_field(ch, F_REMOTE_PORT, Value::Int(0));
+    cf_set(ctx, ch, F_OPEN, Value::Int(1));
+    cf_set(ctx, ch, F_BLOCKING, Value::Int(1));
+    cf_set(ctx, ch, F_REG_ID, Value::Int(-1));
+    cf_set(ctx, ch, F_CONNECTED, Value::Int(0));
+    cf_set(ctx, ch, F_LOCAL_PORT, Value::Int(0));
+    cf_set(ctx, ch, F_REMOTE, Value::Object(None));
+    cf_set(ctx, ch, F_REMOTE_PORT, Value::Int(0));
     Ok(Some(Value::Object(Some(ch))))
 }
 
@@ -1194,10 +1357,8 @@ fn ssc_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let id = tcp_register(TcpHandle::Listener(listener));
     tcp_blocking_state().write().insert(id, blocking);
 
-    if ctx.object_num_fields(this) >= N_FIELDS {
-        ctx.set_field(this, F_REG_ID, Value::Int(id));
-        ctx.set_field(this, F_LOCAL_PORT, Value::Int(local_port));
-    }
+    cf_set(ctx, this, F_REG_ID, Value::Int(id));
+    cf_set(ctx, this, F_LOCAL_PORT, Value::Int(local_port));
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -1226,6 +1387,10 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             _ => return Err(ioex("accept: id is not a listener")),
         }
     };
+    // A cloned socket does not reliably inherit the parent's blocking mode on
+    // Windows, so set it explicitly to match the channel. Without this a
+    // non-blocking accept() would block forever instead of returning null.
+    let _ = listener_clone.set_nonblocking(!blocking);
 
     let accepted = if let Some(stream) = preaccepted {
         let peer = stream.peer_addr().unwrap_or_else(|_| {
@@ -1254,14 +1419,14 @@ fn ssc_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     tcp_blocking_state().write().insert(new_id, blocking);
 
     let child = alloc_obj(ctx, "java/nio/channels/SocketChannel", N_FIELDS);
-    ctx.set_field(child, F_OPEN, Value::Int(1));
-    ctx.set_field(child, F_BLOCKING, Value::Int(if blocking { 1 } else { 0 }));
-    ctx.set_field(child, F_REG_ID, Value::Int(new_id));
-    ctx.set_field(child, F_CONNECTED, Value::Int(1));
-    ctx.set_field(child, F_LOCAL_PORT, Value::Int(local_port));
+    cf_set(ctx, child, F_OPEN, Value::Int(1));
+    cf_set(ctx, child, F_BLOCKING, Value::Int(if blocking { 1 } else { 0 }));
+    cf_set(ctx, child, F_REG_ID, Value::Int(new_id));
+    cf_set(ctx, child, F_CONNECTED, Value::Int(1));
+    cf_set(ctx, child, F_LOCAL_PORT, Value::Int(local_port));
     let host_str = ctx.create_string(&peer.ip().to_string());
-    ctx.set_field(child, F_REMOTE, Value::Object(Some(host_str)));
-    ctx.set_field(child, F_REMOTE_PORT, Value::Int(peer.port() as i32));
+    cf_set(ctx, child, F_REMOTE, Value::Object(Some(host_str)));
+    cf_set(ctx, child, F_REMOTE_PORT, Value::Int(peer.port() as i32));
 
     Ok(Some(Value::Object(Some(child))))
 }
@@ -1298,6 +1463,19 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         r.register(c, "isOpen", "()Z", sc_is_open);
         r.register(c, "isBlocking", "()Z", sc_is_blocking);
         r.register(c, "isConnected", "()Z", sc_is_connected);
+        r.register(c, "socket", "()Ljava/net/Socket;", sc_socket);
+        r.register(
+            c,
+            "getRemoteAddress",
+            "()Ljava/net/SocketAddress;",
+            sc_remote_address,
+        );
+        r.register(
+            c,
+            "getLocalAddress",
+            "()Ljava/net/SocketAddress;",
+            sc_local_address,
+        );
         r.register(
             c,
             "configureBlocking",
@@ -1416,6 +1594,26 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
     r.register(server_socket, "isBound", "()Z", ss_wrapper_is_bound);
     r.register(server_socket, "isClosed", "()Z", ss_wrapper_is_closed);
     r.register(server_socket, "close", "()V", ss_wrapper_close);
+
+    // Option setters on the `java.net.Socket` adapter returned by
+    // SocketChannel.socket(). These are the methods Tomcat's
+    // SocketProperties.setProperties invokes; the adapter has no real
+    // SocketImpl so the real bytecode would NPE in getImpl(). No-op them
+    // (gate-aware: dropped under CRATONVM_REAL_NET_SOCKETS).
+    let client_socket = "java/net/Socket";
+    for (m, d) in [
+        ("setReceiveBufferSize", "(I)V"),
+        ("setSendBufferSize", "(I)V"),
+        ("setKeepAlive", "(Z)V"),
+        ("setReuseAddress", "(Z)V"),
+        ("setTcpNoDelay", "(Z)V"),
+        ("setOOBInline", "(Z)V"),
+        ("setSoLinger", "(ZI)V"),
+        ("setSoTimeout", "(I)V"),
+        ("setPerformancePreferences", "(III)V"),
+    ] {
+        r.register(client_socket, m, d, socket_opt_noop);
+    }
     r.set_category(__prev_cat);
 }
 
@@ -1544,8 +1742,8 @@ fn ssc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(o) => o,
         None => return Ok(Some(Value::Object(None))),
     };
-    let port = ctx.get_field(this, F_LOCAL_PORT).as_int().unwrap_or(0);
-    let id = ctx.get_field(this, F_REG_ID).as_int().unwrap_or(-1);
+    let port = cf_get(ctx, this, F_LOCAL_PORT).as_int().unwrap_or(0);
+    let id = cf_get(ctx, this, F_REG_ID).as_int().unwrap_or(-1);
     if id < 0 || port <= 0 {
         return Ok(Some(Value::Object(None)));
     }
@@ -1593,7 +1791,7 @@ fn ss_wrapper_local_port(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         None => return Ok(Some(Value::Int(0))),
     };
     if let Some(ssc) = ss_back_ref(ctx, this) {
-        let port = ctx.get_field(ssc, F_LOCAL_PORT).as_int().unwrap_or(0);
+        let port = cf_get(ctx, ssc, F_LOCAL_PORT).as_int().unwrap_or(0);
         return Ok(Some(Value::Int(port)));
     }
     Ok(Some(Value::Int(0)))
@@ -1605,7 +1803,7 @@ fn ss_wrapper_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         None => return Ok(Some(Value::Object(None))),
     };
     let port = if let Some(ssc) = ss_back_ref(ctx, this) {
-        ctx.get_field(ssc, F_LOCAL_PORT).as_int().unwrap_or(0)
+        cf_get(ctx, ssc, F_LOCAL_PORT).as_int().unwrap_or(0)
     } else {
         0
     };
@@ -1627,7 +1825,7 @@ fn ss_wrapper_is_bound(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let Some(ssc) = ss_back_ref(ctx, this) else {
         return Ok(Some(Value::Int(0)));
     };
-    let id = ctx.get_field(ssc, F_REG_ID).as_int().unwrap_or(-1);
+    let id = cf_get(ctx, ssc, F_REG_ID).as_int().unwrap_or(-1);
     Ok(Some(Value::Int(if id >= 0 { 1 } else { 0 })))
 }
 
@@ -1637,7 +1835,7 @@ fn ss_wrapper_is_closed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         None => return Ok(Some(Value::Int(1))),
     };
     if let Some(ssc) = ss_back_ref(ctx, this) {
-        let open = ctx.get_field(ssc, F_OPEN).as_int().unwrap_or(0);
+        let open = cf_get(ctx, ssc, F_OPEN).as_int().unwrap_or(0);
         return Ok(Some(Value::Int(if open == 0 { 1 } else { 0 })));
     }
     Ok(Some(Value::Int(0)))

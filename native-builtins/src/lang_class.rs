@@ -5833,6 +5833,58 @@ pub(crate) fn native_constructor_new_instance(
         }
     };
 
+    // Serialization constructor: allocate the real target type.
+    //
+    // `ReflectionFactory.newConstructorForSerialization(cl)` returns a
+    // `Constructor` whose declaring class (`clazz`) is `cl`'s first
+    // non-Serializable ancestor (usually `java.lang.Object`), but whose
+    // `constructorAccessor` is a `DirectConstructorHandleAccessor` whose
+    // MethodHandle `target` is a `DirectMethodHandle$Constructor` that allocates
+    // `cl` itself (its `instanceClass` field) and runs only the ancestor `<init>`.
+    // Allocating `clazz` here would produce a bare `java.lang.Object`, so the JDK
+    // field-setter then throws `cannot assign … in instance of java.lang.Object`
+    // (keycloak SkeletonKeyTokenTest.testSerialization). We can't invoke the
+    // MethodHandle directly (`DirectMethodHandle$Constructor.invokeExact` is
+    // unimplemented), so we read `instanceClass` off the target handle, allocate
+    // that type without running its own ctor, and run the ancestor `<init>`
+    // (`clazz`) — exactly the serialization contract. Ordinary CratonVM reflective
+    // constructors have no accessor object installed (the field holds a non-object
+    // sentinel), so they fall through to the native allocation path below.
+    if let Value::Object(Some(acc)) = ctx.get_field_by_name(this, "constructorAccessor") {
+        let acc_class = ctx.class_name_of_id(ctx.class_id_of_object(acc));
+        if acc_class.as_deref() == Some("jdk/internal/reflect/DirectConstructorHandleAccessor") {
+            if let Value::Object(Some(target_mh)) = ctx.get_field_by_name(acc, "target") {
+                if let Value::Object(Some(inst_mirror)) =
+                    ctx.get_field_by_name(target_mh, "instanceClass")
+                {
+                    if let Some(inst_cid) = ctx.class_id_from_mirror(inst_mirror) {
+                        if let Some(inst_name) = ctx.class_name_of_id(inst_cid) {
+                            if let Some(obj) = ctx.allocate_instance(&inst_name) {
+                                // Run the ancestor's no-arg `<init>` (`clazz`);
+                                // `java.lang.Object.<init>` is a no-op.
+                                if let Value::Object(Some(anc_mirror)) =
+                                    ctx.get_field_by_name(this, "clazz")
+                                {
+                                    if let Some(anc_cid) = ctx.class_id_from_mirror(anc_mirror) {
+                                        if let Some(anc_name) = ctx.class_name_of_id(anc_cid) {
+                                            let _ = ctx.invoke_special(
+                                                &anc_name,
+                                                "<init>",
+                                                "()V",
+                                                &[Value::Object(Some(obj))],
+                                            );
+                                        }
+                                    }
+                                }
+                                return Ok(Some(Value::Object(Some(obj))));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // Get declaring class name (C6: real-JDK field name)
     let declaring_mirror = match ctx.get_field_by_name(this, "clazz") {
         Value::Object(Some(m)) => m,
@@ -7572,11 +7624,41 @@ pub(crate) fn method_class_name_desc(
     let class_id = mirror_class_id(ctx, mirror)?;
     let name = match ctx.get_field_by_name(method_obj, "name") {
         Value::Object(Some(s)) => ctx.read_string(s)?,
-        _ => return None,
+        _ => {
+            // `java.lang.reflect.Constructor` has no `name` field (its
+            // getName() returns the declaring-class name); the method it
+            // describes is always `<init>`. Detect by the receiver's runtime
+            // class so a genuinely malformed `Method` still returns `None`.
+            // This lets the shared Method annotation natives
+            // (getDeclaredAnnotations / getParameterAnnotations / …), when
+            // registered for Constructor too, resolve the `<init>` metadata —
+            // otherwise constructor annotations fall through to real JDK
+            // bytecode that reads raw `annotations`/`parameterAnnotations`
+            // byte[] fields CratonVM never populates (Jackson "no Creators").
+            let cls = ctx.class_name_of_id(ctx.class_id_of_object(method_obj));
+            if cls.as_deref() == Some("java/lang/reflect/Constructor") {
+                "<init>".to_string()
+            } else {
+                return None;
+            }
+        }
     };
-    let desc = method_descriptor_for_invoke(ctx, method_obj);
+    let mut desc = method_descriptor_for_invoke(ctx, method_obj);
     if desc.is_empty() {
         return None;
+    }
+    // Constructors always return void. The mirror-based descriptor composer
+    // defaults a missing `returnType` to `Ljava/lang/Object;` (a Constructor
+    // reflective object has no `returnType` field), and
+    // `method_descriptor_for_invoke` then prefers that mismatched composed
+    // descriptor — so the `<init>` lookup below would key on `(…)Ljava/lang/
+    // Object;` and never match the real `(…)V` method metadata. Coerce the
+    // return to `V` so annotation/param-annotation lookups for `<init>` hit.
+    if name == "<init>" {
+        if let Some(close) = desc.find(')') {
+            desc.truncate(close + 1);
+            desc.push('V');
+        }
     }
     Some((class_id, name, desc))
 }
@@ -9120,11 +9202,22 @@ pub(crate) fn native_class_get_enum_constants(
         // Fall through — we can still try to read $VALUES if it was
         // populated before the failure (common after silent-swallow).
     }
-    // Read $VALUES static field.
-    let idx = match ctx.static_field_index_by_name(class_id, "$VALUES") {
+    // Read the synthetic enum-values array static field.  `javac` names it
+    // `$VALUES`; the Eclipse JDT compiler (`ecj`) — used to build several
+    // WildFly modules — emits `ENUM$VALUES` (ACC_SYNTHETIC) instead.  The
+    // real JDK sidesteps the name entirely by invoking the generated
+    // `values()` accessor reflectively, so it is compiler-agnostic; we read
+    // the field directly (our reflective `values()` invoke historically
+    // returned null), so we must accept both spellings or ecj-compiled app
+    // enums (e.g. org/wildfly/extension/health/HealthSubsystemSchema) fail
+    // with a spurious "not an enum" CCE in EnumSet.allOf / EnumMap.<init>.
+    let idx = match ctx
+        .static_field_index_by_name(class_id, "$VALUES")
+        .or_else(|| ctx.static_field_index_by_name(class_id, "ENUM$VALUES"))
+    {
         Some(i) => i,
         None => {
-            tracing::warn!("native_class_get_enum_constants: no $VALUES field for class={}", class_name);
+            tracing::warn!("native_class_get_enum_constants: no $VALUES/ENUM$VALUES field for class={}", class_name);
             return Ok(Some(Value::Object(None)));
         }
     };

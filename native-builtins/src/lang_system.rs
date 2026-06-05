@@ -1419,27 +1419,45 @@ pub(crate) fn native_pb_start(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
             let cmd_val = ctx.get_field(*this, 0);
             match cmd_val {
                 Value::Object(Some(cmd_obj)) => {
-                    // Try ArrayList layout (data=field0, size=field1).
-                    if let Value::Int(size) = ctx.get_field(cmd_obj, 1) {
-                        if size > 0 {
-                            if let Value::Object(Some(data_arr)) = ctx.get_field(cmd_obj, 0) {
-                                if let Value::Object(Some(s)) = ctx.get_array_element(data_arr, 0) {
-                                    ctx.read_string(s).unwrap_or_default()
-                                } else {
-                                    String::new()
-                                }
-                            } else {
-                                String::new()
-                            }
+                    // `ProcessBuilder.command` is a `List<String>` (typically an
+                    // ArrayList), but `Runtime.exec`/legacy paths may hand us a
+                    // raw `String[]`. Decide which by the object's RUNTIME CLASS,
+                    // then read it layout-independently:
+                    //   * List: read `size` / `elementData` BY FIELD NAME (the
+                    //     real-JDK ArrayList carries `AbstractList.modCount` ahead
+                    //     of `elementData`/`size`, so the old hard-coded
+                    //     `size = field1` assumption failed and fell through to
+                    //     `array_length(list)` — illegal on a non-array, which
+                    //     tripped the array-length guard during picocli's
+                    //     `getTerminalWidth()` ProcessBuilder probe).
+                    //   * Array: only THEN is `array_length` legal.
+                    let cname = ctx
+                        .class_name_of_id(ctx.class_id_of_object(cmd_obj))
+                        .unwrap_or_default();
+                    let read_elem0 = |ctx: &mut dyn NativeContext, arr: ObjectRef| -> String {
+                        match ctx.get_array_element(arr, 0) {
+                            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                            _ => String::new(),
+                        }
+                    };
+                    if cname.starts_with('[') {
+                        // Genuine array (e.g. String[]): array_length is legal.
+                        if ctx.array_length(cmd_obj) > 0 {
+                            read_elem0(ctx, cmd_obj)
                         } else {
                             String::new()
                         }
                     } else {
-                        // Raw String[] fallback.
-                        let len = ctx.array_length(cmd_obj);
-                        if len > 0 {
-                            if let Value::Object(Some(s)) = ctx.get_array_element(cmd_obj, 0) {
-                                ctx.read_string(s).unwrap_or_default()
+                        // A List: read `size` + `elementData` by name.
+                        let size = match ctx.get_field_by_name(cmd_obj, "size") {
+                            Value::Int(n) => n,
+                            _ => 0,
+                        };
+                        if size > 0 {
+                            if let Value::Object(Some(data_arr)) =
+                                ctx.get_field_by_name(cmd_obj, "elementData")
+                            {
+                                read_elem0(ctx, data_arr)
                             } else {
                                 String::new()
                             }
@@ -1879,34 +1897,53 @@ pub(crate) fn native_array_new_array(
         _ => 0,
     };
 
-    // Determine element type from the Class mirror
+    // Determine element type from the Class mirror.
+    //
+    // `Array.newInstance(Class,int)` / `Arrays.copyOf(.., Class)` delegate here
+    // (`reflect/Array.newArray`). The component Class is frequently a
+    // *synthesized array-class mirror* (e.g. `[Ljava/lang/String;` from
+    // `String[][].class.getComponentType()`), whose name is only recoverable
+    // via the VM reverse-map. The previous `read_string`/slot-1 read returned
+    // nothing for those mirrors and defaulted to `java/lang/Object`, so
+    // `rows.toArray(new Value[0][])` (H2 SortOrder.sort) allocated a bare
+    // `Object[]` and CCE'd on the `(Value[][])` checkcast. Resolve via
+    // `mirror_class_name` first (handles array + ordinary classes), keeping the
+    // old readers as a fallback for legacy/unit-test mirrors.
     let comp_name = match args.first() {
         Some(Value::Object(Some(mirror))) => {
-            ctx.read_string(*mirror)
-                .or_else(|| {
-                    // Try reading from the Class mirror's name field (field 1)
-                    match ctx.get_field(*mirror, 1) {
-                        Value::Object(Some(name_obj)) => ctx.read_string(name_obj),
-                        _ => None,
-                    }
+            crate::lang_class::mirror_class_name(&*ctx, *mirror)
+                .filter(|s| !s.is_empty())
+                .or_else(|| ctx.read_string(*mirror))
+                .or_else(|| match ctx.get_field(*mirror, 1) {
+                    Value::Object(Some(name_obj)) => ctx.read_string(name_obj),
+                    _ => None,
                 })
+                .map(|s| s.replace('.', "/"))
                 .unwrap_or_else(|| "java/lang/Object".to_string())
         }
         _ => "java/lang/Object".to_string(),
     };
 
-    // Map primitive type names to ArrayElementType
+    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+        eprintln!("[DBG_TOARRAY] newArray comp_name={:?} len={}", comp_name, length);
+    }
+
+    // Map primitive type names to ArrayElementType. Accept both the human name
+    // (`int`) and the JVM descriptor (`I`) — `mirror_class_name` may return
+    // either depending on how the primitive mirror was registered.
     let arr = match comp_name.as_str() {
-        "int" => ctx.new_array(cratonvm_types::ArrayElementType::Int, length),
-        "long" => ctx.new_array(cratonvm_types::ArrayElementType::Long, length),
-        "float" => ctx.new_array(cratonvm_types::ArrayElementType::Float, length),
-        "double" => ctx.new_array(cratonvm_types::ArrayElementType::Double, length),
-        "boolean" => ctx.new_array(cratonvm_types::ArrayElementType::Boolean, length),
-        "byte" => ctx.new_array(cratonvm_types::ArrayElementType::Byte, length),
-        "char" => ctx.new_array(cratonvm_types::ArrayElementType::Char, length),
-        "short" => ctx.new_array(cratonvm_types::ArrayElementType::Short, length),
+        "int" | "I" => ctx.new_array(cratonvm_types::ArrayElementType::Int, length),
+        "long" | "J" => ctx.new_array(cratonvm_types::ArrayElementType::Long, length),
+        "float" | "F" => ctx.new_array(cratonvm_types::ArrayElementType::Float, length),
+        "double" | "D" => ctx.new_array(cratonvm_types::ArrayElementType::Double, length),
+        "boolean" | "Z" => ctx.new_array(cratonvm_types::ArrayElementType::Boolean, length),
+        "byte" | "B" => ctx.new_array(cratonvm_types::ArrayElementType::Byte, length),
+        "char" | "C" => ctx.new_array(cratonvm_types::ArrayElementType::Char, length),
+        "short" | "S" => ctx.new_array(cratonvm_types::ArrayElementType::Short, length),
         _ => {
-            // Reference array — resolve the component class
+            // Reference array — resolve the component class. `ensure_class_initialized`
+            // synthesizes array-descriptor components (`[L...;`) on demand, so a
+            // multi-dimensional template yields the correct nested array type.
             let comp_id = ctx.ensure_class_initialized(&comp_name)
                 .unwrap_or(cratonvm_types::ClassId::new(0));
             ctx.new_ref_array(comp_id, length)

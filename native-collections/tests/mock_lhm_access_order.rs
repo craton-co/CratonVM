@@ -93,6 +93,34 @@ fn insertion_order_get_does_not_reorder() {
 }
 
 #[test]
+fn insertion_order_beats_bucket_order() {
+    // The property Jackson's `ObjectNode._children` (a default LinkedHashMap)
+    // relies on, and the root of the SD-JWT duplicate-salt message ordering:
+    // a default LHM must iterate in *insertion* order, NOT bucket order.
+    //
+    // Keys 8 then 2: insertion order is [8, 2], but a plain HashMap would
+    // walk bucket 2 before bucket 8 and yield [2, 8]. The LHM must yield the
+    // insertion order [8, 2] — proving it does not fall back to bucket order.
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let lhm = new_linked_hashmap(&reg, &mut ctx, /*access_order=*/ false);
+
+    let k8 = boxed_int(&mut ctx, 8);
+    let v8 = boxed_int(&mut ctx, 80);
+    let k2 = boxed_int(&mut ctx, 2);
+    let v2 = boxed_int(&mut ctx, 20);
+
+    call(&reg, &mut ctx, LHM, "put", PUT,
+         &[Value::Object(Some(lhm)), k8, v8]).unwrap();
+    call(&reg, &mut ctx, LHM, "put", PUT,
+         &[Value::Object(Some(lhm)), k2, v2]).unwrap();
+
+    let order = iter_keys_via_for_each(&reg, &mut ctx, lhm);
+    assert_eq!(order, vec![k8, k2],
+               "default LHM must iterate in insertion order [8,2], not bucket order [2,8]");
+}
+
+#[test]
 fn access_order_put_of_existing_key_moves_to_tail() {
     // Lock in the fix described in review §1.1 row 4 (C25): in an
     // access-order LHM, `put(k, v)` for a k already present must

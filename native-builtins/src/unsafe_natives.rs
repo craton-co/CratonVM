@@ -723,19 +723,18 @@ fn native_unsafe_set_memory_consolidated(
 /// off-heap form (both objects null) copies through the single arena store
 /// with per-byte bounds checks; any form touching a heap object delegates to
 /// the existing bounds-checked lib.rs handler.
-fn native_unsafe_copy_memory_consolidated(
+pub(crate) fn native_unsafe_copy_memory_consolidated(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let src_null = matches!(args.get(1), Some(Value::Object(None)) | None);
     let dst_null = matches!(args.get(3), Some(Value::Object(None)) | None);
 
-    // Any heap-object side → keep lib.rs's bounds-checked array/field copy.
-    if !(src_null && dst_null) {
+    // Heap↔heap: keep lib.rs's bounds-checked array/field copy.
+    if !src_null && !dst_null {
         return crate::native_unsafe_copy_memory(ctx, args);
     }
 
-    // Fully off-heap copy: route through the arena store.
     let src_addr = match args.get(2) {
         Some(Value::Long(a)) => *a,
         Some(Value::Int(a)) => *a as i64,
@@ -761,6 +760,61 @@ fn native_unsafe_copy_memory_consolidated(
             ),
         }
         .into());
+    }
+
+    // MIXED heap↔off-heap copies. The fully-off-heap loop below only handles
+    // arena↔arena, and `native_unsafe_copy_memory` only handles heap↔heap, so
+    // without this a heap↔off-heap copy was silently DROPPED. This is the path
+    // `DirectByteBuffer.put(heapBuffer)` / `get(heapBuffer)` takes (via
+    // `ScopedMemoryAccess.copyMemory` → `Unsafe.copyMemory`), which is exactly
+    // how `IOUtil` fills/drains the temp direct buffer in the FileChannel /
+    // SocketChannel heap-buffer path. The off-heap side is routed through
+    // `copy_*_native_memory` so an `Unsafe.allocateMemory` arena handle lands
+    // in the off-heap store (and a real pointer falls through to a raw copy).
+    if !src_null && dst_null {
+        // heap src → off-heap dst
+        let src_obj = match args.get(1) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let buf = crate::unsafe_array_read_bytes(ctx, src_obj, src_addr as usize, bytes)
+            .ok_or_else(|| RuntimeError::ArrayIndexOutOfBoundsException {
+                index: src_addr as i32,
+            })?;
+        if !ctx.copy_to_native_memory(dst_addr, &buf) {
+            invalidate_arena_cache();
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!(
+                    "Unsafe.copyMemory: dst address 0x{dst_addr:x} is not addressable"
+                ),
+            }
+            .into());
+        }
+        invalidate_arena_cache();
+        return Ok(None);
+    }
+    if src_null && !dst_null {
+        // off-heap src → heap dst
+        let dst_obj = match args.get(3) {
+            Some(Value::Object(Some(o))) => *o,
+            _ => return Ok(None),
+        };
+        let mut buf = vec![0u8; bytes];
+        if !ctx.copy_from_native_memory(src_addr, &mut buf) {
+            return Err(RuntimeError::IllegalArgumentException {
+                message: format!(
+                    "Unsafe.copyMemory: src address 0x{src_addr:x} is not addressable"
+                ),
+            }
+            .into());
+        }
+        if !crate::unsafe_array_write_bytes(ctx, dst_obj, dst_addr as usize, &buf) {
+            return Err(RuntimeError::ArrayIndexOutOfBoundsException {
+                index: dst_addr as i32,
+            }
+            .into());
+        }
+        return Ok(None);
     }
 
     // Read the source bytes first (handles overlapping ranges within the
@@ -1879,6 +1933,58 @@ mod tests {
             put_after_free.is_err(),
             "putInt after free must be rejected (arena evicted), got {put_after_free:?}",
         );
+    }
+
+    /// R1 (silent-corruption fix): a *real* OS pointer must never be
+    /// mis-classified as an arena handle, even when it falls numerically
+    /// inside a live arena block's `[base, base+len)` range. Before the
+    /// fix, `contains` was pure range membership and a real `allocateDirect`
+    /// pointer ≥ 64 GiB landing inside a block would be silently routed to
+    /// the off-heap store. Tagging every handle with bit 62 — which no real
+    /// Windows/Linux user-mode pointer can have set — makes the two spaces
+    /// provably disjoint.
+    #[test]
+    fn real_pointer_in_arena_numeric_range_is_not_misrouted() {
+        let _arena_lock = crate::arena_test_lock(); // shared global arena
+        let addr = crate::unsafe_arena_allocate(4096);
+
+        // The handle itself is in-arena.
+        assert!(
+            crate::unsafe_arena_contains(addr),
+            "freshly allocated handle {addr:#x} must be in-arena",
+        );
+        // Every handle carries the high tag bit (bit 62).
+        assert_ne!(
+            addr & (1i64 << 62),
+            0,
+            "arena handle {addr:#x} must carry the reserved tag bit",
+        );
+
+        // Synthesize a "real-looking" pointer with the SAME low bits as the
+        // handle but the tag bit cleared — i.e. an address in the historical
+        // 2^36-based numeric range a real OS pointer could occupy. It must NOT
+        // be classified as in-arena, so `copy_*_native_memory` would take the
+        // raw path instead of corrupting the off-heap store.
+        let real_like = addr & !(1i64 << 62);
+        assert!(
+            real_like >= 0x10_0000_0000,
+            "sanity: stripped address {real_like:#x} is in the dangerous low range",
+        );
+        assert!(
+            !crate::unsafe_arena_contains(real_like),
+            "real pointer {real_like:#x} (handle with tag stripped) must NOT be \
+             mis-classified as an arena handle",
+        );
+
+        // A range read at the real-looking address must also be refused so the
+        // NIO routing falls through to the raw pointer path.
+        let mut out = [0u8; 8];
+        assert!(
+            !crate::unsafe_arena_copy_out(real_like, &mut out),
+            "copy_out at a non-handle address must fail (forces raw path)",
+        );
+
+        crate::unsafe_arena_free(addr);
     }
 
     #[test]

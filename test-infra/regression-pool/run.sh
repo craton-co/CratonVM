@@ -21,7 +21,7 @@ APPS_ROOT="$POOL_DIR/apps"
 BASELINE_DIR="$POOL_DIR/baselines"
 RESULTS_DIR="$POOL_DIR/results"
 POOL_TSV="$POOL_DIR/pool.tsv"
-RJVM="$REPO_ROOT/target/release/cratonvm.exe"
+RJVM="${RJVM:-$REPO_ROOT/target/release/cratonvm.exe}"
 JDK="${JDK:-C:/Program Files/Java/jdk-25}"
 XMX="${XMX:-512m}"
 

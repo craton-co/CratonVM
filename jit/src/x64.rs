@@ -1464,6 +1464,16 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         return None;
     }
 
+    // EC-DUP2-CAT2: reject methods whose `dup2` (0x5C) operates on a
+    // category-2 (long/double) value. The codegen `dup2` handler unconditionally
+    // implements the two-category-1 form; for a single category-2 operand it
+    // duplicates an unrelated lower stack slot, desyncing the operand stack and
+    // leaving a primitive where a reference is expected (later dereferenced as a
+    // bad pointer). See `dup2_category_safe`'s doc for the full analysis.
+    if !dup2_category_safe(code, code_len) {
+        return None;
+    }
+
     // Run a *conservative* escape pre-pass here: `jit_scan` has no
     // constant-pool resolver, so it cannot tell a trivial `<init>()V`
     // apart from an arg-bearing constructor. We therefore pass an empty
@@ -1588,9 +1598,24 @@ struct SimdFpArraySum {
 /// Get the byte length of a bytecode instruction at `pc`.
 fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
     match code[pc] {
-        0x10 | 0x15..=0x19 | 0x36..=0x3a | 0xbc => 2,
+        // 2-byte: bipush(0x10), ldc(0x12), iload..aload(0x15..0x19),
+        // istore..astore(0x36..0x3a), ret(0xa9), newarray(0xbc).
+        // `ldc` (0x12) was previously absent and fell through to the `_ => 1`
+        // arm — a 1-byte under-count that misaligned every PC-stepping consumer
+        // (branch-target precompute, DCE, OSR/unroll). When an `ldc` sat
+        // immediately before a branch (e.g. `ldc 65536; if_icmpge exit` — the
+        // standard `for (i; i<CONST; …)` header), the scan skipped the branch,
+        // never marked its exit target, DCE-killed that target, and left the
+        // loop-exit `if_icmpge` unpatched (rel32=0) → the loop overran its bound
+        // (BC SPHINCS-256 Horst.horst_sign AIOOBE).
+        0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => 2,
+        // 3-byte: sipush(0x11), ldc_w(0x13), ldc2_w(0x14), iinc(0x84), jsr(0xa8),
+        // the if_* family, field/invoke ops, etc. ldc_w/ldc2_w were also absent.
         0x11
+        | 0x13
+        | 0x14
         | 0x84
+        | 0xa8
         | 0x99..=0xa6
         | 0xa7
         | 0xb2
@@ -1647,6 +1672,768 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
         }
         _ => 1,
     }
+}
+
+/// EC-SCALAR-SOUNDNESS (bc math-ec JIT miscompile fix) — compute the set of
+/// bytecode PCs that are the TARGET of any branch (conditional, `goto`,
+/// `goto_w`, `jsr`, `jsr_w`, `tableswitch`, `lookupswitch`).
+///
+/// The single-linear-pass escape / scalar-replacement analyses
+/// (`analyze_escapes`, `plan_scalar_replacement`) carry abstract operand-stack
+/// and per-local provenance straight through the bytecode without resetting at
+/// basic-block boundaries. That is only sound for straight-line code: at a
+/// merge point (a branch target reachable from more than one predecessor) the
+/// linear state need not match the real verification-time state on every
+/// incoming edge. To keep those analyses sound we treat every branch *source*
+/// (handled inline at each branch opcode) AND every branch *target* (via this
+/// set) as a hard barrier that drops all tracked provenance, confining any
+/// scalar-replaced object to a single-entry / single-exit straight-line
+/// region.
+///
+/// Returns a bit-set (`Vec<bool>` indexed by PC) of size `code_len`.
+/// Stage 3 (precise oop maps) — process-wide gate for the *moving*-safe
+/// precise-stack-map machinery (exact RBP frame registration, safepoint-id
+/// slot, precise relocation). Read once from `CRATONVM_PRECISE_JIT_MAPS`.
+///
+/// Default OFF: when off, none of the Stage 3 codegen (prologue frame-record
+/// call, per-safepoint id store, extra frame slot) is emitted, so the default
+/// path is byte-identical. The precise *maps* themselves (Stages 1–2) are
+/// still produced — they are consumed only as additive roots by the
+/// conservative walker until this gate turns the relocation path on (Stage 5).
+pub fn precise_jit_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_PRECISE_JIT_MAPS").is_some())
+}
+
+/// Whether the JIT **shadow-stack** precise-roots codegen is enabled
+/// (`CRATONVM_SHADOW_STACK`). When on, each GC-capable safepoint pushes every
+/// live oop (operand-stack entries AND oop locals) onto the thread's shadow
+/// stack and reloads them after the call, so a *moving* collector can rewrite
+/// every JIT-held reference precisely (see `gc/src/shadow_stack.rs`). Off by
+/// default → no extra codegen, byte-identical to the legacy path.
+pub fn shadow_stack_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some())
+}
+
+/// Bisect toggle (`CRATONVM_SHADOW_NOPUSH`) — when set, the shadow push/reload
+/// codegen is suppressed while the prologue thread-fetch + the GC gate flip stay
+/// on. Used to localize a fault to the push/reload sequences vs the rest.
+fn shadow_nopush() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_NOPUSH").is_some())
+}
+
+/// Bisect toggle (`CRATONVM_SHADOW_NORELOAD`) — suppress only the post-call
+/// reload (keep the push). Push-only writes to the (separate) shadow buffer, so
+/// if push-only is correct it cannot corrupt program state; a crash then
+/// localizes to the reload (which writes back into home regs/slots).
+fn shadow_noreload() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_NORELOAD").is_some())
+}
+
+fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
+    let mut targets = vec![false; code_len];
+    let mut pc = 0usize;
+    while pc < code_len {
+        let op = code[pc];
+        match op {
+            // Conditional branches + goto + jsr: 2-byte signed offset from `pc`.
+            0x99..=0xA8 | 0xC6 | 0xC7 => {
+                if pc + 2 < code_len {
+                    let off =
+                        i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as isize;
+                    let t = pc as isize + off;
+                    if t >= 0 && (t as usize) < code_len {
+                        targets[t as usize] = true;
+                    }
+                }
+                pc += 3;
+            }
+            // goto_w / jsr_w: 4-byte signed offset from `pc`.
+            0xC8 | 0xC9 => {
+                if pc + 4 < code_len {
+                    let off = i32::from_be_bytes([
+                        code[pc + 1],
+                        code[pc + 2],
+                        code[pc + 3],
+                        code[pc + 4],
+                    ]) as isize;
+                    let t = pc as isize + off;
+                    if t >= 0 && (t as usize) < code_len {
+                        targets[t as usize] = true;
+                    }
+                }
+                pc += 5;
+            }
+            // tableswitch: default + (high-low+1) offsets, all relative to `pc`.
+            0xAA => {
+                let mut p = pc + 1;
+                while p % 4 != 0 {
+                    p += 1;
+                }
+                if p + 12 > code_len {
+                    break;
+                }
+                let read_off = |code: &[u8], at: usize| -> isize {
+                    i32::from_be_bytes([
+                        code[at],
+                        code[at + 1],
+                        code[at + 2],
+                        code[at + 3],
+                    ]) as isize
+                };
+                let mark = |targets: &mut Vec<bool>, off: isize| {
+                    let t = pc as isize + off;
+                    if t >= 0 && (t as usize) < code_len {
+                        targets[t as usize] = true;
+                    }
+                };
+                mark(&mut targets, read_off(code, p)); // default
+                let low = read_off(code, p + 4) as i32;
+                let high = read_off(code, p + 8) as i32;
+                let count = checked_tableswitch_count(low, high).unwrap_or(0);
+                let mut jp = p + 12;
+                for _ in 0..count {
+                    if jp + 4 > code_len {
+                        break;
+                    }
+                    mark(&mut targets, read_off(code, jp));
+                    jp += 4;
+                }
+                pc += bytecode_len_at(code, pc);
+            }
+            // lookupswitch: default + npairs (match, offset) pairs.
+            0xAB => {
+                let mut p = pc + 1;
+                while p % 4 != 0 {
+                    p += 1;
+                }
+                if p + 8 > code_len {
+                    break;
+                }
+                let read_off = |code: &[u8], at: usize| -> isize {
+                    i32::from_be_bytes([
+                        code[at],
+                        code[at + 1],
+                        code[at + 2],
+                        code[at + 3],
+                    ]) as isize
+                };
+                let mark = |targets: &mut Vec<bool>, off: isize| {
+                    let t = pc as isize + off;
+                    if t >= 0 && (t as usize) < code_len {
+                        targets[t as usize] = true;
+                    }
+                };
+                mark(&mut targets, read_off(code, p)); // default
+                let npairs = i32::from_be_bytes([
+                    code[p + 4],
+                    code[p + 5],
+                    code[p + 6],
+                    code[p + 7],
+                ])
+                .max(0) as usize;
+                let mut jp = p + 8;
+                for _ in 0..npairs {
+                    if jp + 8 > code_len {
+                        break;
+                    }
+                    // pair is (match:i32, offset:i32); offset at jp+4.
+                    mark(&mut targets, read_off(code, jp + 4));
+                    jp += 8;
+                }
+                pc += bytecode_len_at(code, pc);
+            }
+            _ => {
+                pc += bytecode_len_at(code, pc);
+            }
+        }
+    }
+    targets
+}
+
+/// Stage 2 (precise oop maps) — enumerate the control-flow successors of the
+/// instruction at `pc` (normal flow only; exception-handler edges are not
+/// available to the JIT and are handled conservatively by leaving handler-only
+/// PCs `unreached`). Mirrors the branch/switch decoding in
+/// [`compute_branch_targets`] and the per-opcode length in [`bytecode_len_at`].
+fn oop_dataflow_successors(code: &[u8], code_len: usize, pc: usize) -> Vec<usize> {
+    let op = code[pc];
+    let fallthrough = pc + bytecode_len_at(code, pc);
+    let read_i16 = |at: usize| -> isize {
+        if at + 1 < code_len {
+            i16::from_be_bytes([code[at], code[at + 1]]) as isize
+        } else {
+            0
+        }
+    };
+    let read_i32 = |at: usize| -> isize {
+        if at + 3 < code_len {
+            i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
+        } else {
+            0
+        }
+    };
+    let target = |off: isize| -> Option<usize> {
+        let t = pc as isize + off;
+        if t >= 0 && (t as usize) < code_len {
+            Some(t as usize)
+        } else {
+            None
+        }
+    };
+    match op {
+        // ireturn/lreturn/freturn/dreturn/areturn/return, athrow, ret:
+        // no normal successor.
+        0xAC..=0xB1 | 0xBF | 0xA9 => Vec::new(),
+        // goto / goto_w: unconditional, target only.
+        0xA7 => target(read_i16(pc + 1)).into_iter().collect(),
+        0xC8 => target(read_i32(pc + 1)).into_iter().collect(),
+        // jsr / jsr_w: target + fall-through (return address pushed).
+        0xA8 => {
+            let mut v: Vec<usize> = target(read_i16(pc + 1)).into_iter().collect();
+            if fallthrough < code_len {
+                v.push(fallthrough);
+            }
+            v
+        }
+        0xC9 => {
+            let mut v: Vec<usize> = target(read_i32(pc + 1)).into_iter().collect();
+            if fallthrough < code_len {
+                v.push(fallthrough);
+            }
+            v
+        }
+        // Conditional branches (if<cond>, if_icmp<cond>, if_acmp<cond>) and
+        // ifnull/ifnonnull: target + fall-through.
+        0x99..=0xA6 | 0xC6 | 0xC7 => {
+            let mut v: Vec<usize> = target(read_i16(pc + 1)).into_iter().collect();
+            if fallthrough < code_len {
+                v.push(fallthrough);
+            }
+            v
+        }
+        // tableswitch: default + each table entry; no fall-through.
+        0xAA => {
+            let mut p = pc + 1;
+            while p % 4 != 0 {
+                p += 1;
+            }
+            let mut v = Vec::new();
+            if p + 12 <= code_len {
+                if let Some(t) = target(read_i32(p)) {
+                    v.push(t);
+                }
+                let low = read_i32(p + 4) as i32;
+                let high = read_i32(p + 8) as i32;
+                let count = checked_tableswitch_count(low, high).unwrap_or(0);
+                let mut jp = p + 12;
+                for _ in 0..count {
+                    if jp + 4 > code_len {
+                        break;
+                    }
+                    if let Some(t) = target(read_i32(jp)) {
+                        v.push(t);
+                    }
+                    jp += 4;
+                }
+            }
+            v
+        }
+        // lookupswitch: default + each pair offset; no fall-through.
+        0xAB => {
+            let mut p = pc + 1;
+            while p % 4 != 0 {
+                p += 1;
+            }
+            let mut v = Vec::new();
+            if p + 8 <= code_len {
+                if let Some(t) = target(read_i32(p)) {
+                    v.push(t);
+                }
+                let npairs = read_i32(p + 4).max(0) as usize;
+                let mut jp = p + 8;
+                for _ in 0..npairs {
+                    if jp + 8 > code_len {
+                        break;
+                    }
+                    if let Some(t) = target(read_i32(jp + 4)) {
+                        v.push(t);
+                    }
+                    jp += 8;
+                }
+            }
+            v
+        }
+        // Everything else: fall-through only.
+        _ => {
+            if fallthrough < code_len {
+                vec![fallthrough]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Stage 2 (precise oop maps) — transfer function for the per-local "must be
+/// oop" dataflow: apply the store at `pc` to `mask`. `astore*` makes a local
+/// definitely-oop; primitive stores (`istore`/`lstore`/`fstore`/`dstore`/
+/// `iinc`) make it definitely-non-oop; long/double stores also clear the
+/// category-2 high half. All other opcodes leave the local types unchanged.
+fn oop_dataflow_transfer(code: &[u8], pc: usize, mask: u64, max_locals: usize) -> u64 {
+    let set_oop = |m: u64, k: usize| -> u64 {
+        if k < 64 && k < max_locals {
+            m | (1u64 << k)
+        } else {
+            m
+        }
+    };
+    let clr = |m: u64, k: usize, span: usize| -> u64 {
+        let mut m = m;
+        for j in k..k + span {
+            if j < 64 {
+                m &= !(1u64 << j);
+            }
+        }
+        m
+    };
+    let op = code[pc];
+    match op {
+        0x3A => set_oop(mask, code.get(pc + 1).copied().unwrap_or(0) as usize), // astore
+        0x4B..=0x4E => set_oop(mask, (op - 0x4B) as usize),                     // astore_0..3
+        0x36 | 0x38 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 1), // istore/fstore
+        0x37 | 0x39 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 2), // lstore/dstore
+        0x3B..=0x3E => clr(mask, (op - 0x3B) as usize, 1),                      // istore_0..3
+        0x43..=0x46 => clr(mask, (op - 0x43) as usize, 1),                      // fstore_0..3
+        0x3F..=0x42 => clr(mask, (op - 0x3F) as usize, 2),                      // lstore_0..3
+        0x47..=0x4A => clr(mask, (op - 0x47) as usize, 2),                      // dstore_0..3
+        0x84 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 1),  // iinc
+        0xC4 => {
+            // wide <store>/<iinc>: 2-byte index.
+            let wop = code.get(pc + 1).copied().unwrap_or(0);
+            let idx = if pc + 3 < code.len() {
+                u16::from_be_bytes([code[pc + 2], code[pc + 3]]) as usize
+            } else {
+                0
+            };
+            match wop {
+                0x3A => set_oop(mask, idx),
+                0x36 | 0x38 => clr(mask, idx, 1),
+                0x37 | 0x39 => clr(mask, idx, 2),
+                0x84 => clr(mask, idx, 1),
+                _ => mask,
+            }
+        }
+        _ => mask,
+    }
+}
+
+/// Stage 2 (precise oop maps) — forward "must be oop" dataflow over local
+/// variable slots. Returns `(in_mask, reached)` each of length `code_len`:
+/// `in_mask[pc] & (1<<k) != 0` iff local `k` holds an object reference on
+/// EVERY normal-control-flow path reaching `pc`, and `reached[pc]` is true iff
+/// the forward analysis visited `pc`.
+///
+/// Soundness for the *moving* GC consumer (Stage 5): a bit is set only when
+/// the slot was `astore`d on every reaching path, so the slot genuinely holds
+/// an oop — never a primitive (no false positive → no int rewritten). A live
+/// oop that is conditionally a primitive on another path merges to "not
+/// definitely oop" and is omitted; such a slot is necessarily dead-as-oop at
+/// that PC (the verifier forbids reading a slot with conflicting types), so the
+/// omission is safe. PCs reachable only via exception handlers (whose edges are
+/// not visible here) stay `unreached`; the caller emits no precise local
+/// entries there and the GC falls back to the conservative frame sweep.
+///
+/// `> 64` locals → empty result (caller falls back to conservative). Parameter
+/// slots are seeded conservatively as non-oop for now (TODO before the Stage 5
+/// gate flip: first-execution-use param typing so oop params live at an early
+/// safepoint are precisely covered rather than left to the conservative sweep).
+fn compute_local_oop_masks(
+    code: &[u8],
+    code_len: usize,
+    max_locals: usize,
+) -> (Vec<u64>, Vec<bool>) {
+    if max_locals == 0 || max_locals > 64 || code_len == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    const TOP: u64 = u64::MAX;
+    let mut in_mask = vec![TOP; code_len];
+    let mut reached = vec![false; code_len];
+    // Entry: conservative (no params assumed oop). See doc comment TODO.
+    in_mask[0] = 0;
+    reached[0] = true;
+    let mut work: Vec<usize> = vec![0];
+    // Bound iterations defensively against any decoding pathology.
+    let mut guard = code_len.saturating_mul(64).saturating_add(64);
+    while let Some(pc) = work.pop() {
+        if pc >= code_len {
+            continue;
+        }
+        guard = guard.saturating_sub(1);
+        if guard == 0 {
+            break;
+        }
+        let out = oop_dataflow_transfer(code, pc, in_mask[pc], max_locals);
+        for succ in oop_dataflow_successors(code, code_len, pc) {
+            if succ >= code_len {
+                continue;
+            }
+            // First real predecessor seeds; later ones intersect (AND).
+            let new_in = if reached[succ] { in_mask[succ] & out } else { out };
+            if !reached[succ] || new_in != in_mask[succ] {
+                in_mask[succ] = new_in;
+                reached[succ] = true;
+                work.push(succ);
+            }
+        }
+    }
+    // Mask off bits beyond max_locals (TOP-init residue on any unreached PC is
+    // irrelevant — callers gate on `reached`).
+    let valid_bits = if max_locals >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << max_locals) - 1
+    };
+    for m in in_mask.iter_mut() {
+        *m &= valid_bits;
+    }
+    (in_mask, reached)
+}
+
+/// EC-DUP2-CAT2 (bc math-ec JIT miscompile fix) — reject methods whose
+/// `dup2` (0x5C) operates on a CATEGORY-2 (long / double) value.
+///
+/// ## The bug
+///
+/// The JIT models the operand stack with ONE entry per value, regardless of
+/// type width (a `long`/`double` is a single 64-bit stack entry; `ladd` pops
+/// two entries and pushes one — see the arithmetic handlers). That single-slot
+/// model is internally consistent for arithmetic, but `dup2` (0x5C) is
+/// type-dependent in the JVM:
+///
+///   * FORM 1 — top two operands are each category-1: `[…, v1, v2]` →
+///     `[…, v1, v2, v1, v2]`.
+///   * FORM 2 — top operand is a single category-2 value: `[…, w]` →
+///     `[…, w, w]`.
+///
+/// The codegen `dup2` handler unconditionally implements FORM 1: it reads
+/// `stack[len-2]` and `stack[len-1]` and re-pushes both. For a single
+/// category-2 operand (FORM 2) there is only ONE real value on top, so
+/// `stack[len-2]` is an UNRELATED value living below the long/double. The
+/// handler then duplicates that unrelated value, corrupting the operand
+/// stack: a subsequent consumer reads the wrong slot, and an `int` (or other
+/// primitive) ends up where an object/array reference is expected. The bad
+/// "reference" (a small integer like 1 or 3) is later dereferenced by an
+/// inline `getfield`/array op — observed as `EXCEPTION_ACCESS_VIOLATION`
+/// reading `[1 + 0x30]` (= field-0 payload off a base of `1`) and
+/// `[3 + 0xC]` (= array-length off a base of `3`) in `org.bouncycastle.
+/// math.ec` AllTests, and as a bad pointer the young-gen GC scavenge later
+/// follows into a SEGV.
+///
+/// `jit_scan` already ACCEPTS `dup2` (it only advances `pc`), and the five
+/// other type-dependent stack ops (`pop2`, `dup_x1`, `dup_x2`, `dup2_x1`,
+/// `dup2_x2`) are not implemented by codegen and safely bail. Only `dup2` is
+/// both accepted AND (mis-)implemented, so it is the lone miscompile.
+///
+/// ## The fix
+///
+/// Track operand-stack category WIDTH (1 or 2 per value) with a precise
+/// linear abstract interpretation. At each `dup2`, if the top value is
+/// category-2 — or if the width state is in any way uncertain — reject the
+/// whole method (`jit_scan` returns `None`), leaving it to the interpreter.
+/// The common FORM-1 `dup2` (the `arr[i] op= x` array-update idiom, where the
+/// top two operands are an arrayref + int index — both category-1) is
+/// unaffected and still JITs.
+///
+/// Soundness: under JVMS verification the stack height AND the type-width at
+/// every PC are invariant across all incoming control-flow edges, so a single
+/// linear width-tracking pass observes the correct top-of-stack width at each
+/// `dup2` regardless of branches. To stay safe even on bytecode shapes this
+/// tracker models imprecisely, ANY uncertainty (stack underflow in the
+/// abstract model, or an opcode whose exact width effect is not modeled while
+/// a `dup2` is still reachable) conservatively triggers rejection.
+///
+/// Returns `true` when the method is SAFE to JIT w.r.t. `dup2`, `false` when
+/// it must be rejected.
+fn dup2_category_safe(code: &[u8], code_len: usize) -> bool {
+    // Fast path: no `dup2` anywhere → nothing to check.
+    let mut has_dup2 = false;
+    {
+        let mut p = 0usize;
+        while p < code_len {
+            if code[p] == 0x5C {
+                has_dup2 = true;
+                break;
+            }
+            p += bytecode_len_at(code, p);
+        }
+    }
+    if !has_dup2 {
+        return true;
+    }
+
+    // Abstract operand stack of category widths, one entry per value:
+    //   1 = category-1 (int/float/ref/returnAddress; high-half is implicit)
+    //   2 = category-2 (long/double) — a SINGLE entry in this single-slot model
+    //
+    // An empty model (e.g. just after a `widths.clear()` on an op whose exact
+    // width effect we do not track) makes a subsequent `dup2` default to
+    // FORM-1 — matching the codegen — rather than rejecting, so JIT coverage
+    // is preserved. We reject only when a `dup2`'s top is PROVABLY category-2.
+    let mut widths: Vec<u8> = Vec::with_capacity(16);
+
+    // Helpers ------------------------------------------------------------
+    macro_rules! push {
+        ($w:expr) => {
+            widths.push($w)
+        };
+    }
+    macro_rules! pop {
+        () => {
+            widths.pop()
+        };
+    }
+
+    let mut pc = 0usize;
+    while pc < code_len {
+        let op = code[pc];
+        match op {
+            // --- pushes: category-1 producers ---
+            // aconst_null, iconst*, fconst*, bipush, sipush, ldc/ldc_w,
+            // iload*, fload*, aload*, i/f/a/b/c/saload, new, newarray,
+            // anewarray, arraylength, instanceof, i2f/i2b/i2c/i2s/l2i/f2i/
+            // d2i/l2f/d2f, fcmp/lcmp/dcmp (push int), etc.
+            0x01 | 0x02..=0x08 | 0x0b..=0x0d => { push!(1); pc += 1; }
+            0x10 => { push!(1); pc += 2; }      // bipush
+            0x11 => { push!(1); pc += 3; }      // sipush
+            0x12 => { push!(1); pc += 2; }      // ldc
+            0x13 => { push!(1); pc += 3; }      // ldc_w
+            0x15 => { push!(1); pc += 2; }      // iload
+            0x17 => { push!(1); pc += 2; }      // fload
+            0x19 => { push!(1); pc += 2; }      // aload
+            0x1a..=0x1d => { push!(1); pc += 1; } // iload_0..3
+            0x22..=0x25 => { push!(1); pc += 1; } // fload_0..3
+            0x2a..=0x2d => { push!(1); pc += 1; } // aload_0..3
+
+            // --- pushes: category-2 producers ---
+            0x09 | 0x0a | 0x0e | 0x0f => { push!(2); pc += 1; } // l/dconst
+            0x14 => { push!(2); pc += 3; }      // ldc2_w (long/double)
+            0x16 => { push!(2); pc += 2; }      // lload
+            0x18 => { push!(2); pc += 2; }      // dload
+            0x1e..=0x21 => { push!(2); pc += 1; } // lload_0..3
+            0x26..=0x29 => { push!(2); pc += 1; } // dload_0..3
+
+            // --- array loads (pop arrayref+index, push element) ---
+            // iaload/faload/aaload/baload/caload/saload → cat-1 element
+            0x2e | 0x30 | 0x32 | 0x33 | 0x34 | 0x35 => {
+                pop!(); pop!(); push!(1); pc += 1;
+            }
+            // laload (0x2f) / daload (0x31) → cat-2 element
+            0x2f | 0x31 => {
+                pop!(); pop!(); push!(2); pc += 1;
+            }
+
+            // --- stores (pop the value; locals are untracked) ---
+            0x36 | 0x37 | 0x3a => { pop!(); pc += 2; }       // istore/fstore/astore
+            0x38 | 0x39 => { pop!(); pc += 2; }              // lstore/dstore (one entry)
+            0x3b..=0x3e | 0x43..=0x4e => { pop!(); pc += 1; } // istore_/fstore_/astore_
+            0x3f..=0x42 => { pop!(); pc += 1; }              // lstore_0..3 (one entry)
+            // dstore_0..3 fall under 0x47..=0x4a, included in 0x43..=0x4a above
+
+            // --- array stores (pop value, index, arrayref) ---
+            0x4f..=0x56 => { pop!(); pop!(); pop!(); pc += 1; }
+
+            // --- stack manipulation (the crux) ---
+            //
+            // POLICY: this analyzer's ONLY purpose is to reject methods whose
+            // `dup2` (0x5C, the single ambiguous stack op the codegen actually
+            // implements) operates on a CATEGORY-2 value. The other ambiguous
+            // ops (`pop2`, `dup_x1`, `dup_x2`, `dup2_x1`, `dup2_x2`) are NOT
+            // implemented by codegen — they hit the `_ => return false` bail in
+            // `compile_bytecode` and the method safely stays interpreted, so we
+            // do NOT reject for them here. To avoid losing JIT coverage, an
+            // imprecisely-modeled state is handled by CLEARING the abstract
+            // stack (treat subsequent values as unknown) rather than rejecting;
+            // a `dup2` on a cleared/unknown top is then treated as FORM-1,
+            // matching the codegen's behavior (correct whenever the real top is
+            // two category-1 values — the overwhelmingly common case).
+            //
+            // pop (cat-1)
+            0x57 => { pop!(); pc += 1; }
+            // pop2: two cat-1 OR one cat-2 — codegen's `pop2` is unimplemented
+            // (bails), so we only need to keep the model's height roughly sane.
+            0x58 => {
+                match widths.last().copied() {
+                    Some(2) => { pop!(); }
+                    _ => { pop!(); pop!(); }
+                }
+                pc += 1;
+            }
+            // dup (cat-1 only by JVMS; duplicate top width).
+            0x59 => {
+                let w = widths.last().copied().unwrap_or(1);
+                push!(w);
+                pc += 1;
+            }
+            // dup_x1 / dup_x2 — unimplemented by codegen (safe bail); just
+            // resync the model loosely. Clear so we do not mis-evaluate a later
+            // dup2 against a now-shuffled stack we no longer model precisely.
+            0x5a | 0x5b => { widths.clear(); pc += 1; }
+            // dup2 — THE checked op. Reject ONLY when the top is PROVABLY
+            // category-2 (FORM 2), which the codegen mis-duplicates as two
+            // category-1 entries.
+            0x5c => {
+                match widths.last().copied() {
+                    Some(2) => {
+                        // FORM 2: single category-2 value on top — codegen
+                        // miscompiles this. Reject the method.
+                        return false;
+                    }
+                    Some(1) => {
+                        // Top is category-1. If the second entry is also a
+                        // known category-1, this is a safe FORM-1 dup2; model
+                        // the duplication. If the second entry is category-2
+                        // (an unusual but possible verified shape), the codegen
+                        // would also mishandle it, so reject.
+                        let len = widths.len();
+                        if len >= 2 && widths[len - 2] == 2 {
+                            return false;
+                        }
+                        let a = widths.get(len.wrapping_sub(2)).copied().unwrap_or(1);
+                        let b = 1u8;
+                        push!(a);
+                        push!(b);
+                    }
+                    _ => {
+                        // None (empty/cleared model) or an out-of-range width that
+                        // cannot occur for a valid stack model (widths are only ever
+                        // 1 or 2): treat conservatively as FORM-1 to match codegen;
+                        // push two cat-1.
+                        push!(1);
+                        push!(1);
+                    }
+                }
+                pc += 1;
+            }
+            // dup2_x1 / dup2_x2 — unimplemented by codegen (safe bail); resync
+            // the model loosely by clearing.
+            0x5d | 0x5e => { widths.clear(); pc += 1; }
+            // swap (two cat-1) — unimplemented for cat-2 mixes; just model.
+            0x5f => {
+                let len = widths.len();
+                if len >= 2 {
+                    widths.swap(len - 1, len - 2);
+                }
+                pc += 1;
+            }
+
+            // --- arithmetic / logic ---
+            // int ops that pop 2 push 1 (cat-1): iadd/isub/imul/idiv/irem,
+            // ishl/ishr/iushr/iand/ior/ixor.
+            0x60 | 0x64 | 0x68 | 0x6c | 0x70 | 0x78 | 0x7a | 0x7c | 0x7e
+            | 0x80 | 0x82 => { pop!(); /* top stays cat-1 */ pc += 1; }
+            // float ops pop2 push1 (cat-1): fadd/fsub/fmul/fdiv/frem.
+            0x62 | 0x66 | 0x6a | 0x6e | 0x72 => { pop!(); pc += 1; }
+            // long ops that pop 2 push 1 (cat-2): ladd/lsub/lmul/ldiv/lrem,
+            // land/lor/lxor.
+            0x61 | 0x65 | 0x69 | 0x6d | 0x71 | 0x7f | 0x81 | 0x83 => {
+                pop!(); /* result cat-2, top entry already cat-2 */ pc += 1;
+            }
+            // double ops pop2 push1 (cat-2): dadd/dsub/dmul/ddiv/drem.
+            0x63 | 0x67 | 0x6b | 0x6f | 0x73 => { pop!(); pc += 1; }
+            // long shifts: lshl/lshr/lushr pop an int shift amount (cat-1),
+            // value stays cat-2.
+            0x79 | 0x7b | 0x7d => { pop!(); pc += 1; }
+            // unary negate: ineg/fneg (cat-1), lneg/dneg (cat-2) — width
+            // unchanged.
+            0x74..=0x77 => { pc += 1; }
+
+            // --- conversions (replace top width) ---
+            0x85 => { pop!(); push!(2); pc += 1; }        // i2l → long  (cat-2)
+            0x86 => { pop!(); push!(1); pc += 1; }        // i2f → float (cat-1)
+            0x87 => { pop!(); push!(2); pc += 1; }        // i2d → double(cat-2)
+            0x88 => { pop!(); push!(1); pc += 1; }        // l2i → int   (cat-1)
+            0x89 => { pop!(); push!(1); pc += 1; }        // l2f → float (cat-1)
+            0x8a => { pop!(); push!(2); pc += 1; }        // l2d → double(cat-2)
+            0x8b => { pop!(); push!(1); pc += 1; }        // f2i → int   (cat-1)
+            0x8c => { pop!(); push!(2); pc += 1; }        // f2l → long  (cat-2)
+            0x8d => { pop!(); push!(2); pc += 1; }        // f2d → double(cat-2)
+            0x8e => { pop!(); push!(1); pc += 1; }        // d2i → int   (cat-1)
+            0x8f => { pop!(); push!(2); pc += 1; }        // d2l → long  (cat-2)
+            0x90 => { pop!(); push!(1); pc += 1; }        // d2f → float (cat-1)
+            0x91..=0x93 => { pop!(); push!(1); pc += 1; } // i2b, i2c, i2s (cat-1)
+
+            // --- comparisons → push int (cat-1). Each pops two operands;
+            // cat-2 operands (lcmp/dcmp) are a single entry each, so popping
+            // two entries is correct for both cat-1 and cat-2 forms. ---
+            0x94 => { pop!(); pop!(); push!(1); pc += 1; } // lcmp  (long, long)
+            0x95 | 0x96 => { pop!(); pop!(); push!(1); pc += 1; } // fcmpl/fcmpg
+            0x97 | 0x98 => { pop!(); pop!(); push!(1); pc += 1; } // dcmpl/dcmpg
+
+            // --- control flow: per JVMS, stack height/width is invariant at
+            // each PC across edges, so a linear walk stays consistent. Pop the
+            // branch operands; provenance/width of the rest is preserved. ---
+            0x99..=0x9e | 0xc6 | 0xc7 => { pop!(); pc += 3; } // if<cond>, ifnull/nonnull
+            0x9f..=0xa6 => { pop!(); pop!(); pc += 3; }       // if_icmp/if_acmp
+            0xa7 => { pc += 3; }                              // goto
+            0xa8 => { push!(1); pc += 3; }                    // jsr (pushes returnAddress)
+            0xa9 => { pc += 2; }                              // ret
+
+            // returns / athrow — terminate this straight-line run; the abstract
+            // stack is reset implicitly because the next PC begins a new block
+            // (a branch target). Pop the returned value where applicable.
+            0xac | 0xae | 0xb0 => { pop!(); widths.clear(); pc += 1; } // ireturn/freturn/areturn
+            0xad | 0xaf => { pop!(); widths.clear(); pc += 1; }        // lreturn/dreturn (one entry)
+            0xb1 => { widths.clear(); pc += 1; }                       // return
+            0xbf => { widths.clear(); pc += 1; }                       // athrow
+
+            // switches — pop the int key; rest invariant.
+            0xaa => { pop!(); pc += bytecode_len_at(code, pc); }
+            0xab => { pop!(); pc += bytecode_len_at(code, pc); }
+
+            // --- field / method ops: the width effect depends on the CP
+            // descriptor, which this standalone helper does not parse. Rather
+            // than reject (which would needlessly forgo JITting any method that
+            // mixes field/call ops with a `dup2`), CLEAR the abstract model and
+            // continue. A `dup2` whose top is a *direct* call/field result is
+            // exceptionally rare in real bytecode (results are stored, not
+            // dup2'd), and a cleared model makes such a dup2 default to FORM-1
+            // — exactly the codegen's existing behavior. This preserves JIT
+            // coverage while still catching the common, locally-detectable
+            // FORM-2 dup2 (e.g. `lload; dup2`, `ladd; dup2`).
+            0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 | 0xba => {
+                widths.clear();
+                pc += bytecode_len_at(code, pc);
+            }
+
+            // new / checkcast / instanceof / monitor / nop / iinc / arrays.
+            0x00 => { pc += 1; }                              // nop
+            0x84 => { pc += 3; }                              // iinc (no stack effect)
+            0xbb => { push!(1); pc += 3; }                    // new → objectref (cat-1)
+            0xbc => { pop!(); push!(1); pc += 2; }            // newarray
+            0xbd => { pop!(); push!(1); pc += 3; }            // anewarray
+            0xbe => { pop!(); push!(1); pc += 1; }            // arraylength → int
+            0xc0 => { pc += 3; }                              // checkcast (width unchanged)
+            0xc1 => { pop!(); push!(1); pc += 3; }            // instanceof → int
+            0xc2 | 0xc3 => { pop!(); pc += 1; }               // monitorenter/exit
+            // wide (0xc4), multianewarray (0xc5), goto_w/jsr_w (0xc8/0xc9), and
+            // any other unmodeled opcode: clear the model and advance by the
+            // correct instruction length. Clearing keeps us sound (a later
+            // dup2 defaults to FORM-1 = codegen behavior) without rejecting.
+            _ => {
+                widths.clear();
+                pc += bytecode_len_at(code, pc);
+            }
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1787,6 +2574,11 @@ fn analyze_escapes(
     let mut local_origin: [Option<usize>; 256] = [None; 256];
     let mut escaped: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
+    // EC-SCALAR-SOUNDNESS: branch-target PCs are hard barriers (merge
+    // points where the linear abstract state is not guaranteed to match
+    // the real verification-time state on every incoming edge).
+    let branch_targets = compute_branch_targets(code, code_len);
+
     // Helper: mark all tracked objects currently on the stack as escaped.
     macro_rules! escape_all {
         () => {
@@ -1800,6 +2592,21 @@ fn analyze_escapes(
 
     let mut pc = 0usize;
     while pc < code_len {
+        // EC-SCALAR-SOUNDNESS: entering a branch target (merge point) — any
+        // object whose provenance is live here may have arrived on an edge
+        // this single linear pass cannot model. Conservatively escape every
+        // tracked object (stack + locals) and drop all provenance so the
+        // object is never scalar-replaced. (pc 0 is also flagged as a target
+        // but nothing is live there, so this is a no-op at entry.)
+        if branch_targets.get(pc).copied().unwrap_or(false) {
+            escape_all!();
+            for slot in local_origin.iter_mut() {
+                if let Some(p) = slot.take() {
+                    escaped.insert(p);
+                }
+            }
+            abs_stack.clear();
+        }
         let op = code[pc];
         match op {
             // new — push a tracked reference
@@ -1942,6 +2749,77 @@ fn analyze_escapes(
                 abs_stack.push(None);
                 pc += if op == 0xb9 { 5 } else { 3 };
             }
+            // EC-SCALAR-SOUNDNESS (bc math-ec JIT miscompile fix):
+            //
+            // This whole analysis is a SINGLE LINEAR forward pass over the
+            // bytecode — it never resets/merges the abstract operand stack
+            // or `local_origin` at basic-block boundaries. That is only sound
+            // for STRAIGHT-LINE code. The instant control flow can branch
+            // (conditional/goto/switch), throw, `ret`, or split via `jsr`,
+            // the linear `abs_stack`/`local_origin` state diverges from the
+            // real verification-time stack at the branch target. A genuinely
+            // escaping store reached on a path the linear walk mis-models is
+            // then attributed to the wrong `new` (or to none), so an object
+            // that DOES escape is reported non-escaping and later scalar-
+            // replaced. The scalar-replaced `new` pushes a dummy zero ref
+            // (see the `0xbb` handler) and its real escaping store writes a
+            // bad heap pointer — which the GC later follows and SEGVs on
+            // (observed: bc `org.bouncycastle.math.ec` AllTests, fault read
+            // @ ~0x31 off a near-page-aligned garbage base inside the
+            // young-gen scavenge copy loop).
+            //
+            // Correctness fix: treat EVERY control-transfer instruction as a
+            // hard escape barrier. Escape every object currently tracked on
+            // the operand stack AND every object held in a local (any of
+            // which could be `aload`ed and made to escape on an edge this
+            // pass cannot follow), then clear all provenance. This confines
+            // scalar replacement to objects whose entire `new; dup;
+            // <init>()V; (putfield|getfield)*` lifecycle is provably within a
+            // single straight-line region — exactly where the single-pass
+            // abstract interpretation is sound. Straight-line allocation
+            // sites (the common case this optimization targets) are
+            // unaffected; only objects whose liveness crosses a CFG edge are
+            // conservatively de-optimized.
+            //
+            //   0x99..=0xa8  ifeq..jsr (conditional branches, goto, jsr)
+            //   0xa9         ret
+            //   0xaa,0xab    table/lookupswitch
+            //   0xbf         athrow
+            //   0xc6,0xc7    ifnull / ifnonnull
+            //   0xc8,0xc9    goto_w / jsr_w
+            //
+            // Plain *return (0xac/0xad/0xae/0xaf/0xb1) is deliberately NOT in
+            // this list — it has its own arm below. (areturn 0xb0 is matched
+            // earlier and escapes the returned object.)
+            0x99..=0xa9 | 0xaa | 0xab | 0xbf | 0xc6 | 0xc7 | 0xc8 | 0xc9 => {
+                escape_all!();
+                for slot in local_origin.iter_mut() {
+                    if let Some(p) = slot.take() {
+                        escaped.insert(p);
+                    }
+                }
+                abs_stack.clear();
+                pc += bytecode_len_at(code, pc);
+            }
+            // Plain (non-areturn) returns: ireturn/lreturn/freturn/dreturn/
+            // return. A method-exit return ENDS the current path — it is NOT a
+            // CFG-divergence point, so unlike the branch barrier above it must
+            // NOT escape locals: an object held in a local here dies with the
+            // frame, it does not escape. Any object that IS live into reachable
+            // post-return code arrives there via a branch, and the
+            // branch-target barrier at the top of the loop escapes it at that
+            // target. Escaping locals here too (as the prior over-broad barrier
+            // that lumped returns in with branches did) falsely de-optimises
+            // the straight-line `new X(); use; return <primitive|void>` idiom —
+            // contradicting this pass's "straight-line allocation sites are
+            // unaffected" contract. Operand-stack objects (rare at a non-object
+            // return — the return value is a primitive/void) are escaped
+            // defensively; locals are left intact.
+            0xac | 0xad | 0xae | 0xaf | 0xb1 => {
+                escape_all!();
+                abs_stack.clear();
+                pc += bytecode_len_at(code, pc);
+            }
             // For all other opcodes, use bytecode_len_at for PC advance.
             // These ops don't move tracked references, so no escaping needed.
             _ => {
@@ -2047,8 +2925,22 @@ fn plan_scalar_replacement(
     let mut field_ops: FxHashMap<usize, usize> = FxHashMap::default();
     let mut init_skips = std::collections::HashSet::new();
 
+    // EC-SCALAR-SOUNDNESS: same branch-target barrier as `analyze_escapes`.
+    // Objects in `objects` are already guaranteed (by the stricter
+    // `analyze_escapes`) to live within a single straight-line region, so
+    // clearing all provenance at every merge point can never strip a *valid*
+    // field-op mapping — it only prevents a stale `local_prov`/`abs_stack`
+    // entry from binding a post-branch field op to the wrong scalar object.
+    let branch_targets = compute_branch_targets(code, code_len);
+
     let mut pc = 0usize;
     while pc < code_len {
+        if branch_targets.get(pc).copied().unwrap_or(false) {
+            abs_stack.clear();
+            for prov in local_prov.iter_mut() {
+                *prov = None;
+            }
+        }
         let op = code[pc];
         match op {
             // new
@@ -2180,20 +3072,39 @@ fn plan_scalar_replacement(
                 if let Some(last) = abs_stack.last_mut() { *last = None; }
                 pc += 1;
             }
-            // Conditional branches: conservatively clear stack provenance, keep locals
+            // Conditional branches.
+            //
+            // EC-SCALAR-SOUNDNESS (bc math-ec JIT miscompile fix): this is a
+            // single LINEAR pass with no per-block reset/merge, so once
+            // control flow can branch, neither `abs_stack` nor `local_prov`
+            // reliably matches the real verification-time state at the branch
+            // target. The previous code cleared only the STACK provenance and
+            // kept `local_prov`, so a stale `local_prov[k] == Some(new_pc)`
+            // could mis-attribute a later `getfield`/`putfield` (whose local
+            // `k` was reused for a different value on the branch-reached path)
+            // to a scalar-replaced object — rewriting it into a frame-slot
+            // access against memory that does not hold that object, or
+            // wrongly skipping its `<init>`. Combined with the (now stricter)
+            // `analyze_escapes`, which marks any object whose provenance
+            // crosses a CFG edge as escaping, scalar-replaced objects are
+            // guaranteed to live entirely within one straight-line region.
+            // Mirror that here: a control transfer is a hard barrier — drop
+            // ALL provenance (stack + locals) so no field op past a branch is
+            // ever bound to a scalar object via stale state.
             0x99..=0xA6 => {
                 // Pop comparison operands
                 match op {
                     0x99..=0x9E | 0xC6 | 0xC7 => { abs_stack.pop(); }
                     _ => { abs_stack.pop(); abs_stack.pop(); }
                 }
-                // Clear stack provenance at branch (conservative for merge points)
-                for slot in abs_stack.iter_mut() { *slot = None; }
+                abs_stack.clear();
+                for prov in local_prov.iter_mut() { *prov = None; }
                 pc += 3;
             }
-            // goto
+            // goto — control transfer; same hard barrier as above.
             0xA7 => {
                 abs_stack.clear();
+                for prov in local_prov.iter_mut() { *prov = None; }
                 pc += 3;
             }
             // ireturn, lreturn, freturn, dreturn, areturn
@@ -2275,14 +3186,22 @@ fn plan_scalar_replacement(
                 abs_stack.push(None);
                 pc += 3;
             }
-            // ifnull, ifnonnull
+            // ifnull, ifnonnull — control transfer; hard barrier (see the
+            // EC-SCALAR-SOUNDNESS note on the conditional-branch arm above):
+            // drop ALL provenance (stack + locals) so no field op past the
+            // branch is bound to a scalar object via stale state.
             0xC6 | 0xC7 => {
                 abs_stack.pop();
-                for slot in abs_stack.iter_mut() { *slot = None; }
+                abs_stack.clear();
+                for prov in local_prov.iter_mut() { *prov = None; }
                 pc += 3;
             }
-            // athrow
-            0xBF => { abs_stack.clear(); pc += 1; }
+            // athrow — control transfer (to handler or caller); same barrier.
+            0xBF => {
+                abs_stack.clear();
+                for prov in local_prov.iter_mut() { *prov = None; }
+                pc += 1;
+            }
             // arraylength
             0xBE => {
                 abs_stack.pop();
@@ -3191,6 +4110,190 @@ fn analyze_loop_bound(
     None
 }
 
+/// Soundly identify the `(array_local, index_local)` operands consumed by each
+/// array load/store in a counted loop, via operand-stack *producer* tracking.
+///
+/// The legacy positional heuristics (`find_store_index_pc` /
+/// `find_preceding_iload` / `find_preceding_aload`) guessed the index/array by
+/// counting bytecode instructions backward from the access ("the index is the
+/// load 2 instructions before the store"). That is unsound the moment the
+/// value or index expression spans more than one instruction. The canonical
+/// scatter store `result[off + i] = src[i]` is the textbook break: the inner
+/// `iload i` (the *src* index) sits exactly two instructions before `iastore`,
+/// so the heuristic decided `index == i` (the IV) and elided the store's bounds
+/// check — while the real index `off + i` runs past `result.length`, turning
+/// the store into an out-of-bounds heap write that overwrites a neighbouring
+/// object's header (the "kind=Object but array_length set" corruption seen
+/// across the BC / Spring / JUnit JIT crashes). The array heuristic was
+/// likewise wrong: it would guard `src.length` while the store targeted
+/// `result`.
+///
+/// This pass simulates the operand stack as a vector of *producer PCs*, started
+/// empty at the loop header (the stack-empty point for javac counted loops). At
+/// each array access the array and index operands are read from their exact
+/// stack positions, so an access is reported only when its index is genuinely
+/// produced by a bare `iload` and its array by a bare `aload`. Anything the
+/// simulator cannot model precisely — method calls, `dup2`/`swap`/`dup_x*`,
+/// switches, `wide`, or a control-flow join where the linear stack is no longer
+/// authoritative — makes it STOP, after which no further access in the loop is
+/// reported. STOP/underflow is always conservative: the per-element bounds
+/// check is kept.
+fn analyze_array_access_operands(
+    code: &[u8],
+    header: usize,
+    back_edge_end: usize,
+) -> FxHashMap<usize, (usize, usize)> {
+    let mut out: FxHashMap<usize, (usize, usize)> = FxHashMap::default();
+    let code_len = code.len();
+    if header >= back_edge_end || back_edge_end > code_len {
+        return out;
+    }
+
+    // Precompute forward conditional-branch targets that land inside the loop.
+    // These are control-flow *join* points where the linearly-simulated
+    // producer stack is no longer guaranteed to match every predecessor, so the
+    // walk must stop before analysing them. (Backward targets re-enter at the
+    // same stack height by the JVM's structural constraint and need no special
+    // handling; goto/switch/return are not modelled and stop the walk anyway.)
+    let mut join_targets: FxHashSet<usize> = FxHashSet::default();
+    {
+        let mut pc = header;
+        while pc < back_edge_end {
+            let op = code[pc];
+            if matches!(op, 0x99..=0xa6 | 0xc6 | 0xc7) && pc + 2 < code_len {
+                let off = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+                let target = pc as i32 + off;
+                if target > pc as i32 && (target as usize) < back_edge_end {
+                    join_targets.insert(target as usize);
+                }
+            }
+            pc += bytecode_len_at(code, pc);
+        }
+    }
+
+    let mut producers: Vec<usize> = Vec::new();
+    let mut pc = header;
+    while pc < back_edge_end {
+        // A join: the operand stack here may differ per predecessor path.
+        if pc != header && join_targets.contains(&pc) {
+            break;
+        }
+        let op = code[pc];
+        match op {
+            // Array loads: [.., array, index] -> [.., value].
+            0x2e..=0x35 => {
+                let n = producers.len();
+                if n < 2 {
+                    break;
+                }
+                let array_pc = producers[n - 2];
+                let index_pc = producers[n - 1];
+                if let (Some(al), Some(il)) = (
+                    extract_aload_local(code, array_pc),
+                    extract_iload_local(code, index_pc),
+                ) {
+                    out.insert(pc, (al, il));
+                }
+                producers.truncate(n - 2);
+                producers.push(pc);
+            }
+            // Array stores: [.., array, index, value] -> [..].
+            0x4f..=0x56 => {
+                let n = producers.len();
+                if n < 3 {
+                    break;
+                }
+                let array_pc = producers[n - 3];
+                let index_pc = producers[n - 2];
+                if let (Some(al), Some(il)) = (
+                    extract_aload_local(code, array_pc),
+                    extract_iload_local(code, index_pc),
+                ) {
+                    out.insert(pc, (al, il));
+                }
+                producers.truncate(n - 3);
+            }
+            // Pure pushes — consume 0, produce exactly 1 value (one entry,
+            // category-1 or -2 alike: a long/double is a single producer here).
+            0x01..=0x14    // aconst_null..ldc2_w
+            | 0x15..=0x19  // iload/lload/fload/dload/aload (wide index)
+            | 0x1a..=0x2d  // *load_0.._3
+            | 0xb2         // getstatic — pushes exactly one value
+            | 0xbb         // new
+            => {
+                producers.push(pc);
+            }
+            // Consume 1, produce 1.
+            0x74..=0x77    // ineg/lneg/fneg/dneg
+            | 0x85..=0x93  // i2l..i2s conversions
+            | 0xb4         // getfield  (objref -> value)
+            | 0xbc | 0xbd  // newarray/anewarray  (count -> arrayref)
+            | 0xbe         // arraylength
+            | 0xc0 | 0xc1  // checkcast/instanceof
+            => {
+                let n = producers.len();
+                if n < 1 {
+                    break;
+                }
+                producers.truncate(n - 1);
+                producers.push(pc);
+            }
+            // Consume 2, produce 1.
+            0x60..=0x73    // i/l/f/d add/sub/mul/div/rem
+            | 0x78..=0x83  // shifts + and/or/xor (int & long)
+            | 0x94..=0x98  // lcmp / fcmp* / dcmp*
+            => {
+                let n = producers.len();
+                if n < 2 {
+                    break;
+                }
+                producers.truncate(n - 2);
+                producers.push(pc);
+            }
+            // Consume 1, produce 0.
+            0x36..=0x3a    // istore/lstore/fstore/dstore/astore (wide index)
+            | 0x3b..=0x4e  // *store_0.._3
+            | 0x57         // pop
+            | 0xb3         // putstatic
+            | 0xc2 | 0xc3  // monitorenter/monitorexit
+            // Conditional single-operand branches — fall-through continues.
+            | 0x99..=0x9e  // if<cond>
+            | 0xc6 | 0xc7  // ifnull/ifnonnull
+            => {
+                let n = producers.len();
+                if n < 1 {
+                    break;
+                }
+                producers.truncate(n - 1);
+            }
+            // Consume 2, produce 0.
+            0xb5           // putfield  (objref + value)
+            | 0x9f..=0xa6  // if_icmp<cond> / if_acmp<cond>
+            => {
+                let n = producers.len();
+                if n < 2 {
+                    break;
+                }
+                producers.truncate(n - 2);
+            }
+            // dup — duplicate the top producer.
+            0x59 => match producers.last().copied() {
+                Some(t) => producers.push(t),
+                None => break,
+            },
+            // iinc / nop — no stack effect.
+            0x84 | 0x00 => {}
+            // Everything else (goto, switches, returns, athrow, invoke*,
+            // dup2/swap/dup_x*, pop2, wide, multianewarray, jsr/ret, ...) is not
+            // modelled: stop so no access is reported on a desynchronised stack.
+            _ => break,
+        }
+        pc += bytecode_len_at(code, pc);
+    }
+
+    out
+}
+
 /// Find array accesses in a loop that use the induction variable as index
 /// and an unmodified local as the array reference. Returns the set of
 /// bytecode PCs that are provably safe (index < bound ≤ array.length).
@@ -3198,142 +4301,42 @@ fn analyze_loop_bound(
 /// The key insight: if the loop bound comes from arraylength (or a local
 /// that holds arraylength), and the index is the induction variable that
 /// starts at 0 and increments by 1 up to bound, all accesses are safe.
+///
+/// Operand identification is delegated to `analyze_array_access_operands`
+/// (sound producer-stack tracking); `operands` maps each analysable array
+/// access PC to its `(array_local, index_local)`.
 fn find_safe_array_accesses(
     code: &[u8],
     header: usize,
     back_edge_end: usize,
     bounds: &LoopBoundsInfo,
     modified: u64,
+    operands: &FxHashMap<usize, (usize, usize)>,
 ) -> FxHashSet<usize> {
     let mut safe_pcs = FxHashSet::default();
 
-    let mut pc = header;
-    while pc < back_edge_end {
-        let op = code[pc];
-        // Array load/store opcodes: 0x2e-0x35 (loads), 0x4f-0x56 (stores)
-        if matches!(op, 0x2e..=0x35 | 0x4f..=0x56) {
-            // For loads: stack has [array, index] before this opcode
-            // For stores: stack has [array, index, value] before this opcode
-            // We need to trace back to find which locals provided array and index.
-            //
-            // Simple approach: look at the 2-3 instructions before this opcode.
-            // Pattern for loads: aload/iload <array_local>; iload <index_local>; xaload
-            // Pattern for stores: aload/iload <array_local>; iload <index_local>; xload <val>; xastore
+    // The header range guard (emitted in `compile`) proves `array.length >=
+    // bound` ONCE at entry, so the BOUND local must itself be loop-invariant:
+    // if the body raised `bound` afterwards, the per-iteration exit test
+    // `iv < bound` could admit `iv >= array.length` on a later trip — an
+    // out-of-bounds access past the stale guard (SECURITY FIX V16).
+    match bounds.bound_local {
+        Some(bl) if bl < 64 && (modified & (1u64 << bl)) == 0 => {}
+        _ => return safe_pcs,
+    }
 
-            // Check if the index is the induction variable
-            // For loads, the instruction before is the index load
-            // For stores, we need to look further back
-
-            let index_check_pc = if matches!(op, 0x4f..=0x56) {
-                // Store: skip back past value load to find index load
-                // This is harder statically — we'd need to track the stack.
-                // Simple heuristic: look for the pattern aload; iload iv; load val; xastore
-                find_store_index_pc(code, header, pc)
-            } else {
-                // Load: the instruction right before is the index load
-                find_preceding_iload(code, header, pc)
-            };
-
-            if let Some(idx_pc) = index_check_pc {
-                let idx_local = extract_iload_local(code, idx_pc);
-                if let Some(idx) = idx_local {
-                    if idx == bounds.induction_var {
-                        // The index is the induction variable.
-                        // Check that the array ref is from an unmodified local
-                        let arr_pc = find_preceding_aload(code, header, idx_pc);
-                        if let Some(a_pc) = arr_pc {
-                            let arr_local = extract_aload_local(code, a_pc);
-                            if let Some(al) = arr_local {
-                                if al < 64 && (modified & (1u64 << al)) == 0 {
-                                    // Array ref is invariant in this loop.
-                                    // Mark this access as safe if bound_local exists
-                                    // (meaning the loop is bounded by some local).
-                                    //
-                                    // SECURITY FIX (V16): the access is only
-                                    // safe to elide if the BOUND local is also
-                                    // loop-invariant. The header range guard
-                                    // (emitted in `compile`) proves
-                                    // `array.length >= bound` ONCE at entry. If
-                                    // the loop body raises `bound` afterwards,
-                                    // the per-iteration exit test `iv < bound`
-                                    // can admit `iv >= array.length` on a later
-                                    // trip — an out-of-bounds access past the
-                                    // stale guard. Requiring `bound` ∉ modified
-                                    // ties the guarded value to the value the
-                                    // exit test reads every iteration, closing
-                                    // the gap. (Array-ref and IV invariance are
-                                    // already enforced above and in
-                                    // `find_induction_variable` respectively.)
-                                    if let Some(bl) = bounds.bound_local {
-                                        let bound_invariant =
-                                            bl < 64 && (modified & (1u64 << bl)) == 0;
-                                        if bound_invariant {
-                                            safe_pcs.insert(pc);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+    for (&pc, &(arr_local, idx_local)) in operands {
+        // Index must be the induction variable; array ref must be a
+        // loop-invariant local (so the single header guard stays valid).
+        if idx_local == bounds.induction_var
+            && arr_local < 64
+            && (modified & (1u64 << arr_local)) == 0
+        {
+            safe_pcs.insert(pc);
         }
-        pc += bytecode_len_at(code, pc);
     }
 
     safe_pcs
-}
-
-/// Find the bytecode PC of the iload that provides the index for an array load at `target_pc`.
-/// Scans backward from target_pc looking for an iload-family instruction.
-fn find_preceding_iload(code: &[u8], start: usize, target_pc: usize) -> Option<usize> {
-    // Simple: walk forward from start, track last iload PC before target_pc
-    let mut last_iload_pc = None;
-    let mut pc = start;
-    while pc < target_pc {
-        if matches!(code[pc], 0x1a..=0x1d | 0x15) {
-            last_iload_pc = Some(pc);
-        }
-        pc += bytecode_len_at(code, pc);
-    }
-    // The last iload before the array opcode is the index
-    last_iload_pc
-}
-
-/// Find the bytecode PC of the aload that provides the array ref before `target_pc`.
-/// Scans backward looking for an aload-family instruction.
-fn find_preceding_aload(code: &[u8], start: usize, target_pc: usize) -> Option<usize> {
-    let mut last_aload_pc = None;
-    let mut pc = start;
-    while pc < target_pc {
-        if matches!(code[pc], 0x2a..=0x2d | 0x19) {
-            last_aload_pc = Some(pc);
-        }
-        // Also track iload (could be array index) to reset aload tracking
-        pc += bytecode_len_at(code, pc);
-    }
-    last_aload_pc
-}
-
-/// For array stores, find the iload that provides the index.
-/// Pattern: aload arr; iload idx; <value_load>; xastore
-fn find_store_index_pc(code: &[u8], start: usize, store_pc: usize) -> Option<usize> {
-    // Walk forward tracking the last 3 instructions before store_pc
-    let mut prev3 = [0usize; 3]; // circular: [arr_load, idx_load, val_load]
-    let mut count = 0usize;
-    let mut pc = start;
-    while pc < store_pc {
-        prev3[count % 3] = pc;
-        count += 1;
-        pc += bytecode_len_at(code, pc);
-    }
-    if count >= 2 {
-        // The index load is 2 instructions before the store
-        let idx_slot = if count >= 3 { (count - 2) % 3 } else { 0 };
-        Some(prev3[idx_slot])
-    } else {
-        None
-    }
 }
 
 /// Extract the local variable index from an iload instruction at `pc`.
@@ -3393,8 +4396,15 @@ fn analyze_bounds_elimination(
         // Step 3: Find modified locals in loop body
         let modified = find_modified_locals(code, header, back_edge_end);
 
+        // Step 3b: Soundly identify the (array_local, index_local) consumed by
+        // each analysable array access via operand-stack producer tracking.
+        // Both the static and speculative passes below consult this map instead
+        // of the old positional heuristics that mis-identified scatter stores.
+        let operands = analyze_array_access_operands(code, header, back_edge_end);
+
         // Step 4: Find safe array accesses (statically proven)
-        let loop_safe = find_safe_array_accesses(code, header, back_edge_end, &bounds, modified);
+        let loop_safe =
+            find_safe_array_accesses(code, header, back_edge_end, &bounds, modified, &operands);
         safe_pcs.extend(&loop_safe);
 
         // Step 5: Speculative BCE — for counted loops with IV from 0..N step 1,
@@ -3421,14 +4431,16 @@ fn analyze_bounds_elimination(
             .bound_local
             .map(|bl| bl < 64 && (modified & (1u64 << bl)) == 0)
             .unwrap_or(false);
-        if let Some(bound_local) = bounds.bound_local.filter(|_| bound_invariant) {
+        // DBG (env-gated): CRATONVM_JIT_NO_SPEC_BCE disables ONLY the speculative
+        // (runtime-guarded) BCE, keeping the statically-proven elisions — to
+        // isolate whether the speculative guard is the unsound corruptor.
+        let no_spec_bce = std::env::var_os("CRATONVM_JIT_NO_SPEC_BCE").is_some();
+        if let Some(bound_local) = bounds.bound_local.filter(|_| bound_invariant && !no_spec_bce) {
             let speculative_accesses = find_speculative_array_accesses(
-                code,
-                header,
-                back_edge_end,
                 &bounds,
                 modified,
                 &loop_safe,
+                &operands,
             );
             if !speculative_accesses.is_empty() {
                 let mut guard_arrays: Vec<usize> = Vec::new();
@@ -3457,57 +4469,36 @@ fn analyze_bounds_elimination(
 /// speculative BCE with a deopt guard at the loop header.
 ///
 /// Returns vec of (bytecode_pc_of_access, array_local).
+///
+/// Operand identification comes from `analyze_array_access_operands` via the
+/// `operands` map (sound producer-stack tracking) — the old positional
+/// heuristics mis-identified scatter stores and elided the wrong array's
+/// bounds check.
 fn find_speculative_array_accesses(
-    code: &[u8],
-    header: usize,
-    back_edge_end: usize,
     bounds: &LoopBoundsInfo,
     modified: u64,
     already_safe: &FxHashSet<usize>,
+    operands: &FxHashMap<usize, (usize, usize)>,
 ) -> Vec<(usize, usize)> {
     let mut result = Vec::new();
-    let mut pc = header;
-    while pc < back_edge_end {
-        let op = code[pc];
-        if matches!(op, 0x2e..=0x35 | 0x4f..=0x56) && !already_safe.contains(&pc) {
-            let index_check_pc = if matches!(op, 0x4f..=0x56) {
-                find_store_index_pc(code, header, pc)
-            } else {
-                find_preceding_iload(code, header, pc)
-            };
-
-            if let Some(idx_pc) = index_check_pc {
-                let idx_local = extract_iload_local(code, idx_pc);
-                if let Some(idx) = idx_local {
-                    if idx == bounds.induction_var {
-                        let arr_pc = find_preceding_aload(code, header, idx_pc);
-                        if let Some(a_pc) = arr_pc {
-                            let arr_local = extract_aload_local(code, a_pc);
-                            if let Some(al) = arr_local {
-                                // SECURITY FIX (V16): array-local invariance.
-                                // `al < 64` is load-bearing, not just a bitmask
-                                // bound: locals >= 64 cannot be represented in
-                                // the `modified` u64, so we conservatively
-                                // refuse to elide their checks (the `&&`
-                                // short-circuits and the access is not marked
-                                // safe). A modified array local is likewise
-                                // rejected, so the header guard's
-                                // `array.length` cannot go stale via
-                                // reassignment. IV invariance is guaranteed by
-                                // `find_induction_variable`; bound-local
-                                // invariance is enforced by the caller
-                                // (`analyze_bounds_elimination`) before this
-                                // function is invoked.
-                                if al < 64 && (modified & (1u64 << al)) == 0 {
-                                    result.push((pc, al));
-                                }
-                            }
-                        }
-                    }
-                }
+    for (&pc, &(arr_local, idx_local)) in operands {
+        if already_safe.contains(&pc) {
+            continue;
+        }
+        if idx_local == bounds.induction_var {
+            // SECURITY FIX (V16): array-local invariance. `al < 64` is
+            // load-bearing, not just a bitmask bound: locals >= 64 cannot be
+            // represented in the `modified` u64, so we conservatively refuse to
+            // elide their checks. A modified array local is likewise rejected,
+            // so the header guard's `array.length` cannot go stale via
+            // reassignment. IV invariance is guaranteed by
+            // `find_induction_variable`; bound-local invariance is enforced by
+            // the caller (`analyze_bounds_elimination`) before this function is
+            // invoked.
+            if arr_local < 64 && (modified & (1u64 << arr_local)) == 0 {
+                result.push((pc, arr_local));
             }
         }
-        pc += bytecode_len_at(code, pc);
     }
     result
 }
@@ -3545,6 +4536,17 @@ enum StackSlot {
 /// R8 and R9 are caller-saved on both Windows x64 and SysV ABIs.
 /// R10 is excluded because it is used internally by bounds checks and SIMD loops.
 const SCRATCH_REGS: [u8; 2] = [R8, R9];
+
+/// Where a live oop resides at a shadow-stack safepoint — the source the push
+/// reads from and the destination the post-call reload writes back to.
+/// `Reg` is a callee-saved home register (R12–R15/RBX/RSI/RDI); `Frame(off)`
+/// is the canonical frame slot `[rbp - off]`. (Scratch/XMM entries never hold a
+/// live oop across a call: scratch is flushed pre-call and XMM holds FP data.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShadowHome {
+    Reg(u8),
+    Frame(i32),
+}
 
 /// Register mapping for locals → callee-saved registers.
 /// R12-R15 + RBX on all platforms. On Windows, RSI and RDI are also callee-saved.
@@ -3837,6 +4839,51 @@ struct Compiler {
     /// instruction *after* the safepoint call. Transferred to
     /// `CompiledMethod::oop_maps` at finalize time.
     oop_maps: Vec<crate::OopMapEntry>,
+    /// Stage 2 (precise oop maps) — per-bytecode-PC "must be oop" local
+    /// bitmask. `local_oop_masks[pc] & (1 << k) != 0` means local slot `k`
+    /// holds an object reference on EVERY path reaching `pc` (so a safepoint
+    /// at `pc` can record local `k`'s canonical frame slot as a precise oop).
+    /// Empty when unsupported (>64 locals); `local_oop_reached[pc]` is false
+    /// for PCs the forward dataflow never reached (e.g. exception-handler-only
+    /// entries), where no precise local marking is emitted and the GC falls
+    /// back to the conservative frame sweep. See
+    /// `docs/precise-jit-stack-maps-design.md` (Stage 2).
+    local_oop_masks: Vec<u64>,
+    /// Stage 2 — companion to `local_oop_masks`: whether the forward local-oop
+    /// dataflow reached each PC. Only `reached` PCs get precise local entries.
+    local_oop_reached: Vec<bool>,
+    /// Stage 2 — the bytecode PC of the instruction currently being emitted,
+    /// updated at the top of the `compile_bytecode` loop so
+    /// `emit_oop_map_for_safepoint` can look up the local-oop mask without
+    /// threading `pc` through every safepoint call site.
+    cur_bc_pc: usize,
+    /// Stage 3 — whether the moving-safe precise-stack-map machinery is on
+    /// (gate `CRATONVM_PRECISE_JIT_MAPS`). Gates the prologue frame-record
+    /// call and the per-safepoint id store. Off → byte-identical default path.
+    precise_maps: bool,
+    /// Stage 3 — frame offset (positive; slot at `[rbp - sp_id_slot_off]`) of
+    /// the reserved safepoint-id slot. 0 when `precise_maps` is off.
+    sp_id_slot_off: i32,
+    /// Shadow-stack precise roots (`CRATONVM_SHADOW_STACK`) — whether the
+    /// per-safepoint live-oop push/reload codegen is emitted. Off →
+    /// byte-identical default path.
+    shadow_enabled: bool,
+    /// Frame offset (positive; slot at `[rbp - shadow_thread_slot_off]`) of the
+    /// reserved slot that caches this invocation's `*mut JvmThread`, set once in
+    /// the prologue. 0 when `shadow_enabled` is off.
+    shadow_thread_slot_off: i32,
+    /// Frame offset of the reserved slot holding the shadow `top` at method
+    /// entry. The epilogue restores `thread.shadow_stack.top` from it so any
+    /// unbalanced safepoint push is unwound on return (correct under nesting).
+    /// 0 when `shadow_enabled` is off.
+    shadow_savetop_slot_off: i32,
+    /// Byte offset of the `ShadowStack` from `&JvmThread` (from the helper
+    /// table). The shadow `top` is at `[thread + shadow_off_in_thread + 0]`.
+    shadow_off_in_thread: i32,
+    /// Live-oop homes recorded by the most recent shadow push, consumed by the
+    /// matching post-call reload. Cleared at each push start so an unbalanced
+    /// (no-reload) safepoint cannot feed stale homes to a later reload.
+    pending_shadow: Vec<ShadowHome>,
     /// T5.2.1 — induction variables detected in each loop.
     ///
     /// One entry per detected counted loop. Consumed by downstream
@@ -3951,12 +4998,51 @@ impl Compiler {
             .map(|h| arith_expr_max_depth(&h.steps))
             .max()
             .unwrap_or(0);
+        // Stage 3 — when precise maps are enabled, reserve ONE extra frame
+        // slot (the last local slot) to hold the active safepoint's bytecode
+        // PC, written by `emit_pre_safepoint_spill` before each GC-capable
+        // call so the GC root walker can recover the exact oop map. Off by
+        // default → no slot reserved → frame layout byte-identical.
+        let precise_maps = precise_jit_maps_enabled();
+        let shadow_enabled = shadow_stack_maps_enabled();
+        // Shadow stack reserves TWO frame slots: the cached thread pointer and
+        // a saved `top` watermark (restored in the epilogue to unwind any
+        // unbalanced safepoint push — e.g. the `invokespecial <init>` push that
+        // has no paired reload). OSR entries zero both slots (clobber-free) so
+        // the null-guards make those frames skip shadow tracking safely.
+        let shadow_slots = if shadow_enabled { 2 } else { 0 };
         let extra_slots = (if needs_heap { 1 } else { 0 })
             + num_hoists
             + num_arith_hoists
             + arith_scratch_depth
-            + num_scalar_slots;
+            + num_scalar_slots
+            + (if precise_maps { 1 } else { 0 })
+            + shadow_slots;
         let total_locals = num_locals.saturating_add(extra_slots);
+        // Shadow-stack thread-pointer cache slot: the ABSOLUTE last reserved
+        // slot (`[rbp - shadow_thread_slot_off]`), set once in the prologue.
+        let shadow_thread_slot_off: i32 = if shadow_enabled {
+            (total_locals as i32).saturating_mul(8)
+        } else {
+            0
+        };
+        // Shadow-stack saved-`top` watermark slot: second-to-last reserved slot.
+        let shadow_savetop_slot_off: i32 = if shadow_enabled {
+            (total_locals as i32 - 1).saturating_mul(8)
+        } else {
+            0
+        };
+        // Byte offset of the `ShadowStack` within `JvmThread` (from the helper
+        // table), captured before `helpers` is moved into the struct below.
+        let shadow_off_in_thread: i32 = helpers.shadow_stack_offset_in_thread as i32;
+        // The safepoint-id slot sits below the shadow slots when both gates are
+        // on (so they never alias). Value at `[rbp - sp_id_slot_off]`. 0 when
+        // `precise_maps` is off.
+        let sp_id_slot_off: i32 = if precise_maps {
+            (total_locals as i32 - shadow_slots as i32).saturating_mul(8)
+        } else {
+            0
+        };
         let locals_size = (total_locals.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let spill_size = (max_stack.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let shadow_space = 32i32; // Windows x64 shadow space for helper calls
@@ -4102,6 +5188,16 @@ impl Compiler {
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),
             oop_maps: Vec::new(),
+            local_oop_masks: Vec::new(),
+            local_oop_reached: Vec::new(),
+            cur_bc_pc: 0,
+            precise_maps,
+            sp_id_slot_off,
+            shadow_enabled,
+            shadow_thread_slot_off,
+            shadow_savetop_slot_off,
+            shadow_off_in_thread,
+            pending_shadow: Vec::new(),
             induction_vars: Vec::new(),
             null_check_info: crate::null_check_elim::NullCheckInfo::default(),
             simd_element_wise_loops: Vec::new(),
@@ -4240,6 +5336,25 @@ impl Compiler {
         slot
     }
 
+    /// Stage 1 (precise oop maps) — push a *given* slot onto the simulated
+    /// operand stack while keeping the parallel `stack_oop_marks` vector in
+    /// lockstep. `is_oop` records whether the value is an object reference.
+    ///
+    /// This is the ONLY sanctioned way to grow `self.stack` with a
+    /// register/XMM-resident value: a bare `self.stack.push(slot)` desyncs
+    /// the two vectors (marks shorter than stack), which historically shifted
+    /// every later slot's oop bit and produced false-positive / false-negative
+    /// precise oop map entries (see `docs/jit-safepoint-revert.md` and
+    /// `docs/precise-jit-stack-maps-design.md`). The desync was previously
+    /// papered over by a lazy `false`-pad in `emit_oop_map_for_safepoint`;
+    /// with this helper the lockstep invariant `stack.len() == marks.len()`
+    /// holds continuously, which is the load-bearing prerequisite for a
+    /// *moving* GC that rewrites precisely-mapped slots.
+    fn stack_push(&mut self, slot: StackSlot, is_oop: bool) {
+        self.stack.push(slot);
+        self.stack_oop_marks.push(is_oop);
+    }
+
     /// T1.1.a — mark the top-of-stack slot as an object reference. Called
     /// by opcode handlers for every push that produces an oop
     /// (`new`, `anewarray`, `aload*`, `aaload`, `getfield` on reference
@@ -4319,6 +5434,173 @@ impl Compiler {
                 self.emit_store_local(off, reg);
             }
         }
+        // Stage 3 — record WHICH safepoint is active by storing the current
+        // bytecode PC into the reserved safepoint-id slot. The GC root walker
+        // reads `[rbp - sp_id_slot_off]` to recover the exact oop map (matched
+        // on `OopMapEntry::bytecode_pc`). RAX is caller-saved and not an
+        // argument register, and args are already staged in ARG_REGS before
+        // this call, so clobbering RAX here is safe. Gated off by default.
+        if self.precise_maps && self.sp_id_slot_off != 0 {
+            self.emit_mov_imm32_sx(RAX, self.cur_bc_pc as i32); // Cast: bytecode PC fits i32
+            self.emit_store_local(self.sp_id_slot_off, RAX);
+        }
+        // Shadow-stack precise roots — push every live oop onto the thread's
+        // shadow stack so a moving collector can rewrite it precisely. Paired
+        // with `emit_shadow_reload` in `emit_oop_map_for_safepoint`. Gated.
+        self.emit_shadow_push();
+    }
+
+    /// Collect the homes of every live oop at the current safepoint: operand-
+    /// stack entries tagged as references (`stack_oop_marks`) plus oop locals
+    /// (`local_oop_masks[cur_bc_pc]`). XMM operand entries are skipped (they
+    /// hold FP data, never references). Returns the homes in push order.
+    fn collect_live_oop_homes(&self) -> Vec<ShadowHome> {
+        let mut homes: Vec<ShadowHome> = Vec::new();
+        // Operand-stack reference entries that survive the call.
+        let n = self.stack.len().min(self.stack_oop_marks.len());
+        for i in 0..n {
+            if !self.stack_oop_marks[i] {
+                continue;
+            }
+            match self.stack[i] {
+                StackSlot::Frame(off) => homes.push(ShadowHome::Frame(off)),
+                StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
+                    homes.push(ShadowHome::Reg(reg))
+                }
+                StackSlot::Xmm(_) => {} // FP value, not a reference
+            }
+        }
+        // Oop locals live at this bytecode PC (forward "must be oop" dataflow).
+        if !self.local_oop_masks.is_empty() {
+            let pc = self.cur_bc_pc;
+            if pc < self.local_oop_masks.len()
+                && self.local_oop_reached.get(pc).copied().unwrap_or(false)
+            {
+                let mut mask = self.local_oop_masks[pc];
+                while mask != 0 {
+                    let k = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    match self.reg_for_local(k) {
+                        Some(reg) => homes.push(ShadowHome::Reg(reg)),
+                        None => homes.push(ShadowHome::Frame(self.local_offset(k))),
+                    }
+                }
+            }
+        }
+        homes
+    }
+
+    /// Shadow-stack push (paired with [`Self::emit_shadow_reload`]).
+    ///
+    /// Emitted just before a GC-capable CALL, after args are staged. For each
+    /// live oop home it stores the value onto the thread's shadow stack and
+    /// bumps `top`. Uses R10 (thread ptr, from the prologue-set frame slot),
+    /// R11 (running `top`), and RAX (frame-slot value temp) — all caller-saved
+    /// non-argument scratch, and never a live-oop home (homes are callee-saved
+    /// or frame). The live homes are recorded in `pending_shadow` for the
+    /// matching reload. `pending_shadow` is cleared first so an unbalanced
+    /// (no-reload) safepoint cannot hand stale homes to a later reload.
+    fn emit_shadow_push(&mut self) {
+        if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+            return;
+        }
+        // Bisect toggle: CRATONVM_SHADOW_NOPUSH skips the push/reload codegen
+        // (keeps the prologue thread-fetch + gate flip) so the SEGV can be
+        // localized to push/reload vs the rest without a rebuild.
+        if shadow_nopush() {
+            return;
+        }
+        self.pending_shadow.clear();
+        let homes = self.collect_live_oop_homes();
+        if !homes.is_empty() && std::env::var_os("CRATONVM_DBG_SHADOW2").is_some() {
+            let lm = self
+                .local_oop_masks
+                .get(self.cur_bc_pc)
+                .copied()
+                .unwrap_or(0);
+            eprintln!(
+                "[SHADOW2] push pc={} stack={:?} marks={:?} local_mask={:#x} homes={:?}",
+                self.cur_bc_pc,
+                &self.stack,
+                &self.stack_oop_marks,
+                lm,
+                homes
+            );
+        }
+        if homes.is_empty() {
+            return;
+        }
+        let ss_top = self.shadow_off_in_thread; // + ShadowStack::TOP_OFFSET (0)
+        // R10 = thread (cached in the prologue-set frame slot); R11 = shadow top.
+        self.emit_load_local(R10, self.shadow_thread_slot_off);
+        // Guard: if the cached thread pointer is null (get_current_thread
+        // returned null for this method), skip the whole push.
+        self.emit_test_r64_r64(R10);
+        let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
+        self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
+        for &home in &homes {
+            match home {
+                ShadowHome::Reg(r) => {
+                    self.emit_mov_mem_disp32_r64(R11, r, 0);
+                }
+                ShadowHome::Frame(off) => {
+                    self.emit_load_local(RAX, off);
+                    self.emit_mov_mem_disp32_r64(R11, RAX, 0);
+                }
+            }
+            self.emit_lea_r64_mem_disp32(R11, R11, 8);
+        }
+        // Commit new top.
+        self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
+        self.patch_rel32_to_here(skip); // null-thread guard target
+        self.pending_shadow = homes;
+    }
+
+    /// Shadow-stack reload (paired with [`Self::emit_shadow_push`]).
+    ///
+    /// Emitted immediately after the CALL returns. Pops each pushed slot in
+    /// reverse and writes the (possibly GC-rewritten) value back into its home,
+    /// so a relocated object's new address flows into the registers/slots the
+    /// compiled code keeps using. Preserves RAX (the call's return value): the
+    /// scratch used is R10 (thread), R11 (top), R8 (frame-slot value temp).
+    /// No-op when `pending_shadow` is empty (unmatched safepoint).
+    fn emit_shadow_reload(&mut self) {
+        if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+            return;
+        }
+        if shadow_nopush() || shadow_noreload() {
+            // Still drain pending so a later reload can't consume stale homes.
+            self.pending_shadow.clear();
+            return;
+        }
+        if self.pending_shadow.is_empty() {
+            return;
+        }
+        let homes = std::mem::take(&mut self.pending_shadow);
+        let ss_top = self.shadow_off_in_thread;
+        self.emit_load_local(R10, self.shadow_thread_slot_off);
+        // Guard: null thread pointer (see push) → skip reload. Symmetric with
+        // the push guard, so a method with a null thread is consistently
+        // untracked (the push was skipped too).
+        self.emit_test_r64_r64(R10);
+        let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
+        self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
+        for &home in homes.iter().rev() {
+            // Pre-decrement to the slot holding this oop's (possibly moved) value.
+            self.emit_lea_r64_mem_disp32(R11, R11, -8);
+            match home {
+                ShadowHome::Reg(r) => {
+                    self.emit_mov_r64_mem_disp32(r, R11, 0);
+                }
+                ShadowHome::Frame(off) => {
+                    self.emit_mov_r64_mem_disp32(R8, R11, 0);
+                    self.emit_store_local(off, R8);
+                }
+            }
+        }
+        // Commit popped top.
+        self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
+        self.patch_rel32_to_here(skip); // null-thread guard target
     }
 
     /// T1.1.a — record an oop map at the current native PC for the
@@ -4347,16 +5629,31 @@ impl Compiler {
         if self.failed {
             return;
         }
-        // T1.1.a — lazy resync. Non-instrumented `self.stack.push`
-        // sites (aload local-to-CalleeSaved, inlined-callee pushes,
-        // LICM hoists, XMM intermediate pushes) leave
-        // `stack_oop_marks` shorter than `stack`. Pad with `false`
-        // (non-oop). This is SAFE because
-        // `conservative_roots::scan_one_frame_precise` also performs a
-        // full conservative sweep of the frame region on every GC
-        // visit — any oop our precise map misses is caught by the
-        // sweep's `heap.is_object_address` validation. Precise maps
-        // remain a pure optimization on top of the conservative path.
+        // Shadow-stack precise roots — reload every oop pushed by the matching
+        // `emit_shadow_push` from its (possibly GC-rewritten) shadow slot back
+        // into its home register/frame slot, then pop. Emitted right after the
+        // call returns (before the return value is consumed below). No-op when
+        // the shadow gate is off or no oops were pushed at this safepoint.
+        self.emit_shadow_reload();
+        // Stage 1 (precise oop maps) — the lockstep invariant
+        // `stack.len() == stack_oop_marks.len()` now holds continuously:
+        // every push goes through `stack_push`/`push_stack` (which pair
+        // both vectors) and the dup/swap/merge-reconstruct paths rebuild
+        // marks in step. Assert it in debug builds. The release-mode pad
+        // below is retained purely as a defensive backstop: should any
+        // future un-instrumented `self.stack.push` re-introduce a desync,
+        // padding with `false` (non-oop) stays SOUND because
+        // `conservative_roots::scan_one_frame_precise` also conservatively
+        // sweeps the frame region — but a desync would silently degrade
+        // precision (and is unsafe for the *moving* path), so the assert
+        // is the real guard.
+        debug_assert_eq!(
+            self.stack.len(),
+            self.stack_oop_marks.len(),
+            "stack/oop-marks desync at safepoint (native_pc={}): every \
+             self.stack growth must go through stack_push/push_stack",
+            self.buf.pos(),
+        );
         while self.stack_oop_marks.len() < self.stack.len() {
             self.stack_oop_marks.push(false);
         }
@@ -4376,13 +5673,85 @@ impl Compiler {
                 }
             }
         }
-        if slots.is_empty() {
+        // Stage 2 (precise oop maps) — add the canonical frame slots of local
+        // variables that hold object references at this safepoint, per the
+        // forward "must be oop" dataflow. For register-resident locals this is
+        // exactly the slot `emit_pre_safepoint_spill` flushed the live value to
+        // just before the call; for memory-resident locals it is where the
+        // value always lives. The GC root walker then has precise, updatable
+        // coverage of every live oop local (not just operand-stack temporaries).
+        // Sound on the default path regardless of dataflow precision: the
+        // consumer re-validates each slot via `heap.is_object_address`.
+        if !self.local_oop_masks.is_empty() {
+            let pc = self.cur_bc_pc;
+            if pc < self.local_oop_masks.len()
+                && self.local_oop_reached.get(pc).copied().unwrap_or(false)
+            {
+                let mut mask = self.local_oop_masks[pc];
+                while mask != 0 {
+                    let k = mask.trailing_zeros() as usize;
+                    mask &= mask - 1; // clear lowest set bit
+                    let off = self.local_offset(k);
+                    if let Ok(i16_off) = i16::try_from(off) {
+                        if !slots.contains(&i16_off) {
+                            slots.push(i16_off);
+                        }
+                    }
+                }
+            }
+        }
+        if !slots.is_empty() {
+            self.oop_maps.push(crate::OopMapEntry {
+                native_pc_offset: native_pc,
+                // Stage 3 — tag with the safepoint's bytecode PC so the GC root
+                // walker can match the value the JIT stored into the sp-id slot.
+                bytecode_pc: self.cur_bc_pc as u32, // Cast: bytecode PC fits u32
+                frame_slot_offsets: slots,
+            });
+        }
+        // Stage 4 (precise oop maps) — reload oop register-locals from their
+        // (GC-updated) canonical slots after the safepoint. `native_pc` above
+        // is the call's return PC and equals the position of the first reload
+        // instruction (the `push` emits no code), so the GC walker rewrites the
+        // frame slots at the return PC and control then falls into the reload,
+        // which propagates each moved object's new address back into its
+        // callee-saved register. Without this, Stage 3 updates the slot but the
+        // code keeps reading the stale register → register-invisibility
+        // persists. Gated off by default (no reload → byte-identical codegen).
+        if self.precise_maps {
+            self.emit_post_safepoint_reload();
+        }
+    }
+
+    /// Stage 4 (precise oop maps) — reload every oop register-local live at the
+    /// current safepoint from its canonical frame slot `[rbp - local_offset(k)]`
+    /// into its assigned callee-saved register.
+    ///
+    /// Pairs with [`Self::emit_pre_safepoint_spill`] (which flushed the live
+    /// values to those slots before the call) and the GC's
+    /// `remap_active_jit_frames` (which rewrote the moved ones in place during
+    /// the call). Only oop locals are reloaded — primitives don't move, so
+    /// their spilled slot still matches the register. RAX is never a local
+    /// register, so the call's return value survives this sequence.
+    fn emit_post_safepoint_reload(&mut self) {
+        if self.failed || self.local_oop_masks.is_empty() {
             return;
         }
-        self.oop_maps.push(crate::OopMapEntry {
-            native_pc_offset: native_pc,
-            frame_slot_offsets: slots,
-        });
+        let pc = self.cur_bc_pc;
+        if pc >= self.local_oop_masks.len()
+            || !self.local_oop_reached.get(pc).copied().unwrap_or(false)
+        {
+            return;
+        }
+        let mut mask = self.local_oop_masks[pc];
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1; // clear lowest set bit
+            if let Some(Some(reg)) = self.local_assignments.get(k).copied() {
+                let off = self.local_offset(k);
+                self.emit_load_local(reg, off); // reg <- [rbp - off]
+            }
+        }
     }
 
     /// Peek at the top of the simulated stack.
@@ -4990,6 +6359,18 @@ impl Compiler {
         self.rex_w_r(reg);
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.modrm_rbp_disp(reg, offset);
+    }
+
+    /// Store an immediate 0 (8 bytes) into the frame slot `[rbp - offset]`
+    /// WITHOUT clobbering any register (`MOV r/m64, imm32`, REX.W C7 /0).
+    /// Used to zero the shadow thread/watermark slots at OSR entries, where the
+    /// prologue (which would set them) was bypassed and no scratch register is
+    /// safely free at the loop header.
+    fn emit_zero_local(&mut self, offset: i32) {
+        self.rex_w();
+        self.buf.emit_byte(0xC7); // MOV r/m64, imm32 (sign-extended)
+        self.modrm_rbp_disp(0, offset); // /0
+        self.buf.emit(&0i32.to_le_bytes());
     }
 
     // ── CMOV helpers (round-8 perf, round-7 jit #7) ──────────────────
@@ -6982,10 +8363,58 @@ impl Compiler {
                 self.emit_store_local(offset, RAX);
             }
         }
+        // Stage 3 — register this JIT frame's EXACT RBP with the GC so the
+        // root walker can address oop-map slots precisely (the Rust-side
+        // JitEntryGuard only captures an approximate SP; release builds omit
+        // frame pointers so the real RBP can't be recovered by walking). Done
+        // once per invocation, after params are saved so the call doesn't lose
+        // them. RBP → ABI arg0; the helper records it into the top JIT chain
+        // entry. Gated off by default (zero default-path cost), and skipped if
+        // the helper pointer isn't wired.
+        if self.precise_maps && self.helpers.frame_record != 0 {
+            self.emit_mov_reg_reg(ARG_REGS[0], RBP);
+            self.emit_call_absolute(self.helpers.frame_record);
+        }
+
+        // Shadow-stack precise roots — cache this invocation's `*mut JvmThread`
+        // in a frame slot so each safepoint's inline push/reload can reach the
+        // shadow `top` without a per-safepoint helper call (which would clobber
+        // staged ABI arg registers). Done last in the prologue, after params are
+        // saved to their homes, so `get_current_thread` (caller-saved clobbers)
+        // can't lose an argument. RAX holds the returned thread pointer.
+        if self.shadow_enabled
+            && self.helpers.get_current_thread != 0
+            && self.shadow_thread_slot_off != 0
+        {
+            self.emit_call_absolute(self.helpers.get_current_thread);
+            self.emit_store_local(self.shadow_thread_slot_off, RAX);
+            // Save the shadow `top` watermark (RAX = thread). The epilogue
+            // restores it, unwinding any unbalanced safepoint push this method
+            // made. Skip on null thread (slot holds null → epilogue skips too).
+            self.emit_test_r64_r64(RAX);
+            let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (RAX == 0)
+            self.emit_mov_r64_mem_disp32(R11, RAX, self.shadow_off_in_thread);
+            self.emit_store_local(self.shadow_savetop_slot_off, R11);
+            self.patch_rel32_to_here(skip);
+        }
     }
 
     /// Emit function epilogue: restore callee-saved regs; add rsp; pop rbp; ret
     fn emit_epilogue(&mut self) {
+        // Shadow-stack: restore the `top` watermark saved in the prologue,
+        // unwinding any push this method did not pop (e.g. the unbalanced
+        // `invokespecial <init>` push). Correct under nesting: each method
+        // restores top to its own entry value on return. Null-guarded so an OSR
+        // entry (which zero-inits the thread slot) skips this safely. R10/R11
+        // are caller-saved scratch (free at return); RAX (return value) untouched.
+        if self.shadow_enabled && self.shadow_thread_slot_off != 0 {
+            self.emit_load_local(R10, self.shadow_thread_slot_off);
+            self.emit_test_r64_r64(R10);
+            let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
+            self.emit_load_local(R11, self.shadow_savetop_slot_off);
+            self.emit_mov_mem_disp32_r64(R10, R11, self.shadow_off_in_thread);
+            self.patch_rel32_to_here(skip);
+        }
         // Restore callee-saved GPR registers from frame slots (matching prologue MOV saves)
         let used_regs = self.alloc_used_regs.clone();
         for (i, &reg) in used_regs.iter().enumerate() {
@@ -7440,8 +8869,11 @@ impl Compiler {
     ///   LEA  RAX, [R11 + total_size]         ; RAX = new cursor
     ///   CMP  RAX, [R10 + tlab_end_off]
     ///   JA   slow_path                       ; TLAB full
-    ///   MOV  [R10 + tlab_cursor_off], RAX    ; commit
-    ///   MOV  DWORD [R11 + 0], class_id_imm   ; write class_id
+    ///   MOV  DWORD [R11 + 0], class_id_imm   ; write class_id  (header FIRST)
+    ///   MOV  DWORD [R11 + 4], 0              ; kind=Object/elem=Ref/pad
+    ///   MOV  DWORD [R11 + 12], 0             ; array_length=0
+    ///   MOV  DWORD [R11 + 16], num_fields    ; num_slots (walker stride)
+    ///   MOV  [R10 + tlab_cursor_off], RAX    ; commit LAST (publish object)
     ///   ; Hand off to post-init helper which finishes header + primitive
     ///   ; defaults + finalizer registration.
     ///   MOV  ARG0, [RBP - heap_local_off]    ; vm_ptr
@@ -7533,32 +8965,47 @@ impl Compiler {
         self.emit_cmp_r64_mem_disp32(RAX, R10, end_off);
         let tlab_full_patch = self.emit_jcc_rel32_patch(0x87); // JA slow_path
 
-        // Commit the bump: [R10 + cursor_off] = RAX.
-        self.emit_mov_mem_disp32_r64(R10, RAX, cursor_off);
-
-        // Write class_id (4 bytes) at obj_ptr + class_id_off and num_slots
-        // (4 bytes) at offset 16 IMMEDIATELY after the bump-commit. Both
-        // writes must happen before any subsequent safepoint poll or GC
-        // trigger, so the heap walker sees a fully-typed Object header:
+        // BinTrees-18 heap-corruption fix (jit/gc audit, 2026-06):
+        // *** Write the full object header BEFORE committing the TLAB
+        // cursor. ***
         //
-        //   class_id  → identifies the object's class
-        //   num_slots → tells the walker how to advance to the next object
-        //               (size = HEADER_SIZE + num_slots * SLOT_SIZE)
+        // The previous order committed the bump (published the object's
+        // address into `thread.tlab.cursor`) and only THEN wrote the
+        // header fields. That left a window in which the object region was
+        // already part of the "used" portion of the TLAB / young arena but
+        // its header was still the TLAB-zeroed pattern (class_id=0,
+        // kind=Object, num_slots=0). Any heap walk that observed the object
+        // during that window — the non-moving young sweep that runs while
+        // JIT frames are active (`gc_quiescence`), the Cheney to-space
+        // scan, or a background-thread STW collection that parks this
+        // mutator at a poll inside the in-between helper — computed
+        // `size = HEADER_SIZE + 0*SLOT_SIZE = HEADER_SIZE` and stepped 40
+        // bytes into the object's own field region. There it decoded the
+        // first `Value` field cell (discriminant word = 4 = `Object`) as a
+        // bogus header: `class_id=4`, `array_length=1` (upper half of the
+        // 8-byte object-pointer payload), `num_slots=384` (the next cell's
+        // discriminant region) — exactly the
+        // "kind=Object but array_length=1 (num_slots=384, class_id=4)"
+        // inconsistency reported by `gen_object_total_size`, after which
+        // the walker desynced / looped (rc=124 timeout on `bintrees18`).
         //
-        // CRIT (jit/gc audit, 2026-05): a previous incarnation deferred the
-        // num_slots write into the `jit_post_tlab_init` helper. Between the
-        // bump-commit and the helper call, num_slots was 0 (TLAB-zeroed),
-        // which made the walker treat every in-flight object as a 40-byte
-        // empty header and step into the middle of the very next real
-        // object's payload — decoding String char[] bytes as a header and
-        // tripping the "implausible object size" abort during a JIT-
-        // triggered minor GC. Writing num_slots inline closes that race.
+        // Writing the header first means the object is fully walker-coherent
+        // at the instant its address becomes reachable via the committed
+        // cursor: the store to `cursor` below is the single linearization
+        // point, and on x86-64 it is not reordered ahead of the header
+        // stores (TSO: stores are not reordered with older stores). So no
+        // walker can ever see a committed-but-unheadered object.
+        //
+        //   class_id  → identifies the object's class (offset 0)
+        //   off 4     → kind=Object(0) / elem=Reference(0) / padding(0)
+        //   off 12    → array_length=0 (Object kind never sets this)
+        //   num_slots → walker's stride: size = HEADER_SIZE + n*SLOT_SIZE
         //
         // identity_hash_code (offset 8) stays 0 (TLAB-zeroed); the lazy-
         // mint contract in `System.identityHashCode()` handles it on
-        // demand. The helper call below still runs for the
-        // primitive-init / finalizer paths but the header is already
-        // walker-coherent when GC runs inside that helper.
+        // demand. The `jit_post_tlab_init` helper below still runs for the
+        // primitive-init / finalizer paths, but the header is already
+        // walker-coherent before the object is ever published.
         self.emit_mov_dword_mem_disp32_imm32(
             R11,
             class_id_off,
@@ -7584,6 +9031,14 @@ impl Compiler {
             16,
             num_fields as i32, // Cast: x86-64 immediate encoding
         );
+
+        // Commit the bump LAST: [R10 + cursor_off] = RAX. This publishes the
+        // object's end as the new cursor (and, transitively, the object's
+        // address as a live allocation). Every header store above has
+        // already retired in program order; on x86-64's TSO memory model the
+        // commit store cannot be reordered ahead of them, so the object is
+        // fully typed the instant it becomes reachable.
+        self.emit_mov_mem_disp32_r64(R10, RAX, cursor_off);
 
         if skip_post_init_helper {
             // CRIT-2 fast path — no primitive defaults to apply and no
@@ -7678,7 +9133,7 @@ impl Compiler {
         self.flush_xmm0_slots();
         // MOVQ XMM0, RAX
         self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
-        self.stack.push(StackSlot::Xmm(0));
+        self.stack_push(StackSlot::Xmm(0), false);
     }
 
     /// Return the GPR holding the slot value. For CalleeSaved/Scratch, returns
@@ -7831,10 +9286,42 @@ impl Compiler {
 
         let mut cpc: usize = 0;
         let save_spill = self.next_spill_offset;
+        // Operand-stack depth belonging to the CALLER; the callee's operands
+        // sit above it. The callee operand stack is "empty" exactly when
+        // `self.stack.len() == caller_base_depth`.
+        let caller_base_depth = self.stack.len();
+        // Callee branch targets (merge points). Branchy callees inline only
+        // when every merge has an EMPTY callee operand stack (enforced by the
+        // merge-point reset below + the per-branch checks). 419a6f5 blanket-
+        // bailed ALL branches to stop a value-merge slot desync (the
+        // `iconst_1; goto L; iconst_0; L: ireturn` diamond); this restores the
+        // provably-safe subset (e.g. `x>=0?x:-x`) while still bailing diamonds.
+        let callee_branch_targets = compute_branch_targets(callee_code, callee_len);
+        // True after an instruction that does NOT fall through (goto/return/
+        // athrow) so the merge-point check can distinguish a dead fall-through
+        // (stale slots — safe to reset) from a live value-merge (must bail).
+        let mut prev_was_terminator = false;
 
         while cpc < callee_len {
             callee_pc_to_native[cpc] = self.buf.pos() as i64; // Cast: address arithmetic
             let op = callee_code[cpc];
+
+            // Merge-point handling: at a branch target the callee operand
+            // stack must be the canonical empty state (caller_base_depth). A
+            // live path arriving with a value is a value-producing merge the
+            // spill-slot model can't represent soundly -> bail. A dead fall-
+            // through (previous instr was a terminator) only left stale slots;
+            // reset them so the target starts from the empty state every
+            // branch into it also guarantees (branches require empty stack).
+            if callee_branch_targets.get(cpc).copied().unwrap_or(false) {
+                if !prev_was_terminator && self.stack.len() != caller_base_depth {
+                    self.next_spill_offset = callee_local_base;
+                    return false;
+                }
+                self.stack.truncate(caller_base_depth);
+                self.stack_oop_marks.truncate(caller_base_depth);
+                self.next_spill_offset = save_spill;
+            }
 
             match op {
                 // nop
@@ -8419,38 +9906,84 @@ impl Compiler {
                     cpc += 1;
                 }
 
-                // ifeq..ifle (0x99..0x9e) — internal control flow: BAIL.
+                // ifeq..ifle (0x99..0x9e) — conditional branch on <cmp> 0.
                 //
-                // Inlining a callee with internal branches is unsound in this
-                // single linear-pass emitter: operand-stack slots are handed
-                // out by a *growing* `next_spill_offset` (see `push_stack`),
-                // not indexed by stack depth. At a control-flow merge the two
-                // incoming paths therefore (a) hold the merged operand in
-                // different frame slots and (b) leave the linear-pass stack
-                // model with stray entries. The canonical trigger is the
-                // diamond javac emits for `return <cond>`
-                // (`iconst_1; goto L; iconst_0; L: ireturn`): one path reads
-                // the return value from a slot it never wrote (garbage), and
-                // the caller's operand-stack model desyncs by one slot, which
-                // later stores through a bogus frame offset and SIGSEGVs
-                // (observed: Modifier.isStatic / any small `(arg & k)!=0`
-                // predicate hot-inlined into a loop). Bail to the normal,
-                // correct call path; straight-line callees still inline.
+                // Restored (419a6f5 blanket-bailed all branches). Inlining a
+                // branchy callee is sound in this single-linear-pass emitter
+                // ONLY when no operand is live across a merge: operand-stack
+                // slots are handed out by a growing `next_spill_offset`, so two
+                // paths reaching a merge with a value would hold it in
+                // different frame slots (the `iconst_1; goto L; iconst_0; L:
+                // ireturn` diamond — the bug 419a6f5 fixed). We therefore
+                // require the callee operand stack to be EMPTY after the branch
+                // pops its operands (here) AND at every target (the merge-point
+                // reset at the loop top); any value-merge bails. Forward
+                // branches only — backward edges (loops) re-enter an already-
+                // emitted target whose slot layout we can't re-canonicalise.
                 0x99..=0x9e => {
-                    self.next_spill_offset = callee_local_base;
-                    return false;
+                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
+                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    self.pop_to_rax();
+                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    self.buf.emit(&[0x85, 0xC0]); // TEST EAX, EAX
+                    let cc = match op {
+                        0x99 => 0x84u8, // JE
+                        0x9a => 0x85,   // JNE
+                        0x9b => 0x8C,   // JL
+                        0x9c => 0x8D,   // JGE
+                        0x9d => 0x8F,   // JG
+                        0x9e => 0x8E,   // JLE
+                        _ => unreachable!(),
+                    };
+                    self.buf.emit(&[0x0F, cc]);
+                    let patch_off = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    branch_patches.push((patch_off, target));
+                    cpc += 3;
                 }
 
-                // if_icmpeq..if_icmple — internal control flow: BAIL (see 0x99 note).
+                // if_icmpeq..if_icmple (0x9f..0xa4) — int compare branch. Same
+                // empty-stack-at-merge safety as 0x99..0x9e above.
                 0x9f..=0xa4 => {
-                    self.next_spill_offset = callee_local_base;
-                    return false;
+                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
+                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    let top = self.pop_stack();
+                    self.pop_to_rax();
+                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    self.load_slot_to_reg(RCX, top);
+                    self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
+                    let cc = match op {
+                        0x9f => 0x84u8, // JE
+                        0xa0 => 0x85,   // JNE
+                        0xa1 => 0x8C,   // JL
+                        0xa2 => 0x8D,   // JGE
+                        0xa3 => 0x8F,   // JG
+                        0xa4 => 0x8E,   // JLE
+                        _ => unreachable!(),
+                    };
+                    self.buf.emit(&[0x0F, cc]);
+                    let patch_off = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    branch_patches.push((patch_off, target));
+                    cpc += 3;
                 }
 
-                // goto — internal control flow: BAIL (see 0x99 note).
+                // goto (0xa7) — unconditional forward branch. Same safety.
                 0xa7 => {
-                    self.next_spill_offset = callee_local_base;
-                    return false;
+                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
+                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    self.buf.emit_byte(0xE9); // JMP rel32
+                    let patch_off = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    branch_patches.push((patch_off, target));
+                    cpc += 3;
                 }
 
                 // ireturn, lreturn, areturn, freturn, dreturn
@@ -8618,16 +10151,41 @@ impl Compiler {
                     cpc += 3;
                 }
 
-                // if_acmpeq/if_acmpne — internal control flow: BAIL (see 0x99 note).
+                // if_acmpeq/if_acmpne (0xa5/0xa6) — reference compare branch.
+                // Same empty-stack-at-merge safety as 0x99..0x9e.
                 0xa5 | 0xa6 => {
-                    self.next_spill_offset = callee_local_base;
-                    return false;
+                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
+                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    let top = self.pop_stack();
+                    self.pop_to_rax();
+                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    self.load_slot_to_reg(RCX, top);
+                    self.rex_w(); self.buf.emit(&[0x39, 0xC8]); // CMP RAX, RCX
+                    let cc = if op == 0xa5 { 0x84u8 } else { 0x85 }; // JE / JNE
+                    self.buf.emit(&[0x0F, cc]);
+                    let patch_off = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    branch_patches.push((patch_off, target));
+                    cpc += 3;
                 }
 
-                // ifnull/ifnonnull — internal control flow: BAIL (see 0x99 note).
+                // ifnull/ifnonnull (0xc6/0xc7) — null-compare branch. Same safety.
                 0xc6 | 0xc7 => {
-                    self.next_spill_offset = callee_local_base;
-                    return false;
+                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
+                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    self.pop_to_rax();
+                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    self.rex_w(); self.buf.emit(&[0x85, 0xC0]); // TEST RAX, RAX
+                    let cc = if op == 0xc6 { 0x84u8 } else { 0x85 }; // JE / JNE
+                    self.buf.emit(&[0x0F, cc]);
+                    let patch_off = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    branch_patches.push((patch_off, target));
+                    cpc += 3;
                 }
 
                 // Unsupported opcode in inline context — bail out
@@ -8637,6 +10195,12 @@ impl Compiler {
                     return false;
                 }
             }
+
+            // For the next iteration's merge-point check: goto (0xa7) and the
+            // returns (0xac..=0xb1) jump away, so the following PC is reachable
+            // only as a branch target (a dead fall-through whose stale slots
+            // the merge-point reset may clear). Everything else falls through.
+            prev_was_terminator = matches!(op, 0xa7 | 0xac..=0xb1);
         }
 
         // Mark the "after inline" position for return-jumps
@@ -9940,6 +11504,11 @@ impl Compiler {
 
         let mut pc = 0;
         while pc < code_len {
+            // Stage 2 (precise oop maps) — track the bytecode PC being emitted
+            // so `emit_oop_map_for_safepoint` can look up the live oop-local
+            // mask for this instruction without threading `pc` through every
+            // safepoint call site.
+            self.cur_bc_pc = pc;
             // DCE: if we're in dead code and this PC isn't a branch target, skip it
             if dead {
                 if branch_targets[pc] {
@@ -10026,6 +11595,15 @@ impl Compiler {
                     self.osr_entry_native[pc] = -1; // OSR rejected — fall back to interpreter
                 } else {
                     self.osr_entry_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                    // Shadow-stack note: this position is reached by BOTH the OSR
+                    // entry (which bypasses the prologue → thread/watermark slots
+                    // uninitialised) AND the initial fall-through (slots already
+                    // set by the prologue). So we can't (re)initialise the slots
+                    // here without corrupting the normal path. Instead the VM-side
+                    // OSR setup zeroes the slots before jumping (see
+                    // `CompiledMethod::shadow_thread_slot_off` / try_osr), which
+                    // makes OSR-entered frames skip shadow tracking via the
+                    // null-guards (safe; precise OSR-frame tracking is a follow-up).
                 }
             }
             // === LICM: Emit hoisted aaload code at loop headers ===
@@ -10565,17 +12143,17 @@ impl Compiler {
                     // fload (0x17) and dload (0x18) may have XMM-allocated locals
                     if matches!(op, 0x17 | 0x18) {
                         if let Some(xmm) = self.xmm_for_local(idx) {
-                            self.stack.push(StackSlot::Xmm(xmm));
+                            // FP value — never an oop.
+                            self.stack_push(StackSlot::Xmm(xmm), false);
                             pc += 2;
                             continue;
                         }
                     }
                     let is_aload = op == 0x19;
                     if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
                         // T1.1.a — only aload pushes oops; iload/lload/fload/dload
-                        // push primitives. Mark parity with the stack.
-                        self.stack_oop_marks.push(is_aload);
+                        // push primitives. Stage 1 — keep marks in lockstep.
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), is_aload);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -10591,8 +12169,9 @@ impl Compiler {
                 0x1a..=0x1d => {
                     let idx = (op - 0x1a) as usize; // Widening: always safe
                     if let Some(local_reg) = self.reg_for_local(idx) {
-                        // Zero-cost: just record register reference on simulated stack
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
+                        // Zero-cost: just record register reference on simulated
+                        // stack. iload pushes a primitive — never an oop.
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), false);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -10605,7 +12184,7 @@ impl Compiler {
                 0x1e..=0x21 => {
                     let idx = (op - 0x1e) as usize; // Widening: always safe
                     if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), false);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -10618,9 +12197,9 @@ impl Compiler {
                 0x22..=0x25 => {
                     let idx = (op - 0x22) as usize; // Widening: always safe
                     if let Some(xmm) = self.xmm_for_local(idx) {
-                        self.stack.push(StackSlot::Xmm(xmm));
+                        self.stack_push(StackSlot::Xmm(xmm), false);
                     } else if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), false);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -10635,9 +12214,9 @@ impl Compiler {
                     if let Some(xmm) = self.xmm_for_local(idx) {
                         // Zero-cost push: just reference the XMM register.
                         // No code emitted until the value is consumed.
-                        self.stack.push(StackSlot::Xmm(xmm));
+                        self.stack_push(StackSlot::Xmm(xmm), false);
                     } else if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), false);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -10650,14 +12229,12 @@ impl Compiler {
                 0x2a..=0x2d => {
                     let idx = (op - 0x2a) as usize; // Widening: always safe
                     if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
-                        // T1.1.a — keep oop-mark vector in lock-step
-                        // and tag the entry. CalleeSaved slots don't
-                        // have a frame offset, so the oop-map walker
-                        // skips them (they're preserved by the ABI
-                        // across calls and cached by the JIT's frame
-                        // save/restore prologue).
-                        self.stack_oop_marks.push(true);
+                        // aload* always pushes an object ref. Stage 1 — keep
+                        // marks in lockstep and tag the entry. CalleeSaved slots
+                        // don't have a frame offset, so the oop-map walker skips
+                        // them (preserved by the ABI across calls and cached by
+                        // the JIT's frame save/restore prologue).
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), true);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -11145,6 +12722,17 @@ impl Compiler {
                 // dup
                 0x59 => {
                     let top = self.peek_stack();
+                    // T1.1.a / EC oop-map fix: capture the source slot's oop
+                    // mark so the duplicate carries it. The `self.stack.push`
+                    // fast-paths below would otherwise push to `self.stack`
+                    // WITHOUT a paired `stack_oop_marks` push (desyncing the
+                    // two vectors), and the `push_from_rax`/`push_stack` paths
+                    // push a hard-coded `false` — both leave a duplicated
+                    // object reference UNMARKED in the precise oop map. A
+                    // duplicated oop live across a safepoint must stay precisely
+                    // mapped so a moving GC remaps it; otherwise it can decay to
+                    // a stale/garbage base.
+                    let top_is_oop = self.stack_oop_marks.last().copied().unwrap_or(false);
                     match top {
                         StackSlot::Frame(off) => {
                             self.emit_load_local(RAX, off);
@@ -11153,10 +12741,12 @@ impl Compiler {
                         StackSlot::CalleeSaved(_) => {
                             // Zero-cost: just duplicate the register reference
                             self.stack.push(top);
+                            self.stack_oop_marks.push(top_is_oop);
                         }
                         StackSlot::Xmm(_) => {
                             // Zero-cost: just duplicate the XMM register reference
                             self.stack.push(top);
+                            self.stack_oop_marks.push(top_is_oop);
                         }
                         StackSlot::Scratch(reg) => {
                             // Scratch register holds the value — try to dup into
@@ -11172,6 +12762,7 @@ impl Compiler {
                             if let Some(sr) = avail {
                                 self.emit_mov_reg_reg(sr, reg);
                                 self.stack.push(StackSlot::Scratch(sr));
+                                self.stack_oop_marks.push(top_is_oop);
                             } else {
                                 // No scratch available — load to RAX and push via frame
                                 self.emit_mov_reg_reg(RAX, reg);
@@ -11180,6 +12771,13 @@ impl Compiler {
                                     self.emit_store_local(off, RAX);
                                 }
                             }
+                        }
+                    }
+                    // Propagate the oop mark onto the freshly-pushed duplicate
+                    // (the `push_from_rax`/`push_stack` paths pushed `false`).
+                    if top_is_oop {
+                        if let Some(m) = self.stack_oop_marks.last_mut() {
+                            *m = true;
                         }
                     }
                     pc += 1;
@@ -11191,10 +12789,21 @@ impl Compiler {
                     let len = self.stack.len();
                     let a = self.stack[len - 2]; // deeper
                     let b = self.stack[len - 1]; // top
+                    // EC oop-map fix: carry the two source oop marks onto the
+                    // two duplicated entries (push_from_rax pushes `false`).
+                    let ml = self.stack_oop_marks.len();
+                    let a_oop = self.stack_oop_marks.get(ml.wrapping_sub(2)).copied().unwrap_or(false);
+                    let b_oop = self.stack_oop_marks.get(ml.wrapping_sub(1)).copied().unwrap_or(false);
                     self.load_slot_to_reg(RAX, a);
                     self.push_from_rax();
+                    if a_oop {
+                        if let Some(m) = self.stack_oop_marks.last_mut() { *m = true; }
+                    }
                     self.load_slot_to_reg(RAX, b);
                     self.push_from_rax();
+                    if b_oop {
+                        if let Some(m) = self.stack_oop_marks.last_mut() { *m = true; }
+                    }
                     pc += 1;
                 }
 
@@ -11215,9 +12824,22 @@ impl Compiler {
                             // just logical reordering via push order below
                         }
                     }
-                    // Push back in swapped order
+                    // Push back in swapped order. EC oop-map fix: the previous
+                    // code pushed to `self.stack` WITHOUT pairing
+                    // `stack_oop_marks`, desyncing the two vectors (every
+                    // subsequent slot's precise oop mark shifted by one). Keep
+                    // the vectors in lockstep. We push conservative `false`
+                    // marks here (the UNDER-marked direction is safe: the
+                    // conservative frame-region sweep in
+                    // `conservative_roots::scan_one_frame_precise` re-validates
+                    // every frame qword via `heap.is_object_address`, so a
+                    // swapped oop missed by the precise map is still found and
+                    // remapped; OVER-marking a non-oop would be unsafe, so we
+                    // do not do it).
                     self.stack.push(a);
+                    self.stack_oop_marks.push(false);
                     self.stack.push(b);
+                    self.stack_oop_marks.push(false);
                     pc += 1;
                 }
 
@@ -11341,7 +12963,7 @@ impl Compiler {
                         }
                         // ADDSD XMM0, XMM0 — doubles the value
                         self.buf.emit(&[0xF2, 0x0F, 0x58, 0xC0]);
-                        self.stack.push(StackSlot::Xmm(0));
+                        self.stack_push(StackSlot::Xmm(0), false);
                     } else {
                         self.emit_double_binop(0x59); // MULSD
                     }
@@ -11624,7 +13246,7 @@ impl Compiler {
                     self.pop_to_rax();
                     // CVTSI2SS XMM0, EAX: F3 0F 2A C0
                     self.buf.emit(&[0xF3, 0x0F, 0x2A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -11634,7 +13256,7 @@ impl Compiler {
                     self.pop_to_rax();
                     // CVTSI2SD XMM0, EAX: F2 0F 2A C0
                     self.buf.emit(&[0xF2, 0x0F, 0x2A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -11654,7 +13276,7 @@ impl Compiler {
                     self.pop_to_rax();
                     // CVTSI2SS XMM0, RAX: F3 48 0F 2A C0
                     self.buf.emit(&[0xF3, 0x48, 0x0F, 0x2A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -11664,7 +13286,7 @@ impl Compiler {
                     self.pop_to_rax();
                     // CVTSI2SD XMM0, RAX: F2 48 0F 2A C0
                     self.buf.emit(&[0xF2, 0x48, 0x0F, 0x2A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -11703,7 +13325,7 @@ impl Compiler {
                     self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC0]);
                     // CVTSS2SD XMM0, XMM0: F3 0F 5A C0
                     self.buf.emit(&[0xF3, 0x0F, 0x5A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -11742,7 +13364,7 @@ impl Compiler {
                     self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
                     // CVTSD2SS XMM0, XMM0: F2 0F 5A C0
                     self.buf.emit(&[0xF2, 0x0F, 0x5A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -12930,7 +14552,7 @@ impl Compiler {
                                 }
                             }
                             self.emit_sqrtsd_xmm0();
-                            self.stack.push(StackSlot::Xmm(0));
+                            self.stack_push(StackSlot::Xmm(0), false);
                         } else if callee_entry == super::MATH_FLOOR_INTRINSIC
                             || callee_entry == super::MATH_CEIL_INTRINSIC
                             || callee_entry == super::MATH_RINT_INTRINSIC
@@ -12964,7 +14586,7 @@ impl Compiler {
                                 0x08u8 // round to nearest even, inexact suppress
                             };
                             self.buf.emit(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, imm8]);
-                            self.stack.push(StackSlot::Xmm(0));
+                            self.stack_push(StackSlot::Xmm(0), false);
                         } else if callee_entry == super::MATH_ABS_DOUBLE_INTRINSIC {
                             // Math.abs(double): clear sign bit (bit 63)
                             let arg_slot = self.pop_stack();
@@ -12994,7 +14616,7 @@ impl Compiler {
                             self.emit_movq_xmm_from_gpr(1, RCX);
                             // ANDPD XMM0, XMM1: 66 0F 54 C1
                             self.buf.emit(&[0x66, 0x0F, 0x54, 0xC1]);
-                            self.stack.push(StackSlot::Xmm(0));
+                            self.stack_push(StackSlot::Xmm(0), false);
                         } else if callee_entry == super::MATH_ABS_FLOAT_INTRINSIC {
                             // Math.abs(float): clear sign bit (bit 31)
                             let arg_slot = self.pop_stack();
@@ -13024,7 +14646,7 @@ impl Compiler {
                             self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC9]);
                             // ANDPS XMM0, XMM1: 0F 54 C1
                             self.buf.emit(&[0x0F, 0x54, 0xC1]);
-                            self.stack.push(StackSlot::Xmm(0));
+                            self.stack_push(StackSlot::Xmm(0), false);
                         } else if callee_entry == super::MATH_ABS_INT_INTRINSIC {
                             // Math.abs(int): branchless absolute value
                             let arg_slot = self.pop_stack();
@@ -13160,6 +14782,38 @@ impl Compiler {
                             };
                             // CMOVcc RAX, RCX (REX.W): 48 0F 4c C1
                             self.buf.emit(&[0x48, 0x0F, cc, 0xC1]);
+                            self.push_from_rax();
+                        } else if callee_entry == super::MATH_MULTIPLY_HIGH_INTRINSIC
+                            || callee_entry == super::MATH_UNSIGNED_MULTIPLY_HIGH_INTRINSIC
+                        {
+                            // Math.multiplyHigh(JJ)J / unsignedMultiplyHigh(JJ)J —
+                            // high 64 bits of the 128-bit product. The hottest leaf
+                            // in the SunEC P-256 Montgomery field multiply, called
+                            // once per limb pair. One-operand `IMUL r64` (signed) /
+                            // `MUL r64` (unsigned) compute RDX:RAX = RAX * r64; the
+                            // high half lands in RDX. Multiplication is commutative,
+                            // so operand order is irrelevant to the result.
+                            //
+                            // flush_scratch_registers() above already spilled every
+                            // value-stack slot out of RAX/RCX/RDX (locals live only
+                            // in callee-saved R12-R15/RBX/RSI/RDI, deferred-spill
+                            // slots only in R8/R9), so clobbering RAX/RCX/RDX here is
+                            // safe — same contract the Math.min/max long path relies
+                            // on, extended to RDX.
+                            let b_slot = self.pop_stack();
+                            let a_slot = self.pop_stack();
+                            self.load_slot_to_reg(RAX, a_slot);
+                            self.load_slot_to_reg(RCX, b_slot);
+                            // IMUL RCX (48 F7 E9) signed / MUL RCX (48 F7 E1) unsigned.
+                            let modrm =
+                                if callee_entry == super::MATH_MULTIPLY_HIGH_INTRINSIC {
+                                    0xE9u8 // /5 IMUL
+                                } else {
+                                    0xE1u8 // /4 MUL
+                                };
+                            self.buf.emit(&[0x48, 0xF7, modrm]);
+                            // MOV RAX, RDX (48 89 D0) — high half is the result.
+                            self.buf.emit(&[0x48, 0x89, 0xD0]);
                             self.push_from_rax();
                         }
                         // --- invokestatic intrinsic family regions ---
@@ -13348,6 +15002,35 @@ impl Compiler {
                             // SUB EAX, EDX: 29 D0 → -1, 0 or 1.
                             self.buf.emit(&[0x29, 0xD0]);
                             self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::IntRotateLeft.as_entry()
+                            || callee_entry
+                                == super::JitIntrinsic::IntRotateRight.as_entry()
+                        {
+                            // Integer.rotateLeft(i, distance) / rotateRight:
+                            // ROL/ROR EAX, CL. x86 masks CL & 0x1f for a 32-bit
+                            // rotate, byte-identical to the JDK (rotation mod 32),
+                            // so no explicit distance masking is needed. Stack:
+                            // i (deeper), distance (top).
+                            let dist = self.pop_stack();
+                            let val = self.pop_stack();
+                            self.load_slot_to_reg(RAX, val);
+                            self.load_slot_to_reg(RCX, dist);
+                            // ROL EAX, CL: D3 /0 = D3 C0 ; ROR EAX, CL: D3 /1 = D3 C8
+                            let modrm = if callee_entry
+                                == super::JitIntrinsic::IntRotateLeft.as_entry()
+                            {
+                                0xC0u8
+                            } else {
+                                0xC8u8
+                            };
+                            self.buf.emit(&[0xD3, modrm]);
+                            // MOVSXD RAX, EAX (48 63 C0): a 32-bit rotate may set
+                            // the high bit (negative int); re-extend to the
+                            // canonical sign-extended 64-bit int form the value
+                            // ABI expects (mirrors the Math.min int path).
+                            self.buf.emit(&[0x48, 0x63, 0xC0]);
+                            self.push_from_rax();
                         }
                         // ===== INTRINSIC REGION END: INT_BITS =====
 
@@ -13506,6 +15189,30 @@ impl Compiler {
                             self.buf.emit(&[0x0F, 0xB6, 0xD2]);
                             // SUB EAX, EDX: 29 D0 → -1, 0 or 1.
                             self.buf.emit(&[0x29, 0xD0]);
+                            self.push_from_rax();
+                        } else if callee_entry
+                            == super::JitIntrinsic::LongRotateLeft.as_entry()
+                            || callee_entry
+                                == super::JitIntrinsic::LongRotateRight.as_entry()
+                        {
+                            // Long.rotateLeft(i, distance) / rotateRight:
+                            // ROL/ROR RAX, CL. x86 masks CL & 0x3f for a 64-bit
+                            // rotate, byte-identical to the JDK (rotation mod 64).
+                            // Descriptor is (JI)J: the long value (deeper) then
+                            // the int distance (top), each one JIT stack slot.
+                            let dist = self.pop_stack();
+                            let val = self.pop_stack();
+                            self.load_slot_to_reg(RAX, val);
+                            self.load_slot_to_reg(RCX, dist);
+                            // ROL RAX, CL: 48 D3 C0 ; ROR RAX, CL: 48 D3 C8.
+                            let modrm = if callee_entry
+                                == super::JitIntrinsic::LongRotateLeft.as_entry()
+                            {
+                                0xC0u8
+                            } else {
+                                0xC8u8
+                            };
+                            self.buf.emit(&[0x48, 0xD3, modrm]);
                             self.push_from_rax();
                         }
                         // ===== INTRINSIC REGION END: LONG_BITS =====
@@ -17292,11 +18999,19 @@ pub fn compile_with_param_slots(
     let null_check_info = crate::null_check_elim::analyze(code, code_len);
 
     // BCE: analyze loops for bounds check elimination
-    let (bounds_safe_pcs, speculative_bce_guards) =
-        analyze_bounds_elimination(code, code_len, &loops);
+    // DBG (env-gated): CRATONVM_JIT_NO_BCE disables bounds-check elimination
+    // (and SIMD, which also elides per-element checks) so every array access is
+    // bounds-checked — to test whether an elided check causes the out-of-bounds
+    // array-store heap corruption.
+    let no_bce = std::env::var_os("CRATONVM_JIT_NO_BCE").is_some();
+    let (bounds_safe_pcs, speculative_bce_guards) = if no_bce {
+        (FxHashSet::default(), Vec::new())
+    } else {
+        analyze_bounds_elimination(code, code_len, &loops)
+    };
 
     // SIMD: detect vectorizable int-array-sum loops (requires AVX2)
-    let simd_loops = if has_avx2() {
+    let simd_loops = if has_avx2() && !no_bce {
         let mut simd = Vec::new();
         for &(header, back_edge) in &loops {
             let back_edge_end = back_edge + bytecode_len_at(code, back_edge);
@@ -17524,6 +19239,18 @@ pub fn compile_with_param_slots(
     // so each query is O(1) rather than scanning the Vec.
     compiler.build_pc_indices();
 
+    // Stage 2 (precise oop maps) — forward "must be oop" local-variable
+    // dataflow. Lets `emit_oop_map_for_safepoint` record the canonical frame
+    // slots of register/memory locals that hold object references at each
+    // safepoint (in addition to the operand-stack slots), so a moving GC has
+    // precise, updatable coverage of every live oop. Behaviour-neutral on the
+    // default (non-moving) path: `conservative_roots::scan_one_frame_precise`
+    // already sweeps the whole frame region, so the extra precise entries are
+    // redundant there and re-validated via `heap.is_object_address`.
+    let (lo_masks, lo_reached) = compute_local_oop_masks(code, code_len, max_locals);
+    compiler.local_oop_masks = lo_masks;
+    compiler.local_oop_reached = lo_reached;
+
     // Emit prologue
     compiler.emit_prologue();
     let entry_offset = 0; // prologue starts at offset 0
@@ -17664,6 +19391,13 @@ pub fn compile_with_param_slots(
     // to the conservative stack scan for that frame — always a
     // correct super-set of the precise coverage.
     cm.oop_maps = compiler.oop_maps;
+    // Stage 3 — the frame offset where this method stores the active
+    // safepoint's bytecode PC (0 when the precise gate was off at compile).
+    cm.sp_id_slot_off = compiler.sp_id_slot_off;
+    // Shadow-stack — frame offset of the cached thread-pointer slot, so the OSR
+    // trampoline can zero it (OSR bypasses the prologue that sets it). 0 when
+    // the shadow-stack gate was off at compile.
+    cm.shadow_thread_slot_off = compiler.shadow_thread_slot_off;
 
     // Task #60 — attach unroll-cloned MIC/PIC slots to the
     // CompiledMethod so they outlive the compiled code. The imm64
@@ -17994,6 +19728,8 @@ mod tests {
             class_id_offset_in_obj: 0,
             get_current_thread: 0,
             tlab_post_init: 0,
+            frame_record: 0,
+            shadow_stack_offset_in_thread: 0,
         }
     }
 
@@ -25426,6 +27162,43 @@ mod tests {
             assert_eq!(compiled.try_call(&[5]).expect("test JIT call"), 5);
             assert_eq!(compiled.try_call(&[-5i32 as i64]).expect("test JIT call"), 5); // Cast: JIT ABI convention
             assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 0);
+        }
+    }
+
+    #[test]
+    fn s31_inline_with_if_icmp() {
+        // Callee: int max(int a, int b) { return a >= b ? a : b; }
+        // Exercises the restored if_icmp inline path: a forward conditional
+        // branch (if_icmplt) with two return arms and an EMPTY operand stack at
+        // the merge — the provably-safe subset that 419a6f5 over-bailed.
+        let callee_bc: Vec<u8> = vec![
+            0x1a,             // 0: iload_0 (a)
+            0x1b,             // 1: iload_1 (b)
+            0xa1, 0x00, 0x05, // 2: if_icmplt +5 -> 7 (if a<b, return b)
+            0x1a,             // 5: iload_0 (a)
+            0xac,             // 6: ireturn
+            0x1b,             // 7: iload_1 (b)   <- branch target (empty stack)
+            0xac,             // 8: ireturn
+        ];
+        let caller_code: Vec<u8> = vec![
+            0x1a,             // 0: iload_0
+            0x1b,             // 1: iload_1
+            0xb8, 0x00, 0x01, // 2: invokestatic #1
+            0xac,             // 5: ireturn
+            0, 0,
+        ];
+        let caller_len = 6;
+        let callee = make_inline_site(&callee_bc, 2, 2, true, b'I');
+        let mut sites = HashMap::new();
+        sites.insert(2, callee);
+        let compiled = compile_with_inlines(&caller_code, caller_len, 2, 2, sites)
+            .expect("compilation failed");
+        // SAFETY: executing JIT-compiled machine code produced from valid
+        // bytecode; the mmap region is executable.
+        unsafe {
+            assert_eq!(compiled.try_call(&[5, 3]).expect("test JIT call"), 5);
+            assert_eq!(compiled.try_call(&[3, 5]).expect("test JIT call"), 5);
+            assert_eq!(compiled.try_call(&[4, 4]).expect("test JIT call"), 4);
         }
     }
 

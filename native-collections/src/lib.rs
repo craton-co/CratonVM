@@ -1233,6 +1233,9 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+        eprintln!("[DBG_TOARRAY] native_al_to_array (0-arg) HIT nargs={}", args.len());
+    }
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
@@ -1272,15 +1275,24 @@ pub fn native_al_to_array_typed(
     let template = args.get(1).copied().unwrap_or(Value::Object(None));
     let elems = al_or_collection_elements(ctx, this);
     let size = elems.len();
-    if dbg_sbload() {
+    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
         eprintln!(
-            "[DBG_SBLOAD] AL.toArray(T[]) size={} template_some={}",
-            size,
-            matches!(template, Value::Object(Some(_)))
+            "[DBG_TOARRAY] native_al_to_array_typed HIT nargs={} size={} template_some={}",
+            args.len(), size, matches!(template, Value::Object(Some(_)))
         );
     }
     let target = match template {
         Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+        // Template too small: allocate a NEW array of the template's runtime
+        // component type (JDK contract `Arrays.copyOf(elementData, size,
+        // a.getClass())`), NOT a bare `Object[]`. For an array object the heap
+        // header stores its component class id, so `class_id_of_object(arr)` IS
+        // the component class id `new_ref_array` wants — preserving multi-dim
+        // types (`Value[][]` for H2 SortOrder.sort, not `Object[]`).
+        Value::Object(Some(arr)) => {
+            let comp = ctx.class_id_of_object(arr);
+            ctx.new_ref_array(comp, size)
+        }
         _ => alloc_ref_array(ctx, size),
     };
     for (i, val) in elems.iter().enumerate() {
@@ -1504,7 +1516,10 @@ fn native_al_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     // `Collections.unmodifiableList` parent address) — without it the
     // appended PathAddress comes out empty and resource-tree
     // registration NPEs in `ConcreteResourceRegistration.registerSubModel`.
-    let elems = collect_collection_elements(ctx, other);
+    // `_or_real` adds the real-`toArray()` fallback so a real-bytecode source
+    // (ConcurrentLinkedQueue, LinkedList, …) the layout heuristics can't read
+    // still contributes its elements.
+    let elems = collect_collection_elements_or_real(ctx, other);
     if elems.is_empty() {
         return Ok(Some(Value::Int(0)));
     }
@@ -1876,7 +1891,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
             h = h.wrapping_mul(31).wrapping_add(cu as i32);
         }
         // Spread bits (like HashMap.hash in JDK)
-        return Ok(h ^ (h >> 16));
+        return Ok(h ^ ((h as u32) >> 16) as i32);
     }
     // Enum constants: hash by (declaring class name, constant name) — the
     // JLS-canonical identity of an enum constant — so an enum-keyed map's
@@ -1893,7 +1908,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
         for b in const_name.bytes() {
             h = h.wrapping_mul(31).wrapping_add(b as i32);
         }
-        return Ok(h ^ (h >> 16));
+        return Ok(h ^ ((h as u32) >> 16) as i32);
     }
     if let Some(prim) = unbox_wrapper(ctx, key) {
         // Wrapper types: hash by their primitive value (matches JDK Integer.hashCode etc.)
@@ -1907,7 +1922,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
             }
             _ => ctx.identity_hash_code(key),
         };
-        return Ok(h ^ (h >> 16));
+        return Ok(h ^ ((h as u32) >> 16) as i32);
     }
     // S111r-bug-fix (peaceful-sammet): for arbitrary user-defined objects we
     // MUST call their `hashCode()` so HashMap honours the equals/hashCode
@@ -1923,7 +1938,7 @@ fn map_hash_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> Result<i32, Meth
         Some(Value::Int(v)) => v,
         _ => ctx.identity_hash_code(key),
     };
-    Ok(h ^ (h >> 16))
+    Ok(h ^ ((h as u32) >> 16) as i32)
 }
 
 /// Compute the *raw* Java `hashCode()` of an element `Value` — i.e. the value
@@ -3015,9 +3030,13 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     // attack/corruption to the caller rather than silently producing
     // wrong data.
     let mut walk_count: usize = 0;
+    // Track the last node visited so a not-found key can be appended at the
+    // tail of the chain (HotSpot HashMap.putVal semantics), not prepended.
+    let mut tail_node: Option<ObjectRef> = None;
     const CHAIN_WALK_LIMIT: usize = 4096;
     while let Value::Object(Some(node)) = node_val {
         walk_count += 1;
+        tail_node = Some(node);
         if walk_count > CHAIN_WALK_LIMIT {
             eprintln!(
                 "[HM-PUT-GUARD] aborting chain walk at {} nodes (suspected cycle); map={:?} idx={} cap={}",
@@ -3072,23 +3091,25 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         node_val = next;
     }
 
-    // Key not found — insert at head of chain
-    let existing_head = ctx.get_array_element(buckets, idx);
-    let head_ref = match existing_head {
-        Value::Object(obj_opt) => obj_opt,
-        _ => None,
-    };
+    // Key not found — append at the TAIL of the chain. This matches HotSpot
+    // HashMap.putVal (JDK 8+), which links the new node after the last bin
+    // entry rather than prepending it. Tail-append makes within-bucket
+    // iteration order equal to insertion order, reproducing HotSpot's
+    // encounter order for keys that collide into the same bucket (the prior
+    // head-prepend reversed them, the dominant source of HashMap iteration-
+    // order divergence vs HotSpot across the gauntlet).
     // Create node — for null keys, store Value::Object(None) in key field
     let new_node = ctx.alloc_object(cratonvm_types::ClassId::new(0), NODE_NUM_FIELDS);
     ctx.set_field(new_node, NODE_FIELD_HASH, Value::Int(hash));
     ctx.set_field(new_node, NODE_FIELD_KEY, key_val);
     ctx.set_field(new_node, NODE_FIELD_VALUE, value);
-    ctx.set_field(
-        new_node,
-        NODE_FIELD_NEXT,
-        head_ref.map_or(Value::Object(None), |r| Value::Object(Some(r))),
-    );
-    ctx.set_array_element(buckets, idx, Value::Object(Some(new_node)));
+    ctx.set_field(new_node, NODE_FIELD_NEXT, Value::Object(None));
+    match tail_node {
+        // Non-empty chain: link after the last node walked above.
+        Some(t) => ctx.set_field(t, NODE_FIELD_NEXT, Value::Object(Some(new_node))),
+        // Empty bucket: the new node becomes the chain head.
+        None => ctx.set_array_element(buckets, idx, Value::Object(Some(new_node))),
+    }
     set_map_size(ctx, this, size + 1);
 
     Ok(Some(Value::Object(None))) // no old value
@@ -3609,7 +3630,22 @@ fn native_map_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         let other_val = native_map_get(ctx, &get_args)?;
         match other_val {
             Some(ref ov) => {
-                if !values_equal(ctx, value, ov) {
+                // Compare values per the `Map.equals` contract: `v.equals(ov)`.
+                // For two object values this must dispatch the value's Java
+                // `equals(Object)` — `values_equal` only knows identity,
+                // String contents and enum identity, so it wrongly reported
+                // unequal for List/bean/etc. values (e.g. two HashMaps whose
+                // values are equal `List`s compared `false`). `map_keys_equal`
+                // already honours the contract (it falls back to the Java
+                // `equals`), so reuse it for object/object pairs and keep
+                // `values_equal` for the primitive / null / mixed cases.
+                let eq = match (value, ov) {
+                    (Value::Object(Some(va)), Value::Object(Some(vb))) => {
+                        map_keys_equal(ctx, *va, *vb)?
+                    }
+                    _ => values_equal(ctx, value, ov),
+                };
+                if !eq {
                     return Ok(Some(Value::Int(0)));
                 }
             }
@@ -3831,6 +3867,46 @@ fn collect_keys_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<Value
     map_collect_keys(ctx, source)
 }
 
+/// Snapshot a HashSet's elements in *iteration order* for the order-sensitive
+/// read paths (iterator / toArray / forEach / stream / toString / addAll-source).
+///
+/// An ordinary (non-view) HashSet has no source map, so we read its elements
+/// straight from `backing` in bucket order. But a keySet/entrySet/values *view*
+/// must iterate in its **source map's** encounter order: insertion order for a
+/// `LinkedHashMap`, sorted order for a `TreeMap`, and HotSpot-faithful bucket
+/// order for a plain `HashMap`. We therefore collect directly from the source
+/// whenever one is present.
+///
+/// Walking the view's own HashSet backing instead is wrong for an `entrySet`:
+/// that backing buckets each freshly-built `Map.Entry` by the entry object's
+/// *identity hash* (a keySet backing buckets by the key's hash, which happens
+/// to reproduce the source's layout), so an entrySet walk re-orders entries by
+/// entry-hash and diverges from both `keySet()` and HotSpot. That surfaced as
+/// the SD-JWT claim-ordering bug and, more broadly, any code that compares
+/// `entrySet()`/`values()` encounter order against HotSpot. Collecting from the
+/// source keeps `entrySet()` order identical to `keySet()` for every map type.
+///
+/// keySet → the source keys; entrySet → freshly built `Map.Entry` objects over
+/// the source's ordered `(key,value)` pairs (slot 0 = key, slot 1 = value, the
+/// layout `native_lhm_entry_set` and `native_hs_remove`'s key-extraction use).
+fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef) -> Vec<Value> {
+    if let Some(source) = view_backing_source(ctx, backing) {
+        if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
+            return collect_entries_any(ctx, source)
+                .into_iter()
+                .map(|(k, v)| {
+                    let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
+                    ctx.set_field(entry, 0, k);
+                    ctx.set_field(entry, 1, v);
+                    Value::Object(Some(entry))
+                })
+                .collect();
+        }
+        return collect_keys_any(ctx, source);
+    }
+    map_collect_keys(ctx, backing)
+}
+
 /// Refresh an ArrayList-backed map view (`values()` OR TreeMap `entrySet()`)
 /// from its live source map, preserving the trailing source-marker slot.
 /// Mirrors `resync_view_set`. The element kind is inferred from the list's
@@ -3839,20 +3915,40 @@ fn collect_keys_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<Value
 /// values). Inferring avoids a separate kind marker and keeps TreeMap
 /// entrySet's Entry elements from being clobbered with bare values (which
 /// caused `ClassCastException: Integer cannot be cast to Map$Entry`).
+/// True only for the JDK-internal synthetic `Map.Entry` classes we materialise
+/// for `entrySet()` views (`java/util/HashMap$Entry` via `tm_make_entry`,
+/// `java/util/Map$Entry`, `java/util/LinkedHashMap$Entry`, ...).
+///
+/// Used to tell an `entrySet()` view (elements are entries) apart from a
+/// `values()` view (elements are values) when both are ArrayList-backed views
+/// sharing the trailing-source-slot marker. The previous test —
+/// `class_name.contains("Entry")` — misfired on application VALUE types whose
+/// simple name merely ends in "Entry": a `Map<String, PathEntry>.values()`
+/// view (WildFly `org/jboss/as/controller/services/path/PathEntry`) was
+/// rebuilt as `HashMap$Entry` objects, so `values().iterator().next()` yielded
+/// an entry and `PathManagerService.addPathManagerResources`'s
+/// `checkcast PathEntry` threw `ClassCastException`. Applications cannot define
+/// classes in the sealed `java/util` package, so the prefix+suffix test is
+/// exact and cannot match an app type.
+fn is_synthetic_map_entry_class(name: &str) -> bool {
+    name.starts_with("java/util/") && name.ends_with("$Entry")
+}
+
 fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) {
     let source = match values_view_source(ctx, list) {
         Some(s) => s,
         None => return,
     };
     // Determine whether elements are Map.Entry (entrySet) by inspecting the
-    // current head element's class.
+    // current head element's class — restricted to our synthetic entry classes
+    // so an app value type named `*Entry` is not misread as an entry.
     let is_entry_view = {
         let (data, size) = al_state(ctx, list);
         match data {
             Some(d) if size > 0 => match ctx.get_array_element(d, 0) {
                 Value::Object(Some(e)) => ctx
                     .class_name_of_id(ctx.class_id_of_object(e))
-                    .map(|n| n.contains("Entry"))
+                    .map(|n| is_synthetic_map_entry_class(&n))
                     .unwrap_or(false),
                 _ => false,
             },
@@ -3929,7 +4025,11 @@ fn propagate_list_removal(
         let cls = ctx
             .class_name_of_id(ctx.class_id_of_object(e))
             .unwrap_or_default();
-        if cls.contains("Entry") {
+        // Only treat the element as a Map.Entry (delete by its key) when it is
+        // one of our synthetic entry classes — not merely any class whose name
+        // ends in "Entry" (an app value type like PathEntry must delete by
+        // value, not by `field(0)`).
+        if is_synthetic_map_entry_class(&cls) {
             let key = ctx.get_field(e, 0);
             return source_map_remove(ctx, source, key);
         }
@@ -4265,7 +4365,7 @@ fn native_hs_to_array_typed(
         Some(m) => m,
         None => return Ok(Some(Value::Object(None))),
     };
-    let keys = map_collect_keys(ctx, backing);
+    let keys = collect_view_snapshot_ordered(ctx, backing);
     if let Some(arr) = target {
         let len = ctx.array_length(arr);
         if len >= keys.len() {
@@ -4278,7 +4378,18 @@ fn native_hs_to_array_typed(
             return Ok(Some(Value::Object(Some(arr))));
         }
     }
-    let arr = alloc_ref_array(ctx, keys.len());
+    // Template too small (or absent): allocate a NEW array of the template's
+    // runtime component type (JDK contract), not a bare `Object[]`. The array
+    // header stores its component class id, so `class_id_of_object(t)` is the
+    // component id `new_ref_array` wants — keeps `Set<String>.toArray(new
+    // String[0])` typed `String[]` instead of `Object[]`.
+    let arr = match target {
+        Some(t) => {
+            let comp = ctx.class_id_of_object(t);
+            ctx.new_ref_array(comp, keys.len())
+        }
+        None => alloc_ref_array(ctx, keys.len()),
+    };
     for (i, k) in keys.iter().enumerate() {
         ctx.set_array_element(arr, i, *k);
     }
@@ -4514,6 +4625,49 @@ fn native_hs_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(m) => m,
         None => return Ok(Some(Value::Int(0))),
     };
+    // entrySet() view: `contains(e)` must follow `AbstractMap`'s contract —
+    // `getNode(e.getKey()) != null && node.value.equals(e.getValue())` — i.e.
+    // compare by Map.Entry equality against the SOURCE map. Looking the entry
+    // object itself up in the view's HashSet backing (as the keySet path below
+    // does) buckets it by the entry's identity hash, so an entry produced by a
+    // different `entrySet()` call (or any foreign Map.Entry) never matches and
+    // `contains` wrongly returns false.
+    if let Some(source) = view_backing_source(ctx, backing) {
+        if view_backing_kind(ctx, backing) == VIEW_KIND_ENTRYSET {
+            // Non-object / null arg is never a Map.Entry → not contained.
+            let entry = match elem {
+                Value::Object(Some(e)) => e,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            // Synthetic Map.Entry layout: slot 0 = key, slot 1 = value (matches
+            // the entrySet builders and `native_hs_remove`'s key extraction).
+            let key = ctx.get_field(entry, 0);
+            let want_val = ctx.get_field(entry, 1);
+            // Resolve via the source map's own `containsKey`/`get` so this works
+            // for every backing map type (HashMap / LinkedHashMap / TreeMap).
+            // `containsKey` distinguishes "absent" from "present with null value".
+            let has_key = ctx.invoke_virtual(
+                source,
+                "containsKey",
+                "(Ljava/lang/Object;)Z",
+                &[key],
+            )?;
+            if !matches!(has_key, Some(Value::Int(1))) {
+                return Ok(Some(Value::Int(0)));
+            }
+            let got = ctx
+                .invoke_virtual(source, "get", "(Ljava/lang/Object;)Ljava/lang/Object;", &[key])?
+                .unwrap_or(Value::Object(None));
+            let eq = values_equal(ctx, &got, &want_val)
+                || match (got, want_val) {
+                    (Value::Object(Some(a)), Value::Object(Some(b))) => {
+                        map_keys_equal(ctx, a, b)?
+                    }
+                    _ => false,
+                };
+            return Ok(Some(Value::Int(if eq { 1 } else { 0 })));
+        }
+    }
     let ck_args = [Value::Object(Some(backing)), elem];
     native_map_contains_key(ctx, &ck_args)
 }
@@ -4551,8 +4705,10 @@ fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             return Ok(Some(Value::Object(None)));
         }
     };
-    // Collect keys into a snapshot array
-    let keys = map_collect_keys(ctx, backing);
+    // Collect keys into a snapshot array (source iteration order for an
+    // insertion-ordered LinkedHashMap / sorted TreeMap view; bucket order
+    // otherwise).
+    let keys = collect_view_snapshot_ordered(ctx, backing);
     if dbg_hs_itr() {
         eprintln!("[HS-ITR-DBG] native_hs_iterator: collected {} keys from backing map {:?}", keys.len(), backing);
     }
@@ -4583,7 +4739,7 @@ fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(m) => m,
         None => return Ok(Some(Value::Object(None))),
     };
-    let keys = map_collect_keys(ctx, backing);
+    let keys = collect_view_snapshot_ordered(ctx, backing);
     let arr = alloc_ref_array(ctx, keys.len());
     for (i, k) in keys.iter().enumerate() {
         ctx.set_array_element(arr, i, *k);
@@ -4604,7 +4760,7 @@ fn native_hs_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             return Ok(Some(Value::Object(Some(s))));
         }
     };
-    let keys = map_collect_keys(ctx, backing);
+    let keys = collect_view_snapshot_ordered(ctx, backing);
     let mut parts = Vec::with_capacity(keys.len());
     for k in &keys {
         parts.push(obj_to_display_string(ctx, k));
@@ -5672,7 +5828,33 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(None)
 }
 
+/// Return the process-wide `Collections.EMPTY_LIST` / `EMPTY_MAP` / `EMPTY_SET`
+/// singleton — the real `Collections$Empty*` instance that `Collections.<clinit>`
+/// already populated into the named static field.
+///
+/// In the JDK, `Collections.emptyList()` is literally `(List<T>) EMPTY_LIST`, so
+/// `emptyList() == EMPTY_LIST` and `emptyList() == emptyList()` hold by identity.
+/// Code relies on that: WildFly's `ModelTestBootOperationsBuilder` initialises
+/// its `bootOperations` field with `emptyList()` and later guards with
+/// `bootOperations != Collections.EMPTY_LIST` ("Boot operations are already
+/// set"). Allocating a fresh list per `emptyList()` call broke that identity and
+/// made the guard throw on every `setXml`/`setXmlResource`. Returning the field
+/// value keeps us identity-consistent with the (correctly populated) singleton.
+fn collections_empty_singleton(ctx: &mut dyn NativeContext, field: &str) -> Option<Value> {
+    let cid = ctx.class_id_by_name("java/util/Collections")?;
+    let _ = ctx.ensure_class_initialized("java/util/Collections");
+    let idx = ctx.static_field_index_by_name(cid, field)?;
+    match ctx.get_static_field(cid, idx) {
+        v @ Value::Object(Some(_)) => Some(v),
+        _ => None,
+    }
+}
+
 fn native_collections_empty_list(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    if let Some(v) = collections_empty_singleton(ctx, "EMPTY_LIST") {
+        return Ok(Some(v));
+    }
+    // Fallback (field not yet initialised): fresh synthetic empty list.
     let __al_n_fields = al_slots(ctx).2;
     let list = alloc_synthetic(ctx, "java/util/ArrayList", __al_n_fields);
     let arr = alloc_ref_array(ctx, 0);
@@ -5793,7 +5975,7 @@ fn native_hs_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(m) => m,
         None => return Ok(None),
     };
-    let keys = map_collect_keys(ctx, backing);
+    let keys = collect_view_snapshot_ordered(ctx, backing);
     for key in &keys {
         ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[*key])?;
     }
@@ -7417,7 +7599,7 @@ fn native_hs_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(m) => m,
         None => return make_stream(ctx, &[]),
     };
-    let keys = map_collect_keys(ctx, backing);
+    let keys = collect_view_snapshot_ordered(ctx, backing);
     make_stream(ctx, &keys)
 }
 
@@ -8041,6 +8223,16 @@ const COLLECTOR_TAG_COLLECTING_AND_THEN: i32 = 13;
 /// `AutoConfigurationImportSelector.AutoConfigurationGroup.selectImports` which
 /// collects entries into a user-supplied LinkedHashSet.
 const COLLECTOR_TAG_TO_COLLECTION: i32 = 14;
+/// `Collectors.mapping(Function, Collector)` — ARG1=mapper Function applied to
+/// each element, ARG2=downstream Collector that accumulates the mapped values.
+/// Registered synthetic so the real `Collectors.mapping` bytecode never runs:
+/// that bytecode eagerly calls `downstream.accumulator()`, and our synthetic
+/// downstream collectors (whose runtime class is the bare `java/util/stream/
+/// Collector` interface) have no concrete `accumulator()` body → the JDK throws
+/// `AbstractMethodError: Collector.accumulator() has no Code attribute`. Keeping
+/// `mapping` synthetic lets it compose with our tagged downstream collectors via
+/// the same recursive sub-stream protocol used by groupingBy(downstream).
+const COLLECTOR_TAG_MAPPING: i32 = 15;
 
 fn register_collectors_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -8165,6 +8357,17 @@ fn register_collectors_natives(r: &mut NativeMethodRegistry) {
         "toCollection",
         "(Ljava/util/function/Supplier;)Ljava/util/stream/Collector;",
         native_collectors_to_collection,
+    );
+    // mapping(Function, Collector) — adapts a downstream collector by mapping
+    // each element first. Must be synthetic: the real bytecode calls
+    // `downstream.accumulator()`, which AbstractMethodErrors on our tagged
+    // synthetic downstream collectors. Exercised by keycloak MapperTypeSerializer
+    // (groupingBy(key, mapping(value, toUnmodifiableList()))).
+    r.register(
+        c,
+        "mapping",
+        "(Ljava/util/function/Function;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;",
+        native_collectors_mapping,
     );
     // Our synthetic Collector objects need a `characteristics()` method that
     // returns a non-null Set — JDK stream internals (e.g.
@@ -8299,6 +8502,16 @@ fn native_collectors_grouping_by_downstream(
     let classifier = args.first().copied().unwrap_or(Value::Object(None));
     let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
     ctx.set_field(c, COLLECTOR_FIELD_ARG1, classifier);
+    ctx.set_field(c, COLLECTOR_FIELD_ARG2, downstream);
+    Ok(Some(Value::Object(Some(c))))
+}
+
+/// `Collectors.mapping(mapper, downstream)` — ARG1=mapper, ARG2=downstream.
+fn native_collectors_mapping(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let c = make_collector(ctx, COLLECTOR_TAG_MAPPING);
+    let mapper = args.first().copied().unwrap_or(Value::Object(None));
+    let downstream = args.get(1).copied().unwrap_or(Value::Object(None));
+    ctx.set_field(c, COLLECTOR_FIELD_ARG1, mapper);
     ctx.set_field(c, COLLECTOR_FIELD_ARG2, downstream);
     Ok(Some(Value::Object(Some(c))))
 }
@@ -8692,6 +8905,36 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 )?
                 .unwrap_or(Value::Object(None));
             Ok(Some(finished))
+        }
+        COLLECTOR_TAG_MAPPING => {
+            // mapping(mapper, downstream): apply `mapper` to every element, then
+            // feed the mapped values into the downstream collector via the same
+            // recursive sub-stream protocol the other downstream-aware arms use.
+            let mapper = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let downstream = ctx.get_field(collector, COLLECTOR_FIELD_ARG2);
+            let mut mapped = Vec::with_capacity(elements.len());
+            for elem in &elements {
+                let m = ctx
+                    .invoke_virtual(
+                        mapper,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[*elem],
+                    )?
+                    .unwrap_or(Value::Object(None));
+                mapped.push(m);
+            }
+            let inner_stream =
+                alloc_synthetic(ctx, "java/util/stream/Stream", STREAM_NUM_FIELDS);
+            let arr = alloc_ref_array(ctx, mapped.len());
+            for (i, v) in mapped.iter().enumerate() {
+                ctx.set_array_element(arr, i, *v);
+            }
+            ctx.set_field(inner_stream, STREAM_FIELD_ELEMENTS, Value::Object(Some(arr)));
+            native_stream_collect(ctx, &[Value::Object(Some(inner_stream)), downstream])
         }
         COLLECTOR_TAG_GROUPING_BY => {
             let classifier = match ctx.get_field(collector, COLLECTOR_FIELD_ARG1) {
@@ -10253,7 +10496,8 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
         }
     };
 
-    // Try to read source as an ArrayList (field 0 = data array, field 1 = size)
+    // Fast path: a genuine ArrayList-shaped source (field-layout match) with
+    // elements — copy the backing array directly.
     let (src_data, src_size) = al_state(ctx, source);
     if let (Some(arr), size) = (src_data, src_size) {
         if size > 0 {
@@ -10265,25 +10509,30 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
             }
             al_set_data(ctx, this, buf);
             al_set_size(ctx, this, size);
-        } else {
-            let buf = alloc_ref_array(ctx, AL_DEFAULT_CAPACITY);
-            al_set_data(ctx, this, buf);
-            al_set_size(ctx, this, 0);
+            return Ok(None);
         }
-    } else {
-        // Source is not an ArrayList-shaped object (e.g. an unmodifiable
-        // view, HashSet, LinkedList, ...). Walk it generically so
-        // `new ArrayList<>(List.of(...))` / `new ArrayList<>(unmodList)`
-        // copy the real elements instead of producing an empty list.
-        let elems = collect_collection_elements(ctx, source);
-        let cap = std::cmp::max(elems.len(), AL_DEFAULT_CAPACITY);
-        let buf = alloc_ref_array(ctx, cap);
-        for (i, val) in elems.iter().enumerate() {
-            ctx.set_array_element(buf, i, *val);
-        }
-        al_set_data(ctx, this, buf);
-        al_set_size(ctx, this, elems.len() as i32);
+        // `al_state` reported a 0-size ArrayList layout. That is either a
+        // genuinely empty ArrayList OR a non-ArrayList whose slots merely
+        // aliased an `elementData`/`size` pair (e.g. ConcurrentLinkedQueue's
+        // real `head`/`tail` Node fields read as (Object, 0)). Fall through to
+        // the generic collector, which double-checks the real `size()` and,
+        // when non-zero, materialises via the collection's own `toArray()`.
     }
+
+    // Source is not an ArrayList-shaped object (an unmodifiable view, HashSet,
+    // LinkedList, ConcurrentLinkedQueue, a third-party Collection, …). Walk it
+    // generically so `new ArrayList<>(...)` copies the real elements instead of
+    // producing an empty list — the JUnit-Vintage `new ArrayList<>(
+    // Description.fChildren)` bug, where `fChildren` is a real-bytecode
+    // ConcurrentLinkedQueue, hid every `@org.junit.Test` method from discovery.
+    let elems = collect_collection_elements_or_real(ctx, source);
+    let cap = std::cmp::max(elems.len(), AL_DEFAULT_CAPACITY);
+    let buf = alloc_ref_array(ctx, cap);
+    for (i, val) in elems.iter().enumerate() {
+        ctx.set_array_element(buf, i, *val);
+    }
+    al_set_data(ctx, this, buf);
+    al_set_size(ctx, this, elems.len() as i32);
 
     Ok(None)
 }
@@ -10331,7 +10580,7 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     // `Collections.unmodifiableList(arrayList)`) silently produced an
     // empty set — wiping every auto-configuration before filtering and
     // surfacing as `MissingWebServerFactoryBeanException` at boot.
-    let elems = collect_collection_elements(ctx, source);
+    let elems = collect_collection_elements_or_real(ctx, source);
     let sentinel = Value::Int(1);
     for val in elems {
         native_map_put(ctx, &[Value::Object(Some(backing)), val, sentinel])?;
@@ -14630,6 +14879,51 @@ fn register_bulk_ops_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// Collect a collection's elements, falling back to its real `toArray()`
+/// bytecode when the layout heuristics in [`collect_collection_elements`] do
+/// not recognise it.
+///
+/// In the default build the JDK collection classes run real bytecode rather
+/// than a synthetic array backing, so a real `ConcurrentLinkedQueue` /
+/// `LinkedList` stores its elements in `head`/`tail` Node chains that the
+/// field-layout heuristics can't read — `collect_collection_elements` returns
+/// empty. The collection's own `size()`/`toArray()` *do* work (real bytecode),
+/// so when the heuristics come up empty we ask the collection directly. This
+/// is what makes `new ArrayList<>(concurrentLinkedQueue)` /
+/// `new HashSet<>(linkedList)` / `addAll(realCollection)` copy the real
+/// elements — and, in particular, fixes JUnit 4.13's `Description.getChildren()`
+/// (`new ArrayList<>(fChildren)` over a `ConcurrentLinkedQueue` of test
+/// methods), which the vintage engine relies on for discovery.
+///
+/// Driving `toArray()` (not `iterator()`) keeps this recursion-safe: the only
+/// native `toArray()` can reach is `native_al_to_array`, which calls
+/// `collect_collection_elements` — NOT this wrapper — so there is no cycle.
+/// The `size() > 0` guard means a genuinely empty (or unrecognised-and-empty)
+/// collection never triggers the extra virtual calls.
+fn collect_collection_elements_or_real(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
+    let elems = collect_collection_elements(ctx, coll);
+    if !elems.is_empty() {
+        return elems;
+    }
+    let real_size = match ctx.invoke_virtual(coll, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) => n,
+        _ => 0,
+    };
+    if real_size <= 0 {
+        return elems;
+    }
+    let arr = match ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(a)))) if ctx.heap_kind_of(a) == ObjectKind::Array => a,
+        _ => return elems,
+    };
+    let len = ctx.array_length(arr);
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        out.push(ctx.get_array_element(arr, i));
+    }
+    out
+}
+
 /// Collect elements from a Collection (ArrayList, HashSet, LinkedList, etc.)
 fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
     // Round 49 fix: Collections$UnmodifiableCollection / $UnmodifiableList
@@ -14822,7 +15116,7 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
                 let s0 = ctx.get_field(backing, MAP_FIELD_BUCKETS);
                 if let Value::Object(Some(arr)) = s0 {
                     if ctx.heap_kind_of(arr) == ObjectKind::Array {
-                        return map_collect_keys(ctx, backing);
+                        return collect_view_snapshot_ordered(ctx, backing);
                     }
                 }
             }
@@ -14913,7 +15207,7 @@ fn native_hs_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let elems = collect_collection_elements(ctx, coll);
+    let elems = collect_collection_elements_or_real(ctx, coll);
     let mut modified = false;
     for e in &elems {
         let result = native_hs_add(ctx, &[Value::Object(Some(this)), *e])?;
@@ -20902,12 +21196,20 @@ fn native_collections_unmodifiable_collection(
 }
 
 fn native_collections_empty_map(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    if let Some(v) = collections_empty_singleton(ctx, "EMPTY_MAP") {
+        return Ok(Some(v));
+    }
+    // Fallback (field not yet initialised): fresh synthetic empty map.
     let map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(map))])?;
     Ok(Some(Value::Object(Some(map))))
 }
 
 fn native_collections_empty_set(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    if let Some(v) = collections_empty_singleton(ctx, "EMPTY_SET") {
+        return Ok(Some(v));
+    }
+    // Fallback (field not yet initialised): fresh synthetic empty set.
     let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
     let inner_map = alloc_backing_map(ctx);
     native_map_init(ctx, &[Value::Object(Some(inner_map))])?;

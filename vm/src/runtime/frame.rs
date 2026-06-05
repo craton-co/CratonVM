@@ -135,6 +135,17 @@ pub struct Frame {
     /// Local variable storage (NaN-boxed CompactValues, one 8-byte slot each).
     locals: Vec<CompactValue>,
 
+    /// Per-local kind marks paralleling `locals` (see [`LKIND_OTHER`]).
+    /// `local_kinds[i]` is `LKIND_LONG` / `LKIND_DOUBLE` iff slot `i` currently
+    /// holds a primitive `long` / `double`. Maintained alongside `locals` by
+    /// every setter; its sole consumer is the GC root scan/update, which must
+    /// never treat a primitive cat-2 value as a heap reference even when its
+    /// NaN-boxed bits collide with the `SUB_OBJECT` pattern (BouncyCastle F2m
+    /// `LongArray` `0xfffd_…` words). Mirrors `ValueStack::kinds`. Reuses the
+    /// `Vec<u8>` half of the frame pool tuple that the 2026-05-16 SoA collapse
+    /// left unused.
+    local_kinds: Vec<u8>,
+
     /// Operand stack (NaN-boxed CompactValues internally).
     pub stack: ValueStack,
 
@@ -201,12 +212,48 @@ pub struct Frame {
     pub monitor_on_exit: Option<ObjectRef>,
 }
 
-fn init_locals(max_locals: u16, args: &[Value]) -> (Vec<CompactValue>, u16) {
+// ---------------------------------------------------------------------------
+// Per-local kind marks (GC root-scan disambiguation)
+// ---------------------------------------------------------------------------
+//
+// A `long` / `double` is stored in a single NaN-boxed `CompactValue` slot,
+// bit-exact (see `CompactValue::long`). A handful of those bit patterns
+// collide with the `SUB_OBJECT` NaN-box tag (bits 63-50 all set, sub-tag
+// 010) — e.g. the BouncyCastle F2m `LongArray` `0xfffd_…` words produced by
+// `lxor`/`lshl`/`lushr` over `long[]`. For such a slot `is_object()` returns
+// `true`, so a *context-free* GC root scan would mistake the primitive long
+// for a heap reference and (when its low 47 bits happen to land on a live
+// object) root + relocate it, corrupting the long and the object graph.
+//
+// The operand stack avoids this with its parallel `ValueStack::kinds`; the
+// 2026-05-16 SoA collapse dropped the equivalent array for locals, which is
+// what reintroduced the corruption. These marks restore it: a slot tagged
+// `LKIND_LONG` / `LKIND_DOUBLE` is a primitive and is NEVER a GC root or a
+// relocation target, regardless of bit pattern.
+const LKIND_OTHER: u8 = 0; // reference / int / float / null / uninit / retaddr
+const LKIND_LONG: u8 = 1;
+const LKIND_DOUBLE: u8 = 2;
+
+/// Kind mark for a `Value` about to be written into a local slot. Only the
+/// category-2 primitives need a positive mark; everything else (including
+/// genuine object references) stays `LKIND_OTHER` so the GC continues to scan
+/// it as a potential root.
+#[inline(always)]
+fn lkind_of_value(v: &Value) -> u8 {
+    match v {
+        Value::Long(_) => LKIND_LONG,
+        Value::Double(_) => LKIND_DOUBLE,
+        _ => LKIND_OTHER,
+    }
+}
+
+fn init_locals(max_locals: u16, args: &[Value]) -> (Vec<CompactValue>, Vec<u8>, u16) {
     let eff = effective_max_locals(max_locals, args);
     let n = eff as usize;
     let mut locals = vec![CompactValue::uninitialized(); n];
-    copy_args_to_locals(&mut locals, args);
-    (locals, eff)
+    let mut kinds = vec![LKIND_OTHER; n];
+    copy_args_to_locals(&mut locals, &mut kinds, args);
+    (locals, kinds, eff)
 }
 
 /// Pool-backed local-Vec initialisation.
@@ -222,29 +269,38 @@ fn init_locals_pooled(
     max_locals: u16,
     args: &[Value],
     pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
-) -> (Vec<CompactValue>, u16) {
+) -> (Vec<CompactValue>, Vec<u8>, u16) {
     let eff = effective_max_locals(max_locals, args);
     let n = eff as usize;
-    let (vals, _tags) = pool.pop().unwrap_or_default();
+    let (vals, mut kinds) = pool.pop().unwrap_or_default();
     // SAFETY: CompactValue is repr(transparent) over u64 — transmute is a
-    // no-op layout-wise. The discarded tag Vec is unused for locals now.
+    // no-op layout-wise. The `Vec<u8>` half (formerly the discarded local-tag
+    // Vec) is reused as the parallel `local_kinds` buffer; clear + resize
+    // overwrites any stale recycled content so no kind leaks across reuse.
     let mut locals = u64_vec_to_compact(vals);
     locals.clear();
     locals.resize(n, CompactValue::uninitialized());
-    copy_args_to_locals(&mut locals, args);
-    (locals, eff)
+    kinds.clear();
+    kinds.resize(n, LKIND_OTHER);
+    copy_args_to_locals(&mut locals, &mut kinds, args);
+    (locals, kinds, eff)
 }
 
-fn copy_args_to_locals(locals: &mut [CompactValue], args: &[Value]) {
+fn copy_args_to_locals(locals: &mut [CompactValue], kinds: &mut [u8], args: &[Value]) {
     let mut slot = 0;
     for arg in args {
         if slot < locals.len() {
             locals[slot] = CompactValue::from_value(*arg);
+            // `kinds` is always the same length as `locals` (both sized to
+            // `n` by every caller), so this index is in bounds whenever the
+            // `locals` write above is.
+            kinds[slot] = lkind_of_value(arg);
             slot += 1;
             // Category 2 values (long, double) occupy two slots; the upper
             // half is left uninitialised by JVM convention.
             if arg.is_category2() && slot < locals.len() {
                 locals[slot] = CompactValue::uninitialized();
+                kinds[slot] = LKIND_OTHER;
                 slot += 1;
             }
         }
@@ -472,13 +528,14 @@ impl Frame {
         max_locals: u16,
         args: &[Value],
     ) -> Self {
-        let (locals, eff_max_locals) = init_locals(max_locals, args);
+        let (locals, local_kinds, eff_max_locals) = init_locals(max_locals, args);
         let is_jdk = class_disables_interp_fast_path(&*class_name);
         Self {
             class_id,
             pc: 0,
             last_instr_pc: 0,
             locals,
+            local_kinds,
             stack: ValueStack::new((max_stack as usize).max(16) + 8),
             code: padded_bytecode(&code),
             max_stack,
@@ -541,13 +598,14 @@ impl Frame {
              bytes (use `padded_bytecode()` on raw classfile bytes). len={}",
             code.len(),
         );
-        let (locals, eff_max_locals) = init_locals(max_locals, args);
+        let (locals, local_kinds, eff_max_locals) = init_locals(max_locals, args);
         let is_jdk = class_disables_interp_fast_path(&*class_name);
         Self {
             class_id,
             pc: 0,
             last_instr_pc: 0,
             locals,
+            local_kinds,
             stack: ValueStack::new((max_stack as usize).max(16) + 8),
             code,
             max_stack,
@@ -582,7 +640,7 @@ impl Frame {
         locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
         stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
     ) -> Self {
-        let (locals, eff_max_locals) =
+        let (locals, local_kinds, eff_max_locals) =
             init_locals_pooled(max_locals, args, locals_pool);
         let padded_max = (max_stack as usize).max(16) + 8;
         let stack = if let Some((vals, tags)) = stacks_pool.pop() {
@@ -596,6 +654,7 @@ impl Frame {
             pc: 0,
             last_instr_pc: 0,
             locals,
+            local_kinds,
             stack,
             code,
             max_stack,
@@ -623,7 +682,7 @@ impl Frame {
         locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
         stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
     ) -> Self {
-        let (locals, eff_max_locals) =
+        let (locals, local_kinds, eff_max_locals) =
             init_locals_pooled(cached.max_locals, args, locals_pool);
         let padded_max = (cached.max_stack as usize).max(16) + 8;
         let stack = if let Some((vals, tags)) = stacks_pool.pop() {
@@ -640,6 +699,7 @@ impl Frame {
             pc: 0,
             last_instr_pc: 0,
             locals,
+            local_kinds,
             stack,
             code,
             max_stack,
@@ -690,24 +750,26 @@ impl Frame {
         let n = eff_max_locals as usize;
         self.locals.clear();
         self.locals.resize(n, CompactValue::uninitialized());
-        copy_args_to_locals(&mut self.locals, args);
+        self.local_kinds.clear();
+        self.local_kinds.resize(n, LKIND_OTHER);
+        copy_args_to_locals(&mut self.locals, &mut self.local_kinds, args);
         // Reset operand stack
         self.stack.clear();
     }
 
     /// Return this frame's Vec allocations to the pool for reuse.
     ///
-    /// The locals tuple's `Vec<u8>` half is now always empty — locals are a
-    /// flat `Vec<CompactValue>` (transmuted to/from `Vec<u64>` at the pool
-    /// boundary via `#[repr(transparent)]`). The tag-Vec slot is retained in
-    /// the tuple shape for backwards compatibility with `JvmThread`'s
-    /// per-vector pool routing.
+    /// The locals tuple's `Vec<u8>` half carries the `local_kinds` buffer so
+    /// the allocation is recycled alongside the `Vec<CompactValue>` locals
+    /// (transmuted to/from `Vec<u64>` at the pool boundary via
+    /// `#[repr(transparent)]`). `init_locals_pooled` clears + resizes it on
+    /// the next reuse, so stale kinds never leak across frames.
     pub fn recycle(
         self,
         locals_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
         stacks_pool: &mut Vec<(Vec<u64>, Vec<u8>)>,
     ) {
-        locals_pool.push((compact_vec_to_u64(self.locals), Vec::new()));
+        locals_pool.push((compact_vec_to_u64(self.locals), self.local_kinds));
         stacks_pool.push(self.stack.into_inner());
     }
 
@@ -718,12 +780,13 @@ impl Frame {
     /// whether to keep the allocation in the thread-local pool or spill it
     /// into the VM-wide `VecPool` on `SharedVm`.
     ///
-    /// `local_tags` is always empty after the HIGH-8 audit migration to
-    /// CompactValue-only locals; the slot remains for ABI compatibility with
-    /// callers that route the per-Vec spill independently.
+    /// `local_tags` carries the `local_kinds` buffer (its `Vec<u8>` slot was
+    /// repurposed from the now-removed SoA local-tag Vec); the per-vector
+    /// spill routing in `recycle_frame_with_shared` recycles it like any other
+    /// pooled `Vec<u8>`, and `init_locals_pooled` overwrites it on reuse.
     pub fn take_pool_parts(self) -> (Vec<u64>, Vec<u8>, Vec<u64>, Vec<u8>) {
         let (stack_vals, stack_tags) = self.stack.into_inner();
-        (compact_vec_to_u64(self.locals), Vec::new(), stack_vals, stack_tags)
+        (compact_vec_to_u64(self.locals), self.local_kinds, stack_vals, stack_tags)
     }
 
     // ── Cold-path accessors (method metadata, exception table) ──────────
@@ -857,6 +920,7 @@ impl Frame {
         let i = index as usize;
         if i < self.locals.len() {
             self.locals[i] = CompactValue::from_value(value);
+            self.local_kinds[i] = lkind_of_value(&value);
         }
     }
 
@@ -868,6 +932,7 @@ impl Frame {
     #[inline(always)]
     pub fn set_local_unchecked(&mut self, index: usize, value: Value) {
         self.locals[index] = CompactValue::from_value(value);
+        self.local_kinds[index] = lkind_of_value(&value);
     }
 
     /// Set a local int slot directly (T10.9.D hot-path, mirrors
@@ -879,6 +944,9 @@ impl Frame {
     #[inline(always)]
     pub fn set_local_int_unchecked(&mut self, index: usize, v: i32) {
         self.locals[index] = CompactValue::int(v);
+        // An int never aliases the SUB_OBJECT pattern, but clearing any prior
+        // cat-2 mark keeps `local_kinds` an exact reflection of the slot.
+        self.local_kinds[index] = LKIND_OTHER;
     }
 
     /// Get a local int slot directly (T10.9.D hot-path, mirrors
@@ -939,6 +1007,12 @@ impl Frame {
         let i = index as usize;
         if i < self.locals.len() {
             self.locals[i] = cv;
+            // The compact setters are only ever fed ints/floats (`istore`,
+            // `fstore`) or genuine references (`astore`); raw long/double
+            // values always arrive via the `Value`-typed `set_local*`. So a
+            // primitive cat-2 never lands here, and `LKIND_OTHER` keeps a
+            // genuine reference scannable by the GC.
+            self.local_kinds[i] = LKIND_OTHER;
         }
     }
 
@@ -949,6 +1023,9 @@ impl Frame {
     #[inline(always)]
     pub fn set_local_compact_unchecked(&mut self, index: usize, cv: CompactValue) {
         self.locals[index] = cv;
+        // See `set_local_compact`: only int/float/reference compacts reach
+        // this path, so the slot is never a primitive cat-2.
+        self.local_kinds[index] = LKIND_OTHER;
     }
 
     /// Get a local as a `CompactValue` without bounds check (fast path).
@@ -980,8 +1057,16 @@ impl Frame {
         let n = self.locals.len();
         let mut vals = Vec::with_capacity(n);
         let mut tags = Vec::with_capacity(n);
-        for cv in &self.locals {
-            let (v, t) = compact_to_local_slot(*cv);
+        for (i, cv) in self.locals.iter().enumerate() {
+            // Honor the kind mark so a long/double whose bits collide with the
+            // NaN-tag space round-trips bit-exact: `compact_to_local_slot`
+            // would otherwise tag a `0xfffd_…` collision long as VTAG_OBJECT
+            // and emit only its low 47 bits, losing the value across thaw.
+            let (v, t) = match self.local_kinds[i] {
+                LKIND_LONG => (cv.raw_bits(), VTAG_LONG),
+                LKIND_DOUBLE => (cv.raw_bits(), VTAG_DOUBLE),
+                _ => compact_to_local_slot(*cv),
+            };
             vals.push(v);
             tags.push(t);
         }
@@ -1036,10 +1121,19 @@ impl Frame {
             "FrozenFrame locals/local_tags length mismatch on thaw"
         );
         let mut locals = Vec::with_capacity(n);
+        let mut local_kinds = Vec::with_capacity(n);
         for i in 0..n {
             let tag = frozen.local_tags.get(i).copied().unwrap_or(VTAG_UNINIT);
             let val = frozen.locals[i];
             locals.push(local_slot_to_compact(val, tag));
+            // Preserve the cat-2 primitive mark across thaw so the GC root
+            // scan keeps skipping a long/double whose bits collide with
+            // SUB_OBJECT (symmetric with `locals_snapshot`).
+            local_kinds.push(match tag {
+                VTAG_LONG => LKIND_LONG,
+                VTAG_DOUBLE => LKIND_DOUBLE,
+                _ => LKIND_OTHER,
+            });
         }
 
         Self {
@@ -1047,6 +1141,7 @@ impl Frame {
             pc: frozen.bytecode_pc,
             last_instr_pc: frozen.bytecode_pc,
             locals,
+            local_kinds,
             stack,
             code,
             max_stack,
@@ -1088,7 +1183,18 @@ impl Frame {
     /// filter unchanged; long-bit-patterns whose lower 47 bits don't point
     /// at a live heap object are correctly excluded.
     pub fn scan_local_objects(&self, roots: &mut Vec<ObjectRef>, heap: &crate::memory::VmHeap) {
-        for cv in &self.locals {
+        for (i, cv) in self.locals.iter().enumerate() {
+            // A primitive `long` / `double` is never a heap reference — not
+            // even when its NaN-boxed bits collide with the SUB_OBJECT tag
+            // (BC F2m `LongArray` `0xfffd_…` words). The `is_heap_addr` filter
+            // below cannot reject a collision long whose low 47 bits happen to
+            // land on a live object, so without this `local_kinds` gate the GC
+            // would root it and then relocate it, corrupting the long and the
+            // object graph. This is the locals-side counterpart to
+            // `ValueStack::scan_object_refs` honoring its `kinds` marks.
+            if self.local_kinds[i] == LKIND_LONG || self.local_kinds[i] == LKIND_DOUBLE {
+                continue;
+            }
             if cv.is_object() {
                 if let Some(ptr) = cv.as_object_ptr() {
                     // Gate on region-membership (`is_heap_addr`), NOT a header
@@ -1127,7 +1233,24 @@ impl Frame {
         pointer_map: &HashMap<usize, usize>,
         heap: &crate::memory::VmHeap,
     ) {
-        for cv in self.locals.iter_mut() {
+        let _ = heap;
+        // Indexed loop so the per-slot `local_kinds` mark can be consulted
+        // without aliasing the `&mut self.locals` borrow.
+        for i in 0..self.locals.len() {
+            // Never remap a primitive `long` / `double` slot. The `pointer_map`
+            // is the *global* relocation record, so a collision long whose low
+            // 47 bits happen to equal some unrelated object's from-space
+            // address WOULD match a key here — rewriting it to the moved
+            // address silently corrupts the long's value. A primitive is a
+            // value, not a pointer, and must be preserved verbatim. This is
+            // the missing symmetric guard for `scan_local_objects`'s kind gate
+            // (the prior comment's "a false positive was never rooted so it
+            // can't be a key" was wrong: rooting and remapping key off
+            // *different* objects).
+            if self.local_kinds[i] == LKIND_LONG || self.local_kinds[i] == LKIND_DOUBLE {
+                continue;
+            }
+            let cv = self.locals[i];
             if !cv.is_object() {
                 continue;
             }
@@ -1145,13 +1268,9 @@ impl Frame {
             // probe, an IllegalMonitorStateException on frame pop, and a final
             // NPE. The `pointer_map` is the authoritative record of
             // relocations and is exactly the criterion `verify_no_stale_refs`
-            // uses, so remap iff the slot's address is a key: a long
-            // bit-pattern false positive (BC SM2) was never rooted and thus
-            // never appears as a key, so it is correctly left untouched —
-            // identical treatment to the rooting scan.
-            let _ = heap;
+            // uses, so remap iff the slot's address is a key.
             if let Some(&new_addr) = pointer_map.get(&(old_ptr as usize)) {
-                *cv = CompactValue::try_from_pointer(new_addr as u64)
+                self.locals[i] = CompactValue::try_from_pointer(new_addr as u64)
                     .unwrap_or_else(CompactValue::null);
             }
         }
@@ -1400,6 +1519,100 @@ mod tests {
         // accessor (CompactValue's Long/Double tag ambiguity is resolved
         // by the caller's instruction context).
         assert_eq!(frame.get_local_compact(0).as_long(), Some(0x2000));
+    }
+
+    /// REGRESSION (bc math-ec collision-long corruption): a primitive `long`
+    /// whose NaN-boxed bits *collide* with the SUB_OBJECT pattern AND whose
+    /// 47-bit payload coincides with a live heap object's address must NOT be
+    /// treated as a GC root. Before the `local_kinds` gate, the collision
+    /// long was bit-identical to a genuine reference, so `scan_local_objects`
+    /// rooted it and the moving collector then relocated + corrupted it. This
+    /// is the discriminating case the older `…pointer_shaped_bits` test misses
+    /// (a low-address long is not even `is_object()`).
+    #[test]
+    fn scan_local_objects_skips_collision_long_aliasing_live_object() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
+
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        // A real, live heap object — its address passes `is_heap_addr`.
+        let obj = heap.alloc_object(ClassId::new(0), 0);
+        let addr = obj.as_ptr() as u64;
+        assert_eq!(addr & 0x7, 0, "heap objects are 8-byte aligned");
+        assert!(addr < (1 << 47), "user-space heap addr fits in 47 bits");
+
+        // A BC-F2m-style primitive `long` whose bits collide with SUB_OBJECT
+        // and whose payload equals the live object's address — bit-identical
+        // to `CompactValue::object(addr)`, but it is a *value*, not a pointer.
+        let collision_bits = CompactValue::object(addr).raw_bits();
+
+        let mut frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            10,
+            4,
+            &[],
+        );
+        // Slot 0: stored as a long ⇒ LKIND_LONG ⇒ never a root.
+        frame.set_local_unchecked(0, Value::Long(collision_bits as i64));
+        // Slot 1: a genuine reference at the *same* address ⇒ a real root.
+        frame.set_local_unchecked(1, Value::Object(Some(obj)));
+        // Both slots carry identical SUB_OBJECT bits…
+        assert!(frame.get_local_compact(0).is_object());
+        assert_eq!(frame.get_local_compact(0).as_object_ptr(), Some(addr));
+
+        let mut roots = Vec::new();
+        frame.scan_local_objects(&mut roots, &heap);
+
+        // …yet only the reference slot is rooted; the collision long is not.
+        assert_eq!(roots.len(), 1, "only the genuine reference is a GC root");
+        assert_eq!(roots[0].as_ptr() as u64, addr);
+    }
+
+    /// Symmetric `update_local_refs` regression: a collision long whose payload
+    /// equals some *unrelated* object's from-space address must be left
+    /// verbatim even though that address is a `pointer_map` key (the map is
+    /// global — rooting and remapping key off different objects).
+    #[test]
+    fn update_local_refs_preserves_collision_long_matching_pointer_map_key() {
+        use crate::memory::VmHeap;
+        use cratonvm_gc::GcBackend;
+        use std::collections::HashMap;
+
+        // Collision long: SUB_OBJECT bits with payload 0x2000.
+        let collision_bits = CompactValue::object(0x2000).raw_bits();
+        let mut frame = Frame::new(
+            ClassId::new(0),
+            "T".to_string(),
+            "m".to_string(),
+            "()V".to_string(),
+            None,
+            vec![0xb1],
+            vec![],
+            10,
+            2,
+            &[],
+        );
+        frame.set_local_unchecked(0, Value::Long(collision_bits as i64));
+        assert!(frame.get_local_compact(0).is_object());
+        assert_eq!(frame.get_local_compact(0).as_object_ptr(), Some(0x2000));
+
+        // A relocation of *some other* object that happened to live at 0x2000.
+        let mut map = HashMap::new();
+        map.insert(0x2000usize, 0x3000usize);
+        let heap = VmHeap::new(GcBackend::Generational, 16 * 1024 * 1024);
+        frame.update_local_refs(&map, &heap);
+
+        // The primitive long is preserved bit-exact (NOT rewritten to 0x3000).
+        assert_eq!(
+            frame.get_local_compact(0).as_long_unchecked(),
+            collision_bits as i64
+        );
     }
 
     #[test]

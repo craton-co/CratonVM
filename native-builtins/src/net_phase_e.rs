@@ -358,7 +358,8 @@ fn populate_inet_holder(ctx: &mut dyn NativeContext, ia: ObjectRef, host: &str, 
     ctx.set_field_by_name(holder, "hostName", Value::Object(Some(host_str)));
     // `address` is the IPv4 address packed big-endian into an int; for IPv6
     // it stays 0 (the bytes live in the separate `Inet6Address` holder).
-    let (packed, family) = match ip.parse::<std::net::IpAddr>() {
+    let parsed = ip.parse::<std::net::IpAddr>();
+    let (packed, family) = match parsed {
         Ok(std::net::IpAddr::V4(v4)) => {
             (i32::from_be_bytes(v4.octets()), IA_FAMILY_V4)
         }
@@ -368,6 +369,33 @@ fn populate_inet_holder(ctx: &mut dyn NativeContext, ia: ObjectRef, host: &str, 
     ctx.set_field_by_name(holder, "address", Value::Int(packed));
     ctx.set_field_by_name(holder, "family", Value::Int(family));
     ctx.set_field_by_name(ia, "holder", Value::Object(Some(holder)));
+
+    // NIO-SERVER-SOCKET (IPv6): a real-JDK `Inet6Address` stores its 16-byte
+    // address in a SEPARATE `holder6` field
+    // (`Inet6Address$Inet6AddressHolder { byte[16] ipaddress; int scope_id; …}`),
+    // NOT in the base `holder` (whose `address` int is 0 for v6). Un-overridden
+    // real-JDK Inet6Address bytecode — `isLinkLocalAddress()`, `getScopeId()`,
+    // and the address checks `NioSocketImpl.bind`/`connect` run on the real
+    // socket path — dereferences `holder6`; leaving it null NPEs before bind0
+    // is ever reached. Populate it so the real path resolves v6 correctly.
+    if let Ok(std::net::IpAddr::V6(v6)) = parsed {
+        let h6 = alloc_concurrent_synthetic(
+            ctx,
+            "java/net/Inet6Address$Inet6AddressHolder",
+            5,
+        );
+        let octets = v6.octets();
+        let arr = ctx.new_array(ArrayElementType::Byte, octets.len());
+        for (i, b) in octets.iter().enumerate() {
+            ctx.set_array_element(arr, i, Value::Int(*b as i32));
+        }
+        ctx.set_field_by_name(h6, "ipaddress", Value::Object(Some(arr)));
+        // Loopback / global addresses carry no scope; link-local scope ids are
+        // not recoverable from a bare `Ipv6Addr`, so leave scope_id unset (0).
+        ctx.set_field_by_name(h6, "scope_id", Value::Int(0));
+        ctx.set_field_by_name(h6, "scope_id_set", Value::Int(0));
+        ctx.set_field_by_name(ia, "holder6", Value::Object(Some(h6)));
+    }
 }
 
 /// Read one logical InetAddress field (`IA_HOST` or `IA_ADDR`) — side table
@@ -782,6 +810,79 @@ fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String {
     }
 }
 
+/// Percent-decode a URI component the way `java.net.URI` getters do: each
+/// `%XX` triplet is one byte, the byte sequence is interpreted as UTF-8, and
+/// every other character (INCLUDING `+`, which URI leaves literal — unlike
+/// `application/x-www-form-urlencoded`) is copied verbatim. A malformed `%`
+/// escape (missing/non-hex digits) is copied through unchanged.
+fn uri_percent_decode(input: &str) -> String {
+    if !input.contains('%') {
+        return input.to_string();
+    }
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(h), Some(l)) = (hi, lo) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Select the raw (still percent-encoded) path of a URI from its full text,
+/// matching `java.net.URI` path semantics:
+///   * Returns `None` for an OPAQUE URI — one that is absolute (has a scheme)
+///     and whose scheme-specific-part does not begin with `/` (e.g.
+///     `mailto:x@y.com`, `urn:isbn:0`, `news:comp.lang.java`). Such URIs have a
+///     null path; `getPath()`/`getRawPath()` must return null, not the SSP.
+///   * Returns `Some(path)` for a HIERARCHICAL URI, where `path` may be the
+///     empty string (e.g. `http://h` — authority but no path — yields `""`,
+///     NOT null).
+/// The scheme delimiter is the first `:` that precedes any `/`, `?` or `#`;
+/// otherwise the `:` sits inside a relative-reference path and there is no
+/// scheme. The path ends at the first `?` or `#`.
+fn uri_select_raw_path(raw: &str) -> Option<String> {
+    let (is_absolute, ssp) = match raw.find(':') {
+        Some(i) => {
+            let scheme = &raw[..i];
+            let scheme_ok = !scheme.is_empty()
+                && !scheme.contains('/')
+                && !scheme.contains('?')
+                && !scheme.contains('#');
+            if scheme_ok {
+                (true, &raw[i + 1..])
+            } else {
+                (false, raw)
+            }
+        }
+        None => (false, raw),
+    };
+    if is_absolute && !ssp.starts_with('/') {
+        return None; // opaque URI → null path
+    }
+    // Hierarchical: strip an optional `//authority`, then the trailing
+    // query/fragment. An authority with no following path yields `""`.
+    let after_auth = if let Some(rest) = ssp.strip_prefix("//") {
+        match rest.find(['/', '?', '#']) {
+            Some(p) => &rest[p..],
+            None => "",
+        }
+    } else {
+        ssp
+    };
+    let end = after_auth.find(['?', '#']).unwrap_or(after_auth.len());
+    Some(after_auth[..end].to_string())
+}
+
 /// RFC 3986 §5.3 path-merge: combine a base hierarchical path with a
 /// relative reference path.
 fn uri_merge_paths(base_path: &str, ref_path: &str, base_has_authority: bool) -> String {
@@ -1026,62 +1127,50 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(ctx.create_string(&ssp)))))
     });
 
-    // getPath() → path field (by name) if set, else parse from raw
+    // getPath() → path field (by name) if set, else parse from raw. Unlike
+    // getRawPath(), `getPath` returns the DECODED path: java.net.URI stores the
+    // raw (percent-encoded) path in the `path` field (and make_uri likewise
+    // stores the raw split component), so we must percent-decode before
+    // returning. Without this, a URI like `otpauth://totp/Test%20Realm:tester`
+    // yielded `/Test%20Realm:tester` from getPath() where the JDK returns the
+    // decoded `/Test Realm:tester` (keycloak OtpPolicyTest label assertions).
     r.register(uri, "getPath", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Real-JDK URI `path` field, read by name (slot-order safe).
-        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "path") {
-            if let Some(v) = ctx.read_string(s) {
-                if !v.is_empty() {
-                    return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
-                }
-            }
-        }
         let raw = uri_raw_string(ctx, this);
-        // For hierarchical URIs: after scheme + "://" + authority, path starts.
-        // Simplified: return everything after scheme:
-        let path = if let Some(i) = raw.find(':') {
-            let ssp = &raw[i + 1..];
-            // Strip leading "//" + authority for hierarchical URIs.
-            if ssp.starts_with("//") {
-                let rest = &ssp[2..];
-                let slash = rest.find('/').unwrap_or(rest.len());
-                rest[slash..].split('?').next().unwrap_or("").to_string()
-            } else {
-                ssp.split('?').next().unwrap_or("").to_string()
-            }
-        } else {
-            raw.clone()
+        // Opaque URIs (e.g. `mailto:x@y.com`) have a null path. Decide from the
+        // raw text rather than the `path` field, because `make_uri` stores a
+        // `path` field for opaque URIs too (from `uri_split`), which would
+        // otherwise surface the scheme-specific-part as the path.
+        let parsed = match uri_select_raw_path(&raw) {
+            None => return Ok(Some(Value::Object(None))),
+            Some(p) => p,
         };
-        if path.is_empty() {
-            Ok(Some(Value::Object(None)))
-        } else {
-            Ok(Some(Value::Object(Some(ctx.create_string(&path)))))
-        }
+        // Hierarchical: prefer the real-JDK `path` field (raw, slot-order safe);
+        // fall back to the parsed path (which may legitimately be "" for an
+        // authority-only URI like `http://h`). Then percent-decode — getPath()
+        // returns the DECODED path (getRawPath() below returns it raw).
+        let raw_path = match ctx.get_field_by_name(this, "path") {
+            Value::Object(Some(s)) => ctx.read_string(s).filter(|v| !v.is_empty()).unwrap_or(parsed),
+            _ => parsed,
+        };
+        let decoded = uri_percent_decode(&raw_path);
+        Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))))
     });
 
-    // getRawPath() → same as getPath (no encoding distinction here)
+    // getRawPath() → same path selection as getPath() but WITHOUT decoding.
+    // Opaque URIs → null; hierarchical authority-only → "".
     r.register(uri, "getRawPath", "()Ljava/lang/String;", |ctx, args| {
-        // Delegate to getPath logic.
         let this = obj_arg(args, 0)?;
         let raw = uri_raw_string(ctx, this);
-        let path = if let Some(i) = raw.find(':') {
-            let ssp = &raw[i + 1..];
-            if ssp.starts_with("//") {
-                let rest = &ssp[2..];
-                let slash = rest.find('/').unwrap_or(rest.len());
-                rest[slash..].split('?').next().unwrap_or("").to_string()
-            } else {
-                ssp.split('?').next().unwrap_or("").to_string()
-            }
-        } else {
-            raw.clone()
+        let parsed = match uri_select_raw_path(&raw) {
+            None => return Ok(Some(Value::Object(None))),
+            Some(p) => p,
         };
-        if path.is_empty() {
-            Ok(Some(Value::Object(None)))
-        } else {
-            Ok(Some(Value::Object(Some(ctx.create_string(&path)))))
-        }
+        let raw_path = match ctx.get_field_by_name(this, "path") {
+            Value::Object(Some(s)) => ctx.read_string(s).filter(|v| !v.is_empty()).unwrap_or(parsed),
+            _ => parsed,
+        };
+        Ok(Some(Value::Object(Some(ctx.create_string(&raw_path)))))
     });
 
     // getHost() → host field (1) or parsed from raw
@@ -1103,16 +1192,49 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 2)))
     });
 
-    // getQuery() → query field (4)
+    // getQuery() → `query` field by name (slot-order safe), else parse the
+    // raw string between '?' and '#'. Reading raw slot 4 was wrong for a
+    // real-JDK-constructed URI (the 5-arg ctor runs bytecode whose field
+    // layout differs from the synthetic one), the same flaw that made
+    // `getFragment` emit a spurious "null". Like getPath (and unlike the
+    // raw `query` field / getRawQuery), `getQuery()` returns the DECODED
+    // query, so percent-decode before returning.
     r.register(uri, "getQuery", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 4)))
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "query") {
+            if let Some(v) = ctx.read_string(s) {
+                let decoded = uri_percent_decode(&v);
+                return Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))));
+            }
+        }
+        let raw = uri_raw_string(ctx, this);
+        if let Some(q) = raw.find('?') {
+            let after = &raw[q + 1..];
+            let end = after.find('#').unwrap_or(after.len());
+            let decoded = uri_percent_decode(&after[..end]);
+            return Ok(Some(Value::Object(Some(ctx.create_string(&decoded)))));
+        }
+        Ok(Some(Value::Object(None)))
     });
 
-    // getFragment() → fragment field (5)
+    // getFragment() → `fragment` field by name (slot-order safe), else parse
+    // the raw string after '#'. Reading raw slot 5 returned the wrong field
+    // for a real-JDK-constructed URI (the unregistered 5-arg ctor runs
+    // bytecode with a different field layout than the synthetic `make_uri`
+    // one), so a null fragment surfaced as the string "null" — Hadoop's
+    // `Path.toString()` then emitted a spurious trailing "#null".
     r.register(uri, "getFragment", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 5)))
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "fragment") {
+            if let Some(v) = ctx.read_string(s) {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+            }
+        }
+        let raw = uri_raw_string(ctx, this);
+        match raw.find('#') {
+            Some(i) => Ok(Some(Value::Object(Some(ctx.create_string(&raw[i + 1..]))))),
+            None => Ok(Some(Value::Object(None))),
+        }
     });
 
     // isAbsolute() → true if scheme is non-null
@@ -1399,6 +1521,11 @@ fn re1_connect_socket(
 }
 
 fn register_re1_socket(r: &mut NativeMethodRegistry) {
+    // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.Socket surface so
+    // real bytecode drives sun/nio/ch/Net. See register_phase53_socket_stubs.
+    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+        return;
+    }
     let sock = "java/net/Socket";
 
     r.register(sock, "<init>", "()V", |ctx, args| {
@@ -1778,6 +1905,12 @@ fn re2_bind_listener(
 }
 
 fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
+    // NIO-SERVER-SOCKET (route 1): skip the synthetic java.net.ServerSocket
+    // surface so real bytecode drives sun/nio/ch/Net. See
+    // register_phase53_socket_stubs.
+    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+        return;
+    }
     let ss = "java/net/ServerSocket";
 
     r.register(ss, "<init>", "()V", |_ctx, args| {

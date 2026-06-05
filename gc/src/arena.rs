@@ -154,6 +154,18 @@ impl Arena {
         self.free_list.iter().map(|b| b.size).sum()
     }
 
+    /// Size of the largest single free-list block (0 if the free list is
+    /// empty). Used by the young-gen allocation probe to decide whether a
+    /// request can be satisfied from reclaimed space when the bump cursor has
+    /// reached capacity (a non-moving sweep cannot retreat the cursor, so a
+    /// cursor-only probe would wrongly report OOM with the free list full).
+    /// Unlike [`Self::free_list_bytes`], this reflects what a *single*
+    /// allocation can actually use (the free list is non-coalescing across
+    /// blocks within one request).
+    pub fn largest_free_block(&self) -> usize {
+        self.free_list.iter().map(|b| b.size).max().unwrap_or(0)
+    }
+
     /// Snapshot of the current free list as `(offset, size)` pairs,
     /// sorted by ascending offset. Used by the non-moving sweep's object
     /// walker to skip holes the same way `OldGen::walk_objects` does.

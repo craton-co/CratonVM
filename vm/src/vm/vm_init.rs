@@ -1477,6 +1477,21 @@ impl SharedVm {
             native_methods.set_category(__prev_bridge);
             register_io_natives(&mut native_methods);
             register_collections_natives(&mut native_methods);
+            // Re-register the side-table-backed `java.util.Random` /
+            // `SecureRandom` natives AFTER `register_collections_natives`:
+            // that earlier call (native-collections `register_random_natives`)
+            // re-registers every `java/util/Random` method with a SYNTHETIC
+            // 2-field layout that reads the LCG seed from instance field 0.
+            // In real-JDK mode field 0 is the `AtomicLong seed` reference, not
+            // a long, so that version reads 0 and every `nextInt/nextLong/
+            // nextDouble/...` returns 0 (a seeded `Random` produced all-zero
+            // output). The `securerandom` module's handlers are layout-
+            // independent (seed in an identity-hash-keyed side table) and
+            // spec-exact, so they must win — same "re-register after
+            // collections clobbers essentials" pattern as Properties below.
+            cratonvm_native_builtins::securerandom::register_random_and_securerandom_natives(
+                &mut native_methods,
+            );
             // Re-register the side-table-backed Properties natives AFTER
             // `register_collections_natives` because that earlier call
             // re-registers `Properties.load`, `getProperty`, `setProperty`,
@@ -1579,6 +1594,16 @@ impl SharedVm {
                     };
                     let target = match template {
                         Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+                        // Template too small: `Collection.toArray(T[])` must return
+                        // a NEW array of the template's RUNTIME type, not a bare
+                        // `Object[]`. An array's heap header stores its component
+                        // class id, so `class_id_of_object(arr)` IS the component
+                        // id `new_ref_array` wants — preserving multi-dimensional
+                        // element types (`Value[][]` for H2 SortOrder.sort).
+                        Value::Object(Some(arr)) => {
+                            let comp = ctx.class_id_of_object(arr);
+                            ctx.new_ref_array(comp, size)
+                        }
                         _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
                     };
                     let it_v = ctx.invoke(
@@ -1627,6 +1652,14 @@ impl SharedVm {
                 };
                 let target = match template {
                     Value::Object(Some(arr)) if ctx.array_length(arr) >= size => arr,
+                    // Template too small: allocate a NEW array of the template's
+                    // runtime component type (see the iterator-path comment above),
+                    // not a bare `Object[]`. Fixes the H2 `SortOrder.sort`
+                    // `rows.toArray(new Value[0][])` CCE (`Object -> [[Value`).
+                    Value::Object(Some(arr)) => {
+                        let comp = ctx.class_id_of_object(arr);
+                        ctx.new_ref_array(comp, size)
+                    }
                     _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, size),
                 };
                 if let Some(d) = data {

@@ -346,6 +346,11 @@ impl FileDescriptorTable {
                 let n = p.lock().read(&mut buf)?;
                 Ok(if n == 0 { -1 } else { buf[0] as i32 })
             }
+            FileEntry::FileReadWrite(file) => {
+                let mut buf = [0u8; 1];
+                let n = file.lock().read(&mut buf)?;
+                Ok(if n == 0 { -1 } else { buf[0] as i32 })
+            }
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),
         }
     }
@@ -359,6 +364,10 @@ impl FileDescriptorTable {
             // WP1.12 — subprocess stdout/stderr bulk read.
             FileEntry::ChildStdoutPipe(p) => p.lock().read(buf),
             FileEntry::ChildStderrPipe(p) => p.lock().read(buf),
+            // Read+write file (FileChannel via newFileChannel /
+            // RandomAccessFile) — the real `FileDispatcherImpl.read0` path
+            // reaches here. Read at the current cursor, matching `rw_read`.
+            FileEntry::FileReadWrite(file) => file.lock().read(buf),
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),
         }
     }
@@ -468,6 +477,10 @@ impl FileDescriptorTable {
                 p.lock().write_all(&[b])?;
                 Ok(())
             }
+            FileEntry::FileReadWrite(file) => {
+                file.lock().write_all(&[b])?;
+                Ok(())
+            }
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),
         }
     }
@@ -505,6 +518,15 @@ impl FileDescriptorTable {
             // WP1.12 — bulk write to subprocess stdin.
             FileEntry::ChildStdinPipe(p) => {
                 p.lock().write_all(data)?;
+                Ok(())
+            }
+            // A read+write file (FileChannel via newFileChannel /
+            // RandomAccessFile) — the real `FileDispatcherImpl.write0` path
+            // reaches here. Write at the file's current cursor (unbuffered
+            // fs::File), matching `rw_write`. Without this arm the generic
+            // write path fell to "bad fd" even though the fd is valid.
+            FileEntry::FileReadWrite(file) => {
+                file.lock().write_all(data)?;
                 Ok(())
             }
             _ => Err(io::Error::new(io::ErrorKind::NotFound, "bad fd")),

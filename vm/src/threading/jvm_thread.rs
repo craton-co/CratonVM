@@ -264,6 +264,15 @@ pub struct JvmThread {
     /// Thread-local allocation buffer for lock-free young-gen allocation.
     pub tlab: cratonvm_gc::Tlab,
 
+    /// Per-thread **shadow stack** of live object references for precise,
+    /// rewritable GC roots inside JIT-compiled code (see
+    /// `cratonvm_gc::shadow_stack`). JIT code pushes live oops onto it before
+    /// a GC-capable call and reloads them after; the collector marks and
+    /// rewrites the pushed slots precisely, which lets a *moving* young-gen
+    /// collection run safely while JIT frames are live. Unallocated (empty)
+    /// until the thread first enters JIT code with the mechanism enabled.
+    pub shadow_stack: cratonvm_gc::shadow_stack::ShadowStack,
+
     /// T1.5.1 — pending asynchronous exception to deliver at the next
     /// safepoint.
     ///
@@ -339,6 +348,24 @@ impl JvmThread {
         })
     }
 
+    /// Byte offset of the `shadow_stack` field from the start of `JvmThread`.
+    ///
+    /// Used by the JIT (`jit/src/x64.rs`) to emit the inline shadow-stack push
+    /// at GC-capable safepoints: the codegen loads/stores the shadow `top` at
+    /// `JvmThread base + shadow_stack_offset() + ShadowStack::TOP_OFFSET`.
+    /// Computed lazily like [`Self::tlab_offset`] (MSRV: no const `offset_of!`).
+    pub fn shadow_stack_offset() -> usize {
+        use std::sync::OnceLock;
+        static OFFSET: OnceLock<usize> = OnceLock::new();
+        *OFFSET.get_or_init(|| {
+            let t = JvmThread::default();
+            let base = &t as *const JvmThread as usize;
+            let ss_addr =
+                &t.shadow_stack as *const cratonvm_gc::shadow_stack::ShadowStack as usize;
+            ss_addr - base
+        })
+    }
+
     /// Create a new thread with the given id and name.
     pub fn new(thread_id: ThreadId, name: &str) -> Self {
         Self {
@@ -363,6 +390,7 @@ impl JvmThread {
             pin_reason: "",
             scoped_values: Vec::new(),
             tlab: cratonvm_gc::Tlab::empty(),
+            shadow_stack: cratonvm_gc::shadow_stack::ShadowStack::empty(),
             pending_async_exception: None,
             single_step_enabled: AtomicBool::new(false),
             frame_pop_requests: Vec::new(),

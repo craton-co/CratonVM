@@ -205,29 +205,68 @@ pub(crate) fn native_get_caller_class(
     _args: &[Value],
 ) -> MethodCallResult {
     let trace = ctx.capture_stack_trace(0);
-    for entry in &trace {
-        let name: &str = &entry.class_name;
-        // Skip StackWalker, internal reflection adapters, and the
-        // MethodHandle invocation surface.
-        if name == "java/lang/StackWalker"
+
+    // `capture_stack_trace` returns frames OUTERMOST-first (index 0 = the
+    // bottom-of-stack `main`, last = the innermost method that ran the
+    // `getCallerClass` native; the native itself is not pushed as a frame).
+    //
+    // Per the JDK spec, `getCallerClass()` returns the class of the caller of
+    // the method that invoked `getCallerClass` — i.e. the frame *below* the
+    // innermost real (non-internal) frame. So: collect the real frames in
+    // stack order, take the last one (the `@CallerSensitive` method that
+    // called us, e.g. H2's `TestBase.createCaller`), and return ITS caller —
+    // the second-to-last real frame (e.g. `TestDate.main`).
+    //
+    // The previous implementation returned the *first* (outermost) real frame,
+    // which only coincidentally matched for a 2-deep stack and returned the
+    // wrong class (the `@CallerSensitive` method's own class) for any deeper
+    // nesting — H2's `createCaller` then tried to `newInstance()` the abstract
+    // `TestBase` and threw `InstantiationException`.
+    let is_internal = |name: &str| {
+        name == "java/lang/StackWalker"
             || name.starts_with("java/lang/StackWalker$")
             || name.starts_with("jdk/internal/reflect/")
             || name.starts_with("sun/reflect/")
             || name == "java/lang/reflect/Method"
             || name == "java/lang/invoke/MethodHandle"
             || name.starts_with("java/lang/invoke/")
-        {
-            continue;
+    };
+    let real: Vec<&str> = trace
+        .iter()
+        .map(|e| e.class_name.as_ref())
+        .filter(|n| !is_internal(n))
+        .collect();
+    if std::env::var("CRATONVM_DBG_CALLER").is_ok() {
+        eprintln!("[DBG_CALLER] getCallerClass trace ({} frames):", trace.len());
+        for (i, e) in trace.iter().enumerate() {
+            eprintln!("  [{}] {}::{} bci={}", i, e.class_name, e.method_name, e.byte_code_index);
         }
-        if let Some(cid) = ctx.class_id_by_name(name) {
+    }
+
+    // Normal case: at least the `@CallerSensitive` method and its caller are on
+    // the captured stack — return the caller (second-to-last real frame).
+    if real.len() >= 2 {
+        let caller = real[real.len() - 2];
+        if let Some(cid) = ctx.class_id_by_name(caller) {
             let mirror = ctx.get_class_mirror(cid);
             return Ok(Some(Value::Object(Some(mirror))));
         }
     }
-    // Fallback: return java/lang/Object's mirror. Real HotSpot would
-    // throw IllegalCallerException, but KC16 bootstrap detectors accept
-    // any non-null Class — returning a known-loaded anchor avoids the
-    // premature bail-out.
+
+    // Degraded case: the caller frame is not on the interpreter stack. This
+    // happens under the JIT, where a compiled caller (e.g. an OSR-compiled
+    // `main`) executes as native code and pushes no interpreter frame, so only
+    // the innermost interpreted frame is visible. Returning that lone frame
+    // would be the @CallerSensitive method itself (wrong), so fall back to the
+    // first available real frame, then to `java/lang/Object` — matching the
+    // historical boot-path behaviour that JBoss-Modules / KC16 detectors
+    // tolerate (they accept any non-null Class).
+    if let Some(first) = real.first() {
+        if let Some(cid) = ctx.class_id_by_name(first) {
+            let mirror = ctx.get_class_mirror(cid);
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+    }
     if let Some(cid) = ctx.class_id_by_name("java/lang/Object") {
         let mirror = ctx.get_class_mirror(cid);
         return Ok(Some(Value::Object(Some(mirror))));

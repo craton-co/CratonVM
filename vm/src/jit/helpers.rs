@@ -172,6 +172,28 @@ impl Drop for JitCalleeGuard {
 /// duration of JIT execution. The pointer is only dereferenced inside JIT helpers
 /// which execute on the same thread that set it.
 pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
+    // Shadow-stack precise roots (CRATONVM_SHADOW_STACK): ensure this thread's
+    // shadow stack is allocated before any JIT code that may push to it runs.
+    // Cheap `base != 0` check after the first entry; gated, no-op otherwise.
+    // Done here (with a legitimate `&mut JvmThread`) rather than in the extern-C
+    // `jit_get_current_thread` getter to avoid deriving an aliasing `&mut`.
+    if crate::jit::conservative_roots::shadow_stack_enabled() {
+        thread.shadow_stack.ensure_allocated();
+        if std::env::var_os("CRATONVM_DBG_SHADOW").is_some() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static ONCE: AtomicBool = AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[SHADOW] set_jit_thread: thread={:p} shadow base={:#x} top={:#x} end={:#x} ss_off={}",
+                    thread as *mut JvmThread,
+                    thread.shadow_stack.base,
+                    thread.shadow_stack.top,
+                    thread.shadow_stack.end,
+                    JvmThread::shadow_stack_offset(),
+                );
+            }
+        }
+    }
     let prev_ptr = JIT_THREAD.with(|t| {
         let old = t.get();
         t.set(thread as *mut JvmThread);
@@ -1911,6 +1933,99 @@ thread_local! {
 /// Invocation threshold for triggering JIT compilation from the dispatch helper.
 const DISPATCH_JIT_THRESHOLD: u32 = 500;
 
+// ===========================================================================
+// BUG-1 fix: native-stack recursion guard for the JIT→JIT dispatch path.
+//
+// A recursive Java method that has been JIT-compiled (e.g. `binaryTrees(18)`'s
+// deep `make(int)` self-recursion) never re-enters `interpreter::execute`, so
+// the interpreter's `EXEC_DEPTH` / `EXEC_DEPTH_CEILING` guard (which throws a
+// *catchable* `StackOverflowError`) never fires. Each compiled recursion level
+// instead stacks a large native Rust frame through
+// `jit_invoke_dispatch` / `jit_invoke_virtual_mic` → compiled entry → … with
+// nothing checking remaining OS stack, so deep recursion overflows the guard
+// page → uncatchable rc=127 abort.
+//
+// We mirror the interpreter's guard with a dedicated thread-local JIT-dispatch
+// depth counter, incremented at the top of BOTH dispatch helpers under an RAII
+// Drop-decrement, compared against the per-thread ceiling
+// `interpreter::jit_dispatch_depth_ceiling()` (derived from the thread's REAL
+// native stack size, using a generous per-level budget because the JIT
+// dispatch frame is much larger than an interpreter level). On overflow we do
+// NOT recurse: we stash a catchable `java/lang/StackOverflowError` in
+// `JIT_PENDING_EXCEPTION` and return the `i64::MIN` deopt sentinel, exactly
+// like the array-NPE / AIOOBE helpers, so the interpreter's post-JIT drain
+// routes it through the method's exception table.
+// ===========================================================================
+thread_local! {
+    /// Re-entrant JIT-dispatch depth for the current thread. Incremented on
+    /// entry to `jit_invoke_dispatch` / `jit_invoke_virtual_mic` and
+    /// decremented (RAII) on return. Compared against
+    /// `interpreter::jit_dispatch_depth_ceiling()`.
+    static JIT_DISPATCH_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+/// RAII guard that decrements [`JIT_DISPATCH_DEPTH`] when dropped. Constructed
+/// by [`enter_jit_dispatch`] only AFTER the depth has been incremented and the
+/// ceiling check passed, so every successful entry has exactly one matching
+/// decrement on every return path (including the compiled callee unwinding).
+struct JitDispatchDepthGuard;
+impl Drop for JitDispatchDepthGuard {
+    fn drop(&mut self) {
+        JIT_DISPATCH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Enter a JIT dispatch level: bump the thread-local depth and check it against
+/// the per-thread native-stack ceiling.
+///
+/// On success returns `Ok(guard)` — the caller binds it (e.g. `let _g = ...`)
+/// so the level is released on return. On overflow returns `Err(sentinel)`:
+/// the depth has already been rolled back, a catchable
+/// `java/lang/StackOverflowError` has been stashed in `JIT_PENDING_EXCEPTION`
+/// (when constructible), and the caller must immediately `return` the contained
+/// `i64::MIN` deopt sentinel WITHOUT recursing further. If the throwable cannot
+/// be constructed (heap too exhausted) the sentinel is still `i64::MIN` so the
+/// JIT caller deopts rather than continuing with corrupt state.
+#[must_use]
+fn enter_jit_dispatch(vm: &SharedVm) -> Result<JitDispatchDepthGuard, i64> {
+    let ceiling = crate::runtime::interpreter::jit_dispatch_depth_ceiling();
+    let depth = JIT_DISPATCH_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v + 1
+    });
+    if depth > ceiling {
+        // Roll back the increment we just made — we are NOT entering a level.
+        JIT_DISPATCH_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        return Err(raise_jit_stack_overflow(vm));
+    }
+    Ok(JitDispatchDepthGuard)
+}
+
+/// Stash a catchable `java/lang/StackOverflowError` for the JIT caller to route
+/// through its exception table, and return the `i64::MIN` deopt sentinel.
+///
+/// Mirrors `jit_newarray_oom`: obtain the current `&mut JvmThread`, construct
+/// the throwable via `create_exception_object`, and `set_jit_pending_exception`.
+/// Cold path — only hit at pathological recursion depth.
+#[cold]
+fn raise_jit_stack_overflow(vm: &SharedVm) -> i64 {
+    // SAFETY: called from inside a JIT dispatch helper, on the thread that set
+    // the JIT thread pointer; no other `&mut JvmThread` is live at this point
+    // (we are above any compiled-callee invocation).
+    if let Some((thread, _guard)) = unsafe { jit_thread_mut() } {
+        if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+            vm,
+            thread,
+            "java/lang/StackOverflowError",
+            None,
+        ) {
+            set_jit_pending_exception(exc);
+        }
+    }
+    i64::MIN
+}
+
 /// S112r9 — JIT dispatch error handler. When a JIT-dispatched callee returns
 /// an error, route it through `JIT_PENDING_EXCEPTION` so the interpreter's
 /// post-JIT exception-routing path can find a handler (or propagate to the
@@ -2103,12 +2218,39 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         std::slice::from_raw_parts(args_ptr as *const i64, num_args as usize)
     };
 
+    // BUG-1: native-stack recursion guard for the JIT→JIT dispatch path. Bump
+    // the per-thread JIT-dispatch depth and check it against the native-stack
+    // ceiling BEFORE we recurse into any compiled callee. On overflow this
+    // stashes a catchable `StackOverflowError` and returns the `i64::MIN`
+    // deopt sentinel instead of overflowing the OS stack. The guard is held
+    // for the rest of this call so the level is released on every return path.
+    let _jit_dispatch_depth_guard = match enter_jit_dispatch(vm) {
+        Ok(g) => g,
+        Err(sentinel) => return sentinel,
+    };
+
     // Fast path: check thread-local dispatch cache for a previously-compiled callee.
     // This avoids the JIT cache lock on every call.
     let info_key = info_ptr as usize;
-    let cached_entry = DISPATCH_CACHE.with(|dc| {
-        dc.borrow().get(&info_key).map(|c| (c.entry, c.needs_context))
-    });
+    // Virtual/interface dispatch (invoke_kind 0/2) must resolve on the RUNTIME
+    // receiver type. The callsite-keyed entry cache below and the
+    // `info.class_name` (static CP class) JIT-cache lookup both assume static
+    // binding, so reusing them at a polymorphic call site dispatches a
+    // SUPERTYPE method — e.g. `Object.equals` (identity `==`) run on boxed
+    // `Integer` receivers, so two equal Integers compare unequal and junit
+    // `assertEquals` fails on identical values. Only the statically-bound kinds
+    // (invokespecial=1, invokestatic=3) may use these fast paths; virtual /
+    // interface fall through to the receiver-resolving slow path
+    // (`ctx.invoke_virtual`). Hot monomorphic virtual sites are already served
+    // by the receiver-guarded MIC helper (`jit_invoke_virtual_mic`).
+    let statically_bound = matches!(info.invoke_kind, 1 | 3);
+    let cached_entry = if statically_bound {
+        DISPATCH_CACHE.with(|dc| {
+            dc.borrow().get(&info_key).map(|c| (c.entry, c.needs_context))
+        })
+    } else {
+        None
+    };
     if let Some((entry, needs_ctx)) = cached_entry {
         // SAFETY: entry is a JIT-compiled function pointer cached from a previous successful
         // compilation. `try_call_compiled_entry` selects the correct extern "C" fn signature
@@ -2139,7 +2281,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     // `info` directly. Earlier code wrapped each in `Arc::from(...)` which
     // allocated a fresh heap buffer + atomic header on every dispatch — three
     // wasted allocations per hot call. Deref coercion handles the conversion.
-    {
+    // Gated on `statically_bound`: the lookup key is the static CP class, which
+    // is only the correct dispatch target for invokespecial/invokestatic.
+    if statically_bound {
         let jit_cache = vm.jit_cache.read();
         if let Some(compiled) = jit_cache.get(info.class_name, info.method_name, info.descriptor) {
             let entry = compiled.entry_ptr() as usize;
@@ -2172,8 +2316,11 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         }
     }
 
-    // Invocation counting — trigger compilation for hot callees
-    let should_compile = DISPATCH_COUNTER.with(|dc| {
+    // Invocation counting — trigger compilation for hot callees. Gated on
+    // `statically_bound`: compiling `info` (the static CP-class method) and
+    // caching it under the callsite key would re-introduce the supertype
+    // miscompile for a virtual/interface site.
+    let should_compile = statically_bound && DISPATCH_COUNTER.with(|dc| {
         let mut map = dc.borrow_mut();
         let count = map.entry(info_key).or_insert(0);
         *count += 1;
@@ -2409,6 +2556,17 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         &[] as &[i64]
     } else {
         std::slice::from_raw_parts(args_ptr as *const i64, num_args as usize)
+    };
+
+    // BUG-1: native-stack recursion guard for the JIT→JIT virtual dispatch
+    // path (the `invokevirtual` sibling of `jit_invoke_dispatch`). Same
+    // contract: bump the per-thread JIT-dispatch depth, and on overflow stash
+    // a catchable `StackOverflowError` + return the `i64::MIN` deopt sentinel
+    // rather than recursing into a compiled callee and blowing the OS stack.
+    // Held for the rest of the call so the level releases on every return.
+    let _jit_dispatch_depth_guard = match enter_jit_dispatch(vm) {
+        Ok(g) => g,
+        Err(sentinel) => return sentinel,
     };
 
     let (thread, _jit_thread_guard) = match jit_thread_mut() {
@@ -3511,7 +3669,34 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         class_id_offset_in_obj: 0,
         get_current_thread: jit_get_current_thread as *const () as usize,
         tlab_post_init: jit_post_tlab_init as *const () as usize,
+        // Stage 3 (precise oop maps) — only wire the frame-record helper when
+        // the precise gate is on; otherwise leave it 0 so the prologue emits
+        // nothing extra. The JIT also gates emission on its own cached flag,
+        // but keying the pointer on the same env keeps the default build inert.
+        frame_record: if cratonvm_jit::x64::precise_jit_maps_enabled() {
+            jit_frame_record as *const () as usize
+        } else {
+            0
+        },
+        // Shadow-stack precise roots — byte offset of the `ShadowStack` field
+        // from `&JvmThread`. The JIT bakes `[thread + this + ShadowStack::TOP_OFFSET]`
+        // as the inline push target. Always wired (harmless when codegen is off,
+        // which gates emission on its own cached `CRATONVM_SHADOW_STACK` flag).
+        shadow_stack_offset_in_thread: JvmThread::shadow_stack_offset(),
     }
+}
+
+/// Stage 3 (precise oop maps) — record the EXACT RBP of the JIT frame that is
+/// about to run, called once from the JIT prologue (gated on
+/// `CRATONVM_PRECISE_JIT_MAPS`). The Rust-side `JitEntryGuard` pushed a chain
+/// entry just before transferring control to compiled code, but it could only
+/// capture an approximate stack pointer; this fills in the precise frame base
+/// so the GC root walker can address oop-map slots as `[rbp - offset]`.
+///
+/// `extern "C"` with the single `rbp` argument in the platform's first
+/// integer-argument register, matching the JIT's `ARG_REGS[0]` load.
+extern "C" fn jit_frame_record(rbp: usize) {
+    crate::jit::conservative_roots::set_top_frame_base(rbp);
 }
 
 /// T1.1.28 — Math.fma(double, double, double) runtime helper.

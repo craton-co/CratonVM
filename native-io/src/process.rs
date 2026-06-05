@@ -929,29 +929,56 @@ fn native_process_builder_start(
         }
     };
 
-    // --- Field 0: command (List or String[]) ---
+    // --- Field 0: command (List<String> or String[]) ---
     let cmd_val = ctx.get_field(this, 0);
     let mut cmd_strings: Vec<String> = Vec::new();
 
     if let Value::Object(Some(cmd_obj)) = cmd_val {
-        // Try ArrayList layout first: field 0 = Object[] data, field 1 = Int size
-        let size_val = ctx.get_field(cmd_obj, 1);
-        match size_val {
-            Value::Int(size) if size > 0 => {
-                if let Value::Object(Some(data_arr)) = ctx.get_field(cmd_obj, 0) {
-                    for i in 0..(size as usize) {
-                        if let Value::Object(Some(s)) = ctx.get_array_element(data_arr, i) {
-                            cmd_strings.push(ctx.read_string(s).unwrap_or_default());
-                        }
-                    }
+        use cratonvm_types::ObjectKind;
+        if ctx.heap_kind_of(cmd_obj) == ObjectKind::Array {
+            // Genuine String[] — `array_length` is legal only on an array.
+            let len = ctx.array_length(cmd_obj);
+            for i in 0..len {
+                if let Value::Object(Some(s)) = ctx.get_array_element(cmd_obj, i) {
+                    cmd_strings.push(ctx.read_string(s).unwrap_or_default());
                 }
             }
-            _ => {
-                // Try as raw String[] array
-                let len = ctx.array_length(cmd_obj);
-                if len > 0 {
-                    for i in 0..len {
-                        if let Value::Object(Some(s)) = ctx.get_array_element(cmd_obj, i) {
+        } else {
+            // A List (typically an ArrayList). Prefer the real-JDK
+            // `size`/`elementData` fields read BY NAME — a real ArrayList
+            // carries `AbstractList.modCount` ahead of `elementData`/`size`,
+            // so the old hard-coded `size = slot1` guess was wrong and fell
+            // through to `array_length(list)`, which is illegal on a non-array
+            // and tripped `[ARRAY-LEN-GUARD]` during picocli's
+            // `getTerminalWidth()` ProcessBuilder probe (junit-console --help).
+            // Fall back to the synthetic ArrayList layout (data=slot0, size=slot1)
+            // only when the named fields are absent.
+            let size_by_name = match ctx.get_field_by_name(cmd_obj, "size") {
+                Value::Int(n) => Some(n),
+                _ => None,
+            };
+            let data_by_name = match ctx.get_field_by_name(cmd_obj, "elementData") {
+                Value::Object(Some(a)) => Some(a),
+                _ => None,
+            };
+            let (size, data) = match (size_by_name, data_by_name) {
+                (Some(sz), Some(arr)) => (sz, Some(arr)),
+                _ => {
+                    let sz = ctx.get_field(cmd_obj, 1).as_int().unwrap_or(0);
+                    let arr = match ctx.get_field(cmd_obj, 0) {
+                        Value::Object(Some(a)) => Some(a),
+                        _ => None,
+                    };
+                    (sz, arr)
+                }
+            };
+            if let Some(data_arr) = data {
+                // Only read the backing store as an array once confirmed.
+                if ctx.heap_kind_of(data_arr) == ObjectKind::Array {
+                    let cap = ctx.array_length(data_arr);
+                    let n = (size.max(0) as usize).min(cap);
+                    for i in 0..n {
+                        if let Value::Object(Some(s)) = ctx.get_array_element(data_arr, i) {
                             cmd_strings.push(ctx.read_string(s).unwrap_or_default());
                         }
                     }

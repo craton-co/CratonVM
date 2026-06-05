@@ -5216,36 +5216,50 @@ fn register_s4_misc(r: &mut NativeMethodRegistry) {
 }
 
 // ---- ByteArrayOutputStream methods needed by response writer ----
+//
+// IMPORTANT: address the backing store by field *name* (`buf`/`count`), NOT by
+// raw slot index. `ByteArrayOutputStream` is subclassed (e.g.
+// `sun.security.util.DerOutputStream`), and the interpreter mis-resolves the
+// inherited `count` `putfield` slot for such subclasses — so raw-slot access
+// here (`S4_BAOS_DATA`/`S4_BAOS_SIZE` = 0/1) disagreed with the real
+// `super.<init>()` bytecode that sets the *named* `buf`, making `write` drop
+// every byte. That produced empty DER output and broke ECDSA signing under real
+// JCA. This registrar otherwise *overrides* the `serialization.rs` intrinsic
+// (registered earlier), so it must carry the same by-name fix.
 fn register_s4_baos(r: &mut NativeMethodRegistry) {
     let cls = "java/io/ByteArrayOutputStream";
     r.register(cls, "write", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if std::env::var_os("CRATON_BAOS_DBG").is_some() {
+            eprintln!("[BAOS-DBG] s4 write(I) called; count={:?} buf={:?}",
+                ctx.get_field_by_name(this, "count"), ctx.get_field_by_name(this, "buf"));
+        }
         let byte = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
-        let size = ctx.get_field(this, S4_BAOS_SIZE).as_int().unwrap_or(0) as usize;
-        let arr = match ctx.get_field(this, S4_BAOS_DATA) {
+        let size = ctx.get_field_by_name(this, "count").as_int().unwrap_or(0) as usize;
+        let arr = match ctx.get_field_by_name(this, "buf") {
             Value::Object(Some(a)) => a,
             _ => {
                 let a = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 256);
-                ctx.set_field(this, S4_BAOS_DATA, Value::Object(Some(a)));
+                ctx.set_field_by_name(this, "buf", Value::Object(Some(a)));
                 a
             }
         };
         let cap = ctx.array_length(arr);
         if size >= cap {
             // Grow: allocate 2x
-            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cap * 2);
+            let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, (cap * 2).max(size + 1));
             for i in 0..size {
                 let v = ctx.get_array_element(arr, i);
                 ctx.set_array_element(new_arr, i, v);
             }
-            ctx.set_field(this, S4_BAOS_DATA, Value::Object(Some(new_arr)));
+            ctx.set_field_by_name(this, "buf", Value::Object(Some(new_arr)));
         }
-        let arr2 = match ctx.get_field(this, S4_BAOS_DATA) {
+        let arr2 = match ctx.get_field_by_name(this, "buf") {
             Value::Object(Some(a)) => a,
             _ => return Ok(None),
         };
-        ctx.set_array_element(arr2, size, Value::Int(byte as i32));
-        ctx.set_field(this, S4_BAOS_SIZE, Value::Int((size + 1) as i32));
+        ctx.set_array_element(arr2, size, Value::Int(byte as i8 as i32));
+        ctx.set_field_by_name(this, "count", Value::Int((size + 1) as i32));
         Ok(None)
     });
     r.register(cls, "write", "([BII)V", |ctx, args| {
@@ -5264,8 +5278,8 @@ fn register_s4_baos(r: &mut NativeMethodRegistry) {
     });
     r.register(cls, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let size = ctx.get_field(this, S4_BAOS_SIZE).as_int().unwrap_or(0) as usize;
-        let arr = match ctx.get_field(this, S4_BAOS_DATA) {
+        let size = ctx.get_field_by_name(this, "count").as_int().unwrap_or(0) as usize;
+        let arr = match ctx.get_field_by_name(this, "buf") {
             Value::Object(Some(a)) => a,
             _ => {
                 let s = ctx.create_string("");
@@ -5282,8 +5296,8 @@ fn register_s4_baos(r: &mut NativeMethodRegistry) {
     });
     r.register(cls, "toByteArray", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let size = ctx.get_field(this, S4_BAOS_SIZE).as_int().unwrap_or(0) as usize;
-        let src = match ctx.get_field(this, S4_BAOS_DATA) {
+        let size = ctx.get_field_by_name(this, "count").as_int().unwrap_or(0) as usize;
+        let src = match ctx.get_field_by_name(this, "buf") {
             Value::Object(Some(a)) => a,
             _ => return Ok(Some(Value::Object(Some(ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0))))),
         };
@@ -5295,11 +5309,11 @@ fn register_s4_baos(r: &mut NativeMethodRegistry) {
     });
     r.register(cls, "size", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, S4_BAOS_SIZE)))
+        Ok(Some(ctx.get_field_by_name(this, "count")))
     });
     r.register(cls, "reset", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, S4_BAOS_SIZE, Value::Int(0));
+        ctx.set_field_by_name(this, "count", Value::Int(0));
         Ok(None)
     });
     r.register(cls, "flush", "()V", |_ctx, _args| Ok(None));
@@ -5307,16 +5321,16 @@ fn register_s4_baos(r: &mut NativeMethodRegistry) {
     r.register(cls, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 32);
-        ctx.set_field(this, S4_BAOS_DATA, Value::Object(Some(buf)));
-        ctx.set_field(this, S4_BAOS_SIZE, Value::Int(0));
+        ctx.set_field_by_name(this, "buf", Value::Object(Some(buf)));
+        ctx.set_field_by_name(this, "count", Value::Int(0));
         Ok(None)
     });
     r.register(cls, "<init>", "(I)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let cap = args.get(1).and_then(|v| v.as_int()).unwrap_or(32) as usize;
         let buf = ctx.new_array(cratonvm_types::ArrayElementType::Byte, cap.max(1));
-        ctx.set_field(this, S4_BAOS_DATA, Value::Object(Some(buf)));
-        ctx.set_field(this, S4_BAOS_SIZE, Value::Int(0));
+        ctx.set_field_by_name(this, "buf", Value::Object(Some(buf)));
+        ctx.set_field_by_name(this, "count", Value::Int(0));
         Ok(None)
     });
 }

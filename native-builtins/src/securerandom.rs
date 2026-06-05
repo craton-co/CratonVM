@@ -756,6 +756,16 @@ pub(crate) fn native_secure_random_generate_seed(
 /// deterministic LCG-based handlers override the legacy CSPRNG aliases
 /// that older code in `lib.rs` registers under `java/util/Random`.
 pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegistry) {
+    // These are real, spec-exact handlers (deterministic LCG for `Random`,
+    // OS-CSPRNG for `SecureRandom`), NOT synthetic stubs. Register them under
+    // `Intrinsic` so the strict no-stubs build (`drop_synthetic_stubs`) does NOT
+    // drop them: `NativeMethodRegistry::register` early-returns when the current
+    // category is `SyntheticStub`, and this function inherits the caller's
+    // category — which at one call site was `SyntheticStub`, silently dropping
+    // every `java/util/Random` registration so the LCG never ran and seeded
+    // `Random` returned all-zero output.
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     // --- java.util.Random ---
     let r = "java/util/Random";
     registry.register(r, "<init>", "()V", native_random_init_noseed);
@@ -797,6 +807,7 @@ pub fn register_random_and_securerandom_natives(registry: &mut NativeMethodRegis
     registry.register(sr, "nextBoolean", "()Z", native_secure_random_next_boolean);
     registry.register(sr, "nextFloat", "()F", native_secure_random_next_float);
     registry.register(sr, "generateSeed", "(I)[B", native_secure_random_generate_seed);
+    registry.set_category(__prev_cat);
 }
 
 // ---------------------------------------------------------------------------

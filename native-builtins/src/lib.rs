@@ -386,6 +386,10 @@ pub mod lang_misc;
 pub mod util_time;
 pub mod phases_early;
 pub mod phases_late;
+pub(crate) mod bc_aes;
+pub(crate) mod bc_chacha;
+pub(crate) mod bc_newhope;
+pub(crate) mod bc_newhope_tables;
 // T19_K3_PROPS_SIDETABLE — robust java.util.Properties storage so
 // KeycloakMain.<clinit>'s Version.<clinit> path
 // (Class.getResourceAsStream → Properties.load → getProperty) returns
@@ -535,6 +539,32 @@ pub fn real_jca_mode() -> bool {
     std::env::var_os("CRATONVM_REAL_JCA").is_some()
 }
 
+/// EC-scoped real-JCA routing (default ON). Unlike [`real_jca_mode`] — which
+/// turns the synthetic JCA layer OFF wholesale and only works for EC (no real
+/// SunRsaSign/SunJCE seeder, so RSA/AES break) — this keeps the synthetic
+/// RSA/AES/digest shims in place but routes the **EC** family
+/// (`KeyPairGenerator`/`KeyFactory`/`AlgorithmParameters`/`Signature` for `EC`
+/// and `*withECDSA`) to the real, pure-Java JDK-25 SunEC SPIs.
+///
+/// Why: the synthetic EC keygen returns a bare `java/security/PublicKey`
+/// *interface* object, so `(java.security.interfaces.ECPublicKey) pub` throws
+/// `ClassCastException` (keycloak surfaces this as "Error obtaining
+/// ECParameterSpec for P-256 curve"). The real SunEC path yields concrete
+/// `sun.security.ec.ECPublicKeyImpl`/`ECPrivateKeyImpl` with a working
+/// `getParams()`. The provider machinery the real path needs
+/// (`seed_sunec_services` + the `sun/security/jca/GetInstance` bridges +
+/// `Security.<clinit>` `spiMap`) is reached **only** by real EC bytecode —
+/// every non-EC `getInstance` is still shadowed by its always-on synthetic
+/// native — so the blast radius is EC-only.
+///
+/// Kill-switch `CRATONVM_SYNTHETIC_EC=1` restores the legacy synthetic EC
+/// stubs (and leaves the bridges unwired) for debugging / regression bisecting.
+pub fn route_ec_to_real() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_EC").is_none())
+}
+
 pub mod deprecated_lang;
 pub mod deprecated_io_util;
 pub mod deprecated_util;
@@ -626,6 +656,12 @@ pub mod atomic_updater;
 // tens of seconds, missing the watchdog safepoint. Real HotSpot replaces
 // these with hand-rolled C2 — we provide spec-correct Rust equivalents.
 pub mod biginteger_intrinsics;
+// Byte-identical native intrinsic for the SunEC P-256 Montgomery field
+// multiply/square (dominant cost of EC keygen/sign/verify).
+pub mod sunec_intpoly;
+// Gated (default-off) coarse native EC scalar-multiply via the p256 crate,
+// bypassing the one-time generator-table precompute.
+pub mod sunec_point;
 
 // WP1.4 — `jdk.internal.access.SharedSecrets` bridge: 15 *Access
 // interface singletons + every per-interface method.  Unblocks
@@ -962,6 +998,32 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // and X9 curves. Our string-decimal helpers (sweep landed alongside
     // this commit, follow-up to 958baae) preserve full precision.
     crate::phases_late::register_p71_biginteger_extras(registry);
+    // BouncyCastle RSA-keygen small-factor prime pre-screen fast-path (Intrinsic).
+    // BC is JIT-banned (value-model collision in its F2m EC path, unrelated), so
+    // `Primes.implHasAnySmallFactors` otherwise runs interpreted and dominates
+    // RSA key generation. Faithful single-word-mod reimplementation; see the fn doc.
+    crate::phases_late::register_bc_primes_small_factors(registry);
+    // BouncyCastle AESEngine single-block transform fast-path (Intrinsic). Same
+    // JIT-ban rationale: the interpreted T-table AES otherwise dominates AESTest's
+    // Monte-Carlo stress. Verbatim FIPS-197-validated port of encrypt/decryptBlock.
+    crate::phases_late::register_bc_aes_engine(registry);
+    // BouncyCastle Strings UTF-8 transcode fast-path (Intrinsic) — dominates
+    // AESTest.testCounter's growing-string round-trips once AES is native.
+    crate::phases_late::register_bc_strings_utf8(registry);
+    // BouncyCastle CTR-mode (SICBlockCipher) per-byte loop fast-path (Intrinsic) —
+    // the sole remaining hot frame in AESTest.testCounter once AES+Strings are native.
+    crate::phases_late::register_bc_sic_ctr(registry);
+    // BouncyCastle ChaCha permutation fast-path (Intrinsic). Same JIT-ban
+    // rationale: the interpreted ChaCha core (dozens of Integers.rotateLeft
+    // calls per block) dominates the SPHINCS-256 PQC RegressionTest (PRG via
+    // ChaChaEngine.chachaCore + hash via Permute.permute/HashFunctions).
+    // Verbatim port, RFC 8439- and HotSpot-validated.
+    crate::phases_late::register_bc_chacha(registry);
+    // BouncyCastle NewHope lattice fast-path (Intrinsic). The NTT
+    // (Poly.toNTT/fromNTT) + SHAKE128 sampler (Poly.uniform) dominate the PQC
+    // RegressionTest's NewHopeTest once ChaCha is native. Verbatim port of
+    // NTT/Reduce + the `sha3` crate's SHAKE128, validated against HotSpot.
+    crate::phases_late::register_bc_newhope(registry);
 
     // Spring Boot loader in real-JDK mode can resolve Pattern natives through
     // synthetic-stub dispatch paths before/without usable JDK bytecode
@@ -1624,7 +1686,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // the current thread. Fixes "Cannot invoke currentCarrierThread on null"
     // on KC16 boot after ConcurrentHashMap / Lookup clinit B6-swallows.
     register_t19_h2_shared_secrets_shim(registry);
-    // WP1.4: SharedSecrets.getJavaXxxAccess() factories for all 15
+    // WP1.4: SharedSecrets.getJavaXxxAccess() factories for the
     // JDK Access interfaces plus the per-interface method natives
     // (currentCarrierThread, doIntersectionPrivilege, copyMethod,
     // parseCookie, …).  Registered after the T19.H2 shim so the
@@ -1667,6 +1729,25 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // (nested sub-tag inside this Bridge-tagged wrapper).
     registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
         biginteger_intrinsics::register_biginteger_intrinsics(registry);
+    });
+
+    // SunEC P-256 Montgomery field multiply/square. The pure-Java
+    // MontgomeryIntegerPolynomialP256.{mult,square} is the dominant cost of EC
+    // keygen/sign/verify (a one-time generator-table precompute calls it
+    // ~10^5–10^6 times); HotSpot intrinsifies the same field arithmetic. The
+    // Rust impl is byte-identical to the JDK (decode→Montgomery-mult→canonical
+    // re-encode; verified vs JDK 25 limb vectors in sunec_intpoly::tests).
+    registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
+        sunec_intpoly::register_sunec_intpoly_intrinsics(registry);
+    });
+
+    // Coarse native EC scalar-multiply that bypasses the one-time ~14 s
+    // generator-table precompute. Default-ON whenever EC is routed real
+    // (`route_ec_to_real`); `CRATONVM_NATIVE_EC_MULTIPLY` force-enables, and the
+    // `CRATONVM_SYNTHETIC_EC=1` kill-switch leaves it inert. P-256 only — other
+    // curves get a clear error (they were already unsupported in default mode).
+    registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
+        sunec_point::register_sunec_point_intrinsics(registry);
     });
 
     // WP4.2: java.util.concurrent.CompletableFuture executor support.
@@ -4387,17 +4468,17 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register(u2, "arrayBaseOffset0", "(Ljava/lang/Class;)I", native_unsafe_array_base_offset);
     registry.register(u2, "arrayIndexScale0", "(Ljava/lang/Class;)I", native_unsafe_array_index_scale);
     registry.register(u2, "ensureClassInitialized0", "(Ljava/lang/Class;)V", native_noop_with_this);
-    registry.register(u2, "copyMemory0", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory);
+    registry.register(u2, "copyMemory0", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", unsafe_natives::native_unsafe_copy_memory_consolidated);
     registry.register(u2, "setMemory0", "(Ljava/lang/Object;JJB)V", native_unsafe_set_memory);
     // compareAndExchange variants (return old value instead of boolean)
     registry.register(u2, "compareAndExchangeInt", "(Ljava/lang/Object;JII)I", native_unsafe_compare_and_exchange_int);
     registry.register(u2, "compareAndExchangeLong", "(Ljava/lang/Object;JJJ)J", native_unsafe_compare_and_exchange_long);
     registry.register(u2, "compareAndExchangeReference", "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;", native_unsafe_compare_and_exchange_reference);
     // Remaining primitive get/put for jdk/internal/misc/Unsafe (JDK 25 declares them directly)
-    registry.register(u2, "getBoolean", "(Ljava/lang/Object;J)Z", native_unsafe_get_int);
-    registry.register(u2, "putBoolean", "(Ljava/lang/Object;JZ)V", native_unsafe_put_int);
-    registry.register(u2, "getByte", "(Ljava/lang/Object;J)B", native_unsafe_get_int);
-    registry.register(u2, "putByte", "(Ljava/lang/Object;JB)V", native_unsafe_put_int);
+    registry.register(u2, "getBoolean", "(Ljava/lang/Object;J)Z", native_unsafe_get_byte_mb);
+    registry.register(u2, "putBoolean", "(Ljava/lang/Object;JZ)V", native_unsafe_put_byte_mb);
+    registry.register(u2, "getByte", "(Ljava/lang/Object;J)B", native_unsafe_get_byte_mb);
+    registry.register(u2, "putByte", "(Ljava/lang/Object;JB)V", native_unsafe_put_byte_mb);
     registry.register(u2, "getShort", "(Ljava/lang/Object;J)S", native_unsafe_get_short_mb);
     registry.register(u2, "putShort", "(Ljava/lang/Object;JS)V", native_unsafe_put_short_mb);
     registry.register(u2, "getChar", "(Ljava/lang/Object;J)C", native_unsafe_get_char_mb);
@@ -6855,6 +6936,45 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         "()[[Ljava/lang/annotation/Annotation;",
         lang_class::native_method_get_parameter_annotations,
     );
+    // Constructor annotation methods. CratonVM builds Constructor reflective
+    // objects (create_constructor_object) WITHOUT the raw `annotations` /
+    // `parameterAnnotations` byte[] fields the real JDK bytecode parses, so
+    // without these native overrides Constructor.getDeclaredAnnotations() /
+    // getParameterAnnotations() fell through to that bytecode and returned
+    // empty — Jackson then reported "no Creators" for an `@JsonCreator`
+    // constructor (keycloak CredentialModelTest / PasswordCredentialData).
+    // The shared Method natives work because `method_class_name_desc` now
+    // resolves a Constructor receiver to its `<init>` metadata.
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getAnnotations",
+        "()[Ljava/lang/annotation/Annotation;",
+        native_method_get_annotations,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getDeclaredAnnotations",
+        "()[Ljava/lang/annotation/Annotation;",
+        native_method_get_annotations,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getAnnotation",
+        "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
+        native_method_get_annotation,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "isAnnotationPresent",
+        "(Ljava/lang/Class;)Z",
+        native_method_is_annotation_present,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getParameterAnnotations",
+        "()[[Ljava/lang/annotation/Annotation;",
+        lang_class::native_method_get_parameter_annotations,
+    );
     // Annotation proxy: annotationType() returns the Class mirror
     registry.register(
         "java/lang/annotation/Annotation",
@@ -7354,6 +7474,31 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // is not compiled. Register common exception constructors/getters here so
     // reflective / Spring bootstrap paths do not die on missing natives.
     register_exception_extras_natives(registry);
+
+    // LOCALE / BREAKITER (real-JDK mode): `java.text.BreakIterator`'s static
+    // factories (`getLineInstance` / `getWordInstance` / `getSentenceInstance`
+    // / `getCharacterInstance`) route through
+    //   BreakIterator.createBreakInstance
+    //     -> sun.util.locale.provider.BreakIteratorProviderImpl.getBreakInstance
+    //       -> LocaleResources.getBreakIteratorInfo("BreakIteratorClasses")
+    // which returns `null` on CratonVM because jdk.localedata's class-based
+    // resource bundles are not surfaced through our jimage path. The bytecode
+    // at `BreakIteratorProviderImpl.getBreakInstance` (JDK 25 line 170) then
+    // does `switch (classNames[type])` on the null `classNames` array, throwing
+    //   java.lang.NullPointerException: Cannot load from null array
+    // and aborting JUnit Platform console `--help` text wrapping
+    // (picocli `TextTable.copy` calls `BreakIterator.getLineInstance()` for
+    // line-break boundaries).
+    //
+    // These BreakIterator factory + instance natives (a REAL, working
+    // boundary-analysis iterator — see `register_p66_break_iterator` in
+    // `phases_late.rs`) historically only shipped via
+    // `register_synthetic_overrides`, which is compiled out in real-JDK CLI
+    // builds (no `synthetic-jdk` feature). Register them here so the real-JDK
+    // path also has a functioning iterator and never reaches the broken
+    // null-resource JDK provider path. The allow-list entry at
+    // `vm/src/vm/vm_exec.rs` (BREAKITER) promotes these over the JDK bytecode.
+    crate::phases_late::register_p66_break_iterator(registry);
 }
 
 #[cfg(feature = "synthetic-jdk")]
@@ -9528,6 +9673,17 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     #[cfg(feature = "experimental-serialization")]
     serialization::register_serialization_natives(registry);
 
+    // `ByteArrayOutputStream` intrinsic is registered unconditionally (NOT
+    // gated behind `experimental-serialization`). It must always win over the
+    // real bytecode: the interpreter mis-resolves inherited `getfield`/
+    // `putfield` slots for `ByteArrayOutputStream` *subclasses* (e.g.
+    // `sun.security.util.DerOutputStream`), so real `write`/`toByteArray`
+    // bytecode silently drops bytes — which produced empty DER output and broke
+    // ECDSA signature encoding under real JCA. The intrinsic addresses `buf`/
+    // `count` by name (consistent with reflection), so it is correct for any
+    // subclass.
+    serialization::register_byte_array_output_stream(registry);
+
     // --- Phase 14.1: CDS/AppCDS ---
     #[cfg(feature = "experimental-aot")]
     cds::register_cds_natives(registry);
@@ -10628,6 +10784,14 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
 
+    if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+        eprintln!(
+            "[DBG_TOARRAY] native_object_get_class ENTER kind={:?} cid={:?} len={}",
+            ctx.heap_kind_of(this),
+            ctx.class_id_of_object(this),
+            if ctx.heap_kind_of(this) == cratonvm_types::ObjectKind::Array { ctx.array_length(this) as i64 } else { -1 }
+        );
+    }
     // For array objects, build a class mirror with the correct array type name
     // (e.g., "[I" for int[], "[Ljava/lang/String;" for String[]).
     // Primitive arrays use ClassId(0) + element_type; reference arrays store
@@ -10681,6 +10845,12 @@ fn native_object_get_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         // `isPrimitive()==true` for an `Object[]` mirror produced here and
         // returns `null`, surfacing as `NPE: Cannot invoke isInstance on
         // null` inside `GenericConversionService.convert`.
+        if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+            eprintln!(
+                "[DBG_TOARRAY] getClass array_class_name={:?} comp_cid={:?} arr_len={}",
+                array_class_name, class_id, ctx.array_length(this)
+            );
+        }
         if let Some(arr_cid) = ctx.class_id_by_name(&array_class_name) {
             let mirror = ctx.get_class_mirror(arr_cid);
             return Ok(Some(Value::Object(Some(mirror))));
@@ -11134,6 +11304,53 @@ fn stream_fd(ctx: &dyn NativeContext, args: &[Value]) -> Option<u32> {
     None
 }
 
+/// Classify a print-sink object (`PrintStream.out` / `PrintWriter` backing)
+/// as a CHAR `java/io/Writer` vs a byte `java/io/OutputStream`.
+///
+/// This is the crux of the picocli/JUnit-console `NoSuchMethodError:
+/// java/io/BufferedWriter.write([BII)V` fix.  A `PrintWriter`'s `out` field
+/// (and a `PrintWriter`'s own backing) is a CHAR `Writer` — the JDK
+/// `PrintWriter(OutputStream)` ctor wraps the sink as
+/// `new BufferedWriter(new OutputStreamWriter(out))`.  `BufferedWriter`
+/// only has `write([CII)V` / `write(Ljava/lang/String;)V`, NOT the byte
+/// `write([BII)V` that our native print intercept previously assumed.  A
+/// `PrintStream`'s `out`, by contrast, is a byte `OutputStream`.
+///
+/// Returns `Some(true)` when `out` is (a subclass of) `java/io/Writer`,
+/// `Some(false)` when it is (a subclass of) `java/io/OutputStream`, and
+/// `None` when it is neither / unresolvable (caller keeps prior behaviour).
+fn sink_is_writer(ctx: &mut dyn NativeContext, out: ObjectRef) -> Option<bool> {
+    let cid = ctx.class_id_of_object(out);
+    if let Some(writer_cid) = ctx.class_id_by_name("java/io/Writer") {
+        if cid == writer_cid || ctx.is_subclass(cid, writer_cid) {
+            return Some(true);
+        }
+    }
+    if let Some(os_cid) = ctx.class_id_by_name("java/io/OutputStream") {
+        if cid == os_cid || ctx.is_subclass(cid, os_cid) {
+            return Some(false);
+        }
+    }
+    None
+}
+
+/// Write `text` to a CHAR `java/io/Writer` sink via the real JDK
+/// `Writer.write(Ljava/lang/String;)V` method.  In real-JDK mode no
+/// synthetic Writer/BufferedWriter natives are registered, so this
+/// correctly dispatches to the JDK's own
+/// `BufferedWriter`/`OutputStreamWriter`/`StreamEncoder` bytecode — no
+/// stub is added.  Returns `true` on a successful invoke.
+fn write_string_to_writer(ctx: &mut dyn NativeContext, out: ObjectRef, text: &str) -> bool {
+    let s = ctx.create_string(text);
+    ctx.invoke_virtual(
+        out,
+        "write",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(s))],
+    )
+    .is_ok()
+}
+
 /// Write text to real stdout/stderr if this is a system stream (dual-mode).
 /// When the receiver `PrintStream` wraps a real underlying `OutputStream`
 /// (its `FilterOutputStream.out` field is non-null — i.e. a user
@@ -11175,6 +11392,18 @@ fn route_write_through_out(ctx: &mut dyn NativeContext, args: &[Value], bytes: &
         Value::Object(Some(o)) => o,
         _ => return false,
     };
+    // Branch on the runtime class of `out`.  A `PrintWriter` wraps its sink
+    // as a CHAR `BufferedWriter`/`OutputStreamWriter` (only `write([CII)V` /
+    // `write(String)`), so the byte `write([BII)V` below would raise
+    // `NoSuchMethodError: java/io/BufferedWriter.write([BII)V` (the picocli /
+    // JUnit-console help-text crash).  Write chars for a `Writer`, bytes for
+    // an `OutputStream`.
+    if let Some(true) = sink_is_writer(ctx, out) {
+        // Reconstruct the text from the UTF-8 bytes the caller built (callers
+        // pass UTF-8 of the original String / println buffer).
+        let text = String::from_utf8_lossy(bytes);
+        return write_string_to_writer(ctx, out, &text);
+    }
     let _ = ctx.invoke_virtual(
         out,
         "write",
@@ -11530,6 +11759,13 @@ fn native_printwriter_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         // Synthetic PrintWriter layout: field 0 = backing Writer/OutputStream.
         if let Some(this) = this_opt {
             if let Value::Object(Some(backing)) = ctx.get_field(this, 0) {
+                // If `backing` is a CHAR `java/io/Writer` (the JDK
+                // `PrintWriter` sink, e.g. BufferedWriter/OutputStreamWriter)
+                // it has NO byte `write([BII)V` — only `write(String)` /
+                // `write([CII)V`.  Never fall through to the byte path for a
+                // Writer, or it raises `NoSuchMethodError:
+                // java/io/BufferedWriter.write([BII)V`.
+                let backing_is_writer = matches!(sink_is_writer(ctx, backing), Some(true));
                 let s = ctx.create_string(&text);
                 // Prefer Writer.write(String) which is the canonical PrintWriter
                 // sink. If that isn't registered we fall through to the
@@ -11542,7 +11778,7 @@ fn native_printwriter_printf(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                         &[Value::Object(Some(s))],
                     )
                     .is_ok();
-                if !wrote_string {
+                if !wrote_string && !backing_is_writer {
                     let bytes = text.as_bytes();
                     let arr =
                         ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
@@ -12354,10 +12590,10 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
         native_unsafe_get_and_set_object,
     );
     // Primitive field access (boolean, byte, short, float, double, char)
-    r.register(u, "getBoolean", "(Ljava/lang/Object;J)Z", native_unsafe_get_int);
-    r.register(u, "putBoolean", "(Ljava/lang/Object;JZ)V", native_unsafe_put_int);
-    r.register(u, "getByte", "(Ljava/lang/Object;J)B", native_unsafe_get_int);
-    r.register(u, "putByte", "(Ljava/lang/Object;JB)V", native_unsafe_put_int);
+    r.register(u, "getBoolean", "(Ljava/lang/Object;J)Z", native_unsafe_get_byte_mb);
+    r.register(u, "putBoolean", "(Ljava/lang/Object;JZ)V", native_unsafe_put_byte_mb);
+    r.register(u, "getByte", "(Ljava/lang/Object;J)B", native_unsafe_get_byte_mb);
+    r.register(u, "putByte", "(Ljava/lang/Object;JB)V", native_unsafe_put_byte_mb);
     r.register(u, "getShort", "(Ljava/lang/Object;J)S", native_unsafe_get_short_mb);
     r.register(u, "putShort", "(Ljava/lang/Object;JS)V", native_unsafe_put_short_mb);
     r.register(u, "getFloat", "(Ljava/lang/Object;J)F", native_unsafe_get_float);
@@ -12379,8 +12615,14 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     r.register(u, "putDoubleVolatile", "(Ljava/lang/Object;JD)V", native_unsafe_put_long_volatile);
     r.register(u, "getCharVolatile", "(Ljava/lang/Object;J)C", native_unsafe_get_int_volatile);
     r.register(u, "putCharVolatile", "(Ljava/lang/Object;JC)V", native_unsafe_put_int_volatile);
-    // copyMemory
-    r.register(u, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory);
+    // copyMemory — use the consolidated handler (superset of the heap↔heap
+    // `native_unsafe_copy_memory`) so MIXED heap↔off-heap copies are NOT
+    // dropped. This is the path `DirectByteBuffer.put/get(byte[])` takes via
+    // `ScopedMemoryAccess.copyMemory`; with the bare heap↔heap handler the
+    // off-heap side was silently lost, so a direct ByteBuffer used for NIO
+    // socket I/O round-tripped as zeros (Tomcat http-nio never saw the
+    // request/response bytes). See `unsafe_natives::native_unsafe_copy_memory_consolidated`.
+    r.register(u, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", unsafe_natives::native_unsafe_copy_memory_consolidated);
     r.register(u, "setMemory", "(Ljava/lang/Object;JJB)V", native_unsafe_set_memory);
     // pageSize
     r.register(u, "pageSize", "()I", |_ctx, _args| Ok(Some(Value::Int(4096))));
@@ -12459,7 +12701,7 @@ fn register_unsafe_natives(r: &mut NativeMethodRegistry) {
     r.register(u2, "getAndAddLong", "(Ljava/lang/Object;JJ)J", native_unsafe_get_and_add_long);
     r.register(u2, "getAndSetLong", "(Ljava/lang/Object;JJ)J", native_unsafe_get_and_set_long);
     r.register(u2, "getAndSetReference", "(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;", native_unsafe_get_and_set_object);
-    r.register(u2, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", native_unsafe_copy_memory);
+    r.register(u2, "copyMemory", "(Ljava/lang/Object;JLjava/lang/Object;JJ)V", unsafe_natives::native_unsafe_copy_memory_consolidated);
     r.register(u2, "pageSize", "()I", |_ctx, _args| Ok(Some(Value::Int(4096))));
     r.register(u2, "addressSize", "()I", |_ctx, _args| Ok(Some(Value::Int(8))));
 
@@ -14019,6 +14261,46 @@ pub(crate) fn native_unsafe_put_int(ctx: &mut dyn NativeContext, args: &[Value])
     Ok(None)
 }
 
+/// `Unsafe.getByte(Object, long)` / `getBoolean` — width-correct 1-byte read.
+///
+/// A NULL base means an off-heap absolute address: route it through the SAME
+/// arena-or-raw path the NIO socket / FileChannel I/O uses
+/// (`copy_from_native_memory`) so a `DirectByteBuffer` round-trips byte-wise
+/// with native reads/writes. The previous handler (`native_unsafe_get_int`)
+/// stashed null-base bytes in a separate `static_int_store`, which diverged
+/// from the raw/arena memory the socket layer reads — so Tomcat's http-nio
+/// byte-wise request parsing saw zeros. A heap base falls back to the generic
+/// field/array accessor.
+pub(crate) fn native_unsafe_get_byte_mb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match unsafe_obj(args, 1) {
+        None => {
+            let addr = unsafe_offset(args, 2) as i64;
+            let mut b = [0u8; 1];
+            ctx.copy_from_native_memory(addr, &mut b);
+            // getByte returns a (sign-extended) byte; getBoolean coerces 0/non-0.
+            Ok(Some(Value::Int(b[0] as i8 as i32)))
+        }
+        Some(_) => native_unsafe_get_int(ctx, args),
+    }
+}
+
+/// `Unsafe.putByte(Object, long, byte)` / `putBoolean` — width-correct 1-byte
+/// write. See [`native_unsafe_get_byte_mb`] for the null-base routing rationale.
+pub(crate) fn native_unsafe_put_byte_mb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match unsafe_obj(args, 1) {
+        None => {
+            let addr = unsafe_offset(args, 2) as i64;
+            let v = match args.get(3) {
+                Some(Value::Int(i)) => *i as u8,
+                _ => 0,
+            };
+            ctx.copy_to_native_memory(addr, &[v]);
+            Ok(None)
+        }
+        Some(_) => native_unsafe_put_int(ctx, args),
+    }
+}
+
 pub(crate) fn native_unsafe_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let offset = unsafe_offset(args, 2);
     // C32: Buffer.address sentinel — answer non-zero so Netty's
@@ -14765,6 +15047,27 @@ mod unsafe_arena {
     use std::collections::{HashMap, HashSet};
     use parking_lot::{Mutex, RwLock};
 
+    /// R1 (silent-corruption fix): reserved high tag bit OR-ed into every
+    /// arena handle. Real OS pointers on every platform CratonVM targets live
+    /// in the low address space — Windows x64 user mode is capped at 2^47-1
+    /// (128 TiB) and even Linux 5-level paging tops user space at 2^56-1 — so
+    /// bit 62 is NEVER set on a real pointer (e.g. a `ByteBuffer.allocateDirect`
+    /// address from `dbb_allocate`). Setting it on every handle makes arena
+    /// handles *provably disjoint* from real pointers, so the range-membership
+    /// scan in `locate`/`contains` can never mis-classify a real pointer that
+    /// happens to fall numerically inside a live block's `[base, base+len)` as
+    /// an arena handle and silently corrupt it.
+    ///
+    /// The tag is part of the address value end-to-end — it is NEVER stripped.
+    /// Handles flow opaquely through Java as `long` (`DirectByteBuffer.address()`,
+    /// `Unsafe.get/put/copy/free`) and come back to `locate` unchanged, so every
+    /// consumer round-trips the tagged value. We deliberately avoid bit 63 so
+    /// handles stay positive `i64`.
+    pub(super) const ARENA_TAG: i64 = 1 << 62; // 0x4000_0000_0000_0000
+    /// First handle handed out: the tag OR-ed onto the historical 2^36 base, so
+    /// the low bits (and existing reasoning/logs about them) are unchanged.
+    const ARENA_BASE: i64 = ARENA_TAG | 0x10_0000_0000;
+
     struct Arena {
         bytes: Vec<u8>,
     }
@@ -14778,7 +15081,7 @@ mod unsafe_arena {
         fn new() -> Self {
             Self {
                 inner: RwLock::new(HashMap::new()),
-                next_addr: Mutex::new(0x10_0000_0000),
+                next_addr: Mutex::new(ARENA_BASE),
             }
         }
 
@@ -14911,6 +15214,72 @@ mod unsafe_arena {
             arena.bytes[offset..end].copy_from_slice(data);
             true
         }
+
+        /// True if `addr` falls inside any live arena block. Exact membership
+        /// (not a range heuristic) — used by native I/O to decide whether a
+        /// pointer is an Unsafe-arena handle vs a real OS address.
+        ///
+        /// R1: every handle carries [`ARENA_TAG`], which no real pointer can
+        /// have set, so an untagged `addr` (a real OS pointer) is rejected
+        /// up front without taking the lock — this is what makes the
+        /// arena/real-pointer classification *provably* unambiguous rather
+        /// than relying on the two ranges happening not to overlap. A tagged
+        /// `addr` still goes through the exact live-block membership check, so
+        /// a freed handle correctly reports `false`.
+        pub(super) fn contains(&self, addr: i64) -> bool {
+            if addr & ARENA_TAG == 0 {
+                return false;
+            }
+            let inner = self.inner.read();
+            Self::locate(&inner, addr).is_some()
+        }
+
+        /// Copy `out.len()` bytes OUT of the arena (arena → `out`). Returns
+        /// false if the `[addr, addr+len)` range is not fully inside one live
+        /// arena block.
+        pub(super) fn copy_out(&self, addr: i64, out: &mut [u8]) -> bool {
+            let inner = self.inner.read();
+            let (base, offset) = match Self::locate(&inner, addr) {
+                Some(v) => v,
+                None => return false,
+            };
+            let arena = match inner.get(&base) {
+                Some(a) => a,
+                None => return false,
+            };
+            let end = match offset.checked_add(out.len()) {
+                Some(e) => e,
+                None => return false,
+            };
+            if end > arena.bytes.len() {
+                return false;
+            }
+            out.copy_from_slice(&arena.bytes[offset..end]);
+            true
+        }
+
+        /// Copy `data` INTO the arena (`data` → arena). Symmetric to
+        /// [`Self::copy_out`].
+        pub(super) fn copy_in(&self, addr: i64, data: &[u8]) -> bool {
+            let mut inner = self.inner.write();
+            let (base, offset) = match Self::locate(&inner, addr) {
+                Some(v) => v,
+                None => return false,
+            };
+            let arena = match inner.get_mut(&base) {
+                Some(a) => a,
+                None => return false,
+            };
+            let end = match offset.checked_add(data.len()) {
+                Some(e) => e,
+                None => return false,
+            };
+            if end > arena.bytes.len() {
+                return false;
+            }
+            arena.bytes[offset..end].copy_from_slice(data);
+            true
+        }
     }
 
     pub(super) fn store() -> &'static ArenaStore {
@@ -14944,6 +15313,32 @@ mod unsafe_arena {
 
 pub(crate) fn unsafe_arena_allocate(size: usize) -> i64 {
     unsafe_arena::store().allocate(size)
+}
+
+/// True if `addr` is a live `Unsafe.allocateMemory` arena handle (as opposed
+/// to a real OS pointer). NIO native I/O (e.g. `sun/nio/ch/Net.read0/write0`,
+/// which live in the `native-io` crate) uses this — via the `NativeContext`
+/// bridge — to read/write `DirectByteBuffer` memory that `Util`'s temp-buffer
+/// path backs with arena handles instead of raw pointers. Without it,
+/// `net_write0` would `memcpy` from a tagged synthetic handle and SIGSEGV.
+///
+/// R1: handles carry [`unsafe_arena::ARENA_TAG`] (bit 62), which is never set
+/// on a real OS pointer, so this is an exact classifier — a real
+/// `allocateDirect` pointer can never be mistaken for a handle.
+pub fn unsafe_arena_contains(addr: i64) -> bool {
+    unsafe_arena::store().contains(addr)
+}
+
+/// Copy bytes out of the Unsafe arena (arena → `out`). Returns false if the
+/// range isn't fully inside one live arena block. See [`unsafe_arena_contains`].
+pub fn unsafe_arena_copy_out(addr: i64, out: &mut [u8]) -> bool {
+    unsafe_arena::store().copy_out(addr, out)
+}
+
+/// Copy bytes into the Unsafe arena (`data` → arena). Symmetric to
+/// [`unsafe_arena_copy_out`].
+pub fn unsafe_arena_copy_in(addr: i64, data: &[u8]) -> bool {
+    unsafe_arena::store().copy_in(addr, data)
 }
 
 /// FIX(test-isolation): the `unsafe_arena` off-heap store is process-global and
@@ -24661,9 +25056,13 @@ fn native_bi_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a = bi_read(ctx, this);
-    let b = bi_read(ctx, other);
-    let result = bi_alloc(ctx, &bi_add_str(&a, &b));
+    // Word-based limb arithmetic (bigint::BigInt) — O(words), no decimal
+    // round-trip. The decimal bi_add_str path this replaces paid an O(n^2)
+    // words->decimal->words conversion on every op, which dominated BC EC
+    // field arithmetic over generic Fp curves (~136ms/scalar-mult interpreted).
+    let a = bi_read_int(ctx, this);
+    let b = bi_read_int(ctx, other);
+    let result = bi_alloc_int(ctx, &a.add(&b));
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -24676,9 +25075,10 @@ fn native_bi_subtract(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a = bi_read(ctx, this);
-    let b = bi_read(ctx, other);
-    let result = bi_alloc(ctx, &bi_sub_str(&a, &b));
+    // Word-based limb arithmetic — see native_bi_add.
+    let a = bi_read_int(ctx, this);
+    let b = bi_read_int(ctx, other);
+    let result = bi_alloc_int(ctx, &a.sub(&b));
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -24691,9 +25091,12 @@ fn native_bi_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a = bi_read(ctx, this);
-    let b = bi_read(ctx, other);
-    let result = bi_alloc(ctx, &bi_mul_str(&a, &b));
+    // Word-based limb multiply (bigint::BigInt::mul, schoolbook O(words^2)) —
+    // replaces the O(digits^2) decimal bi_mul_str plus two O(n^2) decimal
+    // conversions. This is the hot field-multiply for generic Fp EC curves.
+    let a = bi_read_int(ctx, this);
+    let b = bi_read_int(ctx, other);
+    let result = bi_alloc_int(ctx, &a.mul(&b));
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -29841,9 +30244,21 @@ pub(crate) fn compute_digest(algo: &str, data: &[u8]) -> Vec<u8> {
     match upper.as_str() {
         "MD5" => real_md5(data),
         "SHA1" | "SHA" => real_sha1(data),
+        "SHA224" => {
+            // SHA-224: the hand-rolled `crypto_impl` SHA-256 code does not
+            // cover the 224-bit variant, so use the `sha2` crate.
+            let mut h = sha2::Sha224::new();
+            h.update(data);
+            h.finalize().to_vec()
+        }
         "SHA256" => real_sha256(data),
         "SHA384" => real_sha384(data),
         "SHA512" => real_sha512(data),
+        "SHA3224" => {
+            let mut h = sha3::Sha3_224::new();
+            h.update(data);
+            h.finalize().to_vec()
+        }
         "SHA3256" => {
             let mut h = sha3::Sha3_256::new();
             h.update(data);
@@ -33010,14 +33425,23 @@ fn array_new_instance_component_name(
     mirror_arg: Option<&Value>,
 ) -> String {
     match mirror_arg {
-        Some(Value::Object(Some(mirror))) => ctx
-            .read_string(*mirror)
-            .or_else(|| match ctx.get_field(*mirror, 1) {
-                Value::Object(Some(name_obj)) => ctx.read_string(name_obj),
-                _ => None,
-            })
-            .map(|s| s.replace('.', "/"))
-            .unwrap_or_else(|| "java/lang/Object".to_string()),
+        Some(Value::Object(Some(mirror))) => {
+            // Use the canonical mirror-name reader. It consults the VM
+            // reverse-map (`class_id_from_mirror` -> `class_name_of_id`), which
+            // is the ONLY thing that resolves the name of a *synthesized
+            // array-class mirror* such as the `[Ljava/lang/String;` returned by
+            // `Class.getComponentType()` on a `String[][]`. The previous ad-hoc
+            // `read_string`/slot-1 read returned nothing for those mirrors and
+            // fell back to `java/lang/Object`, so `Arrays.copyOf(.., String[][]
+            // .class)` (and H2's `SortOrder.sort` `rows.toArray(new Value[0][])`)
+            // allocated a bare `Object[]` and CCE'd on the caller's
+            // `(Value[][])` / `(String[][])` checkcast.
+            crate::lang_class::mirror_class_name(&*ctx, *mirror)
+                .filter(|s| !s.is_empty())
+                .or_else(|| ctx.read_string(*mirror))
+                .map(|s| s.replace('.', "/"))
+                .unwrap_or_else(|| "java/lang/Object".to_string())
+        }
         _ => "java/lang/Object".to_string(),
     }
 }
@@ -33041,6 +33465,12 @@ fn array_new_instance_for_component(
             let comp_id = ctx
                 .ensure_class_initialized(comp_name)
                 .unwrap_or(cratonvm_types::ClassId::new(0));
+            if std::env::var("CRATONVM_DBG_TOARRAY").is_ok() {
+                eprintln!(
+                    "[DBG_TOARRAY] Array.newInstance comp_name={:?} comp_id={:?} len={}",
+                    comp_name, comp_id, length
+                );
+            }
             ctx.new_ref_array(comp_id, length)
         }
     }

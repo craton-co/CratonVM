@@ -83,6 +83,17 @@ fn ioex<S: Into<String>>(msg: S) -> MethodCallFailed {
     RuntimeError::IOException { message: msg.into() }.into()
 }
 
+/// Temporary diagnostic: `CRATONVM_DBG_NET=1` prints each PlainSocketImpl native
+/// as it fires, to confirm whether the blocking socket path uses the legacy
+/// PlainSocketImpl surface vs the NioSocketImpl→sun/nio/ch/Net path.
+macro_rules! dbgplain {
+    ($($arg:tt)*) => {
+        if std::env::var_os("CRATONVM_DBG_NET").is_some() {
+            eprintln!("[PLAIN] {}", format!($($arg)*));
+        }
+    };
+}
+
 fn iae<S: Into<String>>(msg: S) -> MethodCallFailed {
     RuntimeError::IllegalArgumentException { message: msg.into() }.into()
 }
@@ -252,6 +263,7 @@ fn read_inet_addr(ctx: &dyn NativeContext, addr: ObjectRef) -> Option<std::net::
 /// writing the registry id into the SocketImpl's `fd`.
 fn socket_create(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_obj(args)?;
+    dbgplain!("socketCreate this={this:?}");
     let stream = match args.get(1) {
         Some(Value::Int(v)) => *v != 0,
         // `<this>` is arg 0; for instance methods that take no further args
@@ -328,6 +340,7 @@ fn socket_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
     };
     let sa = SocketAddr::new(ip, port as u16);
     let fd = read_fd(ctx, this);
+    dbgplain!("socketBind fd={fd} addr={sa}");
     with_socket(fd, |s| {
         s.socket
             .bind(&SockAddr::from(sa))
@@ -344,6 +357,7 @@ fn socket_listen(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         _ => 50,
     };
     let fd = read_fd(ctx, this);
+    dbgplain!("socketListen fd={fd} backlog={backlog}");
     with_socket(fd, |s| {
         s.socket
             .listen(backlog)

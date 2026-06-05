@@ -1,5 +1,5 @@
 Kafka version: 3.7.0
 Kafka commit: 2ae524ed625438c5
 Serializer round-trip OK: hello kafka
-ConfigDef OK: [acks, bootstrap.servers]
+ConfigDef OK: [bootstrap.servers, acks]
 OK

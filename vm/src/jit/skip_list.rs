@@ -452,8 +452,33 @@ fn should_skip_jit_internal(
         // gives BcProbe a green path to the first println without a
         // proper Windows-debugger backtrace of the failing JIT codegen.
         // Lifted by `CRATONVM_JIT_ALLOW_PACKAGES=org/bouncycastle/`.
-        // Track for a real fix once the underlying allocate-then-putfield
-        // miscompile is root-caused (see `is_known_miscompile` doc).
+        //
+        // ── Round 2 (2026-06-03) status ──────────────────────────────────
+        // The ban is INTENTIONALLY RETAINED. A round-2 codegen agent
+        // reproduced the EC crash (`org/bouncycastle/math/ec/test/AllTests`
+        // under `CRATONVM_JIT_ALLOW_PACKAGES=org/bouncycastle/`) and
+        // confirmed it is NOT the inline-allocation / allocate-then-putfield
+        // family that round-1 + round-2 fixed (the `bintrees18` inline-TLAB
+        // header-coherence bug in `jit/src/x64.rs::emit_inline_tlab_new` is
+        // now fixed; disabling inline-new via
+        // `CRATONVM_JIT_DISABLE_INLINE_NEW=1` does NOT change the EC crash).
+        //
+        // The EC crash is the *upstream value-production* miscompile
+        // documented in `docs/bc-math-ec-jit-miscompile-investigation.md`:
+        // a primitive `1` (or `3`) lands in a slot that a downstream inline
+        // `getfield`/`arraylength` consumes as an object/array base
+        // (`read at 0x31 == 1 + 0x30`; with `DISABLE_INLINE_GETFIELD=1` the
+        // fault MOVES to `read at 0x0F == 3 + 0xC`, proving the dereference
+        // site is only a witness — the bad value is produced earlier). It
+        // requires many BC packages JIT-compiled together (a cross-package
+        // JIT→JIT dispatch / operand-slot-reuse interaction) and was not
+        // isolatable by single-package bisection. The round-1 dup/swap
+        // oop-mark, escape-analysis per-block barrier, and dup2 cat-2 guard
+        // fixes are sound but do not cover it; root-causing the exact
+        // producing basic block needs an iterative build+bisect loop that
+        // was out of scope for this round. Do NOT lift until that producer
+        // is found and fixed, or until the EC `AllTests` run completes
+        // cleanly under the allow-packages override.
         if class_name.starts_with("org/bouncycastle/")
             && !package_allowed("org/bouncycastle/", allow_packages)
         {
