@@ -26,6 +26,9 @@ pub fn update_all_roots(
     thread: &mut crate::threading::jvm_thread::JvmThread,
     pointer_map: &HashMap<usize, usize>,
 ) {
+    if std::env::var_os("CRATONVM_DBG_PRECISE").is_some() {
+        eprintln!("[PRECISE] update_all_roots called, pointer_map.len()={}", pointer_map.len());
+    }
     if pointer_map.is_empty() {
         return;
     }
@@ -50,6 +53,31 @@ pub fn update_all_roots(
                 debug_assert!(new_addr != 0, "GC pointer map contains null address");
                 *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
             }
+        }
+    }
+
+    // Stage 3 (precise oop maps) — relocate oop slots of active JIT frames on
+    // this thread, the JIT analogue of the interpreter-frame remap above. Inert
+    // unless CRATONVM_PRECISE_JIT_MAPS compiled the frame (sp_id_slot_off != 0);
+    // it is the piece that lets a moving collector run while JIT frames are live
+    // (see docs/precise-jit-stack-maps-design.md, Stage 3).
+    crate::jit::conservative_roots::remap_active_jit_frames(pointer_map);
+
+    // Shadow-stack precise remap (CRATONVM_SHADOW_STACK) — the rewritable
+    // counterpart to the marking scan in roots.rs. Every pushed slot is a known
+    // oop, so relocating it via `pointer_map` is unconditionally safe (no
+    // is-it-really-a-pointer ambiguity, unlike the conservative JIT scan). After
+    // the call returns, JIT codegen reloads each oop from its (now-updated) slot,
+    // so a moved object's new address flows back into the compiled code's
+    // registers. This is what makes the moving collector correct under JIT.
+    if crate::jit::conservative_roots::shadow_stack_enabled() {
+        let _rewritten = thread.shadow_stack.remap(pointer_map);
+        if std::env::var_os("CRATONVM_DBG_SHADOW").is_some() && _rewritten > 0 {
+            eprintln!(
+                "[SHADOW] remap: depth={} rewritten={}",
+                thread.shadow_stack.depth(),
+                _rewritten
+            );
         }
     }
 

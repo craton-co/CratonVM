@@ -627,6 +627,13 @@ pub struct OopMapEntry {
     /// on this offset directly (not via ranges) because the safepoint
     /// is emitted *immediately* before the call.
     pub native_pc_offset: u32,
+    /// Stage 3 (precise oop maps) — bytecode PC of the safepoint
+    /// instruction. The JIT stores this into the frame's safepoint-id
+    /// slot before each GC-capable call so the GC root walker can match
+    /// it back to the *exact* map for the active safepoint (not the
+    /// union-of-all-maps, which is unsafe for relocation). 0 / unused
+    /// when the precise gate is off.
+    pub bytecode_pc: u32,
     /// Frame slot offsets relative to RBP that hold live oops at this
     /// safepoint. `i16` is sufficient because frame sizes are capped
     /// well below 32 KiB in the current JIT; a larger frame would fail
@@ -641,6 +648,7 @@ impl OopMapEntry {
     pub fn new(native_pc_offset: u32) -> Self {
         Self {
             native_pc_offset,
+            bytecode_pc: 0,
             frame_slot_offsets: Vec::new(),
         }
     }
@@ -649,6 +657,63 @@ impl OopMapEntry {
     pub fn slot_count(&self) -> usize {
         self.frame_slot_offsets.len()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 5 (precise oop maps) — JIT code-range registry
+// ---------------------------------------------------------------------------
+//
+// Maps each compiled method's native code range `[entry, entry+len)` to its
+// (Arc-stable) `CompiledMethod` pointer. The GC root walker uses it to resolve
+// which method a return address belongs to while walking the JIT RBP chain, so
+// it can remap EVERY active JIT frame (not just the innermost). Populated at
+// `JitCache::put`, evicted at `JitCache::remove`. The stored pointer is the
+// `Arc<CompiledMethod>` inner address, which is stable for the cm's cache
+// lifetime; a live JIT frame keeps its cm in the cache (hence alive).
+
+/// One registered code range: `(entry, end, cm_ptr)`.
+static JIT_CODE_RANGES: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, usize, usize)>>> =
+    std::sync::OnceLock::new();
+
+fn jit_code_ranges() -> &'static std::sync::Mutex<Vec<(usize, usize, usize)>> {
+    JIT_CODE_RANGES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Register `[entry, entry+len)` → `cm_ptr` (the `Arc<CompiledMethod>` inner
+/// address). No-op for empty/zero ranges. Stage 5.
+pub fn register_jit_code_range(entry: usize, len: usize, cm_ptr: usize) {
+    if entry == 0 || len == 0 || cm_ptr == 0 {
+        return;
+    }
+    if let Ok(mut v) = jit_code_ranges().lock() {
+        v.push((entry, entry + len, cm_ptr));
+    }
+}
+
+/// Remove every range with the given `entry` start (called on cache eviction
+/// so the GC walker never resolves a return address to a freed method). Stage 5.
+pub fn unregister_jit_code_range(entry: usize) {
+    if entry == 0 {
+        return;
+    }
+    if let Ok(mut v) = jit_code_ranges().lock() {
+        v.retain(|&(e, _, _)| e != entry);
+    }
+}
+
+/// Number of registered code ranges (Stage 5 diagnostic).
+pub fn jit_code_range_count() -> usize {
+    jit_code_ranges().lock().map(|v| v.len()).unwrap_or(0)
+}
+
+/// Resolve the `CompiledMethod` pointer whose code range contains `addr`, or
+/// `None`. Linear scan (method counts are modest; only hit at GC time on the
+/// gated precise path). Stage 5.
+pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
+    let v = jit_code_ranges().lock().ok()?;
+    v.iter()
+        .find(|&&(e, end, _)| addr >= e && addr < end)
+        .map(|&(_, _, cm)| cm)
 }
 
 /// A compiled native-code method.
@@ -701,6 +766,12 @@ pub struct CompiledMethod {
     pub osr_callee_saved_base: i32,
     /// OSR metadata: offset of VM context pointer in frame.
     pub osr_heap_local_offset: i32,
+    /// Shadow-stack: frame offset (`[rbp - off]`) of the cached thread-pointer
+    /// slot. The OSR trampoline zeroes this (clobber-free) so an OSR-entered
+    /// frame — which bypasses the prologue thread-fetch — has a null slot,
+    /// making the shadow push/reload/epilogue null-guards skip it safely.
+    /// 0 when shadow stack is disabled.
+    pub shadow_thread_slot_off: i32,
     /// Whether the compiled code uses invoke dispatch (needs set_jit_thread + catch_unwind).
     /// Methods with only direct calls can skip this overhead.
     pub has_dispatch: bool,
@@ -745,6 +816,14 @@ pub struct CompiledMethod {
     /// `push_oop_map`); any `push_oop_map` likewise clears it so the next
     /// lookup re-verifies.
     oop_maps_sorted: bool,
+    /// Stage 3 (precise oop maps) — frame offset (positive; slot at
+    /// `[rbp - sp_id_slot_off]`) where the JIT stored the active
+    /// safepoint's bytecode PC before each GC-capable call. The GC root
+    /// walker reads this slot to recover the exact `OopMapEntry`. `0`
+    /// means the precise gate (`CRATONVM_PRECISE_JIT_MAPS`) was off at
+    /// compile time, so no safepoint-id slot exists and the walker uses
+    /// the conservative path for this method.
+    pub sp_id_slot_off: i32,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -821,6 +900,7 @@ impl CompiledMethod {
             osr_frame_size: 0,
             osr_callee_saved_base: 0,
             osr_heap_local_offset: 0,
+            shadow_thread_slot_off: 0,
             has_dispatch: false,
             inlined_methods: Vec::new(),
             deopt_points: Vec::new(),
@@ -831,6 +911,7 @@ impl CompiledMethod {
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
             oop_maps_sorted: false,
+            sp_id_slot_off: 0,
         }
     }
 
@@ -857,6 +938,7 @@ impl CompiledMethod {
             osr_frame_size: 0,
             osr_callee_saved_base: 0,
             osr_heap_local_offset: 0,
+            shadow_thread_slot_off: 0,
             has_dispatch: false,
             inlined_methods: Vec::new(),
             deopt_points: Vec::new(),
@@ -867,6 +949,7 @@ impl CompiledMethod {
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
             oop_maps_sorted: false,
+            sp_id_slot_off: 0,
         }
     }
 
@@ -955,6 +1038,14 @@ impl CompiledMethod {
     /// Return the raw entry point pointer for direct calls from JIT code.
     pub fn entry_ptr(&self) -> *const u8 {
         self.entry
+    }
+
+    /// Stage 5 (precise oop maps) — length in bytes of this method's emitted
+    /// machine code, so the GC code-range registry can record `[entry,
+    /// entry+code_len())` for return-address → CompiledMethod resolution while
+    /// walking the JIT RBP chain.
+    pub fn code_len(&self) -> usize {
+        self._buffer.pos()
     }
 
     /// Debug-only: raw emitted machine code bytes.
@@ -1165,6 +1256,7 @@ impl CompiledMethod {
             self.osr_heap_local_offset,
             self.needs_context,
             dead_mask,
+            self.shadow_thread_slot_off,
         )
     }
 }
@@ -1217,6 +1309,7 @@ unsafe fn emit_osr_trampoline(
     heap_local_offset: i32,
     needs_context: bool,
     dead_mask: u64,
+    shadow_thread_slot_off: i32,
 ) -> Option<ExecutableBuffer> {
     use crate::x64::LOCAL_REGS;
 
@@ -1304,6 +1397,22 @@ unsafe fn emit_osr_trampoline(
         tramp.emit_byte(0x89); // MOV r/m64, r64
         tramp.emit_byte(0x85 | ((arg1_reg & 7) << 3));
         tramp.emit(&neg_off.to_le_bytes());
+    }
+
+    // Shadow-stack: zero the cached thread-pointer slot. An OSR entry bypasses
+    // the prologue thread-fetch, so this slot would otherwise hold stale stack
+    // garbage (a non-null value the shadow null-guards can't reject), making the
+    // push/reload/epilogue dereference it → crash. Zeroing it (clobber-free
+    // `MOV qword [rbp-off], 0`, REX.W C7 /0) makes those guards skip this frame:
+    // an OSR-entered frame runs WITHOUT shadow tracking (safe — no crash). Full
+    // OSR-frame tracking (storing the real thread ptr + watermark) is a follow-up.
+    if shadow_thread_slot_off != 0 {
+        let neg_off = -shadow_thread_slot_off;
+        tramp.emit_byte(0x48); // REX.W
+        tramp.emit_byte(0xC7); // MOV r/m64, imm32 (sign-extended)
+        tramp.emit_byte(0x85); // mod=10, reg=/0, rm=rbp(5) → [rbp + disp32]
+        tramp.emit(&neg_off.to_le_bytes());
+        tramp.emit(&0i32.to_le_bytes());
     }
 
     #[allow(clippy::needless_range_loop)]
@@ -1403,6 +1512,7 @@ unsafe fn osr_trampoline(
     heap_local_offset: i32,
     needs_context: bool,
     dead_mask: u64,
+    shadow_thread_slot_off: i32,
 ) -> Option<i64> {
     // Look up (or emit and insert) the cached trampoline body for this target.
     // `dead_mask` is a deterministic function of `target_addr` (both encode the
@@ -1437,6 +1547,7 @@ unsafe fn osr_trampoline(
                 heap_local_offset,
                 needs_context,
                 dead_mask,
+                shadow_thread_slot_off,
             )?;
             let fresh_arc = Arc::new(fresh);
             let mut guard = cache.lock();
@@ -3068,7 +3179,19 @@ impl JitCache {
             method_name,
             descriptor,
         };
-        self.methods.insert(h, (key, Arc::new(compiled)));
+        let arc = Arc::new(compiled);
+        // Stage 5 — register this method's code range for the GC RBP-chain
+        // walker. Only when the precise gate is on (the registry is consulted
+        // solely by `remap_active_jit_frames`, which is inert otherwise), so
+        // the default path keeps zero bookkeeping overhead.
+        if crate::x64::precise_jit_maps_enabled() {
+            register_jit_code_range(
+                arc.entry_ptr() as usize,
+                arc.code_len(),
+                Arc::as_ptr(&arc) as usize,
+            );
+        }
+        self.methods.insert(h, (key, arc));
     }
 
     pub fn len(&self) -> usize {
@@ -3091,11 +3214,15 @@ impl JitCache {
         descriptor: &str,
     ) {
         let h = compute_jit_key_hash(class_name, method_name, descriptor);
-        if let Some((key, _)) = self.methods.get(&h) {
+        if let Some((key, cm)) = self.methods.get(&h) {
             if &*key.class_name == class_name
                 && &*key.method_name == method_name
                 && &*key.descriptor == descriptor
             {
+                // Stage 5 — drop this method's GC code-range registration
+                // before evicting, so the RBP-chain walker can never resolve a
+                // return address to a freed CompiledMethod.
+                unregister_jit_code_range(cm.entry_ptr() as usize);
                 self.methods.remove(&h);
             }
         }
@@ -3114,9 +3241,15 @@ impl JitCache {
         let before = self.methods.len();
         self.methods.retain(|_h, (_key, cm)| {
             // Keep the entry iff it does NOT inline from the changed class.
-            !cm.inlined_methods
+            let keep = !cm
+                .inlined_methods
                 .iter()
-                .any(|(cls, _, _)| cls == changed_class)
+                .any(|(cls, _, _)| cls == changed_class);
+            // Stage 5 — drop the GC code-range registration for evicted methods.
+            if !keep {
+                unregister_jit_code_range(cm.entry_ptr() as usize);
+            }
+            keep
         });
         before - self.methods.len()
     }
@@ -3137,6 +3270,10 @@ impl JitCache {
             .collect();
         let count = hashes_to_remove.len();
         for h in hashes_to_remove {
+            // Stage 5 — drop the GC code-range registration before evicting.
+            if let Some((_key, cm)) = self.methods.get(&h) {
+                unregister_jit_code_range(cm.entry_ptr() as usize);
+            }
             self.methods.remove(&h);
         }
         count

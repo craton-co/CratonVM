@@ -1691,6 +1691,52 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
 /// region.
 ///
 /// Returns a bit-set (`Vec<bool>` indexed by PC) of size `code_len`.
+/// Stage 3 (precise oop maps) — process-wide gate for the *moving*-safe
+/// precise-stack-map machinery (exact RBP frame registration, safepoint-id
+/// slot, precise relocation). Read once from `CRATONVM_PRECISE_JIT_MAPS`.
+///
+/// Default OFF: when off, none of the Stage 3 codegen (prologue frame-record
+/// call, per-safepoint id store, extra frame slot) is emitted, so the default
+/// path is byte-identical. The precise *maps* themselves (Stages 1–2) are
+/// still produced — they are consumed only as additive roots by the
+/// conservative walker until this gate turns the relocation path on (Stage 5).
+pub fn precise_jit_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_PRECISE_JIT_MAPS").is_some())
+}
+
+/// Whether the JIT **shadow-stack** precise-roots codegen is enabled
+/// (`CRATONVM_SHADOW_STACK`). When on, each GC-capable safepoint pushes every
+/// live oop (operand-stack entries AND oop locals) onto the thread's shadow
+/// stack and reloads them after the call, so a *moving* collector can rewrite
+/// every JIT-held reference precisely (see `gc/src/shadow_stack.rs`). Off by
+/// default → no extra codegen, byte-identical to the legacy path.
+pub fn shadow_stack_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some())
+}
+
+/// Bisect toggle (`CRATONVM_SHADOW_NOPUSH`) — when set, the shadow push/reload
+/// codegen is suppressed while the prologue thread-fetch + the GC gate flip stay
+/// on. Used to localize a fault to the push/reload sequences vs the rest.
+fn shadow_nopush() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_NOPUSH").is_some())
+}
+
+/// Bisect toggle (`CRATONVM_SHADOW_NORELOAD`) — suppress only the post-call
+/// reload (keep the push). Push-only writes to the (separate) shadow buffer, so
+/// if push-only is correct it cannot corrupt program state; a crash then
+/// localizes to the reload (which writes back into home regs/slots).
+fn shadow_noreload() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_NORELOAD").is_some())
+}
+
 fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
     let mut targets = vec![false; code_len];
     let mut pc = 0usize;
@@ -1810,6 +1856,255 @@ fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
         }
     }
     targets
+}
+
+/// Stage 2 (precise oop maps) — enumerate the control-flow successors of the
+/// instruction at `pc` (normal flow only; exception-handler edges are not
+/// available to the JIT and are handled conservatively by leaving handler-only
+/// PCs `unreached`). Mirrors the branch/switch decoding in
+/// [`compute_branch_targets`] and the per-opcode length in [`bytecode_len_at`].
+fn oop_dataflow_successors(code: &[u8], code_len: usize, pc: usize) -> Vec<usize> {
+    let op = code[pc];
+    let fallthrough = pc + bytecode_len_at(code, pc);
+    let read_i16 = |at: usize| -> isize {
+        if at + 1 < code_len {
+            i16::from_be_bytes([code[at], code[at + 1]]) as isize
+        } else {
+            0
+        }
+    };
+    let read_i32 = |at: usize| -> isize {
+        if at + 3 < code_len {
+            i32::from_be_bytes([code[at], code[at + 1], code[at + 2], code[at + 3]]) as isize
+        } else {
+            0
+        }
+    };
+    let target = |off: isize| -> Option<usize> {
+        let t = pc as isize + off;
+        if t >= 0 && (t as usize) < code_len {
+            Some(t as usize)
+        } else {
+            None
+        }
+    };
+    match op {
+        // ireturn/lreturn/freturn/dreturn/areturn/return, athrow, ret:
+        // no normal successor.
+        0xAC..=0xB1 | 0xBF | 0xA9 => Vec::new(),
+        // goto / goto_w: unconditional, target only.
+        0xA7 => target(read_i16(pc + 1)).into_iter().collect(),
+        0xC8 => target(read_i32(pc + 1)).into_iter().collect(),
+        // jsr / jsr_w: target + fall-through (return address pushed).
+        0xA8 => {
+            let mut v: Vec<usize> = target(read_i16(pc + 1)).into_iter().collect();
+            if fallthrough < code_len {
+                v.push(fallthrough);
+            }
+            v
+        }
+        0xC9 => {
+            let mut v: Vec<usize> = target(read_i32(pc + 1)).into_iter().collect();
+            if fallthrough < code_len {
+                v.push(fallthrough);
+            }
+            v
+        }
+        // Conditional branches (if<cond>, if_icmp<cond>, if_acmp<cond>) and
+        // ifnull/ifnonnull: target + fall-through.
+        0x99..=0xA6 | 0xC6 | 0xC7 => {
+            let mut v: Vec<usize> = target(read_i16(pc + 1)).into_iter().collect();
+            if fallthrough < code_len {
+                v.push(fallthrough);
+            }
+            v
+        }
+        // tableswitch: default + each table entry; no fall-through.
+        0xAA => {
+            let mut p = pc + 1;
+            while p % 4 != 0 {
+                p += 1;
+            }
+            let mut v = Vec::new();
+            if p + 12 <= code_len {
+                if let Some(t) = target(read_i32(p)) {
+                    v.push(t);
+                }
+                let low = read_i32(p + 4) as i32;
+                let high = read_i32(p + 8) as i32;
+                let count = checked_tableswitch_count(low, high).unwrap_or(0);
+                let mut jp = p + 12;
+                for _ in 0..count {
+                    if jp + 4 > code_len {
+                        break;
+                    }
+                    if let Some(t) = target(read_i32(jp)) {
+                        v.push(t);
+                    }
+                    jp += 4;
+                }
+            }
+            v
+        }
+        // lookupswitch: default + each pair offset; no fall-through.
+        0xAB => {
+            let mut p = pc + 1;
+            while p % 4 != 0 {
+                p += 1;
+            }
+            let mut v = Vec::new();
+            if p + 8 <= code_len {
+                if let Some(t) = target(read_i32(p)) {
+                    v.push(t);
+                }
+                let npairs = read_i32(p + 4).max(0) as usize;
+                let mut jp = p + 8;
+                for _ in 0..npairs {
+                    if jp + 8 > code_len {
+                        break;
+                    }
+                    if let Some(t) = target(read_i32(jp + 4)) {
+                        v.push(t);
+                    }
+                    jp += 8;
+                }
+            }
+            v
+        }
+        // Everything else: fall-through only.
+        _ => {
+            if fallthrough < code_len {
+                vec![fallthrough]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Stage 2 (precise oop maps) — transfer function for the per-local "must be
+/// oop" dataflow: apply the store at `pc` to `mask`. `astore*` makes a local
+/// definitely-oop; primitive stores (`istore`/`lstore`/`fstore`/`dstore`/
+/// `iinc`) make it definitely-non-oop; long/double stores also clear the
+/// category-2 high half. All other opcodes leave the local types unchanged.
+fn oop_dataflow_transfer(code: &[u8], pc: usize, mask: u64, max_locals: usize) -> u64 {
+    let set_oop = |m: u64, k: usize| -> u64 {
+        if k < 64 && k < max_locals {
+            m | (1u64 << k)
+        } else {
+            m
+        }
+    };
+    let clr = |m: u64, k: usize, span: usize| -> u64 {
+        let mut m = m;
+        for j in k..k + span {
+            if j < 64 {
+                m &= !(1u64 << j);
+            }
+        }
+        m
+    };
+    let op = code[pc];
+    match op {
+        0x3A => set_oop(mask, code.get(pc + 1).copied().unwrap_or(0) as usize), // astore
+        0x4B..=0x4E => set_oop(mask, (op - 0x4B) as usize),                     // astore_0..3
+        0x36 | 0x38 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 1), // istore/fstore
+        0x37 | 0x39 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 2), // lstore/dstore
+        0x3B..=0x3E => clr(mask, (op - 0x3B) as usize, 1),                      // istore_0..3
+        0x43..=0x46 => clr(mask, (op - 0x43) as usize, 1),                      // fstore_0..3
+        0x3F..=0x42 => clr(mask, (op - 0x3F) as usize, 2),                      // lstore_0..3
+        0x47..=0x4A => clr(mask, (op - 0x47) as usize, 2),                      // dstore_0..3
+        0x84 => clr(mask, code.get(pc + 1).copied().unwrap_or(0) as usize, 1),  // iinc
+        0xC4 => {
+            // wide <store>/<iinc>: 2-byte index.
+            let wop = code.get(pc + 1).copied().unwrap_or(0);
+            let idx = if pc + 3 < code.len() {
+                u16::from_be_bytes([code[pc + 2], code[pc + 3]]) as usize
+            } else {
+                0
+            };
+            match wop {
+                0x3A => set_oop(mask, idx),
+                0x36 | 0x38 => clr(mask, idx, 1),
+                0x37 | 0x39 => clr(mask, idx, 2),
+                0x84 => clr(mask, idx, 1),
+                _ => mask,
+            }
+        }
+        _ => mask,
+    }
+}
+
+/// Stage 2 (precise oop maps) — forward "must be oop" dataflow over local
+/// variable slots. Returns `(in_mask, reached)` each of length `code_len`:
+/// `in_mask[pc] & (1<<k) != 0` iff local `k` holds an object reference on
+/// EVERY normal-control-flow path reaching `pc`, and `reached[pc]` is true iff
+/// the forward analysis visited `pc`.
+///
+/// Soundness for the *moving* GC consumer (Stage 5): a bit is set only when
+/// the slot was `astore`d on every reaching path, so the slot genuinely holds
+/// an oop — never a primitive (no false positive → no int rewritten). A live
+/// oop that is conditionally a primitive on another path merges to "not
+/// definitely oop" and is omitted; such a slot is necessarily dead-as-oop at
+/// that PC (the verifier forbids reading a slot with conflicting types), so the
+/// omission is safe. PCs reachable only via exception handlers (whose edges are
+/// not visible here) stay `unreached`; the caller emits no precise local
+/// entries there and the GC falls back to the conservative frame sweep.
+///
+/// `> 64` locals → empty result (caller falls back to conservative). Parameter
+/// slots are seeded conservatively as non-oop for now (TODO before the Stage 5
+/// gate flip: first-execution-use param typing so oop params live at an early
+/// safepoint are precisely covered rather than left to the conservative sweep).
+fn compute_local_oop_masks(
+    code: &[u8],
+    code_len: usize,
+    max_locals: usize,
+) -> (Vec<u64>, Vec<bool>) {
+    if max_locals == 0 || max_locals > 64 || code_len == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    const TOP: u64 = u64::MAX;
+    let mut in_mask = vec![TOP; code_len];
+    let mut reached = vec![false; code_len];
+    // Entry: conservative (no params assumed oop). See doc comment TODO.
+    in_mask[0] = 0;
+    reached[0] = true;
+    let mut work: Vec<usize> = vec![0];
+    // Bound iterations defensively against any decoding pathology.
+    let mut guard = code_len.saturating_mul(64).saturating_add(64);
+    while let Some(pc) = work.pop() {
+        if pc >= code_len {
+            continue;
+        }
+        guard = guard.saturating_sub(1);
+        if guard == 0 {
+            break;
+        }
+        let out = oop_dataflow_transfer(code, pc, in_mask[pc], max_locals);
+        for succ in oop_dataflow_successors(code, code_len, pc) {
+            if succ >= code_len {
+                continue;
+            }
+            // First real predecessor seeds; later ones intersect (AND).
+            let new_in = if reached[succ] { in_mask[succ] & out } else { out };
+            if !reached[succ] || new_in != in_mask[succ] {
+                in_mask[succ] = new_in;
+                reached[succ] = true;
+                work.push(succ);
+            }
+        }
+    }
+    // Mask off bits beyond max_locals (TOP-init residue on any unreached PC is
+    // irrelevant — callers gate on `reached`).
+    let valid_bits = if max_locals >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << max_locals) - 1
+    };
+    for m in in_mask.iter_mut() {
+        *m &= valid_bits;
+    }
+    (in_mask, reached)
 }
 
 /// EC-DUP2-CAT2 (bc math-ec JIT miscompile fix) — reject methods whose
@@ -4221,6 +4516,17 @@ enum StackSlot {
 /// R10 is excluded because it is used internally by bounds checks and SIMD loops.
 const SCRATCH_REGS: [u8; 2] = [R8, R9];
 
+/// Where a live oop resides at a shadow-stack safepoint — the source the push
+/// reads from and the destination the post-call reload writes back to.
+/// `Reg` is a callee-saved home register (R12–R15/RBX/RSI/RDI); `Frame(off)`
+/// is the canonical frame slot `[rbp - off]`. (Scratch/XMM entries never hold a
+/// live oop across a call: scratch is flushed pre-call and XMM holds FP data.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShadowHome {
+    Reg(u8),
+    Frame(i32),
+}
+
 /// Register mapping for locals → callee-saved registers.
 /// R12-R15 + RBX on all platforms. On Windows, RSI and RDI are also callee-saved.
 #[cfg(target_os = "windows")]
@@ -4512,6 +4818,51 @@ struct Compiler {
     /// instruction *after* the safepoint call. Transferred to
     /// `CompiledMethod::oop_maps` at finalize time.
     oop_maps: Vec<crate::OopMapEntry>,
+    /// Stage 2 (precise oop maps) — per-bytecode-PC "must be oop" local
+    /// bitmask. `local_oop_masks[pc] & (1 << k) != 0` means local slot `k`
+    /// holds an object reference on EVERY path reaching `pc` (so a safepoint
+    /// at `pc` can record local `k`'s canonical frame slot as a precise oop).
+    /// Empty when unsupported (>64 locals); `local_oop_reached[pc]` is false
+    /// for PCs the forward dataflow never reached (e.g. exception-handler-only
+    /// entries), where no precise local marking is emitted and the GC falls
+    /// back to the conservative frame sweep. See
+    /// `docs/precise-jit-stack-maps-design.md` (Stage 2).
+    local_oop_masks: Vec<u64>,
+    /// Stage 2 — companion to `local_oop_masks`: whether the forward local-oop
+    /// dataflow reached each PC. Only `reached` PCs get precise local entries.
+    local_oop_reached: Vec<bool>,
+    /// Stage 2 — the bytecode PC of the instruction currently being emitted,
+    /// updated at the top of the `compile_bytecode` loop so
+    /// `emit_oop_map_for_safepoint` can look up the local-oop mask without
+    /// threading `pc` through every safepoint call site.
+    cur_bc_pc: usize,
+    /// Stage 3 — whether the moving-safe precise-stack-map machinery is on
+    /// (gate `CRATONVM_PRECISE_JIT_MAPS`). Gates the prologue frame-record
+    /// call and the per-safepoint id store. Off → byte-identical default path.
+    precise_maps: bool,
+    /// Stage 3 — frame offset (positive; slot at `[rbp - sp_id_slot_off]`) of
+    /// the reserved safepoint-id slot. 0 when `precise_maps` is off.
+    sp_id_slot_off: i32,
+    /// Shadow-stack precise roots (`CRATONVM_SHADOW_STACK`) — whether the
+    /// per-safepoint live-oop push/reload codegen is emitted. Off →
+    /// byte-identical default path.
+    shadow_enabled: bool,
+    /// Frame offset (positive; slot at `[rbp - shadow_thread_slot_off]`) of the
+    /// reserved slot that caches this invocation's `*mut JvmThread`, set once in
+    /// the prologue. 0 when `shadow_enabled` is off.
+    shadow_thread_slot_off: i32,
+    /// Frame offset of the reserved slot holding the shadow `top` at method
+    /// entry. The epilogue restores `thread.shadow_stack.top` from it so any
+    /// unbalanced safepoint push is unwound on return (correct under nesting).
+    /// 0 when `shadow_enabled` is off.
+    shadow_savetop_slot_off: i32,
+    /// Byte offset of the `ShadowStack` from `&JvmThread` (from the helper
+    /// table). The shadow `top` is at `[thread + shadow_off_in_thread + 0]`.
+    shadow_off_in_thread: i32,
+    /// Live-oop homes recorded by the most recent shadow push, consumed by the
+    /// matching post-call reload. Cleared at each push start so an unbalanced
+    /// (no-reload) safepoint cannot feed stale homes to a later reload.
+    pending_shadow: Vec<ShadowHome>,
     /// T5.2.1 — induction variables detected in each loop.
     ///
     /// One entry per detected counted loop. Consumed by downstream
@@ -4626,12 +4977,51 @@ impl Compiler {
             .map(|h| arith_expr_max_depth(&h.steps))
             .max()
             .unwrap_or(0);
+        // Stage 3 — when precise maps are enabled, reserve ONE extra frame
+        // slot (the last local slot) to hold the active safepoint's bytecode
+        // PC, written by `emit_pre_safepoint_spill` before each GC-capable
+        // call so the GC root walker can recover the exact oop map. Off by
+        // default → no slot reserved → frame layout byte-identical.
+        let precise_maps = precise_jit_maps_enabled();
+        let shadow_enabled = shadow_stack_maps_enabled();
+        // Shadow stack reserves TWO frame slots: the cached thread pointer and
+        // a saved `top` watermark (restored in the epilogue to unwind any
+        // unbalanced safepoint push — e.g. the `invokespecial <init>` push that
+        // has no paired reload). OSR entries zero both slots (clobber-free) so
+        // the null-guards make those frames skip shadow tracking safely.
+        let shadow_slots = if shadow_enabled { 2 } else { 0 };
         let extra_slots = (if needs_heap { 1 } else { 0 })
             + num_hoists
             + num_arith_hoists
             + arith_scratch_depth
-            + num_scalar_slots;
+            + num_scalar_slots
+            + (if precise_maps { 1 } else { 0 })
+            + shadow_slots;
         let total_locals = num_locals.saturating_add(extra_slots);
+        // Shadow-stack thread-pointer cache slot: the ABSOLUTE last reserved
+        // slot (`[rbp - shadow_thread_slot_off]`), set once in the prologue.
+        let shadow_thread_slot_off: i32 = if shadow_enabled {
+            (total_locals as i32).saturating_mul(8)
+        } else {
+            0
+        };
+        // Shadow-stack saved-`top` watermark slot: second-to-last reserved slot.
+        let shadow_savetop_slot_off: i32 = if shadow_enabled {
+            (total_locals as i32 - 1).saturating_mul(8)
+        } else {
+            0
+        };
+        // Byte offset of the `ShadowStack` within `JvmThread` (from the helper
+        // table), captured before `helpers` is moved into the struct below.
+        let shadow_off_in_thread: i32 = helpers.shadow_stack_offset_in_thread as i32;
+        // The safepoint-id slot sits below the shadow slots when both gates are
+        // on (so they never alias). Value at `[rbp - sp_id_slot_off]`. 0 when
+        // `precise_maps` is off.
+        let sp_id_slot_off: i32 = if precise_maps {
+            (total_locals as i32 - shadow_slots as i32).saturating_mul(8)
+        } else {
+            0
+        };
         let locals_size = (total_locals.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let spill_size = (max_stack.min(i32::MAX as usize / 8) as i32).saturating_mul(8); // Cast: address arithmetic
         let shadow_space = 32i32; // Windows x64 shadow space for helper calls
@@ -4777,6 +5167,16 @@ impl Compiler {
             deopt_stubs: Vec::new(),
             stack_oop_marks: Vec::with_capacity(16),
             oop_maps: Vec::new(),
+            local_oop_masks: Vec::new(),
+            local_oop_reached: Vec::new(),
+            cur_bc_pc: 0,
+            precise_maps,
+            sp_id_slot_off,
+            shadow_enabled,
+            shadow_thread_slot_off,
+            shadow_savetop_slot_off,
+            shadow_off_in_thread,
+            pending_shadow: Vec::new(),
             induction_vars: Vec::new(),
             null_check_info: crate::null_check_elim::NullCheckInfo::default(),
             simd_element_wise_loops: Vec::new(),
@@ -4915,6 +5315,25 @@ impl Compiler {
         slot
     }
 
+    /// Stage 1 (precise oop maps) — push a *given* slot onto the simulated
+    /// operand stack while keeping the parallel `stack_oop_marks` vector in
+    /// lockstep. `is_oop` records whether the value is an object reference.
+    ///
+    /// This is the ONLY sanctioned way to grow `self.stack` with a
+    /// register/XMM-resident value: a bare `self.stack.push(slot)` desyncs
+    /// the two vectors (marks shorter than stack), which historically shifted
+    /// every later slot's oop bit and produced false-positive / false-negative
+    /// precise oop map entries (see `docs/jit-safepoint-revert.md` and
+    /// `docs/precise-jit-stack-maps-design.md`). The desync was previously
+    /// papered over by a lazy `false`-pad in `emit_oop_map_for_safepoint`;
+    /// with this helper the lockstep invariant `stack.len() == marks.len()`
+    /// holds continuously, which is the load-bearing prerequisite for a
+    /// *moving* GC that rewrites precisely-mapped slots.
+    fn stack_push(&mut self, slot: StackSlot, is_oop: bool) {
+        self.stack.push(slot);
+        self.stack_oop_marks.push(is_oop);
+    }
+
     /// T1.1.a — mark the top-of-stack slot as an object reference. Called
     /// by opcode handlers for every push that produces an oop
     /// (`new`, `anewarray`, `aload*`, `aaload`, `getfield` on reference
@@ -4994,6 +5413,173 @@ impl Compiler {
                 self.emit_store_local(off, reg);
             }
         }
+        // Stage 3 — record WHICH safepoint is active by storing the current
+        // bytecode PC into the reserved safepoint-id slot. The GC root walker
+        // reads `[rbp - sp_id_slot_off]` to recover the exact oop map (matched
+        // on `OopMapEntry::bytecode_pc`). RAX is caller-saved and not an
+        // argument register, and args are already staged in ARG_REGS before
+        // this call, so clobbering RAX here is safe. Gated off by default.
+        if self.precise_maps && self.sp_id_slot_off != 0 {
+            self.emit_mov_imm32_sx(RAX, self.cur_bc_pc as i32); // Cast: bytecode PC fits i32
+            self.emit_store_local(self.sp_id_slot_off, RAX);
+        }
+        // Shadow-stack precise roots — push every live oop onto the thread's
+        // shadow stack so a moving collector can rewrite it precisely. Paired
+        // with `emit_shadow_reload` in `emit_oop_map_for_safepoint`. Gated.
+        self.emit_shadow_push();
+    }
+
+    /// Collect the homes of every live oop at the current safepoint: operand-
+    /// stack entries tagged as references (`stack_oop_marks`) plus oop locals
+    /// (`local_oop_masks[cur_bc_pc]`). XMM operand entries are skipped (they
+    /// hold FP data, never references). Returns the homes in push order.
+    fn collect_live_oop_homes(&self) -> Vec<ShadowHome> {
+        let mut homes: Vec<ShadowHome> = Vec::new();
+        // Operand-stack reference entries that survive the call.
+        let n = self.stack.len().min(self.stack_oop_marks.len());
+        for i in 0..n {
+            if !self.stack_oop_marks[i] {
+                continue;
+            }
+            match self.stack[i] {
+                StackSlot::Frame(off) => homes.push(ShadowHome::Frame(off)),
+                StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
+                    homes.push(ShadowHome::Reg(reg))
+                }
+                StackSlot::Xmm(_) => {} // FP value, not a reference
+            }
+        }
+        // Oop locals live at this bytecode PC (forward "must be oop" dataflow).
+        if !self.local_oop_masks.is_empty() {
+            let pc = self.cur_bc_pc;
+            if pc < self.local_oop_masks.len()
+                && self.local_oop_reached.get(pc).copied().unwrap_or(false)
+            {
+                let mut mask = self.local_oop_masks[pc];
+                while mask != 0 {
+                    let k = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    match self.reg_for_local(k) {
+                        Some(reg) => homes.push(ShadowHome::Reg(reg)),
+                        None => homes.push(ShadowHome::Frame(self.local_offset(k))),
+                    }
+                }
+            }
+        }
+        homes
+    }
+
+    /// Shadow-stack push (paired with [`Self::emit_shadow_reload`]).
+    ///
+    /// Emitted just before a GC-capable CALL, after args are staged. For each
+    /// live oop home it stores the value onto the thread's shadow stack and
+    /// bumps `top`. Uses R10 (thread ptr, from the prologue-set frame slot),
+    /// R11 (running `top`), and RAX (frame-slot value temp) — all caller-saved
+    /// non-argument scratch, and never a live-oop home (homes are callee-saved
+    /// or frame). The live homes are recorded in `pending_shadow` for the
+    /// matching reload. `pending_shadow` is cleared first so an unbalanced
+    /// (no-reload) safepoint cannot hand stale homes to a later reload.
+    fn emit_shadow_push(&mut self) {
+        if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+            return;
+        }
+        // Bisect toggle: CRATONVM_SHADOW_NOPUSH skips the push/reload codegen
+        // (keeps the prologue thread-fetch + gate flip) so the SEGV can be
+        // localized to push/reload vs the rest without a rebuild.
+        if shadow_nopush() {
+            return;
+        }
+        self.pending_shadow.clear();
+        let homes = self.collect_live_oop_homes();
+        if !homes.is_empty() && std::env::var_os("CRATONVM_DBG_SHADOW2").is_some() {
+            let lm = self
+                .local_oop_masks
+                .get(self.cur_bc_pc)
+                .copied()
+                .unwrap_or(0);
+            eprintln!(
+                "[SHADOW2] push pc={} stack={:?} marks={:?} local_mask={:#x} homes={:?}",
+                self.cur_bc_pc,
+                &self.stack,
+                &self.stack_oop_marks,
+                lm,
+                homes
+            );
+        }
+        if homes.is_empty() {
+            return;
+        }
+        let ss_top = self.shadow_off_in_thread; // + ShadowStack::TOP_OFFSET (0)
+        // R10 = thread (cached in the prologue-set frame slot); R11 = shadow top.
+        self.emit_load_local(R10, self.shadow_thread_slot_off);
+        // Guard: if the cached thread pointer is null (get_current_thread
+        // returned null for this method), skip the whole push.
+        self.emit_test_r64_r64(R10);
+        let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
+        self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
+        for &home in &homes {
+            match home {
+                ShadowHome::Reg(r) => {
+                    self.emit_mov_mem_disp32_r64(R11, r, 0);
+                }
+                ShadowHome::Frame(off) => {
+                    self.emit_load_local(RAX, off);
+                    self.emit_mov_mem_disp32_r64(R11, RAX, 0);
+                }
+            }
+            self.emit_lea_r64_mem_disp32(R11, R11, 8);
+        }
+        // Commit new top.
+        self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
+        self.patch_rel32_to_here(skip); // null-thread guard target
+        self.pending_shadow = homes;
+    }
+
+    /// Shadow-stack reload (paired with [`Self::emit_shadow_push`]).
+    ///
+    /// Emitted immediately after the CALL returns. Pops each pushed slot in
+    /// reverse and writes the (possibly GC-rewritten) value back into its home,
+    /// so a relocated object's new address flows into the registers/slots the
+    /// compiled code keeps using. Preserves RAX (the call's return value): the
+    /// scratch used is R10 (thread), R11 (top), R8 (frame-slot value temp).
+    /// No-op when `pending_shadow` is empty (unmatched safepoint).
+    fn emit_shadow_reload(&mut self) {
+        if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+            return;
+        }
+        if shadow_nopush() || shadow_noreload() {
+            // Still drain pending so a later reload can't consume stale homes.
+            self.pending_shadow.clear();
+            return;
+        }
+        if self.pending_shadow.is_empty() {
+            return;
+        }
+        let homes = std::mem::take(&mut self.pending_shadow);
+        let ss_top = self.shadow_off_in_thread;
+        self.emit_load_local(R10, self.shadow_thread_slot_off);
+        // Guard: null thread pointer (see push) → skip reload. Symmetric with
+        // the push guard, so a method with a null thread is consistently
+        // untracked (the push was skipped too).
+        self.emit_test_r64_r64(R10);
+        let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
+        self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
+        for &home in homes.iter().rev() {
+            // Pre-decrement to the slot holding this oop's (possibly moved) value.
+            self.emit_lea_r64_mem_disp32(R11, R11, -8);
+            match home {
+                ShadowHome::Reg(r) => {
+                    self.emit_mov_r64_mem_disp32(r, R11, 0);
+                }
+                ShadowHome::Frame(off) => {
+                    self.emit_mov_r64_mem_disp32(R8, R11, 0);
+                    self.emit_store_local(off, R8);
+                }
+            }
+        }
+        // Commit popped top.
+        self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
+        self.patch_rel32_to_here(skip); // null-thread guard target
     }
 
     /// T1.1.a — record an oop map at the current native PC for the
@@ -5022,16 +5608,31 @@ impl Compiler {
         if self.failed {
             return;
         }
-        // T1.1.a — lazy resync. Non-instrumented `self.stack.push`
-        // sites (aload local-to-CalleeSaved, inlined-callee pushes,
-        // LICM hoists, XMM intermediate pushes) leave
-        // `stack_oop_marks` shorter than `stack`. Pad with `false`
-        // (non-oop). This is SAFE because
-        // `conservative_roots::scan_one_frame_precise` also performs a
-        // full conservative sweep of the frame region on every GC
-        // visit — any oop our precise map misses is caught by the
-        // sweep's `heap.is_object_address` validation. Precise maps
-        // remain a pure optimization on top of the conservative path.
+        // Shadow-stack precise roots — reload every oop pushed by the matching
+        // `emit_shadow_push` from its (possibly GC-rewritten) shadow slot back
+        // into its home register/frame slot, then pop. Emitted right after the
+        // call returns (before the return value is consumed below). No-op when
+        // the shadow gate is off or no oops were pushed at this safepoint.
+        self.emit_shadow_reload();
+        // Stage 1 (precise oop maps) — the lockstep invariant
+        // `stack.len() == stack_oop_marks.len()` now holds continuously:
+        // every push goes through `stack_push`/`push_stack` (which pair
+        // both vectors) and the dup/swap/merge-reconstruct paths rebuild
+        // marks in step. Assert it in debug builds. The release-mode pad
+        // below is retained purely as a defensive backstop: should any
+        // future un-instrumented `self.stack.push` re-introduce a desync,
+        // padding with `false` (non-oop) stays SOUND because
+        // `conservative_roots::scan_one_frame_precise` also conservatively
+        // sweeps the frame region — but a desync would silently degrade
+        // precision (and is unsafe for the *moving* path), so the assert
+        // is the real guard.
+        debug_assert_eq!(
+            self.stack.len(),
+            self.stack_oop_marks.len(),
+            "stack/oop-marks desync at safepoint (native_pc={}): every \
+             self.stack growth must go through stack_push/push_stack",
+            self.buf.pos(),
+        );
         while self.stack_oop_marks.len() < self.stack.len() {
             self.stack_oop_marks.push(false);
         }
@@ -5051,13 +5652,85 @@ impl Compiler {
                 }
             }
         }
-        if slots.is_empty() {
+        // Stage 2 (precise oop maps) — add the canonical frame slots of local
+        // variables that hold object references at this safepoint, per the
+        // forward "must be oop" dataflow. For register-resident locals this is
+        // exactly the slot `emit_pre_safepoint_spill` flushed the live value to
+        // just before the call; for memory-resident locals it is where the
+        // value always lives. The GC root walker then has precise, updatable
+        // coverage of every live oop local (not just operand-stack temporaries).
+        // Sound on the default path regardless of dataflow precision: the
+        // consumer re-validates each slot via `heap.is_object_address`.
+        if !self.local_oop_masks.is_empty() {
+            let pc = self.cur_bc_pc;
+            if pc < self.local_oop_masks.len()
+                && self.local_oop_reached.get(pc).copied().unwrap_or(false)
+            {
+                let mut mask = self.local_oop_masks[pc];
+                while mask != 0 {
+                    let k = mask.trailing_zeros() as usize;
+                    mask &= mask - 1; // clear lowest set bit
+                    let off = self.local_offset(k);
+                    if let Ok(i16_off) = i16::try_from(off) {
+                        if !slots.contains(&i16_off) {
+                            slots.push(i16_off);
+                        }
+                    }
+                }
+            }
+        }
+        if !slots.is_empty() {
+            self.oop_maps.push(crate::OopMapEntry {
+                native_pc_offset: native_pc,
+                // Stage 3 — tag with the safepoint's bytecode PC so the GC root
+                // walker can match the value the JIT stored into the sp-id slot.
+                bytecode_pc: self.cur_bc_pc as u32, // Cast: bytecode PC fits u32
+                frame_slot_offsets: slots,
+            });
+        }
+        // Stage 4 (precise oop maps) — reload oop register-locals from their
+        // (GC-updated) canonical slots after the safepoint. `native_pc` above
+        // is the call's return PC and equals the position of the first reload
+        // instruction (the `push` emits no code), so the GC walker rewrites the
+        // frame slots at the return PC and control then falls into the reload,
+        // which propagates each moved object's new address back into its
+        // callee-saved register. Without this, Stage 3 updates the slot but the
+        // code keeps reading the stale register → register-invisibility
+        // persists. Gated off by default (no reload → byte-identical codegen).
+        if self.precise_maps {
+            self.emit_post_safepoint_reload();
+        }
+    }
+
+    /// Stage 4 (precise oop maps) — reload every oop register-local live at the
+    /// current safepoint from its canonical frame slot `[rbp - local_offset(k)]`
+    /// into its assigned callee-saved register.
+    ///
+    /// Pairs with [`Self::emit_pre_safepoint_spill`] (which flushed the live
+    /// values to those slots before the call) and the GC's
+    /// `remap_active_jit_frames` (which rewrote the moved ones in place during
+    /// the call). Only oop locals are reloaded — primitives don't move, so
+    /// their spilled slot still matches the register. RAX is never a local
+    /// register, so the call's return value survives this sequence.
+    fn emit_post_safepoint_reload(&mut self) {
+        if self.failed || self.local_oop_masks.is_empty() {
             return;
         }
-        self.oop_maps.push(crate::OopMapEntry {
-            native_pc_offset: native_pc,
-            frame_slot_offsets: slots,
-        });
+        let pc = self.cur_bc_pc;
+        if pc >= self.local_oop_masks.len()
+            || !self.local_oop_reached.get(pc).copied().unwrap_or(false)
+        {
+            return;
+        }
+        let mut mask = self.local_oop_masks[pc];
+        while mask != 0 {
+            let k = mask.trailing_zeros() as usize;
+            mask &= mask - 1; // clear lowest set bit
+            if let Some(Some(reg)) = self.local_assignments.get(k).copied() {
+                let off = self.local_offset(k);
+                self.emit_load_local(reg, off); // reg <- [rbp - off]
+            }
+        }
     }
 
     /// Peek at the top of the simulated stack.
@@ -5665,6 +6338,18 @@ impl Compiler {
         self.rex_w_r(reg);
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.modrm_rbp_disp(reg, offset);
+    }
+
+    /// Store an immediate 0 (8 bytes) into the frame slot `[rbp - offset]`
+    /// WITHOUT clobbering any register (`MOV r/m64, imm32`, REX.W C7 /0).
+    /// Used to zero the shadow thread/watermark slots at OSR entries, where the
+    /// prologue (which would set them) was bypassed and no scratch register is
+    /// safely free at the loop header.
+    fn emit_zero_local(&mut self, offset: i32) {
+        self.rex_w();
+        self.buf.emit_byte(0xC7); // MOV r/m64, imm32 (sign-extended)
+        self.modrm_rbp_disp(0, offset); // /0
+        self.buf.emit(&0i32.to_le_bytes());
     }
 
     // ── CMOV helpers (round-8 perf, round-7 jit #7) ──────────────────
@@ -7657,10 +8342,58 @@ impl Compiler {
                 self.emit_store_local(offset, RAX);
             }
         }
+        // Stage 3 — register this JIT frame's EXACT RBP with the GC so the
+        // root walker can address oop-map slots precisely (the Rust-side
+        // JitEntryGuard only captures an approximate SP; release builds omit
+        // frame pointers so the real RBP can't be recovered by walking). Done
+        // once per invocation, after params are saved so the call doesn't lose
+        // them. RBP → ABI arg0; the helper records it into the top JIT chain
+        // entry. Gated off by default (zero default-path cost), and skipped if
+        // the helper pointer isn't wired.
+        if self.precise_maps && self.helpers.frame_record != 0 {
+            self.emit_mov_reg_reg(ARG_REGS[0], RBP);
+            self.emit_call_absolute(self.helpers.frame_record);
+        }
+
+        // Shadow-stack precise roots — cache this invocation's `*mut JvmThread`
+        // in a frame slot so each safepoint's inline push/reload can reach the
+        // shadow `top` without a per-safepoint helper call (which would clobber
+        // staged ABI arg registers). Done last in the prologue, after params are
+        // saved to their homes, so `get_current_thread` (caller-saved clobbers)
+        // can't lose an argument. RAX holds the returned thread pointer.
+        if self.shadow_enabled
+            && self.helpers.get_current_thread != 0
+            && self.shadow_thread_slot_off != 0
+        {
+            self.emit_call_absolute(self.helpers.get_current_thread);
+            self.emit_store_local(self.shadow_thread_slot_off, RAX);
+            // Save the shadow `top` watermark (RAX = thread). The epilogue
+            // restores it, unwinding any unbalanced safepoint push this method
+            // made. Skip on null thread (slot holds null → epilogue skips too).
+            self.emit_test_r64_r64(RAX);
+            let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (RAX == 0)
+            self.emit_mov_r64_mem_disp32(R11, RAX, self.shadow_off_in_thread);
+            self.emit_store_local(self.shadow_savetop_slot_off, R11);
+            self.patch_rel32_to_here(skip);
+        }
     }
 
     /// Emit function epilogue: restore callee-saved regs; add rsp; pop rbp; ret
     fn emit_epilogue(&mut self) {
+        // Shadow-stack: restore the `top` watermark saved in the prologue,
+        // unwinding any push this method did not pop (e.g. the unbalanced
+        // `invokespecial <init>` push). Correct under nesting: each method
+        // restores top to its own entry value on return. Null-guarded so an OSR
+        // entry (which zero-inits the thread slot) skips this safely. R10/R11
+        // are caller-saved scratch (free at return); RAX (return value) untouched.
+        if self.shadow_enabled && self.shadow_thread_slot_off != 0 {
+            self.emit_load_local(R10, self.shadow_thread_slot_off);
+            self.emit_test_r64_r64(R10);
+            let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
+            self.emit_load_local(R11, self.shadow_savetop_slot_off);
+            self.emit_mov_mem_disp32_r64(R10, R11, self.shadow_off_in_thread);
+            self.patch_rel32_to_here(skip);
+        }
         // Restore callee-saved GPR registers from frame slots (matching prologue MOV saves)
         let used_regs = self.alloc_used_regs.clone();
         for (i, &reg) in used_regs.iter().enumerate() {
@@ -8379,7 +9112,7 @@ impl Compiler {
         self.flush_xmm0_slots();
         // MOVQ XMM0, RAX
         self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
-        self.stack.push(StackSlot::Xmm(0));
+        self.stack_push(StackSlot::Xmm(0), false);
     }
 
     /// Return the GPR holding the slot value. For CalleeSaved/Scratch, returns
@@ -10641,6 +11374,11 @@ impl Compiler {
 
         let mut pc = 0;
         while pc < code_len {
+            // Stage 2 (precise oop maps) — track the bytecode PC being emitted
+            // so `emit_oop_map_for_safepoint` can look up the live oop-local
+            // mask for this instruction without threading `pc` through every
+            // safepoint call site.
+            self.cur_bc_pc = pc;
             // DCE: if we're in dead code and this PC isn't a branch target, skip it
             if dead {
                 if branch_targets[pc] {
@@ -10727,6 +11465,15 @@ impl Compiler {
                     self.osr_entry_native[pc] = -1; // OSR rejected — fall back to interpreter
                 } else {
                     self.osr_entry_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                    // Shadow-stack note: this position is reached by BOTH the OSR
+                    // entry (which bypasses the prologue → thread/watermark slots
+                    // uninitialised) AND the initial fall-through (slots already
+                    // set by the prologue). So we can't (re)initialise the slots
+                    // here without corrupting the normal path. Instead the VM-side
+                    // OSR setup zeroes the slots before jumping (see
+                    // `CompiledMethod::shadow_thread_slot_off` / try_osr), which
+                    // makes OSR-entered frames skip shadow tracking via the
+                    // null-guards (safe; precise OSR-frame tracking is a follow-up).
                 }
             }
             // === LICM: Emit hoisted aaload code at loop headers ===
@@ -11266,17 +12013,17 @@ impl Compiler {
                     // fload (0x17) and dload (0x18) may have XMM-allocated locals
                     if matches!(op, 0x17 | 0x18) {
                         if let Some(xmm) = self.xmm_for_local(idx) {
-                            self.stack.push(StackSlot::Xmm(xmm));
+                            // FP value — never an oop.
+                            self.stack_push(StackSlot::Xmm(xmm), false);
                             pc += 2;
                             continue;
                         }
                     }
                     let is_aload = op == 0x19;
                     if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
                         // T1.1.a — only aload pushes oops; iload/lload/fload/dload
-                        // push primitives. Mark parity with the stack.
-                        self.stack_oop_marks.push(is_aload);
+                        // push primitives. Stage 1 — keep marks in lockstep.
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), is_aload);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -11292,8 +12039,9 @@ impl Compiler {
                 0x1a..=0x1d => {
                     let idx = (op - 0x1a) as usize; // Widening: always safe
                     if let Some(local_reg) = self.reg_for_local(idx) {
-                        // Zero-cost: just record register reference on simulated stack
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
+                        // Zero-cost: just record register reference on simulated
+                        // stack. iload pushes a primitive — never an oop.
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), false);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -11306,7 +12054,7 @@ impl Compiler {
                 0x1e..=0x21 => {
                     let idx = (op - 0x1e) as usize; // Widening: always safe
                     if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), false);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -11319,9 +12067,9 @@ impl Compiler {
                 0x22..=0x25 => {
                     let idx = (op - 0x22) as usize; // Widening: always safe
                     if let Some(xmm) = self.xmm_for_local(idx) {
-                        self.stack.push(StackSlot::Xmm(xmm));
+                        self.stack_push(StackSlot::Xmm(xmm), false);
                     } else if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), false);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -11336,9 +12084,9 @@ impl Compiler {
                     if let Some(xmm) = self.xmm_for_local(idx) {
                         // Zero-cost push: just reference the XMM register.
                         // No code emitted until the value is consumed.
-                        self.stack.push(StackSlot::Xmm(xmm));
+                        self.stack_push(StackSlot::Xmm(xmm), false);
                     } else if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), false);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -11351,14 +12099,12 @@ impl Compiler {
                 0x2a..=0x2d => {
                     let idx = (op - 0x2a) as usize; // Widening: always safe
                     if let Some(local_reg) = self.reg_for_local(idx) {
-                        self.stack.push(StackSlot::CalleeSaved(local_reg));
-                        // T1.1.a — keep oop-mark vector in lock-step
-                        // and tag the entry. CalleeSaved slots don't
-                        // have a frame offset, so the oop-map walker
-                        // skips them (they're preserved by the ABI
-                        // across calls and cached by the JIT's frame
-                        // save/restore prologue).
-                        self.stack_oop_marks.push(true);
+                        // aload* always pushes an object ref. Stage 1 — keep
+                        // marks in lockstep and tag the entry. CalleeSaved slots
+                        // don't have a frame offset, so the oop-map walker skips
+                        // them (preserved by the ABI across calls and cached by
+                        // the JIT's frame save/restore prologue).
+                        self.stack_push(StackSlot::CalleeSaved(local_reg), true);
                     } else {
                         let off = self.local_offset(idx);
                         self.emit_load_local(RAX, off);
@@ -12087,7 +12833,7 @@ impl Compiler {
                         }
                         // ADDSD XMM0, XMM0 — doubles the value
                         self.buf.emit(&[0xF2, 0x0F, 0x58, 0xC0]);
-                        self.stack.push(StackSlot::Xmm(0));
+                        self.stack_push(StackSlot::Xmm(0), false);
                     } else {
                         self.emit_double_binop(0x59); // MULSD
                     }
@@ -12370,7 +13116,7 @@ impl Compiler {
                     self.pop_to_rax();
                     // CVTSI2SS XMM0, EAX: F3 0F 2A C0
                     self.buf.emit(&[0xF3, 0x0F, 0x2A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -12380,7 +13126,7 @@ impl Compiler {
                     self.pop_to_rax();
                     // CVTSI2SD XMM0, EAX: F2 0F 2A C0
                     self.buf.emit(&[0xF2, 0x0F, 0x2A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -12400,7 +13146,7 @@ impl Compiler {
                     self.pop_to_rax();
                     // CVTSI2SS XMM0, RAX: F3 48 0F 2A C0
                     self.buf.emit(&[0xF3, 0x48, 0x0F, 0x2A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -12410,7 +13156,7 @@ impl Compiler {
                     self.pop_to_rax();
                     // CVTSI2SD XMM0, RAX: F2 48 0F 2A C0
                     self.buf.emit(&[0xF2, 0x48, 0x0F, 0x2A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -12449,7 +13195,7 @@ impl Compiler {
                     self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC0]);
                     // CVTSS2SD XMM0, XMM0: F3 0F 5A C0
                     self.buf.emit(&[0xF3, 0x0F, 0x5A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -12488,7 +13234,7 @@ impl Compiler {
                     self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC0]);
                     // CVTSD2SS XMM0, XMM0: F2 0F 5A C0
                     self.buf.emit(&[0xF2, 0x0F, 0x5A, 0xC0]);
-                    self.stack.push(StackSlot::Xmm(0));
+                    self.stack_push(StackSlot::Xmm(0), false);
                     pc += 1;
                 }
 
@@ -13676,7 +14422,7 @@ impl Compiler {
                                 }
                             }
                             self.emit_sqrtsd_xmm0();
-                            self.stack.push(StackSlot::Xmm(0));
+                            self.stack_push(StackSlot::Xmm(0), false);
                         } else if callee_entry == super::MATH_FLOOR_INTRINSIC
                             || callee_entry == super::MATH_CEIL_INTRINSIC
                             || callee_entry == super::MATH_RINT_INTRINSIC
@@ -13710,7 +14456,7 @@ impl Compiler {
                                 0x08u8 // round to nearest even, inexact suppress
                             };
                             self.buf.emit(&[0x66, 0x0F, 0x3A, 0x0B, 0xC0, imm8]);
-                            self.stack.push(StackSlot::Xmm(0));
+                            self.stack_push(StackSlot::Xmm(0), false);
                         } else if callee_entry == super::MATH_ABS_DOUBLE_INTRINSIC {
                             // Math.abs(double): clear sign bit (bit 63)
                             let arg_slot = self.pop_stack();
@@ -13740,7 +14486,7 @@ impl Compiler {
                             self.emit_movq_xmm_from_gpr(1, RCX);
                             // ANDPD XMM0, XMM1: 66 0F 54 C1
                             self.buf.emit(&[0x66, 0x0F, 0x54, 0xC1]);
-                            self.stack.push(StackSlot::Xmm(0));
+                            self.stack_push(StackSlot::Xmm(0), false);
                         } else if callee_entry == super::MATH_ABS_FLOAT_INTRINSIC {
                             // Math.abs(float): clear sign bit (bit 31)
                             let arg_slot = self.pop_stack();
@@ -13770,7 +14516,7 @@ impl Compiler {
                             self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC9]);
                             // ANDPS XMM0, XMM1: 0F 54 C1
                             self.buf.emit(&[0x0F, 0x54, 0xC1]);
-                            self.stack.push(StackSlot::Xmm(0));
+                            self.stack_push(StackSlot::Xmm(0), false);
                         } else if callee_entry == super::MATH_ABS_INT_INTRINSIC {
                             // Math.abs(int): branchless absolute value
                             let arg_slot = self.pop_stack();
@@ -18363,6 +19109,18 @@ pub fn compile_with_param_slots(
     // so each query is O(1) rather than scanning the Vec.
     compiler.build_pc_indices();
 
+    // Stage 2 (precise oop maps) — forward "must be oop" local-variable
+    // dataflow. Lets `emit_oop_map_for_safepoint` record the canonical frame
+    // slots of register/memory locals that hold object references at each
+    // safepoint (in addition to the operand-stack slots), so a moving GC has
+    // precise, updatable coverage of every live oop. Behaviour-neutral on the
+    // default (non-moving) path: `conservative_roots::scan_one_frame_precise`
+    // already sweeps the whole frame region, so the extra precise entries are
+    // redundant there and re-validated via `heap.is_object_address`.
+    let (lo_masks, lo_reached) = compute_local_oop_masks(code, code_len, max_locals);
+    compiler.local_oop_masks = lo_masks;
+    compiler.local_oop_reached = lo_reached;
+
     // Emit prologue
     compiler.emit_prologue();
     let entry_offset = 0; // prologue starts at offset 0
@@ -18503,6 +19261,13 @@ pub fn compile_with_param_slots(
     // to the conservative stack scan for that frame — always a
     // correct super-set of the precise coverage.
     cm.oop_maps = compiler.oop_maps;
+    // Stage 3 — the frame offset where this method stores the active
+    // safepoint's bytecode PC (0 when the precise gate was off at compile).
+    cm.sp_id_slot_off = compiler.sp_id_slot_off;
+    // Shadow-stack — frame offset of the cached thread-pointer slot, so the OSR
+    // trampoline can zero it (OSR bypasses the prologue that sets it). 0 when
+    // the shadow-stack gate was off at compile.
+    cm.shadow_thread_slot_off = compiler.shadow_thread_slot_off;
 
     // Task #60 — attach unroll-cloned MIC/PIC slots to the
     // CompiledMethod so they outlive the compiled code. The imm64
@@ -18833,6 +19598,8 @@ mod tests {
             class_id_offset_in_obj: 0,
             get_current_thread: 0,
             tlab_post_init: 0,
+            frame_record: 0,
+            shadow_stack_offset_in_thread: 0,
         }
     }
 

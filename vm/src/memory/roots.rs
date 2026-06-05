@@ -172,6 +172,25 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     address never causes a wrong relocation.
     crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut roots);
 
+    // 14b. Shadow-stack precise roots (CRATONVM_SHADOW_STACK). JIT code pushes
+    //      every live oop (locals AND operand-stack entries) onto this thread's
+    //      shadow stack immediately before a GC-capable call. Unlike the
+    //      conservative scan above, every slot here is — by construction —
+    //      exactly one object reference, so it is BOTH a precise mark root and
+    //      a *rewritable* root (the matching post-move rewrite is
+    //      `thread.shadow_stack.remap` in gc.rs). We still validate each value
+    //      via `is_object_address`: a defensive guard against a stale slot that
+    //      an abnormal unwind left above `top` is impossible (scan is bounded by
+    //      `top`), but a slot holding null / a not-yet-stored value reads as a
+    //      non-object and is harmlessly skipped.
+    if crate::jit::conservative_roots::shadow_stack_enabled() {
+        thread.shadow_stack.for_each_value(|v| {
+            if let Some(obj_ref) = shared.heap.is_object_address(v) {
+                roots.push(obj_ref);
+            }
+        });
+    }
+
     // 15. Round-9 CRIT GC-correctness fix: process-global Integer.valueOf
     //     (-128..=127) and Boolean.TRUE/FALSE caches. These live in
     //     `native-builtins/src/lang_math.rs` and previously used

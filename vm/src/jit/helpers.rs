@@ -172,6 +172,28 @@ impl Drop for JitCalleeGuard {
 /// duration of JIT execution. The pointer is only dereferenced inside JIT helpers
 /// which execute on the same thread that set it.
 pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
+    // Shadow-stack precise roots (CRATONVM_SHADOW_STACK): ensure this thread's
+    // shadow stack is allocated before any JIT code that may push to it runs.
+    // Cheap `base != 0` check after the first entry; gated, no-op otherwise.
+    // Done here (with a legitimate `&mut JvmThread`) rather than in the extern-C
+    // `jit_get_current_thread` getter to avoid deriving an aliasing `&mut`.
+    if crate::jit::conservative_roots::shadow_stack_enabled() {
+        thread.shadow_stack.ensure_allocated();
+        if std::env::var_os("CRATONVM_DBG_SHADOW").is_some() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static ONCE: AtomicBool = AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[SHADOW] set_jit_thread: thread={:p} shadow base={:#x} top={:#x} end={:#x} ss_off={}",
+                    thread as *mut JvmThread,
+                    thread.shadow_stack.base,
+                    thread.shadow_stack.top,
+                    thread.shadow_stack.end,
+                    JvmThread::shadow_stack_offset(),
+                );
+            }
+        }
+    }
     let prev_ptr = JIT_THREAD.with(|t| {
         let old = t.get();
         t.set(thread as *mut JvmThread);
@@ -3647,7 +3669,34 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         class_id_offset_in_obj: 0,
         get_current_thread: jit_get_current_thread as *const () as usize,
         tlab_post_init: jit_post_tlab_init as *const () as usize,
+        // Stage 3 (precise oop maps) — only wire the frame-record helper when
+        // the precise gate is on; otherwise leave it 0 so the prologue emits
+        // nothing extra. The JIT also gates emission on its own cached flag,
+        // but keying the pointer on the same env keeps the default build inert.
+        frame_record: if cratonvm_jit::x64::precise_jit_maps_enabled() {
+            jit_frame_record as *const () as usize
+        } else {
+            0
+        },
+        // Shadow-stack precise roots — byte offset of the `ShadowStack` field
+        // from `&JvmThread`. The JIT bakes `[thread + this + ShadowStack::TOP_OFFSET]`
+        // as the inline push target. Always wired (harmless when codegen is off,
+        // which gates emission on its own cached `CRATONVM_SHADOW_STACK` flag).
+        shadow_stack_offset_in_thread: JvmThread::shadow_stack_offset(),
     }
+}
+
+/// Stage 3 (precise oop maps) — record the EXACT RBP of the JIT frame that is
+/// about to run, called once from the JIT prologue (gated on
+/// `CRATONVM_PRECISE_JIT_MAPS`). The Rust-side `JitEntryGuard` pushed a chain
+/// entry just before transferring control to compiled code, but it could only
+/// capture an approximate stack pointer; this fills in the precise frame base
+/// so the GC root walker can address oop-map slots as `[rbp - offset]`.
+///
+/// `extern "C"` with the single `rbp` argument in the platform's first
+/// integer-argument register, matching the JIT's `ARG_REGS[0]` load.
+extern "C" fn jit_frame_record(rbp: usize) {
+    crate::jit::conservative_roots::set_top_frame_base(rbp);
 }
 
 /// T1.1.28 — Math.fma(double, double, double) runtime helper.

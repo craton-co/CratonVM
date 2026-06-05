@@ -44,6 +44,7 @@ pub mod region;
 pub mod satb;
 #[cfg(feature = "gpu-offload")]
 pub mod safepoint;
+pub mod shadow_stack;
 pub mod tlab;
 pub mod vm_heap;
 // Round-7 cross-cutting Fix 4: ZGC stub (1884 LOC) gated behind the `zgc`

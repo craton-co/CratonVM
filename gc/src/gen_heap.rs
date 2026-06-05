@@ -1730,7 +1730,16 @@ impl GenerationalHeap {
         // heap-corruption source. UNSAFE if a JIT frame is genuinely live
         // (relocates JIT-held raw pointers); diagnostic only.
         let force_moving = std::env::var_os("CRATONVM_DBG_FORCE_MOVING").is_some();
-        if crate::gc_quiescence::is_active() && !force_moving {
+        // Shadow-stack precise roots (CRATONVM_SHADOW_STACK): when on, JIT code
+        // maintains a precise, *rewritable* set of all its live oops (operand
+        // stack + locals) on each thread's shadow stack, scanned by the marking
+        // root collector and rewritten by the post-move remap. That removes the
+        // reason the collector must avoid relocation under JIT (a conservatively-
+        // discovered slot that can't be safely rewritten), so the moving Cheney
+        // cycle is allowed to run — and only it can drain a large long-lived
+        // young set (the bintrees18 throughput wall).
+        let shadow_roots = std::env::var_os("CRATONVM_SHADOW_STACK").is_some();
+        if crate::gc_quiescence::is_active() && !force_moving && !shadow_roots {
             tracing::debug!(
                 "JIT frames are active (depth={}) — running non-moving \
                  young-gen mark-sweep (compaction deferred until quiescence \
@@ -2785,6 +2794,19 @@ impl GenerationalHeap {
                 }
             }
 
+            // DBG (CRATONVM_SP_STATS): per-GC pin/evac counts, printed
+            // unconditionally (even when nothing evacuated) so we can confirm
+            // whether selective promotion is actually evacuating at a given
+            // heap size, or whether the only active effect is the free-block
+            // coalescing below.
+            if std::env::var_os("CRATONVM_SP_STATS").is_some() {
+                eprintln!(
+                    "[sp-stats] gc: pinned={} evac={}",
+                    pinned.len(),
+                    evac_map.len(),
+                );
+            }
+
             // DBG (CRATONVM_SP_TRACE): directly test the wrong-address/aliasing
             // hypothesis for the bintrees18 bug. Two young objects copied to
             // OVERLAPPING old-gen destinations (an old_gen.alloc collision) would
@@ -3393,7 +3415,9 @@ impl GenerationalHeap {
         // collapses that region to a handful of spans, restoring near-O(1) bump
         // allocation out of a free block. Gated with the selective-promotion
         // feature so the verified default path is byte-identical.
-        if std::env::var_os("CRATONVM_SELECTIVE_PROMOTE").is_some() {
+        if std::env::var_os("CRATONVM_SELECTIVE_PROMOTE").is_some()
+            && std::env::var_os("CRATONVM_SP_NO_COALESCE").is_none()
+        {
             let sorted = young_from.free_blocks_sorted();
             if sorted.len() > 1 {
                 young_from.clear_free_list();
@@ -3437,6 +3461,10 @@ impl GenerationalHeap {
         );
 
         self.stats.minor_gc_count.fetch_add(1, Ordering::Relaxed);
+
+        if std::env::var_os("CRATONVM_DBG_PRECISE").is_some() && !evac_map.is_empty() {
+            eprintln!("[PRECISE] sweep_young_non_moving returning evac_map.len()={}", evac_map.len());
+        }
 
         (
             GcResult {
