@@ -83,21 +83,35 @@ impl Arena {
                     continue;
                 };
                 if total_needed <= block.size {
-                    // swap_remove keeps this O(1).
-                    let block = self.free_list.swap_remove(i);
                     let alloc_offset = block.offset + padding;
-                    if padding > 0 {
+                    let remaining = block.size - padding - size;
+                    // Perf (Fix A follow-up): the hot case is an 8-aligned request
+                    // (padding == 0) carved off the FRONT of a large coalesced span
+                    // — bintrees' Node churn out of the post-sweep free list. Shrink
+                    // the block IN PLACE (advance offset, reduce size) instead of
+                    // swap_remove + push, so a big span allocates at ~bump speed
+                    // (no per-allocation Vec churn). The general (head-padding) case
+                    // keeps the split-and-reinsert path.
+                    if padding == 0 {
+                        if remaining > 0 {
+                            self.free_list[i].offset = alloc_offset + size;
+                            self.free_list[i].size = remaining;
+                        } else {
+                            self.free_list.swap_remove(i); // span exactly consumed
+                        }
+                    } else {
+                        // swap_remove keeps this O(1).
+                        self.free_list.swap_remove(i);
                         self.free_list.push(FreeBlock {
                             offset: block.offset,
                             size: padding,
                         });
-                    }
-                    let remaining = block.size - padding - size;
-                    if remaining > 0 {
-                        self.free_list.push(FreeBlock {
-                            offset: alloc_offset + size,
-                            size: remaining,
-                        });
+                        if remaining > 0 {
+                            self.free_list.push(FreeBlock {
+                                offset: alloc_offset + size,
+                                size: remaining,
+                            });
+                        }
                     }
                     // SAFETY: `alloc_offset + size <= block.offset + block.size`
                     // and the block came from a region inside the buffer.
