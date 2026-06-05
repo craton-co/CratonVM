@@ -1823,6 +1823,11 @@ unsafe fn jit_typecheck_resolve(
     if crate::runtime::interpreter::synthetic_implements_public(vm, obj_class_id, class_name) {
         return true;
     }
+    // Instance-aware annotation-proxy admission (the proxy's real annotation
+    // type lives on the heap object, not its shared ClassId).
+    if crate::runtime::interpreter::annotation_proxy_satisfies_target(vm, obj_ref, class_name) {
+        return true;
+    }
 
     // Array fallback: arrays with class_id 0 (e.g. from Array.newInstance via JIT)
     // lack class hierarchy entries.  Any reference array is assignable to
