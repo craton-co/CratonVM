@@ -6169,10 +6169,33 @@ fn native_opt_or_else_throw_supplier(
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
     if matches!(val, Value::Object(None)) {
-        Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
-            message: "No value present".to_string(),
+        // Empty Optional → `throw exceptionSupplier.get()` (NOT the default
+        // NoSuchElementException). The previous code ignored the supplier and
+        // always threw "No value present", so callers relying on a custom
+        // exception type/message saw the wrong throwable — e.g. Elasticsearch
+        // `ProviderLocator` does `ServiceLoader.findFirst().orElseThrow(supplier)`
+        // and surfaced a bare NoSuchElementException instead of the intended
+        // provider-not-found error.
+        match args.get(1) {
+            Some(Value::Object(Some(supplier))) => {
+                let produced =
+                    ctx.invoke_virtual(*supplier, "get", "()Ljava/lang/Object;", &[])?;
+                match produced {
+                    Some(Value::Object(Some(exc))) => {
+                        Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
+                    }
+                    // supplier returned null → `throw null` is an NPE.
+                    _ => Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                        message: None,
+                    }
+                    .into()),
+                }
+            }
+            // null supplier → invoking get() on it is an NPE.
+            _ => Err(
+                cratonvm_types::error::RuntimeError::NullPointerException { message: None }.into(),
+            ),
         }
-        .into())
     } else {
         Ok(Some(val))
     }
