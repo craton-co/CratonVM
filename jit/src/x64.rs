@@ -9265,10 +9265,42 @@ impl Compiler {
 
         let mut cpc: usize = 0;
         let save_spill = self.next_spill_offset;
+        // Operand-stack depth belonging to the CALLER; the callee's operands
+        // sit above it. The callee operand stack is "empty" exactly when
+        // `self.stack.len() == caller_base_depth`.
+        let caller_base_depth = self.stack.len();
+        // Callee branch targets (merge points). Branchy callees inline only
+        // when every merge has an EMPTY callee operand stack (enforced by the
+        // merge-point reset below + the per-branch checks). 419a6f5 blanket-
+        // bailed ALL branches to stop a value-merge slot desync (the
+        // `iconst_1; goto L; iconst_0; L: ireturn` diamond); this restores the
+        // provably-safe subset (e.g. `x>=0?x:-x`) while still bailing diamonds.
+        let callee_branch_targets = compute_branch_targets(callee_code, callee_len);
+        // True after an instruction that does NOT fall through (goto/return/
+        // athrow) so the merge-point check can distinguish a dead fall-through
+        // (stale slots — safe to reset) from a live value-merge (must bail).
+        let mut prev_was_terminator = false;
 
         while cpc < callee_len {
             callee_pc_to_native[cpc] = self.buf.pos() as i64; // Cast: address arithmetic
             let op = callee_code[cpc];
+
+            // Merge-point handling: at a branch target the callee operand
+            // stack must be the canonical empty state (caller_base_depth). A
+            // live path arriving with a value is a value-producing merge the
+            // spill-slot model can't represent soundly -> bail. A dead fall-
+            // through (previous instr was a terminator) only left stale slots;
+            // reset them so the target starts from the empty state every
+            // branch into it also guarantees (branches require empty stack).
+            if callee_branch_targets.get(cpc).copied().unwrap_or(false) {
+                if !prev_was_terminator && self.stack.len() != caller_base_depth {
+                    self.next_spill_offset = callee_local_base;
+                    return false;
+                }
+                self.stack.truncate(caller_base_depth);
+                self.stack_oop_marks.truncate(caller_base_depth);
+                self.next_spill_offset = save_spill;
+            }
 
             match op {
                 // nop
@@ -9853,38 +9885,84 @@ impl Compiler {
                     cpc += 1;
                 }
 
-                // ifeq..ifle (0x99..0x9e) — internal control flow: BAIL.
+                // ifeq..ifle (0x99..0x9e) — conditional branch on <cmp> 0.
                 //
-                // Inlining a callee with internal branches is unsound in this
-                // single linear-pass emitter: operand-stack slots are handed
-                // out by a *growing* `next_spill_offset` (see `push_stack`),
-                // not indexed by stack depth. At a control-flow merge the two
-                // incoming paths therefore (a) hold the merged operand in
-                // different frame slots and (b) leave the linear-pass stack
-                // model with stray entries. The canonical trigger is the
-                // diamond javac emits for `return <cond>`
-                // (`iconst_1; goto L; iconst_0; L: ireturn`): one path reads
-                // the return value from a slot it never wrote (garbage), and
-                // the caller's operand-stack model desyncs by one slot, which
-                // later stores through a bogus frame offset and SIGSEGVs
-                // (observed: Modifier.isStatic / any small `(arg & k)!=0`
-                // predicate hot-inlined into a loop). Bail to the normal,
-                // correct call path; straight-line callees still inline.
+                // Restored (419a6f5 blanket-bailed all branches). Inlining a
+                // branchy callee is sound in this single-linear-pass emitter
+                // ONLY when no operand is live across a merge: operand-stack
+                // slots are handed out by a growing `next_spill_offset`, so two
+                // paths reaching a merge with a value would hold it in
+                // different frame slots (the `iconst_1; goto L; iconst_0; L:
+                // ireturn` diamond — the bug 419a6f5 fixed). We therefore
+                // require the callee operand stack to be EMPTY after the branch
+                // pops its operands (here) AND at every target (the merge-point
+                // reset at the loop top); any value-merge bails. Forward
+                // branches only — backward edges (loops) re-enter an already-
+                // emitted target whose slot layout we can't re-canonicalise.
                 0x99..=0x9e => {
-                    self.next_spill_offset = callee_local_base;
-                    return false;
+                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
+                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    self.pop_to_rax();
+                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    self.buf.emit(&[0x85, 0xC0]); // TEST EAX, EAX
+                    let cc = match op {
+                        0x99 => 0x84u8, // JE
+                        0x9a => 0x85,   // JNE
+                        0x9b => 0x8C,   // JL
+                        0x9c => 0x8D,   // JGE
+                        0x9d => 0x8F,   // JG
+                        0x9e => 0x8E,   // JLE
+                        _ => unreachable!(),
+                    };
+                    self.buf.emit(&[0x0F, cc]);
+                    let patch_off = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    branch_patches.push((patch_off, target));
+                    cpc += 3;
                 }
 
-                // if_icmpeq..if_icmple — internal control flow: BAIL (see 0x99 note).
+                // if_icmpeq..if_icmple (0x9f..0xa4) — int compare branch. Same
+                // empty-stack-at-merge safety as 0x99..0x9e above.
                 0x9f..=0xa4 => {
-                    self.next_spill_offset = callee_local_base;
-                    return false;
+                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
+                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    let top = self.pop_stack();
+                    self.pop_to_rax();
+                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    self.load_slot_to_reg(RCX, top);
+                    self.buf.emit(&[0x39, 0xC8]); // CMP EAX, ECX
+                    let cc = match op {
+                        0x9f => 0x84u8, // JE
+                        0xa0 => 0x85,   // JNE
+                        0xa1 => 0x8C,   // JL
+                        0xa2 => 0x8D,   // JGE
+                        0xa3 => 0x8F,   // JG
+                        0xa4 => 0x8E,   // JLE
+                        _ => unreachable!(),
+                    };
+                    self.buf.emit(&[0x0F, cc]);
+                    let patch_off = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    branch_patches.push((patch_off, target));
+                    cpc += 3;
                 }
 
-                // goto — internal control flow: BAIL (see 0x99 note).
+                // goto (0xa7) — unconditional forward branch. Same safety.
                 0xa7 => {
-                    self.next_spill_offset = callee_local_base;
-                    return false;
+                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
+                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    self.buf.emit_byte(0xE9); // JMP rel32
+                    let patch_off = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    branch_patches.push((patch_off, target));
+                    cpc += 3;
                 }
 
                 // ireturn, lreturn, areturn, freturn, dreturn
@@ -10052,16 +10130,41 @@ impl Compiler {
                     cpc += 3;
                 }
 
-                // if_acmpeq/if_acmpne — internal control flow: BAIL (see 0x99 note).
+                // if_acmpeq/if_acmpne (0xa5/0xa6) — reference compare branch.
+                // Same empty-stack-at-merge safety as 0x99..0x9e.
                 0xa5 | 0xa6 => {
-                    self.next_spill_offset = callee_local_base;
-                    return false;
+                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
+                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    let top = self.pop_stack();
+                    self.pop_to_rax();
+                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    self.load_slot_to_reg(RCX, top);
+                    self.rex_w(); self.buf.emit(&[0x39, 0xC8]); // CMP RAX, RCX
+                    let cc = if op == 0xa5 { 0x84u8 } else { 0x85 }; // JE / JNE
+                    self.buf.emit(&[0x0F, cc]);
+                    let patch_off = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    branch_patches.push((patch_off, target));
+                    cpc += 3;
                 }
 
-                // ifnull/ifnonnull — internal control flow: BAIL (see 0x99 note).
+                // ifnull/ifnonnull (0xc6/0xc7) — null-compare branch. Same safety.
                 0xc6 | 0xc7 => {
-                    self.next_spill_offset = callee_local_base;
-                    return false;
+                    if cpc + 2 >= callee_len { self.next_spill_offset = callee_local_base; return false; }
+                    let offset = i16::from_be_bytes([callee_code[cpc + 1], callee_code[cpc + 2]]) as i32; // Widening: always safe
+                    let target = (cpc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
+                    if target <= cpc { self.next_spill_offset = callee_local_base; return false; }
+                    self.pop_to_rax();
+                    if self.stack.len() != caller_base_depth { self.next_spill_offset = callee_local_base; return false; }
+                    self.rex_w(); self.buf.emit(&[0x85, 0xC0]); // TEST RAX, RAX
+                    let cc = if op == 0xc6 { 0x84u8 } else { 0x85 }; // JE / JNE
+                    self.buf.emit(&[0x0F, cc]);
+                    let patch_off = self.buf.pos();
+                    self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+                    branch_patches.push((patch_off, target));
+                    cpc += 3;
                 }
 
                 // Unsupported opcode in inline context — bail out
@@ -10071,6 +10174,12 @@ impl Compiler {
                     return false;
                 }
             }
+
+            // For the next iteration's merge-point check: goto (0xa7) and the
+            // returns (0xac..=0xb1) jump away, so the following PC is reachable
+            // only as a branch target (a dead fall-through whose stale slots
+            // the merge-point reset may clear). Everything else falls through.
+            prev_was_terminator = matches!(op, 0xa7 | 0xac..=0xb1);
         }
 
         // Mark the "after inline" position for return-jumps
@@ -27032,6 +27141,43 @@ mod tests {
             assert_eq!(compiled.try_call(&[5]).expect("test JIT call"), 5);
             assert_eq!(compiled.try_call(&[-5i32 as i64]).expect("test JIT call"), 5); // Cast: JIT ABI convention
             assert_eq!(compiled.try_call(&[0]).expect("test JIT call"), 0);
+        }
+    }
+
+    #[test]
+    fn s31_inline_with_if_icmp() {
+        // Callee: int max(int a, int b) { return a >= b ? a : b; }
+        // Exercises the restored if_icmp inline path: a forward conditional
+        // branch (if_icmplt) with two return arms and an EMPTY operand stack at
+        // the merge — the provably-safe subset that 419a6f5 over-bailed.
+        let callee_bc: Vec<u8> = vec![
+            0x1a,             // 0: iload_0 (a)
+            0x1b,             // 1: iload_1 (b)
+            0xa1, 0x00, 0x05, // 2: if_icmplt +5 -> 7 (if a<b, return b)
+            0x1a,             // 5: iload_0 (a)
+            0xac,             // 6: ireturn
+            0x1b,             // 7: iload_1 (b)   <- branch target (empty stack)
+            0xac,             // 8: ireturn
+        ];
+        let caller_code: Vec<u8> = vec![
+            0x1a,             // 0: iload_0
+            0x1b,             // 1: iload_1
+            0xb8, 0x00, 0x01, // 2: invokestatic #1
+            0xac,             // 5: ireturn
+            0, 0,
+        ];
+        let caller_len = 6;
+        let callee = make_inline_site(&callee_bc, 2, 2, true, b'I');
+        let mut sites = HashMap::new();
+        sites.insert(2, callee);
+        let compiled = compile_with_inlines(&caller_code, caller_len, 2, 2, sites)
+            .expect("compilation failed");
+        // SAFETY: executing JIT-compiled machine code produced from valid
+        // bytecode; the mmap region is executable.
+        unsafe {
+            assert_eq!(compiled.try_call(&[5, 3]).expect("test JIT call"), 5);
+            assert_eq!(compiled.try_call(&[3, 5]).expect("test JIT call"), 5);
+            assert_eq!(compiled.try_call(&[4, 4]).expect("test JIT call"), 4);
         }
     }
 
