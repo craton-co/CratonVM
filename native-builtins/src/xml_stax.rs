@@ -78,6 +78,12 @@ struct StaxEvent {
     local_name: String,
     /// Element namespace URI (best-effort: prefix's URI from xmlns* attrs).
     namespace_uri: String,
+    /// Element prefix for START/END_ELEMENT ("" when unprefixed / in the
+    /// default namespace). Needed by the event API: `XMLEventAllocatorImpl`
+    /// builds `new QName(namespaceURI, localName, prefix)` and the QName ctor
+    /// throws `IllegalArgumentException` on a null prefix, so `getPrefix()`
+    /// must return non-null.
+    prefix: String,
     /// Character / CDATA / comment / DTD payload.
     text: String,
     /// Attribute table for START_ELEMENT events.
@@ -324,11 +330,13 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
                 let start_ev =
                     make_element_event(START_ELEMENT, &name, e.attributes(), &scopes);
                 let ns = start_ev.namespace_uri.clone();
+                let prefix = start_ev.prefix.clone();
                 events.push(start_ev);
                 events.push(StaxEvent {
                     kind: END_ELEMENT,
                     local_name: local_name_of(&name),
                     namespace_uri: ns,
+                    prefix,
                     ..Default::default()
                 });
                 scopes.pop();
@@ -343,6 +351,7 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
                     kind: END_ELEMENT,
                     local_name: local,
                     namespace_uri: ns,
+                    prefix,
                     ..Default::default()
                 });
                 scopes.pop();
@@ -351,7 +360,18 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
                 let raw = e.unescape().map(|c| c.into_owned()).unwrap_or_else(|_| {
                     String::from_utf8_lossy(e.as_ref()).into_owned()
                 });
-                events.push(StaxEvent { kind: CHARACTERS, text: raw, ..Default::default() });
+                // Suppress prolog/epilog whitespace — text that appears OUTSIDE
+                // the root element (scope stack empty). The JDK StAX reader does
+                // not report misc/epilog whitespace as a CHARACTERS event, so
+                // neither do we; this keeps the event stream byte-identical to
+                // HotSpot (the trailing "\n" after the root close was an extra
+                // event). Harmless for the cursor API: its consumers locate
+                // START/END via nextTag(), which skips whitespace anyway.
+                if scopes.frames.is_empty() && raw.trim().is_empty() {
+                    // drop epilog/prolog whitespace
+                } else {
+                    events.push(StaxEvent { kind: CHARACTERS, text: raw, ..Default::default() });
+                }
             }
             Ok(QXmlEvent::CData(e)) => {
                 let s = String::from_utf8_lossy(e.as_ref()).into_owned();
@@ -405,7 +425,13 @@ fn make_element_event(
     let (el_prefix, local) = split_qname(qname);
     // Resolve the element's namespace from its prefix (default ns when none).
     let el_ns = scopes.resolve(&el_prefix);
-    let mut ev = StaxEvent { kind, local_name: local, namespace_uri: el_ns, ..Default::default() };
+    let mut ev = StaxEvent {
+        kind,
+        local_name: local,
+        namespace_uri: el_ns,
+        prefix: el_prefix,
+        ..Default::default()
+    };
     for a in attrs.flatten() {
         let key = a.key.as_ref().to_vec();
         let val = a
@@ -648,6 +674,174 @@ fn native_create_reader_from_reader(
     let reader = alloc_synthetic(ctx, "javax/xml/stream/XMLStreamReader")?;
     store_state(ctx, reader, ReaderState { events, cursor: 0 });
     Ok(Some(Value::Object(Some(reader))))
+}
+
+// ---------------------------------------------------------------------------
+// Event API (`createXMLEventReader`).
+//
+// `XMLInputFactory` is abstract and `newInstance()` returns a synthetic
+// instance of it, so without these natives `createXMLEventReader` dispatches to
+// the abstract method and raises `AbstractMethodError: ... has no Code
+// attribute`. We build the same cursor reader as the stream API, then wrap it
+// in the REAL JDK `com.sun.xml.internal.stream.XMLEventReaderImpl` so the JDK's
+// own event-model classes (`StartElementEvent`, `AttributeImpl`,
+// `CharacterEvent`, …) are reused — no native event object model needed.
+// ---------------------------------------------------------------------------
+
+/// Build a synthetic cursor `XMLStreamReader` over the parsed events of `bytes`.
+fn make_cursor_reader(
+    ctx: &mut dyn NativeContext,
+    bytes: &[u8],
+) -> Result<ObjectRef, MethodCallFailed> {
+    let events = parse_to_events(bytes);
+    let reader = alloc_synthetic(ctx, "javax/xml/stream/XMLStreamReader")?;
+    store_state(ctx, reader, ReaderState { events, cursor: 0 });
+    Ok(reader)
+}
+
+/// Drain a `java.io.Reader` into a String, char-at-a-time (small XML payloads).
+fn drain_reader_to_string(ctx: &mut dyn NativeContext, reader_in: ObjectRef) -> String {
+    let mut text = String::new();
+    loop {
+        let res = ctx.invoke("java/io/Reader", "read", "()I", &[Value::Object(Some(reader_in))]);
+        match res {
+            Ok(Some(Value::Int(-1))) => break,
+            Ok(Some(Value::Int(c))) => {
+                if let Some(ch) = char::from_u32(c as u32) {
+                    text.push(ch);
+                }
+            }
+            _ => break,
+        }
+        if text.len() > 64 * 1024 * 1024 {
+            break;
+        }
+    }
+    text
+}
+
+/// Wrap a synthetic cursor reader in the real JDK `XMLEventReaderImpl` adapter.
+/// `new_object_initialized` pins the wrapper across its `<init>` (which
+/// allocates the default `XMLEventAllocatorImpl` and the first event); `cursor`
+/// is rooted as an `<init>` argument and its ReaderState side-table entry is
+/// keyed by GC-stable identity hash, so a collection during construction is safe.
+fn wrap_in_event_reader(ctx: &mut dyn NativeContext, cursor: ObjectRef) -> MethodCallResult {
+    ctx.new_object_initialized(
+        "com/sun/xml/internal/stream/XMLEventReaderImpl",
+        "(Ljavax/xml/stream/XMLStreamReader;)V",
+        &[Value::Object(Some(cursor))],
+    )
+}
+
+fn native_create_event_reader_from_input_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let stream = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException {
+                    message: Some("createXMLEventReader: null InputStream".to_string()),
+                },
+            )))
+        }
+    };
+    let bytes = drain_input_stream(ctx, stream);
+    let cursor = make_cursor_reader(ctx, &bytes)?;
+    wrap_in_event_reader(ctx, cursor)
+}
+
+fn native_create_event_reader_from_input_stream_enc(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // (InputStream, String encoding) — encoding advisory; reuse the 1-arg path.
+    native_create_event_reader_from_input_stream(ctx, args)
+}
+
+fn native_create_event_reader_from_reader(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let reader_in = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException {
+                    message: Some("createXMLEventReader: null Reader".to_string()),
+                },
+            )))
+        }
+    };
+    let text = drain_reader_to_string(ctx, reader_in);
+    let cursor = make_cursor_reader(ctx, text.as_bytes())?;
+    wrap_in_event_reader(ctx, cursor)
+}
+
+/// `XMLStreamReader.getPrefix()` — current element's prefix ("" when
+/// unprefixed). Previously hard-coded to null, which made the event-API
+/// `XMLEventAllocatorImpl.getQName` (`new QName(ns, local, prefix)`) throw
+/// `IllegalArgumentException` on the null prefix.
+fn native_get_prefix(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    current_string(ctx, args, |e| e.prefix.clone())
+}
+
+/// `XMLStreamReader.getProperty(String)` — the event allocator and the
+/// `XMLEventReaderImpl` ctor probe a couple of StAX properties. Report
+/// non-namespace-aware (`Boolean.FALSE`) so the allocator skips its
+/// namespace-context path (which casts `getNamespaceContext()` to the internal
+/// Xerces `NamespaceContextWrapper` we cannot synthesize). Element QNames still
+/// carry their namespace via `getNamespaceURI()`, so JAXB binds by QName and the
+/// (null) event namespace context is tolerated by `UnmarshallingContext` (every
+/// use is ifnull-guarded). All other properties (notably `ALLOCATOR`) report
+/// null, so the ctor defaults to a fresh `XMLEventAllocatorImpl`.
+fn native_get_property(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let name = match args.get(1) {
+        Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
+        _ => String::new(),
+    };
+    if name == "javax.xml.stream.isNamespaceAware" {
+        return ctx.invoke(
+            "java/lang/Boolean",
+            "valueOf",
+            "(Z)Ljava/lang/Boolean;",
+            &[Value::Int(0)],
+        );
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+/// `XMLStreamReader.getAttributeType(int)` — StAX reports "CDATA" for an
+/// ordinary (non-DTD-typed) attribute. The allocator's `fillAttributes` calls
+/// this for every attribute.
+fn native_get_attribute_type(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(Some(Value::Object(Some(ctx.create_string("CDATA")))))
+}
+
+/// `XMLStreamReader.isAttributeSpecified(int)` — our reader only surfaces
+/// attributes literally present in the source, so each one is "specified".
+fn native_is_attribute_specified(
+    _ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    Ok(Some(Value::Int(1)))
+}
+
+/// `XMLStreamReader.getPITarget()` — leading token of a PROCESSING_INSTRUCTION
+/// payload (we store the whole PI text in `local_name`).
+fn native_get_pi_target(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    current_string(ctx, args, |e| {
+        e.local_name.split_whitespace().next().unwrap_or("").to_string()
+    })
+}
+
+/// `XMLStreamReader.getPIData()` — PI payload after the target token.
+fn native_get_pi_data(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    current_string(ctx, args, |e| match e.local_name.split_once(char::is_whitespace) {
+        Some((_, data)) => data.trim_start().to_string(),
+        None => String::new(),
+    })
 }
 
 fn native_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -911,6 +1105,29 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         native_create_reader_from_reader,
     );
 
+    // Event API entry points — wrap the cursor reader in the real JDK
+    // XMLEventReaderImpl. Without these, the abstract `createXMLEventReader`
+    // raised AbstractMethodError (our synthetic factory has no Code attribute
+    // for it), blocking JAXB unmarshalling from an XMLEventReader.
+    registry.register(
+        "javax/xml/stream/XMLInputFactory",
+        "createXMLEventReader",
+        "(Ljava/io/InputStream;)Ljavax/xml/stream/XMLEventReader;",
+        native_create_event_reader_from_input_stream,
+    );
+    registry.register(
+        "javax/xml/stream/XMLInputFactory",
+        "createXMLEventReader",
+        "(Ljava/io/InputStream;Ljava/lang/String;)Ljavax/xml/stream/XMLEventReader;",
+        native_create_event_reader_from_input_stream_enc,
+    );
+    registry.register(
+        "javax/xml/stream/XMLInputFactory",
+        "createXMLEventReader",
+        "(Ljava/io/Reader;)Ljavax/xml/stream/XMLEventReader;",
+        native_create_event_reader_from_reader,
+    );
+
     // Reader cursor methods (interface-keyed; native dispatch matches on
     // the receiver's declared class which is XMLStreamReader for our
     // synthetic objects).
@@ -1067,13 +1284,45 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "javax/xml/stream/XMLStreamReader",
         "getPrefix",
         "()Ljava/lang/String;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        native_get_prefix,
     );
     registry.register(
         "javax/xml/stream/XMLStreamReader",
         "getNamespaceCount",
         "()I",
         |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
+    // Event-API support: XMLEventReaderImpl's ctor + XMLEventAllocatorImpl call
+    // these on the wrapped cursor reader while building XMLEvent objects.
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        native_get_property,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getAttributeType",
+        "(I)Ljava/lang/String;",
+        native_get_attribute_type,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "isAttributeSpecified",
+        "(I)Z",
+        native_is_attribute_specified,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getPITarget",
+        "()Ljava/lang/String;",
+        native_get_pi_target,
+    );
+    registry.register(
+        "javax/xml/stream/XMLStreamReader",
+        "getPIData",
+        "()Ljava/lang/String;",
+        native_get_pi_data,
     );
     registry.register(
         "javax/xml/stream/XMLStreamReader",
