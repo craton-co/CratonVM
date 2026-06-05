@@ -763,7 +763,129 @@ pub fn register_file_channel_real(r: &mut NativeMethodRegistry) {
     r.register(fci, "transferTo0", "(IJJIZ)J", native_fc_transfer_to0);
     r.register(fci, "transferTo0", "(IJJI)J", native_fc_transfer_to0);
     r.register(fci, "maxDirectTransferSize0", "()I", native_fc_max_direct_transfer_size0);
+    // sun/nio/ch/FileKey.init — the file-identity triple used by FileLockTable.
+    // A missing native here is an UnsatisfiedLinkError on the FIRST file-backed
+    // DB open (H2 `SingleFileStore.lockFileChannel` -> `FileChannelImpl.tryLock`
+    // -> `FileKey.create`), so it blocks every persistent H2 database.
+    r.register(
+        "sun/nio/ch/FileKey",
+        "init",
+        "(Ljava/io/FileDescriptor;[I)V",
+        native_filekey_init,
+    );
     r.set_category(__prev_cat);
+}
+
+// ---------------------------------------------------------------------------
+// sun/nio/ch/FileKey.init — file-identity triple for FileLockTable
+// ---------------------------------------------------------------------------
+//
+// `FileKey.create(fd)` allocates `int[3]`, calls the native
+// `init(FileDescriptor, int[])` to fill it, then builds `FileKey(dwVol,
+// idxHigh, idxLow)`. `FileLockTable` keys live locks by this triple so two
+// `FileChannel`s onto the SAME file are detected as overlapping within one JVM
+// (`FileKey.equals`/`hashCode` compare all three ints).
+//
+// Without the native, real-JDK `FileKey.init` is unresolved ->
+// `UnsatisfiedLinkError` -> every file-backed DB open fails (H2's persistent
+// `org.h2.test.TestAll` passes, `TestScript`, etc.). Windows fills the triple
+// from `GetFileInformationByHandle` (the OS file identity). Unix maps
+// `st_dev`/`st_ino` onto the three ints. If the OS query fails we fall back to
+// the fd id so `init` is infallible (never throws): the lock table then
+// degrades to per-open identity, correct for the common single-open case.
+
+#[cfg(windows)]
+mod win_fileid {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Filetime {
+        pub dw_low_date_time: u32,
+        pub dw_high_date_time: u32,
+    }
+
+    /// Mirror of Win32 `BY_HANDLE_FILE_INFORMATION` (ABI-fixed field order).
+    #[repr(C)]
+    pub struct ByHandleFileInformation {
+        pub dw_file_attributes: u32,
+        pub ft_creation_time: Filetime,
+        pub ft_last_access_time: Filetime,
+        pub ft_last_write_time: Filetime,
+        pub dw_volume_serial_number: u32,
+        pub n_file_size_high: u32,
+        pub n_file_size_low: u32,
+        pub n_number_of_links: u32,
+        pub n_file_index_high: u32,
+        pub n_file_index_low: u32,
+    }
+
+    // Hand-declared FFI (same convention as `pipe.rs` — avoids pulling in a
+    // `windows-sys` dependency for a single symbol).
+    #[link(name = "Kernel32")]
+    extern "system" {
+        pub fn GetFileInformationByHandle(
+            h_file: *mut c_void,
+            lp_file_information: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+}
+
+/// Resolve the `(dwVolumeSerialNumber, nFileIndexHigh, nFileIndexLow)` identity
+/// triple for an open fd. Falls back to the fd id; never fails.
+fn file_identity_triple(ctx: &mut dyn NativeContext, fd: FdId) -> (u32, u32, u32) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        if let Ok(file) = ctx.fd_table().clone_file(fd) {
+            // SAFETY: `info` is POD; the OS fully writes it on success and we
+            // only read it when the call returns non-zero. `as_raw_handle`
+            // yields a live OS handle owned by `file` for the call's duration.
+            let mut info: win_fileid::ByHandleFileInformation = unsafe { std::mem::zeroed() };
+            let ok = unsafe {
+                win_fileid::GetFileInformationByHandle(file.as_raw_handle() as *mut _, &mut info)
+            };
+            if ok != 0 {
+                return (
+                    info.dw_volume_serial_number,
+                    info.n_file_index_high,
+                    info.n_file_index_low,
+                );
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(file) = ctx.fd_table().clone_file(fd) {
+            if let Ok(md) = file.metadata() {
+                let ino = md.ino();
+                return (md.dev() as u32, (ino >> 32) as u32, ino as u32);
+            }
+        }
+    }
+    // OS query failed (or an unknown platform): a per-open identity keyed on the
+    // fd id keeps `init` infallible.
+    (fd as u32, 0, fd as u32)
+}
+
+/// `sun/nio/ch/FileKey.init(FileDescriptor fd, int[] result)` — fill
+/// `result[0..3]` with the file-identity triple. See the module comment above.
+fn native_filekey_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let fd_obj = fd_arg(args, 0)?;
+    let arr = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Err(io_error("FileKey.init: null result array")),
+    };
+    let fd = fd_from_descriptor(ctx, fd_obj)
+        .ok_or_else(|| io_error("FileKey.init: FileDescriptor has no open handle"))?;
+    let (vol, hi, lo) = file_identity_triple(ctx, fd);
+    if ctx.array_length(arr) >= 3 {
+        ctx.set_array_element(arr, 0, Value::Int(vol as i32));
+        ctx.set_array_element(arr, 1, Value::Int(hi as i32));
+        ctx.set_array_element(arr, 2, Value::Int(lo as i32));
+    }
+    Ok(None)
 }
 
 /// Variant of `map0` for legacy FileChannelImpl signatures where
