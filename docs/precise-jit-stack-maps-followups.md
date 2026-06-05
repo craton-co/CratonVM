@@ -1,11 +1,49 @@
 # Shadow-stack precise JIT roots — follow-ups
 
-Status as of 2026-06-05 (merged to dev): the shadow stack **works** — with
-`CRATONVM_SHADOW_STACK=1` the moving collector runs under JIT and precisely
-relocates JIT-held oops, so **bt10=135854, bt16=14985902, bt18=67674804 are all
-golden** and bt18 drains young (~21.5 s). The gate is **default-OFF** and the
-default path is byte-identical. Background + the two fixed crash root causes are
-in `docs/precise-jit-stack-maps-findings.md`.
+## ⚠⚠ GROUND-TRUTH CORRECTION (2026-06-05) — the bt18 "golden" was WRONG
+
+**HotSpot ground truth: `bintrees18 = 68332206`, NOT 67674804.** Verified three
+independent ways: real `java -cp bench BenchSuite bintrees18` → 68332206; closed-
+form hand arithmetic of the benchmark → 68332206; and CratonVM
+`CRATONVM_SELECTIVE_PROMOTE=1` → 68332206. `bt10/14/16` HotSpot values DO match
+their recorded goldens (135854 / 3222190 / 14985902) — **only bt18's golden was
+mis-recorded.** Someone recorded CratonVM's own buggy under-count (67674804) as
+"golden" without cross-checking HotSpot, and the whole saga inherited it.
+
+Consequences (this inverts much of the prior framing — including this doc's old
+header below and `findings.md`):
+- **`CRATONVM_SHADOW_STACK=1` → bt18 = 67674804 is WRONG** (a 657402 under-count).
+  The shadow stack fixes bt18's *throughput* (drains young) but **not its
+  correctness** — it merely reproduces the pre-existing default under-count.
+- **`CRATONVM_SELECTIVE_PROMOTE=1` → 68332206 is CORRECT**, not "the bug." It was
+  mislabeled. (It does break back to 67674804 when combined with the shadow gate.)
+- **The real bug = the young *moving* GC (shadow Cheney / `DBG_FORCE_MOVING`)
+  prematurely RECLAIMS live `make`/`check` tree nodes** (incomplete precise
+  rooting and/or the old→young remembered set). Proof it's reclamation, not
+  codegen: with **no GC** (`--Xmx 32g`, 0 collections) every config — shadow,
+  shadow+OSR-track — yields the correct **68332206**. `selective-promote` avoids
+  it by promoting survivors to old gen.
+- **§1 OSR-tracking is a *partial correctness fix*, not a regression.** It moves
+  bt18 67674804 → **68199090** (toward the true 68332206) by rooting binaryTrees'
+  `longLived` + spine, so fewer live nodes are reclaimed. The earlier
+  "regresses bt18 / deeper to-space-copy bug" framing is WRONG: the JIT codegen
+  (incl. OSR track) is sound (no-GC = correct), and there is **no to-space
+  corruption** — it's GC reclamation, the project's long-standing register-
+  invisibility problem, now correctly *targeted at 68332206*.
+
+**Open:** make the young moving GC retain all live nodes → bt18 = 68332206 with
+the shadow stack (complete rooting and/or remembered-set fix), or adopt
+selective-promote as the moving-under-JIT policy. Until then NO shadow config is
+*correct* for bt18 (all under-count); they only differ in how much.
+
+---
+
+(Superseded header, kept for context) Status as of 2026-06-05 (merged to dev):
+the shadow stack "works" — with `CRATONVM_SHADOW_STACK=1` the moving collector
+runs under JIT and precisely relocates JIT-held oops, so bt10=135854,
+bt16=14985902, bt18=67674804 "are all golden" and bt18 drains young (~21.5 s).
+**The bt18=67674804 claim is now known WRONG — see the correction above.** The
+gate is default-OFF and the default path is byte-identical.
 
 These are the remaining items before the mechanism can be trusted broadly and
 turned on by default, roughly in priority order.
@@ -41,25 +79,23 @@ even at baseline, a separate large-heap/promotion confound):**
   they never actually exercise OSR tracking under a move); bt18 = **68199090**
   (wrong), rc=0 (no crash).
 
-**Why gated (the deeper bug, NOT an OSR-mechanism bug):** `DBG_SHADOW` shows the
-track path adds **exactly +1** remapped oop per GC (38→39, 57→58) — the OSR'd
-`binaryTrees`'s `longLivedTree` root. Remapping it makes `check()` read
-`longLivedTree`'s **to-space** (evacuated) copy instead of the from-space copy
-that *every* golden config relies on (SKIP-shadow and `DBG_FORCE_MOVING` both
-leave binaryTrees' frame un-remapped). The to-space copy is **structurally wrong**
-at bt18's depth-18 scale specifically under the shadow×conservative **mix**:
-`FORCE_MOVING` (uniform moving, all-conservative) evacuates the same tree
-**correctly** (golden 67674804), so pure moving is fine — the inconsistency is a
-copying-collector-with-pinning problem (a moved object whose subtree contains
-conservatively-pinned interior nodes), i.e. the same "unresolved interaction"
-flagged in `precise-jit-stack-maps-design.md`. It is out of scope for the OSR
-trampoline and must be root-caused in the collector (gen_heap evacuation / pin
-handling) before OSR tracking — or default-on (§6) — is safe.
+**Why still gated (corrected — see the GROUND-TRUTH CORRECTION at the top):**
+68199090 is **not** a regression — it is *closer to the true 68332206* than the
+shadow gate's 67674804. `DBG_SHADOW` shows the track path adds **+1** marked/
+remapped oop per GC (the OSR'd `binaryTrees`'s `longLived` + spine), which lets
+~524k more live nodes survive a young GC instead of being prematurely reclaimed.
+The original "track reads a structurally-wrong to-space copy / collector
+pinning bug" theory is **REFUTED**: with no GC (`--Xmx 32g`) track yields the
+correct 68332206, so the codegen is sound and there is no to-space corruption.
+It stays default-OFF only because it is still a *partial* fix (68199090, not the
+true 68332206) and carries the §5 push/reload overhead — not because it regresses
+anything.
 
-**Next for this item:** root-cause the to-space evacuation inconsistency under the
-shadow×conservative mix (compare a TRACK-mode GC's to-space `longLivedTree` against
-the from-space original; instrument evac of an object that is also conservatively
-pinned). Until then `CRATONVM_SHADOW_OSR_TRACK` stays default-OFF.
+**Next for this item:** close the remaining under-count so the shadow stack (with
+OSR track) reaches **68332206** — i.e. root *every* live `make`/`check` node under
+the young moving GC (the remaining missed roots, ~133116 worth, after track),
+and/or fix the old→young remembered set that `selective-promote` sidesteps. Once
+bt18 = 68332206 with the gate on, OSR track can be default-on.
 
 ## 2. Regression pool (correctness, before default-on) — DONE (18/18 PASS)
 
