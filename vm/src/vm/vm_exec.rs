@@ -943,6 +943,53 @@ impl<'a> NativeContextImpl<'a> {
         *self.shared.main_thread_group.write() = Some(tg);
         Some(tg)
     }
+
+    /// Seed `Thread.interruptLock` with a fresh `Object` if the slot is not
+    /// already a reference. Real `java.lang.Thread` declares
+    /// `final Object interruptLock = new Object();` as a field initializer in
+    /// the `Thread(ThreadGroup,String,int,Runnable,long)` constructor, but that
+    /// complex ctor does not run to completion for app-created threads in our
+    /// VM, leaving the slot at its zero default (which reads back as `Int(0)`,
+    /// not `Object(None)`, because `alloc_object` zeroes every slot regardless
+    /// of declared type). `Thread.blockedOn(Interruptible)` does
+    /// `synchronized (interruptLock)` on EVERY `AbstractInterruptibleChannel`
+    /// begin/end (every FileChannel / SocketChannel op), so a null lock makes
+    /// `monitorenter` throw NPE and takes down the interruptible-channel
+    /// subsystem — e.g. H2's MVStore background writer on a file database.
+    /// Idempotent: a no-op once the slot holds a real reference. Resolves the
+    /// field through the receiver's own class hierarchy, so it works for Thread
+    /// subclasses (BackgroundWriterThread, ForkJoinWorkerThread, …) too.
+    pub(crate) fn ensure_thread_interrupt_lock(&mut self, thread_obj: ObjectRef) {
+        let class_id = self.shared.heap.class_id_of(thread_obj);
+        let slot = {
+            let cm = self.shared.class_manager.read();
+            resolve_field_index_in_hierarchy(class_id, "interruptLock", &cm.class_store)
+        };
+        let Some(slot) = slot else { return };
+        if matches!(
+            self.shared.heap.get_field(thread_obj, slot),
+            Value::Object(Some(_))
+        ) {
+            return;
+        }
+        let obj_class = {
+            let cm = self.shared.class_manager.read();
+            cm.get_loaded_class_id("java/lang/Object")
+        }
+        .or_else(|| {
+            self.shared
+                .class_manager
+                .write()
+                .load_class("java/lang/Object")
+                .ok()
+        });
+        if let Some(obj_class) = obj_class {
+            let lock = self.shared.heap.alloc_object(obj_class, 0);
+            self.shared
+                .heap
+                .set_field(thread_obj, slot, Value::Object(Some(lock)));
+        }
+    }
 }
 
 impl<'a> NativeContext for NativeContextImpl<'a> {
@@ -2529,6 +2576,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .thread_registry
             .set_interrupted_flag(tid, pre_interrupted.clone());
 
+        // Seed `Thread.interruptLock` on the child's Thread object before it
+        // runs: its AbstractInterruptibleChannel begin/end path calls
+        // `Thread.blockedOn` -> `synchronized (interruptLock)`, which NPEs on a
+        // null lock. Real `Thread.<init>` sets this, but the complex ctor the
+        // field-initializer lives in does not run to completion for app-created
+        // threads in our VM (e.g. H2 MVStore's background writer on a file DB).
+        self.ensure_thread_interrupt_lock(thread_obj);
         let thread_obj_for_spawn = thread_obj;
         // Round-9 misc HIGH fix (audit `round9-misc.md`): this knob sizes the
         // *native Rust stack* for the carrier OS thread that hosts a Java
@@ -2847,52 +2901,12 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                         .set_field(thread_obj, slot, Value::Object(Some(loader)));
                 }
             }
-            // INTERRUPTLOCK: real `java.lang.Thread` declares
-            // `final Object interruptLock = new Object();` as an instance-field
-            // initializer run by `Thread.<init>`. A VM-synthesized Thread object
-            // (the main thread, and any native-spawned thread that first
-            // observes its Thread via this method) never runs `<init>`, so the
-            // slot keeps its zero default (`Int(0)` here — `alloc_object` zeroes
-            // every slot regardless of declared type, so an unset reference
-            // field reads back as `Int(0)`, NOT `Object(None)`).
-            // `Thread.blockedOn(Interruptible)` —
-            // `synchronized (interruptLock) { nioBlocker = b; }` — is invoked by
-            // `AbstractInterruptibleChannel.begin/end` on EVERY FileChannel /
-            // SocketChannel operation; a non-reference lock value makes
-            // `monitorenter` throw NPE and takes down the entire
-            // interruptible-channel subsystem before any I/O native runs. Seed
-            // it with a fresh `Object` unless a real `<init>` already populated
-            // it (threads created by `new Thread(...)` in bytecode run the real
-            // ctor and carry their own lock; this only fills the VM-created gap).
-            let interrupt_lock_slot = {
-                let cm = self.shared.class_manager.read();
-                resolve_field_index_in_hierarchy(class_id, "interruptLock", &cm.class_store)
-            };
-            if let Some(slot) = interrupt_lock_slot {
-                let already_set = matches!(
-                    self.shared.heap.get_field(thread_obj, slot),
-                    Value::Object(Some(_))
-                );
-                if !already_set {
-                    let obj_class = {
-                        let cm = self.shared.class_manager.read();
-                        cm.get_loaded_class_id("java/lang/Object")
-                    }
-                    .or_else(|| {
-                        self.shared
-                            .class_manager
-                            .write()
-                            .load_class("java/lang/Object")
-                            .ok()
-                    });
-                    if let Some(obj_class) = obj_class {
-                        let lock = self.shared.heap.alloc_object(obj_class, 0);
-                        self.shared
-                            .heap
-                            .set_field(thread_obj, slot, Value::Object(Some(lock)));
-                    }
-                }
-            }
+            // INTERRUPTLOCK: seed `Thread.interruptLock` so the real-JDK
+            // `Thread.blockedOn`'s `synchronized (interruptLock)` (driven by
+            // every `AbstractInterruptibleChannel` begin/end) never NPEs on a
+            // VM-synthesized Thread object that never ran `<init>`. See
+            // `ensure_thread_interrupt_lock`.
+            self.ensure_thread_interrupt_lock(thread_obj);
             return thread_obj;
         }
 
