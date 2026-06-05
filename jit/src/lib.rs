@@ -766,6 +766,12 @@ pub struct CompiledMethod {
     pub osr_callee_saved_base: i32,
     /// OSR metadata: offset of VM context pointer in frame.
     pub osr_heap_local_offset: i32,
+    /// Shadow-stack: frame offset (`[rbp - off]`) of the cached thread-pointer
+    /// slot. The OSR trampoline zeroes this (clobber-free) so an OSR-entered
+    /// frame — which bypasses the prologue thread-fetch — has a null slot,
+    /// making the shadow push/reload/epilogue null-guards skip it safely.
+    /// 0 when shadow stack is disabled.
+    pub shadow_thread_slot_off: i32,
     /// Whether the compiled code uses invoke dispatch (needs set_jit_thread + catch_unwind).
     /// Methods with only direct calls can skip this overhead.
     pub has_dispatch: bool,
@@ -894,6 +900,7 @@ impl CompiledMethod {
             osr_frame_size: 0,
             osr_callee_saved_base: 0,
             osr_heap_local_offset: 0,
+            shadow_thread_slot_off: 0,
             has_dispatch: false,
             inlined_methods: Vec::new(),
             deopt_points: Vec::new(),
@@ -931,6 +938,7 @@ impl CompiledMethod {
             osr_frame_size: 0,
             osr_callee_saved_base: 0,
             osr_heap_local_offset: 0,
+            shadow_thread_slot_off: 0,
             has_dispatch: false,
             inlined_methods: Vec::new(),
             deopt_points: Vec::new(),
@@ -1248,6 +1256,7 @@ impl CompiledMethod {
             self.osr_heap_local_offset,
             self.needs_context,
             dead_mask,
+            self.shadow_thread_slot_off,
         )
     }
 }
@@ -1300,6 +1309,7 @@ unsafe fn emit_osr_trampoline(
     heap_local_offset: i32,
     needs_context: bool,
     dead_mask: u64,
+    shadow_thread_slot_off: i32,
 ) -> Option<ExecutableBuffer> {
     use crate::x64::LOCAL_REGS;
 
@@ -1387,6 +1397,22 @@ unsafe fn emit_osr_trampoline(
         tramp.emit_byte(0x89); // MOV r/m64, r64
         tramp.emit_byte(0x85 | ((arg1_reg & 7) << 3));
         tramp.emit(&neg_off.to_le_bytes());
+    }
+
+    // Shadow-stack: zero the cached thread-pointer slot. An OSR entry bypasses
+    // the prologue thread-fetch, so this slot would otherwise hold stale stack
+    // garbage (a non-null value the shadow null-guards can't reject), making the
+    // push/reload/epilogue dereference it → crash. Zeroing it (clobber-free
+    // `MOV qword [rbp-off], 0`, REX.W C7 /0) makes those guards skip this frame:
+    // an OSR-entered frame runs WITHOUT shadow tracking (safe — no crash). Full
+    // OSR-frame tracking (storing the real thread ptr + watermark) is a follow-up.
+    if shadow_thread_slot_off != 0 {
+        let neg_off = -shadow_thread_slot_off;
+        tramp.emit_byte(0x48); // REX.W
+        tramp.emit_byte(0xC7); // MOV r/m64, imm32 (sign-extended)
+        tramp.emit_byte(0x85); // mod=10, reg=/0, rm=rbp(5) → [rbp + disp32]
+        tramp.emit(&neg_off.to_le_bytes());
+        tramp.emit(&0i32.to_le_bytes());
     }
 
     #[allow(clippy::needless_range_loop)]
@@ -1486,6 +1512,7 @@ unsafe fn osr_trampoline(
     heap_local_offset: i32,
     needs_context: bool,
     dead_mask: u64,
+    shadow_thread_slot_off: i32,
 ) -> Option<i64> {
     // Look up (or emit and insert) the cached trampoline body for this target.
     // `dead_mask` is a deterministic function of `target_addr` (both encode the
@@ -1520,6 +1547,7 @@ unsafe fn osr_trampoline(
                 heap_local_offset,
                 needs_context,
                 dead_mask,
+                shadow_thread_slot_off,
             )?;
             let fresh_arc = Arc::new(fresh);
             let mut guard = cache.lock();

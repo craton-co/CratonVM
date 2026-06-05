@@ -4984,8 +4984,12 @@ impl Compiler {
         // default → no slot reserved → frame layout byte-identical.
         let precise_maps = precise_jit_maps_enabled();
         let shadow_enabled = shadow_stack_maps_enabled();
-        // Shadow stack reserves ONE frame slot: the cached thread pointer.
-        let shadow_slots = if shadow_enabled { 1 } else { 0 };
+        // Shadow stack reserves TWO frame slots: the cached thread pointer and
+        // a saved `top` watermark (restored in the epilogue to unwind any
+        // unbalanced safepoint push — e.g. the `invokespecial <init>` push that
+        // has no paired reload). OSR entries zero both slots (clobber-free) so
+        // the null-guards make those frames skip shadow tracking safely.
+        let shadow_slots = if shadow_enabled { 2 } else { 0 };
         let extra_slots = (if needs_heap { 1 } else { 0 })
             + num_hoists
             + num_arith_hoists
@@ -5001,9 +5005,12 @@ impl Compiler {
         } else {
             0
         };
-        // Watermark slot removed (reverted): the epilogue restore was unsafe at
-        // OSR/alternate entries that bypass the prologue's thread-slot init.
-        let shadow_savetop_slot_off: i32 = 0;
+        // Shadow-stack saved-`top` watermark slot: second-to-last reserved slot.
+        let shadow_savetop_slot_off: i32 = if shadow_enabled {
+            (total_locals as i32 - 1).saturating_mul(8)
+        } else {
+            0
+        };
         // Byte offset of the `ShadowStack` within `JvmThread` (from the helper
         // table), captured before `helpers` is moved into the struct below.
         let shadow_off_in_thread: i32 = helpers.shadow_stack_offset_in_thread as i32;
@@ -5484,6 +5491,21 @@ impl Compiler {
         }
         self.pending_shadow.clear();
         let homes = self.collect_live_oop_homes();
+        if !homes.is_empty() && std::env::var_os("CRATONVM_DBG_SHADOW2").is_some() {
+            let lm = self
+                .local_oop_masks
+                .get(self.cur_bc_pc)
+                .copied()
+                .unwrap_or(0);
+            eprintln!(
+                "[SHADOW2] push pc={} stack={:?} marks={:?} local_mask={:#x} homes={:?}",
+                self.cur_bc_pc,
+                &self.stack,
+                &self.stack_oop_marks,
+                lm,
+                homes
+            );
+        }
         if homes.is_empty() {
             return;
         }
@@ -6316,6 +6338,18 @@ impl Compiler {
         self.rex_w_r(reg);
         self.buf.emit_byte(0x89); // MOV r/m64, r64
         self.modrm_rbp_disp(reg, offset);
+    }
+
+    /// Store an immediate 0 (8 bytes) into the frame slot `[rbp - offset]`
+    /// WITHOUT clobbering any register (`MOV r/m64, imm32`, REX.W C7 /0).
+    /// Used to zero the shadow thread/watermark slots at OSR entries, where the
+    /// prologue (which would set them) was bypassed and no scratch register is
+    /// safely free at the loop header.
+    fn emit_zero_local(&mut self, offset: i32) {
+        self.rex_w();
+        self.buf.emit_byte(0xC7); // MOV r/m64, imm32 (sign-extended)
+        self.modrm_rbp_disp(0, offset); // /0
+        self.buf.emit(&0i32.to_le_bytes());
     }
 
     // ── CMOV helpers (round-8 perf, round-7 jit #7) ──────────────────
@@ -8333,16 +8367,33 @@ impl Compiler {
         {
             self.emit_call_absolute(self.helpers.get_current_thread);
             self.emit_store_local(self.shadow_thread_slot_off, RAX);
+            // Save the shadow `top` watermark (RAX = thread). The epilogue
+            // restores it, unwinding any unbalanced safepoint push this method
+            // made. Skip on null thread (slot holds null → epilogue skips too).
+            self.emit_test_r64_r64(RAX);
+            let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (RAX == 0)
+            self.emit_mov_r64_mem_disp32(R11, RAX, self.shadow_off_in_thread);
+            self.emit_store_local(self.shadow_savetop_slot_off, R11);
+            self.patch_rel32_to_here(skip);
         }
     }
 
     /// Emit function epilogue: restore callee-saved regs; add rsp; pop rbp; ret
     fn emit_epilogue(&mut self) {
         // Shadow-stack: restore the `top` watermark saved in the prologue,
-        // unwinding any push this method did not pop (e.g. an unbalanced
-        // safepoint with no reload). Correct under nesting: each method restores
-        // top to its own entry value on return. R10/R11 are caller-saved scratch
-        // (free at return); RAX (the return value) is untouched.
+        // unwinding any push this method did not pop (e.g. the unbalanced
+        // `invokespecial <init>` push). Correct under nesting: each method
+        // restores top to its own entry value on return. Null-guarded so an OSR
+        // entry (which zero-inits the thread slot) skips this safely. R10/R11
+        // are caller-saved scratch (free at return); RAX (return value) untouched.
+        if self.shadow_enabled && self.shadow_thread_slot_off != 0 {
+            self.emit_load_local(R10, self.shadow_thread_slot_off);
+            self.emit_test_r64_r64(R10);
+            let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
+            self.emit_load_local(R11, self.shadow_savetop_slot_off);
+            self.emit_mov_mem_disp32_r64(R10, R11, self.shadow_off_in_thread);
+            self.patch_rel32_to_here(skip);
+        }
         // Restore callee-saved GPR registers from frame slots (matching prologue MOV saves)
         let used_regs = self.alloc_used_regs.clone();
         for (i, &reg) in used_regs.iter().enumerate() {
@@ -11414,22 +11465,15 @@ impl Compiler {
                     self.osr_entry_native[pc] = -1; // OSR rejected — fall back to interpreter
                 } else {
                     self.osr_entry_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
-                    // Shadow-stack: an OSR entry jumps HERE, bypassing the
-                    // prologue that caches the thread pointer — so re-fetch it
-                    // into the cache slot. This code also runs on the initial
-                    // fall-through (where the slot is already set; a redundant
-                    // re-fetch is harmless), but NOT on back-edges (they target
-                    // `pc_to_native`, after the preheader). Safe to call here:
-                    // at a loop header the operand stack is empty and locals
-                    // live in callee-saved registers (preserved across the
-                    // call), so clobbering caller-saved RAX is fine.
-                    if self.shadow_enabled
-                        && self.helpers.get_current_thread != 0
-                        && self.shadow_thread_slot_off != 0
-                    {
-                        self.emit_call_absolute(self.helpers.get_current_thread);
-                        self.emit_store_local(self.shadow_thread_slot_off, RAX);
-                    }
+                    // Shadow-stack note: this position is reached by BOTH the OSR
+                    // entry (which bypasses the prologue → thread/watermark slots
+                    // uninitialised) AND the initial fall-through (slots already
+                    // set by the prologue). So we can't (re)initialise the slots
+                    // here without corrupting the normal path. Instead the VM-side
+                    // OSR setup zeroes the slots before jumping (see
+                    // `CompiledMethod::shadow_thread_slot_off` / try_osr), which
+                    // makes OSR-entered frames skip shadow tracking via the
+                    // null-guards (safe; precise OSR-frame tracking is a follow-up).
                 }
             }
             // === LICM: Emit hoisted aaload code at loop headers ===
@@ -19220,6 +19264,10 @@ pub fn compile_with_param_slots(
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;
+    // Shadow-stack — frame offset of the cached thread-pointer slot, so the OSR
+    // trampoline can zero it (OSR bypasses the prologue that sets it). 0 when
+    // the shadow-stack gate was off at compile.
+    cm.shadow_thread_slot_off = compiler.shadow_thread_slot_off;
 
     // Task #60 — attach unroll-cloned MIC/PIC slots to the
     // CompiledMethod so they outlive the compiled code. The imm64
