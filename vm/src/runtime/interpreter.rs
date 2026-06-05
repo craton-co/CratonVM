@@ -5928,100 +5928,105 @@ fn execute_instruction(
             thread.frames[frame_idx].stack.pop_compact_checked()?;
         }
         Instruction::Pop2 => {
-            let val = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            if !val.is_category2() {
-                thread.frames[frame_idx].stack.pop_compact_checked()?;
+            // Kind-aware: a collision-shaped long is one logical cat-2 value.
+            let (val, kind) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            if !crate::runtime::ValueStack::is_cat2_kind(kind, val) {
+                thread.frames[frame_idx].stack.pop_with_kind()?;
             }
         }
         Instruction::Dup => {
-            let val = thread.frames[frame_idx].stack.peek_compact_checked()?;
-            thread.frames[frame_idx].stack.push_compact_checked(val)?;
+            // Preserve the kind so a duplicated collision-long stays KIND_LONG
+            // (otherwise the copy lands KIND_UNKNOWN and the GC mis-roots it).
+            let (val, kind) = thread.frames[frame_idx].stack.peek_with_kind()?;
+            thread.frames[frame_idx].stack.push_with_kind(val, kind)?;
         }
         Instruction::DupX1 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-            thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-            thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+            let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+            thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+            thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
         }
         Instruction::DupX2 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            if val2.is_category2() {
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+            let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            if crate::runtime::ValueStack::is_cat2_kind(k2, val2) {
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             } else {
-                let val3 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val3)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                let (val3, k3) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val3, k3)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             }
         }
         Instruction::Dup2 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            if val1.is_category2() {
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+            let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            if crate::runtime::ValueStack::is_cat2_kind(k1, val1) {
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             } else {
-                let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             }
         }
         Instruction::Dup2X1 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            if val1.is_category2() {
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+            let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            if crate::runtime::ValueStack::is_cat2_kind(k1, val1) {
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             } else {
-                let val3 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val3)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                let (val3, k3) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val3, k3)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             }
         }
         Instruction::Dup2X2 => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            if val1.is_category2() && val2.is_category2() {
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-            } else if val1.is_category2() {
-                let val3 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val3)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-            } else if val2.is_category2() {
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+            let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            let v1c2 = crate::runtime::ValueStack::is_cat2_kind(k1, val1);
+            let v2c2 = crate::runtime::ValueStack::is_cat2_kind(k2, val2);
+            if v1c2 && v2c2 {
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+            } else if v1c2 {
+                let (val3, k3) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val3, k3)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+            } else if v2c2 {
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             } else {
-                let val3 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                let val4 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val4)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val3)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val2)?;
-                thread.frames[frame_idx].stack.push_compact_checked(val1)?;
+                let (val3, k3) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                let (val4, k4) = thread.frames[frame_idx].stack.pop_with_kind()?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+                thread.frames[frame_idx].stack.push_with_kind(val4, k4)?;
+                thread.frames[frame_idx].stack.push_with_kind(val3, k3)?;
+                thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
+                thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
             }
         }
         Instruction::Swap => {
-            let val1 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            let val2 = thread.frames[frame_idx].stack.pop_compact_checked()?;
-            thread.frames[frame_idx].stack.push_compact_checked(val1)?;
-            thread.frames[frame_idx].stack.push_compact_checked(val2)?;
+            let (val1, k1) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            let (val2, k2) = thread.frames[frame_idx].stack.pop_with_kind()?;
+            thread.frames[frame_idx].stack.push_with_kind(val1, k1)?;
+            thread.frames[frame_idx].stack.push_with_kind(val2, k2)?;
         }
 
         // -- Integer arithmetic --

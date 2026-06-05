@@ -1,5 +1,45 @@
 # keycloak-core SdJwtTest — "Error obtaining ECParameterSpec for P-256 curve"
 
+## ✅ RESOLVED (2026-06-05) — EC routed to the real SunEC SPIs in default mode
+Fixed by **EC-scoped real-SunEC routing, default-ON** (`crate::route_ec_to_real()`,
+kill-switch `CRATONVM_SYNTHETIC_EC=1`). RSA/AES stay synthetic ("EC real now,
+RSA/AES later"). The EC family now DRIVES the real pure-Java JDK-25
+`sun.security.ec.*` SPIs and returns concrete `ECPublicKeyImpl`/`ECPrivateKeyImpl`.
+
+- `provider_chain.rs`: `seed_sunec_services()` + `sun/security/jca/GetInstance`
+  bridges + `Provider$Service.newInstance` wired under `route_ec_to_real` (BC-only
+  `getProperty`/`EventHelper` stay `real_jca_mode`-only). `cipher.rs`:
+  `Security.<clinit>` sets `spiMap` so real `AlgorithmParameters.getInstance("EC")`
+  resolves.
+- `key_factory.rs`: `kpg_generate_key_pair`/`kf_generate_public`/`kf_generate_private`
+  drive the real `ECKeyPairGenerator`/`ECKeyFactory` engines (via
+  `ctx.new_object_initialized`+`invoke_virtual`, GC-pinned). `keypair_get_public/
+  private` discriminate real KeyPair (`privateKey@0,publicKey@1`) vs synthetic
+  (`pub@0,priv@1`) by slot-0 class.
+- `signature.rs`: ECDSA `sign`/`verify` drive the real `ECDSASignature$SHA256/384`
+  (buffer payload + stash real key in `SIG_OFF_KEYOBJ`).
+- **Perf**: the native EC scalar-mul (`CRATONVM_NATIVE_EC_MULTIPLY`, bypasses the
+  ~14 s generator-table precompute) is now **default-on under route_ec_to_real**.
+- **Full P-256/384/521**: the native scalar-mul covers all three curves
+  (`p256`/`p384`/`p521` crates; curve detected from the field class) and KPG keygen
+  honours the requested curve (forwards the `ECGenParameterSpec` to the real
+  `initialize`); `SHA512withECDSA` (ES512) added. Verified keygen+sign+verify +
+  cross-VM (CratonVM sign → HotSpot verify) for secp256r1/384r1/521r1.
+
+**KEY mechanic:** a native returning `Ok(None)` does NOT fall through to bytecode
+(it's "handled, push nothing"); native lookup is keyed on the resolved method's
+declaring class (exact). `getInstance` is one native for all algorithms, so EC
+can't be "unregistered" without dropping RSA/AES → the drive-real approach.
+
+**Validation:** `SdJwtTest` → `OK (2 tests)`, rc=0 (JIT on), 10 s. Full
+keycloak-core via `RunDirTests`: **101 tests, 1 failure** = the shared
+`JWKUtilTest.testBigInteger380bit48bytesErrorFor256` that ALSO fails on HotSpot →
+parity with HotSpot. `CryptoSmoke`: RSA/EC/MessageDigest/SecureRandom OK (the
+AES-GCM line exercises the `legacy-synthetic-crypto` javax.crypto plumbing, which
+is default-OFF and unrelated to the verified `bc_aes` AES-engine intrinsic).
+
+The original analysis (root cause + reverted attempts) is preserved below.
+
 ## TL;DR (status 2026-06-04)
 - **Confirmed root cause:** the message is keycloak wrapping a `ClassCastException`.
   In default (synthetic-JCA) mode `KeyPairGenerator.getInstance("EC")` returns a
