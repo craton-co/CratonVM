@@ -11380,6 +11380,11 @@ fn try_stackless_invoke(
         eprintln!("[try_stackless_invoke] class_name={} method={} desc={} native_cb={} walk_native={}",
                   class_name, method_name, descriptor, native_cb.is_some(), walk_native_hierarchy);
     }
+    if method_name == "<init>" && std::env::var_os("CRATONVM_DBG_STTRACE").is_some()
+        && (class_name.contains("Exception") || class_name.contains("Throwable") || class_name.contains("Error")) {
+        eprintln!("STTRACE_DBG_TSI class={class_name} desc={descriptor} native_cb={} walk={walk_native_hierarchy}",
+                  native_cb.is_some());
+    }
     if let Some(callback) = native_cb {
         let result = safe_native_call(shared, thread, callback, args)?;
         if let Some(value) = result {

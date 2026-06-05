@@ -1252,13 +1252,20 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(None),
     );
 
-    // RKC16N-RECON: throwable / permission ctors that take a String message.
-    // Real JDK has bytecode for these; the dispatcher fails to find them
-    // (same root-cause as String — see RKC16N.7) so we register layout-
-    // neutral natives that just stash the message in field 0 (the
-    // canonical detailMessage slot for Throwable subclasses).
+    // RKC16N-RECON: throwable ctors that take a String message. Real JDK has
+    // bytecode for these; the dispatcher historically failed to find them
+    // (same root-cause as String — see RKC16N.7), so we shadow `<init>`.
+    //
+    // STACK-TRACE CAPTURE FIX: route these throwable ctors through the canonical
+    // capturing natives (`native_exc_init_message` / `native_exc_init_noargs`)
+    // instead of a local closure that only stashed the message in raw slot 0.
+    // The old closure had two bugs: (1) it never called fillInStackTrace, so
+    // `getStackTrace()` came back empty for these subclasses; (2) it wrote the
+    // String into slot 0, which in the real-JDK Throwable layout is `backtrace`
+    // — clobbering the marker `getOurStackTrace()` keys on. The shared natives
+    // write `detailMessage` by name, seed the `cause = this` sentinel, and
+    // capture the trace.
     for cls in &[
-        "java/lang/RuntimePermission",
         "java/lang/ClassCastException",
         "java/lang/IllegalArgumentException",
         "java/lang/IllegalStateException",
@@ -1275,30 +1282,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let cls_static: &'static str = Box::leak(cls.to_string().into_boxed_str());
         registry.register(
             cls_static, "<init>", "(Ljava/lang/String;)V",
-            |ctx, args| {
-                let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
-                if let Some(Value::Object(Some(msg))) = args.get(1) {
-                    ctx.set_field(this, 0, Value::Object(Some(*msg)));
-                    // S111r27 diag: log first few IAE/ISE constructions with messages
-                    if let Some(m) = ctx.read_string(*msg) {
-                        if m.len() > 2
-                            && matches!(
-                                std::env::var("CRATONVM_DIAG_EXINIT").as_deref(),
-                                Ok("1") | Ok("true") | Ok("yes")
-                            )
-                        {
-                            eprintln!("[EXINIT-DBG] Exception<init>(msg): {}", &m[..m.len().min(200)]);
-                        }
-                    }
-                }
-                Ok(None)
-            },
+            crate::lang_misc::native_exc_init_message,
         );
         registry.register(
             cls_static, "<init>", "()V",
-            |_ctx, _args| Ok(None),
+            crate::lang_misc::native_exc_init_noargs,
         );
     }
+    // `java/lang/RuntimePermission` is NOT a Throwable — its `(String)` ctor
+    // stores the permission *name* in field 0 (the real `Permission.name`
+    // slot), and it has no `detailMessage`/`backtrace`/stack trace. Keep its
+    // dedicated layout-neutral closure (must not route through the Throwable
+    // capture path, which would no-op the name write and pointlessly record a
+    // trace under the permission's identity hash).
+    registry.register(
+        "java/lang/RuntimePermission", "<init>", "(Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
+            if let Some(Value::Object(Some(name))) = args.get(1) {
+                ctx.set_field(this, 0, Value::Object(Some(*name)));
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/RuntimePermission", "<init>", "()V",
+        |_ctx, _args| Ok(None),
+    );
     registry.register(
         "java/lang/String", "indexOf", "(Ljava/lang/String;)I",
         |ctx, args| {
@@ -32501,8 +32511,14 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
     }
 }
 
-fn native_exception_init_empty(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // No-op — fields already null by default
+fn native_exception_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Fields already null by default; but we must still capture the stack
+    // trace (the JDK no-arg Throwable ctor calls fillInStackTrace()). Without
+    // this, a no-arg `new IllegalStateException()` thrown from bytecode had an
+    // empty getStackTrace(). Same root cause as native_exception_init_msg.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        crate::lang_misc::capture_throwable_trace(ctx, *this);
+    }
     Ok(None)
 }
 
@@ -32512,13 +32528,18 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(None),
     };
     let msg = args.get(1).cloned().unwrap_or(Value::Object(None));
-    // Mirror to both the named field (real-JDK Throwable layout has
-    // detailMessage at slot 1, after backtrace) and slot 0 (synthetic-stub
-    // layout with unnamed `_f0`). See `lang_misc::write_throwable_detail_message`.
+    // Mirror to the named field (real-JDK Throwable layout has detailMessage at
+    // slot 1, after backtrace). See `lang_misc::write_throwable_detail_message`.
+    //
+    // NOTE (stack-trace capture fix): we deliberately do NOT also blast `msg`
+    // into raw slot 0 anymore. In the real-JDK Throwable layout slot 0 is
+    // `backtrace`, which `capture_throwable_trace` (called below) sets to the
+    // self-reference marker that `getOurStackTrace()` keys on. Writing the
+    // String message there would clobber the backtrace marker and re-break
+    // getStackTrace(). The named-field write above is the correct, layout-aware
+    // path; the only objects without a named `detailMessage` are synthetic
+    // stubs, which the no-stubs build does not produce.
     ctx.set_field_by_name(this, "detailMessage", msg);
-    if ctx.object_num_fields(this) >= 1 {
-        ctx.set_field(this, 0, msg);
-    }
     // Surefire bootstrap forensics: capture exact Java callsite for the
     // recurring `NullPointerException("Name is null")` blocker so we can
     // patch the true producer instead of masking symptoms.
@@ -32540,6 +32561,16 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             }
         }
     }
+    // STACK-TRACE CAPTURE FIX: `register_exception_extras_natives` registers
+    // this native for ~50 exception subclasses (IllegalStateException,
+    // IllegalArgumentException, NumberFormatException, …) and runs LAST, so it
+    // wins the registry slot over the capturing `native_exc_init_message` from
+    // `register_throwable_subclass_natives`. Previously this native shadowed the
+    // JDK `<init>` without ever calling `fillInStackTrace`, so `getStackTrace()`
+    // returned 0 frames for every one of those subclasses thrown from bytecode.
+    // Route through the shared capture helper so they match HotSpot (and the
+    // base Throwable/RuntimeException classes, which these lists omit).
+    crate::lang_misc::capture_throwable_trace(ctx, this);
     Ok(None)
 }
 

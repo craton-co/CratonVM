@@ -241,8 +241,22 @@ fn write_throwable_cause(ctx: &mut dyn NativeContext, this: ObjectRef, cause: Va
 /// thread-local trace store keyed by the throwable's identity hash, and set
 /// the `backtrace`/`depth` fields so the real-JDK `getOurStackTrace()` path
 /// also works for callers that hit it directly.
-fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectRef) {
+///
+/// `pub(crate)` so the *other* exception-constructor natives in `lib.rs`
+/// (`native_exception_init_msg` / `native_exception_init_empty`, registered
+/// by `register_exception_extras_natives`, and the RKC16N ctor closures in
+/// `register_essential_natives`) can route through the same capture logic.
+/// Those natives are registered LATER than `register_throwable_subclass_natives`
+/// and therefore win the registry slot for ~50 exception subclasses
+/// (IllegalStateException, IllegalArgumentException, NumberFormatException, …);
+/// without this capture they left `getStackTrace()` empty for every such
+/// subclass thrown from bytecode (only the Throwable/Exception/RuntimeException/
+/// Error base classes — which those lists omit — kept a working trace).
+pub(crate) fn capture_throwable_trace(ctx: &mut dyn NativeContext, this: ObjectRef) {
     let hash = ctx.identity_hash_code(this);
+    if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+        eprintln!("STTRACE_DBG_CTOR_CAP this={:?} hash={hash}", this.as_ptr());
+    }
     let trace = ctx.capture_stack_trace(hash);
     let depth = trace.len() as i32;
     // `getOurStackTrace()` only materialises frames when `backtrace != null`;
@@ -897,6 +911,9 @@ pub(crate) fn native_throwable_get_stack_trace_array(
         }
     };
     let hash = ctx.identity_hash_code(this);
+    if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+        eprintln!("STTRACE_DBG_GET_ARRAY this={:?} hash={hash}", this.as_ptr());
+    }
     // Clone trace data to avoid borrow conflict with ctx. We keep the
     // slashed `class_name` Arc<str> (not the dotted form) so we can pass
     // it back through the cached `dotted_class_name` helper below and
