@@ -396,6 +396,31 @@ pub fn safe_native_call(
     };
     cratonvm_native_api::native_ring::record_exit(_ring_idx);
 
+    // DBG (bc math-ec, CRATONVM_DBG_ECWATCH_NATIVE): the native callback above
+    // is the suspected raw-writer of `0x4` into an EC reference field. Re-read
+    // every watched EC ref cell now that this native has returned; any that
+    // flipped to a non-zero `<0x1000` value was corrupted by THIS native.
+    // Gated separately (expensive: O(watch-list) per native).
+    if crate::runtime::ec_watch::native_enabled() {
+        let hits = crate::runtime::ec_watch::detect();
+        if !hits.is_empty() {
+            let native = cratonvm_native_api::native_ring::name_of(callback as usize)
+                .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+            for (holder, idx, expected, now) in hits {
+                eprintln!(
+                    "[ecwatch] CORRUPTED holder@0x{holder:x} fld[{idx}]: 0x{expected:x} -> 0x{now:x}  by NATIVE {native}"
+                );
+            }
+            eprintln!("[ecwatch] Java stack at corruption (top first):");
+            for f in thread.frames.iter().rev().take(24) {
+                eprintln!(
+                    "[ecwatch]   {}.{}{} pc={}",
+                    f.class_name(), f.method_name(), f.method_descriptor(), f.pc,
+                );
+            }
+        }
+    }
+
     let out: MethodCallResult = match result {
         Ok(method_result) => {
             if let Some(exc_handle) = crate::native::jni::take_jni_pending_exception() {
@@ -1393,6 +1418,27 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         if addr <= 0 {
             return false;
+        }
+        // DBG (bc math-ec): a raw copy whose destination aliases the MANAGED
+        // HEAP is the prime suspect for the `0x4`-into-Fp-reference-field
+        // corruption (e.g. Unsafe.copyMemory(heapSrc, off, null, heapAddr, n)
+        // routed here with a heap dst). Catch it with the live Java stack so
+        // the offending call site is pinned. is_heap_addr is region-membership
+        // only (no header read) so it is safe on an arbitrary address.
+        if std::env::var_os("CRATONVM_DBG_HEAPCOPY").is_some()
+            && self.shared.heap.is_heap_addr(addr as usize).is_some()
+        {
+            let n = data.len().min(16);
+            eprintln!(
+                "[heapcopy-WRITE] addr=0x{:x} len={} data={:02x?}",
+                addr, data.len(), &data[..n],
+            );
+            for f in self.thread.frames.iter().rev().take(14) {
+                eprintln!(
+                    "[heapcopy-STK]   {}.{} pc={}",
+                    f.class_name(), f.method_name(), f.pc,
+                );
+            }
         }
         // SAFETY: `addr` is a real, writable native pointer (not an arena
         // handle); `data.len()` bytes are copied to it.

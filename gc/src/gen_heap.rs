@@ -1025,6 +1025,18 @@ impl GenerationalHeap {
     /// Automatically fires the write barrier for generational GC correctness.
     /// Callers do NOT need to call `write_barrier` separately.
     pub fn set_field(&self, obj_ref: ObjectRef, index: usize, value: Value) {
+        // DIAGNOSTIC (bc math-ec): catch a fake `0x4`-style reference (a
+        // collision-long payload) persisted into a heap field via ANY caller of
+        // the heap set API (bytecode putfield, native ctx.set_field, reflection).
+        if let Value::Object(Some(p)) = value {
+            let a = p.as_ptr() as usize;
+            if a != 0 && a < 0x1_0000 && std::env::var_os("CRATONVM_DBG_BADREF").is_some() {
+                eprintln!(
+                    "[BADREF:set_field] recv_class_id={} idx={} ptr=0x{:x}",
+                    self.get_header(obj_ref).class_id.as_u32(), index, a,
+                );
+            }
+        }
         // KC16 SIGSEGV audit: runtime bounds check.  Silently drop writes
         // that fall past the object's declared layout (layout mismatch
         // between synthetic and real JDK class shapes) rather than
@@ -1430,6 +1442,15 @@ impl GenerationalHeap {
         index: usize,
         value: Value,
     ) -> Result<(), i32> {
+        // DIAGNOSTIC (bc math-ec): catch a fake `0x4` reference stored into a
+        // reference array element via the heap set API (bytecode aastore,
+        // native System.arraycopy / clone / reflection).
+        if let Value::Object(Some(p)) = value {
+            let a = p.as_ptr() as usize;
+            if a != 0 && a < 0x1_0000 && std::env::var_os("CRATONVM_DBG_BADREF").is_some() {
+                eprintln!("[BADREF:set_array_element] idx={} ptr=0x{:x}", index, a);
+            }
+        }
         let header = self.get_header(obj_ref);
         debug_assert_eq!(header.kind, ObjectKind::Array);
         if index >= header.array_length as usize {
@@ -1768,6 +1789,157 @@ impl GenerationalHeap {
         self.card_table.flush_all();
         self.card_table.drain_pending();
         let card_table: &CardTable = &self.card_table;
+
+        // ---- DBG (bc math-ec): pre-GC remembered-set audit ----------------
+        // For each old-gen object, check every old->young reference edge
+        // against the card bitmap (post flush+drain). A CLEAN card on a live
+        // old->young edge is a write-barrier / remembered-set MISS: the young
+        // referent will be skipped by scan_dirty_cards and reclaimed though
+        // still reachable — the FixedPointTest premature-reclamation corruption
+        // (ECCurve$Fp/ECFieldElement$Fp fields decaying to ZEROED/OFF-HEAP).
+        // Caught at GC entry, BEFORE reclamation, with the offending old obj.
+        if std::env::var_os("CRATONVM_DBG_RSET_AUDIT").is_some() {
+            let cbase = card_table.base_addr();
+            let csize = crate::card_table::CARD_SIZE;
+            let mut edges = 0usize;
+            let mut misses = 0usize;
+            let mut reported = 0usize;
+            for (obj_ptr, _sz) in old_gen.walk_objects() {
+                let hdr = unsafe { &*(obj_ptr as *const ObjectHeader) };
+                let addr = obj_ptr as usize;
+                let card_idx = addr.wrapping_sub(cbase) / csize;
+                let dirty = card_table.is_dirty(card_idx);
+                if hdr.kind == ObjectKind::Array {
+                    if hdr.element_type == ArrayElementType::Reference {
+                        for i in 0..hdr.array_length as usize {
+                            let s_ptr =
+                                unsafe { obj_ptr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                            let raw = unsafe { std::ptr::read(s_ptr as *const u64) };
+                            if raw != 0 && raw < 0x1000 {
+                                let cn = crate::gc::resolve_class_info(hdr.class_id.as_u32())
+                                    .map(|(n, _)| n).unwrap_or_else(|| "<unresolved>".to_string());
+                                eprintln!(
+                                    "[small4] PRE-GC OLD {} @0x{:x} arr[{}] -> 0x{:x}",
+                                    cn, addr, i, raw,
+                                );
+                            }
+                            if raw != 0 && young_from.contains(raw as usize as *mut u8) {
+                                edges += 1;
+                                if !dirty {
+                                    misses += 1;
+                                    if reported < 60 {
+                                        reported += 1;
+                                        let cn = crate::gc::resolve_class_info(
+                                            hdr.class_id.as_u32(),
+                                        )
+                                        .map(|(n, _)| n)
+                                        .unwrap_or_else(|| "<unresolved>".to_string());
+                                        eprintln!(
+                                            "[rset-miss] OLD {} @0x{:x} arr[{}] -> young 0x{:x} CLEAN(card={})",
+                                            cn, addr, i, raw, card_idx,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for slot_idx in 0..hdr.num_slots as usize {
+                        let s_ptr = unsafe { obj_ptr.add(HEADER_SIZE + slot_idx * SLOT_SIZE) };
+                        let value = unsafe { std::ptr::read(s_ptr as *const Value) };
+                        if let Value::Object(Some(ro)) = value {
+                            let p = ro.as_ptr() as usize;
+                            if p != 0 && p < 0x1000 {
+                                let cn = crate::gc::resolve_class_info(hdr.class_id.as_u32())
+                                    .map(|(n, _)| n).unwrap_or_else(|| "<unresolved>".to_string());
+                                eprintln!(
+                                    "[small4] PRE-GC OLD {} @0x{:x} fld[{}] -> 0x{:x}",
+                                    cn, addr, slot_idx, p,
+                                );
+                            }
+                            if young_from.contains(ro.as_ptr()) {
+                                edges += 1;
+                                if !dirty {
+                                    misses += 1;
+                                    if reported < 60 {
+                                        reported += 1;
+                                        let cn = crate::gc::resolve_class_info(
+                                            hdr.class_id.as_u32(),
+                                        )
+                                        .map(|(n, _)| n)
+                                        .unwrap_or_else(|| "<unresolved>".to_string());
+                                        eprintln!(
+                                            "[rset-miss] OLD {} @0x{:x} fld[{}] -> young 0x{:x} CLEAN(card={})",
+                                            cn, addr, slot_idx, ro.as_ptr() as usize, card_idx,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if edges > 0 {
+                eprintln!(
+                    "[rset-audit] old->young edges={} clean-card MISSES={}",
+                    edges, misses,
+                );
+            }
+            // Pre-GC linear scan of young_from for small-payload object refs
+            // (mutator/native-written 0x4). If found here, the 0x4 PRE-EXISTS
+            // the GC (it is NOT created by the collector). Linear walk may
+            // truncate on a bad header (logged) — but the bump-allocated
+            // young space is contiguous so it usually reaches everything.
+            let ybase = young_from.base_ptr_mut() as usize;
+            let yused = young_from.used();
+            let mut ycur = 0usize;
+            let mut found4 = 0usize;
+            while ycur < yused {
+                let h = unsafe { &*((ybase + ycur) as *const ObjectHeader) };
+                let size = gen_object_total_size(h);
+                if size == 0 || ycur + size > yused {
+                    eprintln!("[small4] young walk truncated at off={} used={}", ycur, yused);
+                    break;
+                }
+                let optr = (ybase + ycur) as *mut u8;
+                if h.kind == ObjectKind::Object {
+                    for si in 0..h.num_slots as usize {
+                        let sp = unsafe { optr.add(HEADER_SIZE + si * SLOT_SIZE) };
+                        let v = unsafe { std::ptr::read(sp as *const Value) };
+                        if let Value::Object(Some(ro)) = v {
+                            let p = ro.as_ptr() as usize;
+                            if p != 0 && p < 0x1000 && found4 < 40 {
+                                found4 += 1;
+                                let cn = crate::gc::resolve_class_info(h.class_id.as_u32())
+                                    .map(|(n, _)| n).unwrap_or_else(|| "<unresolved>".to_string());
+                                eprintln!(
+                                    "[small4] PRE-GC YOUNG {} @0x{:x} fld[{}] -> 0x{:x}",
+                                    cn, ybase + ycur, si, p,
+                                );
+                            }
+                        }
+                    }
+                } else if h.kind == ObjectKind::Array
+                    && h.element_type == ArrayElementType::Reference
+                {
+                    for i in 0..h.array_length as usize {
+                        let sp = unsafe { optr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                        let raw = unsafe { std::ptr::read(sp as *const u64) } as usize;
+                        if raw != 0 && raw < 0x1000 && found4 < 40 {
+                            found4 += 1;
+                            let cn = crate::gc::resolve_class_info(h.class_id.as_u32())
+                                .map(|(n, _)| n).unwrap_or_else(|| "<unresolved>".to_string());
+                            eprintln!(
+                                "[small4] PRE-GC YOUNG {} @0x{:x} arr[{}] -> 0x{:x}",
+                                cn, ybase + ycur, i, raw,
+                            );
+                        }
+                    }
+                }
+                ycur += size;
+            }
+        }
+        // -------------------------------------------------------------------
 
         let bytes_before = young_from.used();
         let mut objects_copied: usize = 0;
@@ -3881,7 +4053,45 @@ impl GenerationalHeap {
     /// observing a high survival rate, see [`GC_PROMOTE_PRESSURE_PERCENT`]),
     /// every survivor is promoted regardless of age. This breaks the
     /// long-lived-tree semispace death spiral.
+    #[allow(clippy::too_many_arguments)]
     fn forward_object(
+        young_from: &Arena,
+        young_to: &mut Arena,
+        old_gen: &mut OldGen,
+        old_ptr: *mut u8,
+        objects_copied: &mut usize,
+        pointer_map: &mut FxHashMap<usize, usize>,
+        promoted_worklist: &mut Vec<*mut u8>,
+        force_promote_all: bool,
+    ) -> *mut u8 {
+        // DBG (bc math-ec, CRATONVM_DBG_GCWRITE): wrap the forwarder so we can
+        // see if it EVER returns a small (<0x1000) address — that would mean a
+        // GC ref-update writes `Object(Some(0x4))` from forward_object's result
+        // (the value-source for every minor-GC reference write).
+        let r = Self::forward_object_impl(
+            young_from,
+            young_to,
+            old_gen,
+            old_ptr,
+            objects_copied,
+            pointer_map,
+            promoted_worklist,
+            force_promote_all,
+        );
+        if (r as usize) != 0
+            && (r as usize) < 0x1000
+            && std::env::var_os("CRATONVM_DBG_GCWRITE").is_some()
+        {
+            eprintln!(
+                "[gcwrite] forward_object RETURNED 0x{:x} for old_ptr=0x{:x}",
+                r as usize, old_ptr as usize,
+            );
+        }
+        r
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_object_impl(
         young_from: &Arena,
         young_to: &mut Arena,
         old_gen: &mut OldGen,
@@ -4101,6 +4311,33 @@ impl GenerationalHeap {
         // SAFETY: `old_ptr` and `new_ptr` are valid, non-overlapping regions of `total_size` bytes.
         unsafe {
             std::ptr::copy_nonoverlapping(old_ptr, new_ptr, total_size);
+        }
+        // DBG (bc math-ec, CRATONVM_DBG_GCWRITE): does the GC object copy
+        // produce a small (<0x1000) object-field payload that the SOURCE did
+        // not have? That would mean the copy truncated / used a wrong size and
+        // the destination field holds stale to-space bytes (the 0x4). If the
+        // source ALSO has the small payload, the 0x4 pre-existed in from-space.
+        if !is_array && std::env::var_os("CRATONVM_DBG_GCWRITE").is_some() {
+            let ns = header.num_slots as usize;
+            for si in 0..ns {
+                let dv = unsafe {
+                    std::ptr::read(new_ptr.add(HEADER_SIZE + si * SLOT_SIZE) as *const Value)
+                };
+                if let Value::Object(Some(r)) = dv {
+                    let p = r.as_ptr() as usize;
+                    if p != 0 && p < 0x1000 {
+                        let sv = unsafe {
+                            std::ptr::read(old_ptr.add(HEADER_SIZE + si * SLOT_SIZE) as *const Value)
+                        };
+                        let src_small = matches!(sv, Value::Object(Some(rr))
+                            if { let q = rr.as_ptr() as usize; q != 0 && q < 0x1000 });
+                        eprintln!(
+                            "[gcwrite] COPY fld[{}]=0x{:x} src_small={} cid={} num_slots={} total_size={} new=0x{:x}",
+                            si, p, src_small, header.class_id.as_u32(), ns, total_size, new_ptr as usize,
+                        );
+                    }
+                }
+            }
         }
 
         // Round-2 fix (T2-4): explicit atomic load+store for the mark_word

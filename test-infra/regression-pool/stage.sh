@@ -28,6 +28,7 @@ wildfly-40.0.0.Final|https://github.com/wildfly/wildfly/releases/download/40.0.0
 keycloak-16.1.1|https://github.com/keycloak/keycloak/releases/download/16.1.1/keycloak-16.1.1.tar.gz|tgz|keycloak-16.1.1
 keycloak-26.2.4|https://github.com/keycloak/keycloak/releases/download/26.2.4/keycloak-26.2.4.tar.gz|tgz|keycloak-26.2.4
 kafka_2.13-3.7.0|https://archive.apache.org/dist/kafka/3.7.0/kafka_2.13-3.7.0.tgz|tgz|kafka_2.13-3.7.0
+elasticsearch-8.15.5|https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-8.15.5-linux-x86_64.tar.gz|tgz|elasticsearch-8.15.5
 apache-hadoop-3.4.0|https://archive.apache.org/dist/hadoop/common/hadoop-3.4.0/hadoop-3.4.0.tar.gz|tgz|hadoop-3.4.0
 apache-hbase-2.5.10|https://archive.apache.org/dist/hbase/2.5.10/hbase-2.5.10-bin.tar.gz|tgz|hbase-2.5.10
 apache-cassandra-4.1.4|https://archive.apache.org/dist/cassandra/4.1.4/apache-cassandra-4.1.4-bin.tar.gz|tgz|apache-cassandra-4.1.4

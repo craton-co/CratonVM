@@ -93,6 +93,30 @@ use crate::vm::{
 /// 2. Other threads deposit their root snapshots and pause
 /// 3. The initiator collects all roots and runs GC
 /// 4. All threads update their own frame references from the pointer map
+/// Memoized `class_id -> is a watched EC holder` decision for the
+/// `CRATONVM_DBG_ECWATCH` software watchpoint (only the few-instance curve /
+/// asn1.x9 holders). The class-name resolution happens once per class id;
+/// subsequent reference-field stores pay only a hashmap lookup, so the
+/// per-ref-putfield overhead stays negligible.
+fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool {
+    use parking_lot::Mutex;
+    use std::sync::OnceLock;
+    static MEMO: OnceLock<Mutex<std::collections::HashMap<u32, bool>>> = OnceLock::new();
+    let memo = MEMO.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let key = cid.as_u32();
+    if let Some(&v) = memo.lock().get(&key) {
+        return v;
+    }
+    let v = {
+        let cm = shared.class_manager.read();
+        cm.get_class(cid)
+            .map(|c| c.name.contains("/asn1/x9/") || c.name.contains("Curve"))
+            .unwrap_or(false)
+    };
+    memo.lock().insert(key, v);
+    v
+}
+
 fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
@@ -110,6 +134,29 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
         // Update our root snapshot before requesting STW
         update_root_snapshot(shared, thread);
 
+        // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): detect watched-cell corruption
+        // at GC ENTRY (addresses still valid, pre-relocation). Fires even if the
+        // corruptor was NOT dispatched via `safe_native_call` (e.g. an inline
+        // interpreter intrinsic), confirming the watch machinery works and that
+        // a watched EC field really did flip to a small value before this GC.
+        if crate::runtime::ec_watch::enabled() {
+            let watched = crate::runtime::ec_watch::size();
+            let gc_hits = crate::runtime::ec_watch::detect();
+            if !gc_hits.is_empty() {
+                eprintln!(
+                    "[ecwatch-GC] {} CORRUPTED-at-GC of {} watched cells:",
+                    gc_hits.len(), watched,
+                );
+                for (holder, idx, expected, now) in gc_hits {
+                    eprintln!(
+                        "[ecwatch-GC]   holder@0x{holder:x} fld[{idx}]: 0x{expected:x} -> 0x{now:x}"
+                    );
+                }
+            } else if watched > 0 {
+                eprintln!("[ecwatch-GC] {watched} watched cells, all clean at this GC");
+            }
+        }
+
         // Truncation-checked: alive_count (usize) to u32; thread count realistically bounded
         let alive_count = u32::try_from(shared.thread_registry.alive_count()).unwrap_or(u32::MAX);
         if alive_count <= 1 {
@@ -123,6 +170,21 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
             let result = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
             process_references_after_gc(shared, &result.pointer_map);
             update_all_roots(shared, thread, &result.pointer_map);
+            // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): the moving collector
+            // relocated survivors — REMAP each watched holder through the
+            // pointer_map so watches PERSIST across this GC (the corruption
+            // frequently hits an object that survived the GC that wrote it).
+            crate::runtime::ec_watch::remap(&result.pointer_map);
+            // GC-EXIT detect: a watched cell that was clean at GC ENTRY (above)
+            // but reads 0x4 here was corrupted *by collect_garbage itself*
+            // (between entry and exit) — isolating GC-vs-mutator definitively.
+            if crate::runtime::ec_watch::enabled() {
+                for (holder, idx, expected, now) in crate::runtime::ec_watch::detect() {
+                    eprintln!(
+                        "[ecwatch-GCEXIT] holder@0x{holder:x} fld[{idx}]: 0x{expected:x} -> 0x{now:x} (corrupted DURING collect_garbage)"
+                    );
+                }
+            }
             // DBG (env-gated): validate every young object's header size against
             // its class — pins a JIT `new` that wrote a wrong-size header.
             crate::memory::gc::validate_object_sizes(shared);
@@ -230,6 +292,8 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
 
                 // Update shared VM state (statics, string pool, etc.)
                 update_all_roots(shared, thread, &result.pointer_map);
+                // DBG (bc math-ec): remap watchpoints through the pointer_map.
+                crate::runtime::ec_watch::remap(&result.pointer_map);
 
                 tracing::debug!(
                     "GC completed (multi-thread, {} threads): {} objects copied, {} bytes freed",
@@ -281,6 +345,7 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
         let result = shared.heap.collect_garbage(&stw, &mut roots, &shared.monitors);
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
+        crate::runtime::ec_watch::remap(&result.pointer_map);
         // T19.3.G1 — count forced cycles (allocation-failure-driven) too.
         shared
             .gc_cycle_count
@@ -335,6 +400,7 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
         );
         process_references_after_gc(shared, &result.pointer_map);
         update_all_roots(shared, thread, &result.pointer_map);
+        crate::runtime::ec_watch::remap(&result.pointer_map);
         // Enqueue dead finalizable objects (their new addresses) for finalization
         for new_addr in &dead_finalizers {
             shared.finalizer_thread.enqueue(*new_addr);
@@ -6988,6 +7054,24 @@ fn execute_instruction(
                     .set_field_volatile(obj_ref, field.field_index, value);
             } else {
                 shared.heap.set_field(obj_ref, field.field_index, value);
+            }
+            // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): when a *valid* reference is
+            // stored into an EC object's reference field, arm a software
+            // watchpoint on the field's payload so the later raw `0x4` overwrite
+            // (which bypasses this very set_field) is attributed to the native
+            // that does it (checked in `safe_native_call`). See runtime::ec_watch.
+            if crate::runtime::ec_watch::enabled() {
+                if let (true, Value::Object(Some(p))) = (field.is_reference, value) {
+                    let recv_cid = shared.heap.class_id_of(obj_ref);
+                    if ec_is_watched_class(shared, recv_cid) {
+                        crate::runtime::ec_watch::record(
+                            obj_ref,
+                            field.field_index,
+                            p.as_ptr() as usize,
+                            recv_cid.as_u32(),
+                        );
+                    }
+                }
             }
             // write_barrier fires automatically inside set_field / set_field_volatile.
             // TODO(orchestrator): migrate the remaining `heap.satb_barrier(...)`
