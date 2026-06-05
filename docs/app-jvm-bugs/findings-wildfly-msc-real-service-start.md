@@ -57,23 +57,47 @@ exactly as before (zero regression risk; pool stays green). When **on**:
   → start id=1 OK`. MCS reaches bci 507 (`putfield controller`) and returns. P1 held the service refs
   across the heavy `ModelControllerImpl` construction without a use-after-free.
 
-## Next gap (where `testSubsystem` now fails)
-`org.jboss.as.server.mgmt.ManagementWorkerService.installService:71` →
-`NullPointerException: null object argument`. `CRATONVM_DBG_NULL_NATIVE` shows a 3-arg native called
-with `args[1] == null` (backtrace unsymbolized in the release strip build). `installService` does
-`ServiceTarget.addService(SERVICE_NAME, new ManagementWorkerService(...)).setInitialMode(ON_DEMAND).install()`
-(xnio worker). This is the start of the "iterate on natives the model boot surfaces" long tail the
-plan anticipated — it is reached **only because boot now progresses past the controller assignment**.
-To pinpoint the native, rebuild with `[profile.release] strip="none", debug="line-tables-only"` and
-re-run with `CRATONVM_DBG_NULL_NATIVE=1`.
+## Session 2 — xnio gap RESOLVED (merged), new interpreter blocker found
 
-## Remaining work (per plan phases)
-- **P2 tail:** chase surfaced natives (ManagementWorkerService null-arg first) until `testSubsystem`
-  passes. Likely also needs **value injection** — `provides(name).accept(v)` → `requires(name).get()`
-  — which is currently NOT wired (a dependent's injected `Supplier.get()` returns null). The
-  `executorService` supplier survived here because it is passed via the ctor, not MSC-injected.
-- **P4:** async services + standalone daemon to `WFLYSRV0025` + port 9990.
-- **P5:** `stop()` lifecycle; remove `CRATONVM_DBG_MSC` scaffolding before un-gating.
+**`ManagementWorkerService.installService` (the old "next gap") is FIXED** — three real fixes in
+`native-builtins/src/xnio_async.rs` (commit on `fix/xnio` path, merged to dev), all always-on, **pool
+18/18**:
+1. `Options.<clinit>` shim populated a Rust store + getter methods but never wrote the real Java
+   `public static final Option` fields → `getstatic Options.WORKER_IO_THREADS` was null → `Builder.set`
+   NPE. Now also `set_static_field_by_name` each well-known option (+ added `CORK`).
+2. `OptionMap` and `OptionMap$Builder` stored their Rust registry handle (a Long) in slot 0, which in
+   real-JDK mode is the loaded class's **Object** field (`value` / `list`) — a Long there does not
+   round-trip (read back as Object → handle 0 → "stale or unknown handle"). Moved the handle to a
+   trailing extra slot (1), mirroring the `ServiceController._mscId` pattern; allocate 2 slots.
+3. `Builder.set` / `set(boolean)` now tolerate a null `Option` (an unpopulated well-known static) by
+   skipping it — the synthetic XnioWorker defaults options it doesn't read.
+
+**New blocker (where `testSubsystem` now fails):** a VM **interpreter operand-stack overflow** —
+`thread 'main-vm' panicked at vm/src/runtime/value_stack.rs:350: index out of bounds: the len is 24
+but the index is 24` (`push_compact` past `max_size`). Identified via `CRATONVM_FRAME_TRACE=1`: it
+fires during **`java.util.RegularEnumSet$EnumSetIterator`** iteration, which calls
+`Long.numberOfTrailingZeros(J)I` → the interpreter **tail-call-optimizes** it (`[FRAME_TCO]`) into
+`Integer.numberOfTrailingZeros(I)I`. Reached during the WildFly model boot (after MCS.start + the
+worker install). This is a **general interpreter bug** (NOT MSC-specific, NOT my MSC code) exposed by
+boot progress — `ntz` has a tiny `max_stack`, so the overflow is in a frame with `max_stack=24` near
+the TCO / `stackless_cached` / `vcached2` cached-execution paths; the frame-trace depths interleave
+(13–16 vs 35–36), pointing at nested invoke contexts from the MSC drive. `reset_for_tail_call`
+(`frame.rs`) sets `max_stack` + `stack.clear()` but does NOT resize the reused `ValueStack`'s
+`max_size` — a prime suspect, but the exact "why 24" needs an instrumented build (log each frame's
+`max_stack` + the overflowing opcode). **This deserves its own focused effort; do not speculatively
+change TCO (it is load-bearing) without root-causing.** Repro:
+`CRATONVM_MSC_REAL_START=1 CRATONVM_FRAME_TRACE=1 bash run-health.sh` (grep the last `[FRAME_*]` before
+`panicked`).
+
+## Remaining work (current order — each blocks the next)
+1. **Interpreter TCO / value-stack overflow** (the new blocker above) — must be fixed first; it
+   currently aborts the VM mid-boot.
+2. **P2 tail:** keep chasing whatever the boot surfaces after that until `testSubsystem` passes.
+   Likely also needs **value injection** — `provides(name).accept(v)` → `requires(name).get()` —
+   which is NOT wired (a dependent's injected `Supplier.get()` returns null). The `executorService`
+   supplier survived so far because it's passed via the ctor, not MSC-injected.
+3. **P4:** async services + standalone daemon to `WFLYSRV0025` + port 9990.
+4. **P5:** `stop()` lifecycle; remove `CRATONVM_DBG_MSC` scaffolding before un-gating.
 
 ## Repro
 - Build: `C:\craton\CratonVM-wfmsc\build-wfmsc.bat` (renamed toolchain survives parallel taskkill).
