@@ -4118,10 +4118,7 @@ impl GenerationalHeap {
             promoted_worklist,
             force_promote_all,
         );
-        if (r as usize) != 0
-            && (r as usize) < 0x1000
-            && std::env::var_os("CRATONVM_DBG_GCWRITE").is_some()
-        {
+        if (r as usize) != 0 && (r as usize) < 0x1000 && gcw_enabled() {
             eprintln!(
                 "[gcwrite] forward_object RETURNED 0x{:x} for old_ptr=0x{:x}",
                 r as usize, old_ptr as usize,
@@ -4357,7 +4354,7 @@ impl GenerationalHeap {
         // not have? That would mean the copy truncated / used a wrong size and
         // the destination field holds stale to-space bytes (the 0x4). If the
         // source ALSO has the small payload, the 0x4 pre-existed in from-space.
-        if !is_array && std::env::var_os("CRATONVM_DBG_GCWRITE").is_some() {
+        if !is_array && gcw_enabled() {
             let ns = header.num_slots as usize;
             for si in 0..ns {
                 let dv = unsafe {
@@ -4803,6 +4800,16 @@ fn for_each_ref(obj: *mut u8, header: &ObjectHeader, mut f: impl FnMut(usize)) {
 /// `MAX_SANE_OBJECT_SIZE` corrupt-header check, so a bad array length is
 /// surfaced as corruption instead of corrupting the cursor.
 #[inline]
+/// Cached `CRATONVM_DBG_GCWRITE` gate (bc math-ec diagnostic). Cached in a
+/// `OnceLock` so the per-object-copy check in `forward_object` does NOT pay an
+/// `env::var_os` lookup on the hot GC path when the gate is off.
+#[inline]
+fn gcw_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_GCWRITE").is_some())
+}
+
 fn gen_object_total_size(header: &ObjectHeader) -> usize {
     if header.kind == ObjectKind::Array {
         match array_data_size(header.array_length as usize, header.element_type) {
