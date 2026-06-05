@@ -23778,7 +23778,58 @@ fn native_pbq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     let arr = alloc_ref_array(ctx, PBQ_DEFAULT_CAPACITY);
     ctx.set_field(this, PBQ_FIELD_DATA, Value::Object(Some(arr)));
     ctx.set_field(this, PBQ_FIELD_SIZE, Value::Int(0));
+    // Our synthetic offer/poll/peek/etc. manage queue(slot 0)/size(slot 1)
+    // directly and ignore the monitor, but the real-JDK PBQ methods we do NOT
+    // override — clear(), remove(Object), iterator(), drainTo(), … — all begin
+    // with `lock.lock()`. Against the real class the `lock`/`notEmpty` fields
+    // are otherwise null here (this native skips the real ctor), so e.g.
+    // `clear()` does `null.lock()` -> "Cannot invoke lock on null" (H2 MVStore
+    // close -> PriorityBlockingQueue.clear). Seed a genuine ReentrantLock + its
+    // Condition so those real methods work. Skipped in synthetic-stub mode
+    // (that PBQ layout has no `lock` field).
+    if !ctx.is_class_synthetic_stub("java/util/concurrent/PriorityBlockingQueue") {
+        pbq_seed_real_lock(ctx, this);
+    }
     Ok(None)
+}
+
+/// Seed the real-JDK `PriorityBlockingQueue.lock` (`ReentrantLock`) and
+/// `notEmpty` (`Condition`) fields with genuine instances so the real-bytecode
+/// PBQ methods we don't override (clear/remove/iterator/drainTo/…), which all
+/// take `lock.lock()`, don't NPE on a null lock. GC-safe: `this` and the new
+/// lock are pinned across the re-entrant ReentrantLock construction +
+/// `newCondition` call (both allocate), and re-read forwarded afterward.
+fn pbq_seed_real_lock(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let h_this = ctx.pin_native_root(this);
+    let lock = match ctx.new_object_initialized(
+        "java/util/concurrent/locks/ReentrantLock",
+        "()V",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(l)))) => l,
+        _ => {
+            ctx.unpin_native_roots(h_this);
+            return;
+        }
+    };
+    let h_lock = ctx.pin_native_root(lock);
+    let cond = match ctx.invoke(
+        "java/util/concurrent/locks/ReentrantLock",
+        "newCondition",
+        "()Ljava/util/concurrent/locks/Condition;",
+        &[Value::Object(Some(lock))],
+    ) {
+        Ok(Some(v @ Value::Object(Some(_)))) => Some(v),
+        _ => None,
+    };
+    // Re-read forwarded refs (the allocations above may have moved them).
+    let lock = ctx.read_native_pin(h_lock, lock);
+    let this = ctx.read_native_pin(h_this, this);
+    ctx.set_field_by_name(this, "lock", Value::Object(Some(lock)));
+    if let Some(cond) = cond {
+        ctx.set_field_by_name(this, "notEmpty", cond);
+    }
+    ctx.unpin_native_roots(h_this);
 }
 
 fn pbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usize) {
