@@ -9202,11 +9202,22 @@ pub(crate) fn native_class_get_enum_constants(
         // Fall through — we can still try to read $VALUES if it was
         // populated before the failure (common after silent-swallow).
     }
-    // Read $VALUES static field.
-    let idx = match ctx.static_field_index_by_name(class_id, "$VALUES") {
+    // Read the synthetic enum-values array static field.  `javac` names it
+    // `$VALUES`; the Eclipse JDT compiler (`ecj`) — used to build several
+    // WildFly modules — emits `ENUM$VALUES` (ACC_SYNTHETIC) instead.  The
+    // real JDK sidesteps the name entirely by invoking the generated
+    // `values()` accessor reflectively, so it is compiler-agnostic; we read
+    // the field directly (our reflective `values()` invoke historically
+    // returned null), so we must accept both spellings or ecj-compiled app
+    // enums (e.g. org/wildfly/extension/health/HealthSubsystemSchema) fail
+    // with a spurious "not an enum" CCE in EnumSet.allOf / EnumMap.<init>.
+    let idx = match ctx
+        .static_field_index_by_name(class_id, "$VALUES")
+        .or_else(|| ctx.static_field_index_by_name(class_id, "ENUM$VALUES"))
+    {
         Some(i) => i,
         None => {
-            tracing::warn!("native_class_get_enum_constants: no $VALUES field for class={}", class_name);
+            tracing::warn!("native_class_get_enum_constants: no $VALUES/ENUM$VALUES field for class={}", class_name);
             return Ok(Some(Value::Object(None)));
         }
     };
