@@ -211,11 +211,82 @@ fn line_col_of(bytes: &[u8], byte_pos: usize) -> (i32, i32) {
     (line, col)
 }
 
+/// Namespace-scope stack used while walking the document so that an element's
+/// (and its attributes') namespace URI is resolved against ALL in-scope
+/// `xmlns`/`xmlns:prefix` declarations — not just declarations that appear on
+/// the element itself. XML namespaces are lexically scoped: a default namespace
+/// (`xmlns="…"`) declared on an ancestor applies to every descendant element
+/// that does not redeclare it. Without this, WildFly's `standalone.xml`
+/// (`xmlns="urn:jboss:domain:20.0"` on `<server>`) reports the correct URI for
+/// `<server>` but an empty URI for `<extensions>`, `<extension>`, … which makes
+/// staxmapper's `QName`-keyed parser lookup fail and aborts the boot with an
+/// `XMLStreamException` (then WildFly's vdx error reporter hangs).
+#[derive(Default)]
+struct NsScopes {
+    /// One frame per open element. Each frame holds the `(prefix, uri)` pairs
+    /// DECLARED on that element. The default namespace uses prefix == "".
+    frames: Vec<Vec<(String, String)>>,
+}
+
+impl NsScopes {
+    /// Build a frame from an element's attribute list (the xmlns / xmlns:p
+    /// declarations) and push it. Call once per START_ELEMENT, BEFORE resolving
+    /// the element's own namespace.
+    fn push_from_attrs(&mut self, attrs: quick_xml::events::attributes::Attributes) {
+        let mut frame: Vec<(String, String)> = Vec::new();
+        for a in attrs.flatten() {
+            let key = a.key.as_ref();
+            let val = a
+                .unescape_value()
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
+            if key == b"xmlns" {
+                frame.push((String::new(), val));
+            } else if let Some(prefix) = key.strip_prefix(b"xmlns:") {
+                frame.push((String::from_utf8_lossy(prefix).into_owned(), val));
+            }
+        }
+        self.frames.push(frame);
+    }
+
+    fn pop(&mut self) {
+        self.frames.pop();
+    }
+
+    /// Resolve a prefix to a namespace URI against the current scope stack
+    /// (innermost frame wins). An empty `prefix` resolves the default
+    /// namespace. Returns "" when no binding is in scope (unbound prefix or no
+    /// default namespace), matching StAX's `getNamespaceURI()==null/""`.
+    fn resolve(&self, prefix: &str) -> String {
+        for frame in self.frames.iter().rev() {
+            for (p, uri) in frame.iter().rev() {
+                if p == prefix {
+                    return uri.clone();
+                }
+            }
+        }
+        String::new()
+    }
+}
+
+/// Split a possibly-prefixed qualified name into `(prefix, local)`. An absent
+/// prefix yields `""`.
+fn split_qname(qname: &[u8]) -> (String, String) {
+    let s = String::from_utf8_lossy(qname);
+    match s.find(':') {
+        Some(i) => (s[..i].to_string(), s[i + 1..].to_string()),
+        None => (String::new(), s.into_owned()),
+    }
+}
+
 fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
     let mut events: Vec<StaxEvent> = Vec::new();
     // START_DOCUMENT sits at the very start of the source (line 1, col 1, offset 0).
     let (l0, c0) = line_col_of(bytes, 0);
     events.push(StaxEvent { kind: START_DOCUMENT, line: l0, column: c0, char_offset: 0, ..Default::default() });
+    // Lexical namespace-scope stack (default + prefixed) maintained across the
+    // whole document so descendant elements inherit ancestor xmlns decls.
+    let mut scopes = NsScopes::default();
 
     let mut reader = Reader::from_reader(bytes);
     reader.trim_text(false);
@@ -235,23 +306,46 @@ fn parse_to_events(bytes: &[u8]) -> Vec<StaxEvent> {
         buf.clear();
         match reader.read_event_into(&mut buf) {
             Ok(QXmlEvent::Start(e)) => {
-                events.push(make_element_event(START_ELEMENT, e.name().as_ref(), e.attributes()));
+                // Push this element's xmlns declarations, then resolve its
+                // namespace (and its attributes') against the full scope stack.
+                scopes.push_from_attrs(e.attributes());
+                events.push(make_element_event(
+                    START_ELEMENT,
+                    e.name().as_ref(),
+                    e.attributes(),
+                    &scopes,
+                ));
             }
             Ok(QXmlEvent::Empty(e)) => {
                 let name = e.name().as_ref().to_vec();
-                events.push(make_element_event(START_ELEMENT, &name, e.attributes()));
+                // Self-closing: push the scope only for the duration of
+                // resolving this element, then pop immediately (no children).
+                scopes.push_from_attrs(e.attributes());
+                let start_ev =
+                    make_element_event(START_ELEMENT, &name, e.attributes(), &scopes);
+                let ns = start_ev.namespace_uri.clone();
+                events.push(start_ev);
                 events.push(StaxEvent {
                     kind: END_ELEMENT,
                     local_name: local_name_of(&name),
+                    namespace_uri: ns,
                     ..Default::default()
                 });
+                scopes.pop();
             }
             Ok(QXmlEvent::End(e)) => {
+                let name = e.name().as_ref().to_vec();
+                // Resolve the end tag's namespace in its still-open scope, then
+                // pop the frame the matching START pushed.
+                let (prefix, local) = split_qname(&name);
+                let ns = scopes.resolve(&prefix);
                 events.push(StaxEvent {
                     kind: END_ELEMENT,
-                    local_name: local_name_of(e.name().as_ref()),
+                    local_name: local,
+                    namespace_uri: ns,
                     ..Default::default()
                 });
+                scopes.pop();
             }
             Ok(QXmlEvent::Text(e)) => {
                 let raw = e.unescape().map(|c| c.into_owned()).unwrap_or_else(|_| {
@@ -306,26 +400,35 @@ fn make_element_event(
     kind: i32,
     qname: &[u8],
     attrs: quick_xml::events::attributes::Attributes,
+    scopes: &NsScopes,
 ) -> StaxEvent {
-    let local = local_name_of(qname);
-    let mut ev = StaxEvent { kind, local_name: local, ..Default::default() };
+    let (el_prefix, local) = split_qname(qname);
+    // Resolve the element's namespace from its prefix (default ns when none).
+    let el_ns = scopes.resolve(&el_prefix);
+    let mut ev = StaxEvent { kind, local_name: local, namespace_uri: el_ns, ..Default::default() };
     for a in attrs.flatten() {
         let key = a.key.as_ref().to_vec();
         let val = a
             .unescape_value()
             .map(|c| c.into_owned())
             .unwrap_or_else(|_| String::from_utf8_lossy(&a.value).into_owned());
-        // Skip xmlns / xmlns:* declarations for attribute enumeration; mirror them
-        // into namespace_uri when the prefix matches.
+        // Skip xmlns / xmlns:* declarations themselves — they are not reported
+        // as ordinary attributes by StAX (getAttributeCount excludes them).
         if key == b"xmlns" || key.starts_with(b"xmlns:") {
-            if key == b"xmlns" {
-                ev.namespace_uri = val;
-            }
             continue;
         }
+        // Per the Namespaces-in-XML spec, an UNPREFIXED attribute has NO
+        // namespace (the default namespace does NOT apply to attributes); a
+        // prefixed attribute resolves its prefix against the scope stack.
+        let (attr_prefix, attr_local) = split_qname(&key);
+        let attr_ns = if attr_prefix.is_empty() {
+            String::new()
+        } else {
+            scopes.resolve(&attr_prefix)
+        };
         ev.attributes.push(StaxAttr {
-            local_name: local_name_of(&key),
-            namespace_uri: String::new(),
+            local_name: attr_local,
+            namespace_uri: attr_ns,
             value: val,
         });
     }
