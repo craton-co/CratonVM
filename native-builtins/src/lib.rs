@@ -387,6 +387,7 @@ pub mod util_time;
 pub mod phases_early;
 pub mod phases_late;
 pub(crate) mod bc_aes;
+pub(crate) mod bc_chacha;
 // T19_K3_PROPS_SIDETABLE — robust java.util.Properties storage so
 // KeycloakMain.<clinit>'s Version.<clinit> path
 // (Class.getResourceAsStream → Properties.load → getProperty) returns
@@ -1007,6 +1008,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // BouncyCastle Strings UTF-8 transcode fast-path (Intrinsic) — dominates
     // AESTest.testCounter's growing-string round-trips once AES is native.
     crate::phases_late::register_bc_strings_utf8(registry);
+    // BouncyCastle CTR-mode (SICBlockCipher) per-byte loop fast-path (Intrinsic) —
+    // the sole remaining hot frame in AESTest.testCounter once AES+Strings are native.
+    crate::phases_late::register_bc_sic_ctr(registry);
+    // BouncyCastle ChaCha permutation fast-path (Intrinsic). Same JIT-ban
+    // rationale: the interpreted ChaCha core (dozens of Integers.rotateLeft
+    // calls per block) dominates the SPHINCS-256 PQC RegressionTest (PRG via
+    // ChaChaEngine.chachaCore + hash via Permute.permute). Verbatim port,
+    // RFC 8439-validated.
+    crate::phases_late::register_bc_chacha(registry);
 
     // Spring Boot loader in real-JDK mode can resolve Pattern natives through
     // synthetic-stub dispatch paths before/without usable JDK bytecode
@@ -1724,8 +1734,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         sunec_intpoly::register_sunec_intpoly_intrinsics(registry);
     });
 
-    // Gated default-off (CRATONVM_NATIVE_EC_MULTIPLY): coarse native EC
-    // scalar-multiply that bypasses the one-time ~14 s generator-table precompute.
+    // Coarse native EC scalar-multiply that bypasses the one-time ~14 s
+    // generator-table precompute. Default-ON whenever EC is routed real
+    // (`route_ec_to_real`); `CRATONVM_NATIVE_EC_MULTIPLY` force-enables, and the
+    // `CRATONVM_SYNTHETIC_EC=1` kill-switch leaves it inert. P-256 only — other
+    // curves get a clear error (they were already unsupported in default mode).
     registry.with_category(cratonvm_native_api::NativeKind::Intrinsic, |registry| {
         sunec_point::register_sunec_point_intrinsics(registry);
     });

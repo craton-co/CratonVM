@@ -137,65 +137,6 @@ fn get_kpg_keysize(this: ObjectRef) -> Option<i32> {
     kpg_keysize_table().lock().get(&this).copied()
 }
 
-// ---------------------------------------------------------------------------
-// EC-scoped real-SunEC routing (crate::route_ec_to_real, default ON)
-// ---------------------------------------------------------------------------
-//
-// In default (synthetic-JCA) mode the EC family is routed to the real,
-// pure-Java JDK-25 SunEC SPIs (`sun.security.ec.*`). The synthetic
-// `getInstance` natives return `Ok(None)` for `EC`/`ECDSA` so the real
-// `KeyPairGenerator`/`KeyFactory.getInstance` bytecode runs (resolving the
-// SunEC services seeded into the provider map via the `GetInstance` bridge),
-// and the per-instance synthetic natives fall through for any *real*
-// (non-synthetic) receiver so the real SPI delegation runs instead of the
-// synthetic shim. RSA/AES/digest stay fully synthetic.
-
-/// Class name of an object (`internal/slash/form`), or empty if unknown.
-fn obj_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
-    ctx.class_name_of_id(ctx.class_id_of_object(obj))
-        .unwrap_or_default()
-}
-
-/// A *synthetic* `KeyPairGenerator` is allocated as the exact (abstract in the
-/// real JDK!) class `java/security/KeyPairGenerator`. The real `getInstance`
-/// path can never return that — `KeyPairGenerator` is abstract, and SunEC's
-/// `ECKeyPairGenerator` extends `KeyPairGeneratorSpi`, so a real instance is
-/// always a `java/security/KeyPairGenerator$Delegate`. Exact match → synthetic;
-/// anything else → real → fall through to real bytecode.
-fn is_synthetic_kpg(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
-    obj_class_name(ctx, this) == "java/security/KeyPairGenerator"
-}
-
-/// `java.security.KeyFactory` is concrete (not abstract) and `getInstance`
-/// returns the exact `java/security/KeyFactory` class for both real and
-/// synthetic instances — so the class-name trick used for KPG/Signature does
-/// not work here. Track synthetic KeyFactory receivers by GC-stable identity
-/// hash code instead (mirrors `signature::sig_algo_table`).
-fn kf_synth_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>> {
-    use std::sync::OnceLock;
-    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<i32, i32>>> =
-        OnceLock::new();
-    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
-}
-
-fn mark_synthetic_kf(ctx: &dyn NativeContext, this: ObjectRef, algo: i32) {
-    kf_synth_table().lock().insert(ctx.identity_hash_code(this), algo);
-}
-
-/// `Some(algo)` if this KeyFactory was produced by our synthetic `getInstance`.
-fn synthetic_kf_algo(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i32> {
-    kf_synth_table()
-        .lock()
-        .get(&ctx.identity_hash_code(this))
-        .copied()
-}
-
-/// True if `v` is one of our synthetic bare-interface key objects of class
-/// `class_name` (`java/security/PublicKey` or `java/security/PrivateKey`).
-fn is_synthetic_key(ctx: &dyn NativeContext, v: &Value, class_name: &str) -> bool {
-    matches!(v, Value::Object(Some(o)) if obj_class_name(ctx, *o) == class_name)
-}
-
 // Synthetic-slot offsets relative to `synthetic_base_offset(...)`.
 const KPG_OFF_ALGO: usize = 0;
 const KPG_OFF_KEYSIZE: usize = 1;
@@ -335,12 +276,6 @@ fn alloc_keypair(ctx: &mut dyn NativeContext, pubk: ObjectRef, privk: ObjectRef)
 fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
     let idx = algo_idx(&alg);
-    // EC routes to the real SunEC KeyPairGenerator SPI: fall through so the real
-    // `KeyPairGenerator.getInstance("EC")` bytecode runs and returns a concrete
-    // ECPublicKey/ECPrivateKey (fixes the bare-interface CCE).
-    if crate::route_ec_to_real() && idx == ALGO_EC {
-        return Ok(None);
-    }
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let kpg = alloc_concurrent_synthetic(
         ctx,
@@ -370,9 +305,6 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn kpg_initialize_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    if crate::route_ec_to_real() && !is_synthetic_kpg(ctx, this) {
-        return Ok(None); // real KeyPairGenerator$Delegate → run real SPI
-    }
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let bits = match args.get(1) {
         Some(Value::Int(n)) => *n,
@@ -393,9 +325,6 @@ fn kpg_initialize_spec(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // P-256, so any spec sets bits=256.  RSA spec keysize is preserved
     // from the previous value / the default.
     let this = this_arg(args)?;
-    if crate::route_ec_to_real() && !is_synthetic_kpg(ctx, this) {
-        return Ok(None); // real KeyPairGenerator$Delegate → run real SPI
-    }
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let cur = get_kpg_keysize(this).unwrap_or_else(|| match ctx.get_field(this, base + KPG_OFF_KEYSIZE) {
         Value::Int(n) => n,
@@ -418,9 +347,6 @@ fn kpg_initialize_spec_random(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 
 fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    if crate::route_ec_to_real() && !is_synthetic_kpg(ctx, this) {
-        return Ok(None); // real KeyPairGenerator$Delegate → run real SPI
-    }
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     // SigProbe fix: prefer the side-table read (survives real-JDK class
     // layouts where slot 0 collides with an inherited Object field).
@@ -488,9 +414,6 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn kpg_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    if crate::route_ec_to_real() && !is_synthetic_kpg(ctx, this) {
-        return Ok(None); // real KeyPairGenerator$Delegate → run real getAlgorithm()
-    }
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let idx = match ctx.get_field(this, base + KPG_OFF_ALGO) {
         Value::Int(i) => i,
@@ -507,12 +430,6 @@ fn kpg_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
     let idx = algo_idx(&alg);
-    // EC routes to the real SunEC KeyFactory SPI so `generatePublic`/
-    // `generatePrivate` over EC{Public,Private}KeySpec produce concrete
-    // sun.security.ec.EC*KeyImpl. Fall through to real bytecode.
-    if crate::route_ec_to_real() && idx == ALGO_EC {
-        return Ok(None);
-    }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let kf = alloc_concurrent_synthetic(
         ctx,
@@ -520,7 +437,6 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         base + KF_PRIVATE_SLOTS,
     );
     ctx.set_field(kf, base + KF_OFF_ALGO, Value::Int(idx));
-    mark_synthetic_kf(ctx, kf, idx);
     Ok(Some(Value::Object(Some(kf))))
 }
 
@@ -530,9 +446,6 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// a key with `key_id == 0` so verify-time falls through gracefully.
 fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    if crate::route_ec_to_real() && synthetic_kf_algo(ctx, this).is_none() {
-        return Ok(None); // real KeyFactory → run real generatePublic
-    }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let algo = match ctx.get_field(this, base + KF_OFF_ALGO) {
         Value::Int(i) => i,
@@ -609,9 +522,6 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // `getEncoded` to round-trip the bytes (which is the typical
     // KeyStore-write path).
     let this = this_arg(args)?;
-    if crate::route_ec_to_real() && synthetic_kf_algo(ctx, this).is_none() {
-        return Ok(None); // real KeyFactory → run real generatePrivate
-    }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let algo = match ctx.get_field(this, base + KF_OFF_ALGO) {
         Value::Int(i) => i,
@@ -631,9 +541,6 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn kf_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    if crate::route_ec_to_real() && synthetic_kf_algo(ctx, this).is_none() {
-        return Ok(None); // real KeyFactory → run real getAlgorithm()
-    }
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let idx = match ctx.get_field(this, base + KF_OFF_ALGO) {
         Value::Int(i) => i,
@@ -649,25 +556,12 @@ fn kf_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 
 fn keypair_get_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let slot0 = ctx.get_field(this, 0);
-    // Synthetic KeyPair stores publicKey@0 (a synthetic java/security/PublicKey).
-    // A *real* java.security.KeyPair lays out privateKey@0, publicKey@1, so a raw
-    // slot-0 read would return the PRIVATE key — fall through to real getPublic().
-    if crate::route_ec_to_real() && !is_synthetic_key(ctx, &slot0, "java/security/PublicKey") {
-        return Ok(None);
-    }
-    Ok(Some(slot0))
+    Ok(Some(ctx.get_field(this, 0)))
 }
 
 fn keypair_get_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
-    let slot1 = ctx.get_field(this, 1);
-    // Synthetic KeyPair stores privateKey@1 (a synthetic java/security/PrivateKey);
-    // a real java.security.KeyPair has publicKey@1 — fall through to real getPrivate().
-    if crate::route_ec_to_real() && !is_synthetic_key(ctx, &slot1, "java/security/PrivateKey") {
-        return Ok(None);
-    }
-    Ok(Some(slot1))
+    Ok(Some(ctx.get_field(this, 1)))
 }
 
 fn key_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

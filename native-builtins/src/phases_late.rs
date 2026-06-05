@@ -35545,6 +35545,260 @@ pub(crate) fn register_bc_aes_engine(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// Native fast-path for the BouncyCastle ChaCha permutation kernels that
+/// dominate SPHINCS-256 (`org.bouncycastle.pqc.crypto.test.RegressionTest`,
+/// which otherwise times out >360 s vs HotSpot ~1.3 s). Intercepts the two
+/// `public static` pure ChaCha cores:
+///   * `ChaChaEngine.chachaCore(int rounds, int[] input, int[] x)` — the PRG
+///     block function (`Seed.prg` → `Salsa20Engine.processBytes` →
+///     `generateKeyStream`), the profiled hot leaf.
+///   * `Permute.permute(int rounds, int[] x)` — the SPHINCS hash permutation
+///     (`HashFunctions.hash_2n_n`/`hash_n_n`).
+/// With `org/bouncycastle/*` JIT-banned, both run interpreted and their dozens
+/// of per-block `Integers.rotateLeft` *method calls* crush the interpreter. The
+/// Rust bodies (`crate::bc_chacha`) are verbatim, RFC 8439-validated ports.
+/// Both are invoked via invokestatic, so the native registry shadows the
+/// bytecode (`execute_invokestatic` `direct_native`). Length/odd-rounds guards
+/// mirror BC's `IllegalArgumentException`s (defensive — never fire in the real
+/// callers, which always pass length-16 arrays and even rounds).
+pub(crate) fn register_bc_chacha(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+
+    // Read a Java int[16] into a Rust array; None when the length isn't 16
+    // (→ caller raises IAE, matching BC's `x.length != 16` guard).
+    fn read16(ctx: &dyn NativeContext, arr: ObjectRef) -> Option<[i32; 16]> {
+        if ctx.array_length(arr) != 16 {
+            return None;
+        }
+        let mut out = [0i32; 16];
+        for k in 0..16 {
+            match ctx.get_array_element(arr, k) {
+                Value::Int(v) => out[k] = v,
+                _ => return None,
+            }
+        }
+        Some(out)
+    }
+
+    fn iae(msg: &str) -> MethodCallFailed {
+        RuntimeError::IllegalArgumentException { message: msg.into() }.into()
+    }
+
+    // ChaChaEngine.chachaCore: x[i] = permute(input)_i + input[i]. `input` and
+    // `x` are distinct arrays (engine state vs keystream buffer).
+    r.register(
+        "org/bouncycastle/crypto/engines/ChaChaEngine",
+        "chachaCore",
+        "(I[I[I)V",
+        |ctx, args| {
+            let rounds = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => return Err(iae("chachaCore: missing rounds")),
+            };
+            let input_arr = obj_arg(args, 1)?;
+            let x_arr = obj_arg(args, 2)?;
+            // BC checks input.length, then x.length, then rounds parity.
+            let input = read16(ctx, input_arr).ok_or_else(|| iae(""))?;
+            if ctx.array_length(x_arr) != 16 {
+                return Err(iae(""));
+            }
+            if rounds % 2 != 0 {
+                return Err(iae("Number of rounds must be even"));
+            }
+            let mut x = [0i32; 16];
+            crate::bc_chacha::chacha_core(rounds, &input, &mut x);
+            for k in 0..16 {
+                ctx.set_array_element(x_arr, k, Value::Int(x[k]));
+            }
+            Ok(None)
+        },
+    );
+
+    // Permute.permute: in-place permutation of x, no final input-add.
+    r.register(
+        "org/bouncycastle/pqc/crypto/sphincs/Permute",
+        "permute",
+        "(I[I)V",
+        |ctx, args| {
+            let rounds = match args.first() {
+                Some(Value::Int(v)) => *v,
+                _ => return Err(iae("permute: missing rounds")),
+            };
+            let x_arr = obj_arg(args, 1)?;
+            let mut x = read16(ctx, x_arr).ok_or_else(|| iae(""))?;
+            if rounds % 2 != 0 {
+                return Err(iae("Number of rounds must be even"));
+            }
+            crate::bc_chacha::permute(rounds, &mut x);
+            for k in 0..16 {
+                ctx.set_array_element(x_arr, k, Value::Int(x[k]));
+            }
+            Ok(None)
+        },
+    );
+
+    r.set_category(__prev_cat);
+}
+
+/// Native fast-path for `org.bouncycastle.crypto.modes.SICBlockCipher.processBytes`
+/// (CTR mode). Once the AES engine is native, this per-byte XOR loop is the sole
+/// remaining hot frame in `AESTest.testCounter` (profiled: ~112s vs ~0.4s for the
+/// String half). Faithful reimplementation of the bytecode loop:
+///   if byteCount==0 { checkLastIncrement(); cipher.processBlock(counter,counterOut);
+///                     next = in ^ counterOut[byteCount++]; }
+///   else { next = in ^ counterOut[byteCount++];
+///          if byteCount==counter.length { byteCount=0; incrementCounter(); } }
+/// For AES (the common case) the keystream block is produced natively from the
+/// engine's `WorkingKey` (no per-block invoke, GC-safe — all loop state is in Rust
+/// locals). For any other underlying cipher it falls back to invoking
+/// `cipher.processBlock` per block (handles held across the invoke, matching the
+/// apps_h2.rs convention; the default young GC is non-moving). `checkLastIncrement`
+/// is a no-op when the IV fills the block (AESTest's case).
+pub(crate) fn register_bc_sic_ctr(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
+
+    r.register(
+        "org/bouncycastle/crypto/modes/SICBlockCipher",
+        "processBytes",
+        "([BII[BI)I",
+        |ctx, args| {
+            let arg_i32 = |i: usize| -> i32 {
+                match args.get(i) {
+                    Some(Value::Int(v)) => *v,
+                    _ => 0,
+                }
+            };
+            let ise = |m: &str| -> MethodCallFailed {
+                RuntimeError::IllegalStateException { message: m.into() }.into()
+            };
+            let this = obj_arg(args, 0)?;
+            let in_arr = obj_arg(args, 1)?;
+            let in_off = arg_i32(2);
+            let len_i = arg_i32(3);
+            let out_arr = obj_arg(args, 4)?;
+            let out_off = arg_i32(5);
+
+            let obj_field = |name: &str| match ctx.get_field_by_name(this, name) {
+                Value::Object(Some(o)) => Some(o),
+                _ => None,
+            };
+            let cipher = obj_field("cipher").ok_or_else(|| ise("SIC: null cipher"))?;
+            let counter_arr = obj_field("counter").ok_or_else(|| ise("SIC: null counter"))?;
+            let counter_out_arr = obj_field("counterOut").ok_or_else(|| ise("SIC: null counterOut"))?;
+            let iv_arr = obj_field("IV").ok_or_else(|| ise("SIC: null IV"))?;
+            let mut byte_count = match ctx.get_field_by_name(this, "byteCount") {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+
+            let bs = ctx.array_length(counter_arr);
+            if bs == 0 {
+                return Err(ise("SIC: zero block size"));
+            }
+            // CTR misuse guard (BC throws DataLength/OutputLengthException; both
+            // are RuntimeExceptions and this is a can't-happen path for valid use).
+            if in_off < 0
+                || len_i < 0
+                || out_off < 0
+                || (in_off as usize) + (len_i as usize) > ctx.array_length(in_arr)
+                || (out_off as usize) + (len_i as usize) > ctx.array_length(out_arr)
+            {
+                return Err(ise("CTR/SIC buffer length out of range"));
+            }
+            let len = len_i as usize;
+
+            let mut counter = vec![0u8; bs];
+            ctx.read_byte_array_into(counter_arr, 0, &mut counter);
+            let mut keystream = vec![0u8; bs];
+            ctx.read_byte_array_into(counter_out_arr, 0, &mut keystream);
+            let iv_len = ctx.array_length(iv_arr);
+            let iv_last = if iv_len >= 1 && iv_len <= bs {
+                match ctx.get_array_element(iv_arr, iv_len - 1) {
+                    Value::Int(v) => v as u8,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+
+            let mut in_buf = vec![0u8; len];
+            ctx.read_byte_array_into(in_arr, in_off as usize, &mut in_buf);
+            let mut out_buf = vec![0u8; len];
+
+            // AES fast path: produce the keystream block natively from WorkingKey.
+            let is_aes = ctx
+                .class_name_of_id(ctx.class_id_of_object(cipher))
+                .as_deref()
+                == Some("org/bouncycastle/crypto/engines/AESEngine");
+            let kw: Vec<[u32; 4]> = if is_aes {
+                match ctx.get_field_by_name(cipher, "WorkingKey") {
+                    Value::Object(Some(wk)) => read_aes_kw(ctx, wk),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            let use_aes = kw.len() >= 2;
+
+            for i in 0..len {
+                let next;
+                if byte_count == 0 {
+                    // checkLastIncrement (no-op when IV fills the block)
+                    if iv_len < bs && counter[iv_len - 1] != iv_last {
+                        return Err(ise("Counter in CTR/SIC mode out of range."));
+                    }
+                    if use_aes {
+                        crate::bc_aes::encrypt_block(&kw, &counter, &mut keystream);
+                    } else {
+                        ctx.write_byte_array_from(counter_arr, 0, &counter);
+                        ctx.invoke_virtual(
+                            cipher,
+                            "processBlock",
+                            "([BI[BI)I",
+                            &[
+                                Value::Object(Some(counter_arr)),
+                                Value::Int(0),
+                                Value::Object(Some(counter_out_arr)),
+                                Value::Int(0),
+                            ],
+                        )?;
+                        ctx.read_byte_array_into(counter_out_arr, 0, &mut keystream);
+                    }
+                    next = in_buf[i] ^ keystream[byte_count as usize];
+                    byte_count += 1;
+                } else {
+                    next = in_buf[i] ^ keystream[byte_count as usize];
+                    byte_count += 1;
+                    if byte_count as usize == bs {
+                        byte_count = 0;
+                        // incrementCounter (big-endian, from the last byte)
+                        let mut j = bs;
+                        while j > 0 {
+                            j -= 1;
+                            counter[j] = counter[j].wrapping_add(1);
+                            if counter[j] != 0 {
+                                break;
+                            }
+                        }
+                    }
+                }
+                out_buf[i] = next;
+            }
+
+            // Persist mutated state + output.
+            ctx.write_byte_array_from(counter_arr, 0, &counter);
+            ctx.write_byte_array_from(counter_out_arr, 0, &keystream);
+            ctx.set_field_by_name(this, "byteCount", Value::Int(byte_count));
+            ctx.write_byte_array_from(out_arr, out_off as usize, &out_buf);
+            Ok(Some(Value::Int(len as i32)))
+        },
+    );
+
+    r.set_category(__prev_cat);
+}
+
 /// Intrinsics for `org.bouncycastle.util.Strings` UTF-8 transcode. With BC
 /// JIT-banned these otherwise run interpreted through `UTF8.transcodeToUTF16`
 /// and the slow `new String(char[])` / `StringUTF16.compress` path, which
@@ -35563,7 +35817,12 @@ pub(crate) fn register_bc_strings_utf8(r: &mut NativeMethodRegistry) {
         let mut buf = vec![0u8; len];
         ctx.read_byte_array_into(arr, 0, &mut buf);
         match std::str::from_utf8(&buf) {
-            Ok(text) => Ok(Some(Value::Object(Some(ctx.create_string(text))))),
+            // BC's `new String(chars, 0, len)` is a fresh, DISTINCT, un-interned
+            // object — must NOT go through the pooling `create_string`, which
+            // would (a) leak every dynamically-decoded string into the intern
+            // pool (testCounter decodes 255k unique growing strings → heap
+            // exhaustion) and (b) give wrong `==` identity semantics.
+            Ok(text) => Ok(Some(Value::Object(Some(ctx.create_string_uninterned(text))))),
             Err(_) => Err(RuntimeError::IllegalArgumentException {
                 message: "Invalid UTF-8 input".into(),
             }
