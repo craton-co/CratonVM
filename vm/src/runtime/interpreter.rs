@@ -12978,6 +12978,13 @@ fn try_osr(
 
     // Set JIT thread for invoke dispatch callbacks (save/restore for re-entrancy)
     let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
+    // Shadow-stack (follow-up §1): capture this `*mut JvmThread` so the OSR
+    // trampoline can cache it and the OSR-entered frame's safepoints push/reload
+    // precisely (instead of skipping shadow tracking). `set_jit_thread` just
+    // allocated this thread's shadow stack — it's the same thread. The value is a
+    // raw address (Copy `i64`, holds no borrow), so the closure below captures it
+    // by value and `thread` stays free for later use.
+    let thread_ptr = thread as *mut JvmThread as i64;
     // NEW-1.5 + T1.1.a: record native stack pointer for GC root scan.
     // Uses the precise-oop-map path when the compiled method has
     // populated maps; falls back to conservative otherwise.
@@ -12988,7 +12995,7 @@ fn try_osr(
     let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
     let result_i64 = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: compiled is a finalized JIT CompiledMethod whose entry point was validated; jit_locals match the method's local variable layout at the OSR entry point.
-        unsafe { compiled.osr_enter(vm_ptr, &jit_locals, entry_pc) }
+        unsafe { compiled.osr_enter(vm_ptr, &jit_locals, entry_pc, thread_ptr) }
     }));
     // DBG: detect a quiescence LEAK across the OSR call (a nested JIT entry
     // that did not pop). After osr_enter returns, depth should be back to

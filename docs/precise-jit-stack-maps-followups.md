@@ -10,29 +10,56 @@ in `docs/precise-jit-stack-maps-findings.md`.
 These are the remaining items before the mechanism can be trusted broadly and
 turned on by default, roughly in priority order.
 
-## 1. OSR-frame *tracking* (correctness, highest priority)
+## 1. OSR-frame *tracking* (correctness, highest priority) — IMPLEMENTED (gated, default-OFF); blocked by a deeper collector bug
 
-**Now:** an OSR-entered frame bypasses the prologue thread-fetch, so the OSR
-trampoline (`jit/src/lib.rs::emit_osr_trampoline`) **zeroes** the cached thread
-slot; the push/reload/epilogue null-guards then make that frame **skip** shadow
-tracking entirely. bt18 is golden anyway because the OSR'd `binaryTrees`'s
-`longLivedTree` survives via the tracked `make`/`check` spine and the from-space
-staleness window — but an OSR frame whose live oop is *only* reachable from that
-frame would go stale under a moving GC. Not robust.
+**Status (2026-06-05, branch `feat/shadow-stack-followups`):** the mechanism is
+built and works mechanically, but it is gated behind its **own** sub-flag
+`CRATONVM_SHADOW_OSR_TRACK` (default-OFF) because turning it on **regresses
+bt18** via a deeper shadow×conservative-pin GC interaction (see "Why gated"
+below). The default `CRATONVM_SHADOW_STACK` path keeps the proven-golden SKIP
+behaviour.
 
-**Do:** make OSR *track* instead of skip — store the real thread pointer (and
-save the `top` watermark) at OSR entry.
-- `osr_enter` is called from `interpreter.rs::try_osr`, which holds
-  `thread: &mut JvmThread`. Pass `thread as *mut JvmThread as i64` into
-  `osr_enter` → `osr_trampoline` → `emit_osr_trampoline` (alongside the existing
-  `shadow_thread_slot_off`).
-- In `emit_osr_trampoline`, instead of zeroing: store that thread pointer into
-  `[rbp - shadow_thread_slot_off]`, then load `[thread + shadow_off + TOP]` and
-  store it into `[rbp - shadow_savetop_slot_off]` (so the epilogue watermark
-  restore is correct). Needs `shadow_off_in_thread` + `shadow_savetop_slot_off`
-  also threaded onto `CompiledMethod` / into the trampoline.
-- The trampoline is cached by `target_addr`; all of these are constant per
-  target, so caching stays valid.
+**What was done** (the original plan, implemented verbatim):
+- `osr_enter` now takes `thread_ptr: i64` (`try_osr` passes
+  `thread as *mut JvmThread as i64`; the shadow stack was just `ensure_allocated`d
+  by the preceding `set_jit_thread`). Threaded
+  `osr_enter → osr_trampoline → emit_osr_trampoline`.
+- The cached trampoline now takes a 3rd C-ABI arg (arg2 = R8 / RDX) = `thread_ptr`.
+- `CompiledMethod` gained `shadow_savetop_slot_off` + `shadow_off_in_thread`
+  (set from the compiler next to `shadow_thread_slot_off`).
+- `emit_osr_trampoline`, when `osr_shadow_track_enabled()`, replicates the
+  prologue's shadow setup: `MOV [rbp-thread_slot], arg2`; `MOV r11, [arg2+shadow_off]`;
+  `MOV [rbp-savetop_slot], r11`. Else (default) it keeps zeroing the thread slot
+  (SKIP). Offsets are constant per `target_addr`, so the cache stays valid;
+  `thread_ptr` is a runtime arg (different threads OSR the same target), not baked in.
+
+**Validation (8g, the only reliable heap — 16g/30g give a non-golden 68332206
+even at baseline, a separate large-heap/promotion confound):**
+- `CRATONVM_SHADOW_STACK=1` (OSR track OFF): bt10=135854, bt16=14985902,
+  bt18=**67674804** — golden, unchanged. No regression.
+- `+ CRATONVM_SHADOW_OSR_TRACK=1`: bt10/16 golden (they do **0** moving GCs — so
+  they never actually exercise OSR tracking under a move); bt18 = **68199090**
+  (wrong), rc=0 (no crash).
+
+**Why gated (the deeper bug, NOT an OSR-mechanism bug):** `DBG_SHADOW` shows the
+track path adds **exactly +1** remapped oop per GC (38→39, 57→58) — the OSR'd
+`binaryTrees`'s `longLivedTree` root. Remapping it makes `check()` read
+`longLivedTree`'s **to-space** (evacuated) copy instead of the from-space copy
+that *every* golden config relies on (SKIP-shadow and `DBG_FORCE_MOVING` both
+leave binaryTrees' frame un-remapped). The to-space copy is **structurally wrong**
+at bt18's depth-18 scale specifically under the shadow×conservative **mix**:
+`FORCE_MOVING` (uniform moving, all-conservative) evacuates the same tree
+**correctly** (golden 67674804), so pure moving is fine — the inconsistency is a
+copying-collector-with-pinning problem (a moved object whose subtree contains
+conservatively-pinned interior nodes), i.e. the same "unresolved interaction"
+flagged in `precise-jit-stack-maps-design.md`. It is out of scope for the OSR
+trampoline and must be root-caused in the collector (gen_heap evacuation / pin
+handling) before OSR tracking — or default-on (§6) — is safe.
+
+**Next for this item:** root-cause the to-space evacuation inconsistency under the
+shadow×conservative mix (compare a TRACK-mode GC's to-space `longLivedTree` against
+the from-space original; instrument evac of an object that is also conservatively
+pinned). Until then `CRATONVM_SHADOW_OSR_TRACK` stays default-OFF.
 
 ## 2. Regression pool (correctness, before default-on)
 

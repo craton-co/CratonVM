@@ -19264,10 +19264,13 @@ pub fn compile_with_param_slots(
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;
-    // Shadow-stack — frame offset of the cached thread-pointer slot, so the OSR
-    // trampoline can zero it (OSR bypasses the prologue that sets it). 0 when
-    // the shadow-stack gate was off at compile.
+    // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline
+    // can replicate the prologue's shadow setup (cache the thread ptr + snapshot
+    // the `top` watermark) for OSR-entered frames (follow-up §1). All 0 when the
+    // shadow-stack gate was off at compile.
     cm.shadow_thread_slot_off = compiler.shadow_thread_slot_off;
+    cm.shadow_savetop_slot_off = compiler.shadow_savetop_slot_off;
+    cm.shadow_off_in_thread = compiler.shadow_off_in_thread;
 
     // Task #60 — attach unroll-cloned MIC/PIC slots to the
     // CompiledMethod so they outlive the compiled code. The imm64
@@ -24457,7 +24460,7 @@ mod tests {
         let jit_locals: [i64; 3] = [10, 10, 5]; // n=10, s=10, i=5
         // SAFETY: Entering JIT-compiled code via OSR; the CompiledMethod was produced
         // from valid bytecode, locals array is correctly sized, and the mmap region is executable.
-        let osr_result = unsafe { compiled.osr_enter(0, &jit_locals, 4) };
+        let osr_result = unsafe { compiled.osr_enter(0, &jit_locals, 4, /* thread_ptr */ 0) };
         assert!(osr_result.is_some(), "OSR entry should succeed at PC=4");
         assert_eq!(osr_result.unwrap(), 45); // s=10 + 5+6+7+8+9 = 45
     }
@@ -24507,7 +24510,7 @@ mod tests {
         // Remaining sum 1000..1999 = 1499500; total = 1999000.
         // jit_locals layout: index 0=n, 1=(n high), 2=s, 3=(s high), 4=i, 5=(i high)
         let jit_locals: [i64; 6] = [2000, 0, 499500, 0, 1000, 0];
-        let osr_result = unsafe { compiled.osr_enter(0, &jit_locals, 5) };
+        let osr_result = unsafe { compiled.osr_enter(0, &jit_locals, 5, /* thread_ptr */ 0) };
         assert!(osr_result.is_some(), "OSR entry should succeed at PC=5");
         assert_eq!(osr_result.unwrap(), 1999000, "OSR long loop result");
     }
