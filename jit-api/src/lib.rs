@@ -169,6 +169,11 @@ pub struct JitRuntimeHelpers {
     /// captures an approximate SP). `0` = not wired → the prologue skips
     /// the call and the walker uses the conservative path. Optional.
     pub frame_record: usize,
+    /// Shadow-stack precise roots (`CRATONVM_SHADOW_STACK`) — byte offset of
+    /// the `ShadowStack` field from `&JvmThread`. The JIT emits the inline
+    /// push as `[thread + shadow_stack_offset_in_thread + ShadowStack::TOP_OFFSET]`.
+    /// `0` when the mechanism is off → no shadow codegen is emitted.
+    pub shadow_stack_offset_in_thread: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -297,6 +302,7 @@ helper_fields! {
     (get_current_thread,             FieldKind::OptionalPtr),
     (tlab_post_init,                 FieldKind::OptionalPtr),
     (frame_record,                   FieldKind::OptionalPtr),
+    (shadow_stack_offset_in_thread,  FieldKind::Offset),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -322,7 +328,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 39,
+    JitRuntimeHelpers::NUM_FIELDS == 40,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -818,8 +824,8 @@ mod tests {
             std::mem::size_of::<JitRuntimeHelpers>(),
             JitRuntimeHelpers::NUM_FIELDS * FIELD_WIDTH,
         );
-        // And the macro-driven count is the canonical 38.
-        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 39);
+        // And the macro-driven count is the canonical 40.
+        assert_eq!(JitRuntimeHelpers::NUM_FIELDS, 40);
     }
 
     #[test]
@@ -868,6 +874,7 @@ mod tests {
             (36, "get_current_thread",           std::mem::offset_of!(JitRuntimeHelpers, get_current_thread)),
             (37, "tlab_post_init",               std::mem::offset_of!(JitRuntimeHelpers, tlab_post_init)),
             (38, "frame_record",                 std::mem::offset_of!(JitRuntimeHelpers, frame_record)),
+            (39, "shadow_stack_offset_in_thread", std::mem::offset_of!(JitRuntimeHelpers, shadow_stack_offset_in_thread)),
         ];
 
         // (a) Each field is at its documented sequential byte offset.
@@ -917,7 +924,7 @@ mod tests {
         let off = f.iter().filter(|e| e.kind == FieldKind::Offset).count();
         assert_eq!(req, 33, "required-pointer count drifted");
         assert_eq!(opt, 2, "optional-pointer count drifted");
-        assert_eq!(off, 3, "offset-field count drifted");
+        assert_eq!(off, 4, "offset-field count drifted");
         assert_eq!(req + opt + off, JitRuntimeHelpers::NUM_FIELDS);
     }
 

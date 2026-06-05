@@ -186,6 +186,23 @@ static GLOBAL_JIT_DEPTH: AtomicUsize = AtomicUsize::new(0);
 /// lived in the vm crate.
 pub use cratonvm_gc::gc_quiescence::is_active as gc_must_defer;
 
+/// Whether the JIT **shadow-stack** precise-roots mechanism is enabled
+/// (`CRATONVM_SHADOW_STACK`). Cached on first read.
+///
+/// When on, JIT codegen pushes live oops onto each thread's
+/// [`cratonvm_gc::shadow_stack::ShadowStack`] around GC-capable safepoints, the
+/// marking root scan folds those values into the root set, the post-move remap
+/// rewrites them in place, and the young-gen collector is permitted to run the
+/// *moving* (Cheney) cycle even while JIT frames are live (see
+/// `gen_heap.rs` quiescence gate). Off by default: zero codegen change, the
+/// collector keeps deferring to the non-moving sweep under JIT.
+#[inline]
+pub fn shadow_stack_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some())
+}
+
 /// Capture the current native stack pointer.
 ///
 /// Implemented as the address of a probe variable that **must** live in the

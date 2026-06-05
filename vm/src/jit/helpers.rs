@@ -172,6 +172,28 @@ impl Drop for JitCalleeGuard {
 /// duration of JIT execution. The pointer is only dereferenced inside JIT helpers
 /// which execute on the same thread that set it.
 pub fn set_jit_thread(thread: &mut JvmThread) -> JitThreadScope {
+    // Shadow-stack precise roots (CRATONVM_SHADOW_STACK): ensure this thread's
+    // shadow stack is allocated before any JIT code that may push to it runs.
+    // Cheap `base != 0` check after the first entry; gated, no-op otherwise.
+    // Done here (with a legitimate `&mut JvmThread`) rather than in the extern-C
+    // `jit_get_current_thread` getter to avoid deriving an aliasing `&mut`.
+    if crate::jit::conservative_roots::shadow_stack_enabled() {
+        thread.shadow_stack.ensure_allocated();
+        if std::env::var_os("CRATONVM_DBG_SHADOW").is_some() {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static ONCE: AtomicBool = AtomicBool::new(false);
+            if !ONCE.swap(true, Ordering::Relaxed) {
+                eprintln!(
+                    "[SHADOW] set_jit_thread: thread={:p} shadow base={:#x} top={:#x} end={:#x} ss_off={}",
+                    thread as *mut JvmThread,
+                    thread.shadow_stack.base,
+                    thread.shadow_stack.top,
+                    thread.shadow_stack.end,
+                    JvmThread::shadow_stack_offset(),
+                );
+            }
+        }
+    }
     let prev_ptr = JIT_THREAD.with(|t| {
         let old = t.get();
         t.set(thread as *mut JvmThread);
@@ -3656,6 +3678,11 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         } else {
             0
         },
+        // Shadow-stack precise roots — byte offset of the `ShadowStack` field
+        // from `&JvmThread`. The JIT bakes `[thread + this + ShadowStack::TOP_OFFSET]`
+        // as the inline push target. Always wired (harmless when codegen is off,
+        // which gates emission on its own cached `CRATONVM_SHADOW_STACK` flag).
+        shadow_stack_offset_in_thread: JvmThread::shadow_stack_offset(),
     }
 }
 

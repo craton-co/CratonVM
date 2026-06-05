@@ -1706,6 +1706,37 @@ pub fn precise_jit_maps_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_PRECISE_JIT_MAPS").is_some())
 }
 
+/// Whether the JIT **shadow-stack** precise-roots codegen is enabled
+/// (`CRATONVM_SHADOW_STACK`). When on, each GC-capable safepoint pushes every
+/// live oop (operand-stack entries AND oop locals) onto the thread's shadow
+/// stack and reloads them after the call, so a *moving* collector can rewrite
+/// every JIT-held reference precisely (see `gc/src/shadow_stack.rs`). Off by
+/// default → no extra codegen, byte-identical to the legacy path.
+pub fn shadow_stack_maps_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some())
+}
+
+/// Bisect toggle (`CRATONVM_SHADOW_NOPUSH`) — when set, the shadow push/reload
+/// codegen is suppressed while the prologue thread-fetch + the GC gate flip stay
+/// on. Used to localize a fault to the push/reload sequences vs the rest.
+fn shadow_nopush() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_NOPUSH").is_some())
+}
+
+/// Bisect toggle (`CRATONVM_SHADOW_NORELOAD`) — suppress only the post-call
+/// reload (keep the push). Push-only writes to the (separate) shadow buffer, so
+/// if push-only is correct it cannot corrupt program state; a crash then
+/// localizes to the reload (which writes back into home regs/slots).
+fn shadow_noreload() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_NORELOAD").is_some())
+}
+
 fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
     let mut targets = vec![false; code_len];
     let mut pc = 0usize;
@@ -4485,6 +4516,17 @@ enum StackSlot {
 /// R10 is excluded because it is used internally by bounds checks and SIMD loops.
 const SCRATCH_REGS: [u8; 2] = [R8, R9];
 
+/// Where a live oop resides at a shadow-stack safepoint — the source the push
+/// reads from and the destination the post-call reload writes back to.
+/// `Reg` is a callee-saved home register (R12–R15/RBX/RSI/RDI); `Frame(off)`
+/// is the canonical frame slot `[rbp - off]`. (Scratch/XMM entries never hold a
+/// live oop across a call: scratch is flushed pre-call and XMM holds FP data.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShadowHome {
+    Reg(u8),
+    Frame(i32),
+}
+
 /// Register mapping for locals → callee-saved registers.
 /// R12-R15 + RBX on all platforms. On Windows, RSI and RDI are also callee-saved.
 #[cfg(target_os = "windows")]
@@ -4801,6 +4843,26 @@ struct Compiler {
     /// Stage 3 — frame offset (positive; slot at `[rbp - sp_id_slot_off]`) of
     /// the reserved safepoint-id slot. 0 when `precise_maps` is off.
     sp_id_slot_off: i32,
+    /// Shadow-stack precise roots (`CRATONVM_SHADOW_STACK`) — whether the
+    /// per-safepoint live-oop push/reload codegen is emitted. Off →
+    /// byte-identical default path.
+    shadow_enabled: bool,
+    /// Frame offset (positive; slot at `[rbp - shadow_thread_slot_off]`) of the
+    /// reserved slot that caches this invocation's `*mut JvmThread`, set once in
+    /// the prologue. 0 when `shadow_enabled` is off.
+    shadow_thread_slot_off: i32,
+    /// Frame offset of the reserved slot holding the shadow `top` at method
+    /// entry. The epilogue restores `thread.shadow_stack.top` from it so any
+    /// unbalanced safepoint push is unwound on return (correct under nesting).
+    /// 0 when `shadow_enabled` is off.
+    shadow_savetop_slot_off: i32,
+    /// Byte offset of the `ShadowStack` from `&JvmThread` (from the helper
+    /// table). The shadow `top` is at `[thread + shadow_off_in_thread + 0]`.
+    shadow_off_in_thread: i32,
+    /// Live-oop homes recorded by the most recent shadow push, consumed by the
+    /// matching post-call reload. Cleared at each push start so an unbalanced
+    /// (no-reload) safepoint cannot feed stale homes to a later reload.
+    pending_shadow: Vec<ShadowHome>,
     /// T5.2.1 — induction variables detected in each loop.
     ///
     /// One entry per detected counted loop. Consumed by downstream
@@ -4921,17 +4983,35 @@ impl Compiler {
         // call so the GC root walker can recover the exact oop map. Off by
         // default → no slot reserved → frame layout byte-identical.
         let precise_maps = precise_jit_maps_enabled();
+        let shadow_enabled = shadow_stack_maps_enabled();
+        // Shadow stack reserves ONE frame slot: the cached thread pointer.
+        let shadow_slots = if shadow_enabled { 1 } else { 0 };
         let extra_slots = (if needs_heap { 1 } else { 0 })
             + num_hoists
             + num_arith_hoists
             + arith_scratch_depth
             + num_scalar_slots
-            + (if precise_maps { 1 } else { 0 });
+            + (if precise_maps { 1 } else { 0 })
+            + shadow_slots;
         let total_locals = num_locals.saturating_add(extra_slots);
-        // The safepoint-id slot is the LAST local slot; its value is at
-        // `[rbp - sp_id_slot_off]`. 0 when the gate is off (disabled).
+        // Shadow-stack thread-pointer cache slot: the ABSOLUTE last reserved
+        // slot (`[rbp - shadow_thread_slot_off]`), set once in the prologue.
+        let shadow_thread_slot_off: i32 = if shadow_enabled {
+            (total_locals as i32).saturating_mul(8)
+        } else {
+            0
+        };
+        // Watermark slot removed (reverted): the epilogue restore was unsafe at
+        // OSR/alternate entries that bypass the prologue's thread-slot init.
+        let shadow_savetop_slot_off: i32 = 0;
+        // Byte offset of the `ShadowStack` within `JvmThread` (from the helper
+        // table), captured before `helpers` is moved into the struct below.
+        let shadow_off_in_thread: i32 = helpers.shadow_stack_offset_in_thread as i32;
+        // The safepoint-id slot sits below the shadow slots when both gates are
+        // on (so they never alias). Value at `[rbp - sp_id_slot_off]`. 0 when
+        // `precise_maps` is off.
         let sp_id_slot_off: i32 = if precise_maps {
-            (total_locals as i32).saturating_mul(8) // = (last_index+1)*8
+            (total_locals as i32 - shadow_slots as i32).saturating_mul(8)
         } else {
             0
         };
@@ -5085,6 +5165,11 @@ impl Compiler {
             cur_bc_pc: 0,
             precise_maps,
             sp_id_slot_off,
+            shadow_enabled,
+            shadow_thread_slot_off,
+            shadow_savetop_slot_off,
+            shadow_off_in_thread,
+            pending_shadow: Vec::new(),
             induction_vars: Vec::new(),
             null_check_info: crate::null_check_elim::NullCheckInfo::default(),
             simd_element_wise_loops: Vec::new(),
@@ -5331,6 +5416,148 @@ impl Compiler {
             self.emit_mov_imm32_sx(RAX, self.cur_bc_pc as i32); // Cast: bytecode PC fits i32
             self.emit_store_local(self.sp_id_slot_off, RAX);
         }
+        // Shadow-stack precise roots — push every live oop onto the thread's
+        // shadow stack so a moving collector can rewrite it precisely. Paired
+        // with `emit_shadow_reload` in `emit_oop_map_for_safepoint`. Gated.
+        self.emit_shadow_push();
+    }
+
+    /// Collect the homes of every live oop at the current safepoint: operand-
+    /// stack entries tagged as references (`stack_oop_marks`) plus oop locals
+    /// (`local_oop_masks[cur_bc_pc]`). XMM operand entries are skipped (they
+    /// hold FP data, never references). Returns the homes in push order.
+    fn collect_live_oop_homes(&self) -> Vec<ShadowHome> {
+        let mut homes: Vec<ShadowHome> = Vec::new();
+        // Operand-stack reference entries that survive the call.
+        let n = self.stack.len().min(self.stack_oop_marks.len());
+        for i in 0..n {
+            if !self.stack_oop_marks[i] {
+                continue;
+            }
+            match self.stack[i] {
+                StackSlot::Frame(off) => homes.push(ShadowHome::Frame(off)),
+                StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
+                    homes.push(ShadowHome::Reg(reg))
+                }
+                StackSlot::Xmm(_) => {} // FP value, not a reference
+            }
+        }
+        // Oop locals live at this bytecode PC (forward "must be oop" dataflow).
+        if !self.local_oop_masks.is_empty() {
+            let pc = self.cur_bc_pc;
+            if pc < self.local_oop_masks.len()
+                && self.local_oop_reached.get(pc).copied().unwrap_or(false)
+            {
+                let mut mask = self.local_oop_masks[pc];
+                while mask != 0 {
+                    let k = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    match self.reg_for_local(k) {
+                        Some(reg) => homes.push(ShadowHome::Reg(reg)),
+                        None => homes.push(ShadowHome::Frame(self.local_offset(k))),
+                    }
+                }
+            }
+        }
+        homes
+    }
+
+    /// Shadow-stack push (paired with [`Self::emit_shadow_reload`]).
+    ///
+    /// Emitted just before a GC-capable CALL, after args are staged. For each
+    /// live oop home it stores the value onto the thread's shadow stack and
+    /// bumps `top`. Uses R10 (thread ptr, from the prologue-set frame slot),
+    /// R11 (running `top`), and RAX (frame-slot value temp) — all caller-saved
+    /// non-argument scratch, and never a live-oop home (homes are callee-saved
+    /// or frame). The live homes are recorded in `pending_shadow` for the
+    /// matching reload. `pending_shadow` is cleared first so an unbalanced
+    /// (no-reload) safepoint cannot hand stale homes to a later reload.
+    fn emit_shadow_push(&mut self) {
+        if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+            return;
+        }
+        // Bisect toggle: CRATONVM_SHADOW_NOPUSH skips the push/reload codegen
+        // (keeps the prologue thread-fetch + gate flip) so the SEGV can be
+        // localized to push/reload vs the rest without a rebuild.
+        if shadow_nopush() {
+            return;
+        }
+        self.pending_shadow.clear();
+        let homes = self.collect_live_oop_homes();
+        if homes.is_empty() {
+            return;
+        }
+        let ss_top = self.shadow_off_in_thread; // + ShadowStack::TOP_OFFSET (0)
+        // R10 = thread (cached in the prologue-set frame slot); R11 = shadow top.
+        self.emit_load_local(R10, self.shadow_thread_slot_off);
+        // Guard: if the cached thread pointer is null (get_current_thread
+        // returned null for this method), skip the whole push.
+        self.emit_test_r64_r64(R10);
+        let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
+        self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
+        for &home in &homes {
+            match home {
+                ShadowHome::Reg(r) => {
+                    self.emit_mov_mem_disp32_r64(R11, r, 0);
+                }
+                ShadowHome::Frame(off) => {
+                    self.emit_load_local(RAX, off);
+                    self.emit_mov_mem_disp32_r64(R11, RAX, 0);
+                }
+            }
+            self.emit_lea_r64_mem_disp32(R11, R11, 8);
+        }
+        // Commit new top.
+        self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
+        self.patch_rel32_to_here(skip); // null-thread guard target
+        self.pending_shadow = homes;
+    }
+
+    /// Shadow-stack reload (paired with [`Self::emit_shadow_push`]).
+    ///
+    /// Emitted immediately after the CALL returns. Pops each pushed slot in
+    /// reverse and writes the (possibly GC-rewritten) value back into its home,
+    /// so a relocated object's new address flows into the registers/slots the
+    /// compiled code keeps using. Preserves RAX (the call's return value): the
+    /// scratch used is R10 (thread), R11 (top), R8 (frame-slot value temp).
+    /// No-op when `pending_shadow` is empty (unmatched safepoint).
+    fn emit_shadow_reload(&mut self) {
+        if self.failed || !self.shadow_enabled || self.shadow_thread_slot_off == 0 {
+            return;
+        }
+        if shadow_nopush() || shadow_noreload() {
+            // Still drain pending so a later reload can't consume stale homes.
+            self.pending_shadow.clear();
+            return;
+        }
+        if self.pending_shadow.is_empty() {
+            return;
+        }
+        let homes = std::mem::take(&mut self.pending_shadow);
+        let ss_top = self.shadow_off_in_thread;
+        self.emit_load_local(R10, self.shadow_thread_slot_off);
+        // Guard: null thread pointer (see push) → skip reload. Symmetric with
+        // the push guard, so a method with a null thread is consistently
+        // untracked (the push was skipped too).
+        self.emit_test_r64_r64(R10);
+        let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
+        self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
+        for &home in homes.iter().rev() {
+            // Pre-decrement to the slot holding this oop's (possibly moved) value.
+            self.emit_lea_r64_mem_disp32(R11, R11, -8);
+            match home {
+                ShadowHome::Reg(r) => {
+                    self.emit_mov_r64_mem_disp32(r, R11, 0);
+                }
+                ShadowHome::Frame(off) => {
+                    self.emit_mov_r64_mem_disp32(R8, R11, 0);
+                    self.emit_store_local(off, R8);
+                }
+            }
+        }
+        // Commit popped top.
+        self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
+        self.patch_rel32_to_here(skip); // null-thread guard target
     }
 
     /// T1.1.a — record an oop map at the current native PC for the
@@ -5359,6 +5586,12 @@ impl Compiler {
         if self.failed {
             return;
         }
+        // Shadow-stack precise roots — reload every oop pushed by the matching
+        // `emit_shadow_push` from its (possibly GC-rewritten) shadow slot back
+        // into its home register/frame slot, then pop. Emitted right after the
+        // call returns (before the return value is consumed below). No-op when
+        // the shadow gate is off or no oops were pushed at this safepoint.
+        self.emit_shadow_reload();
         // Stage 1 (precise oop maps) — the lockstep invariant
         // `stack.len() == stack_oop_marks.len()` now holds continuously:
         // every push goes through `stack_push`/`push_stack` (which pair
@@ -8087,10 +8320,29 @@ impl Compiler {
             self.emit_mov_reg_reg(ARG_REGS[0], RBP);
             self.emit_call_absolute(self.helpers.frame_record);
         }
+
+        // Shadow-stack precise roots — cache this invocation's `*mut JvmThread`
+        // in a frame slot so each safepoint's inline push/reload can reach the
+        // shadow `top` without a per-safepoint helper call (which would clobber
+        // staged ABI arg registers). Done last in the prologue, after params are
+        // saved to their homes, so `get_current_thread` (caller-saved clobbers)
+        // can't lose an argument. RAX holds the returned thread pointer.
+        if self.shadow_enabled
+            && self.helpers.get_current_thread != 0
+            && self.shadow_thread_slot_off != 0
+        {
+            self.emit_call_absolute(self.helpers.get_current_thread);
+            self.emit_store_local(self.shadow_thread_slot_off, RAX);
+        }
     }
 
     /// Emit function epilogue: restore callee-saved regs; add rsp; pop rbp; ret
     fn emit_epilogue(&mut self) {
+        // Shadow-stack: restore the `top` watermark saved in the prologue,
+        // unwinding any push this method did not pop (e.g. an unbalanced
+        // safepoint with no reload). Correct under nesting: each method restores
+        // top to its own entry value on return. R10/R11 are caller-saved scratch
+        // (free at return); RAX (the return value) is untouched.
         // Restore callee-saved GPR registers from frame slots (matching prologue MOV saves)
         let used_regs = self.alloc_used_regs.clone();
         for (i, &reg) in used_regs.iter().enumerate() {
@@ -11162,6 +11414,22 @@ impl Compiler {
                     self.osr_entry_native[pc] = -1; // OSR rejected — fall back to interpreter
                 } else {
                     self.osr_entry_native[pc] = self.buf.pos() as i32; // Cast: x86-64 immediate encoding
+                    // Shadow-stack: an OSR entry jumps HERE, bypassing the
+                    // prologue that caches the thread pointer — so re-fetch it
+                    // into the cache slot. This code also runs on the initial
+                    // fall-through (where the slot is already set; a redundant
+                    // re-fetch is harmless), but NOT on back-edges (they target
+                    // `pc_to_native`, after the preheader). Safe to call here:
+                    // at a loop header the operand stack is empty and locals
+                    // live in callee-saved registers (preserved across the
+                    // call), so clobbering caller-saved RAX is fine.
+                    if self.shadow_enabled
+                        && self.helpers.get_current_thread != 0
+                        && self.shadow_thread_slot_off != 0
+                    {
+                        self.emit_call_absolute(self.helpers.get_current_thread);
+                        self.emit_store_local(self.shadow_thread_slot_off, RAX);
+                    }
                 }
             }
             // === LICM: Emit hoisted aaload code at loop headers ===
@@ -19283,6 +19551,7 @@ mod tests {
             get_current_thread: 0,
             tlab_post_init: 0,
             frame_record: 0,
+            shadow_stack_offset_in_thread: 0,
         }
     }
 
