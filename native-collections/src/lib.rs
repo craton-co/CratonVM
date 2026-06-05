@@ -13773,6 +13773,23 @@ fn register_array_deque_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "element", "()Ljava/lang/Object;", native_ad_get_first);
     r.register(c, "remove", "()Ljava/lang/Object;", native_ad_remove_first);
     r.register(c, "contains", "(Ljava/lang/Object;)Z", native_ad_contains);
+    // Object-removal methods. Without these natives they fall through to the
+    // real JDK `delete(...)` bytecode, which leaves our synthetic `size` slot
+    // stale and silently corrupts the deque (see
+    // `native_ad_remove_first_occurrence` — the H2 SYS-lock leak).
+    r.register(c, "remove", "(Ljava/lang/Object;)Z", native_ad_remove_first_occurrence);
+    r.register(
+        c,
+        "removeFirstOccurrence",
+        "(Ljava/lang/Object;)Z",
+        native_ad_remove_first_occurrence,
+    );
+    r.register(
+        c,
+        "removeLastOccurrence",
+        "(Ljava/lang/Object;)Z",
+        native_ad_remove_last_occurrence,
+    );
     r.register(c, "clear", "()V", native_ad_clear);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_ad_to_array);
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_ad_iterator);
@@ -13934,6 +13951,108 @@ fn native_ad_remove_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
     ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
     Ok(Some(elem))
+}
+
+/// Remove the element at *logical* index `k` (0 = head) from the circular
+/// buffer: shift the elements after it one position back toward the head,
+/// clear the vacated last slot, and decrement `tail`/`size`. `head` is left
+/// unchanged. Used by the object-removal natives below.
+fn ad_remove_at_logical(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    buf: ObjectRef,
+    head: i32,
+    size: i32,
+    cap: i32,
+    k: usize,
+) {
+    let size_u = size as usize;
+    for j in k..(size_u - 1) {
+        let from = ((head + j as i32 + 1) % cap) as usize;
+        let to = ((head + j as i32) % cap) as usize;
+        let v = ctx.get_array_element(buf, from);
+        ctx.set_array_element(buf, to, v);
+    }
+    // Clear the (now-duplicated) last logical slot so dropped references don't
+    // pin garbage and `toArray`/iteration never observe a stale value.
+    let last = ((head + size - 1) % cap) as usize;
+    ctx.set_array_element(buf, last, Value::Object(None));
+    let new_tail = (head + size - 1) % cap; // old tail - 1 (mod cap)
+    ctx.set_field(this, AD_FIELD_TAIL, Value::Int(new_tail));
+    ctx.set_field(this, AD_FIELD_SIZE, Value::Int(size - 1));
+}
+
+/// `ArrayDeque.remove(Object)` / `removeFirstOccurrence(Object)` — remove the
+/// first element (scanning from the head) equal to the argument; return whether
+/// one was removed.
+///
+/// These must be intercepted: without a native, they fall through to the real
+/// JDK `ArrayDeque.delete(...)` bytecode, which updates `elements`/`head`/`tail`
+/// but is oblivious to our synthetic `size` slot (field 3) — so `size()`,
+/// `isEmpty()`, iteration and `getFirst()` desync from the real buffer. That
+/// silent corruption is what stranded H2's `MVTable.waitingSessions` lock-wait
+/// queue (a single `addLast`+`remove(session)` round leaves `size()`==1 instead
+/// of 0), so `doLock1`'s `waitingSessions.getFirst() == session` guard never
+/// holds and every later DDL dead-ends in "Timeout trying to lock table SYS".
+fn native_ad_remove_first_occurrence(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data, head, _tail, size) = ad_state(ctx, this);
+    let buf = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let cap = ctx.array_length(buf) as i32;
+    if cap == 0 || size <= 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    for k in 0..size as usize {
+        let idx = ((head + k as i32) % cap) as usize;
+        let elem = ctx.get_array_element(buf, idx);
+        if values_equal(ctx, &elem, &target) {
+            ad_remove_at_logical(ctx, this, buf, head, size, cap, k);
+            return Ok(Some(Value::Int(1)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
+}
+
+/// `ArrayDeque.removeLastOccurrence(Object)` — remove the last element (scanning
+/// from the tail) equal to the argument. Same desync hazard as
+/// [`native_ad_remove_first_occurrence`].
+fn native_ad_remove_last_occurrence(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let target = args.get(1).copied().unwrap_or(Value::Object(None));
+    let (data, head, _tail, size) = ad_state(ctx, this);
+    let buf = match data {
+        Some(d) => d,
+        None => return Ok(Some(Value::Int(0))),
+    };
+    let cap = ctx.array_length(buf) as i32;
+    if cap == 0 || size <= 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    for k in (0..size as usize).rev() {
+        let idx = ((head + k as i32) % cap) as usize;
+        let elem = ctx.get_array_element(buf, idx);
+        if values_equal(ctx, &elem, &target) {
+            ad_remove_at_logical(ctx, this, buf, head, size, cap, k);
+            return Ok(Some(Value::Int(1)));
+        }
+    }
+    Ok(Some(Value::Int(0)))
 }
 
 fn native_ad_poll_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
