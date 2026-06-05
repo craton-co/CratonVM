@@ -2534,19 +2534,20 @@ pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
 // =============================================================================
 
 pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
-    // FLAGGED SyntheticStub — lang_invoke.rs::register_p68_invoke_extras.
-    // This whole registration block is fake/placeholder plumbing to unblock
-    // reflective callers, not a faithful JDK implementation:
-    //   * MethodHandleProxies.asInterfaceInstance returns the MH itself as the
-    //     "proxy"; isWrapperInstance→0; wrapperInstance{Target,Type}→null.
-    //   * LambdaMetafactory.metafactory / altMetafactory: the original was "a
-    //     native stub that returns null so the JDK path is bypassed". It now
-    //     synthesises a non-null ConstantCallSite wrapping a no-op
-    //     `LambdaMetafactory$NoOp` MethodHandle (mh_dispatch returns null) when
-    //     no real implMethod is present — still a placeholder, NOT real
-    //     invokedynamic/lambda-proxy synthesis. NOT deleted: real
-    //     LambdaMetafactory needs working invokedynamic which may not exist.
-    //     Left for the orchestrator to evaluate.
+    // Mixed block:
+    //   * MethodHandleProxies.asInterfaceInstance is still a SIMPLIFIED stub —
+    //     returns the MH itself as the "proxy"; isWrapperInstance→0;
+    //     wrapperInstance{Target,Type}→null.
+    //   * LambdaMetafactory.metafactory / altMetafactory are now a faithful
+    //     bridge to the VM's real lambda-proxy machinery (the same one the
+    //     `invokedynamic` opcode uses): they register a proxy class via
+    //     `register_lambda_proxy` and hand back a FROZEN ConstantCallSite whose
+    //     target is an `MH_KIND_LAMBDA_FACTORY` MethodHandle. Invoking that
+    //     target with the captured args yields a genuine SAM instance whose
+    //     abstract method dispatches to the impl method — so reflective callers
+    //     (log4j2 `ServiceLoaderUtil`, Elasticsearch CLI bootstrap) work end to
+    //     end. A no-op frozen CallSite remains only as a defensive fallback when
+    //     the implMethod is absent.
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // MethodHandleProxies
@@ -2617,32 +2618,28 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
     // `mh_dispatch`, which returns null for an unknown target — exactly what
     // log4j/ES interpret as "no service provider", and crucially avoids the
     // upstream NPE.
+    // metafactory / altMetafactory are a real bridge (see header), not stubs.
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let lmf = "java/lang/invoke/LambdaMetafactory";
     r.register(lmf, "metafactory",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;",
         |ctx, args| {
-            // args layout (with implicit `null` receiver slot 0 for statics
-            // when called via Class.getMethod().invoke() — but the standard
-            // native ABI in this codebase passes static args from slot 0):
-            //   args[0] = Lookup caller
-            //   args[1] = String invokedName
-            //   args[2] = MethodType invokedType (factory signature)
-            //   args[3] = MethodType samMethodType
-            //   args[4] = MethodHandle implMethod
-            //   args[5] = MethodType instantiatedMethodType
-            //
-            // If args[4] (implMethod) is a real MH allocated by one of our
-            // `Lookup.find*` shims we re-use it directly; otherwise we
-            // synthesise a no-op MH so the CallSite's target is still
-            // non-null.
-
-            // Round-9 perf: consult the bootstrap-arg cache before doing any
-            // allocation. Identical (invokedType, samType, implMethod,
-            // instantiatedType) tuples always yield the same CallSite.
+            // Reflective `LambdaMetafactory.metafactory`. (The `invokedynamic`
+            // opcode is handled inline in `runtime/invokedynamic.rs` and never
+            // reaches this native — only reflective callers like log4j2's
+            // `ServiceLoaderUtil.loadClassloaderServices` / the Elasticsearch
+            // CLI bootstrap do.)  args:
+            //   [0]=Lookup, [1]=String invokedName,
+            //   [2]=MethodType invokedType (factory signature),
+            //   [3]=MethodType samMethodType, [4]=MethodHandle implMethod,
+            //   [5]=MethodType instantiatedMethodType.
             let invoked_type = match args.get(2) { Some(Value::Object(o)) => *o, _ => None };
             let sam_type     = match args.get(3) { Some(Value::Object(o)) => *o, _ => None };
             let impl_method  = match args.get(4) { Some(Value::Object(o)) => *o, _ => None };
             let inst_type    = match args.get(5) { Some(Value::Object(o)) => *o, _ => None };
+
+            // Bootstrap-arg cache: identical (invokedType, samType, implMethod,
+            // instantiatedType) tuples always yield the same CallSite.
             let key = LambdaKey {
                 invoked: lambda_key_of(invoked_type),
                 sam: lambda_key_of(sam_type),
@@ -2659,101 +2656,97 @@ pub fn register_p68_invoke_extras(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let target_mh = match args.get(4) {
-                Some(Value::Object(Some(m))) => *m,
-                _ => {
-                    tracing::warn!(
-                        "LambdaMetafactory.metafactory: implMethod arg is null \
-                         (invokedName='{}') — returning ConstantCallSite with no-op MH",
-                        invoked_name
-                    );
-                    // Synthesise a no-op MH. mh_dispatch on a MH with an
-                    // empty class returns Value::Object(None), which is the
-                    // benign "no service provider" outcome.
-                    alloc_method_handle(
-                        ctx,
-                        "java/lang/invoke/LambdaMetafactory$NoOp",
-                        if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
-                        "()Ljava/lang/Object;",
-                        MH_KIND_STATIC,
-                    )
+
+            // Preferred path: synthesise a genuine lambda proxy + factory MH so
+            // `cs.getTarget().bindTo(..).invoke()` yields a working SAM instance
+            // whose abstract method runs the impl method.
+            if let Some(ccs) = build_reflective_lambda_callsite(
+                ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type,
+            ) {
+                if key.impl_ != 0 {
+                    lambda_callsite_cache().lock().insert(key, ccs);
                 }
-            };
-            // Propagate the invokedType (factory signature) onto the MH's
-            // `type` field — some downstream JDK code reads `mh.type()` for
-            // arity validation before calling invokeExact.
+                return Ok(Some(Value::Object(Some(ccs))));
+            }
+
+            // Fallback (implMethod missing / proxy registration unavailable): a
+            // FROZEN ConstantCallSite wrapping a no-op MH. Still non-null and
+            // getTarget()-safe (the real ConstantCallSite.getTarget() throws
+            // IllegalStateException unless isFrozen).
+            tracing::warn!(
+                "LambdaMetafactory.metafactory: could not synthesise lambda proxy \
+                 (invokedName='{}') — returning frozen ConstantCallSite with no-op MH",
+                invoked_name
+            );
+            let noop = alloc_method_handle(
+                ctx,
+                "java/lang/invoke/LambdaMetafactory$NoOp",
+                if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
+                "()Ljava/lang/Object;",
+                MH_KIND_STATIC,
+            );
             if let Some(Value::Object(Some(mt))) = args.get(2) {
-                ctx.set_field_by_name(target_mh, "type", Value::Object(Some(*mt)));
+                ctx.set_field_by_name(noop, "type", Value::Object(Some(*mt)));
             }
-            // Allocate a ConstantCallSite with the target MH at slot 0
-            // (matches the synthetic layout used by `register_p60_callsite`).
-            let ccs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
-            ctx.set_field(ccs, 0, Value::Object(Some(target_mh)));
-            // Some JDK code reads `target` by name as well.
-            ctx.set_field_by_name(ccs, "target", Value::Object(Some(target_mh)));
-            // Round-9 perf: install in the cache so subsequent metafactory
-            // calls with the same bootstrap args skip the whole materialise
-            // dance. Only cache when we have a non-null implMethod — the
-            // null-impl path produced a NoOp stub that callers may interpret
-            // through reflection in surprising ways; safer to not share it.
-            if key.impl_ != 0 {
-                lambda_callsite_cache().lock().insert(key, ccs);
-            }
-            Ok(Some(Value::Object(Some(ccs))))
+            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)))))
         });
     r.register(lmf, "altMetafactory",
         "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;[Ljava/lang/Object;)Ljava/lang/invoke/CallSite;",
         |ctx, args| {
-            // `altMetafactory` packs (samMethodType, implMethod, instantiated,
-            // flags, ...) into args[3]: Object[]. Extract implMethod if
-            // present at index 1 of that array; otherwise fall back to a
-            // synthetic no-op MH.
+            // `altMetafactory` packs (samMethodType, implMethod,
+            // instantiatedMethodType, flags, markerInterfaces, ...) into
+            // args[3]: Object[]. invokedType is args[2] (factory signature).
+            let invoked_type = match args.get(2) { Some(Value::Object(o)) => *o, _ => None };
+            let (sam_type, impl_method, inst_type) = match args.get(3) {
+                Some(Value::Object(Some(arr))) => {
+                    let arr = *arr;
+                    let len = ctx.array_length(arr);
+                    let e = |ctx: &dyn NativeContext, i: usize| if i < len {
+                        match ctx.get_array_element(arr, i) { Value::Object(o) => o, _ => None }
+                    } else { None };
+                    (e(ctx, 0), e(ctx, 1), e(ctx, 2))
+                }
+                _ => (None, None, None),
+            };
+            let key = LambdaKey {
+                invoked: lambda_key_of(invoked_type),
+                sam: lambda_key_of(sam_type),
+                impl_: lambda_key_of(impl_method),
+                instantiated: lambda_key_of(inst_type),
+            };
+            if key.impl_ != 0 {
+                if let Some(cached) = { let c = lambda_callsite_cache().lock(); c.get(&key).copied() } {
+                    return Ok(Some(Value::Object(Some(cached))));
+                }
+            }
             let invoked_name = match args.get(1) {
                 Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
                 _ => String::new(),
             };
-            let target_mh = match args.get(3) {
-                Some(Value::Object(Some(arr))) if ctx.array_length(*arr) > 1 => {
-                    match ctx.get_array_element(*arr, 1) {
-                        Value::Object(Some(m)) => m,
-                        _ => {
-                            tracing::warn!(
-                                "LambdaMetafactory.altMetafactory: implMethod (bsm_args[1]) is null \
-                                 (invokedName='{}') — using no-op MH",
-                                invoked_name
-                            );
-                            alloc_method_handle(
-                                ctx,
-                                "java/lang/invoke/LambdaMetafactory$NoOp",
-                                if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
-                                "()Ljava/lang/Object;",
-                                MH_KIND_STATIC,
-                            )
-                        }
-                    }
+            if let Some(ccs) = build_reflective_lambda_callsite(
+                ctx, invoked_type, &invoked_name, sam_type, impl_method, inst_type,
+            ) {
+                if key.impl_ != 0 {
+                    lambda_callsite_cache().lock().insert(key, ccs);
                 }
-                _ => {
-                    tracing::warn!(
-                        "LambdaMetafactory.altMetafactory: bsm_args array is null/empty \
-                         (invokedName='{}') — using no-op MH",
-                        invoked_name
-                    );
-                    alloc_method_handle(
-                        ctx,
-                        "java/lang/invoke/LambdaMetafactory$NoOp",
-                        if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
-                        "()Ljava/lang/Object;",
-                        MH_KIND_STATIC,
-                    )
-                }
-            };
-            if let Some(Value::Object(Some(mt))) = args.get(2) {
-                ctx.set_field_by_name(target_mh, "type", Value::Object(Some(*mt)));
+                return Ok(Some(Value::Object(Some(ccs))));
             }
-            let ccs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
-            ctx.set_field(ccs, 0, Value::Object(Some(target_mh)));
-            ctx.set_field_by_name(ccs, "target", Value::Object(Some(target_mh)));
-            Ok(Some(Value::Object(Some(ccs))))
+            tracing::warn!(
+                "LambdaMetafactory.altMetafactory: could not synthesise lambda proxy \
+                 (invokedName='{}') — returning frozen ConstantCallSite with no-op MH",
+                invoked_name
+            );
+            let noop = alloc_method_handle(
+                ctx,
+                "java/lang/invoke/LambdaMetafactory$NoOp",
+                if invoked_name.is_empty() { "apply" } else { invoked_name.as_str() },
+                "()Ljava/lang/Object;",
+                MH_KIND_STATIC,
+            );
+            if let Some(Value::Object(Some(mt))) = args.get(2) {
+                ctx.set_field_by_name(noop, "type", Value::Object(Some(*mt)));
+            }
+            Ok(Some(Value::Object(Some(alloc_frozen_constant_call_site(ctx, noop)))))
         });
 
     // NB: an earlier draft added a short-circuit for
@@ -2867,6 +2860,16 @@ const MH_KIND_DROP:        i32 = 8;
 /// `extra_args` to mh_dispatch are the dynamic call-site arguments.
 /// Returns a `java/lang/String` ObjectRef. See `p58_make_concat*`.
 pub(crate) const MH_KIND_STRING_CONCAT: i32 = 9;
+/// Lambda factory target produced by a *reflective* `LambdaMetafactory`
+/// call (log4j2 `ServiceLoaderUtil`, ES CLI bootstrap, etc.). MH_CLASS holds
+/// the synthetic lambda-proxy `ClassId` as a decimal string; MH_DESC holds the
+/// factory descriptor (`(captures...)FunctionalInterface`). MH_BOUND holds an
+/// `Object[]` of captures accumulated via `bindTo` (the single-slot MH_BOUND
+/// used by the other kinds cannot represent a multi-capture factory). When
+/// invoked, the factory gathers captures (`bound[]` ++ invoke args), allocates
+/// a proxy instance of the proxy class, and returns it — the interpreter's
+/// SAM dispatch then routes the proxy's abstract method to the impl handle.
+pub(crate) const MH_KIND_LAMBDA_FACTORY: i32 = 10;
 
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
@@ -3118,6 +3121,176 @@ pub(crate) fn mh_read_desc(ctx: &dyn NativeContext, mh: cratonvm_types::ObjectRe
     }
 }
 
+/// Extract the return type of a method descriptor as an internal class name
+/// (only for reference returns; `None` for primitive/void). E.g.
+/// `(I)Ljava/util/function/Consumer;` → `Some("java/util/function/Consumer")`.
+fn descriptor_return_internal_name(desc: &str) -> Option<String> {
+    let ret = desc.rsplit(')').next()?;
+    if ret.starts_with('L') && ret.ends_with(';') {
+        Some(ret[1..ret.len() - 1].to_string())
+    } else {
+        None
+    }
+}
+
+/// One type char per descriptor parameter (`'L'` for any reference/array,
+/// the primitive char otherwise) — the `capture_types` convention used by the
+/// `invokedynamic` lambda bootstrap (`parse_descriptor_args`).
+fn descriptor_param_chars(desc: &str) -> String {
+    let mut out = String::new();
+    let bytes = desc.as_bytes();
+    let mut i = 0;
+    if i < bytes.len() && bytes[i] == b'(' {
+        i += 1;
+    }
+    while i < bytes.len() && bytes[i] != b')' {
+        match bytes[i] {
+            b'L' => {
+                out.push('L');
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                out.push('L');
+                while i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    if bytes[i] == b'L' {
+                        while i < bytes.len() && bytes[i] != b';' {
+                            i += 1;
+                        }
+                        i += 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            c @ (b'J' | b'D' | b'F' | b'I' | b'B' | b'C' | b'S' | b'Z') => {
+                out.push(c as char);
+                i += 1;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Map our internal `MH_KIND_*` to a JVMS `reference_kind` byte (1..=9) for
+/// `MethodHandleKind::from_tag`. Interface and virtual both map to
+/// `REF_invokeVirtual` (5); the interpreter's lambda dispatch treats them
+/// identically.
+fn mh_kind_to_ref_kind(mh_kind: i32) -> u8 {
+    match mh_kind {
+        MH_KIND_STATIC => 6,      // REF_invokeStatic
+        MH_KIND_VIRTUAL => 5,     // REF_invokeVirtual
+        MH_KIND_SPECIAL => 7,     // REF_invokeSpecial
+        MH_KIND_CONSTRUCTOR => 8, // REF_newInvokeSpecial
+        MH_KIND_GETTER => 1,      // REF_getField
+        MH_KIND_SETTER => 3,      // REF_putField
+        _ => 6,
+    }
+}
+
+/// Allocate a *frozen* `ConstantCallSite` wrapping `target_mh`.
+///
+/// The real JDK `ConstantCallSite.getTarget()` throws a bare
+/// `IllegalStateException` unless `isFrozen` is set — normally by the
+/// constructor, which `alloc_concurrent_synthetic` bypasses. Setting it here
+/// lets the genuine `getTarget()` bytecode return the target in real-JDK builds
+/// (where the synthetic `getTarget` native is not registered).
+fn alloc_frozen_constant_call_site(
+    ctx: &mut dyn NativeContext,
+    target_mh: cratonvm_types::ObjectRef,
+) -> cratonvm_types::ObjectRef {
+    let ccs = alloc_concurrent_synthetic(ctx, "java/lang/invoke/ConstantCallSite", 2);
+    ctx.set_field(ccs, 0, Value::Object(Some(target_mh)));
+    ctx.set_field_by_name(ccs, "target", Value::Object(Some(target_mh)));
+    ctx.set_field_by_name(ccs, "isFrozen", Value::Int(1));
+    ccs
+}
+
+/// Build a real lambda-factory `CallSite` from the reflective
+/// `LambdaMetafactory.metafactory` / `altMetafactory` arguments.
+///
+/// Returns a frozen `ConstantCallSite` whose target is an
+/// `MH_KIND_LAMBDA_FACTORY` MethodHandle. Invoking that target (after the
+/// caller's `bindTo` captures) allocates a genuine lambda proxy whose SAM is
+/// dispatched to `impl_method` by the interpreter — the same machinery the
+/// `invokedynamic` opcode uses. Returns `None` (caller falls back to a no-op
+/// CallSite) when the arguments are insufficient or the host cannot register a
+/// proxy.
+fn build_reflective_lambda_callsite(
+    ctx: &mut dyn NativeContext,
+    invoked_type: Option<cratonvm_types::ObjectRef>,
+    invoked_name: &str,
+    sam_type: Option<cratonvm_types::ObjectRef>,
+    impl_method: Option<cratonvm_types::ObjectRef>,
+    instantiated_type: Option<cratonvm_types::ObjectRef>,
+) -> Option<cratonvm_types::ObjectRef> {
+    let invoked_mt = invoked_type?;
+    let impl_mh = impl_method?;
+
+    // Factory signature: (captures...)FunctionalInterface.
+    let invoked_desc = descriptor_from_method_type(ctx, invoked_mt);
+    let functional_interface = descriptor_return_internal_name(&invoked_desc)?;
+    let capture_types = descriptor_param_chars(&invoked_desc);
+
+    // SAM erased descriptor (default to the most common erasure if unreadable).
+    let sam_desc = match sam_type {
+        Some(mt) => descriptor_from_method_type(ctx, mt),
+        None => "()Ljava/lang/Object;".to_string(),
+    };
+    let inst_desc = match instantiated_type {
+        Some(mt) => descriptor_from_method_type(ctx, mt),
+        None => sam_desc.clone(),
+    };
+
+    // Implementation method coordinates from the impl MethodHandle object.
+    let impl_class = mh_read_class(ctx, impl_mh)?;
+    if impl_class.is_empty() {
+        return None;
+    }
+    let impl_member = mh_read_name(ctx, impl_mh).unwrap_or_default();
+    let impl_desc = mh_read_desc(ctx, impl_mh).unwrap_or_default();
+    let impl_kind = match ctx.get_field(impl_mh, MH_KIND) {
+        Value::Int(k) => k,
+        _ => MH_KIND_STATIC,
+    };
+    let impl_ref_kind = mh_kind_to_ref_kind(impl_kind);
+
+    // Register the proxy class + SAM-dispatch metadata in the VM.
+    let proxy_cid = ctx.register_lambda_proxy(
+        &functional_interface,
+        invoked_name,
+        &sam_desc,
+        &impl_class,
+        &impl_member,
+        &impl_desc,
+        impl_ref_kind,
+        &inst_desc,
+        &capture_types,
+    );
+    if proxy_cid == 0 {
+        return None;
+    }
+
+    // Factory MethodHandle: MH_CLASS = proxy ClassId (decimal), MH_DESC = the
+    // factory signature (so type()/arity and capture-count are derivable).
+    let factory_mh = alloc_method_handle(
+        ctx,
+        &proxy_cid.to_string(),
+        invoked_name,
+        &invoked_desc,
+        MH_KIND_LAMBDA_FACTORY,
+    );
+    Some(alloc_frozen_constant_call_site(ctx, factory_mh))
+}
+
 /// Core dispatch: given a populated MethodHandle and argument list, invoke it.
 /// `extra_args` are the args passed to invoke() after `this` (the MH itself).
 pub(crate) fn mh_dispatch(
@@ -3353,6 +3526,44 @@ pub(crate) fn mh_dispatch(
             }
             let s = ctx.create_string(&out);
             Ok(Some(Value::Object(Some(s))))
+        }
+        MH_KIND_LAMBDA_FACTORY => {
+            // Reflective lambda factory (see `build_reflective_lambda_callsite`).
+            // MH_CLASS = synthetic proxy ClassId (decimal); MH_DESC = factory
+            // signature `(captures...)FI`. Gather the captures — those bound via
+            // `bindTo` (MH_BOUND Object[]) followed by any direct invoke args —
+            // allocate a proxy instance, and return it. The interpreter's SAM
+            // dispatch then routes the proxy's abstract method to the impl.
+            let proxy_raw: u32 = mh_read_class(ctx, mh)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if proxy_raw == 0 {
+                return Ok(Some(Value::Object(None)));
+            }
+            let proxy_cid = cratonvm_types::ClassId::new(proxy_raw);
+            let num_captures = count_descriptor_params(&desc);
+
+            let mut captures: Vec<Value> = Vec::with_capacity(num_captures);
+            if let Value::Object(Some(arr)) = bound {
+                let blen = ctx.array_length(arr);
+                for i in 0..blen {
+                    captures.push(ctx.get_array_element(arr, i));
+                }
+            }
+            captures.extend_from_slice(extra_args);
+            // Defensive: a well-formed factory yields exactly `num_captures`
+            // values, but tolerate over/under supply rather than corrupting the
+            // proxy layout.
+            captures.truncate(num_captures);
+            while captures.len() < num_captures {
+                captures.push(Value::Object(None));
+            }
+
+            let proxy = ctx.alloc_object(proxy_cid, num_captures);
+            for (i, v) in captures.iter().enumerate() {
+                ctx.set_field(proxy, i, *v);
+            }
+            Ok(Some(Value::Object(Some(proxy))))
         }
         MH_KIND_SPECIAL => {
             // WP2.9 — invokespecial semantics: dispatch *exactly* on the
@@ -3638,7 +3849,33 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
         let desc  = mh_read_desc(ctx, this).unwrap_or_default();
         let kind  = match ctx.get_field(this, MH_KIND) { Value::Int(k) => k, _ => MH_KIND_VIRTUAL };
         let new_mh = alloc_method_handle(ctx, &class, &name, &desc, kind);
-        ctx.set_field(new_mh, MH_BOUND, recv);
+        if kind == MH_KIND_LAMBDA_FACTORY {
+            // A lambda factory may capture more than one value (e.g. log4j's
+            // `factory.bindTo(serviceType).bindTo(classLoader)`). The single-slot
+            // MH_BOUND used by the other kinds would drop all but the last bind,
+            // so accumulate captures, in bind order, into an Object[].
+            let prev = ctx.get_field(this, MH_BOUND);
+            let new_arr = match prev {
+                Value::Object(Some(old)) => {
+                    let oldlen = ctx.array_length(old);
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, oldlen + 1);
+                    for i in 0..oldlen {
+                        let v = ctx.get_array_element(old, i);
+                        ctx.set_array_element(arr, i, v);
+                    }
+                    ctx.set_array_element(arr, oldlen, recv);
+                    arr
+                }
+                _ => {
+                    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 1);
+                    ctx.set_array_element(arr, 0, recv);
+                    arr
+                }
+            };
+            ctx.set_field(new_mh, MH_BOUND, Value::Object(Some(new_arr)));
+        } else {
+            ctx.set_field(new_mh, MH_BOUND, recv);
+        }
         Ok(Some(Value::Object(Some(new_mh))))
     });
     // asType — type adaptation: return self, but propagate the supplied

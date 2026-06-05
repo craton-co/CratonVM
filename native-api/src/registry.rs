@@ -721,6 +721,53 @@ pub trait NativeContext {
         ClassId::new(0)
     }
 
+    /// Register a lambda proxy synthesized from a *reflective*
+    /// `LambdaMetafactory.metafactory` / `altMetafactory` call (as opposed to
+    /// the `invokedynamic` opcode, which is handled inline in the interpreter).
+    ///
+    /// Returns the raw `u32` of a freshly-allocated synthetic proxy `ClassId`
+    /// whose lambda call-site metadata is registered in the VM's
+    /// `lambda_proxies` table — identical in shape to the metadata produced by
+    /// the `invokedynamic` lambda bootstrap, so the interpreter's SAM-dispatch
+    /// path (`try_lambda_dispatch`) handles instances of it without any further
+    /// special-casing. A factory `MethodHandle` (kind `MH_KIND_LAMBDA_FACTORY`)
+    /// later allocates proxy instances of this class once the captured values
+    /// are known.
+    ///
+    /// `impl_ref_kind` is the JVMS `reference_kind` byte (1..=9) of the
+    /// implementation method handle. `capture_types` is one type char per
+    /// captured value (`'L'`, `'I'`, `'J'`, ...), in factory-argument order.
+    ///
+    /// Returns `0` when the host cannot register a proxy (e.g. test mocks, or
+    /// the proxy table is full); callers treat `0` as "unsupported" and fall
+    /// back to a non-null no-op `CallSite`.
+    #[allow(clippy::too_many_arguments)]
+    fn register_lambda_proxy(
+        &mut self,
+        functional_interface: &str,
+        sam_method_name: &str,
+        sam_descriptor: &str,
+        impl_class: &str,
+        impl_member: &str,
+        impl_descriptor: &str,
+        impl_ref_kind: u8,
+        instantiated_descriptor: &str,
+        capture_types: &str,
+    ) -> u32 {
+        let _ = (
+            functional_interface,
+            sam_method_name,
+            sam_descriptor,
+            impl_class,
+            impl_member,
+            impl_descriptor,
+            impl_ref_kind,
+            instantiated_descriptor,
+            capture_types,
+        );
+        0
+    }
+
     /// Check if child_class is a subclass of parent_class.
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool;
 

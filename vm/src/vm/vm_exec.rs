@@ -2079,6 +2079,51 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .ensure_synthetic_class(name, num_fields)
     }
 
+    fn register_lambda_proxy(
+        &mut self,
+        functional_interface: &str,
+        sam_method_name: &str,
+        sam_descriptor: &str,
+        impl_class: &str,
+        impl_member: &str,
+        impl_descriptor: &str,
+        impl_ref_kind: u8,
+        instantiated_descriptor: &str,
+        capture_types: &str,
+    ) -> u32 {
+        use crate::classloading::resolution::{LambdaCallSite, MethodHandle};
+        use std::sync::Arc;
+
+        // Reflective `LambdaMetafactory` (e.g. log4j2's `ServiceLoaderUtil`)
+        // builds the same lambda metadata the `invokedynamic` opcode would —
+        // route it through the identical `lambda_proxies` table so the
+        // interpreter's SAM dispatch handles instances uniformly.
+        let kind = MethodHandleKind::from_tag(impl_ref_kind)
+            .unwrap_or(MethodHandleKind::InvokeStatic);
+        let proxy_class_id = self.shared.alloc_lambda_proxy_id();
+        let call_site = LambdaCallSite {
+            functional_interface: Arc::from(functional_interface),
+            sam_method_name: Arc::from(sam_method_name),
+            sam_descriptor: Arc::from(sam_descriptor),
+            impl_handle: MethodHandle {
+                kind,
+                class_name: Arc::from(impl_class),
+                member_name: Arc::from(impl_member),
+                descriptor: Arc::from(impl_descriptor),
+            },
+            instantiated_descriptor: Arc::from(instantiated_descriptor),
+            capture_types: capture_types.chars().collect(),
+            proxy_class_id,
+        };
+        let mut proxies = self.shared.lambda_proxies.write();
+        if proxies.len() < crate::vm::MAX_LAMBDA_PROXIES {
+            proxies.insert(proxy_class_id, call_site);
+            proxy_class_id.as_u32()
+        } else {
+            0
+        }
+    }
+
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {
         if self
             .shared
