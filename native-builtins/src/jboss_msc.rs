@@ -577,6 +577,69 @@ impl ServiceContainer {
             }
         }
     }
+
+    /// P2 (real `start()` drive): pick one service that is ready to start —
+    /// `Down`/`New`, an auto-start mode (`Active`/`Passive`), and every
+    /// dependency already `Up` — transition it to `Starting`, and return its
+    /// id. Returns `None` when nothing is ready.
+    ///
+    /// Unlike [`Self::drain_tasks_locally`] this scans the whole service map
+    /// rather than the task queue, so it is robust to services installed
+    /// before their dependencies (the `add_service` back-edge wiring only
+    /// records a dependent when the dependency already exists). The drive
+    /// loop calls this repeatedly; re-entrant `addService`/`install` calls
+    /// made by a running `start()` just add more services that a later scan
+    /// picks up.
+    ///
+    /// The caller must NOT hold any container lock across the subsequent
+    /// `start()` invocation; this method takes and releases `inner` itself.
+    fn take_ready_start(&self) -> Option<u64> {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut chosen: Option<(Arc<ServiceName>, u64)> = None;
+        for (name, c) in state.services.iter() {
+            if matches!(c.state, ServiceState::Down | ServiceState::New)
+                && matches!(c.mode, Mode::Active | Mode::Passive)
+                && can_start(&state.services, name)
+            {
+                chosen = Some((name.clone(), c.id));
+                break;
+            }
+        }
+        let (name, id) = chosen?;
+        if let Some(c) = state.services.get_mut(&name) {
+            c.state = ServiceState::Starting;
+        }
+        state.in_flight.insert(id);
+        Some(id)
+    }
+
+    /// P2: finish a `start()` that returned normally. Unless the service
+    /// marked itself async-pending (`StartContext.asynchronous()`), transition
+    /// `Starting → Up` so dependents become start-eligible on the next scan.
+    fn finish_start(&self, id: u64) {
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let name = match state.by_id.get(&id).cloned() {
+            Some(n) => n,
+            None => return,
+        };
+        let async_pending = state
+            .services
+            .get(&name)
+            .map(|c| c.async_pending)
+            .unwrap_or(false);
+        if async_pending {
+            // Stays `Starting`; the service's later `complete()` finishes it.
+            return;
+        }
+        if let Some(c) = state.services.get_mut(&name) {
+            if matches!(c.state, ServiceState::Starting) {
+                c.state = ServiceState::Up;
+                c.failure_message = None;
+            }
+        }
+        state.in_flight.remove(&id);
+        schedule_dependents_of(&mut state, &name, &self.pool_cv);
+    }
 }
 
 /// Detect whether adding `(name -> deps)` to the services map would
@@ -1408,6 +1471,482 @@ pub fn bind_controller_id(
     ctx.set_field(obj, SC_FIELD_ID, Value::Long(id as i64));
 }
 
+// ===========================================================================
+// P1 — GC roots for service objects held only by the Rust container.
+//
+// The container references Java objects (the `Service` instance whose
+// `start()`/`stop()` we invoke, the synthetic `ServiceController` mirror, the
+// child `ServiceTarget`, the in-flight `StartContext`) that live ONLY in
+// process-global Rust side-tables — invisible to the frame / static / heap
+// root scans. Without rooting them, a moving young GC reclaims or relocates
+// them while the container still holds the address, and the next
+// `invoke_virtual(service, "start", ...)` is a use-after-free (same class of
+// bug as the cached-ClassLoader root gap). Mirrors the `lang_math` /
+// `classloader` process-global cache root pattern (`roots.rs` steps 15–18 +
+// the `gc.rs` companion remaps).
+// ===========================================================================
+
+/// GC-visible references held per controller id. Every `Some` field is a root
+/// and a post-move remap target.
+#[derive(Default, Clone, Copy)]
+struct ServiceRoots {
+    /// The Java `org.jboss.msc.Service` instance to drive `start`/`stop` on.
+    service: Option<ObjectRef>,
+    /// The synthetic `ServiceController` mirror returned by `install()` and
+    /// `StartContext.getController()`.
+    controller_mirror: Option<ObjectRef>,
+    /// The real `ServiceTargetImpl` to hand back from
+    /// `StartContext.getChildTarget()` so child installs route to the same
+    /// (working) target.
+    child_target: Option<ObjectRef>,
+    /// The synthetic `StartContext` (kept live while the service is `Starting`
+    /// / async-pending so a later `complete()` can still reach it).
+    start_context: Option<ObjectRef>,
+}
+
+/// Process-global side-table: controller id → held Java refs.
+fn service_roots() -> &'static Mutex<HashMap<u64, ServiceRoots>> {
+    static T: OnceLock<Mutex<HashMap<u64, ServiceRoots>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// GC root scan for the container-held service objects. Companion remap is
+/// [`gc_update_msc_service_refs`]. Uses a blocking lock (never held across a
+/// Java allocation, so the allocating thread can never self-deadlock here).
+pub fn gc_scan_msc_service_roots(out: &mut Vec<ObjectRef>) {
+    let map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+    for r in map.values() {
+        for o in [r.service, r.controller_mirror, r.child_target, r.start_context]
+            .into_iter()
+            .flatten()
+        {
+            out.push(o);
+        }
+    }
+}
+
+/// Post-GC remap for the container-held service objects (companion to
+/// [`gc_scan_msc_service_roots`]). After a moving collection the held objects
+/// relocate; repoint every stored `ObjectRef` to its new address.
+pub fn gc_update_msc_service_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let remap = |slot: &mut Option<ObjectRef>| {
+        if let Some(obj_ref) = slot.as_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    };
+    let mut map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+    for r in map.values_mut() {
+        remap(&mut r.service);
+        remap(&mut r.controller_mirror);
+        remap(&mut r.child_target);
+        remap(&mut r.start_context);
+    }
+}
+
+// ===========================================================================
+// P2/P3 — drive the real Java `service.start(StartContext)` callback.
+//
+// Gated behind `CRATONVM_MSC_REAL_START` (default-OFF): when off, the
+// `ServiceBuilderImpl.install()` / `StartContext.getController()` etc. natives
+// below are NOT registered, so WildFly's real MSC bytecode runs exactly as
+// before (no regression risk). When on, `install()` extracts the service from
+// the builder, registers it in the Rust container, and drives `start()`.
+// `CRATONVM_DBG_MSC` traces the install/start sequence.
+// ===========================================================================
+
+/// Cached check of the `CRATONVM_MSC_REAL_START` gate.
+fn msc_real_start_enabled() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("CRATONVM_MSC_REAL_START").is_some())
+}
+
+/// Cached check of the `CRATONVM_DBG_MSC` trace flag.
+fn msc_dbg() -> bool {
+    static F: OnceLock<bool> = OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("CRATONVM_DBG_MSC").is_some())
+}
+
+thread_local! {
+    /// Re-entrancy guard: only the outermost `install()` drives the start
+    /// loop; nested `install()` calls made by a running `start()` just register
+    /// + return, and the outer loop drains them iteratively.
+    static DRIVING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Read a jboss-msc `ServiceController$Mode` enum object by its `name` field
+/// (robust to ordinal differences across MSC versions). Null → `Active`.
+fn read_mode_by_name(ctx: &mut dyn NativeContext, mode_obj: Option<ObjectRef>) -> Mode {
+    let m = match mode_obj {
+        Some(o) => o,
+        None => return Mode::Active,
+    };
+    match ctx.get_field_by_name(m, "name") {
+        Value::Object(Some(s)) => ctx
+            .read_string(s)
+            .map(|t| Mode::parse(&t))
+            .unwrap_or(Mode::Active),
+        _ => Mode::Active,
+    }
+}
+
+/// Read the dependency `ServiceName`s out of a `ServiceBuilderImpl.requires`
+/// map (keys). Defensive: returns empty on any failure / null map.
+/// Robustly extract a canonical `ServiceName` from a Java `ServiceName` object,
+/// tolerating the real jboss-msc layout where `canonicalName` is computed
+/// LAZILY (null until `getCanonicalName()` runs). Strategy:
+///   1. the `canonicalName` field (populated by our `of()` natives, or lazily
+///      by real code that already called `getCanonicalName()`),
+///   2. the synthetic `canonical` field (synthetic-jdk layout),
+///   3. reconstruct from the `name` (leaf) + `parent` chain — independent of
+///      the lazy cache and of our `getCanonicalName` native override.
+///
+/// `read_java_service_name` (a slot-1 read) returns `None` for a real
+/// ServiceName whose `canonicalName` cache is still null, which is exactly the
+/// form WildFly's `AbstractControllerService` install passes — so the install
+/// hook and dependency reader use this instead.
+fn read_service_name_robust(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+) -> Option<Arc<ServiceName>> {
+    for field in ["canonicalName", "canonical"] {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(obj, field) {
+            if let Some(t) = ctx.read_string(s) {
+                if !t.is_empty() {
+                    return Some(ServiceName::parse(&t));
+                }
+            }
+        }
+    }
+    // Reconstruct leaf-to-root from the name/parent chain.
+    let mut segs: Vec<String> = Vec::new();
+    let mut cur = Some(obj);
+    let mut guard = 0u32;
+    while let Some(o) = cur {
+        guard += 1;
+        if guard > 256 {
+            break;
+        }
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(o, "name") {
+            if let Some(leaf) = ctx.read_string(s) {
+                if !leaf.is_empty() {
+                    segs.push(leaf);
+                }
+            }
+        }
+        cur = match ctx.get_field_by_name(o, "parent") {
+            Value::Object(Some(p)) => Some(p),
+            _ => None,
+        };
+    }
+    if segs.is_empty() {
+        return None;
+    }
+    segs.reverse();
+    Some(ServiceName::of(segs))
+}
+
+/// Best-effort runtime class name of an object (for diagnostics).
+fn obj_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
+    ctx.class_name_of_id(ctx.class_id_of_object(obj))
+        .unwrap_or_else(|| "<unknown>".to_string())
+}
+
+/// Read the dependency `ServiceName`s out of a `ServiceBuilderImpl.requires`
+/// map (keys). Defensive: returns empty on any failure / null map.
+fn read_dep_names(
+    ctx: &mut dyn NativeContext,
+    requires_map: Option<ObjectRef>,
+) -> Vec<Arc<ServiceName>> {
+    let map = match requires_map {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+    // invoke_virtual prepends the receiver; `args` is parameters ONLY (none here).
+    let set = match ctx.invoke_virtual(map, "keySet", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return Vec::new(),
+    };
+    let arr = match ctx.invoke_virtual(set, "toArray", "()[Ljava/lang/Object;", &[]) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return Vec::new(),
+    };
+    let n = ctx.array_length(arr);
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Value::Object(Some(sn)) = ctx.get_array_element(arr, i) {
+            if let Some(name) = read_service_name_robust(ctx, sn) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Allocate a synthetic `StartContext` carrying `controller_id`, and root it.
+fn build_start_context(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
+    let sctx = alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/StartContext", CTX_NUM_SLOTS);
+    ctx.set_field(sctx, CTX_FIELD_CONTROLLER_ID, Value::Long(id as i64));
+    {
+        let mut map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(id).or_default().start_context = Some(sctx);
+    }
+    sctx
+}
+
+/// Iteratively drive every ready service's real `start()` callback until none
+/// remain. NEVER holds the container lock across `invoke_virtual`. The receiver
+/// and `StartContext` are kept live across the call by the invoked frame's
+/// own root scan; container-held refs are re-read from `service_roots` (which
+/// the GC remaps) rather than from stale locals.
+fn drive_starts(ctx: &mut dyn NativeContext, container: &ServiceContainer) {
+    let mut guard: u32 = 0;
+    loop {
+        guard += 1;
+        if guard > 200_000 {
+            if msc_dbg() {
+                eprintln!("[msc] drive_starts: re-entrancy guard limit hit, stopping");
+            }
+            break;
+        }
+        let id = match container.take_ready_start() {
+            Some(i) => i,
+            None => break,
+        };
+        let svc = service_roots()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .and_then(|r| r.service);
+        let svc = match svc {
+            Some(s) => s,
+            None => {
+                // Provides-only service (no `Service` instance): nothing to
+                // run — transition straight to Up so dependents unblock.
+                if msc_dbg() {
+                    eprintln!("[msc] start id={id}: no service instance, marking Up");
+                }
+                container.finish_start(id);
+                continue;
+            }
+        };
+        let sctx = build_start_context(ctx, id);
+        if msc_dbg() {
+            eprintln!("[msc] -> start id={id}");
+        }
+        // invoke_virtual prepends the receiver; `args` is parameters ONLY.
+        let res = ctx.invoke_virtual(
+            svc,
+            "start",
+            "(Lorg/jboss/msc/service/StartContext;)V",
+            &[Value::Object(Some(sctx))],
+        );
+        match res {
+            Ok(_) => {
+                if msc_dbg() {
+                    eprintln!("[msc] <- start id={id} OK");
+                }
+                container.finish_start(id);
+            }
+            Err(e) => {
+                if msc_dbg() {
+                    eprintln!("[msc] <- start id={id} FAILED: {e:?}");
+                }
+                container.record_failure(id, format!("service start failed: {e:?}"));
+                // Do not propagate: record + keep draining other services so a
+                // single failed service does not abort the whole boot.
+            }
+        }
+    }
+}
+
+/// P2 hook: `org.jboss.msc.service.ServiceBuilderImpl.install()`.
+///
+/// Modern WildFly installs every service through the ServiceBuilder API
+/// (`ServiceTarget.addService(name).provides(...).setInstance(svc).install()`),
+/// NOT the legacy 2-arg `ServiceContainer.addService`. `install()` is the point
+/// where the service object + name + deps are all attached, so we intercept it,
+/// register the service in the Rust container, and drive its real `start()`.
+fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let builder = obj_arg(args, 0)?;
+
+    // ServiceBuilderImpl field layout (jboss-msc 1.5.x, reversed via `javap -p`):
+    //   serviceId : ServiceName        (the primary name)
+    //   service   : org.jboss.msc.Service (the instance to start; may be null)
+    //   initialMode : ServiceController$Mode (null => ACTIVE)
+    //   requires  : Map<ServiceName, Dependency>   (dependency names)
+    //   serviceTarget : ServiceTargetImpl          (for getChildTarget)
+    let sn_obj = match ctx.get_field_by_name(builder, "serviceId") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    let name = sn_obj.and_then(|o| read_service_name_robust(ctx, o));
+    let name = match name {
+        Some(n) => n,
+        None => {
+            if msc_dbg() {
+                let bcls = obj_class_name(ctx, builder);
+                let sid = match sn_obj {
+                    Some(o) => format!("ServiceName<{}>", obj_class_name(ctx, o)),
+                    None => "null".to_string(),
+                };
+                eprintln!(
+                    "[msc] install: unreadable serviceId (builder={bcls}, serviceId={sid}) — returning null controller"
+                );
+            }
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+    let service_ref = match ctx.get_field_by_name(builder, "service") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    let mode = match ctx.get_field_by_name(builder, "initialMode") {
+        Value::Object(o) => read_mode_by_name(ctx, o),
+        _ => Mode::Active,
+    };
+    let child_target = match ctx.get_field_by_name(builder, "serviceTarget") {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    };
+    let deps = match ctx.get_field_by_name(builder, "requires") {
+        Value::Object(Some(o)) => read_dep_names(ctx, Some(o)),
+        _ => Vec::new(),
+    };
+
+    let container = global_container().clone();
+    let id = match container.add_service(
+        name.clone(),
+        deps.clone(),
+        mode,
+        service_ref.map(|o| o.as_ptr() as usize).unwrap_or(0),
+    ) {
+        Ok(id) => id,
+        Err(msg) => {
+            if msc_dbg() {
+                eprintln!("[msc] install {}: add_service error: {msg}", name.canonical());
+            }
+            return Ok(Some(Value::Object(None)));
+        }
+    };
+
+    // Build the synthetic ServiceController mirror (returned to the caller and
+    // from StartContext.getController()).
+    let ctrl_obj = alloc_concurrent_synthetic(
+        ctx,
+        "org/jboss/msc/service/ServiceController",
+        SC_NUM_SLOTS,
+    );
+    if let Some(sn) = sn_obj {
+        ctx.set_field(ctrl_obj, SC_FIELD_NAME, Value::Object(Some(sn)));
+    }
+    ctx.set_field(ctrl_obj, SC_FIELD_MODE, Value::Int(mode.ordinal()));
+    ctx.set_field(ctrl_obj, SC_FIELD_STATE, Value::Int(ServiceState::Down.ordinal()));
+    ctx.set_field(ctrl_obj, SC_FIELD_VALUE, Value::Object(None));
+    ctx.set_field(ctrl_obj, SC_FIELD_ID, Value::Long(id as i64));
+
+    // Register every held Java ref as a GC root BEFORE driving start() (which
+    // allocates heavily and can move/collect these).
+    {
+        let mut map = service_roots().lock().unwrap_or_else(|e| e.into_inner());
+        let r = map.entry(id).or_default();
+        r.service = service_ref;
+        r.controller_mirror = Some(ctrl_obj);
+        r.child_target = child_target;
+    }
+
+    if msc_dbg() {
+        eprintln!(
+            "[msc] install id={id} name={} mode={mode:?} has_service={} deps={}",
+            name.canonical(),
+            service_ref.is_some(),
+            deps.len()
+        );
+    }
+
+    // Drive starts iteratively; only the outermost install drives. Nested
+    // install() calls (made by a running start()) just register + return.
+    let was_driving = DRIVING.with(|d| d.replace(true));
+    if !was_driving {
+        drive_starts(ctx, &container);
+        DRIVING.with(|d| d.set(false));
+    }
+
+    // Re-read the (possibly relocated) mirror from the GC-remapped side-table.
+    let final_mirror = service_roots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .and_then(|r| r.controller_mirror)
+        .unwrap_or(ctrl_obj);
+    Ok(Some(Value::Object(Some(final_mirror))))
+}
+
+/// `StartContext.getController()` → the synthetic ServiceController mirror.
+fn native_start_context_get_controller(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = match ctx.get_field(this, CTX_FIELD_CONTROLLER_ID) {
+        Value::Long(l) => l as u64,
+        _ => 0,
+    };
+    let mirror = service_roots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .and_then(|r| r.controller_mirror);
+    Ok(Some(Value::Object(mirror)))
+}
+
+/// `StartContext.getChildTarget()` → the real ServiceTargetImpl captured from
+/// the builder, so child installs route through the same working target.
+fn native_start_context_get_child_target(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = match ctx.get_field(this, CTX_FIELD_CONTROLLER_ID) {
+        Value::Long(l) => l as u64,
+        _ => 0,
+    };
+    let tgt = service_roots()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .and_then(|r| r.child_target);
+    Ok(Some(Value::Object(tgt)))
+}
+
+/// `StartContext.failed(StartException)` → mark the service failed.
+fn native_start_context_failed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let id = match ctx.get_field(this, CTX_FIELD_CONTROLLER_ID) {
+        Value::Long(l) => l as u64,
+        _ => 0,
+    };
+    global_container().record_failure(id, "service start failed (StartContext.failed)".to_string());
+    Ok(None)
+}
+
+/// `ServiceController.getServiceContainer()` → a synthetic ServiceContainer
+/// (forces the global container to exist; the mirror is a thin handle).
+fn native_service_controller_get_service_container(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    let _ = global_container();
+    let obj = alloc_concurrent_synthetic(ctx, "org/jboss/msc/service/ServiceContainer", 2);
+    Ok(Some(Value::Object(Some(obj))))
+}
+
 // ---------------------------------------------------------------------------
 // Registration — called from `lib.rs` once the essential natives have been
 // wired up.
@@ -1697,6 +2236,46 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(obj))))
         },
     );
+
+    // P2/P3 (WildFly real service.start): GATED behind CRATONVM_MSC_REAL_START
+    // (default-OFF). When off, none of these are registered so WildFly's real
+    // MSC bytecode runs unchanged. When on, we intercept ServiceBuilder.install
+    // and drive the real start() callback. See native_service_builder_install.
+    if msc_real_start_enabled() {
+        let sbi = "org/jboss/msc/service/ServiceBuilderImpl";
+        r.register(
+            sbi,
+            "install",
+            "()Lorg/jboss/msc/service/ServiceController;",
+            native_service_builder_install,
+        );
+        let start_ctx = "org/jboss/msc/service/StartContext";
+        r.register(
+            start_ctx,
+            "getController",
+            "()Lorg/jboss/msc/service/ServiceController;",
+            native_start_context_get_controller,
+        );
+        r.register(
+            start_ctx,
+            "getChildTarget",
+            "()Lorg/jboss/msc/service/ServiceTarget;",
+            native_start_context_get_child_target,
+        );
+        r.register(
+            start_ctx,
+            "failed",
+            "(Lorg/jboss/msc/service/StartException;)V",
+            native_start_context_failed,
+        );
+        let ctrl = "org/jboss/msc/service/ServiceController";
+        r.register(
+            ctrl,
+            "getServiceContainer",
+            "()Lorg/jboss/msc/service/ServiceContainer;",
+            native_service_controller_get_service_container,
+        );
+    }
 
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
     r.set_category(__prev_cat);

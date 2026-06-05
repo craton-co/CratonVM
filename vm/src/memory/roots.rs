@@ -229,6 +229,18 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     (`gc_update_loader_singleton_refs`).
     cratonvm_native_builtins::classloader::gc_scan_loader_singleton_roots(&mut roots);
 
+    // 19. JBoss MSC container-held service objects. The `ServiceContainer` Rust
+    //     state machine references Java objects (the `Service` instance whose
+    //     `start()`/`stop()` we invoke, the synthetic `ServiceController`
+    //     mirror, the child `ServiceTarget`, the in-flight `StartContext`) only
+    //     through a process-global side-table in
+    //     `native-builtins/src/jboss_msc.rs`, invisible to every scan above.
+    //     Without rooting them a moving GC reclaims/relocates a held service
+    //     and the next `invoke_virtual(service, "start", ...)` is a
+    //     use-after-free. Remap companion in `gc.rs`
+    //     (`gc_update_msc_service_refs`).
+    cratonvm_native_builtins::jboss_msc::gc_scan_msc_service_roots(&mut roots);
+
     roots
 }
 
