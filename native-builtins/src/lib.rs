@@ -1252,13 +1252,20 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         |_ctx, _args| Ok(None),
     );
 
-    // RKC16N-RECON: throwable / permission ctors that take a String message.
-    // Real JDK has bytecode for these; the dispatcher fails to find them
-    // (same root-cause as String — see RKC16N.7) so we register layout-
-    // neutral natives that just stash the message in field 0 (the
-    // canonical detailMessage slot for Throwable subclasses).
+    // RKC16N-RECON: throwable ctors that take a String message. Real JDK has
+    // bytecode for these; the dispatcher historically failed to find them
+    // (same root-cause as String — see RKC16N.7), so we shadow `<init>`.
+    //
+    // STACK-TRACE CAPTURE FIX: route these throwable ctors through the canonical
+    // capturing natives (`native_exc_init_message` / `native_exc_init_noargs`)
+    // instead of a local closure that only stashed the message in raw slot 0.
+    // The old closure had two bugs: (1) it never called fillInStackTrace, so
+    // `getStackTrace()` came back empty for these subclasses; (2) it wrote the
+    // String into slot 0, which in the real-JDK Throwable layout is `backtrace`
+    // — clobbering the marker `getOurStackTrace()` keys on. The shared natives
+    // write `detailMessage` by name, seed the `cause = this` sentinel, and
+    // capture the trace.
     for cls in &[
-        "java/lang/RuntimePermission",
         "java/lang/ClassCastException",
         "java/lang/IllegalArgumentException",
         "java/lang/IllegalStateException",
@@ -1275,30 +1282,33 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         let cls_static: &'static str = Box::leak(cls.to_string().into_boxed_str());
         registry.register(
             cls_static, "<init>", "(Ljava/lang/String;)V",
-            |ctx, args| {
-                let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
-                if let Some(Value::Object(Some(msg))) = args.get(1) {
-                    ctx.set_field(this, 0, Value::Object(Some(*msg)));
-                    // S111r27 diag: log first few IAE/ISE constructions with messages
-                    if let Some(m) = ctx.read_string(*msg) {
-                        if m.len() > 2
-                            && matches!(
-                                std::env::var("CRATONVM_DIAG_EXINIT").as_deref(),
-                                Ok("1") | Ok("true") | Ok("yes")
-                            )
-                        {
-                            eprintln!("[EXINIT-DBG] Exception<init>(msg): {}", &m[..m.len().min(200)]);
-                        }
-                    }
-                }
-                Ok(None)
-            },
+            crate::lang_misc::native_exc_init_message,
         );
         registry.register(
             cls_static, "<init>", "()V",
-            |_ctx, _args| Ok(None),
+            crate::lang_misc::native_exc_init_noargs,
         );
     }
+    // `java/lang/RuntimePermission` is NOT a Throwable — its `(String)` ctor
+    // stores the permission *name* in field 0 (the real `Permission.name`
+    // slot), and it has no `detailMessage`/`backtrace`/stack trace. Keep its
+    // dedicated layout-neutral closure (must not route through the Throwable
+    // capture path, which would no-op the name write and pointlessly record a
+    // trace under the permission's identity hash).
+    registry.register(
+        "java/lang/RuntimePermission", "<init>", "(Ljava/lang/String;)V",
+        |ctx, args| {
+            let this = match args.first() { Some(Value::Object(Some(o))) => *o, _ => return Ok(None) };
+            if let Some(Value::Object(Some(name))) = args.get(1) {
+                ctx.set_field(this, 0, Value::Object(Some(*name)));
+            }
+            Ok(None)
+        },
+    );
+    registry.register(
+        "java/lang/RuntimePermission", "<init>", "()V",
+        |_ctx, _args| Ok(None),
+    );
     registry.register(
         "java/lang/String", "indexOf", "(Ljava/lang/String;)I",
         |ctx, args| {
@@ -4896,12 +4906,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // --- java.util.concurrent.atomic.AtomicReference (Session 13) ---
     register_atomic_reference_natives(registry);
 
-    // --- C23: AtomicReferenceArray (also AtomicStampedReference /
-    //      AtomicMarkableReference) ---  required in real-JDK mode because
-    //      the JDK bytecode path for these classes routes writes through a
-    //      VarHandle on the inner Object[], which our VarHandle machinery
-    //      cannot honour for array element CAS.  The registrations also
-    //      cover the get/set/getAndSet/length fast paths.
+    // --- C23: AtomicReferenceArray ---  required in real-JDK mode because the
+    //      JDK bytecode path routes writes through a VarHandle on the inner
+    //      Object[], which our VarHandle machinery cannot honour for array
+    //      element CAS.  The registrations also cover the get/set/getAndSet/
+    //      length fast paths.  (AtomicStampedReference / AtomicMarkableReference
+    //      are handled by register_atomic_stamped_ref_natives /
+    //      register_atomic_markable_ref_natives, registered later.)
     phases_early::register_atomic_reference_array_natives(registry);
 
     // --- SecurityManager / AccessController (T8.1.8) ---
@@ -32500,8 +32511,14 @@ fn register_exception_extras_natives(registry: &mut NativeMethodRegistry) {
     }
 }
 
-fn native_exception_init_empty(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // No-op — fields already null by default
+fn native_exception_init_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Fields already null by default; but we must still capture the stack
+    // trace (the JDK no-arg Throwable ctor calls fillInStackTrace()). Without
+    // this, a no-arg `new IllegalStateException()` thrown from bytecode had an
+    // empty getStackTrace(). Same root cause as native_exception_init_msg.
+    if let Some(Value::Object(Some(this))) = args.first() {
+        crate::lang_misc::capture_throwable_trace(ctx, *this);
+    }
     Ok(None)
 }
 
@@ -32511,13 +32528,18 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         _ => return Ok(None),
     };
     let msg = args.get(1).cloned().unwrap_or(Value::Object(None));
-    // Mirror to both the named field (real-JDK Throwable layout has
-    // detailMessage at slot 1, after backtrace) and slot 0 (synthetic-stub
-    // layout with unnamed `_f0`). See `lang_misc::write_throwable_detail_message`.
+    // Mirror to the named field (real-JDK Throwable layout has detailMessage at
+    // slot 1, after backtrace). See `lang_misc::write_throwable_detail_message`.
+    //
+    // NOTE (stack-trace capture fix): we deliberately do NOT also blast `msg`
+    // into raw slot 0 anymore. In the real-JDK Throwable layout slot 0 is
+    // `backtrace`, which `capture_throwable_trace` (called below) sets to the
+    // self-reference marker that `getOurStackTrace()` keys on. Writing the
+    // String message there would clobber the backtrace marker and re-break
+    // getStackTrace(). The named-field write above is the correct, layout-aware
+    // path; the only objects without a named `detailMessage` are synthetic
+    // stubs, which the no-stubs build does not produce.
     ctx.set_field_by_name(this, "detailMessage", msg);
-    if ctx.object_num_fields(this) >= 1 {
-        ctx.set_field(this, 0, msg);
-    }
     // Surefire bootstrap forensics: capture exact Java callsite for the
     // recurring `NullPointerException("Name is null")` blocker so we can
     // patch the true producer instead of masking symptoms.
@@ -32539,6 +32561,16 @@ fn native_exception_init_msg(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             }
         }
     }
+    // STACK-TRACE CAPTURE FIX: `register_exception_extras_natives` registers
+    // this native for ~50 exception subclasses (IllegalStateException,
+    // IllegalArgumentException, NumberFormatException, …) and runs LAST, so it
+    // wins the registry slot over the capturing `native_exc_init_message` from
+    // `register_throwable_subclass_natives`. Previously this native shadowed the
+    // JDK `<init>` without ever calling `fillInStackTrace`, so `getStackTrace()`
+    // returned 0 frames for every one of those subclasses thrown from bytecode.
+    // Route through the shared capture helper so they match HotSpot (and the
+    // base Throwable/RuntimeException classes, which these lists omit).
+    crate::lang_misc::capture_throwable_trace(ctx, this);
     Ok(None)
 }
 
@@ -34538,8 +34570,55 @@ fn native_ab_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 }
 
 // ===========================================================================
-// AtomicStampedReference — 2-field (ref=0, stamp=1 Int)
+// AtomicStampedReference — JDK-faithful single `pair` field (slot 0) that
+// holds an `AtomicStampedReference$Pair { reference@0, stamp@1 }`.
+//
+// The real class declares exactly ONE instance field (`private volatile
+// Pair<V> pair`) plus a static `PAIR` VarHandle, so the allocated object has
+// num_slots==1. The old intrinsic stored `stamp` directly at slot 1, which is
+// out-of-bounds on a 1-slot object → the GC guard dropped the write and
+// `getStamp` read garbage. Worse, every public ASR method (`getReference`,
+// `getStamp`, `get`, `compareAndSet`, `set`, `attemptStamp`) reads
+// `this.pair.reference` / `this.pair.stamp`, so any of these methods that the
+// intrinsic does NOT intercept (e.g. `casPair`, or a future method) runs real
+// bytecode against slot 0 expecting a Pair — finding a bare reference instead
+// and reading bogus interior fields (the source of the stray `index=3`
+// out-of-bounds writes during boot). Modelling the real Pair object keeps the
+// intrinsic and any real bytecode perfectly consistent.
 // ===========================================================================
+
+const ASR_PAIR_CLASS: &str = "java/util/concurrent/atomic/AtomicStampedReference$Pair";
+
+/// Allocate a real-layout `AtomicStampedReference$Pair` holding
+/// `(reference, stamp)`. Slot 0 = reference (Object), slot 1 = stamp (int),
+/// matching the JDK field order so real ASR bytecode reading `pair.reference`
+/// / `pair.stamp` stays consistent with the intrinsic.
+fn asr_alloc_pair(ctx: &mut dyn NativeContext, reference: Value, stamp: i32) -> ObjectRef {
+    // `alloc_concurrent_synthetic` resolves the real Pair class (2 fields) when
+    // loadable and falls back to a 2-field synthetic class otherwise, so the
+    // header's declared field count always matches the 2 slots we write.
+    let pair = alloc_concurrent_synthetic(ctx, ASR_PAIR_CLASS, 2);
+    ctx.set_field(pair, 0, reference);
+    ctx.set_field(pair, 1, Value::Int(stamp));
+    pair
+}
+
+/// Read `(reference, stamp)` out of the `pair` stored in `this.field(0)`.
+/// Returns `(Value::Object(None), 0)` if the pair slot is null or somehow not
+/// a 2-field object (defensive — should not happen after construction).
+fn asr_read_pair(ctx: &mut dyn NativeContext, this: ObjectRef) -> (Value, i32) {
+    match ctx.get_field(this, 0) {
+        Value::Object(Some(pair)) => {
+            let reference = ctx.get_field(pair, 0);
+            let stamp = match ctx.get_field(pair, 1) {
+                Value::Int(v) => v,
+                _ => 0,
+            };
+            (reference, stamp)
+        }
+        _ => (Value::Object(None), 0),
+    }
+}
 
 fn register_atomic_stamped_ref_natives(r: &mut NativeMethodRegistry) {
     // census-tag: AtomicStampedReference atomic primitive → Bridge.
@@ -34554,6 +34633,9 @@ fn register_atomic_stamped_ref_natives(r: &mut NativeMethodRegistry) {
         native_asr_get_ref,
     );
     r.register(c, "getStamp", "()I", native_asr_get_stamp);
+    // get([I)Ljava/lang/Object; — reads stamp into stampHolder[0] and
+    // returns the reference. Faithful to the JDK two-result accessor.
+    r.register(c, "get", "([I)Ljava/lang/Object;", native_asr_get_with_holder);
     r.register(c, "set", "(Ljava/lang/Object;I)V", native_asr_set);
     r.register(
         c,
@@ -34586,8 +34668,10 @@ fn native_asr_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    ctx.set_field(this, 0, r);
-    ctx.set_field(this, 1, Value::Int(stamp));
+    // Store a real Pair object in the single `pair` field (slot 0). No write to
+    // slot 1 — the ASR object itself has only one slot.
+    let pair = asr_alloc_pair(ctx, r, stamp);
+    ctx.set_field(this, 0, Value::Object(Some(pair)));
     Ok(None)
 }
 
@@ -34596,7 +34680,8 @@ fn native_asr_get_ref(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    Ok(Some(ctx.get_field(this, 0)))
+    let (reference, _stamp) = asr_read_pair(ctx, this);
+    Ok(Some(reference))
 }
 
 fn native_asr_get_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -34604,7 +34689,22 @@ fn native_asr_get_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(ctx.get_field(this, 1)))
+    let (_reference, stamp) = asr_read_pair(ctx, this);
+    Ok(Some(Value::Int(stamp)))
+}
+
+/// `V get(int[] stampHolder)` — store the current stamp into `stampHolder[0]`
+/// and return the current reference (matches JDK semantics).
+fn native_asr_get_with_holder(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (reference, stamp) = asr_read_pair(ctx, this);
+    if let Some(Value::Object(Some(holder))) = args.get(1) {
+        ctx.set_array_element(*holder, 0, Value::Int(stamp));
+    }
+    Ok(Some(reference))
 }
 
 fn native_asr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -34617,8 +34717,10 @@ fn native_asr_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    ctx.set_field(this, 0, r);
-    ctx.set_field(this, 1, Value::Int(stamp));
+    // JDK `set` allocates a fresh Pair only when reference or stamp differ; we
+    // always install a fresh Pair (semantically identical, slightly simpler).
+    let pair = asr_alloc_pair(ctx, r, stamp);
+    ctx.set_field(this, 0, Value::Object(Some(pair)));
     Ok(None)
 }
 
@@ -34632,9 +34734,11 @@ fn native_asr_attempt_stamp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let current_ref = ctx.get_field(this, 0);
+    let (current_ref, _current_stamp) = asr_read_pair(ctx, this);
     if values_ref_equal(current_ref, expected_ref) {
-        ctx.set_field(this, 1, Value::Int(new_stamp));
+        // Swap in a new Pair carrying the (unchanged) reference + new stamp.
+        let pair = asr_alloc_pair(ctx, current_ref, new_stamp);
+        ctx.set_field(this, 0, Value::Object(Some(pair)));
         Ok(Some(Value::Int(1)))
     } else {
         Ok(Some(Value::Int(0)))
@@ -34656,14 +34760,14 @@ fn native_asr_cas(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let current_ref = ctx.get_field(this, 0);
-    let current_stamp = match ctx.get_field(this, 1) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let (current_ref, current_stamp) = asr_read_pair(ctx, this);
     if values_ref_equal(current_ref, expected_ref) && current_stamp == expected_stamp {
-        ctx.set_field(this, 0, new_ref);
-        ctx.set_field(this, 1, Value::Int(new_stamp));
+        // Install a new Pair only if reference or stamp actually changes (the
+        // JDK fast-path: when both are identical it skips the casPair entirely).
+        if !values_ref_equal(current_ref, new_ref) || current_stamp != new_stamp {
+            let pair = asr_alloc_pair(ctx, new_ref, new_stamp);
+            ctx.set_field(this, 0, Value::Object(Some(pair)));
+        }
         Ok(Some(Value::Int(1)))
     } else {
         Ok(Some(Value::Int(0)))

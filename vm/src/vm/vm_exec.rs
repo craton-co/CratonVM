@@ -1298,6 +1298,16 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             &self.thread.frames,
         );
         drop(cm);
+        if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+            eprintln!(
+                "STTRACE_DBG_CAP hash={throwable_hash} frames={} depth={}",
+                self.thread.frames.len(),
+                trace.len()
+            );
+            for (i, e) in trace.iter().enumerate() {
+                eprintln!("  STTRACE_DBG_CAP[{i}] {}.{}", e.class_name, e.method_name);
+            }
+        }
         self.thread
             .throwable_stacks
             .insert(throwable_hash, trace.clone());
@@ -1305,10 +1315,19 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn get_stack_trace(&self, throwable_hash: i32) -> Option<&[StackTraceEntry]> {
-        self.thread
+        let r = self.thread
             .throwable_stacks
             .get(&throwable_hash)
-            .map(|v| v.as_slice())
+            .map(|v| v.as_slice());
+        if std::env::var_os("CRATONVM_DBG_STTRACE").is_some() {
+            eprintln!(
+                "STTRACE_DBG_LOOKUP hash={throwable_hash} hit={} len={} keys={:?}",
+                r.is_some(),
+                r.map_or(0, |s| s.len()),
+                self.thread.throwable_stacks.keys().collect::<Vec<_>>()
+            );
+        }
+        r
     }
 
     // -- Heap access methods --
