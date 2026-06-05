@@ -1687,6 +1687,78 @@ impl GenerationalHeap {
         self.young_from.lock().used() + self.old_gen.lock().used()
     }
 
+    /// DBG (bc math-ec `0x4`): scan the young from-space for the FIRST object
+    /// reference field (or ref-array element) holding `Object(Some(p))` with
+    /// `0 < p < 0x1000` — the `0x4` corruption signature, which we proved is
+    /// written to a YOUNG object by the mutator (between GCs), NOT by the GC.
+    /// Returns `(holder_addr, class_id, field_idx, payload, nbr_disc)` where
+    /// `nbr_disc` is the discriminant word of the NEXT cell (field_idx+1) — for
+    /// a misaligned-by-8 `Value::Object` write the seed cell reads payload `4`
+    /// AND the next cell's disc reads the stray write's real (large) payload,
+    /// confirming the misalignment mechanism. `field_idx` has bit 0x4000_0000
+    /// set for a ref-array element. Locks `young_from`; call only OUTSIDE a GC.
+    pub fn dbg_first_young_small_ref(&self) -> Option<(usize, u32, usize, usize, u64)> {
+        let from = self.young_from.lock();
+        let base = from.base_ptr();
+        let used = from.used();
+        let base_a = base as usize;
+        let end_a = base_a + used;
+        // HEADER-INDEPENDENT brute-force: the corruption scribbles garbage into
+        // young object HEADERS too, so any object-walk (even re-syncing) can be
+        // desynced past the victim. Instead scan every 8-aligned word for the
+        // raw 16-byte `Object(Some(0<p<0x1000))` bit pattern (disc word == 4,
+        // payload word in (0,0x1000)), then BACK-VALIDATE the hit sits at a real
+        // field-cell offset of a plausible non-array object — which filters out
+        // primitive-array `{4, small}` data (the dominant young bytes in EC).
+        let mut a = base_a;
+        while a + 16 <= end_a {
+            let disc = unsafe { std::ptr::read(a as *const u64) };
+            if disc == 4 {
+                let payload = unsafe { std::ptr::read((a + 8) as *const u64) };
+                if payload != 0 && payload < 0x1000 {
+                    // Back-validate: for each candidate field index `fld`, the
+                    // owning header would start at H = a - HEADER_SIZE - fld*16.
+                    // Accept the first H that is in-arena, kind=Object,
+                    // array_length==0, and num_slots in (fld, 1<<20].
+                    let mut found: Option<(usize, u32, usize)> = None;
+                    let max_fld = 256usize;
+                    for fld in 0..max_fld {
+                        let off = HEADER_SIZE + fld * SLOT_SIZE;
+                        if a < base_a + off {
+                            break;
+                        }
+                        let h_addr = a - off;
+                        let h = unsafe { &*(h_addr as *const ObjectHeader) };
+                        if (h.kind as u8) == 0
+                            && h.array_length == 0
+                            && (h.num_slots as usize) > fld
+                            && h.num_slots <= (1 << 20)
+                        {
+                            // Strong filter: a REAL object's class resolves and
+                            // its declared instance-field count equals num_slots.
+                            // Rejects spurious "headers" read out of a neighbour's
+                            // mid-object bytes (the victims are real JDK/EC types).
+                            let cid = h.class_id.as_u32();
+                            let real = crate::gc::resolve_class_info(cid)
+                                .map(|(_, n)| n == h.num_slots as usize)
+                                .unwrap_or(false);
+                            if real {
+                                found = Some((h_addr, cid, fld));
+                                break;
+                            }
+                        }
+                    }
+                    if let Some((h_addr, cid, fld)) = found {
+                        let nbr = unsafe { std::ptr::read((a + 16) as *const u64) };
+                        return Some((h_addr, cid, fld, payload as usize, nbr));
+                    }
+                }
+            }
+            a += 8;
+        }
+        None
+    }
+
     /// Check if the old generation is above 75% capacity.
     pub fn old_gen_needs_gc(&self) -> bool {
         let og = self.old_gen.lock();
@@ -1807,6 +1879,24 @@ impl GenerationalHeap {
         let mut young_from = self.young_from.lock();
         let mut young_to = self.young_to.lock();
         let mut old_gen = self.old_gen.lock();
+
+        // bc math-ec 0x4 seed-phase bisect (CRATONVM_DBG_SEEDHUNT): count
+        // `Object(Some(0<p<0x1000))` slots in old gen at GC ENTRY. Compared
+        // against the post-Cheney and post-major counts below to localize the
+        // collector path that SEEDS the `0x4`. See the helper docs above.
+        let mut sh_printed: usize = 0;
+        let sh_cap: usize = 40;
+        let sh_entry_old: usize = if seedhunt_enabled() {
+            let mut c = 0usize;
+            for (op, _) in old_gen.walk_objects() {
+                // SAFETY: `op` is a live old-gen object header from walk_objects.
+                let h = unsafe { &*(op as *const ObjectHeader) };
+                c += seedhunt_scan_obj(op, h, "entry", "O", &mut sh_printed, sh_cap);
+            }
+            c
+        } else {
+            0
+        };
 
         // T5.5.2 (HIGH-1 fix): drain every mutator's thread-local card
         // buffer into the authoritative bitmap BEFORE the dirty-card
@@ -2471,6 +2561,29 @@ impl GenerationalHeap {
 
         let bytes_copied = young_to.used();
 
+        // bc math-ec 0x4 seed-phase bisect: count `0x4` slots in the Cheney
+        // to-space survivors and in old gen AFTER the minor (Cheney +
+        // promotion) collection, BEFORE the possible major GC. A jump above
+        // `sh_entry_old` here means the MINOR collector seeded the `0x4`.
+        let (sh_cheney_young, sh_cheney_old): (usize, usize) = if seedhunt_enabled() {
+            let cy = seedhunt_scan_young(
+                young_to.base_ptr(),
+                young_to.used(),
+                "cheney",
+                &mut sh_printed,
+                sh_cap,
+            );
+            let mut co = 0usize;
+            for (op, _) in old_gen.walk_objects() {
+                // SAFETY: `op` is a live old-gen object header from walk_objects.
+                let h = unsafe { &*(op as *const ObjectHeader) };
+                co += seedhunt_scan_obj(op, h, "cheney", "O", &mut sh_printed, sh_cap);
+            }
+            (cy, co)
+        } else {
+            (0, 0)
+        };
+
         // Phase H (RH.1): compute promotion / young-copy stats from the
         // pointer_map BEFORE major_gc appends its own entries below.
         // Every entry at this point is a minor-GC forward: new_addr is
@@ -2586,6 +2699,34 @@ impl GenerationalHeap {
             card_table.mark_dirty_bulk(&deferred_dirty_cards);
             false
         };
+
+        // bc math-ec 0x4 seed-phase bisect: count `0x4` slots in the post-swap
+        // young from-space (the just-collected survivors) and in old gen AFTER
+        // the possible major GC. A jump in the OLD count from `sh_cheney_old`
+        // to here means the MAJOR mark-compact (update_refs_in_object /
+        // fixup_young_old_refs) seeded the `0x4` — see handoff §6.1.
+        if seedhunt_enabled() {
+            let py = seedhunt_scan_young(
+                young_from.base_ptr(),
+                young_from.used(),
+                "post",
+                &mut sh_printed,
+                sh_cap,
+            );
+            let mut po = 0usize;
+            for (op, _) in old_gen.walk_objects() {
+                // SAFETY: `op` is a live old-gen object header from walk_objects.
+                let h = unsafe { &*(op as *const ObjectHeader) };
+                po += seedhunt_scan_obj(op, h, "post", "O", &mut sh_printed, sh_cap);
+            }
+            if sh_entry_old | sh_cheney_young | sh_cheney_old | py | po != 0 {
+                eprintln!(
+                    "[seedhunt] GC entry_old={} | post-cheney young={} old={} | major_ran={} | \
+                     post-major young={} old={}",
+                    sh_entry_old, sh_cheney_young, sh_cheney_old, major_ran, py, po,
+                );
+            }
+        }
 
         // Phase 4b (moved): remap monitors with the FINAL composed pointer_map.
         // Doing this after a possible major GC ensures monitor keys for
@@ -4808,6 +4949,100 @@ fn gcw_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_GCWRITE").is_some())
+}
+
+/// Cached `CRATONVM_DBG_SEEDHUNT` gate (bc math-ec `0x4` seed-phase bisect).
+/// When on, `collect_garbage_inner` scans the young + old arenas for object/
+/// array reference slots holding `Object(Some(p))` with `0 < p < 0x1000` (the
+/// `0x4` corruption signature) at three points — GC entry, after the Cheney
+/// loop, and after a possible major GC — printing per-phase counts. A count
+/// that JUMPS at a specific phase localizes the SEEDING collector path
+/// (minor Cheney/promotion vs. major mark-compact) — see
+/// docs/bc-math-ec-gc-0x4-handoff.md §6.4.
+#[inline]
+fn seedhunt_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_SEEDHUNT").is_some())
+}
+
+/// Scan a single object's reference slots for the `0x4` seed signature
+/// (`Object(Some(0 < p < 0x1000))` in a field, or a raw `0 < x < 0x1000` in a
+/// ref-array element). Returns the number of bad slots found; prints up to
+/// `cap` victims (shared budget via `printed`).
+fn seedhunt_scan_obj(
+    optr: *mut u8,
+    h: &ObjectHeader,
+    label: &str,
+    arena: &str,
+    printed: &mut usize,
+    cap: usize,
+) -> usize {
+    let mut count = 0usize;
+    if h.kind == ObjectKind::Object {
+        for si in 0..h.num_slots as usize {
+            // SAFETY: `si < num_slots`; offset stays within the object.
+            let sp = unsafe { optr.add(HEADER_SIZE + si * SLOT_SIZE) };
+            let v = unsafe { std::ptr::read(sp as *const Value) };
+            if let Value::Object(Some(r)) = v {
+                let p = r.as_ptr() as usize;
+                if p != 0 && p < 0x1000 {
+                    count += 1;
+                    if *printed < cap {
+                        *printed += 1;
+                        eprintln!(
+                            "[seedhunt] {} {} @0x{:x} cid={} fld[{}] -> 0x{:x}",
+                            label, arena, optr as usize, h.class_id.as_u32(), si, p,
+                        );
+                    }
+                }
+            }
+        }
+    } else if h.kind == ObjectKind::Array && h.element_type == ArrayElementType::Reference {
+        for i in 0..h.array_length as usize {
+            // SAFETY: `i < array_length`; offset stays within the array data.
+            let sp = unsafe { optr.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+            let raw = unsafe { std::ptr::read(sp as *const u64) } as usize;
+            if raw != 0 && raw < 0x1000 {
+                count += 1;
+                if *printed < cap {
+                    *printed += 1;
+                    eprintln!(
+                        "[seedhunt] {} {}ARR @0x{:x} cid={} arr[{}] -> 0x{:x}",
+                        label, arena, optr as usize, h.class_id.as_u32(), i, raw,
+                    );
+                }
+            }
+        }
+    }
+    count
+}
+
+/// Scan a contiguous, bump-allocated young arena (Cheney to-space, or the
+/// post-swap from-space) for the `0x4` seed signature. Linear walk by
+/// `gen_object_total_size`; bails on a malformed header (these spaces are
+/// freshly compacted/contiguous so the walk normally reaches every object).
+fn seedhunt_scan_young(
+    base: *const u8,
+    used: usize,
+    label: &str,
+    printed: &mut usize,
+    cap: usize,
+) -> usize {
+    let mut count = 0usize;
+    let mut cur = 0usize;
+    while cur < used {
+        // SAFETY: `cur < used`; pointer stays within the arena.
+        let optr = unsafe { base.add(cur) as *mut u8 };
+        let h = unsafe { &*(optr as *const ObjectHeader) };
+        let size = gen_object_total_size(h);
+        if size < HEADER_SIZE || cur + size > used {
+            break;
+        }
+        count += seedhunt_scan_obj(optr, h, label, "Y", printed, cap);
+        cur += size;
+    }
+    count
 }
 
 fn gen_object_total_size(header: &ObjectHeader) -> usize {

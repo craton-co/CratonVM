@@ -98,6 +98,15 @@ use crate::vm::{
 /// asn1.x9 holders). The class-name resolution happens once per class id;
 /// subsequent reference-field stores pay only a hashmap lookup, so the
 /// per-ref-putfield overhead stays negligible.
+/// Cached `CRATONVM_DBG_STRAYSTACK` gate (bc math-ec `0x4`): dump the Java
+/// stack at a putfield whose receiver header is the stray/stale signature.
+#[inline]
+fn straystack_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_STRAYSTACK").is_some())
+}
+
 fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool {
     use parking_lot::Mutex;
     use std::sync::OnceLock;
@@ -110,7 +119,18 @@ fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool 
     let v = {
         let cm = shared.class_manager.read();
         cm.get_class(cid)
-            .map(|c| c.name.contains("/asn1/x9/") || c.name.contains("Curve"))
+            .map(|c| {
+                c.name.contains("/asn1/x9/")
+                    || c.name.contains("Curve")
+                    // bc math-ec 0x4: the mutator-written victim VARIES across
+                    // runs and is often a small, frequently-allocated JDK class
+                    // (the pre-GC young 0x4 was measured on java/util/HexFormat
+                    // fld[1] and java/util/logging/Level). Watch those too so the
+                    // per-native detect (CRATONVM_DBG_ECWATCH_NATIVE) names the
+                    // writer whichever object the stray write lands on.
+                    || c.name.contains("java/util/HexFormat")
+                    || c.name.contains("java/util/logging/Level")
+            })
             .unwrap_or(false)
     };
     memo.lock().insert(key, v);
@@ -619,6 +639,24 @@ fn process_references_after_gc(
         let actual_addr = pointer_map.get(&ref_addr).copied().unwrap_or(ref_addr);
         // SAFETY: actual_addr was produced by process_references and points at a valid object header within the heap arena.
         let obj_ref = unsafe { ObjectRef::from_raw(actual_addr as *mut u8) };
+        // bc math-ec 0x4 STALE-REF FIX: `cleared` holds PRE-GC addresses;
+        // `unwrap_or(ref_addr)` keeps the stale address when the Reference was
+        // not relocated via `pointer_map`. If that Reference was actually
+        // RECLAIMED this cycle and its slot reused for a smaller object,
+        // `set_field(.., 0, ..)` is a STRAY write into the reusing object —
+        // the `set_field out-of-bounds` flood AND, when the reusing object is
+        // larger, silent field corruption. A live `java.lang.ref.Reference`
+        // always has >= 2 instance fields (referent, queue); a reused slot is a
+        // bare 0-field `Object`. Mirror the `q_obj` liveness guard below.
+        if shared.heap.num_fields(obj_ref) < 2 {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP stale CLEARED ref @0x{:x} (num_fields={})",
+                    actual_addr, shared.heap.num_fields(obj_ref),
+                );
+            }
+            continue;
+        }
         shared.heap.set_field(obj_ref, 0, Value::Object(None));
     }
 
@@ -644,6 +682,23 @@ fn process_references_after_gc(
         // unaffected. A dead queue has no consumer to `poll()` the reference
         // back out, so dropping the enqueue is correct.
         if shared.heap.num_fields(q_obj) < 2 {
+            continue;
+        }
+        // bc math-ec 0x4 STALE-REF FIX: the same reclaimed-and-reused hazard
+        // applies to `ref_obj` (writes to its fields 0 and 1 below), which —
+        // unlike `q_obj` — was NOT liveness-checked. A `ref_addr` not present in
+        // `pointer_map` keeps its stale PRE-GC address via `unwrap_or`; if that
+        // Reference was reclaimed and its slot reused, `set_field(ref_obj, ..)`
+        // strays into the reusing object (and `set_field(q_obj,0,ref_obj)` would
+        // publish a dangling head). A live Reference has >= 2 fields; skip the
+        // whole enqueue otherwise (a dead ref has no consumer to poll it back).
+        if shared.heap.num_fields(ref_obj) < 2 {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP stale ENQUEUE ref @0x{:x} (num_fields={}) into q@0x{:x}",
+                    actual_ref, shared.heap.num_fields(ref_obj), actual_q,
+                );
+            }
             continue;
         }
         // Push onto queue's linked list head (field 0 = head, field 1 = size)
@@ -7016,6 +7071,39 @@ fn execute_instruction(
                 ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
+            // bc math-ec 0x4 (CRATONVM_DBG_STRAYSTACK): catch a STRAY/STALE
+            // receiver reaching putfield. The corruption's reliable face is the
+            // `set_field out-of-bounds` flood: a relocated-but-unremapped (or
+            // wild) `objectref` whose header reads `num_slots=0` (real obj NOT
+            // forwarded; class_id reads a Value-disc 0/1/4) or `num_slots` huge
+            // (real obj forwarded → forwarding_ptr low bits). Dump the Java
+            // stack + receiver so we can trace where the stale ref originates
+            // (operand-stack slot not remapped after a young GC). Rate-limited.
+            if straystack_enabled() {
+                let h = shared.heap.get_header(obj_ref);
+                let ns = h.num_slots as usize;
+                if field.field_index >= ns || h.num_slots > (1 << 24) {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static N: AtomicUsize = AtomicUsize::new(0);
+                    let k = N.fetch_add(1, Ordering::Relaxed);
+                    if k < 12 {
+                        eprintln!(
+                            "[straystack] #{k} STRAY putfield recv@0x{:x} cid={} num_slots={} array_len={} kind={} -> field '{}' idx={} is_ref={} value={:?}",
+                            obj_ref.as_ptr() as usize,
+                            h.class_id.as_u32(), h.num_slots, h.array_length, h.kind as u8,
+                            field_name.as_deref().unwrap_or("?"),
+                            field.field_index, field.is_reference, value,
+                        );
+                        eprintln!("[straystack] Java stack (top first):");
+                        for f in thread.frames.iter().rev().take(28) {
+                            eprintln!(
+                                "[straystack]   {}.{}{} pc={}",
+                                f.class_name(), f.method_name(), f.method_descriptor(), f.pc,
+                            );
+                        }
+                    }
+                }
+            }
             if std::env::var("CRATON_HASHTABLEOFINT_TRACE").is_ok() {
                 let cname = thread.frames[frame_idx].class_name();
                 let mname = thread.frames[frame_idx].method_name();

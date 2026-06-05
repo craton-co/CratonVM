@@ -339,6 +339,48 @@ fn pin_value_for_native_call(shared: &SharedVm, roots: &mut Vec<ObjectRef>, v: &
 
 /// Call a native callback, catching panics and converting them to
 /// `MethodCallFailed` so that a bug in a native method doesn't crash the VM.
+/// Cached `CRATONVM_DBG_YOUNGSCAN` gate (bc math-ec `0x4` mutator-write hunt).
+#[inline]
+fn youngscan_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_YOUNGSCAN").is_some())
+}
+
+/// Cached `CRATONVM_DBG_STRAYSTACK` gate — native-side stray-receiver dump.
+#[inline]
+fn youngscan_straystack_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_STRAYSTACK").is_some())
+}
+
+/// Throttle stride for the whole-young scan (every Nth native). Default 1.
+#[inline]
+fn youngscan_stride() -> u64 {
+    use std::sync::OnceLock;
+    static S: OnceLock<u64> = OnceLock::new();
+    *S.get_or_init(|| {
+        std::env::var("CRATONVM_YOUNGSCAN_STRIDE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(1)
+    })
+}
+
+/// One-shot latch so the youngscan dumps only the FIRST `0x4` (its writer).
+static YOUNGSCAN_FOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[inline]
+fn youngscan_found() -> bool {
+    YOUNGSCAN_FOUND.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// CAS the latch; returns `true` if it was ALREADY set (so the caller should skip).
+#[inline]
+fn youngscan_mark_found() -> bool {
+    YOUNGSCAN_FOUND.swap(true, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn safe_native_call(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -417,6 +459,42 @@ pub fn safe_native_call(
                     "[ecwatch]   {}.{}{} pc={}",
                     f.class_name(), f.method_name(), f.method_descriptor(), f.pc,
                 );
+            }
+        }
+    }
+
+    // DBG (bc math-ec, CRATONVM_DBG_YOUNGSCAN): robust catch-all for the `0x4`
+    // mutator write. We PROVED the `0x4` is written to a YOUNG object's
+    // reference field between GCs (NOT by the GC: it is present in young at GC
+    // entry — `[small4] PRE-GC YOUNG`). The victim CLASS varies run-to-run
+    // (HexFormat, Level, EC types) so watching specific classes is unreliable;
+    // instead scan the WHOLE young from-space after natives. ONE-SHOT: on the
+    // first `0x4` found, dump the victim + the just-returned native + the full
+    // Java stack (the corruptor is this native, or a bytecode in the top frame
+    // just before it), then stop. STRIDE (CRATONVM_YOUNGSCAN_STRIDE, default 1)
+    // throttles the whole-young walk on slow runs.
+    if youngscan_enabled() && !youngscan_found() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::Relaxed);
+        if n % youngscan_stride() == 0 {
+            if let Some((addr, cid, fld, payload, nbr)) = shared.heap.dbg_first_young_small_ref() {
+                if !youngscan_mark_found() {
+                    let native = cratonvm_native_api::native_ring::name_of(callback as usize)
+                        .unwrap_or_else(|| format!("<cb@{:#x}>", callback as usize));
+                    let is_arr = fld & 0x4000_0000 != 0;
+                    eprintln!(
+                        "[youngscan] FIRST 0x4 in YOUNG: holder@0x{addr:x} cid={cid} {}[{}] -> 0x{payload:x}  nbr_disc=0x{nbr:x}  (just-returned NATIVE {native})",
+                        if is_arr { "arr" } else { "fld" }, fld & 0x3fff_ffff,
+                    );
+                    eprintln!("[youngscan] Java stack (top first):");
+                    for f in thread.frames.iter().rev().take(30) {
+                        eprintln!(
+                            "[youngscan]   {}.{}{} pc={}",
+                            f.class_name(), f.method_name(), f.method_descriptor(), f.pc,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1373,6 +1451,31 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn set_field(&self, obj: ObjectRef, index: usize, value: Value) {
+        // bc math-ec 0x4 (CRATONVM_DBG_STRAYSTACK): a NATIVE writing through a
+        // STRAY/STALE receiver (relocated-but-unremapped or wild). Same stray
+        // header signature as the interpreter putfield check. Dumps the native
+        // caller's Java stack so we can trace the cached-receiver use-after-move.
+        if youngscan_straystack_enabled() {
+            let h = self.shared.heap.get_header(obj);
+            if index >= h.num_slots as usize || h.num_slots > (1 << 24) {
+                use std::sync::atomic::{AtomicUsize, Ordering};
+                static N: AtomicUsize = AtomicUsize::new(0);
+                let k = N.fetch_add(1, Ordering::Relaxed);
+                if k < 12 {
+                    eprintln!(
+                        "[straystack-native] #{k} STRAY ctx.set_field recv@0x{:x} cid={} num_slots={} kind={} idx={} value={:?}",
+                        obj.as_ptr() as usize, h.class_id.as_u32(), h.num_slots, h.kind as u8, index, value,
+                    );
+                    eprintln!("[straystack-native] Java stack (top first):");
+                    for f in self.thread.frames.iter().rev().take(28) {
+                        eprintln!(
+                            "[straystack-native]   {}.{}{} pc={}",
+                            f.class_name(), f.method_name(), f.method_descriptor(), f.pc,
+                        );
+                    }
+                }
+            }
+        }
         // T10.9.E вЂ” descriptor-aware write path. Normalizing the stored
         // `Value` variant to the declared field type prevents tag drift
         // from leaking across subsequent reads. Fallback: legacy
