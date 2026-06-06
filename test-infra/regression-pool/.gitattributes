@@ -1,6 +1,0 @@
-# pool.tsv is parsed by bash with IFS=$'\t'; CRLF would leave \r on the last
-# field. Force LF on Windows checkouts so the file works in MSYS bash
-# without the runner having to strip CRs.
-pool.tsv text eol=lf
-*.sh text eol=lf
-*.expected.txt text eol=lf

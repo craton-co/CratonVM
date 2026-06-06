@@ -107,6 +107,12 @@ cached_is_set!(nsme_dbg, "CRATONVM_DBG_NSME");
 cached_is_set!(cce_dbg, "CRATONVM_DBG_CCE");
 cached_is_set!(lambda_dbg, "CRATONVM_DBG_LAMBDA");
 cached_is_set!(resume_pc_dbg, "CRATONVM_DBG_RESUME_PC");
+/// `CRATONVM_DBG_BADRECV` — on a getfield/putfield/array/invoke receiver whose
+/// pointer is not a valid heap address (the H2 TestScript SEGV: a corrupted
+/// `Object(Some(ptr=6))` reaching `get_field` → header read faults), log the
+/// Java frame stack + field + Rust backtrace and raise an NPE instead of
+/// dereferencing the wild pointer, so the origin can be localized.
+cached_is_set!(badrecv_dbg, "CRATONVM_DBG_BADRECV");
 /// `CRATONVM_DBG_JETTY` — trace dispatch into the `org/eclipse/jetty/start/`
 /// launcher package (every invokevirtual/invokespecial receiver + args) so
 /// the boot-test NPE at `Main.start(Main.java:397)` can be pinpointed.

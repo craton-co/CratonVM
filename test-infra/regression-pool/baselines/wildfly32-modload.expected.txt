@@ -1,4 +1,0 @@
-Modules dir: C:\craton\CratonVM\test-infra\regression-pool\apps\wildfly-32.0.1.Final\modules
-Loader created: local module loader @<id> (finder: local module finder @<id> (roots: C:\craton\CratonVM\test-infra\regression-pool\apps\wildfly-32.0.1.Final\modules))
-Loaded module: org.jboss.logging
-OK

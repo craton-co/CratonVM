@@ -1,4 +1,0 @@
-Modules dir: C:\craton\CratonVM\test-infra\regression-pool\apps\keycloak-16.1.1\modules
-Loader created: local module loader @<id> (finder: local module finder @<id> (roots: C:\craton\CratonVM\test-infra\regression-pool\apps\keycloak-16.1.1\modules))
-Loaded module: org.keycloak.keycloak-services
-OK

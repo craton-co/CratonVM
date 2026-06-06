@@ -6862,6 +6862,44 @@ fn execute_instruction(
                 ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
+            // CRATONVM_DBG_BADRECV — localize the H2 TestScript SEGV: a getfield
+            // whose receiver is a corrupted `Object(Some(ptr))` not pointing into
+            // any managed arena (e.g. ptr=6) faults in `get_field`'s header read.
+            // Log the Java frame stack + field + a Rust backtrace (to name the
+            // native that drove this method via invoke_virtual), then raise NPE
+            // instead of dereferencing the wild pointer.
+            if crate::runtime::env_cache::badrecv_dbg() {
+                let p = obj_ref.as_ptr() as usize;
+                if p != 0 && shared.heap.is_heap_addr(p).is_none() {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static N: AtomicUsize = AtomicUsize::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        let cn = thread.frames[frame_idx].class_name().to_string();
+                        let mn = thread.frames[frame_idx].method_name().to_string();
+                        let pc = thread.frames[frame_idx].pc;
+                        eprintln!(
+                            "[BADRECV #{n}] getfield receiver=0x{p:x} field={field_name:?} \
+                             field_index={} is_ref={} in {cn}.{mn} pc={pc}",
+                            field.field_index, field.is_reference,
+                        );
+                        eprintln!("[BADRECV #{n}] Java frames (innermost first):");
+                        for f in thread.frames.iter().rev().take(24) {
+                            eprintln!("    {}.{}", f.class_name(), f.method_name());
+                        }
+                        eprintln!(
+                            "[BADRECV #{n}] Rust backtrace:\n{}",
+                            std::backtrace::Backtrace::force_capture()
+                        );
+                        use std::io::Write;
+                        let _ = std::io::stderr().flush();
+                    }
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some(format!("[BADRECV] non-heap getfield receiver 0x{p:x}")),
+                    }
+                    .into());
+                }
+            }
             if std::env::var("CRATON_HASHTABLEOFINT_TRACE").is_ok() {
                 let cname = thread.frames[frame_idx].class_name();
                 let mname = thread.frames[frame_idx].method_name();
