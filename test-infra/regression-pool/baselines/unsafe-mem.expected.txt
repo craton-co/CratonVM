@@ -1,0 +1,11 @@
+byte0=0
+byte1=3
+byte2=6
+byte3=9
+byte4=12
+byte5=15
+byte6=18
+byte7=21
+realloc0=0
+realloc7=21
+OK

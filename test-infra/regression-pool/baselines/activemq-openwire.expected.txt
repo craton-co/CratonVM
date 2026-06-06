@@ -1,0 +1,6 @@
+ConnectionFactory: brokerURL=vm://probe-broker?broker.persistent=false&broker.useJmx=false
+Queue: name=probe.queue physical=probe.queue
+Built message: id=probe-conn:1:1:1:42 text=hello from probe
+Marshalled bytes: 171
+Round-trip OK: hello from probe
+OK

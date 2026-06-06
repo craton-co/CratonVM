@@ -1,0 +1,3 @@
+Configuration round-trip OK (5 types)
+Path OK: file:/tmp/probe.txt
+OK
