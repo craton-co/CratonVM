@@ -1,5 +1,0 @@
-suite	task	variant	rc	pass	wall_s	note
-commons-math	reactor(3204/3204)	cratonvm-cpu	0	PASS	88	[WARNING] Tests run: 3204, Failures: 0, Errors: 0, Skipped: 30, Flakes: 3
-commons-math	reactor(3204/3204)	cratonvm-gpu	0	PASS	70	[WARNING] Tests run: 3204, Failures: 0, Errors: 0, Skipped: 30, Flakes: 6
-commons-math	reactor(3204/3204)	hotspot	0	PASS	69	[WARNING] Tests run: 3204, Failures: 0, Errors: 0, Skipped: 30, Flakes: 4
-commons-math	reactor(3204/3204)	tornadovm	0	PASS	71	[WARNING] Tests run: 3204, Failures: 0, Errors: 0, Skipped: 30, Flakes: 6

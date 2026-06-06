@@ -23627,6 +23627,14 @@ fn decimal_to_mag_words(decimal: &str) -> Vec<u32> {
 
 pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/math/BigInteger", 2);
+    // GC-SAFETY (use-after-move — mirrors the `bi_alloc_int` fix): `obj` is
+    // freshly allocated and not yet reachable from any Java root. The
+    // `new_array` / `create_string` allocations below can trigger a minor GC
+    // that relocates `obj`; the bare local would then be STALE (resolving to a
+    // reused java.lang.Object slot) and the subsequent `set_field` would corrupt
+    // the heap — the H2 TestScript BigDecimal SEGV + `set_field` OOB flood. Pin
+    // `obj` across the allocation and re-read the forwarded ref before writing.
+    let h = ctx.pin_native_root(obj);
     let signum = if value.starts_with('-') {
         -1
     } else if value == "0" {
@@ -23639,18 +23647,23 @@ pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
         // representation that bytecode reads via `getfield`.
         let mag_words = decimal_to_mag_words(value);
         let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, mag_words.len());
+        let obj = ctx.read_native_pin(h, obj);
         for (i, w) in mag_words.iter().enumerate() {
             ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
         }
         ctx.set_field(obj, sig_i, Value::Int(signum));
         ctx.set_field(obj, mag_i, Value::Object(Some(mag_arr)));
+        ctx.unpin_native_roots(h);
+        obj
     } else {
         // Synthetic-stub fallback.
         let s = ctx.create_string(value);
+        let obj = ctx.read_native_pin(h, obj);
         ctx.set_field(obj, BI_FIELD_VALUE, Value::Object(Some(s)));
         ctx.set_field(obj, BI_FIELD_SIGNUM, Value::Int(signum));
+        ctx.unpin_native_roots(h);
+        obj
     }
-    obj
 }
 
 /// Read a `BigInteger` instance directly into the limb-based [`crate::bigint::BigInt`]
@@ -25529,6 +25542,13 @@ fn bd_layout(ctx: &dyn NativeContext) -> Option<(usize, usize, usize, usize)> {
 
 fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/math/BigDecimal", 3);
+    // GC-SAFETY (use-after-move — see `bi_alloc`/`bi_alloc_int`): pin `obj`
+    // across the `bi_alloc` / `create_string` allocations below, which can
+    // trigger a minor GC that relocates the not-yet-rooted `obj`. Each branch
+    // re-reads the forwarded ref before its `set_field`s, and the returned ref
+    // is the forwarded one. Without this, a GC inside `bi_alloc` leaves `obj`
+    // stale → `set_field` corrupts the heap (H2 TestScript BigDecimal SEGV).
+    let h = ctx.pin_native_root(obj);
     let precision = value.replace(['-', '.'], "").len() as i32;
     if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
         // Real-JDK layout: build the value as the scaled unscaled-integer
@@ -25543,30 +25563,37 @@ fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
             // treat as inflated to keep the sentinel pure).  Allocate an
             // intVal BigInteger.
             let bi = bi_alloc(ctx, &unscaled_str);
+            let obj = ctx.read_native_pin(h, obj);
             ctx.set_field(obj, iv_i, Value::Object(Some(bi)));
             ctx.set_field(obj, ic_i, Value::Long(BD_INFLATED));
+            ctx.set_field(obj, sc_i, Value::Int(scale));
+            ctx.set_field(obj, pr_i, Value::Int(precision));
         } else {
             // Compact path: leave `intVal` null (or, when non-null, the JDK
             // expects it to mirror `intCompact`).  Allocate a backing
             // BigInteger so reflective reads of `intVal` still see a real
             // object — matches HotSpot's behaviour for `BigDecimal.ONE`
             // where `intVal != null` even though `intCompact == 1`.
-            if bi_class_id.is_some() {
-                let bi = bi_alloc(ctx, &unscaled_str);
-                ctx.set_field(obj, iv_i, Value::Object(Some(bi)));
+            let bi = if bi_class_id.is_some() {
+                Some(bi_alloc(ctx, &unscaled_str))
             } else {
-                ctx.set_field(obj, iv_i, Value::Object(None));
-            }
+                None
+            };
+            let obj = ctx.read_native_pin(h, obj);
+            ctx.set_field(obj, iv_i, Value::Object(bi));
             ctx.set_field(obj, ic_i, Value::Long(int_compact));
+            ctx.set_field(obj, sc_i, Value::Int(scale));
+            ctx.set_field(obj, pr_i, Value::Int(precision));
         }
-        ctx.set_field(obj, sc_i, Value::Int(scale));
-        ctx.set_field(obj, pr_i, Value::Int(precision));
     } else {
         let s = ctx.create_string(value);
+        let obj = ctx.read_native_pin(h, obj);
         ctx.set_field(obj, BD_FIELD_VALUE, Value::Object(Some(s)));
         ctx.set_field(obj, BD_FIELD_SCALE, Value::Int(scale));
         ctx.set_field(obj, BD_FIELD_PRECISION, Value::Int(precision));
     }
+    let obj = ctx.read_native_pin(h, obj);
+    ctx.unpin_native_roots(h);
     obj
 }
 
@@ -25773,27 +25800,34 @@ fn native_bd_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// Picks the layout (real-JDK intVal/scale/precision/intCompact vs. legacy
 /// synthetic value/scale/precision) automatically.
 fn bd_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str, scale: i32) {
+    // GC-SAFETY (use-after-move — see `bi_alloc`): pin `this` across the
+    // `bi_alloc` / `create_string` allocations, which can trigger a minor GC
+    // that relocates it. Re-read the forwarded ref before the `set_field`s so we
+    // initialize the LIVE copy of the receiver, not a stale (reused) slot.
+    let h = ctx.pin_native_root(this);
     let precision = value.replace(['-', '.'], "").len() as i32;
     if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
         let unscaled_str = value.replace('.', "");
         let int_compact = unscaled_str.parse::<i64>().unwrap_or(BD_INFLATED);
-        if int_compact == BD_INFLATED {
-            let bi = bi_alloc(ctx, &unscaled_str);
-            ctx.set_field(this, iv_i, Value::Object(Some(bi)));
-            ctx.set_field(this, ic_i, Value::Long(BD_INFLATED));
+        let bi = bi_alloc(ctx, &unscaled_str);
+        let ic = if int_compact == BD_INFLATED {
+            BD_INFLATED
         } else {
-            let bi = bi_alloc(ctx, &unscaled_str);
-            ctx.set_field(this, iv_i, Value::Object(Some(bi)));
-            ctx.set_field(this, ic_i, Value::Long(int_compact));
-        }
+            int_compact
+        };
+        let this = ctx.read_native_pin(h, this);
+        ctx.set_field(this, iv_i, Value::Object(Some(bi)));
+        ctx.set_field(this, ic_i, Value::Long(ic));
         ctx.set_field(this, sc_i, Value::Int(scale));
         ctx.set_field(this, pr_i, Value::Int(precision));
     } else {
         let val_str = ctx.create_string(value);
+        let this = ctx.read_native_pin(h, this);
         ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(val_str)));
         ctx.set_field(this, BD_FIELD_SCALE, Value::Int(scale));
         ctx.set_field(this, BD_FIELD_PRECISION, Value::Int(precision));
     }
+    ctx.unpin_native_roots(h);
 }
 
 fn native_bd_init_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

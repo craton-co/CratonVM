@@ -1,3 +1,0 @@
-Configuration OK: hdfs://nn:9000/hbase
-HConstants OK (utf8=UTF-8, latest_ts=9223372036854775807)
-OK

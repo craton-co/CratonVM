@@ -1,4 +1,0 @@
-Keycloak name=Keycloak
-Keycloak version=26.2.4
-Feature count: 43
-OK
