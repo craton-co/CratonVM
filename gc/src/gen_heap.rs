@@ -1715,7 +1715,12 @@ impl GenerationalHeap {
             let disc = unsafe { std::ptr::read(a as *const u64) };
             if disc == 4 {
                 let payload = unsafe { std::ptr::read((a + 8) as *const u64) };
-                if payload != 0 && payload < 0x1000 {
+                // Precise signature: the corruption payload is ALWAYS exactly 4
+                // (== the Value::Object discriminant landing on a field payload).
+                // Requiring ==4 (not just <0x1000) rejects transient
+                // primitive-array `{4, n}` data (e.g. the startup 0x2c false
+                // positive) and other small-but-not-4 values.
+                if payload == 4 {
                     // Back-validate: for each candidate field index `fld`, the
                     // owning header would start at H = a - HEADER_SIZE - fld*16.
                     // Accept the first H that is in-arena, kind=Object,
@@ -1734,15 +1739,20 @@ impl GenerationalHeap {
                             && (h.num_slots as usize) > fld
                             && h.num_slots <= (1 << 20)
                         {
-                            // Strong filter: a REAL object's class resolves and
-                            // its declared instance-field count equals num_slots.
-                            // Rejects spurious "headers" read out of a neighbour's
-                            // mid-object bytes (the victims are real JDK/EC types).
+                            // Filter: the candidate header's class must RESOLVE
+                            // to a real class AND the corrupted field index `fld`
+                            // must be a VALID field of that class (`fld < n`).
+                            // This accepts a real victim whose num_slots differs
+                            // from the resolved count (synthetic-vs-real layout,
+                            // e.g. ECFieldElement$F2m) while rejecting bogus
+                            // headers read out of neighbour bytes — notably
+                            // cid=0 (java/lang/Object, 0 fields) which `is_some`
+                            // alone wrongly accepted at fld[22].
                             let cid = h.class_id.as_u32();
-                            let real = crate::gc::resolve_class_info(cid)
-                                .map(|(_, n)| n == h.num_slots as usize)
+                            let ok = crate::gc::resolve_class_info(cid)
+                                .map(|(_, n)| fld < n)
                                 .unwrap_or(false);
-                            if real {
+                            if ok {
                                 found = Some((h_addr, cid, fld));
                                 break;
                             }
