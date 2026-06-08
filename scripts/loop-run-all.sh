@@ -3,7 +3,7 @@
 set +e
 
 ITER="${1:-r1}"
-ROOT="C:/Projects/CratonVM/.claude/worktrees/infallible-solomon-1d423b"
+ROOT="C:/Projects/cratonvm"
 LOGDIR="$ROOT/applogs/loop-$ITER"
 mkdir -p "$LOGDIR"
 

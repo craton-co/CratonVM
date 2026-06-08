@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set +e
 ITER="${1:-rseq}"
-ROOT="C:/Projects/CratonVM/.claude/worktrees/infallible-solomon-1d423b"
+ROOT="C:/Projects/cratonvm"
 LOGDIR="$ROOT/applogs/loop-$ITER"
 mkdir -p "$LOGDIR"
 CRATONVM="$ROOT/target/release/cratonvm.exe"
