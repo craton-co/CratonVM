@@ -1,0 +1,15 @@
+[kafka_2.13-3.7.0]
+  [DL]   https://archive.apache.org/dist/kafka/3.7.0/kafka_2.13-3.7.0.tgz
+  [FAIL] curl failed for kafka_2.13-3.7.0 (https://archive.apache.org/dist/kafka/3.7.0/kafka_2.13-3.7.0.tgz)
+
+stage.sh summary: ok=0 skip=0 fail=1
+[spring-boot-4.0.6]
+  [DL]   https://repo1.maven.org/maven2/org/springframework/boot/spring-boot/4.0.6/spring-boot-4.0.6.jar
+  [FAIL] curl failed for spring-boot-4.0.6 (https://repo1.maven.org/maven2/org/springframework/boot/spring-boot/4.0.6/spring-boot-4.0.6.jar)
+
+stage.sh summary: ok=0 skip=0 fail=1
+[apache-tomcat-10.1.31]
+  [DL]   https://archive.apache.org/dist/tomcat/tomcat-10/v10.1.31/bin/apache-tomcat-10.1.31.tar.gz
+  [FAIL] curl failed for apache-tomcat-10.1.31 (https://archive.apache.org/dist/tomcat/tomcat-10/v10.1.31/bin/apache-tomcat-10.1.31.tar.gz)
+
+stage.sh summary: ok=0 skip=0 fail=1

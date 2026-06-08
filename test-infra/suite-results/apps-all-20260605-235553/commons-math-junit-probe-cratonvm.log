@@ -1,0 +1,2 @@
+Exception in thread "main" java/lang/NoClassDefFoundError: org/junit/platform/launcher/core/LauncherDiscoveryRequestBuilder
+	at JUnitProbe.main(JUnitProbe.java:10)

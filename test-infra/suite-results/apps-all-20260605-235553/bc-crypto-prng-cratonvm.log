@@ -1,0 +1,10 @@
+2026-06-06T02:57:35.069455Z  WARN cratonvm_vm::vm::vm_util: Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+CTRDRBGTest: Okay
+DualECDRBG: Okay
+HashDRBG: Okay
+HMacDRBG: Okay
+SP800RandomTest: Okay
+X931: Okay
+FixedSecureRandom: Okay
+-----
+All tests successful.
