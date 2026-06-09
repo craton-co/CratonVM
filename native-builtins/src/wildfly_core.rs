@@ -846,9 +846,6 @@ const LVL_NUM_FIELDS: usize = 2;
 const MC_FIELD_STATE: usize = 0;
 const MC_NUM_FIELDS: usize = 1;
 
-const CPS_FIELD_ORDINAL: usize = 0;
-const CPS_NUM_FIELDS: usize = 1;
-
 fn native_services_deployment_unit_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1032,14 +1029,33 @@ fn native_process_state_get_state(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let ord = global_model_controller().get_state().ordinal();
-    let obj = alloc_concurrent_synthetic(
-        ctx,
-        "org/jboss/as/controller/ControlledProcessState",
-        CPS_NUM_FIELDS,
-    );
-    ctx.set_field(obj, CPS_FIELD_ORDINAL, Value::Int(ord));
-    Ok(Some(Value::Object(Some(obj))))
+    // getState() returns `ControlledProcessState$State` — the ENUM — not the
+    // outer `ControlledProcessState`. The previous impl allocated a
+    // `ControlledProcessState`, so any `x.getState().ordinal()` / switch-map
+    // (e.g. `ModelControllerImpl$4`) threw
+    // `NoSuchMethodError: ControlledProcessState.ordinal()I`. Return the REAL
+    // enum-constant singleton matching our Rust-side process state (correct
+    // type + identity + ordinal, so `==`, `ordinal()` and enum switches work).
+    // Note: our `ProcessState` ordinals differ from the JDK `State` enum order,
+    // so map by NAME, not ordinal. `Reloading`/`Restarting` map to the JDK's
+    // `RELOAD_REQUIRED`/`RESTART_REQUIRED`.
+    let name = match global_model_controller().get_state() {
+        ProcessState::Stopped => "STOPPED",
+        ProcessState::Starting => "STARTING",
+        ProcessState::Running => "RUNNING",
+        ProcessState::Reloading => "RELOAD_REQUIRED",
+        ProcessState::Restarting => "RESTART_REQUIRED",
+        ProcessState::Stopping => "STOPPING",
+    };
+    let cls = "org/jboss/as/controller/ControlledProcessState$State";
+    let cid = match ctx.ensure_class_initialized(cls) {
+        Ok(cid) => cid,
+        Err(_) => return Ok(Some(Value::Object(None))),
+    };
+    if let Some(idx) = ctx.static_field_index_by_name(cid, name) {
+        return Ok(Some(ctx.get_static_field(cid, idx)));
+    }
+    Ok(Some(Value::Object(None)))
 }
 
 // ===========================================================================
