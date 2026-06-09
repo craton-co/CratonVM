@@ -25893,6 +25893,60 @@ fn native_bd_value_of_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(result))))
 }
 
+/// Read a `BigDecimal` as `(unscaled BigInteger, scale)` for EXACT decimal
+/// arithmetic. Replaces the old `f64` round-trip that silently dropped both
+/// scale (Rust `{}`-formatting strips trailing zeros: `10.0` → "10") and
+/// precision (an `f64` holds ~15-16 significant digits). Prefers the real-JDK
+/// `intCompact`/`intVal` layout, falling back to the synthetic decimal string.
+fn bd_unscaled_bigint(ctx: &dyn NativeContext, this: ObjectRef) -> (crate::bigint::BigInt, i32) {
+    use crate::bigint::BigInt;
+    let scale = bd_scale_of(ctx, this);
+    if let Some((iv_i, _sc_i, _pr_i, ic_i)) = bd_layout(ctx) {
+        let ic = match ctx.get_field(this, ic_i) {
+            Value::Long(l) => l,
+            _ => BD_INFLATED,
+        };
+        if ic != BD_INFLATED {
+            return (BigInt::from_decimal(&ic.to_string()), scale);
+        }
+        if let Value::Object(Some(bi)) = ctx.get_field(this, iv_i) {
+            return (bi_read_int(ctx, bi), scale);
+        }
+        return (BigInt::zero(), scale);
+    }
+    let s = match ctx.get_field(this, BD_FIELD_VALUE) {
+        Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_else(|| "0".to_string()),
+        _ => "0".to_string(),
+    };
+    (BigInt::from_decimal(&s.replace('.', "")), scale)
+}
+
+/// Multiply an unscaled `BigInt` by `10^n` (n >= 0) — used to align scales for
+/// `add`/`subtract` (BigDecimal rescales the smaller-scale operand up to the
+/// larger scale before adding the unscaled integers).
+fn bigint_mul_pow10(bi: &crate::bigint::BigInt, n: i32) -> crate::bigint::BigInt {
+    if n <= 0 {
+        return bi.clone();
+    }
+    let mut p = String::with_capacity(1 + n as usize);
+    p.push('1');
+    for _ in 0..n {
+        p.push('0');
+    }
+    bi.mul(&crate::bigint::BigInt::from_decimal(&p))
+}
+
+/// Construct a `BigDecimal` from an exact `(unscaled, scale)` pair (the inverse
+/// of `bd_unscaled_bigint`).
+fn bd_alloc_bigint(
+    ctx: &mut dyn NativeContext,
+    unscaled: &crate::bigint::BigInt,
+    scale: i32,
+) -> ObjectRef {
+    let value = apply_scale(&unscaled.to_decimal(), scale);
+    bd_alloc(ctx, &value, scale)
+}
+
 fn native_bd_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -25902,11 +25956,12 @@ fn native_bd_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a: f64 = bd_read(ctx, this).parse().unwrap_or(0.0);
-    let b: f64 = bd_read(ctx, other).parse().unwrap_or(0.0);
-    let s = format!("{}", a + b);
-    let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    let result = bd_alloc(ctx, &s, scale);
+    // Exact: result scale = max(sa, sb); rescale both unscaled to it, then add.
+    let (ua, sa) = bd_unscaled_bigint(ctx, this);
+    let (ub, sb) = bd_unscaled_bigint(ctx, other);
+    let s = sa.max(sb);
+    let sum = bigint_mul_pow10(&ua, s - sa).add(&bigint_mul_pow10(&ub, s - sb));
+    let result = bd_alloc_bigint(ctx, &sum, s);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -25919,11 +25974,12 @@ fn native_bd_subtract(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a: f64 = bd_read(ctx, this).parse().unwrap_or(0.0);
-    let b: f64 = bd_read(ctx, other).parse().unwrap_or(0.0);
-    let s = format!("{}", a - b);
-    let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    let result = bd_alloc(ctx, &s, scale);
+    // Exact: result scale = max(sa, sb); rescale both unscaled to it, then subtract.
+    let (ua, sa) = bd_unscaled_bigint(ctx, this);
+    let (ub, sb) = bd_unscaled_bigint(ctx, other);
+    let s = sa.max(sb);
+    let diff = bigint_mul_pow10(&ua, s - sa).sub(&bigint_mul_pow10(&ub, s - sb));
+    let result = bd_alloc_bigint(ctx, &diff, s);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -25936,11 +25992,12 @@ fn native_bd_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a: f64 = bd_read(ctx, this).parse().unwrap_or(0.0);
-    let b: f64 = bd_read(ctx, other).parse().unwrap_or(0.0);
-    let s = format!("{}", a * b);
-    let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    let result = bd_alloc(ctx, &s, scale);
+    // Exact: result scale = sa + sb; multiply the unscaled integers directly.
+    let (ua, sa) = bd_unscaled_bigint(ctx, this);
+    let (ub, sb) = bd_unscaled_bigint(ctx, other);
+    let s = sa + sb;
+    let prod = ua.mul(&ub);
+    let result = bd_alloc_bigint(ctx, &prod, s);
     Ok(Some(Value::Object(Some(result))))
 }
 

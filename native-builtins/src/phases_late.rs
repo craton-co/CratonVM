@@ -18357,9 +18357,9 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             };
             let new_pos = cur_pos + start;
             let new_lim = cur_pos + end;
-            // Allocate a fresh CharBuffer pointing at the same char[]
+            // Allocate a fresh HeapCharBuffer pointing at the same char[]
             // — JDK's HeapCharBuffer.subSequence does the same.
-            let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
+            let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
             ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
             ctx.set_field_by_name(buf, "offset", Value::Int(cur_off));
             ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
@@ -18606,7 +18606,9 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
 
 fn p62_alloc_char_buffer(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, cap);
-    let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
+    // Use HeapCharBuffer (concrete) not CharBuffer (abstract) so real-JDK
+    // bytecode methods like compact() dispatch correctly.
+    let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
     cb_write_hb(ctx, buf, arr, cap as i32);
     buf
 }

@@ -16224,7 +16224,13 @@ fn resolve_method_ref(
         ));
     }
 
-    let cm = shared.class_manager.read();
+    // read_recursive() instead of read() — resolve_method_ref can be called
+    // from ctx.invoke_virtual within a native, which may itself be dispatched
+    // by an interpreter frame that already holds class_manager.read() on this
+    // thread. parking_lot's write-preferring policy blocks new read() calls
+    // when a writer is queued, so a recursive plain read() → deadlock;
+    // read_recursive() succeeds immediately for an existing read-holder.
+    let cm = shared.class_manager.read_recursive();
     let class = cm
         .get_class(current_class_id)
         .ok_or_else(|| VmError::Internal {
