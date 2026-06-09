@@ -15743,7 +15743,13 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
         "getModule",
         "()Ljava/lang/Module;",
         |ctx, args| {
+            // GC-safety: pin m_obj across the `create_string` allocation below;
+            // otherwise a moving GC reclaims/relocates the unpinned local and
+            // getModule() returns a stale ref (a reused slot → String →
+            // `String.isNamed()` NoSuchMethodError). Mirror of the real-JDK
+            // getModule in lib.rs. Same bug class as reference_classloader_gc_root_gap.
             let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+            let pin = ctx.pin_native_root(m_obj);
             let module_name_val = if let Some(Value::Object(Some(mirror))) = args.first() {
                 let class_id = ctx.class_id_of_object(*mirror);
                 ctx.module_name_of_class(class_id)
@@ -15752,7 +15758,9 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
             } else {
                 Value::Object(None)
             };
+            let m_obj = ctx.read_native_pin(pin, m_obj);
             ctx.set_field(m_obj, 0, module_name_val);
+            ctx.unpin_native_roots(pin);
             Ok(Some(Value::Object(Some(m_obj))))
         },
     );

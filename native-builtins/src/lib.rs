@@ -2982,6 +2982,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Module;",
         |ctx, args| {
             let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+            // GC-safety: `create_string` below allocates (String + char[]) and
+            // can trigger a moving GC. `m_obj` lives only in this Rust local —
+            // not a GC root — so without pinning it would be relocated/reclaimed
+            // and returned STALE, resolving to a reused slot (observed as
+            // getModule() handing back a String → `String.isNamed()`
+            // NoSuchMethodError during WildFly ResourceBundle.checkNamedModule).
+            // Pin across the allocation and read the forwarded ref back. Same
+            // bug class as reference_classloader_gc_root_gap.
+            let pin = ctx.pin_native_root(m_obj);
             let module_name_val = if let Some(Value::Object(Some(mirror))) = args.first() {
                 let class_id = ctx.class_id_of_object(*mirror);
                 ctx.module_name_of_class(class_id)
@@ -2990,7 +2999,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             } else {
                 Value::Object(None)
             };
+            let m_obj = ctx.read_native_pin(pin, m_obj);
             ctx.set_field(m_obj, 0, module_name_val);
+            ctx.unpin_native_roots(pin);
             Ok(Some(Value::Object(Some(m_obj))))
         },
     );
