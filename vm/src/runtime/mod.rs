@@ -9,6 +9,7 @@
 mod call_stack;
 pub mod ec_watch;
 pub mod env_cache;
+pub mod memwatch;
 pub mod exceptions;
 pub mod frame;
 pub mod interpreter;

@@ -1,5 +1,84 @@
 # H2 TestScript `--nojit` SEGV — findings (2026-06-05)
 
+> ## ⚡ UPDATE 2026-06-09 (bc-math-ec side, worktree `CratonVM-ecgc`, branch
+> `fix/bc-math-ec-gc-0x4`, now == dev) — **pin fix did NOT cure it; the
+> corruption is a `long[]` SMEAR, not a single stray Value write.**
+>
+> ### Measured (FixedPointTest, JIT off, -Xmx128m)
+> 1. **`bi_alloc`/`bd_alloc`/`bd_write_into` pins (526edf9b) verified IN the
+>    binary → still 0/8 clean runs.** Same outcomes as before (wrong point /
+>    NPE null / occasional SEGV). So the pinned natives were NOT the writer
+>    (consistent with this doc's "SEGV persists, flood=0").
+> 2. **Resolved-victim sweep across 8 runs:** every resolved victim field reads
+>    payload EXACTLY `0x4` on EC objects at per-class-stable field indices
+>    (X9ECParameters fld[1]/[2], ECCurve$* fld[4], ECPoint/SecT* fld[2],
+>    ECFieldElement$Fp fld[1]); victim ADDRESSES repeat across runs
+>    (ECCurve$Fp AND ECCurve$F2m @0x20a00fb8 fld[4] in different runs —
+>    allocation layout is deterministic).
+> 3. **`CRATONVM_DBG_MEMWATCH` (new, vm/src/runtime/memwatch.rs): O(1)
+>    absolute-address watch** polled at every safepoint + native return +
+>    post-GC. Armed on the repeat victim payload (0x20a01028): **flip
+>    `0x0 -> 0x1c` caught at a safepoint inside
+>    `LongArray.addShiftedUp([JI[JIII)J` ← `modMultiply` ←
+>    `ECFieldElement$F2m.multiply` ← `ECPoint$F2m.add`** — i.e. an interpreted
+>    F2m long[]-arithmetic store wrote a small long to the watched address
+>    while its surroundings read as raw math data (the "cell disc" at -8 was
+>    garbage, not a Value disc).
+> 4. The same runs show **massively smashed young HEADERS** ("GC: inconsistent
+>    header — kind=Object array_length=2561 num_slots=942662 class_id=0", many
+>    variants) and earlier whole-REGIONS of small values at stride 8
+>    (`<unresolved>` arr[9..991]).
+>
+> ### Reframe (supersedes "stray 16-byte Value write off-by-8")
+> An interpreted **`lastore` loop writing through a STALE (GC-moved) `long[]`
+> reference** sprays dozens of math longs over the young heap: headers become
+> garbage (the WARNs), reference-field payloads become small longs — `0x4`,
+> `0x6`, `0x1c`, `0x3` are just F2m bit patterns (`0x4` was over-interpreted as
+> the Object discriminant; the H2 `0x6` likewise needs no Uninitialized-disc
+> story). `set_array_element` bounds-checks against the GARBAGE header at the
+> stale address (random `array_length` parses huge) so the writes pass.
+> Candidate stale-ref source: the **jobject-as-Long smuggle** — an invoke
+> return carrying `[J` as compact long bits, `astore`d into a local →
+> `LKIND_LONG` → **`scan_local_objects`/`update_local_refs` SKIP it** (the
+> 2026-06-04 collision-long fix) → never remapped after a young GC → stale.
+> Note the tension: that skip is REQUIRED for genuine collision longs; the fix
+> must be at the smuggle (a `[J`/`[I` value must never sit in a local AS Long),
+> not by re-rooting LONG-kind slots.
+>
+> ### New gated instruments (all default-OFF, committed on the branch)
+> - `CRATONVM_DBG_MEMWATCH=<hexaddr>` — the absolute-address watch (above).
+> - `CRATONVM_DBG_ARRSTORE` — `Lastore`/`Iastore`-family receiver-header
+>   validation at the write (raw kind/elem/array_length bytes); dumps receiver
+>   + Java stack on a garbage-header receiver = catches the smear at store #1.
+> - `CRATONVM_DBG_STALELONG` — at GC remap, logs any LONG-kind local whose raw
+>   bits match a `pointer_map` key, with the owning method (smuggled-ref
+>   candidates; collision longs also match — discriminate by method).
+> - **Verdicts (all measured, 3+ corrupting runs each): NEGATIVE — do not redo.**
+>   `[arrstore]`=0 (no interpreted Xastore through a GARBAGE-header receiver),
+>   `[stalelong]`=0 (no LONG-kind LOCAL matching a moved object at remap),
+>   `[longroot]`=0 (the value_stack O1-hybrid Long|Double loose-rooting branch
+>   NEVER fires in this workload) and `CRATONVM_LONGROOT_STRICT=1` changes
+>   nothing (0/4). Also note: corrupting runs occur WITH ZERO header-smear
+>   WARNs (subtle mode: wrong point / NPE-null only) — the big smear is a
+>   sometimes-symptom, not the constant.
+> - Note the latent (unrelated-to-this-bug?) asymmetry found while testing:
+>   `ValueStack::scan_object_refs` roots `CompactTag::Long`-tagged slots via
+>   loose `is_heap_addr` (O1 hybrid, WildFly smuggle) but
+>   `update_object_refs` has NO Long arm — a rooted Long-tagged smuggle goes
+>   stale on every move. Latent because the branch never fires here.
+> - REMAINING live theory: a stale array ref pointing at a REUSED region that
+>   now holds ANOTHER plausible array (kind=1 header → every validator passes,
+>   bounds-checked against the wrong array's length). Discriminator in flight:
+>   memwatch HIT dump now includes the top frame's locals + array extents — if
+>   the watched (corrupted) address falls INSIDE the frame's `[J` receiver
+>   extents the write is legit-but-relocated (theory dead too); if OUTSIDE,
+>   the stale/OOB receiver is proven with its exact geometry.
+>
+> Also: dev's scripts cleanup deleted `build-wt.bat`; recreate it (vcvars +
+> unset VCINSTALLDIR/VSCMD_ARG_TGT_ARCH/CARGO_TARGET_DIR + cargo build) — see
+> the memory file. The earlier `[refproc]`/reference-processing stale-ref fix
+> (merged) stays valid (OOB-flood 1-13 → 0) but is unrelated to this smear.
+
 Companion to `docs/bc-math-ec-gc-0x4-handoff.md`. **The H2 `org.h2.test.scripts.TestScript`
 `--nojit` FATAL `EXCEPTION_ACCESS_VIOLATION` is a SECOND reproduction of the bc-math-ec
 `0x4` GC corruption** — same mechanism, different app/payload.

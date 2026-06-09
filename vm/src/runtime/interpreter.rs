@@ -107,6 +107,66 @@ fn straystack_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_STRAYSTACK").is_some())
 }
 
+/// Cached `CRATONVM_DBG_ARRSTORE` gate (bc math-ec 0x4 smear hunt): validate
+/// primitive-array-store receivers at the write.
+#[inline]
+fn arrstore_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ARRSTORE").is_some())
+}
+
+/// Validate a primitive-array-store receiver header; dump receiver + Java
+/// stack when it is not a plausible array (the stale-ref smear signature).
+/// Reads raw header BYTES (not enum fields) — a garbage `kind`/`element_type`
+/// byte outside the declared variants would be UB to materialize as the enum.
+fn arrstore_check(
+    _shared: &SharedVm,
+    thread: &JvmThread,
+    array_ref: cratonvm_types::ObjectRef,
+    index: i32,
+    op: &str,
+) {
+    let p = array_ref.as_ptr();
+    // SAFETY: `array_ref` was decoded from the operand stack as an in-heap
+    // pointer; reading the first 16 header bytes of managed memory is safe
+    // (arenas stay mapped) even if the contents are garbage.
+    let (class_id_raw, kind_byte, elem_byte, array_len) = unsafe {
+        (
+            (p as *const u32).read_unaligned(),
+            *p.add(4),
+            *p.add(5),
+            (p.add(12) as *const u32).read_unaligned(),
+        )
+    };
+    // ObjectKind::Array == 1; ArrayElementType has < 16 variants; a real
+    // array_length is <= i32::MAX. Anything else = garbage header = stale ref.
+    let plausible = kind_byte == 1 && elem_byte < 16 && array_len <= i32::MAX as u32;
+    if plausible {
+        return;
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    if k >= 8 {
+        return;
+    }
+    eprintln!(
+        "[arrstore] #{k} {op} through GARBAGE-HEADER receiver @0x{:x}: class_id_raw={} kind_byte={} elem_byte={} array_len={} index={}",
+        p as usize, class_id_raw, kind_byte, elem_byte, array_len, index,
+    );
+    eprintln!("[arrstore] Java stack (top first):");
+    for f in thread.frames.iter().rev().take(28) {
+        eprintln!(
+            "[arrstore]   {}.{}{} pc={}",
+            f.class_name(),
+            f.method_name(),
+            f.method_descriptor(),
+            f.pc,
+        );
+    }
+}
+
 fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool {
     use parking_lot::Mutex;
     use std::sync::OnceLock;
@@ -205,6 +265,28 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                     );
                 }
             }
+            // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): post-GC poll of the
+            // watched absolute address — a HIT here (vs at a mutator
+            // safepoint) means the flip happened inside collect_garbage /
+            // reference processing.
+            crate::runtime::memwatch::poll("post-gc", || {
+                thread
+                    .frames
+                    .iter()
+                    .rev()
+                    .take(28)
+                    .map(|f| {
+                        format!(
+                            "  {}.{}{} pc={}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor(),
+                            f.pc
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
             // DBG (env-gated): validate every young object's header size against
             // its class — pins a JIT `new` that wrote a wrong-size header.
             crate::memory::gc::validate_object_sizes(shared);
@@ -1143,6 +1225,59 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
 /// then applies the pointer map to update its own frame references.
 fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
     use std::sync::atomic::Ordering;
+    // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): O(1) poll of one absolute
+    // watched address at full safepoint frequency — catches the corrupting
+    // write within one safepoint window, with the live Java stack. Off ⇒
+    // a single predicted branch. On a HIT the dump includes the TOP frame's
+    // locals (raw bits + array header/extent for in-heap-shaped values) so
+    // the watched address can be placed inside/outside the frame's array
+    // receivers (legit-write-to-reused-slot vs stale/OOB receiver).
+    crate::runtime::memwatch::poll("safepoint", || {
+        let mut s = thread
+            .frames
+            .iter()
+            .rev()
+            .take(28)
+            .map(|f| {
+                format!(
+                    "  {}.{}{} pc={}",
+                    f.class_name(),
+                    f.method_name(),
+                    f.method_descriptor(),
+                    f.pc
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(top) = thread.frames.last() {
+            s.push_str("\n  -- top-frame locals --");
+            let n = top.locals_len().min(10);
+            for i in 0..n {
+                let raw = top.get_local_raw(i);
+                let p = (raw & 0x0000_7fff_ffff_ffff) as usize;
+                let mut extra = String::new();
+                if p != 0 && p % 8 == 0 && shared.heap.is_heap_addr(p).is_some() {
+                    // SAFETY: in-heap address; first 16 header bytes of managed
+                    // memory are always readable (raw bytes, not enum fields).
+                    let (kind_b, elem_b, alen) = unsafe {
+                        let q = p as *const u8;
+                        (
+                            *q.add(4),
+                            *q.add(5),
+                            (q.add(12) as *const u32).read_unaligned(),
+                        )
+                    };
+                    extra = format!(
+                        " [heap obj kind={kind_b} elem={elem_b} len={alen} data=0x{:x}..0x{:x}]",
+                        p + 40,
+                        p + 40 + (alen as usize) * 8,
+                    );
+                }
+                s.push_str(&format!("\n  local[{i}] = 0x{raw:x}{extra}"));
+            }
+        }
+        s
+    });
     if shared.gc_barrier.stw_requested.load(Ordering::Acquire) {
         // Round-5 fix (CRIT — UAF): drain this thread's per-thread SATB
         // buffer into the global queue BEFORE we park at the barrier.
@@ -6030,6 +6165,10 @@ fn execute_instruction(
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
             let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // bc math-ec 0x4 smear hunt — see the Lastore twin below.
+            if arrstore_enabled() {
+                arrstore_check(shared, thread, array_ref, index, "iastore");
+            }
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, value) // Widening: index conversion
@@ -6053,6 +6192,17 @@ fn execute_instruction(
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
             let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // bc math-ec 0x4 smear hunt (CRATONVM_DBG_ARRSTORE): validate the
+            // receiver's header AT THE WRITE. A stale (GC-moved) long[] ref
+            // points at reused memory whose "header" is garbage math data —
+            // kind byte (offset 4) is then almost never the Array(1) it must
+            // be. `set_array_element` would still bounds-check against the
+            // garbage array_length and SMEAR longs over neighboring objects
+            // (the headline corruption). Dump the receiver + Java stack at the
+            // first such store — theory-free attribution of the writer.
+            if arrstore_enabled() {
+                arrstore_check(shared, thread, array_ref, index, "lastore");
+            }
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Long(v))
