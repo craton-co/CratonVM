@@ -110,9 +110,27 @@ pushed the correct `java/lang/Module.isNamed()`. Suspect a **GC stale-ref / reus
 Module (cf. `reference_classloader_gc_root_gap`) and/or synthetic-Module field layout vs real
 `java.lang.Module`. Investigate with the heap/frame stale-ref tooling, not a quick patch.
 
+## Session 4 — `String.isNamed` RESOLVED (merged); now processing mgmt operations
+
+NOT a GC stale-ref (large heap didn't help). Real cause: `ResourceBundle.getCallerModule` returns
+`caller.getModule()` only when `Reflection.getCallerClass() != null`, else
+`getSystemClassLoader().getUnnamedModule()`. `ClassLoader.getUnnamedModule()` ran **stock bytecode**
+reading the synthetic loader's never-populated `unnamedModule` field → a String receiver for `isNamed()`.
+Fix (merged): registered `ClassLoader.getUnnamedModule()` (classloader_real.rs) returning a synthetic
+**unnamed** Module (field0 = null → the `Module.isNamed()` native = false → `checkNamedModule` passes;
+single alloc, GC-safe) + pinned `m_obj` across `create_string` in both `Class.getModule` natives. Pool
+15/18 (3 `*-modload` = path-only baseline staleness from the `apps/probe/` pool move).
+
+**New blocker:** boot now PROCESSES management operations (`WFLYCTL0161` committed / `WFLYCTL0013`
+failed), then `NoSuchMethodError: org/jboss/as/controller/ControlledProcessState.ordinal()I`.
+`ControlledProcessState` is a regular class (`state: AtomicStampedReference<State>`); its nested `State`
+is the enum with `ordinal()`. So `.ordinal()` is being called on a `ControlledProcessState` instead of
+`getState()`'s `State` enum — a type confusion (suspect the ControlledProcessState shim /
+`AtomicStampedReference.getReference()` returning the wrong object).
+
 ## Remaining work (current order — each blocks the next)
-1. **`Class.getModule()` → String / `String.isNamed` NoSuchMethodError** (the new blocker above) — likely
-   a GC stale-ref on the synthetic Module; must be fixed first.
+1. **`ControlledProcessState.ordinal` type confusion** (the new blocker above) — `.ordinal()` on a
+   `ControlledProcessState` instead of its `State` enum; must be fixed first.
 2. **P2 tail:** keep chasing whatever the boot surfaces after that until `testSubsystem` passes.
    Likely also needs **value injection** — `provides(name).accept(v)` → `requires(name).get()` —
    which is NOT wired (a dependent's injected `Supplier.get()` returns null). The `executorService`
