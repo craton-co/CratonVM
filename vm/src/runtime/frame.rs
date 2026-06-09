@@ -753,8 +753,24 @@ impl Frame {
         self.local_kinds.clear();
         self.local_kinds.resize(n, LKIND_OTHER);
         copy_args_to_locals(&mut self.locals, &mut self.local_kinds, args);
-        // Reset operand stack
+        // Reset operand stack. CRITICAL: the reused stack was sized for the
+        // PREVIOUS method's max_stack; the tail-called method may declare a
+        // LARGER max_stack, so grow the backing Vecs to match — otherwise its
+        // pushes overflow the smaller stack (the `push_compact` "index out of
+        // bounds: len == max_size" panic seen in WildFly's
+        // RegularEnumSet$EnumSetIterator → Long/Integer.numberOfTrailingZeros
+        // tail-call path). `locals` is already resized for the new method
+        // above; the operand stack needs the same treatment.
         self.stack.clear();
+        let grew = self.stack.ensure_max_size(max_stack as usize);
+        if grew && crate::runtime::env_cache::frame_trace() {
+            eprintln!(
+                "[TCO_GROW] {}.{} reused stack grown to max_stack={}",
+                self.class_name(),
+                self.method_name(),
+                max_stack
+            );
+        }
     }
 
     /// Return this frame's Vec allocations to the pool for reuse.
