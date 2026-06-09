@@ -1579,6 +1579,27 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
         native_exec_execute,
     );
 
+    // EnhancedQueueExecutor shutdown lifecycle. Our executor is fully
+    // synthetic (Rust-backed, inline task drain — see native_exec_execute), so
+    // its `threadStatus` long field is never maintained. The stock
+    // `shutdown()` bytecode spins forever in `compareAndSetThreadStatus`
+    // (an `AtomicLongFieldUpdater.compareAndSet` on that field, which can never
+    // succeed against an unmaintained field) — observed as an infinite hang in
+    // the subsystem-test @After cleanup (SubsystemTestDelegate.cleanup →
+    // ModelTestKernelServicesImpl.shutdown → EnhancedQueueExecutor.shutdown).
+    // Shim the lifecycle to clean terminal values so cleanup completes.
+    let eqe = "org/jboss/threads/EnhancedQueueExecutor";
+    r.register(eqe, "shutdown", "()V", |_ctx, _args| Ok(None));
+    r.register(eqe, "shutdown", "(Z)V", |_ctx, _args| Ok(None));
+    r.register(eqe, "isShutdown", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    r.register(eqe, "isTerminated", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+    r.register(
+        eqe,
+        "awaitTermination",
+        "(JLjava/util/concurrent/TimeUnit;)Z",
+        |_ctx, _args| Ok(Some(Value::Int(1))),
+    );
+
     // --- AsyncFutureTask ---
     // Short-circuit `await()` so the Keycloak boot path (`Main.main` ->
     // `Bootstrap.bootstrap().get()`) doesn't park forever in
