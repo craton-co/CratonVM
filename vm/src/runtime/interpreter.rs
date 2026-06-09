@@ -116,6 +116,15 @@ fn arrstore_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ARRSTORE").is_some())
 }
 
+/// Cached `CRATONVM_DBG_NO_REFPROC` gate (bc math-ec 0x4): skip ALL post-GC
+/// reference processing — subsystem-level exclusion experiment.
+#[inline]
+fn no_refproc() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_NO_REFPROC").is_some())
+}
+
 /// Validate a primitive-array-store receiver header; dump receiver + Java
 /// stack when it is not a plausible array (the stale-ref smear signature).
 /// Reads raw header BYTES (not enum fields) — a garbage `kind`/`element_type`
@@ -545,6 +554,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
 /// Per the `Cleaner` contract, exceptions thrown by an action are caught
 /// and logged — they must not propagate into the GC pipeline.
 fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
+    // bc math-ec 0x4 exclusion switch — see `process_references_after_gc`.
+    if no_refproc() {
+        return;
+    }
     // Re-entrancy safety: if a JIT helper currently holds the `&mut JvmThread`
     // (we were reached via `jit_invoke_dispatch` → `bail_to_interpreter` →
     // interpreter → `maybe_gc`), running a cleaner action's `run()` could
@@ -659,6 +672,10 @@ fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
 
 /// Dequeue pending finalizable objects and invoke their finalize() method.
 fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
+    // bc math-ec 0x4 exclusion switch — see `process_references_after_gc`.
+    if no_refproc() {
+        return;
+    }
     // Same JIT-borrow re-entrancy guard as `run_cleaner_actions`: a `finalize()`
     // invoked while a JIT helper holds the `&mut JvmThread` could re-enter the
     // JIT and alias the borrow. Defer to the next top-level safepoint; the
@@ -702,6 +719,15 @@ fn process_references_after_gc(
     shared: &SharedVm,
     pointer_map: &std::collections::HashMap<usize, usize>,
 ) {
+    // bc math-ec 0x4 (CRATONVM_DBG_NO_REFPROC): subsystem-level exclusion
+    // switch — skip ALL post-GC reference processing (clears, enqueues,
+    // finalizer/cleaner submissions). If the corruption persists with this
+    // set, the whole reference subsystem is exonerated in one experiment;
+    // if it stops, the writer is in here. Diagnostic only (weak refs never
+    // clear; memory grows).
+    if no_refproc() {
+        return;
+    }
     let mut ref_proc = shared.ref_processor.lock();
 
     // An object is "marked" (survived GC) if:
@@ -714,22 +740,45 @@ fn process_references_after_gc(
 
     let result = ref_proc.process_references(&is_marked, 64, 0);
 
+    // bc math-ec 0x4 ROOT-CAUSE FIX (2026-06-09, hexdump-proven): the
+    // cleared/enqueue lists hold PRE-GC addresses; `pointer_map.get(..)
+    // .unwrap_or(addr)` keeps the STALE address for a Reference that was
+    // RECLAIMED this cycle (a live young object is ALWAYS in the pointer map
+    // after a moving young GC). Writing through that stale address corrupts
+    // whatever now occupies the memory: the measured corruption was THIS
+    // loop's `Object(None)` referent-clear landing mis-gridded — victim
+    // payload = 0x4 (the Object discriminant), next word nulled (hexdump in
+    // docs/internal/h2-testscript-segv-findings.md). The earlier
+    // `num_fields < 2` guard was too weak (a phantom header at the stale
+    // address can read num_slots >= 2). PRECISE criterion: a pre-GC address
+    // in EITHER young semispace that is NOT a pointer-map key did not
+    // survive — skip it entirely. Old-gen addresses don't move in a minor GC
+    // (major relocations ARE merged into the map) and stay processed.
+    let is_stale_young = |addr: usize| -> bool {
+        !pointer_map.contains_key(&addr) && shared.heap.is_in_young_addr(addr)
+    };
+
     // Null referent field (field 0) on cleared weak/soft references
     let cleared = ref_proc.cleared_ref_objects();
     for ref_addr in cleared {
+        // ROOT-CAUSE guard (see `is_stale_young` above): a pre-GC young
+        // address absent from the pointer map did NOT survive this GC —
+        // writing the `Object(None)` clear through it would corrupt the
+        // memory's new occupant (the PROVEN bc-math-ec 0x4 writer).
+        if is_stale_young(ref_addr) {
+            if straystack_enabled() {
+                eprintln!("[refproc] SKIP dead CLEARED ref @0x{ref_addr:x} (young, not in map)");
+            }
+            continue;
+        }
         // The ref object itself may have been relocated
         let actual_addr = pointer_map.get(&ref_addr).copied().unwrap_or(ref_addr);
         // SAFETY: actual_addr was produced by process_references and points at a valid object header within the heap arena.
         let obj_ref = unsafe { ObjectRef::from_raw(actual_addr as *mut u8) };
-        // bc math-ec 0x4 STALE-REF FIX: `cleared` holds PRE-GC addresses;
-        // `unwrap_or(ref_addr)` keeps the stale address when the Reference was
-        // not relocated via `pointer_map`. If that Reference was actually
-        // RECLAIMED this cycle and its slot reused for a smaller object,
-        // `set_field(.., 0, ..)` is a STRAY write into the reusing object —
-        // the `set_field out-of-bounds` flood AND, when the reusing object is
-        // larger, silent field corruption. A live `java.lang.ref.Reference`
-        // always has >= 2 instance fields (referent, queue); a reused slot is a
-        // bare 0-field `Object`. Mirror the `q_obj` liveness guard below.
+        // Belt-and-suspenders: a live `java.lang.ref.Reference` always has
+        // >= 2 instance fields (referent, queue); a reused/zeroed slot is a
+        // bare 0-field `Object`. (Kept in addition to the precise
+        // `is_stale_young` guard — also covers old-gen reuse after a major GC.)
         if shared.heap.num_fields(obj_ref) < 2 {
             if straystack_enabled() {
                 eprintln!(
@@ -746,6 +795,18 @@ fn process_references_after_gc(
     // The linked-list protocol: push ref onto queue's head, use referent field as "next" ptr,
     // clear the ref's queue field (one-shot enqueue), increment queue size.
     for (ref_addr, queue_addr) in &result.to_enqueue {
+        // ROOT-CAUSE guard (see `is_stale_young` above): skip the whole
+        // enqueue when either the Reference or its queue did not survive —
+        // the head/size/next writes below through a stale address are the
+        // same proven corruption class as the cleared-referent write.
+        if is_stale_young(*ref_addr) || is_stale_young(*queue_addr) {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP dead ENQUEUE ref@0x{ref_addr:x}/q@0x{queue_addr:x} (young, not in map)"
+                );
+            }
+            continue;
+        }
         let actual_ref = pointer_map.get(ref_addr).copied().unwrap_or(*ref_addr);
         let actual_q = pointer_map.get(queue_addr).copied().unwrap_or(*queue_addr);
         // SAFETY: actual_ref and actual_q were produced by process_references (with pointer_map relocation) and point at valid object headers within the heap arena.
@@ -799,6 +860,15 @@ fn process_references_after_gc(
     // Enqueue objects for finalization (M8 fix: relocate via pointer_map
     // because the ref-processor holds pre-GC addresses).
     for obj_addr in &result.to_finalize {
+        // Finalizable objects are rooted via `finalizer_addrs`, so a LIVE one
+        // is always in the pointer map after a moving young GC; a stale young
+        // address here would be dereferenced later by `run_finalizers`.
+        if is_stale_young(*obj_addr) {
+            if straystack_enabled() {
+                eprintln!("[refproc] SKIP dead FINALIZE obj @0x{obj_addr:x} (young, not in map)");
+            }
+            continue;
+        }
         let actual = pointer_map.get(obj_addr).copied().unwrap_or(*obj_addr);
         shared.finalizer_thread.enqueue(actual);
     }
@@ -815,6 +885,13 @@ fn process_references_after_gc(
     // Without this, run_cleaner_actions later derefs a stale address
     // pointing at evacuated memory → SEGV at class_id_of (cleaner_probe).
     for action_addr in &result.cleaner_actions {
+        // Same staleness guard as the finalize loop above.
+        if is_stale_young(*action_addr) {
+            if straystack_enabled() {
+                eprintln!("[refproc] SKIP dead CLEANER action @0x{action_addr:x} (young, not in map)");
+            }
+            continue;
+        }
         let actual = pointer_map.get(action_addr).copied().unwrap_or(*action_addr);
         shared.cleaner_thread.submit_action(actual);
     }

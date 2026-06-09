@@ -74,6 +74,44 @@
 >   extents the write is legit-but-relocated (theory dead too); if OUTSIDE,
 >   the stale/OOB receiver is proven with its exact geometry.
 >
+> ### ⚡ HEXDUMP BREAKTHROUGH (one-shot dump at [small4] detection)
+> Victim `java/util/logging/Level.fld[4] -> 0x4` captured with ±128 bytes
+> (full dump in session log; reproduce with `CRATONVM_DBG_RSET_AUDIT=1`):
+> **victim payload word = 0x4 and the IMMEDIATELY FOLLOWING u64 = 0x0 (the
+> neighbour Level's class_id word, zeroed)** — i.e. a verbatim 16-byte
+> `Value::Object(None)` `{disc=4, payload=0}` written **8 bytes off the cell
+> grid**. The corruption is a NULL-REFERENCE FIELD WRITE through a wrong/stale
+> receiver. Geometry: write target = stale_obj+40 (field 0) with
+> stale_obj = victim+0x48 (interior). CRITICAL COROLLARY: when the same stray
+> write lands ON-grid (~50%), it produces a PERFECTLY LEGAL null — invisible
+> to every small-value scanner — explaining the "Errors: NPE-on-null with
+> small4=0" runs. The 0x4 face is just the off-grid half.
+>
+> ### Fix landed (correct + verified firing, but NOT sufficient) + verdict
+> `process_references_after_gc` writes (referent clear `Object(None)`,
+> enqueue head/size/next, finalize/cleaner submits) now SKIP any pre-GC
+> address that is in EITHER young semispace and NOT a pointer-map key — the
+> precise "did not survive" criterion (new `VmHeap::is_in_young_addr` /
+> `GenerationalHeap::is_in_young_either`). The old `num_fields < 2` guard was
+> too weak (phantom num_slots >= 2 passes). Logs `[refproc] SKIP dead ...`
+> under `CRATONVM_DBG_STRAYSTACK`. **Verdict: guard fires 159–1433×/run, yet
+> 0/8 runs pass — BigInteger-null NPEs persist. So refproc's loops are not
+> the (only) Object(None)-writer.** (Possible confound to check: are the
+> 1433 "dead" skips genuinely dead, or is the ref registry's relocation
+> (`ReferenceProcessor::update_after_gc`, called from memory/gc.rs:206 via
+> update_all_roots AFTER process_references_after_gc) skipped/partial in some
+> path, making live refs look dead by one stale generation?)
+>
+> ### In flight: subsystem exclusion (`CRATONVM_DBG_NO_REFPROC=1`)
+> Skips process_references_after_gc + run_finalizers + run_cleaner_actions
+> entirely. Corruption persisting ⇒ the whole reference/finalizer/cleaner
+> subsystem is exonerated in one experiment; stopping ⇒ writer is inside it
+> (next suspects there: cleaner/finalizer Java invokes on stale queued
+> addresses — `Cleanable.clean()` unlinks with null writes through `this`).
+> Next writers to hunt if exonerated: any other `Object(None)`-through-
+> possibly-stale-receiver path (interpreter ReferenceQueue poll/remove
+> helpers ~interpreter.rs:530-690; JNI SetObjectField; exception-init paths).
+>
 > Also: dev's scripts cleanup deleted `build-wt.bat`; recreate it (vcvars +
 > unset VCINSTALLDIR/VSCMD_ARG_TGT_ARCH/CARGO_TARGET_DIR + cargo build) — see
 > the memory file. The earlier `[refproc]`/reference-processing stale-ref fix

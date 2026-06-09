@@ -2049,6 +2049,38 @@ impl GenerationalHeap {
                                     "[small4] PRE-GC YOUNG {} @0x{:x} fld[{}] -> 0x{:x}",
                                     cn, ybase + ycur, si, p,
                                 );
+                                // bc math-ec 0x4 (2026-06-09): ONE-SHOT hex dump
+                                // of the victim ±128 bytes. The surroundings
+                                // answer "smear vs surgical": a run of math
+                                // longs around the cell = OOB/stale smear; an
+                                // otherwise-intact object with ONE flipped
+                                // payload = a surgical single write. Words are
+                                // u64 at 8-byte stride; the corrupt payload is
+                                // marked `<<<<`.
+                                static DUMPED: std::sync::atomic::AtomicBool =
+                                    std::sync::atomic::AtomicBool::new(false);
+                                if !DUMPED.swap(true, Ordering::Relaxed) {
+                                    let victim = ybase + ycur;
+                                    let cell_payload =
+                                        victim + HEADER_SIZE + si * SLOT_SIZE + 8;
+                                    let lo = victim.saturating_sub(128).max(ybase);
+                                    let hi = (victim + size + 128).min(ybase + yused);
+                                    eprintln!(
+                                        "[small4] HEXDUMP victim=0x{victim:x} size={size} cell_payload=0x{cell_payload:x}:"
+                                    );
+                                    let mut a = lo & !7;
+                                    while a < hi {
+                                        let w = unsafe {
+                                            std::ptr::read(a as *const u64)
+                                        };
+                                        eprintln!(
+                                            "[small4]   0x{a:x}: 0x{w:016x}{}{}",
+                                            if a == victim { "  <-- victim header" } else { "" },
+                                            if a == cell_payload { "  <<<< corrupt payload" } else { "" },
+                                        );
+                                        a += 8;
+                                    }
+                                }
                             }
                         }
                     }
@@ -4423,6 +4455,46 @@ impl GenerationalHeap {
             );
             return old_ptr; // Leave unmoved — likely not a real object
         }
+
+        // bc math-ec 0x4 (2026-06-09): a STALE/INTERIOR pointer whose garbage
+        // bytes PARSE plausibly (kind 0/1, small num_slots — common when the
+        // bytes are long[] math data) slips past every guard above; the copy
+        // is wasteful but the killer is the forwarding-pointer install below:
+        // an 8-byte raw write at old_ptr+24 INTO THE MIDDLE OF A LIVE OBJECT,
+        // corrupting whatever field/element lives there. One seed then
+        // self-propagates: the corrupted cell feeds the next GC another false
+        // root. Discriminator: every REAL object's class_id resolves in the
+        // registry; garbage class_ids essentially never do. (class_id==0 ==
+        // java/lang/Object resolves and stays allowed — zeroed-region refs are
+        // handled by the existing guards.)
+        // `CRATONVM_DBG_FWDGUARD` logs offenders; `CRATONVM_FWD_RESOLVE_STRICT`
+        // rejects them (leave unmoved, no forwarding install) — candidate FIX.
+        if fwdguard_enabled() || fwd_resolve_strict() {
+            let cid = header.class_id.as_u32();
+            if crate::gc::resolve_class_info(cid).is_none() {
+                if fwdguard_enabled() {
+                    use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+                    static N: AtomicUsize = AtomicUsize::new(0);
+                    let k = N.fetch_add(1, AOrd::Relaxed);
+                    if k < 24 {
+                        eprintln!(
+                            "[fwdguard] #{k} UNRESOLVABLE class_id={} at old_ptr=0x{:x} \
+                             (kind_byte={} num_slots={} array_len={} total_size={}) — {}",
+                            cid,
+                            old_ptr as usize,
+                            header.kind as u8,
+                            header.num_slots,
+                            header.array_length,
+                            total_size,
+                            if fwd_resolve_strict() { "REJECTED" } else { "copied anyway" },
+                        );
+                    }
+                }
+                if fwd_resolve_strict() {
+                    return old_ptr; // false root — never install forwarding at +24
+                }
+            }
+        }
         // Promote if this GC survival would reach or exceed the promotion age,
         // OR if the previous minor GC observed high survival pressure and
         // armed the force-promote-all flag. The latter breaks the death
@@ -4723,6 +4795,15 @@ impl GenerationalHeap {
         self.young_from.lock().contains(ptr)
     }
 
+    /// Check if a pointer is in EITHER young semispace. A PRE-GC young
+    /// address sits in the buffer that became the (empty) to-space after the
+    /// Cheney swap, which `is_in_young` (from-space only) misses — reference
+    /// processing uses this to detect stale/dead pre-GC Reference addresses
+    /// (in young + not in the pointer map ⇒ the object did not survive).
+    pub fn is_in_young_either(&self, ptr: *const u8) -> bool {
+        self.young_from.lock().contains(ptr) || self.young_to.lock().contains(ptr)
+    }
+
     /// Check if a pointer is in the old generation.
     pub fn is_in_old(&self, ptr: *const u8) -> bool {
         self.old_gen.lock().contains(ptr)
@@ -4959,6 +5040,25 @@ fn gcw_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_GCWRITE").is_some())
+}
+
+/// Cached `CRATONVM_DBG_FWDGUARD` gate (bc math-ec 0x4): log forward_object
+/// candidates whose header class_id does NOT resolve (false interior/stale
+/// roots that would get a forwarding_ptr smashed into live-object interiors).
+#[inline]
+fn fwdguard_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_FWDGUARD").is_some())
+}
+
+/// Cached `CRATONVM_FWD_RESOLVE_STRICT` gate: REJECT (leave unmoved, no
+/// forwarding install) forward_object candidates with unresolvable class_id.
+#[inline]
+fn fwd_resolve_strict() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_FWD_RESOLVE_STRICT").is_some())
 }
 
 /// Cached `CRATONVM_DBG_SEEDHUNT` gate (bc math-ec `0x4` seed-phase bisect).

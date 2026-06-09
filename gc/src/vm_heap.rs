@@ -1082,6 +1082,17 @@ impl VmHeap {
         }
     }
 
+    /// Generational: is `addr` inside EITHER young semispace? Used by
+    /// reference processing to detect stale PRE-GC Reference addresses
+    /// (young + absent from the pointer map ⇒ did not survive the GC).
+    /// G1: `false` (no semispace; staleness is handled by `is_addr_live`).
+    pub fn is_in_young_addr(&self, addr: usize) -> bool {
+        match self {
+            VmHeap::Generational(h) => h.is_in_young_either(addr as *const u8),
+            VmHeap::G1(_) => false,
+        }
+    }
+
     /// Walk all live objects in the heap (both generations / all regions).
     /// Must be called during a GC safepoint (all mutator threads paused).
     pub fn walk_objects(&self) -> Vec<(*mut u8, usize)> {
