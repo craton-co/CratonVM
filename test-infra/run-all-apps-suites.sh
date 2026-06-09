@@ -154,7 +154,22 @@ fi
 CM="$ROOT/apps/_test-suites/commons-math"
 JUNIT="$ROOT/.bench-cache/junit-platform-console-standalone-1.10.2.jar"
 M2="${HOME}/.m2/repository"
+# commons-math-transform/test-classes pull in commons-math3 + commons-rng-simple
+# (transitive test dependencies declared in commons-math-transform/pom.xml).
+# Without them, TransformUtilsTest.<clinit> fails with NoClassDefFoundError on
+# org/apache/commons/math3/analysis/function/Sin during execute (discover only
+# reads annotations and never triggers <clinit>, so the gap is invisible until
+# the launcher tries to instantiate the test).
 CMCP="$JUNIT;$CM/commons-math-transform/target/classes;$CM/commons-math-transform/target/test-classes;$CM/commons-math-core/target/classes;$M2/org/apache/commons/commons-numbers-rng/1.2/commons-numbers-rng-1.2.jar;$M2/org/apache/commons/commons-numbers-core/1.2/commons-numbers-core-1.2.jar"
+for opt_jar in \
+  "$M2/org/apache/commons/commons-numbers-complex/1.3/commons-numbers-complex-1.3.jar" \
+  "$M2/org/apache/commons/commons-math3/3.6.1/commons-math3-3.6.1.jar" \
+  "$M2/org/apache/commons/commons-rng-simple/1.7/commons-rng-simple-1.7.jar" \
+  "$M2/org/apache/commons/commons-rng-client-api/1.7/commons-rng-client-api-1.7.jar" \
+  "$M2/org/apache/commons/commons-rng-core/1.7/commons-rng-core-1.7.jar" \
+; do
+  [ -f "$opt_jar" ] && CMCP="$CMCP;$opt_jar"
+done
 [ -f "$ROOT/bench/JUnitProbe.class" ] && [ -d "$CM/commons-math-transform/target/test-classes" ] && \
   run_suite "commons-math-junit-probe" "2g" "$ROOT/bench;$CMCP" JUnitProbe ""
 

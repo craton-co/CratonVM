@@ -2097,7 +2097,7 @@ fn handle_jit_dispatch_error(
     err: crate::error::MethodCallFailed,
     info: &JitInvokeInfo,
 ) -> i64 {
-    use crate::error::{MethodCallFailed, RuntimeError, VmError};
+    use crate::error::{ClassFileError, LinkageError, MethodCallFailed, RuntimeError, VmError};
     match err {
         MethodCallFailed::ExceptionThrown(exc) => {
             set_jit_pending_exception(exc);
@@ -2150,6 +2150,89 @@ fn handle_jit_dispatch_error(
                         set_jit_pending_exception(exc);
                     }
                 }
+            }
+        }
+        // `VmError::Linkage` variants are catchable Java errors in the
+        // `java.lang.LinkageError` hierarchy (NoClassDefFoundError,
+        // NoSuchFieldError, NoSuchMethodError, …). The interpreter
+        // already converts them at opcode boundaries via
+        // `convert_class_not_found` (`runtime/exceptions.rs`); the JIT
+        // dispatch path previously fell through to the catch-all and
+        // wrapped them in `java/lang/InternalError`, breaking
+        // `catch (NoClassDefFoundError)` / `catch (LinkageError)` in
+        // application code — notably JUnit Platform's test-execution
+        // error handler in `EngineExecutionOrchestrator.execute`, which
+        // expects `NoClassDefFoundError` from a JIT-compiled callee to
+        // propagate as-is so the orchestrator can record the test as
+        // failed instead of aborting the whole JVM.
+        //
+        // Mirror the interpreter: build the matching Java throwable so
+        // the caller's exception table can find a handler.
+        MethodCallFailed::InternalError(VmError::Linkage(linkage_err)) => {
+            let (exc_class, detail) = match &linkage_err {
+                LinkageError::NoClassDefFoundError { class_name } => {
+                    ("java/lang/NoClassDefFoundError", class_name.clone())
+                }
+                LinkageError::NoSuchFieldError { class_name, field_name } => {
+                    ("java/lang/NoSuchFieldError", format!("{}.{}", class_name, field_name))
+                }
+                LinkageError::NoSuchMethodError {
+                    class_name, method_name, method_descriptor,
+                } => (
+                    "java/lang/NoSuchMethodError",
+                    format!("{}.{}{}", class_name, method_name, method_descriptor),
+                ),
+                LinkageError::IncompatibleClassChangeError { message } => {
+                    ("java/lang/IncompatibleClassChangeError", message.clone())
+                }
+                LinkageError::AbstractMethodError { class_name, method_name } => {
+                    ("java/lang/AbstractMethodError", format!("{}.{}", class_name, method_name))
+                }
+                LinkageError::IllegalAccessError { message } => {
+                    ("java/lang/IllegalAccessError", message.clone())
+                }
+                LinkageError::VerifyError { class_name, method_name, message } => (
+                    "java/lang/VerifyError",
+                    format!("{}.{}: {}", class_name, method_name, message),
+                ),
+                LinkageError::ClassFormatError { class_name, message } => {
+                    ("java/lang/ClassFormatError", format!("{}: {}", class_name, message))
+                }
+                LinkageError::UnsupportedClassRedefinitionError { class_name, message } => (
+                    "java/lang/UnsupportedOperationException",
+                    format!("{}: {}", class_name, message),
+                ),
+            };
+            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                vm, thread, exc_class, Some(&detail),
+            ) {
+                set_jit_pending_exception(exc);
+            } else {
+                // Throwable construction failed (heap / rt.jar gap) — fall
+                // back to the legacy InternalError wrap so the failure is
+                // still visible rather than silently dropped.
+                let msg = format!(
+                    "JIT dispatch into {}.{}{} failed: {}",
+                    info.class_name, info.method_name, info.descriptor, linkage_err,
+                );
+                if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                    vm, thread, "java/lang/InternalError", Some(&msg),
+                ) {
+                    set_jit_pending_exception(exc);
+                }
+            }
+        }
+        // A class-resolution miss in the resolver surfaces as
+        // `VmError::ClassFile(ClassNotFound)`. The interpreter maps this
+        // to `NoClassDefFoundError` (see `raise_no_class_def_found`); do
+        // the same here so JIT-dispatched callees behave identically.
+        MethodCallFailed::InternalError(VmError::ClassFile(
+            ClassFileError::ClassNotFound { ref class_name },
+        )) => {
+            if let Ok(exc) = crate::runtime::exceptions::create_exception_object(
+                vm, thread, "java/lang/NoClassDefFoundError", Some(class_name),
+            ) {
+                set_jit_pending_exception(exc);
             }
         }
         MethodCallFailed::InternalError(vm_err) => {
