@@ -7520,6 +7520,31 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // null-resource JDK provider path. The allow-list entry at
     // `vm/src/vm/vm_exec.rs` (BREAKITER) promotes these over the JDK bytecode.
     crate::phases_late::register_p66_break_iterator(registry);
+
+    // NIO file-attribute bridge (real-JDK mode): `BasicFileAttributes` is a
+    // pure interface in `java.base` — its methods (`isDirectory`, `size`,
+    // `lastModifiedTime`, …) have no `Code` attribute. The JDK code path that
+    // produces a concrete `BasicFileAttributes` runs through
+    // `WindowsFileSystemProvider.readAttributes` → `WindowsNativeDispatcher`
+    // which CratonVM has not wired up. Without an intercept, real JDK bytecode
+    // for `Files.walkFileTree` → `FileTreeWalker.visit` → `attrs.isDirectory()`
+    // dispatches to the abstract interface declaration and throws
+    // `AbstractMethodError: BasicFileAttributes.isDirectory()Z has no Code
+    // attribute` — fatal for any `Files.walkFileTree` / `Files.walk` /
+    // `Files.find` caller, including JUnit Platform's `ClasspathScanner`
+    // (which uses `--select-package` discovery to find tests).
+    //
+    // `register_p59_file_attributes` registers `Files.readAttributes(Path,
+    // Class, LinkOption[])` to allocate a synthetic 5-field BFA populated
+    // from real `std::fs::metadata` (no fabricated values), and registers
+    // `BasicFileAttributes.{isDirectory,isRegularFile,size,…}` natives that
+    // read those fields. The native is found via the abstract-declaration
+    // rescue at `interpreter::execute` (the path that looks for a native
+    // registered directly on the resolved interface class before throwing
+    // AbstractMethodError). Historically the registration shipped only via
+    // `register_synthetic_overrides`; promote it here so real-JDK CLI builds
+    // get the same coverage.
+    crate::phases_late::register_p59_file_attributes(registry);
 }
 
 #[cfg(feature = "synthetic-jdk")]

@@ -15266,6 +15266,16 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 4)))
     });
+    // `fileKey()` returns an object that uniquely identifies the file, or
+    // `null` if a file key is not available. The JDK Windows file system
+    // returns null when running on FAT-class volumes / network shares; we
+    // return null unconditionally — this is the documented JDK contract,
+    // not a fabricated value, and it lets `FileTreeWalker.wouldLoop`
+    // (the only `fileKey` consumer in the JDK walker) skip its identity
+    // comparison instead of throwing `AbstractMethodError`.
+    r.register(bfa, "fileKey", "()Ljava/lang/Object;", |_ctx, _args| {
+        Ok(Some(Value::Object(None)))
+    });
 
     // FileTime = 1-field (millis=0 Long)
     let ft = "java/nio/file/attribute/FileTime";
