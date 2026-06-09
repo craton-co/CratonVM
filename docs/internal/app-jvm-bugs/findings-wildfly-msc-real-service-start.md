@@ -128,13 +128,33 @@ is the enum with `ordinal()`. So `.ordinal()` is being called on a `ControlledPr
 `getState()`'s `State` enum — a type confusion (suspect the ControlledProcessState shim /
 `AtomicStampedReference.getReference()` returning the wrong object).
 
+## Session 5 — `ControlledProcessState.ordinal` + `EnhancedQueueExecutor` hang RESOLVED → testSubsystem now COMPLETES
+
+- **`ControlledProcessState.ordinal`:** `native_process_state_get_state` (wildfly_core.rs) allocated a
+  `ControlledProcessState`, but `getState()`'s return type is `ControlledProcessState$State` (the enum),
+  so `x.getState().ordinal()` / switch-maps (`ModelControllerImpl$4`) hit
+  `NoSuchMethodError ControlledProcessState.ordinal()I`. Fixed: return the real `State` enum-constant
+  singleton (map our `ProcessState` → JDK constant by NAME — ordinals differ — via
+  `static_field_index_by_name` + `get_static_field`).
+- **`EnhancedQueueExecutor` cleanup hang:** the synthetic Rust-backed executor never maintains its
+  `threadStatus` long, so stock `shutdown()` spins forever in `compareAndSetThreadStatus`
+  (`AtomicLongFieldUpdater.compareAndSet`) during the `@After` cleanup. Located with
+  `--stack-dump-on-timeout 75` (the harness disables it with `0`). Fixed: shim
+  shutdown()/shutdown(Z)/isShutdown/isTerminated/awaitTermination to terminal values.
+
+**MILESTONE:** `testSubsystem` + `testSchema` now **run to completion** (`Tests run: 2`) instead of
+crashing/hanging. `testSubsystem` fails as a normal `RuntimeException` at
+`SubsystemTestDelegate.validateDescriptionProviders:470` — a WildFly **model-validation** failure, a
+different category from the (now-cleared) VM crashes/hangs.
+
 ## Remaining work (current order — each blocks the next)
-1. **`ControlledProcessState.ordinal` type confusion** (the new blocker above) — `.ordinal()` on a
-   `ControlledProcessState` instead of its `State` enum; must be fixed first.
-2. **P2 tail:** keep chasing whatever the boot surfaces after that until `testSubsystem` passes.
-   Likely also needs **value injection** — `provides(name).accept(v)` → `requires(name).get()` —
-   which is NOT wired (a dependent's injected `Supplier.get()` returns null). The `executorService`
-   supplier survived so far because it's passed via the ctor, not MSC-injected.
+1. **`validateDescriptionProviders` RuntimeException** — a boot op (`WFLYCTL0013`) failed during the
+   subsystem `:add`. The failure description is HIDDEN by a jboss-logging gap (`WFLYCTL0013` logs literal
+   `%s`, args unsubstituted). Fix the `%s` substitution (or surface the op-failure another way) first,
+   then diagnose the health-subsystem op / description-provider mismatch.
+2. **P2 tail / value injection** — `provides(name).accept(v)` → `requires(name).get()` is NOT wired (a
+   dependent's injected `Supplier.get()` returns null); the `executorService` supplier survived only
+   because it is ctor-passed, not MSC-injected.
 3. **P4:** async services + standalone daemon to `WFLYSRV0025` + port 9990.
 4. **P5:** `stop()` lifecycle; remove `CRATONVM_DBG_MSC` scaffolding before un-gating.
 
