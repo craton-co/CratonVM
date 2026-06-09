@@ -89,9 +89,30 @@ change TCO (it is load-bearing) without root-causing.** Repro:
 `CRATONVM_MSC_REAL_START=1 CRATONVM_FRAME_TRACE=1 bash run-health.sh` (grep the last `[FRAME_*]` before
 `panicked`).
 
+## Session 3 — TCO / value-stack overflow RESOLVED (merged)
+
+Root cause: `Frame::reset_for_tail_call` (frame.rs) resized the reused frame's **locals** for the
+tail-called method but only `clear()`-ed the operand stack — it kept the old `ValueStack`'s `max_size` +
+backing Vecs. A tail call into a method with a **larger `max_stack`** then overflowed the smaller reused
+stack (`RegularEnumSet$EnumSetIterator` → `Long.numberOfTrailingZeros` TCO→`Integer.numberOfTrailingZeros`).
+Fix: added `ValueStack::ensure_max_size` (grow-only — never shrinks a live stack) and call it in
+`reset_for_tail_call`, mirroring the locals resize already there. General interpreter correctness fix.
+Pool clean (the 3 `*-modload` "REGRESS" are **path-only baseline staleness** — dev relocated the pool to
+`apps/probe/test-infra/regression-pool/`; baselines embed the old `...\test-infra\...` path, lines 3-4
+`Loaded module`/`OK` match; affects any binary, not this change).
+
+**New blocker:** boot now reaches **real ModelController op processing** (`TRACE WFLYCTL0161: Operation
+succeeded, committing`), then `java.util.ResourceBundle.checkNamedModule` → `getCallerModule(Class).isNamed()`
+throws `NoSuchMethodError: java/lang/String.isNamed()Z` — i.e. `Class.getModule()` (synthetic Module;
+`lib.rs` ~2979 / `phases_late.rs` ~15743 alloc a `java/lang/Module` with field0 = name String) handed
+back a **String** as the `isNamed()` receiver. **Nondeterministic** — a `CRATONVM_FRAME_TRACE` run instead
+pushed the correct `java/lang/Module.isNamed()`. Suspect a **GC stale-ref / reused-slot** on the synthetic
+Module (cf. `reference_classloader_gc_root_gap`) and/or synthetic-Module field layout vs real
+`java.lang.Module`. Investigate with the heap/frame stale-ref tooling, not a quick patch.
+
 ## Remaining work (current order — each blocks the next)
-1. **Interpreter TCO / value-stack overflow** (the new blocker above) — must be fixed first; it
-   currently aborts the VM mid-boot.
+1. **`Class.getModule()` → String / `String.isNamed` NoSuchMethodError** (the new blocker above) — likely
+   a GC stale-ref on the synthetic Module; must be fixed first.
 2. **P2 tail:** keep chasing whatever the boot surfaces after that until `testSubsystem` passes.
    Likely also needs **value injection** — `provides(name).accept(v)` → `requires(name).get()` —
    which is NOT wired (a dependent's injected `Supplier.get()` returns null). The `executorService`
