@@ -246,6 +246,29 @@ impl ValueStack {
         }
     }
 
+    /// Grow the stack's capacity to at least `new_max` slots, returning `true`
+    /// if it actually grew.
+    ///
+    /// Used by tail-call frame reuse ([`Frame::reset_for_tail_call`]): the
+    /// reused frame's stack was sized for the PREVIOUS method's `max_stack`,
+    /// but the tail-called method may declare a LARGER `max_stack`. Without
+    /// this, the new method's pushes overflow the smaller backing Vecs — the
+    /// `push_compact` "index out of bounds: len == max_size" panic observed
+    /// in WildFly's `RegularEnumSet$EnumSetIterator` path (Long → Integer
+    /// `numberOfTrailingZeros` tail call). Only ever GROWS (a no-op when
+    /// already large enough), so it can never shrink a live stack or drop
+    /// in-use slots; newly added slots are zero / `KIND_UNKNOWN`.
+    pub fn ensure_max_size(&mut self, new_max: usize) -> bool {
+        if new_max > self.max_size {
+            self.slots.resize(new_max, CompactValue::zero());
+            self.kinds.resize(new_max, KIND_UNKNOWN);
+            self.max_size = new_max;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Consume this stack and return the inner Vecs for pooling.
     ///
     /// The tag half is returned as an empty Vec (CompactValue encodes its
