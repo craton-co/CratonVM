@@ -341,6 +341,30 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // ClassLoader.getUnnamedModule() — return THIS loader's unnamed module.
+    // Stock bytecode returns `this.unnamedModule`, but our synthetic loaders
+    // never populate that field, so the real-bytecode read hands back a
+    // null/garbage value — observed as a String reaching
+    // `ResourceBundle.getCallerModule(...).isNamed()` (when `getCallerClass()`
+    // is null, `getCallerModule` falls back to
+    // `getSystemClassLoader().getUnnamedModule()`), surfacing as
+    // `NoSuchMethodError: java/lang/String.isNamed()Z` mid WildFly boot.
+    // Return a synthetic *unnamed* Module: field 0 (name) = null, so the
+    // `Module.isNamed()` native (phases_late `register_p59_module`) reports
+    // false and `checkNamedModule` passes. Single allocation (no
+    // `create_string`), so there is no GC window that could relocate/reclaim
+    // the unpinned object before return.
+    r.register(
+        cl,
+        "getUnnamedModule",
+        "()Ljava/lang/Module;",
+        |ctx, _args| {
+            let m = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+            ctx.set_field(m, 0, Value::Object(None)); // null name => unnamed => isNamed() == false
+            Ok(Some(Value::Object(Some(m))))
+        },
+    );
+
     // ClassLoader.findLoadedClass(String) — check if class is already loaded
     r.register(
         cl,
