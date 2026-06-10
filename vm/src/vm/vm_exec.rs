@@ -463,6 +463,38 @@ pub fn safe_native_call(
         }
     }
 
+    // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): O(1) poll of the watched
+    // absolute address after EVERY native return — a HIT here (vs at a
+    // bytecode safepoint) blames the just-returned native directly.
+    {
+        let cb = callback as usize;
+        crate::runtime::memwatch::poll_with(
+            || {
+                let native = cratonvm_native_api::native_ring::name_of(cb)
+                    .unwrap_or_else(|| format!("<cb@{cb:#x}>"));
+                format!("native:{native}")
+            },
+            || {
+                thread
+                    .frames
+                    .iter()
+                    .rev()
+                    .take(28)
+                    .map(|f| {
+                        format!(
+                            "  {}.{}{} pc={}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor(),
+                            f.pc
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            },
+        );
+    }
+
     // DBG (bc math-ec, CRATONVM_DBG_YOUNGSCAN): robust catch-all for the `0x4`
     // mutator write. We PROVED the `0x4` is written to a YOUNG object's
     // reference field between GCs (NOT by the GC: it is present in young at GC

@@ -234,6 +234,16 @@ const LKIND_OTHER: u8 = 0; // reference / int / float / null / uninit / retaddr
 const LKIND_LONG: u8 = 1;
 const LKIND_DOUBLE: u8 = 2;
 
+/// Cached `CRATONVM_DBG_STALELONG` gate (bc math-ec 0x4 smear hunt): log
+/// LONG-kind locals whose bits match a `pointer_map` key at remap time —
+/// candidate smuggled-object-ref-as-long going stale.
+#[inline]
+fn stalelong_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_STALELONG").is_some())
+}
+
 /// Kind mark for a `Value` about to be written into a local slot. Only the
 /// category-2 primitives need a positive mark; everything else (including
 /// genuine object references) stays `LKIND_OTHER` so the GC continues to scan
@@ -1264,6 +1274,29 @@ impl Frame {
             // can't be a key" was wrong: rooting and remapping key off
             // *different* objects).
             if self.local_kinds[i] == LKIND_LONG || self.local_kinds[i] == LKIND_DOUBLE {
+                // bc math-ec 0x4 smear hunt (CRATONVM_DBG_STALELONG): a LONG-
+                // kind local whose raw bits equal a pointer_map KEY is either a
+                // collision long (benign — must NOT be remapped) or a SMUGGLED
+                // OBJECT REF stored as a long (jobject-as-Long contract) — which
+                // this skip leaves STALE after the move. The frame's method name
+                // discriminates: LongArray/BigInteger methods holding [J/[I args
+                // as LONG-kind locals are the smear suspects.
+                if stalelong_enabled() {
+                    let raw = self.locals[i].raw_bits() as usize;
+                    if let Some(&new_addr) = pointer_map.get(&raw) {
+                        use std::sync::atomic::{AtomicUsize, Ordering as AOrd};
+                        static N: AtomicUsize = AtomicUsize::new(0);
+                        let k = N.fetch_add(1, AOrd::Relaxed);
+                        if k < 24 {
+                            eprintln!(
+                                "[stalelong] #{k} LONG-kind local[{i}] bits=0x{raw:x} MATCHES moved obj (-> 0x{new_addr:x}) in {}.{}{} — NOT remapped (stale if smuggled ref)",
+                                self.class_name(),
+                                self.method_name(),
+                                self.method_descriptor(),
+                            );
+                        }
+                    }
+                }
                 continue;
             }
             let cv = self.locals[i];

@@ -1,5 +1,23 @@
 # bc-math-ec `0x4` heap corruption — full handoff (2026-06-05)
 
+> # ✅ RESOLVED 2026-06-10 (branch fix/bc-math-ec-gc-0x4)
+> **Root cause: ReferenceProcessor re-emission** — every cleared/enqueued/
+> cleaner action was re-emitted on EVERY GC forever; once the Reference died,
+> its recycled registry address aliased innocent objects and the per-GC
+> referent-null / enqueue writes corrupted them through validly-remapped
+> addresses. On-grid hits = silent legal nulls (the BigInteger NPEs);
+> interior hits = the mis-gridded 16-byte `Object(None)` `{disc=4,payload=0}`
+> = the `Object(Some(0x4))` signature this doc chronicles. NOT a collector
+> write — the writes happen in the post-GC reference-processing window,
+> which is what fooled the GC-EXIT detector ("fact 4").
+> **Fix:** exactly-once emission (gc/src/reference.rs `take_newly_cleared` /
+> drained `pending_queues` + `finalization_queue` / cleaner `action_emitted`)
+> + dead-Reference `is_stale_young` guards in `process_references_after_gc`.
+> **Validated:** FixedPointTest -Xmx128m 8/8 OK default-mode (was 0/40+);
+> regression pool zero regressions, commons-math-junit-probe FAIL→PASS.
+> Full causal chain + evidence: `docs/internal/h2-testscript-segv-findings.md`.
+> Everything below is the historical hunt log.
+
 > ## ⚡⚡ SESSION UPDATE 2026-06-05 ("take on this job", worktree `CratonVM-ecgc`,
 > branch `fix/bc-math-ec-gc-0x4`) — **THE "GC WRITES THE 0x4" FRAMING (this
 > doc's headline + fact 4) IS WRONG. The `0x4` is a MUTATOR write to a YOUNG
