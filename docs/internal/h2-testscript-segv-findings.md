@@ -78,37 +78,69 @@
 > capture run, ZERO crash signatures (pre-fix: 6/6 deterministic SEGV in
 > 84–229 s).
 >
-> ## ⛔ NEXT BLOCKER (separate bug, now localized): the queryGroup
-> ## infinite loop — TestScript still cannot COMPLETE
+> ## ✅ BLOCKER 2 FIXED (dev f0a44501): the queryGroup pseudo-hang was a
+> ## BigDecimal comparison-cycle from the active precision natives
 >
-> With the SEGV gone, every run stalls ~35 s in (after the SQL-~6500
-> region, well past the historical 5219 crash cluster): stderr goes
-> silent, the process spins forever. cdb on the live rwd build
-> (`capture-h2-hang-rwd.ps1` → `h2-hang-rwd-stacks.txt`, 2026-06-10):
-> **main-vm is NOT blocked — it executes a Java infinite loop**
-> (`Vtable::lookup_slot ← execute_invokevirtual_vtable_fast`, hot), and
-> the VM watchdog's Java dump pins it:
-> `Select.queryGroup(pc=11) → gatherGroup(pc=59) →
-> SelectGroups$Grouped.nextSource(pc=94) → SessionLocal.compare(pc=0)` —
-> H2's GROUP BY row-gathering loop never terminates. ALL other threads
-> are healthy (rq backoff park; MVStore workers in ordinary timed
-> Object.wait/Condition.await) — NO lock deadlock; the old
-> "write-preferring RwLock deadlock" hypothesis is DEAD for this hang
-> (resolve_method_ref already uses read_recursive, interpreter.rs:16529).
-> This is the doc's old "silent nondeterministic hang past line ~457" —
-> now deterministic-ish and cornered. Prime suspect: a mis-executed VALUE
-> COMPARISON driving the cursor/group loop in circles — see "Mismatches"
-> below: `native_bd_add/subtract/multiply/negate` compute BigDecimal via
-> f64 and LOSE SCALE; `SessionLocal.compare` → database compareTypeSafe
-> over such values is exactly where an inconsistent compare would cycle a
-> B-tree/group iteration. Next steps: (1) arm the default watchdog
-> (no DISABLE env) ~120 s for the Java dump with pcs; (2) log
-> compare inputs/outputs at the stall (which Value types?); (3) if
-> BigDecimal: replace the f64 natives with unscaled-int+scale arithmetic
-> or drop them so real bytecode runs. Verification after that fix:
-> `run-h2-verify.ps1 -Runs 5 -TimeoutSec 2400` (a clean full run takes
-> >900 s interpreted; HotSpot harness ≈133 s) + the apps suite (baseline
-> apps-all-20260609-231417: 10 PASS / 2 known FAIL).
+> Post-SEGV-fix runs stalled ~35 s in, watchdog-pinned to
+> `Select.queryGroup → gatherGroup → SelectGroups$Grouped.nextSource →
+> SessionLocal.compare` (main-vm hot in the interpreter, all other
+> threads healthy). Recon (4-agent sweep, 2026-06-10): the GROUP BY key
+> map is `new TreeMap<>(session)` — serviced by the NATIVE TreeMap
+> shadow in comparator/array mode (`native-collections` `tm_binary_search`
+> → `comparator_compare` → interpreted `SessionLocal.compare`; explains
+> the missing TreeMap frames). The comparison itself was corrupted by the
+> ACTIVE real-JDK-build BigDecimal natives — NOT the doc's old f64
+> add/sub/mul theory (those were already exact):
+> `native_bd_precision` returned the raw lazy-0 slot (JDK's "not yet
+> computed" sentinel) into real `compareTo`'s compareMagnitude
+> adjusted-exponent quick exit, and `bd_alloc` overcounted precision for
+> |v|<1 ("0.05" → 3, true 1) — together provably producing strict
+> comparison CYCLES (a<b<c<a) over H2 DECIMAL values → TreeMap binary
+> search misses existing keys → duplicate group per row → O(n²) with
+> deep interpreted compare chains = the "hang" (the INVOICE
+> DECIMAL(10,2) block right after the SQL-6554 marker). Plus a
+> negative-scale 1000× value inflation (`apply_scale` round-trip) and
+> f64-based signum (also shadowed inside real compareTo). **Fix (dev
+> f0a44501):** `bd_unscaled_and_precision` (JDK-true precision +
+> negative-scale-aware unscaled recovery) in both allocators;
+> `native_bd_precision` computes-and-caches on the 0 sentinel; exact
+> negate/abs/signum via the unscaled BigInt. Measured: stall point moved
+> ~24 s/10.1 KB stderr → ~201 s+/14.8-34.8 KB, the 6 deterministic
+> line-5219 mismatches → 0.
+>
+> ## ⛔ BLOCKER 3 (current): class-resolution RwLock deadlock,
+> ## nondeterministic, several minutes in
+>
+> With blockers 1+2 fixed, runs progress much further then either stall
+> or (less often) SEGV at a new face (release RVA 0x7A34E5, unmapped
+> heap-shaped read 0x86DA8E08, main-vm). The stall is now a REAL LOCK
+> DEADLOCK — fully symbolized census in
+> `apps/h2database/h2/h2-stall2-stacks.txt` (2026-06-10, rwd build):
+> - main-vm: `resolve_field_ref` → `RawRwLock::lock_exclusive_slow`
+>   (wants WRITE);
+> - Thread-2: `execute_string_concat` (indy) → `alloc_java_string_object`
+>   → `RwLock::write` (second queued WRITER);
+> - Thread-1: `populate_virtual_invoke_cache` → `resolve_method_ref`
+>   → `lock_shared_slow` at +0x5c (the function's FIRST lock — queued
+>   READER behind the writers);
+> - Thread-3/Thread-4: parked in Java `Condition.await`
+>   (`native_cond_await` → `monitor_wait`) — one of them almost
+>   certainly entered the park while a caller frame still HELD the
+>   contended guard (the original "don't hold class_manager across the
+>   re-entrant invoke" warning — `resolve_method_ref`'s read_recursive
+>   at interpreter.rs:16529 protects only same-thread recursion, not
+>   guard-across-park).
+> Next steps: identify the exact lock (read `resolve_field_ref`'s
+> exclusive site + `alloc_java_string_object`'s write site — likely
+> class_manager or resolution_cache) and audit every path that can run
+> Java (invoke/execute/monitor_wait) under a held guard; fix = drop the
+> guard before re-entering Java. The rarer 0x7A34E5 SEGV face needs an
+> rwd capture once the deadlock no longer pre-empts it
+> (`capture-h2-segv-rwd.ps1`). Verification: `run-h2-verify.ps1 -Runs 5
+> -TimeoutSec 2400` (clean full run >900 s interpreted; HotSpot harness
+> ≈133 s) + the apps suite (2026-06-10 run: zero regressions vs baseline,
+> elasticsearch-version FAIL→PASS, wildfly-health known-FAIL mode change
+> attributed to the concurrent session's WildFly boot-latch work).
 >
 > Historical analysis below: the ReferenceProcessor re-emission (fixed at
 > dev a9bc91f6) was the FIRST writer; the superseded status + hunt log
