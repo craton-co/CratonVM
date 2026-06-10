@@ -1,7 +1,9 @@
 # H2 TestScript `--nojit` SEGV — findings (2026-06-05)
 
-> # ✅ RESOLVED 2026-06-10 — root cause found and fixed (bc-math-ec `0x4` /
-> silent-null corruption; very likely this H2 SEGV too — re-verify H2)
+> # ⚠ PARTIALLY RESOLVED — the bc-math-ec `0x4` / silent-null corruption is
+> FIXED (dev a9bc91f6), but the H2 SEGV below PERSISTS on the fixed build
+> (re-verified 2026-06-10: 5/5 runs crash) — H2 has an ADDITIONAL
+> stale-receiver writer beyond the ReferenceProcessor re-emission
 >
 > **Root cause: the `ReferenceProcessor` re-emitted every cleared/enqueued/
 > cleaner action on EVERY GC, forever** (`pending_queues` read
@@ -37,8 +39,35 @@
 > four consumer loops, `VmHeap::is_in_young_addr` /
 > `GenerationalHeap::is_in_young_either`.
 >
-> H2 TestScript + the `--nojit` SEGV below should be re-verified against the
-> fixed binary; the mechanism matches (DECIMAL-region reference churn).
+> **H2 RE-VERIFICATION 2026-06-10 (dev a9bc91f6, post-fix build): the SEGV
+> PERSISTS — 5/5 runs FATAL `EXCEPTION_ACCESS_VIOLATION` (walls 84–229s).**
+> The ReferenceProcessor fix did NOT cure H2; an additional writer produces
+> the same wild-small-receiver corruption. Same site + call shape as the
+> historical log below: `GenerationalHeap::get_field` header read
+> (`gen_heap.rs:920`) consumed by a `getfield` (interpreter.rs:7222) inside
+> a Java method driven by native `register_essential_natives::closure$105`
+> → `ctx.invoke_virtual` (full symbolized stack:
+> `apps/h2database/h2/h2-rwd-symbolized.log`, hs_err archives alongside).
+> Faces: release build is fully DETERMINISTIC — every run reads
+> `0x0000000100000004` (receiver payload exactly 2^32) at RVA `0x1D8549`
+> on thread "main-vm"; release-with-debug build reads `0x11` (receiver
+> `Object(Some(0x1))` + the 0x10 header offset — the historical
+> `Object(Some(6))→0x16` face) on "Thread-1". The mismatch cluster at
+> `testScript.sql` line 5219 (X'…'/CHAR-padding region) precedes every
+> crash. Next: localize with the gated bc-math-ec instruments, all
+> in-tree on dev — `CRATONVM_DBG_MEMWATCH=<hexaddr>`,
+> `CRATONVM_DBG_SEEDHUNT`, `CRATONVM_DBG_STRAYSTACK`.
+>
+> Repro gotchas (each cost a false start): the DEFAULT 120s stack-dump
+> watchdog (vm-cli/src/main.rs) `abort()`s TestScript mid-run and fakes a
+> "clean" non-SEGV exit — set `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1`; copy
+> the binary to a unique non-`cratonvm*` name first (cross-session
+> `taskkill /F /IM cratonvm.exe` sweeps); `CRATONVM_SYMBOLIZE` is an
+> offline RVA-symbolizer (prints symbols and EXITS — not a runtime gate):
+> crash first, then feed the hs_err RVAs back through the SAME binary
+> (release profile has no usable symbols; use release-with-debug).
+> Scripts: `apps/h2database/h2/run-h2-verify.ps1` (N-run verify loop) and
+> `capture-h2-segv-rwd.ps1` (crash + auto-symbolize, release-with-debug).
 > Sections below are the historical hunt log.
 
 > ## ⚡ UPDATE 2026-06-09 (bc-math-ec side, worktree `CratonVM-ecgc`, branch

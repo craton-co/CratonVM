@@ -8,7 +8,8 @@ ROOT="${ROOT:-C:/craton/CratonVM}"
 CV="${CV:-$ROOT/target/release/cratonvm.exe}"
 JDK="${JDK:-C:/Program Files/Java/jdk-25}"
 HS="$JDK/bin/java.exe"
-POOL="$ROOT/test-infra/regression-pool"
+POOL="${POOL:-$ROOT/apps/probe/test-infra/regression-pool}"
+[ -d "$POOL" ] || POOL="$ROOT/test-infra/regression-pool"
 TS=$(date +%Y%m%d-%H%M%S)
 LOGDIR="$ROOT/test-infra/suite-results/apps-all-$TS"
 OUT="$LOGDIR/results.tsv"
@@ -37,6 +38,8 @@ run_suite() {
   grep -qE "RESULT.*ok=false|HIB_SMOKE.*FAIL" "$cvlog" && state=FAIL
   grep -qE ": Okay|All tests successful" "$cvlog" && ! grep -qaiE "Exception|Error:" "$cvlog" && state=PASS
   grep -qE "RESULT.*ok=true|HIB_SMOKE_OK" "$cvlog" && [ "$rc" -eq 0 ] && state=PASS
+  # JUnitProbe success: EXEC_FOUND=N SUCCEEDED=N FAILED=0 — avoid "FAILED" false-positive above
+  grep -qE "SUCCEEDED=[0-9]+ FAILED=0" "$cvlog" && [ "$rc" -eq 0 ] && state=PASS
   [ "$rc" -ne 0 ] && [ "$state" != PASS ] && state=FAIL
   sig=$(grep -aiE "Exception|Error|SEGV|panic|AbstractMethodError|NoSuchMethod|System\.exit" "$cvlog" \
     | grep -avE "^\s*at " | head -1 | sed 's/\x1b\[[0-9;]*m//g' | head -c 120)
