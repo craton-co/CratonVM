@@ -73,13 +73,42 @@
 > 0x100000004, RVA 0x1D8549) is gone — post-fix runs progress far past the
 > historical SQL-5219 crash cluster with no SEGV; each fix layer shifted the
 > failure signature exactly as predicted (wild-small receiver → unmapped
-> stale receiver in the rq guard → stale-Thread WARN flood → clean). A full
-> clean `--nojit` suite run exceeds 900 s (interpreter; HotSpot full harness
-> ≈133 s) — use `run-h2-verify.ps1 -Runs 5 -TimeoutSec 2400`+. NOTE: final
-> long-run verification was CPU-starved by a concurrent session building in
-> the same checkout — re-run the formal 5/5 + the apps regression suite
-> (baseline apps-all-20260609-231417: 10 PASS / 2 known FAIL) on a quiet
-> machine.
+> stale receiver in the rq guard → stale-Thread WARN flood → clean). SEGV
+> verification on the converged dev build: 2× 2400 s runs + 1× 600 s
+> capture run, ZERO crash signatures (pre-fix: 6/6 deterministic SEGV in
+> 84–229 s).
+>
+> ## ⛔ NEXT BLOCKER (separate bug, now localized): the queryGroup
+> ## infinite loop — TestScript still cannot COMPLETE
+>
+> With the SEGV gone, every run stalls ~35 s in (after the SQL-~6500
+> region, well past the historical 5219 crash cluster): stderr goes
+> silent, the process spins forever. cdb on the live rwd build
+> (`capture-h2-hang-rwd.ps1` → `h2-hang-rwd-stacks.txt`, 2026-06-10):
+> **main-vm is NOT blocked — it executes a Java infinite loop**
+> (`Vtable::lookup_slot ← execute_invokevirtual_vtable_fast`, hot), and
+> the VM watchdog's Java dump pins it:
+> `Select.queryGroup(pc=11) → gatherGroup(pc=59) →
+> SelectGroups$Grouped.nextSource(pc=94) → SessionLocal.compare(pc=0)` —
+> H2's GROUP BY row-gathering loop never terminates. ALL other threads
+> are healthy (rq backoff park; MVStore workers in ordinary timed
+> Object.wait/Condition.await) — NO lock deadlock; the old
+> "write-preferring RwLock deadlock" hypothesis is DEAD for this hang
+> (resolve_method_ref already uses read_recursive, interpreter.rs:16529).
+> This is the doc's old "silent nondeterministic hang past line ~457" —
+> now deterministic-ish and cornered. Prime suspect: a mis-executed VALUE
+> COMPARISON driving the cursor/group loop in circles — see "Mismatches"
+> below: `native_bd_add/subtract/multiply/negate` compute BigDecimal via
+> f64 and LOSE SCALE; `SessionLocal.compare` → database compareTypeSafe
+> over such values is exactly where an inconsistent compare would cycle a
+> B-tree/group iteration. Next steps: (1) arm the default watchdog
+> (no DISABLE env) ~120 s for the Java dump with pcs; (2) log
+> compare inputs/outputs at the stall (which Value types?); (3) if
+> BigDecimal: replace the f64 natives with unscaled-int+scale arithmetic
+> or drop them so real bytecode runs. Verification after that fix:
+> `run-h2-verify.ps1 -Runs 5 -TimeoutSec 2400` (a clean full run takes
+> >900 s interpreted; HotSpot harness ≈133 s) + the apps suite (baseline
+> apps-all-20260609-231417: 10 PASS / 2 known FAIL).
 >
 > Historical analysis below: the ReferenceProcessor re-emission (fixed at
 > dev a9bc91f6) was the FIRST writer; the superseded status + hunt log
