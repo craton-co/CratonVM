@@ -2752,6 +2752,42 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     let receiver_class_id = vm.heap.class_id_of(receiver_ref);
     let receiver_cid = receiver_class_id.as_u32();
 
+    // Lambda-proxy receiver: its class id is a synthetic id absent from the
+    // class store, so the resolution below derives an EMPTY class name and
+    // `invoke_or_native("")` surfaces as a message-less
+    // `NoClassDefFoundError` — e.g. `Consumer.accept` inside a JIT-compiled
+    // `CollectionUtils.forEachInReverseOrder` (JUnit5 listener notification)
+    // died on the first compiled execution. Mirror the interpreter's
+    // invokeinterface route: dispatch through the lambda's SAM impl_handle.
+    if vm.lambda_proxies.read().contains_key(&receiver_class_id) {
+        let rest: Vec<Value> = values[1..].to_vec();
+        match crate::runtime::interpreter::try_lambda_dispatch(
+            vm,
+            thread,
+            receiver_ref,
+            receiver_class_id,
+            info.method_name,
+            &rest,
+        ) {
+            Ok(Some(result)) => {
+                return match result {
+                    Some(Value::Int(v)) => v as i64,
+                    Some(Value::Long(v)) => v,
+                    Some(Value::Float(f)) => f.to_bits() as i64,
+                    Some(Value::Double(d)) => d.to_bits() as i64,
+                    Some(Value::Object(Some(obj))) => obj.as_ptr() as i64,
+                    Some(Value::Object(None)) | None => 0,
+                    _ => 0,
+                };
+            }
+            // SAM arity/name mismatch (e.g. a same-named default method) —
+            // fall through; the CP interface fallback below dispatches the
+            // default body via the static call-site class.
+            Ok(None) => {}
+            Err(e) => return handle_jit_dispatch_error(vm, thread, e, info),
+        }
+    }
+
     let mic = &*(mic_ptr as *const JitMICSlot);
     let cached_cid = mic
         .cached_class_id
@@ -2827,7 +2863,9 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                     let cm = vm.class_manager.read();
                     cm.get_class(receiver_class_id)
                         .map(|c| c.name.to_string())
-                        .unwrap_or_default()
+                        // Same fallback as the miss path below: never
+                        // dispatch on an empty class name.
+                        .unwrap_or_else(|| info.class_name.to_string())
                 }
             }
         };
@@ -2945,7 +2983,11 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         let cm = vm.class_manager.read();
         cm.get_class(receiver_class_id)
             .map(|c| c.name.clone())
-            .unwrap_or_default()
+            // Receiver class id not in the class store (synthetic alloc) —
+            // dispatching on "" would raise a message-less
+            // NoClassDefFoundError; the CP call-site class is the
+            // spec-correct resolution target.
+            .unwrap_or_else(|| std::sync::Arc::from(info.class_name))
     };
 
     // Try to compile callee for cached entry. Resolve by the RECEIVER's class
