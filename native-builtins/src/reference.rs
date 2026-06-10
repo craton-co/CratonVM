@@ -426,25 +426,30 @@ fn native_rq_remove_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // Handler thread parks here for the whole process lifetime). Mark a
     // blocking region so a concurrent stop-the-world GC does not
     // deadlock waiting for this thread in `wait_for_all`.
-    ctx.begin_blocking_region();
+    //
+    // Stale-receiver fix (the H2 MVStore "compareAndSetRoot on null"
+    // writer): the poll must run OUTSIDE the blocked region. While
+    // blocked, this thread is excluded from the STW barrier, so a moving
+    // GC can relocate the queue mid-loop and the raw `args` receiver goes
+    // stale — `native_rq_poll` then splices head/referent/size fields
+    // through whatever live object recycled the address. Outside the
+    // region we are an expected mutator: a GC may START but cannot
+    // COMPLETE until we arrive (at the next region boundary), so `largs`
+    // cannot go stale mid-poll. The region is entered only around the
+    // yield, and `end_blocking_region_refs` re-syncs both the frames and
+    // our local arg copies against the GC fixup accumulated while parked.
+    let mut largs: Vec<Value> = args.to_vec();
     loop {
-        let result = native_rq_poll(ctx, args);
-        let result = match result {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.end_blocking_region();
-                return Err(e);
-            }
-        };
+        let result = native_rq_poll(ctx, &largs)?;
         if let Some(Value::Object(Some(_))) = result {
-            ctx.end_blocking_region();
             return Ok(result);
         }
         if start.elapsed() >= timeout {
-            ctx.end_blocking_region();
             return Ok(Some(Value::Object(None)));
         }
+        ctx.begin_blocking_region();
         std::thread::yield_now();
+        ctx.end_blocking_region_refs(&mut largs);
     }
 }
 
@@ -460,27 +465,23 @@ fn native_rq_remove_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     }
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    // T19.H1 — see `native_rq_remove_blocking`: mark a blocking region
-    // so a concurrent stop-the-world GC does not wait for this thread.
-    ctx.begin_blocking_region();
+    // T19.H1 + stale-receiver fix — see `native_rq_remove_blocking`: poll
+    // outside the blocked region (an expected mutator cannot observe a GC
+    // completing mid-poll), park inside it only for the yield, and re-sync
+    // the local arg copies on every region exit. The JDK Common Cleaner
+    // parks here (`remove(60_000)`) for the whole process lifetime.
+    let mut largs: Vec<Value> = args.to_vec();
     loop {
-        let result = native_rq_poll(ctx, args);
-        let result = match result {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.end_blocking_region();
-                return Err(e);
-            }
-        };
+        let result = native_rq_poll(ctx, &largs)?;
         if let Some(Value::Object(Some(_))) = result {
-            ctx.end_blocking_region();
             return Ok(result);
         }
         if start.elapsed() >= timeout {
-            ctx.end_blocking_region();
             return Ok(Some(Value::Object(None)));
         }
+        ctx.begin_blocking_region();
         std::thread::yield_now();
+        ctx.end_blocking_region_refs(&mut largs);
     }
 }
 

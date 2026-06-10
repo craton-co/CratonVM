@@ -24,7 +24,7 @@ Each file is a self-contained bug report with reproduction steps and a fix direc
 
 | App | File | Open bugs |
 |---|---|---|
-| WildFly health tests | [apps/wildfly/CRATONVM_BUGS.md](../../apps/wildfly/CRATONVM_BUGS.md) | testSchema (Premature EOF), testSubsystem (ISE no-message), stack-trace loss (meta-blocker) |
+| WildFly health tests | [apps/wildfly/CRATONVM_BUGS.md](../../apps/wildfly/CRATONVM_BUGS.md) | ~~testSchema (Premature EOF)~~ **FIXED** (2026-06-10); testSubsystem (ISE no-message) + stack-trace loss still open |
 | Elasticsearch 8.15.5 | [apps/elasticsearch-8.15.5/CRATONVM_BUGS.md](../../apps/elasticsearch-8.15.5/CRATONVM_BUGS.md) | Log4j2 NPE on array reflection param, XContent ServiceLoader gap |
 | Commons Math 4 | [apps/_test-suites/commons-math/CRATONVM_BUGS.md](../../apps/_test-suites/commons-math/CRATONVM_BUGS.md) | JIT dispatch InternalError, BasicFileAttributes NIO gap |
 | Bouncy Castle | [apps/_test-suites/bc-java/CLAUDE.md](../../apps/_test-suites/bc-java/CLAUDE.md) | math-ec TIMEOUT (only remaining); crypto-regression PASS (342s) |
@@ -134,19 +134,45 @@ Logs: `test-infra/suite-results/apps-all-20260609-222654/`
 
 ---
 
+## 2026-06-10 app suite run — full summary (after WildFly MSC merge, dev `85f6799b`)
+
+CPU binary rebuilt Jun 10 00:36, GPU binary rebuilt Jun 10 00:49.  
+Logs: `test-infra/suite-results/apps-all-20260610-005325/`
+
+| Suite | CratonVM | HotSpot | Wall time (CV/HS) | Notes |
+|---|---|---|---|---|
+| h2-testall-fast | PASS | PASS | 1.3s / 0.4s | 3.3× |
+| wildfly-health | **PARTIAL** | SKIP | 4.3s | testSchema ✅ **FIXED** — testSubsystem still fails |
+| elasticsearch-version | FAIL | SKIP | 3.5s | 2 pre-existing bugs unchanged |
+| gpu-bench-cpu | PASS | PASS | 1.3s / 0.2s | 6.5× |
+| gpu-offload-probe | PASS | PASS | 1.6s / 0.2s | 8× |
+| bc-asn1-regression | PASS | PASS | 25.5s / 0.8s | 31.9× |
+| bc-crypto-prng | PASS | PASS | 32.3s / 0.5s | 64.6× |
+| commons-math-junit-probe | PASS | PASS† | 4.9s / 0.5s | 9.8× |
+| dacapo-avrora | PASS | N/S | 5.5s / — | DaCapo/JDK25 compat |
+| pool:kafka-codec/spring-boot-run/tomcat | PASS | REGRESS* | | ✓ |
+
+† HotSpot JUnitProbe discovers 0 tests (classpath scan difference); CratonVM 4/4 is correct.  
+\* pool:* REGRESS = HotSpot baselines not set up; expected.
+
+**New vs 2026-06-09:** wildfly testSchema FIXED. No new regressions.
+
+---
+
 ## 2026-06-10 GPU comparison — CratonVM vs TornadoVM (RTX 2060, GpuCompute.heavy 96×multiply-add)
 
-Full results: `test-infra/suite-results/gpu-comparison-20260609-final.md`
+Full results: `test-infra/suite-results/gpu-comparison-20260610-005542.md`  
+Fresh GPU binary rebuilt Jun 10 00:49.
 
 | N | CratonVM CPU | CratonVM GPU | HotSpot CPU | TornadoVM GPU |
 |---|---|---|---|---|
-| 2²⁰ (1M)  | 155ms | 19ms (8.2× CV-CPU) | 21ms | 2ms (10.5× HS) |
-| 2²² (4M)  | 618ms | 25ms (24.7× CV-CPU) | 21ms | 6ms (3.5× HS) |
-| 2²⁴ (16M) | 2404ms | 83ms (29.0× CV-CPU) | 27ms | 19ms (1.4× HS) |
-| 2²⁶ (64M) | 9954ms | 286ms† (34.8× CV-CPU) | 55ms | 77ms (0.7× HS) |
+| 2²⁰ (1M)  | 149ms | 10ms **(14.9× CV-CPU)** | 21ms | 2ms (10.5× HS) |
+| 2²² (4M)  | ~618ms | 24ms **(25.8× CV-CPU)** | 21ms | 5ms (4.2× HS) |
+| 2²⁴ (16M) | 2369ms | 78ms **(30.4× CV-CPU)** | 28ms | 24ms (1.2× HS) |
+| 2²⁶ (64M) | 9884ms | 330ms **(29.9× CV-CPU)** | 58ms | 87ms (0.7× HS) |
 
-† intermittent crash at 2^26, always crashes at 2^28. All checksums match HotSpot ✓.  
-Key finding: CratonVM `--gpu` delivers 8–35× speedup vs CratonVM CPU (scales well) but is behind HotSpot CPU at large N; TornadoVM GPU advantage over HotSpot vanishes above 2^24. GpuProbe.vaddMap checksums agree all 4 VMs all 4 sizes.
+CratonVM GPU still crashes for GpuProbe (3-kernel) at N=2^26; GpuCompute.heavy stable to 2^26; always crashes at 2^28.  
+All checksums match HotSpot ✓. TornadoVM GPU advantage over HotSpot vanishes above 2^24 (memory-bandwidth wall).
 
 ---
 

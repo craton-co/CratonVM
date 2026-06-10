@@ -835,58 +835,154 @@ impl<'a> NativeContextImpl<'a> {
                     }
                 }
             }
+            // A synchronized method's implicit monitorexit target. For
+            // instance methods it duplicates local 0, but a STATIC
+            // synchronized method locks the class mirror, which lives in no
+            // local — without this entry the blocked-thread fixup
+            // (`fold_pointer_map_into_blocked`) has no chain key for it and
+            // the wake-time `monitor_on_exit` remap misses.
+            if let Some(m) = frame.monitor_on_exit {
+                snapshot.push(m);
+            }
         }
         snapshot.extend(self.thread.native_pin_roots.iter().copied());
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
+        drop(snapshot);
+        // Mark the blocked region AFTER the snapshot is complete: from this
+        // point on, every GC initiator maintains this thread's roots via
+        // `fold_pointer_map_into_blocked` (snapshot remap + frame-fixup
+        // composition) until `check_post_block_gc` clears the flag on wake.
+        self.thread
+            .gc_block_state
+            .in_blocked_region
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Check if a GC happened while this thread was blocked (wait/park/join).
-    /// If so, apply the pointer map to update frame references.
+    /// Re-sync this thread's GC state after waking from a blocking region
+    /// (wait/park/join/ReferenceQueue-remove).
+    ///
+    /// Every *moving* GC that completed while this thread was blocked folded
+    /// its pointer map into `gc_block_state.fixup` (composed across multiple
+    /// missed collections, keyed by the addresses our frames still hold) and
+    /// kept our `root_snapshot` remapped — see
+    /// `ThreadRegistry::fold_pointer_map_into_blocked`. Here we apply that
+    /// composed fixup to the frames and thread-local refs, refresh the
+    /// snapshot, and leave the blocked region.
+    ///
+    /// Ordering/race notes (the barrier's `expected` accounting is what makes
+    /// this sound):
+    /// - The caller's `BlockedGuard` has already dropped (or
+    ///   `mark_blocked_region_leave` already ran), so this thread counts as
+    ///   an expected mutator: a NEW stop-the-world can start but cannot
+    ///   COMPLETE until we arrive — so after the arrive-loop below drains, no
+    ///   fold can race the fixup application.
+    /// - The map returned by `arrive_and_wait` is deliberately DISCARDED:
+    ///   `in_blocked_region` is still set while we wait, so that same GC
+    ///   folded its map into our fixup; applying both would double-apply.
+    /// - The flag is cleared LAST, after the snapshot refresh: a GC that
+    ///   starts in between waits for us (expected), sees a fresh snapshot,
+    ///   and folds nothing new.
     fn check_post_block_gc(&mut self) {
+        self.check_post_block_gc_refs(&mut []);
+    }
+
+    /// `check_post_block_gc` + re-sync of native-local raw `Value` refs
+    /// (`extra_refs`) against the same accumulated fixup — used by native
+    /// poll loops that captured their args before blocking (see
+    /// `NativeContext::end_blocking_region_refs`).
+    fn check_post_block_gc_refs(&mut self, extra_refs: &mut [Value]) {
         use crate::memory::gc::update_value_ref;
         use std::sync::atomic::Ordering;
 
-        // Check if STW is active вЂ” if so, participate
-        if self.shared.gc_barrier.stw_requested.load(Ordering::Acquire) {
-            // We just woke up from blocking but STW is active.
-            // Our snapshot is already deposited from before the block.
-            // Wait for GC to complete and apply the pointer map.
-            let pointer_map = self
+        // Drain any in-flight stop-the-world pause(s). We may have woken
+        // mid-collection; arrive so the initiator's `wait_for_all` can
+        // complete, then re-check (another GC may start immediately).
+        while self.shared.gc_barrier.stw_requested.load(Ordering::Acquire) {
+            let _ = self
                 .shared
                 .gc_barrier
                 .arrive_and_wait(self.thread.thread_id);
-            if !pointer_map.is_empty() {
-                for frame in &mut self.thread.frames {
-                    frame.update_local_refs(&pointer_map, &self.shared.heap);
-                    frame.stack.update_object_refs(&pointer_map, &self.shared.heap);
-                }
-                for val in &mut self.thread.printed {
-                    update_value_ref(val, &pointer_map);
-                }
-                if let Some(ref mut obj_ref) = self.thread.java_thread_obj {
+        }
+
+        // Apply the composed fixup accumulated for every GC we slept through.
+        let fixup = {
+            let mut f = self.thread.gc_block_state.fixup.lock();
+            std::mem::take(&mut *f)
+        };
+        if !fixup.is_empty() {
+            if std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some() {
+                eprintln!(
+                    "[blockgc] wake tid={} applying {} composed fixups ({} frames)",
+                    self.thread.thread_id.0,
+                    fixup.len(),
+                    self.thread.frames.len()
+                );
+            }
+            for frame in &mut self.thread.frames {
+                frame.update_local_refs(&fixup, &self.shared.heap);
+                frame.stack.update_object_refs(&fixup, &self.shared.heap);
+                // A blocked `synchronized` method must release the RELOCATED
+                // monitor object on frame-pop, not the stale address.
+                if let Some(ref mut obj_ref) = frame.monitor_on_exit {
                     let old_addr = obj_ref.as_ptr() as usize;
-                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                        *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-                    }
-                }
-                for obj_ref in &mut self.thread.native_pin_roots {
-                    let old_addr = obj_ref.as_ptr() as usize;
-                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
-                        *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-                    }
-                }
-                if let Some(ref mut obj_ref) = self.thread.native_pending_return {
-                    let old_addr = obj_ref.as_ptr() as usize;
-                    if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    if let Some(&new_addr) = fixup.get(&old_addr) {
                         *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
                     }
                 }
             }
+            for val in &mut self.thread.printed {
+                update_value_ref(val, &fixup);
+            }
+            if let Some(ref mut obj_ref) = self.thread.java_thread_obj {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+            for obj_ref in &mut self.thread.native_pin_roots {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+            if let Some(ref mut obj_ref) = self.thread.native_pending_return {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+            for (_key_id, key_ref, val) in &mut self.thread.scoped_values {
+                if let Some(obj_ref) = key_ref {
+                    let old_addr = obj_ref.as_ptr() as usize;
+                    if let Some(&new_addr) = fixup.get(&old_addr) {
+                        *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                    }
+                }
+                update_value_ref(val, &fixup);
+            }
+            if let Some(ref mut obj_ref) = self.thread.pending_async_exception {
+                let old_addr = obj_ref.as_ptr() as usize;
+                if let Some(&new_addr) = fixup.get(&old_addr) {
+                    *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+            for val in extra_refs.iter_mut() {
+                update_value_ref(val, &fixup);
+            }
         }
-        // Clear the root snapshot вЂ” it's now stale
-        self.thread.root_snapshot.lock().clear();
+
+        // Refresh (don't clear) the snapshot: we are runnable again but may
+        // not reach a safepoint before the next GC scans roots; an empty
+        // snapshot would hide every object reachable only from our frames.
+        // NOTE: `deposit_root_snapshot` re-sets `in_blocked_region`; clear
+        // it right after — we are leaving the blocked region.
+        self.deposit_root_snapshot();
+        self.thread
+            .gc_block_state
+            .in_blocked_region
+            .store(false, Ordering::Release);
     }
 
     /// T19.K1 вЂ” Read the daemon flag from a Java `Thread` object.
@@ -2809,6 +2905,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             shared_arc
                 .thread_registry
                 .set_root_snapshot(tid, jvm_thread.root_snapshot.clone());
+            // Share blocked-region GC state so initiators can maintain this
+            // thread's roots while it parks in a blocking native.
+            shared_arc
+                .thread_registry
+                .set_gc_block_state(tid, jvm_thread.gc_block_state.clone());
             // WP4.8: For real-JDK virtual threads (e.g.
             // `java.lang.ThreadBuilders$BoundVirtualThread`), `Thread.run()`
             // is overridden вЂ” `BoundVirtualThread.run()` invokes the user's
@@ -3369,6 +3470,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // with any GC that ran while we were blocked.
         self.shared.gc_barrier.mark_blocked_region_leave();
         self.check_post_block_gc();
+    }
+
+    fn end_blocking_region_refs(&mut self, refs: &mut [Value]) {
+        // Like `end_blocking_region`, but also rewrites the caller's
+        // native-local raw `Value` refs through the accumulated blocked-GC
+        // fixup (the `ReferenceQueue.remove` poll receiver would otherwise
+        // keep its stale pre-GC address — the stale-receiver writer).
+        self.shared.gc_barrier.mark_blocked_region_leave();
+        self.check_post_block_gc_refs(refs);
     }
 
     fn declared_fields(&self, class_id: ClassId) -> Vec<FieldMetadata> {

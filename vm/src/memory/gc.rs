@@ -304,6 +304,21 @@ pub fn update_all_roots(
     //     service after a moving GC.
     cratonvm_native_builtins::jboss_msc::gc_update_msc_service_refs(pointer_map);
 
+    // 20. Blocked-thread root maintenance (the H2 TestScript stale-receiver
+    //     SEGV fix). Threads parked in a blocking native (Object.wait /
+    //     Thread.join / LockSupport.park / ReferenceQueue.remove) are
+    //     excluded from the STW barrier and cannot apply this pointer map
+    //     themselves; without this step their deposited root_snapshot goes
+    //     stale after the first missed moving GC (and the NEXT collection
+    //     then evacuates garbage through the stale addresses — a heap
+    //     corruptor), and their frames resume with recycled from-space
+    //     addresses. The fold remaps each blocked thread's snapshot in
+    //     place and composes this map into its pending wake-time frame
+    //     fixup (applied in `check_post_block_gc`).
+    shared
+        .thread_registry
+        .fold_pointer_map_into_blocked(pointer_map);
+
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);
     // Opt-in (CRATONVM_DBG_HEAP_STALE=1) deep heap-walk: catch un-forwarded /

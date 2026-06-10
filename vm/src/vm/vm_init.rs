@@ -4161,6 +4161,11 @@ impl Vm {
         shared
             .thread_registry
             .set_root_snapshot(ThreadId(0), main_thread.root_snapshot.clone());
+        // Share blocked-region GC state so initiators can maintain the main
+        // thread's roots while it parks in a blocking native (wait/join/park)
+        shared
+            .thread_registry
+            .set_gc_block_state(ThreadId(0), main_thread.gc_block_state.clone());
 
         // Start JDWP debug server if configured
         #[cfg(feature = "experimental-debug")]
