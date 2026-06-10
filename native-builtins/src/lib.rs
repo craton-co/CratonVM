@@ -818,18 +818,19 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
     // PrintStream registration and the long-standing fd-stream flush contract.
     registry.register("java/io/PrintStream", "flush", "()V", native_printstream_flush);
     registry.register("java/io/PrintStream", "close", "()V", native_printstream_close);
-    // PrintWriter
+    // PrintWriter — use dedicated variants that route through the underlying
+    // Writer when the backing is non-fd (e.g. StringWriter in ModelNode.toString()).
     registry.register(
         "java/io/PrintWriter",
         "write",
         "(Ljava/lang/String;II)V",
-        native_printstream_write_string_range,
+        native_printwriter_write_string_range,
     );
     registry.register(
         "java/io/PrintWriter",
         "write",
         "(Ljava/lang/String;)V",
-        native_printstream_write_string,
+        native_printwriter_write_string,
     );
     registry.register("java/io/PrintWriter", "println", "(Ljava/lang/String;)V", native_println_string);
     registry.register("java/io/PrintWriter", "println", "()V", native_println_void);
@@ -8569,7 +8570,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/io/PrintWriter",
         "write",
         "(I)V",
-        native_noop_with_this,
+        native_printwriter_write_int,
     );
 
     // --- java.lang.StringBuilder ---
@@ -11968,6 +11969,86 @@ fn native_printstream_write_string_range(
     let text = String::from_utf16_lossy(&units[start..end]);
     ctx.record_printed_line(text.clone());
     stream_write(ctx, args, &text);
+    Ok(None)
+}
+
+/// Return the underlying `Writer` from a `PrintWriter` object when it is a
+/// non-fd-backed Writer (e.g. `StringWriter` in `ModelNode.toString()`).
+///
+/// Strategy: try `get_field_by_name("out")` first (set by real JDK bytecode in
+/// `PrintWriter(Writer,boolean)` ctor), then slot-0 (synthetic convention from
+/// `native_printwriter_init_outputstream`).  Returns `None` when the sink is a
+/// `BufferedWriter` (the JDK-wrapping chain for `PrintWriter(OutputStream)` →
+/// those still belong to the fd-table path) or when no Writer backing is found.
+fn printwriter_get_backing_writer(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let by_name = ctx.get_field_by_name(this, "out");
+    let candidate = if matches!(by_name, Value::Object(Some(_))) {
+        by_name
+    } else {
+        ctx.get_field(this, 0)
+    };
+    if let Value::Object(Some(out_obj)) = candidate {
+        if matches!(sink_is_writer(ctx, out_obj), Some(true)) {
+            // Exclude BufferedWriter: it is the JDK wrapper placed by
+            // PrintWriter(OutputStream) → those connect to stdout/stderr and
+            // must keep using the fd-table path.
+            let cid = ctx.class_id_of_object(out_obj);
+            let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+            if cn != "java/io/BufferedWriter" {
+                return Some(out_obj);
+            }
+        }
+    }
+    None
+}
+
+/// `PrintWriter.write(String)V` — routes through the underlying `Writer out`
+/// for real-JDK `PrintWriter(Writer)` constructions such as `ModelNode.toString()`
+/// wrapping a `StringWriter`.  Falls back to the fd path for PrintStream-backed
+/// writers (e.g. JUnit's `PrintWriter(System.out)`).
+fn native_printwriter_write_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        if let Some(out_obj) = printwriter_get_backing_writer(ctx, this) {
+            // Pass the EXISTING Java String arg directly to out.write(String).
+            // Do NOT call write_string_to_writer (which does ctx.create_string → GC hazard:
+            // create_string allocates, potentially triggering a compacting GC that moves
+            // `out_obj` before it is passed to invoke_virtual).
+            let str_val = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let _ = ctx.invoke_virtual(out_obj, "write", "(Ljava/lang/String;)V", &[str_val]);
+            return Ok(None);
+        }
+    }
+    native_printstream_write_string(ctx, args)
+}
+
+/// `PrintWriter.write(String,II)V` — routes through the underlying Writer;
+/// falls back to the fd path for PrintStream-backed writers.
+fn native_printwriter_write_string_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        if let Some(out_obj) = printwriter_get_backing_writer(ctx, this) {
+            // Pass the original String + range args directly — no allocation, no GC hazard.
+            let str_val = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let off_val = args.get(2).cloned().unwrap_or(Value::Int(0));
+            let len_val = args.get(3).cloned().unwrap_or(Value::Int(0));
+            let _ = ctx.invoke_virtual(out_obj, "write", "(Ljava/lang/String;II)V", &[str_val, off_val, len_val]);
+            return Ok(None);
+        }
+    }
+    native_printstream_write_string_range(ctx, args)
+}
+
+/// `PrintWriter.write(int c)V` — routes through the underlying `Writer out`
+/// so single-char writes (e.g. JSON-quoting `"` from `ModelNode.toString()`)
+/// reach the Writer.  No-op for fd-backed streams (those are handled by
+/// `print*`/`println*` natives).
+fn native_printwriter_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        if let Some(out_obj) = printwriter_get_backing_writer(ctx, this) {
+            let ch = args.get(1).cloned().unwrap_or(Value::Int(0));
+            let _ = ctx.invoke_virtual(out_obj, "write", "(I)V", &[ch]);
+            return Ok(None);
+        }
+    }
     Ok(None)
 }
 

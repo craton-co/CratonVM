@@ -488,6 +488,22 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/util/Locale;Ljava/util/ResourceBundle$Control;)Ljava/util/ResourceBundle;",
         rb_get_bundle,
     );
+    // (String, Locale, ClassLoader, Control) — used by WildFly's
+    // `StandardResourceDescriptionResolver.getResourceBundle`
+    // (`ResourceBundle.getBundle(base, locale, bundleLoader.get(),
+    // Control.getNoFallbackControl(FORMAT_PROPERTIES))`). This was the ONE
+    // `getBundle` overload left unintercepted, so it ran the real-JDK bytecode
+    // whose Module/caller-class machinery trips in our partial bootstrap and
+    // surfaced as `MissingResourceException: Can't find bundle for base name
+    // org.wildfly.extension.health.LocalDescriptions` even though the
+    // `.properties` is on the classpath. Route it through the same builder as
+    // the other overloads (which load the resource via `find_resource`).
+    registry.register(
+        rb,
+        "getBundle",
+        "(Ljava/lang/String;Ljava/util/Locale;Ljava/lang/ClassLoader;Ljava/util/ResourceBundle$Control;)Ljava/util/ResourceBundle;",
+        rb_get_bundle,
+    );
     registry.register(
         rb,
         "getBundle",

@@ -5955,6 +5955,42 @@ const SR_FIELD_LENGTH: usize = 2;
 const SW_FIELD_BUF: usize = 0;
 const SW_FIELD_COUNT: usize = 1;
 
+// The synthetic StringWriter layout stores the content `char[]` at slot 0 and
+// the logical length at slot 1. The REAL `java.io.StringWriter` field layout is
+// `Writer.lock` (slot 0, `Ljava/lang/Object;`) + `StringWriter.buf` (slot 1,
+// `Ljava/io/StringBuffer;`) — BOTH reference-typed. CratonVM's descriptor-aware
+// `ctx.set_field` (vm_exec) coerces any value to the declared field type, and
+// `coerce_field_value_by_descriptor` maps an `Int`/`Long` written to an `L`/`[`
+// slot to `Object(None)` (heap.rs:1323). So a naive `set_field(this, 1,
+// Int(count))` is silently dropped to null — every write appears to land but the
+// count reads back as 0, and `toString()` returns "" (the JBoss DMR
+// `ModelNode.toString` → empty `WFLYCTL0013` symptom). To survive the coercion
+// we keep the count inside a 1-element `int[]` holder (a heap object, so it
+// matches the slot-1 reference descriptor and is traced/relocated by the GC).
+fn sw_count(ctx: &mut dyn NativeContext, this: ObjectRef) -> usize {
+    match ctx.get_field(this, SW_FIELD_COUNT) {
+        Value::Object(Some(holder)) => match ctx.get_array_element(holder, 0) {
+            Value::Int(c) => c.max(0) as usize,
+            _ => 0,
+        },
+        // Legacy/uninitialized: an `Int` here would have been coerced to null on
+        // write, so a surviving `Int` only appears if the descriptor path was
+        // bypassed; honor it for robustness.
+        Value::Int(c) => c.max(0) as usize,
+        _ => 0,
+    }
+}
+
+fn sw_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: usize) {
+    if let Value::Object(Some(holder)) = ctx.get_field(this, SW_FIELD_COUNT) {
+        ctx.set_array_element(holder, 0, Value::Int(count as i32));
+        return;
+    }
+    let holder = ctx.new_array(cratonvm_types::ArrayElementType::Int, 1);
+    ctx.set_array_element(holder, 0, Value::Int(count as i32));
+    ctx.set_field(this, SW_FIELD_COUNT, Value::Object(Some(holder)));
+}
+
 fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -6263,7 +6299,7 @@ fn native_sw_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     };
     let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, 32);
     ctx.set_field(this, SW_FIELD_BUF, Value::Object(Some(buf)));
-    ctx.set_field(this, SW_FIELD_COUNT, Value::Int(0));
+    sw_set_count(ctx, this, 0);
     Ok(None)
 }
 
@@ -6278,7 +6314,7 @@ fn native_sw_init_cap(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     let buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, cap.max(1));
     ctx.set_field(this, SW_FIELD_BUF, Value::Object(Some(buf)));
-    ctx.set_field(this, SW_FIELD_COUNT, Value::Int(0));
+    sw_set_count(ctx, this, 0);
     Ok(None)
 }
 
@@ -6288,10 +6324,7 @@ fn sw_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usiz
         _ => return,
     };
     let cap = ctx.array_length(buf);
-    let count = match ctx.get_field(this, SW_FIELD_COUNT) {
-        Value::Int(c) => c as usize,
-        _ => 0,
-    };
+    let count = sw_count(ctx, this);
     if count + needed > cap {
         let new_cap = (cap * 2).max(count + needed);
         let new_buf = ctx.new_array(cratonvm_types::ArrayElementType::Char, new_cap);
@@ -6313,16 +6346,13 @@ fn native_sw_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(None),
     };
     sw_ensure_capacity(ctx, this, 1);
-    let count = match ctx.get_field(this, SW_FIELD_COUNT) {
-        Value::Int(c) => c as usize,
-        _ => 0,
-    };
+    let count = sw_count(ctx, this);
     let buf = match ctx.get_field(this, SW_FIELD_BUF) {
         Value::Object(Some(b)) => b,
         _ => return Ok(None),
     };
     ctx.set_array_element(buf, count, Value::Int(ch));
-    ctx.set_field(this, SW_FIELD_COUNT, Value::Int((count + 1) as i32));
+    sw_set_count(ctx, this, count + 1);
     Ok(None)
 }
 
@@ -6337,10 +6367,7 @@ fn native_sw_write_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     let chars: Vec<u16> = s.encode_utf16().collect();
     sw_ensure_capacity(ctx, this, chars.len());
-    let count = match ctx.get_field(this, SW_FIELD_COUNT) {
-        Value::Int(c) => c as usize,
-        _ => 0,
-    };
+    let count = sw_count(ctx, this);
     let buf = match ctx.get_field(this, SW_FIELD_BUF) {
         Value::Object(Some(b)) => b,
         _ => return Ok(None),
@@ -6348,11 +6375,7 @@ fn native_sw_write_string(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     for (i, &ch) in chars.iter().enumerate() {
         ctx.set_array_element(buf, count + i, Value::Int(ch as i32));
     }
-    ctx.set_field(
-        this,
-        SW_FIELD_COUNT,
-        Value::Int((count + chars.len()) as i32),
-    );
+    sw_set_count(ctx, this, count + chars.len());
     Ok(None)
 }
 
@@ -6374,10 +6397,7 @@ fn native_sw_write_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => 0,
     };
     sw_ensure_capacity(ctx, this, len);
-    let count = match ctx.get_field(this, SW_FIELD_COUNT) {
-        Value::Int(c) => c as usize,
-        _ => 0,
-    };
+    let count = sw_count(ctx, this);
     let buf = match ctx.get_field(this, SW_FIELD_BUF) {
         Value::Object(Some(b)) => b,
         _ => return Ok(None),
@@ -6386,7 +6406,7 @@ fn native_sw_write_chars(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         let v = ctx.get_array_element(src, off + i);
         ctx.set_array_element(buf, count + i, v);
     }
-    ctx.set_field(this, SW_FIELD_COUNT, Value::Int((count + len) as i32));
+    sw_set_count(ctx, this, count + len);
     Ok(None)
 }
 
@@ -6409,10 +6429,7 @@ fn native_sw_write_string_off(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     let chars: Vec<u16> = s.encode_utf16().skip(off).take(len).collect();
     sw_ensure_capacity(ctx, this, chars.len());
-    let count = match ctx.get_field(this, SW_FIELD_COUNT) {
-        Value::Int(c) => c as usize,
-        _ => 0,
-    };
+    let count = sw_count(ctx, this);
     let buf = match ctx.get_field(this, SW_FIELD_BUF) {
         Value::Object(Some(b)) => b,
         _ => return Ok(None),
@@ -6420,11 +6437,7 @@ fn native_sw_write_string_off(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     for (i, &ch) in chars.iter().enumerate() {
         ctx.set_array_element(buf, count + i, Value::Int(ch as i32));
     }
-    ctx.set_field(
-        this,
-        SW_FIELD_COUNT,
-        Value::Int((count + chars.len()) as i32),
-    );
+    sw_set_count(ctx, this, count + chars.len());
     Ok(None)
 }
 
@@ -6433,10 +6446,7 @@ fn native_sw_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let count = match ctx.get_field(this, SW_FIELD_COUNT) {
-        Value::Int(c) => c as usize,
-        _ => 0,
-    };
+    let count = sw_count(ctx, this);
     let buf = match ctx.get_field(this, SW_FIELD_BUF) {
         Value::Object(Some(b)) => b,
         _ => return Ok(Some(Value::Object(None))),

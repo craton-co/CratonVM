@@ -1068,11 +1068,14 @@ pub(crate) fn sb_state(
 
 /// Helper: ensure the StringBuilder has capacity for `additional` more chars.
 /// Returns the char[] buffer (possibly newly allocated and copied).
+/// Returns `(updated_this, buf)`.  The first element is the post-GC ObjectRef
+/// for `this`; callers MUST use it for all subsequent writes to the StringBuilder
+/// because `ctx.new_array` can trigger a moving GC that relocates `this`.
 pub(crate) fn sb_ensure_capacity(
     ctx: &mut dyn NativeContext,
     this: cratonvm_types::ObjectRef,
     additional: usize,
-) -> cratonvm_types::ObjectRef {
+) -> (cratonvm_types::ObjectRef, cratonvm_types::ObjectRef) {
     use cratonvm_types::ArrayElementType;
 
     let (buf, count) = sb_state(ctx, this);
@@ -1080,29 +1083,37 @@ pub(crate) fn sb_ensure_capacity(
     let old_cap = buf.map_or(0, |b| ctx.array_length(b));
 
     if count + additional <= old_cap {
-        return buf.unwrap();
+        return (this, buf.unwrap());
     }
 
     // Grow: max(old_cap * 2 + 2, count + additional)
     let new_cap = std::cmp::max(old_cap * 2 + 2, count + additional);
-    let new_buf = ctx.new_array(ArrayElementType::Char, new_cap);
 
+    // Pin `this` before `ctx.new_array` — allocation can trigger a moving GC
+    // that relocates `this`, making the Rust-local copy stale.
+    let this_pin = ctx.pin_native_root(this);
+    let new_buf = ctx.new_array(ArrayElementType::Char, new_cap);
+    // Re-read `this` from the pin; GC updated it if the object moved.
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+
+    // Re-read old_buf via the GC-updated `this` (GC also updates object fields).
     // audit-round5 fix #6 (HIGH): use the `bulk_array_copy` intrinsic
     // (single `copy_nonoverlapping` in the VM override) instead of a
     // per-element `get_array_element` / `set_array_element` loop. This
     // collapses 2N virtual trait dispatches into one bulk call on the
     // StringBuilder grow path.
-    if let Some(old_buf) = buf {
+    if let Value::Object(Some(old_buf)) = ctx.get_field(this, 0) {
         let _ = ctx.bulk_array_copy(old_buf, 0, new_buf, 0, count);
     }
 
     ctx.set_field(this, 0, Value::Object(Some(new_buf)));
-    new_buf
+    (this, new_buf)
 }
 
 /// Helper: append a slice of u16 chars to a StringBuilder.
 pub(crate) fn sb_append_chars(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, chars: &[u16]) {
-    let buf = sb_ensure_capacity(ctx, this, chars.len());
+    let (this, buf) = sb_ensure_capacity(ctx, this, chars.len());
     let (_, count) = sb_state(ctx, this);
     let count = count as usize;
     for (i, &ch) in chars.iter().enumerate() {
@@ -1123,7 +1134,12 @@ pub(crate) fn native_sb_init_default(ctx: &mut dyn NativeContext, args: &[Value]
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Pin `this` before `ctx.new_array` — a moving GC during allocation would
+    // relocate `this`, leaving the Rust-local copy stale.
+    let this_pin = ctx.pin_native_root(this);
     let buf = ctx.new_array(ArrayElementType::Char, 16);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     ctx.set_field(this, 0, Value::Object(Some(buf)));
     ctx.set_field(this, 1, Value::Int(0));
     Ok(None)
@@ -1141,7 +1157,10 @@ pub(crate) fn native_sb_init_string(ctx: &mut dyn NativeContext, args: &[Value])
     };
     let chars: Vec<u16> = text.encode_utf16().collect();
     let cap = chars.len() + 16;
+    let this_pin = ctx.pin_native_root(this);
     let buf = ctx.new_array(ArrayElementType::Char, cap);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     for (i, &ch) in chars.iter().enumerate() {
         ctx.set_array_element(buf, i, Value::Int(ch as i32));
     }
@@ -1173,6 +1192,9 @@ pub(crate) fn native_sb_init_charsequence(
     };
     // Real JDK `AbstractStringBuilder(CharSequence)` calls `seq.length()`, so a
     // null sequence throws NPE; coerce any non-null CharSequence to its text.
+    // Pin `this` before any allocating call: `invoke_to_string` and `new_array`
+    // can both trigger a moving GC that relocates `this`.
+    let this_pin = ctx.pin_native_root(this);
     let text = match args.get(1) {
         Some(Value::Object(Some(o))) => invoke_to_string(ctx, *o).unwrap_or_default(),
         _ => String::new(),
@@ -1180,6 +1202,8 @@ pub(crate) fn native_sb_init_charsequence(
     let chars: Vec<u16> = text.encode_utf16().collect();
     let cap = chars.len() + 16;
     let buf = ctx.new_array(ArrayElementType::Char, cap);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     for (i, &ch) in chars.iter().enumerate() {
         ctx.set_array_element(buf, i, Value::Int(ch as i32));
     }
@@ -1198,7 +1222,10 @@ pub(crate) fn native_sb_init_capacity(ctx: &mut dyn NativeContext, args: &[Value
         Some(Value::Int(v)) => std::cmp::max(*v, 0) as usize,
         _ => 16,
     };
+    let this_pin = ctx.pin_native_root(this);
     let buf = ctx.new_array(ArrayElementType::Char, cap);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
     ctx.set_field(this, 0, Value::Object(Some(buf)));
     ctx.set_field(this, 1, Value::Int(0));
     Ok(None)
@@ -1276,7 +1303,7 @@ pub(crate) fn native_sb_append_char_array_off_len(
     // audit-round5 fix #6 (HIGH): both sides are Java `char[]` — go
     // through `bulk_array_copy` (single `copy_nonoverlapping` in the VM
     // override) instead of materialising a per-element Rust `Vec<u16>`.
-    let buf = sb_ensure_capacity(ctx, this, copy_len);
+    let (this, buf) = sb_ensure_capacity(ctx, this, copy_len);
     let (_, count) = sb_state(ctx, this);
     let count = count as usize;
     let _ = ctx.bulk_array_copy(arr, start, buf, count, copy_len);
@@ -1300,7 +1327,7 @@ pub(crate) fn native_sb_append_char_array(
     let n = ctx.array_length(arr);
     // audit-round5 fix #6 (HIGH): bulk-copy directly into the SB buffer
     // (see `native_sb_append_char_array_off_len` for rationale).
-    let buf = sb_ensure_capacity(ctx, this, n);
+    let (this, buf) = sb_ensure_capacity(ctx, this, n);
     let (_, count) = sb_state(ctx, this);
     let count = count as usize;
     let _ = ctx.bulk_array_copy(arr, 0, buf, count, n);
@@ -1658,7 +1685,7 @@ pub(crate) fn sb_read_chars(ctx: &dyn NativeContext, this: cratonvm_types::Objec
 pub(crate) fn sb_write_chars(ctx: &mut dyn NativeContext, this: cratonvm_types::ObjectRef, chars: &[u16]) {
     let current_count = sb_state(ctx, this).1 as usize;
     let additional = chars.len().saturating_sub(current_count);
-    let buf = sb_ensure_capacity(ctx, this, additional);
+    let (this, buf) = sb_ensure_capacity(ctx, this, additional);
     for (i, &ch) in chars.iter().enumerate() {
         ctx.set_array_element(buf, i, Value::Int(ch as i32));
     }
@@ -1880,19 +1907,22 @@ pub(crate) fn native_sb_set_length(ctx: &mut dyn NativeContext, args: &[Value]) 
     let count = count as usize;
     if new_len > count {
         // Extend with null chars
-        let buf = sb_ensure_capacity(ctx, this, new_len - count);
+        let (this, buf) = sb_ensure_capacity(ctx, this, new_len - count);
         for i in count..new_len {
             ctx.set_array_element(buf, i, Value::Int(0));
         }
-    } else if new_len < count {
-        // Just zero the excess (optional for correctness), but must update count
-        if let Some(buf) = buf {
-            for i in new_len..count {
-                ctx.set_array_element(buf, i, Value::Int(0));
+        ctx.set_field(this, 1, Value::Int(new_len as i32));
+    } else {
+        if new_len < count {
+            // Just zero the excess (optional for correctness), but must update count
+            if let Some(buf) = buf {
+                for i in new_len..count {
+                    ctx.set_array_element(buf, i, Value::Int(0));
+                }
             }
         }
+        ctx.set_field(this, 1, Value::Int(new_len as i32));
     }
-    ctx.set_field(this, 1, Value::Int(new_len as i32));
     Ok(None)
 }
 

@@ -1077,7 +1077,13 @@ impl VmHeap {
     /// live objects in non-collected regions from dead objects.
     pub fn is_addr_live(&self, addr: usize) -> bool {
         match self {
-            VmHeap::Generational(_) => false,
+            // A minor (young) GC never collects the old generation, so any
+            // old-gen address is live. Reference processing uses this to avoid
+            // clearing weak/soft refs whose referent was tenured in an earlier
+            // cycle (see `GenerationalHeap::is_old_gen_addr`). Returning `false`
+            // here unconditionally — the prior behavior — cleared every weak
+            // reference to a promoted object on the next young GC.
+            VmHeap::Generational(h) => h.is_old_gen_addr(addr),
             VmHeap::G1(h) => h.is_addr_in_live_region(addr),
         }
     }

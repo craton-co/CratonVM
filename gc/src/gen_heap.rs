@@ -1643,6 +1643,26 @@ impl GenerationalHeap {
         (og.base_ptr() as usize, og.capacity())
     }
 
+    /// True when `addr` lies inside the old generation arena.
+    ///
+    /// Used by weak/soft/phantom reference processing after a **young** GC to
+    /// decide whether a referent survived. A minor collection never touches the
+    /// old generation, so every old-gen object is live for the purpose of
+    /// reference clearing — the referent must NOT be cleared just because it was
+    /// promoted out of the young space in an earlier cycle.
+    ///
+    /// Without this, `VmHeap::is_addr_live` returned `false` for the
+    /// generational collector and `process_references_after_gc`'s
+    /// `pointer_map.contains_key(addr) || is_addr_live(addr)` predicate cleared
+    /// EVERY weak reference whose referent had been tenured to old gen. Visible
+    /// symptom: a `WeakReference<ClassLoader>` (e.g. WildFly's
+    /// `StandardResourceDescriptionResolver.bundleLoader`) read back null after
+    /// the first young GC even though the classloader was strongly reachable,
+    /// so `ResourceBundle.getBundle(.., null, ..)` threw `MissingResourceException`.
+    pub fn is_old_gen_addr(&self, addr: usize) -> bool {
+        self.old_gen.lock().contains(addr as *const u8)
+    }
+
     /// Access the old generation directly (for concurrent sweep).
     /// Returns a lock guard.
     pub fn old_gen_lock(&self) -> parking_lot::MutexGuard<'_, OldGen> {
