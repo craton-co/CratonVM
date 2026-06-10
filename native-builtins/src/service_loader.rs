@@ -924,25 +924,55 @@ fn native_sl_stream(
         let type_final = ctx.read_native_pin(type_pin, type_class);
         let ctor_final = ctx.read_native_pin(ctor_pin, ctor);
 
-        // new ServiceLoader$ProviderImpl(service, type, ctor, acc) — the
+        // new ServiceLoader$ProviderImpl(service, type, ctor[, acc]) — the
         // classpath-flavour constructor (factoryMethod = null, acc = null).
-        // JDK 22: descriptor includes AccessControlContext as the 4th param.
+        // JDK 17–23: 4-arg form with a trailing AccessControlContext.
+        // JDK 24+ (security-manager removal): the acc parameter is GONE —
+        // 3-arg form. Hardcoding either breaks the other java-home (jdk-25
+        // runs hit NoSuchMethodError on the 4-arg call, cascading into
+        // "Log4j2 could not find a logging implementation"). Probe both and
+        // remember which form this JDK has (0=unknown, 1=4-arg, 2=3-arg).
+        const CTOR_4ARG: &str =
+            "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/reflect/Constructor;Ljava/security/AccessControlContext;)V";
+        const CTOR_3ARG: &str =
+            "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/reflect/Constructor;)V";
+        static CTOR_FORM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
         let provider = ctx.alloc_object(pi_cid, pi_fields);
         let provider_pin = ctx.pin_native_root(provider);
-        if let Err(e) = ctx.invoke(
-            PROVIDER_IMPL,
-            "<init>",
-            "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/reflect/Constructor;Ljava/security/AccessControlContext;)V",
-            &[
-                Value::Object(Some(provider)),
+        let mut ctor_ok = false;
+        let mut ctor_err = None;
+        for (tag, desc) in [(1u8, CTOR_4ARG), (2u8, CTOR_3ARG)] {
+            let remembered = CTOR_FORM.load(std::sync::atomic::Ordering::Relaxed);
+            if remembered != 0 && remembered != tag {
+                continue;
+            }
+            // Re-read pins: a failed prior attempt may have allocated (GC).
+            let provider_now = ctx.read_native_pin(provider_pin, provider);
+            let type_now = ctx.read_native_pin(type_pin, type_final);
+            let ctor_now = ctx.read_native_pin(ctor_pin, ctor_final);
+            let mut args = vec![
+                Value::Object(Some(provider_now)),
                 service,
-                Value::Object(Some(type_final)),
-                Value::Object(Some(ctor_final)),
-                Value::Object(None), // acc = null (deprecated in JDK 17+)
-            ],
-        ) {
+                Value::Object(Some(type_now)),
+                Value::Object(Some(ctor_now)),
+            ];
+            if tag == 1 {
+                args.push(Value::Object(None)); // acc = null
+            }
+            match ctx.invoke(PROVIDER_IMPL, "<init>", desc, &args) {
+                Ok(_) => {
+                    CTOR_FORM.store(tag, std::sync::atomic::Ordering::Relaxed);
+                    ctor_ok = true;
+                    break;
+                }
+                Err(e) => ctor_err = Some(e),
+            }
+        }
+        if !ctor_ok {
             if diag {
-                eprintln!("[SL-DBG]   stream skip (ProviderImpl <init> {fqn} → {e:?})");
+                eprintln!(
+                    "[SL-DBG]   stream skip (ProviderImpl <init> {fqn} → {ctor_err:?})"
+                );
             }
             ctx.unpin_native_roots(type_pin);
             continue;
