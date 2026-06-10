@@ -55,7 +55,7 @@
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
-use cratonvm_types::error::{MethodCallResult, RuntimeError};
+use cratonvm_types::error::{MethodCallFailed, MethodCallResult, RuntimeError};
 
 use crate::alloc_concurrent_synthetic;
 use crate::crypto_impl;
@@ -404,6 +404,32 @@ fn alloc_keypair(ctx: &mut dyn NativeContext, pubk: ObjectRef, privk: ObjectRef)
     kp
 }
 
+/// Construct and throw a real `java/security/NoSuchAlgorithmException` with
+/// `msg`, mirroring the JDK contract for an algorithm we recognise but cannot
+/// generate keys for. NSAE is a `GeneralSecurityException`, so callers can
+/// catch it the same way they would under HotSpot.
+///
+/// No-synthetic-stubs policy: the previous fallback here minted a `KeyPair`
+/// with empty DER and `key_id == 0`, presenting failed keygen as success — any
+/// app that then signed/encrypted with it got garbage or a false success. We
+/// fail loudly instead. If the real exception class can't be constructed we
+/// still raise a catchable `SecurityException` rather than returning an empty
+/// key.
+fn throw_no_such_algorithm(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    let detail = ctx.create_string(msg);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/security/NoSuchAlgorithmException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return MethodCallFailed::ExceptionThrown(exc);
+    }
+    RuntimeError::SecurityException {
+        message: msg.to_string(),
+    }
+    .into()
+}
+
 // ---------------------------------------------------------------------------
 // KeyPairGenerator natives
 // ---------------------------------------------------------------------------
@@ -548,12 +574,15 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return Ok(Some(Value::Object(Some(alloc_keypair(ctx, pub_obj, priv_obj)))));
     }
 
-    // Fallback: synthetic empty keys so the caller doesn't NPE.  The
-    // associated `Signature` natives return `false` from `verify` in
-    // this case (no key_id wired through).
-    let pub_obj = alloc_public_key(ctx, algo, bits as i32, &[], 0);
-    let priv_obj = alloc_private_key(ctx, algo, bits as i32, &[], 0);
-    Ok(Some(Value::Object(Some(alloc_keypair(ctx, pub_obj, priv_obj)))))
+    // Recognised but not implemented (ML-KEM, ML-DSA, Ed25519, X25519, or an
+    // unknown name). Real key generation is unavailable, so honour the JDK
+    // contract and throw `NoSuchAlgorithmException` rather than minting a
+    // KeyPair with empty key material (no-synthetic-stubs policy). RSA and EC
+    // returned above with real keys.
+    Err(throw_no_such_algorithm(
+        ctx,
+        &format!("{} KeyPairGenerator not available", algo_name(algo)),
+    ))
 }
 
 fn kpg_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -936,5 +965,74 @@ mod tests {
         assert_eq!(algo_name(ALGO_EC), "EC");
         assert_eq!(algo_name(ALGO_ED25519), "Ed25519");
         assert_eq!(algo_name(-1), "Unknown");
+    }
+
+    /// No-synthetic-stubs policy: a `KeyPairGenerator` for an algorithm we
+    /// recognise but cannot implement (ML-KEM, ML-DSA, Ed25519, X25519) — or an
+    /// outright unknown name — must throw from `generateKeyPair`, never return a
+    /// `KeyPair` with empty key material. The previous fallback minted an
+    /// empty-DER / `key_id == 0` key, presenting failed keygen as success.
+    #[test]
+    fn unimplemented_algorithm_keygen_throws_not_empty_key() {
+        for algo in ["ML-KEM-512", "ML-KEM-768", "ML-DSA-44", "ML-DSA-65", "X25519", "Ed25519", "Totally-Bogus"] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let name = ctx.create_string(algo);
+            let kpg = kpg_get_instance(&mut ctx, &[Value::Object(Some(name))])
+                .expect("getInstance should not fail")
+                .expect("getInstance should return a KeyPairGenerator");
+            let err = kpg_generate_key_pair(&mut ctx, &[kpg]).expect_err(&format!(
+                "{algo} generateKeyPair must throw, not silently return an empty key"
+            ));
+            // Real-JDK mode constructs a genuine NoSuchAlgorithmException; the
+            // mock's `new_object_initialized` yields a Throwable object, so we
+            // get `ExceptionThrown` (the catchable path) rather than the
+            // `SecurityException` defensive fallback.
+            match err {
+                MethodCallFailed::ExceptionThrown(_) => {}
+                other => panic!(
+                    "{algo}: expected ExceptionThrown(NoSuchAlgorithmException), got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// Guard against the fail-closed change accidentally catching RSA: RSA must
+    /// still produce a `KeyPair` backed by real DER + a non-zero `key_id`. Uses
+    /// a small key size to keep the software keygen fast.
+    #[test]
+    fn rsa_keygen_still_returns_real_key_material() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let name = ctx.create_string("RSA");
+        let kpg = kpg_get_instance(&mut ctx, &[Value::Object(Some(name))])
+            .unwrap()
+            .unwrap();
+        let kpg_ref = match kpg {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected KeyPairGenerator, got {other:?}"),
+        };
+        // initialize(512) — exercises the real keygen path without the cost of
+        // a 2048-bit prime search.
+        kpg_initialize_int(&mut ctx, &[Value::Object(Some(kpg_ref)), Value::Int(512)]).unwrap();
+        let kp = match kpg_generate_key_pair(&mut ctx, &[Value::Object(Some(kpg_ref))])
+            .unwrap()
+            .unwrap()
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected KeyPair object, got {other:?}"),
+        };
+        let pubk = match ctx.get_field(kp, 0) {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected public key, got {other:?}"),
+        };
+        assert!(
+            matches!(ctx.get_field(pubk, KEY_FIELD_KEYID), Value::Long(id) if id != 0),
+            "RSA public key must carry a real key_id"
+        );
+        match ctx.get_field(pubk, KEY_FIELD_DER) {
+            Value::Object(Some(der)) => {
+                assert!(ctx.array_length(der) > 0, "RSA public DER must be non-empty")
+            }
+            other => panic!("expected DER byte[], got {other:?}"),
+        }
     }
 }
