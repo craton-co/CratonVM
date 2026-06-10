@@ -1033,13 +1033,14 @@ fn native_jboss_logging_logger_do_log(ctx: &mut dyn NativeContext, args: &[Value
 }
 
 /// Same as `do_log` but for the printf-style `doLogf(Level,String fqcn,
-/// String format,Object[] params,Throwable)`. We don't attempt actual
-/// printf substitution — emit the format string verbatim, which is
-/// sufficient to make boot progress visible.
+/// String format,Object[] params,Throwable)`. Substitutes `%s`/`%%`/`%n`
+/// from the params array so callers like `WFLYCTL0013` show their full
+/// failure description instead of literal `%s`.
 fn native_jboss_logging_logger_do_logf(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
     let level_obj = match args.get(1) { Some(Value::Object(o)) => *o, _ => None };
     let format_obj = match args.get(3) { Some(Value::Object(o)) => *o, _ => None };
+    let params_obj = match args.get(4) { Some(Value::Object(o)) => *o, _ => None };
     let throwable_obj = match args.get(5) { Some(Value::Object(o)) => *o, _ => None };
     let logger_name = this
         .and_then(|o| match ctx.get_field_by_name(o, "name") {
@@ -1056,7 +1057,60 @@ fn native_jboss_logging_logger_do_logf(ctx: &mut dyn NativeContext, args: &[Valu
     let format = format_obj
         .and_then(|o| ctx.read_string(o))
         .unwrap_or_default();
-    eprintln!("{level_name} [{logger_name}] {format}");
+    // Substitute %s/%% /%n from the params Object[] so structured messages
+    // (e.g. WFLYCTL0013 failure description) are visible in the output.
+    let message = if let Some(params) = params_obj {
+        let n = ctx.array_length(params);
+        // Build strings up-front so we don't hold a borrow while calling
+        // ctx.invoke_virtual (which needs &mut ctx).
+        let elems: Vec<Value> = (0..n).map(|i| ctx.get_array_element(params, i)).collect();
+        let mut param_strs: Vec<String> = Vec::with_capacity(n);
+        for elem in elems {
+            let s = match elem {
+                Value::Object(Some(o)) => {
+                    if let Some(s) = ctx.read_string(o) {
+                        s
+                    } else {
+                        let cn = ctx.class_name_of_id(ctx.class_id_of_object(o))
+                            .unwrap_or_else(|| "?".to_string());
+                        let ts_result = ctx.invoke_virtual(o, "toString", "()Ljava/lang/String;", &[]);
+                        match ts_result {
+                            Ok(Some(Value::Object(Some(sr)))) => {
+                                ctx.read_string(sr).unwrap_or_else(|| format!("{{{cn}}}"))
+                            }
+                            _ => format!("{{{cn}}}"),
+                        }
+                    }
+                }
+                Value::Object(None) => "null".to_string(),
+                v => format!("{v:?}"),
+            };
+            param_strs.push(s);
+        }
+        let mut result = String::with_capacity(format.len() + 64);
+        let mut param_idx = 0usize;
+        let mut chars = format.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                match chars.peek().copied() {
+                    Some('s') | Some('S') => {
+                        chars.next();
+                        result.push_str(param_strs.get(param_idx).map(|s| s.as_str()).unwrap_or("?"));
+                        param_idx += 1;
+                    }
+                    Some('%') => { chars.next(); result.push('%'); }
+                    Some('n') => { chars.next(); result.push('\n'); }
+                    _ => result.push('%'),
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    } else {
+        format
+    };
+    eprintln!("{level_name} [{logger_name}] {message}");
     if let Some(t) = throwable_obj {
         dump_throwable_to_stderr(ctx, t, "    ");
     }
