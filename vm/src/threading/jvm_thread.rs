@@ -41,6 +41,60 @@ pub type SoaPool = Vec<(Vec<u64>, Vec<u8>)>;
 const MAX_POOL_SIZE: usize = 64;
 
 // ---------------------------------------------------------------------------
+// GcBlockState — blocked-region GC maintenance state (shared with registry)
+// ---------------------------------------------------------------------------
+
+/// Blocked-region GC state for one thread, shared `JvmThread` ↔ `ThreadRegistry`
+/// (same pattern as `root_snapshot`).
+///
+/// A thread parked in a blocking native (`Object.wait`, `Thread.join`,
+/// `LockSupport.park`, `ReferenceQueue.remove`, …) is excluded from the
+/// stop-the-world barrier (`GcBarrier::threads_blocked`), so any number of
+/// GCs can complete while it sleeps. Two things would otherwise go stale:
+///
+/// 1. its deposited `root_snapshot` — scanned as roots by every GC; after the
+///    first missed *moving* collection the snapshot addresses point into a
+///    vacated semispace, and once that space cycles back around and is
+///    collected again the collector evacuates garbage "objects" through
+///    them (writing forwarding state into the interior of innocent live
+///    objects — the H2 TestScript stale-receiver SEGV);
+/// 2. its frames — `check_post_block_gc` only applied the pointer map when a
+///    STW was active at the exact wake instant; a GC that completed mid-block
+///    left every local/operand-stack ref pointing at recycled from-space.
+///
+/// The GC initiator therefore calls
+/// `ThreadRegistry::fold_pointer_map_into_blocked` (`update_all_roots`
+/// step 20, under STW) for every thread whose `in_blocked_region` flag is
+/// set: it remaps the thread's `root_snapshot` in place and composes the
+/// GC's pointer map into `fixup` (chaining `orig → cur → new` across
+/// multiple missed GCs, keyed by the address the frames still hold). On
+/// wake the thread applies and clears `fixup` in `check_post_block_gc`.
+pub struct GcBlockState {
+    /// True from `deposit_root_snapshot` (just before the thread blocks)
+    /// until the end of `check_post_block_gc` (after the fixup is applied).
+    pub in_blocked_region: AtomicBool,
+    /// Composed `frame-held address → current address` map accumulated by GC
+    /// initiators for every collection that completed while the thread was
+    /// in a blocked region. Applied + cleared on wake.
+    pub fixup: PLMutex<std::collections::HashMap<usize, usize>>,
+}
+
+impl GcBlockState {
+    pub fn new() -> Self {
+        Self {
+            in_blocked_region: AtomicBool::new(false),
+            fixup: PLMutex::new(std::collections::HashMap::new()),
+        }
+    }
+}
+
+impl Default for GcBlockState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ParkState — binary semaphore for LockSupport.park() / unpark()
 // ---------------------------------------------------------------------------
 
@@ -217,6 +271,12 @@ pub struct JvmThread {
     /// Updated at safepoints and before blocking operations.
     pub root_snapshot: Arc<parking_lot::Mutex<Vec<ObjectRef>>>,
 
+    /// Blocked-region GC state: shared with ThreadRegistry so a GC initiator
+    /// can maintain this thread's roots while it is parked in a blocking
+    /// native (`Object.wait` / `Thread.join` / `LockSupport.park` /
+    /// `ReferenceQueue.remove`). See [`GcBlockState`].
+    pub gc_block_state: Arc<GcBlockState>,
+
     /// GC roots for `Value::Object` arguments popped from the operand stack into a
     /// Rust `Vec` while a registered native runs (`safe_native_call`). Those refs
     /// are no longer on the Java stack until the callee returns, so without this
@@ -382,6 +442,7 @@ impl JvmThread {
             java_thread_obj: None,
             park_state: Arc::new(ParkState::new()),
             root_snapshot: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            gc_block_state: Arc::new(GcBlockState::new()),
             native_pin_roots: Vec::new(),
             native_pending_return: None,
             invoke_cache: InvokeCache::new(),

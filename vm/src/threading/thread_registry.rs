@@ -15,7 +15,7 @@ use std::thread::JoinHandle;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
-use crate::threading::jvm_thread::{ParkState, ThreadId};
+use crate::threading::jvm_thread::{GcBlockState, ParkState, ThreadId};
 use crate::types::ObjectRef;
 
 /// An entry in the thread registry for one JVM thread.
@@ -44,6 +44,11 @@ struct ThreadEntry {
     /// Root snapshot: ObjectRefs from this thread's frames, deposited at safepoints
     /// and before blocking operations. Used by GC to scan all threads' roots.
     root_snapshot: Arc<Mutex<Vec<ObjectRef>>>,
+    /// Blocked-region GC state (shared with the JvmThread, like `root_snapshot`):
+    /// lets a GC initiator remap this thread's snapshot and accumulate frame
+    /// fixups while the thread is parked in a blocking native. See
+    /// `GcBlockState` and `fold_pointer_map_into_blocked`.
+    gc_block_state: Arc<GcBlockState>,
     /// T1.5.1 — pending async exception slot. Set by cross-thread
     /// `Thread.stop` / `Thread.stop0` calls; consumed by the target
     /// thread's next `safepoint_check`.
@@ -125,6 +130,7 @@ impl ThreadRegistry {
             park_state: park_state.clone(),
             interrupted: Arc::new(AtomicBool::new(false)),
             root_snapshot: Arc::new(Mutex::new(Vec::new())),
+            gc_block_state: Arc::new(GcBlockState::new()),
             async_exception_slot: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };
         self.threads.lock().insert(thread_id, entry);
@@ -440,6 +446,106 @@ impl ThreadRegistry {
             }
         }
         all_roots
+    }
+
+    /// Set the blocked-region GC state Arc for a thread (share JvmThread's
+    /// state with the registry, like `set_root_snapshot`).
+    pub fn set_gc_block_state(&self, thread_id: ThreadId, state: Arc<GcBlockState>) {
+        if let Some(entry) = self.threads.lock().get_mut(&thread_id) {
+            entry.gc_block_state = state;
+        }
+    }
+
+    /// Blocked-thread root maintenance — called by the GC initiator (under
+    /// STW, before `complete_gc`) with the collection's pointer map.
+    ///
+    /// For every alive thread currently inside a blocked region (parked in
+    /// `Object.wait` / `Thread.join` / `LockSupport.park` /
+    /// `ReferenceQueue.remove`, hence excluded from the barrier and unable
+    /// to apply this map itself):
+    ///
+    /// 1. compose the map into the thread's pending frame fixup, chaining
+    ///    `orig → cur → new` so the entry stays keyed by the address the
+    ///    thread's frames still hold, no matter how many GCs it sleeps
+    ///    through;
+    /// 2. seed first-move entries from the (pre-remap) snapshot — a snapshot
+    ///    address with no existing chain IS the frame-held address;
+    /// 3. remap the thread's `root_snapshot` in place so the NEXT collection
+    ///    scans live addresses instead of a vacated semispace (scanning a
+    ///    stale snapshot is itself a heap corruptor: the collector would
+    ///    evacuate garbage "objects" through recycled addresses).
+    ///
+    /// Threads NOT in a blocked region never need this: `request_stw` counts
+    /// them in `expected`, so no GC can complete before they refresh their
+    /// snapshot and self-apply the map at a safepoint.
+    ///
+    /// The thread applies + clears its fixup in `check_post_block_gc` on
+    /// wake. While it still holds stale frame addresses the only consumers
+    /// are this fold (keyed by those addresses) and the wake-side apply,
+    /// so the chain stays consistent.
+    pub fn fold_pointer_map_into_blocked(
+        &self,
+        pointer_map: &HashMap<usize, usize>,
+    ) {
+        if pointer_map.is_empty() {
+            return;
+        }
+        let dbg = std::env::var_os("CRATONVM_DBG_BLOCKGC").is_some();
+        let threads = self.threads.lock();
+        for (tid, entry) in threads.iter() {
+            if !entry.alive.load(Ordering::Acquire) {
+                continue;
+            }
+            if !entry
+                .gc_block_state
+                .in_blocked_region
+                .load(Ordering::Acquire)
+            {
+                continue;
+            }
+            let mut fixup = entry.gc_block_state.fixup.lock();
+            let mut snapshot = entry.root_snapshot.lock();
+            // Addresses already chained (frame holds the ORIG key, the
+            // snapshot holds the CUR value) — collected before composing so
+            // the snapshot pass below can tell first moves apart from
+            // already-chained objects.
+            let chained: rustc_hash::FxHashSet<usize> =
+                fixup.values().copied().collect();
+            let mut composed = 0usize;
+            let mut seeded = 0usize;
+            for cur in fixup.values_mut() {
+                if let Some(&new) = pointer_map.get(cur) {
+                    *cur = new;
+                    composed += 1;
+                }
+            }
+            for r in snapshot.iter_mut() {
+                let s = r.as_ptr() as usize;
+                if let Some(&new) = pointer_map.get(&s) {
+                    if !chained.contains(&s) {
+                        // First move of this object while blocked: the frames
+                        // hold `s` itself. `or_insert` guards the ABA case
+                        // where `s` was recycled and is also an existing
+                        // chain key for a DIFFERENT (older) object.
+                        fixup.entry(s).or_insert(new);
+                        seeded += 1;
+                    }
+                    // SAFETY: `new` comes from the GC pointer map and points
+                    // at the relocated object's header.
+                    *r = unsafe { ObjectRef::from_raw(new as *mut u8) };
+                }
+            }
+            if dbg && (composed > 0 || seeded > 0) {
+                eprintln!(
+                    "[blockgc] fold tid={} composed={} seeded={} fixup_total={} snapshot_len={}",
+                    tid.0,
+                    composed,
+                    seeded,
+                    fixup.len(),
+                    snapshot.len()
+                );
+            }
+        }
     }
 
     /// Get the number of registered threads.

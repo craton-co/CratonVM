@@ -21791,6 +21791,52 @@ fn native_cond_signal_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 
 // --- CountDownLatch ---
 
+// The real `java.util.concurrent.CountDownLatch` has a single field,
+// `sync: Ljava/util/concurrent/CountDownLatch$Sync;` — a REFERENCE slot. The
+// synthetic natives below own every public entry point (init/countDown/await/
+// getCount/toString), so the slot is exclusively theirs — but a bare
+// `set_field(this, 0, Int(count))` is silently coerced to `Object(None)` by
+// the descriptor-aware write path (`coerce_field_value_by_descriptor` maps a
+// primitive written to an `L` slot to null; same trap as the StringWriter
+// count, see native-io). Every later read then sees `Object(None)` → count 0 →
+// `await()` returns immediately and `countDown()` no-ops. Visible symptom:
+// WildFly's subsystem-test `waitForSetup()` fell through before the boot
+// thread assigned `bootSuccess`, so `isSuccessfulBoot()` read false and the
+// test failed with "Subsystem boot failed!" while boot later succeeded.
+// Store the count in a 1-element int[] holder instead — an object reference
+// matches the declared slot type, survives the coercion, and is traced and
+// relocated by the GC.
+fn cdl_count(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    match ctx.get_field(this, CDL_FIELD_COUNT) {
+        Value::Object(Some(holder)) => match ctx.get_array_element(holder, 0) {
+            Value::Int(v) => v,
+            _ => 0,
+        },
+        // Legacy synthetic objects (alloc_concurrent_synthetic, no real class
+        // layout → no descriptor → the raw Int write survives).
+        Value::Int(v) => v,
+        _ => 0,
+    }
+}
+
+fn cdl_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: i32) {
+    if let Value::Object(Some(holder)) = ctx.get_field(this, CDL_FIELD_COUNT) {
+        ctx.set_array_element(holder, 0, Value::Int(count));
+        return;
+    }
+    // No holder yet (or a legacy Int slot): install one. The raw Int fallback
+    // path still works for synthetic allocations where set_field is uncoerced,
+    // but route everything through the holder for uniformity. Pin `this`
+    // across the allocation — a moving GC during `new_array` would relocate
+    // the receiver and leave the Rust-local copy stale.
+    let this_pin = ctx.pin_native_root(this);
+    let holder = ctx.new_array(cratonvm_types::ArrayElementType::Int, 1);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    ctx.set_array_element(holder, 0, Value::Int(count));
+    ctx.set_field(this, CDL_FIELD_COUNT, Value::Object(Some(holder)));
+}
+
 fn native_cdl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -21806,7 +21852,7 @@ fn native_cdl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         }
         .into());
     }
-    ctx.set_field(this, CDL_FIELD_COUNT, Value::Int(count));
+    cdl_set_count(ctx, this, count);
     Ok(None)
 }
 
@@ -21815,19 +21861,22 @@ fn native_cdl_count_down(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let count = match ctx.get_field(this, CDL_FIELD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    // Serialize the read-modify-write against concurrent countDown() calls —
+    // two racing decrements must not lose one (the boot-thread/test-thread
+    // handshake counts on exactly-N decrements releasing the latch).
+    ctx.monitor_enter(this);
+    let count = cdl_count(ctx, this);
     if count > 0 {
-        ctx.set_field(this, CDL_FIELD_COUNT, Value::Int(count - 1));
+        cdl_set_count(ctx, this, count - 1);
         if count - 1 == 0 {
             // Count reached zero — wake all waiting threads
-            ctx.monitor_enter(this);
-            ctx.monitor_notify_all(this)?;
+            let notify_result = ctx.monitor_notify_all(this);
             ctx.monitor_exit(this);
+            notify_result?;
+            return Ok(None);
         }
     }
+    ctx.monitor_exit(this);
     Ok(None)
 }
 
@@ -21836,19 +21885,17 @@ fn native_cdl_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let mut count = match ctx.get_field(this, CDL_FIELD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    while count > 0 {
-        // Yield to allow other threads to count down
-        std::thread::yield_now();
-        count = match ctx.get_field(this, CDL_FIELD_COUNT) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+    // Block on the monitor instead of spinning. The bounded wait (10ms)
+    // covers the lost-wakeup window between the count read and the wait.
+    loop {
+        if cdl_count(ctx, this) <= 0 {
+            return Ok(None);
+        }
+        ctx.monitor_enter(this);
+        let wait_result = ctx.monitor_wait(this, Some(10));
+        ctx.monitor_exit(this);
+        wait_result?;
     }
-    Ok(None)
 }
 
 fn native_cdl_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -21869,10 +21916,7 @@ fn native_cdl_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
 
     loop {
-        let count = match ctx.get_field(this, CDL_FIELD_COUNT) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+        let count = cdl_count(ctx, this);
         if count == 0 {
             return Ok(Some(Value::Int(1))); // true — count reached zero
         }
@@ -21892,10 +21936,7 @@ fn native_cdl_get_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let count = match ctx.get_field(this, CDL_FIELD_COUNT) {
-        Value::Int(v) => v as i64,
-        _ => 0,
-    };
+    let count = cdl_count(ctx, this) as i64;
     Ok(Some(Value::Long(count)))
 }
 
@@ -21904,10 +21945,7 @@ fn native_cdl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let count = match ctx.get_field(this, CDL_FIELD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let count = cdl_count(ctx, this);
     let s = format!(
         "java.util.concurrent.CountDownLatch@{:x}[Count = {count}]",
         this.as_ptr() as usize
@@ -21918,6 +21956,58 @@ fn native_cdl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 
 // --- Semaphore ---
 
+// The real `java.util.concurrent.Semaphore` has a single field
+// (`sync: Ljava/util/concurrent/Semaphore$Sync;` — a REFERENCE slot). Writing
+// the permit count as a bare Int into slot 0 is silently coerced to null by
+// the descriptor-aware `set_field` path (`coerce_field_value_by_descriptor`
+// maps a primitive written to an `L` slot to null), and the FAIR flag write
+// to slot 1 falls past the real 1-field layout entirely (dropped by the OOB
+// guard). Every later read then saw count 0: `availablePermits()` lied,
+// `acquire()` blocked forever, `release()` no-op'd. Same bug shape as the
+// CountDownLatch count above — keep both ints in an int[2] holder
+// ([0]=permits, [1]=fair) stored in slot 0: an object reference matches the
+// declared slot type, survives the coercion, and is traced/relocated by the
+// GC. The raw-Int fallback covers legacy synthetic allocations
+// (alloc_concurrent_synthetic — no real layout, so the Int writes survive).
+fn sem_holder(ctx: &mut dyn NativeContext, this: ObjectRef) -> (ObjectRef, ObjectRef) {
+    if let Value::Object(Some(h)) = ctx.get_field(this, SEM_FIELD_PERMITS) {
+        return (this, h);
+    }
+    // Install the holder, migrating any legacy raw-Int values.
+    let legacy_permits = match ctx.get_field(this, SEM_FIELD_PERMITS) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let legacy_fair = match ctx.get_field(this, SEM_FIELD_FAIR) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    // Pin `this` across the allocation — a moving GC during `new_array` would
+    // relocate the receiver and leave the Rust-local copy stale (the
+    // StringBuffer-GC-hazard pattern).
+    let this_pin = ctx.pin_native_root(this);
+    let h = ctx.new_array(cratonvm_types::ArrayElementType::Int, 2);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    ctx.set_array_element(h, 0, Value::Int(legacy_permits));
+    ctx.set_array_element(h, 1, Value::Int(legacy_fair));
+    ctx.set_field(this, SEM_FIELD_PERMITS, Value::Object(Some(h)));
+    (this, h)
+}
+
+fn sem_permits(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    let (_, h) = sem_holder(ctx, this);
+    match ctx.get_array_element(h, 0) {
+        Value::Int(v) => v,
+        _ => 0,
+    }
+}
+
+fn sem_set_permits(ctx: &mut dyn NativeContext, this: ObjectRef, permits: i32) {
+    let (_, h) = sem_holder(ctx, this);
+    ctx.set_array_element(h, 0, Value::Int(permits));
+}
+
 fn native_sem_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -21927,8 +22017,10 @@ fn native_sem_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    ctx.set_field(this, SEM_FIELD_PERMITS, Value::Int(permits));
-    ctx.set_field(this, SEM_FIELD_FAIR, Value::Int(0));
+    let (this, h) = sem_holder(ctx, this);
+    let _ = this;
+    ctx.set_array_element(h, 0, Value::Int(permits));
+    ctx.set_array_element(h, 1, Value::Int(0));
     Ok(None)
 }
 
@@ -21945,9 +22037,37 @@ fn native_sem_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    ctx.set_field(this, SEM_FIELD_PERMITS, Value::Int(permits));
-    ctx.set_field(this, SEM_FIELD_FAIR, Value::Int(fair));
+    let (this, h) = sem_holder(ctx, this);
+    let _ = this;
+    ctx.set_array_element(h, 0, Value::Int(permits));
+    ctx.set_array_element(h, 1, Value::Int(fair));
     Ok(None)
+}
+
+/// Shared blocking-acquire: take `n` permits, waiting until enough are
+/// available. The read-modify-write runs under the object monitor so racing
+/// acquirers can't both observe and consume the same permit; waiting uses
+/// bounded monitor-waits (woken by release's notify) instead of a busy spin.
+fn sem_acquire_blocking(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    n: i32,
+) -> MethodCallResult {
+    // Install the holder up-front (re-binding `this` across the possible
+    // allocation) so no allocation happens inside the monitor section.
+    let (this, _) = sem_holder(ctx, this);
+    loop {
+        ctx.monitor_enter(this);
+        let permits = sem_permits(ctx, this);
+        if permits >= n {
+            sem_set_permits(ctx, this, permits - n);
+            ctx.monitor_exit(this);
+            return Ok(None);
+        }
+        let wait_result = ctx.monitor_wait(this, Some(10));
+        ctx.monitor_exit(this);
+        wait_result?;
+    }
 }
 
 fn native_sem_acquire(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -21955,22 +22075,7 @@ fn native_sem_acquire(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let mut permits = match ctx.get_field(this, SEM_FIELD_PERMITS) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    // Block until a permit is available
-    if permits <= 0 {
-        while permits <= 0 {
-            std::thread::yield_now();
-            permits = match ctx.get_field(this, SEM_FIELD_PERMITS) {
-                Value::Int(v) => v,
-                _ => 0,
-            };
-        }
-    }
-    ctx.set_field(this, SEM_FIELD_PERMITS, Value::Int(permits - 1));
-    Ok(None)
+    sem_acquire_blocking(ctx, this, 1)
 }
 
 fn native_sem_acquire_n(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -21982,11 +22087,21 @@ fn native_sem_acquire_n(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v,
         _ => 1,
     };
-    let permits = match ctx.get_field(this, SEM_FIELD_PERMITS) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    ctx.set_field(this, SEM_FIELD_PERMITS, Value::Int((permits - n).max(0)));
+    sem_acquire_blocking(ctx, this, n.max(0))
+}
+
+fn sem_release_n_inner(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    n: i32,
+) -> MethodCallResult {
+    let (this, _) = sem_holder(ctx, this);
+    ctx.monitor_enter(this);
+    let permits = sem_permits(ctx, this);
+    sem_set_permits(ctx, this, permits + n);
+    let notify_result = ctx.monitor_notify_all(this);
+    ctx.monitor_exit(this);
+    notify_result?;
     Ok(None)
 }
 
@@ -21995,16 +22110,7 @@ fn native_sem_release(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let permits = match ctx.get_field(this, SEM_FIELD_PERMITS) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    ctx.set_field(this, SEM_FIELD_PERMITS, Value::Int(permits + 1));
-    // Notify one waiting thread that a permit is available
-    ctx.monitor_enter(this);
-    ctx.monitor_notify(this)?;
-    ctx.monitor_exit(this);
-    Ok(None)
+    sem_release_n_inner(ctx, this, 1)
 }
 
 fn native_sem_release_n(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -22016,16 +22122,19 @@ fn native_sem_release_n(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Int(v)) => *v,
         _ => 1,
     };
-    let permits = match ctx.get_field(this, SEM_FIELD_PERMITS) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    ctx.set_field(this, SEM_FIELD_PERMITS, Value::Int(permits + n));
-    // Notify waiting threads that permits are available
+    sem_release_n_inner(ctx, this, n.max(0))
+}
+
+fn sem_try_acquire_inner(ctx: &mut dyn NativeContext, this: ObjectRef, n: i32) -> bool {
+    let (this, _) = sem_holder(ctx, this);
     ctx.monitor_enter(this);
-    ctx.monitor_notify_all(this)?;
+    let permits = sem_permits(ctx, this);
+    let ok = permits >= n;
+    if ok {
+        sem_set_permits(ctx, this, permits - n);
+    }
     ctx.monitor_exit(this);
-    Ok(None)
+    ok
 }
 
 fn native_sem_try_acquire(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -22033,16 +22142,7 @@ fn native_sem_try_acquire(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let permits = match ctx.get_field(this, SEM_FIELD_PERMITS) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    if permits > 0 {
-        ctx.set_field(this, SEM_FIELD_PERMITS, Value::Int(permits - 1));
-        Ok(Some(Value::Int(1)))
-    } else {
-        Ok(Some(Value::Int(0)))
-    }
+    Ok(Some(Value::Int(if sem_try_acquire_inner(ctx, this, 1) { 1 } else { 0 })))
 }
 
 fn native_sem_try_acquire_n(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -22054,21 +22154,40 @@ fn native_sem_try_acquire_n(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Int(v)) => *v,
         _ => 1,
     };
-    let permits = match ctx.get_field(this, SEM_FIELD_PERMITS) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    if permits >= n {
-        ctx.set_field(this, SEM_FIELD_PERMITS, Value::Int(permits - n));
-        Ok(Some(Value::Int(1)))
-    } else {
-        Ok(Some(Value::Int(0)))
-    }
+    Ok(Some(Value::Int(if sem_try_acquire_inner(ctx, this, n) { 1 } else { 0 })))
 }
 
 fn native_sem_try_acquire_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Simplified: same as tryAcquire (ignores timeout)
-    native_sem_try_acquire(ctx, args)
+    // args: this, timeout(long), TimeUnit — honor the timeout with bounded
+    // monitor-waits (was: ignored the timeout and returned tryAcquire()).
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let timeout_val = match args.get(1) {
+        Some(Value::Long(v)) => *v,
+        _ => 0,
+    };
+    let unit_ordinal = match args.get(2) {
+        Some(Value::Object(Some(u))) => ctx.get_field(*u, 0).as_int().unwrap_or(2),
+        _ => 2, // MILLISECONDS
+    };
+    let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    loop {
+        if sem_try_acquire_inner(ctx, this, 1) {
+            return Ok(Some(Value::Int(1)));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(Some(Value::Int(0)));
+        }
+        let wait_ms = remaining.as_millis().min(10) as u64;
+        ctx.monitor_enter(this);
+        let wait_result = ctx.monitor_wait(this, Some(wait_ms));
+        ctx.monitor_exit(this);
+        wait_result?;
+    }
 }
 
 fn native_sem_available_permits(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -22076,10 +22195,7 @@ fn native_sem_available_permits(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let permits = match ctx.get_field(this, SEM_FIELD_PERMITS) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let permits = sem_permits(ctx, this);
     Ok(Some(Value::Int(permits)))
 }
 
@@ -22088,11 +22204,11 @@ fn native_sem_drain_permits(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let permits = match ctx.get_field(this, SEM_FIELD_PERMITS) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    ctx.set_field(this, SEM_FIELD_PERMITS, Value::Int(0));
+    let (this, _) = sem_holder(ctx, this);
+    ctx.monitor_enter(this);
+    let permits = sem_permits(ctx, this);
+    sem_set_permits(ctx, this, 0);
+    ctx.monitor_exit(this);
     Ok(Some(Value::Int(permits)))
 }
 
@@ -22101,7 +22217,8 @@ fn native_sem_is_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let fair = match ctx.get_field(this, SEM_FIELD_FAIR) {
+    let (_, h) = sem_holder(ctx, this);
+    let fair = match ctx.get_array_element(h, 1) {
         Value::Int(v) => v,
         _ => 0,
     };
@@ -22113,10 +22230,7 @@ fn native_sem_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let permits = match ctx.get_field(this, SEM_FIELD_PERMITS) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let permits = sem_permits(ctx, this);
     let s = format!(
         "java.util.concurrent.Semaphore@{:x}[Permits = {permits}]",
         this.as_ptr() as usize
@@ -22126,6 +22240,60 @@ fn native_sem_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 }
 
 // --- CyclicBarrier ---
+
+// Same descriptor-coercion trap as Semaphore/CountDownLatch above: the real
+// `java.util.concurrent.CyclicBarrier` layout is lock(0,L), trip(1,L),
+// parties(2,I), barrierCommand(3,L), generation(4,L), count(5,I) — so the
+// synthetic Int writes to slots 0/1 were coerced to null and the "broken"
+// write to slot 2 landed in the REAL `parties` int. Keep the three ints in an
+// int[3] holder ([0]=parties, [1]=count, [2]=broken) stored in slot 0 (an
+// `L` slot — an object survives). Raw-Int fallback covers legacy synthetic
+// allocations.
+fn cb_holder(ctx: &mut dyn NativeContext, this: ObjectRef) -> (ObjectRef, ObjectRef) {
+    if let Value::Object(Some(h)) = ctx.get_field(this, CB_FIELD_PARTIES) {
+        return (this, h);
+    }
+    let legacy_parties = match ctx.get_field(this, CB_FIELD_PARTIES) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let legacy_count = match ctx.get_field(this, CB_FIELD_COUNT) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let legacy_broken = match ctx.get_field(this, CB_FIELD_BROKEN) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    // Pin across the allocation (moving-GC receiver-relocation hazard).
+    let this_pin = ctx.pin_native_root(this);
+    let h = ctx.new_array(cratonvm_types::ArrayElementType::Int, 3);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    ctx.set_array_element(h, 0, Value::Int(legacy_parties));
+    ctx.set_array_element(h, 1, Value::Int(legacy_count));
+    ctx.set_array_element(h, 2, Value::Int(legacy_broken));
+    ctx.set_field(this, CB_FIELD_PARTIES, Value::Object(Some(h)));
+    (this, h)
+}
+
+fn cb_get(ctx: &mut dyn NativeContext, this: ObjectRef, idx: usize) -> i32 {
+    let (_, h) = cb_holder(ctx, this);
+    match ctx.get_array_element(h, idx) {
+        Value::Int(v) => v,
+        _ => 0,
+    }
+}
+
+fn cb_set(ctx: &mut dyn NativeContext, this: ObjectRef, idx: usize, v: i32) {
+    let (_, h) = cb_holder(ctx, this);
+    ctx.set_array_element(h, idx, Value::Int(v));
+}
+
+// Holder indices (NOT object slots).
+const CB_H_PARTIES: usize = 0;
+const CB_H_COUNT: usize = 1;
+const CB_H_BROKEN: usize = 2;
 
 fn native_cb_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -22142,9 +22310,11 @@ fn native_cb_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         }
         .into());
     }
-    ctx.set_field(this, CB_FIELD_PARTIES, Value::Int(parties));
-    ctx.set_field(this, CB_FIELD_COUNT, Value::Int(0)); // number currently waiting
-    ctx.set_field(this, CB_FIELD_BROKEN, Value::Int(0));
+    let (this, h) = cb_holder(ctx, this);
+    let _ = this;
+    ctx.set_array_element(h, CB_H_PARTIES, Value::Int(parties));
+    ctx.set_array_element(h, CB_H_COUNT, Value::Int(0)); // number currently waiting
+    ctx.set_array_element(h, CB_H_BROKEN, Value::Int(0));
     Ok(None)
 }
 
@@ -22153,39 +22323,86 @@ fn native_cb_init_action(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     native_cb_init(ctx, args)
 }
 
-fn native_cb_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let broken = match ctx.get_field(this, CB_FIELD_BROKEN) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    if broken != 0 {
+/// Shared barrier-await. `deadline: None` blocks indefinitely (the plain
+/// `await()`, which previously returned WITHOUT waiting for the other
+/// parties — wrong for any real barrier user once the storage works).
+fn cb_await_inner(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    deadline: Option<std::time::Instant>,
+) -> MethodCallResult {
+    // Install the holder up-front so no allocation happens inside the
+    // monitor section (re-binds `this` across the possible allocation).
+    let (this, _) = cb_holder(ctx, this);
+
+    ctx.monitor_enter(this);
+    if cb_get(ctx, this, CB_H_BROKEN) != 0 {
+        ctx.monitor_exit(this);
         return Err(RuntimeError::IllegalStateException {
             message: "BrokenBarrierException".to_string(),
         }
         .into());
     }
-    let parties = match ctx.get_field(this, CB_FIELD_PARTIES) {
-        Value::Int(v) => v,
-        _ => 1,
-    };
-    let count = match ctx.get_field(this, CB_FIELD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let parties = cb_get(ctx, this, CB_H_PARTIES).max(1);
+    let count = cb_get(ctx, this, CB_H_COUNT);
     let new_count = count + 1;
+
     if new_count >= parties {
-        // All parties arrived: reset count, return 0 (last arrival index)
-        ctx.set_field(this, CB_FIELD_COUNT, Value::Int(0));
-        Ok(Some(Value::Int(0)))
-    } else {
-        ctx.set_field(this, CB_FIELD_COUNT, Value::Int(new_count));
-        // Simplified: return arrival index (parties - new_count)
-        Ok(Some(Value::Int(parties - new_count)))
+        // All parties arrived: reset count for the next generation and wake
+        // the waiters. Return 0 (the last arrival's index).
+        cb_set(ctx, this, CB_H_COUNT, 0);
+        let notify_result = ctx.monitor_notify_all(this);
+        ctx.monitor_exit(this);
+        notify_result?;
+        return Ok(Some(Value::Int(0)));
     }
+
+    // Not all parties yet — record the arrival and wait for the trip (count
+    // reset to 0) or a timeout/broken barrier.
+    cb_set(ctx, this, CB_H_COUNT, new_count);
+    loop {
+        let current_count = cb_get(ctx, this, CB_H_COUNT);
+        if current_count == 0 || current_count >= parties {
+            ctx.monitor_exit(this);
+            return Ok(Some(Value::Int(parties - new_count)));
+        }
+        if cb_get(ctx, this, CB_H_BROKEN) != 0 {
+            ctx.monitor_exit(this);
+            return Err(RuntimeError::IllegalStateException {
+                message: "BrokenBarrierException".to_string(),
+            }
+            .into());
+        }
+        let wait_ms = match deadline {
+            Some(dl) => {
+                let remaining = dl.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    // Timeout — break the barrier so other waiters fail too.
+                    cb_set(ctx, this, CB_H_BROKEN, 1);
+                    let notify_result = ctx.monitor_notify_all(this);
+                    ctx.monitor_exit(this);
+                    notify_result?;
+                    return Err(RuntimeError::IllegalStateException {
+                        message: "TimeoutException: CyclicBarrier await timed out".to_string(),
+                    }
+                    .into());
+                }
+                remaining.as_millis().min(10) as u64
+            }
+            None => 10,
+        };
+        // monitor_wait releases the monitor while parked and reacquires it
+        // before returning, so the loop re-reads state under the lock.
+        ctx.monitor_wait(this, Some(wait_ms))?;
+    }
+}
+
+fn native_cb_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    cb_await_inner(ctx, this, None)
 }
 
 fn native_cb_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -22203,65 +22420,8 @@ fn native_cb_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => 2,
     };
     let timeout_ms = convert_time_unit_to_millis(timeout_val, unit_ordinal);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
-
-    // Check if barrier is broken
-    let broken = match ctx.get_field(this, CB_FIELD_BROKEN) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    if broken != 0 {
-        return Err(RuntimeError::IllegalStateException {
-            message: "BrokenBarrierException".to_string(),
-        }
-        .into());
-    }
-
-    let parties = match ctx.get_field(this, CB_FIELD_PARTIES) {
-        Value::Int(v) => v,
-        _ => 1,
-    };
-    let count = match ctx.get_field(this, CB_FIELD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    let new_count = count + 1;
-
-    if new_count >= parties {
-        // All parties arrived: reset count, return 0 (last arrival index)
-        ctx.set_field(this, CB_FIELD_COUNT, Value::Int(0));
-        ctx.monitor_enter(this);
-        ctx.monitor_notify_all(this)?;
-        ctx.monitor_exit(this);
-        return Ok(Some(Value::Int(0)));
-    }
-
-    // Not all parties yet — increment and wait with timeout
-    ctx.set_field(this, CB_FIELD_COUNT, Value::Int(new_count));
-
-    loop {
-        let current_count = match ctx.get_field(this, CB_FIELD_COUNT) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        // If count was reset to 0, all parties arrived
-        if current_count == 0 || current_count >= parties {
-            return Ok(Some(Value::Int(parties - new_count)));
-        }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            // Timeout — break the barrier
-            ctx.set_field(this, CB_FIELD_BROKEN, Value::Int(1));
-            return Err(RuntimeError::IllegalStateException {
-                message: "TimeoutException: CyclicBarrier await timed out".to_string(),
-            }
-            .into());
-        }
-        let wait_ms = remaining.as_millis().min(10) as u64;
-        ctx.monitor_enter(this);
-        ctx.monitor_wait(this, Some(wait_ms))?;
-        ctx.monitor_exit(this);
-    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    cb_await_inner(ctx, this, Some(deadline))
 }
 
 fn native_cb_get_parties(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -22269,10 +22429,7 @@ fn native_cb_get_parties(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let parties = match ctx.get_field(this, CB_FIELD_PARTIES) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let parties = cb_get(ctx, this, CB_H_PARTIES);
     Ok(Some(Value::Int(parties)))
 }
 
@@ -22281,10 +22438,7 @@ fn native_cb_get_number_waiting(ctx: &mut dyn NativeContext, args: &[Value]) -> 
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let count = match ctx.get_field(this, CB_FIELD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let count = cb_get(ctx, this, CB_H_COUNT);
     Ok(Some(Value::Int(count)))
 }
 
@@ -22293,10 +22447,7 @@ fn native_cb_is_broken(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let broken = match ctx.get_field(this, CB_FIELD_BROKEN) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let broken = cb_get(ctx, this, CB_H_BROKEN);
     Ok(Some(Value::Int(broken)))
 }
 
@@ -22305,8 +22456,13 @@ fn native_cb_reset(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    ctx.set_field(this, CB_FIELD_COUNT, Value::Int(0));
-    ctx.set_field(this, CB_FIELD_BROKEN, Value::Int(0));
+    let (this, _) = cb_holder(ctx, this);
+    ctx.monitor_enter(this);
+    cb_set(ctx, this, CB_H_COUNT, 0);
+    cb_set(ctx, this, CB_H_BROKEN, 0);
+    let notify_result = ctx.monitor_notify_all(this);
+    ctx.monitor_exit(this);
+    notify_result?;
     Ok(None)
 }
 
