@@ -125,6 +125,17 @@ fn no_refproc() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_NO_REFPROC").is_some())
 }
 
+/// Cached `CRATONVM_DBG_NO_CLEANERS` gate (bc math-ec 0x4 bisect): skip ONLY
+/// `run_cleaner_actions` + `run_finalizers` (the Java invokes on queued —
+/// possibly stale — addresses), keeping `process_references_after_gc` live.
+/// Discriminates "the invokes corrupt" from "the refproc loops corrupt".
+#[inline]
+fn no_cleaners() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_NO_CLEANERS").is_some())
+}
+
 /// Validate a primitive-array-store receiver header; dump receiver + Java
 /// stack when it is not a plausible array (the stale-ref smear signature).
 /// Reads raw header BYTES (not enum fields) — a garbage `kind`/`element_type`
@@ -554,8 +565,8 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
 /// Per the `Cleaner` contract, exceptions thrown by an action are caught
 /// and logged — they must not propagate into the GC pipeline.
 fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
-    // bc math-ec 0x4 exclusion switch — see `process_references_after_gc`.
-    if no_refproc() {
+    // bc math-ec 0x4 exclusion switches — see `process_references_after_gc`.
+    if no_refproc() || no_cleaners() {
         return;
     }
     // Re-entrancy safety: if a JIT helper currently holds the `&mut JvmThread`
@@ -672,8 +683,8 @@ fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
 
 /// Dequeue pending finalizable objects and invoke their finalize() method.
 fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
-    // bc math-ec 0x4 exclusion switch — see `process_references_after_gc`.
-    if no_refproc() {
+    // bc math-ec 0x4 exclusion switches — see `process_references_after_gc`.
+    if no_refproc() || no_cleaners() {
         return;
     }
     // Same JIT-borrow re-entrancy guard as `run_cleaner_actions`: a `finalize()`
@@ -758,8 +769,13 @@ fn process_references_after_gc(
         !pointer_map.contains_key(&addr) && shared.heap.is_in_young_addr(addr)
     };
 
-    // Null referent field (field 0) on cleared weak/soft references
-    let cleared = ref_proc.cleared_ref_objects();
+    // Null referent field (field 0) on cleared weak/soft references.
+    // ROOT-CAUSE FIX (2026-06-10): once-only emission — the legacy
+    // `cleared_ref_objects()` re-emitted every ever-cleared Reference on
+    // EVERY GC; after the Reference died, the per-cycle null-write through
+    // its recycled (and then legitimately-remapped!) address corrupted the
+    // innocent object reusing the memory. A referent is nulled exactly once.
+    let cleared = ref_proc.take_newly_cleared();
     for ref_addr in cleared {
         // ROOT-CAUSE guard (see `is_stale_young` above): a pre-GC young
         // address absent from the pointer map did NOT survive this GC —

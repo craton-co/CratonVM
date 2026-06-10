@@ -50,6 +50,18 @@ pub struct ReferenceEntry {
     pub cleared: bool,
     /// Timestamp of the last `get()` call -- used for SoftReference LRU.
     pub last_access_time_ms: u64,
+    /// bc math-ec 0x4 ROOT-CAUSE FIX (2026-06-10): once-only emission flags.
+    /// The VM-side consumers WRITE heap fields for each emitted action
+    /// (null the referent; submit the cleaner action). Before these flags the
+    /// registry RE-EMITTED every cleared entry on EVERY GC, forever — and once
+    /// the Reference object died, its recycled address was "remapped" onto
+    /// whatever innocent object reused the memory, corrupting it with
+    /// perfectly-legal-looking writes (the FixedPointTest `Object(Some(0x4))`
+    /// / silent-null corruption; see docs/internal/h2-testscript-segv-findings.md).
+    /// `clear_emitted`: the referent-null for this entry was already handed out.
+    pub clear_emitted: bool,
+    /// `action_emitted`: the cleaner action for this entry was already handed out.
+    pub action_emitted: bool,
 }
 
 /// Aggregated stats for one round of reference processing.
@@ -231,6 +243,8 @@ impl ReferenceProcessor {
             enqueued: false,
             cleared: false,
             last_access_time_ms: 0,
+            clear_emitted: false,
+            action_emitted: false,
         };
         match ref_type {
             ReferenceType::Soft => {
@@ -398,18 +412,42 @@ impl ReferenceProcessor {
         let mut to_finalize = Vec::new();
         let mut cleaner_actions = Vec::new();
 
-        // Gather enqueue pairs from pending_queues
-        for (&queue_addr, refs) in &self.pending_queues {
-            for &ref_obj in refs {
+        // bc math-ec 0x4 ROOT-CAUSE FIX (2026-06-10): ONCE-ONLY emission.
+        //
+        // Previously this block RE-EMITTED, on EVERY GC forever: every pending
+        // enqueue pair (`pending_queues` was read non-destructively), every
+        // pending finalization (`finalization_queue.iter()`), and every
+        // cleared cleaner. The VM-side consumer WRITES heap fields per emitted
+        // action (queue head/size/next; referent null; cleaner submit). Those
+        // raw registry addresses are only single-step-remapped per cycle, so
+        // the moment an emitted Reference/queue object DIED, its recycled
+        // address aliased an innocent live object on a later cycle — and the
+        // per-GC re-emission then corrupted that object with valid-looking
+        // writes every collection (FixedPointTest `Object(Some(0x4))` /
+        // silent-null corruption — proven by hexdump + the NO_REFPROC 6/6
+        // exclusion run; docs/internal/h2-testscript-segv-findings.md).
+        //
+        // Java semantics want each of these EXACTLY ONCE: Reference.enqueue is
+        // one-shot, a referent is nulled once, a Cleaner runs once, finalize()
+        // runs once. Drain/flag accordingly.
+
+        // Gather enqueue pairs — DRAIN pending_queues (each pair was pushed
+        // exactly once when its entry was first cleared).
+        for (queue_addr, refs) in std::mem::take(&mut self.pending_queues) {
+            for ref_obj in refs {
                 to_enqueue.push((ref_obj, queue_addr));
             }
         }
 
-        to_finalize.extend(self.finalization_queue.iter().copied());
+        // DRAIN the finalization queue. (Also fixes the double-enqueue: the
+        // interpreter additionally drains via `dequeue_for_finalization`
+        // right after consuming this result — that loop now finds it empty.)
+        to_finalize.extend(self.finalization_queue.drain(..));
 
-        // Cleaner actions are the reference_obj addresses of cleared cleaners
-        for entry in &self.cleaner_refs {
-            if entry.cleared {
+        // Cleaner actions: emit each cleared cleaner ONCE.
+        for entry in &mut self.cleaner_refs {
+            if entry.cleared && !entry.action_emitted {
+                entry.action_emitted = true;
                 cleaner_actions.push(entry.reference_obj);
             }
         }
@@ -655,6 +693,27 @@ impl ReferenceProcessor {
         }
         // Phantom refs: Java 9+ does NOT clear the referent, but we enqueue them.
         // Cleaners: cleared flag used for cleaner actions, already handled.
+        result
+    }
+
+    /// bc math-ec 0x4 ROOT-CAUSE FIX (2026-06-10): once-only variant of
+    /// [`Self::cleared_ref_objects`] for the post-GC referent-null writer.
+    /// Returns each cleared soft/weak Reference EXACTLY ONCE across the
+    /// registry's lifetime (flagging `clear_emitted`). The legacy idempotent
+    /// accessor re-emitted every cleared entry on every GC forever — and once
+    /// the Reference object died, the per-cycle `set_field(.., 0,
+    /// Object(None))` through its recycled/remapped address corrupted
+    /// whatever innocent object reused the memory (the FixedPointTest
+    /// `0x4`/silent-null corruption). A referent is nulled once; re-nulling
+    /// is never needed.
+    pub fn take_newly_cleared(&mut self) -> Vec<usize> {
+        let mut result = Vec::new();
+        for e in self.soft_refs.iter_mut().chain(self.weak_refs.iter_mut()) {
+            if e.cleared && !e.clear_emitted {
+                e.clear_emitted = true;
+                result.push(e.reference_obj);
+            }
+        }
         result
     }
 

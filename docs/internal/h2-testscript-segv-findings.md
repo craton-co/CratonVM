@@ -1,5 +1,46 @@
 # H2 TestScript `--nojit` SEGV — findings (2026-06-05)
 
+> # ✅ RESOLVED 2026-06-10 — root cause found and fixed (bc-math-ec `0x4` /
+> silent-null corruption; very likely this H2 SEGV too — re-verify H2)
+>
+> **Root cause: the `ReferenceProcessor` re-emitted every cleared/enqueued/
+> cleaner action on EVERY GC, forever** (`pending_queues` read
+> non-destructively; `cleared_ref_objects()` idempotent; cleaner
+> `cleared`-flag rescan; `finalization_queue.iter()`). The post-GC consumer
+> (`process_references_after_gc`, interpreter.rs) WRITES heap fields per
+> emission (referent null = 16-byte `Object(None)` to fld[0]; queue
+> head/size/next). Registry addresses are only single-step remapped per
+> cycle, so once an emitted Reference/queue DIED, its address stuck in the
+> registry forever; when the young allocator recycled that memory for a live
+> object which later MOVED, the stale address became a pointer-map KEY and
+> the per-GC re-emission wrote into the innocent object through a
+> "legitimately remapped" address — defeating every receiver-side guard by
+> construction. On-grid landings = perfectly legal nulls (the scanner-
+> invisible "Cannot invoke isZero/subtract on null" BigInteger NPEs);
+> interior landings = the mis-gridded `{disc=4, payload=0}` → the famous
+> `Object(Some(0x4))` + zeroed next word (hexdump-proven). Explains the
+> GC-pressure correlation, random victims, promotion-survival, and the
+> "GC writes it" illusion (the writes happen in the post-GC window, before
+> ec_watch's GC-EXIT detect).
+>
+> **Evidence chain:** hexdump of victim ±128B (mis-gridded `Object(None)`),
+> `CRATONVM_DBG_NO_REFPROC=1` exclusion → FixedPointTest **6/6 OK** (first
+> passes ever, was 0/40+), `CRATONVM_DBG_NO_CLEANERS=1` bisect → 0/6 (loops,
+> not invokes), once-only fix → **8/8 OK default-mode** + regression pool:
+> zero regressions and commons-math-junit-probe FAIL→PASS.
+>
+> **Fix (gc/src/reference.rs + interpreter.rs):** exactly-once emission per
+> Java semantics — `take_newly_cleared()` (flags `clear_emitted`),
+> `pending_queues` drained on emission, `finalization_queue.drain(..)` (also
+> fixes a double-finalize), cleaner `action_emitted` flag. Defense-in-depth
+> kept: `is_stale_young` guards (young + not-in-map ⇒ dead ⇒ skip) on all
+> four consumer loops, `VmHeap::is_in_young_addr` /
+> `GenerationalHeap::is_in_young_either`.
+>
+> H2 TestScript + the `--nojit` SEGV below should be re-verified against the
+> fixed binary; the mechanism matches (DECIMAL-region reference churn).
+> Sections below are the historical hunt log.
+
 > ## ⚡ UPDATE 2026-06-09 (bc-math-ec side, worktree `CratonVM-ecgc`, branch
 > `fix/bc-math-ec-gc-0x4`, now == dev) — **pin fix did NOT cure it; the
 > corruption is a `long[]` SMEAR, not a single stray Value write.**
