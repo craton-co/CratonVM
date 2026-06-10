@@ -93,11 +93,23 @@ pub fn execute_invokedynamic(
     let current_class_id = thread.frames[frame_idx].class_id;
 
     // --- Fast path: check call site cache ---
-    {
+    //
+    // Lock-order discipline (the H2 TestScript class-resolution DEADLOCK):
+    // clone the cached site OUT of the `resolution_cache` read guard and
+    // DROP the guard before executing. Holding it across
+    // `execute_cached_call_site` runs arbitrary code under the lock —
+    // StringConcat allocates Strings (`alloc_java_string_object` takes
+    // `class_manager.write()`), lambdas invoke Java — while
+    // `resolve_field_ref` takes class_manager THEN resolution_cache: a
+    // textbook ABBA inversion that wedged main-vm against a concat worker
+    // with every resolver queued behind the writers. The clone is cheap:
+    // `ResolvedCallSite`'s strings are `Arc<str>` (refcount bumps).
+    let cached_site = {
         let cache = shared.resolution_cache.read();
-        if let Some(site) = cache.get_call_site(current_class_id, cp_index) {
-            return execute_cached_call_site(shared, thread, frame_idx, site);
-        }
+        cache.get_call_site(current_class_id, cp_index).cloned()
+    };
+    if let Some(site) = cached_site {
+        return execute_cached_call_site(shared, thread, frame_idx, &site);
     }
 
     // --- Slow path: bootstrap the call site ---

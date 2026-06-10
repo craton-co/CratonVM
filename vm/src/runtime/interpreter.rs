@@ -9267,8 +9267,21 @@ fn resolve_field_ref(
     let field_class_id = shared.load_class_concurrent(&field_class_name)?;
 
     // First check: is this a static field? Look in the declaring class's own fields.
-    {
+    //
+    // Lock-order discipline (the H2 TestScript class-resolution DEADLOCK):
+    // NEVER hold `class_manager` while acquiring `resolution_cache` — the
+    // cache write below used to live INSIDE the `cm` read guard, while the
+    // invokedynamic string-concat path holds resolution-side state and then
+    // takes `class_manager.write()` (`alloc_java_string_object`'s
+    // `load_class("java/lang/String")`) — a textbook ABBA inversion that
+    // wedged main-vm (this fn, lock_exclusive) against a concat worker,
+    // with every other resolver piling up behind the queued writer.
+    // `resolve_method_ref` already documents and follows this rule
+    // ("Drop the read lock before acquiring write lock"); mirror it here:
+    // resolve under `cm`, DROP it at block end, then cache + return.
+    let own_resolved = {
         let cm = shared.class_manager.read();
+        let mut found: Option<ResolvedField> = None;
         if let Some(class) = cm.get_class(field_class_id) {
             let mut static_idx = 0usize;
             let mut instance_idx = 0usize;
@@ -9289,19 +9302,14 @@ fn resolve_field_ref(
                         eprintln!("[FIELD-TRACE] OOB resolve(own): decl={} field={} field_index={} num_total_fields={} first_field_index={}",
                             class.name, field_name, index, class.num_total_fields, class.first_field_index);
                     }
-                    let resolved = ResolvedField {
+                    found = Some(ResolvedField {
                         declaring_class_id: declaring_id,
                         field_index: index,
                         is_static,
                         is_volatile: f.is_volatile(),
                         is_reference: is_ref,
-                    };
-                    shared.resolution_cache.write().put_field(
-                        current_class_id,
-                        cp_index,
-                        resolved.clone(),
-                    );
-                    return Ok(resolved);
+                    });
+                    break;
                 }
                 if f.is_static() {
                     static_idx += 1;
@@ -9310,6 +9318,15 @@ fn resolve_field_ref(
                 }
             }
         }
+        found
+    };
+    if let Some(resolved) = own_resolved {
+        shared.resolution_cache.write().put_field(
+            current_class_id,
+            cp_index,
+            resolved.clone(),
+        );
+        return Ok(resolved);
     }
 
     // Walk the superclass chain for inherited fields
