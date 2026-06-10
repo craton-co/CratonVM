@@ -1628,6 +1628,33 @@ fn native_al_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     }
     let (data_a, size_a) = al_state(ctx, this);
     let (data_b, size_b) = al_state(ctx, other);
+    // Cross-layout comparison: either side may be a List that is NOT
+    // ArrayList-shaped — e.g. `ArrayList.equals(LinkedList)` (and the
+    // reverse, since this native is registered on the List interface).
+    // `al_state` reads ArrayList slots on such a receiver and reports
+    // data=None, and the old strict match answered `false` even for equal
+    // contents. The AbstractList.equals contract is defined by element
+    // ITERATION, not by class — walk both sides' own iterator() instead.
+    // (kafka ConfigDef testGroupInference: assertEquals(ArrayList, LinkedList).)
+    if data_a.is_none() || data_b.is_none() {
+        // Spec guard: a non-List operand is never equal — but synthetic
+        // allocs (class id 0 / bare Object) carry no usable hierarchy, so
+        // only reject when the class is known and provably not a List.
+        if !al_eq_operand_is_list(ctx, other) || !al_eq_operand_is_list(ctx, this) {
+            return Ok(Some(Value::Int(0)));
+        }
+        let ea = collection_elements_generic(ctx, this);
+        let eb = collection_elements_generic(ctx, other);
+        if ea.len() != eb.len() {
+            return Ok(Some(Value::Int(0)));
+        }
+        for (va, vb) in ea.iter().zip(eb.iter()) {
+            if !values_equal_deep(ctx, va, vb)? {
+                return Ok(Some(Value::Int(0)));
+            }
+        }
+        return Ok(Some(Value::Int(1)));
+    }
     if size_a != size_b {
         return Ok(Some(Value::Int(0)));
     }
@@ -1637,7 +1664,7 @@ fn native_al_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
             for i in 0..size {
                 let va = ctx.get_array_element(da, i);
                 let vb = ctx.get_array_element(db, i);
-                if !values_equal(ctx, &va, &vb) {
+                if !values_equal_deep(ctx, &va, &vb)? {
                     return Ok(Some(Value::Int(0)));
                 }
             }
@@ -1645,6 +1672,47 @@ fn native_al_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         }
         (None, None) => Ok(Some(Value::Int(1))),
         _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+/// Deep value equality for collection elements: `values_equal` plus a
+/// virtual `equals(Object)` fallback for arbitrary object types — the same
+/// gap `map_keys_equal` closed for HashMap keys. Without the fallback, two
+/// equal-but-distinct objects of any type that is not a String / enum /
+/// boxed primitive (e.g. `java.util.UUID`) compare as NOT equal:
+/// `List.of(uuid).equals(List.of(sameUuidParsedBack))` returned false
+/// (kafka listSerde round-trip assertEquals on ArrayList<UUID>).
+fn values_equal_deep(
+    ctx: &mut dyn NativeContext,
+    a: &Value,
+    b: &Value,
+) -> Result<bool, MethodCallFailed> {
+    if values_equal(ctx, a, b) {
+        return Ok(true);
+    }
+    if let (Value::Object(Some(oa)), Value::Object(Some(ob))) = (a, b) {
+        return map_keys_equal(ctx, *oa, *ob);
+    }
+    Ok(false)
+}
+
+/// Is `obj` usable as a List operand for `equals`? Known non-List classes
+/// (a HashSet, a Map view, …) must compare unequal per the List.equals
+/// contract; synthetic allocations whose class id is 0 / bare Object carry
+/// no hierarchy information, so they are accepted leniently (matches the
+/// old behavior for our internal placeholder lists).
+fn al_eq_operand_is_list(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(obj);
+    let name = match ctx.class_name_of_id(cid) {
+        Some(n) => n,
+        None => return true, // synthetic / unknown — lenient
+    };
+    if name.is_empty() || name == "java/lang/Object" {
+        return true;
+    }
+    match ctx.class_id_by_name("java/util/List") {
+        Some(list_id) => ctx.is_subclass(cid, list_id),
+        None => true,
     }
 }
 
@@ -9498,6 +9566,12 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/IntUnaryOperator;)Ljava/util/stream/IntStream;",
         native_int_stream_map,
     );
+    r.register(
+        c,
+        "mapToObj",
+        "(Ljava/util/function/IntFunction;)Ljava/util/stream/Stream;",
+        native_int_stream_map_to_obj,
+    );
     r.register(c, "toArray", "()[I", native_int_stream_to_array);
     r.register(
         c,
@@ -9721,6 +9795,33 @@ fn native_int_stream_map(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         mapped.push(result.unwrap_or(Value::Int(0)));
     }
     make_int_stream(ctx, &mapped)
+}
+
+/// IntStream.mapToObj(IntFunction) → Stream<T>. The synthetic IntStream has
+/// no real bytecode, so without this native the call resolves to the
+/// abstract interface declaration — `AbstractMethodError: mapToObj has no
+/// Code attribute`. JUnit5 jupiter-params hits this for every primitive
+/// @ValueSource (`IntStream.range(0, n).mapToObj(i -> Array.get(src, i))`).
+fn native_int_stream_map_to_obj(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let function = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = int_stream_elements(ctx, this);
+    let mut mapped = Vec::with_capacity(elements.len());
+    for elem in &elements {
+        let result =
+            ctx.invoke_virtual(function, "apply", "(I)Ljava/lang/Object;", &[*elem])?;
+        mapped.push(result.unwrap_or(Value::Object(None)));
+    }
+    make_stream(ctx, &mapped)
 }
 
 fn native_int_stream_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11985,11 +12086,23 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(itr, "next", "()Ljava/lang/Object;", native_ll_itr_next);
     registry.register(itr, "remove", "()V", native_ll_itr_remove);
 
-    // LinkedList$ListItr — synthetic 3-field overlay
+    // LinkedList snapshot ListIterator — synthetic 3-field overlay
     //   field 0 = Object[] snapshot of list elements
     //   field 1 = Int cursor (nextIndex)
     //   field 2 = list ref (so set() can mutate the backing LinkedList node)
-    let lit = "java/util/LinkedList$ListItr";
+    //
+    // CratonVM-internal class name, deliberately NOT
+    // `java/util/LinkedList$ListItr`: in real-JDK mode that name resolves to
+    // the REAL preloaded JDK class, so `alloc_synthetic` bound our 3-slot
+    // overlay to the real 5-field layout and descriptor-aware field coercion
+    // mangled the Int cursor write into the real `next:Node` slot — `next()`
+    // never advanced, so `AbstractList.equals` (real bytecode iterating via
+    // `listIterator()`) compared element 0 forever and answered false for
+    // ANY LinkedList vs other-List comparison (kafka ConfigDef
+    // testGroupInference assertEquals(ArrayList, LinkedList)). The interface
+    // natives registered on `java/util/ListIterator` share the same
+    // array@0/cursor@1 layout, so dispatch through either route agrees.
+    let lit = "cratonvm/internal/LinkedListSnapshotListItr";
     registry.register(lit, "hasNext", "()Z", native_ll_listitr_has_next);
     registry.register(lit, "next", "()Ljava/lang/Object;", native_ll_listitr_next);
     registry.register(lit, "hasPrevious", "()Z", native_ll_listitr_has_previous);
@@ -12036,7 +12149,7 @@ fn native_ll_list_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Object(None))),
     };
     let arr = ll_snapshot_array(ctx, this);
-    let it = alloc_synthetic(ctx, "java/util/LinkedList$ListItr", 3);
+    let it = alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3);
     ctx.set_field(it, 0, Value::Object(Some(arr)));
     ctx.set_field(it, 1, Value::Int(0));
     ctx.set_field(it, 2, Value::Object(Some(this)));
@@ -12053,7 +12166,7 @@ fn native_ll_list_iterator_idx(ctx: &mut dyn NativeContext, args: &[Value]) -> M
         _ => 0,
     };
     let arr = ll_snapshot_array(ctx, this);
-    let it = alloc_synthetic(ctx, "java/util/LinkedList$ListItr", 3);
+    let it = alloc_synthetic(ctx, "cratonvm/internal/LinkedListSnapshotListItr", 3);
     ctx.set_field(it, 0, Value::Object(Some(arr)));
     ctx.set_field(it, 1, Value::Int(idx.max(0)));
     ctx.set_field(it, 2, Value::Object(Some(this)));

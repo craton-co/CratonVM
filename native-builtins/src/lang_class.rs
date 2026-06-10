@@ -489,6 +489,16 @@ fn enforce_module_check_on_field(
     accessible: bool,
     operation: &str,
 ) -> Result<(), cratonvm_types::error::MethodCallFailed> {
+    // JEP 403/261 distinction (same pattern as Method.invoke /
+    // Constructor.newInstance): a PUBLIC field needs only `exports`,
+    // not `opens` — only non-public fields require the deep check.
+    let field_modifiers = match ctx.get_field_by_name(this, "modifiers") {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    if (field_modifiers & 0x0001) != 0 {
+        return Ok(());
+    }
     let target_class_name = match ctx.get_field_by_name(this, "clazz") {
         Value::Object(Some(m)) => mirror_class_name(ctx, m),
         _ => None,
@@ -5944,12 +5954,29 @@ pub(crate) fn native_constructor_new_instance(
 
     // NEW-19: JPMS deep-reflection check. Accessible flag lives in a
     // CratonVM extra slot; when true the check is already paid (JEP 403).
+    //
+    // JEP 403/261 distinction (same pattern as Method.invoke): a PUBLIC
+    // constructor needs only `exports`, not `opens` — e.g.
+    // `ArrayList.class.getConstructor(int.class).newInstance(16)` must
+    // succeed without any --add-opens (java.base exports java.util).
+    // kafka's ListDeserializer constructs its backing list exactly this
+    // way; the previous unconditional deep check denied it with
+    // `module java.base does not "opens java.util"`, surfacing as
+    // "Could not construct a list instance of java.util.ArrayList".
+    // Only a non-public constructor requires the opens/deep check.
     let accessible = read_constructor_accessible(ctx, this);
-    if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
-        return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
-            message: format!("Constructor.newInstance: {class_name}: {msg}"),
+    let ctor_modifiers = match ctx.get_field_by_name(this, "modifiers") {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let ctor_is_public = (ctor_modifiers & 0x0001) != 0;
+    if !ctor_is_public {
+        if let Err(msg) = check_reflection_module_access(ctx, &class_name, accessible) {
+            return Err(cratonvm_types::error::RuntimeError::IllegalAccessException {
+                message: format!("Constructor.newInstance: {class_name}: {msg}"),
+            }
+            .into());
         }
-        .into());
     }
 
     // Descriptor: extra slot / side table, or rebuild from `parameterTypes`

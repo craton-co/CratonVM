@@ -3916,15 +3916,31 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             if let Value::Object(Some(s)) = ctx.get_field(uri, 3) {
                 if let Some(t) = ctx.read_string(s) { candidates.push(t); }
             }
-            // 3. URI.string by name (full URI text on real-JDK URIs).
+            // 3. Slot 4 — the `Path.toUri()` natives' synthetic layout
+            //    stores the path component there (URIs from
+            //    `selectClasspathRoots`-style Path→URI→Path round trips,
+            //    e.g. the JUnit5 ClasspathScanner). Without this probe the
+            //    round trip yielded an EMPTY path: by-name `path`/`string`
+            //    resolve to real-JDK URI slots (6/18) that are out of
+            //    bounds on the 5-slot synthetic, and slots 3/5 are unset.
+            if let Value::Object(Some(s)) = ctx.get_field(uri, 4) {
+                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+            }
+            // 4. URI.string by name (full URI text on real-JDK URIs).
             if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "string") {
                 if let Some(t) = ctx.read_string(s) { candidates.push(t); }
             }
-            // 4. Synthetic URL_FIELD_FULL (slot 5) where url_parse stores
+            // 5. Synthetic URL_FIELD_FULL (slot 5) where url_parse stores
             //    the full URI string. (For our synthetic URIs allocated
             //    with real-JDK layout this slot may have been clobbered
             //    with non-string data, so guarded by Object pattern.)
             if let Value::Object(Some(s)) = ctx.get_field(uri, 5) {
+                if let Some(t) = ctx.read_string(s) { candidates.push(t); }
+            }
+            // 6. Slot 0 — the `Path.toUri()` synthetic layout stores the
+            //    full `file://...` text there; the scheme-strip loop below
+            //    reduces it to the path component.
+            if let Value::Object(Some(s)) = ctx.get_field(uri, 0) {
                 if let Some(t) = ctx.read_string(s) { candidates.push(t); }
             }
             // Pick the first non-empty candidate; strip any `file:` scheme.
@@ -4056,6 +4072,22 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 .strip_prefix(base_path)
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| target.clone());
+            // Separator-normalize the result. `strip_prefix` returns a
+            // SLICE of `target`, so the relative path keeps whatever
+            // separators the caller's strings used (often '/') while the
+            // real WindowsPath.toString() renders '\' and zipfs renders
+            // '/'. JUnit5's ClasspathScanner does
+            // `relativize(...).toString().replace(fs.getSeparator(), ".")`
+            // — a separator mismatch silently no-ops the replace, package
+            // names keep slashes, and every scanned class fails the
+            // package filter (classpath-root discovery found 0 tests).
+            let relative = if jarfs_decode(&base).is_some() || jarfs_decode(&target).is_some() {
+                relative.replace('\\', "/")
+            } else if cfg!(windows) {
+                relative.replace('/', "\\")
+            } else {
+                relative
+            };
             let result = p57_alloc_path(ctx, &relative);
             Ok(Some(Value::Object(Some(result))))
         },
@@ -4210,7 +4242,17 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // --- FileSystem methods ---
     let fs_class = "java/nio/file/FileSystem";
 
-    r.register(fs_class, "getSeparator", "()Ljava/lang/String;", |ctx, _args| {
+    r.register(fs_class, "getSeparator", "()Ljava/lang/String;", |ctx, args| {
+        // A mounted-jar FileSystem renders '/' (matches the JDK zipfs
+        // separator — JUnit5's ClasspathScanner splits scanned entry paths
+        // on this to build package names); the host FS renders the OS
+        // separator.
+        if let Ok(this) = obj_arg(args, 0) {
+            if let Value::Object(Some(_)) = ctx.get_field(this, P57_FS_JAR_FIELD) {
+                let s = ctx.create_string("/");
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        }
         let sep = if cfg!(windows) { "\\" } else { "/" };
         let s = ctx.create_string(sep);
         Ok(Some(Value::Object(Some(s))))
@@ -4384,6 +4426,35 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             if !jar_path.is_empty() {
                 let jp = ctx.create_string(&jar_path);
                 ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
+            }
+            Ok(Some(Value::Object(Some(fs))))
+        },
+    );
+
+    // FileSystemProvider.newFileSystem(URI, Map) — the URI overload of the
+    // above. JUnit5's classpath scanner (CloseablePath.create) mounts a JAR
+    // via `FileSystems.newFileSystem(URI.create("jar:file:/...!/"), Map.of())`;
+    // the real-JDK FileSystems bytecode matches our synthetic "jar" provider
+    // (installedProviders below) and invokes this overload on it. Without a
+    // native the dispatch lands on the abstract declaration —
+    // `AbstractMethodError: newFileSystem(URI, Map) has no Code attribute` —
+    // killing all package/classpath-root test discovery. Mount the same
+    // jar-backed FileSystem the (Path, Map) overload produces.
+    r.register(
+        fsp,
+        "newFileSystem",
+        "(Ljava/net/URI;Ljava/util/Map;)Ljava/nio/file/FileSystem;",
+        |ctx, args| {
+            let uri = obj_arg(args, 1)?;
+            let text = p57_uri_full_text(ctx, uri);
+            let fs = p57_alloc_default_filesystem(ctx);
+            if let Some(jar) = p57_jar_uri_to_os_path(&text) {
+                // Only mount paths that exist as regular files — a `file:`
+                // URI naming a directory is not a mountable archive.
+                if std::path::Path::new(&jar).is_file() {
+                    let jp = ctx.create_string(&jar);
+                    ctx.set_field(fs, P57_FS_JAR_FIELD, Value::Object(Some(jp)));
+                }
             }
             Ok(Some(Value::Object(Some(fs))))
         },
@@ -6757,6 +6828,101 @@ fn jarfs_list_dir(jar: &str, dir: &str) -> Vec<String> {
         }
     }
     seen.into_iter().collect()
+}
+
+/// List immediate children of `dir` inside a JAR together with an
+/// is-directory flag, in ONE pass over the archive. `walkFileTree` needs the
+/// flag per child; calling `jarfs_classify` per child would re-read and
+/// re-parse the whole zip for every entry (O(n²) over a test jar with
+/// hundreds of classes).
+fn jarfs_list_dir_classified(jar: &str, dir: &str) -> Vec<(String, bool)> {
+    let dir = dir.trim_start_matches('/').trim_end_matches('/');
+    let prefix = if dir.is_empty() {
+        String::new()
+    } else {
+        format!("{dir}/")
+    };
+    let jar_bytes = match std::fs::read(jar) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    let cursor = std::io::Cursor::new(jar_bytes);
+    let mut zip = match zip::ZipArchive::new(cursor) {
+        Ok(z) => z,
+        Err(_) => return Vec::new(),
+    };
+    let mut seen: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    for i in 0..zip.len() {
+        if let Ok(f) = zip.by_index(i) {
+            let name = f.name();
+            if let Some(rest) = name.strip_prefix(&prefix) {
+                let trimmed = rest.trim_end_matches('/');
+                if trimmed.is_empty() {
+                    continue;
+                }
+                // Immediate child; it is a directory when the entry path
+                // descends further (contains '/') or is an explicit
+                // directory entry (trailing '/').
+                let (child, is_dir) = match trimmed.find('/') {
+                    Some(j) => (&trimmed[..j], true),
+                    None => (trimmed, rest.ends_with('/')),
+                };
+                let e = seen.entry(format!("{prefix}{child}")).or_insert(false);
+                *e = *e || is_dir;
+            }
+        }
+    }
+    seen.into_iter().collect()
+}
+
+/// Best-effort extraction of a `java/net/URI`'s full text. Real-JDK URIs
+/// (e.g. from `URI.create`) store it in the `string` field; our synthetic
+/// URIs (url_parse / Path.toUri layouts) store the full text or fragments
+/// at low slots. Prefer a candidate that carries a scheme; otherwise take
+/// the longest string found.
+fn p57_uri_full_text(ctx: &mut dyn NativeContext, uri: ObjectRef) -> String {
+    let mut cands: Vec<String> = Vec::new();
+    if let Value::Object(Some(s)) = ctx.get_field_by_name(uri, "string") {
+        if let Some(t) = ctx.read_string(s) {
+            cands.push(t);
+        }
+    }
+    for slot in 0..=5usize {
+        if let Value::Object(Some(s)) = ctx.get_field(uri, slot) {
+            if let Some(t) = ctx.read_string(s) {
+                cands.push(t);
+            }
+        }
+    }
+    cands
+        .iter()
+        .find(|c| c.starts_with("jar:") || c.starts_with("file:") || c.contains("://"))
+        .cloned()
+        .or_else(|| cands.into_iter().max_by_key(|c| c.len()))
+        .unwrap_or_default()
+}
+
+/// Convert `jar:file:/C:/x.jar!/entry` / `file:///C:/x.jar` URI text to the
+/// OS path of the backing JAR file. Returns `None` for text that does not
+/// look like a file-backed URI (empty / unparseable).
+fn p57_jar_uri_to_os_path(text: &str) -> Option<String> {
+    let t = text.split("!/").next().unwrap_or(text);
+    let t = t.strip_prefix("jar:").unwrap_or(t);
+    let t = t
+        .strip_prefix("file://")
+        .or_else(|| t.strip_prefix("file:"))
+        .unwrap_or(t);
+    // `/C:/...` URI-path form → `C:/...`
+    let t = if t.len() >= 3 && t.starts_with('/') && t.as_bytes()[2] == b':' {
+        &t[1..]
+    } else {
+        t
+    };
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
 }
 
 /// Build a `java.io.IOException` runtime error from a Rust IO error — used so
@@ -15277,20 +15443,26 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(None)))
     });
 
-    // FileTime = 1-field (millis=0 Long)
+    // FileTime — see `filetime_alloc` / `filetime_read_millis`. The millis is
+    // stored in the real `long value` field (by name) so descriptor coercion
+    // doesn't destroy it; slot 0 of a real-JDK-bound FileTime is a *reference*
+    // field (`instant`/`unit` cache), so a raw `set_field(ft, 0, Long)` was
+    // coerced to null — `toMillis()` returned 0 (vs the real mtime on HotSpot).
     let ft = "java/nio/file/attribute/FileTime";
     r.register(ft, "toMillis", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Long(filetime_read_millis(ctx, this))))
     });
     r.register(
         ft,
         "fromMillis",
         "(J)Ljava/nio/file/attribute/FileTime;",
         |ctx, args| {
-            let millis = args.first().copied().unwrap_or(Value::Long(0));
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(obj, 0, millis);
+            let millis = match args.first() {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let obj = filetime_alloc(ctx, millis);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -15301,23 +15473,14 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let other = obj_arg(args, 1)?;
-            let a = match ctx.get_field(this, 0) {
-                Value::Long(v) => v,
-                _ => 0,
-            };
-            let b = match ctx.get_field(other, 0) {
-                Value::Long(v) => v,
-                _ => 0,
-            };
+            let a = filetime_read_millis(ctx, this);
+            let b = filetime_read_millis(ctx, other);
             Ok(Some(Value::Int(a.cmp(&b) as i32)))
         },
     );
     r.register(ft, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let millis = match ctx.get_field(this, 0) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
+        let millis = filetime_read_millis(ctx, this);
         let s = ctx.create_string(&format!("{millis}ms"));
         Ok(Some(Value::Object(Some(s))))
     });
@@ -15340,12 +15503,45 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
             } else {
                 0
             };
-            let ft = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(ft, 0, Value::Long(millis));
+            let ft = filetime_alloc(ctx, millis);
             Ok(Some(Value::Object(Some(ft))))
         },
     );
     r.set_category(__prev_cat);
+}
+
+/// Allocate a `java.nio.file.attribute.FileTime` carrying `millis`.
+///
+/// In real-JDK mode the object binds to the real `FileTime` class (so a
+/// `checkcast FileTime` / `instanceof FileTime` in `BasicFileAttributes`
+/// consumers holds). The millis is written into the real `long value` field
+/// **by name** so descriptor coercion keeps it a `Long`. A raw slot-0 write is
+/// only used as the synthetic-jdk-mode fallback (no named `value` field):
+/// slot 0 of a real FileTime is a *reference* field, so a `Long` written there
+/// is coerced to null — the overlay-on-real-class bug that made `toMillis()`
+/// return 0 instead of the file's mtime.
+fn filetime_alloc(ctx: &mut dyn NativeContext, millis: i64) -> ObjectRef {
+    let ft = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
+    ctx.set_field_by_name(ft, "value", Value::Long(millis));
+    // Only fall back to slot 0 when the real `value` field is absent
+    // (synthetic-jdk stub) — touching slot 0 of a real FileTime would clobber
+    // a reference cache field.
+    if !matches!(ctx.get_field_by_name(ft, "value"), Value::Long(_)) {
+        ctx.set_field(ft, 0, Value::Long(millis));
+    }
+    ft
+}
+
+/// Read the millis from a FileTime built by [`filetime_alloc`]: prefer the
+/// real `long value` field (real-JDK mode), else slot 0 (synthetic mode).
+fn filetime_read_millis(ctx: &dyn NativeContext, ft: ObjectRef) -> i64 {
+    if let Value::Long(v) = ctx.get_field_by_name(ft, "value") {
+        return v;
+    }
+    match ctx.get_field(ft, 0) {
+        Value::Long(v) => v,
+        _ => 0,
+    }
 }
 
 /// Extract path string from a Path argument (field 0 = String)
@@ -15372,6 +15568,38 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // Extract path from first argument (Path object, field 0 = string)
     let path_str = extract_path_string(ctx, args.first());
 
+    // jar-FS path — attributes come from the archive listing, not the host
+    // filesystem. The real-JDK `Files.walkFileTree` (FileTreeWalker) decides
+    // dir-vs-file purely from this BFA; std::fs::metadata on the encoded
+    // sentinel string ENOENTs, which made the walker treat every mounted-jar
+    // root as a zero-length regular file (JUnit5 jar scanning found nothing).
+    if let Some((jar, entry)) = jarfs_decode(&path_str) {
+        let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
+        let ft = filetime_alloc(ctx, 0);
+        ctx.set_field(bfa, 0, Value::Object(Some(ft)));
+        ctx.set_field(bfa, 1, Value::Object(Some(ft)));
+        ctx.set_field(bfa, 2, Value::Object(Some(ft)));
+        let (is_dir, size) = match jarfs_classify(&jar, &entry) {
+            JarFsKind::Dir => (1, 0i64),
+            JarFsKind::File => (
+                0,
+                jarfs_read_entry(&jar, &entry).map(|b| b.len() as i64).unwrap_or(0),
+            ),
+            JarFsKind::Absent => {
+                // Real readAttributes throws NoSuchFileException (an
+                // IOException) for missing files; FileTreeWalker catches it
+                // and reports visitFileFailed instead of walking garbage.
+                return Err(RuntimeError::IOException {
+                    message: format!("NoSuchFileException: {entry} in {jar}"),
+                }
+                .into());
+            }
+        };
+        ctx.set_field(bfa, 3, Value::Int(is_dir));
+        ctx.set_field(bfa, 4, Value::Long(size));
+        return Ok(Some(Value::Object(Some(bfa))));
+    }
+
     // Check if NOFOLLOW_LINKS is specified (would use symlink_metadata)
     let meta_result = if path_str.is_empty() {
         Err(std::io::Error::new(std::io::ErrorKind::NotFound, "empty path"))
@@ -15385,18 +15613,15 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Ok(meta) => {
             // Creation time
             let creation_millis = meta.created().ok().map(system_time_to_millis).unwrap_or(0);
-            let ft_create = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(ft_create, 0, Value::Long(creation_millis));
+            let ft_create = filetime_alloc(ctx, creation_millis);
 
             // Last access time
             let access_millis = meta.accessed().ok().map(system_time_to_millis).unwrap_or(0);
-            let ft_access = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(ft_access, 0, Value::Long(access_millis));
+            let ft_access = filetime_alloc(ctx, access_millis);
 
             // Last modified time
             let mod_millis = meta.modified().ok().map(system_time_to_millis).unwrap_or(0);
-            let ft_mod = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(ft_mod, 0, Value::Long(mod_millis));
+            let ft_mod = filetime_alloc(ctx, mod_millis);
 
             ctx.set_field(bfa, 0, Value::Object(Some(ft_create)));
             ctx.set_field(bfa, 1, Value::Object(Some(ft_access)));
@@ -15406,8 +15631,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
         Err(_) => {
             // Return default zeros for non-existent files
-            let ft = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(ft, 0, Value::Long(0));
+            let ft = filetime_alloc(ctx, 0);
             ctx.set_field(bfa, 0, Value::Object(Some(ft)));
             ctx.set_field(bfa, 1, Value::Object(Some(ft)));
             ctx.set_field(bfa, 2, Value::Object(Some(ft)));
@@ -23590,7 +23814,29 @@ fn p98_walk_dir(
         if ord == 1 { return Ok(false); } // TERMINATE
         if ord == 2 { return Ok(true); }  // SKIP_SUBTREE
     }
-    if let Ok(entries) = std::fs::read_dir(dir) {
+    if let Some((jar, entry)) = jarfs_decode(dir) {
+        // jar-FS directory — children come from the archive listing, not the
+        // host filesystem (std::fs::read_dir on the encoded sentinel string
+        // would ENOENT and silently visit nothing, so e.g. JUnit5's
+        // ClasspathScanner would "discover" an empty jar).
+        for (child, is_dir) in jarfs_list_dir_classified(&jar, &entry) {
+            let es = jarfs_encode(&jar, &child);
+            let epo = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
+            let s = ctx.create_string(&es);
+            ctx.set_field(epo, 0, Value::Object(Some(s)));
+            if is_dir {
+                if !p98_walk_dir(ctx, &es, visitor, epo)? { return Ok(false); }
+            } else {
+                let fa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 0);
+                let vr = ctx.invoke_virtual(visitor, "visitFile",
+                    "(Ljava/lang/Object;Ljava/nio/file/attribute/BasicFileAttributes;)Ljava/nio/file/FileVisitResult;",
+                    &[Value::Object(Some(epo)), Value::Object(Some(fa))])?;
+                if let Some(Value::Object(Some(r))) = vr {
+                    if ctx.get_field(r, 1).as_int().unwrap_or(0) == 1 { return Ok(false); }
+                }
+            }
+        }
+    } else if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let ep = entry.path();
             let es = ep.to_string_lossy().to_string();
@@ -33828,7 +34074,8 @@ pub(crate) fn register_posix_file_permission_stub_clinit(r: &mut NativeMethodReg
 pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // FileTime = 1-field (millis=0 Long)
+    // FileTime — millis stored in the real `long value` field (by name) so
+    // descriptor coercion preserves it; see `filetime_alloc`.
     let ft = "java/nio/file/attribute/FileTime";
     r.register(
         ft,
@@ -33839,8 +34086,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(obj, 0, Value::Long(millis));
+            let obj = filetime_alloc(ctx, millis);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -33853,8 +34099,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(obj, 0, Value::Long(val));
+            let obj = filetime_alloc(ctx, val);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -33863,14 +34108,13 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
         "from",
         "(Ljava/time/Instant;)Ljava/nio/file/attribute/FileTime;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(obj, 0, Value::Long(0));
+            let obj = filetime_alloc(ctx, 0);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.register(ft, "toMillis", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Long(filetime_read_millis(ctx, this))))
     });
     r.register(ft, "toInstant", "()Ljava/time/Instant;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
@@ -33885,23 +34129,14 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let a = match ctx.get_field(this, 0) {
-                Value::Long(v) => v,
-                _ => 0,
-            };
-            let b = match ctx.get_field(other, 0) {
-                Value::Long(v) => v,
-                _ => 0,
-            };
+            let a = filetime_read_millis(ctx, this);
+            let b = filetime_read_millis(ctx, other);
             Ok(Some(Value::Int(a.cmp(&b) as i32)))
         },
     );
     r.register(ft, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let millis = match ctx.get_field(this, 0) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
+        let millis = filetime_read_millis(ctx, this);
         let s = ctx.create_string(&format!("{}ms", millis));
         Ok(Some(Value::Object(Some(s))))
     });
