@@ -1234,6 +1234,27 @@ fn register_runtime_mxbean(r: &mut NativeMethodRegistry) {
         "()Z",
         |_ctx, _args| Ok(Some(Value::Int(0))),
     );
+    // getSystemProperties() -> Map<String,String>. Used by Elasticsearch's
+    // `JvmInfo.<clinit>` (and many frameworks) to snapshot the system props.
+    // The synthetic `RuntimeMXBean` is an interface object, so an unregistered
+    // method falls through to the abstract interface method and raises
+    // `AbstractMethodError: ... has no Code attribute`. Return the live
+    // `System.getProperties()` (a `Properties`, i.e. a `Map` whose values are
+    // all `String`s) which satisfies the `Map<String,String>` contract callers
+    // use (get / containsKey / entrySet iteration).
+    r.register(
+        cls,
+        "getSystemProperties",
+        "()Ljava/util/Map;",
+        |ctx, _args| {
+            ctx.invoke(
+                "java/lang/System",
+                "getProperties",
+                "()Ljava/util/Properties;",
+                &[],
+            )
+        },
+    );
     r.set_category(__prev_cat);
 }
 

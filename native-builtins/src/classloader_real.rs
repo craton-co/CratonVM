@@ -487,6 +487,74 @@ pub fn register_classloader_real_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // ES.2 — package-private `AccessControlContext`-carrying constructors.
+    //
+    // `URLClassLoader.newInstance(URL[])` (and the 2-arg variant) is a static
+    // factory that the JDK and apps use to build a child classloader whose
+    // loaded classes inherit the *caller's* protection domain. It allocates a
+    // `java.net.FactoryURLClassLoader` (a package-private subclass), whose
+    // constructor chains to `super(urls, acc)` / `super(name, urls, parent,
+    // acc)`. Those two `URLClassLoader` constructors are PACKAGE-PRIVATE and
+    // were not registered here, so they fell through to real-JDK bytecode that
+    // builds a `jdk.internal.loader.URLClassPath` `ucp` field — but CratonVM's
+    // `findClass`/`getResource` consult the GLOBAL dynamic classpath
+    // (`register_dynamic_classpath`), NOT the `ucp` field, so the URLs were
+    // never wired in and classes inside them were invisible.
+    //
+    // Concrete breakage: Elasticsearch's `CliToolProvider.load` builds the
+    // server-cli classloader via `URLClassLoader.newInstance(URL[])`; the
+    // `server` `CliToolProvider` lived in that jar and so was never found
+    // (`ServiceLoader` saw only the parent-classpath `node`/`shard`
+    // providers → `AssertionError: CliToolProvider [server] not found`).
+    // Mirror the public ctors: wire the URLs into the dynamic classpath.
+    //
+    // `URLClassLoader(URL[], AccessControlContext)` — real JDK calls the no-arg
+    // `super()`, so the delegation parent is the system class loader.
+    r.register(
+        ucl,
+        "<init>",
+        "([Ljava/net/URL;Ljava/security/AccessControlContext;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let urls = args.get(1).copied().unwrap_or(Value::Object(None));
+            let acc = args.get(2).copied().unwrap_or(Value::Object(None));
+            let parent = get_or_create_system_cl(ctx);
+            ctx.set_field_by_name(this, "parent", Value::Object(parent));
+            ctx.set_field_by_name(this, "acc", acc);
+            init_classloader_common_fields(ctx, this);
+            init_urlclassloader_fields(ctx, this);
+            register_url_array(ctx, urls);
+            Ok(None)
+        },
+    );
+    // `URLClassLoader(String, URL[], ClassLoader, AccessControlContext)` —
+    // real JDK calls `super(name, parent)`, so the parent is the explicit arg.
+    r.register(
+        ucl,
+        "<init>",
+        "(Ljava/lang/String;[Ljava/net/URL;Ljava/lang/ClassLoader;Ljava/security/AccessControlContext;)V",
+        |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(None),
+            };
+            let name = args.get(1).copied().unwrap_or(Value::Object(None));
+            let urls = args.get(2).copied().unwrap_or(Value::Object(None));
+            let parent = args.get(3).copied().unwrap_or(Value::Object(None));
+            let acc = args.get(4).copied().unwrap_or(Value::Object(None));
+            ctx.set_field_by_name(this, "name", name);
+            ctx.set_field_by_name(this, "parent", parent);
+            ctx.set_field_by_name(this, "acc", acc);
+            init_classloader_common_fields(ctx, this);
+            init_urlclassloader_fields(ctx, this);
+            register_url_array(ctx, urls);
+            Ok(None)
+        },
+    );
+
     // S111r9 — SecureClassLoader.<clinit> override.
     //
     // The real-JDK bytecode for `java/security/SecureClassLoader.<clinit>` is
