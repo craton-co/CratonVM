@@ -2380,104 +2380,17 @@ impl Arm64Backend {
     }
 }
 
-/// Describes a detected vectorizable loop pattern in JVM bytecode.
-#[derive(Debug, Clone)]
-pub enum NeonVectorizablePattern {
-    /// Sum of int array elements: `for (i=0; i<len; i++) sum += arr[i]`
-    IntArraySum {
-        /// Local index of the array reference.
-        array_local: usize,
-        /// Local index of the accumulator.
-        accum_local: usize,
-        /// Local index of the loop counter.
-        counter_local: usize,
-    },
-    /// Dot product of two int arrays: `for (i=0; i<len; i++) sum += a[i] * b[i]`
-    IntDotProduct {
-        array_a_local: usize,
-        array_b_local: usize,
-        accum_local: usize,
-        counter_local: usize,
-    },
-}
-
-/// Analyze bytecode for NEON-vectorizable patterns.
-///
-/// Returns a list of detected patterns that could be compiled to NEON code.
-/// Currently detects:
-/// - Int array sum loops (iaload + iadd accumulation pattern)
-/// - Int dot product loops (two iaload + imul + iadd pattern)
-pub fn detect_neon_patterns(bytecode: &[u8], _num_locals: usize) -> Vec<NeonVectorizablePattern> {
-    let mut patterns = Vec::new();
-    let code_len = bytecode.len();
-
-    // Scan for backward branches (loop back-edges) to find loop bodies.
-    let mut pc = 0;
-    while pc < code_len {
-        let op = bytecode[pc];
-
-        // Look for backward branch (goto with negative offset or ifXX with negative offset)
-        let (is_branch, offset_pos) = match op {
-            0xa7 => (true, pc + 1), // goto
-            0x99..=0xa6 | 0xc6 | 0xc7 => (true, pc + 1), // conditional branches
-            _ => (false, 0),
-        };
-
-        if is_branch && offset_pos + 1 < code_len {
-            let offset = i16::from_be_bytes([bytecode[offset_pos], bytecode[offset_pos + 1]]) as i32;
-            if offset < 0 {
-                // This is a backward branch — potential loop
-                let loop_start = (pc as i32 + offset) as usize;
-                let loop_end = pc;
-
-                // Scan loop body for iaload + iadd pattern (array sum)
-                let mut has_iaload = false;
-                let mut has_iadd = false;
-                let mut has_imul = false;
-                let mut iaload_count = 0;
-
-                let mut lpc = loop_start;
-                while lpc < loop_end && lpc < code_len {
-                    match bytecode[lpc] {
-                        0x2e => { has_iaload = true; iaload_count += 1; } // iaload
-                        0x60 => { has_iadd = true; }  // iadd
-                        0x68 => { has_imul = true; }  // imul
-                        _ => {}
-                    }
-                    lpc += super::regalloc::bc_len(bytecode, lpc);
-                }
-
-                if has_iaload && has_iadd && !has_imul && iaload_count == 1 {
-                    // Simple array sum pattern detected
-                    patterns.push(NeonVectorizablePattern::IntArraySum {
-                        array_local: 0, // placeholder — full analysis would resolve these
-                        accum_local: 0,
-                        counter_local: 0,
-                    });
-                } else if iaload_count >= 2 && has_imul && has_iadd {
-                    // Dot product pattern detected
-                    patterns.push(NeonVectorizablePattern::IntDotProduct {
-                        array_a_local: 0,
-                        array_b_local: 0,
-                        accum_local: 0,
-                        counter_local: 0,
-                    });
-                }
-            }
-        }
-
-        pc += match op {
-            0x10 | 0x15..=0x19 | 0x36..=0x3a | 0xbc => 2,
-            0x11 | 0x84 | 0x99..=0xa7 | 0xb2..=0xb8 | 0xbd | 0xc0 | 0xc1 | 0xc6 | 0xc7 => 3,
-            0xbb => 3,
-            0xc5 => 4,
-            0xb9 => 5,
-            _ => 1,
-        };
-    }
-
-    patterns
-}
+// NOTE: A `detect_neon_patterns` / `NeonVectorizablePattern` bytecode scanner
+// previously lived here. It was dead code — only ever called from its own unit
+// tests, never wired into any aarch64 codegen path — and, worse, it emitted
+// patterns with hardcoded placeholder local indices (`array_local: 0` etc.) with
+// the operand analysis left unfinished, so it would have vectorized against the
+// wrong locals (a miscompile) if ever consumed. aarch64 is not the production
+// backend (x64.rs is). Removed in the 2026-06-10 JIT cleanup pass rather than
+// gated, since nothing non-test referenced it. If NEON auto-vectorization is
+// pursued, reuse the real operand resolution from the x64 BCE analysis
+// (`analyze_array_access_operands` / `find_induction_variable`) instead of
+// placeholders, and wire the result into codegen before adding it back.
 
 // ---------------------------------------------------------------------------
 // Machine code emission
@@ -3960,38 +3873,10 @@ mod tests {
         assert_eq!(ld1_count, 2, "NEON dot product should load from two arrays");
     }
 
-    #[test]
-    fn p95_neon_pattern_detection_array_sum() {
-        // Bytecode representing: for (i=0; i<len; i++) sum += arr[i]
-        // iload_2 (array), iload_3 (index), iaload, iload_1 (sum), iadd,
-        // istore_1 (sum), iinc 3 1, iload_3, iload_0(len), if_icmplt -12
-        let bytecode = &[
-            0x1c,             // 0: iload_2  (array)
-            0x1d,             // 1: iload_3  (index)
-            0x2e,             // 2: iaload
-            0x1b,             // 3: iload_1  (sum)
-            0x60,             // 4: iadd
-            0x3c,             // 5: istore_1 (sum)
-            0x84, 0x03, 0x01, // 6: iinc 3, 1
-            0x1d,             // 9: iload_3  (index)
-            0x1a,             // 10: iload_0 (len)
-            0xa1, 0xff, 0xf5, // 11: if_icmplt -11 → 0
-            0x1b,             // 14: iload_1  (sum)
-            0xac,             // 15: ireturn
-        ];
-        let patterns = detect_neon_patterns(bytecode, 4);
-        assert!(!patterns.is_empty(), "should detect array sum pattern");
-        assert!(matches!(patterns[0], NeonVectorizablePattern::IntArraySum { .. }),
-            "detected pattern should be IntArraySum");
-    }
-
-    #[test]
-    fn p95_neon_pattern_detection_no_pattern() {
-        // Simple bytecode with no loop — should detect nothing
-        let bytecode = &[0x1a, 0xac]; // iload_0, ireturn
-        let patterns = detect_neon_patterns(bytecode, 1);
-        assert!(patterns.is_empty(), "no loop = no patterns");
-    }
+    // NOTE: the `p95_neon_pattern_detection_*` tests were removed alongside the
+    // dead `detect_neon_patterns` / `NeonVectorizablePattern` scanner (2026-06-10
+    // JIT cleanup). That scanner was never wired into codegen and emitted
+    // placeholder local indices; see the removal note near the top of this file.
 
     #[test]
     fn p95_neon_machine_code_emission() {

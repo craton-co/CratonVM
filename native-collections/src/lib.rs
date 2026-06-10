@@ -5746,13 +5746,12 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     //   1. Snapshot the array into a Vec<Value>.
     //   2. Verify every non-null element is Comparable; throw
     //      ClassCastException on the first non-Comparable element.
-    //   3. Sort via insertion sort, dispatching through
+    //   3. Sort via a stable merge sort (O(n log n)), dispatching through
     //      `Comparable.compareTo(Object)` for every pair-wise comparison.
-    //      Insertion sort is O(n^2) but works correctly with a fallible
-    //      comparator (a thrown compareTo propagates out cleanly) and is
-    //      acceptable for the synthetic-stub path — real JDK code uses
-    //      a TimSort that we can't replicate while propagating exceptions
-    //      from Rust's stable `sort_by`.
+    //      The merge is fallible: a thrown compareTo propagates out cleanly
+    //      and short-circuits the sort. We can't use Rust's stable `sort_by`
+    //      because its comparator is infallible, so we run our own stable
+    //      merge sort (`merge_sort_fallible`) that threads the error through.
     //
     // Null elements are permitted (JDK sorts them as if smaller than any
     // non-null element when the comparator is null, but throws NPE when
@@ -5782,18 +5781,8 @@ fn native_arrays_sort_objects(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         }
     }
 
-    // Insertion sort with fallible comparator.
-    for i in 1..items.len() {
-        let mut j = i;
-        while j > 0 {
-            let cmp = compare_via_compare_to(ctx, &items[j - 1], &items[j])?;
-            if cmp <= 0 {
-                break;
-            }
-            items.swap(j - 1, j);
-            j -= 1;
-        }
-    }
+    // Stable merge sort (O(n log n)) with fallible comparator.
+    merge_sort_fallible(ctx, &mut items, |c, a, b| compare_via_compare_to(c, a, b))?;
 
     for (i, val) in items.iter().enumerate() {
         ctx.set_array_element(arr, i, *val);
@@ -5873,6 +5862,104 @@ fn compare_via_compare_to(
         // Non-object slots are unreachable in an Object[]; defensive fallback.
         _ => Ok(0),
     }
+}
+
+/// Stable, fallible merge sort — O(n log n).
+///
+/// Sorts `items` in place using `cmp`, a comparison closure that returns
+/// `Ok(<0 | 0 | >0)` (the usual `compareTo`/`Comparator.compare` contract) or
+/// an `Err` when the underlying Java comparison throws (e.g.
+/// `ClassCastException` or a comparator-thrown exception). The first error
+/// short-circuits the whole sort and is propagated to the caller, leaving
+/// `items` in a partially-merged (but memory-safe) state — matching the
+/// behaviour of the previous insertion sort, which also stopped on the first
+/// `Err` mid-pass.
+///
+/// `ctx` is threaded through to the closure on each call so the comparison can
+/// dispatch back into the VM (`invoke_virtual`) without the closure having to
+/// borrow `ctx` itself. The merge is **stable**: when two elements compare
+/// equal, the one originally earlier in `items` is kept earlier, which is the
+/// contract `Collections.sort`/`Arrays.sort` guarantee and that the old
+/// insertion sort provided (`cmp <= 0 => break`).
+///
+/// This is a classic bottom-up (iterative) merge sort to avoid recursion and
+/// keep the borrow of `ctx`/`cmp` flat. The merge step copies the left run
+/// into a scratch buffer and merges it back with the (untouched) right run,
+/// preferring the left element on ties to preserve stability.
+fn merge_sort_fallible<F>(
+    ctx: &mut dyn NativeContext,
+    items: &mut [Value],
+    mut cmp: F,
+) -> Result<(), MethodCallFailed>
+where
+    F: FnMut(&mut dyn NativeContext, &Value, &Value) -> Result<i32, MethodCallFailed>,
+{
+    let n = items.len();
+    if n <= 1 {
+        return Ok(());
+    }
+    // Scratch buffer holds a copy of the current left run during each merge.
+    let mut scratch: Vec<Value> = Vec::with_capacity(n / 2 + 1);
+    let mut width = 1usize;
+    while width < n {
+        let mut lo = 0usize;
+        while lo < n {
+            let mid = (lo + width).min(n);
+            let hi = (lo + 2 * width).min(n);
+            // Already sorted relative to each other if there is no right run.
+            if mid < hi {
+                merge_runs_fallible(ctx, items, lo, mid, hi, &mut scratch, &mut cmp)?;
+            }
+            lo += 2 * width;
+        }
+        width *= 2;
+    }
+    Ok(())
+}
+
+/// Merge the two adjacent sorted runs `[lo, mid)` and `[mid, hi)` of `items`
+/// into a single sorted run `[lo, hi)`. Stable: ties keep the left element
+/// first. `scratch` is reused across calls to avoid per-merge allocation.
+fn merge_runs_fallible<F>(
+    ctx: &mut dyn NativeContext,
+    items: &mut [Value],
+    lo: usize,
+    mid: usize,
+    hi: usize,
+    scratch: &mut Vec<Value>,
+    cmp: &mut F,
+) -> Result<(), MethodCallFailed>
+where
+    F: FnMut(&mut dyn NativeContext, &Value, &Value) -> Result<i32, MethodCallFailed>,
+{
+    // Copy the left run aside; the right run stays in place in `items`.
+    scratch.clear();
+    scratch.extend_from_slice(&items[lo..mid]);
+
+    let mut l = 0usize; // index into scratch (left run)
+    let mut r = mid; // index into items (right run)
+    let mut out = lo; // write position in items
+    let left_len = scratch.len();
+
+    while l < left_len && r < hi {
+        // Stable: take the left element when left <= right.
+        let c = cmp(ctx, &scratch[l], &items[r])?;
+        if c <= 0 {
+            items[out] = scratch[l];
+            l += 1;
+        } else {
+            items[out] = items[r];
+            r += 1;
+        }
+        out += 1;
+    }
+    // Drain whatever remains of the left run (right run is already in place).
+    while l < left_len {
+        items[out] = scratch[l];
+        l += 1;
+        out += 1;
+    }
+    Ok(())
 }
 
 fn native_arrays_fill_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6013,18 +6100,42 @@ fn native_collections_sort(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         None => return Ok(None),
     };
     let len = size as usize;
-    // Read elements with string keys
-    let mut items: Vec<(String, Value)> = Vec::with_capacity(len);
-    for i in 0..len {
-        let val = ctx.get_array_element(data, i);
-        let key = match &val {
-            Value::Object(Some(obj)) => ctx.read_string(*obj).unwrap_or_default(),
-            _ => String::new(),
-        };
-        items.push((key, val));
+    if len <= 1 {
+        return Ok(None);
     }
-    items.sort_by(|a, b| a.0.cmp(&b.0));
-    for (i, (_, val)) in items.iter().enumerate() {
+    // Sort by the elements' natural ordering (Comparable.compareTo), matching
+    // `Arrays.sort(Object[])`. The previous implementation sorted by each
+    // element's `read_string()` representation, so `List<Integer>` /
+    // `List<Date>` / any non-String Comparable produced an all-empty-string
+    // key and the list was returned UNSORTED (B3). We mirror
+    // `native_arrays_sort_objects`: verify Comparable, then merge-sort
+    // dispatching through `compare_via_compare_to` (stable, O(n log n), and
+    // correct with a fallible comparator — a thrown compareTo propagates
+    // cleanly and short-circuits the sort).
+    let mut items: Vec<Value> = Vec::with_capacity(len);
+    for i in 0..len {
+        items.push(ctx.get_array_element(data, i));
+    }
+    // Verify Comparable on every non-null element (JDK throws CCE otherwise).
+    for v in &items {
+        if let Value::Object(Some(obj)) = v {
+            if !implements_comparable(ctx, *obj) {
+                let cname = ctx
+                    .class_name_of_id(ctx.class_id_of_object(*obj))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                return Err(cratonvm_types::error::RuntimeError::ClassCastException {
+                    message: format!(
+                        "element of class {} does not implement java.lang.Comparable",
+                        cname
+                    ),
+                }
+                .into());
+            }
+        }
+    }
+    // Stable merge sort (O(n log n)) with fallible comparator.
+    merge_sort_fallible(ctx, &mut items, |c, a, b| compare_via_compare_to(c, a, b))?;
+    for (i, val) in items.iter().enumerate() {
         ctx.set_array_element(data, i, *val);
     }
     Ok(None)
@@ -6442,7 +6553,7 @@ fn native_collections_sort_comparator(
     sort_with_comparator(ctx, list, comparator)
 }
 
-/// Insertion sort using a Comparator lambda.
+/// Stable merge sort (O(n log n)) using a Comparator lambda.
 fn sort_with_comparator(
     ctx: &mut dyn NativeContext,
     list: ObjectRef,
@@ -6464,24 +6575,16 @@ fn sort_with_comparator(
         elems.push(ctx.get_array_element(data, i));
     }
 
-    // Insertion sort — O(n²) but stable and correct.
-    for i in 1..len {
-        let key = elems[i];
-        let mut j = i;
-        while j > 0 {
-            let cmp_result = comparator_compare(ctx, comparator, elems[j - 1], key)?;
-            let cmp = match cmp_result {
-                Some(Value::Int(v)) => v,
-                _ => 0,
-            };
-            if cmp <= 0 {
-                break;
-            }
-            elems[j] = elems[j - 1];
-            j -= 1;
+    // Stable merge sort — O(n log n) — dispatching through the Comparator.
+    // The comparison is fallible: a comparator that throws propagates the
+    // error out and short-circuits the sort. A non-Int return is treated as
+    // 0 ("equal"), preserving the previous insertion-sort semantics.
+    merge_sort_fallible(ctx, &mut elems, |c, a, b| {
+        match comparator_compare(c, comparator, *a, *b)? {
+            Some(Value::Int(v)) => Ok(v),
+            _ => Ok(0),
         }
-        elems[j] = key;
-    }
+    })?;
 
     // Write sorted elements back.
     for (i, val) in elems.iter().enumerate() {
@@ -7997,25 +8100,20 @@ fn native_stream_sorted_cmp(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return make_stream(ctx, &[]),
     };
     let mut elems = stream_elements(ctx, this);
-    let len = elems.len();
-    // Insertion sort — O(n²) but stable.
-    for i in 1..len {
-        let key = elems[i];
-        let mut j = i;
-        while j > 0 {
-            let cmp_result = comparator_compare(ctx, comparator, elems[j - 1], key)?;
-            let cmp = match cmp_result {
-                Some(Value::Int(v)) => v,
-                _ => 0,
-            };
-            if cmp <= 0 {
-                break;
-            }
-            elems[j] = elems[j - 1];
-            j -= 1;
+
+    // Stable merge sort — O(n log n) — dispatching through the Comparator.
+    // Mirrors `sort_with_comparator` (Collections.sort(List, cmp)): the
+    // comparison is fallible (a comparator that throws propagates the error
+    // out and short-circuits the sort) and a non-Int return is treated as 0
+    // ("equal"), preserving the previous insertion-sort semantics
+    // (`cmp <= 0 => keep left first` ⇒ stable).
+    merge_sort_fallible(ctx, &mut elems, |c, a, b| {
+        match comparator_compare(c, comparator, *a, *b)? {
+            Some(Value::Int(v)) => Ok(v),
+            _ => Ok(0),
         }
-        elems[j] = key;
-    }
+    })?;
+
     make_stream(ctx, &elems)
 }
 
@@ -11033,7 +11131,13 @@ fn natural_compare(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> MethodC
                 (Value::Double(a), Value::Double(b)) => {
                     Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
                 }
-                _ => Ok(Some(Value::Int(0))),
+                // Not a String and not a homogeneous primitive wrapper —
+                // dispatch the element's real `Comparable.compareTo`. Without
+                // this, comparator-less `TreeMap`/`TreeSet` of a custom
+                // `Comparable` key (the array-mode path → `tree_compare`)
+                // silently treated every element as equal (returned 0),
+                // collapsing the ordering and dropping/dedup-ing entries (B2).
+                _ => Ok(Some(Value::Int(compare_via_compare_to(ctx, a, b)?))),
             }
         }
         // Compare bare ints/longs/etc. (for comparingInt results)
@@ -21875,11 +21979,36 @@ fn native_collections_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
 // ===========================================================================
 
 // LinkedBlockingQueue = 4-field synthetic (same as LinkedList + capacity)
-const LBQ_FIELD_HEAD: usize = 0;
-const LBQ_FIELD_TAIL: usize = 1;
+const LBQ_FIELD_HEAD: usize = 0; // Object[] backing buffer (NOT an index)
+const LBQ_FIELD_TAIL: usize = 1; // Int: head index into the backing buffer
 const LBQ_FIELD_SIZE: usize = 2;
 const LBQ_FIELD_CAPACITY: usize = 3;
 const _LBQ_NUM_FIELDS: usize = 4;
+
+// ---------------------------------------------------------------------------
+// FIFO layout (perf P1 fix): the backing `Object[]` (in LBQ_FIELD_HEAD) holds
+// the live elements at indices `[head .. head + size)`, where `head` is the
+// integer in LBQ_FIELD_TAIL (previously an unused, always-0 slot). A `poll`
+// returns element `head` and advances `head` by one — O(1) — instead of the
+// former O(n) left-shift of every remaining element (which made an N-element
+// drain O(n^2)). The buffer is a linear (non-wrapping) window that drifts
+// rightward as elements are polled; `lbq_ensure_capacity` compacts the window
+// back to index 0 (and grows when necessary) before any append, so the tail
+// never runs off the end. Logical element `i` therefore lives at array index
+// `head + i`.
+
+/// Current head index (offset of logical element 0 within the backing array).
+fn lbq_head(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
+    match ctx.get_field(this, LBQ_FIELD_TAIL) {
+        Value::Int(v) if v >= 0 => v as usize,
+        _ => 0,
+    }
+}
+
+/// Store the head index.
+fn lbq_set_head(ctx: &mut dyn NativeContext, this: ObjectRef, head: usize) {
+    ctx.set_field(this, LBQ_FIELD_TAIL, Value::Int(head as i32));
+}
 
 fn register_blocking_queue_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -22100,8 +22229,27 @@ fn native_cld_offer_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
-    };
-    lbq_ensure_capacity(ctx, this, (size + 1) as usize);
+    } as usize;
+    // Fast path: if the head window has drifted rightward there is already a
+    // free slot in front — just decrement head and write there (O(1)).
+    let head = lbq_head(ctx, this);
+    if head > 0 {
+        let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
+            Value::Object(Some(a)) => a,
+            _ => {
+                ctx.monitor_exit(this);
+                return Ok(Some(Value::Int(0)));
+            }
+        };
+        ctx.set_array_element(arr, head - 1, elem);
+        lbq_set_head(ctx, this, head - 1);
+        ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size as i32 + 1));
+        ctx.monitor_exit(this);
+        return Ok(Some(Value::Int(1)));
+    }
+    // Slow path: head == 0, no front room. Grow/compact so the window fits,
+    // then shift the live elements right by one to open index 0.
+    lbq_ensure_capacity(ctx, this, size + 1);
     let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
         _ => {
@@ -22109,14 +22257,13 @@ fn native_cld_offer_first(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
             return Ok(Some(Value::Int(0)));
         }
     };
-    // Shift elements right to make room at index 0.
-    if size > 0 {
-        for i in (1..=(size as usize)).rev() {
-            ctx.set_array_element(arr, i, ctx.get_array_element(arr, i - 1));
-        }
+    // ensure_capacity reset head to 0 if it relocated; re-read defensively.
+    let head = lbq_head(ctx, this);
+    for i in (1..=size).rev() {
+        ctx.set_array_element(arr, head + i, ctx.get_array_element(arr, head + i - 1));
     }
-    ctx.set_array_element(arr, 0, elem);
-    ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size + 1));
+    ctx.set_array_element(arr, head, elem);
+    ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size as i32 + 1));
     ctx.monitor_exit(this);
     Ok(Some(Value::Int(1)))
 }
@@ -22129,7 +22276,7 @@ fn native_lbq_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let arr = alloc_ref_array(ctx, 16);
     ctx.set_field(this, LBQ_FIELD_HEAD, Value::Object(Some(arr)));
-    ctx.set_field(this, LBQ_FIELD_TAIL, Value::Int(0)); // unused, we use simple array
+    ctx.set_field(this, LBQ_FIELD_TAIL, Value::Int(0)); // head index = 0
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(0));
     ctx.set_field(this, LBQ_FIELD_CAPACITY, Value::Int(i32::MAX));
     Ok(None)
@@ -22161,21 +22308,49 @@ fn native_abq_init_fair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     native_lbq_init_cap(ctx, args)
 }
 
+/// Ensure the backing array can hold `needed` logical elements *starting at
+/// the current head index*. If the window `[head .. head + needed)` would run
+/// off the end of the array, first try compacting the live `[head .. head +
+/// size)` window back to index 0 (no allocation); only allocate a larger
+/// buffer when even a compacted window doesn't fit. Resets `head` to 0
+/// whenever it relocates elements. Logical element layout (`head + i`) is
+/// preserved.
 fn lbq_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, needed: usize) {
     let arr = match ctx.get_field(this, LBQ_FIELD_HEAD) {
         Value::Object(Some(a)) => a,
         _ => return,
     };
     let old_len = ctx.array_length(arr);
-    if needed <= old_len {
+    let head = lbq_head(ctx, this);
+    // Fits in the current window — nothing to do.
+    if head + needed <= old_len {
         return;
     }
+    let size = match ctx.get_field(this, LBQ_FIELD_SIZE) {
+        Value::Int(v) if v >= 0 => v as usize,
+        _ => 0,
+    };
+    // Compact-in-place if the live window fits at index 0 (head has merely
+    // drifted right past the tail). This is the common steady-state case for
+    // a balanced producer/consumer queue and avoids reallocation.
+    if needed <= old_len {
+        for i in 0..size {
+            ctx.set_array_element(arr, i, ctx.get_array_element(arr, head + i));
+        }
+        for i in size..old_len {
+            ctx.set_array_element(arr, i, Value::Object(None));
+        }
+        lbq_set_head(ctx, this, 0);
+        return;
+    }
+    // Grow: allocate a larger buffer and copy the live window to index 0.
     let new_len = (old_len * 2).max(needed).max(16);
     let new_arr = alloc_ref_array(ctx, new_len);
-    for i in 0..old_len {
-        ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, i));
+    for i in 0..size {
+        ctx.set_array_element(new_arr, i, ctx.get_array_element(arr, head + i));
     }
     ctx.set_field(this, LBQ_FIELD_HEAD, Value::Object(Some(new_arr)));
+    lbq_set_head(ctx, this, 0);
 }
 
 // =====================================================================
@@ -22223,7 +22398,10 @@ fn native_lbq_offer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Value::Object(Some(a)) => a,
         _ => return Ok(None),
     };
-    ctx.set_array_element(arr, size as usize, elem);
+    // Append at the logical tail (head + size). ensure_capacity guarantees
+    // this slot exists (and may have reset head to 0 by compacting).
+    let head = lbq_head(ctx, this);
+    ctx.set_array_element(arr, head + size as usize, elem);
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size + 1));
     Ok(None)
 }
@@ -22326,14 +22504,19 @@ fn lbq_poll_locked(ctx: &mut dyn NativeContext, this: ObjectRef) -> Value {
         Value::Object(Some(a)) => a,
         _ => return Value::Object(None),
     };
-    let head = ctx.get_array_element(arr, 0);
-    // Shift elements left.
-    for i in 0..(size - 1) as usize {
-        ctx.set_array_element(arr, i, ctx.get_array_element(arr, i + 1));
+    // O(1) FIFO dequeue: read the head element, clear its slot and advance the
+    // head index by one (no element shifting — see the layout note above).
+    let head = lbq_head(ctx, this);
+    let elem = ctx.get_array_element(arr, head);
+    ctx.set_array_element(arr, head, Value::Object(None));
+    if size - 1 == 0 {
+        // Empty: reset head to 0 so the window starts fresh.
+        lbq_set_head(ctx, this, 0);
+    } else {
+        lbq_set_head(ctx, this, head + 1);
     }
-    ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
-    head
+    elem
 }
 
 fn native_lbq_poll(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -22370,8 +22553,13 @@ fn native_lbq_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             return Ok(Some(Value::Object(None)));
         }
     };
-    let tail = ctx.get_array_element(arr, (size - 1) as usize);
-    ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
+    let head = lbq_head(ctx, this);
+    let tail_idx = head + (size - 1) as usize;
+    let tail = ctx.get_array_element(arr, tail_idx);
+    ctx.set_array_element(arr, tail_idx, Value::Object(None));
+    if size - 1 == 0 {
+        lbq_set_head(ctx, this, 0);
+    }
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
     let _ = ctx.monitor_notify_all(this);
     ctx.monitor_exit(this);
@@ -22399,9 +22587,10 @@ fn native_lbq_peek(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
             return Ok(Some(Value::Object(None)));
         }
     };
-    let head = ctx.get_array_element(arr, 0);
+    let head = lbq_head(ctx, this);
+    let front = ctx.get_array_element(arr, head);
     ctx.monitor_exit(this);
-    Ok(Some(head))
+    Ok(Some(front))
 }
 
 fn native_lbq_peek_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -22425,7 +22614,8 @@ fn native_lbq_peek_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             return Ok(Some(Value::Object(None)));
         }
     };
-    let tail = ctx.get_array_element(arr, (size - 1) as usize);
+    let head = lbq_head(ctx, this);
+    let tail = ctx.get_array_element(arr, head + (size - 1) as usize);
     ctx.monitor_exit(this);
     Ok(Some(tail))
 }
@@ -22476,6 +22666,8 @@ fn native_lbq_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     };
     ctx.monitor_enter(this);
     ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(0));
+    // Reset the head window so the buffer is reused from index 0.
+    lbq_set_head(ctx, this, 0);
     // Wake any thread parked in `put()` — capacity was just fully reclaimed.
     let _ = ctx.monitor_notify_all(this);
     ctx.monitor_exit(this);
@@ -22500,8 +22692,9 @@ fn native_lbq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             return Ok(Some(Value::Int(0)));
         }
     };
+    let head = lbq_head(ctx, this);
     for i in 0..size as usize {
-        let elem = ctx.get_array_element(arr, i);
+        let elem = ctx.get_array_element(arr, head + i);
         if values_equal(ctx, &elem, &target) {
             ctx.monitor_exit(this);
             return Ok(Some(Value::Int(1)));
@@ -22529,13 +22722,22 @@ fn native_lbq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
             return Ok(Some(Value::Int(0)));
         }
     };
+    let head = lbq_head(ctx, this);
     for i in 0..size as usize {
-        let elem = ctx.get_array_element(arr, i);
+        let elem = ctx.get_array_element(arr, head + i);
         if values_equal(ctx, &elem, &target) {
+            // Shift the tail of the window left by one over the removed slot.
             for j in i..(size - 1) as usize {
-                ctx.set_array_element(arr, j, ctx.get_array_element(arr, j + 1));
+                ctx.set_array_element(
+                    arr,
+                    head + j,
+                    ctx.get_array_element(arr, head + j + 1),
+                );
             }
-            ctx.set_array_element(arr, (size - 1) as usize, Value::Object(None));
+            ctx.set_array_element(arr, head + (size - 1) as usize, Value::Object(None));
+            if size - 1 == 0 {
+                lbq_set_head(ctx, this, 0);
+            }
             ctx.set_field(this, LBQ_FIELD_SIZE, Value::Int(size - 1));
             // Wake any thread parked in `put()` — a slot just freed.
             let _ = ctx.monitor_notify_all(this);
@@ -22564,9 +22766,10 @@ fn native_lbq_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             return Ok(Some(Value::Object(None)));
         }
     };
+    let head = lbq_head(ctx, this);
     let result = alloc_ref_array(ctx, size as usize);
     for i in 0..size as usize {
-        ctx.set_array_element(result, i, ctx.get_array_element(arr, i));
+        ctx.set_array_element(result, i, ctx.get_array_element(arr, head + i));
     }
     ctx.monitor_exit(this);
     Ok(Some(Value::Object(Some(result))))
@@ -22589,9 +22792,10 @@ fn native_lbq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             return Ok(Some(Value::Object(None)));
         }
     };
+    let head = lbq_head(ctx, this);
     let snap = alloc_ref_array(ctx, size as usize);
     for i in 0..size as usize {
-        ctx.set_array_element(snap, i, ctx.get_array_element(arr, i));
+        ctx.set_array_element(snap, i, ctx.get_array_element(arr, head + i));
     }
     ctx.monitor_exit(this);
     let itr = alloc_synthetic(ctx, "java/util/concurrent/LinkedBlockingQueue$Itr", 2);
@@ -26732,6 +26936,125 @@ mod tests {
                 "put returned in {elapsed:?} without waiting for clear",
             );
             assert_eq!(lbq_size(&ctx, q), 1);
+        }
+
+        // -------- Test 5: head-index FIFO drains in order across the
+        // backing-buffer boundary (perf P1: O(1) poll via head index) ----
+        //
+        // Single-threaded, deterministic. With a bounded buffer of len 3
+        // (== capacity) we offer 3, poll 2 (head drifts to index 2), then
+        // offer 2 more — forcing `lbq_ensure_capacity` to compact the live
+        // window back to index 0. Draining must still yield strict FIFO
+        // order, proving the head-index poll never reorders or drops
+        // elements and that compaction preserves the queue contents.
+        #[test]
+        fn head_index_fifo_across_buffer_wrap() {
+            let mut ctx = MockCtx::new(1);
+            let q = make_lbq(&mut ctx, 3);
+            // Fill to capacity.
+            for v in [10, 20, 30] {
+                offer_must_succeed(&mut ctx, q, v);
+            }
+            // Poll two → head advances; 10 then 20 come out first (FIFO).
+            let a = native_lbq_poll(&mut ctx, &[Value::Object(Some(q))]).unwrap();
+            let b = native_lbq_poll(&mut ctx, &[Value::Object(Some(q))]).unwrap();
+            assert_eq!(a, Some(Value::Int(10)));
+            assert_eq!(b, Some(Value::Int(20)));
+            assert_eq!(lbq_size(&ctx, q), 1);
+            // Offer two more → tail would overflow the buffer, forcing a
+            // compaction of the live window (just `30`) back to index 0.
+            offer_must_succeed(&mut ctx, q, 40);
+            offer_must_succeed(&mut ctx, q, 50);
+            assert_eq!(lbq_size(&ctx, q), 3);
+            // Drain: must be the remaining elements in strict FIFO order.
+            let mut drained = Vec::new();
+            for _ in 0..3 {
+                if let Some(Value::Int(v)) =
+                    native_lbq_poll(&mut ctx, &[Value::Object(Some(q))]).unwrap()
+                {
+                    drained.push(v);
+                }
+            }
+            assert_eq!(drained, vec![30, 40, 50], "FIFO order across compaction");
+            assert_eq!(lbq_size(&ctx, q), 0, "queue fully drained");
+            // After full drain the head index resets to 0 so the buffer is
+            // reusable from the front.
+            assert_eq!(lbq_head(&ctx, q), 0, "head reset on empty");
+        }
+
+        // ---- merge_sort_fallible: O(n log n) stable fallible sort ----------
+
+        /// Sorts correctly across several merge passes (n large enough to
+        /// exercise width = 1,2,4,8,…) and is stable on equal keys. Each
+        /// element packs `(key << 32) | original_index` into a `Value::Long`;
+        /// the comparison looks at the key only, so a stable sort must leave
+        /// equal-key elements in ascending original-index order.
+        #[test]
+        fn merge_sort_fallible_sorts_and_is_stable() {
+            let mut ctx = MockCtx::new(1);
+            // Keys with deliberate duplicates and reverse-ish ordering.
+            let keys = [5i64, 3, 5, 1, 3, 9, 5, 2, 3, 8, 1, 7, 0, 3, 5];
+            let mut items: Vec<Value> = keys
+                .iter()
+                .enumerate()
+                .map(|(idx, &k)| Value::Long((k << 32) | idx as i64))
+                .collect();
+
+            merge_sort_fallible(&mut ctx, &mut items, |_c, a, b| {
+                let ka = match a {
+                    Value::Long(p) => p >> 32,
+                    _ => 0,
+                };
+                let kb = match b {
+                    Value::Long(p) => p >> 32,
+                    _ => 0,
+                };
+                Ok((ka - kb) as i32)
+            })
+            .unwrap();
+
+            // Decode back to (key, original_index).
+            let decoded: Vec<(i64, i64)> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Long(p) => (p >> 32, p & 0xFFFF_FFFF),
+                    _ => panic!("unexpected value"),
+                })
+                .collect();
+
+            // Keys must be non-decreasing.
+            for w in decoded.windows(2) {
+                assert!(w[0].0 <= w[1].0, "keys sorted: {:?}", decoded);
+            }
+            // Stable: within an equal-key run, original indices ascend.
+            for w in decoded.windows(2) {
+                if w[0].0 == w[1].0 {
+                    assert!(w[0].1 < w[1].1, "stable on ties: {:?}", decoded);
+                }
+            }
+            // Same multiset of keys as the input (nothing lost/duplicated).
+            let mut got: Vec<i64> = decoded.iter().map(|(k, _)| *k).collect();
+            got.sort_unstable();
+            let mut want: Vec<i64> = keys.to_vec();
+            want.sort_unstable();
+            assert_eq!(got, want, "all elements present");
+        }
+
+        /// An error from the comparison closure short-circuits the whole sort
+        /// and is propagated to the caller (mirrors a comparator throwing).
+        #[test]
+        fn merge_sort_fallible_propagates_comparator_error() {
+            let mut ctx = MockCtx::new(1);
+            let mut items: Vec<Value> =
+                (0..8).rev().map(Value::Int).collect();
+            let res = merge_sort_fallible(&mut ctx, &mut items, |_c, _a, _b| {
+                Err(MethodCallFailed::from(
+                    cratonvm_types::error::RuntimeError::ClassCastException {
+                        message: "boom".to_string(),
+                    },
+                ))
+            });
+            assert!(res.is_err(), "comparator error must propagate");
         }
     }
 

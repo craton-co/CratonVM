@@ -2869,7 +2869,11 @@ pub(crate) fn register_object_stream_class_for_phases_late(r: &mut NativeMethodR
 //   0: data (byte[]), 1: size (Int)
 // ---------------------------------------------------------------------------
 
-fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
+// `pub(crate)`: unlike the sibling `register_*` helpers (called from this
+// module's aggregator), this one is also invoked cross-module from `lib.rs`
+// (the real-JCA ByteArrayOutputStream intrinsic wiring), so it must be visible
+// outside this module. Pre-existing `synthetic-jdk`-config build break (E0603).
+pub(crate) fn register_byte_array_output_stream(r: &mut NativeMethodRegistry) {
     let cls = "java/io/ByteArrayOutputStream";
 
     r.register(cls, "<init>", "()V", |ctx, args| {

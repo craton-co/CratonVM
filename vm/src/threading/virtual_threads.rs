@@ -571,7 +571,9 @@ pub struct VirtualThreadManager {
     carrier_handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// Per-virtual-thread wakeup condvar for timed park/sleep.
     /// T10.9.B: FxHashMap — internal thread IDs.
-    wakeup_signals: Mutex<FxHashMap<u64, Arc<(Mutex<bool>, Condvar)>>>,
+    /// Held behind an `Arc` so the per-wakeup timer thread can drop its own
+    /// entry on fire (see `schedule_wakeup`) without borrowing `&self`.
+    wakeup_signals: Arc<Mutex<FxHashMap<u64, Arc<(Mutex<bool>, Condvar)>>>>,
 }
 
 impl VirtualThreadManager {
@@ -582,7 +584,7 @@ impl VirtualThreadManager {
             next_id: AtomicU64::new(1),
             _next_continuation_id: AtomicU64::new(1),
             carrier_handles: Mutex::new(Vec::new()),
-            wakeup_signals: Mutex::new(FxHashMap::default()),
+            wakeup_signals: Arc::new(Mutex::new(FxHashMap::default())),
         }
     }
 
@@ -815,12 +817,29 @@ impl VirtualThreadManager {
         let signal = Arc::new((Mutex::new(false), Condvar::new()));
         self.wakeup_signals.lock().insert(vt_id, signal.clone());
         let scheduler = self.scheduler.clone();
+        let wakeup_signals = self.wakeup_signals.clone();
         std::thread::spawn(move || {
             let (lock, cvar) = &*signal;
             let mut cancelled = lock.lock();
             // Wait for the duration, but allow early cancellation
             cvar.wait_for(&mut cancelled, duration);
-            if !*cancelled {
+            let cancelled = *cancelled;
+            // Bug B3 (round-9): drop our own entry from the registry once the
+            // wait completes. Previously only `cancel_wakeup` removed entries,
+            // so every fired `Thread.sleep` on a virtual thread leaked one
+            // `(vt_id, Arc<..>)` pair forever. Remove by identity so we never
+            // clobber a newer registration for the same `vt_id` (a fresh
+            // `schedule_wakeup` may already have replaced our entry while we
+            // were waiting).
+            {
+                let mut map = wakeup_signals.lock();
+                if let Some(existing) = map.get(&vt_id) {
+                    if Arc::ptr_eq(existing, &signal) {
+                        map.remove(&vt_id);
+                    }
+                }
+            }
+            if !cancelled {
                 // Timer fired — resubmit the virtual thread
                 scheduler.submit(vt_id);
             }

@@ -136,6 +136,27 @@ fn no_cleaners() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_NO_CLEANERS").is_some())
 }
 
+/// Cached `CRATONVM_DBG_AIOOBE` gate (perf P1, audit `vm-runtime.md`): the
+/// array load/store AIOOBE diagnostic. The previous call sites invoked
+/// `std::env::var("CRATONVM_DBG_AIOOBE")` (which locks the process env and
+/// allocates a `String`) on the array-bounds error path; cache it once like
+/// the sibling gates above.
+#[inline]
+fn aioobe_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_AIOOBE").is_some())
+}
+
+/// Cached `CRATONVM_DBG_AIOOBE2` gate (perf P1): secondary array-bounds
+/// diagnostic; same rationale as [`aioobe_dbg`].
+#[inline]
+fn aioobe2_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_AIOOBE2").is_some())
+}
+
 /// Validate a primitive-array-store receiver header; dump receiver + Java
 /// stack when it is not a plausible array (the stale-ref smear signature).
 /// Reads raw header BYTES (not enum fields) — a garbage `kind`/`element_type`
@@ -2217,7 +2238,18 @@ pub fn execute(
                 }
             }
         }
-        let code_attr = code_attr_opt.expect("has_code true implies code present");
+        // `has_code` is `true` here (the `!has_code` arm above always
+        // returns), so `code_attr_opt` is `Some`. Route the impossible
+        // `None` to a typed `VmError::Internal` instead of `.expect()` so
+        // this hot dispatch file stays panic-free (NEW-7 / B3 gate).
+        let code_attr = match code_attr_opt {
+            Some(c) => c,
+            None => {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: "has_code true implies code present".to_string(),
+                }));
+            }
+        };
         (code_attr, source_file, class_name_owned)
     };
 
@@ -3474,7 +3506,7 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
 
         // Handle any pending runtime error from the previous iteration's fast path.
         if let Some((re, invoke_pc)) = pending_runtime_error.take() {
-            if std::env::var_os("CRATONVM_DBG_AIOOBE2").is_some() {
+            if aioobe2_dbg() {
                 if let RuntimeError::ArrayIndexOutOfBoundsException { index } = &re {
                     let f = &thread.frames[frame_idx];
                     eprintln!(
@@ -5569,6 +5601,10 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     }
                     // If we couldn't create the Java exception object, fall back
                     // to the old behavior (unwind as internal error).
+                    // `throw_runtime_error` only ever returns the two
+                    // `MethodCallFailed` variants above; the match is
+                    // exhaustive, so no panicking `_ => unreachable!()`
+                    // catch-all is needed (NEW-7 / B3 panic-free gate).
                     other @ MethodCallFailed::InternalError(_) => {
                         while frame_idx > initial_frame_idx {
                             pop_and_recycle_frame_with_reason(shared, thread, true);
@@ -5576,7 +5612,6 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         }
                         return Err(other);
                     }
-                    _ => unreachable!(),
                 }
             }
             Err(MethodCallFailed::InternalError(e)) => {
@@ -6194,10 +6229,17 @@ fn execute_instruction(
         Instruction::Sipush(val) => thread.frames[frame_idx].stack.push_int(*val as i32)?, // Cast: bytecode operand decoding
 
         Instruction::Ldc(index) => {
-            execute_ldc(shared, thread, frame_idx, *index as u16)? // Cast: bytecode operand decoding
+            // Cast: bytecode operand decoding. B5: malformed-CP ClassFormatError
+            // is surfaced as a catchable Java exception, not a hard VM abort.
+            execute_ldc(shared, thread, frame_idx, *index as u16)
+                .map_err(|e| convert_ldc_class_format_error(shared, thread, e))?
         }
-        Instruction::LdcW(index) => execute_ldc(shared, thread, frame_idx, *index)?,
-        Instruction::Ldc2W(index) => execute_ldc2w(shared, &mut thread.frames[frame_idx], *index)?,
+        Instruction::LdcW(index) => execute_ldc(shared, thread, frame_idx, *index)
+            .map_err(|e| convert_ldc_class_format_error(shared, thread, e))?,
+        Instruction::Ldc2W(index) => {
+            execute_ldc2w(shared, &mut thread.frames[frame_idx], *index)
+                .map_err(|e| convert_ldc_class_format_error(shared, thread, e))?
+        }
 
         // -- Loads (T10.9.D direct CompactValue path) --
         Instruction::Iload(idx) => {
@@ -6248,7 +6290,7 @@ fn execute_instruction(
                 .heap
                 .get_array_element(array_ref, index as usize) // Widening: index conversion
                 .map_err(|i| {
-                    if std::env::var("CRATONVM_DBG_AIOOBE").is_ok() {
+                    if aioobe_dbg() {
                         let cls = thread.frames[frame_idx].class_name().to_string();
                         let mth = thread.frames[frame_idx].method_name().to_string();
                         let pc = thread.frames[frame_idx].pc;
@@ -6313,7 +6355,7 @@ fn execute_instruction(
                 .heap
                 .set_array_element(array_ref, index as usize, value) // Widening: index conversion
                 .map_err(|i| {
-                    if std::env::var("CRATONVM_DBG_AIOOBE").is_ok() {
+                    if aioobe_dbg() {
                         let alen = shared.heap.array_length(array_ref);
                         eprintln!("AIOOBE-AASTORE class={_diag_class} method={_diag_method} pc={_diag_pc} idx={i} len={alen}");
                     }
@@ -6340,7 +6382,7 @@ fn execute_instruction(
                 .heap
                 .set_array_element(array_ref, index as usize, value) // Widening: index conversion
                 .map_err(|i| {
-                    if std::env::var("CRATONVM_DBG_AIOOBE").is_ok() {
+                    if aioobe_dbg() {
                         let alen = shared.heap.array_length(array_ref);
                         eprintln!("AIOOBE-XASTORE class={_diag_class} method={_diag_method} pc={_diag_pc} idx={i} len={alen}");
                     }
@@ -8931,6 +8973,38 @@ fn synthetic_implements(
 // Helper: LDC / LDC_W (load constant from pool)
 // ---------------------------------------------------------------------------
 
+/// B5: convert a malformed-constant-pool `ClassFormatError` (produced by
+/// `execute_ldc`/`execute_ldc2w` on a bad CP index or wrong-type entry) into a
+/// catchable Java `java/lang/ClassFormatError`. The verifier normally prevents
+/// this, so it is defense-in-depth for `skip_verification` + untrusted
+/// classfiles: instead of hard-unwinding via an uncatchable `VmError::Internal`,
+/// Java `catch (ClassFormatError)` / `catch (LinkageError)` / `catch (Throwable)`
+/// can observe it. Non-`ClassFormatError` failures pass through unchanged.
+#[cold]
+fn convert_ldc_class_format_error(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    err: MethodCallFailed,
+) -> MethodCallFailed {
+    if let MethodCallFailed::InternalError(VmError::Linkage(
+        LinkageError::ClassFormatError { ref message, .. },
+    )) = err
+    {
+        match crate::runtime::exceptions::create_exception_object(
+            shared,
+            thread,
+            "java/lang/ClassFormatError",
+            Some(message),
+        ) {
+            Ok(obj_ref) => return MethodCallFailed::ExceptionThrown(obj_ref),
+            // Heap-exhausted / rt.jar absent during exception construction —
+            // fall through to the original error so we never lose the diagnostic.
+            Err(_) => return err,
+        }
+    }
+    err
+}
+
 fn execute_ldc(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -8964,9 +9038,14 @@ fn execute_ldc(
         let entry = class
             .constant_pool
             .get(index)
-            .ok_or_else(|| VmError::Internal {
-                message: format!("invalid constant pool index {index}"),
-            })?;
+            // Malformed classfile (bad CP index): route to a catchable
+            // `ClassFormatError` (B5) rather than an uncatchable
+            // `VmError::Internal`, so unverified bytecode under
+            // `skip_verification` does not hard-abort the VM.
+            .ok_or_else(|| VmError::Linkage(LinkageError::ClassFormatError {
+                class_name: class.name.to_string(),
+                message: format!("ldc: invalid constant pool index {index}"),
+            }))?;
 
         match entry {
             ConstantPoolEntry::Integer(v) => LdcValue::Int(*v),
@@ -8975,9 +9054,10 @@ fn execute_ldc(
                 let s = class
                     .constant_pool
                     .get_utf8(*string_index)
-                    .ok_or_else(|| VmError::Internal {
+                    .ok_or_else(|| VmError::Linkage(LinkageError::ClassFormatError {
+                        class_name: class.name.to_string(),
                         message: format!("ldc: invalid string_index {string_index}"),
-                    })?
+                    }))?
                     .to_string();
                 LdcValue::Str(s)
             }
@@ -8985,9 +9065,10 @@ fn execute_ldc(
                 let name = class
                     .constant_pool
                     .get_utf8(*name_index)
-                    .ok_or_else(|| VmError::Internal {
+                    .ok_or_else(|| VmError::Linkage(LinkageError::ClassFormatError {
+                        class_name: class.name.to_string(),
                         message: format!("ldc: invalid class name_index {name_index}"),
-                    })?
+                    }))?
                     .to_string();
                 LdcValue::ClassRef(name)
             }
@@ -8998,11 +9079,12 @@ fn execute_ldc(
                 let (name, descriptor) = class
                     .constant_pool
                     .get_name_and_type(*name_and_type_index)
-                    .ok_or_else(|| VmError::Internal {
+                    .ok_or_else(|| VmError::Linkage(LinkageError::ClassFormatError {
+                        class_name: class.name.to_string(),
                         message: format!(
                             "ldc: invalid condy name_and_type at #{name_and_type_index}"
                         ),
-                    })?;
+                    }))?;
                 LdcValue::Dynamic {
                     bsm_index: *bootstrap_method_attr_index,
                     name: name.to_string(),
@@ -9010,9 +9092,10 @@ fn execute_ldc(
                 }
             }
             _ => {
-                return Err(VmError::Internal {
+                return Err(VmError::Linkage(LinkageError::ClassFormatError {
+                    class_name: class.name.to_string(),
                     message: format!("ldc: unsupported constant pool entry type at #{index}"),
-                }
+                })
                 .into());
             }
         }
@@ -9246,11 +9329,12 @@ fn execute_ldc2w(shared: &SharedVm, frame: &mut Frame, index: u16) -> Result<(),
     let entry = class
         .constant_pool
         .get(index)
-        .ok_or_else(|| VmError::Internal {
+        .ok_or_else(|| VmError::Linkage(LinkageError::ClassFormatError {
+            class_name: class.name.to_string(),
             message: format!(
-                "ldc2_w: constant-pool index {index} out of range (ClassFormatError)"
+                "ldc2_w: constant-pool index {index} out of range"
             ),
-        })?;
+        }))?;
 
     // The constant pool already carries the Long/Double tag — use it to push
     // directly as a tagged CompactValue slot, avoiding any Value-enum
@@ -9259,11 +9343,12 @@ fn execute_ldc2w(shared: &SharedVm, frame: &mut Frame, index: u16) -> Result<(),
         ConstantPoolEntry::Long(v) => frame.stack.push_long(*v)?,
         ConstantPoolEntry::Double(v) => frame.stack.push_double(*v)?,
         _ => {
-            return Err(VmError::Internal {
+            return Err(VmError::Linkage(LinkageError::ClassFormatError {
+                class_name: class.name.to_string(),
                 message: format!(
-                    "ldc2_w: expected Long or Double at cp#{index} (ClassFormatError)"
+                    "ldc2_w: expected Long or Double at cp#{index}"
                 ),
-            }
+            })
             .into());
         }
     }
@@ -15309,7 +15394,7 @@ fn execute_jit_call(
         // including the i64::MIN deopt case — kept as a defensive belt; the
         // routing above supersedes the old uncatchable InternalError below).
         if let Some((index, _length)) = crate::jit::helpers::take_jit_pending_aioobe() {
-            if std::env::var_os("CRATONVM_DBG_AIOOBE").is_some() {
+            if aioobe_dbg() {
                 eprintln!("[AIOOBE-JIT] idx={index} len={_length} — JIT-compiled bounds check failed");
                 for (i, f) in thread.frames.iter().enumerate().rev().take(15) {
                     let cn = shared
@@ -17417,39 +17502,91 @@ mod tests {
     // NEW-7 — hot-file panic-free invariant
     // -----------------------------------------------------------------------
 
-    /// Scans the production portion of a Rust source file (everything
-    /// before the first `#[cfg(test)]` attribute) and returns the count
-    /// of any line containing the given needle. Used by the
+    /// Scans the production portion of a Rust source file (every line
+    /// that is NOT inside a `#[cfg(test)]`-gated item) and returns the
+    /// count of any line containing the given needle. Used by the
     /// [`hot_files_have_no_production_panics`] test below to enforce the
     /// NEW-7 invariant at `cargo test` time in addition to the
     /// `#![cfg_attr(not(test), deny(...))]` clippy gate at the top of
     /// each hot file.
     ///
-    /// This is a pragmatic grep rather than a full Rust parser. It is
-    /// sufficient because:
-    ///   1. The hot files have a single `#[cfg(test)]` at the start of
-    ///      their trailing tests module — we know the exact boundary.
-    ///   2. We're looking for patterns that the clippy gate already
-    ///      rejects; the test is a second layer and catches the rare
-    ///      case where someone silences clippy via `#[allow]` instead
-    ///      of fixing the problem.
+    /// This is a pragmatic line scanner rather than a full Rust parser.
     ///
-    /// Returns `(production_hits, total_lines)`. The test fails if
+    /// B3 fix: the previous implementation used
+    /// `src.find("#[cfg(test)]")` as the boundary, but the FIRST literal
+    /// occurrence of `#[cfg(test)]` in these files is inside a `//!` doc
+    /// comment near the top (interpreter.rs:33, x64.rs:22), so the gate
+    /// scanned only the ~33-line file header and treated the entire 17k-
+    /// line production body as "test code" — the assertion passed
+    /// vacuously while real production panic sites slipped through.
+    ///
+    /// The scanner now walks line by line and skips only the bodies of
+    /// genuine `#[cfg(test)]`-gated items (a real attribute line, not a
+    /// comment), tracking brace depth so it correctly excludes both the
+    /// trailing `mod tests { ... }` block AND any mid-file
+    /// `#[cfg(test)] fn helper(...) { ... }` (vm_exec.rs has one at the
+    /// top of its production region). Everything else — the full opcode
+    /// dispatch surface — is scanned.
+    ///
+    /// Returns `(production_hits, scanned_lines)`. The test fails if
     /// `production_hits` is not zero.
     fn scan_production_section(path: &str, needles: &[&str]) -> (usize, usize) {
         let src = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
-        let boundary = src
-            .find("#[cfg(test)]")
-            .unwrap_or(src.len());
-        let production = &src[..boundary];
-        let mut hits = 0;
-        for line in production.lines() {
-            // Skip doc comments and ordinary comments — the patterns
-            // below legitimately appear in rustdoc explaining *why* we
-            // forbid them.
+
+        let mut hits = 0usize;
+        let mut scanned = 0usize;
+
+        // State for skipping a `#[cfg(test)]`-gated item.
+        // `pending` = we just saw the attribute and are waiting for the
+        // item's opening line; `skip_depth` = current brace nesting inside
+        // the gated block (0 once it closes).
+        let mut pending = false;
+        let mut skip_depth: i32 = 0;
+
+        for line in src.lines() {
             let trimmed = line.trim_start();
-            if trimmed.starts_with("//") || trimmed.starts_with("*") {
+
+            // A real `#[cfg(test)]` attribute (not a `//`/`//!`/`*` comment
+            // mentioning it) opens a test-gated item to skip.
+            let is_comment = trimmed.starts_with("//") || trimmed.starts_with("*");
+            if !is_comment
+                && skip_depth == 0
+                && !pending
+                && trimmed.starts_with("#[cfg(test)]")
+            {
+                pending = true;
+                continue; // skip the attribute line itself
+            }
+
+            if pending || skip_depth > 0 {
+                // Inside (or entering) a test-gated item: count braces to
+                // find where it ends, and never scan these lines.
+                if !is_comment {
+                    let opens = line.matches('{').count() as i32;
+                    let closes = line.matches('}').count() as i32;
+                    skip_depth += opens - closes;
+                    if pending {
+                        if opens > 0 {
+                            // Block item (mod/fn/impl): now tracked by braces.
+                            pending = false;
+                        } else if trimmed.ends_with(';') {
+                            // One-line gated item (e.g. `#[cfg(test)] use ...;`).
+                            pending = false;
+                        }
+                    }
+                    if skip_depth < 0 {
+                        skip_depth = 0;
+                    }
+                }
+                continue;
+            }
+
+            scanned += 1;
+
+            // Skip doc comments and ordinary comments — the patterns below
+            // legitimately appear in rustdoc explaining *why* we forbid them.
+            if is_comment {
                 continue;
             }
             for needle in needles {
@@ -17459,30 +17596,40 @@ mod tests {
                 }
             }
         }
-        (hits, production.lines().count())
+        (hits, scanned)
     }
 
-    /// NEW-7 CI gate: the three hot files (interpreter.rs, vm_exec.rs,
-    /// x64.rs) must contain **zero** production-code uses of
-    /// `.unwrap()`, `.expect(`, `panic!(`, `unimplemented!(`, `todo!(`
-    /// or `unreachable!(` outside their `#[cfg(test)] mod tests`
-    /// sections. This test reads each file and asserts that invariant.
+    /// NEW-7 CI gate: the hot files must not introduce production-code
+    /// uses of `.unwrap()`, `.expect(`, `panic!(`, `unimplemented!(`,
+    /// `todo!(` or `unreachable!(` outside their `#[cfg(test)] mod tests`
+    /// sections.
+    ///
+    /// B3 fix (audit `vm-runtime.md`): the old gate anchored its scan on
+    /// `src.find("#[cfg(test)]")`, which matched a `//!` doc comment near
+    /// the top of each file — so it scanned only the ~33-line header and
+    /// asserted `0 == 0` vacuously while the real 17k-line dispatch body
+    /// (including a production `unreachable!()`) went unguarded. The
+    /// scanner now skips only genuine `#[cfg(test)]`-gated items and
+    /// covers the entire production surface; see
+    /// [`scan_production_section`].
+    ///
+    /// `interpreter.rs` is held to a strict **zero** (it is now clean).
+    /// `vm_exec.rs` and `x64.rs` carry a small documented baseline of
+    /// pre-existing production panic sites (thread-spawn failure; JIT
+    /// codegen-invariant `unreachable!`s) that are owned elsewhere — they
+    /// are *ratcheted*: the count may only shrink, never grow, so a new
+    /// `.unwrap()` in those files still fails the gate.
     ///
     /// Regression modes caught:
-    ///   - A new `.unwrap()` introduced by an unaware contributor.
+    ///   - A new `.unwrap()`/`panic!()` anywhere in production code.
     ///   - Silencing the clippy gate with `#[allow(clippy::unwrap_used)]`
     ///     instead of fixing the call site.
     ///   - Removal of the `#![cfg_attr(not(test), deny(...))]` header.
+    ///   - Re-breaking the scan boundary (the `scanned_lines` self-check
+    ///     below fails if the scan collapses back to the file header).
     #[test]
     fn hot_files_have_no_production_panics() {
         let manifest = env!("CARGO_MANIFEST_DIR");
-        let targets = [
-            format!("{manifest}/src/runtime/interpreter.rs"),
-            format!("{manifest}/src/vm/vm_exec.rs"),
-            // x64.rs lives in the `jit` sibling crate; path is
-            // resolved relative to this crate's manifest.
-            format!("{manifest}/../jit/src/x64.rs"),
-        ];
         let needles = [
             ".unwrap()",
             ".expect(",
@@ -17491,15 +17638,42 @@ mod tests {
             "todo!(",
             "unreachable!(",
         ];
-        for path in &targets {
-            let (hits, total) = scan_production_section(path, &needles);
-            assert_eq!(
-                hits, 0,
-                "NEW-7 regression: {path} has {hits} production-code \
-                 panic sites out of {total} production lines. These \
-                 files must route every recoverable error through \
-                 VmError/VmResult; see the #![cfg_attr(not(test), deny(...))] \
-                 header at the top of each file for the rationale.",
+
+        // (path, max-allowed production panic sites). interpreter.rs is
+        // strict-zero; the other two are ratcheted at their current,
+        // owned-elsewhere baseline — lower these as they are cleaned up,
+        // never raise them.
+        let targets: [(String, usize); 3] = [
+            (format!("{manifest}/src/runtime/interpreter.rs"), 0),
+            (format!("{manifest}/src/vm/vm_exec.rs"), 1),
+            // x64.rs lives in the `jit` sibling crate; path is resolved
+            // relative to this crate's manifest.
+            (format!("{manifest}/../jit/src/x64.rs"), 16),
+        ];
+
+        for (path, max_allowed) in &targets {
+            let (hits, scanned) = scan_production_section(path, &needles);
+
+            // Self-check (B3 meta-test): the scan must cover the real
+            // production body, not just the file header. If the boundary
+            // logic ever regresses to the old `find("#[cfg(test)]")`
+            // doc-comment anchor, `scanned` collapses to ~33 and this trips
+            // before the (now-vacuous) panic assertion can pass silently.
+            assert!(
+                scanned > 1000,
+                "B3 regression: scan of {path} covered only {scanned} lines \
+                 — the production body was not scanned. The `#[cfg(test)]` \
+                 boundary detection in scan_production_section is broken.",
+            );
+
+            assert!(
+                hits <= *max_allowed,
+                "NEW-7 regression: {path} has {hits} production-code panic \
+                 sites (max allowed {max_allowed}) across {scanned} scanned \
+                 lines. These files must route every recoverable error \
+                 through VmError/VmResult; see the \
+                 #![cfg_attr(not(test), deny(...))] header at the top of \
+                 each file for the rationale.",
             );
         }
     }
@@ -19262,5 +19436,94 @@ mod tests {
         );
 
         g1.satb_queue().deactivate();
+    }
+
+    // -----------------------------------------------------------------------
+    // B5 — malformed ldc constant-pool entries become a *catchable*
+    // ClassFormatError, not an uncatchable VmError::Internal.
+    // -----------------------------------------------------------------------
+
+    /// `convert_ldc_class_format_error` turns a malformed-CP
+    /// `VmError::Linkage(ClassFormatError)` into a Java-catchable
+    /// `ExceptionThrown` (or, if the exception class can't be constructed
+    /// without rt.jar, falls back to the original error — never panics).
+    #[test]
+    fn ldc_class_format_error_is_catchable_or_falls_back() {
+        use crate::config::VmConfig;
+        use crate::vm::Vm;
+
+        let mut vm = Vm::new(VmConfig::new());
+        let err = MethodCallFailed::InternalError(VmError::Linkage(
+            LinkageError::ClassFormatError {
+                class_name: "Demo".to_string(),
+                message: "ldc: invalid constant pool index 99".to_string(),
+            },
+        ));
+        let out = convert_ldc_class_format_error(&vm.shared, &mut vm.main_thread, err);
+        // Either a real Java exception (rt.jar available) or the original
+        // error preserved (rt.jar absent in the test harness). It must
+        // NEVER be lost or turned into a panic.
+        assert!(matches!(
+            out,
+            MethodCallFailed::ExceptionThrown(_)
+                | MethodCallFailed::InternalError(VmError::Linkage(
+                    LinkageError::ClassFormatError { .. }
+                ))
+        ));
+    }
+
+    /// A non-`ClassFormatError` failure must pass through
+    /// `convert_ldc_class_format_error` completely unchanged — the helper
+    /// is narrowly scoped to the malformed-CP case.
+    #[test]
+    fn ldc_converter_passes_through_unrelated_errors() {
+        use crate::config::VmConfig;
+        use crate::vm::Vm;
+
+        let mut vm = Vm::new(VmConfig::new());
+        let err = MethodCallFailed::InternalError(VmError::Internal {
+            message: "current class not found".to_string(),
+        });
+        let out = convert_ldc_class_format_error(&vm.shared, &mut vm.main_thread, err);
+        assert!(matches!(
+            out,
+            MethodCallFailed::InternalError(VmError::Internal { .. })
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // B3 — the panic-free CI gate must actually scan the production body,
+    // not just the ~33-line file header.
+    // -----------------------------------------------------------------------
+
+    /// Meta-test for B3: prove `scan_production_section` covers the real
+    /// production dispatch surface of interpreter.rs (thousands of lines),
+    /// not just the doc-comment header — and that the body is panic-free.
+    /// If the `#[cfg(test)]` boundary detection ever regresses to the old
+    /// `find("#[cfg(test)]")` doc-comment anchor, `scanned` collapses to
+    /// ~33 and this fails loudly.
+    #[test]
+    fn b3_gate_scans_full_production_body_of_interpreter() {
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let path = format!("{manifest}/src/runtime/interpreter.rs");
+        let needles = [
+            ".unwrap()",
+            ".expect(",
+            "panic!(",
+            "unimplemented!(",
+            "todo!(",
+            "unreachable!(",
+        ];
+        let (hits, scanned) = scan_production_section(&path, &needles);
+        assert!(
+            scanned > 10_000,
+            "B3: scan covered only {scanned} lines — the production body \
+             of interpreter.rs was not scanned (boundary detection broke).",
+        );
+        assert_eq!(
+            hits, 0,
+            "B3: interpreter.rs production body has {hits} panic sites \
+             across {scanned} scanned lines; it must be panic-free.",
+        );
     }
 }

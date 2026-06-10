@@ -120,6 +120,10 @@ fn native_sd_for_isr_charset(
 }
 
 /// `forInputStreamReader(InputStream, Object, String) -> StreamDecoder`.
+///
+/// The JDK factory declares `throws UnsupportedEncodingException`; an
+/// unknown or unsupported charset *name* must surface that exception
+/// rather than silently decoding the stream as UTF-8.
 fn native_sd_for_isr_name(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let is = match obj_arg(args, 0) {
         Some(o) => o,
@@ -129,7 +133,10 @@ fn native_sd_for_isr_name(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(s) => ctx.read_string(s).unwrap_or_else(|| "UTF-8".to_string()),
         None => "UTF-8".to_string(),
     };
-    let norm = normalize(&name_str);
+    let norm = match normalize_supported(&name_str) {
+        Some(n) => n,
+        None => return Err(throw_unsupported_encoding(ctx, &name_str)),
+    };
     let sd = alloc_stream_decoder(ctx, is, &norm);
     Ok(Some(Value::Object(Some(sd))))
 }
@@ -171,30 +178,70 @@ fn resolve_name(
 }
 
 fn normalize(n: &str) -> String {
-    cratonvm_native_builtins_normalize(n)
+    normalize_supported(n).unwrap_or_else(|| "UTF-8".to_string())
 }
 
-/// Thin wrapper so we don't pull in the full `cratonvm-native-builtins`
-/// crate from native-io (it would create a cycle). The rule set is
-/// intentionally the strict subset our engine understands.
-fn cratonvm_native_builtins_normalize(name: &str) -> String {
-    match name.to_uppercase().replace(['-', '_'], "").as_str() {
-        "UTF8" => "UTF-8".to_string(),
-        "UTF16" => "UTF-16".to_string(),
-        "UTF16BE" => "UTF-16BE".to_string(),
-        "UTF16LE" => "UTF-16LE".to_string(),
-        "UTF32" => "UTF-32".to_string(),
-        "UTF32BE" => "UTF-32BE".to_string(),
-        "UTF32LE" => "UTF-32LE".to_string(),
-        "USASCII" | "ASCII" => "US-ASCII".to_string(),
-        "ISO88591" | "LATIN1" => "ISO-8859-1".to_string(),
-        "ISO88592" => "ISO-8859-2".to_string(),
-        "ISO885915" => "ISO-8859-15".to_string(),
-        "WINDOWS1252" | "CP1252" => "windows-1252".to_string(),
-        "WINDOWS1251" | "CP1251" => "windows-1251".to_string(),
-        "KOI8R" => "KOI8-R".to_string(),
-        _ => "UTF-8".to_string(),
+/// Canonicalize a user-supplied charset *name* and confirm the transcoding
+/// engine can actually decode it. Returns `None` when the name is unknown
+/// (no canonical mapping) or maps to a charset the engine does not implement
+/// — both of which the JDK reports as `UnsupportedEncodingException`.
+///
+/// Thin local rule set so we don't pull in the full `cratonvm-native-builtins`
+/// crate from native-io (it would create a cycle). The mapping is the strict
+/// subset our engine understands; the trailing `engine`-support probe guards
+/// against a name canonicalizing here while the engine still lacks it.
+fn normalize_supported(name: &str) -> Option<String> {
+    let canon = match name.to_uppercase().replace(['-', '_'], "").as_str() {
+        "UTF8" => "UTF-8",
+        "UTF16" => "UTF-16",
+        "UTF16BE" => "UTF-16BE",
+        "UTF16LE" => "UTF-16LE",
+        "UTF32" => "UTF-32",
+        "UTF32BE" => "UTF-32BE",
+        "UTF32LE" => "UTF-32LE",
+        "USASCII" | "ASCII" => "US-ASCII",
+        "ISO88591" | "LATIN1" => "ISO-8859-1",
+        "ISO88592" => "ISO-8859-2",
+        "ISO885915" => "ISO-8859-15",
+        "WINDOWS1252" | "CP1252" => "windows-1252",
+        "WINDOWS1251" | "CP1251" => "windows-1251",
+        "KOI8R" => "KOI8-R",
+        _ => return None,
+    };
+    // Probe with an empty slice: the engine's name `match` returns
+    // `UnsupportedCharset` before examining any byte, so this is free.
+    if matches!(
+        engine::decode_bytes(canon, &[]),
+        Err(engine::CodingError {
+            kind: engine::CodingErrorKind::UnsupportedCharset,
+            ..
+        })
+    ) {
+        return None;
     }
+    Some(canon.to_string())
+}
+
+/// Build (and request the throw of) a `java.io.UnsupportedEncodingException`
+/// carrying the offending charset name. Falls back to a generic `IOException`
+/// (its superclass — still catchable as `IOException`) if the concrete class
+/// cannot be constructed in the current build.
+fn throw_unsupported_encoding(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> cratonvm_types::error::MethodCallFailed {
+    let detail = ctx.create_string(name);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/io/UnsupportedEncodingException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc);
+    }
+    cratonvm_types::error::RuntimeError::IOException {
+        message: format!("UnsupportedEncodingException: {name}"),
+    }
+    .into()
 }
 
 /// Read one character (int, or -1 at EOF).
@@ -548,5 +595,31 @@ mod tests {
             split_complete_prefix("UTF-32BE", &[0, 0, 0, 0x41, 0, 0]),
             4
         );
+    }
+
+    #[test]
+    fn normalize_supported_accepts_known_aliases() {
+        assert_eq!(normalize_supported("utf-8").as_deref(), Some("UTF-8"));
+        assert_eq!(normalize_supported("Latin1").as_deref(), Some("ISO-8859-1"));
+        assert_eq!(
+            normalize_supported("Cp1252").as_deref(),
+            Some("windows-1252")
+        );
+    }
+
+    #[test]
+    fn normalize_supported_rejects_unknown_name() {
+        // Genuinely unknown name → None (caller throws UnsupportedEncodingException)
+        // instead of the old silent UTF-8 fallback.
+        assert_eq!(normalize_supported("NoSuchCharset-42"), None);
+    }
+
+    #[test]
+    fn normalize_supported_rejects_real_but_unimplemented_charsets() {
+        // "Shift_JIS" / "EUC-JP" are real charset names but neither this local
+        // alias table nor the transcoding engine implements them, so the
+        // factory must reject the name instead of silently decoding as UTF-8.
+        assert_eq!(normalize_supported("Shift_JIS"), None);
+        assert_eq!(normalize_supported("EUC-JP"), None);
     }
 }

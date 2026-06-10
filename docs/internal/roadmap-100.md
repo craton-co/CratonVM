@@ -61,7 +61,7 @@ Total: ~835 atomic steps. Cross-references between tiers are marked
 > | T1.7.7 HPROF dump on OOM | ✅ **NEW** | `-XX:+HeapDumpOnOutOfMemoryError` + `-XX:HeapDumpPath=` wired through `gc_alloc_object`/`gc_alloc_array`. 4 unit tests. |
 > | T1.7.10 GC parallel allocation stress | ✅ **NEW** | `t1_parallel_allocation_no_lost_objects` |
 > | T1.8.2 deny-gate extension | ✅ **NEW** | `vm/src/threading/jvm_thread.rs` + `classloading/src/loaders.rs` |
-> | T1.8.4 lock-order doc | ✅ **NEW** | `docs/lock-order.md` |
+> | T1.8.4 lock-order doc | ✅ **NEW** | `vm/src/runtime/lock_order.rs` |
 > | T1.9.1 `Reference.reachabilityFence` | ✅ **NEW** | `std::hint::black_box` intrinsic registered |
 > | T1.10 StringReader/StringWriter shape fix | ✅ **NEW** | latent 1/2-field vs 3/2-field inconsistency at `classloading/src/class_manager.rs:1541-1542` fixed — had been silently producing `gen_heap::set_field` panics in `test_s48_sw_basic` / `test_s48_sr_readChar` / `test_s49_blocking_queue_producer_consumer` under specific test orderings. 3 interpreter tests go from flaky-fail to green. |
 >
@@ -113,8 +113,8 @@ Total: ~835 atomic steps. Cross-references between tiers are marked
 > | T1.9.2 weak-ref stress | `t1_reference_processor_weak_ref_stress` — 100 weak-ref discoveries, counter verifies no leak |
 > | T1.9.4 reachability fence | `t1_reachability_fence_accepts_null_and_object` — pins the null + object acceptance contract via the registered intrinsic |
 > | T1.9.5 weak cleared on GC | `t1_weak_ref_cleared_on_referent_unreachable` — simulated mark leaves referent unreachable, asserts `cleared_ref_objects()` non-empty |
-> | T1.8.3 RwLock-across-FFI audit | Documented in `docs/lock-order.md` — every `class_manager.write()` site surveyed; none hold across FFI, invariant recorded |
-> | T1.8.5 unsafe SAFETY comments | `#![warn(clippy::undocumented_unsafe_blocks)]` added to `interpreter.rs`; documented in `lock-order.md` that T1.1.a + NEW-18 new unsafe blocks are SAFETY-annotated; historical back-fill tracked as a follow-up since the repo has ~448 `unsafe` blocks |
+> | T1.8.3 RwLock-across-FFI audit | Documented in `vm/src/runtime/lock_order.rs` — every `class_manager.write()` site surveyed; none hold across FFI, invariant recorded |
+> | T1.8.5 unsafe SAFETY comments | `#![warn(clippy::undocumented_unsafe_blocks)]` added to `interpreter.rs`; documented in `vm/src/runtime/lock_order.rs` that T1.1.a + NEW-18 new unsafe blocks are SAFETY-annotated; historical back-fill tracked as a follow-up since the repo has ~448 `unsafe` blocks |
 >
 > **32/32 tier1 tests pass.** Plus 561 jit + 287 classloading + 53 vm lib jit/new17 + 903 interpreter + 5 new18 + 20 bench-gate = **1861 tests** across every crate T1 touched.
 >
@@ -392,7 +392,7 @@ and class loader.
 - **T1.8.3** Replace every `RwLock::write` that holds across an FFI
   call with a tightly scoped lock.
 - **T1.8.4** Audit lock ordering: document the global lock hierarchy
-  in `docs/lock-order.md`. Tests assert no inversions.
+  in `vm/src/runtime/lock_order.rs`. Tests assert no inversions.
 - **T1.8.5** Audit `unsafe` blocks. Every `unsafe` must have a
   `// SAFETY:` comment naming the invariant.
 

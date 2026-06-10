@@ -282,13 +282,28 @@ fn essential_quarkus_locale_convert(
         return Ok(Some(Value::Object(None)));
     }
     if trimmed == "all" {
-        // Locale.ROOT
-        return ctx.invoke(
-            "java/util/Locale",
-            "getDefault",
-            "()Ljava/util/Locale;",
-            &[],
+        // B2 fix: "all" maps to Locale.ROOT (the empty locale), NOT the host's
+        // default locale. `Locale.ROOT` is equivalent to `new Locale("", "")`
+        // (empty language/country/variant), so build it via the constructor
+        // rather than returning getDefault() (which would leak e.g. en_US).
+        let cls = "java/util/Locale";
+        let loc_obj = match ctx.new_object(cls) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let empty = ctx.create_string("");
+        let _ = ctx.invoke(
+            cls,
+            "<init>",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V",
+            &[
+                Value::Object(Some(loc_obj)),
+                Value::Object(Some(empty)),
+                Value::Object(Some(empty)),
+                Value::Object(Some(empty)),
+            ],
         );
+        return Ok(Some(Value::Object(Some(loc_obj))));
     }
     // Normalise: replace '_' with '-' then split.
     let normalised: String = trimmed.replace('_', "-");
@@ -21230,37 +21245,15 @@ fn register_t31_concurrent_extras(registry: &mut NativeMethodRegistry) {
         Ok(None)
     });
 
-    // SubmissionPublisher — concrete implementation of Flow.Publisher
-    let sp = "java/util/concurrent/SubmissionPublisher";
-    registry.register(sp, "<init>", "()V", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(None),
-        };
-        // Fields: 0=subscribers_list, 1=closed
-        let subs = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 8);
-        ctx.set_field(subs, 0, Value::Object(Some(arr)));
-        ctx.set_field(subs, 1, Value::Int(0));
-        ctx.set_field(this, 0, Value::Object(Some(subs)));
-        ctx.set_field(this, 1, Value::Int(0));
-        Ok(None)
-    });
-    registry.register(sp, "close", "()V", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(None),
-        };
-        ctx.set_field(this, 1, Value::Int(1));
-        Ok(None)
-    });
-    registry.register(sp, "isClosed", "()Z", |ctx, args| {
-        let this = match args.first() {
-            Some(Value::Object(Some(o))) => *o,
-            _ => return Ok(Some(Value::Int(0))),
-        };
-        Ok(Some(ctx.get_field(this, 1)))
-    });
+    // SubmissionPublisher — B6 dedup (nb-core-mediums, fable-2026-06-10):
+    // the stale `<init>`/`close`/`isClosed` registrations that used to live here
+    // were registered LAST (register_t31_concurrent_extras runs after
+    // register_phase60_natives), so they SHADOWED the working phase-60
+    // (`register_p60_flow`) versions in phases_late.rs that Round 5 wired up for
+    // real subscriber delivery. In particular this `close()V` only flipped the
+    // closed flag and never fired `onComplete()`, defeating the fix. The block
+    // is deleted so the delivering phase-60 registrations win. See
+    // phases_late.rs:16549+ for the canonical implementations.
 }
 
 /// Helper: create a ConcurrentSkipListMap containing entries in [from, to) range

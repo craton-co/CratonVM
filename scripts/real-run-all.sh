@@ -2,12 +2,12 @@
 # Run every shimmed app with CRATONVM_<APP>_REAL=1 to disable the shim and
 # exercise real bytecode. Capture first error line for each.
 set +e
-ROOT="C:/Projects/CratonVM/.claude/worktrees/infallible-solomon-1d423b"
+ROOT="${ROOT:-$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || echo C:/craton/CratonVM)}"
 LOGDIR="$ROOT/applogs/real-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$LOGDIR"
 RJVM="$ROOT/target/release/cratonvm.exe"
-JDK="C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot"
-APPS="C:/Projects/cratonvm/apps"
+JDK="${JDK:-${JAVA_HOME:-C:/Program Files/Java/jdk-25}}"
+APPS="${APPS:-$ROOT/apps}"
 
 run() {
     local name="$1"; shift

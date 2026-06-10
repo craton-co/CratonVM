@@ -1,13 +1,14 @@
 Build Scripts (Windows .bat)
+build-cpu.bat - Standard CPU build for cratonvm into the default target/release directory.
 build-cpu-isolated.bat - Isolated CPU build into target-fresh-cpu directory with single-threaded cargo build (-j 1) to avoid lock contention. Sets increased Rust stack size.
 build-cpu-java.bat - Builds the java.exe binary alias (same as cratonvm but with java name) using the java-bin-alias feature. Used as CPU binary after EC fixes to avoid locked cratonvm.exe.
-build-cpu.bat - Standard CPU build for cratonvm into default target/release directory.
-build-devverify.bat - Uses custom rustc/hmcargo toolchain for development verification builds. Sets specific toolchain paths for a specialized build environment.
-build-gpu-isolated.bat - Isolated GPU build into target-fresh-gpu with single-threaded cargo build, enabling the gpu-driver feature.
-build-gpu.bat - GPU build with gpu-driver feature into target-gpu directory.
-build-h2.bat - Isolated CPU build into private target-h2 directory to avoid lock contention with concurrent builds. Seeded from target/release for incremental speed.
-build-rwd.bat - Release-with-debug build (same codegen as release but with line-tables/symbols) for SEGV symbolization during debugging.
-build-wt.bat - Isolated worktree build for CratonVM-wfenum (wildfly enum constants fix). Unsets VC environment variables to keep prebuilt libffi.lib valid.
+build-debug.bat - release-with-debug build (same codegen as release plus line-tables/symbols) for SEGV symbolization during debugging.
+build-devverify.bat - Development-verification build. Uses the standard cargo on PATH by default; a custom toolchain can be supplied via the CARGO/RUSTC environment variables.
+build-gpu.bat - GPU build with the gpu-driver feature into the target-gpu directory.
+build-gpu-isolated.bat - Isolated GPU build into target-fresh-gpu with single-threaded cargo build (-j 1), enabling the gpu-driver feature.
+
+Note: the repository root also carries build-cpu.bat and build-cpu-rwd.bat (the
+release-with-debug variant), which are convenience wrappers run from the repo root.
 
 Benchmark Scripts
 bench-4way.sh - 4-way vector-add benchmark comparing: HotSpot C2, CratonVM CPU (JIT on/off), CratonVM GPU, and TornadoVM. Reports best/mean nanoseconds and correctness.

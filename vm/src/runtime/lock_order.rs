@@ -3,23 +3,46 @@
 
 //! Lock ordering enforcement framework.
 //!
-//! This module is the **runtime enforcement** of the lock hierarchy spelled out
-//! in `docs/lock-order.md`. **The two MUST stay in sync.** When a level is
-//! added, removed, or renumbered in the doc, update [`LockLevel`] (and the
-//! mapping in [`tracking::level_from_u8`]) in lockstep.
+//! **This module is the canonical, in-source definition of CratonVM's global
+//! lock acquisition order.** There is no separate `docs/lock-order.md`; the
+//! [`LockLevel`] enum below (with its doc comments) *is* the authoritative
+//! hierarchy, and the wrappers in this module are its runtime enforcement. When
+//! a level is added, removed, or renumbered, update [`LockLevel`] and the
+//! mapping in [`tracking::level_from_u8`] together — they are the single source
+//! of truth, so there is no external document to keep in sync.
+//!
+//! ## The global lock acquisition order
+//!
+//! Locks are numbered L0 (lowest) through L10 (highest). The full hierarchy,
+//! highest-first (acquired-first), is:
+//!
+//! | Level | Name | Lock |
+//! |------:|------|------|
+//! | L10 | `class_manager`   | `SharedVm::class_manager` (RwLock) — acquired first |
+//! | L9  | `native_methods`  | `SharedVm::native_methods` (append-only Mutex) |
+//! | L8  | `heap`            | `SharedVm::heap` interior locks (in the `gc` crate) |
+//! | L7  | `ref_processor`   | `SharedVm::ref_processor` (Mutex) |
+//! | L6  | `monitors`        | per-object monitor registry (`MonitorTable`) |
+//! | L5  | `thread_registry` | `SharedVm::thread_registry` (Mutex) |
+//! | L4  | `flight_recorder` | `SharedVm::flight_recorder` (Mutex) |
+//! | L3  | `cleaner_actions` | `cleaner_thread.pending_actions` (Mutex) |
+//! | L2  | `native_memory`   | `SharedVm::native_memory` (Mutex) |
+//! | L1  | `jvm_thread`       | `JvmThread`-local state (owning thread only) |
+//! | L0  | `scratch`         | per-call scratch collections — released first |
+//!
+//! The integer discriminants of [`LockLevel`] match this table exactly.
 //!
 //! ## The rule
 //!
-//! Per `docs/lock-order.md`, the hierarchy is **descending**: a thread holding
-//! a lock at level N may *only* acquire a lock at a level **strictly less than
-//! N** (i.e. a lower number). Equivalently: lower number == acquired *later*
-//! and released *first*; higher number == acquired *earlier* and held longer.
+//! The hierarchy is **descending**: a thread holding a lock at level N may
+//! *only* acquire a lock at a level **strictly less than N** (i.e. a lower
+//! number). Equivalently: lower number == acquired *later* and released
+//! *first*; higher number == acquired *earlier* and held longer.
 //!
-//! Example (from the doc): a thread holding `class_manager` (L10) may then
-//! acquire `heap` (L8), then `monitors` (L6), then `thread_registry` (L5) —
-//! the levels descend monotonically. A thread holding `monitors` (L6) must
-//! **not** acquire `class_manager` (L10) or `heap` (L8); it has to release
-//! the monitor first.
+//! Example: a thread holding `class_manager` (L10) may then acquire `heap`
+//! (L8), then `monitors` (L6), then `thread_registry` (L5) — the levels
+//! descend monotonically. A thread holding `monitors` (L6) must **not** acquire
+//! `class_manager` (L10) or `heap` (L8); it has to release the monitor first.
 //!
 //! ## Enforcement strategy
 //!
@@ -35,12 +58,19 @@
 //! Wiring is incremental, starting with the highest-level locks. As of the
 //! V11 hardening pass the **L6 `monitors` registry** is wired: both internal
 //! maps of [`crate::threading::monitor::MonitorTable`] (`monitors` and
-//! `cas_locks`) are [`OrderedMutex`] at [`LockLevel::Monitors`]. See
-//! `docs/lock-order.md` ("Runtime enforcement status") for the authoritative,
-//! non-aspirational list of which locks are checked vs still raw.
+//! `cas_locks`) are [`OrderedMutex`] at [`LockLevel::Monitors`].
 //!
-//! The other two high-level locks named in the doc are **not** wired and the
-//! checker therefore does not observe them:
+//! ### Runtime enforcement status
+//!
+//! Authoritative, non-aspirational list of which locks are checked vs still
+//! raw:
+//! - **Wired (checked):** L6 `monitors` (both `MonitorTable` maps).
+//! - **Not wired (not observed by the checker):** L10 `class_manager` and
+//!   L8 `heap`, for the reasons below; the remaining levels are documented
+//!   here for ordering purposes but not yet wrapped.
+//!
+//! The two high-level locks above are **not** wired and the checker therefore
+//! does not observe them:
 //! - `class_manager` (L10) is a `parking_lot::RwLock` reached from ~19 modules
 //!   (including FFI/JNI surfaces this pass is not permitted to touch); swapping
 //!   its type would ripple guard-API changes through those files.
@@ -57,9 +87,10 @@ use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, Lo
 
 /// Ordered lock levels.
 ///
-/// Integer discriminants match the levels in `docs/lock-order.md` exactly so
-/// the two are obviously aligned. A thread holding a lock at level N may only
-/// acquire locks at level **strictly less than N** (descending order).
+/// These variants, and the table in this module's doc comment, *are* the
+/// canonical global lock acquisition order — the integer discriminants are the
+/// single source of truth. A thread holding a lock at level N may only acquire
+/// locks at level **strictly less than N** (descending order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 pub enum LockLevel {
@@ -203,8 +234,8 @@ mod tracking {
 ///
 /// In debug builds, acquiring this lock asserts that the calling thread holds
 /// no lock at an equal or **lower** [`LockLevel`] (the descending-order rule
-/// from `docs/lock-order.md`). In release builds the check is compiled away
-/// entirely, making this a zero-cost wrapper.
+/// documented at the top of this module). In release builds the check is
+/// compiled away entirely, making this a zero-cost wrapper.
 pub struct OrderedMutex<T> {
     inner: Mutex<T>,
     level: LockLevel,
@@ -509,8 +540,9 @@ mod tests {
 
     #[test]
     fn lock_level_discriminants_match_docs() {
-        // These integer values come straight from docs/lock-order.md and MUST
-        // not drift. If you change them, change the doc too.
+        // These integer values are the canonical hierarchy (see this module's
+        // doc comment) and MUST not drift. If you change them, change the table
+        // in the module doc too.
         assert_eq!(LockLevel::Scratch as u8, 0);
         assert_eq!(LockLevel::JvmThread as u8, 1);
         assert_eq!(LockLevel::NativeMemory as u8, 2);
@@ -583,7 +615,7 @@ mod tests {
     #[should_panic(expected = "lock order violation")]
     fn mutex_ascending_order_panics() {
         // Holding Heap (8) and then trying to acquire ClassManager (10) is the
-        // forbidden inversion from docs/lock-order.md.
+        // forbidden inversion described in this module's doc comment.
         let a = OrderedMutex::new((), LockLevel::Heap);
         let b = OrderedMutex::new((), LockLevel::ClassManager);
         let _ga = a.lock().unwrap();
@@ -685,7 +717,7 @@ mod tests {
 
     #[test]
     fn mixed_rwlock_then_mutex_descending_ok() {
-        // The textbook combo from the doc: class_manager (RwLock, L10) held,
+        // The textbook combo from this module: class_manager (RwLock, L10) held,
         // then heap (Mutex, L8) acquired.
         let rw = OrderedRwLock::new((), LockLevel::ClassManager);
         let m = OrderedMutex::new((), LockLevel::Heap);
@@ -704,7 +736,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "lock order violation")]
     fn mixed_mutex_then_rwlock_ascending_panics() {
-        // The exact "Forbidden: monitor -> class manager" case from the doc.
+        // The exact "Forbidden: monitor -> class manager" case from this module.
         let m = OrderedMutex::new((), LockLevel::Monitors);
         let rw = OrderedRwLock::new((), LockLevel::ClassManager);
         let _gm = m.lock().unwrap();
@@ -763,8 +795,8 @@ mod tests {
 
     #[test]
     fn full_descending_chain() {
-        // Mirrors the descending hierarchy in docs/lock-order.md from L10 down
-        // to L0. Acquiring in this order must succeed.
+        // Mirrors the descending hierarchy documented in this module from L10
+        // down to L0. Acquiring in this order must succeed.
         let locks: Vec<OrderedMutex<usize>> = vec![
             OrderedMutex::new(10, LockLevel::ClassManager),
             OrderedMutex::new(9, LockLevel::NativeMethods),
@@ -786,12 +818,12 @@ mod tests {
 
     // -- Smoke test: every documented L -> L transition succeeds ------------
     //
-    // `docs/lock-order.md` lists allowed combinations such as:
+    // This module's hierarchy permits combinations such as:
     //   class_manager (L10) -> heap (L8) -> ref_processor (L7)
     //   class_manager (L10) -> monitors (L6) -> thread_registry (L5)
     //   heap (L8)          -> monitors (L6) -> thread_registry (L5)
     //
-    // The smoke test below exercises each adjacent pair in the doc's table
+    // The smoke test below exercises each adjacent pair in the module's table
     // (acquire the higher-level lock, then acquire the lower-level lock, then
     // drop both) to prove the wrappers and the doc agree.
 
@@ -825,7 +857,7 @@ mod tests {
 
     #[test]
     fn smoke_canonical_doc_examples() {
-        // Example from the doc: "GC stops the world" — heap (L8) holds, then
+        // Example: "GC stops the world" — heap (L8) holds, then
         // monitors (L6), then thread_registry (L5).
         {
             let heap = OrderedMutex::new((), LockLevel::Heap);
@@ -895,7 +927,7 @@ mod tests {
 
     // SECURITY FIX (V11): holding the L6 monitors registry and then reaching
     // *up* for class_manager (L10) is the canonical forbidden monitor ->
-    // class_manager inversion from docs/lock-order.md. Even though
+    // class_manager inversion documented in this module. Even though
     // class_manager itself is not yet wrapped, the check fires the moment any
     // higher-level OrderedRwLock is acquired under a held monitor.
     #[test]

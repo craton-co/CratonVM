@@ -141,6 +141,17 @@ pub fn reset_policy() {
 /// blocking at the literal-IP layer catches the direct-IP SSRF that
 /// guest code typically attempts; embedders that want resolution-aware
 /// policy can install their own via `set_policy`.
+///
+/// V2 HARDENING (2026-06-10): when the opt-in `CRATONVM_BLOCK_PRIVATE_NETS`
+/// env flag is engaged, the default policy *additionally* denies loopback
+/// (`127.0.0.0/8`, `::1`) and the RFC1918 private ranges (`10.0.0.0/8`,
+/// `172.16.0.0/12`, `192.168.0.0/16`) plus their IPv6 equivalents (IPv4-
+/// mapped private ranges and the `fc00::/7` unique-local block), so a
+/// confined / untrusted workload cannot reach internal services via SSRF.
+/// The flag is **off by default** — the env-less default behaviour (block
+/// only link-local cloud-metadata) is unchanged, matching the JDK-faithful
+/// permissive default the rest of the crate uses. Embedders that need a
+/// different posture still install their own rule via [`set_policy`].
 fn default_policy(target: &str) -> PolicyDecision {
     let host = host_part(target);
     if let Ok(ip) = host.parse::<IpAddr>() {
@@ -149,17 +160,128 @@ fn default_policy(target: &str) -> PolicyDecision {
                 "link-local cloud-metadata address {ip} is blocked by default policy"
             ));
         }
+        // Opt-in (CRATONVM_BLOCK_PRIVATE_NETS): also deny loopback + RFC1918
+        // private ranges so an untrusted workload can't reach internal
+        // services. Default-off; the link-local block above always runs.
+        if block_private_nets_enabled() && is_private_or_loopback_ip(&ip) {
+            return PolicyDecision::Deny(format!(
+                "private/loopback address {ip} is blocked (CRATONVM_BLOCK_PRIVATE_NETS)"
+            ));
+        }
     }
     PolicyDecision::Allow
 }
 
-/// Strip the `:port` suffix from a `host:port` string. Handles bracketed
-/// IPv6 (`[::1]:80`) too.
+/// Cached `CRATONVM_BLOCK_PRIVATE_NETS` flag. Read once on first connect so
+/// the policy stays a cheap branch on the hot path (the env var cannot
+/// meaningfully change mid-process). Presence = enabled; the value `0` /
+/// `false` / `off` / `no` (case-insensitive) disables. Tri-state encoding in
+/// the atomic: 0 = not yet computed, 1 = disabled, 2 = enabled — so the
+/// "absent" default (disabled) is never mistaken for "uncomputed".
+static BLOCK_PRIVATE_NETS: AtomicU64 = AtomicU64::new(0);
+
+fn block_private_nets_enabled() -> bool {
+    match BLOCK_PRIVATE_NETS.load(Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            let on = match std::env::var("CRATONVM_BLOCK_PRIVATE_NETS") {
+                Ok(v) => {
+                    let v = v.trim().to_ascii_lowercase();
+                    !(v.is_empty() || v == "0" || v == "false" || v == "off" || v == "no")
+                }
+                Err(_) => false,
+            };
+            BLOCK_PRIVATE_NETS.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// Returns true for loopback and RFC1918 private IPv4/IPv6 addresses.
+/// Used only when `CRATONVM_BLOCK_PRIVATE_NETS` is engaged; the link-local
+/// metadata block is separate and always-on. Does not overlap the
+/// metadata check (link-local `169.254/16` and `fe80::/10` are handled by
+/// [`is_link_local_metadata_ip`]).
+fn is_private_or_loopback_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_v4_private_or_loopback(v4),
+        IpAddr::V6(v6) => {
+            // An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) tunnels the v4
+            // ranges — classify by the embedded v4 octets so a mapped
+            // private/loopback address can't slip past.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_v4_private_or_loopback(&v4);
+            }
+            is_v6_private_or_loopback(v6)
+        }
+    }
+}
+
+fn is_v4_private_or_loopback(v4: &Ipv4Addr) -> bool {
+    let o = v4.octets();
+    // 127.0.0.0/8 loopback
+    if o[0] == 127 {
+        return true;
+    }
+    // 10.0.0.0/8
+    if o[0] == 10 {
+        return true;
+    }
+    // 172.16.0.0/12  (172.16.0.0 – 172.31.255.255)
+    if o[0] == 172 && (16..=31).contains(&o[1]) {
+        return true;
+    }
+    // 192.168.0.0/16
+    if o[0] == 192 && o[1] == 168 {
+        return true;
+    }
+    false
+}
+
+fn is_v6_private_or_loopback(v6: &Ipv6Addr) -> bool {
+    // ::1 loopback
+    if v6.is_loopback() {
+        return true;
+    }
+    // fc00::/7 — IPv6 unique-local addresses (the v6 RFC1918 equivalent).
+    // Top 7 bits == 1111110.
+    let segs = v6.segments();
+    if segs[0] & 0xfe00 == 0xfc00 {
+        return true;
+    }
+    false
+}
+
+/// Strip the `:port` suffix from a `host:port` string and return the bare
+/// host. Handles three input shapes:
+///
+///   * bracketed IPv6 (`[::1]:80` → `::1`, `[fe80::1]` → `fe80::1`),
+///   * `host:port` with a single colon (`127.0.0.1:80` → `127.0.0.1`,
+///     `example.com:443` → `example.com`), and
+///   * a **bare, unbracketed IPv6 literal** (`fe80::1`, `::1`,
+///     `fd00:ec2::254`) which contains multiple colons and *no* port.
+///
+/// B4 FIX (2026-06-10): the old `rsplit_once(':')` split a bare IPv6 literal
+/// on the colon *inside* the address (`fe80::1` → `fe80:`), yielding an
+/// unparseable host so `default_policy` returned `Allow` — letting an
+/// unbracketed link-local / metadata IPv6 literal slip past the default
+/// block at the literal-string layer. We now only strip a trailing `:port`
+/// when the unbracketed string contains exactly one colon; a string with
+/// two or more colons and no brackets is a bare IPv6 literal and is returned
+/// whole. (Bracketed forms keep `host:port` parsing unambiguous and are
+/// handled first, so a bracketed literal *with* a port is unaffected.)
 fn host_part(target: &str) -> &str {
     if let Some(rest) = target.strip_prefix('[') {
         if let Some(end) = rest.find(']') {
             return &rest[..end];
         }
+    }
+    // Unbracketed: a single colon is `host:port`; two or more colons is a
+    // bare IPv6 literal (no port) and must be returned intact so it parses
+    // as an `IpAddr`. `matches(':').count()` counts colon occurrences.
+    if target.matches(':').count() >= 2 {
+        return target;
     }
     match target.rsplit_once(':') {
         Some((host, _)) => host,
@@ -426,5 +548,89 @@ mod tests {
         assert_eq!(host_part("[::1]:80"), "::1");
         assert_eq!(host_part("example.com:443"), "example.com");
         assert_eq!(host_part("bare"), "bare");
+    }
+
+    /// B4 (2026-06-10): a bare, *unbracketed* IPv6 literal (multiple colons,
+    /// no port) must be returned whole so it parses as an `IpAddr`. The old
+    /// `rsplit_once(':')` split it on an internal colon (`fe80::1` → `fe80:`),
+    /// making it unparseable and silently `Allow`ed by `default_policy`.
+    #[test]
+    fn host_part_handles_bare_ipv6_literal() {
+        assert_eq!(host_part("fe80::1"), "fe80::1");
+        assert_eq!(host_part("::1"), "::1");
+        assert_eq!(host_part("fd00:ec2::254"), "fd00:ec2::254");
+        // Bracketed literal *without* a port still strips the brackets.
+        assert_eq!(host_part("[fe80::1]"), "fe80::1");
+        // And each of these now parses as a real IpAddr (the whole point).
+        assert!(host_part("fe80::1").parse::<IpAddr>().is_ok());
+        assert!(host_part("fd00:ec2::254").parse::<IpAddr>().is_ok());
+    }
+
+    /// B4 end-to-end: an unbracketed link-local / metadata IPv6 literal must
+    /// be denied by the default policy (previously slipped through because
+    /// `host_part` mangled it). `default_policy` is consulted directly so the
+    /// test does not depend on networking.
+    #[test]
+    fn default_policy_denies_bare_ipv6_metadata() {
+        // Unbracketed link-local and AWS-metadata IPv6 literals — these are
+        // exactly the inputs the old `host_part` mangled into `Allow`.
+        assert!(matches!(default_policy("fe80::1"), PolicyDecision::Deny(_)));
+        assert!(matches!(default_policy("fd00:ec2::254"), PolicyDecision::Deny(_)));
+        // The bracketed-with-port form must keep working too.
+        assert!(matches!(default_policy("[fd00:ec2::254]:80"), PolicyDecision::Deny(_)));
+        // A public IPv6 literal is still allowed (no false positives).
+        assert!(matches!(default_policy("2001:4860:4860::8888"), PolicyDecision::Allow));
+    }
+
+    /// V2 (2026-06-10): the opt-in private-net classifier covers loopback
+    /// (`127/8`, `::1`) and the RFC1918 ranges (`10/8`, `172.16/12`,
+    /// `192.168/16`) plus IPv6 ULA (`fc00::/7`) and IPv4-mapped private v6.
+    /// These functions are gated on `CRATONVM_BLOCK_PRIVATE_NETS` in
+    /// `default_policy`; here we test the pure classifier so the assertion
+    /// does not race the process-global env cache.
+    #[test]
+    fn private_net_classifier_covers_loopback_and_rfc1918() {
+        let denied = [
+            "127.0.0.1",
+            "127.255.255.255",
+            "10.0.0.5",
+            "172.16.0.1",
+            "172.31.255.255",
+            "192.168.1.1",
+            "::1",
+            "fc00::1",
+            "fd12:3456::1",
+            "::ffff:10.0.0.1", // IPv4-mapped private v6
+            "::ffff:127.0.0.1",
+        ];
+        for s in denied {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(is_private_or_loopback_ip(&ip), "expected private/loopback: {s}");
+        }
+        let allowed = [
+            "8.8.8.8",
+            "1.1.1.1",
+            "172.15.0.1", // just below the /12
+            "172.32.0.1", // just above the /12
+            "192.169.0.1",
+            "2001:4860:4860::8888",
+            "::ffff:8.8.8.8", // IPv4-mapped public v6
+        ];
+        for s in allowed {
+            let ip: IpAddr = s.parse().unwrap();
+            assert!(!is_private_or_loopback_ip(&ip), "expected public: {s}");
+        }
+    }
+
+    /// The private-net block must NOT overlap or weaken the always-on
+    /// link-local metadata block: link-local addresses stay denied
+    /// regardless of the opt-in flag.
+    #[test]
+    fn private_net_classifier_excludes_link_local_metadata() {
+        // 169.254/16 and fe80::/10 are handled by the metadata classifier,
+        // not the private classifier — verify they are not mis-bucketed.
+        let imds: IpAddr = "169.254.169.254".parse().unwrap();
+        assert!(!is_private_or_loopback_ip(&imds));
+        assert!(is_link_local_metadata_ip(&imds));
     }
 }

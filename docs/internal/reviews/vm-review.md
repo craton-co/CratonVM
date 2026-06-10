@@ -37,7 +37,7 @@ header.
   (`class_manager`, `heap`, `monitors`, `thread_registry`, `statics`,
   `resolution_cache`, `string_pool`, `class_mirrors`, `native_methods`,
   `jni_global_refs`) the published 10-level hierarchy in
-  `docs/lock-order.md` is purely documentary.
+  `vm/src/runtime/lock_order.rs` is purely documentary.
 - **HIGH** — `runtime/crash_handler.rs:230-322` panic hook and Unix signal
   handler call `format!`, `eprintln!`, `std::fs::write` (via
   `write_crash_report`) — none async-signal-safe. A SIGSEGV that fires while
@@ -303,7 +303,9 @@ file (`vm_benchmarks.rs`), Criterion harness.
   ties `SharedVm` / `JvmThread` / `Vm`.
 - `src/runtime/interpreter.rs:1-46` — bytecode interpreter philosophy,
   NEW-7 panic-discipline gate.
-- `src/runtime/lock_order.rs:1-39` — points to `docs/lock-order.md` and
+- `src/runtime/lock_order.rs:1-39` — the self-contained canonical lock-order
+  authority (the L0–L10 table; formerly cross-referenced a standalone
+  `docs/lock-order.md` that has since been consolidated into this module) and
   states the wrappers are not yet wired.
 - `src/threading/monitor.rs:1-112` — thin-lock state-machine doc.
 - `src/threading/gc_barrier.rs:1-58` — STW + blocked-thread accounting.
@@ -316,7 +318,7 @@ file (`vm_benchmarks.rs`), Criterion harness.
 
 - No `MODULES.md` mapping the 94 source files to the README sections; the
   current README scope bullet conflates `runtime/`, `vm/`, and `memory/`.
-- `docs/lock-order.md` documents the hierarchy but does not list the
+- `vm/src/runtime/lock_order.rs` documents the hierarchy but does not list the
   call-site wiring status — outdated relative to
   `runtime/lock_order.rs:35`'s "not wired" admission.
 - No rustdoc on the major public types' invariants:

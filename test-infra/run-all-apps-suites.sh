@@ -4,9 +4,9 @@ set +e
 export MSYS2_ARG_CONV_EXCL='*'
 export MSYS_NO_PATHCONV=1
 
-ROOT="${ROOT:-C:/craton/CratonVM}"
+ROOT="${ROOT:-$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || echo C:/craton/CratonVM)}"
 CV="${CV:-$ROOT/target/release/cratonvm.exe}"
-JDK="${JDK:-C:/Program Files/Java/jdk-25}"
+JDK="${JDK:-${JAVA_HOME:-C:/Program Files/Java/jdk-25}}"
 HS="$JDK/bin/java.exe"
 POOL="${POOL:-$ROOT/apps/probe/test-infra/regression-pool}"
 [ -d "$POOL" ] || POOL="$ROOT/test-infra/regression-pool"
@@ -18,7 +18,21 @@ TIMEOUT="${TIMEOUT:-600}"
 
 mkdir -p "$LOGDIR" "$ROOT/test-infra/suite-results"
 printf "suite\tvm\trc\tstate\twall_s\tnote\n" > "$OUT"
-taskkill //F //IM cratonvm.exe 2>/dev/null || true
+
+# Kill ONLY leftover cratonvm.exe processes launched from THIS tree ($ROOT),
+# so a parallel suite / another worktree / a dev session is left untouched.
+# Never let a no-match surface as a failure (the documented rc=1 footgun of
+# `taskkill /F /IM cratonvm.exe`, which also kills unrelated processes).
+kill_stray_cratonvm() {
+  local root_win
+  root_win=$(printf '%s' "$ROOT" | sed 's|/|\\\\|g')
+  powershell.exe -NoProfile -Command \
+    "Get-CimInstance Win32_Process -Filter \"Name='cratonvm.exe'\" |
+       Where-Object { \$_.ExecutablePath -and \$_.ExecutablePath -like '${root_win}*' } |
+       ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" \
+    >/dev/null 2>&1 || true
+}
+kill_stray_cratonvm
 [ -x "$CV" ] || { echo "ERROR: missing $CV"; exit 3; }
 
 run_suite() {

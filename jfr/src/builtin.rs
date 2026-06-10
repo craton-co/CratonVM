@@ -3106,6 +3106,20 @@ pub fn emit_custom_event(
 /// JFR configuration profile — corresponds to .jfc files (default.jfc, profile.jfc).
 ///
 /// Defines which events are enabled and their settings (threshold, stacktrace, period).
+///
+/// EXPERIMENTAL / NOT-YET-WIRED (S1, 2026-06-10): this profile model and its
+/// constructors ([`default_profile`](JfrProfile::default_profile),
+/// [`detailed_profile`](JfrProfile::detailed_profile)) are a **planned but
+/// currently unwired** configuration surface. Nothing in [`FlightRecorder`]'s
+/// recording-startup path consults a `JfrProfile`, and the only caller of
+/// [`apply_to`](JfrProfile::apply_to) is this crate's own test suite — so the
+/// `enabled` / `threshold` / `stacktrace` / `period` values **do not currently
+/// gate any recording**. Real JFR drives recording configuration from these
+/// `.jfc` profiles; this models that surface ahead of plumbing it through
+/// `FlightRecorder`. Treat it as data-only until that wiring lands. The
+/// `stacktrace` and `period` fields are additionally inert because stack-trace
+/// capture and periodic-event sampling are not yet implemented (see
+/// `dump::write_metadata_section` for the stack-trace gap).
 #[derive(Debug, Clone)]
 pub struct JfrProfile {
     pub name: String,
@@ -3114,6 +3128,10 @@ pub struct JfrProfile {
 }
 
 /// Settings for a single event type in a JFR profile.
+///
+/// EXPERIMENTAL / NOT-YET-WIRED (S1, 2026-06-10): see [`JfrProfile`]. These
+/// per-event settings are not yet applied to live recordings; `stacktrace` and
+/// `period` are inert (no stack-trace capture, no periodic sampling).
 #[derive(Debug, Clone)]
 pub struct JfrEventSetting {
     pub event_name: String,
@@ -3219,6 +3237,13 @@ impl JfrProfile {
     }
 
     /// Apply this profile's settings to a `RecordingSettings`.
+    ///
+    /// EXPERIMENTAL / NOT-YET-WIRED (S1, 2026-06-10): no production path calls
+    /// this — only the crate's own `t6_profile_apply_to_settings` test does, so
+    /// in practice profiles never reach any live recording. When it *is* called
+    /// it maps only `enabled` (→ `enabled_events`) and `threshold` (→
+    /// `event_thresholds`); the `stacktrace` and `period` fields are NOT applied
+    /// (those features are unimplemented — see [`JfrProfile`]).
     pub fn apply_to(&self, settings: &mut crate::recording::RecordingSettings, registry: &EventTypeRegistry) {
         for es in &self.settings {
             if !es.enabled {

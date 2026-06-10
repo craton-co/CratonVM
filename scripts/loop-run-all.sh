@@ -3,13 +3,13 @@
 set +e
 
 ITER="${1:-r1}"
-ROOT="C:/Projects/cratonvm"
+ROOT="${ROOT:-$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || echo C:/craton/CratonVM)}"
 LOGDIR="$ROOT/applogs/loop-$ITER"
 mkdir -p "$LOGDIR"
 
 CRATONVM="$ROOT/target/release/cratonvm.exe"
-JDK="C:/Program Files/Eclipse Adoptium/jdk-25.0.2.10-hotspot"
-APPS="C:/Projects/cratonvm/apps"
+JDK="${JDK:-${JAVA_HOME:-C:/Program Files/Java/jdk-25}}"
+APPS="${APPS:-$ROOT/apps}"
 
 run_app() {
     local name="$1"; shift

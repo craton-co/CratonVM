@@ -3001,9 +3001,43 @@ impl SharedVm {
             }
         }
 
-        // We are the loader for this class — mark as loading
+        // We are the loader for this class — mark as loading.
+        //
+        // B3: wrap the `*loading = true` … `*loading = false` + notify span in
+        // an RAII guard so that an UNWIND through `load_class` (which has many
+        // `.expect`/`pop_unchecked` paths) still resets the flag and wakes
+        // waiters. Without it, a panic during load leaves `*loading == true`
+        // forever: every later loader of this class double-checks (not loaded),
+        // enters `while *loading`, and spins on the 30s wait timeout that no
+        // notifier will ever satisfy — turning one load panic into a cascade of
+        // stuck/aborting loaders. The guard's `Drop` runs on both the success
+        // path and the unwind path; success-path cleanup (`remove(name)`) runs
+        // after the guard is dropped below.
         *loading = true;
         drop(loading);
+
+        /// Resets the per-class loading flag and notifies waiters on drop,
+        /// including when the enclosing scope unwinds due to a panic.
+        struct LoadingFlagGuard {
+            lock: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+        impl Drop for LoadingFlagGuard {
+            fn drop(&mut self) {
+                let (lock, cvar) = &*self.lock;
+                // On unwind the mutex is not poisoned (we dropped the guard
+                // before the fallible work), but tolerate a poisoned lock
+                // defensively so the notify still fires.
+                let mut loading = match lock.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *loading = false;
+                cvar.notify_all();
+            }
+        }
+        let loading_guard = LoadingFlagGuard {
+            lock: class_lock.clone(),
+        };
 
         // T19.H7 diag — periodic checkpoints around class load.
         // Rate-limited via static AtomicU32 so we don't drown stderr.
@@ -3103,15 +3137,15 @@ impl SharedVm {
             }
         }
 
-        // Mark done and notify all waiters for this class
-        let mut loading = lock.lock().expect(
-            "class-loading mutex poisoned: a thread panicked during class loading",
-        );
-        *loading = false;
-        cvar.notify_all();
+        // Mark done and notify all waiters for this class. Dropping the guard
+        // re-acquires the lock, sets `*loading = false`, and `notify_all()`s
+        // (the same work the old manual block did) — and it would have run the
+        // same reset/notify automatically had `load_class` above unwound.
+        drop(loading_guard);
 
         // Clean up per-class lock entry to avoid unbounded growth
-        // (only if nobody else is waiting — check refcount)
+        // (only if nobody else is waiting — check refcount). Done after the
+        // guard drop so waiters have already been notified.
         if Arc::strong_count(&class_lock) <= 2 {
             // 2 = our local + the HashMap entry — no other thread holds it
             self.class_loading_locks.lock().remove(name);

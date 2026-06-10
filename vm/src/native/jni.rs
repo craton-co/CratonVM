@@ -2325,6 +2325,74 @@ release_array_elements!(jni_release_long_array_elements, JLong, |v: JLong| Value
 release_array_elements!(jni_release_float_array_elements, JFloat, |v: JFloat| Value::Float(v)); // 197
 release_array_elements!(jni_release_double_array_elements, JDouble, |v: JDouble| Value::Double(v)); // 198
 
+// ---------------------------------------------------------------------------
+// Region bounds-checking (JNI Get/Set<Type>ArrayRegion + string regions)
+// ---------------------------------------------------------------------------
+//
+// The JNI spec mandates that `Get/Set<Type>ArrayRegion` and the string-region
+// accessors throw `ArrayIndexOutOfBoundsException` (resp. `StringIndexOutOf-
+// BoundsException`, which we surface as AIOOBE) when `start`/`len` fall outside
+// the array/string. Previously these helpers relied only on the per-element
+// accessor's *internal* bounds check, which silently swallowed an out-of-range
+// request (reading/writing nothing) instead of signalling the contract error.
+// `region_bounds_ok` performs the explicit, overflow-safe check; on failure it
+// raises a pending AIOOBE so the interpreter throws it on native return.
+
+/// Set a pending `ArrayIndexOutOfBoundsException` for the current JNI call.
+///
+/// When a `JvmThread` context is available we materialise a real exception
+/// object and store its handle in `JNI_PENDING_EXCEPTION` (the same slot
+/// `Throw`/`ThrowNew` use), so `vm_exec` rethrows it as a catchable Java
+/// exception on return from the native call. Without a thread context (e.g. a
+/// direct unit-test call) we fall back to the `ThrowNew` sentinel so the error
+/// is still flagged rather than silently dropped.
+fn raise_jni_aioobe(index: usize, length: usize) {
+    let msg = format!("Index {index} out of bounds for length {length}");
+    let raised = with_jni_context(|shared, thread| {
+        match crate::runtime::exceptions::create_exception_object(
+            shared,
+            thread,
+            "java/lang/ArrayIndexOutOfBoundsException",
+            Some(&msg),
+        ) {
+            Ok(exc) => {
+                let handle = obj_to_jobject(exc);
+                JNI_PENDING_EXCEPTION.with(|cell| cell.set(handle));
+                true
+            }
+            Err(_) => false,
+        }
+    })
+    .unwrap_or(false);
+    if !raised {
+        // No thread context or allocation failed: flag the pending-exception
+        // sentinel so the condition is not silently swallowed.
+        JNI_PENDING_EXCEPTION.with(|cell| cell.set(u64::MAX));
+    }
+}
+
+/// Validate that the `[start, start + len)` window lies within `[0, length)`.
+///
+/// `start`/`len` are caller-supplied `JSize` (i32). Returns `true` for an
+/// in-bounds (or empty) region and `false` otherwise; on `false` a pending
+/// AIOOBE has been raised. Uses checked arithmetic so `start + len` cannot
+/// overflow and wrap into a spuriously-valid range.
+fn region_bounds_ok(start: JSize, len: JSize, length: usize) -> bool {
+    if start < 0 || len < 0 {
+        raise_jni_aioobe(start.max(0) as usize, length);
+        return false;
+    }
+    let start = start as usize;
+    let len = len as usize;
+    match start.checked_add(len) {
+        Some(end) if end <= length => true,
+        _ => {
+            raise_jni_aioobe(start, length);
+            false
+        }
+    }
+}
+
 // ---- Indices 199-206: Get<Type>ArrayRegion ----
 macro_rules! get_array_region {
     ($name:ident, $rust_type:ty, $value_variant:ident, $default:expr) => {
@@ -2340,6 +2408,11 @@ macro_rules! get_array_region {
             }
             with_shared_vm(|shared| {
                 let oref = jobject_to_obj(array)?;
+                // JNI contract: validate the requested window against the array
+                // length BEFORE touching memory; raise AIOOBE on a bad range.
+                if !region_bounds_ok(start, len, shared.heap.array_length(oref)) {
+                    return None;
+                }
                 for i in 0..len as usize {
                     let val = shared
                         .heap
@@ -2383,6 +2456,12 @@ macro_rules! set_array_region {
             }
             with_shared_vm(|shared| {
                 let oref = jobject_to_obj(array)?;
+                // JNI contract: validate the requested window against the array
+                // length BEFORE writing; raise AIOOBE on a bad range so no
+                // partial / out-of-range store is performed.
+                if !region_bounds_ok(start, len, shared.heap.array_length(oref)) {
+                    return None;
+                }
                 for i in 0..len as usize {
                     let val = unsafe { *buf.add(i) };
                     let _ = shared.heap.set_array_element(
@@ -2636,11 +2715,14 @@ extern "C" fn jni_get_string_region(
         let oref = jobject_to_obj(str_obj)?;
         let s = read_java_string(&shared.heap, oref)?;
         let utf16: Vec<u16> = s.encode_utf16().collect();
-        let start = start as usize;
-        let len = len as usize;
-        if start + len > utf16.len() {
+        // JNI contract: a region outside the string raises (String)IndexOutOf-
+        // BoundsException — surfaced here as AIOOBE via the shared checker
+        // (overflow-safe; no partial copy on a bad range).
+        if !region_bounds_ok(start, len, utf16.len()) {
             return None;
         }
+        let start = start as usize;
+        let len = len as usize;
         unsafe {
             std::ptr::copy_nonoverlapping(
                 utf16[start..start + len].as_ptr(),
@@ -2668,17 +2750,22 @@ extern "C" fn jni_get_string_utf_region(
         let s = read_java_string(&shared.heap, oref)?;
         // In JNI, start/len refer to UTF-16 code units.
         let utf16: Vec<u16> = s.encode_utf16().collect();
-        let start = start as usize;
-        let len = len as usize;
-        if start + len > utf16.len() {
+        // JNI contract: a region outside the string raises (String)IndexOutOf-
+        // BoundsException — surfaced here as AIOOBE via the shared checker.
+        if !region_bounds_ok(start, len, utf16.len()) {
             return None;
         }
+        let start = start as usize;
+        let len = len as usize;
         let region = String::from_utf16_lossy(&utf16[start..start + len]);
         let bytes = region.as_bytes();
         unsafe {
+            // Per the JNI spec, GetStringUTFRegion does NOT null-terminate the
+            // destination buffer (unlike GetStringUTFChars). Writing a trailing
+            // NUL would be a 1-byte overflow past a caller buffer sized exactly
+            // to the region length, so copy only the region bytes. HotSpot
+            // likewise writes no terminator here.
             std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const c_char, buf, bytes.len());
-            // Null-terminate
-            *buf.add(bytes.len()) = 0;
         }
         Some(())
     });
@@ -4769,6 +4856,54 @@ mod tests {
         let mut out = [0i32; 4];
         jni_get_int_array_region(env, arr, 0, 4, out.as_mut_ptr());
         assert_eq!(out, [10, 20, 30, 40]);
+        clear_jni_context();
+    }
+
+    #[test]
+    fn region_bounds_ok_rejects_out_of_range() {
+        // In-bounds / empty windows accept.
+        assert!(region_bounds_ok(0, 4, 4));
+        assert!(region_bounds_ok(4, 0, 4));
+        assert!(region_bounds_ok(2, 2, 4));
+        // Drain any pending sentinel set by the rejecting cases below so this
+        // test doesn't leak into the shared thread-local.
+        let _ = take_jni_pending_exception();
+        // Out-of-range windows reject and flag a pending exception.
+        assert!(!region_bounds_ok(3, 2, 4)); // start+len = 5 > 4
+        assert!(take_jni_pending_exception().is_some());
+        assert!(!region_bounds_ok(5, 0, 4)); // start past end
+        let _ = take_jni_pending_exception();
+        // Overflow can't wrap into a spuriously-valid range.
+        assert!(!region_bounds_ok(JSize::MAX, JSize::MAX, 4));
+        let _ = take_jni_pending_exception();
+    }
+
+    #[test]
+    fn jni_get_array_region_out_of_bounds_no_partial_write() {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        let shared = Arc::new(SharedVm::new(VmConfig::default()));
+        set_jni_context_arc(shared.clone());
+        let env = get_jni_env();
+        let arr = jni_new_int_array(env, 4);
+        let data: [JInt; 4] = [10, 20, 30, 40];
+        jni_set_int_array_region(env, arr, 0, 4, data.as_ptr());
+        // Request a region that runs off the end: start=2 len=4 on a length-4
+        // array. The destination must be left fully untouched (no partial copy)
+        // and a pending exception must be flagged.
+        let _ = take_jni_pending_exception();
+        let mut out = [-1i32; 4];
+        jni_get_int_array_region(env, arr, 2, 4, out.as_mut_ptr());
+        assert_eq!(out, [-1, -1, -1, -1], "OOB region must not write");
+        assert!(take_jni_pending_exception().is_some());
+
+        // An OOB set must not corrupt the array either.
+        let bad: [JInt; 4] = [99, 99, 99, 99];
+        jni_set_int_array_region(env, arr, 2, 4, bad.as_ptr());
+        let _ = take_jni_pending_exception();
+        let mut back = [0i32; 4];
+        jni_get_int_array_region(env, arr, 0, 4, back.as_mut_ptr());
+        assert_eq!(back, [10, 20, 30, 40], "OOB set must not mutate array");
         clear_jni_context();
     }
 

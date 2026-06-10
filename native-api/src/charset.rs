@@ -146,7 +146,15 @@ pub fn decode_bytes_lossy(name: &str, bytes: &[u8]) -> Vec<u16> {
         "UTF-32" => decode_utf32_bom_lossy(bytes, true),
         "UTF-32BE" => decode_utf32_fixed_lossy(bytes, true),
         "UTF-32LE" => decode_utf32_fixed_lossy(bytes, false),
-        _ => bytes.iter().map(|_| REPLACEMENT_CHAR).collect(),
+        // Unsupported charset name. The lossy signature is infallible, so we
+        // cannot surface the `UnsupportedCharset` error here. Replacing every
+        // byte with U+FFFD would be doubly wrong: it discards the input AND
+        // misreports the *length* (a 1:1 byte->char map for an unknown name is
+        // arbitrary). Instead fall back to ISO-8859-1 (Latin-1), the only
+        // charset that maps every byte 0x00..=0xFF losslessly and identically.
+        // This preserves the bytes' identity (round-trippable) rather than
+        // fabricating replacement characters for valid data.
+        _ => bytes.iter().map(|&b| b as u16).collect(),
     }
 }
 
@@ -154,8 +162,20 @@ pub fn decode_bytes_lossy(name: &str, bytes: &[u8]) -> Vec<u16> {
 pub fn encode_chars_lossy(name: &str, chars: &[u16]) -> Vec<u8> {
     match encode_chars(name, chars) {
         Ok(v) => v,
+        // The strict encode failed on an unmappable code point. The REPLACE
+        // action substitutes the charset's replacement byte (`'?'`) for each
+        // unmappable unit while still encoding the mappable ones in the
+        // *requested* charset. Re-encoding the whole input as UTF-8 (the old
+        // catch-all) was wrong: a `windows-1252` sink would receive UTF-8
+        // multibyte sequences for any supplementary character.
         Err(_) => match name {
-            "UTF-8" => encode_utf8(chars),
+            // UTF-8 / UTF-16 / UTF-32 can represent every code point, so a
+            // strict failure means malformed surrogate units; `encode_utf8`
+            // (and the UTF-16/32 encoders, reached via the Ok path) already
+            // substitute U+FFFD, so this branch is effectively unreachable for
+            // them, but keep UTF-8 as the safe representable fallback.
+            "UTF-8" | "UTF-16" | "UTF-16BE" | "UTF-16LE" | "UTF-32" | "UTF-32BE"
+            | "UTF-32LE" => encode_utf8(chars),
             "US-ASCII" => chars
                 .iter()
                 .map(|&c| if c < 0x80 { c as u8 } else { REPLACEMENT_BYTE })
@@ -164,9 +184,42 @@ pub fn encode_chars_lossy(name: &str, chars: &[u16]) -> Vec<u8> {
                 .iter()
                 .map(|&c| if c < 0x100 { c as u8 } else { REPLACEMENT_BYTE })
                 .collect(),
-            _ => encode_utf8(chars),
+            // Supported single-byte code pages: encode mappable units in the
+            // target charset and substitute `'?'` for unmappable ones, rather
+            // than dropping to UTF-8.
+            "windows-1252" => encode_sb_lossy(chars, cp1252_rev()),
+            "windows-1251" => encode_sb_lossy(chars, cp1251_rev()),
+            "KOI8-R" => encode_sb_lossy(chars, koi8r_rev()),
+            "ISO-8859-2" => encode_sb_lossy(chars, iso_8859_2_rev()),
+            "ISO-8859-15" => encode_sb_lossy(chars, iso_8859_15_rev()),
+            // Unsupported charset name. The lossy signature is infallible, so
+            // we cannot surface `UnsupportedCharset`. Re-encoding as UTF-8
+            // silently produced bytes in the *wrong* encoding for the sink.
+            // Fall back to ISO-8859-1 (the byte-identity charset) with `'?'`
+            // substitution: representable units keep their byte value, the
+            // rest become `'?'`. Still lossy, but never the wrong encoding.
+            _ => chars
+                .iter()
+                .map(|&c| if c < 0x100 { c as u8 } else { REPLACEMENT_BYTE })
+                .collect(),
         },
     }
+}
+
+/// Lossy single-byte encode: encode each mappable code unit in the target
+/// charset via its prebuilt reverse table, substituting [`REPLACEMENT_BYTE`]
+/// (`'?'`) for any unmappable unit. Mirrors [`encode_sb`] but never errors.
+fn encode_sb_lossy(chars: &[u16], rev: &[u8; 65536]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(chars.len());
+    for &c in chars {
+        if c < 0x80 {
+            out.push(c as u8);
+        } else {
+            let b = rev[c as usize];
+            out.push(if b != 0 { b } else { REPLACEMENT_BYTE });
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -913,5 +966,37 @@ mod tests {
         assert_eq!(d, vec![0x0430]);
         let b = encode_chars("KOI8-R", &[0x0430]).unwrap();
         assert_eq!(b, &[0xC1]);
+    }
+
+    #[test]
+    fn lossy_decode_unknown_name_is_latin1_not_all_replacement() {
+        // An unsupported charset name must NOT fabricate an all-U+FFFD buffer
+        // (which discards the bytes and misreports content). It falls back to
+        // Latin-1 byte identity, which round-trips through ISO-8859-1.
+        let bytes: &[u8] = &[0x41, 0x80, 0xFF, 0x00];
+        let chars = decode_bytes_lossy("Some-Unknown-Charset", bytes);
+        assert_eq!(chars, vec![0x0041, 0x0080, 0x00FF, 0x0000]);
+        // None of them are the replacement character.
+        assert!(chars.iter().all(|&c| c != REPLACEMENT_CHAR));
+    }
+
+    #[test]
+    fn lossy_encode_unknown_name_is_latin1_with_question_mark() {
+        // Old behavior re-encoded as UTF-8, producing bytes in the wrong
+        // encoding. Now: representable units keep their byte value, the rest
+        // become '?'. Emoji = 2 surrogate units, each unmappable -> '?'.
+        let chars = "A\u{00FF}\u{1F600}".encode_utf16().collect::<Vec<_>>();
+        let bytes = encode_chars_lossy("Some-Unknown-Charset", &chars);
+        assert_eq!(bytes, vec![0x41, 0xFF, b'?', b'?']);
+    }
+
+    #[test]
+    fn lossy_encode_single_byte_charset_substitutes_question_mark() {
+        // windows-1252 cannot represent an emoji; lossy encode must emit '?'
+        // in the *target* charset, NOT re-encode the whole input as UTF-8.
+        // 'A' (mappable) + euro sign U+20AC (maps to 0x80) + emoji (unmappable).
+        let chars = "A\u{20AC}\u{1F600}".encode_utf16().collect::<Vec<_>>();
+        let bytes = encode_chars_lossy("windows-1252", &chars);
+        assert_eq!(bytes, vec![b'A', 0x80, b'?', b'?']);
     }
 }

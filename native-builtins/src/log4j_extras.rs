@@ -358,11 +358,19 @@ fn native_core_logger_get_parent(_ctx: &mut dyn NativeContext, _args: &[Value]) 
 
 /// Register every log4j 2.x LogManager / Logger shim owned by this module.
 ///
-/// Wired unconditionally from `register_essential_natives` in
-/// `native-builtins/src/lib.rs`. No env-var gate — the shims only fire
-/// when a caller actually invokes one of these methods, so apps that
-/// don't touch log4j are unaffected.
+/// FLAGGED SyntheticStub: this is a *silent no-op logging pipeline* — every
+/// `getLogger`/`getContext` hands back a synthetic logger whose log methods
+/// discard records. It fakes app behaviour (logging is silently dropped),
+/// so per the no-stubs policy it is:
+///   * tagged [`NativeKind::SyntheticStub`] (the save/set/restore below), and
+///   * wired ONLY from the default-OFF `app-stubs` feature in
+///     `native-builtins/src/lib.rs` (`register_app_stubs`).
+/// The real fix is the LambdaMetafactory / invokedynamic `<clinit>` path that
+/// no-ops `LogManager.<clinit>` and leaves the `factory` static null; until
+/// that lands this shim only exists under `app-stubs`.
 pub fn register_log4j_stubs(registry: &mut NativeMethodRegistry) {
+    let __prev_cat = registry.current_category();
+    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     // --- LogManager.getContext overloads ------------------------------
     // Every overload returns the same synthetic SimpleLoggerContext.
     let get_ctx_descriptors = [
@@ -848,6 +856,7 @@ pub fn register_log4j_stubs(registry: &mut NativeMethodRegistry) {
         "(Z)V",
         native_log_void,
     );
+    registry.set_category(__prev_cat);
 }
 
 /// Register no-op natives on `SimpleLogger` for every Logger interface

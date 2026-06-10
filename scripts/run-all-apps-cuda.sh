@@ -5,10 +5,10 @@
 # line per app into ROLLUP.md.
 set +e
 
-ROOT=C:/craton/CratonVM/.claude/worktrees/angry-brown-38c5dc
-APPS=C:/craton/CratonVM/apps
+ROOT="${ROOT:-$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || echo C:/craton/CratonVM)}"
+APPS="${APPS:-$ROOT/apps}"
 RJVM="$ROOT/target/release/cratonvm.exe"
-JDK="C:/Program Files/Java/jdk-25"
+JDK="${JDK:-${JAVA_HOME:-C:/Program Files/Java/jdk-25}}"
 CRATON_GPU=$(ls -d "$ROOT/target/release/build/craton-gpu-"*/out/classes 2>/dev/null | head -1)
 M2="$HOME/.m2/repository"
 LOG="$ROOT/applogs/all-apps-gpu-$(date +%H%M%S)"

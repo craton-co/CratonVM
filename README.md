@@ -25,13 +25,17 @@ tracked known JIT issue — see [SECURITY.md](SECURITY.md).
 ## Features
 
 - **Bytecode interpreter** with 140+ fast-path opcodes
-- **x86-64 JIT compiler** (~7,200 lines, ~140 bytecodes, 26 optimization rounds)
+- **x86-64 JIT compiler** (x64 core ~7,200 lines, ~140 bytecodes, 26 optimization rounds)
 - **Generational garbage collector** with write barriers
 - **Multi-threading** with monitors, locks, and barriers
 - **Lambda/invokedynamic** support via LambdaMetafactory
 - **3,100+ native method registrations** (java.lang, java.util, java.io, java.time, ...)
-- **6,000+ tests** passing, **0** clippy warnings
+- **6,000+ tests** passing, **0** clippy warnings <sup>[1]</sup>
 - **~323,000+ lines** of Rust
+
+<sup>[1]</sup> Under the workspace lint configuration (see the `[lints]` table in the
+root `Cargo.toml`, which `allow`s `dead_code`/`unused_*` and several rustdoc lints);
+`cargo clippy --all-targets -- -D warnings` is clean with that config.
 
 ### Java Version Support
 
@@ -159,7 +163,7 @@ cargo run --release -p cratonvm-cli -- --Xmx 1g --classpath . BigProgram
 ## Limitations
 
 - **AWT/Swing** — implemented natively (headless) via the `native-awt` crate;
-  no on-screen rendering. **JavaFX** is out of tree (see [docs/javafx-status.md](docs/javafx-status.md)).
+  no on-screen rendering. **JavaFX** is out of tree (see [docs/internal/javafx-status.md](docs/internal/javafx-status.md)).
 - **No `java.sql`/JDBC** — no database connectivity.
 - **Limited reflection** — `Class.forName` / `Method.invoke` work; some edge cases unsupported.
 - **Partial JNI** — function table structure exists; limited function implementations.
@@ -210,9 +214,9 @@ cratonvm/
   jit/                 - x86-64 / AArch64 JIT compiler
   jit-cuda/            - Java bytecode -> PTX lowering for GPU offload
   cuda-bridge/         - Thin CUDA Driver API bridge for GPU offload
-  craton-gpu/          - GPU offload runtime integration
+  craton-gpu/          - Build-time Java annotation sources for GPU offload (@Parallel etc.)
   classloading/        - Class loading & bytecode verification
-  gc/                  - Garbage collectors (semi-space, G1, ZGC)
+  gc/                  - Generational GC (young/old; Cheney moving + non-moving sweep; experimental zgc-gated stub, no G1)
   jfr/                 - Java Flight Recorder
   vm/                  - Virtual machine runtime
   vm-cli/              - Command-line entry point
@@ -229,15 +233,15 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed overview of the codebase s
 See [BUILD_GUIDE.md](BUILD_GUIDE.md) for detailed build instructions, benchmarking, and project structure.
 See [docs/INSTALL.md](docs/INSTALL.md) for binary installation and getting started.
 See [docs/CONFIG.md](docs/CONFIG.md) for all configuration options and tuning parameters.
-See [docs/embedding.md](docs/embedding.md) for embedding `cratonvm-vm` as a library in a Rust application.
-See [docs/gc-tuning.md](docs/gc-tuning.md) for choosing a GC backend, sizing the heap, and diagnosing pauses.
+See [docs/internal/embedding.md](docs/internal/embedding.md) for embedding `cratonvm-vm` as a library in a Rust application.
+See [docs/internal/gc-tuning.md](docs/internal/gc-tuning.md) for choosing a GC backend, sizing the heap, and diagnosing pauses.
 See [docs/PLATFORMS.md](docs/PLATFORMS.md) for the per-feature Linux / Windows / macOS support matrix.
 See [ROADMAP.md](ROADMAP.md) for future plans and the performance roadmap.
 See [docs/gpu/README.md](docs/gpu/README.md) for the full GPU-offload reference: build modes, CLI flags, architecture, file index, FAQ. The feature is opt-in via Cargo features — the default `cargo build` produces a CPU-only JVM with no GPU code linked.
 
 ## Contributing
 
-**Design constraint:** prefer real `.class` files from the JDK and application classpath over synthetic stub classes for application-visible types; see [docs/jvm-no-synthetic-stubs.md](docs/jvm-no-synthetic-stubs.md).
+**Design constraint:** prefer real `.class` files from the JDK and application classpath over synthetic stub classes for application-visible types; see [docs/internal/app-jvm-bugs/jvm-no-synthetic-stubs.md](docs/internal/app-jvm-bugs/jvm-no-synthetic-stubs.md).
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute.
 

@@ -92,6 +92,23 @@ pub(crate) fn bc_len(code: &[u8], pc: usize) -> usize {
         0xbb => 3,
         0xc5 => 4,
         0xb9 => 5,
+        // wide (0xc4) — prefix modifies the following opcode to use a 2-byte
+        // local index. JVMS §6.5 wide: `wide <opcode> <indexbyte1> <indexbyte2>`
+        // is 4 bytes for the load/store/ret family, and `wide iinc <index>
+        // <const>` is 6 bytes (extra 2-byte signed constant). The modified
+        // opcode is the byte at `pc + 1`: only `iinc` (0x84) takes the 6-byte
+        // form. Currently latent — `jit_scan` rejects `wide`, so no compiled
+        // method contains it — but the length table must stay correct as
+        // defense-in-depth so every PC-stepping consumer stays in lockstep if
+        // `wide` is ever accepted. Keep the x64.rs `bytecode_len_at` twin in
+        // sync.
+        0xc4 => {
+            if pc + 1 < code.len() && code[pc + 1] == 0x84 {
+                6 // wide iinc
+            } else {
+                4 // wide <load/store/ret>
+            }
+        }
         // tableswitch — variable length.
         //
         // HIGH security fix: adversarial bytecode can craft `high < low - 1`

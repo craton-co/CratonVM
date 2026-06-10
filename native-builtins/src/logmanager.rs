@@ -437,6 +437,15 @@ pub(crate) fn reset_state_for_tests() {
     if let Ok(mut r) = logger_registry().lock() {
         r.clear();
     }
+    if let Ok(mut g) = jboss_log_context_singleton().lock() {
+        *g = None;
+    }
+    if let Ok(mut r) = jboss_logger_registry().lock() {
+        r.clear();
+    }
+    if let Ok(mut m) = attachments().lock() {
+        m.clear();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1450,6 +1459,157 @@ fn native_get_property(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodC
 }
 
 // ---------------------------------------------------------------------------
+// GC integration — root scan + post-move remap for the cached ObjectRefs
+// ---------------------------------------------------------------------------
+//
+// B4 fix: every side-table in this module stores Java object addresses as raw
+// `u64` (singleton `LogManager`, the JUL + JBoss logger registries, the JBoss
+// `LogContext` singleton, and the attachment side-table — whose *keys* are
+// themselves `(receiver-addr, key-addr)` pairs). The old safety comments
+// conflated "we never free these" with "these never move": a moving young GC
+// relocates the underlying objects, after which `object_from_u64` rebuilds an
+// `ObjectRef` over a stale (recycled) address — a use-after-free / wrong-object
+// hazard, the exact bug class MEMORY.md documents for the classloader and
+// lang_math caches.
+//
+// The fix mirrors `jboss_msc::{gc_scan_msc_service_roots,
+// gc_update_msc_service_refs}`:
+//   * `gc_scan_logmanager_roots` reports every cached object as a GC root so a
+//     moving collector pins + relocates (rather than reclaims) it; and
+//   * `gc_update_logmanager_refs` repoints every stored address (including BOTH
+//     halves of each `attachments` key) to the relocated address afterwards.
+//
+// REGISTRATION REQUIRED (call sites are in files this agent does not own — see
+// the existing MSC wiring for the exact shape):
+//   * `vm/src/memory/roots.rs` (alongside step 19, after
+//     `gc_scan_msc_service_roots`):
+//         cratonvm_native_builtins::logmanager::gc_scan_logmanager_roots(&mut roots);
+//   * `vm/src/memory/gc.rs` (alongside step 19, after
+//     `gc_update_msc_service_refs`):
+//         cratonvm_native_builtins::logmanager::gc_update_logmanager_refs(pointer_map);
+// Until both are wired the scan/remap are inert (no behavior change) but the
+// stale-pointer hazard remains — they MUST be registered to close B4.
+
+/// GC root scan for every Java object cached by this module's side-tables.
+/// Companion remap is [`gc_update_logmanager_refs`]. Reports the singleton
+/// `LogManager`, both logger registries, the JBoss `LogContext` singleton, and
+/// every attachment receiver / key / value so a moving collector relocates
+/// (rather than reclaims) them. Uses blocking locks that are never held across
+/// a Java allocation, so the allocating thread cannot self-deadlock here.
+pub fn gc_scan_logmanager_roots(out: &mut Vec<ObjectRef>) {
+    // SAFETY (all `object_from_u64` calls below): the addresses were produced
+    // by `as_ptr()` on live ObjectRefs allocated by this process's heap and
+    // stored under these locks; reporting them as roots is exactly what keeps
+    // them live across a moving collection.
+    let mut push_addr = |addr: u64| {
+        if addr != 0 {
+            out.push(unsafe { object_from_u64(addr) });
+        }
+    };
+
+    if let Some(addr) = *singleton_cell().lock().unwrap_or_else(|e| e.into_inner()) {
+        push_addr(addr);
+    }
+    if let Some(addr) = *jboss_log_context_singleton()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+    {
+        push_addr(addr);
+    }
+    for &addr in logger_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
+        push_addr(addr);
+    }
+    for &addr in jboss_logger_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
+        push_addr(addr);
+    }
+    // The attachment table keys ON object addresses (receiver, AttachmentKey)
+    // and stores the attached value address — all three are live Java objects
+    // and must be rooted (the keys too, else the AttachmentKey decays and the
+    // post-move key remap cannot find its new address).
+    for (&(this, key), &value) in attachments()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        push_addr(this);
+        push_addr(key);
+        push_addr(value);
+    }
+}
+
+/// Post-GC remap for every cached ObjectRef (companion to
+/// [`gc_scan_logmanager_roots`]). After a moving collection the cached objects
+/// relocate; repoint every stored address — including BOTH halves of each
+/// `attachments` key — to its new location so later `object_from_u64`
+/// reconstructions resolve to the live object instead of a recycled slot.
+pub fn gc_update_logmanager_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    // Map an old address to its relocated address, leaving it untouched when the
+    // collector did not move it (not every object relocates in a young GC).
+    let remap = |addr: u64| -> u64 {
+        if addr == 0 {
+            return 0;
+        }
+        match pointer_map.get(&(addr as usize)) {
+            Some(&new_addr) => {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                new_addr as u64
+            }
+            None => addr,
+        }
+    };
+    let remap_slot = |slot: &mut Option<u64>| {
+        if let Some(addr) = slot.as_mut() {
+            *addr = remap(*addr);
+        }
+    };
+
+    remap_slot(&mut singleton_cell().lock().unwrap_or_else(|e| e.into_inner()));
+    remap_slot(
+        &mut jboss_log_context_singleton()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    );
+    for addr in logger_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values_mut()
+    {
+        *addr = remap(*addr);
+    }
+    for addr in jboss_logger_registry()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values_mut()
+    {
+        *addr = remap(*addr);
+    }
+    // Rebuild the attachment table: both the `(this, key)` key addresses and
+    // the value address can relocate, so we cannot mutate values in place —
+    // collect, remap key+value, and reinsert under the relocated key.
+    {
+        let mut map = attachments().lock().unwrap_or_else(|e| e.into_inner());
+        if !map.is_empty() {
+            let rebuilt: HashMap<AttachKey, u64> = map
+                .drain()
+                .map(|((this, key), value)| ((remap(this), remap(key)), remap(value)))
+                .collect();
+            *map = rebuilt;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
@@ -2455,5 +2615,219 @@ mod tests {
         let name = ctx.class_name_of_id(cid).unwrap_or_default();
         // Falls through to the default LogManager class on rejection.
         assert_eq!(name, CLS_JUL_LOG_MANAGER);
+    }
+
+    // -- B4: GC root scan + post-move remap for the cached ObjectRefs --
+
+    /// Snapshot the raw addresses currently held in this module's
+    /// side-tables (singleton, both logger registries, the JBoss
+    /// `LogContext` singleton, and every attachment receiver/key/value).
+    fn cached_addrs_snapshot() -> Vec<u64> {
+        let mut v = Vec::new();
+        if let Some(a) = *singleton_cell().lock().unwrap_or_else(|e| e.into_inner()) {
+            v.push(a);
+        }
+        if let Some(a) = *jboss_log_context_singleton()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            v.push(a);
+        }
+        v.extend(
+            logger_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .copied(),
+        );
+        v.extend(
+            jboss_logger_registry()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .values()
+                .copied(),
+        );
+        for (&(this, key), &value) in attachments()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            v.extend_from_slice(&[this, key, value]);
+        }
+        v
+    }
+
+    #[test]
+    fn b4_gc_scan_reports_every_cached_object_as_root() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+
+        // Populate every side-table: singleton, a JUL logger, a JBoss
+        // logger, the JBoss LogContext singleton, and one attachment.
+        let mgr = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+        let jul_name = ctx.create_string("scan.jul.logger");
+        let _ = native_get_logger(
+            &mut ctx,
+            &[Value::Object(Some(mgr)), Value::Object(Some(jul_name))],
+        )
+        .unwrap();
+        let jb_name = ctx.create_string("scan.jboss.logger");
+        let _ = native_jboss_log_context_get_logger(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(jb_name))],
+        )
+        .unwrap();
+        let _ = ensure_jboss_log_context(&mut ctx);
+        let recv = alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
+        let key = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1);
+        let val = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1);
+        let _ = native_jboss_logger_attach(
+            &mut ctx,
+            &[
+                Value::Object(Some(recv)),
+                Value::Object(Some(key)),
+                Value::Object(Some(val)),
+            ],
+        )
+        .unwrap();
+
+        let expected = cached_addrs_snapshot();
+        assert!(!expected.is_empty(), "side-tables must be populated");
+
+        let mut roots = Vec::new();
+        gc_scan_logmanager_roots(&mut roots);
+        let root_addrs: std::collections::HashSet<u64> =
+            roots.iter().map(|o| o.as_ptr() as u64).collect();
+        for a in expected {
+            assert!(
+                root_addrs.contains(&a),
+                "cached object {a:#x} must be reported as a GC root"
+            );
+        }
+    }
+
+    #[test]
+    fn b4_gc_update_repoints_every_cached_address() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+
+        let mgr = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+        let jul_name = ctx.create_string("remap.jul.logger");
+        let _ = native_get_logger(
+            &mut ctx,
+            &[Value::Object(Some(mgr)), Value::Object(Some(jul_name))],
+        )
+        .unwrap();
+        let jb_name = ctx.create_string("remap.jboss.logger");
+        let _ = native_jboss_log_context_get_logger(
+            &mut ctx,
+            &[Value::Object(None), Value::Object(Some(jb_name))],
+        )
+        .unwrap();
+        let _ = ensure_jboss_log_context(&mut ctx);
+        let recv = alloc_concurrent_synthetic(&mut ctx, "org/jboss/logmanager/Logger", LOGGER_NUM_FIELDS);
+        let key = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1);
+        let val = alloc_concurrent_synthetic(&mut ctx, "java/lang/Object", 1);
+        let _ = native_jboss_logger_attach(
+            &mut ctx,
+            &[
+                Value::Object(Some(recv)),
+                Value::Object(Some(key)),
+                Value::Object(Some(val)),
+            ],
+        )
+        .unwrap();
+
+        // Simulate a moving GC: every cached old address maps to a fresh,
+        // non-overlapping synthetic "relocated" address.
+        let old_addrs = cached_addrs_snapshot();
+        assert!(!old_addrs.is_empty());
+        let mut pointer_map: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
+        // Use a high base so the synthetic targets never collide with a
+        // real old address (which would make the assertion ambiguous).
+        let base: usize = 0x1_0000_0000_0000;
+        for (i, &a) in old_addrs.iter().enumerate() {
+            pointer_map.insert(a as usize, base + (i + 1) * 0x1000);
+        }
+
+        gc_update_logmanager_refs(&pointer_map);
+
+        // Every stored address must now be the relocated target — no old
+        // address may survive (that would be the use-after-free B4 flags).
+        let new_addrs = cached_addrs_snapshot();
+        assert_eq!(
+            new_addrs.len(),
+            old_addrs.len(),
+            "remap must preserve table cardinality (attachment key rebuild intact)"
+        );
+        for a in &new_addrs {
+            assert!(
+                (*a as usize) >= base,
+                "address {a:#x} was not remapped to its relocated slot"
+            );
+            assert!(
+                pointer_map.values().any(|&v| v as u64 == *a),
+                "address {a:#x} is not one of the synthetic relocated targets"
+            );
+        }
+    }
+
+    #[test]
+    fn b4_gc_update_is_noop_for_empty_pointer_map() {
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let mgr = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+        let n = ctx.create_string("noop.logger");
+        let _ = native_get_logger(
+            &mut ctx,
+            &[Value::Object(Some(mgr)), Value::Object(Some(n))],
+        )
+        .unwrap();
+        let before = cached_addrs_snapshot();
+        gc_update_logmanager_refs(&std::collections::HashMap::new());
+        let after = cached_addrs_snapshot();
+        assert_eq!(before, after, "empty pointer map must not mutate any address");
+    }
+
+    #[test]
+    fn b4_gc_update_leaves_unmoved_addresses_untouched() {
+        // Objects the young collector did not relocate are absent from the
+        // pointer map; their cached address must be preserved verbatim.
+        let _g = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        reset_state_for_tests();
+        let mut ctx = mock_ctx();
+        let mgr = match native_get_log_manager(&mut ctx, &[]).unwrap().unwrap() {
+            Value::Object(Some(o)) => o,
+            _ => panic!(),
+        };
+        let n = ctx.create_string("stable.logger");
+        let _ = native_get_logger(
+            &mut ctx,
+            &[Value::Object(Some(mgr)), Value::Object(Some(n))],
+        )
+        .unwrap();
+        let before = cached_addrs_snapshot();
+        // A pointer map that mentions only some unrelated address.
+        let mut pm: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        pm.insert(0xdead_beef, 0xfeed_face);
+        gc_update_logmanager_refs(&pm);
+        let after = cached_addrs_snapshot();
+        assert_eq!(
+            before, after,
+            "addresses absent from the pointer map must be left unchanged"
+        );
     }
 }

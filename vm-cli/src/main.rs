@@ -805,11 +805,30 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
         // `-Xmx` only, so the minimum-heap hint is accepted and ignored
         // rather than rejected. A drop-in `java` must not abort on it —
         // Maven Surefire forks pass `-Xms512m` unconditionally.
+        //
+        // Both the inline (`-Xms512m`) and separate-token (`-Xms 512m`) forms
+        // must be handled. The separate-token form is listed in
+        // `VALUE_TAKING_OPTS`, so `insert_program_args_separator` keeps the
+        // value adjacent to the flag here; if we only dropped the `-Xms`
+        // token the bare value (`512m`) would survive and clap would mistake
+        // it for the main-class positional, shifting/consuming the real
+        // class name and the following program args. So when the value is a
+        // separate token (`a == "-Xms"`), consume it too — mirroring the
+        // `-Xshare`/`-Xverify`/`-Xbootclasspath`/`-Xlog` separate-token
+        // branches. The flag is accepted-and-ignored, so nothing is emitted
+        // either way.
         else if a.starts_with("-Xms") {
             if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
                 eprintln!("[cratonvm] ignoring unimplemented HotSpot flag: {a}");
             }
-            i += 1;
+            if a == "-Xms" && i + 1 < args.len() {
+                // Separate-token form `-Xms 512m`: drop the value token too.
+                i += 2;
+            } else {
+                // Inline form `-Xms512m` (value rides on the same token), or a
+                // bare trailing `-Xms` with no value: drop just this token.
+                i += 1;
+            }
         }
         // Any other `-XX:...` flag is a HotSpot tuning knob CratonVM does not
         // implement (`-XX:MetaspaceSize`, `-XX:MaxMetaspaceSize`,
@@ -819,6 +838,22 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
         // Surefire / Gradle fork — which passes these unconditionally —
         // launches instead of clap aborting with "unexpected argument '-X'".
         else if a.starts_with("-XX:") {
+            if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
+                eprintln!("[cratonvm] ignoring unimplemented HotSpot flag: {a}");
+            }
+            i += 1;
+        }
+        // Any other single-dash `-X...` flag is a HotSpot knob CratonVM does
+        // not implement (`-Xss<size>` thread stack size — Surefire/Gradle pass
+        // this routinely — `-Xint`, `-Xbatch`, `-Xrs`, `-XshowSettings`,
+        // `-Xnoclassgc`, …). The recognized value-taking `-X` spellings
+        // (`-Xmx`/`-Xms`/`-Xshare`/`-Xverify`/`-Xbootclasspath`/`-Xlog`) are
+        // rewritten by the branches above; everything else is accepted-and-
+        // ignored here — same as `-XX:` — so a drop-in `java` launches instead
+        // of clap aborting with "unexpected argument '-X...'". These remaining
+        // `-X` flags are all the inline/no-value form, so dropping the single
+        // token is correct (HotSpot has no separate-token spelling for them).
+        else if a.starts_with("-X") {
             if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
                 eprintln!("[cratonvm] ignoring unimplemented HotSpot flag: {a}");
             }
@@ -1064,7 +1099,25 @@ fn run() -> Result<()> {
     if args.class_name.as_deref() == Some("--") {
         args.class_name = None;
     }
-    args.args.retain(|a| a != "--");
+    // Remove only the launcher-inserted `--` separator, NOT every `--`.
+    //
+    // clap already consumes the first lone `--` as its option-parsing
+    // terminator, so in the normal-class and `-jar` launch modes no launcher
+    // `--` ever reaches `args.args` — any `--` left there is genuinely a
+    // program argument and MUST be delivered to `main` verbatim (stock
+    // `java Main a -- b` gives the program `["a", "--", "b"]`; many CLI tools
+    // use their own `--` end-of-options convention).
+    //
+    // The one exception is the JBoss-Modules `-mp` path: `normalize_java_
+    // launcher_argv` prepends an extra `--` (so `-mp` isn't mis-parsed as the
+    // `-m`/`-p` short-flag cluster), which makes `insert_program_args_
+    // separator`'s own trailing `--` leak past clap's terminator as the LAST
+    // element of `args.args`. Strip exactly that trailing artifact — a single
+    // `--` and only when it is the final token — leaving interior (user) `--`
+    // tokens untouched.
+    if args.args.last().map(String::as_str) == Some("--") {
+        args.args.pop();
+    }
 
     // Validate: exactly one of class_name or --jar must be provided
     if args.class_name.is_none() && args.jar.is_none() {
@@ -1884,9 +1937,15 @@ fn run() -> Result<()> {
     // class. See the comment on the `initPhase1` block above for why
     // this ordering matters in real-JDK mode.
     if let Err(e) = vm.load_class(&class_name) {
+        // `class_name` is in internal slash form here; the inner error `e`
+        // typically embeds that same slash-form name, so render both dotted so
+        // the message doesn't show the class two ways (`com.example.Main` then
+        // `class not found: com/example/Main`). HotSpot reports the binary
+        // (dotted) name throughout.
         bail!(
-            "Could not find or load main class {}: {e}",
-            class_name.replace('/', ".")
+            "Could not find or load main class {}: {}",
+            class_name.replace('/', "."),
+            e.to_string().replace('/', ".")
         );
     }
 
@@ -3389,6 +3448,49 @@ mod tests {
     }
 
     #[test]
+    fn hotspot_xms_inline_is_dropped_keeping_class_name() {
+        // `-Xms512m` (inline value) is accepted-and-ignored: the whole token
+        // is dropped and the main-class name is untouched.
+        let raw = argv(&["java", "-Xms512m", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(out, argv(&["java", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xms_separate_token_drops_value_not_class_name() {
+        // B1 regression: `-Xms 512m` (separate value token) must drop BOTH
+        // the flag and its value. Previously only `-Xms` was dropped, leaving
+        // `512m` to be mistaken for the main-class positional and shifting
+        // `Main` into a program arg. Maven Surefire / Gradle forks emit this
+        // form. The value sits adjacent here because `-Xms` is in
+        // VALUE_TAKING_OPTS, so we mirror the full pre-clap pipeline.
+        let stage1 = insert_program_args_separator(argv(&["java", "-Xms", "512m", "Main"]));
+        let out = normalize_java_launcher_argv(stage1);
+        // `512m` is gone; `Main` survives as the (only) main-class positional,
+        // followed by the launcher-inserted `--` program-args separator.
+        assert_eq!(out, argv(&["java", "Main", "--"]));
+    }
+
+    #[test]
+    fn hotspot_xms_separate_token_passes_clap_after_full_pipeline() {
+        // B1 acceptance: stock `java -Xms512m -Xmx256m -classpath x Main`
+        // with the separate-token `-Xms 512m` form must parse end-to-end with
+        // `Main` resolved as the main class (not the heap-size value `512m`).
+        let argv0: Vec<String> = argv(&[
+            "java", "-Xms", "512m", "-Xmx", "256m", "-classpath", "x", "Main",
+        ]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4)
+            .expect("clap must accept HotSpot separate-token -Xms");
+        assert_eq!(parsed.max_heap.as_deref(), Some("256m"));
+        assert_eq!(parsed.classpath.as_deref(), Some("x"));
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+    }
+
+    #[test]
     fn hotspot_xshare_colon_rewrites_to_clap_long() {
         let raw = argv(&["java", "-Xshare:on", "Main"]);
         let out = normalize_java_launcher_argv(raw);
@@ -3552,5 +3654,88 @@ mod tests {
         let parsed = Args::try_parse_from(argv(&["cratonvm", "--nojit", "Main"]))
             .expect("clap must accept --nojit");
         assert!(parsed.nojit);
+    }
+
+    #[test]
+    fn hotspot_xss_inline_is_accepted_and_ignored() {
+        // B3 regression: single-dash `-Xss<size>` (thread stack size —
+        // Surefire/Gradle pass this routinely) was not in the handled set, so
+        // it fell through to the final `else`, reached clap verbatim, and clap
+        // rejected it as "unexpected argument '-X'". The catch-all `-X` arm now
+        // accepts-and-ignores it (the whole token is dropped), same as `-XX:`.
+        let raw = argv(&["java", "-Xss512k", "Main"]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(out, argv(&["java", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_misc_x_flags_are_accepted_and_ignored() {
+        // Other no-value `-X` knobs HotSpot accepts: `-Xint`, `-Xbatch`,
+        // `-Xrs`, `-XshowSettings`, `-Xnoclassgc`. All drop out, leaving the
+        // class name (and any later args) intact.
+        let raw = argv(&[
+            "java", "-Xint", "-Xbatch", "-Xrs", "-Xnoclassgc", "Main",
+        ]);
+        let out = normalize_java_launcher_argv(raw);
+        assert_eq!(out, argv(&["java", "Main"]));
+    }
+
+    #[test]
+    fn hotspot_xss_passes_clap_after_full_pipeline() {
+        // B3 acceptance: stock `java -Xss512k -classpath x Main` must parse
+        // end-to-end with `Main` resolved as the main class — previously clap
+        // aborted on the unrecognized `-Xss512k`.
+        let argv0: Vec<String> = argv(&["java", "-Xss512k", "-classpath", "x", "Main"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed =
+            Args::try_parse_from(stage4).expect("clap must accept HotSpot -Xss after pipeline");
+        assert_eq!(parsed.classpath.as_deref(), Some("x"));
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+    }
+
+    #[test]
+    fn user_double_dash_reaches_program_args() {
+        // B2 regression: a user `--` between program args
+        // (`java Main a -- b`) must be delivered to the program verbatim as
+        // `["a", "--", "b"]`. The launcher's own separator is consumed by clap
+        // (it never reaches `parsed.args`), so the interior `--` here is purely
+        // user data and must survive the whole pipeline.
+        let argv0: Vec<String> = argv(&["java", "Main", "a", "--", "b"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must parse user `--` argv");
+        assert_eq!(parsed.class_name.as_deref(), Some("Main"));
+        // The interior user `--` is present in the trailing program args.
+        assert_eq!(parsed.args, argv(&["a", "--", "b"]));
+        // `run()`'s post-clap cleanup only pops a *trailing* `--`; an interior
+        // one like this is left untouched, so the program sees ["a","--","b"].
+        assert_ne!(parsed.args.last().map(String::as_str), Some("--"));
+    }
+
+    #[test]
+    fn launcher_trailing_double_dash_artifact_is_popped() {
+        // B2: the only launcher `--` that leaks into `parsed.args` is the
+        // JBoss `-mp` double-separator trailing artifact. `run()` removes it
+        // by popping a single *trailing* `--`; verify both that the leak occurs
+        // and that the pop rule (mirrored here) removes exactly one token and
+        // leaves interior `--` alone.
+        let argv0: Vec<String> = argv(&["java", "-mp", "/modules"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must parse `-mp` argv");
+        let mut prog = parsed.args;
+        // The leaked launcher separator is the final token.
+        assert_eq!(prog.last().map(String::as_str), Some("--"));
+        if prog.last().map(String::as_str) == Some("--") {
+            prog.pop();
+        }
+        assert_eq!(prog, argv(&["-mp", "/modules"]));
     }
 }

@@ -10,12 +10,13 @@
 #   5. TornadoVM            — PolyEvalTornado.java via tornado launcher
 set +e
 
-ROOT=C:/craton/CratonVM
+ROOT="${ROOT:-$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || echo C:/craton/CratonVM)}"
 RJVM="$ROOT/target/release/cratonvm.exe"
-HOTSPOT="C:/Program Files/Java/jdk-25/bin/java.exe"
+JDK="${JDK:-${JAVA_HOME:-C:/Program Files/Java/jdk-25}}"
+HOTSPOT="$JDK/bin/java.exe"
 TORNADO_DIR="$ROOT/bench-tornado"
 CRATON_GPU=$(ls -d "$ROOT/target-gpu/release/cratonvm.exe"*/out/classes 2>/dev/null | head -1)
-BENCH_CLASSES="C:/craton/CratonVM/apps/gpu-bench/classes"
+BENCH_CLASSES="$ROOT/apps/gpu-bench/classes"
 LOG="$ROOT/applogs/bench-poly-4way-$(date +%H%M%S)"
 mkdir -p "$LOG"
 
@@ -48,7 +49,7 @@ echo "hotspot_c2,$(extract "$LOG/hotspot.out")" >> "$CSV"
 
 # 2. CratonVM CPU JIT-on
 echo "----- CratonVM CPU JIT-on -----"
-CRATONVM_DISABLE_JIT=0 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
+CRATONVM_DISABLE_JIT=0 timeout 300 "$RJVM" --java-home "$JDK" \
     --Xmx 2g -c "$BENCH_CLASSES" CpuPolyBench "$N" "$ITERS" "$WARMUP" \
     > "$LOG/cratoncpu_jit_on.out" 2> "$LOG/cratoncpu_jit_on.err"
 echo "cratoncpu_jit_on rc=$?"
@@ -56,7 +57,7 @@ echo "cratonvm_cpu_jit_on,$(extract "$LOG/cratoncpu_jit_on.out")" >> "$CSV"
 
 # 3. CratonVM CPU JIT-off
 echo "----- CratonVM CPU JIT-off -----"
-CRATONVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
+CRATONVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "$JDK" \
     --Xmx 2g -c "$BENCH_CLASSES" CpuPolyBench "$N" "$ITERS" "$WARMUP" \
     > "$LOG/cratoncpu_jit_off.out" 2> "$LOG/cratoncpu_jit_off.err"
 echo "cratoncpu_jit_off rc=$?"
@@ -64,7 +65,7 @@ echo "cratonvm_cpu_jit_off,$(extract "$LOG/cratoncpu_jit_off.out")" >> "$CSV"
 
 # 4. CratonVM GPU
 echo "----- CratonVM GPU -----"
-CRATONVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
+CRATONVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "$JDK" \
     --Xmx 2g --gpu --print-gpu-decisions \
     -c "$BENCH_CLASSES;$CRATON_GPU" GpuPolyBench "$N" "$ITERS" "$WARMUP" \
     > "$LOG/cratongpu.out" 2> "$LOG/cratongpu.err"

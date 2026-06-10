@@ -1,5 +1,15 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2024-2026 Craton Software Company
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Portions of this file are derived from the Bouncy Castle Cryptography Library
+// (the ChaCha / Salsa20 permutation kernels, `ChaChaEngine.chachaCore` /
+// `Permute.permute`): the quarter-round structure and constant rotation
+// distances are mechanically transcribed from BouncyCastle Java source. Those
+// portions are
+//   Copyright (c) 2000-2024 The Legion of the Bouncy Castle Inc.
+// and are used under the Bouncy Castle Licence (an MIT-style permissive licence),
+// NOT Apache-2.0. The Craton-authored glue/integration code is
+//   Copyright 2024-2026 Craton Software Company (Apache-2.0).
+// See ../THIRD-PARTY-NOTICES.md for the full Bouncy Castle Licence text.
 
 //! Native fast-path for the BouncyCastle ChaCha permutation kernels that
 //! dominate the SPHINCS-256 post-quantum scheme.

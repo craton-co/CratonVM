@@ -221,13 +221,25 @@ fn read_u8(data: &[u8], pos: &mut usize) -> Result<u8, ClassReaderError> {
 }
 
 fn read_u16(data: &[u8], pos: &mut usize) -> Result<u16, ClassReaderError> {
-    if *pos + 2 > data.len() {
-        return Err(ClassReaderError::InvalidClassData {
-            message: format!("StackMapTable: unexpected end of data at position {}", *pos),
-        });
-    }
+    // Round 11 audit fix (reader B2): use `checked_add` for `*pos + 2`
+    // instead of the bare `*pos + 2 > data.len()` compare. `pos` currently
+    // starts at 0 and only advances by small bounded reads, so it cannot
+    // reach near `usize::MAX` today — but a bare add wraps if a future
+    // caller ever seeds `pos` from an external offset, silently passing the
+    // bounds check and indexing OOB. Matches the `checked_add` hardening the
+    // rest of the crate (`buffer.rs::read_bytes`, `instruction.rs`)
+    // standardised on. On overflow we surface the same `InvalidClassData`
+    // end-of-data error a short buffer would produce.
+    let end = match pos.checked_add(2) {
+        Some(end) if end <= data.len() => end,
+        _ => {
+            return Err(ClassReaderError::InvalidClassData {
+                message: format!("StackMapTable: unexpected end of data at position {}", *pos),
+            });
+        }
+    };
     let val = u16::from_be_bytes([data[*pos], data[*pos + 1]]);
-    *pos += 2;
+    *pos = end;
     Ok(val)
 }
 
@@ -717,5 +729,35 @@ mod tests {
         let data = [0x00];
         // Actually this will read count=0 from a single u16 attempt → error
         assert!(StackMapTable::parse(&data).is_err());
+    }
+
+    /// Regression (reader B2): `read_u16` must NOT wrap or panic when
+    /// `*pos + 2` overflows `usize`. With the bare `*pos + 2 > data.len()`
+    /// compare a near-`usize::MAX` `pos` wraps to a small value that passes
+    /// the bounds check; the `checked_add` form rejects it as
+    /// `InvalidClassData` (unexpected end of data) instead.
+    #[test]
+    fn read_u16_overflow_returns_error() {
+        let data = [0u8; 4];
+        // pos + 2 overflows usize::MAX → checked_add returns None.
+        let mut pos = usize::MAX - 1;
+        let err = read_u16(&data, &mut pos).unwrap_err();
+        assert!(matches!(err, ClassReaderError::InvalidClassData { .. }));
+        // Failure leaves `pos` untouched so a retry observes the same error.
+        assert_eq!(pos, usize::MAX - 1);
+    }
+
+    /// `read_u16` at the exact buffer boundary: `*pos + 2 == data.len()`
+    /// is the last valid read (non-overflowing, in-bounds); one byte short
+    /// is rejected.
+    #[test]
+    fn read_u16_boundary() {
+        let data = [0xAB, 0xCD];
+        let mut pos = 0;
+        assert_eq!(read_u16(&data, &mut pos).unwrap(), 0xABCD);
+        assert_eq!(pos, 2);
+        // pos now at end: a further read is out of bounds.
+        assert!(read_u16(&data, &mut pos).is_err());
+        assert_eq!(pos, 2);
     }
 }

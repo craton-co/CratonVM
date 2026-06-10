@@ -38,24 +38,66 @@ fn int_arg(args: &[Value], i: usize) -> i32 {
 }
 
 fn normalize(n: &str) -> String {
-    // Small copy — see stream_decoder::cratonvm_native_builtins_normalize.
-    match n.to_uppercase().replace(['-', '_'], "").as_str() {
-        "UTF8" => "UTF-8".to_string(),
-        "UTF16" => "UTF-16".to_string(),
-        "UTF16BE" => "UTF-16BE".to_string(),
-        "UTF16LE" => "UTF-16LE".to_string(),
-        "UTF32BE" => "UTF-32BE".to_string(),
-        "UTF32LE" => "UTF-32LE".to_string(),
-        "UTF32" => "UTF-32".to_string(),
-        "USASCII" | "ASCII" => "US-ASCII".to_string(),
-        "ISO88591" | "LATIN1" => "ISO-8859-1".to_string(),
-        "ISO88592" => "ISO-8859-2".to_string(),
-        "ISO885915" => "ISO-8859-15".to_string(),
-        "WINDOWS1252" | "CP1252" => "windows-1252".to_string(),
-        "WINDOWS1251" | "CP1251" => "windows-1251".to_string(),
-        "KOI8R" => "KOI8-R".to_string(),
-        _ => "UTF-8".to_string(),
+    normalize_supported(n).unwrap_or_else(|| "UTF-8".to_string())
+}
+
+/// Canonicalize a user-supplied charset *name* and confirm the transcoding
+/// engine can actually encode it. Returns `None` for an unknown name or for
+/// a name that maps to a charset the engine does not implement — the JDK
+/// reports both as `UnsupportedEncodingException`.
+///
+/// Small copy — see `stream_decoder::normalize_supported`.
+fn normalize_supported(name: &str) -> Option<String> {
+    let canon = match name.to_uppercase().replace(['-', '_'], "").as_str() {
+        "UTF8" => "UTF-8",
+        "UTF16" => "UTF-16",
+        "UTF16BE" => "UTF-16BE",
+        "UTF16LE" => "UTF-16LE",
+        "UTF32BE" => "UTF-32BE",
+        "UTF32LE" => "UTF-32LE",
+        "UTF32" => "UTF-32",
+        "USASCII" | "ASCII" => "US-ASCII",
+        "ISO88591" | "LATIN1" => "ISO-8859-1",
+        "ISO88592" => "ISO-8859-2",
+        "ISO885915" => "ISO-8859-15",
+        "WINDOWS1252" | "CP1252" => "windows-1252",
+        "WINDOWS1251" | "CP1251" => "windows-1251",
+        "KOI8R" => "KOI8-R",
+        _ => return None,
+    };
+    // Probe with an empty slice: the engine's name `match` returns
+    // `UnsupportedCharset` before encoding anything, so this is free.
+    if matches!(
+        engine::encode_chars(canon, &[]),
+        Err(engine::CodingError {
+            kind: engine::CodingErrorKind::UnsupportedCharset,
+            ..
+        })
+    ) {
+        return None;
     }
+    Some(canon.to_string())
+}
+
+/// Build (and request the throw of) a `java.io.UnsupportedEncodingException`
+/// for the offending charset name, falling back to a generic `IOException`
+/// (its superclass) if the concrete class cannot be constructed.
+fn throw_unsupported_encoding(
+    ctx: &mut dyn NativeContext,
+    name: &str,
+) -> cratonvm_types::error::MethodCallFailed {
+    let detail = ctx.create_string(name);
+    if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
+        "java/io/UnsupportedEncodingException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(detail))],
+    ) {
+        return cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc);
+    }
+    cratonvm_types::error::RuntimeError::IOException {
+        message: format!("UnsupportedEncodingException: {name}"),
+    }
+    .into()
 }
 
 fn resolve_name(
@@ -106,6 +148,10 @@ pub(crate) fn alloc_stream_encoder(
 }
 
 /// `forOutputStreamWriter(OutputStream, Object, String) -> StreamEncoder`.
+///
+/// The JDK factory declares `throws UnsupportedEncodingException`; an unknown
+/// or unsupported charset *name* must surface that exception rather than
+/// silently encoding the stream as UTF-8.
 fn native_se_for_osw_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -115,7 +161,13 @@ fn native_se_for_osw_name(
         None => return Ok(Some(Value::Object(None))),
     };
     let name = match obj_arg(args, 2) {
-        Some(s) => normalize(&ctx.read_string(s).unwrap_or_default()),
+        Some(s) => {
+            let raw = ctx.read_string(s).unwrap_or_default();
+            match normalize_supported(&raw) {
+                Some(n) => n,
+                None => return Err(throw_unsupported_encoding(ctx, &raw)),
+            }
+        }
         None => "UTF-8".to_string(),
     };
     let se = alloc_stream_encoder(ctx, os, &name);
@@ -310,4 +362,36 @@ pub fn register_stream_encoder_natives(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(if open { 1 } else { 0 })))
     });
     registry.set_category(__prev_cat);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_supported_accepts_known_aliases() {
+        assert_eq!(normalize_supported("UTF8").as_deref(), Some("UTF-8"));
+        assert_eq!(normalize_supported("ascii").as_deref(), Some("US-ASCII"));
+        assert_eq!(normalize_supported("KOI8-R").as_deref(), Some("KOI8-R"));
+    }
+
+    #[test]
+    fn normalize_supported_rejects_unknown_name() {
+        assert_eq!(normalize_supported("NoSuchCharset-42"), None);
+    }
+
+    #[test]
+    fn normalize_supported_rejects_real_but_unimplemented_charsets() {
+        // Real charset names the encoder engine does not implement must be
+        // rejected, not silently encoded as UTF-8.
+        assert_eq!(normalize_supported("Shift_JIS"), None);
+        assert_eq!(normalize_supported("GBK"), None);
+    }
+
+    #[test]
+    fn normalize_keeps_utf8_fallback_for_object_path() {
+        // The infallible `normalize` (used only on the already-validated
+        // Charset-object path) still maps unknowns to UTF-8.
+        assert_eq!(normalize("NoSuchCharset-42"), "UTF-8");
+    }
 }

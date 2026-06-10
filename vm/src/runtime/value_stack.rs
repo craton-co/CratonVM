@@ -313,9 +313,16 @@ impl ValueStack {
 
     pub fn push(&mut self, value: Value) -> Result<(), RuntimeError> {
         if self.len >= self.max_size {
-            return Err(RuntimeError::NotImplemented {
-                feature: "operand stack overflow".to_string(),
-            });
+            // B4 (audit `vm-runtime.md`): an operand-stack overflow is a
+            // JVM-recoverable condition that MUST surface as a *catchable*
+            // `java.lang.StackOverflowError`, not the uncatchable
+            // `NotImplemented` internal error (which `exceptions.rs` maps to a
+            // `MethodCallFailed::InternalError` and the interpreter explicitly
+            // excludes from runtime-error → Java-exception conversion). Return
+            // the dedicated `StackOverflowError` variant, which the interpreter
+            // already routes to a real `java/lang/StackOverflowError` throwable
+            // (`exceptions.rs` map + `interpreter.rs` runtime-error routing).
+            return Err(RuntimeError::StackOverflowError);
         }
         self.kinds[self.len] = Self::kind_of_value(&value);
         self.slots[self.len] = CompactValue::from_value(value);
@@ -533,9 +540,16 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_int(&mut self, v: i32) -> Result<(), RuntimeError> {
         if self.len >= self.max_size {
-            return Err(RuntimeError::NotImplemented {
-                feature: "operand stack overflow".to_string(),
-            });
+            // B4 (audit `vm-runtime.md`): an operand-stack overflow is a
+            // JVM-recoverable condition that MUST surface as a *catchable*
+            // `java.lang.StackOverflowError`, not the uncatchable
+            // `NotImplemented` internal error (which `exceptions.rs` maps to a
+            // `MethodCallFailed::InternalError` and the interpreter explicitly
+            // excludes from runtime-error → Java-exception conversion). Return
+            // the dedicated `StackOverflowError` variant, which the interpreter
+            // already routes to a real `java/lang/StackOverflowError` throwable
+            // (`exceptions.rs` map + `interpreter.rs` runtime-error routing).
+            return Err(RuntimeError::StackOverflowError);
         }
         self.kinds[self.len] = KIND_UNKNOWN;
         self.slots[self.len] = CompactValue::int(v);
@@ -547,9 +561,16 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_long(&mut self, v: i64) -> Result<(), RuntimeError> {
         if self.len >= self.max_size {
-            return Err(RuntimeError::NotImplemented {
-                feature: "operand stack overflow".to_string(),
-            });
+            // B4 (audit `vm-runtime.md`): an operand-stack overflow is a
+            // JVM-recoverable condition that MUST surface as a *catchable*
+            // `java.lang.StackOverflowError`, not the uncatchable
+            // `NotImplemented` internal error (which `exceptions.rs` maps to a
+            // `MethodCallFailed::InternalError` and the interpreter explicitly
+            // excludes from runtime-error → Java-exception conversion). Return
+            // the dedicated `StackOverflowError` variant, which the interpreter
+            // already routes to a real `java/lang/StackOverflowError` throwable
+            // (`exceptions.rs` map + `interpreter.rs` runtime-error routing).
+            return Err(RuntimeError::StackOverflowError);
         }
         self.kinds[self.len] = KIND_LONG;
         self.slots[self.len] = CompactValue::long(v);
@@ -561,9 +582,16 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_float(&mut self, v: f32) -> Result<(), RuntimeError> {
         if self.len >= self.max_size {
-            return Err(RuntimeError::NotImplemented {
-                feature: "operand stack overflow".to_string(),
-            });
+            // B4 (audit `vm-runtime.md`): an operand-stack overflow is a
+            // JVM-recoverable condition that MUST surface as a *catchable*
+            // `java.lang.StackOverflowError`, not the uncatchable
+            // `NotImplemented` internal error (which `exceptions.rs` maps to a
+            // `MethodCallFailed::InternalError` and the interpreter explicitly
+            // excludes from runtime-error → Java-exception conversion). Return
+            // the dedicated `StackOverflowError` variant, which the interpreter
+            // already routes to a real `java/lang/StackOverflowError` throwable
+            // (`exceptions.rs` map + `interpreter.rs` runtime-error routing).
+            return Err(RuntimeError::StackOverflowError);
         }
         self.kinds[self.len] = KIND_UNKNOWN;
         self.slots[self.len] = CompactValue::float(v);
@@ -575,9 +603,16 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_double(&mut self, v: f64) -> Result<(), RuntimeError> {
         if self.len >= self.max_size {
-            return Err(RuntimeError::NotImplemented {
-                feature: "operand stack overflow".to_string(),
-            });
+            // B4 (audit `vm-runtime.md`): an operand-stack overflow is a
+            // JVM-recoverable condition that MUST surface as a *catchable*
+            // `java.lang.StackOverflowError`, not the uncatchable
+            // `NotImplemented` internal error (which `exceptions.rs` maps to a
+            // `MethodCallFailed::InternalError` and the interpreter explicitly
+            // excludes from runtime-error → Java-exception conversion). Return
+            // the dedicated `StackOverflowError` variant, which the interpreter
+            // already routes to a real `java/lang/StackOverflowError` throwable
+            // (`exceptions.rs` map + `interpreter.rs` runtime-error routing).
+            return Err(RuntimeError::StackOverflowError);
         }
         self.kinds[self.len] = KIND_DOUBLE;
         self.slots[self.len] = CompactValue::double(v);
@@ -589,9 +624,16 @@ impl ValueStack {
     #[inline(always)]
     pub fn push_null(&mut self) -> Result<(), RuntimeError> {
         if self.len >= self.max_size {
-            return Err(RuntimeError::NotImplemented {
-                feature: "operand stack overflow".to_string(),
-            });
+            // B4 (audit `vm-runtime.md`): an operand-stack overflow is a
+            // JVM-recoverable condition that MUST surface as a *catchable*
+            // `java.lang.StackOverflowError`, not the uncatchable
+            // `NotImplemented` internal error (which `exceptions.rs` maps to a
+            // `MethodCallFailed::InternalError` and the interpreter explicitly
+            // excludes from runtime-error → Java-exception conversion). Return
+            // the dedicated `StackOverflowError` variant, which the interpreter
+            // already routes to a real `java/lang/StackOverflowError` throwable
+            // (`exceptions.rs` map + `interpreter.rs` runtime-error routing).
+            return Err(RuntimeError::StackOverflowError);
         }
         self.kinds[self.len] = KIND_UNKNOWN;
         self.slots[self.len] = CompactValue::null();
@@ -1466,6 +1508,38 @@ mod tests {
         stack.push(Value::Int(1)).unwrap();
         stack.push(Value::Int(2)).unwrap();
         assert!(stack.push(Value::Int(3)).is_err());
+    }
+
+    /// B4 (audit `vm-runtime.md`): an operand-stack overflow must surface as
+    /// the *catchable* `RuntimeError::StackOverflowError` (which the
+    /// interpreter routes to a real `java/lang/StackOverflowError`), NOT the
+    /// uncatchable `RuntimeError::NotImplemented` it previously returned. This
+    /// covers every `push*` overflow site that shares the contract.
+    #[test]
+    fn overflow_returns_stack_overflow_error() {
+        // Generic `push`.
+        let mut stack = ValueStack::new(1);
+        stack.push(Value::Int(1)).unwrap();
+        assert!(
+            matches!(stack.push(Value::Int(2)), Err(RuntimeError::StackOverflowError)),
+            "push overflow must be StackOverflowError, not NotImplemented"
+        );
+
+        // Type-specialised hot-path pushes share the same overflow contract.
+        let mut s_int = ValueStack::new(0);
+        assert!(matches!(s_int.push_int(1), Err(RuntimeError::StackOverflowError)));
+
+        let mut s_long = ValueStack::new(0);
+        assert!(matches!(s_long.push_long(1), Err(RuntimeError::StackOverflowError)));
+
+        let mut s_float = ValueStack::new(0);
+        assert!(matches!(s_float.push_float(1.0), Err(RuntimeError::StackOverflowError)));
+
+        let mut s_double = ValueStack::new(0);
+        assert!(matches!(s_double.push_double(1.0), Err(RuntimeError::StackOverflowError)));
+
+        let mut s_null = ValueStack::new(0);
+        assert!(matches!(s_null.push_null(), Err(RuntimeError::StackOverflowError)));
     }
 
     #[test]

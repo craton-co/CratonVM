@@ -1057,29 +1057,55 @@ fn native_nel_run(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 }
 
 /// `*.execute(Ljava/lang/Runnable;)V`
+///
+/// B1 FIX: previously this enqueued a Rust no-op stub onto the loop's
+/// `task_queue` and dropped the real `Runnable` on the floor, so every task
+/// submitted to a Netty/Vert.x event loop silently never ran. The loop's
+/// `task_queue` carries `Box<dyn FnOnce() + Send>` Rust closures that fire on
+/// the pinned OS thread *without* a `NativeContext`, so it cannot drive a Java
+/// `run()`; deferring there is structurally impossible.
+///
+/// The correct fix is to run the `Runnable` here, where we *do* hold the
+/// interpreter `ctx`. We invoke `Runnable.run()` synchronously via
+/// `ctx.invoke_virtual` (the same bridge MSC uses to drive `Service.start()` —
+/// see `jboss_msc.rs::drive_starts`). This guarantees the task actually
+/// executes. Per the Netty `execute()` contract the call returns `void` and
+/// the task runs "on the event loop"; an exception thrown by the task is
+/// reported to the loop (logged) rather than propagated to the submitter, so
+/// we catch and log it instead of failing this native.
 fn native_nel_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // Validate the Runnable is non-null.
-    match args.get(1) {
-        Some(Value::Object(Some(_))) => {}
+    let runnable = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
         _ => {
             return Err(RuntimeError::NullPointerException {
                 message: Some("NioEventLoop.execute: Runnable is null".into()),
             }
             .into())
         }
-    }
-    let raw = match ctx.get_field(this, NEL_FIELD_EVENT_LOOP_ID) {
-        Value::Long(v) => v,
-        _ => return Ok(None),
     };
-    if let Some(el) = lookup_vertx_loop(raw) {
-        // We can't invoke Runnable.run() from outside the interpreter, so we
-        // enqueue a no-op stub.  The real invocation comes from the VM
-        // interpreter dispatching `run()` on this event-loop thread.
-        let _ = el.schedule_task(Box::new(|| {}));
+    // Refresh the loop's wakeup stats so callers observing them still see the
+    // submission, then actually run the task. `invoke_virtual` prepends the
+    // receiver; the `run()V` signature takes no further parameters.
+    if let Value::Long(raw) = ctx.get_field(this, NEL_FIELD_EVENT_LOOP_ID) {
+        if let Some(el) = lookup_vertx_loop(raw) {
+            el.stats.tasks_run.fetch_add(1, Ordering::Relaxed);
+        }
     }
-    Ok(None)
+    match ctx.invoke_virtual(runnable, "run", "()V", &[]) {
+        Ok(_) => Ok(None),
+        Err(e) => {
+            // Do not propagate: `execute()` is fire-and-forget; a task failure
+            // must not break the submitter. Mirror Netty's "rejected/uncaught
+            // task" handling by logging and returning normally.
+            tracing::warn!(
+                error = ?e,
+                "NioEventLoop.execute: submitted Runnable.run() threw; swallowing per execute() contract",
+            );
+            Ok(None)
+        }
+    }
 }
 
 /// `*.schedule(Ljava/lang/Runnable;JLjava/util/concurrent/TimeUnit;)Ljava/util/concurrent/ScheduledFuture;`
@@ -1098,6 +1124,14 @@ fn native_nel_schedule(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => 0,
     };
     let delay_ms = delay_raw.max(0) as u64;
+    // SAFETY: validated non-null above.
+    let runnable = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let sf = alloc_scheduled_future_obj(ctx);
+            return Ok(Some(Value::Object(Some(sf))));
+        }
+    };
     let raw = match ctx.get_field(this, NEL_FIELD_EVENT_LOOP_ID) {
         Value::Long(v) => v,
         _ => {
@@ -1106,7 +1140,32 @@ fn native_nel_schedule(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         }
     };
     let sf = alloc_scheduled_future_obj(ctx);
-    if let Some(el) = lookup_vertx_loop(raw) {
+    // B1 FIX: the previous `schedule_timer(Box::new(|| {}))` dropped the real
+    // Runnable — it only ever fired a no-op on the loop's timer heap. Like
+    // `execute()`, the loop body runs on a pinned OS thread with no
+    // `NativeContext`, so a deferred Rust closure cannot drive a Java `run()`.
+    //
+    // A zero/negative-delay schedule is the common "run ASAP on the loop"
+    // case (e.g. `eventLoop.schedule(r, 0, MILLISECONDS)`); for that we invoke
+    // `run()` now via the interpreter so the work actually happens. For a real
+    // future delay we keep the timer registration (returns a working
+    // ScheduledFuture/Key) rather than running synchronously now, which would
+    // violate the delay contract — invoking deferred Java tasks on the carrier
+    // is the broader gap tracked separately.
+    if delay_ms == 0 {
+        match ctx.invoke_virtual(runnable, "run", "()V", &[]) {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "NioEventLoop.schedule(delay=0): Runnable.run() threw; swallowing",
+                );
+            }
+        }
+    } else if let Some(el) = lookup_vertx_loop(raw) {
+        // Best-effort: register the timer so loop bookkeeping (deadline,
+        // wakeups) stays consistent. The fired closure cannot itself invoke
+        // Java; the deferred-dispatch wiring is a separate follow-up.
         let _ = el.schedule_timer(
             Instant::now() + Duration::from_millis(delay_ms),
             Box::new(|| {}),
@@ -1472,6 +1531,77 @@ mod tests {
         );
         assert!(res.is_ok(), "execute must succeed: {:?}", res.err());
         native_vertx_close(&mut ctx, &[Value::Object(Some(vm))]).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // B1 regression: execute() actually drives Runnable.run() (not a no-op).
+    //
+    // We can't observe the synthetic-loop side-effect directly in the mock,
+    // but we CAN prove `native_nel_execute` reached `ctx.invoke_virtual`: if
+    // it did, the pre-armed one-shot result is consumed (so a *second* read
+    // sees `None`). If `execute()` still dropped the Runnable, the armed
+    // result would remain. We arm an Err to additionally assert the
+    // fire-and-forget contract: a throwing task must NOT fail `execute()`.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn nel_execute_invokes_runnable_and_swallows_task_error() {
+        let mut ctx = mock_ctx();
+        let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
+        ctx.set_field(nel, NEL_FIELD_EVENT_LOOP_ID, Value::Long(0));
+        let runnable = alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0);
+        // Arm the next invoke_virtual (the Runnable.run() call) to throw.
+        unsafe {
+            *ctx.invoke_virtual_result.get() = Some(Err(
+                MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                    RuntimeError::IllegalStateException {
+                        message: "task boom".to_string(),
+                    },
+                )),
+            ));
+        }
+        let res = native_nel_execute(
+            &mut ctx,
+            &[Value::Object(Some(nel)), Value::Object(Some(runnable))],
+        );
+        // Fire-and-forget: a throwing task must not surface to the submitter.
+        assert!(res.is_ok(), "execute() must swallow task error, got {:?}", res.err());
+        // Proof the Runnable was actually invoked: the one-shot armed result
+        // was consumed by `invoke_virtual`, so it is now None.
+        let consumed = unsafe { (*ctx.invoke_virtual_result.get()).is_none() };
+        assert!(
+            consumed,
+            "execute() must invoke Runnable.run() (armed invoke_virtual result \
+             should have been consumed)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // B1 regression: submit() also drives the Runnable and still returns a
+    // non-null Future even when the task throws.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn nel_submit_invokes_runnable_and_returns_future_on_task_error() {
+        let mut ctx = mock_ctx();
+        let nel = alloc_concurrent_synthetic(&mut ctx, CLS_NIO_EVENT_LOOP, NEL_NUM_SLOTS);
+        ctx.set_field(nel, NEL_FIELD_EVENT_LOOP_ID, Value::Long(0));
+        let runnable = alloc_concurrent_synthetic(&mut ctx, "java/lang/Runnable", 0);
+        unsafe {
+            *ctx.invoke_virtual_result.get() = Some(Err(
+                MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
+                    RuntimeError::IllegalStateException {
+                        message: "task boom".to_string(),
+                    },
+                )),
+            ));
+        }
+        let res = native_nel_submit(
+            &mut ctx,
+            &[Value::Object(Some(nel)), Value::Object(Some(runnable))],
+        );
+        assert!(res.is_ok());
+        assert!(matches!(res.unwrap(), Some(Value::Object(Some(_)))));
+        let consumed = unsafe { (*ctx.invoke_virtual_result.get()).is_none() };
+        assert!(consumed, "submit() must invoke Runnable.run()");
     }
 
     // -----------------------------------------------------------------------

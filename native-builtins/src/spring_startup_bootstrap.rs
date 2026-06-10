@@ -1122,77 +1122,102 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         spring_app_get_or_create_environment,
     );
 
-    // Register property-access methods on StandardEnvironment, AbstractEnvironment,
-    // and the Environment/ConfigurableEnvironment interfaces so invokevirtual on
-    // our synthetic object always hits the native.
-    for env_class in &[STD_ENV, ABS_ENV, ENV_IFACE, CONF_ENV] {
-        registry.register(
-            env_class,
-            "getProperty",
-            "(Ljava/lang/String;)Ljava/lang/String;",
-            env_get_property_str,
-        );
-        registry.register(
-            env_class,
-            "getProperty",
-            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-            env_get_property_str_default,
-        );
-        registry.register(
-            env_class,
-            "getProperty",
-            "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
-            env_get_property_class,
-        );
-        registry.register(
-            env_class,
-            "containsProperty",
-            "(Ljava/lang/String;)Z",
-            env_contains_property,
-        );
-        registry.register(
-            env_class,
-            "getActiveProfiles",
-            "()[Ljava/lang/String;",
-            env_get_active_profiles,
-        );
-        registry.register(
-            env_class,
-            "getDefaultProfiles",
-            "()[Ljava/lang/String;",
-            env_get_default_profiles,
-        );
-        registry.register(
-            env_class,
-            "acceptsProfiles",
-            "(Lorg/springframework/core/env/Profiles;)Z",
-            env_accepts_profiles,
-        );
-        registry.register(
-            env_class,
-            "acceptsProfiles",
-            "([Ljava/lang/String;)Z",
-            env_accepts_profiles_arr,
-        );
-        registry.register(
-            env_class,
-            "getPropertySources",
-            "()Lorg/springframework/core/env/MutablePropertySources;",
-            env_get_property_sources,
-        );
-        registry.register(
-            env_class,
-            "resolveRequiredPlaceholders",
-            "(Ljava/lang/String;)Ljava/lang/String;",
-            env_resolve_placeholders,
-        );
-        registry.register(
-            env_class,
-            "resolvePlaceholders",
-            "(Ljava/lang/String;)Ljava/lang/String;",
-            env_resolve_placeholders,
-        );
+    // ── B5: faked Environment property access — GATED OFF BY DEFAULT ───────
+    //
+    // FLAGGED SyntheticStub (B5 — forbidden fabricated-config shim): these
+    // overrides make Spring's `Environment` lie about its contents —
+    // `getProperty()` always returns null, `containsProperty()` always false,
+    // `acceptsProfiles()` always true, `getActiveProfiles()` empty. Any Spring
+    // app that reads config through `Environment` therefore gets wrong/empty
+    // answers, masking the real blocker (`AbstractEnvironment.<init>`
+    // CLDR/resource-bundle NPE in CratonVM's partial bootstrap). The correct
+    // fix is to make that initialiser work so the REAL property-source chain
+    // (`systemProperties` / `systemEnvironment` + app config) answers queries.
+    //
+    // Per the no-stubs policy this fabricated-config layer is gated behind the
+    // default-OFF `app-stubs` feature. When OFF, these natives are not
+    // installed, so the REAL `AbstractEnvironment` / `StandardEnvironment`
+    // bytecode runs and reports honest property values (or surfaces the
+    // underlying init bug). The whole `register` fn is already tagged
+    // `NativeKind::SyntheticStub` via `set_category` above.
+    #[cfg(feature = "app-stubs")]
+    {
+        // Register property-access methods on StandardEnvironment,
+        // AbstractEnvironment, and the Environment/ConfigurableEnvironment
+        // interfaces so invokevirtual on our synthetic object always hits the
+        // native.
+        for env_class in &[STD_ENV, ABS_ENV, ENV_IFACE, CONF_ENV] {
+            registry.register(
+                env_class,
+                "getProperty",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                env_get_property_str,
+            );
+            registry.register(
+                env_class,
+                "getProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                env_get_property_str_default,
+            );
+            registry.register(
+                env_class,
+                "getProperty",
+                "(Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;",
+                env_get_property_class,
+            );
+            registry.register(
+                env_class,
+                "containsProperty",
+                "(Ljava/lang/String;)Z",
+                env_contains_property,
+            );
+            registry.register(
+                env_class,
+                "getActiveProfiles",
+                "()[Ljava/lang/String;",
+                env_get_active_profiles,
+            );
+            registry.register(
+                env_class,
+                "getDefaultProfiles",
+                "()[Ljava/lang/String;",
+                env_get_default_profiles,
+            );
+            registry.register(
+                env_class,
+                "acceptsProfiles",
+                "(Lorg/springframework/core/env/Profiles;)Z",
+                env_accepts_profiles,
+            );
+            registry.register(
+                env_class,
+                "acceptsProfiles",
+                "([Ljava/lang/String;)Z",
+                env_accepts_profiles_arr,
+            );
+            registry.register(
+                env_class,
+                "getPropertySources",
+                "()Lorg/springframework/core/env/MutablePropertySources;",
+                env_get_property_sources,
+            );
+            registry.register(
+                env_class,
+                "resolveRequiredPlaceholders",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                env_resolve_placeholders,
+            );
+            registry.register(
+                env_class,
+                "resolvePlaceholders",
+                "(Ljava/lang/String;)Ljava/lang/String;",
+                env_resolve_placeholders,
+            );
+        }
     }
+    // Reference the constants/fns so the default (no `app-stubs`) build does
+    // not warn about unused items when the registration loop is compiled out.
+    let _ = (STD_ENV, ABS_ENV, ENV_IFACE, CONF_ENV);
 
     // ── BeanFactory fix ────────────────────────────────────────────────────
     // GenericApplicationContext.getBeanFactory() — lazily create the
@@ -2739,6 +2764,9 @@ mod tests {
     #[test]
     fn environment_intercepts_registered() {
         let r = build_registry();
+        // getEnvironment/createEnvironment are always registered — they are
+        // non-null guards that prefer the real StandardEnvironment.<init>(),
+        // not fabricated-config shims.
         assert!(r
             .find(
                 ABSTRACT_CTX,
@@ -2746,7 +2774,16 @@ mod tests {
                 "()Lorg/springframework/core/env/ConfigurableEnvironment;",
             )
             .is_some());
-        // Property-access methods registered on the StandardEnvironment surface.
+    }
+
+    // B5: the faked property-access getters are only installed under the
+    // default-OFF `app-stubs` feature. Under the default build the real
+    // Environment bytecode answers property queries, so the override is
+    // intentionally absent.
+    #[cfg(feature = "app-stubs")]
+    #[test]
+    fn environment_property_access_intercepts_registered_under_app_stubs() {
+        let r = build_registry();
         assert!(r
             .find(
                 "org/springframework/core/env/StandardEnvironment",

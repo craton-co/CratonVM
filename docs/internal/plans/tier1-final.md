@@ -219,6 +219,6 @@ Before Tier 1 can be declared complete:
    runs without panic (bench-gate still valid).
 3. Every CP above has at least one passing test or a
    committed-and-documented `#[ignore]` reproducer.
-4. `docs/lock-order.md` reflects the audit status.
+4. `vm/src/runtime/lock_order.rs` reflects the audit status.
 5. `docs/roadmap-100.md` Tier 1 section updated with the final
    100/100 scorecard.

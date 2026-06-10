@@ -1,5 +1,14 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2024-2026 Craton Software Company
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Portions of this file are derived from the Bouncy Castle Cryptography Library
+// (the NewHope lattice kernels `NTT` / `Reduce` / `Poly`): the number-theoretic
+// transform, Montgomery reduction, and polynomial arithmetic are mechanically
+// transcribed from BouncyCastle Java source. Those portions are
+//   Copyright (c) 2000-2024 The Legion of the Bouncy Castle Inc.
+// and are used under the Bouncy Castle Licence (an MIT-style permissive licence),
+// NOT Apache-2.0. The Craton-authored glue/integration code is
+//   Copyright 2024-2026 Craton Software Company (Apache-2.0).
+// See ../THIRD-PARTY-NOTICES.md for the full Bouncy Castle Licence text.
 
 //! Native fast-path for the BouncyCastle NewHope (post-quantum key exchange)
 //! lattice kernels that dominate `NewHopeTest` once the ChaCha cores are native.
@@ -14,7 +23,8 @@
 //! With `org/bouncycastle/*` JIT-banned (the F2m-EC value-model collision, a
 //! `long`-only bug unrelated to these `short`/`int` kernels), both run
 //! interpreted. This module is a verbatim transcription of `NTT`/`Reduce`/
-//! `Poly` (BouncyCastle, Apache-2.0) — bit-identical by construction — plus
+//! `Poly` (BouncyCastle, under the Bouncy Castle Licence — MIT-style; see
+//! ../THIRD-PARTY-NOTICES.md) — bit-identical by construction — plus
 //! SHAKE128 from the already-present `sha3` crate (standard, == BC's
 //! `SHAKEDigest(128)`). Validated by an NTT round-trip test, `Reduce` spot
 //! checks, and a SHAKE128 KAT below, and end-to-end by `NewHopeTest`'s own KAT.

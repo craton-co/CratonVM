@@ -1982,18 +1982,58 @@ pub(crate) fn register_core_stdlib_extras(r: &mut NativeMethodRegistry) {
 // Phase 51: Scanner, StringReader, StringWriter (CLI app support)
 // ===========================================================================
 
+/// Drain a `java.io.InputStream` fully into a Rust `String` for the synthetic
+/// Scanner buffer (B3 fix). Calls `readAllBytes()` virtually so any concrete
+/// stream (FileInputStream, System.in, ByteArrayInputStream, …) supplies its
+/// data, then decodes the byte[] as UTF-8 (lossy). Returns an empty string if
+/// the stream yields nothing or the call fails — never panics.
+fn scanner_drain_input_stream(ctx: &mut dyn NativeContext, stream: ObjectRef) -> String {
+    let arr = match ctx.invoke_virtual(stream, "readAllBytes", "()[B", &[]) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return String::new(),
+    };
+    let len = ctx.array_length(arr);
+    if len == 0 {
+        return String::new();
+    }
+    let mut buf = vec![0u8; len];
+    let n = ctx.read_byte_array_into(arr, 0, &mut buf);
+    buf.truncate(n);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Slice `source` from the stored byte offset `pos`, snapping `pos` UP to the
+/// next UTF-8 char boundary (B4 fix). The Scanner stores a byte position that
+/// is normally a boundary (delimiters are ASCII), but defensive callers may
+/// leave it mid-codepoint; a raw `&source[pos..]` would panic in that case.
+fn scanner_remaining(source: &str, pos: usize) -> &str {
+    let mut start = pos.min(source.len());
+    while start < source.len() && !source.is_char_boundary(start) {
+        start += 1;
+    }
+    &source[start..]
+}
+
 // Scanner = 3-field synthetic (source_string=0, position=1, delimiter_pattern=2)
 pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Intrinsic);
     let sc = "java/util/Scanner";
 
-    // Scanner(InputStream) — read all from stdin into string
+    // Scanner(InputStream) — drain the wrapped stream into the source buffer.
+    // B3 fix: previously stored an empty string, so every hasNext/next/nextLine
+    // saw no data. We now read the whole stream via InputStream.readAllBytes()
+    // (a virtual call so real FileInputStream / System.in / ByteArrayInputStream
+    // all work) and decode the bytes as UTF-8 (lossy, matching the default
+    // platform charset closely enough for the synthetic Scanner model).
     r.register(sc, "<init>", "(Ljava/io/InputStream;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // For stdin, we store an empty string (stdin reads are synchronous)
-        let empty = ctx.create_string("");
-        ctx.set_field(this, 0, Value::Object(Some(empty)));
+        let text = match args.get(1) {
+            Some(Value::Object(Some(stream))) => scanner_drain_input_stream(ctx, *stream),
+            _ => String::new(),
+        };
+        let s = ctx.create_string(&text);
+        ctx.set_field(this, 0, Value::Object(Some(s)));
         ctx.set_field(this, 1, Value::Int(0));
         let delim = ctx.create_string("\\s+");
         ctx.set_field(this, 2, Value::Object(Some(delim)));
@@ -2036,7 +2076,7 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Int(0))),
         };
         let pos = match ctx.get_field(this, 1) { Value::Int(p) => p as usize, _ => 0 };
-        let remaining = &source[pos.min(source.len())..];
+        let remaining = scanner_remaining(&source, pos);
         let trimmed = remaining.trim_start();
         Ok(Some(Value::Int(if trimmed.is_empty() { 0 } else { 1 })))
     });
@@ -2060,7 +2100,7 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Int(0))),
         };
         let pos = match ctx.get_field(this, 1) { Value::Int(p) => p as usize, _ => 0 };
-        let remaining = &source[pos.min(source.len())..];
+        let remaining = scanner_remaining(&source, pos);
         let token = remaining.trim_start().split_whitespace().next().unwrap_or("");
         Ok(Some(Value::Int(if token.parse::<i32>().is_ok() { 1 } else { 0 })))
     });
@@ -2073,7 +2113,7 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         let pos = match ctx.get_field(this, 1) { Value::Int(p) => p as usize, _ => 0 };
-        let remaining = &source[pos.min(source.len())..];
+        let remaining = scanner_remaining(&source, pos);
         let trimmed = remaining.trim_start();
         let skip_ws = remaining.len() - trimmed.len();
         if let Some(end) = trimmed.find(char::is_whitespace) {
@@ -2096,7 +2136,7 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         let pos = match ctx.get_field(this, 1) { Value::Int(p) => p as usize, _ => 0 };
-        let remaining = &source[pos.min(source.len())..];
+        let remaining = scanner_remaining(&source, pos);
         if let Some(nl) = remaining.find('\n') {
             let line = &remaining[..nl];
             let line = line.trim_end_matches('\r');
@@ -2118,7 +2158,7 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Int(0))),
         };
         let pos = match ctx.get_field(this, 1) { Value::Int(p) => p as usize, _ => 0 };
-        let remaining = &source[pos.min(source.len())..];
+        let remaining = scanner_remaining(&source, pos);
         let trimmed = remaining.trim_start();
         let skip_ws = remaining.len() - trimmed.len();
         let token = trimmed.split_whitespace().next().unwrap_or("0");
@@ -2135,7 +2175,7 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Long(0))),
         };
         let pos = match ctx.get_field(this, 1) { Value::Int(p) => p as usize, _ => 0 };
-        let remaining = &source[pos.min(source.len())..];
+        let remaining = scanner_remaining(&source, pos);
         let trimmed = remaining.trim_start();
         let skip_ws = remaining.len() - trimmed.len();
         let token = trimmed.split_whitespace().next().unwrap_or("0");
@@ -2152,7 +2192,7 @@ pub(crate) fn register_scanner_natives(r: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Double(0.0))),
         };
         let pos = match ctx.get_field(this, 1) { Value::Int(p) => p as usize, _ => 0 };
-        let remaining = &source[pos.min(source.len())..];
+        let remaining = scanner_remaining(&source, pos);
         let trimmed = remaining.trim_start();
         let skip_ws = remaining.len() - trimmed.len();
         let token = trimmed.split_whitespace().next().unwrap_or("0");
@@ -2801,6 +2841,98 @@ fn bs_word_count(nbits: usize) -> usize {
     nbits.div_ceil(64)
 }
 
+/// Upper bound on the BitSet backing-`long[]` length, in words.
+///
+/// A bit index is a Java `int`, so the largest legal index is
+/// `Integer.MAX_VALUE` (2^31 - 1) → ceil((2^31 - 1 + 1) / 64) = 2^25 words
+/// = 256 MiB of `long`s. We accept up to that (matching the real JDK's
+/// reachable maximum) but never beyond, so an untrusted index that survives
+/// the non-negative check still cannot drive an unbounded allocation: the
+/// word-count derived from `bit_index` is clamped/validated against this cap
+/// before any `new_array`.
+const BS_MAX_WORDS: usize = ((i32::MAX as usize) + 64) / 64;
+
+/// Build a catchable `java.lang.IndexOutOfBoundsException` carrying `msg` and
+/// return it as a thrown Java exception (not an internal/fatal VM error).
+///
+/// Uses `new_object_initialized` with the `(String)` constructor so the
+/// `detailMessage` is set correctly regardless of the (synthetic vs real-JDK)
+/// Throwable field layout, and the object is kept GC-pinned across `<init>`.
+fn bs_throw_index_oob(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    let msg_str = ctx.create_string(msg);
+    match ctx.new_object_initialized(
+        "java/lang/IndexOutOfBoundsException",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(msg_str))],
+    ) {
+        Ok(Some(Value::Object(Some(exc)))) => MethodCallFailed::ExceptionThrown(exc),
+        // Could not materialise the exception object (class not yet loaded on
+        // early boot, etc.) — fall back to the closest catchable runtime error
+        // rather than panicking or silently succeeding.
+        _ => MethodCallFailed::from(RuntimeError::IllegalArgumentException {
+            message: msg.to_string(),
+        }),
+    }
+}
+
+/// Read a single `int` bit index from `args[idx]` and validate it the way the
+/// real JDK `BitSet` mutators/accessors do: a negative index throws
+/// `IndexOutOfBoundsException`. A non-`Int` value (which the descriptor should
+/// never permit) is treated as `0`.
+///
+/// This is the fix for the negative-index wrap: `*n as usize` on a negative
+/// `int` produced a near-`usize::MAX` value that flowed into the capacity
+/// math, overflowing `bit_index + 64` and driving a gigantic allocation.
+fn bs_checked_bit_index(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    idx: usize,
+) -> Result<usize, MethodCallFailed> {
+    match args.get(idx) {
+        Some(Value::Int(n)) => {
+            if *n < 0 {
+                Err(bs_throw_index_oob(ctx, &format!("bitIndex < 0: {n}")))
+            } else {
+                Ok(*n as usize)
+            }
+        }
+        _ => Ok(0),
+    }
+}
+
+/// Validate a `(fromIndex, toIndex)` pair the way the real JDK `BitSet`
+/// range mutators do: `fromIndex < 0` or `toIndex < 0` throws
+/// `IndexOutOfBoundsException`, and `fromIndex > toIndex` throws
+/// `IndexOutOfBoundsException`. Returns the `(from, to)` as `usize`.
+fn bs_checked_range(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    from_idx: usize,
+    to_idx: usize,
+) -> Result<(usize, usize), MethodCallFailed> {
+    let from_raw = match args.get(from_idx) {
+        Some(Value::Int(n)) => *n,
+        _ => 0,
+    };
+    let to_raw = match args.get(to_idx) {
+        Some(Value::Int(n)) => *n,
+        _ => 0,
+    };
+    if from_raw < 0 {
+        return Err(bs_throw_index_oob(ctx, &format!("fromIndex < 0: {from_raw}")));
+    }
+    if to_raw < 0 {
+        return Err(bs_throw_index_oob(ctx, &format!("toIndex < 0: {to_raw}")));
+    }
+    if from_raw > to_raw {
+        return Err(bs_throw_index_oob(
+            ctx,
+            &format!("fromIndex: {from_raw} > toIndex: {to_raw}"),
+        ));
+    }
+    Ok((from_raw as usize, to_raw as usize))
+}
+
 fn native_bs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let words = ctx.new_array(cratonvm_types::ArrayElementType::Long, 1);
@@ -2827,7 +2959,14 @@ fn bs_ensure_capacity(ctx: &mut dyn NativeContext, this: ObjectRef, bit_index: u
         Value::Int(n) => n as usize,
         _ => 64,
     };
-    let needed = ((bit_index + 64) / 64) * 64;
+    // Defensive bound: callers validate the bit index (non-negative, ≤
+    // Integer.MAX_VALUE) before reaching here, but clamp the requested word
+    // count to `BS_MAX_WORDS` so a stray huge index can never overflow
+    // `bit_index + 64` (panic in debug / wrap in release) nor drive an
+    // unbounded `new_array`. `bit_index` is at most `i32::MAX` after
+    // validation, so `+ 64` cannot overflow `usize` on a 64-bit target.
+    let new_words_req = bs_word_count(bit_index.saturating_add(1)).min(BS_MAX_WORDS);
+    let needed = new_words_req.saturating_mul(64);
     if needed <= old_nbits {
         return;
     }
@@ -2901,20 +3040,14 @@ fn bs_read_words(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<i64> {
 
 fn native_bs_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let bit = match args.get(1) {
-        Some(Value::Int(n)) => *n as usize,
-        _ => 0,
-    };
+    let bit = bs_checked_bit_index(ctx, args, 1)?;
     bs_set_bit(ctx, this, bit, true);
     Ok(None)
 }
 
 fn native_bs_set_val(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let bit = match args.get(1) {
-        Some(Value::Int(n)) => *n as usize,
-        _ => 0,
-    };
+    let bit = bs_checked_bit_index(ctx, args, 1)?;
     let val = match args.get(2) {
         Some(Value::Int(v)) => *v != 0,
         _ => true,
@@ -2925,14 +3058,7 @@ fn native_bs_set_val(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
 
 fn native_bs_set_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let from = match args.get(1) {
-        Some(Value::Int(n)) => *n as usize,
-        _ => 0,
-    };
-    let to = match args.get(2) {
-        Some(Value::Int(n)) => *n as usize,
-        _ => 0,
-    };
+    let (from, to) = bs_checked_range(ctx, args, 1, 2)?;
     for bit in from..to {
         bs_set_bit(ctx, this, bit, true);
     }
@@ -2941,10 +3067,7 @@ fn native_bs_set_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn native_bs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let bit = match args.get(1) {
-        Some(Value::Int(n)) => *n as usize,
-        _ => 0,
-    };
+    let bit = bs_checked_bit_index(ctx, args, 1)?;
     bs_set_bit(ctx, this, bit, false);
     Ok(None)
 }
@@ -2964,14 +3087,7 @@ fn native_bs_clear_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 
 fn native_bs_clear_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let from = match args.get(1) {
-        Some(Value::Int(n)) => *n as usize,
-        _ => 0,
-    };
-    let to = match args.get(2) {
-        Some(Value::Int(n)) => *n as usize,
-        _ => 0,
-    };
+    let (from, to) = bs_checked_range(ctx, args, 1, 2)?;
     for bit in from..to {
         bs_set_bit(ctx, this, bit, false);
     }
@@ -2980,10 +3096,7 @@ fn native_bs_clear_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 fn native_bs_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let bit = match args.get(1) {
-        Some(Value::Int(n)) => *n as usize,
-        _ => 0,
-    };
+    let bit = bs_checked_bit_index(ctx, args, 1)?;
     Ok(Some(Value::Int(if bs_get_bit(ctx, this, bit) {
         1
     } else {
@@ -2993,10 +3106,7 @@ fn native_bs_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 
 fn native_bs_flip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let bit = match args.get(1) {
-        Some(Value::Int(n)) => *n as usize,
-        _ => 0,
-    };
+    let bit = bs_checked_bit_index(ctx, args, 1)?;
     let cur = bs_get_bit(ctx, this, bit);
     bs_set_bit(ctx, this, bit, !cur);
     Ok(None)
@@ -3004,14 +3114,7 @@ fn native_bs_flip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 
 fn native_bs_flip_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let from = match args.get(1) {
-        Some(Value::Int(n)) => *n as usize,
-        _ => 0,
-    };
-    let to = match args.get(2) {
-        Some(Value::Int(n)) => *n as usize,
-        _ => 0,
-    };
+    let (from, to) = bs_checked_range(ctx, args, 1, 2)?;
     for bit in from..to {
         let cur = bs_get_bit(ctx, this, bit);
         bs_set_bit(ctx, this, bit, !cur);
@@ -7569,10 +7672,19 @@ fn p52_message_format_apply(
             }
             if end < chars.len() {
                 let inner: String = chars[start..end].iter().collect();
-                let idx_str = inner.split(',').next().unwrap_or("0").trim();
+                // Split into at most 3 parts: index, format-type, and the rest
+                // as the format-style (which may itself contain commas, e.g. the
+                // grouping separators in a `number` subformat pattern).
+                let mut it = inner.splitn(3, ',');
+                let idx_str = it.next().unwrap_or("0").trim();
+                let ftype = it.next().map(|s| s.trim());
+                let fstyle = it.next().map(|s| s.trim());
                 if let Ok(idx) = idx_str.parse::<usize>() {
                     if idx < format_args.len() {
-                        p52_format_value(ctx, &format_args[idx], &mut result);
+                        // B8 fix: honor the typed format element where tractable
+                        // (number styles), falling back to the plain value
+                        // rendering for date/time/choice (not yet localized).
+                        p52_format_typed_value(ctx, &format_args[idx], ftype, fstyle, &mut result);
                     } else {
                         result.push('{');
                         result.push_str(&inner);
@@ -7617,11 +7729,144 @@ fn p52_format_value(ctx: &mut dyn NativeContext, val: &Value, out: &mut String) 
         Value::Float(f) => out.push_str(&f.to_string()),
         Value::Double(d) => out.push_str(&d.to_string()),
         Value::Object(Some(r)) => {
-            out.push_str(&ctx.read_string(*r).unwrap_or_else(|| "null".to_string()));
+            // String objects read directly; other reference types render via
+            // toString() (B8) rather than the misleading literal "null".
+            if let Some(s) = ctx.read_string(*r) {
+                out.push_str(&s);
+            } else {
+                match ctx.invoke_virtual(*r, "toString", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(s)))) => {
+                        out.push_str(&ctx.read_string(s).unwrap_or_else(|| "null".to_string()));
+                    }
+                    _ => out.push_str("null"),
+                }
+            }
         }
         Value::Object(None) => out.push_str("null"),
         _ => out.push('?'),
     }
+}
+
+/// Apply a MessageFormat typed element `{idx,type,style}` (B8). For `number`
+/// elements the common styles are honored (`integer`, `percent`, `currency`,
+/// and explicit `#`/`0`/`.`/`,` decimal patterns); `date`/`time`/`choice` are
+/// not yet localized, so they fall through to the plain value rendering. This
+/// is correct-or-plain rather than silently dropping the type.
+fn p52_format_typed_value(
+    ctx: &mut dyn NativeContext,
+    val: &Value,
+    ftype: Option<&str>,
+    fstyle: Option<&str>,
+    out: &mut String,
+) {
+    let num = match val {
+        Value::Int(n) => Some(*n as f64),
+        Value::Long(n) => Some(*n as f64),
+        Value::Float(f) => Some(*f as f64),
+        Value::Double(d) => Some(*d),
+        _ => None,
+    };
+    match (ftype, num) {
+        (Some("number"), Some(n)) => {
+            let s = p52_format_number(n, fstyle);
+            out.push_str(&s);
+        }
+        // date/time/choice are not yet localized — render the plain value so the
+        // output is at least correct in magnitude rather than dropped.
+        _ => p52_format_value(ctx, val, out),
+    }
+}
+
+/// Render a number for a MessageFormat `{n,number,style}` element. Supports the
+/// named styles (`integer`, `percent`, `currency`) and explicit decimal
+/// patterns of the form `#,##0.00` (the fraction-digit count is taken from the
+/// run of `0`/`#` after the decimal point; `,` requests grouping). Defaults to
+/// the JDK's general number form (grouping, up to 3 fraction digits).
+fn p52_format_number(n: f64, style: Option<&str>) -> String {
+    match style {
+        Some("integer") => p52_group_int(n.round() as i64),
+        Some("percent") => format!("{}%", p52_group_int((n * 100.0).round() as i64)),
+        Some("currency") => {
+            let cents = (n * 100.0).round() / 100.0;
+            format!("${}", p52_format_fixed(cents, 2, true))
+        }
+        Some(pat) if pat.contains('#') || pat.contains('0') || pat.contains('.') => {
+            let grouping = pat.contains(',');
+            let frac = match pat.split('.').nth(1) {
+                Some(after) => after.chars().filter(|c| *c == '0' || *c == '#').count(),
+                None => 0,
+            };
+            p52_format_fixed(n, frac, grouping)
+        }
+        _ => {
+            // General number form: group the integer part, keep up to 3 fraction
+            // digits without trailing zeros.
+            if n.fract() == 0.0 && n.abs() < 9.0e18 {
+                p52_group_int(n as i64)
+            } else {
+                let s = format!("{:.3}", n);
+                let trimmed = s.trim_end_matches('0').trim_end_matches('.');
+                match trimmed.split_once('.') {
+                    Some((int_part, frac_part)) => {
+                        let neg = int_part.starts_with('-');
+                        let digits = int_part.trim_start_matches('-');
+                        let grouped = p52_group_digits(digits);
+                        format!("{}{}.{}", if neg { "-" } else { "" }, grouped, frac_part)
+                    }
+                    None => p52_group_int(trimmed.parse::<i64>().unwrap_or(0)),
+                }
+            }
+        }
+    }
+}
+
+/// Format `n` with exactly `frac` fraction digits, optionally grouping the
+/// integer part with commas.
+fn p52_format_fixed(n: f64, frac: usize, grouping: bool) -> String {
+    let s = format!("{:.*}", frac, n);
+    let neg = s.starts_with('-');
+    let body = s.trim_start_matches('-');
+    let (int_part, frac_part) = match body.split_once('.') {
+        Some((a, b)) => (a, Some(b)),
+        None => (body, None),
+    };
+    let int_out = if grouping { p52_group_digits(int_part) } else { int_part.to_string() };
+    let mut out = String::new();
+    if neg {
+        out.push('-');
+    }
+    out.push_str(&int_out);
+    if let Some(fp) = frac_part {
+        out.push('.');
+        out.push_str(fp);
+    }
+    out
+}
+
+/// Group an `i64` with comma thousands separators.
+fn p52_group_int(n: i64) -> String {
+    let neg = n < 0;
+    let digits = n.unsigned_abs().to_string();
+    let grouped = p52_group_digits(&digits);
+    if neg {
+        format!("-{grouped}")
+    } else {
+        grouped
+    }
+}
+
+/// Insert comma thousands separators into a string of decimal digits.
+fn p52_group_digits(digits: &str) -> String {
+    let bytes = digits.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -15399,5 +15644,163 @@ mod t2_tests {
             ],
         );
         assert!(r.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // B1 / V1: BitSet negative / oversized index validation
+    // -----------------------------------------------------------------------
+
+    /// Allocate a default BitSet via the real init native.
+    fn make_bitset(ctx: &mut dyn NativeContext) -> cratonvm_types::ObjectRef {
+        let bs = crate::alloc_concurrent_synthetic(ctx, "java/util/BitSet", 2);
+        native_bs_init(ctx, &[Value::Object(Some(bs))]).unwrap();
+        bs
+    }
+
+    /// A thrown Java exception (catchable), not an internal/fatal VM error.
+    fn assert_thrown(r: &MethodCallResult) {
+        match r {
+            Err(MethodCallFailed::ExceptionThrown(_)) => {}
+            other => panic!("expected ExceptionThrown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bs_set_negative_index_throws() {
+        let mut ctx = mock_ctx();
+        let bs = make_bitset(&mut ctx);
+        let r = native_bs_set(&mut ctx, &[Value::Object(Some(bs)), Value::Int(-1)]);
+        assert_thrown(&r);
+    }
+
+    #[test]
+    fn bs_clear_negative_index_throws() {
+        let mut ctx = mock_ctx();
+        let bs = make_bitset(&mut ctx);
+        let r = native_bs_clear(&mut ctx, &[Value::Object(Some(bs)), Value::Int(-5)]);
+        assert_thrown(&r);
+    }
+
+    #[test]
+    fn bs_flip_negative_index_throws() {
+        let mut ctx = mock_ctx();
+        let bs = make_bitset(&mut ctx);
+        let r = native_bs_flip(&mut ctx, &[Value::Object(Some(bs)), Value::Int(-1)]);
+        assert_thrown(&r);
+    }
+
+    #[test]
+    fn bs_get_negative_index_throws() {
+        let mut ctx = mock_ctx();
+        let bs = make_bitset(&mut ctx);
+        let r = native_bs_get(&mut ctx, &[Value::Object(Some(bs)), Value::Int(-1)]);
+        assert_thrown(&r);
+    }
+
+    #[test]
+    fn bs_set_min_int_index_does_not_panic_and_throws() {
+        // i32::MIN as usize used to wrap to ~usize::MAX and drive a gigantic
+        // allocation / overflow. It must now be a clean IndexOutOfBounds throw.
+        let mut ctx = mock_ctx();
+        let bs = make_bitset(&mut ctx);
+        let r = native_bs_set(&mut ctx, &[Value::Object(Some(bs)), Value::Int(i32::MIN)]);
+        assert_thrown(&r);
+    }
+
+    #[test]
+    fn bs_set_range_negative_from_throws() {
+        let mut ctx = mock_ctx();
+        let bs = make_bitset(&mut ctx);
+        let r = native_bs_set_range(
+            &mut ctx,
+            &[Value::Object(Some(bs)), Value::Int(-1), Value::Int(4)],
+        );
+        assert_thrown(&r);
+    }
+
+    #[test]
+    fn bs_set_range_from_greater_than_to_throws() {
+        let mut ctx = mock_ctx();
+        let bs = make_bitset(&mut ctx);
+        let r = native_bs_set_range(
+            &mut ctx,
+            &[Value::Object(Some(bs)), Value::Int(8), Value::Int(4)],
+        );
+        assert_thrown(&r);
+    }
+
+    #[test]
+    fn bs_set_then_get_valid_index_roundtrips() {
+        // Non-negative indices still work normally after the validation.
+        let mut ctx = mock_ctx();
+        let bs = make_bitset(&mut ctx);
+        native_bs_set(&mut ctx, &[Value::Object(Some(bs)), Value::Int(130)]).unwrap();
+        let g = native_bs_get(&mut ctx, &[Value::Object(Some(bs)), Value::Int(130)]).unwrap();
+        assert_eq!(g, Some(Value::Int(1)));
+        let g0 = native_bs_get(&mut ctx, &[Value::Object(Some(bs)), Value::Int(129)]).unwrap();
+        assert_eq!(g0, Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn bs_max_words_bounds_largest_int_index() {
+        // The backing-word cap must accommodate the largest legal bit index
+        // (Integer.MAX_VALUE) so we never reject a spec-valid index, while
+        // still bounding the allocation.
+        assert_eq!(bs_word_count((i32::MAX as usize) + 1), BS_MAX_WORDS);
+    }
+
+    // -----------------------------------------------------------------------
+    // nb-core-mediums (fable-2026-06-10): Scanner UTF-8 boundary (B4) and
+    // MessageFormat number element (B8) pure-helper coverage.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scanner_remaining_snaps_to_char_boundary() {
+        // "é" is 2 bytes (0xC3 0xA9); slicing at byte offset 1 is mid-codepoint.
+        let s = "éx";
+        // Snapping forward from offset 1 lands on the next boundary (byte 2),
+        // yielding "x" — and crucially does NOT panic.
+        assert_eq!(scanner_remaining(s, 1), "x");
+        // Boundary offsets behave like a plain slice.
+        assert_eq!(scanner_remaining(s, 0), "éx");
+        assert_eq!(scanner_remaining(s, 2), "x");
+        // Past-end is clamped, not a panic.
+        assert_eq!(scanner_remaining(s, 999), "");
+    }
+
+    #[test]
+    fn mf_number_integer_groups_thousands() {
+        assert_eq!(p52_format_number(1234567.0, Some("integer")), "1,234,567");
+        assert_eq!(p52_format_number(-1234.0, Some("integer")), "-1,234");
+        assert_eq!(p52_format_number(0.0, Some("integer")), "0");
+    }
+
+    #[test]
+    fn mf_number_percent_and_currency() {
+        assert_eq!(p52_format_number(0.5, Some("percent")), "50%");
+        assert_eq!(p52_format_number(12.5, Some("currency")), "$12.50");
+    }
+
+    #[test]
+    fn mf_number_explicit_decimal_pattern() {
+        // Two fraction digits, with grouping.
+        assert_eq!(p52_format_number(1234.5, Some("#,##0.00")), "1,234.50");
+        // No grouping, three fraction digits.
+        assert_eq!(p52_format_number(3.14159, Some("0.000")), "3.142");
+    }
+
+    #[test]
+    fn mf_number_default_style_general_form() {
+        assert_eq!(p52_format_number(1000.0, None), "1,000");
+        assert_eq!(p52_format_number(1234.5, None), "1,234.5");
+    }
+
+    #[test]
+    fn mf_group_digits_basic() {
+        assert_eq!(p52_group_digits("1"), "1");
+        assert_eq!(p52_group_digits("12"), "12");
+        assert_eq!(p52_group_digits("123"), "123");
+        assert_eq!(p52_group_digits("1234"), "1,234");
+        assert_eq!(p52_group_digits("1234567"), "1,234,567");
     }
 }

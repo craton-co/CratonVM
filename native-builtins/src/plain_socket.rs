@@ -379,30 +379,34 @@ fn socket_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         return Err(ioex("socketAccept: not bound"));
     }
     // `accept` is allowed to block indefinitely. We honour SO_TIMEOUT if set.
-    let timeout = {
+    //
+    // CRITICAL: we must NOT hold the registry lock across the blocking
+    // `accept()` — every other socket op needs `registry().write()` via
+    // `with_socket`, so blocking here while holding the read guard would
+    // serialize ALL socket I/O process-wide until a connection arrives.
+    // Instead we `try_clone()` the listening socket out under a short lock
+    // (dups the underlying fd — accepting on the clone is equivalent to
+    // accepting on the original), drop the lock, then block on the clone.
+    // This mirrors `net_phase_e::re10_start_server`'s `listener.try_clone()`.
+    let (listener, timeout) = {
         let g = registry().read();
-        g.sockets.get(&fd).and_then(|s| s.so_timeout_ms)
+        let s = g.sockets.get(&fd).ok_or_else(|| ioex("socket gone"))?;
+        let clone = s
+            .socket
+            .try_clone()
+            .map_err(|e| ioex(format!("socketAccept: {e}")))?;
+        (clone, s.so_timeout_ms)
     };
     let accepted: (Socket, SockAddr) = if let Some(t) = timeout {
-        // Set non-blocking + busy-poll the listener until either accept
-        // succeeds or the deadline passes. We must avoid double-locking
-        // the registry while sleeping.
+        // Set non-blocking + busy-poll the (already cloned-out) listener
+        // until either accept succeeds or the deadline passes. The clone is
+        // local, so no registry lock is held while we sleep.
         let deadline = std::time::Instant::now() + Duration::from_millis(t as u64);
-        {
-            let mut g = registry().write();
-            if let Some(s) = g.sockets.get_mut(&fd) {
-                let _ = s.socket.set_nonblocking(true);
-            }
-        }
+        let _ = listener.set_nonblocking(true);
         let mut last_err: Option<std::io::Error> = None;
         let mut got: Option<(Socket, SockAddr)> = None;
         loop {
-            let res = {
-                let g = registry().read();
-                let s = g.sockets.get(&fd).ok_or_else(|| ioex("socket gone"))?;
-                s.socket.accept()
-            };
-            match res {
+            match listener.accept() {
                 Ok(pair) => {
                     got = Some(pair);
                     break;
@@ -418,12 +422,9 @@ fn socket_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             }
             std::thread::sleep(Duration::from_millis(5));
         }
-        {
-            let mut g = registry().write();
-            if let Some(s) = g.sockets.get_mut(&fd) {
-                let _ = s.socket.set_nonblocking(false);
-            }
-        }
+        // Restoring blocking mode on the clone is harmless (it is dropped
+        // here), but kept for parity with the previous behavior.
+        let _ = listener.set_nonblocking(false);
         match got {
             Some(p) => p,
             None => {
@@ -435,9 +436,9 @@ fn socket_accept(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
             }
         }
     } else {
-        let g = registry().read();
-        let s = g.sockets.get(&fd).ok_or_else(|| ioex("socket gone"))?;
-        s.socket
+        // No registry lock held across this blocking accept — the clone is
+        // a local handle dup'd out above.
+        listener
             .accept()
             .map_err(|e| ioex(format!("socketAccept: {e}")))?
     };
@@ -1074,5 +1075,75 @@ mod tests {
         let msg = format!("{err:?}");
         assert!(msg.contains("unknown cmd"), "got {msg}");
         drop_socket(id);
+    }
+
+    /// Regression for the P1 lock-contention bug: a blocking `accept()` must
+    /// NOT hold the registry lock for its duration. We reproduce the shape of
+    /// the (no-SO_TIMEOUT) accept path — clone the listener out under a short
+    /// lock, then block on the clone — and assert that a concurrent
+    /// `with_socket` write on another socket succeeds *while* the accept is
+    /// still blocked waiting for a connection. Before the fix the read guard
+    /// was held across `accept()`, so this `with_socket` would block until a
+    /// client connected (or forever).
+    #[test]
+    fn blocking_accept_does_not_hold_registry_lock() {
+        use std::sync::mpsc;
+
+        // Server listener registered like socketCreate/Bind/Listen would.
+        let server = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).unwrap();
+        server.set_reuse_address(true).unwrap();
+        server
+            .bind(&SockAddr::from(SocketAddr::V4(SocketAddrV4::new(
+                Ipv4Addr::LOCALHOST,
+                0,
+            ))))
+            .unwrap();
+        server.listen(50).unwrap();
+        let bound = server.local_addr().unwrap().as_socket().unwrap();
+        let server_id = register_socket(SocketState {
+            socket: server,
+            so_timeout_ms: None,
+            is_listening: true,
+            is_connected: false,
+            is_stream: true,
+            closed: false,
+        });
+
+        // A second, unrelated socket whose registry entry we'll touch while
+        // the accept is blocked.
+        let other_id = fresh_stream_socket();
+
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let accept_thread = std::thread::spawn(move || {
+            // Mirror socket_accept's no-timeout path: clone out under a short
+            // lock, release, then block on the clone.
+            let listener = {
+                let g = registry().read();
+                let s = g.sockets.get(&server_id).unwrap();
+                s.socket.try_clone().unwrap()
+            };
+            started_tx.send(()).unwrap();
+            let (_accepted, _peer) = listener.accept().unwrap();
+        });
+
+        // Wait until the accept thread has cloned-out and is about to block.
+        started_rx.recv().unwrap();
+
+        // While the accept blocks, a write-locking registry op on the OTHER
+        // socket must complete promptly (it would deadlock under the old code).
+        with_socket::<_, ()>(other_id, |s| {
+            s.is_connected = true;
+            Ok(())
+        })
+        .unwrap();
+
+        // Now unblock the accept so the thread can finish.
+        let mut client = std::net::TcpStream::connect(bound).unwrap();
+        client.write_all(b"x").unwrap();
+        client.flush().unwrap();
+        accept_thread.join().unwrap();
+
+        drop_socket(server_id);
+        drop_socket(other_id);
     }
 }

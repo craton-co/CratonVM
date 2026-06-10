@@ -1,5 +1,14 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2024-2026 Craton Software Company
+// SPDX-License-Identifier: MIT AND Apache-2.0
+//
+// Portions of this file are derived from the Bouncy Castle Cryptography Library
+// (`org.bouncycastle.crypto.engines.AESEngine`): the AES S-box / inverse S-box,
+// the T/Tinv tables, and the round structure are mechanically transcribed from
+// BouncyCastle Java source. Those portions are
+//   Copyright (c) 2000-2024 The Legion of the Bouncy Castle Inc.
+// and are used under the Bouncy Castle Licence (an MIT-style permissive licence),
+// NOT Apache-2.0. The Craton-authored glue/integration code is
+//   Copyright 2024-2026 Craton Software Company (Apache-2.0).
+// See ../THIRD-PARTY-NOTICES.md for the full Bouncy Castle Licence text.
 
 //! Native fast-path for BouncyCastle's `org.bouncycastle.crypto.engines.AESEngine`
 //! single-block transform. A faithful, table-for-table port of BC's
@@ -13,7 +22,8 @@
 //! (`AESTest` → `BlockCipherMonteCarloTest`), the documented AES non-finish.
 //!
 //! Tables and round code are mechanically transcribed from `AESEngine.java`
-//! (BouncyCastle, Apache-2.0). `shift(r, n)` in BC == `r.rotate_right(n)`
+//! (BouncyCastle, under the Bouncy Castle Licence — MIT-style; see
+//! ../THIRD-PARTY-NOTICES.md). `shift(r, n)` in BC == `r.rotate_right(n)`
 //! (it computes `(r >>> n) | (r << (32 - n))`). Validated by a FIPS-197 KAT
 //! below and end-to-end by BC's own `AESTest` vectors.
 

@@ -47,10 +47,9 @@ use cratonvm_types::{ArrayElementType, ClassId, ObjectRef, Value};
 
 use crate::{alloc_concurrent_synthetic, obj_arg};
 
-// We intentionally only *read* HPACK static-table indices from `http2.rs` so we
-// can speak HTTP/2 against servers that prefer it after ALPN. http2.rs itself
-// is owned by another agent and must not be modified.
-use crate::http2::HpackStaticTable;
+// We read HPACK static-table indices and the RFC 7541 Huffman decoder from
+// `http2.rs` so we can speak HTTP/2 against servers that prefer it after ALPN.
+use crate::http2::{hpack_huffman_decode, HpackStaticTable};
 
 // ---------------------------------------------------------------------------
 // HttpClientImpl synthetic field layout
@@ -93,6 +92,16 @@ const REDIRECT_NORMAL: i32 = 1;
 const REDIRECT_ALWAYS: i32 = 2;
 
 const MAX_RESPONSE_BODY: usize = 16 * 1024 * 1024;
+/// Largest single HTTP/2 frame payload we will buffer. The HTTP/2 default
+/// `SETTINGS_MAX_FRAME_SIZE` is 16 KiB (RFC 7540 §6.5.2); we never advertise a
+/// larger value, so a server that sends a bigger frame is misbehaving. The
+/// 24-bit length field otherwise permits up to 16 MiB per frame, which a
+/// malicious server could use to force large per-frame allocations.
+const H2_MAX_FRAME_SIZE: usize = 16 * 1024;
+/// Cap on the total HPACK header block accumulated across HEADERS +
+/// CONTINUATION frames. Without this, a server can stream CONTINUATION frames
+/// forever (never setting END_HEADERS) and grow the block unbounded -> OOM.
+const H2_MAX_HEADER_BLOCK: usize = 256 * 1024;
 const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const POOL_MAX_PER_HOST: usize = 8;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -549,6 +558,13 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
         let size_str = size_line.split(';').next().unwrap_or("").trim();
         let size = usize::from_str_radix(size_str, 16)
             .map_err(|_| format!("bad chunk size: {size_line:?}"))?;
+        // Reject an oversized chunk *before* buffering any of it: a malicious or
+        // compromised server can advertise a multi-GiB (or near-usize::MAX)
+        // chunk and force an unbounded allocation otherwise. Bound against the
+        // total body cap (a single chunk can never legitimately exceed it).
+        if size > MAX_RESPONSE_BODY {
+            return Err("chunked: chunk size exceeds MAX_RESPONSE_BODY".into());
+        }
         // Drop the size line (including CRLF).
         prefix.drain(..line_end + 2);
         if size == 0 {
@@ -564,6 +580,12 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
             }
             return Ok(out);
         }
+        // Reject the *aggregate* before buffering this chunk so the running
+        // total can never exceed the cap (size is already <= MAX_RESPONSE_BODY,
+        // so size + 2 cannot overflow usize here).
+        if out.len() + size > MAX_RESPONSE_BODY {
+            return Err("response body exceeded MAX_RESPONSE_BODY".into());
+        }
         // Read `size` bytes of chunk data + trailing CRLF.
         while prefix.len() < size + 2 {
             let n = stream
@@ -575,9 +597,6 @@ fn read_chunked<S: Read>(prefix: &mut Vec<u8>, stream: &mut S) -> Result<Vec<u8>
             prefix.extend_from_slice(&tmp[..n]);
         }
         out.extend_from_slice(&prefix[..size]);
-        if out.len() > MAX_RESPONSE_BODY {
-            return Err("response body exceeded MAX_RESPONSE_BODY".into());
-        }
         prefix.drain(..size + 2); // also discard CRLF
     }
 }
@@ -752,6 +771,15 @@ fn http2_request(
         let flags = hdr[4];
         let stream_id =
             u32::from_be_bytes([hdr[5] & 0x7f, hdr[6], hdr[7], hdr[8]]);
+        // Enforce SETTINGS_MAX_FRAME_SIZE before allocating: a misbehaving or
+        // hostile server can set the 24-bit length up to 16 MiB and force a
+        // large per-frame allocation. We never advertise a frame size larger
+        // than the 16 KiB default, so anything bigger is a protocol violation.
+        if length as usize > H2_MAX_FRAME_SIZE {
+            return Err(format!(
+                "h2 frame size {length} exceeds SETTINGS_MAX_FRAME_SIZE ({H2_MAX_FRAME_SIZE})"
+            ));
+        }
         let mut payload = vec![0u8; length as usize];
         if length > 0 {
             stream
@@ -798,6 +826,9 @@ fn http2_request(
                     }
                     p = &p[5..];
                 }
+                if header_block.len() + p.len() > H2_MAX_HEADER_BLOCK {
+                    return Err("h2 header block exceeds limit".into());
+                }
                 header_block.extend_from_slice(p);
                 if flags & 0x4 != 0 {
                     // END_HEADERS — decode the block.
@@ -812,6 +843,11 @@ fn http2_request(
                 }
             }
             0x9 if stream_id == 1 => {
+                // Cap CONTINUATION accumulation: a server that never sets
+                // END_HEADERS would otherwise grow header_block without bound.
+                if header_block.len() + payload.len() > H2_MAX_HEADER_BLOCK {
+                    return Err("h2 header block exceeds limit".into());
+                }
                 header_block.extend_from_slice(&payload);
                 if flags & 0x4 != 0 {
                     let (st, hs) = decode_hpack_response(&header_block)?;
@@ -964,7 +1000,13 @@ fn decode_hpack_int(input: &[u8], prefix_bits: u8) -> Result<(usize, &[u8]), Str
         }
         let b = input[i];
         i += 1;
-        value += ((b & 0x7f) as usize) << shift;
+        // checked_add so a hostile encoding can't silently wrap the accumulator
+        // into a misleading small value (it would otherwise feed a bogus length
+        // / table index downstream).
+        let term = ((b & 0x7f) as usize)
+            .checked_shl(shift)
+            .ok_or("hpack int: shift overflow")?;
+        value = value.checked_add(term).ok_or("hpack int: overflow")?;
         if b & 0x80 == 0 {
             return Ok((value, &input[i..]));
         }
@@ -986,10 +1028,11 @@ fn decode_hpack_string(input: &[u8]) -> Result<(String, &[u8]), String> {
     }
     let bytes = &rest[..len];
     let s = if huffman {
-        // We don't speak Huffman on the read side. Surface as opaque for now —
-        // the headers we actually need (`:status`, `content-length`,
-        // `content-type`, etc.) are sent literal by the typical server config.
-        String::from_utf8_lossy(bytes).to_string()
+        // Decode per RFC 7541 Appendix B. `hpack_huffman_decode` fails closed on
+        // malformed input (bad padding / EOS / unmatchable code) rather than
+        // returning wrong data, so a corrupt header surfaces as an error here.
+        let decoded = hpack_huffman_decode(bytes).map_err(|e| format!("hpack huffman: {e}"))?;
+        String::from_utf8(decoded).map_err(|e| format!("hpack huffman utf8: {e}"))?
     } else {
         std::str::from_utf8(bytes)
             .map_err(|e| format!("hpack str utf8: {e}"))?
@@ -1819,5 +1862,48 @@ mod http_client_tests {
         let obj = alloc_response(&mut ctx, &resp, req, "http://example.com/");
         assert_eq!(ctx.get_field(obj, HRS_STATUS), Value::Int(200));
         assert_eq!(ctx.get_field(obj, HRS_VERSION), Value::Int(HTTP_VERSION_1_1));
+    }
+
+    #[test]
+    fn test_read_chunked_happy_path() {
+        // "5\r\nhello\r\n0\r\n\r\n" -> "hello"
+        let mut prefix = b"5\r\nhello\r\n0\r\n\r\n".to_vec();
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        let out = read_chunked(&mut prefix, &mut empty).expect("decode");
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn test_read_chunked_rejects_oversized_chunk_no_alloc() {
+        // A near-usize::MAX hex chunk size must be rejected immediately, before
+        // buffering anything (covers the overflow + pre-cap allocation DoS).
+        let mut prefix = b"ffffffffffffffff\r\n".to_vec();
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        let err = read_chunked(&mut prefix, &mut empty).unwrap_err();
+        assert!(err.contains("MAX_RESPONSE_BODY"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_read_chunked_rejects_large_but_parseable_chunk() {
+        // 0x7FFFFFFF (~2 GiB) is a valid hex size but exceeds the body cap; it
+        // must be rejected without attempting to buffer 2 GiB.
+        let mut prefix = b"7fffffff\r\n".to_vec();
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        let err = read_chunked(&mut prefix, &mut empty).unwrap_err();
+        assert!(err.contains("MAX_RESPONSE_BODY"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn test_decode_hpack_string_huffman_roundtrip() {
+        // HPACK string: H=1, len=12, then Huffman("www.example.com" is 15 bytes;
+        // use RFC 7541 C.4.1 "www.example.com" encoded = 12 bytes).
+        // Length prefix 0x8c = 0x80 (Huffman) | 0x0c (len 12).
+        let mut input = vec![0x8c];
+        input.extend_from_slice(&[
+            0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b, 0xa0, 0xab, 0x90, 0xf4, 0xff,
+        ]);
+        let (s, rest) = decode_hpack_string(&input).expect("huffman decode");
+        assert_eq!(s, "www.example.com");
+        assert!(rest.is_empty());
     }
 }

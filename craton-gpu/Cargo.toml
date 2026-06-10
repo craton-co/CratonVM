@@ -17,6 +17,11 @@ build = "build.rs"
 # crates that depend on `craton-gpu` can read the metadata this crate's
 # build.rs emits via `cargo:annotations_dir=` / `cargo:annotations_jar=`.
 links = "craton-gpu-annotations"
+# Withheld from crates.io at 0.3.0: early-maturity GPU/platform-glue crate.
+publish = false
 
 [lib]
 path = "src/lib.rs"
+
+[lints]
+workspace = true

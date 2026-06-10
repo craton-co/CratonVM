@@ -110,13 +110,27 @@ pub fn coerce_value_for_return(value: Value, ret_type: u8) -> Value {
     match ret_type {
         b'I' | b'B' | b'C' | b'S' | b'Z' => match value {
             Value::Object(None) => Value::Int(0),
-            Value::Object(Some(p)) => Value::Int(p.as_ptr() as usize as i32),
+            // B4: an `Object(Some(_))` reaching an int return slot is a
+            // type-confusion case that "shouldn't happen". Truncating the
+            // 64-bit heap pointer to i32 (the old `p.as_ptr() as usize as i32`)
+            // would silently emit a corrupted int. Fail loudly in debug builds
+            // and yield the zero default in release rather than a half-pointer.
+            Value::Object(Some(_)) => {
+                debug_assert!(false, "coerce_value_for_return: Object reached I/B/C/S/Z return slot");
+                Value::Int(0)
+            }
             Value::Long(v) => Value::Int(v as i32),
             other => other,
         },
         b'J' => match value {
             Value::Object(None) => Value::Long(0),
-            Value::Object(Some(p)) => Value::Long(p.as_ptr() as usize as i64),
+            // B4: same type-confusion guard as the int arm. A `long` slot is
+            // wide enough to hold a pointer without truncation, but surfacing a
+            // raw heap address as a Java `long` is still a bug, so default to 0.
+            Value::Object(Some(_)) => {
+                debug_assert!(false, "coerce_value_for_return: Object reached J return slot");
+                Value::Long(0)
+            }
             Value::Int(v) => Value::Long(v as i64),
             other => other,
         },
@@ -298,24 +312,21 @@ pub fn unbox_poly_return(
 // Safe native callback invocation
 // ---------------------------------------------------------------------------
 
-/// Extract a heap [`ObjectRef`] from a [`Value`] that may carry a JNI
-/// `jobject` as `Value::Long` (aligned pointer bits).
-#[inline]
-pub fn value_as_object_ref(v: Value) -> Option<ObjectRef> {
-    match v {
-        Value::Object(Some(o)) => Some(o),
-        Value::Long(bits) => jlong_bits_as_aligned_object_ptr(bits as u64)
-            .map(|p| unsafe { ObjectRef::from_raw(p as *mut u8) }),
-        _ => None,
-    }
-}
+// NOTE (B5): the historical *unvalidated* `value_as_object_ref` was removed.
+// It reinterpreted any aligned `Value::Long` bits as an `ObjectRef` via
+// `ObjectRef::from_raw` without checking the address belongs to the heap —
+// the exact pattern that lets a `long` carrying a file size / hash code be
+// marked/moved by the GC and SEGV (0xC0000005). It had no callers in
+// `vm/src` (all sites use the validated variant below). Keeping it deleted
+// prevents a future caller from reintroducing the GC-mark hazard. Use
+// [`value_as_validated_object_ref`] instead.
 
-/// Like [`value_as_object_ref`] but verifies that a `Value::Long` whose bits
-/// look like an aligned pointer actually points at a heap object before
-/// returning it. Without this check, a real `Value::Long` carrying e.g. a
-/// file size that happens to be 8-byte aligned would be reinterpreted as a
-/// jobject; the GC would later try to mark/move that bogus pointer and
-/// SEGV.  Real `Value::Object(Some(_))` is always returned as-is.
+/// Verifies that a `Value::Long` whose bits look like an aligned pointer
+/// actually points at a heap object before returning it. Without this check,
+/// a real `Value::Long` carrying e.g. a file size that happens to be 8-byte
+/// aligned would be reinterpreted as a jobject; the GC would later try to
+/// mark/move that bogus pointer and SEGV. Real `Value::Object(Some(_))` is
+/// always returned as-is.
 #[inline]
 pub fn value_as_validated_object_ref(shared: &SharedVm, v: Value) -> Option<ObjectRef> {
     match v {
@@ -9907,6 +9918,33 @@ fn invoke_on_class_shared_inner(
                 (recv, if args.is_empty() { args } else { &args[1..] })
             };
 
+            // V2: the descriptor comes from (untrusted) classfile data while
+            // `call_args` is the actual operand-stack frame. `dispatch_jni_native`
+            // `zip`s the two together, so a descriptor whose parameter count
+            // disagrees with `call_args.len()` silently builds a malformed C
+            // call frame (missing/extra register args) — UB inside the unsafe
+            // dispatch. Reject the mismatch with UnsatisfiedLinkError before the
+            // unsafe call instead of entering it with a bad frame.
+            let expected_params = crate::runtime::proxy::count_descriptor_params(descriptor);
+            if expected_params != call_args.len() {
+                crate::native::jni::clear_jni_context();
+                crate::native::jni::clear_jni_thread();
+                tracing::warn!(
+                    method = %format!("{class_name}.{method_name}{descriptor}"),
+                    expected_params,
+                    got_args = call_args.len(),
+                    "JNI native arity mismatch — refusing unsafe dispatch"
+                );
+                return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::UnsatisfiedLinkError {
+                        message: format!(
+                            "{class_name}.{method_name}{descriptor}: descriptor arity {expected_params} != {} args",
+                            call_args.len()
+                        ),
+                    },
+                )));
+            }
+
             // Safety: fn_ptr was stored from a trusted RegisterNatives / JNI_OnLoad call.
             let result_value = unsafe {
                 crate::native::jni::dispatch_jni_native(fn_ptr, env, receiver, call_args, descriptor)
@@ -9949,6 +9987,30 @@ fn invoke_on_class_shared_inner(
                 };
                 (recv, if args.is_empty() { args } else { &args[1..] })
             };
+
+            // V2: same descriptor-arity vs call-frame sanity check as the
+            // RegisterNatives path above — a malformed descriptor on the
+            // auto-resolved (dlsym) symbol must not enter the unsafe dispatch
+            // with a mismatched argument frame.
+            let expected_params = crate::runtime::proxy::count_descriptor_params(descriptor);
+            if expected_params != call_args.len() {
+                crate::native::jni::clear_jni_context();
+                crate::native::jni::clear_jni_thread();
+                tracing::warn!(
+                    method = %format!("{class_name}.{method_name}{descriptor}"),
+                    expected_params,
+                    got_args = call_args.len(),
+                    "JNI native arity mismatch — refusing unsafe dispatch"
+                );
+                return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                    RuntimeError::UnsatisfiedLinkError {
+                        message: format!(
+                            "{class_name}.{method_name}{descriptor}: descriptor arity {expected_params} != {} args",
+                            call_args.len()
+                        ),
+                    },
+                )));
+            }
 
             let result_value = unsafe {
                 crate::native::jni::dispatch_jni_native(fn_ptr, env, receiver, call_args, descriptor)
@@ -10142,6 +10204,55 @@ mod tests {
     #[test]
     fn cas_double_nan_bit_equal() {
         assert!(values_equal_for_cas(&Value::Double(f64::NAN), &Value::Double(f64::NAN)));
+    }
+
+    // -----------------------------------------------------------------------
+    // coerce_value_for_return — B4 (null/primitive coercion, no truncation)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn coerce_null_object_to_int_is_zero() {
+        // Object(None) reaching an int slot becomes the zero default.
+        assert_eq!(coerce_value_for_return(Value::Object(None), b'I'), Value::Int(0));
+        assert_eq!(coerce_value_for_return(Value::Object(None), b'Z'), Value::Int(0));
+    }
+
+    #[test]
+    fn coerce_null_object_to_long_is_zero() {
+        assert_eq!(coerce_value_for_return(Value::Object(None), b'J'), Value::Long(0));
+    }
+
+    #[test]
+    fn coerce_long_to_int_truncates_value_not_pointer() {
+        // Legitimate Long->I narrowing (a primitive smuggled as Long) is
+        // unchanged by the B4 fix — only the Object(Some) pointer arm changed.
+        assert_eq!(coerce_value_for_return(Value::Long(0x1_0000_0001), b'I'), Value::Int(1));
+    }
+
+    #[test]
+    fn coerce_int_to_long_widens() {
+        assert_eq!(coerce_value_for_return(Value::Int(-1), b'J'), Value::Long(-1));
+    }
+
+    // -----------------------------------------------------------------------
+    // V2 — descriptor arity helper used to guard JNI native dispatch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn jni_arity_helper_matches_jvm_spec_param_count() {
+        // long/double count as one parameter (matches the one-Value-per-param
+        // shape of `call_args`), so the dispatch guard compares like-for-like.
+        assert_eq!(crate::runtime::proxy::count_descriptor_params("()V"), 0);
+        assert_eq!(crate::runtime::proxy::count_descriptor_params("(I)V"), 1);
+        assert_eq!(
+            crate::runtime::proxy::count_descriptor_params("(JD)V"),
+            2,
+            "long+double are one param each"
+        );
+        assert_eq!(
+            crate::runtime::proxy::count_descriptor_params("(Ljava/lang/String;[IJ)Z"),
+            3
+        );
     }
 
     #[test]

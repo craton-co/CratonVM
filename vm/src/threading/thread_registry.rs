@@ -56,10 +56,14 @@ struct ThreadEntry {
     /// Stores the raw address of a `Throwable`-shaped `ObjectRef`. We
     /// use `AtomicUsize` (0 = empty) rather than a `Mutex<Option<ObjectRef>>`
     /// so the setter doesn't need to take a lock and cannot block the
-    /// stopping thread. The pointee must be kept alive by the caller
-    /// until the target thread consumes it (GC roots scan the target
-    /// thread's frames; the `stop()` helper allocates the Throwable
-    /// from the caller's heap which is reachable until handoff).
+    /// stopping thread.
+    ///
+    /// B1 fix — the GC treats a non-zero slot as a strong root: it is
+    /// scanned in `collect_all_root_snapshots` and repointed in
+    /// `update_thread_objs_after_gc`, so the pointee stays live and
+    /// non-dangling across a moving GC for the whole post→consume window
+    /// (a fresh `Thread.stop` throwable is generally NOT frame-reachable
+    /// on the target, so this slot is the only thing keeping it alive).
     async_exception_slot: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -174,12 +178,15 @@ impl ThreadRegistry {
 
     /// T1.5.1 — Post an asynchronous exception to the target thread.
     ///
-    /// The target will raise the exception at its next safepoint. The
-    /// caller must guarantee that `throwable` remains reachable as a
-    /// GC root until the target consumes it; in practice this means
-    /// allocating the Throwable in the caller's heap (roots from the
-    /// target's frames will pick it up once stored) OR handing over a
-    /// reference held by a reachable static field.
+    /// The target will raise the exception at its next safepoint.
+    ///
+    /// B1 fix — once stored, the slot is itself a GC root: it is scanned
+    /// in `collect_all_root_snapshots` and remapped in
+    /// `update_thread_objs_after_gc`, so the throwable stays alive and
+    /// non-dangling across any moving GC in the post→consume window. The
+    /// caller therefore no longer needs to keep `throwable` independently
+    /// reachable (it previously had to be frame- or static-reachable, which
+    /// was not guaranteed for a freshly allocated `Thread.stop` throwable).
     pub fn post_async_exception(
         &self,
         thread_id: ThreadId,
@@ -436,6 +443,15 @@ impl ThreadRegistry {
 
     /// Collect root snapshots from all alive threads.
     /// Returns a combined vector of all ObjectRefs from all threads' snapshots.
+    ///
+    /// B1 fix — also reports each thread's pending **async-exception slot**
+    /// (`async_exception_slot`, set by a cross-thread `Thread.stop` /
+    /// `post_async_exception` and consumed at the target's next safepoint).
+    /// The stored throwable is a fresh Java object that is generally NOT
+    /// held by the target's frames between post and consume, so without
+    /// scanning it here a young/moving GC could collect it (no root keeps
+    /// it alive) — the target would then raise a reclaimed object. The
+    /// matching remap is in `update_thread_objs_after_gc` (gc.rs step 21).
     pub fn collect_all_root_snapshots(&self) -> Vec<ObjectRef> {
         let threads = self.threads.lock();
         let mut all_roots = Vec::new();
@@ -443,6 +459,17 @@ impl ThreadRegistry {
             if entry.alive.load(Ordering::Acquire) {
                 let snapshot = entry.root_snapshot.lock();
                 all_roots.extend(snapshot.iter().copied());
+            }
+            // A posted async exception must survive even if the target
+            // thread is dead-but-not-yet-reaped: it may still be consumed
+            // on a final safepoint. Scan regardless of `alive`.
+            let raw = entry
+                .async_exception_slot
+                .load(std::sync::atomic::Ordering::Acquire);
+            if raw != 0 {
+                // SAFETY: a non-zero slot holds a valid `ObjectRef::as_ptr()`
+                // address written by `post_async_exception`.
+                all_roots.push(unsafe { ObjectRef::from_raw(raw as *mut u8) });
             }
         }
         all_roots
@@ -481,6 +508,23 @@ impl ThreadRegistry {
                     // SAFETY: produced by the GC pointer map.
                     *obj = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
                     rekeyed.push((old_addr, new_addr));
+                }
+            }
+            // B1 fix — repoint a pending async-exception slot too. It stores
+            // the raw address of a posted `Throwable`; a moving collection
+            // relocates that object, so without this the slot dangles and
+            // the target raises a stale/garbage object at its next
+            // safepoint. The slot is scanned as a root in
+            // `collect_all_root_snapshots`, so the object is kept alive and
+            // therefore present in the pointer map when it moved.
+            let old_exc = entry
+                .async_exception_slot
+                .load(std::sync::atomic::Ordering::Acquire);
+            if old_exc != 0 {
+                if let Some(&new_exc) = pointer_map.get(&old_exc) {
+                    entry
+                        .async_exception_slot
+                        .store(new_exc, std::sync::atomic::Ordering::Release);
                 }
             }
         }
@@ -764,6 +808,81 @@ mod tests {
     fn unknown_thread_not_alive() {
         let registry = ThreadRegistry::new();
         assert!(!registry.is_alive(ThreadId(99)));
+    }
+
+    // -----------------------------------------------------------------
+    // B1 — async-exception slot is a GC root and is remapped
+    // -----------------------------------------------------------------
+
+    /// Build a non-null, 8-byte-aligned dummy heap address. The registry
+    /// only round-trips the address (scan as root / remap) and never
+    /// dereferences it, so a live `Box` allocation is a safe stand-in for
+    /// a real heap object pointer.
+    fn dummy_aligned_objref(backing: &mut [u64; 2]) -> ObjectRef {
+        let ptr = backing.as_mut_ptr() as *mut u8;
+        // SAFETY: `backing` is a live, 8-byte-aligned, non-null allocation.
+        unsafe { ObjectRef::from_raw(ptr) }
+    }
+
+    /// A posted async exception is reported as a GC root by
+    /// `collect_all_root_snapshots` (so a moving GC cannot collect it
+    /// before the target consumes it).
+    #[test]
+    fn b1_async_exception_slot_is_a_root() {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+        registry.register(tid, "victim", None);
+
+        let mut backing = [0u64; 2];
+        let throwable = dummy_aligned_objref(&mut backing);
+
+        // No async exception posted yet → not a root.
+        assert!(registry.collect_all_root_snapshots().is_empty());
+
+        assert!(registry.post_async_exception(tid, throwable));
+
+        let roots = registry.collect_all_root_snapshots();
+        assert_eq!(roots.len(), 1, "posted async exception must be a root");
+        assert_eq!(roots[0].as_ptr(), throwable.as_ptr());
+
+        // Consuming the slot removes the root.
+        let taken = registry.take_async_exception(tid).expect("posted");
+        assert_eq!(taken.as_ptr(), throwable.as_ptr());
+        assert!(registry.collect_all_root_snapshots().is_empty());
+    }
+
+    /// After a moving GC relocates the throwable,
+    /// `update_thread_objs_after_gc` repoints the slot to the new address,
+    /// so `take_async_exception` hands back the relocated (live) object
+    /// rather than a dangling from-space pointer.
+    #[test]
+    fn b1_async_exception_slot_is_remapped() {
+        let registry = ThreadRegistry::new();
+        let tid = ThreadId(1);
+        registry.register(tid, "victim", None);
+
+        let mut old_backing = [0u64; 2];
+        let mut new_backing = [0u64; 2];
+        let old_ref = dummy_aligned_objref(&mut old_backing);
+        let new_ref = dummy_aligned_objref(&mut new_backing);
+        let old_addr = old_ref.as_ptr() as usize;
+        let new_addr = new_ref.as_ptr() as usize;
+        assert_ne!(old_addr, new_addr);
+
+        assert!(registry.post_async_exception(tid, old_ref));
+
+        // Simulate a moving collection that relocated old → new.
+        let mut pm = HashMap::new();
+        pm.insert(old_addr, new_addr);
+        registry.update_thread_objs_after_gc(&pm);
+
+        // The target now consumes the RELOCATED address, not the stale one.
+        let taken = registry.take_async_exception(tid).expect("posted");
+        assert_eq!(
+            taken.as_ptr() as usize,
+            new_addr,
+            "slot must be repointed to the relocated throwable",
+        );
     }
 
     #[test]

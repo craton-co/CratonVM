@@ -1315,16 +1315,37 @@ fn s2_bb_arr(ctx: &dyn NativeContext, buf: ObjectRef) -> Option<ObjectRef> {
 }
 
 fn s2_bb_get_byte(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i8 {
+    // B8: a negative `idx` (overflowed/garbage index from Java bytecode)
+    // would become a huge `usize` and either panic or read out of bounds.
+    // Bound-check explicitly here: a negative or out-of-range index reads
+    // back 0 (the JDK would throw IndexOutOfBoundsException; our synthetic
+    // path stays panic-free and returns a benign zero byte instead).
+    if idx < 0 {
+        return 0;
+    }
     if let Some(arr) = s2_bb_arr(ctx, buf) {
-        ctx.get_array_element(arr, idx as usize).as_int().unwrap_or(0) as i8
+        let i = idx as usize;
+        if i >= ctx.array_length(arr) {
+            return 0;
+        }
+        ctx.get_array_element(arr, i).as_int().unwrap_or(0) as i8
     } else {
         0
     }
 }
 
 fn s2_bb_put_byte(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, b: i8) {
+    // B8: mirror the read-side bound check — a negative or out-of-range
+    // index is silently dropped rather than panicking / clobbering memory.
+    if idx < 0 {
+        return;
+    }
     if let Some(arr) = s2_bb_arr(ctx, buf) {
-        ctx.set_array_element(arr, idx as usize, Value::Int(b as i32));
+        let i = idx as usize;
+        if i >= ctx.array_length(arr) {
+            return;
+        }
+        ctx.set_array_element(arr, i, Value::Int(b as i32));
     }
 }
 
@@ -1341,9 +1362,31 @@ fn s2_bb_remaining_bytes(ctx: &dyn NativeContext, buf: ObjectRef) -> Vec<u8> {
     }
 }
 
+/// B8: compute `idx + off` for a multi-byte ByteBuffer access without
+/// overflowing. A wrap (in release) or panic (in debug) is reachable when
+/// Java bytecode hands us an `idx` near `i32::MAX`. On overflow we return a
+/// negative sentinel, which `s2_bb_get_byte` / `s2_bb_put_byte` treat as
+/// out-of-range (read 0 / drop the write) — matching the benign behaviour of
+/// a genuine bounds miss.
+#[inline]
+fn s2_bb_off(idx: i32, off: i32) -> i32 {
+    idx.checked_add(off).unwrap_or(-1)
+}
+
+/// B8: byte offset of int-unit index `unit` (relative to byte-start `bs`),
+/// i.e. `bs + unit * 4`, computed without overflow. Used by the IntBuffer
+/// view get/put. Overflow saturates to a negative sentinel so the byte
+/// accessors treat it as out-of-range.
+#[inline]
+fn s2_bb_int_byte_off(bs: i32, unit: i32) -> i32 {
+    unit.checked_mul(4)
+        .and_then(|b| bs.checked_add(b))
+        .unwrap_or(-1)
+}
+
 fn s2_bb_read2(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i16 {
     let b0 = s2_bb_get_byte(ctx, buf, idx) as u8 as u16;
-    let b1 = s2_bb_get_byte(ctx, buf, idx + 1) as u8 as u16;
+    let b1 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 1)) as u8 as u16;
     if s2_bb_order(ctx, buf) == 1 { (b1 << 8 | b0) as i16 } else { (b0 << 8 | b1) as i16 }
 }
 
@@ -1354,14 +1397,14 @@ fn s2_bb_write2(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, val: i16) {
         ((val >> 8) as u8, val as u8)
     };
     s2_bb_put_byte(ctx, buf, idx, b0 as i8);
-    s2_bb_put_byte(ctx, buf, idx + 1, b1 as i8);
+    s2_bb_put_byte(ctx, buf, s2_bb_off(idx, 1), b1 as i8);
 }
 
 fn s2_bb_read4(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i32 {
     let b0 = s2_bb_get_byte(ctx, buf, idx) as u8 as u32;
-    let b1 = s2_bb_get_byte(ctx, buf, idx + 1) as u8 as u32;
-    let b2 = s2_bb_get_byte(ctx, buf, idx + 2) as u8 as u32;
-    let b3 = s2_bb_get_byte(ctx, buf, idx + 3) as u8 as u32;
+    let b1 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 1)) as u8 as u32;
+    let b2 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 2)) as u8 as u32;
+    let b3 = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, 3)) as u8 as u32;
     if s2_bb_order(ctx, buf) == 1 {
         (b3 << 24 | b2 << 16 | b1 << 8 | b0) as i32
     } else {
@@ -1372,14 +1415,14 @@ fn s2_bb_read4(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i32 {
 fn s2_bb_write4(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, val: i32) {
     let bytes = if s2_bb_order(ctx, buf) == 1 { val.to_le_bytes() } else { val.to_be_bytes() };
     for (i, &b) in bytes.iter().enumerate() {
-        s2_bb_put_byte(ctx, buf, idx + i as i32, b as i8);
+        s2_bb_put_byte(ctx, buf, s2_bb_off(idx, i as i32), b as i8);
     }
 }
 
 fn s2_bb_read8(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i64 {
     let mut bs = [0u8; 8];
     for i in 0..8i32 {
-        bs[i as usize] = s2_bb_get_byte(ctx, buf, idx + i) as u8;
+        bs[i as usize] = s2_bb_get_byte(ctx, buf, s2_bb_off(idx, i)) as u8;
     }
     if s2_bb_order(ctx, buf) == 1 { i64::from_le_bytes(bs) } else { i64::from_be_bytes(bs) }
 }
@@ -1387,7 +1430,7 @@ fn s2_bb_read8(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32) -> i64 {
 fn s2_bb_write8(ctx: &dyn NativeContext, buf: ObjectRef, idx: i32, val: i64) {
     let bytes = if s2_bb_order(ctx, buf) == 1 { val.to_le_bytes() } else { val.to_be_bytes() };
     for (i, &b) in bytes.iter().enumerate() {
-        s2_bb_put_byte(ctx, buf, idx + i as i32, b as i8);
+        s2_bb_put_byte(ctx, buf, s2_bb_off(idx, i as i32), b as i8);
     }
 }
 
@@ -2702,7 +2745,10 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             return Err(RuntimeError::BufferUnderflowException.into());
         }
         let bs = { let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1); if m < 0 { -(m+1) } else { 0 } };
-        let v  = s2_bb_read4(ctx, this, bs + pos * 4);
+        // B8: `pos * 4` and the following add can overflow for a corrupt
+        // position; `s2_bb_int_byte_off` saturates to a negative sentinel that
+        // the byte accessors treat as out-of-range.
+        let v  = s2_bb_read4(ctx, this, s2_bb_int_byte_off(bs, pos));
         ctx.set_field(this, BB_POS, Value::Int(pos + 1));
         Ok(Some(Value::Int(v)))
     });
@@ -2710,7 +2756,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let idx  = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let bs   = { let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1); if m < 0 { -(m+1) } else { 0 } };
-        Ok(Some(Value::Int(s2_bb_read4(ctx, this, bs + idx * 4))))
+        Ok(Some(Value::Int(s2_bb_read4(ctx, this, s2_bb_int_byte_off(bs, idx)))))
     });
     r.register(ib, "put", "(I)Ljava/nio/IntBuffer;", |ctx, args| {
         let this = obj_arg(args, 0)?;
@@ -2720,7 +2766,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
             return Err(RuntimeError::BufferOverflowException.into());
         }
         let bs = { let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1); if m < 0 { -(m+1) } else { 0 } };
-        s2_bb_write4(ctx, this, bs + pos * 4, v);
+        s2_bb_write4(ctx, this, s2_bb_int_byte_off(bs, pos), v);
         ctx.set_field(this, BB_POS, Value::Int(pos + 1));
         Ok(Some(Value::Object(Some(this))))
     });
@@ -2729,7 +2775,7 @@ fn register_s2_bytebuffer(r: &mut NativeMethodRegistry) {
         let idx  = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         let v    = args.get(2).and_then(|v| v.as_int()).unwrap_or(0);
         let bs   = { let m = ctx.get_field(this, BB_MARK).as_int().unwrap_or(-1); if m < 0 { -(m+1) } else { 0 } };
-        s2_bb_write4(ctx, this, bs + idx * 4, v);
+        s2_bb_write4(ctx, this, s2_bb_int_byte_off(bs, idx), v);
         Ok(Some(Value::Object(Some(this))))
     });
 
@@ -3674,6 +3720,35 @@ mod tests {
         assert!(reg.streams.is_empty());
         assert!(reg.listeners.is_empty());
         assert!(reg.dgrams.is_empty());
+    }
+
+    // =======================================================================
+    // B8 — ByteBuffer relative-read index arithmetic must not overflow/panic.
+    // =======================================================================
+
+    #[test]
+    fn b8_bb_off_no_overflow_panic() {
+        // Normal case: simple addition.
+        assert_eq!(s2_bb_off(10, 3), 13);
+        assert_eq!(s2_bb_off(0, 7), 7);
+        // Overflow near i32::MAX must saturate to the negative out-of-range
+        // sentinel rather than panicking (debug) or wrapping (release).
+        assert_eq!(s2_bb_off(i32::MAX, 1), -1);
+        assert_eq!(s2_bb_off(i32::MAX - 2, 7), -1);
+        // A negative starting index stays negative (out-of-range sentinel).
+        assert!(s2_bb_off(-1, 1) < 0);
+    }
+
+    #[test]
+    fn b8_bb_int_byte_off_no_overflow_panic() {
+        // Normal case: byte offset = base + unit*4.
+        assert_eq!(s2_bb_int_byte_off(0, 3), 12);
+        assert_eq!(s2_bb_int_byte_off(8, 2), 16);
+        // `unit * 4` overflow saturates to the out-of-range sentinel.
+        assert_eq!(s2_bb_int_byte_off(0, i32::MAX), -1);
+        assert_eq!(s2_bb_int_byte_off(0, i32::MAX / 3), -1);
+        // `base + bytes` overflow also saturates.
+        assert_eq!(s2_bb_int_byte_off(i32::MAX, 1), -1);
     }
 
     // =======================================================================

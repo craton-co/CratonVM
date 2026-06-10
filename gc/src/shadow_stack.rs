@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2024-2026 Craton Software Company
+
 //! Per-thread **shadow stack** of live object references for precise,
 //! *rewritable* GC roots inside JIT-compiled code.
 //!

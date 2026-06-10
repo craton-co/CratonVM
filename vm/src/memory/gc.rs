@@ -304,6 +304,12 @@ pub fn update_all_roots(
     //     service after a moving GC.
     cratonvm_native_builtins::jboss_msc::gc_update_msc_service_refs(pointer_map);
 
+    // 19b. logmanager.rs cached LogManager / Logger / LogContext singletons and
+    //      the attachments table (Round-4 B4) — repoint the stored addresses to
+    //      their relocated locations after a moving GC. Scanned as roots in
+    //      `roots.rs` step 19b.
+    cratonvm_native_builtins::logmanager::gc_update_logmanager_refs(pointer_map);
+
     // 20. Blocked-thread root maintenance (the H2 TestScript stale-receiver
     //     SEGV fix). Threads parked in a blocking native (Object.wait /
     //     Thread.join / LockSupport.park / ReferenceQueue.remove) are

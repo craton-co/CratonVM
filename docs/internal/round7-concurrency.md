@@ -11,7 +11,7 @@ Two `SeqCst` fences around a plain multi-word `Value` write enforce ordering, no
 
 ## CRIT-2 — `ProfileStore::get_or_insert_borrowed` inverted lock order
 **File:** `jit/src/profile.rs:362-389`.
-Read path: `name_index.read()` → drop → `methods.write()` → `name_index.write()` (while still holding `methods.write()`, line 384). The forward path takes them L→R, the slow path R→L → classic AB/BA deadlock under contention. Neither lock is in `docs/lock-order.md`.
+Read path: `name_index.read()` → drop → `methods.write()` → `name_index.write()` (while still holding `methods.write()`, line 384). The forward path takes them L→R, the slow path R→L → classic AB/BA deadlock under contention. Neither lock is in `vm/src/runtime/lock_order.rs`.
 **Fix:** Enforce `methods > name_index`; drop `methods.write()` before taking `name_index.write()`. Add both to lock-order table.
 
 ## CRIT-3 — `ProfileStore::snapshot_all` holds outer read while locking per-entry mutex
@@ -72,7 +72,7 @@ JNI pin/unpin and GC root scan serialise on one Mutex.
 
 ## Process notes
 
-- **lock-order.md gaps:** `jit_cache`, `vtable_manager`, `name_index`+`methods` (ProfileStore), `osr_trampoline_cache`, `tiered.rs` triple lock — none documented.
+- **vm/src/runtime/lock_order.rs gaps:** `jit_cache`, `vtable_manager`, `name_index`+`methods` (ProfileStore), `osr_trampoline_cache`, `tiered.rs` triple lock — none documented.
 - **Channels:** `std::sync::mpsc` still in `vm/src/debug/*` and `native-io/src/lib.rs:12209-12266` — prefer `crossbeam_channel`. JFR `SpscEventRing` correctly lock-free post wave-1.
 - **Atomics:** No naked `.load/.store` without ordering. `SeqCst` elsewhere is conservative-correct; CRIT-1 is wrong about atomicity, not ordering.
 - **Thread pools:** no global pool; each subsystem spawns its own. Consider `rayon` for parallel-mark.

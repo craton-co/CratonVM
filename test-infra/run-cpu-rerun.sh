@@ -3,8 +3,8 @@
 set +e
 export MSYS2_ARG_CONV_EXCL='*'
 export MSYS_NO_PATHCONV=1
-ROOT="${ROOT:-C:/craton/CratonVM}"
-JDK="${JDK:-C:/Program Files/Java/jdk-25}"
+ROOT="${ROOT:-$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || echo C:/craton/CratonVM)}"
+JDK="${JDK:-${JAVA_HOME:-C:/Program Files/Java/jdk-25}}"
 CV="$ROOT/target-fresh-cpu/release/cratonvm.exe"
 LOG="$ROOT/test-infra/suite-results/cpu-rerun-$(date +%Y%m%d-%H%M%S).log"
 mkdir -p "$ROOT/test-infra/suite-results" "$ROOT/target/release"
@@ -12,7 +12,20 @@ exec > >(tee -a "$LOG") 2>&1
 
 echo "=== CPU rerun — build + bench + apps ==="
 echo "Log: $LOG"
-taskkill //F //IM cratonvm.exe 2>/dev/null || true
+
+# Kill ONLY leftover cratonvm.exe launched from THIS tree ($ROOT) so the copy
+# below isn't blocked by a locked binary, without touching a parallel suite /
+# another worktree / a dev session; never surface a no-match as a failure.
+kill_stray_cratonvm() {
+  local root_win
+  root_win=$(printf '%s' "$ROOT" | sed 's|/|\\\\|g')
+  powershell.exe -NoProfile -Command \
+    "Get-CimInstance Win32_Process -Filter \"Name='cratonvm.exe'\" |
+       Where-Object { \$_.ExecutablePath -and \$_.ExecutablePath -like '${root_win}*' } |
+       ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }" \
+    >/dev/null 2>&1 || true
+}
+kill_stray_cratonvm
 
 echo "--- compile bench + harness ---"
 "$JDK/bin/javac.exe" -d "$ROOT/bench" "$ROOT/bench/BenchSuite.java" 2>&1

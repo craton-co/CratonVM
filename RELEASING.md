@@ -62,20 +62,35 @@ This document describes how to cut a new release of CratonVM.
 
 ## 3. Publishing to crates.io (when ready)
 
-The workspace currently sets `publish = false` at `[workspace.package]`,
-so nothing is pushed to crates.io. To start publishing:
+Publish gating is **per-crate**, not workspace-wide. There is no
+`publish = false` at `[workspace.package]`; instead, the immature /
+non-shippable crates each carry their own `publish = false` in their
+`[package]` table, while every other library crate is publishable. As of
+this writing the crates fenced off with `publish = false` are:
 
-1. **Decide a per-crate publish policy.** Crates that are path-only
-   integration glue or contain bundled assets — `cuda-bridge`, `jit-cuda`,
-   `native-awt`, internal `fuzz` targets — should stay `publish = false`.
-2. **Override at the crate level** for each publishable crate by adding
-   `publish = true` to its own `[package]` table (this overrides the
-   workspace default).
-3. **Convert path-only deps to versioned form.** crates.io rejects pure
-   `{ path = "..." }` dependencies on publish. Bump each inter-crate
-   dependency to `{ path = "...", version = "X.Y.Z" }` so local builds
-   stay path-resolved while the published metadata has a version.
-4. **Publish in dependency order**, leaves first. A typical order is:
+- `cuda-bridge` — thin CUDA Driver API bridge (GPU offload, opt-in/immature),
+- `jit-cuda` — Java-bytecode → PTX lowering (GPU offload, opt-in/immature),
+- `craton-gpu` — build-time GPU-offload annotation sources,
+- `native-awt` — headless AWT/Swing/Java2D peers (immature),
+- `fuzz` — the libFuzzer harness (a nightly-only internal target, never published).
+
+Everything else — `cratonvm-types`, `cratonvm-reader`, `cratonvm-jit-api`,
+`cratonvm-native-api`, `cratonvm-gc`, `cratonvm-classloading`, `cratonvm-jit`,
+`cratonvm-jfr`, `cratonvm-native-collections`, `cratonvm-native-io`,
+`cratonvm-native-builtins`, `cratonvm-vm`, and `cratonvm-cli` — is publishable.
+
+To publish:
+
+1. **Confirm the publish gates.** Verify the GPU/AWT crates and `fuzz` above
+   still carry `publish = false`, and that no newly-added immature crate should
+   join that list. Set `publish = false` on a crate's own `[package]` table to
+   keep it off crates.io.
+2. **Path deps already carry versions.** Each inter-crate dependency is already
+   in the versioned form `{ path = "...", version = "X.Y.Z" }` (see §1) — local
+   builds resolve by path while the published metadata carries the version that
+   crates.io requires. Just keep the `version =` literals in lockstep with the
+   workspace version when you bump it.
+3. **Publish in dependency order**, leaves first. A typical order is:
    `cratonvm-types` → `cratonvm-reader` → `cratonvm-jit-api` →
    `cratonvm-native-api` → `cratonvm-gc` → `cratonvm-classloading` →
    `cratonvm-jit` → `cratonvm-jfr` → `cratonvm-native-collections` →

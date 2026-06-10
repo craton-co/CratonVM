@@ -13,10 +13,12 @@ Each file is a self-contained bug report with reproduction steps and a fix direc
 | [gap-nio-basicfileattributes-isdirectory.md](gap-nio-basicfileattributes-isdirectory.md) | High | `Files.walkFileTree` / JUnit Platform classpath scanner / any NIO file walk | **Fixed** (BFA natives promoted to real-JDK mode) |
 | [gap-bc-math-ec-crypto-regression-timeout.md](gap-bc-math-ec-crypto-regression-timeout.md) | High | BC `math-ec` TIMEOUT (F2m JIT ban); `crypto-regression` **RESOLVED** (342s, PASS) | math-ec Open |
 | [gap-anonymous-object-getinputstream.md](gap-anonymous-object-getinputstream.md) | Medium | Synthetic `Process` had no reachable natives (`getInputStream`/`waitFor`/`isAlive`/...) — root cause was the ClassId(0) alloc fallback, not anonymous-class proxies | **Fixed** (branch `fix/anonymous-object-getinputstream`) |
-| [gap-gpu-compute-large-n-crash.md](gap-gpu-compute-large-n-crash.md) | Medium | GPU offload crashes at N=2²⁸ (GpuCompute.heavy); works at N≤2²⁴ with 14.8× speedup | Open |
+| [gap-gpu-compute-large-n-crash.md](gap-gpu-compute-large-n-crash.md) | Medium | GPU offload crashes at N=2²⁸ (GpuCompute.heavy); stable to N=2²⁶ (582ms GPU vs 106ms HotSpot CPU; TornadoVM 119ms) | Open (N=2²⁸ only) |
 | [gap-jit-ternary-in-loop-increment.md](gap-jit-ternary-in-loop-increment.md) | Medium | Any code using `i += i == 0 ? a : b` (ternary in for-loop step) | **Fixed** (const peepholes no longer fuse across merge points) |
 | [gap-jit-canonicalize-operand-clobber.md](gap-jit-canonicalize-operand-clobber.md) | High | Conditional branches with a register-allocated local below frame-resident operands (methods with >7 live int locals); `swap` of two frame slots was a no-op | **Fixed** (alias-safe parallel-move canonicalization, canonicalize-before-pop, swap repair) |
 | [gap-bintrees18-gc-throughput.md](gap-bintrees18-gc-throughput.md) | High | bintrees18 58× GC throughput deficit — non-moving sweep cannot tenure depth-18 live set | Open (needs precise JIT stack maps) |
+| [gap-junit5-test-discovery.md](gap-junit5-test-discovery.md) | High | JUnit5 test discovery blocked by 3 bugs: `FileSystemProvider.newFileSystem` no-Code, NIO `Path.exists` wrong on Windows abs paths, NPE in `MethodSelector` reflection | **Fixed** (branch `fix/junit5-test-discovery`; not yet merged) |
+| [gap-phaser-real-bytecode-state.md](gap-phaser-real-bytecode-state.md) | Medium | Real `Phaser` bytecode misexecutes in real-JDK builds (`state` reads 0, `root` reads null → NPE in `reconcileState`); synthetic natives are synthetic-jdk-only so nothing masks it | Open |
 
 ---
 
@@ -24,8 +26,8 @@ Each file is a self-contained bug report with reproduction steps and a fix direc
 
 | App | File | Open bugs |
 |---|---|---|
-| WildFly health tests | [apps/wildfly/CRATONVM_BUGS.md](../../apps/wildfly/CRATONVM_BUGS.md) | ~~testSchema (Premature EOF)~~ **FIXED** (2026-06-10); testSubsystem (ISE no-message) + stack-trace loss still open |
-| Elasticsearch 8.15.5 | [apps/elasticsearch-8.15.5/CRATONVM_BUGS.md](../../apps/elasticsearch-8.15.5/CRATONVM_BUGS.md) | Log4j2 NPE on array reflection param, XContent ServiceLoader gap |
+| WildFly health tests | [apps/wildfly/CRATONVM_BUGS.md](../../apps/wildfly/CRATONVM_BUGS.md) | ~~testSchema~~ FIXED; testSubsystem now loops in `AccessConstraintDefinition.Factory` get_field(0) on 0-slot objects (was ISE 4.3s; now TIMEOUT 300s — deeper progress) |
+| Elasticsearch 8.15.5 | [apps/elasticsearch-8.15.5/CRATONVM_BUGS.md](../../apps/elasticsearch-8.15.5/CRATONVM_BUGS.md) | ~~Log4j2 NPE + XContent ServiceLoader~~ **BOTH FIXED** (dev `aac45ade`) — elasticsearch-version PASS ✅ |
 | Commons Math 4 | [apps/_test-suites/commons-math/CRATONVM_BUGS.md](../../apps/_test-suites/commons-math/CRATONVM_BUGS.md) | JIT dispatch InternalError, BasicFileAttributes NIO gap |
 | Bouncy Castle | [apps/_test-suites/bc-java/CLAUDE.md](../../apps/_test-suites/bc-java/CLAUDE.md) | math-ec TIMEOUT (only remaining); crypto-regression PASS (342s) |
 

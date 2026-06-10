@@ -45,7 +45,7 @@ an individual is officially representing the community in public spaces.
 ## Enforcement
 
 Instances of abusive, harassing, or otherwise unacceptable behavior may be
-reported by emailing **conduct@craton.co** or by opening a GitHub issue with
+reported by emailing **conduct@craton.com.ar** or by opening a GitHub issue with
 the `conduct` label. All reports will be handled confidentially.
 
 All complaints will be reviewed and investigated promptly and fairly.

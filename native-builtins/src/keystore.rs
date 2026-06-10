@@ -772,7 +772,7 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
 
     let Some(store) = keystore_lookup(id) else {
         return Ok(Some(Value::Object(None)));
@@ -806,7 +806,7 @@ fn engine_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
 fn engine_get_certificate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
 
     let Some(store) = keystore_lookup(id) else { return Ok(Some(Value::Object(None))); };
     let Some(entry) = store.entries.get(&alias) else { return Ok(Some(Value::Object(None))); };
@@ -825,7 +825,7 @@ fn engine_get_certificate(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 fn engine_get_certificate_chain(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
 
     let Some(store) = keystore_lookup(id) else { return Ok(Some(Value::Object(None))); };
     let Some(entry) = store.entries.get(&alias) else { return Ok(Some(Value::Object(None))); };
@@ -881,7 +881,7 @@ fn engine_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 fn engine_contains_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
     let present = keystore_lookup(id).map(|s| s.entries.contains_key(&alias)).unwrap_or(false);
     Ok(Some(Value::Int(if present { 1 } else { 0 })))
 }
@@ -889,7 +889,7 @@ fn engine_contains_alias(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 fn engine_is_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
     let yes = keystore_lookup(id)
         .and_then(|s| s.entries.get(&alias).map(|e| matches!(e.kind, EntryKind::PrivateKey { .. })))
         .unwrap_or(false);
@@ -899,7 +899,7 @@ fn engine_is_key_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 fn engine_is_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
     let yes = keystore_lookup(id)
         .and_then(|s| s.entries.get(&alias).map(|e| matches!(e.kind, EntryKind::TrustedCert { .. })))
         .unwrap_or(false);
@@ -909,7 +909,7 @@ fn engine_is_certificate_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> M
 fn engine_get_creation_date(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let id = get_store_id(ctx, this);
-    let alias = args.get(1).and_then(read_string_arg).map(|s| s.to_string()).unwrap_or_default();
+    let alias = args.get(1).and_then(|v| read_string_arg(ctx, v)).unwrap_or_default();
     let ms = keystore_lookup(id).and_then(|s| s.entries.get(&alias).map(|e| e.creation_time_ms)).unwrap_or(0);
 
     // java/util/Date has a single `fastTime` long field in real-JDK layout
@@ -923,13 +923,21 @@ fn engine_get_creation_date(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 // Helpers — store-id stash, mirror allocation, alias decode
 // ---------------------------------------------------------------------------
 
-fn read_string_arg(v: &Value) -> Option<&'static str> {
-    // Caller passes &Value but we need to dispatch through ctx.read_string —
-    // those callers do that themselves. This helper is a placeholder so the
-    // pattern is uniform across `engineFoo` callbacks: real reads go through
-    // the longer form below.
-    let _ = v;
-    None
+/// Extract the alias `String` argument of an `engine*` callback.
+///
+/// The alias is the second arg (`args.get(1)`) of every alias-taking
+/// `engine*` method (`engineGetKey`, `engineGetCertificate`, …). It arrives
+/// as a `Value::Object(Some(string_ref))`; we decode it through the
+/// `NativeContext::read_string` accessor the rest of `native-builtins` uses
+/// (e.g. `log4j_extras::extract_logger_name`). Returns `None` for a null /
+/// non-string arg so the caller can `.unwrap_or_default()` to the empty
+/// alias, matching real-JDK's behaviour of treating a null alias as "no such
+/// entry".
+fn read_string_arg(ctx: &mut dyn NativeContext, v: &Value) -> Option<String> {
+    match v {
+        Value::Object(Some(o)) => ctx.read_string(*o),
+        _ => None,
+    }
 }
 
 fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, cert_der: &[u8]) -> ObjectRef {

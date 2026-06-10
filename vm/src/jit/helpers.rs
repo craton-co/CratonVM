@@ -1136,7 +1136,15 @@ pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
     let ptr = array_ptr as *const u8;
     let length = *(ptr.add(ARRAY_LENGTH_OFFSET) as *const u32) as i64;
     if index < 0 || index >= length {
-        return 0;
+        // JVMS §baload: throw ArrayIndexOutOfBoundsException on an out-of-bounds
+        // index. Previously returned 0, which silently fabricated a zero byte and
+        // masked real OOB bugs in user code — the same silent-fabrication class the
+        // null arm above was fixed for. Mirror `jit_throw_aioobe`: flag the pending
+        // AIOOBE and return the `i64::MIN` deopt sentinel so the post-JIT interpreter
+        // path constructs the real exception and routes it through the method's
+        // exception table.
+        JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+        return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize);
     *elem_ptr as i8 as i64
@@ -1185,6 +1193,13 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
     let ptr = array_ptr as *mut u8;
     let length = *(ptr.add(ARRAY_LENGTH_OFFSET) as *const u32) as i64;
     if index < 0 || index >= length {
+        // JVMS §bastore: throw ArrayIndexOutOfBoundsException on an out-of-bounds
+        // index. Previously the store was silently dropped, masking real OOB bugs.
+        // The void return cannot carry the `i64::MIN` deopt sentinel, so — exactly
+        // like the void-return null arm above — we set the pending-AIOOBE flag and
+        // return; the interpreter's post-JIT drain surfaces the exception at this
+        // method (see `take_jit_pending_aioobe` in runtime/interpreter.rs).
+        JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
         return;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize);
@@ -1207,7 +1222,11 @@ pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
     let ptr = array_ptr as *const u8;
     let length = *(ptr.add(ARRAY_LENGTH_OFFSET) as *const u32) as i64;
     if index < 0 || index >= length {
-        return 0;
+        // JVMS §iaload: throw ArrayIndexOutOfBoundsException on an out-of-bounds
+        // index (same protocol as `jit_throw_aioobe`). Previously returned 0,
+        // silently fabricating a zero element and masking real OOB bugs.
+        JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+        return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * 4) as *const i32;
     *elem_ptr as i64
@@ -1230,6 +1249,12 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
     let ptr = array_ptr as *mut u8;
     let length = *(ptr.add(ARRAY_LENGTH_OFFSET) as *const u32) as i64;
     if index < 0 || index >= length {
+        // JVMS §iastore: throw ArrayIndexOutOfBoundsException on an out-of-bounds
+        // index. Previously the store was silently dropped. Set the pending-AIOOBE
+        // flag and return — the void return cannot carry the deopt sentinel, so the
+        // interpreter's post-JIT drain surfaces the exception (same void-arm protocol
+        // as the null case above).
+        JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
         return;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * 4) as *mut i32;
@@ -1250,7 +1275,11 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
     let ptr = array_ptr as *const u8;
     let length = *(ptr.add(ARRAY_LENGTH_OFFSET) as *const u32) as i64;
     if index < 0 || index >= length {
-        return 0;
+        // JVMS §aaload: throw ArrayIndexOutOfBoundsException on an out-of-bounds
+        // index (same protocol as `jit_throw_aioobe`). Previously returned 0 (null),
+        // silently fabricating a null element and masking real OOB bugs.
+        JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
+        return i64::MIN;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * REF_ELEMENT_SIZE) as *const u64;
     std::ptr::read(elem_ptr) as i64
@@ -1275,6 +1304,12 @@ pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, va
     let ptr = array_ptr as *mut u8;
     let length = *(ptr.add(ARRAY_LENGTH_OFFSET) as *const u32) as i64;
     if index < 0 || index >= length {
+        // JVMS §aastore: throw ArrayIndexOutOfBoundsException on an out-of-bounds
+        // index. Previously the store was silently dropped. Set the pending-AIOOBE
+        // flag and return BEFORE the SATB barrier / write below (no element is read
+        // or written on the OOB path). The void return cannot carry the deopt
+        // sentinel, so the interpreter's post-JIT drain surfaces the exception.
+        JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
         return;
     }
     let elem_ptr = ptr.add(HEADER_SIZE + index as usize * REF_ELEMENT_SIZE) as *mut u64;
@@ -1376,9 +1411,33 @@ pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
 // to a live object. field_index is the resolved field slot index within the object layout.
 // ptr::read is used because Value may contain non-Copy variants (ObjectRef).
 pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
-    if obj_ptr == 0 { return 0; }
-    // SAFETY: obj_ptr is non-null and points to a live object. HEADER_SIZE + field_index * SLOT_SIZE
-    // is within the object's allocated region because field_index was resolved at JIT compile time.
+    if obj_ptr == 0 {
+        // JVMS §getfield: throw NullPointerException on a null receiver.
+        // Previously returned 0, which silently fabricated a zero/null field
+        // value and masked real null-deref bugs in user code — the same
+        // silent-fabrication class the array-load helpers were fixed for.
+        // Flag the pending NPE (drained on every JIT method return — see
+        // `take_jit_pending_npe` in runtime/interpreter.rs) and return the
+        // `i64::MIN` deopt sentinel, mirroring `jit_arraylength`.
+        set_jit_pending_npe();
+        return i64::MIN;
+    }
+    // B2 fix (audit `vm-runtime.md`): bounds-check the field slot against the
+    // receiver's declared `num_slots` BEFORE the raw read, mirroring the
+    // symmetric `jit_putfield_slot_in_bounds` guard on every `jit_putfield_*`
+    // helper. Without this, a stale `field_index` (synthetic/real-JDK layout
+    // drift) or an operand-stack miscompile reads `obj + HEADER + index*SLOT`
+    // out of the object and into the *neighbouring* heap object, leaking its
+    // bytes back to JIT'd Java as an i64/object pointer (info leak + potential
+    // follow-on UAF if interpreted as a ref). The interpreter (`get_field`)
+    // returns a default for an out-of-range slot rather than reading past the
+    // object; match that by returning 0 without dereferencing.
+    if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
+        return 0;
+    }
+    // SAFETY: obj_ptr is non-null and points to a live object, and field_index is now
+    // verified < num_slots, so HEADER_SIZE + field_index * SLOT_SIZE is within the
+    // object's allocated region.
     let ptr = (obj_ptr as *const u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
     let val: Value = std::ptr::read(ptr as *const Value);
     let result = match val {
@@ -3463,11 +3522,203 @@ mod tests {
         assert!(take_jit_pending_npe(), "aastore(null) must set pending NPE flag");
     }
 
+    // ----------------------------------------------------------------------
+    // B1 fix (review `vm-runtime.md`): the array load/store helpers used to
+    // silently swallow an out-of-bounds index (load returned a fabricated 0 /
+    // null, store dropped the write) instead of raising AIOOBE, diverging from
+    // JVMS and masking real bugs. They now mirror `jit_throw_aioobe`: set the
+    // pending-AIOOBE payload + return the `i64::MIN` deopt sentinel (loads) /
+    // set the flag and return (void stores). The fast in-bounds path is
+    // unchanged — verified by the round-trip assertions below.
+    // ----------------------------------------------------------------------
+
+    /// Allocate a small real heap and a single array on it. Returns the owning
+    /// `SharedVm` box (kept alive by the caller) and the raw array pointer the
+    /// JIT helpers consume.
+    fn alloc_test_array(et: ArrayElementType, len: usize) -> (Box<crate::vm::SharedVm>, i64) {
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        let mut config = VmConfig::default();
+        config.max_heap_size = 4 * 1024 * 1024; // 4 MB — plenty for one tiny array
+        config.initial_heap_size = 4 * 1024 * 1024;
+        let vm_box: Box<SharedVm> = Box::new(SharedVm::new(config));
+        let arr = vm_box.heap.alloc_array(ClassId::new(0), et, len);
+        let arr_ptr = arr.as_ptr() as i64;
+        (vm_box, arr_ptr)
+    }
+
     #[test]
-    fn jit_getfield_null_returns_zero() {
+    fn jit_iaload_oob_sets_pending_aioobe() {
+        let _ = take_jit_pending_aioobe(); // clear any prior state
+        let (_vm, arr_ptr) = alloc_test_array(ArrayElementType::Int, 4);
+        // SAFETY: arr_ptr is a live int[4] on the test heap; index 4 is out of
+        // bounds so the helper takes the bounds-check arm and never dereferences
+        // an element. index -1 is likewise rejected before any element read.
+        let hi = unsafe { jit_iaload(arr_ptr, 4) };
+        assert_eq!(hi, i64::MIN, "iaload OOB-high must return the deopt sentinel");
+        assert_eq!(
+            take_jit_pending_aioobe(),
+            Some((4, 4)),
+            "iaload OOB-high must set pending AIOOBE (index, length)"
+        );
+        let lo = unsafe { jit_iaload(arr_ptr, -1) };
+        assert_eq!(lo, i64::MIN, "iaload OOB-low must return the deopt sentinel");
+        assert_eq!(
+            take_jit_pending_aioobe(),
+            Some((-1, 4)),
+            "iaload OOB-low (negative index) must set pending AIOOBE"
+        );
+    }
+
+    #[test]
+    fn jit_iastore_oob_sets_pending_aioobe() {
+        let _ = take_jit_pending_aioobe();
+        let (_vm, arr_ptr) = alloc_test_array(ArrayElementType::Int, 4);
+        // SAFETY: arr_ptr is a live int[4]; index 7 is OOB so the store is not
+        // performed and no element pointer is dereferenced.
+        unsafe { jit_iastore(arr_ptr, 7, 0x1234) };
+        assert_eq!(
+            take_jit_pending_aioobe(),
+            Some((7, 4)),
+            "iastore OOB must set pending AIOOBE and not write past the array"
+        );
+    }
+
+    #[test]
+    fn jit_baload_oob_sets_pending_aioobe() {
+        let _ = take_jit_pending_aioobe();
+        let (_vm, arr_ptr) = alloc_test_array(ArrayElementType::Byte, 2);
+        // SAFETY: arr_ptr is a live byte[2]; index 2 is OOB.
+        let r = unsafe { jit_baload(arr_ptr, 2) };
+        assert_eq!(r, i64::MIN, "baload OOB must return the deopt sentinel");
+        assert_eq!(take_jit_pending_aioobe(), Some((2, 2)));
+    }
+
+    #[test]
+    fn jit_bastore_oob_sets_pending_aioobe() {
+        let _ = take_jit_pending_aioobe();
+        let (_vm, arr_ptr) = alloc_test_array(ArrayElementType::Byte, 2);
+        // SAFETY: arr_ptr is a live byte[2]; index 5 is OOB so no write occurs.
+        unsafe { jit_bastore(arr_ptr, 5, 0xFF) };
+        assert_eq!(take_jit_pending_aioobe(), Some((5, 2)));
+    }
+
+    #[test]
+    fn jit_aaload_oob_sets_pending_aioobe() {
+        let _ = take_jit_pending_aioobe();
+        let (_vm, arr_ptr) = alloc_test_array(ArrayElementType::Reference, 3);
+        // SAFETY: arr_ptr is a live Object[3]; index 3 is OOB.
+        let r = unsafe { jit_aaload(arr_ptr, 3) };
+        assert_eq!(r, i64::MIN, "aaload OOB must return the deopt sentinel");
+        assert_eq!(take_jit_pending_aioobe(), Some((3, 3)));
+    }
+
+    #[test]
+    fn jit_aastore_oob_sets_pending_aioobe() {
+        let _ = take_jit_pending_aioobe();
+        let (vm, arr_ptr) = alloc_test_array(ArrayElementType::Reference, 3);
+        let vm_ptr = &*vm as *const crate::vm::SharedVm as i64;
+        // SAFETY: arr_ptr is a live Object[3]; index 9 is OOB so the helper
+        // returns BEFORE the SATB barrier / element write and never touches
+        // vm_ptr or val. vm_ptr is a live SharedVm regardless.
+        unsafe { jit_aastore(vm_ptr, arr_ptr, 9, 0) };
+        assert_eq!(take_jit_pending_aioobe(), Some((9, 3)));
+    }
+
+    #[test]
+    fn jit_int_array_in_bounds_roundtrip_unchanged() {
+        // The fast in-bounds path must be untouched by the B1 fix: a value
+        // stored at a valid index reads back identically, and no AIOOBE flag
+        // is left pending.
+        let _ = take_jit_pending_aioobe();
+        let (_vm, arr_ptr) = alloc_test_array(ArrayElementType::Int, 4);
+        // SAFETY: arr_ptr is a live int[4]; indices 0..4 are all in bounds.
+        unsafe {
+            jit_iastore(arr_ptr, 0, 11);
+            jit_iastore(arr_ptr, 3, -7);
+        }
+        assert!(
+            take_jit_pending_aioobe().is_none(),
+            "in-bounds stores must NOT set the AIOOBE flag"
+        );
+        // SAFETY: in-bounds loads.
+        let a = unsafe { jit_iaload(arr_ptr, 0) };
+        let b = unsafe { jit_iaload(arr_ptr, 3) };
+        assert_eq!(a, 11, "in-bounds iaload(0) must read back the stored value");
+        assert_eq!(b, -7, "in-bounds iaload(3) must read back the stored value");
+        assert!(
+            take_jit_pending_aioobe().is_none(),
+            "in-bounds loads must NOT set the AIOOBE flag"
+        );
+    }
+
+    #[test]
+    fn jit_getfield_null_sets_pending_npe() {
+        // B2 fix (review `vm-runtime.md`): JVMS §getfield throws NPE on a null
+        // receiver. The helper used to return 0, silently fabricating a
+        // zero/null field value (same masked-null-deref class as the array-load
+        // helpers). It now sets the pending-NPE flag and returns the i64::MIN
+        // deopt sentinel, mirroring `jit_arraylength`.
+        let _ = take_jit_pending_npe(); // clear any prior state
         // SAFETY: obj_ptr is 0 (null), so the function returns early without dereferencing.
         let result = unsafe { jit_getfield(0, 0) };
-        assert_eq!(result, 0);
+        assert_eq!(result, i64::MIN, "getfield(null) must return the deopt sentinel");
+        assert!(
+            take_jit_pending_npe(),
+            "getfield(null) must set pending NPE flag"
+        );
+    }
+
+    #[test]
+    fn jit_getfield_oob_slot_does_not_read_past_object() {
+        // B2 fix (review `vm-runtime.md`): a stale/miscompiled `field_index`
+        // must NOT read past the object into the neighbouring heap object
+        // (info leak / follow-on UAF). The helper now bounds-checks the slot
+        // against the receiver's `num_slots` header field — exactly like the
+        // symmetric `jit_putfield_slot_in_bounds` guard on the putfield
+        // helpers — and returns 0 (mirroring the interpreter's out-of-range
+        // `get_field` default) instead of dereferencing.
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        let _ = take_jit_pending_npe();
+        let vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
+        // Object with exactly 2 reference fields (num_slots == 2).
+        let obj = vm_box.heap.alloc_object(ClassId::new(0), 2);
+        let obj_ptr = obj.as_ptr() as i64;
+        // SAFETY: obj_ptr is a live 2-field object; slot indices 2 and 5 are
+        // out of range so the helper takes the bounds-check arm and never
+        // dereferences past the object. A negative index is likewise rejected.
+        let oob_hi = unsafe { jit_getfield(obj_ptr, 2) };
+        assert_eq!(oob_hi, 0, "getfield on an out-of-range slot must not read OOB");
+        let oob_far = unsafe { jit_getfield(obj_ptr, 5) };
+        assert_eq!(oob_far, 0, "getfield far past num_slots must not read OOB");
+        let oob_neg = unsafe { jit_getfield(obj_ptr, -1) };
+        assert_eq!(oob_neg, 0, "getfield on a negative slot must not read OOB");
+        assert!(
+            !take_jit_pending_npe(),
+            "an in-range receiver with an OOB slot must not raise NPE"
+        );
+    }
+
+    #[test]
+    fn jit_getfield_in_bounds_reads_stored_int() {
+        // The fast in-bounds path must be untouched by the B2 fix: a value
+        // written into a valid slot reads back identically.
+        use crate::config::VmConfig;
+        use crate::vm::SharedVm;
+        let _ = take_jit_pending_npe();
+        let vm_box: Box<SharedVm> = Box::new(SharedVm::new(VmConfig::default()));
+        let obj = vm_box.heap.alloc_object(ClassId::new(0), 2);
+        // Write via the interpreter path (the helper read must observe it).
+        vm_box.heap.set_field(obj, 1, Value::Int(0x5A5A));
+        let obj_ptr = obj.as_ptr() as i64;
+        // SAFETY: obj_ptr is a live 2-field object; slot 1 is in bounds.
+        let v = unsafe { jit_getfield(obj_ptr, 1) };
+        assert_eq!(v, 0x5A5A, "in-bounds getfield must read back the stored value");
+        assert!(
+            !take_jit_pending_npe(),
+            "an in-bounds getfield must not raise NPE"
+        );
     }
 
     #[test]

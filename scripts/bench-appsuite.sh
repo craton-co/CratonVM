@@ -11,12 +11,12 @@
 
 set +e
 
-ROOT=C:/craton/CratonVM
+ROOT="${ROOT:-$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || echo C:/craton/CratonVM)}"
 # Relative cache path: the TornadoVM launcher mis-parses a `;`-separated
 # classpath whose entries carry a Windows drive-letter colon (C:/...), so
 # the bench `cd`s into ROOT and uses drive-letter-free relative paths.
 BC=".bench-cache"
-JH="C:/Program Files/Java/jdk-25"
+JH="${JAVA_HOME:-C:/Program Files/Java/jdk-25}"
 RJVM="$ROOT/target/release/cratonvm.exe"
 
 SLF="apps/slf4j;$BC/slf4j-api-2.0.13.jar;$BC/slf4j-simple-2.0.13.jar"

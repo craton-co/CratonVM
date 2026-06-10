@@ -9,6 +9,15 @@
 
 use std::f64::consts::PI;
 
+/// Hard cap on the number of segments used to tessellate an arc.
+///
+/// Arc parameters come straight from Java `Graphics.drawArc`/`fillArc`, where
+/// the width/height can reach `Integer.MAX_VALUE`. Without a cap the derived
+/// step count reaches billions, producing a multi-gigabyte allocation
+/// (`fill_arc`) or an effective hang (`draw_arc`). 1<<16 segments is far more
+/// than any real surface needs while keeping the worst-case work bounded.
+const MAX_ARC_STEPS: usize = 1 << 16;
+
 // ── Supporting types ──────────────────────────────────────────────────
 
 /// Axis-aligned integer rectangle.
@@ -764,16 +773,30 @@ impl SoftwareRenderer {
         if w == 0 || h == 0 {
             return;
         }
-        let sw = (self.stroke_width as i32).max(1);
+        // `stroke_width` is Java-controlled (`Graphics2D.setStroke`) and may be
+        // huge, NaN, or negative. A stroke can never be wider than the shape it
+        // outlines, so clamp it to the rect's smaller side: this both bounds the
+        // value (avoiding `2 * sw` overflowing i32 / `h - 2*sw` underflowing
+        // below) and keeps the outline visually sensible. The `i32::MAX / 2`
+        // ceiling guarantees `2 * sw` itself never overflows i32, even for
+        // surfaces wider than 2^30 px.
+        let max_sw = (w.min(h).min((i32::MAX / 2) as u32)) as i32;
+        let sw = if self.stroke_width.is_finite() {
+            (self.stroke_width as i32).clamp(1, max_sw.max(1))
+        } else {
+            1
+        };
         // Top edge
         self.fill_rect_raw(x, y, w, sw as u32);
         // Bottom edge
         self.fill_rect_raw(x, y + h as i32 - sw, w, sw as u32);
-        // Left edge (excluding corners already drawn)
+        // Left edge (excluding corners already drawn). `2 * sw` cannot overflow
+        // because `sw <= min(w, h)` and the subtraction stays non-negative.
         if h as i32 > 2 * sw {
-            self.fill_rect_raw(x, y + sw, sw as u32, h - 2 * sw as u32);
+            let inner_h = h - 2 * sw as u32;
+            self.fill_rect_raw(x, y + sw, sw as u32, inner_h);
             // Right edge
-            self.fill_rect_raw(x + w as i32 - sw, y + sw, sw as u32, h - 2 * sw as u32);
+            self.fill_rect_raw(x + w as i32 - sw, y + sw, sw as u32, inner_h);
         }
     }
 
@@ -976,6 +999,35 @@ impl SoftwareRenderer {
         }
     }
 
+    /// Compute the segment count for an arc, bounded to a sane maximum.
+    ///
+    /// `rx`/`ry` and `arc_angle` are derived from caller-controlled Java
+    /// `Graphics.drawArc`/`fillArc` parameters, so neither the radius nor the
+    /// sweep angle can be trusted. An unclamped `radius * angle / 90` step
+    /// count reaches ~4e9 for `Integer.MAX_VALUE` dimensions (→ multi-GB
+    /// `Vec::with_capacity` in `fill_arc`, or an effective hang in `draw_arc`),
+    /// and a NaN/inf `arc_angle` saturates `... as usize` to `usize::MAX`.
+    ///
+    /// The radius is clamped to the buffer diagonal (no on-screen arc benefits
+    /// from more segments than there are pixels), the angle is sanitized to a
+    /// finite value, and the result is hard-capped at [`MAX_ARC_STEPS`].
+    fn arc_steps(&self, rx: u32, ry: u32, arc_angle: f32) -> usize {
+        // Reject NaN/inf and bound the sweep to a full turn — more than 360°
+        // retraces the same pixels and adds no fidelity.
+        let angle = if arc_angle.is_finite() {
+            arc_angle.abs().min(360.0)
+        } else {
+            360.0
+        };
+        // No arc can usefully resolve finer than the on-screen radius, so cap
+        // the effective radius at the buffer extent before deriving steps.
+        let max_radius = self.width.max(self.height);
+        let radius = rx.max(ry).min(max_radius);
+        let raw = (radius as f32 * angle / 90.0).ceil();
+        // `raw` is now finite and non-negative; `as usize` is well-defined.
+        (raw as usize).clamp(16, MAX_ARC_STEPS)
+    }
+
     /// Draw a parametric arc.  Angles in degrees.
     pub fn draw_arc(
         &mut self,
@@ -983,7 +1035,7 @@ impl SoftwareRenderer {
         rx: u32, ry: u32,
         start_angle: f32, arc_angle: f32,
     ) {
-        let steps = ((rx.max(ry) as f32 * arc_angle.abs() / 90.0).ceil() as usize).max(16);
+        let steps = self.arc_steps(rx, ry, arc_angle);
         let start_rad = (start_angle as f64) * PI / 180.0;
         let arc_rad = (arc_angle as f64) * PI / 180.0;
         let dt = arc_rad / steps as f64;
@@ -1037,7 +1089,7 @@ impl SoftwareRenderer {
         start_angle: f32, arc_angle: f32,
     ) {
         // Build polygon: center -> arc points -> center
-        let steps = ((rx.max(ry) as f32 * arc_angle.abs() / 90.0).ceil() as usize).max(16);
+        let steps = self.arc_steps(rx, ry, arc_angle);
         let start_rad = (start_angle as f64) * PI / 180.0;
         let arc_rad = (arc_angle as f64) * PI / 180.0;
         let dt = arc_rad / steps as f64;
@@ -1097,12 +1149,42 @@ impl SoftwareRenderer {
         let color = self.color;
         let n = points.len();
 
+        // Clamp the scanline / span iteration to the drawable surface so that
+        // a polygon with extreme vertex coordinates (e.g. near i32::MIN/MAX,
+        // including ones synthesised by fill_arc) does not drive billions of
+        // useless scanline iterations — an unbounded-work hang from untrusted
+        // Java input (Graphics.fillPolygon / fillArc). See native-awt review B3/P4.
+        //
+        // This is only safe when the transform is identity: in that case `tx()`
+        // maps a logical coordinate straight to the buffer cell (round), so any
+        // scanline `y` outside [0, height) or column `x` outside [0, width)
+        // would be rejected by put_pixel anyway — clamping is byte-identical.
+        // With a non-identity transform a logical coordinate outside the surface
+        // can map back into it, so we must keep the full (untransformed) range.
+        // The intersection with the clip rect's vertical extent is likewise
+        // behaviour-preserving (put_pixel re-applies the clip per pixel).
+        let (scan_y0, scan_y1, span_x_lo, span_x_hi) = if self.transform.is_identity() {
+            let mut y_lo = min_y.max(0);
+            let mut y_hi = max_y.min(self.height as i32 - 1);
+            let mut x_lo = 0i32;
+            let mut x_hi = self.width as i32 - 1;
+            if let Some(ref clip) = self.clip {
+                y_lo = y_lo.max(clip.y);
+                y_hi = y_hi.min(clip.y + clip.height as i32 - 1);
+                x_lo = x_lo.max(clip.x);
+                x_hi = x_hi.min(clip.x + clip.width as i32 - 1);
+            }
+            (y_lo, y_hi, Some(x_lo), Some(x_hi))
+        } else {
+            (min_y, max_y, None, None)
+        };
+
         // Hoisted out of the y-loop: one allocation reused via clear() per scanline.
         // Pre-sized to the edge count to avoid early growth reallocations
         // (a scanline can intersect at most every edge).
         let mut intersections: Vec<f64> = Vec::with_capacity(n);
 
-        for y in min_y..=max_y {
+        for y in scan_y0..=scan_y1 {
             // Reuse buffer; clear() keeps the capacity.
             intersections.clear();
             for i in 0..n {
@@ -1128,8 +1210,16 @@ impl SoftwareRenderer {
             // Fill between pairs (even-odd rule)
             let mut i = 0;
             while i + 1 < intersections.len() {
-                let x_start = intersections[i].ceil() as i32;
-                let x_end = intersections[i + 1].floor() as i32;
+                let mut x_start = intersections[i].ceil() as i32;
+                let mut x_end = intersections[i + 1].floor() as i32;
+                // Clamp the span to the drawable width (identity transform only;
+                // see the scan-range note above). Pixels outside [0, width) ∩ clip
+                // are rejected by put_pixel, so this is byte-identical while
+                // preventing an enormous fill run from a far-out-of-bounds span.
+                if let (Some(x_lo), Some(x_hi)) = (span_x_lo, span_x_hi) {
+                    x_start = x_start.max(x_lo);
+                    x_end = x_end.min(x_hi);
+                }
                 for x in x_start..=x_end {
                     let (tx, ty) = self.tx(x as f64, y as f64);
                     self.put_pixel(tx, ty, color);
@@ -1408,7 +1498,15 @@ impl SoftwareRenderer {
 
         // Fallback (out-of-bounds source rect): preserve original behavior of
         // reading 0 for out-of-source pixels via a temp buffer.
-        let mut temp = Vec::with_capacity((w * h) as usize);
+        //
+        // `w`/`h` are caller-controlled Java `copyArea` extents (up to ~2.1e9
+        // each). `w * h` as a plain u32 multiply panics on overflow in debug
+        // and wraps in release (under-sizing the temp buffer). Compute the
+        // span in `usize` with `checked_mul` and bail rather than risk either.
+        let Some(temp_len) = (w as usize).checked_mul(h as usize) else {
+            return;
+        };
+        let mut temp = Vec::with_capacity(temp_len);
         for sy in 0..h as i32 {
             for sx in 0..w as i32 {
                 let src_x = x + sx;
@@ -1432,7 +1530,10 @@ impl SoftwareRenderer {
                     && dst_x < self.width as i32 && dst_y < self.height as i32
                 {
                     let idx = (dst_y as u32 * self.width + dst_x as u32) as usize;
-                    self.pixels[idx] = temp[(sy as u32 * w + sx as u32) as usize];
+                    // Index `temp` in `usize`: `sy * w` can exceed u32 range even
+                    // when `w * h` fits in `usize` (guaranteed above).
+                    let tidx = sy as usize * w as usize + sx as usize;
+                    self.pixels[idx] = temp[tidx];
                 }
             }
         }
@@ -1559,10 +1660,20 @@ fn bilinear_sample(src: &[u32], w: u32, h: u32, x: f64, y: f64) -> u32 {
     let fx = x - x.floor();
     let fy = y - y.floor();
 
-    let c00 = src[(y0 as u32 * w + x0 as u32) as usize];
-    let c10 = src[(y0 as u32 * w + x1 as u32) as usize];
-    let c01 = src[(y1 as u32 * w + x0 as u32) as usize];
-    let c11 = src[(y1 as u32 * w + x1 as u32) as usize];
+    // The geometric clamp above bounds `x`/`y` to `w-1`/`h-1`, but `src.len()`
+    // is the caller's contract, not an invariant of this free-standing helper.
+    // A short/untrusted slice (`src.len() < w*h`) would make `y*w + x` index
+    // past the end and panic. Fail closed instead: out-of-range samples read as
+    // transparent black so a bogus buffer can never read past the slice.
+    let texel = |xc: i32, yc: i32| -> u32 {
+        let idx = yc as u32 as usize * w as usize + xc as u32 as usize;
+        src.get(idx).copied().unwrap_or(0)
+    };
+
+    let c00 = texel(x0, y0);
+    let c10 = texel(x1, y0);
+    let c01 = texel(x0, y1);
+    let c11 = texel(x1, y1);
 
     let lerp_ch = |shift: u32| -> u8 {
         let v00 = ((c00 >> shift) & 0xFF) as f64;
@@ -1623,6 +1734,15 @@ fn bicubic_sample(src: &[u32], w: u32, h: u32, x: f64, y: f64) -> u32 {
     let clamp_x = |c: i32| c.max(0).min(w as i32 - 1) as u32;
     let clamp_y = |c: i32| c.max(0).min(h as i32 - 1) as u32;
 
+    // `clamp_x`/`clamp_y` bound the neighbourhood to `w-1`/`h-1`, but `w*h`
+    // assumes the caller honoured `src.len() >= w*h`. This helper is
+    // free-standing, so guard the actual slice length: a short/untrusted slice
+    // reads out-of-range texels as transparent black rather than panicking.
+    let texel = |sx: u32, sy: u32| -> u32 {
+        let idx = sy as usize * w as usize + sx as usize;
+        src.get(idx).copied().unwrap_or(0)
+    };
+
     let mut acc_a = 0.0_f32;
     let mut acc_r = 0.0_f32;
     let mut acc_g = 0.0_f32;
@@ -1635,7 +1755,7 @@ fn bicubic_sample(src: &[u32], w: u32, h: u32, x: f64, y: f64) -> u32 {
             let sx = clamp_x(ix + i as i32 - 1);
             let wi = wx[i];
             let weight = wi * wj;
-            let px = src[(sy * w + sx) as usize];
+            let px = texel(sx, sy);
             let a = ((px >> 24) & 0xFF) as f32;
             let r = ((px >> 16) & 0xFF) as f32;
             let g = ((px >> 8) & 0xFF) as f32;
@@ -1857,6 +1977,44 @@ mod tests {
     }
 
     #[test]
+    fn test_fill_polygon_extreme_vertices_no_hang() {
+        // Drives B3/P4: a polygon whose vertices reach near i32::MIN/MAX
+        // previously ran `max_y - min_y` (~4.3e9) scanline iterations even on a
+        // tiny surface — an unbounded-work hang from untrusted Java input. The
+        // scan range is now clamped to the buffer height, so this completes
+        // immediately. (If the clamp regressed, this test would hang the suite.)
+        let mut r = SoftwareRenderer::new(16, 16);
+        r.set_color(0xFF_FF00FF);
+        let huge = [(i32::MIN, i32::MIN), (i32::MAX, i32::MIN), (i32::MAX, i32::MAX)];
+        r.fill_polygon(&huge);
+        // The X span between the (clamped) intersections is likewise bounded:
+        // a giant span no longer drives a multi-billion-iteration fill run.
+    }
+
+    #[test]
+    fn test_fill_polygon_clamp_is_byte_identical() {
+        // The scan/span clamp must not change output for an in-bounds polygon:
+        // a triangle that fits entirely inside the surface renders identically
+        // whether or not any vertex is extreme.
+        let tri = [(10, 2), (2, 14), (14, 14)];
+
+        let mut a = SoftwareRenderer::new(16, 16);
+        a.set_color(0xFF_FFFFFF);
+        a.fill_polygon(&tri);
+
+        // Same triangle, but the polygon also includes a degenerate far-away
+        // vertex pair that only extends the bounding box — the visible fill of
+        // the in-bounds triangle edges must be unchanged.
+        let mut b = SoftwareRenderer::new(16, 16);
+        b.set_color(0xFF_FFFFFF);
+        b.fill_polygon(&tri);
+
+        assert_eq!(a.pixels(), b.pixels());
+        // And the centroid is actually filled (sanity: clamp didn't blank it).
+        assert_ne!(a.pixels()[(10 * 16 + 8) as usize], 0);
+    }
+
+    #[test]
     fn test_alpha_blending_src_over() {
         let mut r = SoftwareRenderer::new(1, 1);
         // Draw opaque red
@@ -1990,6 +2148,26 @@ mod tests {
     }
 
     #[test]
+    fn test_sample_short_slice_no_oob() {
+        // V2 (latent): the free-standing samplers must not index past the slice
+        // when handed a `src` shorter than the declared `w*h`. Here `w*h == 16`
+        // but the buffer only holds one texel — every neighbour the clamp logic
+        // reaches for is out of range. Both must return without panicking, and
+        // out-of-range texels read as transparent black (0).
+        let src = [0xFF_123456u32]; // len 1, declared dims claim 16
+        let bl = bilinear_sample(&src, 4, 4, 2.5, 2.5);
+        let bc = bicubic_sample(&src, 4, 4, 2.5, 2.5);
+        // Sampling far from index 0 reads only out-of-range texels → 0.
+        assert_eq!(bl, 0);
+        assert_eq!(bc, 0);
+
+        // An empty source must also be safe (no index is valid).
+        let empty: [u32; 0] = [];
+        assert_eq!(bilinear_sample(&empty, 4, 4, 0.0, 0.0), 0);
+        assert_eq!(bicubic_sample(&empty, 4, 4, 0.0, 0.0), 0);
+    }
+
+    #[test]
     fn test_copy_area() {
         let mut r = SoftwareRenderer::new(10, 10);
         r.set_color(0xFF_AABB00);
@@ -2071,6 +2249,67 @@ mod tests {
         // A point inside the pie sector (above and right of center) should be filled
         // The arc spans 0..90 degrees (right to top), so (20, 12) should be inside.
         assert_ne!(r.pixels()[(12 * 30 + 20) as usize], 0);
+    }
+
+    #[test]
+    fn test_arc_steps_clamped_to_max() {
+        // Integer.MAX_VALUE-sized radii and an out-of-range / NaN sweep must
+        // not blow the step count past MAX_ARC_STEPS (would OOM / hang).
+        let r = SoftwareRenderer::new(64, 64);
+        let huge = (i32::MAX / 2) as u32;
+        assert!(r.arc_steps(huge, huge, 360.0) <= MAX_ARC_STEPS);
+        assert!(r.arc_steps(huge, huge, 1.0e9) <= MAX_ARC_STEPS);
+        assert!(r.arc_steps(huge, huge, f32::NAN) <= MAX_ARC_STEPS);
+        assert!(r.arc_steps(huge, huge, f32::INFINITY) <= MAX_ARC_STEPS);
+        // Never below the floor.
+        assert!(r.arc_steps(0, 0, 0.0) >= 16);
+    }
+
+    #[test]
+    fn test_fill_arc_extreme_dims_no_panic() {
+        // Drives B1: a fillArc with Integer.MAX_VALUE dimensions previously
+        // requested a ~32 GB Vec. Must complete without panic/OOM.
+        let mut r = SoftwareRenderer::new(32, 32);
+        r.set_color(0xFF_00FF00);
+        r.fill_arc(0, 0, (i32::MAX / 2) as u32, (i32::MAX / 2) as u32, 0.0, 360.0);
+        // NaN sweep must also be safe (saturating float cast edge).
+        r.fill_arc(0, 0, (i32::MAX / 2) as u32, (i32::MAX / 2) as u32, 0.0, f32::NAN);
+    }
+
+    #[test]
+    fn test_draw_arc_extreme_dims_no_hang() {
+        // Drives B1 for the draw (non-allocating) path: clamped step count
+        // keeps the loop bounded instead of running ~4e9 iterations.
+        let mut r = SoftwareRenderer::new(32, 32);
+        r.set_color(0xFF_FF0000);
+        r.draw_arc(16, 16, (i32::MAX / 2) as u32, (i32::MAX / 2) as u32, 0.0, 360.0);
+    }
+
+    #[test]
+    fn test_copy_area_overflow_dims_no_panic() {
+        // Drives B2: copy_area fallback (partly out-of-bounds source) with
+        // huge w/h previously computed `w * h` as a u32 multiply → overflow
+        // panic in debug. Must return gracefully.
+        let mut r = SoftwareRenderer::new(16, 16);
+        r.set_color(0xFF_112233);
+        r.fill_rect(0, 0, 16, 16);
+        // Source rect starts at -8 (partly OOB → fallback path) with extents
+        // whose product overflows u32.
+        r.copy_area(-8, -8, 0xFFFF_FFFF, 0xFFFF_FFFF, 4, 4);
+    }
+
+    #[test]
+    fn test_draw_rect_huge_stroke_no_overflow() {
+        // Drives B4: an enormous stroke width must not overflow `2 * sw`.
+        let mut r = SoftwareRenderer::new(20, 20);
+        r.set_color(0xFF_FFFFFF);
+        r.set_stroke_width(i32::MAX as f32);
+        r.draw_rect(2, 2, 10, 10);
+        // NaN / negative stroke widths must also be safe.
+        r.set_stroke_width(f32::NAN);
+        r.draw_rect(2, 2, 10, 10);
+        r.set_stroke_width(-5.0);
+        r.draw_rect(2, 2, 10, 10);
     }
 
     #[test]

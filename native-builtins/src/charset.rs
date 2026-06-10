@@ -288,6 +288,26 @@ pub fn encode_with_charset(ctx: &dyn NativeContext, charset: ObjectRef, chars: &
     engine::encode_chars_lossy(&name, chars)
 }
 
+/// Returns `true` when `canon` (a name already produced by
+/// `normalize_charset_name`) is a charset the transcoding engine can
+/// actually decode/encode. A name like `"Shift_JIS"` normalizes cleanly
+/// yet the engine does not implement it, so the lossy helpers would
+/// silently fall back to Latin-1; this probe lets the name-taking native
+/// methods surface an unsupported-charset error instead.
+///
+/// Probing with an empty input slice short-circuits in the engine's
+/// charset-name `match` (the `_ => Err(UnsupportedCharset)` arm fires
+/// before any byte/char is examined), so this does no transcoding work.
+pub(crate) fn engine_supports(canon: &str) -> bool {
+    !matches!(
+        engine::decode_bytes(canon, &[]),
+        Err(engine::CodingError {
+            kind: engine::CodingErrorKind::UnsupportedCharset,
+            ..
+        })
+    )
+}
+
 /// Encode a Rust `&str` as bytes for the named charset.  Used by
 /// PrintStream / PrintWriter / OutputStreamWriter and
 /// `String.getBytes(String)`.
@@ -586,7 +606,12 @@ fn native_string_get_bytes_named(
         _ => String::new(),
     };
     let norm = normalize_charset_name(&name);
-    if norm.is_empty() {
+    // `String.getBytes(String)` throws the *checked* `UnsupportedEncodingException`
+    // for a name that is unknown (`norm` empty) OR that normalizes to a canonical
+    // charset the transcoding engine cannot actually encode (e.g. "Shift_JIS").
+    // Previously the latter slipped through to `encode_chars_lossy`, which
+    // silently produced Latin-1 bytes for an unsupported charset.
+    if norm.is_empty() || !engine_supports(&norm) {
         return Err(RuntimeError::IOException {
             message: format!("UnsupportedEncodingException: {}", name),
         }
@@ -791,5 +816,23 @@ mod tests {
         let b = encode_str_named("ISO-8859-1", s);
         assert_eq!(b.last().copied(), Some(0xE9));
         assert_eq!(decode_str_named("ISO-8859-1", &b), s);
+    }
+
+    #[test]
+    fn engine_supports_known_canonical_names() {
+        assert!(engine_supports("UTF-8"));
+        assert!(engine_supports("ISO-8859-1"));
+        assert!(engine_supports("windows-1252"));
+    }
+
+    #[test]
+    fn engine_supports_rejects_unimplemented_canonical_name() {
+        // `normalize_charset_name` canonicalizes "Shift_JIS" successfully, but
+        // the transcoding engine has no Shift_JIS coder — the name-path natives
+        // must surface an unsupported-charset error rather than fall back to
+        // a lossy Latin-1 encode.
+        assert_eq!(normalize_charset_name("Shift_JIS"), "Shift_JIS");
+        assert!(!engine_supports("Shift_JIS"));
+        assert!(!engine_supports("EUC-JP"));
     }
 }

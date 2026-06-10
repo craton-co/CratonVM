@@ -411,6 +411,25 @@ const METADATA_TYPE_ID: u64 = 0;
 const CHECKPOINT_TYPE_ID: u64 = 1;
 
 /// Write the metadata section describing all event types directly into `writer`.
+///
+/// LIMITATION (S3, 2026-06-10): this is a **simplified custom metadata
+/// encoding, not stock JFR binary metadata**. Real JFR stores type/field
+/// descriptors as a binary-encoded, pool-referenced, XML-like structure that
+/// JDK Mission Control (JMC) and the `jfr` CLI parse to fully describe each
+/// event type. The format written here round-trips through *this crate's own*
+/// [`read_events`] reader but is **not loadable by stock JMC / `jfr` as
+/// fully-described types**. It is sufficient for an internal recorder; it caps
+/// external-tool interoperability.
+///
+/// LIMITATION (S2, 2026-06-10): the per-type `has_stacktrace` flag is written
+/// here faithfully (and ~20 built-in types declare `has_stacktrace: true`),
+/// but **no stack trace is ever captured or serialized**. [`EventInstance`]
+/// has no stack-trace representation and no `emit_*` helper records a real call
+/// stack — events such as `jdk.ExecutionSample` carry a caller-supplied,
+/// pre-formatted `stackTrace` *string field* instead of a JFR `stackTrace`
+/// constant-pool reference. Consequently JMC's stack-trace / call-tree views
+/// would be empty even if the file were JMC-loadable. The flag describes the
+/// event type's intent, not a captured stack.
 fn write_metadata_section<W: Write>(
     writer: &mut W,
     registry: &EventTypeRegistry,
@@ -421,7 +440,8 @@ fn write_metadata_section<W: Write>(
     //
     // Real JFR metadata uses a complex XML-like structure stored in binary.
     // We use a simplified but compatible format: a single metadata event containing
-    // all type descriptors encoded as compressed fields.
+    // all type descriptors encoded as compressed fields. See the doc comment
+    // above for the JMC-interop (S3) and stack-trace (S2) limitations.
 
     let mut body = Vec::with_capacity(1024);
 
@@ -1332,8 +1352,23 @@ pub fn read_events(
         })?;
 
         let mut fields = crate::event::EventFields::with_capacity(ty.fields.len());
+        // B1 (2026-06-10): bound every field decode to this record's own
+        // declared size. The `record_end > events_end` guard above only
+        // validates the *declared* `total_size`; it does NOT guarantee the
+        // decoded fields stay within `[pos, record_end)`. A malformed record
+        // can declare a small `total_size` yet contain a tag-3 inline string
+        // whose length runs past `record_end` into the next record's bytes —
+        // yielding silently-wrong decoded values (it does not crash, since all
+        // decodes are bounded by the slice length and `pos = record_end`
+        // re-syncs each iteration). Slicing against `record_end` makes a field
+        // decode unable to cross the record boundary, matching the bounding
+        // `parse_checkpoint_pool` already applies to checkpoint fields.
+        // `record_end <= events_end <= data.len()` (validated above) so the
+        // slice is in range, and `rpos` starts at `pos + size_len <= record_end`
+        // and only advances by bytes a `record_end`-bounded decode consumed.
+        let record_slice = &data[..record_end];
         for field in &ty.fields {
-            let (v, c) = decode_event_value(&data, rpos, &field.type_name, pool_ref)?;
+            let (v, c) = decode_event_value(record_slice, rpos, &field.type_name, pool_ref)?;
             fields.push(v);
             rpos += c;
         }
@@ -1901,6 +1936,93 @@ mod tests {
         // reading the trailing bytes or panicking.
         let result = read_events(&path, &reg);
         assert!(result.is_err(), "checkpoint field decode must stay within record");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// B1 (2026-06-10) regression: a record whose declared `total_size` is
+    /// honest but that contains a tag-3 inline string whose *declared length*
+    /// runs past `record_end` must error, not silently read into the following
+    /// record. Before the fix the field decode ran against the full file slice
+    /// (`&data`), so an over-long string length was satisfied by the next
+    /// record's bytes — yielding a silently-wrong decoded value. The decode is
+    /// now bounded by `&data[..record_end]`, so it returns "string body
+    /// truncated".
+    #[test]
+    fn test_read_events_field_decode_bounded_by_record() {
+        let dir = std::env::temp_dir().join("jfr_test_field_bounded");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("field_bounded.jfr");
+
+        // One event type with a single `string` field.
+        let mut reg = EventTypeRegistry::new();
+        let type_id = reg.register(EventType {
+            id: EventTypeId(0),
+            name: "test.StrEvent".into(),
+            category: vec!["Test".into()],
+            description: "string field event".into(),
+            fields: vec![EventField::new("name", "string", "Name")],
+            has_thread: true,
+            has_stacktrace: false,
+            period: EventPeriod::None,
+            threshold: None,
+        });
+
+        // Build the corrupt record body (everything after the size prefix).
+        // Layout: [type_id][start_delta][duration][thread_id][string field].
+        // The string field is tag 3 (inline) with a declared length of 64,
+        // but we provide NO payload bytes inside the record — so the declared
+        // length crosses `record_end` into the trailing bytes appended below.
+        let mut inner = Vec::new();
+        write_compressed_int_into(&mut inner, type_id.0 as u64); // type_id
+        write_compressed_long_into(&mut inner, 0); // start_delta
+        write_compressed_long_into(&mut inner, 0); // duration
+        write_compressed_long_into(&mut inner, 0); // thread_id
+        inner.push(3); // STRING tag 3 (inline length-prefixed)
+        write_compressed_int_into(&mut inner, 64); // declared len, no payload
+
+        // Size-prefix the record (size includes the prefix itself).
+        let mut record = Vec::new();
+        {
+            let body_len = inner.len();
+            let mut prefix_len = 1usize;
+            let total = loop {
+                let t = prefix_len + body_len;
+                let actual = compressed_int_len(t as u64);
+                if actual == prefix_len {
+                    break t;
+                }
+                prefix_len = actual;
+            };
+            write_compressed_int_into(&mut record, total as u64);
+            record.extend_from_slice(&inner);
+        }
+        let record_end_offset = HEADER_SIZE as usize + record.len();
+
+        // Trailing bytes that the over-long string would read into if the
+        // decode were unbounded. Make them valid UTF-8 so that, pre-fix, the
+        // decode would *succeed* with a wrong value rather than fail — proving
+        // the bound (not an unrelated error) is what stops the cross-read.
+        let trailing = vec![b'A'; 64];
+
+        // metadata_offset == checkpoint_offset == record_end_offset so the
+        // events region is exactly [HEADER_SIZE, record_end_offset): the single
+        // corrupt record, with `trailing` living past `events_end`.
+        let mut data = make_header_with_offsets(
+            record_end_offset as u64,
+            record_end_offset as u64,
+        );
+        data.extend_from_slice(&record);
+        data.extend_from_slice(&trailing);
+        std::fs::write(&path, &data).unwrap();
+
+        let result = read_events(&path, &reg);
+        assert!(
+            result.is_err(),
+            "field decode must stay within the record boundary, got {:?}",
+            result.map(|v| v.len())
+        );
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);

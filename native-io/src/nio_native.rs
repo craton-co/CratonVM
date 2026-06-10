@@ -871,37 +871,52 @@ pub fn register_nio_natives_real(r: &mut NativeMethodRegistry) {
 //   AsynchronousChannelGroup      = 1 field  (state=0 — 1=running, 0=shut)
 //   DatagramChannel               = 5 fields (port=0, open=1, connected=2, blocking=3, sock_id=4)
 
-use parking_lot::RwLock;
 use cratonvm_types::ClassId;
+
+// The UDP-socket machinery below backs the synthetic DatagramChannel shims
+// (`t16_dc_*`). Those shims fabricate datagram/"connected" state, so per the
+// no-synthetic-stubs policy they — and this helper block + its imports — are
+// gated to `synthetic-jdk` only. In the default build the real JDK
+// `DatagramChannel`/`sun.nio.ch` bytecode runs instead (see `datagram.rs`).
+#[cfg(feature = "synthetic-jdk")]
+use parking_lot::RwLock;
+#[cfg(feature = "synthetic-jdk")]
 use std::collections::HashMap;
+#[cfg(feature = "synthetic-jdk")]
 use std::net::UdpSocket;
+#[cfg(feature = "synthetic-jdk")]
 use std::sync::OnceLock;
 
 /// Process-wide registry keeping `UdpSocket` handles alive while a
 /// `DatagramChannel` Java object references them. The id stored in the
 /// channel's `sock_id` field indexes into this map. Matches the
 /// Session-86/87 Delta pattern for per-handle resource tables.
+#[cfg(feature = "synthetic-jdk")]
 fn udp_registry() -> &'static RwLock<HashMap<i32, UdpSocket>> {
     static REG: OnceLock<RwLock<HashMap<i32, UdpSocket>>> = OnceLock::new();
     REG.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn udp_next_id() -> i32 {
     use std::sync::atomic::{AtomicI32, Ordering};
     static NEXT: AtomicI32 = AtomicI32::new(1);
     NEXT.fetch_add(1, Ordering::SeqCst)
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn udp_register(sock: UdpSocket) -> i32 {
     let id = udp_next_id();
     udp_registry().write().insert(id, sock);
     id
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn udp_with<T>(id: i32, f: impl FnOnce(&UdpSocket) -> T) -> Option<T> {
     udp_registry().read().get(&id).map(f)
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn udp_remove(id: i32) {
     udp_registry().write().remove(&id);
 }
@@ -1068,8 +1083,17 @@ fn t16_acg_await_termination(_ctx: &mut dyn NativeContext, _args: &[Value]) -> M
     Ok(Some(Value::Int(1)))
 }
 
-// ---- DatagramChannel ----
+// ---- DatagramChannel (SYNTHETIC, synthetic-jdk only) ----
+//
+// FLAGGED SyntheticStub: these `t16_dc_*` shims fabricate datagram state — the
+// connect handler invents a `127.0.0.1:9` target, ignores the underlying
+// `udp.connect()` result, and unconditionally flips the channel to "connected".
+// That is fake UDP behavior the no-synthetic-stubs policy forbids, so the whole
+// family is gated to `synthetic-jdk` (off by default) and registered under
+// `NativeKind::SyntheticStub`. In the default build the real JDK
+// `DatagramChannel`/`sun.nio.ch` bytecode runs (see `datagram.rs`).
 
+#[cfg(feature = "synthetic-jdk")]
 fn t16_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     let ch = alloc_t16(ctx, "java/nio/channels/DatagramChannel", 5);
     // Bind a real UDP socket to 0.0.0.0:0 so the handle-ownership
@@ -1090,6 +1114,7 @@ fn t16_dc_open(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult
     Ok(Some(Value::Object(Some(ch))))
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn t16_dc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
         Some(o) if ctx.object_num_fields(o) >= 2 => Ok(Some(ctx.get_field(o, 1))),
@@ -1097,6 +1122,7 @@ fn t16_dc_is_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     }
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn t16_dc_is_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
         Some(o) if ctx.object_num_fields(o) >= 3 => Ok(Some(ctx.get_field(o, 2))),
@@ -1104,6 +1130,7 @@ fn t16_dc_is_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     }
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn t16_dc_is_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     match obj_or_none(args, 0) {
         Some(o) if ctx.object_num_fields(o) >= 4 => Ok(Some(ctx.get_field(o, 3))),
@@ -1111,6 +1138,7 @@ fn t16_dc_is_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     }
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn t16_dc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_or_none(args, 0) {
         Some(o) => o,
@@ -1130,6 +1158,7 @@ fn t16_dc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(this))))
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn t16_dc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_or_none(args, 0) {
         Some(o) => o,
@@ -1165,6 +1194,7 @@ fn t16_dc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Object(Some(this))))
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn t16_dc_disconnect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_or_none(args, 0) {
         Some(o) => o,
@@ -1176,6 +1206,7 @@ fn t16_dc_disconnect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(Value::Object(Some(this))))
 }
 
+#[cfg(feature = "synthetic-jdk")]
 fn t16_dc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(this) = obj_or_none(args, 0) {
         let nf = ctx.object_num_fields(this);
@@ -1271,31 +1302,44 @@ pub fn register_t16_channel_overrides(r: &mut NativeMethodRegistry) {
         t16_acg_await_termination,
     );
 
-    // DatagramChannel
-    let dc = "java/nio/channels/DatagramChannel";
-    r.register(dc, "open", "()Ljava/nio/channels/DatagramChannel;", t16_dc_open);
-    r.register(dc, "isOpen", "()Z", t16_dc_is_open);
-    r.register(dc, "isConnected", "()Z", t16_dc_is_connected);
-    r.register(dc, "isBlocking", "()Z", t16_dc_is_blocking);
-    r.register(
-        dc,
-        "configureBlocking",
-        "(Z)Ljava/nio/channels/SelectableChannel;",
-        t16_dc_configure_blocking,
-    );
-    r.register(
-        dc,
-        "connect",
-        "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;",
-        t16_dc_connect,
-    );
-    r.register(
-        dc,
-        "disconnect",
-        "()Ljava/nio/channels/DatagramChannel;",
-        t16_dc_disconnect,
-    );
-    r.register(dc, "close", "()V", t16_dc_close);
+    // DatagramChannel (SYNTHETIC, synthetic-jdk only).
+    //
+    // FLAGGED SyntheticStub: the `t16_dc_*` family fabricates datagram/connect
+    // state (per `S1` in docs/reviews/fable-2026-06-10/native-io.md). Per the
+    // no-synthetic-stubs policy these overrides are compiled in only under
+    // `synthetic-jdk` and tagged `NativeKind::SyntheticStub`. In the default
+    // build they are absent, so the real JDK `DatagramChannel`/`sun.nio.ch`
+    // bytecode (and `datagram.rs`) runs instead of a faked channel.
+    #[cfg(feature = "synthetic-jdk")]
+    {
+        let dc = "java/nio/channels/DatagramChannel";
+        r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+        r.register(dc, "open", "()Ljava/nio/channels/DatagramChannel;", t16_dc_open);
+        r.register(dc, "isOpen", "()Z", t16_dc_is_open);
+        r.register(dc, "isConnected", "()Z", t16_dc_is_connected);
+        r.register(dc, "isBlocking", "()Z", t16_dc_is_blocking);
+        r.register(
+            dc,
+            "configureBlocking",
+            "(Z)Ljava/nio/channels/SelectableChannel;",
+            t16_dc_configure_blocking,
+        );
+        r.register(
+            dc,
+            "connect",
+            "(Ljava/net/SocketAddress;)Ljava/nio/channels/DatagramChannel;",
+            t16_dc_connect,
+        );
+        r.register(
+            dc,
+            "disconnect",
+            "()Ljava/nio/channels/DatagramChannel;",
+            t16_dc_disconnect,
+        );
+        r.register(dc, "close", "()V", t16_dc_close);
+        // Restore the family default category for the remaining (Bridge) entries.
+        r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    }
 
     // java.util.logging extras — null-tolerant variants that supersede the
     // phase-72 handlers, which NPE on `args.first() == Object(None)`.

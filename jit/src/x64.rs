@@ -1635,6 +1635,22 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
         0xbb => 3, // new
         0xc5 => 4,
         0xb9 => 5, // invokeinterface: opcode, cp_hi, cp_lo, count, 0
+        // wide (0xc4) — prefix modifies the following opcode to use a 2-byte
+        // local index. JVMS §6.5 wide: `wide <opcode> <indexbyte1> <indexbyte2>`
+        // is 4 bytes for the load/store/ret family, and `wide iinc <index>
+        // <const>` is 6 bytes (extra 2-byte signed constant). The modified
+        // opcode is the byte at `pc + 1`: only `iinc` (0x84) takes the 6-byte
+        // form. Currently latent — `jit_scan` rejects `wide`, so no compiled
+        // method contains it — but the length table must stay correct as
+        // defense-in-depth so every PC-stepping consumer stays in lockstep if
+        // `wide` is ever accepted. Keep the regalloc.rs `bc_len` twin in sync.
+        0xc4 => {
+            if pc + 1 < code.len() && code[pc + 1] == 0x84 {
+                6 // wide iinc
+            } else {
+                4 // wide <load/store/ret>
+            }
+        }
         // tableswitch — variable length
         0xaa => {
             let mut p = pc + 1;
@@ -3370,12 +3386,15 @@ fn find_modified_locals(code: &[u8], start: usize, end: usize) -> u64 {
             }
             // istore/lstore/fstore/dstore/astore (wide index)
             0x36..=0x3a => {
-                modified |= 1 << code[pc + 1];
+                // Local index is 0..255; clamp the shift like every other
+                // shift-by-local site (a high local saturates to bit 63, which
+                // is conservatively treated as "some local >= 63 modified").
+                modified |= 1u64 << (code[pc + 1] as usize).min(63);
                 pc += 2;
             }
             // iinc
             0x84 => {
-                modified |= 1 << code[pc + 1];
+                modified |= 1u64 << (code[pc + 1] as usize).min(63);
                 pc += 3;
             }
             // Other: advance by instruction length
@@ -3869,6 +3888,16 @@ fn find_fp_strength_reductions(
 // Array Bounds Check Elimination (BCE)
 // ---------------------------------------------------------------------------
 
+/// Whether speculative (runtime-guarded) BCE is disabled via
+/// `CRATONVM_JIT_NO_SPEC_BCE`. Cached in a `OnceLock` like the other env gates
+/// in this file (e.g. `precise_jit_maps_enabled`) so the lookup is paid once
+/// rather than per loop header on every compile.
+fn jit_no_spec_bce() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_NO_SPEC_BCE").is_some())
+}
+
 /// Info about a loop's induction variable and bounds.
 struct LoopBoundsInfo {
     /// The local variable that serves as the induction variable (incremented by iinc +1).
@@ -3879,6 +3908,14 @@ struct LoopBoundsInfo {
     /// Constant upper bound (if the bound is iconst/bipush/sipush).
     #[allow(dead_code)]
     bound_const: Option<i32>,
+    /// Whether the loop comparator is *inclusive* of `bound` (`if_icmpgt` exit
+    /// or `if_icmple` continue, i.e. a `for (i = 0; i <= n; i++)` loop). When
+    /// true the induction variable reaches `bound` itself, so the maximum index
+    /// accessed is `bound`, requiring `array.length >= bound + 1`. The single
+    /// header guard only proves `array.length >= bound` (SECURITY FIX V17), so
+    /// BCE — both static and speculative — is REFUSED for inclusive loops to
+    /// avoid an off-by-one out-of-bounds heap access at `index == bound`.
+    inclusive: bool,
 }
 
 /// Speculative bounds check elimination: a deopt guard emitted at the loop header.
@@ -4108,22 +4145,31 @@ fn analyze_loop_bound(
                     let target = (after_bound as i32 + offset) as usize; // Cast: x86-64 immediate encoding
 
                     // Pattern A: Exit condition — if_icmpge/if_icmpgt with target OUTSIDE loop
-                    // e.g. `iload i; iload n; if_icmpge exit` at loop header
+                    // e.g. `iload i; iload n; if_icmpge exit` at loop header.
+                    // `if_icmpgt` (0xa3) exits only when `iv > bound`, so the loop
+                    // body still runs at `iv == bound` → inclusive (index reaches
+                    // `bound`). `if_icmpge` (0xa2) exits at `iv == bound` →
+                    // exclusive (max index `bound - 1`).
                     if matches!(cmp_op, 0xa2 | 0xa3) && (target > back_edge || target < header) {
                         return Some(LoopBoundsInfo {
                             induction_var,
                             bound_local: Some(bound),
                             bound_const: None,
+                            inclusive: cmp_op == 0xa3,
                         });
                     }
 
                     // Pattern B: Continue condition — if_icmplt/if_icmple with target INSIDE loop
-                    // e.g. `iload i; iload n; if_icmplt loop_body` (standard javac for-loop pattern)
+                    // e.g. `iload i; iload n; if_icmplt loop_body` (standard javac for-loop pattern).
+                    // `if_icmple` (0xa4) continues while `iv <= bound`, so the body
+                    // runs at `iv == bound` → inclusive. `if_icmplt` (0xa1)
+                    // continues while `iv < bound` → exclusive.
                     if matches!(cmp_op, 0xa1 | 0xa4) && target >= header && target <= back_edge {
                         return Some(LoopBoundsInfo {
                             induction_var,
                             bound_local: Some(bound),
                             bound_const: None,
+                            inclusive: cmp_op == 0xa4,
                         });
                     }
                 }
@@ -4340,6 +4386,17 @@ fn find_safe_array_accesses(
 ) -> FxHashSet<usize> {
     let mut safe_pcs = FxHashSet::default();
 
+    // SECURITY FIX (V17): an inclusive comparator (`if_icmpgt` exit /
+    // `if_icmple` continue) lets the induction variable reach `bound` itself, so
+    // the maximum index accessed is `bound`, requiring `array.length >= bound +
+    // 1`. The header range guard only proves `array.length >= bound`, which is
+    // off-by-one for `index == bound` (an OOB heap read/write one element past
+    // the end). Refuse to mark any access safe for inclusive loops so the
+    // per-element check is always kept.
+    if bounds.inclusive {
+        return safe_pcs;
+    }
+
     // The header range guard (emitted in `compile`) proves `array.length >=
     // bound` ONCE at entry, so the BOUND local must itself be loop-invariant:
     // if the body raised `bound` afterwards, the per-iteration exit test
@@ -4452,14 +4509,23 @@ fn analyze_bounds_elimination(
         //      `iv >= array.length` — an OOB access past the stale guard.
         // (1) and (2) were already checked; (3) was NOT. Enforce it here so the
         // speculative guard is only installed when `bound_local` is invariant.
-        let bound_invariant = bounds
-            .bound_local
-            .map(|bl| bl < 64 && (modified & (1u64 << bl)) == 0)
-            .unwrap_or(false);
+        //
+        // SECURITY FIX (V17): an inclusive comparator reaches `index == bound`,
+        // which the single `array.length >= bound` header guard does NOT cover
+        // (it would need `array.length >= bound + 1`). Refuse the speculative
+        // guard for inclusive loops so no per-element check is elided past the
+        // stale-by-one guard. (`find_safe_array_accesses` already refused the
+        // static elisions for the same reason.)
+        let bound_invariant = !bounds.inclusive
+            && bounds
+                .bound_local
+                .map(|bl| bl < 64 && (modified & (1u64 << bl)) == 0)
+                .unwrap_or(false);
         // DBG (env-gated): CRATONVM_JIT_NO_SPEC_BCE disables ONLY the speculative
         // (runtime-guarded) BCE, keeping the statically-proven elisions — to
         // isolate whether the speculative guard is the unsound corruptor.
-        let no_spec_bce = std::env::var_os("CRATONVM_JIT_NO_SPEC_BCE").is_some();
+        // Cached in a OnceLock so the env lookup is paid once, not per loop.
+        let no_spec_bce = jit_no_spec_bce();
         if let Some(bound_local) = bounds.bound_local.filter(|_| bound_invariant && !no_spec_bce) {
             let speculative_accesses = find_speculative_array_accesses(
                 &bounds,
@@ -4712,6 +4778,11 @@ struct Compiler {
     /// Speculative BCE: deopt guards to emit at loop headers.
     /// Each guard checks that array.length >= loop_bound before entering the loop.
     speculative_bce_guards: Vec<SpeculativeBCEGuard>,
+    /// Speculative BCE guards indexed by their loop-header PC, built once from
+    /// `speculative_bce_guards`. The per-header bytecode emit loop looks guards
+    /// up here in O(1) instead of re-scanning the whole guard vector at every
+    /// loop header.
+    speculative_bce_guards_by_header: FxHashMap<usize, Vec<SpeculativeBCEGuard>>,
     /// Resolved `new` (0xbb) metadata.
     ///
     /// Tuple layout (CRIT-2):
@@ -5181,6 +5252,7 @@ impl Compiler {
             null_check_store_stubs: Vec::new(),
             exception_check_stubs: Vec::new(),
             speculative_bce_guards: Vec::new(),
+            speculative_bce_guards_by_header: FxHashMap::default(),
             new_info: Vec::new(),
             anewarray_info: Vec::new(),
             invoke_info: Vec::new(),
@@ -11191,19 +11263,17 @@ impl Compiler {
         let do_div_off = self.buf.pos();
         let rel1 = (do_div_off as i64) - (jne1_patch as i64 + 1);
         let rel2 = (do_div_off as i64) - (jne2_patch as i64 + 1);
-        // Hard runtime checks: a rel8 displacement that does not fit in an i8
-        // would silently miscompile in release builds. `emit_safe_idiv` cannot
-        // signal a failure (it returns `()`), so assert rather than emit a
-        // broken branch. The intervening block is fixed-size and small, so
-        // this can only fire on a genuine codegen bug.
-        assert!(
-            (-128..=127).contains(&rel1),
-            "emit_safe_idiv: JNE1 rel8 displacement {rel1} out of i8 range",
-        );
-        assert!(
-            (-128..=127).contains(&rel2),
-            "emit_safe_idiv: JNE2 rel8 displacement {rel2} out of i8 range",
-        );
+        // A rel8 displacement that does not fit in an i8 would silently
+        // miscompile in release builds. `emit_safe_idiv` cannot signal a failure
+        // (it returns `()`), so honor the no-panic contract: mark the buffer
+        // overflowed (the driver's `if buf.overflowed() { return None; }`
+        // discards the half-emitted method and falls back to the interpreter)
+        // instead of asserting. The intervening block is fixed-size and small,
+        // so this can only fire on a genuine codegen bug.
+        if !(-128..=127).contains(&rel1) || !(-128..=127).contains(&rel2) {
+            self.buf.mark_overflowed();
+            return;
+        }
         self.buf
             .try_patch_byte(jne1_patch, rel1 as u8)
             .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
@@ -11242,12 +11312,13 @@ impl Compiler {
         // :after_div — patch the JMP from the overflow path.
         let after_off = self.buf.pos();
         let rel_jmp = (after_off as i64) - (jmp_after_patch as i64 + 1);
-        // Hard runtime check (see JNE patch checks above): a rel8 that does not
-        // fit in an i8 would silently miscompile in release builds.
-        assert!(
-            (-128..=127).contains(&rel_jmp),
-            "emit_safe_idiv: JMP rel8 displacement {rel_jmp} out of i8 range",
-        );
+        // No-panic bail (see JNE patch checks above): a rel8 that does not fit in
+        // an i8 would silently miscompile, so mark the buffer overflowed and let
+        // the driver discard the method instead of asserting.
+        if !(-128..=127).contains(&rel_jmp) {
+            self.buf.mark_overflowed();
+            return;
+        }
         self.buf
             .try_patch_byte(jmp_after_patch, rel_jmp as u8)
             .ok(); // on Err try_patch_byte set buf.overflowed; compile bails
@@ -12157,12 +12228,13 @@ impl Compiler {
             //   CMP R10D, ECX  (array.length vs loop_bound)
             //   JB deopt_stub  (if array.length < loop_bound, deopt)
             {
+                // O(1) lookup of this header's guards (indexed once in `compile`)
+                // instead of re-scanning the whole guard vector per loop header.
                 let guards: Vec<SpeculativeBCEGuard> = self
-                    .speculative_bce_guards
-                    .iter()
-                    .filter(|g| g.loop_header == pc)
+                    .speculative_bce_guards_by_header
+                    .get(&pc)
                     .cloned()
-                    .collect();
+                    .unwrap_or_default();
                 for guard in guards {
                     // Load array reference into RAX
                     if let Some(reg) = self.reg_for_local(guard.array_local) {
@@ -19614,6 +19686,16 @@ pub fn compile_with_param_slots(
     compiler.param_jvm_slots = param_jvm_slots.to_vec();
     compiler.param_slot_span = param_slot_span;
     compiler.bounds_safe_pcs = bounds_safe_pcs;
+    // Index the speculative guards by loop-header PC once, so the per-header
+    // emit loop does an O(1) map lookup instead of an O(guards) filtered scan
+    // at every loop header.
+    {
+        let mut by_header: FxHashMap<usize, Vec<SpeculativeBCEGuard>> = FxHashMap::default();
+        for g in &speculative_bce_guards {
+            by_header.entry(g.loop_header).or_default().push(g.clone());
+        }
+        compiler.speculative_bce_guards_by_header = by_header;
+    }
     compiler.speculative_bce_guards = speculative_bce_guards;
     compiler.new_info = new_info;
     compiler.anewarray_info = anewarray_info;
@@ -24738,6 +24820,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_bounds_elimination_inclusive_not_safe() {
+        // SECURITY FIX (V17 / B1): an INCLUSIVE comparator reaches index == bound,
+        // which the single `array.length >= bound` header guard does NOT cover.
+        // The access must therefore KEEP its per-element bounds check (not be in
+        // `safe_pcs`) and NO speculative guard may be installed.
+        //
+        // Same shape as `test_bounds_elimination_analysis` but the exit test is
+        // `if_icmpgt` (0xa3) — `for (int i = 0; i <= n; i++) { arr[i]; }`:
+        //   0: iload_0          ; i
+        //   1: iload_2          ; n
+        //   2: if_icmpgt +13    ; exit if i > n (inclusive) → 15
+        //   5: aload_1          ; arr
+        //   6: iload_0          ; i
+        //   7: iaload           ; arr[i]
+        //   8: pop
+        //   9: iinc 0, 1        ; i++
+        //  12: goto -12         ; back to 0
+        //  15: return
+        let code: Vec<u8> = vec![
+            0x1a, // 0: iload_0 (i)
+            0x1c, // 1: iload_2 (n)
+            0xa3, 0x00, 0x0d, // 2: if_icmpgt +13 → 15 (INCLUSIVE exit)
+            0x2b, // 5: aload_1 (arr)
+            0x1a, // 6: iload_0 (i)
+            0x2e, // 7: iaload
+            0x57, // 8: pop
+            0x84, 0x00, 0x01, // 9: iinc 0, 1
+            0xa7, 0xff, 0xf4, // 12: goto -12 → 0
+            0xb1, // 15: return
+            0, 0,
+        ];
+        let code_len = 16;
+        let loops = detect_loops(&code, code_len);
+        assert_eq!(loops[0], (0, 12));
+
+        // analyze_loop_bound must flag the loop as inclusive.
+        let bounds = analyze_loop_bound(&code, 0, 12, 15, 0).expect("loop bound recognized");
+        assert!(bounds.inclusive, "if_icmpgt exit must be marked inclusive");
+
+        // The iaload at pc=7 must NOT be elided, and no speculative guard emitted.
+        let (safe_pcs, speculative_guards) = analyze_bounds_elimination(&code, code_len, &loops);
+        assert!(
+            !safe_pcs.contains(&7),
+            "inclusive-loop iaload at pc=7 must keep its bounds check, got {:?}",
+            safe_pcs
+        );
+        assert!(
+            speculative_guards.is_empty(),
+            "no speculative guard may be installed for an inclusive loop, got {:?}",
+            speculative_guards
+                .iter()
+                .map(|g| (g.loop_header, g.array_local, g.bound_local))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_find_modified_locals_high_local_no_panic() {
+        // B2: `find_modified_locals` must not panic (debug) or set the wrong bit
+        // (release) for a local index >= 64. A wide `istore 200` / `iinc 200, 1`
+        // must saturate to bit 63 via the `.min(63)` clamp.
+        //
+        //   0: istore 200   (0x36 0xc8)
+        //   2: iinc 200, 1  (0x84 0xc8 0x01)
+        //   5: return       (0xb1)
+        let code: Vec<u8> = vec![0x36, 0xc8, 0x84, 0xc8, 0x01, 0xb1];
+        let modified = find_modified_locals(&code, 0, code.len());
+        // High locals saturate to bit 63; no panic, and the low bits are clear.
+        assert_eq!(
+            modified,
+            1u64 << 63,
+            "high-local store/iinc must saturate to bit 63"
+        );
+    }
+
     #[cfg(feature = "vm-tests")]
     #[test]
     fn test_bounds_check_loop_compiled() {
@@ -25110,6 +25268,23 @@ mod tests {
         assert_eq!(bytecode_len_at(&[0xb6, 0x00, 0x01], 0), 3); // invokevirtual
         assert_eq!(bytecode_len_at(&[0xb7, 0x00, 0x01], 0), 3); // invokespecial
         assert_eq!(bytecode_len_at(&[0xb9, 0x00, 0x01, 0x02, 0x00], 0), 5); // invokeinterface
+    }
+
+    #[test]
+    fn test_bytecode_len_wide() {
+        // wide (0xc4) prefix — JVMS §6.5. Must stay in lockstep with
+        // regalloc.rs::bc_len's 0xc4 arm.
+        // `wide iload <2-byte index>` → 4 bytes (0x15 = iload).
+        assert_eq!(bytecode_len_at(&[0xc4, 0x15, 0x01, 0x00], 0), 4);
+        // `wide istore <2-byte index>` → 4 bytes (0x36 = istore).
+        assert_eq!(bytecode_len_at(&[0xc4, 0x36, 0x01, 0x00], 0), 4);
+        // `wide ret <2-byte index>` → 4 bytes (0xa9 = ret).
+        assert_eq!(bytecode_len_at(&[0xc4, 0xa9, 0x01, 0x00], 0), 4);
+        // `wide iinc <2-byte index> <2-byte const>` → 6 bytes (0x84 = iinc).
+        assert_eq!(bytecode_len_at(&[0xc4, 0x84, 0x01, 0x00, 0x00, 0x01], 0), 6);
+        // Truncated prefix (no modified-opcode byte): the `pc + 1 < code.len()`
+        // bounds check must not panic and falls to the 4-byte form.
+        assert_eq!(bytecode_len_at(&[0xc4], 0), 4);
     }
 
     #[test]

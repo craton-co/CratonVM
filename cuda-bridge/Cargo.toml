@@ -11,6 +11,8 @@ repository.workspace = true
 homepage.workspace = true
 keywords = ["cuda", "ffi", "gpu", "nvidia"]
 categories = ["api-bindings", "external-ffi-bindings"]
+# Withheld from crates.io at 0.3.0: early-maturity GPU/platform-glue crate.
+publish = false
 
 [dependencies]
 thiserror = { workspace = true }

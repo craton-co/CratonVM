@@ -186,6 +186,50 @@ fn alloc_java_string_object(shared: &SharedVm, text: &str) -> ObjectRef {
     str_obj
 }
 
+/// Bulk-read a compact `byte[]` array payload into a `Vec<u8>`.
+///
+/// Mirrors [`VmHeap::read_char_array_bulk`] but for the 1-byte-per-element
+/// `byte[]` storage used by JDK 9+ compact strings. `byte[]` elements are
+/// stored contiguously immediately after the object header, one byte each
+/// (the same layout exploited by `write_byte_array_from` /
+/// `read_byte_array_into` in `vm_exec.rs`), so the common case is a single
+/// `copy_nonoverlapping` instead of `len` boxed `get_array_element` calls
+/// (each a virtual dispatch + `Value` box + element-type match).
+///
+/// `array_data_ptr` returns `None` for a G1 *humongous* array (payload split
+/// across non-contiguous regions); in that case we fall back to the
+/// region-safe per-element accessor, exactly as `read_char_array_bulk` does.
+fn read_byte_array_bulk(heap: &VmHeap, obj: ObjectRef) -> Vec<u8> {
+    let len = heap.array_length(obj);
+    let mut out = vec![0u8; len];
+    if len == 0 {
+        return out;
+    }
+    match heap.array_data_ptr(obj) {
+        // SAFETY: `obj` is a live `byte[]` (kind + element type checked by the
+        // caller); its payload is `len` contiguous bytes starting at
+        // `array_data_ptr` (1 byte per element). `out` was just allocated with
+        // exactly `len` bytes. Heap arena (source) and the fresh `Vec`
+        // (destination) cannot overlap. This is a synchronous read with no
+        // intervening allocation, so the payload cannot move under the copy —
+        // the same convention `read_char_array_bulk` / `read_byte_array_into`
+        // already rely on.
+        Some(base) => unsafe {
+            std::ptr::copy_nonoverlapping(base, out.as_mut_ptr(), len);
+        },
+        // G1 humongous byte[]: region-safe per-element read. Byte slots decode
+        // to `Value::Int(u8 as i32)`; mask back to the 8-bit value.
+        None => {
+            for (i, slot) in out.iter_mut().enumerate() {
+                if let Ok(Value::Int(v)) = heap.get_array_element(obj, i) {
+                    *slot = (v & 0xFF) as u8;
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Decode the JDK `String.value` array payload (compact `byte[]` or legacy `char[]`).
 pub fn decode_java_string_value_array(
     heap: &VmHeap,
@@ -202,33 +246,28 @@ pub fn decode_java_string_value_array(
             Some(String::from_utf16_lossy(&utf16))
         }
         ArrayElementType::Byte => {
-            let len = heap.array_length(value_array);
+            // Bulk-read the byte payload once, then decode from the contiguous
+            // slice. Identical output to the previous per-element loops; only
+            // the O(n) virtual-dispatch / Value-box overhead is removed.
+            let bytes = read_byte_array_bulk(heap, value_array);
             if coder == CODER_LATIN1 {
-                let mut s = String::with_capacity(len);
-                for i in 0..len {
-                    let b = match heap.get_array_element(value_array, i) {
-                        Ok(Value::Int(v)) => (v & 0xFF) as u8,
-                        _ => 0,
-                    };
+                // LATIN1: 1 byte per char, code points U+0000..U+00FF map
+                // directly via `b as char` (same as the old `(v & 0xFF) as u8`
+                // push — the bytes are already masked to 8 bits).
+                let mut s = String::with_capacity(bytes.len());
+                for &b in &bytes {
                     s.push(b as char);
                 }
                 Some(s)
             } else {
-                let num_units = len / 2;
-                let mut utf16 = Vec::with_capacity(num_units);
-                for i in 0..num_units {
-                    // Little-endian: low byte at even index (matches
-                    // StringUTF16.isBigEndian()==false and create_java_string).
-                    let lo = match heap.get_array_element(value_array, i * 2) {
-                        Ok(Value::Int(v)) => (v & 0xFF) as u16,
-                        _ => 0,
-                    };
-                    let hi = match heap.get_array_element(value_array, i * 2 + 1) {
-                        Ok(Value::Int(v)) => (v & 0xFF) as u16,
-                        _ => 0,
-                    };
-                    utf16.push((hi << 8) | lo);
-                }
+                // UTF16: 2 bytes per code unit, little-endian (low byte at the
+                // even index — matches StringUTF16.isBigEndian()==false and
+                // create_java_string). `chunks_exact(2)` drops any trailing odd
+                // byte, exactly as the old `len / 2` loop did.
+                let utf16: Vec<u16> = bytes
+                    .chunks_exact(2)
+                    .map(|c| u16::from(c[0]) | (u16::from(c[1]) << 8))
+                    .collect();
                 Some(String::from_utf16_lossy(&utf16))
             }
         }
@@ -1100,6 +1139,56 @@ mod tests {
         let obj1 = create_java_string(&shared, "same");
         let obj2 = create_java_string(&shared, "same");
         assert_eq!(obj1.as_ptr(), obj2.as_ptr());
+    }
+
+    /// Build a `byte[]` payload directly and decode it via
+    /// `decode_java_string_value_array`, exercising the bulk byte read
+    /// (`read_byte_array_bulk`) added in the P1 perf fix. Pins exact output
+    /// for LATIN1 (1 byte/char), UTF16 little-endian (2 bytes/char), the empty
+    /// array, and an odd-length UTF16 buffer (the trailing odd byte must be
+    /// dropped, matching the previous `len / 2` per-element loop).
+    fn make_byte_array(shared: &SharedVm, bytes: &[u8]) -> ObjectRef {
+        let arr = shared
+            .heap
+            .alloc_array(ClassId::new(0), ArrayElementType::Byte, bytes.len());
+        for (i, &b) in bytes.iter().enumerate() {
+            let _ = shared.heap.set_array_element(arr, i, Value::Int(b as i32));
+        }
+        arr
+    }
+
+    #[test]
+    fn decode_value_array_byte_paths_bulk() {
+        let shared = test_shared();
+
+        // LATIN1: one byte per char, U+0000..U+00FF map directly.
+        let latin1 = make_byte_array(&shared, &[b'H', b'i', 0xFF]);
+        assert_eq!(
+            decode_java_string_value_array(&shared.heap, latin1, CODER_LATIN1),
+            Some("Hi\u{00FF}".to_string())
+        );
+
+        // UTF16 little-endian: low byte at even index. "Ā" = U+0100 → [0x00,0x01].
+        let utf16 = make_byte_array(&shared, &[b'A', 0x00, 0x00, 0x01]);
+        assert_eq!(
+            decode_java_string_value_array(&shared.heap, utf16, CODER_UTF16),
+            Some("A\u{0100}".to_string())
+        );
+
+        // Empty byte[] decodes to the empty string under either coder.
+        let empty = make_byte_array(&shared, &[]);
+        assert_eq!(
+            decode_java_string_value_array(&shared.heap, empty, CODER_LATIN1),
+            Some(String::new())
+        );
+
+        // Odd-length UTF16 buffer: the trailing odd byte is dropped, exactly
+        // as the previous `num_units = len / 2` per-element loop did.
+        let odd = make_byte_array(&shared, &[b'A', 0x00, 0x42]);
+        assert_eq!(
+            decode_java_string_value_array(&shared.heap, odd, CODER_UTF16),
+            Some("A".to_string())
+        );
     }
 
     /// Wave 2 (S108) regression: a non-String object whose `field 0` holds an

@@ -139,6 +139,76 @@ const SYNTHETIC_PROCESS_CLASS: &str = "cratonvm/synthetic/Process";
 // Spawn + teardown primitives
 // ---------------------------------------------------------------------------
 
+/// SECURITY (V1, HIGH): vet the *executable* of a subprocess spawn against
+/// the CWD-confinement policy before launching it.
+///
+/// `validate_path` confines guest file *reads/writes* to the sandbox root,
+/// but a spawned child inherits the JVM's full ambient authority — once it
+/// runs it can open files anywhere the host process can, completely bypassing
+/// every per-syscall path check the guest is subject to. Spawning an arbitrary
+/// host program (`new ProcessBuilder("/bin/sh").start()`,
+/// `Runtime.exec("C:\\Windows\\System32\\cmd.exe ...")`) is therefore a far
+/// larger escape than the file reads the certified profile is designed to
+/// block, and the work-dir validation alone left it wide open.
+///
+/// Policy:
+///   * Confinement OFF (the JDK-faithful single-tenant default): unchanged —
+///     `Ok` for any program, matching `validate_path`'s default of letting a
+///     `java -jar app.jar` launch reach the host freely.
+///   * Confinement ON (`CRATONVM_CONFINE_IO` / `set_path_confine_to_cwd(true)`):
+///     fail closed. The program must be an *explicit* path (contain a path
+///     separator) — a bare command name such as `sh` or `cmd` would
+///     `PATH`-resolve to an arbitrary host binary and is rejected — AND that
+///     path must resolve, via `validate_path`, to a location inside the
+///     sandbox root. Anything else is rejected with a `SecurityException`,
+///     which the caller maps to the `IOException` that `ProcessBuilder.start`
+///     / `UNIXProcess.forkAndExec` raise for an unusable command.
+fn validate_spawn_program(program: &str) -> Result<(), RuntimeError> {
+    // Null bytes are rejected unconditionally (truncate the host C-string at
+    // the boundary); `validate_path` already does this, mirror it here so a
+    // bare-name reject path can't slip a NUL through under confinement-off.
+    if program.contains('\0') {
+        return Err(RuntimeError::SecurityException {
+            message: format!(
+                "ProcessBuilder.start: program contains null byte: {}",
+                program.replace('\0', "\\0")
+            ),
+        });
+    }
+
+    // Default (unconfined) profile: JDK-faithful, spawn freely.
+    if !crate::is_path_confine_to_cwd() {
+        return Ok(());
+    }
+
+    // --- Confined profile: fail closed --------------------------------------
+    //
+    // Reject bare command names. `Command::new("sh")` resolves `sh` through
+    // the host `PATH` to an arbitrary system binary that has nothing to do
+    // with the sandbox, so under confinement only an explicit path that we
+    // can range-check is allowed.
+    let has_separator = program.contains('/') || program.contains('\\');
+    if !has_separator {
+        return Err(RuntimeError::SecurityException {
+            message: format!(
+                "ProcessBuilder.start: bare program name rejected under CWD confinement \
+                 (PATH-resolved host binary escapes sandbox): {program}"
+            ),
+        });
+    }
+
+    // Explicit path: it must resolve inside the sandbox root, exactly like
+    // any file the confined guest is allowed to touch.
+    match crate::validate_path(program) {
+        Ok(_) => Ok(()),
+        Err(_) => Err(RuntimeError::SecurityException {
+            message: format!(
+                "ProcessBuilder.start: program rejected by sandbox (escapes confinement root): {program}"
+            ),
+        }),
+    }
+}
+
 /// Spawn a command and populate a synthetic `java/lang/Process` object.
 ///
 /// This is the workhorse called by every `Runtime.exec` overload and
@@ -165,6 +235,21 @@ pub fn spawn_and_wrap(
             message: "ProcessBuilder: empty program".to_string(),
         }
         .into());
+    }
+
+    // SECURITY (V1, HIGH): vet the executable against the CWD-confinement
+    // policy before spawning. Under confinement this rejects bare PATH-resolved
+    // host binaries and any explicit path that escapes the sandbox root; with
+    // confinement off (the default) it is a no-op. The validator's
+    // `SecurityException` is mapped to `IOException` so the failure looks like
+    // any other unusable-command spawn error to `ProcessBuilder.start` /
+    // `UNIXProcess.forkAndExec`.
+    if let Err(security_err) = validate_spawn_program(program) {
+        let detail = match security_err {
+            RuntimeError::SecurityException { message } => message,
+            other => format!("{other:?}"),
+        };
+        return Err(RuntimeError::IOException { message: detail }.into());
     }
 
     let mut command = Command::new(program);
@@ -1128,10 +1213,18 @@ fn native_process_builder_start(
     }
 
     // --- Field 1: directory (File) ---
+    // B5: read the File's path string BY NAME (`path`) — a real-JDK
+    // `java.io.File` does not place its `String path` field at slot 0, so the
+    // old fixed `get_field(file_obj, 0)` silently dropped
+    // `ProcessBuilder.directory(dir)` (spawning in CWD instead). Fall back to
+    // slot 0 only for the synthetic File layout where the field is unnamed.
     let work_dir: Option<String> = match ctx.get_field(this, 1) {
-        Value::Object(Some(file_obj)) => match ctx.get_field(file_obj, 0) {
+        Value::Object(Some(file_obj)) => match ctx.get_field_by_name(file_obj, "path") {
             Value::Object(Some(s)) => ctx.read_string(s),
-            _ => None,
+            _ => match ctx.get_field(file_obj, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            },
         },
         _ => None,
     };
@@ -1267,6 +1360,47 @@ mod tests {
         let _ = wait_for_handle(handle);
         // pid should still be retrievable post-wait.
         assert_eq!(pid_for_handle(handle), pid);
+    }
+
+    /// V1: under CWD confinement the spawn gate rejects a bare PATH-resolved
+    /// program name and an explicit path that escapes the sandbox, while the
+    /// default (unconfined) profile accepts anything. NUL is always rejected.
+    #[test]
+    fn validate_spawn_program_confinement_gate() {
+        // Default profile: anything spawns (JDK-faithful single-tenant).
+        crate::set_path_confine_to_cwd(false);
+        assert!(validate_spawn_program("sh").is_ok());
+        assert!(validate_spawn_program("/bin/sh").is_ok());
+        assert!(validate_spawn_program(r"C:\Windows\System32\cmd.exe").is_ok());
+        // NUL is rejected even with confinement off (host C-string truncation).
+        assert!(validate_spawn_program("sh\0-c").is_err());
+
+        // Confined profile: fail closed.
+        crate::set_path_confine_to_cwd(true);
+        // Bare command name -> PATH-resolved host binary -> rejected.
+        assert!(
+            validate_spawn_program("sh").is_err(),
+            "bare program name must be rejected under confinement"
+        );
+        assert!(
+            validate_spawn_program("cmd").is_err(),
+            "bare program name must be rejected under confinement"
+        );
+        // An explicit absolute path outside the sandbox is rejected by the
+        // containment check inside `validate_path`.
+        #[cfg(unix)]
+        assert!(
+            validate_spawn_program("/bin/sh").is_err(),
+            "explicit out-of-sandbox path must be rejected under confinement"
+        );
+        #[cfg(windows)]
+        assert!(
+            validate_spawn_program(r"C:\Windows\System32\cmd.exe").is_err(),
+            "explicit out-of-sandbox path must be rejected under confinement"
+        );
+
+        // Restore the global default so we don't leak state to other tests.
+        crate::set_path_confine_to_cwd(false);
     }
 
     #[test]

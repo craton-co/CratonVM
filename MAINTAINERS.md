@@ -10,8 +10,8 @@ The GitHub team `@craton-co/cratonvm-maintainers` referenced from
 ## Steward
 
 - **Craton Software Company** — project owner, trademark holder, release
-  manager. Contact: `hello@craton.co` for general matters,
-  `security@craton.co` for security (see [SECURITY.md](SECURITY.md)).
+  manager. Contact: `hello@craton.com.ar` for general matters,
+  `security@craton.com.ar` for security (see [SECURITY.md](SECURITY.md)).
 
 ## Maintainers
 

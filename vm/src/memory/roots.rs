@@ -254,6 +254,15 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     (`gc_update_msc_service_refs`).
     cratonvm_native_builtins::jboss_msc::gc_scan_msc_service_roots(&mut roots);
 
+    // 19b. Round-4 B4: java.util.logging / JBoss LogManager mirrors — the
+    //     LogManager / Logger / LogContext singletons and the attachments
+    //     table are cached as raw addresses in process-global side-tables in
+    //     `native-builtins/src/logmanager.rs` with no GC visibility. Root them
+    //     so a moving GC cannot reclaim/relocate a cached logger out from under
+    //     a later native lookup (use-after-free). Remap companion in `gc.rs`
+    //     (`gc_update_logmanager_refs`).
+    cratonvm_native_builtins::logmanager::gc_scan_logmanager_roots(&mut roots);
+
     roots
 }
 

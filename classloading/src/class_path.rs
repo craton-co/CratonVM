@@ -243,6 +243,18 @@ enum ClassPathEntry {
         /// `by_name` probes for absent versions. `None` means the
         /// cache hasn't been built yet.
         versions_cache: Mutex<Option<BTreeSet<u32>>>,
+        /// Report P1 (perf): memoized verified signer cert chain (leaf+chain
+        /// DER) for this archive. `extract_jar_signer_blocks` is a pure
+        /// function of the archive — the `CodeSource` certificates are
+        /// identical for every class in the JAR — but it was re-run on every
+        /// class lookup: full central-directory rescan, re-read of every
+        /// `*.RSA`/`*.SF`, PKCS#7 parse, RSA/ECDSA/DSA verify, trust-chain
+        /// walk, and (post V1 fix) a MANIFEST.MF + per-entry digest re-hash.
+        /// Populated once on the first signed lookup and cloned thereafter;
+        /// an empty `Vec` (unsigned, or failed verification) is also cached so
+        /// the rescan is skipped for unsigned JARs too. Security is unchanged
+        /// — the full verification still runs, exactly once.
+        signer_cache: OnceLock<Vec<Vec<u8>>>,
     },
     /// A virtual directory inside a fat JAR (e.g. `BOOT-INF/classes/`).
     /// Entries are stored as a map from relative path to byte content.
@@ -262,6 +274,10 @@ enum ClassPathEntry {
         nested_path: String,
         /// The extracted nested archive.
         archive: Mutex<ZipArchive<Cursor<Vec<u8>>>>,
+        /// Report P1 (perf): memoized verified signer cert chain for this
+        /// nested archive — see the matching field on `JarFile`. Populated
+        /// once on the first signed lookup, cloned thereafter.
+        signer_cache: OnceLock<Vec<Vec<u8>>>,
     },
     /// A JDK 9+ JMOD file (ZIP with 4-byte `JM\x01\x00` prefix).
     /// All entries under `classes/` are pre-extracted into an in-memory cache
@@ -571,6 +587,37 @@ pub(crate) const MAX_UNCOMPRESSED_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
 #[inline]
 fn safe_with_capacity(declared_size: u64) -> usize {
     declared_size.min(MAX_UNCOMPRESSED_ENTRY_BYTES) as usize
+}
+
+/// V2 (decompression-bomb DoS): read a ZIP entry's *streaming* inflate
+/// output, bounding the **actual** inflated size — not just the declared
+/// pre-allocation [`safe_with_capacity`] guards.
+///
+/// The `zip` reader streams deflate output up to the entry's declared
+/// uncompressed size, which is attacker-controlled; a highly compressible
+/// payload (~1000:1) lets a tiny compressed entry inflate to GBs and
+/// `read_to_end` grows the buffer to that full size regardless of the
+/// 512 MiB capacity clamp. Here we read with `Read::take(cap + 1)` and
+/// reject (with an `io::Error`) the instant the running inflated total
+/// exceeds [`MAX_UNCOMPRESSED_ENTRY_BYTES`], so the buffer can never grow
+/// past the cap by more than one byte before the abort.
+///
+/// `declared_size` is the central-directory `size()` used only to seed the
+/// initial `Vec` capacity (already clamped via [`safe_with_capacity`]); the
+/// cap, not the declared size, is the authoritative bound on what we read.
+fn read_entry_capped<R: Read>(reader: &mut R, declared_size: u64) -> std::io::Result<Vec<u8>> {
+    let cap = MAX_UNCOMPRESSED_ENTRY_BYTES;
+    let mut data = Vec::with_capacity(safe_with_capacity(declared_size));
+    // Read at most `cap + 1` bytes: hitting `cap + 1` proves the real
+    // inflated stream exceeds the cap (a lying-small `size()` bomb).
+    let read = reader.take(cap + 1).read_to_end(&mut data)?;
+    if read as u64 > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "zip entry inflated size exceeds MAX_UNCOMPRESSED_ENTRY_BYTES (decompression bomb)",
+        ));
+    }
+    Ok(data)
 }
 
 /// Audit-fix #3: reject zip-slip-style entry names so attacker-controlled
@@ -1017,6 +1064,7 @@ impl ClassPath {
                                 archive: Mutex::new(reloaded),
                                 multi_release: mr,
                                 versions_cache: Mutex::new(None),
+                                signer_cache: OnceLock::new(),
                             });
                         }
                         Err(e) => {
@@ -1034,6 +1082,7 @@ impl ClassPath {
                         archive: Mutex::new(archive),
                         multi_release: mr,
                         versions_cache: Mutex::new(None),
+                        signer_cache: OnceLock::new(),
                     });
                 }
             }
@@ -1048,10 +1097,13 @@ impl ClassPath {
         let result = archive
             .by_name("META-INF/MANIFEST.MF")
             .and_then(|mut entry| {
-                // Audit-fix #2: clamp attacker-controlled declared size.
-                let mut data = Vec::with_capacity(safe_with_capacity(entry.size()));
-                entry.read_to_end(&mut data)?;
-                Ok(data)
+                // Audit-fix #2 (capacity) + V2 (streaming bound): clamp the
+                // attacker-controlled declared size AND bound the actual
+                // inflate via `read_entry_capped`. The `?` converts the
+                // `io::Error` overflow into `ZipError` so the closure stays
+                // in the `ZipResult` the `and_then` expects.
+                let size = entry.size();
+                Ok(read_entry_capped(&mut entry, size)?)
             });
         match result {
             Ok(data) => ManifestInfo::parse(&data),
@@ -1139,9 +1191,9 @@ impl ClassPath {
                 if !relative.is_empty() && !relative.ends_with('/') && is_safe_entry_name(relative)
                 {
                     if let Ok(mut entry) = archive.by_name(&name) {
-                        // Audit-fix #2: clamp zip-bomb declared size.
-                        let mut data = Vec::with_capacity(safe_with_capacity(entry.size()));
-                        if entry.read_to_end(&mut data).is_ok() {
+                        // Audit-fix #2 (capacity) + V2 (streaming bound).
+                        let size = entry.size();
+                        if let Ok(data) = read_entry_capped(&mut entry, size) {
                             classes_cache.insert(relative.to_string(), data);
                         }
                     }
@@ -1152,9 +1204,9 @@ impl ClassPath {
                 if !relative.is_empty() && !relative.ends_with('/') && is_safe_entry_name(relative)
                 {
                     if let Ok(mut entry) = archive.by_name(&name) {
-                        // Audit-fix #2: clamp zip-bomb declared size.
-                        let mut data = Vec::with_capacity(safe_with_capacity(entry.size()));
-                        if entry.read_to_end(&mut data).is_ok() {
+                        // Audit-fix #2 (capacity) + V2 (streaming bound).
+                        let size = entry.size();
+                        if let Ok(data) = read_entry_capped(&mut entry, size) {
                             classes_cache.insert(relative.to_string(), data);
                         }
                     }
@@ -1185,9 +1237,9 @@ impl ClassPath {
         let mut nested_count = 0;
         for jar_name in &nested_jar_names {
             if let Ok(mut entry) = archive.by_name(jar_name) {
-                // Audit-fix #2: clamp zip-bomb declared size.
-                let mut jar_data = Vec::with_capacity(safe_with_capacity(entry.size()));
-                if entry.read_to_end(&mut jar_data).is_ok() {
+                // Audit-fix #2 (capacity) + V2 (streaming bound).
+                let size = entry.size();
+                if let Ok(jar_data) = read_entry_capped(&mut entry, size) {
                     let cursor = Cursor::new(jar_data);
                     match ZipArchive::new(cursor) {
                         Ok(nested_archive) => {
@@ -1195,6 +1247,7 @@ impl ClassPath {
                                 parent_jar: path.to_path_buf(),
                                 nested_path: jar_name.clone(),
                                 archive: Mutex::new(nested_archive),
+                                signer_cache: OnceLock::new(),
                             });
                             nested_count += 1;
                         }
@@ -1390,8 +1443,9 @@ impl ClassPath {
                 continue;
             }
             if let Ok(mut entry) = archive.by_name(&name) {
-                let mut bytes = Vec::with_capacity(safe_with_capacity(entry.size()));
-                if entry.read_to_end(&mut bytes).is_ok() {
+                // V2 (streaming bound) in addition to the capacity clamp.
+                let size = entry.size();
+                if let Ok(bytes) = read_entry_capped(&mut entry, size) {
                     entries_cache.insert(relative.to_string(), bytes);
                 }
             }
@@ -1628,7 +1682,7 @@ impl ClassPath {
                         );
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, versions_cache, path } => {
+                ClassPathEntry::JarFile { archive, multi_release, versions_cache, path, .. } => {
                     let found = if *multi_release {
                         Self::find_in_multi_release_archive(archive, versions_cache, &relative_path).is_some()
                     } else {
@@ -1646,7 +1700,7 @@ impl ClassPath {
                     }
                 }
                 ClassPathEntry::NestedJar {
-                    parent_jar, archive, nested_path,
+                    parent_jar, archive, nested_path, ..
                 } => {
                     if Self::find_in_archive(archive, &relative_path).is_some() {
                         // Return "$parent_jar!/$nested_path" style (JAR-in-JAR)
@@ -1725,7 +1779,7 @@ impl ClassPath {
                         return Some((format!("file:/{p}/"), Vec::new()));
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, versions_cache, path } => {
+                ClassPathEntry::JarFile { archive, multi_release, versions_cache, path, signer_cache } => {
                     let found = if *multi_release {
                         Self::find_in_multi_release_archive(archive, versions_cache, &relative_path).is_some()
                     } else {
@@ -1738,7 +1792,11 @@ impl ClassPath {
                         let p = abs.to_string_lossy().replace('\\', "/");
                         let p = p.strip_prefix("//?/").unwrap_or(&p).to_string();
                         let p = p.trim_start_matches('/').to_string();
-                        let certs = Self::extract_jar_signer_blocks(archive);
+                        // Report P1 (perf): verify the signer blocks at most once
+                        // per archive, then clone the cached cert chain.
+                        let certs = signer_cache
+                            .get_or_init(|| Self::extract_jar_signer_blocks(archive))
+                            .clone();
                         return Some((format!("file:/{p}"), certs));
                     }
                 }
@@ -1751,11 +1809,15 @@ impl ClassPath {
                         return Some((format!("file:/{p}"), Vec::new()));
                     }
                 }
-                ClassPathEntry::NestedJar { parent_jar, archive, nested_path } => {
+                ClassPathEntry::NestedJar { parent_jar, archive, nested_path, signer_cache } => {
                     if Self::find_in_archive(archive, &relative_path).is_some() {
                         let outer = parent_jar.to_string_lossy().replace('\\', "/");
                         let outer = outer.trim_start_matches('/').to_string();
-                        let certs = Self::extract_jar_signer_blocks(archive);
+                        // Report P1 (perf): verify the signer blocks at most once
+                        // per nested archive, then clone the cached cert chain.
+                        let certs = signer_cache
+                            .get_or_init(|| Self::extract_jar_signer_blocks(archive))
+                            .clone();
                         return Some((format!("jar:file:/{outer}!/{nested_path}"), certs));
                     }
                 }
@@ -1838,11 +1900,11 @@ impl ClassPath {
 
         let mut out: Vec<Vec<u8>> = Vec::new();
         for name in signer_block_names {
-            // Read signer block bytes (clamped against zip-bomb sizes).
+            // Read signer block bytes (clamped against zip-bomb sizes,
+            // streaming-bounded by `read_entry_capped` — V2).
             let block = match guard.by_name(&name).and_then(|mut e| {
-                let mut data = Vec::with_capacity(safe_with_capacity(e.size()));
-                e.read_to_end(&mut data)?;
-                Ok(data)
+                let size = e.size();
+                Ok(read_entry_capped(&mut e, size)?)
             }) {
                 Ok(d) if !d.is_empty() => d,
                 _ => continue,
@@ -1868,9 +1930,8 @@ impl ClassPath {
                 }
             };
             let sf_bytes = match guard.by_name(&sf_name).and_then(|mut e| {
-                let mut data = Vec::with_capacity(safe_with_capacity(e.size()));
-                e.read_to_end(&mut data)?;
-                Ok(data)
+                let size = e.size();
+                Ok(read_entry_capped(&mut e, size)?)
             }) {
                 Ok(d) => d,
                 Err(_) => continue,
@@ -1886,12 +1947,89 @@ impl ClassPath {
             if let Some(vs) =
                 crate::jar_signer::verify_signer_block(&block, &sf_bytes, trust_store)
             {
-                for cert in vs.chain {
-                    out.push(cert);
+                // V1: the signature/`.SF` check above only binds the `.SF`
+                // to the signer. The full jarsigner trust chain is
+                // signature -> .SF -> MANIFEST.MF -> per-entry digest ->
+                // bytes. Without the last two links, an attacker can swap a
+                // signed JAR's class body (leaving MANIFEST/.SF/.RSA intact)
+                // and still surface the original signer's certificate.
+                // `verify_signed_entries` re-reads MANIFEST.MF and every
+                // entry it commits to, computes the named digest, and
+                // rejects the whole signer block on any mismatch — so the
+                // certs are dropped (CodeSource reported as unsigned),
+                // matching HotSpot's "fails verify" behaviour.
+                if Self::verify_signed_entries(&mut guard, &sf_bytes) {
+                    for cert in vs.chain {
+                        out.push(cert);
+                    }
+                } else {
+                    debug!(
+                        "jar signer: signer block {} verified but a manifest \
+                         entry digest did not match — dropping certs",
+                        name
+                    );
                 }
             }
         }
         out
+    }
+
+    /// V1: bind a verified signer to the actual entry bytes.
+    ///
+    /// Given the already signature-verified `.SF` bytes, this:
+    ///   1. reads `META-INF/MANIFEST.MF` from the archive,
+    ///   2. confirms the `.SF`'s `<alg>-Digest-Manifest` matches the
+    ///      digest of that `MANIFEST.MF` (so the manifest is the one the
+    ///      signer committed to), and
+    ///   3. for every per-entry section in the manifest, re-reads the
+    ///      named entry and confirms its bytes hash to the manifest's
+    ///      `<alg>-Digest` value.
+    ///
+    /// Returns `true` only when the manifest is bound by the `.SF` **and**
+    /// every declared entry digest matches. Any missing manifest, missing
+    /// committed entry, unreadable entry, or digest mismatch returns
+    /// `false` (fail-closed). Directory entries (`Name:` ending in `/`)
+    /// carry no digest and are skipped by the parser.
+    fn verify_signed_entries(
+        archive: &mut ZipArchive<Cursor<Vec<u8>>>,
+        sf_bytes: &[u8],
+    ) -> bool {
+        // (1) Read MANIFEST.MF (streaming-bounded against zip-bombs).
+        let manifest_bytes = match archive.by_name("META-INF/MANIFEST.MF").and_then(|mut e| {
+            let size = e.size();
+            Ok(read_entry_capped(&mut e, size)?)
+        }) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+
+        // (2) The `.SF` must commit to this exact MANIFEST.MF.
+        if !crate::jar_signer::verify_sf_binds_manifest(sf_bytes, &manifest_bytes) {
+            return false;
+        }
+
+        // (3) Every entry the manifest declares a digest for must match.
+        let declared = crate::jar_signer::parse_manifest_entry_digests(&manifest_bytes);
+        for entry in &declared {
+            // Defence-in-depth: never let a manifest `Name:` smuggle a
+            // traversal/drive-letter key into the lookup.
+            if !is_safe_entry_name(&entry.name) {
+                return false;
+            }
+            let bytes = match archive.by_name(&entry.name).and_then(|mut e| {
+                let size = e.size();
+                Ok(read_entry_capped(&mut e, size)?)
+            }) {
+                Ok(d) => d,
+                // A manifest that signs an entry which is absent or
+                // unreadable is a tampered/broken JAR — fail-closed.
+                Err(_) => return false,
+            };
+            if !crate::jar_signer::digest_matches(entry.alg, &bytes, &entry.expected) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Find a raw resource file by its classpath-relative name.
@@ -2255,7 +2393,7 @@ impl ClassPath {
                         urls.push(format!("file:/{p}"));
                     }
                 }
-                ClassPathEntry::JarFile { archive, multi_release, versions_cache, path } => {
+                ClassPathEntry::JarFile { archive, multi_release, versions_cache, path, .. } => {
                     let direct = if *multi_release {
                         Self::find_in_multi_release_archive(archive, versions_cache, name).is_some()
                     } else {
@@ -2309,7 +2447,7 @@ impl ClassPath {
                         urls.push(format!("jar:file:/{p}!/{prefix}{name}"));
                     }
                 }
-                ClassPathEntry::NestedJar { parent_jar, archive, nested_path } => {
+                ClassPathEntry::NestedJar { parent_jar, archive, nested_path, .. } => {
                     if Self::find_in_archive(archive, name).is_some() {
                         let p = parent_jar.to_string_lossy().replace('\\', "/");
                         let p = p.trim_start_matches('/');
@@ -2685,12 +2823,12 @@ impl ClassPath {
         let result = guard.by_name(name).and_then(|mut zip_entry| {
             // Audit-fix #2 / zip-bomb: the declared `size()` comes from the
             // JAR central directory and is attacker-controlled (up to
-            // `u64::MAX`). Clamp it via `safe_with_capacity` to avoid a
-            // multi-GiB pre-allocation from a crafted JAR, matching the
-            // sibling entry-read paths.
-            let mut data = Vec::with_capacity(safe_with_capacity(zip_entry.size()));
-            zip_entry.read_to_end(&mut data)?;
-            Ok(data)
+            // `u64::MAX`). `read_entry_capped` clamps the pre-allocation
+            // AND bounds the actual streaming inflate (V2), matching the
+            // sibling entry-read paths. The `?` converts the `io::Error`
+            // overflow into the `ZipError` the `and_then` expects.
+            let size = zip_entry.size();
+            Ok(read_entry_capped(&mut zip_entry, size)?)
         });
         match result {
             Ok(data) => Some(data),
@@ -2775,10 +2913,11 @@ impl ClassPath {
             if let Some(relative) = name.strip_prefix("classes/") {
                 if !relative.is_empty() && !relative.ends_with('/') {
                     if let Ok(mut entry) = archive.by_name(&name) {
-                        // Audit-fix (zip-bomb): clamp the attacker-controlled
-                        // central-directory `size()` like every other path.
-                        let mut buf = Vec::with_capacity(safe_with_capacity(entry.size()));
-                        if entry.read_to_end(&mut buf).is_ok() {
+                        // Audit-fix (zip-bomb) + V2: clamp the attacker-
+                        // controlled central-directory `size()` AND bound the
+                        // actual streaming inflate like every other path.
+                        let size = entry.size();
+                        if let Ok(buf) = read_entry_capped(&mut entry, size) {
                             classes_cache.insert(relative.to_string(), buf);
                         }
                     }

@@ -304,7 +304,18 @@ impl EnhancedQueueExecutor {
             next_thread_id: AtomicUsize::new(0),
         });
         for _ in 0..config.core_size {
-            spawn_worker(exec.clone());
+            // B9: a failed worker spawn (OS thread-limit / ENOMEM) is logged
+            // and tolerated rather than panicking the process. The pool still
+            // functions with whatever workers did start; if none start, callers
+            // fall back to `drain_locally` / `drain_all_pending_runnables`.
+            if let Err(e) = spawn_worker(exec.clone()) {
+                tracing::warn!(
+                    target: "wildfly_core",
+                    pool = %config.name,
+                    error = %e,
+                    "failed to spawn EnhancedQueueExecutor worker — continuing with fewer workers"
+                );
+            }
         }
         exec
     }
@@ -401,11 +412,16 @@ impl EnhancedQueueExecutor {
     }
 }
 
-fn spawn_worker(exec: Arc<EnhancedQueueExecutor>) {
+/// Spawn one worker thread for `exec`.
+///
+/// B9: an OS thread-limit / ENOMEM failure must not abort the whole process.
+/// We return the spawn error so the caller can decide what to do (the pool
+/// simply runs with fewer workers; tasks can still drain via the surviving
+/// workers, `drain_locally`, or `drain_all_pending_runnables`).
+fn spawn_worker(exec: Arc<EnhancedQueueExecutor>) -> std::io::Result<()> {
     let b = exec.new_thread_builder();
     let e2 = exec.clone();
-    b.spawn(move || worker_loop(e2))
-        .expect("failed to spawn EnhancedQueueExecutor worker");
+    b.spawn(move || worker_loop(e2)).map(|_handle| ())
 }
 
 fn worker_loop(exec: Arc<EnhancedQueueExecutor>) {
@@ -1081,6 +1097,10 @@ fn native_process_state_get_state(
 // the native even on null this), which matches the JDK contract because
 // these methods only mutate per-instance bookkeeping that is otherwise
 // unobserved.
+// B6: these state-transition shims are only registered under the default-OFF
+// `app-stubs` feature (see `register_wildfly_core_natives`). Suppress dead-code
+// warnings in the DEFAULT build where they are intentionally not wired up.
+#[cfg_attr(not(feature = "app-stubs"), allow(dead_code))]
 fn native_process_state_set_starting(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -1092,6 +1112,7 @@ fn native_process_state_set_starting(
     Ok(None)
 }
 
+#[cfg_attr(not(feature = "app-stubs"), allow(dead_code))]
 fn native_process_state_set_running(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -1100,6 +1121,7 @@ fn native_process_state_set_running(
     Ok(None)
 }
 
+#[cfg_attr(not(feature = "app-stubs"), allow(dead_code))]
 fn native_process_state_set_stopping(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -1108,6 +1130,7 @@ fn native_process_state_set_stopping(
     Ok(None)
 }
 
+#[cfg_attr(not(feature = "app-stubs"), allow(dead_code))]
 fn native_process_state_set_stopped(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -1119,6 +1142,7 @@ fn native_process_state_set_stopped(
     Ok(None)
 }
 
+#[cfg_attr(not(feature = "app-stubs"), allow(dead_code))]
 fn native_process_state_noop_object(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -1129,6 +1153,7 @@ fn native_process_state_noop_object(
     Ok(Some(Value::Object(None)))
 }
 
+#[cfg_attr(not(feature = "app-stubs"), allow(dead_code))]
 fn native_process_state_noop_void(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
@@ -1415,26 +1440,45 @@ fn native_async_future_task_await(
         let result_field = ctx.get_field_by_name(this, "result");
         let has_result = !matches!(result_field, Value::Object(None));
         if has_result {
+            // HONEST path: a producer DID call setResult on this future, so the
+            // result is genuinely available — flipping status to COMPLETE is a
+            // benign nudge to wake the waiter, not a fabricated boot. Always on.
             ctx.set_field_by_name(this, "status", complete.clone());
             return Ok(Some(complete));
         }
-        // result is still null. For Keycloak compatibility (which discards
-        // the result regardless), keep the COMPLETE flip behind an opt-out
-        // env. Default behavior remains COMPLETE-flip to avoid regressing
-        // Keycloak; set CRATONVM_AWAIT_NO_SHORTCIRCUIT=1 to surface the real
-        // WildFly hang (Object.wait) so it can be diagnosed.
-        if std::env::var_os("CRATONVM_AWAIT_NO_SHORTCIRCUIT").is_some() {
-            // Return current WAITING status. AsyncFutureTask.get() loops on
-            // status==WAITING calling await(); with a non-Java native we
-            // would normally Object.wait() here, but the surrounding
-            // monitor is already held by the caller and we have no other
-            // thread to notify. Yield instead to let any pending native
-            // bookkeeping run.
+        // result is still null AND status is still WAITING: the MSC service
+        // container never reached STABLE, so there is NO real boot result.
+        //
+        // B2 (SyntheticStub): flipping status to COMPLETE here FAKES a
+        // successful WildFly/Keycloak boot when the service graph never
+        // actually started. The underlying gap is that CratonVM does not drive
+        // the MSC service container to RUNNING in real-JDK mode (see
+        // `jboss_msc.rs` worker/`drive_starts`). Per the no-synthetic-stub
+        // policy this fake is gated behind the default-OFF `app-stubs` feature
+        // so the DEFAULT build no longer fakes the boot; it instead returns the
+        // real WAITING status, surfacing the hang/gap for diagnosis.
+        #[cfg(feature = "app-stubs")]
+        {
+            // Keycloak compatibility: `org/jboss/modules/Main.main` discards
+            // the future result, so the COMPLETE flip lets its boot proceed.
+            // `CRATONVM_AWAIT_NO_SHORTCIRCUIT=1` opts out even under app-stubs
+            // to surface the real WildFly hang (Object.wait) for diagnosis.
+            if std::env::var_os("CRATONVM_AWAIT_NO_SHORTCIRCUIT").is_some() {
+                std::thread::yield_now();
+                return Ok(Some(status));
+            }
+            ctx.set_field_by_name(this, "status", complete.clone());
+            return Ok(Some(complete));
+        }
+        #[cfg(not(feature = "app-stubs"))]
+        {
+            // DEFAULT build: do not fake the boot. Return the real WAITING
+            // status untouched so the unmet MSC-startup gap is visible rather
+            // than masked by a fabricated COMPLETE.
+            let _ = complete;
             std::thread::yield_now();
             return Ok(Some(status));
         }
-        ctx.set_field_by_name(this, "status", complete.clone());
-        return Ok(Some(complete));
     }
     Ok(Some(status))
 }
@@ -1565,43 +1609,58 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
         "()Lorg/jboss/as/controller/ControlledProcessState$State;",
         native_process_state_get_state,
     );
-    // State-transition shims — bypass the AtomicStampedReference-backed
-    // bytecode path (see comment on the implementations above).
-    let cps = "org/jboss/as/controller/ControlledProcessState";
-    r.register(cps, "setStarting", "()V", native_process_state_set_starting);
-    r.register(cps, "setRunning", "()V", native_process_state_set_running);
-    r.register(cps, "setStopping", "()V", native_process_state_set_stopping);
-    r.register(cps, "setStopped", "()V", native_process_state_set_stopped);
-    r.register(
-        cps,
-        "setRestartRequired",
-        "()Ljava/lang/Object;",
-        native_process_state_noop_object,
-    );
-    r.register(
-        cps,
-        "setReloadRequired",
-        "()Ljava/lang/Object;",
-        native_process_state_noop_object,
-    );
-    r.register(
-        cps,
-        "revertRestartRequired",
-        "(Ljava/lang/Object;)V",
-        native_process_state_noop_void,
-    );
-    r.register(
-        cps,
-        "revertReloadRequired",
-        "(Ljava/lang/Object;)V",
-        native_process_state_noop_void,
-    );
-    r.register(
-        cps,
-        "checkRestartRequired",
-        "()V",
-        native_process_state_noop_void,
-    );
+    // B6 (SyntheticStub): state-transition shims that BYPASS the real
+    // `ControlledProcessState` bytecode to hide an AtomicStampedReference
+    // VarHandle modeling gap (the ASR-backed `state` field reads back null on
+    // the `setStarting()` boot path → NPE → WFLYSRV0239; see the comment on
+    // the implementations above). These no-op the transition and update only
+    // the Rust-side `global_model_controller()`, which FAKES the WildFly
+    // process-state machine instead of fixing the underlying VarHandle defect.
+    //
+    // Per the no-synthetic-stub policy these are gated behind the default-OFF
+    // `app-stubs` feature: in the DEFAULT build they are NOT installed, so the
+    // real bytecode runs and the VarHandle gap surfaces honestly (rather than
+    // being masked). `getState()` above stays registered unconditionally — it
+    // is an honest bridge returning the real enum-constant singleton, not a
+    // fake.
+    #[cfg(feature = "app-stubs")]
+    r.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |r| {
+        let cps = "org/jboss/as/controller/ControlledProcessState";
+        r.register(cps, "setStarting", "()V", native_process_state_set_starting);
+        r.register(cps, "setRunning", "()V", native_process_state_set_running);
+        r.register(cps, "setStopping", "()V", native_process_state_set_stopping);
+        r.register(cps, "setStopped", "()V", native_process_state_set_stopped);
+        r.register(
+            cps,
+            "setRestartRequired",
+            "()Ljava/lang/Object;",
+            native_process_state_noop_object,
+        );
+        r.register(
+            cps,
+            "setReloadRequired",
+            "()Ljava/lang/Object;",
+            native_process_state_noop_object,
+        );
+        r.register(
+            cps,
+            "revertRestartRequired",
+            "(Ljava/lang/Object;)V",
+            native_process_state_noop_void,
+        );
+        r.register(
+            cps,
+            "revertReloadRequired",
+            "(Ljava/lang/Object;)V",
+            native_process_state_noop_void,
+        );
+        r.register(
+            cps,
+            "checkRestartRequired",
+            "()V",
+            native_process_state_noop_void,
+        );
+    });
 
     // --- EnhancedQueueExecutor ---
     r.register(
@@ -1661,12 +1720,21 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
     // `Bootstrap.bootstrap().get()`) doesn't park forever in
     // `Object.wait()` waiting for an MSC service graph that we don't
     // fully drive to RUNNING.
-    r.register(
-        "org/jboss/threads/AsyncFutureTask",
-        "await",
-        "()Lorg/jboss/threads/AsyncFuture$Status;",
-        native_async_future_task_await,
-    );
+    //
+    // B2: the null-result WAITING->COMPLETE flip inside this native fakes a
+    // successful boot and is now gated behind the default-OFF `app-stubs`
+    // feature (see `native_async_future_task_await`). Tagged SyntheticStub so
+    // the audit / `--dump-native-registry` census flags it; the honest paths
+    // (already-terminal status, real has_result flip, queued-Runnable drain)
+    // remain active in the default build.
+    r.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |r| {
+        r.register(
+            "org/jboss/threads/AsyncFutureTask",
+            "await",
+            "()Lorg/jboss/threads/AsyncFuture$Status;",
+            native_async_future_task_await,
+        );
+    });
 }
 
 // ===========================================================================
@@ -1701,6 +1769,66 @@ mod tests {
         // And a derived unit must be a child of the base.
         let base2 = sn.parent().and_then(|p| p.parent()).unwrap();
         assert_eq!(base2.canonical(), "jboss.deployment");
+    }
+
+    /// B2/B6 gating contract:
+    ///   * `ControlledProcessState` getState is an honest bridge → always
+    ///     registered.
+    ///   * The state-transition *setter* no-op shims (B6) that mask the
+    ///     AtomicStampedReference VarHandle gap are only registered under the
+    ///     default-OFF `app-stubs` feature; in the default build they are
+    ///     absent so real bytecode runs.
+    ///   * `AsyncFutureTask.await` (B2) is always registered (it has honest
+    ///     paths) but tagged `SyntheticStub` so the audit census flags it.
+    #[test]
+    fn b2_b6_wildfly_stub_gating_contract() {
+        let mut r = NativeMethodRegistry::new();
+        // Deterministic regardless of the CRATONVM_NO_STUBS env: keep
+        // SyntheticStub registrations so we can assert the tag + presence.
+        r.set_drop_synthetic_stubs(false);
+        register_wildfly_core_natives(&mut r);
+
+        let cps = "org/jboss/as/controller/ControlledProcessState";
+        // getState is an honest bridge — present in every build.
+        assert!(
+            r.find(
+                cps,
+                "getState",
+                "()Lorg/jboss/as/controller/ControlledProcessState$State;",
+            )
+            .is_some(),
+            "ControlledProcessState.getState must always be registered"
+        );
+
+        // B6: the setStarting no-op shim is gated on `app-stubs`.
+        let set_starting = r.find(cps, "setStarting", "()V");
+        if cfg!(feature = "app-stubs") {
+            assert!(
+                set_starting.is_some(),
+                "with app-stubs, setStarting shim should be registered"
+            );
+            assert_eq!(
+                r.kind_of(cps, "setStarting", "()V"),
+                Some(cratonvm_native_api::NativeKind::SyntheticStub),
+                "setStarting shim must be tagged SyntheticStub"
+            );
+        } else {
+            assert!(
+                set_starting.is_none(),
+                "default build must NOT register the setStarting shim (real bytecode runs)"
+            );
+        }
+
+        // B2: await is always registered but tagged SyntheticStub.
+        assert_eq!(
+            r.kind_of(
+                "org/jboss/threads/AsyncFutureTask",
+                "await",
+                "()Lorg/jboss/threads/AsyncFuture$Status;",
+            ),
+            Some(cratonvm_native_api::NativeKind::SyntheticStub),
+            "AsyncFutureTask.await must be tagged SyntheticStub for the audit"
+        );
     }
 
     #[test]

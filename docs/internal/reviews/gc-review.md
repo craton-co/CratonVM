@@ -26,7 +26,7 @@
 ### Vulnerabilities (heap soundness, races, UAFs)
 
 - **`gc.rs:368-387` and `gen_heap.rs:2748-2768` — explicit atomic load+store for `mark_word`** during STW Cheney copy. The comment correctly notes that the bulk `copy_nonoverlapping` would otherwise be UB for the embedded `AtomicU64`. Audit-worthy fix that pairs with future concurrent-GC plans; documented well.
-- **`heap.rs:676-700` `is_valid_heap_object` uses `try_lock` to avoid deadlock during concurrent autobox unboxing** (lock-order doc `docs/lock-order.md` reserves L8 for heap interior locks). Correct: degrades to "not provably valid" on contention. Documented in `heap.rs:665-675`. Audit-worthy positive.
+- **`heap.rs:676-700` `is_valid_heap_object` uses `try_lock` to avoid deadlock during concurrent autobox unboxing** (lock-order doc `vm/src/runtime/lock_order.rs` reserves L8 for heap interior locks). Correct: degrades to "not provably valid" on contention. Documented in `heap.rs:665-675`. Audit-worthy positive.
 - **`heap.rs:1234-1311` `coerce_field_value_by_descriptor`** explicitly rejects `Value::Double` → `Value::Object` reinterpret (the audit note `heap.rs:1299-1306` documents that the previous revision could fabricate live `ObjectRef` out of double bit patterns). The fix is correct and well-explained.
 - **`satb.rs:329-371` `deactivate_and_drain`** — round-9 fix correctly closes the TOCTOU window where a mutator observed ACTIVE, was preempted, and pushed after the drain. Documented heavily; tested by `tests/loom_satb.rs` (requires `RUSTFLAGS="--cfg loom"`). Audit-worthy positive: solid concurrent-FSM work.
 - **`gen_heap.rs:910` `debug_assert!(index < num_slots)`** is **redundant** with the runtime check at 852 — but harmless. Note: line 910's `self.get_header(obj_ref)` is a *second* dereference of the same pointer; the compiler may not CSE it across the `set_field` call.
@@ -108,14 +108,14 @@
 - **Module-level rustdoc** on every file with a clear "what this implements" paragraph.
 - **Most `unsafe` blocks have `// SAFETY:` comments** — sampled 50+ blocks, all but a handful are documented. Notably good: `heap.rs:121-131` (Heap Send/Sync), `gen_heap.rs:2747-2768` (atomic mark_word handling), `arena.rs:170-202` (`reset_no_zero` invariants).
 - **`docs/gc-tuning.md`** is comprehensive: backend choice, sizing, TLAB, GPU-offload, JFR.
-- **`docs/lock-order.md`** specifies heap interior locks at L8 and documents the global hierarchy. The gc crate's internal sub-hierarchy (`young_from` < `young_to` < `old_gen`) is followed but **NOT documented in either file** — the convention is buried in code comments (`heap.rs:665-675`, `gen_heap.rs:1498-1500`).
+- **`vm/src/runtime/lock_order.rs`** specifies heap interior locks at L8 and documents the global hierarchy. The gc crate's internal sub-hierarchy (`young_from` < `young_to` < `old_gen`) is followed but **NOT documented in either file** — the convention is buried in code comments (`heap.rs:665-675`, `gen_heap.rs:1498-1500`).
 - **JIT contract for TLAB layout** (`tlab.rs:77-126`) is excellent — explicit byte-offset table, `test_tlab_offsets` enforces it at runtime.
 
 ### Missing / incomplete
 
 - **No collector phase diagram.** The concurrent-mark FSM (`concurrent_mark.rs:43-99`) and the SATB activation FSM (`satb.rs:18-58`) are described in prose. A state-machine diagram (Mermaid in `docs/gc-tuning.md` or `concurrent_mark.rs`) would speed up auditing.
 - **No safepoint protocol doc.** `gc_quiescence.rs` documents the JIT-active gate but nothing covers the full protocol: mutator-park → flush SATB buffer → flush card buffer → run GC → unpark. The protocol is split across `vm_heap.rs:646-675`, `card_table.rs:290-306`, `satb.rs:60-113` with no single owner.
-- **`docs/lock-order.md` should document the gc internal sub-hierarchy.** The fact that `young_from < young_to < old_gen` is a global heap invariant lives only in code comments. A future contributor running tests in a different order could deadlock.
+- **`vm/src/runtime/lock_order.rs` should document the gc internal sub-hierarchy.** The fact that `young_from < young_to < old_gen` is a global heap invariant lives only in code comments. A future contributor running tests in a different order could deadlock.
 - **`tlab.rs::install_tail_filler`** docstring documents the layout but doesn't link to the `HumongousFiller` walker-sentinel pattern in `g1.rs::is_humongous_filler` (`g1.rs:2822-2824`). Two different sentinel schemes coexist without cross-reference.
 - **`compact_header.rs:91-95`** documents the 8-GB forwarding-pointer ceiling but does not mention this in `Cargo.toml` keywords or `gc-tuning.md`. An embedder configuring `-Xmx32g` would silently truncate forwarding pointers in release.
 - **`reference.rs::ReferenceQueue::remove_blocking`** docstring claims "spin-wait with yield" — does not name the 60-second safety cap. The cap should be in `docs/gc-tuning.md` under "diagnosing common pause / allocation symptoms."

@@ -105,10 +105,13 @@ impl GcBarrier {
         //
         // Race analysis (the count may change after this read):
         //  * blocked→running after the read: the waking thread runs
-        //    `check_post_block_gc`, sees `stw_requested`, and calls
-        //    `arrive_and_wait` — which only ever *over*-counts `arrived`
-        //    (harmless: `wait_for_all` uses a `<` test, and the extra
-        //    `notify_all` is a no-op once already signalled).
+        //    `check_post_block_gc`, sees `stw_requested`, and waits the
+        //    pause out. B2 fix — it does so via `arrive_and_wait_excluded`
+        //    (or, once it has left the blocked region and become a counted
+        //    mutator, via the participating `arrive_and_wait`). An excluded
+        //    caller never bumps `arrived`, so it can no longer satisfy the
+        //    `arrived >= expected` quota early and release `wait_for_all`
+        //    while a counted mutator is still running.
         //  * running→blocked after the read: handled by `enter_blocked`,
         //    which — if a STW is already active — makes the thread
         //    arrive at the barrier *before* it parks, so the initiator
@@ -228,16 +231,61 @@ impl GcBarrier {
     ///
     /// The thread signals its arrival, then waits for GC to complete.
     /// Returns the pointer map for updating this thread's frame references.
+    ///
+    /// This is the **participating** (counted) entry: the caller is a
+    /// running mutator that `request_stw` included in `expected` (a genuine
+    /// interpreter safepoint, or a thread whose `enter_blocked` reported
+    /// `pre_stw == true` — it became blocked *after* `expected` was
+    /// computed, so it was counted). Use [`arrive_and_wait_excluded`] for a
+    /// thread that was NOT in `expected` (parked in a blocking native and
+    /// excluded by `request_stw`); counting such a thread can satisfy the
+    /// `arrived >= expected` quota early and release `wait_for_all` while a
+    /// real mutator is still running.
     pub fn arrive_and_wait(&self, tid: ThreadId) -> HashMap<usize, usize> {
+        self.arrive_and_wait_inner(tid, true)
+    }
+
+    /// Like [`arrive_and_wait`], but for a thread that is **excluded** from
+    /// the current STW's `expected` count (it was parked in a blocking
+    /// native when `request_stw` ran, so it must not be counted toward
+    /// `arrived`).
+    ///
+    /// B2 fix — the excluded thread still has to *wait out* the pause (so
+    /// the moving collector never relocates objects under its live Rust
+    /// `ObjectRef`s once it resumes), but it must NOT bump `arrived` or fire
+    /// `all_arrived`: doing so can push `arrived` to `expected` while a
+    /// counted mutator has not yet reached its safepoint, releasing the
+    /// initiator's `wait_for_all` early and letting GC run under a live
+    /// mutator.
+    pub fn arrive_and_wait_excluded(&self, tid: ThreadId) -> HashMap<usize, usize> {
+        self.arrive_and_wait_inner(tid, false)
+    }
+
+    /// Shared core for [`arrive_and_wait`] / [`arrive_and_wait_excluded`].
+    ///
+    /// `participating` selects whether this caller counts toward the
+    /// barrier's `arrived` quota. Non-participating (excluded) callers only
+    /// wait for GC to complete and never signal `all_arrived`.
+    fn arrive_and_wait_inner(
+        &self,
+        tid: ThreadId,
+        participating: bool,
+    ) -> HashMap<usize, usize> {
         let mut inner = self.inner.lock();
         // If this is the initiator or STW is not active, return immediately
         if !self.stw_requested.load(Ordering::Acquire) || inner.initiator == Some(tid) {
             return HashMap::new();
         }
-        // Signal arrival
-        inner.arrived += 1;
-        if inner.arrived >= inner.expected {
-            self.all_arrived.notify_all();
+        // Signal arrival — but only for threads the initiator is actually
+        // waiting for. An excluded (blocked) thread that wakes mid-STW must
+        // not inflate `arrived`: it was never in `expected`, so counting it
+        // could satisfy `arrived >= expected` before a counted mutator has
+        // arrived and prematurely release `wait_for_all`.
+        if participating {
+            inner.arrived += 1;
+            if inner.arrived >= inner.expected {
+                self.all_arrived.notify_all();
+            }
         }
         // Wait for GC to complete
         while self.stw_requested.load(Ordering::Acquire) {
@@ -398,5 +446,68 @@ mod tests {
         assert!(map.is_empty());
         barrier.wait_for_all();
         barrier.complete_gc(HashMap::new());
+    }
+
+    /// B2 — an EXCLUDED (blocked) thread that wakes mid-STW and calls
+    /// `arrive_and_wait_excluded` must NOT count toward `arrived`, so it
+    /// cannot satisfy the quota and release the initiator's `wait_for_all`
+    /// while the genuine counted mutator has not yet arrived.
+    ///
+    /// Scenario: 3 alive threads — initiator I, counted mutator M, blocked
+    /// (excluded) thread B. `request_stw` is told 1 thread is blocked, so
+    /// `expected = 3 - 1 (initiator) - 1 (blocked) = 1` (just M).
+    #[test]
+    fn barrier_excluded_thread_does_not_release_early() {
+        let barrier = Arc::new(GcBarrier::new());
+        // Pretend B is already parked in a blocking native.
+        barrier.threads_blocked.store(1, Ordering::Release);
+        assert!(barrier.request_stw(ThreadId(0), 3));
+        // expected counts only the running mutator M.
+        {
+            let inner = barrier.inner.lock();
+            assert_eq!(inner.expected, 1);
+        }
+
+        // B (excluded) wakes mid-STW and drains via the excluded entry.
+        let b = barrier.clone();
+        let hb = std::thread::spawn(move || b.arrive_and_wait_excluded(ThreadId(2)));
+
+        // Give B time to run its (non-counting) arrival.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        // The excluded arrival must NOT have satisfied the quota: M (the
+        // only counted thread) has not arrived, so `arrived` stays 0 and
+        // `wait_for_all` would still block. `pending_count` proves it.
+        assert_eq!(
+            barrier.pending_count(),
+            1,
+            "excluded thread must not be counted toward arrived",
+        );
+
+        // Now the counted mutator M arrives — quota satisfied.
+        let m = barrier.clone();
+        let hm = std::thread::spawn(move || m.arrive_and_wait(ThreadId(1)));
+
+        // The initiator can now proceed.
+        barrier.wait_for_all();
+        assert_eq!(barrier.pending_count(), 0);
+
+        barrier.complete_gc(HashMap::new());
+        let _ = hm.join();
+        let _ = hb.join();
+    }
+
+    /// B2 — sanity: with no excluded threads, the participating entry still
+    /// counts and releases exactly as before.
+    #[test]
+    fn barrier_participating_entry_counts() {
+        let barrier = Arc::new(GcBarrier::new());
+        assert!(barrier.request_stw(ThreadId(0), 2));
+        let b2 = barrier.clone();
+        let h = std::thread::spawn(move || b2.arrive_and_wait(ThreadId(1)));
+        barrier.wait_for_all();
+        barrier.complete_gc(HashMap::new());
+        let _ = h.join();
+        assert_eq!(barrier.gc_generation.load(Ordering::Relaxed), 1);
     }
 }

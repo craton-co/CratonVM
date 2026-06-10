@@ -339,6 +339,17 @@ pub(crate) fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
     // launcher) whose data files live outside CWD. When confinement is
     // off we are done: the `..`-segment and null-byte checks above are
     // the security guarantee.
+    //
+    // V3 (2026-06-10): THIS is the documented "absolute paths accepted when
+    // confinement is OFF" behaviour. It is by-design for single-tenant
+    // `java -jar` (JDK-faithful) and is the one contract an embedder MUST
+    // understand before exposing this crate to untrusted bytecode — turn
+    // confinement ON (`set_path_confine_to_cwd(true)` /
+    // `CRATONVM_CONFINE_IO` / `CRATONVM_UNTRUSTED_CODE`). When confinement
+    // IS on we fall through to the canonicalize-then-contain check below,
+    // which rejects any absolute path (or symlink) that resolves outside the
+    // sandbox root — see the `is_within_sandbox` gate and the
+    // `path_validation_rejects_out_of_sandbox_absolute_when_confined` test.
     if !is_path_confine_to_cwd() {
         return Ok(path.to_string());
     }
@@ -2435,13 +2446,22 @@ fn native_bais_read_bytes(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(Some(Value::Int(-1))),
     };
     let off = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let len = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    // JDK `InputStream.read(byte[] b, int off, int len)` does
+    // `Objects.checkFromIndexSize(off, len, b.length)` up front — reject
+    // negative off/len and a range past the array end with
+    // IndexOutOfBoundsException before any read, instead of silently
+    // dropping OOB writes at the GC layer (or overflowing `off + i` in a
+    // debug build).
+    check_array_bounds(off, len, ctx.array_length(buf))?;
+    let off = off as usize;
+    let len = len as usize;
     // This native is registered on the base `java/io/InputStream` class as a
     // fallback for synthetic streams (URL.openStream, getResourceAsStream)
     // that materialise as bare InputStream-typed receivers but actually have
@@ -4648,6 +4668,29 @@ fn bb_state(ctx: &dyn NativeContext, this: ObjectRef) -> Result<(ObjectRef, i32,
     Ok((arr, pos, lim, cap))
 }
 
+/// JDK-faithful bounds test for a typed-buffer ABSOLUTE accessor: a `width`-byte
+/// read/write at `index` is valid iff `0 <= index` and `index + width <= bound`.
+/// Uses checked arithmetic so a large positive `index` (near `i32::MAX`) cannot
+/// overflow `index + width` into a negative that would slip past a naive
+/// `index + width > bound` test (and panic in a debug build). Rejecting a
+/// negative `index` is the lower-bound check the abs accessors were missing.
+fn abs_access_in_bounds(index: i32, width: i32, bound: i32) -> bool {
+    index >= 0
+        && index
+            .checked_add(width)
+            .map_or(false, |end| end <= bound)
+}
+
+/// JDK-faithful bounds test for an element-indexed typed-buffer absolute
+/// accessor (IntBuffer/LongBuffer/FloatBuffer/…/CharBuffer get(i)/put(i,v)):
+/// the element at `idx` is in range iff `0 <= idx < bound` (one element wide).
+/// Rejecting `idx < 0` is the lower-bound check these accessors were missing —
+/// without it a negative Java index is cast to a huge `usize` and silently
+/// reads/writes nothing at the GC layer instead of throwing.
+fn tb_index_in_bounds(idx: i32, bound: i32) -> bool {
+    idx >= 0 && idx < bound
+}
+
 fn register_nio_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -5334,20 +5377,25 @@ fn native_bb_get_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
     let offset = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let length = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    // JDK `ByteBuffer.get(byte[] dst, int offset, int length)` first validates
+    // `offset`/`length` against `dst.length` (Objects.checkFromIndexSize →
+    // IndexOutOfBoundsException), rejecting negatives and overflow, BEFORE
+    // checking the buffer's `remaining`. Without this a negative Java offset
+    // becomes a huge usize and the per-element loop writes out of range.
+    check_array_bounds(offset, length, ctx.array_length(dst))?;
     let (arr, pos, lim, _) = bb_state(ctx, this)?;
     let remaining = (lim - pos) as usize;
+    let length = length as usize;
+    let offset = offset as usize;
     if length > remaining {
-        return Err(RuntimeError::IllegalStateException {
-            message: "BufferUnderflowException".to_string(),
-        }
-        .into());
+        return Err(RuntimeError::BufferUnderflowException.into());
     }
     for i in 0..length {
         let v = ctx.get_array_element(arr, pos as usize + i);
@@ -5406,20 +5454,24 @@ fn native_bb_put_bulk(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(Some(Value::Object(Some(this)))),
     };
     let offset = match args.get(2) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let length = match args.get(3) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
+    // JDK `ByteBuffer.put(byte[] src, int offset, int length)` validates
+    // `offset`/`length` against `src.length` (Objects.checkFromIndexSize →
+    // IndexOutOfBoundsException), rejecting negatives and overflow, BEFORE
+    // checking the buffer's `remaining`.
+    check_array_bounds(offset, length, ctx.array_length(src))?;
     let (arr, pos, lim, _) = bb_state(ctx, this)?;
     let remaining = (lim - pos) as usize;
+    let length = length as usize;
+    let offset = offset as usize;
     if length > remaining {
-        return Err(RuntimeError::IllegalStateException {
-            message: "BufferOverflowException".to_string(),
-        }
-        .into());
+        return Err(RuntimeError::BufferOverflowException.into());
     }
     for i in 0..length {
         let v = ctx.get_array_element(src, offset + i);
@@ -5492,7 +5544,7 @@ fn native_bb_get_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => 0,
     };
     let (arr, _, _, cap) = bb_state(ctx, this)?;
-    if index + 4 > cap {
+    if !abs_access_in_bounds(index, 4, cap) {
         return Err(RuntimeError::IllegalArgumentException {
             message: "IndexOutOfBoundsException".to_string(),
         }
@@ -5546,7 +5598,7 @@ fn native_bb_put_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => 0,
     };
     let (arr, _, _, cap) = bb_state(ctx, this)?;
-    if index + 4 > cap {
+    if !abs_access_in_bounds(index, 4, cap) {
         return Err(RuntimeError::IllegalArgumentException {
             message: "IndexOutOfBoundsException".to_string(),
         }
@@ -9629,11 +9681,17 @@ fn native_cb_get_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Int(0))),
     };
     let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, _) = bb_state(ctx, this)?;
-    Ok(Some(ctx.get_array_element(arr, idx)))
+    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    if !tb_index_in_bounds(idx, cap) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "IndexOutOfBoundsException".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(ctx.get_array_element(arr, idx as usize)))
 }
 
 fn native_cb_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9659,15 +9717,21 @@ fn native_cb_put_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => return Ok(Some(Value::Object(None))),
     };
     let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let ch = match args.get(2) {
         Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, _) = bb_state(ctx, this)?;
-    ctx.set_array_element(arr, idx, Value::Int(ch));
+    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    if !tb_index_in_bounds(idx, cap) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "IndexOutOfBoundsException".to_string(),
+        }
+        .into());
+    }
+    ctx.set_array_element(arr, idx as usize, Value::Int(ch));
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -9819,11 +9883,17 @@ fn native_tb_get_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Int(0))),
     };
     let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, _) = bb_state(ctx, this)?;
-    Ok(Some(ctx.get_array_element(arr, idx)))
+    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    if !tb_index_in_bounds(idx, cap) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "IndexOutOfBoundsException".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(ctx.get_array_element(arr, idx as usize)))
 }
 
 fn native_tb_put_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9846,12 +9916,18 @@ fn native_tb_put_int_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         _ => return Ok(Some(Value::Object(None))),
     };
     let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Int(0));
-    let (arr, _, _, _) = bb_state(ctx, this)?;
-    ctx.set_array_element(arr, idx, val);
+    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    if !tb_index_in_bounds(idx, cap) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "IndexOutOfBoundsException".to_string(),
+        }
+        .into());
+    }
+    ctx.set_array_element(arr, idx as usize, val);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -9900,11 +9976,17 @@ fn native_tb_get_long_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(Some(Value::Long(0))),
     };
     let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, _) = bb_state(ctx, this)?;
-    Ok(Some(ctx.get_array_element(arr, idx)))
+    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    if !tb_index_in_bounds(idx, cap) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "IndexOutOfBoundsException".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(ctx.get_array_element(arr, idx as usize)))
 }
 
 fn native_tb_put_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -9927,12 +10009,18 @@ fn native_tb_put_long_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(Some(Value::Object(None))),
     };
     let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Long(0));
-    let (arr, _, _, _) = bb_state(ctx, this)?;
-    ctx.set_array_element(arr, idx, val);
+    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    if !tb_index_in_bounds(idx, cap) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "IndexOutOfBoundsException".to_string(),
+        }
+        .into());
+    }
+    ctx.set_array_element(arr, idx as usize, val);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -9981,11 +10069,17 @@ fn native_tb_get_float_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Float(0.0))),
     };
     let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, _) = bb_state(ctx, this)?;
-    Ok(Some(ctx.get_array_element(arr, idx)))
+    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    if !tb_index_in_bounds(idx, cap) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "IndexOutOfBoundsException".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(ctx.get_array_element(arr, idx as usize)))
 }
 
 fn native_tb_put_float(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10008,12 +10102,18 @@ fn native_tb_put_float_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Object(None))),
     };
     let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Float(0.0));
-    let (arr, _, _, _) = bb_state(ctx, this)?;
-    ctx.set_array_element(arr, idx, val);
+    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    if !tb_index_in_bounds(idx, cap) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "IndexOutOfBoundsException".to_string(),
+        }
+        .into());
+    }
+    ctx.set_array_element(arr, idx as usize, val);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -10062,11 +10162,17 @@ fn native_tb_get_double_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(Some(Value::Double(0.0))),
     };
     let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, _) = bb_state(ctx, this)?;
-    Ok(Some(ctx.get_array_element(arr, idx)))
+    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    if !tb_index_in_bounds(idx, cap) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "IndexOutOfBoundsException".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(ctx.get_array_element(arr, idx as usize)))
 }
 
 fn native_tb_put_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10089,12 +10195,18 @@ fn native_tb_put_double_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         _ => return Ok(Some(Value::Object(None))),
     };
     let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Double(0.0));
-    let (arr, _, _, _) = bb_state(ctx, this)?;
-    ctx.set_array_element(arr, idx, val);
+    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    if !tb_index_in_bounds(idx, cap) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "IndexOutOfBoundsException".to_string(),
+        }
+        .into());
+    }
+    ctx.set_array_element(arr, idx as usize, val);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -10143,11 +10255,17 @@ fn native_tb_get_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Int(0))),
     };
     let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
-    let (arr, _, _, _) = bb_state(ctx, this)?;
-    Ok(Some(ctx.get_array_element(arr, idx)))
+    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    if !tb_index_in_bounds(idx, cap) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "IndexOutOfBoundsException".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(ctx.get_array_element(arr, idx as usize)))
 }
 
 fn native_tb_put_short(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10170,12 +10288,18 @@ fn native_tb_put_short_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         _ => return Ok(Some(Value::Object(None))),
     };
     let idx = match args.get(1) {
-        Some(Value::Int(v)) => *v as usize,
+        Some(Value::Int(v)) => *v,
         _ => 0,
     };
     let val = args.get(2).cloned().unwrap_or(Value::Int(0));
-    let (arr, _, _, _) = bb_state(ctx, this)?;
-    ctx.set_array_element(arr, idx, val);
+    let (arr, _, _, cap) = bb_state(ctx, this)?;
+    if !tb_index_in_bounds(idx, cap) {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "IndexOutOfBoundsException".to_string(),
+        }
+        .into());
+    }
+    ctx.set_array_element(arr, idx as usize, val);
     Ok(Some(Value::Object(Some(this))))
 }
 
@@ -14989,6 +15113,273 @@ mod bais_layout_tests {
         assert_eq!(ctx.get_field(this, BAIS_FIELD_POS), Value::Int(3));
         assert_eq!(ctx.get_field(this, BAIS_FIELD_MARK), Value::Int(3));
         assert_eq!(ctx.get_field(this, BAIS_FIELD_COUNT), Value::Int(7));
+    }
+}
+
+// ===========================================================================
+// Bounds-check coverage for the ByteBuffer / ByteArrayInputStream bulk and
+// absolute natives (fable-2026-06-10 review B1/B2/B3): negative / overflow /
+// past-the-end indices must raise an exception, not silently drop the write.
+// ===========================================================================
+#[cfg(test)]
+mod buffer_bounds_tests {
+    use super::*;
+    use crate::test_support::MockNativeContext;
+
+    fn make_bb(ctx: &mut MockNativeContext, cap: usize) -> ObjectRef {
+        // alloc_byte_buffer leaves pos=0, lim=cap, cap=cap.
+        alloc_byte_buffer(ctx, cap)
+    }
+
+    // --- B1: bulk get/put destination/source bounds ---
+
+    #[test]
+    fn bb_get_bulk_rejects_negative_offset() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 8);
+        let dst = ctx.new_array(ArrayElementType::Byte, 8);
+        let r = native_bb_get_bulk(
+            &mut ctx,
+            &[
+                Value::Object(Some(bb)),
+                Value::Object(Some(dst)),
+                Value::Int(-1),
+                Value::Int(4),
+            ],
+        );
+        assert!(r.is_err(), "negative offset must throw, got {r:?}");
+    }
+
+    #[test]
+    fn bb_get_bulk_rejects_offset_plus_len_past_array() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 8);
+        let dst = ctx.new_array(ArrayElementType::Byte, 4);
+        // dst.len()==4, so off=2 len=4 overruns the destination array.
+        let r = native_bb_get_bulk(
+            &mut ctx,
+            &[
+                Value::Object(Some(bb)),
+                Value::Object(Some(dst)),
+                Value::Int(2),
+                Value::Int(4),
+            ],
+        );
+        assert!(r.is_err(), "off+len past dst must throw, got {r:?}");
+    }
+
+    #[test]
+    fn bb_get_bulk_underflow_when_len_exceeds_remaining() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 2); // only 2 bytes remaining
+        let dst = ctx.new_array(ArrayElementType::Byte, 16);
+        let r = native_bb_get_bulk(
+            &mut ctx,
+            &[
+                Value::Object(Some(bb)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(8),
+            ],
+        );
+        assert!(r.is_err(), "len>remaining must underflow, got {r:?}");
+    }
+
+    #[test]
+    fn bb_get_bulk_valid_copies_bytes() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 4);
+        let (arr, _, _, _) = bb_state(&ctx, bb).unwrap();
+        for i in 0..4 {
+            ctx.set_array_element(arr, i, Value::Int((i as i32) + 1));
+        }
+        let dst = ctx.new_array(ArrayElementType::Byte, 4);
+        let r = native_bb_get_bulk(
+            &mut ctx,
+            &[
+                Value::Object(Some(bb)),
+                Value::Object(Some(dst)),
+                Value::Int(0),
+                Value::Int(4),
+            ],
+        )
+        .unwrap();
+        assert!(r.is_some());
+        for i in 0..4 {
+            assert_eq!(ctx.get_array_element(dst, i), Value::Int((i as i32) + 1));
+        }
+    }
+
+    #[test]
+    fn bb_put_bulk_rejects_negative_offset() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 8);
+        let src = ctx.new_array(ArrayElementType::Byte, 8);
+        let r = native_bb_put_bulk(
+            &mut ctx,
+            &[
+                Value::Object(Some(bb)),
+                Value::Object(Some(src)),
+                Value::Int(-2),
+                Value::Int(4),
+            ],
+        );
+        assert!(r.is_err(), "negative offset must throw, got {r:?}");
+    }
+
+    #[test]
+    fn bb_put_bulk_rejects_offset_plus_len_past_array() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 16);
+        let src = ctx.new_array(ArrayElementType::Byte, 4);
+        let r = native_bb_put_bulk(
+            &mut ctx,
+            &[
+                Value::Object(Some(bb)),
+                Value::Object(Some(src)),
+                Value::Int(2),
+                Value::Int(4),
+            ],
+        );
+        assert!(r.is_err(), "off+len past src must throw, got {r:?}");
+    }
+
+    // --- B2: ByteArrayInputStream.read([BII) bounds ---
+
+    fn make_bais(ctx: &mut MockNativeContext, bytes: &[u8]) -> ObjectRef {
+        let buf = ctx.new_array(ArrayElementType::Byte, bytes.len());
+        for (i, b) in bytes.iter().enumerate() {
+            ctx.set_array_element(buf, i, Value::Int(*b as i32));
+        }
+        let this = ctx.alloc_object_with_class(4, "java/io/ByteArrayInputStream");
+        native_bais_init(ctx, &[Value::Object(Some(this)), Value::Object(Some(buf))])
+            .expect("init ok");
+        this
+    }
+
+    #[test]
+    fn bais_read_bytes_rejects_negative_off() {
+        let mut ctx = MockNativeContext::new();
+        let this = make_bais(&mut ctx, b"hello");
+        let dst = ctx.new_array(ArrayElementType::Byte, 8);
+        let r = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(-1),
+                Value::Int(2),
+            ],
+        );
+        assert!(r.is_err(), "negative off must throw, got {r:?}");
+    }
+
+    #[test]
+    fn bais_read_bytes_rejects_off_plus_len_past_array() {
+        let mut ctx = MockNativeContext::new();
+        let this = make_bais(&mut ctx, b"hello");
+        let dst = ctx.new_array(ArrayElementType::Byte, 4);
+        let r = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(3),
+                Value::Int(4),
+            ],
+        );
+        assert!(r.is_err(), "off+len past dst must throw, got {r:?}");
+    }
+
+    #[test]
+    fn bais_read_bytes_valid_in_bounds_ok() {
+        let mut ctx = MockNativeContext::new();
+        let this = make_bais(&mut ctx, b"hello");
+        let dst = ctx.new_array(ArrayElementType::Byte, 8);
+        let r = native_bais_read_bytes(
+            &mut ctx,
+            &[
+                Value::Object(Some(this)),
+                Value::Object(Some(dst)),
+                Value::Int(1),
+                Value::Int(5),
+            ],
+        )
+        .unwrap();
+        assert_eq!(r, Some(Value::Int(5)));
+    }
+
+    // --- B3: typed-buffer absolute accessor lower-bound + overflow ---
+
+    #[test]
+    fn bb_get_int_abs_rejects_negative_index() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 8);
+        let r = native_bb_get_int_abs(
+            &mut ctx,
+            &[Value::Object(Some(bb)), Value::Int(-1)],
+        );
+        assert!(r.is_err(), "negative index must throw, got {r:?}");
+    }
+
+    #[test]
+    fn bb_get_int_abs_rejects_index_overflow() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 8);
+        // i32::MAX-2 + 4 overflows; must be rejected, not panic / pass.
+        let r = native_bb_get_int_abs(
+            &mut ctx,
+            &[Value::Object(Some(bb)), Value::Int(i32::MAX - 2)],
+        );
+        assert!(r.is_err(), "overflowing index must throw, got {r:?}");
+    }
+
+    #[test]
+    fn bb_put_int_abs_rejects_negative_index() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 8);
+        let r = native_bb_put_int_abs(
+            &mut ctx,
+            &[Value::Object(Some(bb)), Value::Int(-1), Value::Int(0x1234)],
+        );
+        assert!(r.is_err(), "negative index must throw, got {r:?}");
+    }
+
+    #[test]
+    fn bb_get_int_abs_valid_index_ok() {
+        let mut ctx = MockNativeContext::new();
+        let bb = make_bb(&mut ctx, 8);
+        let r = native_bb_get_int_abs(
+            &mut ctx,
+            &[Value::Object(Some(bb)), Value::Int(4)],
+        );
+        assert!(r.is_ok(), "in-range index must succeed, got {r:?}");
+    }
+
+    #[test]
+    fn tb_get_int_abs_rejects_negative_index() {
+        let mut ctx = MockNativeContext::new();
+        // IntBuffer-style typed buffer: cap=4 elements.
+        let buf = alloc_typed_buffer(&mut ctx, "java/nio/IntBuffer", ArrayElementType::Int, 4);
+        buf_set_limit(&mut ctx, buf, 4);
+        let r = native_tb_get_int_abs(
+            &mut ctx,
+            &[Value::Object(Some(buf)), Value::Int(-1)],
+        );
+        assert!(r.is_err(), "negative element index must throw, got {r:?}");
+    }
+
+    #[test]
+    fn tb_get_int_abs_rejects_index_at_capacity() {
+        let mut ctx = MockNativeContext::new();
+        let buf = alloc_typed_buffer(&mut ctx, "java/nio/IntBuffer", ArrayElementType::Int, 4);
+        buf_set_limit(&mut ctx, buf, 4);
+        // idx == cap is out of range (valid indices are 0..cap).
+        let r = native_tb_get_int_abs(
+            &mut ctx,
+            &[Value::Object(Some(buf)), Value::Int(4)],
+        );
+        assert!(r.is_err(), "index==cap must throw, got {r:?}");
     }
 }
 

@@ -229,10 +229,20 @@ pub(crate) fn register_phase55_charset(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let name_ref = obj_arg(args, 0)?;
             let raw_name = ctx.read_string(name_ref).unwrap_or_default();
+            // B7: fail-closed for unknown charset names. `normalize_charset_name`
+            // returns "" for any name it does not recognise, so an unsupported
+            // name throws here instead of silently yielding a fake Charset.
+            // The real JDK throws java.nio.charset.UnsupportedCharsetException,
+            // which *extends* IllegalArgumentException; the VM has no dedicated
+            // UnsupportedCharsetException RuntimeError variant, so we raise the
+            // IllegalArgumentException supertype with the JDK message text —
+            // callers catching IllegalArgumentException behave correctly. (A
+            // precise UnsupportedCharsetException type would require a new
+            // RuntimeError variant in types/src/error.rs.)
             let normalized = normalize_charset_name(&raw_name);
             if normalized.is_empty() {
                 return Err(RuntimeError::IllegalArgumentException {
-                    message: format!("Unsupported charset: {}", raw_name),
+                    message: raw_name,
                 }
                 .into());
             }
@@ -508,7 +518,16 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "(Ljava/util/function/Supplier;Ljava/util/concurrent/Executor;)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
             let supplier = obj_arg(args, 0)?;
-            // Executor argument ignored — execute eagerly
+            // B5 limitation (documented, not silent): this synthetic
+            // CompletableFuture model runs the supplier EAGERLY on the calling
+            // thread, so the supplied Executor's thread/affinity/parallelism is
+            // not honored. The *result value* is correct (the supplier always
+            // runs) and the returned CF is completed; only the async scheduling
+            // dimension differs from the JDK. Routing through executor.execute()
+            // is deliberately NOT done because an asynchronous executor would
+            // return before producing the result, leaving the CF marked done
+            // with no value — that would trade a scheduling difference for a
+            // correctness bug. A faithful fix needs the real carrier scheduler.
             let result = ctx.invoke_virtual(supplier, "get", "()Ljava/lang/Object;", &[]);
             let future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
@@ -554,6 +573,10 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Runnable;Ljava/util/concurrent/Executor;)Ljava/util/concurrent/CompletableFuture;",
         |ctx, args| {
             let runnable = obj_arg(args, 0)?;
+            // B5 limitation (documented, not silent): the Runnable runs eagerly
+            // on the calling thread; the supplied Executor is not used. The CF
+            // completes with the correct (void) outcome — see the supplyAsync
+            // overload above for why we do not route through executor.execute().
             let result = ctx.invoke_virtual(runnable, "run", "()V", &[]);
             let future =
                 alloc_concurrent_synthetic(ctx, "java/util/concurrent/CompletableFuture", 3);
@@ -16340,9 +16363,158 @@ fn p60_http_send_async(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCa
 }
 
 // =============================================================================
-// java.util.concurrent.Flow — Reactive Streams interfaces
-// Flow.Publisher, Flow.Subscriber, Flow.Subscription, Flow.Processor
+// java.util.concurrent.SubmissionPublisher delivery helpers (B6)
+//
+// Field layout (publisher `this`): field 0 = subscribers list, field 1 = closed
+// (Int). The `()V` constructor that actually runs lives in lib.rs
+// (`register_t31_concurrent_extras`, registered LAST so it wins over the
+// phase-60 ctor here) and sets field 0 to an `java.util.ArrayList`-style
+// WRAPPER object whose own field 0 is a reference array (cap 8) and field 1 is
+// the Int count. These helpers therefore read/write subscribers THROUGH that
+// wrapper so the model stays consistent with the constructor that runs. See the
+// nb-core-stubs fix note for the cross-file coupling with lib.rs.
+//
+// The previous implementation stored only the last submitted item and never
+// delivered anything to subscribers (submit/offer returned a hardcoded lag of
+// 1, subscribe was a no-op). Reactive-Streams consumers therefore silently
+// received nothing. These helpers maintain a real subscriber list and drive
+// the Flow.Subscriber callbacks (onSubscribe / onNext / onComplete) eagerly on
+// the calling thread. This is synchronous (no carrier-pool dispatch), so the
+// estimated-lag return value is the live subscriber count and demand/back-
+// pressure is not enforced — adequate for the common "request(Long.MAX_VALUE)
+// in onSubscribe" subscriber but documented as a limitation.
 // =============================================================================
+
+/// Return the subscriber-list wrapper for a publisher, lazily creating it (an
+/// `ArrayList`-style 2-field synthetic: field 0 = ref array, field 1 = Int
+/// count) when the publisher's field 0 is null. `this` is pinned by the caller
+/// or pinned here across the allocation. Returns the (post-alloc) wrapper ref.
+fn sp_wrapper_ensure(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
+    if let Value::Object(Some(w)) = ctx.get_field(this, 0) {
+        return w;
+    }
+    let this_pin = ctx.pin_native_root(this);
+    let wrapper = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+    let w_pin = ctx.pin_native_root(wrapper);
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 8);
+    let wrapper = ctx.read_native_pin(w_pin, wrapper);
+    ctx.set_field(wrapper, 0, Value::Object(Some(arr)));
+    ctx.set_field(wrapper, 1, Value::Int(0));
+    let this = ctx.read_native_pin(this_pin, this);
+    let wrapper = ctx.read_native_pin(w_pin, wrapper);
+    ctx.set_field(this, 0, Value::Object(Some(wrapper)));
+    ctx.unpin_native_roots(this_pin);
+    wrapper
+}
+
+/// Read `(backing_array, count)` from a publisher's subscriber-list wrapper, or
+/// `None` when there is no wrapper / no subscribers. Read-only (no allocation).
+fn sp_subscribers(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(ObjectRef, usize)> {
+    let wrapper = match ctx.get_field(this, 0) {
+        Value::Object(Some(w)) => w,
+        _ => return None,
+    };
+    let arr = match ctx.get_field(wrapper, 0) {
+        Value::Object(Some(a)) => a,
+        // Defensive: some path may have stored a bare array directly in field 0.
+        _ => return None,
+    };
+    let count = match ctx.get_field(wrapper, 1) {
+        Value::Int(n) if n >= 0 => n as usize,
+        // No explicit count slot → fall back to the array capacity.
+        _ => ctx.array_length(arr),
+    };
+    let cap = ctx.array_length(arr);
+    Some((arr, count.min(cap)))
+}
+
+/// Append `subscriber` to the publisher's subscriber-list wrapper, growing the
+/// backing array (doubling) when full and bumping the count. `this` is pinned
+/// by the caller; we additionally pin across the internal allocations.
+fn sp_append_subscriber(ctx: &mut dyn NativeContext, this: ObjectRef, subscriber: ObjectRef) {
+    let this_pin = ctx.pin_native_root(this);
+    let sub_pin = ctx.pin_native_root(subscriber);
+    let wrapper = sp_wrapper_ensure(ctx, this);
+    let w_pin = ctx.pin_native_root(wrapper);
+    let (arr, cap, count) = match ctx.get_field(wrapper, 0) {
+        Value::Object(Some(a)) => {
+            let cap = ctx.array_length(a);
+            let count = match ctx.get_field(wrapper, 1) {
+                Value::Int(n) if n >= 0 => n as usize,
+                _ => 0,
+            };
+            (a, cap, count)
+        }
+        _ => (subscriber /*placeholder*/, 0usize, 0usize),
+    };
+    // Grow the backing array if full.
+    let arr = if count >= cap {
+        let new_cap = (cap.max(4)) * 2;
+        let new_arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+        let a_pin = ctx.pin_native_root(new_arr);
+        let wrapper = ctx.read_native_pin(w_pin, wrapper);
+        if let Value::Object(Some(old_arr)) = ctx.get_field(wrapper, 0) {
+            for i in 0..count {
+                let elem = ctx.get_array_element(old_arr, i);
+                ctx.set_array_element(new_arr, i, elem);
+            }
+        }
+        let new_arr = ctx.read_native_pin(a_pin, new_arr);
+        let wrapper = ctx.read_native_pin(w_pin, wrapper);
+        ctx.set_field(wrapper, 0, Value::Object(Some(new_arr)));
+        new_arr
+    } else {
+        arr
+    };
+    let subscriber = ctx.read_native_pin(sub_pin, subscriber);
+    ctx.set_array_element(arr, count, Value::Object(Some(subscriber)));
+    let wrapper = ctx.read_native_pin(w_pin, wrapper);
+    ctx.set_field(wrapper, 1, Value::Int((count + 1) as i32));
+    ctx.unpin_native_roots(this_pin);
+}
+
+/// Deliver one item to every registered subscriber via `onNext`. Returns the
+/// number of subscribers reached (used as the synchronous estimated lag). The
+/// `this` and `item` references are pinned across the re-entrant invokes so a
+/// moving GC during a subscriber callback cannot strand them. We deliberately
+/// do NOT write the item into any publisher field — pinning the item ref is
+/// sufficient to keep it live, and the real-JDK SubmissionPublisher layout
+/// has no synthetic `lastItem` slot to clobber.
+fn sp_deliver_on_next(ctx: &mut dyn NativeContext, this: ObjectRef, item: Value) -> i32 {
+    // Pin `this` and the item; re-read both across every subscriber callback.
+    let this_pin = ctx.pin_native_root(this);
+    let item_pin = match item {
+        Value::Object(Some(item_ref)) => Some(ctx.pin_native_root(item_ref)),
+        _ => None,
+    };
+    let mut delivered = 0;
+    let mut idx = 0;
+    loop {
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let (arr, len) = match sp_subscribers(ctx, this_cur) {
+            Some(v) => v,
+            None => break,
+        };
+        if idx >= len {
+            break;
+        }
+        if let Value::Object(Some(sub)) = ctx.get_array_element(arr, idx) {
+            // Re-read the (possibly relocated) item for this callback.
+            let item_now = match item_pin {
+                Some(p) => match item {
+                    Value::Object(Some(orig)) => Value::Object(Some(ctx.read_native_pin(p, orig))),
+                    _ => item,
+                },
+                None => item,
+            };
+            let _ = ctx.invoke_virtual(sub, "onNext", "(Ljava/lang/Object;)V", &[item_now]);
+            delivered += 1;
+        }
+        idx += 1;
+    }
+    ctx.unpin_native_roots(this_pin);
+    delivered
+}
 
 pub(crate) fn register_p60_flow(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -16374,19 +16546,33 @@ pub(crate) fn register_p60_flow(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(256)))
     });
 
-    // SubmissionPublisher = 3-field (subscribers=0 ArrayList, closed=1, lastItem=2)
+    // SubmissionPublisher: field 0 = subscriber-list wrapper (null until the
+    // first subscribe; lazily created by sp_wrapper_ensure), field 1 = closed.
+    // NOTE: the `()V` ctor that actually runs is in lib.rs
+    // (register_t31_concurrent_extras, registered later → wins); it allocates
+    // the wrapper eagerly. This phase-60 ctor is the fallback and leaves the
+    // list null — both shapes are handled by the delivery helpers above.
     let sp = "java/util/concurrent/SubmissionPublisher";
     r.register(sp, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, Value::Object(None)); // no subscribers list
+        ctx.set_field(this, 0, Value::Object(None)); // no subscribers yet
         ctx.set_field(this, 1, Value::Int(0)); // not closed
-        ctx.set_field(this, 2, Value::Object(None));
         Ok(None)
     });
     r.register(sp, "submit", "(Ljava/lang/Object;)I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
-        Ok(Some(Value::Int(1))) // 1 subscriber estimated lag
+        // Reject submission to a closed publisher (matches JDK IllegalStateException).
+        if ctx.get_field(this, 1).as_int().unwrap_or(0) != 0 {
+            return Err(RuntimeError::IllegalStateException {
+                message: "Publisher is closed".into(),
+            }
+            .into());
+        }
+        let item = args.get(1).copied().unwrap_or(Value::Object(None));
+        // Deliver eagerly to every registered subscriber; return the synchronous
+        // estimated lag (subscriber count). With no subscribers this is 0.
+        let lag = sp_deliver_on_next(ctx, this, item);
+        Ok(Some(Value::Int(lag)))
     });
     r.register(
         sp,
@@ -16394,30 +16580,103 @@ pub(crate) fn register_p60_flow(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/util/function/BiPredicate;)I",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            ctx.set_field(this, 2, args.get(1).copied().unwrap_or(Value::Object(None)));
-            Ok(Some(Value::Int(1)))
+            if ctx.get_field(this, 1).as_int().unwrap_or(0) != 0 {
+                // JDK offer on a closed publisher returns a negative value.
+                return Ok(Some(Value::Int(-1)));
+            }
+            let item = args.get(1).copied().unwrap_or(Value::Object(None));
+            let lag = sp_deliver_on_next(ctx, this, item);
+            Ok(Some(Value::Int(lag)))
         },
     );
+    // NOTE: lib.rs `register_t31_concurrent_extras` registers a `close()V` for
+    // SubmissionPublisher LATER, so at runtime THAT one wins and this body does
+    // not execute (the lib.rs version only flips the closed flag and does not
+    // fire onComplete). This implementation is the correct fallback and runs
+    // only if the registration order changes. Firing onComplete on close is a
+    // genuine gap owned by lib.rs — see the nb-core-stubs fix note.
     r.register(sp, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        if ctx.get_field(this, 1).as_int().unwrap_or(0) != 0 {
+            return Ok(None); // already closed — idempotent
+        }
         ctx.set_field(this, 1, Value::Int(1));
+        // Signal completion to every subscriber.
+        let pin = ctx.pin_native_root(this);
+        let mut idx = 0;
+        loop {
+            let this_cur = ctx.read_native_pin(pin, this);
+            let (arr, len) = match sp_subscribers(ctx, this_cur) {
+                Some(v) => v,
+                None => break,
+            };
+            if idx >= len {
+                break;
+            }
+            if let Value::Object(Some(sub)) = ctx.get_array_element(arr, idx) {
+                let _ = ctx.invoke_virtual(sub, "onComplete", "()V", &[]);
+            }
+            idx += 1;
+        }
+        ctx.unpin_native_roots(pin);
         Ok(None)
     });
     r.register(sp, "isClosed", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 1)))
     });
-    r.register(sp, "hasSubscribers", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(sp, "hasSubscribers", "()Z", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let has = matches!(sp_subscribers(ctx, this), Some((_, n)) if n > 0);
+        Ok(Some(Value::Int(if has { 1 } else { 0 })))
     });
-    r.register(sp, "getNumberOfSubscribers", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(sp, "getNumberOfSubscribers", "()I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let n = sp_subscribers(ctx, this).map(|(_, n)| n).unwrap_or(0);
+        Ok(Some(Value::Int(n as i32)))
     });
     r.register(
         sp,
         "subscribe",
         "(Ljava/util/concurrent/Flow$Subscriber;)V",
-        native_noop_with_this,
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let subscriber = match args.get(1) {
+                Some(Value::Object(Some(s))) => *s,
+                // null subscriber → JDK throws NPE.
+                _ => {
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some("subscriber is null".into()),
+                    }
+                    .into())
+                }
+            };
+            // Pin `this` and the subscriber across the allocations and the
+            // re-entrant onSubscribe call (both can move objects under a
+            // relocating GC). The subscription is pinned right after allocation.
+            let pin = ctx.pin_native_root(this);
+            let sub_arg_pin = ctx.pin_native_root(subscriber);
+            // Build a Flow.Subscription (cancelled=0, demand=1) and hand it to
+            // the subscriber so it can establish demand.
+            let subscription =
+                alloc_concurrent_synthetic(ctx, "java/util/concurrent/Flow$Subscription", 2);
+            let sub_pin = ctx.pin_native_root(subscription);
+            ctx.set_field(subscription, 0, Value::Int(0));
+            ctx.set_field(subscription, 1, Value::Long(0));
+            let this = ctx.read_native_pin(pin, this);
+            let subscriber = ctx.read_native_pin(sub_arg_pin, subscriber);
+            sp_append_subscriber(ctx, this, subscriber);
+            let subscriber = ctx.read_native_pin(sub_arg_pin, subscriber);
+            let subscription = ctx.read_native_pin(sub_pin, subscription);
+            let _ = ctx.invoke_virtual(
+                subscriber,
+                "onSubscribe",
+                "(Ljava/util/concurrent/Flow$Subscription;)V",
+                &[Value::Object(Some(subscription))],
+            );
+            ctx.unpin_native_roots(pin);
+            Ok(None)
+        },
     );
     r.set_category(__prev_cat);
 }
@@ -33812,15 +34071,13 @@ pub(crate) fn register_p69_compact_number_format(r: &mut NativeMethodRegistry) {
 pub(crate) fn register_p69_submission_publisher(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // SubmissionPublisher core methods already registered in Phase 60 (<init>, submit, offer, close, isClosed)
-    // Only add new methods not present in Phase 60
+    // SubmissionPublisher core methods (<init>, submit, offer, close, isClosed,
+    // subscribe, hasSubscribers, getNumberOfSubscribers) are registered in Phase
+    // 60 (`register_p60_flow`) and now perform REAL subscriber delivery (B6). Do
+    // NOT re-register those here — a later registration overwrites the earlier
+    // one (`methods.insert`), and the old no-op/zero stubs would clobber the
+    // working delivery path. Only add methods genuinely absent from Phase 60.
     let sp = "java/util/concurrent/SubmissionPublisher";
-    r.register(sp, "getNumberOfSubscribers", "()I", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
-    r.register(sp, "hasSubscribers", "()Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
-    });
     r.register(sp, "getMaxBufferCapacity", "()I", |_ctx, _args| {
         Ok(Some(Value::Int(256)))
     });
@@ -33829,12 +34086,6 @@ pub(crate) fn register_p69_submission_publisher(r: &mut NativeMethodRegistry) {
         "getClosedException",
         "()Ljava/lang/Throwable;",
         |_ctx, _args| Ok(Some(Value::Object(None))),
-    );
-    r.register(
-        sp,
-        "subscribe",
-        "(Ljava/util/concurrent/Flow$Subscriber;)V",
-        native_noop_with_this,
     );
     r.set_category(__prev_cat);
 }
@@ -44046,5 +44297,215 @@ mod bc_small_factors_tests {
         assert!(!bc_util_has_any_small_factors(&mag_le(751))); // smallest prime > 743
         assert!(!bc_util_has_any_small_factors(&mag_le(999_983))); // prime
         assert!(!bc_util_has_any_small_factors(&mag_le((1u128 << 61) - 1))); // M61
+    }
+}
+
+// =============================================================================
+// nb-core fixes (fable-2026-06-10): SubmissionPublisher subscriber delivery
+// (B6) and Charset.forName fail-closed for unknown charsets (B7).
+// =============================================================================
+#[cfg(test)]
+mod nb_core_stubs_fix_tests {
+    use super::*;
+    use crate::test_utils::mock_ctx;
+    use cratonvm_native_api::NativeMethodRegistry;
+
+    fn sp_registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        register_p60_flow(&mut r);
+        register_p69_submission_publisher(&mut r);
+        r
+    }
+
+    #[test]
+    fn b6_submission_publisher_core_methods_registered() {
+        let r = sp_registry();
+        let sp = "java/util/concurrent/SubmissionPublisher";
+        assert!(r.find(sp, "submit", "(Ljava/lang/Object;)I").is_some());
+        assert!(r
+            .find(sp, "subscribe", "(Ljava/util/concurrent/Flow$Subscriber;)V")
+            .is_some());
+        assert!(r.find(sp, "hasSubscribers", "()Z").is_some());
+        assert!(r.find(sp, "getNumberOfSubscribers", "()I").is_some());
+    }
+
+    #[test]
+    fn b6_subscribe_grows_subscriber_list_and_counts() {
+        let r = sp_registry();
+        let mut ctx = mock_ctx();
+        let pub_cid = ctx
+            .ensure_class_initialized("java/util/concurrent/SubmissionPublisher")
+            .unwrap();
+        let publisher = ctx.alloc_object(pub_cid, 3);
+        // Fresh publisher: no subscribers.
+        ctx.set_field(publisher, 0, Value::Object(None));
+        ctx.set_field(publisher, 1, Value::Int(0));
+
+        let count = r
+            .find("java/util/concurrent/SubmissionPublisher", "getNumberOfSubscribers", "()I")
+            .unwrap();
+        let n0 = count(&mut ctx, &[Value::Object(Some(publisher))]).unwrap().unwrap();
+        assert_eq!(n0, Value::Int(0), "fresh publisher has 0 subscribers");
+
+        // Register two distinct subscribers.
+        let sub_cid = ctx
+            .ensure_class_initialized("FlowSubscriberImpl")
+            .unwrap();
+        let s1 = ctx.alloc_object(sub_cid, 1);
+        let s2 = ctx.alloc_object(sub_cid, 1);
+        let subscribe = r
+            .find(
+                "java/util/concurrent/SubmissionPublisher",
+                "subscribe",
+                "(Ljava/util/concurrent/Flow$Subscriber;)V",
+            )
+            .unwrap();
+        subscribe(&mut ctx, &[Value::Object(Some(publisher)), Value::Object(Some(s1))]).unwrap();
+        subscribe(&mut ctx, &[Value::Object(Some(publisher)), Value::Object(Some(s2))]).unwrap();
+
+        let n2 = count(&mut ctx, &[Value::Object(Some(publisher))]).unwrap().unwrap();
+        assert_eq!(n2, Value::Int(2), "two subscribers registered");
+
+        let has = r
+            .find("java/util/concurrent/SubmissionPublisher", "hasSubscribers", "()Z")
+            .unwrap();
+        assert_eq!(
+            has(&mut ctx, &[Value::Object(Some(publisher))]).unwrap().unwrap(),
+            Value::Int(1),
+            "hasSubscribers true once registered"
+        );
+
+        // field 0 is an ArrayList-style wrapper; its field 0 is the backing
+        // array and field 1 is the count. Both subscribers are stored in order.
+        let wrapper = match ctx.get_field(publisher, 0) {
+            Value::Object(Some(w)) => w,
+            other => panic!("subscribers field should be a wrapper object, got {other:?}"),
+        };
+        assert_eq!(ctx.get_field(wrapper, 1), Value::Int(2), "wrapper count is 2");
+        if let Value::Object(Some(arr)) = ctx.get_field(wrapper, 0) {
+            assert!(ctx.array_length(arr) >= 2);
+            assert_eq!(ctx.get_array_element(arr, 0), Value::Object(Some(s1)));
+            assert_eq!(ctx.get_array_element(arr, 1), Value::Object(Some(s2)));
+        } else {
+            panic!("wrapper field 0 should be a reference array after subscribe");
+        }
+    }
+
+    #[test]
+    fn b6_subscribe_null_subscriber_throws_npe() {
+        let r = sp_registry();
+        let mut ctx = mock_ctx();
+        let pub_cid = ctx
+            .ensure_class_initialized("java/util/concurrent/SubmissionPublisher")
+            .unwrap();
+        let publisher = ctx.alloc_object(pub_cid, 3);
+        let subscribe = r
+            .find(
+                "java/util/concurrent/SubmissionPublisher",
+                "subscribe",
+                "(Ljava/util/concurrent/Flow$Subscriber;)V",
+            )
+            .unwrap();
+        let res = subscribe(&mut ctx, &[Value::Object(Some(publisher)), Value::Object(None)]);
+        assert!(res.is_err(), "null subscriber must throw, not silently no-op");
+    }
+
+    #[test]
+    fn b6_submit_to_closed_publisher_throws() {
+        let r = sp_registry();
+        let mut ctx = mock_ctx();
+        let pub_cid = ctx
+            .ensure_class_initialized("java/util/concurrent/SubmissionPublisher")
+            .unwrap();
+        let publisher = ctx.alloc_object(pub_cid, 3);
+        ctx.set_field(publisher, 0, Value::Object(None));
+        ctx.set_field(publisher, 1, Value::Int(1)); // closed
+        let submit = r
+            .find("java/util/concurrent/SubmissionPublisher", "submit", "(Ljava/lang/Object;)I")
+            .unwrap();
+        let item = ctx.create_string("x");
+        let res = submit(
+            &mut ctx,
+            &[Value::Object(Some(publisher)), Value::Object(Some(item))],
+        );
+        assert!(res.is_err(), "submit on a closed publisher must throw, not return a fake lag");
+    }
+
+    #[test]
+    fn b6_submit_with_no_subscribers_returns_zero_lag() {
+        let r = sp_registry();
+        let mut ctx = mock_ctx();
+        let pub_cid = ctx
+            .ensure_class_initialized("java/util/concurrent/SubmissionPublisher")
+            .unwrap();
+        let publisher = ctx.alloc_object(pub_cid, 3);
+        ctx.set_field(publisher, 0, Value::Object(None));
+        ctx.set_field(publisher, 1, Value::Int(0));
+        let submit = r
+            .find("java/util/concurrent/SubmissionPublisher", "submit", "(Ljava/lang/Object;)I")
+            .unwrap();
+        let item = ctx.create_string("x");
+        // No subscribers -> 0 delivered (the old code returned a hardcoded 1).
+        let lag = submit(
+            &mut ctx,
+            &[Value::Object(Some(publisher)), Value::Object(Some(item))],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(lag, Value::Int(0), "no subscribers => estimated lag 0, not a fake 1");
+    }
+
+    fn charset_registry() -> NativeMethodRegistry {
+        let mut r = NativeMethodRegistry::new();
+        register_phase55_charset(&mut r);
+        r
+    }
+
+    #[test]
+    fn b7_charset_for_name_rejects_unknown() {
+        let r = charset_registry();
+        let mut ctx = mock_ctx();
+        let for_name = r
+            .find(
+                "java/nio/charset/Charset",
+                "forName",
+                "(Ljava/lang/String;)Ljava/nio/charset/Charset;",
+            )
+            .unwrap();
+        let bogus = ctx.create_string("NOT-A-REAL-CHARSET-9000");
+        let res = for_name(&mut ctx, &[Value::Object(Some(bogus))]);
+        assert!(
+            res.is_err(),
+            "forName on an unknown charset must throw (IAE supertype of UnsupportedCharsetException), not return a fake Charset"
+        );
+    }
+
+    #[test]
+    fn b7_charset_for_name_accepts_known() {
+        let r = charset_registry();
+        let mut ctx = mock_ctx();
+        let for_name = r
+            .find(
+                "java/nio/charset/Charset",
+                "forName",
+                "(Ljava/lang/String;)Ljava/nio/charset/Charset;",
+            )
+            .unwrap();
+        let name = ctx.create_string("utf-8");
+        let res = for_name(&mut ctx, &[Value::Object(Some(name))])
+            .expect("forName(utf-8) ok")
+            .expect("forName(utf-8) returns a Charset");
+        match res {
+            Value::Object(Some(cs)) => {
+                // Canonical name normalises to "UTF-8".
+                match ctx.get_field(cs, 0) {
+                    Value::Object(Some(s)) => {
+                        assert_eq!(ctx.read_string(s).as_deref(), Some("UTF-8"));
+                    }
+                    other => panic!("charset name field should be a String, got {other:?}"),
+                }
+            }
+            other => panic!("forName should return a Charset object, got {other:?}"),
+        }
     }
 }

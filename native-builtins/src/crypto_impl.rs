@@ -1694,10 +1694,17 @@ impl Rsa {
     }
 
     /// PKCS#1 v1.5 SHA-256 signature.
+    ///
+    /// Returns an empty `Vec` if the key is too small to hold the DigestInfo
+    /// plus the minimum PKCS#1 v1.5 padding (RFC 8017 §9.2 requires `k >=
+    /// tLen + 11`). Callers must treat an empty result as a failure; a real
+    /// RSA key used for SHA-256 signing is always large enough.
     pub fn sign_sha256(key: &RsaPrivateKey, message: &[u8]) -> Vec<u8> {
         let hash = Sha256::digest(message);
         let k = (key.n.bit_length() + 7) / 8;
-        let em = Self::pkcs1v15_encode(&hash, k);
+        let Some(em) = Self::pkcs1v15_encode(&hash, k) else {
+            return Vec::new();
+        };
         let m = BigUint::from_bytes_be(&em);
         let s = m.modpow(&key.d, &key.n);
         s.to_bytes_be_padded(k)
@@ -1712,19 +1719,36 @@ impl Rsa {
         let em = m.to_bytes_be_padded(k);
 
         let hash = Sha256::digest(message);
-        let expected = Self::pkcs1v15_encode(&hash, k);
+        // A modulus too small to hold the DigestInfo + padding can never carry
+        // a valid PKCS#1 v1.5 signature. Reject it as a verification failure
+        // (fail-closed) rather than underflowing the padding-length math — this
+        // is reachable from `verify_signature`/`checkServerTrusted` with an
+        // attacker-supplied issuer key carrying a tiny RSA modulus.
+        let Some(expected) = Self::pkcs1v15_encode(&hash, k) else {
+            return false;
+        };
         em == expected
     }
 
-    /// Build PKCS#1 v1.5 DigestInfo for SHA-256.
-    fn pkcs1v15_encode(hash: &[u8], k: usize) -> Vec<u8> {
+    /// Build the PKCS#1 v1.5 EMSA encoding (DigestInfo for SHA-256 wrapped in
+    /// `00 01 FF.. 00 || T`).
+    ///
+    /// Returns `None` when the encoded-message length `k` is smaller than the
+    /// minimum permitted by RFC 8017 §9.2 (`k >= tLen + 11`). Without this
+    /// check the `k - t_len - 3` padding-length computation underflows on a
+    /// small key (panic in debug; in release a wrap to ~`usize::MAX` then a
+    /// multi-exabyte `repeat(0xff).take(..)` allocation → abort) — a DoS
+    /// reachable from a malicious certificate chain.
+    fn pkcs1v15_encode(hash: &[u8], k: usize) -> Option<Vec<u8>> {
         // DigestInfo DER prefix for SHA-256
         let digest_info_prefix: &[u8] = &[
             0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
             0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
         ];
         let t_len = digest_info_prefix.len() + hash.len();
-        let ps_len = k - t_len - 3;
+        // Need: 00 01 || PS(>=8 bytes of FF) || 00 || T  => k >= t_len + 11.
+        // `ps_len = k - t_len - 3` must be >= 8, equivalently k >= t_len + 11.
+        let ps_len = k.checked_sub(t_len + 3).filter(|&ps| ps >= 8)?;
         let mut em = Vec::with_capacity(k);
         em.push(0x00);
         em.push(0x01);
@@ -1732,7 +1756,7 @@ impl Rsa {
         em.push(0x00);
         em.extend_from_slice(digest_info_prefix);
         em.extend_from_slice(hash);
-        em
+        Some(em)
     }
 
     /// Serialize public key to DER (SubjectPublicKeyInfo).
@@ -2375,9 +2399,14 @@ fn der_read_tag_length(data: &[u8]) -> Option<(usize, &[u8])> {
     if data.len() < 2 { return None; }
     let _tag = data[0];
     let (len, hdr_size) = der_read_length(&data[1..])?;
+    // `1 + hdr_size` cannot overflow (hdr_size <= 9), but the content end
+    // `total_hdr + len` can wrap when `len` is large — use checked_add and
+    // bound against the actual buffer so a forged length never produces an
+    // inverted/out-of-range slice (panic / DoS on a malicious certificate).
     let total_hdr = 1 + hdr_size;
-    if data.len() < total_hdr + len { return None; }
-    Some((total_hdr + len, &data[total_hdr..total_hdr + len]))
+    let end = total_hdr.checked_add(len)?;
+    if data.len() < end { return None; }
+    Some((end, &data[total_hdr..end]))
 }
 
 fn der_read_length(data: &[u8]) -> Option<(usize, usize)> {
@@ -2387,6 +2416,13 @@ fn der_read_length(data: &[u8]) -> Option<(usize, usize)> {
     } else {
         let num_bytes = (data[0] & 0x7f) as usize;
         if num_bytes == 0 || data.len() < 1 + num_bytes { return None; }
+        // A length encoded in more bytes than a `usize` can hold would wrap
+        // the accumulator below to a small value that then slips past the
+        // caller's bounds check, so reject an over-wide width outright. With
+        // `num_bytes <= size_of::<usize>()` the shift/or accumulation fits
+        // exactly and cannot overflow; any oversized-but-in-range `len` is
+        // then caught by the caller's `checked_add` + buffer-length guard.
+        if num_bytes > core::mem::size_of::<usize>() { return None; }
         let mut len = 0usize;
         for i in 0..num_bytes {
             len = (len << 8) | data[1 + i] as usize;
@@ -2399,11 +2435,12 @@ fn der_read_integer(data: &[u8]) -> Option<(Vec<u8>, &[u8])> {
     if data.is_empty() || data[0] != 0x02 { return None; }
     let (len, hdr_size) = der_read_length(&data[1..])?;
     let start = 1 + hdr_size;
-    if data.len() < start + len { return None; }
-    let mut bytes = data[start..start + len].to_vec();
+    let end = start.checked_add(len)?;
+    if data.len() < end { return None; }
+    let mut bytes = data[start..end].to_vec();
     // Strip leading zero used for sign
     while bytes.len() > 1 && bytes[0] == 0 { bytes.remove(0); }
-    Some((bytes, &data[start + len..]))
+    Some((bytes, &data[end..]))
 }
 
 /// Parsed X.509 certificate.
@@ -2544,13 +2581,28 @@ impl X509Cert {
         time_secs >= self.not_before && time_secs <= self.not_after
     }
 
-    /// Does this certificate's subject match the given (slash-form) DN string?
+    /// Does this certificate's subject match the given (slash-form) CN string?
     ///
-    /// Used for PKIX chain construction — we accept equality on the extracted
-    /// subject-CN because our lightweight parser only materialises that
-    /// attribute. Callers with richer RDN data should bypass this helper.
+    /// **Do NOT use this for trust decisions.** CN-string equality is *not* a
+    /// safe basis for chain construction or anchor matching: two distinct
+    /// issuers can share a CN, enabling chain-confusion. This helper exists
+    /// only for diagnostics / display. Trust matching must use full Name-DER
+    /// equality — see [`X509Cert::subject_der_matches`] and
+    /// [`x509_manager::validate_chain`].
     pub fn subject_cn_matches(&self, candidate_cn: &str) -> bool {
         !self.subject_cn.is_empty() && self.subject_cn == candidate_cn
+    }
+
+    /// Does this certificate's subject Name DER exactly equal `issuer_der`?
+    ///
+    /// This is the trust-safe predicate used for PKIX anchor matching and
+    /// chain continuity: it compares the *entire* DER-encoded
+    /// `subject`/`issuer` Name (all RDNs), mirroring
+    /// `x509_manager::validate_chain`'s `issuer_der == subject_der` check.
+    /// An empty subject Name never matches, so an unparsed certificate can
+    /// never masquerade as a trust anchor.
+    pub fn subject_der_matches(&self, issuer_der: &[u8]) -> bool {
+        !self.subject_raw.is_empty() && self.subject_raw == issuer_der
     }
 }
 
@@ -2599,6 +2651,17 @@ impl core::fmt::Display for PkixError {
 ///   3. Stops with `Ok(())` the moment an issuer is found in `trust_anchors`.
 ///
 /// A hard cap of 10 levels guards against malformed chains looping.
+///
+/// # WARNING — not the production trust path
+///
+/// This validator is **test-only** and is deliberately **not wired** to the
+/// live TLS / `X509TrustManager` path; the production validator is
+/// [`x509_manager::validate_chain`], which performs BasicConstraints CA
+/// checks, full RFC 5280 §6 anchor handling and fail-closed OID dispatch.
+/// **Do not adopt this function for real trust decisions.** Matching here is
+/// done on full subject/issuer Name DER (never on the CN string alone) so it
+/// cannot become a silent CN-confusion bypass, but it still lacks the CA /
+/// pathlen / keyUsage checks the production path enforces.
 pub fn verify_cert_chain(
     chain: &[X509Cert],
     trust_anchors: &[X509Cert],
@@ -2619,11 +2682,18 @@ pub fn verify_cert_chain(
             });
         }
         // Find the issuer: first try the chain's next element (more specific),
-        // then fall through to the trust anchor set.
-        let next_in_chain = chain.get(i + 1);
+        // then fall through to the trust anchor set. Both lookups match on the
+        // FULL issuer/subject Name DER (`subject_der_matches`), never on the CN
+        // string — CN-only equality is a chain-confusion bypass (two distinct
+        // issuers can share a CN). When the next chain element is used as the
+        // issuer we additionally require strict Name-DER continuity, matching
+        // `x509_manager::validate_chain` step 3.
+        let next_in_chain = chain.get(i + 1).filter(|next| {
+            next.subject_der_matches(&cert.issuer_raw)
+        });
         let anchor = trust_anchors
             .iter()
-            .find(|a| a.subject_cn_matches(&cert.issuer_cn));
+            .find(|a| a.subject_der_matches(&cert.issuer_raw));
         let issuer = next_in_chain.or(anchor);
         let Some(issuer_cert) = issuer else {
             return Err(PkixError::UntrustedRoot {
@@ -4679,5 +4749,84 @@ mod tests {
         assert!(os_random_bytes(&mut b));
         // Two 64-byte draws from a CSPRNG should effectively never match.
         assert_ne!(a, b, "consecutive CSPRNG draws must differ");
+    }
+
+    // B1: a tiny RSA modulus (256-bit → k=32, below tLen+11=62 for SHA-256)
+    // must be rejected as a verification failure, NOT underflow the PKCS#1
+    // v1.5 padding-length math (panic in debug / exabyte alloc in release).
+    // Reachable from `verify_signature`/`checkServerTrusted` with an
+    // attacker-supplied issuer key.
+    #[test]
+    fn b1_small_rsa_modulus_verify_rejects_without_panic() {
+        let n = BigUint::from_bytes_be(&[0xFFu8; 32]); // 256-bit modulus
+        let e = BigUint::from_bytes_be(&[0x01, 0x00, 0x01]);
+        let key = RsaPublicKey { n, e };
+        // Signature length must equal k (=32) to reach the encode step.
+        let sig = vec![0x01u8; 32];
+        assert!(
+            !Rsa::verify_sha256(&key, b"anything", &sig),
+            "small-modulus RSA verify must fail closed, not panic"
+        );
+    }
+
+    // B1: signing with a too-small key returns an empty signature (treated as
+    // a failure by callers) instead of underflowing the padding math.
+    #[test]
+    fn b1_small_rsa_modulus_sign_returns_empty() {
+        let n = BigUint::from_bytes_be(&[0xFFu8; 32]);
+        let d = BigUint::from_bytes_be(&[0x03]);
+        let e = BigUint::from_bytes_be(&[0x01, 0x00, 0x01]);
+        let key = RsaPrivateKey { n, d, e };
+        assert!(
+            Rsa::sign_sha256(&key, b"anything").is_empty(),
+            "sign with a sub-minimum modulus must yield an empty signature"
+        );
+    }
+
+    // B2: a DER length field encoded in 8 bytes near usize::MAX must be
+    // rejected (None), not wrap `total_hdr + len` and produce an inverted /
+    // out-of-range slice panic.
+    #[test]
+    fn b2_der_oversized_length_rejected_without_panic() {
+        // tag=0x30, long-form length: 0x88 (=> 8 length octets) all 0xFF,
+        // then a couple of content bytes. The encoded length is ~usize::MAX.
+        let mut data = vec![0x30u8, 0x88];
+        data.extend_from_slice(&[0xFFu8; 8]);
+        data.extend_from_slice(&[0x01, 0x02]);
+        assert!(
+            der_read_tag_length(&data).is_none(),
+            "oversized DER length must be rejected, not panic"
+        );
+    }
+
+    // B2: a length wider than a usize (9 length octets) is rejected outright.
+    #[test]
+    fn b2_der_overwide_length_field_rejected() {
+        let mut data = vec![0x30u8, 0x89]; // 9 length octets — too wide
+        data.extend_from_slice(&[0xFFu8; 9]);
+        data.push(0x00);
+        assert!(der_read_tag_length(&data).is_none());
+    }
+
+    // B2: a parseable but truncated certificate (length exceeds buffer) is a
+    // clean parse error, not a panic.
+    #[test]
+    fn b2_truncated_der_is_parse_error() {
+        // SEQUENCE claiming 100 content bytes but only 3 present.
+        let data = vec![0x30u8, 100, 0x01, 0x02, 0x03];
+        assert!(der_read_tag_length(&data).is_none());
+    }
+
+    // V1: full Name-DER matching — a cert whose subject DER differs must not
+    // match even if a CN string would have collided.
+    #[test]
+    fn v1_subject_der_matches_uses_full_name() {
+        let c = mock_cert("root", "root", 0, i64::MAX);
+        // mock_cert sets subject_raw = subject.as_bytes().
+        assert!(c.subject_der_matches(b"root"));
+        assert!(!c.subject_der_matches(b"r00t"));
+        // Empty subject Name never matches (an unparsed cert can't be anchor).
+        let empty = mock_cert("", "", 0, i64::MAX);
+        assert!(!empty.subject_der_matches(b""));
     }
 }

@@ -223,18 +223,41 @@ fn register_peer_source(peer_id: PeerId, source: ObjectRef, java_hash: i32, gc_g
 fn lookup_peer_source(peer_id: PeerId, current_gc_gen: u64) -> Option<ObjectRef> {
     let entry = peer_source_table().lock().get(peer_id.0)?;
     if entry.ptr == 0 {
+        // Null is never a valid heap object — `ObjectRef::from_raw` requires
+        // non-null (debug_assert) and the VM never represents `null` this way.
         return None;
     }
     if entry.gc_gen != current_gc_gen {
-        // A (moving) collection ran since the source was registered. The
-        // cached pointer may be dangling/relocated — refuse to resurrect it.
+        // A collection ran since the source was registered. The cached pointer
+        // may be dangling (object freed) or relocated (moving collector) —
+        // refuse to resurrect it. See the precise invariant in the SAFETY note.
         return None;
     }
-    // SAFETY: no GC has run since `register_peer_source` captured this
-    // pointer (the collection count is unchanged), so the moving collector
-    // has not relocated or freed the object and `ptr` still designates the
-    // same live heap object. We only reconstruct the ref to hand it back to
-    // the VM as a `Value::Object(Some(ref))`.
+    // Liveness sanity check consistent with `ObjectRef::from_raw`'s second
+    // precondition: every CratonVM heap object is 8-byte aligned. A cached
+    // pointer that is not 8-byte aligned cannot designate a real object, so a
+    // bogus/corrupt entry that slipped past the GC-gen gate fails closed here
+    // rather than constructing a malformed `ObjectRef`.
+    if entry.ptr & 0b111 != 0 {
+        return None;
+    }
+    // SAFETY: `entry.ptr` is non-null and 8-byte aligned (both checked above),
+    // satisfying `ObjectRef::from_raw`'s preconditions. The pointer still
+    // designates the same live heap object because no collection has run since
+    // `register_peer_source` captured it.
+    //
+    // INVARIANT (load-bearing): this rests on `NativeContext::gc_collection_count()`
+    // incrementing on *every* collection that can free or relocate a heap
+    // object — moving (G1 evacuation / full compaction) AND any non-moving
+    // sweep that reclaims dead objects. If a collection that frees `ptr`'s
+    // object did NOT bump the count, the gc_gen gate above would let a freed
+    // pointer through (use-after-free). The counter is incremented at the
+    // single collection entry point in the GC, so any current or future
+    // collector is covered; a new collector path that frees objects without
+    // bumping it would break this invariant and must update the counter.
+    //
+    // We only reconstruct the ref to hand it back to the VM as a
+    // `Value::Object(Some(ref))` event source; we never mutate through it here.
     let _ = entry.java_hash; // retained for the future hash→ref resolution path
     Some(unsafe { ObjectRef::from_raw(entry.ptr as *mut u8) })
 }
@@ -451,10 +474,22 @@ fn flush_image(image_id: ImageId) {
     });
 }
 
+/// Upper bound on the up-front capacity reserved from a reported array length.
+///
+/// `array_length` comes from the heap layout of a (possibly malformed/hostile)
+/// array object. A bogus length would otherwise force a giant eager
+/// `Vec::with_capacity` allocation before a single element is read. We reserve
+/// at most this many slots and let the `Vec` grow on demand for legitimately
+/// large arrays — the per-element read loop bounds total memory anyway.
+const MAX_INT_ARRAY_PREALLOC: usize = 1 << 20; // 1M ints = 4 MiB
+
 /// Read an int[] array into a Vec<i32>.
 fn read_int_array(ctx: &dyn NativeContext, obj: ObjectRef) -> Vec<i32> {
     let len = ctx.array_length(obj);
-    let mut out = Vec::with_capacity(len);
+    // Cap the pre-reserve so a bogus reported length can't trigger a huge
+    // up-front allocation; the loop still appends exactly `len` elements,
+    // growing the Vec as needed for genuinely large (but valid) arrays.
+    let mut out = Vec::with_capacity(len.min(MAX_INT_ARRAY_PREALLOC));
     for i in 0..len {
         if let Value::Int(v) = ctx.get_array_element(obj, i) {
             out.push(v);
@@ -2243,6 +2278,20 @@ mod tests {
         assert!(count >= 50, "Expected >= 50 AWT natives, got {count}");
     }
 
+    /// V1: `read_int_array` must cap its up-front reserve so a bogus reported
+    /// array length can't force a giant eager allocation. The reserve is
+    /// `len.min(MAX_INT_ARRAY_PREALLOC)`; this guards the cap against being
+    /// set to a degenerate value and documents the bound.
+    #[test]
+    fn int_array_prealloc_cap_is_sane() {
+        assert!(MAX_INT_ARRAY_PREALLOC > 0);
+        // A hostile length must collapse to the cap, not the raw length.
+        let hostile = usize::MAX;
+        assert_eq!(hostile.min(MAX_INT_ARRAY_PREALLOC), MAX_INT_ARRAY_PREALLOC);
+        // A legitimate small length must be honored exactly.
+        assert_eq!(8usize.min(MAX_INT_ARRAY_PREALLOC), 8);
+    }
+
     /// Build a fake `ObjectRef` for tests — guaranteed 8-aligned & non-null.
     fn fake_object_ref(seed: u64) -> ObjectRef {
         let ptr = ((seed + 1) << 3) as *mut u8;
@@ -2403,6 +2452,30 @@ mod tests {
         assert_eq!(lookup_peer_source(PeerId(11), u64::MAX), None);
         // Unknown peer -> None.
         assert_eq!(lookup_peer_source(PeerId(9999), 5), None);
+    }
+
+    /// V3: `lookup_peer_source` must fail closed on a cached pointer that
+    /// cannot designate a real heap object — even at the matching GC
+    /// generation. A non-8-byte-aligned pointer is provably bogus (heap
+    /// objects are 8-byte aligned), so the guard returns `None` rather than
+    /// feeding a malformed pointer to `ObjectRef::from_raw`.
+    #[test]
+    fn peer_source_lookup_rejects_misaligned_pointer() {
+        // Insert a misaligned entry directly (a real `ObjectRef` can't carry
+        // a misaligned pointer, but a corrupt/forged side-table entry could).
+        peer_source_table().lock().insert(
+            424242,
+            PeerSourceEntry { ptr: 0x1001, java_hash: 7, gc_gen: 9 },
+        );
+        // Matching generation, non-null — only the alignment guard stops it.
+        assert_eq!(lookup_peer_source(PeerId(424242), 9), None);
+
+        // A null cached pointer also fails closed at the same generation.
+        peer_source_table().lock().insert(
+            424243,
+            PeerSourceEntry { ptr: 0, java_hash: 7, gc_gen: 9 },
+        );
+        assert_eq!(lookup_peer_source(PeerId(424243), 9), None);
     }
 
     /// Component / Focus / Action events are TODO and intentionally

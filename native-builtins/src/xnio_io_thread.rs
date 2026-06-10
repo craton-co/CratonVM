@@ -1092,12 +1092,18 @@ fn native_iot_get_worker(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
 /// `org.xnio.XnioIoThread.execute(Ljava/lang/Runnable;)V`
 ///
-/// Posts the Runnable onto this thread's immediate task queue. In
-/// synthetic mode we cannot invoke the Runnable's `run()` bytecode from
-/// the I/O loop (no `NativeContext` on that thread), so we record the
-/// runnable-ref and fire a `handler_ran` signal via the registry when
-/// the loop picks it up. The unit tests use Rust `IoTask` closures via
-/// the direct `IoThreadHandle::try_execute` API.
+/// `org.xnio.XnioIoThread.execute(Ljava/lang/Runnable;)V`
+///
+/// B1 FIX: the loop body (`run_io_loop`) runs on a pinned OS thread with no
+/// `NativeContext`, so it cannot drive a Java `Runnable.run()`. The previous
+/// implementation therefore enqueued a closure that only flagged
+/// `mark_synthetic_runnable_ran(ptr)` — the real `run()` bytecode never
+/// executed, so every task submitted to an XNIO I/O thread silently did
+/// nothing. We now invoke `Runnable.run()` synchronously here, where we DO
+/// hold `ctx` (the same `ctx.invoke_virtual` bridge MSC uses in
+/// `jboss_msc.rs::drive_starts`). The dispatched-set marker is retained for
+/// test observability. `execute()` is fire-and-forget: a task that throws
+/// must not surface to the submitter, so we log and swallow it.
 fn native_iot_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let runnable = match args.get(1) {
@@ -1113,30 +1119,36 @@ fn native_iot_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Value::Long(v) => v as u64,
         _ => 0,
     };
-    let handle = match lookup_io_thread(id) {
-        Some(h) => h,
-        None => {
-            // Unknown thread id — tests that don't register a real
-            // IoThreadHandle reach here. Stash the runnable on a process-
-            // wide "pending runnables" list so test code can assert on it.
-            record_synthetic_pending(id, runnable);
-            return Ok(None);
-        }
-    };
-    // Wrap the Runnable reference in a closure that, when run, flags
-    // that this runnable was dispatched. We cannot actually invoke
-    // `run()` from a non-VM thread; the real wire-up lives in
-    // T19.7.b's worker-thread setup where the VM context is available.
     let raw_ptr = runnable.as_ptr() as usize;
-    let res = handle.try_execute(Box::new(move || {
-        mark_synthetic_runnable_ran(raw_ptr);
-    }));
-    match res {
-        Ok(()) => Ok(None),
-        Err(_) => Err(rejected_execution(format!(
-            "XnioIoThread.execute: queue at cap {}",
-            MAX_PENDING_TASKS
-        ))),
+    // Record dispatch (test hook) and, for a known thread, keep the queue
+    // bookkeeping honest by rejecting when the loop's queue is at cap.
+    if let Some(handle) = lookup_io_thread(id) {
+        if handle.pending_len.load(Ordering::Acquire) >= MAX_PENDING_TASKS {
+            return Err(rejected_execution(format!(
+                "XnioIoThread.execute: queue at cap {}",
+                MAX_PENDING_TASKS
+            )));
+        }
+    } else {
+        // Unknown thread id — tests that don't register a real
+        // IoThreadHandle reach here. Stash the runnable on a process-wide
+        // "pending runnables" list so test code can assert on it. We still
+        // run the task below so behavior is correct either way.
+        record_synthetic_pending(id, runnable);
+    }
+    mark_synthetic_runnable_ran(raw_ptr);
+    // Actually run the task. `invoke_virtual` prepends the receiver; `run()V`
+    // takes no further parameters.
+    match ctx.invoke_virtual(runnable, "run", "()V", &[]) {
+        Ok(_) => Ok(None),
+        Err(e) => {
+            tracing::warn!(
+                error = ?e,
+                "XnioIoThread.execute: submitted Runnable.run() threw; \
+                 swallowing per execute() contract",
+            );
+            Ok(None)
+        }
     }
 }
 

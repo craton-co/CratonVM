@@ -98,25 +98,40 @@ pub(crate) fn register_apps_h2_overrides(registry: &mut NativeMethodRegistry) {
 
 /// C42: Register a corrective native for `org.h2.table.TableFilter.prepare()V`.
 ///
-/// The real bytecode at pc=44..52 dereferences `this.index.getColumnIndex(col)`
-/// to decide whether an index-condition should be pruned. In our VM the
-/// plan-optimisation pipeline sometimes leaves `index` null for single-table
-/// queries with a WHERE clause, so the original implementation NPE's. We
-/// reproduce the method's logic, but lazily bootstrap `index` with the
-/// table's scan index first — which matches what real-JDK's Optimizer
-/// would have done via `setPlanItem`.
+/// FLAGGED SyntheticStub: this natively re-implements H2 *application*
+/// bytecode (`TableFilter.prepare`) to paper over an underlying CratonVM
+/// optimizer defect — our `org.h2.command.dml.Optimizer.optimize` pipeline
+/// leaves `TableFilter.index` null for simple single-table WHERE queries
+/// (the plan lookup returns null where real-JDK's `setPlanItem` would have
+/// populated it), so the real bytecode at `prepare pc=44..52` NPEs on
+/// `this.index.getColumnIndex(col)`. The correct fix is in the VM optimizer
+/// (populate the plan item / scan index), NOT a per-app native shim.
+///
+/// Per the no-stubs policy the shim is therefore gated behind the default-OFF
+/// `app-stubs` feature. When the feature is OFF this function is a no-op, so
+/// the real `TableFilter.prepare` bytecode runs and the underlying optimizer
+/// bug surfaces honestly (rather than being silently masked). The shim is
+/// still tagged [`NativeKind::SyntheticStub`] when it IS registered.
 pub fn register_h2_table_filter_prepare(registry: &mut NativeMethodRegistry) {
-    let __prev_cat = registry.current_category();
-    registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-    registry.register(
-        "org/h2/table/TableFilter",
-        "prepare",
-        "()V",
-        table_filter_prepare,
-    );
-    registry.set_category(__prev_cat);
+    #[cfg(feature = "app-stubs")]
+    {
+        let __prev_cat = registry.current_category();
+        registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
+        registry.register(
+            "org/h2/table/TableFilter",
+            "prepare",
+            "()V",
+            table_filter_prepare,
+        );
+        registry.set_category(__prev_cat);
+    }
+    // Without `app-stubs` the corrective native is not installed; real H2
+    // bytecode runs. `registry` is unused in that configuration.
+    #[cfg(not(feature = "app-stubs"))]
+    let _ = registry;
 }
 
+#[cfg_attr(not(feature = "app-stubs"), allow(dead_code))]
 fn table_filter_prepare(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -129,6 +144,7 @@ fn table_filter_prepare(
     Ok(None)
 }
 
+#[cfg_attr(not(feature = "app-stubs"), allow(dead_code))]
 fn table_filter_prepare_on(
     ctx: &mut dyn NativeContext,
     this: cratonvm_types::ObjectRef,

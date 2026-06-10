@@ -124,7 +124,7 @@ need to touch it directly.
 | Custom natives | Must be `fn` (not `FnMut`); state goes in `static` / `OnceLock`. |
 
 The full lock hierarchy is documented in
-[`docs/lock-order.md`](lock-order.md).
+[`vm/src/runtime/lock_order.rs`](../../vm/src/runtime/lock_order.rs).
 
 ## Pitfalls
 
@@ -159,4 +159,4 @@ The full lock hierarchy is documented in
 - Flag reference: [`docs/CONFIG.md`](CONFIG.md).
 - GC sizing and backends: [`docs/gc-tuning.md`](gc-tuning.md).
 - Platform feature matrix for syscalls: [`docs/PLATFORMS.md`](PLATFORMS.md).
-- Lock hierarchy: [`docs/lock-order.md`](lock-order.md).
+- Lock hierarchy: [`vm/src/runtime/lock_order.rs`](../../vm/src/runtime/lock_order.rs).

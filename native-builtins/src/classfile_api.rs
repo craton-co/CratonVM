@@ -2,11 +2,35 @@
 // Copyright 2024-2026 Craton Software Company
 
 //! Java Class-File API (JEP 484, JDK 24) native method registrations.
+//!
+//! FLAGGED SyntheticStub: CratonVM does not actually implement JEP 484. The
+//! accessors below fabricate canned model objects, but the *productive*
+//! entry points — the ones whose wrong answers would silently corrupt a
+//! caller (`ClassFile.parse`, `build`/`buildTo`/`buildModule`/`transformClass`,
+//! `ClassBuilder.build`, `ClassTransform.transformClass`) — throw a clear
+//! `UnsupportedOperationException` instead of returning a fixed ClassModel or
+//! an empty `byte[]`. This honours the no-stubs policy: a real Class-File API
+//! user fails loudly (and catchably, since it is a normal Java exception)
+//! rather than receiving fabricated bytes. The whole surface stays tagged
+//! [`NativeKind::SyntheticStub`].
 
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
+use cratonvm_types::error::{MethodCallResult, MethodCallFailed, RuntimeError};
 use cratonvm_types::{ObjectRef, Value};
 
-use crate::{native_noop, native_noop_with_this, obj_arg, alloc_concurrent_synthetic};
+use crate::{obj_arg, alloc_concurrent_synthetic};
+
+/// Throw a clear `UnsupportedOperationException` from a Class-File API entry
+/// point that CratonVM cannot honestly implement (real parsing / bytecode
+/// generation). Catchable Java-side, so callers degrade gracefully instead
+/// of consuming fabricated bytes.
+fn classfile_unsupported(method: &str) -> MethodCallResult {
+    Err(MethodCallFailed::from(RuntimeError::UnsupportedOperationException {
+        message: format!(
+            "java.lang.classfile.{method}: the JEP 484 Class-File API is not implemented by CratonVM"
+        ),
+    }))
+}
 
 // ---------------------------------------------------------------------------
 // Class file version constants
@@ -76,51 +100,37 @@ fn register_classfile(r: &mut NativeMethodRegistry) {
     });
 
     // parse(byte[]) -> ClassModel
-    r.register(cf, "parse", "([B)Ljava/lang/classfile/ClassModel;", |ctx, _args| {
-        let model = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassModel", 6);
-        ctx.set_field(model, 0, Value::Int(CLASSFILE_MAJOR_69 as i32));
-        ctx.set_field(model, 1, Value::Int(0)); // minor
-        ctx.set_field(model, 2, Value::Int(ACC_PUBLIC as i32));
-        ctx.set_field(model, 3, Value::Int(1)); // this_class_idx
-        ctx.set_field(model, 4, Value::Int(3)); // super_class_idx
-        ctx.set_field(model, 5, Value::Int(0)); // field_count
-        Ok(Some(Value::Object(Some(model))))
+    // Real parsing is not implemented; a fabricated ClassModel would silently
+    // misreport the class structure. Fail loudly (catchable) instead.
+    r.register(cf, "parse", "([B)Ljava/lang/classfile/ClassModel;", |_ctx, _args| {
+        classfile_unsupported("ClassFile.parse(byte[])")
     });
 
     // parse(Path) -> ClassModel
-    r.register(cf, "parse", "(Ljava/nio/file/Path;)Ljava/lang/classfile/ClassModel;", |ctx, _args| {
-        let model = alloc_concurrent_synthetic(ctx, "java/lang/classfile/ClassModel", 6);
-        ctx.set_field(model, 0, Value::Int(CLASSFILE_MAJOR_69 as i32));
-        ctx.set_field(model, 1, Value::Int(0));
-        ctx.set_field(model, 2, Value::Int(ACC_PUBLIC as i32));
-        ctx.set_field(model, 3, Value::Int(1));
-        ctx.set_field(model, 4, Value::Int(3));
-        ctx.set_field(model, 5, Value::Int(0));
-        Ok(Some(Value::Object(Some(model))))
+    r.register(cf, "parse", "(Ljava/nio/file/Path;)Ljava/lang/classfile/ClassModel;", |_ctx, _args| {
+        classfile_unsupported("ClassFile.parse(Path)")
     });
 
     // build(ClassDesc, Consumer<ClassBuilder>) -> byte[]
-    r.register(cf, "build", "(Ljava/lang/constant/ClassDesc;Ljava/util/function/Consumer;)[B", |ctx, _args| {
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        Ok(Some(Value::Object(Some(arr))))
+    // Returning an empty byte[] fabricates a "successful" but invalid class.
+    // Fail loudly instead so callers do not write a corrupt class file.
+    r.register(cf, "build", "(Ljava/lang/constant/ClassDesc;Ljava/util/function/Consumer;)[B", |_ctx, _args| {
+        classfile_unsupported("ClassFile.build")
     });
 
     // buildTo(Path, ClassDesc, Consumer<ClassBuilder>) -> void
-    // Instance method on ClassFile. Our synthetic ClassFile does not
-    // actually generate bytes — it returns an empty array from `build`
-    // and buildTo is a no-op. NEW-6: documented intentional no-op.
-    r.register(cf, "buildTo", "(Ljava/nio/file/Path;Ljava/lang/constant/ClassDesc;Ljava/util/function/Consumer;)V", native_noop_with_this);
+    r.register(cf, "buildTo", "(Ljava/nio/file/Path;Ljava/lang/constant/ClassDesc;Ljava/util/function/Consumer;)V", |_ctx, _args| {
+        classfile_unsupported("ClassFile.buildTo")
+    });
 
     // buildModule(ModuleDesc, Consumer) -> byte[]
-    r.register(cf, "buildModule", "(Ljava/lang/module/ModuleDescriptor;Ljava/util/function/Consumer;)[B", |ctx, _args| {
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        Ok(Some(Value::Object(Some(arr))))
+    r.register(cf, "buildModule", "(Ljava/lang/module/ModuleDescriptor;Ljava/util/function/Consumer;)[B", |_ctx, _args| {
+        classfile_unsupported("ClassFile.buildModule")
     });
 
     // transformClass(ClassModel, ClassTransform) -> byte[]
-    r.register(cf, "transformClass", "(Ljava/lang/classfile/ClassModel;Ljava/lang/classfile/ClassTransform;)[B", |ctx, _args| {
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        Ok(Some(Value::Object(Some(arr))))
+    r.register(cf, "transformClass", "(Ljava/lang/classfile/ClassModel;Ljava/lang/classfile/ClassTransform;)[B", |_ctx, _args| {
+        classfile_unsupported("ClassFile.transformClass")
     });
 
     // latestMajorVersion() -> int
@@ -456,9 +466,9 @@ fn register_class_builder(r: &mut NativeMethodRegistry) {
     });
 
     // build() -> byte[]
-    r.register(cb, "build", "()[B", |ctx, _args| {
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        Ok(Some(Value::Object(Some(arr))))
+    // An empty byte[] is an invalid class file; fail loudly instead.
+    r.register(cb, "build", "()[B", |_ctx, _args| {
+        classfile_unsupported("ClassBuilder.build")
     });
 }
 
@@ -690,9 +700,9 @@ fn register_class_transform(r: &mut NativeMethodRegistry) {
     });
 
     // transformClass(ClassModel) -> byte[]
-    r.register(ct, "transformClass", "(Ljava/lang/classfile/ClassModel;)[B", |ctx, _args| {
-        let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        Ok(Some(Value::Object(Some(arr))))
+    // An empty byte[] is an invalid class file; fail loudly instead.
+    r.register(ct, "transformClass", "(Ljava/lang/classfile/ClassModel;)[B", |_ctx, _args| {
+        classfile_unsupported("ClassTransform.transformClass")
     });
 }
 

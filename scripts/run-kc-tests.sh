@@ -6,8 +6,9 @@ set +e
 CP_FILE="$1"; shift
 OUT="$1"; shift
 CP="$(cat "$CP_FILE")"
-RJVM="C:/craton/CratonVM-kctests/target/release/cratonvm.exe"
-JDK="C:/Program Files/Java/jdk-25"
+ROOT="${ROOT:-$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || echo C:/craton/CratonVM)}"
+RJVM="${RJVM:-$ROOT/target/release/cratonvm.exe}"
+JDK="${JDK:-${JAVA_HOME:-C:/Program Files/Java/jdk-25}}"
 # NOTE: assertions (-ea) are intentionally NOT enabled by default. The native
 # `desiredAssertionStatus` honours CRATONVM_ENABLE_ASSERTIONS, but turning it on
 # globally fires asserts inside CratonVM's synthetic MethodHandle/MemberName

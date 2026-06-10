@@ -326,17 +326,91 @@ pub(crate) fn locate_module_xml(root: &Path, name: &str) -> Option<PathBuf> {
     None
 }
 
+/// Resolve a candidate path for the under-root check, following symlinks in
+/// the on-disk prefix without requiring the *whole* candidate to exist.
+///
+/// V1 — the old code fell back to the raw (non-canonical) candidate whenever
+/// `canonicalize` failed (which happens for a not-yet-existing path or a
+/// symlink with an unresolvable target). That fallback bypassed the symlink
+/// guard. We instead canonicalize the **longest existing ancestor** (so any
+/// symlink in the real prefix is followed) and re-attach the remaining
+/// lexical components, rejecting any `..` segment. `None` means the path
+/// could not be safely resolved and the caller must fail closed.
+fn resolve_for_confinement(candidate: &Path) -> Option<PathBuf> {
+    // Fast path: the whole candidate exists and canonicalizes — symlinks fully
+    // followed.
+    if let Ok(c) = std::fs::canonicalize(candidate) {
+        return Some(c);
+    }
+    // Walk up to the longest existing ancestor, canonicalizing it (so a
+    // symlink anywhere in the existing prefix is resolved), then append the
+    // trailing components that don't yet exist on disk.
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = candidate;
+    loop {
+        if let Ok(canon_prefix) = std::fs::canonicalize(cur) {
+            let mut resolved = canon_prefix;
+            for seg in tail.iter().rev() {
+                // A `..` in the not-yet-existing tail could climb back out of
+                // the resolved prefix — refuse it. (Normal segments and `.`
+                // are fine; `.` is a no-op.)
+                if seg.as_os_str() == ".." {
+                    return None;
+                }
+                if seg.as_os_str() == "." {
+                    continue;
+                }
+                resolved.push(seg);
+            }
+            return Some(resolved);
+        }
+        match cur.parent() {
+            Some(parent) => {
+                if let Some(name) = cur.file_name() {
+                    tail.push(name.to_os_string());
+                }
+                // `parent()` of e.g. "foo" is "" — stop to avoid an infinite
+                // loop on a relative path whose root never exists.
+                if parent.as_os_str().is_empty() {
+                    return None;
+                }
+                cur = parent;
+            }
+            None => return None,
+        }
+    }
+}
+
 /// Given a canonicalized module-path root and a resolved
 /// `module.xml` path, assert the module path is *under* the root.
 ///
-/// Defeats both `..` traversal and symlink attacks: every path is
-/// canonicalized first, so a symlink target outside the root is
-/// detected by the prefix check.
+/// Defeats both `..` traversal and symlink attacks: the candidate is resolved
+/// through [`resolve_for_confinement`] (symlinks in its existing prefix are
+/// followed) before the prefix check.
+///
+/// V1 — fails **closed**: if the candidate cannot be safely resolved (e.g. a
+/// symlink with an unresolvable target, or a path whose existing prefix can't
+/// be canonicalized), we reject rather than falling back to the raw path,
+/// which would have let a symlink escape the root.
 fn ensure_under_root(root: &Path, candidate: &Path) -> Result<(), RuntimeError> {
-    let canonical_candidate = std::fs::canonicalize(candidate)
-        .unwrap_or_else(|_| candidate.to_path_buf());
+    // The root is trusted configuration computed once from `-mp`; for a root
+    // that doesn't exist (test tempdirs that were torn down, etc.) we keep the
+    // non-canonical fallback so deterministic test roots still work. The
+    // candidate, by contrast, is attacker-influenced and must fail closed.
     let canonical_root = std::fs::canonicalize(root)
         .unwrap_or_else(|_| root.to_path_buf());
+    let canonical_candidate = match resolve_for_confinement(candidate) {
+        Some(c) => c,
+        None => {
+            return Err(RuntimeError::SecurityException {
+                message: format!(
+                    "module path {} could not be resolved for confinement under {}",
+                    candidate.display(),
+                    canonical_root.display(),
+                ),
+            });
+        }
+    };
     if !canonical_candidate.starts_with(&canonical_root) {
         return Err(RuntimeError::SecurityException {
             message: format!(
@@ -3174,6 +3248,58 @@ mod tests {
         let outside = tmp_other.path().join("foo");
         std::fs::write(&outside, "x").unwrap();
         let err = ensure_under_root(tmp_root.path(), &outside).unwrap_err();
+        assert!(matches!(err, RuntimeError::SecurityException { .. }));
+    }
+
+    #[test]
+    fn t19_h4_ensure_under_root_accepts_nonexistent_descendant() {
+        // V1: a resource-root jar that doesn't physically exist yet must
+        // still be accepted as long as its existing prefix (the module dir)
+        // is under the root. The existing module dir is canonicalized and the
+        // not-yet-existing jar name is re-attached.
+        let _g = TEST_LOCK.lock();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let module_dir = root.join("system/layers/base/com/example/main");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        let missing_jar = module_dir.join("not-yet-here.jar");
+        // The jar does not exist on disk, but its prefix does.
+        ensure_under_root(root, &missing_jar).unwrap();
+    }
+
+    #[test]
+    fn t19_h4_ensure_under_root_fails_closed_on_nonexistent_escape() {
+        // V1: a non-existent candidate that lexically escapes the root must be
+        // rejected (fail closed) rather than slipping through on the old raw
+        // fallback. The existing prefix (`tmp_other`) canonicalizes outside the
+        // root, so the prefix check rejects it.
+        let _g = TEST_LOCK.lock();
+        let tmp_root = tempfile::tempdir().unwrap();
+        let tmp_other = tempfile::tempdir().unwrap();
+        // Candidate that does NOT exist on disk yet, but whose existing prefix
+        // lives outside the module root.
+        let outside_missing = tmp_other.path().join("ghost/escape.jar");
+        let err = ensure_under_root(tmp_root.path(), &outside_missing).unwrap_err();
+        assert!(matches!(err, RuntimeError::SecurityException { .. }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn t19_h4_ensure_under_root_rejects_symlink_escape() {
+        // V1: a symlink inside the root whose target lives outside the root
+        // must be rejected — `resolve_for_confinement` follows the symlink in
+        // the existing prefix before the under-root check, so the escape is
+        // detected even though the link itself sits under the root.
+        let _g = TEST_LOCK.lock();
+        let tmp_root = tempfile::tempdir().unwrap();
+        let tmp_other = tempfile::tempdir().unwrap();
+        let target_dir = tmp_other.path().join("secret");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let link = tmp_root.path().join("link");
+        std::os::unix::fs::symlink(&target_dir, &link).unwrap();
+        // Candidate goes through the in-root symlink but resolves outside.
+        let candidate = link.join("loot.jar");
+        let err = ensure_under_root(tmp_root.path(), &candidate).unwrap_err();
         assert!(matches!(err, RuntimeError::SecurityException { .. }));
     }
 

@@ -1705,14 +1705,33 @@ fn build_start_context(ctx: &mut dyn NativeContext, id: u64) -> ObjectRef {
 /// and `StartContext` are kept live across the call by the invoked frame's
 /// own root scan; container-held refs are re-read from `service_roots` (which
 /// the GC remaps) rather than from stale locals.
-fn drive_starts(ctx: &mut dyn NativeContext, container: &ServiceContainer) {
+///
+/// Fault handling (B7): a failing `start()` is never silently swallowed. The
+/// service's name + failure are always surfaced via `tracing::error!` (not
+/// gated behind the `CRATONVM_MSC_DBG` env), and the service is marked `Failed`
+/// in the container so a half-started graph cannot present as healthy. We then
+/// distinguish the two failure kinds:
+///   * [`MethodCallFailed::ExceptionThrown`] — a real Java exception (e.g.
+///     `StartException`). Real MSC catches these at the framework boundary and
+///     marks the service `Failed` *without* aborting `install()`; dependents
+///     stay blocked but independent services continue. We mirror that: record +
+///     continue (now logged), so behaviour stays MSC-faithful.
+///   * [`MethodCallFailed::InternalError`] — an uncatchable Rust/VM-level error.
+///     There is no MSC "catch" for this; swallowing it would mask a real VM
+///     defect. We propagate it out so the caller (`install()`) returns the
+///     error through its result path instead of reporting a successful boot.
+fn drive_starts(
+    ctx: &mut dyn NativeContext,
+    container: &ServiceContainer,
+) -> Result<(), MethodCallFailed> {
     let mut guard: u32 = 0;
     loop {
         guard += 1;
         if guard > 200_000 {
-            if msc_dbg() {
-                eprintln!("[msc] drive_starts: re-entrancy guard limit hit, stopping");
-            }
+            tracing::warn!(
+                target: "jboss_msc",
+                "drive_starts: re-entrancy guard limit hit ({guard}), stopping"
+            );
             break;
         }
         let id = match container.take_ready_start() {
@@ -1755,15 +1774,44 @@ fn drive_starts(ctx: &mut dyn NativeContext, container: &ServiceContainer) {
                 container.finish_start(id);
             }
             Err(e) => {
-                if msc_dbg() {
-                    eprintln!("[msc] <- start id={id} FAILED: {e:?}");
-                }
+                // Always surface the failure (not just under CRATONVM_MSC_DBG):
+                // record it in the container AND log it so a failed service is
+                // never silently hidden.
+                let name = {
+                    let state = container.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    state
+                        .by_id
+                        .get(&id)
+                        .map(|n| n.canonical().to_string())
+                        .unwrap_or_else(|| format!("<id {id}>"))
+                };
                 container.record_failure(id, format!("service start failed: {e:?}"));
-                // Do not propagate: record + keep draining other services so a
-                // single failed service does not abort the whole boot.
+                match e {
+                    MethodCallFailed::ExceptionThrown(_) => {
+                        // Catchable Java exception: MSC-faithful — mark Failed
+                        // (done above) and keep draining other services.
+                        tracing::error!(
+                            target: "jboss_msc",
+                            service = %name,
+                            "MSC service start() threw — marked FAILED, boot continues: {e:?}"
+                        );
+                    }
+                    MethodCallFailed::InternalError(_) => {
+                        // Uncatchable VM-level error: do not swallow. Surface it
+                        // through the result path so install() reports the real
+                        // failure instead of a fake successful boot.
+                        tracing::error!(
+                            target: "jboss_msc",
+                            service = %name,
+                            "MSC service start() hit an internal VM error — propagating: {e:?}"
+                        );
+                        return Err(e);
+                    }
+                }
             }
         }
     }
+    Ok(())
 }
 
 /// P2 hook: `org.jboss.msc.service.ServiceBuilderImpl.install()`.
@@ -1872,10 +1920,14 @@ fn native_service_builder_install(ctx: &mut dyn NativeContext, args: &[Value]) -
 
     // Drive starts iteratively; only the outermost install drives. Nested
     // install() calls (made by a running start()) just register + return.
+    // B7: an uncatchable VM-level start failure is propagated out of
+    // `drive_starts` rather than swallowed — reset the re-entrancy flag and
+    // return the error so a failed boot is surfaced, not faked as success.
     let was_driving = DRIVING.with(|d| d.replace(true));
     if !was_driving {
-        drive_starts(ctx, &container);
+        let drive_res = drive_starts(ctx, &container);
         DRIVING.with(|d| d.set(false));
+        drive_res?;
     }
 
     // Re-read the (possibly relocated) mirror from the GC-remapped side-table.

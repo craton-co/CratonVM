@@ -2840,6 +2840,229 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 // ---------------------------------------------------------------------------
+// V1 — per-entry manifest digest binding (jarsigner integrity chain)
+//
+// `verify_signer_block` proves the signature over `MANIFEST.MF` (via the
+// `.SF` companion).  That is only the first half of the JAR signing trust
+// chain.  The full chain is:
+//
+//     signature  ->  .SF  ->  MANIFEST.MF  ->  per-entry digests  ->  bytes
+//
+// Without the second half an attacker can take a properly signed JAR,
+// replace a `.class` body (leaving `MANIFEST.MF` / `.SF` / `.RSA` intact),
+// and `Class.getCodeSource().getCertificates()` would still report the
+// original signer.  The helpers below let the archive-holding caller
+// (`class_path::extract_jar_signer_blocks`) bind every entry's bytes to
+// the digest recorded in `MANIFEST.MF` before surfacing the signer.
+// ---------------------------------------------------------------------------
+
+/// One per-entry digest declaration parsed out of a JAR `MANIFEST.MF`
+/// per-entry section: the entry's `Name:` and the strongest recognised
+/// `<alg>-Digest:` value (decoded from base64) found in that section.
+#[derive(Debug, Clone)]
+pub struct ManifestEntryDigest {
+    /// The `Name:` value — a JAR-internal entry path (e.g.
+    /// `com/example/Foo.class`).
+    pub name: String,
+    /// Digest algorithm named by the `<alg>-Digest` attribute.
+    pub alg: DigestAlg,
+    /// The expected digest bytes (base64-decoded from the manifest).
+    pub expected: Vec<u8>,
+}
+
+/// Map a JAR-manifest digest-attribute algorithm token (the `<alg>` in
+/// `<alg>-Digest` / `<alg>-Digest-Manifest`) to a [`DigestAlg`].
+///
+/// The JAR spec spells SHA-1 as both `SHA1` and `SHA-1`; SHA-2 variants
+/// always carry the dash (`SHA-256`).  Matching is case-insensitive.
+fn manifest_digest_alg(token: &str) -> Option<DigestAlg> {
+    match token.to_ascii_uppercase().as_str() {
+        "SHA-256" | "SHA256" => Some(DigestAlg::Sha256),
+        "SHA-384" | "SHA384" => Some(DigestAlg::Sha384),
+        "SHA-512" | "SHA512" => Some(DigestAlg::Sha512),
+        "SHA1" | "SHA-1" => Some(DigestAlg::Sha1),
+        _ => None,
+    }
+}
+
+/// Relative strength ordering for digest algorithms — higher is stronger.
+/// Used to pick the strongest `<alg>-Digest` when a manifest section lists
+/// several (jarsigner emits whichever the signer requested; if more than
+/// one is present we verify against the strongest).
+fn digest_strength(alg: DigestAlg) -> u8 {
+    match alg {
+        DigestAlg::Sha1 => 1,
+        DigestAlg::Sha256 => 2,
+        DigestAlg::Sha384 => 3,
+        DigestAlg::Sha512 => 4,
+    }
+}
+
+/// Fold a JAR manifest/`.SF` blob into logical lines, honouring the
+/// 72-byte continuation rule (a physical line that begins with a single
+/// space continues the previous logical line; the leading space is
+/// dropped).  Mirrors the folding `ManifestInfo` performs in
+/// `class_path.rs`, kept self-contained here so the signer module has no
+/// dependency on the class-path manifest parser.
+fn fold_manifest_lines(text: &str) -> Vec<String> {
+    let text = text.replace('\r', "");
+    let mut folded: Vec<String> = Vec::new();
+    let mut buf = String::new();
+    for line in text.split('\n') {
+        if line.starts_with(' ') && !buf.is_empty() {
+            buf.push_str(&line[1..]);
+        } else {
+            if !buf.is_empty() {
+                folded.push(std::mem::take(&mut buf));
+            }
+            buf.push_str(line);
+        }
+    }
+    if !buf.is_empty() {
+        folded.push(buf);
+    }
+    folded
+}
+
+/// Verify that the caller-supplied `MANIFEST.MF` bytes are the same bytes
+/// the verified `.SF` committed to, by matching the `.SF` main-section
+/// `<alg>-Digest-Manifest` attribute against the freshly computed digest
+/// of `manifest_bytes`.
+///
+/// This binds the (signature-verified) `.SF` to the actual `MANIFEST.MF`
+/// content; it is the link that lets the per-entry digests in the manifest
+/// be trusted.  Returns `true` only when a recognised
+/// `<alg>-Digest-Manifest` attribute is present in the `.SF` main section
+/// **and** its base64 value equals `H_alg(manifest_bytes)`.  An absent
+/// `*-Digest-Manifest` returns `false` (fail-closed: we will not trust a
+/// manifest the `.SF` did not commit to).
+pub fn verify_sf_binds_manifest(sf_bytes: &[u8], manifest_bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(sf_bytes);
+    let lines = fold_manifest_lines(&text);
+    let mut best: Option<(DigestAlg, Vec<u8>)> = None;
+    for line in &lines {
+        // Stop at the first blank line: only the `.SF` main section
+        // carries `-Digest-Manifest`; per-entry sections follow.
+        if line.is_empty() {
+            break;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        // We match `<alg>-Digest-Manifest` (digest of the whole manifest).
+        // `<alg>-Digest-Manifest-Main-Attributes` is intentionally NOT
+        // accepted as a substitute — it only covers the main section, not
+        // the per-entry digests we are about to trust.
+        let Some(alg_token) = key.strip_suffix("-Digest-Manifest") else {
+            continue;
+        };
+        let Some(alg) = manifest_digest_alg(alg_token) else {
+            continue;
+        };
+        let Some(expected) = base64_decode(value.trim()) else {
+            continue;
+        };
+        if best.as_ref().map_or(true, |(b, _)| digest_strength(alg) > digest_strength(*b)) {
+            best = Some((alg, expected));
+        }
+    }
+    match best {
+        Some((alg, expected)) => {
+            let actual = raw_digest(alg, manifest_bytes);
+            !actual.is_empty() && ct_eq(&expected, &actual)
+        }
+        None => false,
+    }
+}
+
+/// Parse every per-entry section of a JAR `MANIFEST.MF` into the strongest
+/// `<alg>-Digest` declaration it carries.  Each manifest section is
+/// `Name: <entry>` followed by one or more `<alg>-Digest: <base64>` lines;
+/// the main section (before the first blank line, no `Name:`) is skipped.
+///
+/// The returned vector lists, per signed entry, the entry name, the
+/// digest algorithm, and the expected digest bytes — the caller fetches
+/// the entry's actual bytes and compares with [`digest_matches`].
+pub fn parse_manifest_entry_digests(manifest_bytes: &[u8]) -> Vec<ManifestEntryDigest> {
+    let text = String::from_utf8_lossy(manifest_bytes);
+    let lines = fold_manifest_lines(&text);
+    let mut out: Vec<ManifestEntryDigest> = Vec::new();
+    let mut cur_name: Option<String> = None;
+    let mut cur_best: Option<(DigestAlg, Vec<u8>)> = None;
+
+    // Flush the in-progress section (only if it has BOTH a name and a
+    // digest); always clears the in-progress state. Plain `fn` (captures
+    // nothing) to keep the borrows unambiguous.
+    fn flush(
+        name: &mut Option<String>,
+        best: &mut Option<(DigestAlg, Vec<u8>)>,
+        out: &mut Vec<ManifestEntryDigest>,
+    ) {
+        if let (Some(n), Some((alg, expected))) = (name.take(), best.take()) {
+            out.push(ManifestEntryDigest {
+                name: n,
+                alg,
+                expected,
+            });
+        } else {
+            *name = None;
+            *best = None;
+        }
+    }
+
+    for line in &lines {
+        if line.is_empty() {
+            // Section boundary: flush whatever we have.
+            flush(&mut cur_name, &mut cur_best, &mut out);
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        if key.eq_ignore_ascii_case("Name") {
+            // New section starts. (Defensive: a `Name` before the first
+            // blank line would still be treated as a per-entry section.)
+            flush(&mut cur_name, &mut cur_best, &mut out);
+            // Cap entry-name length to keep a hostile manifest from
+            // ballooning memory; legitimate JAR paths are well under 4 KiB.
+            if value.len() <= 4096 {
+                cur_name = Some(value.to_string());
+            } else {
+                cur_name = None;
+            }
+            cur_best = None;
+        } else if let Some(alg_token) = key.strip_suffix("-Digest") {
+            if cur_name.is_some() {
+                if let Some(alg) = manifest_digest_alg(alg_token) {
+                    if let Some(expected) = base64_decode(value) {
+                        if cur_best
+                            .as_ref()
+                            .map_or(true, |(b, _)| digest_strength(alg) > digest_strength(*b))
+                        {
+                            cur_best = Some((alg, expected));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Flush the final section (manifests need not end with a blank line).
+    flush(&mut cur_name, &mut cur_best, &mut out);
+    out
+}
+
+/// Constant-time check that `H_alg(data)` equals the `expected` digest
+/// recorded in a manifest entry section.  Returns `false` on length
+/// mismatch (i.e. tampered or wrong-algorithm bytes).
+pub fn digest_matches(alg: DigestAlg, data: &[u8], expected: &[u8]) -> bool {
+    let actual = raw_digest(alg, data);
+    !actual.is_empty() && ct_eq(expected, &actual)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -4183,5 +4406,97 @@ mod tests {
         };
         let cert = X509Cert::parse(&der).expect("parse expired cert");
         assert!(!super::cert_dates_ok(&cert), "year-2001 notAfter must be expired");
+    }
+
+    // -----------------------------------------------------------------
+    // V1 — per-entry manifest digest binding helpers.
+    // -----------------------------------------------------------------
+
+    /// Minimal standard base64 encoder for the manifest-digest tests.
+    fn b64enc(input: &[u8]) -> String {
+        const ALPHA: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in input.chunks(3) {
+            let b0 = chunk[0] as u32;
+            let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+            let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+            let n = (b0 << 16) | (b1 << 8) | b2;
+            out.push(ALPHA[((n >> 18) & 63) as usize] as char);
+            out.push(ALPHA[((n >> 12) & 63) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                ALPHA[((n >> 6) & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                ALPHA[(n & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn sf_binds_manifest_accepts_matching_digest() {
+        let manifest = b"Manifest-Version: 1.0\r\n\r\nName: a/B.class\r\nSHA-256-Digest: xyz\r\n";
+        let mdigest = b64enc(&raw_digest(DigestAlg::Sha256, manifest));
+        let sf = format!(
+            "Signature-Version: 1.0\r\nSHA-256-Digest-Manifest: {mdigest}\r\n\r\n"
+        );
+        assert!(verify_sf_binds_manifest(sf.as_bytes(), manifest));
+    }
+
+    #[test]
+    fn sf_binds_manifest_rejects_tampered_manifest() {
+        let manifest = b"Manifest-Version: 1.0\r\n\r\nName: a/B.class\r\nSHA-256-Digest: xyz\r\n";
+        let mdigest = b64enc(&raw_digest(DigestAlg::Sha256, manifest));
+        let sf = format!("Signature-Version: 1.0\r\nSHA-256-Digest-Manifest: {mdigest}\r\n\r\n");
+        let tampered = b"Manifest-Version: 1.0\r\n\r\nName: a/B.class\r\nSHA-256-Digest: zzz\r\n";
+        assert!(!verify_sf_binds_manifest(sf.as_bytes(), tampered));
+    }
+
+    #[test]
+    fn sf_binds_manifest_fails_closed_without_digest_manifest() {
+        // A `.SF` that only commits to the main attributes (not the whole
+        // manifest) must NOT be accepted as binding the manifest.
+        let manifest = b"Manifest-Version: 1.0\r\n\r\nName: a/B.class\r\nSHA-256-Digest: xyz\r\n";
+        let sf = b"Signature-Version: 1.0\r\nSHA-256-Digest-Manifest-Main-Attributes: AAAA\r\n\r\n";
+        assert!(!verify_sf_binds_manifest(sf, manifest));
+    }
+
+    #[test]
+    fn parse_manifest_entry_digests_extracts_each_section() {
+        let body = b"hello world contents";
+        let dig = b64enc(&raw_digest(DigestAlg::Sha256, body));
+        let manifest = format!(
+            "Manifest-Version: 1.0\r\n\r\n\
+             Name: pkg/Foo.class\r\nSHA-256-Digest: {dig}\r\n\r\n\
+             Name: pkg/dir/\r\n\r\n"
+        );
+        let parsed = parse_manifest_entry_digests(manifest.as_bytes());
+        // Directory section (no digest) is dropped; only Foo.class remains.
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "pkg/Foo.class");
+        assert_eq!(parsed[0].alg, DigestAlg::Sha256);
+        assert!(digest_matches(parsed[0].alg, body, &parsed[0].expected));
+        // A different body must NOT match the recorded digest.
+        assert!(!digest_matches(parsed[0].alg, b"tampered", &parsed[0].expected));
+    }
+
+    #[test]
+    fn parse_manifest_entry_digests_picks_strongest_alg() {
+        let body = b"abc";
+        let d1 = b64enc(&raw_digest(DigestAlg::Sha1, body));
+        let d256 = b64enc(&raw_digest(DigestAlg::Sha256, body));
+        let manifest = format!(
+            "Manifest-Version: 1.0\r\n\r\n\
+             Name: X.class\r\nSHA1-Digest: {d1}\r\nSHA-256-Digest: {d256}\r\n\r\n"
+        );
+        let parsed = parse_manifest_entry_digests(manifest.as_bytes());
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].alg, DigestAlg::Sha256, "strongest digest wins");
+        assert!(digest_matches(parsed[0].alg, body, &parsed[0].expected));
     }
 }

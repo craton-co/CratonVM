@@ -10,12 +10,13 @@
 
 set +e
 
-ROOT=C:/craton/CratonVM
+ROOT="${ROOT:-$(git -C "$(dirname "${BASH_SOURCE[0]}")" rev-parse --show-toplevel 2>/dev/null || echo C:/craton/CratonVM)}"
 RJVM="$ROOT/target/release/cratonvm.exe"
-HOTSPOT="C:/Program Files/Java/jdk-25/bin/java.exe"
-TORNADO_SDK_SETUP="C:/craton/tornadovm/setvars.sh"
+JDK="${JDK:-${JAVA_HOME:-C:/Program Files/Java/jdk-25}}"
+HOTSPOT="$JDK/bin/java.exe"
+TORNADO_SDK_SETUP="${TORNADO_SDK_SETUP:-C:/craton/tornadovm/setvars.sh}"
 CRATON_GPU=$(ls -d "$ROOT/target/release/build/craton-gpu-"*/out/classes 2>/dev/null | head -1)
-BENCH_CLASSES="C:/craton/CratonVM/apps/gpu-bench/classes"
+BENCH_CLASSES="$ROOT/apps/gpu-bench/classes"
 TORNADO_DIR="$ROOT/bench-tornado"
 LOG="$ROOT/applogs/bench-4way-$(date +%H%M%S)"
 mkdir -p "$LOG"
@@ -49,7 +50,7 @@ echo "hotspot_c2,$(extract "$LOG/hotspot.out")" >> "$CSV"
 
 # ----- 2. CratonVM CPU (JIT on) -----
 echo "----- CratonVM CPU JIT-on -----"
-CRATONVM_DISABLE_JIT=0 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
+CRATONVM_DISABLE_JIT=0 timeout 300 "$RJVM" --java-home "$JDK" \
     -c "$BENCH_CLASSES" CpuOnlyBench "$N" "$ITERS" "$WARMUP" \
     > "$LOG/cratoncpu.out" 2> "$LOG/cratoncpu.err"
 echo "cratoncpu rc=$?"
@@ -57,7 +58,7 @@ echo "cratonvm_cpu_jit_on,$(extract "$LOG/cratoncpu.out")" >> "$CSV"
 
 # ----- 3. CratonVM CPU (JIT off — workaround for int[] loop regression) -----
 echo "----- CratonVM CPU JIT-off -----"
-CRATONVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
+CRATONVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "$JDK" \
     -c "$BENCH_CLASSES" CpuOnlyBench "$N" "$ITERS" "$WARMUP" \
     > "$LOG/cratoncpu_nojit.out" 2> "$LOG/cratoncpu_nojit.err"
 echo "cratoncpu_nojit rc=$?"
@@ -65,7 +66,7 @@ echo "cratonvm_cpu_jit_off,$(extract "$LOG/cratoncpu_nojit.out")" >> "$CSV"
 
 # ----- 4. CratonVM GPU (--gpu) — uses GpuBench (with craton.gpu.*) -----
 echo "----- CratonVM GPU -----"
-CRATONVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "C:/Program Files/Java/jdk-25" \
+CRATONVM_DISABLE_JIT=1 timeout 300 "$RJVM" --java-home "$JDK" \
     --gpu --print-gpu-decisions \
     -c "$BENCH_CLASSES;$CRATON_GPU" GpuBench "$N" "$ITERS" "$WARMUP" \
     > "$LOG/cratongpu.out" 2> "$LOG/cratongpu.err"

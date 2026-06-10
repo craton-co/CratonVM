@@ -91,7 +91,7 @@ All correctness CRITs from rounds 1–10 are now addressed. Round 11 closed the 
 
 ### Docs
 - **docs/PROFILING.md** still cites round-26 — refresh with round-11 baseline.
-- **docs/lock-order.md** additions for round-10 stripe arrays (CHM seg, CSLM seg, volatile stripe) and round-11 ProfileStore shards.
+- **vm/src/runtime/lock_order.rs** additions for round-10 stripe arrays (CHM seg, CSLM seg, volatile stripe) and round-11 ProfileStore shards.
 
 ## MED / LOW (carry-over)
 

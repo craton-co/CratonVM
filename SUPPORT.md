@@ -38,7 +38,7 @@ include a minimal reproducer (Java source plus the exact command line).
 ### Email (general inquiries)
 
 For questions that don't fit a public forum (partnerships, press, license
-clarifications), email **hello@craton.co**. Please use GitHub Discussions or
+clarifications), email **hello@craton.com.ar**. Please use GitHub Discussions or
 Issues for technical support — email is not staffed for engineering help and
 will be slower.
 
@@ -53,7 +53,7 @@ security-adjacent issues may be filed with the `security` label.
 
 Paid support, prioritized bug fixes, custom feature work, and consulting
 engagements are available from Craton Software Company. Contact
-**support@craton.co** to discuss a commercial arrangement. Note: as CratonVM
+**support@craton.com.ar** to discuss a commercial arrangement. Note: as CratonVM
 is still pre-1.0 and experimental, commercial offerings are limited and
 scoped case-by-case.
 

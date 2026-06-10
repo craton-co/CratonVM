@@ -63,15 +63,34 @@ impl VirtualThreadScheduler {
     /// Release a carrier permit, waking one waiting virtual thread.
     ///
     /// Called when a virtual thread blocks (sleep, park, wait) or terminates.
+    ///
+    /// Bug B4 (round-9): the increment is clamped to `carrier_count`. An
+    /// unbalanced or double `release()` (one not paired with a prior
+    /// `acquire()`) previously raised `available` above `carrier_count`,
+    /// permanently weakening the concurrency bound the semaphore exists to
+    /// enforce (and, in the limit, could wrap on overflow). Saturating at
+    /// `carrier_count` makes a stray release a no-op rather than corrupting
+    /// the permit count. We only `notify_one()` when a permit actually became
+    /// available so a clamped (already-full) release doesn't spuriously wake
+    /// a waiter.
     pub fn release(&self) {
         let mut state = self.state.lock();
-        state.available += 1;
-        self.condvar.notify_one();
+        let next = (state.available + 1).min(self.carrier_count);
+        if next != state.available {
+            state.available = next;
+            self.condvar.notify_one();
+        }
     }
 
     /// The total number of carrier threads.
     pub fn carrier_count(&self) -> usize {
         self.carrier_count
+    }
+
+    /// Number of currently-available permits (test-only introspection).
+    #[cfg(test)]
+    fn available(&self) -> usize {
+        self.state.lock().available
     }
 }
 
@@ -97,6 +116,30 @@ mod tests {
         sched.acquire();
         sched.release();
         sched.release();
+    }
+
+    #[test]
+    fn release_cannot_exceed_carrier_count() {
+        // Bug B4: an over-release (release without a paired acquire) must not
+        // raise `available` past `carrier_count`.
+        let sched = VirtualThreadScheduler::new(2);
+        assert_eq!(sched.available(), 2);
+
+        // Stray releases while already full are no-ops.
+        sched.release();
+        sched.release();
+        sched.release();
+        assert_eq!(sched.available(), 2, "available must clamp to carrier_count");
+
+        // The bound is still enforced: exactly two acquires drain the pool.
+        sched.acquire();
+        sched.acquire();
+        assert_eq!(sched.available(), 0);
+
+        // One release restores one permit, not more even after extra releases.
+        sched.release();
+        sched.release();
+        assert_eq!(sched.available(), 1, "double release adds at most one permit");
     }
 
     #[test]

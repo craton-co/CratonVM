@@ -527,7 +527,14 @@ pub fn parse_class_signature_cached(sig: &Arc<str>) -> Option<Arc<ClassSig>> {
         Some(_) => return parse_class_signature(sig).map(Arc::new),
         None => {}
     }
-    let parsed = SigParser::new(sig).parse_class_sig();
+    let mut p = SigParser::new(sig);
+    let parsed = p.parse_class_sig();
+    // Honor the sticky depth-exceeded guard exactly like the uncached
+    // `parse_class_signature`: a hostile signature that nests past
+    // `MAX_SIG_DEPTH` must be treated (and cached) as Invalid, otherwise
+    // the cached path would accept — and memoize — a partial AST the
+    // uncached path rejects, defeating the recursion/DoS guard.
+    let parsed = if p.depth_exceeded { None } else { parsed };
     let mut cache = signature_cache().lock();
     match parsed {
         Some(c) => {
@@ -550,7 +557,11 @@ pub fn parse_method_signature_cached(sig: &Arc<str>) -> Option<Arc<MethodSig>> {
         Some(_) => return parse_method_signature(sig).map(Arc::new),
         None => {}
     }
-    let parsed = SigParser::new(sig).parse_method_sig();
+    let mut p = SigParser::new(sig);
+    let parsed = p.parse_method_sig();
+    // Honor the sticky depth-exceeded guard exactly like the uncached
+    // `parse_method_signature` (see `parse_class_signature_cached`).
+    let parsed = if p.depth_exceeded { None } else { parsed };
     let mut cache = signature_cache().lock();
     match parsed {
         Some(m) => {
@@ -573,7 +584,11 @@ pub fn parse_field_signature_cached(sig: &Arc<str>) -> Option<Arc<TypeSig>> {
         Some(_) => return parse_field_signature(sig).map(Arc::new),
         None => {}
     }
-    let parsed = SigParser::new(sig).parse_type_sig();
+    let mut p = SigParser::new(sig);
+    let parsed = p.parse_type_sig();
+    // Honor the sticky depth-exceeded guard exactly like the uncached
+    // `parse_field_signature` (see `parse_class_signature_cached`).
+    let parsed = if p.depth_exceeded { None } else { parsed };
     let mut cache = signature_cache().lock();
     match parsed {
         Some(t) => {
@@ -666,5 +681,44 @@ mod tests {
         // Second call still returns None — the cache should record
         // the Invalid verdict and short-circuit.
         assert!(parse_field_signature_cached(&bad).is_none());
+    }
+
+    #[test]
+    fn cached_and_uncached_agree_on_depth_bomb() {
+        // Regression for the depth-guard bypass: a generic signature
+        // nested past MAX_SIG_DEPTH must be rejected on BOTH the cached
+        // and uncached paths. Previously the cached path discarded the
+        // parser and never read `depth_exceeded`, so it accepted (and
+        // memoized) a partial AST the uncached path rejects.
+        let mut nested = String::new();
+        for _ in 0..100_000 {
+            nested.push_str("Lp<");
+        }
+        nested.push_str("Lp;");
+        for _ in 0..100_000 {
+            nested.push_str(">;");
+        }
+        // Unique marker so we don't collide with the sibling
+        // `deeply_nested_signature_is_rejected_not_overflow` test or
+        // race on the shared cache.
+        nested.push_str("// cached_depth_bomb_marker");
+        let key: Arc<str> = Arc::from(nested.as_str());
+
+        // Uncached verdict is the ground truth.
+        assert!(
+            parse_field_signature(&key).is_none(),
+            "uncached path must reject a depth-bombed signature"
+        );
+        // Cached path must agree on the FIRST (parsing) call...
+        assert!(
+            parse_field_signature_cached(&key).is_none(),
+            "cached path must honor the depth-exceeded guard"
+        );
+        // ...and on subsequent (memoized) calls — the verdict cached
+        // must be Invalid, not a partial AST.
+        assert!(
+            parse_field_signature_cached(&key).is_none(),
+            "cached path must remember the Invalid verdict"
+        );
     }
 }

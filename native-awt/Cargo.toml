@@ -11,6 +11,8 @@ repository.workspace = true
 homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
+# Withheld from crates.io at 0.3.0: early-maturity GPU/platform-glue crate.
+publish = false
 
 [features]
 default = []
