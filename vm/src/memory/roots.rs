@@ -134,6 +134,19 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         roots.push(*obj_ref);
     }
 
+    // 10b. Registry-held java.lang.Thread mirrors of every ALIVE thread.
+    //      HotSpot semantics: a thread's mirror is a strong root while the
+    //      thread lives. Natives serve these raw copies back into bytecode
+    //      (`enumerate_threads`, `Thread.getAllStackTraces`) and the
+    //      `unpark(Thread)` reverse index is keyed by their addresses — a
+    //      mirror reachable ONLY through the registry must not be collected
+    //      (a collected one resurfaces as the all-zero-header invokevirtual
+    //      receiver). The matching remap is
+    //      `ThreadRegistry::update_thread_objs_after_gc` (gc.rs step 21).
+    for obj_ref in shared.thread_registry.alive_thread_objects(usize::MAX) {
+        roots.push(obj_ref);
+    }
+
     // 11. Root snapshot (for cross-thread GC scanning)
     {
         let snapshot = thread.root_snapshot.lock();

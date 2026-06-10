@@ -13689,6 +13689,54 @@ fn try_osr(
     }
 }
 
+/// CRIT-2 — shared body for the JIT `cp_new_resolver` closures: resolve a
+/// `new`/`anewarray` CP index in `holder_cid`'s constant pool to
+/// `(class_id, num_fields, has_primitive_init, has_finalizer)`.
+///
+/// The two flags feed the inline-TLAB `new` fast path, which skips the
+/// `jit_post_tlab_init` helper call when BOTH are false — i.e. no
+/// primitive-typed instance field anywhere in the hierarchy (the typed-zero
+/// defaults would be a no-op on the TLAB-zeroed region) and no finalizer to
+/// register. `has_primitive_init` mirrors the hierarchy walk in
+/// `crate::jit::helpers::jit_init_primitive_fields`; `has_finalizer` mirrors
+/// the single-class read in `jit_post_tlab_init`. Unresolvable metadata
+/// reports `(true, true)` so the helper call stays in place.
+fn resolve_jit_new_site(
+    cm: &crate::classloading::ClassManager,
+    holder_cid: ClassId,
+    cp_idx: u16,
+) -> Option<(u32, usize, bool, bool)> {
+    let class = cm.get_class(holder_cid)?;
+    let class_name = class.constant_pool.get_class_name(cp_idx)?;
+    let target_id = cm.find_class_by_name(class_name)?;
+    let Some(target) = cm.get_class(target_id) else {
+        return Some((target_id.as_u32(), 0, true, true));
+    };
+    let num_fields = target.num_total_fields;
+    let has_finalizer = target.has_finalizer;
+    let mut has_prim_init = false;
+    let mut cid = Some(target_id);
+    while let Some(current) = cid {
+        let Some(c) = cm.get_class(current) else {
+            // Unknown superclass — conservatively keep the helper call.
+            has_prim_init = true;
+            break;
+        };
+        if c.fields.iter().any(|f| {
+            !f.is_static()
+                && matches!(
+                    f.descriptor.as_bytes().first(),
+                    Some(b'I' | b'B' | b'C' | b'S' | b'Z' | b'J' | b'F' | b'D')
+                )
+        }) {
+            has_prim_init = true;
+            break;
+        }
+        cid = c.superclass;
+    }
+    Some((target_id.as_u32(), num_fields, has_prim_init, has_finalizer))
+}
+
 /// Try to JIT-compile a method and return the upgraded cache target.
 /// Returns None if the method is not JIT-compatible.
 /// Uses the shared JIT cache to avoid re-compiling across threads.
@@ -13936,14 +13984,11 @@ fn try_jit_upgrade_with_gate(
             descriptor.to_string(),
         ))
     };
-    // new/anewarray resolver: maps CP index of `new`/`anewarray` to (class_id_raw, num_fields).
-    let new_resolver = |cp_idx: u16| -> Option<(u32, usize)> {
+    // new/anewarray resolver: maps CP index of `new`/`anewarray` to
+    // (class_id_raw, num_fields, has_primitive_init, has_finalizer).
+    let new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
         let cm = shared.class_manager.read();
-        let class = cm.get_class(class_id)?;
-        let class_name = class.constant_pool.get_class_name(cp_idx)?;
-        let target_id = cm.find_class_by_name(class_name)?;
-        let num_fields = cm.get_class(target_id).map_or(0, |c| c.num_total_fields);
-        Some((target_id.as_u32(), num_fields))
+        resolve_jit_new_site(&cm, class_id, cp_idx)
     };
     // invoke class-id resolver: maps an invoke* CP index to the class id of
     // its declared (Methodref) class. Used by the CRC32/CRC32C `update`
@@ -14110,13 +14155,9 @@ fn try_jit_upgrade_with_gate(
             };
 
             // new/anewarray resolver for callee's constant pool
-            let c_new_resolver = |cp_idx: u16| -> Option<(u32, usize)> {
+            let c_new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
                 let cm = shared.class_manager.read();
-                let class = cm.get_class(callee_cid)?;
-                let class_name = class.constant_pool.get_class_name(cp_idx)?;
-                let target_id = cm.find_class_by_name(class_name)?;
-                let num_fields = cm.get_class(target_id).map_or(0, |c| c.num_total_fields);
-                Some((target_id.as_u32(), num_fields))
+                resolve_jit_new_site(&cm, callee_cid, cp_idx)
             };
             // invoke class-id resolver for the callee's constant pool — maps
             // an invoke* CP index to its declared class id, for the CRC32/
@@ -14458,13 +14499,9 @@ pub fn try_jit_compile_callee(
         let (method_name, descriptor) = class.constant_pool.get_name_and_type(nat_idx)?;
         Some((target_class.to_string(), method_name.to_string(), descriptor.to_string()))
     };
-    let new_resolver = |cp_idx: u16| -> Option<(u32, usize)> {
+    let new_resolver = |cp_idx: u16| -> Option<(u32, usize, bool, bool)> {
         let cm = shared.class_manager.read();
-        let class = cm.get_class(cid)?;
-        let class_name = class.constant_pool.get_class_name(cp_idx)?;
-        let target_id = cm.find_class_by_name(class_name)?;
-        let num_fields = cm.get_class(target_id).map_or(0, |c| c.num_total_fields);
-        Some((target_id.as_u32(), num_fields))
+        resolve_jit_new_site(&cm, cid, cp_idx)
     };
     // invoke class-id resolver — maps an invoke* CP index to its declared
     // class id, consumed by the CRC32/CRC32C `update` receiver class-id guard.

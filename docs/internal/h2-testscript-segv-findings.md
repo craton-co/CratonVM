@@ -1,6 +1,120 @@
 # H2 TestScript `--nojit` SEGV — findings (2026-06-05)
 
-> # ⚠ PARTIALLY RESOLVED — the bc-math-ec `0x4` / silent-null corruption is
+> # ✅ ROOT-CAUSED & FIXED (2026-06-10, branch fix/blocked-thread-gc-remap-wip,
+> # commit 1d4e77e4 + the GcBlockState half swept into dev f3156c00)
+>
+> **The "additional writer" was the BLOCKED-THREAD GC MAINTENANCE GAP — five
+> stacked defects, all around threads excluded from the STW barrier:**
+>
+> 1. **Stale root_snapshot scanned as GC roots.** A thread parked in a
+>    blocking native (`Object.wait`/`Thread.join`/`LockSupport.park`/
+>    `ReferenceQueue.remove`) deposits its frame roots once; `update_all_roots`
+>    step 11 remapped ONLY the initiator's snapshot. After the first missed
+>    moving GC the blocked thread's snapshot pointed into a vacated semispace;
+>    once that space cycled back to from-space, the collector EVACUATED
+>    GARBAGE through the stale addresses (forwarding-state writes into the
+>    interior of innocent live objects) — the heap-side writer.
+> 2. **Frames never remapped for missed GCs.** `check_post_block_gc` applied
+>    the pointer map only when an STW was active at the exact wake instant;
+>    the `gc_generation` counter built to detect missed GCs had zero
+>    consumers. Waking threads resumed on recycled from-space addresses —
+>    the consumer-side stale receiver faulting in `get_field`. All four
+>    crash "faces" (0x1 / 0x4 / 0x6 / 0x100000000) decode as ONE mechanism:
+>    a field cell is [disc u32][payload32 u32][payload64 u64] and objects
+>    whose bases differ 8 mod 16 have mutually +8-shifted cell grids, so a
+>    stale-receiver getfield over re-allocated memory reads a neighbor
+>    cell's [disc|payload32] as the pointer — Long→0x1, Object(None)→0x4,
+>    Uninitialized→0x6, Int(1)→0x100000000. No off-grid WRITE required.
+> 3. **`ReferenceQueue.remove` polled a raw captured `this` inside the
+>    blocked region** (acknowledged in the avrora-era comment, band-aided by
+>    the num_fields<2 guard). With 1+2 fixed, the guard itself faulted on
+>    the stale header — PDB-symbolized smoking gun:
+>    `object_num_fields ← native_rq_poll (reference.rs:392) ←
+>    native_rq_remove_timeout` on the Common Cleaner thread. Its splice
+>    writes (head / referent=Object(None) / size) through stale-but-mapped
+>    receivers are the MVStore "Cannot invoke compareAndSetRoot on null"
+>    silent-null writer.
+> 4. **Registry `java_thread_obj` mirrors + the `unpark(Thread)` reverse
+>    index were never scanned nor remapped** — natives (`Thread.enumerate`,
+>    `getAllStackTraces`) resurrect collected/stale mirrors into bytecode
+>    (the "Stale pointer detected in invokevirtual receiver (all-zero
+>    header) — falling back to CP class java/lang/Thread" flood), and
+>    unpark lookups by the relocated address silently MISS (lost wakeups).
+> 5. **The barrier's "harmless over-count" was not harmless.** `request_stw`
+>    excludes blocked threads via a racy counter read; a thread waking just
+>    after the read called `arrive_and_wait`, inflating `arrived` for a
+>    pause that never counted it — releasing `wait_for_all` while a counted
+>    mutator still ran ⇒ the moving collector raced live frames
+>    (nondeterministic bootstrap stalls once the rq loops cycled
+>    blocked↔expected at ~100Hz).
+>
+> **Fix (all general, ungated):** per-thread `GcBlockState`
+> (`in_blocked_region` flag + composed `orig→cur→new` fixup map, shared
+> JvmThread↔registry like root_snapshot); GC initiators call
+> `ThreadRegistry::fold_pointer_map_into_blocked` under STW (update_all_roots
+> step 20) — remaps blocked snapshots in place + composes every missed GC's
+> map into the per-thread fixup; `check_post_block_gc` drains in-flight STWs
+> then applies+clears the fixup (frames, monitor_on_exit, pins, printed,
+> scoped values) and RE-DEPOSITS the snapshot (the old clear hid a waking
+> thread's roots); `deposit_root_snapshot` also pushes `monitor_on_exit`
+> (static-synchronized monitors live in no local); the rq remove loops poll
+> OUTSIDE the blocked region (an expected mutator cannot observe a GC
+> completing mid-poll) with an exponential-backoff park (200µs→10ms — a hot
+> yield-spin was a ~10x bootstrap slowdown) and re-sync their local args via
+> `end_blocking_region_refs`; registry mirrors are rooted while alive
+> (roots step 10b) and remapped + reverse-index re-keyed per GC
+> (`update_thread_objs_after_gc`, gc step 21); blocked-region transitions
+> are serialized under the barrier's inner lock and the leave side WAITS OUT
+> any active STW while still counted blocked (exact arrivals — no
+> over-count, no mutator/GC race). Diagnostics: `CRATONVM_DBG_BLOCKGC=1`
+> prints fold/wake activity.
+>
+> **Verification:** the deterministic pre-fix crash (6/6 runs, read at
+> 0x100000004, RVA 0x1D8549) is gone — post-fix runs progress far past the
+> historical SQL-5219 crash cluster with no SEGV; each fix layer shifted the
+> failure signature exactly as predicted (wild-small receiver → unmapped
+> stale receiver in the rq guard → stale-Thread WARN flood → clean). SEGV
+> verification on the converged dev build: 2× 2400 s runs + 1× 600 s
+> capture run, ZERO crash signatures (pre-fix: 6/6 deterministic SEGV in
+> 84–229 s).
+>
+> ## ⛔ NEXT BLOCKER (separate bug, now localized): the queryGroup
+> ## infinite loop — TestScript still cannot COMPLETE
+>
+> With the SEGV gone, every run stalls ~35 s in (after the SQL-~6500
+> region, well past the historical 5219 crash cluster): stderr goes
+> silent, the process spins forever. cdb on the live rwd build
+> (`capture-h2-hang-rwd.ps1` → `h2-hang-rwd-stacks.txt`, 2026-06-10):
+> **main-vm is NOT blocked — it executes a Java infinite loop**
+> (`Vtable::lookup_slot ← execute_invokevirtual_vtable_fast`, hot), and
+> the VM watchdog's Java dump pins it:
+> `Select.queryGroup(pc=11) → gatherGroup(pc=59) →
+> SelectGroups$Grouped.nextSource(pc=94) → SessionLocal.compare(pc=0)` —
+> H2's GROUP BY row-gathering loop never terminates. ALL other threads
+> are healthy (rq backoff park; MVStore workers in ordinary timed
+> Object.wait/Condition.await) — NO lock deadlock; the old
+> "write-preferring RwLock deadlock" hypothesis is DEAD for this hang
+> (resolve_method_ref already uses read_recursive, interpreter.rs:16529).
+> This is the doc's old "silent nondeterministic hang past line ~457" —
+> now deterministic-ish and cornered. Prime suspect: a mis-executed VALUE
+> COMPARISON driving the cursor/group loop in circles — see "Mismatches"
+> below: `native_bd_add/subtract/multiply/negate` compute BigDecimal via
+> f64 and LOSE SCALE; `SessionLocal.compare` → database compareTypeSafe
+> over such values is exactly where an inconsistent compare would cycle a
+> B-tree/group iteration. Next steps: (1) arm the default watchdog
+> (no DISABLE env) ~120 s for the Java dump with pcs; (2) log
+> compare inputs/outputs at the stall (which Value types?); (3) if
+> BigDecimal: replace the f64 natives with unscaled-int+scale arithmetic
+> or drop them so real bytecode runs. Verification after that fix:
+> `run-h2-verify.ps1 -Runs 5 -TimeoutSec 2400` (a clean full run takes
+> >900 s interpreted; HotSpot harness ≈133 s) + the apps suite (baseline
+> apps-all-20260609-231417: 10 PASS / 2 known FAIL).
+>
+> Historical analysis below: the ReferenceProcessor re-emission (fixed at
+> dev a9bc91f6) was the FIRST writer; the superseded status + hunt log
+> follow.
+
+> ## (superseded 2026-06-10) ⚠ PARTIALLY RESOLVED — the bc-math-ec `0x4` / silent-null corruption is
 > FIXED (dev a9bc91f6), but the H2 SEGV below PERSISTS on the fixed build
 > (re-verified 2026-06-10: 5/5 runs crash) — H2 has an ADDITIONAL
 > stale-receiver writer beyond the ReferenceProcessor re-emission

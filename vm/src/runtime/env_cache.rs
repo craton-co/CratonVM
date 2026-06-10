@@ -96,6 +96,15 @@ cached_is_set!(jit_mic_dbg, "CRATONVM_DBG_JIT_MIC");
 cached_is_set!(jit_entry_dbg, "CRATONVM_DBG_JIT_ENTRY");
 cached_is_set!(jit_putfield_diag, "CRATONVM_DBG_JIT_PUTFIELD");
 cached_is_set!(letsgo_dbg, "CRATONVM_DBG_LETSGO");
+/// `CRATON_JIT_PFO_TRACE` / `CRATON_JIT_PFI_TRACE` / `CRATON_JIT_NEWARRAY_TRACE`
+/// — suspect-pattern tracing in the JIT putfield/newarray helpers. These sit on
+/// the hottest allocation/store paths (`jit_putfield_object` runs once per
+/// reference field store), where an uncached `env::var_os` is a per-call
+/// environment-block scan under the process env lock — measured as a
+/// multi-second cost on allocation-heavy runs (bintrees18: ~69M ref stores).
+cached_is_set!(jit_pfo_trace, "CRATON_JIT_PFO_TRACE");
+cached_is_set!(jit_pfi_trace, "CRATON_JIT_PFI_TRACE");
+cached_is_set!(jit_newarray_trace, "CRATON_JIT_NEWARRAY_TRACE");
 
 // ── Frame-trace and interpreter hot-path flags ──────────────────────────
 
