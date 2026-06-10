@@ -404,21 +404,22 @@ fn alloc_keypair(ctx: &mut dyn NativeContext, pubk: ObjectRef, privk: ObjectRef)
     kp
 }
 
-/// Construct and throw a real `java/security/NoSuchAlgorithmException` with
-/// `msg`, mirroring the JDK contract for an algorithm we recognise but cannot
-/// generate keys for. NSAE is a `GeneralSecurityException`, so callers can
-/// catch it the same way they would under HotSpot.
+/// Construct and throw a real JCA exception of `class_name` (internal form,
+/// e.g. `java/security/NoSuchAlgorithmException` or
+/// `java/security/spec/InvalidKeySpecException`) carrying `msg`. These are all
+/// `GeneralSecurityException` subclasses, so Java callers catch them exactly as
+/// under HotSpot.
 ///
-/// No-synthetic-stubs policy: the previous fallback here minted a `KeyPair`
-/// with empty DER and `key_id == 0`, presenting failed keygen as success — any
-/// app that then signed/encrypted with it got garbage or a false success. We
-/// fail loudly instead. If the real exception class can't be constructed we
-/// still raise a catchable `SecurityException` rather than returning an empty
-/// key.
-fn throw_no_such_algorithm(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+/// No-synthetic-stubs policy: the fallbacks these replace minted keys with
+/// empty DER / `key_id == 0`, presenting failed keygen or key import as
+/// success — any app that then signed/encrypted/verified with one got garbage
+/// or a false success. We fail loudly instead. If the real exception class
+/// can't be constructed we still raise a catchable `SecurityException` rather
+/// than returning an empty/unusable key.
+fn throw_jca(ctx: &mut dyn NativeContext, class_name: &str, msg: &str) -> MethodCallFailed {
     let detail = ctx.create_string(msg);
     if let Ok(Some(Value::Object(Some(exc)))) = ctx.new_object_initialized(
-        "java/security/NoSuchAlgorithmException",
+        class_name,
         "(Ljava/lang/String;)V",
         &[Value::Object(Some(detail))],
     ) {
@@ -428,6 +429,18 @@ fn throw_no_such_algorithm(ctx: &mut dyn NativeContext, msg: &str) -> MethodCall
         message: msg.to_string(),
     }
     .into()
+}
+
+/// `KeyPairGenerator.generateKeyPair` contract for a recognised-but-unimplemented
+/// algorithm.
+fn throw_no_such_algorithm(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    throw_jca(ctx, "java/security/NoSuchAlgorithmException", msg)
+}
+
+/// `KeyFactory.generatePublic` / `generatePrivate` contract when we cannot turn
+/// the given `KeySpec` into a usable key (parse failure, or no implementation).
+fn throw_invalid_key_spec(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallFailed {
+    throw_jca(ctx, "java/security/spec/InvalidKeySpecException", msg)
 }
 
 // ---------------------------------------------------------------------------
@@ -615,8 +628,12 @@ fn kf_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 
 /// generatePublic(KeySpec) -> PublicKey.  We surface the most common path
 /// (X509EncodedKeySpec wrapping a SubjectPublicKeyInfo DER blob) and
-/// re-parse via crypto_impl.  For unrecognised KeySpec shapes we return
-/// a key with `key_id == 0` so verify-time falls through gracefully.
+/// re-parse via crypto_impl.  EC (default) routes to the real SunEC
+/// KeyFactory.  When we cannot produce a usable key — the RSA/EC spec fails
+/// to parse, or the algorithm has no real implementation — we throw
+/// `InvalidKeySpecException` (generatePublic's declared checked exception)
+/// rather than returning a `key_id == 0` key that silently fails every later
+/// verify (no-synthetic-stubs policy).
 fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
@@ -697,15 +714,26 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     }
 
-    let pk = alloc_public_key(ctx, algo, 0, &der, 0);
-    Ok(Some(Value::Object(Some(pk))))
+    // No usable key could be produced: the RSA/EC spec failed to parse, or the
+    // algorithm has no real implementation (ML-KEM, ML-DSA, Ed25519, X25519, or
+    // an unknown name). Throw generatePublic's declared `InvalidKeySpecException`
+    // rather than returning a `key_id == 0` key that silently fails every later
+    // verify (no-synthetic-stubs policy).
+    Err(throw_invalid_key_spec(
+        ctx,
+        &format!(
+            "cannot generate a usable {} public key from the given KeySpec",
+            algo_name(algo)
+        ),
+    ))
 }
 
+/// generatePrivate(KeySpec) -> PrivateKey.  Only the real SunEC EC path can
+/// import a usable private key; `crypto_impl` has no other private-key parser,
+/// so every other algorithm would otherwise yield a `key_id == 0` key that can
+/// never sign.  Honour generatePrivate's declared `InvalidKeySpecException`
+/// rather than returning that unusable synthetic key (no-synthetic-stubs).
 fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Without a private-key parser in `crypto_impl` we emit a private
-    // key with key_id=0; callers then can't sign, but they CAN call
-    // `getEncoded` to round-trip the bytes (which is the typical
-    // KeyStore-write path).
     let this = this_arg(args)?;
     let base = synthetic_base_offset(ctx, "java/security/KeyFactory");
     let algo = match ctx.get_field(this, base + KF_OFF_ALGO) {
@@ -713,7 +741,7 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => -1,
     };
     // EC: drive the real SunEC KeyFactory over the ECPrivateKeySpec → real
-    // ECPrivateKeyImpl (the synthetic path emits a key_id=0 unusable key).
+    // ECPrivateKeyImpl (the only private-key import we can satisfy).
     if algo == ALGO_EC && crate::route_ec_to_real() {
         if let Some(Value::Object(Some(spec))) = args.get(1) {
             return drive_real_ec_keyfactory(
@@ -724,16 +752,13 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             );
         }
     }
-    let der = if let Some(Value::Object(Some(spec))) = args.get(1) {
-        match ctx.get_field(*spec, 0) {
-            Value::Object(Some(arr)) => read_byte_array(ctx, arr),
-            _ => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
-    let pk = alloc_private_key(ctx, algo, 0, &der, 0);
-    Ok(Some(Value::Object(Some(pk))))
+    Err(throw_invalid_key_spec(
+        ctx,
+        &format!(
+            "cannot generate a usable {} private key from the given KeySpec",
+            algo_name(algo)
+        ),
+    ))
 }
 
 fn kf_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1034,5 +1059,85 @@ mod tests {
             }
             other => panic!("expected DER byte[], got {other:?}"),
         }
+    }
+
+    /// Build a `KeyFactory` synthetic for `algo` and call `generatePublic` /
+    /// `generatePrivate` with a KeySpec whose encoded byte[] (field 0) is `der`.
+    fn kf_call(
+        ctx: &mut crate::test_utils::MockNativeContext,
+        algo: &str,
+        method: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult,
+        der: &[u8],
+    ) -> Result<Option<Value>, MethodCallFailed> {
+        let name = ctx.create_string(algo);
+        let kf = kf_get_instance(ctx, &[Value::Object(Some(name))])
+            .unwrap()
+            .unwrap();
+        let kf_ref = match kf {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected KeyFactory, got {other:?}"),
+        };
+        let spec = alloc_concurrent_synthetic(ctx, "java/security/spec/X509EncodedKeySpec", 1);
+        let der_arr = alloc_byte_array(ctx, der);
+        ctx.set_field(spec, 0, Value::Object(Some(der_arr)));
+        method(ctx, &[Value::Object(Some(kf_ref)), Value::Object(Some(spec))])
+    }
+
+    /// No-synthetic-stubs policy on the KeyFactory import path: when no usable
+    /// key can be produced — an unimplemented algorithm, or an RSA/EC spec that
+    /// fails to parse — generatePublic/generatePrivate must throw
+    /// `InvalidKeySpecException`, never return a `key_id == 0` key that silently
+    /// fails every later verify/sign.
+    #[test]
+    fn keyfactory_unproducible_key_throws_not_dead_key() {
+        // generatePublic: unimplemented algorithms.
+        for algo in ["ML-KEM-512", "ML-DSA-65", "X25519", "Ed25519", "Totally-Bogus"] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let err = kf_call(&mut ctx, algo, kf_generate_public, &[1, 2, 3])
+                .expect_err(&format!("{algo} generatePublic must throw, not return a dead key"));
+            assert!(
+                matches!(err, MethodCallFailed::ExceptionThrown(_)),
+                "{algo} generatePublic: expected ExceptionThrown(InvalidKeySpecException), got {err:?}"
+            );
+        }
+        // generatePublic: RSA with an unparseable spec.
+        {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let err = kf_call(&mut ctx, "RSA", kf_generate_public, &[0xDE, 0xAD, 0xBE, 0xEF])
+                .expect_err("RSA generatePublic with garbage DER must throw");
+            assert!(matches!(err, MethodCallFailed::ExceptionThrown(_)), "got {err:?}");
+        }
+        // generatePrivate: no private-key importer exists for RSA (or anything
+        // but the real-SunEC EC path) → must throw.
+        for algo in ["RSA", "ML-DSA-65"] {
+            let mut ctx = crate::test_utils::MockNativeContext::new();
+            let err = kf_call(&mut ctx, algo, kf_generate_private, &[1, 2, 3])
+                .expect_err(&format!("{algo} generatePrivate must throw, not return a dead key"));
+            assert!(
+                matches!(err, MethodCallFailed::ExceptionThrown(_)),
+                "{algo} generatePrivate: expected ExceptionThrown(InvalidKeySpecException), got {err:?}"
+            );
+        }
+    }
+
+    /// Guard the real RSA public-key import path: a valid SubjectPublicKeyInfo
+    /// DER must still round-trip to a key backed by a real `key_id` — the
+    /// fail-closed change must not catch the parseable case.
+    #[test]
+    fn keyfactory_rsa_public_import_still_returns_real_key() {
+        let mut ctx = crate::test_utils::MockNativeContext::new();
+        let (pk, _sk) = crypto_impl::Rsa::generate_keypair(512);
+        let der = crypto_impl::Rsa::public_key_to_der(&pk);
+        let pub_obj = match kf_call(&mut ctx, "RSA", kf_generate_public, &der)
+            .expect("valid RSA spec must not throw")
+            .expect("generatePublic must return a key")
+        {
+            Value::Object(Some(o)) => o,
+            other => panic!("expected PublicKey, got {other:?}"),
+        };
+        assert!(
+            matches!(ctx.get_field(pub_obj, KEY_FIELD_KEYID), Value::Long(id) if id != 0),
+            "imported RSA public key must carry a real key_id"
+        );
     }
 }
