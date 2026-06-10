@@ -6831,14 +6831,29 @@ impl Compiler {
     /// Try to fuse a known constant with the immediately following arithmetic
     /// opcode (imul/idiv/irem). The constant is the RIGHT operand (top of stack).
     /// If the peephole fires, the following opcode is consumed and `true` is returned.
+    ///
+    /// `branch_targets` is the per-PC branch-target map of the enclosing
+    /// `compile_bytecode` pass: fusing is only sound when `next_op_pc` is NOT
+    /// a branch target. The fused sequence binds `pc_to_native[next_op_pc]`
+    /// to code that hardcodes THIS path's constant and pops only the left
+    /// operand; another predecessor branching to `next_op_pc` arrives with
+    /// its own right operand on the canonical stack (ternary-in-step merge:
+    /// `i += i == 0 ? 2 : 1` — both `iconst` arms feed one `iadd`), so it
+    /// would have that operand silently dropped and the fall-through
+    /// constant used instead (gap-jit-ternary-in-loop-increment).
     fn try_const_arith_peephole(
         &mut self,
         const_val: i32,
         next_op_pc: usize,
         code: &[u8],
         code_len: usize,
+        branch_targets: &[bool],
     ) -> bool {
         if next_op_pc >= code_len {
+            return false;
+        }
+        // Never fuse across a merge point (see doc comment).
+        if branch_targets.get(next_op_pc).copied().unwrap_or(true) {
             return false;
         }
         let next_op = code[next_op_pc];
@@ -7001,14 +7016,24 @@ impl Compiler {
     /// Try to fuse a constant with a following if_icmp* opcode.
     /// The constant is value2 (top of stack); value1 is already on the simulated stack.
     /// If the peephole fires, the if_icmp opcode is consumed and the new PC is returned.
+    ///
+    /// `branch_targets`: same soundness precondition as
+    /// `try_const_arith_peephole` — a fused `const; if_icmp*` binds
+    /// `pc_to_native[next_op_pc]` to code that compares against THIS path's
+    /// constant; a predecessor branching to the if_icmp expects its own
+    /// value2 on the stack. Never fuse across a merge point.
     fn try_const_compare_peephole(
         &mut self,
         const_val: i32,
         next_op_pc: usize,
         code: &[u8],
         code_len: usize,
+        branch_targets: &[bool],
     ) -> Option<usize> {
         if next_op_pc + 2 >= code_len {
+            return None;
+        }
+        if branch_targets.get(next_op_pc).copied().unwrap_or(true) {
             return None;
         }
         let next_op = code[next_op_pc];
@@ -7026,6 +7051,19 @@ impl Compiler {
 
         let offset = i16::from_be_bytes([code[next_op_pc + 1], code[next_op_pc + 2]]) as i32; // Widening: always safe
         let target_pc = (next_op_pc as i32 + offset) as usize; // Cast: x86-64 immediate encoding
+
+        // Values left below value1 must be flushed to canonical frame slots
+        // for the taken edge (the merge-target revival reconstructs them from
+        // canonical offsets; the regular if_icmp handler does the same).
+        // Canonicalize BEFORE popping value1: a register-resident slot below
+        // it would otherwise be stored to a canonical offset that can collide
+        // with value1's own frame slot (register slots occupy a stack
+        // position but no frame slot, shifting the slots above them down).
+        // With value1 still on the simulated stack it is relocated above
+        // every store target, so the CMP below reads the preserved value.
+        if target_pc > next_op_pc && self.stack.len() > 1 {
+            self.canonicalize_stack();
+        }
 
         // Pop value1 (already on stack before the constant was pushed)
         let val1 = self.pop_stack();
@@ -7072,6 +7110,11 @@ impl Compiler {
         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
         self.forward_patches.push((patch_offset, target_pc));
+        // Record the taken-edge stack depth so the merge-target revival
+        // rebuilds the canonicalized slots (mirrors the regular handler).
+        self.branch_target_stack_depth
+            .entry(target_pc)
+            .or_insert(self.stack.len());
         self.reset_spills();
 
         Some(next_op_pc + 3)
@@ -12150,10 +12193,10 @@ impl Compiler {
                 // iconst_m1..iconst_5
                 0x02..=0x08 => {
                     let val = op as i32 - 3; // Widening: always safe
-                    if self.try_const_arith_peephole(val, pc + 1, code, code_len) {
+                    if self.try_const_arith_peephole(val, pc + 1, code, code_len, &branch_targets) {
                         pc += 2;
                     } else if let Some(next_pc) =
-                        self.try_const_compare_peephole(val, pc + 1, code, code_len)
+                        self.try_const_compare_peephole(val, pc + 1, code, code_len, &branch_targets)
                     {
                         pc = next_pc;
                     } else {
@@ -12220,10 +12263,10 @@ impl Compiler {
                 // bipush
                 0x10 => {
                     let val = code[pc + 1] as i8 as i32; // Widening: always safe
-                    if self.try_const_arith_peephole(val, pc + 2, code, code_len) {
+                    if self.try_const_arith_peephole(val, pc + 2, code, code_len, &branch_targets) {
                         pc += 3;
                     } else if let Some(next_pc) =
-                        self.try_const_compare_peephole(val, pc + 2, code, code_len)
+                        self.try_const_compare_peephole(val, pc + 2, code, code_len, &branch_targets)
                     {
                         pc = next_pc;
                     } else {
@@ -12236,10 +12279,10 @@ impl Compiler {
                 // sipush
                 0x11 => {
                     let val = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32; // Widening: always safe
-                    if self.try_const_arith_peephole(val, pc + 3, code, code_len) {
+                    if self.try_const_arith_peephole(val, pc + 3, code, code_len, &branch_targets) {
                         pc += 4;
                     } else if let Some(next_pc) =
-                        self.try_const_compare_peephole(val, pc + 3, code, code_len)
+                        self.try_const_compare_peephole(val, pc + 3, code, code_len, &branch_targets)
                     {
                         pc = next_pc;
                     } else {

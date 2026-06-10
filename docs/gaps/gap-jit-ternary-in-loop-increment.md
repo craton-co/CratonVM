@@ -2,7 +2,7 @@
 
 **Discovered:** 2026-06-09 (commons-math FFT test fallout, narrowed from `FastFourierTransformerTest`)
 **Severity:** Medium — fundamental control-flow miscompile, but the exact bytecode shape (`iload; iload; ifne; iconst_a; goto; iconst_b; iadd; istore`) only fires in code that uses a ternary directly in a loop step. Real-world tripwire so far: commons-math `FastFourierTransformerTest.testSinFunction` and `testAdHocData`.
-**Status:** Open — has a tight minimal repro; narrow skip applied to the two failing test methods so commons-math runs.
+**Status:** FIXED 2026-06-09 (branch `fix/jit-ternary-loop-increment`) — root cause was NOT the IR phi lowering suspected below; it was the const-fusion peepholes in `jit/src/x64.rs` fusing `iconst_1; iadd` across the merge point. See "Actual root cause and fix" at the end.
 
 ---
 
@@ -126,3 +126,56 @@ Until the underlying merge-lowering bug is fixed, the practical workaround for a
 - Windows 11, MSVC build.
 - JDK 25 used as `--java-home`.
 - Real-JDK CLI build (no `synthetic-jdk`).
+
+---
+
+## Actual root cause and fix (2026-06-09, branch `fix/jit-ternary-loop-increment`)
+
+The "Suspected cause" above was wrong in one load-bearing way: the emitting
+path is not the sea-of-nodes IR (`jit/src/ir.rs`) at all — `compile_bytecode`
+in `jit/src/x64.rs` is a single-linear-pass template emitter with a simulated
+operand stack. The miscompile came from its **constant-fusion peepholes**.
+
+`try_const_arith_peephole` fuses `iconst_N; <iadd/isub/imul/…>` into one
+sequence and binds `pc_to_native[next_op_pc]` (the arith op's native label) to
+that fused code. In the repro, pc=30 `iconst_1` is directly followed by pc=31
+`iadd` — but pc=31 is also the **goto's branch target** (the ternary merge).
+The fused code pops only the left operand (`i`, canonical stack slot 0,
+`[rbp-0x20]`) and adds the hardcoded fall-through constant `1`. Both branch
+edges (`jne` → pc 30 label, `goto` → pc 31 label) resolve to that same fused
+sequence, so the `goto` path — which arrives with `[i, 2]` correctly
+canonicalized on the frame — has its `2` (canonical slot 1) silently ignored
+and gets `i + 1` instead of `i + 2`. Hence "every iteration adds the same
+value". (The hex dump above omitted the `mov [rbp-0x28], rax` spill of the
+`2`; the `mov rax, [rbp-0x20]` at the merge is the fused load of `i`, not a
+phi-slot read.)
+
+**Fix:** never fuse across a merge point. Both `try_const_arith_peephole` and
+`try_const_compare_peephole` now take the pass's `branch_targets` map and bail
+when `next_op_pc` is a branch target, so the constant is materialized to its
+canonical slot and the merge-target opcode is emitted standalone (correct for
+all predecessors). `try_const_compare_peephole` additionally was missing the
+regular if_icmp handler's remaining-stack canonicalization and
+`branch_target_stack_depth` recording for the taken edge (a latent variant of
+the same merge-layout bug when values sit below the compared pair); both added.
+
+Validated: `Tern3 50000` OK (was BAD at trial 500), JIT unit suite 689+90/0,
+bintrees10/12/14/16/18 all exact HotSpot checksums, regression-pool stageable
+probes 5/5.
+
+**Note:** the three FFT-adjacent failures are NOT all this bug.
+`testSinFunction` / `testStandardTransformFunction` / `testAdHocData` still
+fail post-fix with *different* signatures (numeric drift ~1e-3/1e-16 and a
+null-field NPE instead of the catastrophic `-128.0`), and all three pass with
+`--nojit` — separate JIT defect(s) in code outside the test class, matching
+the "Workaround attempted" observation above. Needs its own gap doc once
+narrowed.
+
+**Related latent hazard found during review (NOT fixed here):** the regular
+ifeq..ifle / if_icmp* handlers canonicalize the remaining stack AFTER popping
+their operands; a `CalleeSaved` slot below a Frame-resident operand shifts
+canonical offsets such that `canonicalize_stack()` can store over the popped
+operand's frame slot before the CMP reads it (reachable when locals exceed
+the callee-saved register budget). The fixed `try_const_compare_peephole`
+canonicalizes BEFORE popping for exactly this reason — the regular handlers
+should adopt the same order. Filed as a separate task.
