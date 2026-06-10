@@ -1082,6 +1082,23 @@ pub trait NativeContext {
     /// Re-syncs the thread with any GC that ran while it was blocked.
     fn end_blocking_region(&mut self) {}
 
+    /// End a blocking region AND re-sync caller-held raw `Value` refs.
+    ///
+    /// A native poll loop captures its arguments as raw `Value`s before
+    /// entering the region; a moving GC that completes while the thread is
+    /// blocked relocates the referenced objects, and the thread-side
+    /// re-sync (`end_blocking_region`) only repairs the *frames* — the
+    /// native-local copies would keep their stale pre-GC addresses (the
+    /// `ReferenceQueue.remove` stale-receiver writer). Pass those locals
+    /// here so they are rewritten through the same accumulated GC fixup.
+    ///
+    /// The default impl ends the region without touching `refs` (matches
+    /// VMs/tests whose collector never moves objects under natives).
+    fn end_blocking_region_refs(&mut self, refs: &mut [Value]) {
+        let _ = &refs;
+        self.end_blocking_region();
+    }
+
     // -- Reflection metadata methods --
 
     /// Get metadata for all fields declared in this class (not inherited).
