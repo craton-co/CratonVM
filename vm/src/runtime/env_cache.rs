@@ -114,6 +114,15 @@ cached_is_set!(bd_debug, "CRATONVM_BD_DEBUG");
 cached_is_set!(nocode_dbg, "CRATONVM_DBG_NOCODE");
 cached_is_set!(nsme_dbg, "CRATONVM_DBG_NSME");
 cached_is_set!(cce_dbg, "CRATONVM_DBG_CCE");
+/// `CRATONVM_DBG_OVERLAY` — a native `set_field`/`get_field` whose value tag
+/// is destructively cross-type with the bound class's declared field
+/// descriptor at that slot (a primitive written to a reference field, or a
+/// reference written to a primitive field). This is the "synthetic overlay
+/// bound to a real JDK class" corruption: the slot's real descriptor coerces
+/// the overlay value to null / numeric and silently loses it (the
+/// LinkedList$ListItr cursor bug). The hunter logs class + slot + value +
+/// descriptor + native caller so every instance can be enumerated in one run.
+cached_is_set!(overlay_corruption_dbg, "CRATONVM_DBG_OVERLAY");
 cached_is_set!(lambda_dbg, "CRATONVM_DBG_LAMBDA");
 cached_is_set!(resume_pc_dbg, "CRATONVM_DBG_RESUME_PC");
 /// `CRATONVM_DBG_BADRECV` — on a getfield/putfield/array/invoke receiver whose

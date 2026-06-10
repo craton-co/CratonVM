@@ -800,6 +800,80 @@ fn resolve_field_descriptor_byte_cached(
 /// This replaces the previous `impl NativeContext for Vm`. Native methods
 /// receive a `&mut NativeContextImpl` which provides access to the shared
 /// VM state and the calling thread's state.
+/// Would `coerce_field_value_by_descriptor(value, desc)` DESTROY `value`?
+///
+/// Only the two cross-type-class cases lose data: a primitive value landing
+/// in a reference-typed (`L`/`[`) slot coerces to `Object(None)`, and a
+/// non-null reference value landing in a primitive slot coerces to a numeric
+/// reinterpretation of the pointer. Same-type-class tag normalization
+/// (Long-as-Double -> Long, `Object(None)`/`Uninitialized` -> typed zero) is
+/// benign and is NOT flagged. Real bytecode (verified) never triggers the
+/// cross-type cases — only a synthetic overlay bound to a real JDK class does.
+fn overlay_write_is_destructive(value: Value, desc: u8) -> bool {
+    match desc {
+        b'L' | b'[' => matches!(
+            value,
+            Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_)
+        ),
+        b'J' | b'D' | b'F' | b'I' | b'B' | b'C' | b'S' | b'Z' => {
+            matches!(value, Value::Object(Some(_)))
+        }
+        _ => false,
+    }
+}
+
+/// Cold path for the overlay-corruption hunter. Logs the destructive native
+/// field write: the bound class (real JDK class whose declared field
+/// descriptor is coercing the overlay value away), the slot, the value being
+/// lost, and the native caller's Java frames so the offending native is
+/// directly identifiable. Gated by `CRATONVM_DBG_OVERLAY`.
+#[cold]
+#[inline(never)]
+fn cold_log_overlay_corruption(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    class_id: ClassId,
+    index: usize,
+    value: Value,
+    desc: u8,
+) {
+    let class_name = {
+        let cm = shared.class_manager.read();
+        // Suppress the dominant benign case: a synthetic `<init>` native
+        // writing placeholder `size`/`capacity` Ints to a `java.util.Map`
+        // subtype. The map's real fields at those slots are references
+        // (`values`/`table`), so coercion-to-null produces exactly the
+        // null-initialized state real Map bytecode expects (S111r29) — the
+        // map then runs real bytecode and works. Flagging these drowns the
+        // genuinely-broken overlays. Set CRATONVM_DBG_OVERLAY_ALL=1 to see
+        // them too.
+        if std::env::var_os("CRATONVM_DBG_OVERLAY_ALL").is_none() {
+            if let Some(map_id) = cm.get_loaded_class_id("java/util/Map") {
+                if cm.is_subclass_of(class_id, map_id) {
+                    return;
+                }
+            }
+        }
+        cm.get_class(class_id)
+            .map(|c| c.name.to_string())
+            .unwrap_or_else(|| format!("<cid {}>", class_id.as_u32()))
+    };
+    eprintln!(
+        "[OVERLAY] destructive native set_field: class={class_name} slot={index} \
+         value={value:?} real_field_desc='{}' (overlay layout bound to a real JDK class)",
+        desc as char,
+    );
+    for f in thread.frames.iter().rev().take(6) {
+        eprintln!(
+            "[OVERLAY]   at {}.{}{} pc={}",
+            f.class_name(),
+            f.method_name(),
+            f.method_descriptor(),
+            f.pc,
+        );
+    }
+}
+
 pub struct NativeContextImpl<'a> {
     pub shared: &'a SharedVm,
     pub thread: &'a mut JvmThread,
@@ -1657,7 +1731,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // `set_field` when the descriptor is unresolvable.
         let class_id = self.shared.heap.class_id_of(obj);
         match resolve_field_descriptor_byte_cached(self.shared, class_id, index) {
-            Some(desc) => self.shared.heap.set_field_as(obj, index, value, desc),
+            Some(desc) => {
+                // Overlay-corruption hunter (CRATONVM_DBG_OVERLAY): a native
+                // writing a primitive value to a reference-typed slot (or a
+                // reference to a primitive slot) is a synthetic overlay bound
+                // to a real JDK class — the descriptor coercion below silently
+                // destroys the value (Int->null / ref->numeric). Surface it.
+                if crate::runtime::env_cache::overlay_corruption_dbg()
+                    && overlay_write_is_destructive(value, desc)
+                {
+                    cold_log_overlay_corruption(
+                        self.shared, self.thread, class_id, index, value, desc,
+                    );
+                }
+                self.shared.heap.set_field_as(obj, index, value, desc)
+            }
             None => self.shared.heap.set_field(obj, index, value),
         }
         // write_barrier fires automatically inside set_field / set_field_as
