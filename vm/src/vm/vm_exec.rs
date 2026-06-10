@@ -611,7 +611,9 @@ pub fn native_return_pushed_to_stack(shared: &SharedVm, thread: &mut JvmThread) 
     crate::runtime::interpreter::update_root_snapshot(shared, thread);
 }
 
-/// Acquire a Java monitor, blocking GC-SAFELY on contention.
+/// Acquire a Java monitor, blocking GC-SAFELY on contention. Returns the
+/// (possibly GC-relocated) object ref — the caller MUST use the returned
+/// ref for any later monitor operation (exit pairing).
 ///
 /// The uncontended/re-entrant paths are a couple of CASes
 /// (`enter_or_contend` → `None`). On contention the current owner may be
@@ -619,19 +621,29 @@ pub fn native_return_pushed_to_stack(shared: &SharedVm, thread: &mut JvmThread) 
 /// blocks while still counted in the STW barrier's `expected` then wedges
 /// the whole VM (owner waits GC, contender waits owner, GC initiator waits
 /// contender — the H2 TestScript three-way deadlock). So before blocking we
-/// run the full blocking-site protocol: deposit roots, mark GC-blocked
-/// (collections proceed without us and fold our frame fixups), block, then
-/// re-sync via `check_post_block_gc`.
+/// run the full blocking-site protocol: PIN `obj` (the popped Rust copy is
+/// otherwise invisible to the root scan and un-remapped — feeding a stale
+/// ref to `header_of` after a moving GC is what tripped the "monitor
+/// inflation invariant" panic), deposit roots, mark GC-blocked, block, then
+/// re-sync via `check_post_block_gc` (which remaps the pin) and pop the
+/// updated ref back.
+///
+/// SAFETY CONTRACT: only call from sites where every OTHER raw heap ref
+/// the caller still needs is rooted AND remapped across the block (frame
+/// slots are; immutable `&[Value]` arg slices are NOT — see the
+/// synchronized-method prologue, which deliberately does not use this).
 pub(crate) fn monitor_enter_blocking(
     shared: &SharedVm,
     thread: &mut JvmThread,
     obj: ObjectRef,
-) {
+) -> ObjectRef {
     let Some(m) = shared.monitors.enter_or_contend(obj, thread.thread_id) else {
-        return;
+        return obj;
     };
     let tid = thread.thread_id;
     let mut ctx = NativeContextImpl { shared, thread };
+    let pin_base = ctx.thread.native_pin_roots.len();
+    ctx.thread.native_pin_roots.push(obj);
     ctx.deposit_root_snapshot();
     {
         let blk = shared.gc_barrier.enter_blocked();
@@ -644,6 +656,14 @@ pub(crate) fn monitor_enter_blocking(
         drop(blk);
     }
     ctx.check_post_block_gc();
+    let fixed = ctx
+        .thread
+        .native_pin_roots
+        .get(pin_base)
+        .copied()
+        .unwrap_or(obj);
+    ctx.thread.native_pin_roots.truncate(pin_base);
+    fixed
 }
 
 // ---------------------------------------------------------------------------
@@ -2713,8 +2733,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn monitor_enter(&mut self, obj: ObjectRef) {
-        // GC-safe contended acquire — see `monitor_enter_blocking`.
-        monitor_enter_blocking(self.shared, self.thread, obj);
+        // NOTE deliberately NOT monitor_enter_blocking: the calling native
+        // holds raw `Value` copies (its args slice) that are neither rooted
+        // nor remappable across a GC-blocked wait; block as an EXPECTED
+        // mutator instead (a concurrent STW waits for us).
+        self.shared.monitors.enter(obj, self.thread.thread_id);
         // JEP 491: a virtual thread that holds a monitor is pinned to its
         // carrier and cannot be unmounted. Track the pin depth so that
         // subsequent park/sleep calls can emit `jdk.VirtualThreadPinned`.
@@ -9820,9 +9843,17 @@ fn invoke_on_class_shared_inner(
                 }
             }
         };
-        // GC-safe contended acquire (see monitor_enter_blocking): every
-        // synchronized Java method dispatch funnels through here.
-        monitor_enter_blocking(shared, thread, obj);
+        // NOTE deliberately NOT monitor_enter_blocking: the caller-held
+        // `args: &[Value]` slice (this + parameters, already popped off the
+        // operand stack) is unrooted, un-remappable Rust memory — letting a
+        // GC complete while we block here would both expose those objects
+        // to collection and build the callee frame from stale refs. We
+        // block as an EXPECTED mutator instead: a concurrent STW waits for
+        // us (the residual, pre-existing owner-parked-at-safepoint wedge is
+        // documented in docs/internal/h2-testscript-segv-findings.md; the
+        // proper fix needs an interpreter-level participation loop that can
+        // remap the args).
+        shared.monitors.enter(obj, thread.thread_id);
         Some(SynchronizedMethodGuard {
             monitor_pool: &shared.monitors,
             obj,

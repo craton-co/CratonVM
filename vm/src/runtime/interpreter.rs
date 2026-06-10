@@ -8279,8 +8279,13 @@ fn execute_instruction(
             // GC-safe contended acquire — an unmarked contended wait here is
             // counted in the STW barrier's `expected` and deadlocks the
             // collector against a safepoint-parked owner (see
-            // vm_exec::monitor_enter_blocking).
-            crate::vm::monitor_enter_blocking(shared, thread, obj_ref);
+            // vm_exec::monitor_enter_blocking). Safe HERE because the only
+            // raw copy is `obj_ref` (pinned + remapped inside) — the object
+            // also lives in a frame local (javac's synchronized-block temp),
+            // which the wake-side fixup remaps, and the paired monitorexit
+            // re-reads it from that fixed local. The returned (possibly
+            // relocated) ref is not needed afterwards.
+            let _ = crate::vm::monitor_enter_blocking(shared, thread, obj_ref);
             if let Some(start) = mon_start {
                 let mon_dur = start.elapsed();
                 if mon_dur.as_micros() > 1000 {
