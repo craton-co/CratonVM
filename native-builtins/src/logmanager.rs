@@ -1181,6 +1181,62 @@ fn jboss_logger_emit(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
     }
 }
 
+/// `Logger.{info,warn,error}(String loggerFqcn, Object message, Throwable t)` —
+/// the forms `DelegatingBasicLogger` delegates to. args[1] is the WRAPPER-CLASS
+/// FQCN (e.g. "org.jboss.logging.DelegatingBasicLogger"), NOT the message; the
+/// generic `jboss_logger_emit` takes the first String arg as the message, so it
+/// printed the FQCN and dropped the real message and throwable — hiding e.g.
+/// the WildFly subsystem-test boot error behind
+/// `ERROR [org.jboss.as.controller] org.jboss.logging.DelegatingBasicLogger`.
+/// Read the message at args[2] (invoking toString() for non-String objects)
+/// and the throwable at args[3].
+fn jboss_logger_emit_fqcn(ctx: &mut dyn NativeContext, args: &[Value], level: &str) {
+    let this = match args.first() { Some(Value::Object(o)) => *o, _ => None };
+    let logger_name = this
+        .and_then(|o| match ctx.get_field_by_name(o, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let message = match args.get(2) {
+        Some(Value::Object(Some(o))) => {
+            let o = *o;
+            if let Some(s) = ctx.read_string(o) {
+                s
+            } else {
+                let cn = ctx
+                    .class_name_of_id(ctx.class_id_of_object(o))
+                    .unwrap_or_else(|| "?".to_string());
+                match ctx.invoke_virtual(o, "toString", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(sr)))) => {
+                        ctx.read_string(sr).unwrap_or_else(|| format!("{{{cn}}}"))
+                    }
+                    _ => format!("{{{cn}}}"),
+                }
+            }
+        }
+        Some(Value::Object(None)) => "null".to_string(),
+        _ => String::new(),
+    };
+    eprintln!("{level} [{logger_name}] {message}");
+    if let Some(Value::Object(Some(t))) = args.get(3) {
+        dump_throwable_to_stderr(ctx, *t, "    ");
+    }
+}
+
+fn native_jboss_logger_info_fqcn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    jboss_logger_emit_fqcn(ctx, args, "INFO");
+    Ok(None)
+}
+fn native_jboss_logger_warn_fqcn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    jboss_logger_emit_fqcn(ctx, args, "WARN");
+    Ok(None)
+}
+fn native_jboss_logger_error_fqcn(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    jboss_logger_emit_fqcn(ctx, args, "ERROR");
+    Ok(None)
+}
+
 fn native_jboss_logger_info(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     jboss_logger_emit(ctx, args, "INFO");
     Ok(None)
@@ -1687,10 +1743,29 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
     // use (JBossLogManagerLogger, JDKLogger, Slf4jLogger, etc.).
     let jlog = "org/jboss/logging/Logger";
     // info family
+    // The `(String loggerFqcn, Object message, Throwable)` forms get the
+    // fqcn-aware handler — message is args[2], NOT the first String arg.
+    registry.register(
+        jlog,
+        "info",
+        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
+        native_jboss_logger_info_fqcn,
+    );
+    registry.register(
+        jlog,
+        "warn",
+        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
+        native_jboss_logger_warn_fqcn,
+    );
+    registry.register(
+        jlog,
+        "error",
+        "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V",
+        native_jboss_logger_error_fqcn,
+    );
     for (m, sig) in &[
         ("info", "(Ljava/lang/Object;)V"),
         ("info", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
-        ("info", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V"),
         ("infof", "(Ljava/lang/String;Ljava/lang/Object;)V"),
         ("infof", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
         ("infof", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
@@ -1707,7 +1782,6 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
     for (m, sig) in &[
         ("warn", "(Ljava/lang/Object;)V"),
         ("warn", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
-        ("warn", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V"),
         ("warnf", "(Ljava/lang/String;Ljava/lang/Object;)V"),
         ("warnf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
         ("warnf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
@@ -1724,7 +1798,6 @@ pub fn register_logmanager_natives(registry: &mut NativeMethodRegistry) {
     for (m, sig) in &[
         ("error", "(Ljava/lang/Object;)V"),
         ("error", "(Ljava/lang/Object;Ljava/lang/Throwable;)V"),
-        ("error", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Throwable;)V"),
         ("errorf", "(Ljava/lang/String;Ljava/lang/Object;)V"),
         ("errorf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;)V"),
         ("errorf", "(Ljava/lang/String;Ljava/lang/Object;Ljava/lang/Object;Ljava/lang/Object;)V"),
