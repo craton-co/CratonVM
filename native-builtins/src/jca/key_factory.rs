@@ -444,6 +444,79 @@ fn throw_invalid_key_spec(ctx: &mut dyn NativeContext, msg: &str) -> MethodCallF
 }
 
 // ---------------------------------------------------------------------------
+// Post-quantum (ML-DSA / ML-KEM) → real JDK SPI routing (crate::route_pqc_to_real)
+// ---------------------------------------------------------------------------
+//
+// CratonVM has no native ML-DSA/ML-KEM lattice crypto, but JDK 25 ships real
+// pure-Java implementations: ML-DSA in the SUN provider
+// (`sun.security.provider.ML_DSA_Impls`) and ML-KEM in SunJCE
+// (`com.sun.crypto.provider.ML_KEM_Impls`). Both use the JDK "Named" SPI
+// framework with one concrete `KeyFactorySpi`/`KeyPairGeneratorSpi` subclass per
+// parameter set, suffixed by NIST security category (2/3/5). We drive those SPIs
+// the same way `drive_real_ec_*` drives `sun.security.ec.*`, so keycloak's AKP
+// JWK parsing (`KeyFactory.getInstance("ML-DSA-44").generatePublic(spec)`) and
+// keypair generation yield real, HotSpot-equivalent keys instead of the
+// synthetic stub's `NoSuchAlgorithmException`/`InvalidKeySpecException`.
+
+/// `(keypairgen_spi_class, keyfactory_spi_class)` for an ML-DSA/ML-KEM algo
+/// index, or `None` for any non-PQC algorithm. Suffix mapping verified against
+/// the JDK 25 SPI constructors (e.g. `ML_DSA_Impls$KF2` → "ML-DSA-44").
+fn pqc_spi_classes(algo: i32) -> Option<(String, String)> {
+    let (base, suffix) = match algo {
+        0 => ("com/sun/crypto/provider/ML_KEM_Impls", "2"), // ML-KEM-512
+        1 => ("com/sun/crypto/provider/ML_KEM_Impls", "3"), // ML-KEM-768
+        2 => ("com/sun/crypto/provider/ML_KEM_Impls", "5"), // ML-KEM-1024
+        3 => ("sun/security/provider/ML_DSA_Impls", "2"),   // ML-DSA-44
+        4 => ("sun/security/provider/ML_DSA_Impls", "3"),   // ML-DSA-65
+        5 => ("sun/security/provider/ML_DSA_Impls", "5"),   // ML-DSA-87
+        _ => return None,
+    };
+    Some((format!("{base}$KPG{suffix}"), format!("{base}$KF{suffix}")))
+}
+
+// NOTE: ML-DSA/ML-KEM *key generation* is deliberately NOT routed to the real
+// JDK SPI. The JDK keygen (`ML_DSA.generateKeyPairInternal`) produces degenerate
+// all-zero key material under CratonVM (a deep interpreter bug in the SHAKE/NTT
+// lattice math, compounded by `JCAUtil.getDefSecureRandom()` returning zero
+// bytes), so routing it would mint an INSECURE, predictable key. Until the
+// keygen math is fixed, `kpg_generate_key_pair` keeps PQC keygen fail-closed.
+// Only *import* (`KeyFactory.generate{Public,Private}`) is routed below — it is
+// pure decode (no randomness) and produces HotSpot-byte-identical keys.
+
+/// Drive the real JDK PQC `KeyFactory` SPI's `engineGenerate{Public,Private}`
+/// over `spec`. `method`/`ret` select public vs private. Pins `spec` across the
+/// SPI allocation (which can GC).
+fn drive_real_pqc_keyfactory(
+    ctx: &mut dyn NativeContext,
+    algo: i32,
+    spec: ObjectRef,
+    method: &str,
+    ret: &str,
+) -> MethodCallResult {
+    let kf_class = match pqc_spi_classes(algo) {
+        Some((_, kf)) => kf,
+        None => return Err(throw_invalid_key_spec(ctx, "not a post-quantum algorithm")),
+    };
+    let spec_pin = ctx.pin_native_root(spec);
+    let spi = match ctx.new_object_initialized(&kf_class, "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        other => {
+            ctx.unpin_native_roots(spec_pin);
+            other?;
+            return Err(throw_invalid_key_spec(
+                ctx,
+                &format!("{} KeyFactory not available", algo_name(algo)),
+            ));
+        }
+    };
+    let spec = ctx.read_native_pin(spec_pin, spec);
+    let desc = format!("(Ljava/security/spec/KeySpec;){ret}");
+    let r = ctx.invoke_virtual(spi, method, &desc, &[Value::Object(Some(spec))]);
+    ctx.unpin_native_roots(spec_pin);
+    r
+}
+
+// ---------------------------------------------------------------------------
 // KeyPairGenerator natives
 // ---------------------------------------------------------------------------
 
@@ -588,10 +661,13 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
 
     // Recognised but not implemented (ML-KEM, ML-DSA, Ed25519, X25519, or an
-    // unknown name). Real key generation is unavailable, so honour the JDK
-    // contract and throw `NoSuchAlgorithmException` rather than minting a
-    // KeyPair with empty key material (no-synthetic-stubs policy). RSA and EC
-    // returned above with real keys.
+    // unknown name). NOTE: ML-DSA/ML-KEM *import* IS routed to the real JDK SPI
+    // (see kf_generate_public), but *key generation* is NOT — the JDK lattice
+    // keygen (`ML_DSA.generateKeyPairInternal`) produces degenerate all-zero key
+    // material under CratonVM (a deep interpreter bug in the SHAKE/NTT math,
+    // compounded by `JCAUtil.getDefSecureRandom()` yielding zero bytes). Routing
+    // it would hand back an INSECURE, predictable key — worse than failing — so
+    // we keep it fail-closed (throw) until the underlying keygen math is fixed.
     Err(throw_no_such_algorithm(
         ctx,
         &format!("{} KeyPairGenerator not available", algo_name(algo)),
@@ -714,11 +790,25 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         }
     }
 
+    // ML-DSA / ML-KEM: drive the real JDK 25 PQC KeyFactory SPI over the
+    // X509EncodedKeySpec → real public key (keycloak AKP JWK parsing path).
+    if crate::route_pqc_to_real() && pqc_spi_classes(algo).is_some() {
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            return drive_real_pqc_keyfactory(
+                ctx,
+                algo,
+                *spec,
+                "engineGeneratePublic",
+                "Ljava/security/PublicKey;",
+            );
+        }
+    }
+
     // No usable key could be produced: the RSA/EC spec failed to parse, or the
-    // algorithm has no real implementation (ML-KEM, ML-DSA, Ed25519, X25519, or
-    // an unknown name). Throw generatePublic's declared `InvalidKeySpecException`
-    // rather than returning a `key_id == 0` key that silently fails every later
-    // verify (no-synthetic-stubs policy).
+    // algorithm has no real implementation (Ed25519, X25519, an unknown name,
+    // or PQC with routing disabled). Throw generatePublic's declared
+    // `InvalidKeySpecException` rather than returning a `key_id == 0` key that
+    // silently fails every later verify (no-synthetic-stubs policy).
     Err(throw_invalid_key_spec(
         ctx,
         &format!(
@@ -746,6 +836,19 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         if let Some(Value::Object(Some(spec))) = args.get(1) {
             return drive_real_ec_keyfactory(
                 ctx,
+                *spec,
+                "engineGeneratePrivate",
+                "Ljava/security/PrivateKey;",
+            );
+        }
+    }
+    // ML-DSA / ML-KEM: drive the real JDK 25 PQC KeyFactory SPI over the
+    // PKCS8EncodedKeySpec → real private key.
+    if crate::route_pqc_to_real() && pqc_spi_classes(algo).is_some() {
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            return drive_real_pqc_keyfactory(
+                ctx,
+                algo,
                 *spec,
                 "engineGeneratePrivate",
                 "Ljava/security/PrivateKey;",
