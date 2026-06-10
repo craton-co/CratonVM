@@ -122,6 +122,19 @@ const EXIT_NOT_YET: i32 = i32::MIN;
 /// Total number of fields on the synthetic Process.
 const PROC_FIELD_COUNT: usize = 6;
 
+/// Class name the synthetic Process is allocated under.
+///
+/// Virtual dispatch on these objects resolves by the RECEIVER's class-chain
+/// names (the call-site `java/lang/Process` entry is only reached when the
+/// resolved method's declaring class matches), so the object must carry a
+/// name the registrations below are keyed on. Allocating with
+/// `ClassId::new(0)` decayed the receiver to the anonymous fallback class
+/// `cratonvm/synthetic/AnonymousObject$6`, on which EVERY `Process` virtual
+/// (`waitFor`, `isAlive`, `getInputStream`, ...) raised NoSuchMethodError —
+/// first seen as picocli's terminal-width probe failing during
+/// `junit-platform-console --help` (docs/gaps/gap-anonymous-object-getinputstream.md).
+const SYNTHETIC_PROCESS_CLASS: &str = "cratonvm/synthetic/Process";
+
 // ---------------------------------------------------------------------------
 // Spawn + teardown primitives
 // ---------------------------------------------------------------------------
@@ -243,8 +256,10 @@ pub fn spawn_and_wrap(
         },
     );
 
-    // Allocate synthetic Process and populate its 6 fields.
-    let proc_ref = ctx.alloc_object(cratonvm_types::ClassId::new(0), PROC_FIELD_COUNT);
+    // Allocate the synthetic Process under its own named class (see
+    // SYNTHETIC_PROCESS_CLASS) and populate its 6 fields.
+    let proc_class = ctx.ensure_synthetic_class(SYNTHETIC_PROCESS_CLASS, PROC_FIELD_COUNT);
+    let proc_ref = ctx.alloc_object(proc_class, PROC_FIELD_COUNT);
     ctx.set_field(proc_ref, PROC_FIELD_EXIT, Value::Int(EXIT_NOT_YET));
     ctx.set_field(proc_ref, PROC_FIELD_STDIN_FD, Value::Int(stdin_fd));
     ctx.set_field(proc_ref, PROC_FIELD_STDOUT_FD, Value::Int(stdout_fd));
@@ -768,6 +783,93 @@ fn native_process_pid(
     Ok(Some(Value::Long(pid_for_handle(handle))))
 }
 
+/// Wrap an `FdTable` id in a real JDK stream object (`stream_class` must
+/// declare a public `(Ljava/io/FileDescriptor;)V` constructor, i.e.
+/// `java/io/FileInputStream` or `java/io/FileOutputStream`).
+///
+/// The descriptor carries the id in both its `fd` (int) and `handle` (long)
+/// fields — the same dual-write contract as `fis_set_fd`/`fos_get_fd` in
+/// `lib.rs`, so every existing read/write/available/close native resolves it.
+/// An absent pipe (`fd_id == -1`) yields a descriptor neither lookup accepts,
+/// which the stream natives surface as EOF / dropped writes — matching the
+/// "inherited or closed" semantics the spawn path encodes as -1.
+fn wrap_fd_in_stream(
+    ctx: &mut dyn NativeContext,
+    fd_id: i32,
+    stream_class: &str,
+) -> MethodCallResult {
+    let fd_obj = match ctx.new_object_initialized("java/io/FileDescriptor", "()V", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::IOException {
+                message: "Process stream: FileDescriptor construction failed".to_string(),
+            }
+            .into())
+        }
+    };
+    ctx.set_field_by_name(fd_obj, "fd", Value::Int(fd_id));
+    ctx.set_field_by_name(fd_obj, "handle", Value::Long(fd_id as i64));
+    ctx.new_object_initialized(
+        stream_class,
+        "(Ljava/io/FileDescriptor;)V",
+        &[Value::Object(Some(fd_obj))],
+    )
+}
+
+/// Shared body of the three `java.lang.Process` stream getters: read the
+/// pipe's fd id from the synthetic field and wrap it in a real stream.
+///
+/// A non-synthetic receiver (field holds a reference or nothing) degrades to
+/// fd -1 — the same foreign-receiver tolerance `handle_of` gives `waitFor`.
+fn process_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    fd_field: usize,
+    stream_class: &str,
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => {
+            return Err(RuntimeError::NullPointerException {
+                message: Some("Process stream getter: null this".to_string()),
+            }
+            .into())
+        }
+    };
+    let fd_id = match ctx.get_field(this, fd_field) {
+        Value::Int(v) => v,
+        _ => -1,
+    };
+    wrap_fd_in_stream(ctx, fd_id, stream_class)
+}
+
+/// `java.lang.Process.getInputStream()Ljava/io/InputStream;` — the child's
+/// stdout pipe.
+fn native_process_get_input_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    process_stream(ctx, args, PROC_FIELD_STDOUT_FD, "java/io/FileInputStream")
+}
+
+/// `java.lang.Process.getErrorStream()Ljava/io/InputStream;` — the child's
+/// stderr pipe.
+fn native_process_get_error_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    process_stream(ctx, args, PROC_FIELD_STDERR_FD, "java/io/FileInputStream")
+}
+
+/// `java.lang.Process.getOutputStream()Ljava/io/OutputStream;` — the child's
+/// stdin pipe.
+fn native_process_get_output_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    process_stream(ctx, args, PROC_FIELD_STDIN_FD, "java/io/FileOutputStream")
+}
+
 // ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
@@ -882,22 +984,53 @@ pub fn register_process_natives(registry: &mut NativeMethodRegistry) {
     // Process methods on our synthetic Process — override the stubs
     // from phases_late::register_phase57_process with real fd-aware
     // implementations.
-    registry.register("java/lang/Process", "waitFor", "()I", native_process_wait_for);
-    registry.register(
-        "java/lang/Process",
-        "exitValue",
-        "()I",
-        native_process_exit_value,
-    );
-    registry.register("java/lang/Process", "isAlive", "()Z", native_process_is_alive);
-    registry.register("java/lang/Process", "destroy", "()V", native_process_destroy);
-    registry.register(
-        "java/lang/Process",
-        "destroyForcibly",
-        "()Ljava/lang/Process;",
-        native_process_destroy_forcibly,
-    );
-    registry.register("java/lang/Process", "pid", "()J", native_process_pid);
+    //
+    // Registered under BOTH `java/lang/Process` (call-site keyed lookups,
+    // and parity with the phase57 stubs) and SYNTHETIC_PROCESS_CLASS:
+    // receiver-driven dispatch probes the registry by the receiver's
+    // class-chain names, and the synthetic stub's chain never reaches
+    // `java/lang/Process` (superclass: None), so without the second
+    // registration every one of these raised NoSuchMethodError on the
+    // objects `spawn_and_wrap` actually creates.
+    for proc_cls in ["java/lang/Process", SYNTHETIC_PROCESS_CLASS] {
+        registry.register(proc_cls, "waitFor", "()I", native_process_wait_for);
+        registry.register(proc_cls, "exitValue", "()I", native_process_exit_value);
+        registry.register(proc_cls, "isAlive", "()Z", native_process_is_alive);
+        registry.register(proc_cls, "destroy", "()V", native_process_destroy);
+        registry.register(
+            proc_cls,
+            "destroyForcibly",
+            "()Ljava/lang/Process;",
+            native_process_destroy_forcibly,
+        );
+        registry.register(proc_cls, "pid", "()J", native_process_pid);
+
+        // Stream getters. The spawn path stores the child's pipe fd ids in
+        // fields 1-3 precisely so streams can be served through the
+        // fd_table; until these were registered the synthetic Process had
+        // NO getInputStream/getErrorStream/getOutputStream anywhere (the
+        // phase57 stubs are synthetic-jdk-only), so the first caller —
+        // picocli's terminal-width probe reading `mode con` output during
+        // junit-console --help — hit NoSuchMethodError.
+        registry.register(
+            proc_cls,
+            "getInputStream",
+            "()Ljava/io/InputStream;",
+            native_process_get_input_stream,
+        );
+        registry.register(
+            proc_cls,
+            "getErrorStream",
+            "()Ljava/io/InputStream;",
+            native_process_get_error_stream,
+        );
+        registry.register(
+            proc_cls,
+            "getOutputStream",
+            "()Ljava/io/OutputStream;",
+            native_process_get_output_stream,
+        );
+    }
 
     // ProcessBuilder.start — route through the real spawn path.  This
     // overrides the synthetic stub from phases_late.
