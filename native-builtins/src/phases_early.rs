@@ -4824,13 +4824,22 @@ pub(crate) fn register_currency_natives(r: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// Exchanger — 3-field synthetic: slot=0, state=1 (0=empty, 1=waiting, 2=exchanged), other_val=2
-// Two threads rendezvous: first thread deposits its value and waits;
-// second thread swaps values and wakes the first.
+// Exchanger — single-slot rendezvous over the REAL field layout.
+//
+// The real `java.util.concurrent.Exchanger` instance layout is
+// arena(0, `[`-descriptor), ncpu(1, I), bound(2, I). The synthetic protocol
+// keeps the deposited value in slot 0 (an Object into a `[`/`L` slot passes
+// the descriptor-aware coercion) and the state Int in slot 1 (an `I` slot —
+// Int lands intact). The previous 3-field protocol ALSO wrote the reply
+// Object into slot 2 — but slot 2 is the real `int bound`, so the
+// descriptor-aware path mangled the reference into `Int(ptr)` and the
+// exchange returned garbage in real-JDK builds. The reply now REUSES slot 0:
+//   state 0 (empty):    first thread writes slot0 = its value, state = 1
+//   state 1 (waiting):  partner reads slot0, writes slot0 = ITS value, state = 2
+//   state 2 (exchanged): first thread reads slot0 as the reply, resets to 0
 // ---------------------------------------------------------------------------
 const EXCH_FIELD_SLOT: usize = 0;
 const EXCH_FIELD_STATE: usize = 1;
-const EXCH_FIELD_OTHER: usize = 2;
 
 pub(crate) fn register_exchanger_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -4840,7 +4849,6 @@ pub(crate) fn register_exchanger_natives(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         ctx.set_field(this, EXCH_FIELD_SLOT, Value::Object(None));
         ctx.set_field(this, EXCH_FIELD_STATE, Value::Int(0)); // empty
-        ctx.set_field(this, EXCH_FIELD_OTHER, Value::Object(None));
         Ok(Some(Value::Object(None)))
     });
 
@@ -4885,37 +4893,58 @@ fn exchanger_do_exchange(
     my_val: Value,
     timeout_ms: Option<i64>,
 ) -> MethodCallResult {
-    ctx.monitor_enter(this);
-    let state = ctx.get_field(this, EXCH_FIELD_STATE).as_int().unwrap_or(0);
+    let deadline = timeout_ms.map(|ms| {
+        std::time::Instant::now() + std::time::Duration::from_millis(ms.max(0) as u64)
+    });
 
-    if state == 0 {
-        // No other thread waiting — deposit our value, mark as waiting
+    loop {
+        ctx.monitor_enter(this);
+        let state = ctx.get_field(this, EXCH_FIELD_STATE).as_int().unwrap_or(0);
+
+        if state == 1 {
+            // Another thread is waiting — swap: take its value out of the
+            // slot, leave ours as the reply, mark exchanged, wake it.
+            let other_val = ctx.get_field(this, EXCH_FIELD_SLOT);
+            ctx.set_field(this, EXCH_FIELD_SLOT, my_val);
+            ctx.set_field(this, EXCH_FIELD_STATE, Value::Int(2)); // exchanged
+            let notify_result = ctx.monitor_notify_all(this);
+            ctx.monitor_exit(this);
+            notify_result?;
+            return Ok(Some(other_val));
+        }
+
+        if state == 2 {
+            // A previous exchange is still completing (the first thread has
+            // not yet collected its reply) — wait for the reset, then retry.
+            let wait_result = ctx.monitor_wait(this, Some(5));
+            ctx.monitor_exit(this);
+            wait_result?;
+            continue;
+        }
+
+        // state == 0: no partner yet — deposit our value, mark as waiting.
         ctx.set_field(this, EXCH_FIELD_SLOT, my_val);
         ctx.set_field(this, EXCH_FIELD_STATE, Value::Int(1)); // waiting
         ctx.monitor_exit(this);
 
-        // Now spin-wait until the other thread completes the exchange
-        let deadline = timeout_ms.map(|ms| {
-            std::time::Instant::now() + std::time::Duration::from_millis(ms.max(0) as u64)
-        });
-
+        // Wait until a partner completes the exchange (state == 2).
         loop {
+            ctx.monitor_enter(this);
             let cur_state = ctx.get_field(this, EXCH_FIELD_STATE).as_int().unwrap_or(0);
             if cur_state == 2 {
-                // Exchange completed by the other thread
-                let other_val = ctx.get_field(this, EXCH_FIELD_OTHER);
-                // Reset state for reuse
-                ctx.monitor_enter(this);
+                // Partner swapped: the slot now holds ITS value (our reply).
+                let other_val = ctx.get_field(this, EXCH_FIELD_SLOT);
                 ctx.set_field(this, EXCH_FIELD_STATE, Value::Int(0));
                 ctx.set_field(this, EXCH_FIELD_SLOT, Value::Object(None));
-                ctx.set_field(this, EXCH_FIELD_OTHER, Value::Object(None));
+                // Wake any third thread parked in the state==2 retry branch.
+                let notify_result = ctx.monitor_notify_all(this);
                 ctx.monitor_exit(this);
+                notify_result?;
                 return Ok(Some(other_val));
             }
             if let Some(dl) = deadline {
                 if std::time::Instant::now() >= dl {
-                    // Timeout — reset state and throw
-                    ctx.monitor_enter(this);
+                    // Timeout — withdraw our deposit and throw.
                     ctx.set_field(this, EXCH_FIELD_STATE, Value::Int(0));
                     ctx.set_field(this, EXCH_FIELD_SLOT, Value::Object(None));
                     ctx.monitor_exit(this);
@@ -4925,27 +4954,76 @@ fn exchanger_do_exchange(
                     .into());
                 }
             }
-            ctx.monitor_enter(this);
-            ctx.monitor_wait(this, Some(5))?;
+            let wait_result = ctx.monitor_wait(this, Some(5));
             ctx.monitor_exit(this);
+            wait_result?;
         }
-    } else {
-        // Another thread is waiting — grab its value and complete
-        let other_val = ctx.get_field(this, EXCH_FIELD_SLOT);
-        ctx.set_field(this, EXCH_FIELD_OTHER, my_val);
-        ctx.set_field(this, EXCH_FIELD_STATE, Value::Int(2)); // exchanged
-        ctx.monitor_notify_all(this)?;
-        ctx.monitor_exit(this);
-        Ok(Some(other_val))
     }
 }
 
 // ---------------------------------------------------------------------------
-// Phaser — 3-field synthetic (parties=0, arrivals=1, phase=2)
+// Phaser — int[3] holder ([0]=parties, [1]=arrivals, [2]=phase) stored in
+// object slot 1.
+//
+// The real `java.util.concurrent.Phaser` instance layout is state(0, J),
+// parent(1, L), root(2, L), evenQ(3, L), oddQ(4, L). The old synthetic Int
+// writes to slots 0/1/2 were destroyed by the descriptor-aware coercion:
+// slot 0 (J) turned Int(parties) into Long(parties) — which the Int-matching
+// reads then saw as 0 — and slots 1/2 (L) nulled the Ints outright. The
+// holder lives in slot 1 (`parent`, a reference slot, so the array object
+// passes the coercion); slot 0 must NOT be used — an object written to a J
+// slot is reinterpreted as Long(ptr). Legacy raw-Int reads (and the
+// Long-coerced parties at slot 0) cover synthetic allocations.
 // ---------------------------------------------------------------------------
-const PH_FIELD_PARTIES: usize = 0;
-const PH_FIELD_ARRIVALS: usize = 1;
-const PH_FIELD_PHASE: usize = 2;
+const PH_HOLDER_SLOT: usize = 1;
+const PH_H_PARTIES: usize = 0;
+const PH_H_ARRIVALS: usize = 1;
+const PH_H_PHASE: usize = 2;
+
+fn ph_holder(ctx: &mut dyn NativeContext, this: ObjectRef) -> (ObjectRef, ObjectRef) {
+    if let Value::Object(Some(h)) = ctx.get_field(this, PH_HOLDER_SLOT) {
+        return (this, h);
+    }
+    // Migrate legacy values written before the holder existed: parties may
+    // survive at slot 0 as Int (synthetic layout) or Long (real layout — the
+    // J-descriptor coercion widened it); arrivals/phase only as raw Ints.
+    let legacy_parties = match ctx.get_field(this, 0) {
+        Value::Int(v) => v,
+        Value::Long(v) => v as i32,
+        _ => 0,
+    };
+    let legacy_arrivals = match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    let legacy_phase = match ctx.get_field(this, 2) {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    // Pin across the allocation (moving-GC receiver-relocation hazard).
+    let this_pin = ctx.pin_native_root(this);
+    let h = ctx.new_array(cratonvm_types::ArrayElementType::Int, 3);
+    let this = ctx.read_native_pin(this_pin, this);
+    ctx.unpin_native_roots(this_pin);
+    ctx.set_array_element(h, PH_H_PARTIES, Value::Int(legacy_parties));
+    ctx.set_array_element(h, PH_H_ARRIVALS, Value::Int(legacy_arrivals));
+    ctx.set_array_element(h, PH_H_PHASE, Value::Int(legacy_phase));
+    ctx.set_field(this, PH_HOLDER_SLOT, Value::Object(Some(h)));
+    (this, h)
+}
+
+fn ph_get(ctx: &mut dyn NativeContext, this: ObjectRef, idx: usize) -> i32 {
+    let (_, h) = ph_holder(ctx, this);
+    match ctx.get_array_element(h, idx) {
+        Value::Int(v) => v,
+        _ => 0,
+    }
+}
+
+fn ph_set(ctx: &mut dyn NativeContext, this: ObjectRef, idx: usize, v: i32) {
+    let (_, h) = ph_holder(ctx, this);
+    ctx.set_array_element(h, idx, Value::Int(v));
+}
 
 pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
@@ -4953,9 +5031,11 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
     let c = "java/util/concurrent/Phaser";
     r.register(c, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, PH_FIELD_PARTIES, Value::Int(0));
-        ctx.set_field(this, PH_FIELD_ARRIVALS, Value::Int(0));
-        ctx.set_field(this, PH_FIELD_PHASE, Value::Int(0));
+        let (this, h) = ph_holder(ctx, this);
+        let _ = this;
+        ctx.set_array_element(h, PH_H_PARTIES, Value::Int(0));
+        ctx.set_array_element(h, PH_H_ARRIVALS, Value::Int(0));
+        ctx.set_array_element(h, PH_H_PHASE, Value::Int(0));
         Ok(Some(Value::Object(None)))
     });
     r.register(c, "<init>", "(I)V", |ctx, args| {
@@ -4964,86 +5044,69 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
             Some(Value::Int(v)) => *v,
             _ => 0,
         };
-        ctx.set_field(this, PH_FIELD_PARTIES, Value::Int(parties));
-        ctx.set_field(this, PH_FIELD_ARRIVALS, Value::Int(0));
-        ctx.set_field(this, PH_FIELD_PHASE, Value::Int(0));
+        let (this, h) = ph_holder(ctx, this);
+        let _ = this;
+        ctx.set_array_element(h, PH_H_PARTIES, Value::Int(parties));
+        ctx.set_array_element(h, PH_H_ARRIVALS, Value::Int(0));
+        ctx.set_array_element(h, PH_H_PHASE, Value::Int(0));
         Ok(Some(Value::Object(None)))
     });
     r.register(c, "register", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let p = match ctx.get_field(this, PH_FIELD_PARTIES) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        ctx.set_field(this, PH_FIELD_PARTIES, Value::Int(p + 1));
-        let phase = match ctx.get_field(this, PH_FIELD_PHASE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+        let (this, _) = ph_holder(ctx, this);
+        ctx.monitor_enter(this);
+        let p = ph_get(ctx, this, PH_H_PARTIES);
+        ph_set(ctx, this, PH_H_PARTIES, p + 1);
+        let phase = ph_get(ctx, this, PH_H_PHASE);
+        ctx.monitor_exit(this);
         Ok(Some(Value::Int(phase)))
     });
     r.register(c, "arrive", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let (this, _) = ph_holder(ctx, this);
         ctx.monitor_enter(this);
-        let arrivals = match ctx.get_field(this, PH_FIELD_ARRIVALS) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let parties = match ctx.get_field(this, PH_FIELD_PARTIES) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let phase = match ctx.get_field(this, PH_FIELD_PHASE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+        let arrivals = ph_get(ctx, this, PH_H_ARRIVALS);
+        let parties = ph_get(ctx, this, PH_H_PARTIES);
+        let phase = ph_get(ctx, this, PH_H_PHASE);
         let new_arrivals = arrivals + 1;
         if new_arrivals >= parties && parties > 0 {
-            ctx.set_field(this, PH_FIELD_ARRIVALS, Value::Int(0));
-            ctx.set_field(this, PH_FIELD_PHASE, Value::Int(phase + 1));
+            ph_set(ctx, this, PH_H_ARRIVALS, 0);
+            ph_set(ctx, this, PH_H_PHASE, phase + 1);
             // Notify all waiting threads that phase has advanced
             ctx.monitor_notify_all(this)?;
         } else {
-            ctx.set_field(this, PH_FIELD_ARRIVALS, Value::Int(new_arrivals));
+            ph_set(ctx, this, PH_H_ARRIVALS, new_arrivals);
         }
         ctx.monitor_exit(this);
         Ok(Some(Value::Int(phase)))
     });
     r.register(c, "arriveAndAwaitAdvance", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let (this, _) = ph_holder(ctx, this);
         ctx.monitor_enter(this);
-        let arrivals = match ctx.get_field(this, PH_FIELD_ARRIVALS) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let parties = match ctx.get_field(this, PH_FIELD_PARTIES) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let phase = match ctx.get_field(this, PH_FIELD_PHASE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+        let arrivals = ph_get(ctx, this, PH_H_ARRIVALS);
+        let parties = ph_get(ctx, this, PH_H_PARTIES);
+        let phase = ph_get(ctx, this, PH_H_PHASE);
         let new_arrivals = arrivals + 1;
         if new_arrivals >= parties && parties > 0 {
             // Last party to arrive — advance phase and notify all waiters
-            ctx.set_field(this, PH_FIELD_ARRIVALS, Value::Int(0));
+            ph_set(ctx, this, PH_H_ARRIVALS, 0);
             let np = phase + 1;
-            ctx.set_field(this, PH_FIELD_PHASE, Value::Int(np));
+            ph_set(ctx, this, PH_H_PHASE, np);
             ctx.monitor_notify_all(this)?;
             ctx.monitor_exit(this);
             Ok(Some(Value::Int(np)))
         } else {
             // Not all parties arrived yet — record arrival and wait for phase to advance
-            ctx.set_field(this, PH_FIELD_ARRIVALS, Value::Int(new_arrivals));
+            ph_set(ctx, this, PH_H_ARRIVALS, new_arrivals);
             let target_phase = phase + 1;
-            // Spin-wait on the monitor until phase advances
+            // Bounded monitor-waits until the phase advances
             loop {
-                ctx.monitor_wait(this, Some(10))?;
-                let current_phase = match ctx.get_field(this, PH_FIELD_PHASE) {
-                    Value::Int(v) => v,
-                    _ => 0,
-                };
+                if let Err(e) = ctx.monitor_wait(this, Some(10)) {
+                    ctx.monitor_exit(this);
+                    return Err(e);
+                }
+                let current_phase = ph_get(ctx, this, PH_H_PHASE);
                 if current_phase >= target_phase || current_phase < 0 {
                     ctx.monitor_exit(this);
                     return Ok(Some(Value::Int(current_phase)));
@@ -5053,30 +5116,22 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
     });
     r.register(c, "arriveAndDeregister", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let (this, _) = ph_holder(ctx, this);
         ctx.monitor_enter(this);
-        let parties = match ctx.get_field(this, PH_FIELD_PARTIES) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let arrivals = match ctx.get_field(this, PH_FIELD_ARRIVALS) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let phase = match ctx.get_field(this, PH_FIELD_PHASE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+        let parties = ph_get(ctx, this, PH_H_PARTIES);
+        let arrivals = ph_get(ctx, this, PH_H_ARRIVALS);
+        let phase = ph_get(ctx, this, PH_H_PHASE);
         let new_parties = (parties - 1).max(0);
-        ctx.set_field(this, PH_FIELD_PARTIES, Value::Int(new_parties));
+        ph_set(ctx, this, PH_H_PARTIES, new_parties);
         // Check if remaining parties are all arrived after deregistration
         let new_arrivals = arrivals + 1;
         if new_arrivals >= new_parties && new_parties > 0 {
-            ctx.set_field(this, PH_FIELD_ARRIVALS, Value::Int(0));
-            ctx.set_field(this, PH_FIELD_PHASE, Value::Int(phase + 1));
+            ph_set(ctx, this, PH_H_ARRIVALS, 0);
+            ph_set(ctx, this, PH_H_PHASE, phase + 1);
             ctx.monitor_notify_all(this)?;
         } else if new_parties == 0 {
             // No more parties — terminate
-            ctx.set_field(this, PH_FIELD_PHASE, Value::Int(-1));
+            ph_set(ctx, this, PH_H_PHASE, -1);
             ctx.monitor_notify_all(this)?;
         }
         ctx.monitor_exit(this);
@@ -5084,39 +5139,35 @@ pub(crate) fn register_phaser_natives(r: &mut NativeMethodRegistry) {
     });
     r.register(c, "getPhase", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, PH_FIELD_PHASE)))
+        Ok(Some(Value::Int(ph_get(ctx, this, PH_H_PHASE))))
     });
     r.register(c, "getRegisteredParties", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, PH_FIELD_PARTIES)))
+        Ok(Some(Value::Int(ph_get(ctx, this, PH_H_PARTIES))))
     });
     r.register(c, "getArrivedParties", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, PH_FIELD_ARRIVALS)))
+        Ok(Some(Value::Int(ph_get(ctx, this, PH_H_ARRIVALS))))
     });
     r.register(c, "getUnarrivedParties", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let p = match ctx.get_field(this, PH_FIELD_PARTIES) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        let a = match ctx.get_field(this, PH_FIELD_ARRIVALS) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+        let p = ph_get(ctx, this, PH_H_PARTIES);
+        let a = ph_get(ctx, this, PH_H_ARRIVALS);
         Ok(Some(Value::Int((p - a).max(0))))
     });
     r.register(c, "isTerminated", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let phase = match ctx.get_field(this, PH_FIELD_PHASE) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+        let phase = ph_get(ctx, this, PH_H_PHASE);
         Ok(Some(Value::Int(if phase < 0 { 1 } else { 0 })))
     });
     r.register(c, "forceTermination", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, PH_FIELD_PHASE, Value::Int(-1));
+        let (this, _) = ph_holder(ctx, this);
+        ctx.monitor_enter(this);
+        ph_set(ctx, this, PH_H_PHASE, -1);
+        let notify_result = ctx.monitor_notify_all(this);
+        ctx.monitor_exit(this);
+        notify_result?;
         Ok(Some(Value::Object(None)))
     });
     r.set_category(__prev_cat);

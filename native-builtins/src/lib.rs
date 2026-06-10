@@ -22392,8 +22392,13 @@ fn cb_await_inner(
             None => 10,
         };
         // monitor_wait releases the monitor while parked and reacquires it
-        // before returning, so the loop re-reads state under the lock.
-        ctx.monitor_wait(this, Some(wait_ms))?;
+        // before returning, so the loop re-reads state under the lock. On
+        // error (interrupt) the monitor is still held — release it before
+        // propagating so the unwind doesn't leak ownership.
+        if let Err(e) = ctx.monitor_wait(this, Some(wait_ms)) {
+            ctx.monitor_exit(this);
+            return Err(e);
+        }
     }
 }
 
@@ -36719,20 +36724,25 @@ mod concurrency_tests {
     // CountDownLatch
     // -----------------------------------------------------------------------
 
+    // NOTE: since the descriptor-coercion fix the count lives in an int[1]
+    // holder object in slot 0 (the real CountDownLatch's only field is the
+    // reference-typed `sync`, so a raw Int there was coerced to null in
+    // real-JDK builds). Assert through `cdl_count` — the storage accessor —
+    // rather than the raw slot.
     #[test]
     fn cdl_countdown_to_zero_triggers_notify() {
         let mut ctx = make_ctx();
         let cdl = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/CountDownLatch", 1);
         native_cdl_init(&mut ctx, &[Value::Object(Some(cdl)), Value::Int(2)]).unwrap();
 
-        assert_eq!(ctx.get_field(cdl, CDL_FIELD_COUNT), Value::Int(2));
+        assert_eq!(cdl_count(&mut ctx, cdl), 2);
 
         native_cdl_count_down(&mut ctx, &[Value::Object(Some(cdl))]).unwrap();
-        assert_eq!(ctx.get_field(cdl, CDL_FIELD_COUNT), Value::Int(1));
+        assert_eq!(cdl_count(&mut ctx, cdl), 1);
 
         // Second countDown reaches zero -- triggers monitor_notify_all (no-op in mock)
         native_cdl_count_down(&mut ctx, &[Value::Object(Some(cdl))]).unwrap();
-        assert_eq!(ctx.get_field(cdl, CDL_FIELD_COUNT), Value::Int(0));
+        assert_eq!(cdl_count(&mut ctx, cdl), 0);
     }
 
     #[test]
@@ -36744,7 +36754,7 @@ mod concurrency_tests {
 
         // Should not block (count is already 0)
         native_cdl_await(&mut ctx, &[Value::Object(Some(cdl))]).unwrap();
-        assert_eq!(ctx.get_field(cdl, CDL_FIELD_COUNT), Value::Int(0));
+        assert_eq!(cdl_count(&mut ctx, cdl), 0);
     }
 
     #[test]
@@ -36755,23 +36765,26 @@ mod concurrency_tests {
 
         native_cdl_count_down(&mut ctx, &[Value::Object(Some(cdl))]).unwrap();
         native_cdl_count_down(&mut ctx, &[Value::Object(Some(cdl))]).unwrap(); // extra
-        assert_eq!(ctx.get_field(cdl, CDL_FIELD_COUNT), Value::Int(0));
+        assert_eq!(cdl_count(&mut ctx, cdl), 0);
     }
 
     // -----------------------------------------------------------------------
     // Semaphore
     // -----------------------------------------------------------------------
 
+    // NOTE: since the descriptor-coercion fix the permits/fair pair lives in
+    // an int[2] holder object in slot 0 (the real Semaphore's only field is
+    // the reference-typed `sync`). Assert through `sem_permits`.
     #[test]
     fn sem_acquire_decrements_permits() {
         let mut ctx = make_ctx();
         let sem = alloc_concurrent_synthetic(&mut ctx, "java/util/concurrent/Semaphore", 2);
         native_sem_init(&mut ctx, &[Value::Object(Some(sem)), Value::Int(3)]).unwrap();
 
-        assert_eq!(ctx.get_field(sem, SEM_FIELD_PERMITS), Value::Int(3));
+        assert_eq!(sem_permits(&mut ctx, sem), 3);
 
         native_sem_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
-        assert_eq!(ctx.get_field(sem, SEM_FIELD_PERMITS), Value::Int(2));
+        assert_eq!(sem_permits(&mut ctx, sem), 2);
     }
 
     #[test]
@@ -36782,7 +36795,7 @@ mod concurrency_tests {
 
         // Release adds a permit (calls monitor_notify internally)
         native_sem_release(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
-        assert_eq!(ctx.get_field(sem, SEM_FIELD_PERMITS), Value::Int(2));
+        assert_eq!(sem_permits(&mut ctx, sem), 2);
     }
 
     #[test]
@@ -36793,7 +36806,7 @@ mod concurrency_tests {
 
         let result = native_sem_try_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
         assert_eq!(result, Some(Value::Int(0))); // false -- no permits available
-        assert_eq!(ctx.get_field(sem, SEM_FIELD_PERMITS), Value::Int(0));
+        assert_eq!(sem_permits(&mut ctx, sem), 0);
     }
 
     #[test]
@@ -36804,7 +36817,7 @@ mod concurrency_tests {
 
         let result = native_sem_try_acquire(&mut ctx, &[Value::Object(Some(sem))]).unwrap();
         assert_eq!(result, Some(Value::Int(1))); // true
-        assert_eq!(ctx.get_field(sem, SEM_FIELD_PERMITS), Value::Int(4));
+        assert_eq!(sem_permits(&mut ctx, sem), 4);
     }
 
     // -----------------------------------------------------------------------
