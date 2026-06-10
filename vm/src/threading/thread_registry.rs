@@ -456,6 +456,45 @@ impl ThreadRegistry {
         }
     }
 
+    /// GC maintenance for the registry's raw `java.lang.Thread` mirrors —
+    /// called by the GC initiator (under STW) with the collection's pointer
+    /// map.
+    ///
+    /// Every `ThreadEntry.java_thread_obj` is a raw address copy, and the
+    /// `thread_obj_to_park` reverse index is KEYED by such addresses. A
+    /// moving collection relocates the mirrors; without this step the
+    /// copies dangle: natives that serve them back to Java
+    /// (`enumerate_threads` / `Thread.getAllStackTraces`) resurrect stale
+    /// refs into bytecode (the all-zero-header invokevirtual WARN flood),
+    /// and `LockSupport.unpark(Thread)`'s O(1) lookup misses the live
+    /// mirror's new address — a silently lost unpark.
+    pub fn update_thread_objs_after_gc(&self, pointer_map: &HashMap<usize, usize>) {
+        if pointer_map.is_empty() {
+            return;
+        }
+        let mut threads = self.threads.lock();
+        let mut rekeyed: Vec<(usize, usize)> = Vec::new();
+        for entry in threads.values_mut() {
+            if let Some(ref mut obj) = entry.java_thread_obj {
+                let old_addr = obj.as_ptr() as usize;
+                if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                    // SAFETY: produced by the GC pointer map.
+                    *obj = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                    rekeyed.push((old_addr, new_addr));
+                }
+            }
+        }
+        drop(threads);
+        if !rekeyed.is_empty() {
+            let mut idx = self.thread_obj_to_park.lock();
+            for (old_addr, new_addr) in rekeyed {
+                if let Some(ps) = idx.remove(&old_addr) {
+                    idx.insert(new_addr, ps);
+                }
+            }
+        }
+    }
+
     /// Blocked-thread root maintenance — called by the GC initiator (under
     /// STW, before `complete_gc`) with the collection's pointer map.
     ///

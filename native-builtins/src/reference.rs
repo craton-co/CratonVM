@@ -439,6 +439,14 @@ fn native_rq_remove_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // yield, and `end_blocking_region_refs` re-syncs both the frames and
     // our local arg copies against the GC fixup accumulated while parked.
     let mut largs: Vec<Value> = args.to_vec();
+    // Exponential-backoff park (200µs → 10ms): the queue is usually empty
+    // (always, during bootstrap), and the JDK Reference Handler + Common
+    // Cleaner sit in this loop for the whole process lifetime. A hot
+    // yield-spin here costs a full core each AND a region-transition +
+    // root-snapshot deposit per iteration — measured as a ~10x bootstrap
+    // slowdown. Reference processing tolerates a ≤10ms wake (HotSpot
+    // blocks on a monitor here outright).
+    let mut backoff_us: u64 = 200;
     loop {
         let result = native_rq_poll(ctx, &largs)?;
         if let Some(Value::Object(Some(_))) = result {
@@ -448,8 +456,9 @@ fn native_rq_remove_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
             return Ok(Some(Value::Object(None)));
         }
         ctx.begin_blocking_region();
-        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_micros(backoff_us));
         ctx.end_blocking_region_refs(&mut largs);
+        backoff_us = (backoff_us * 2).min(10_000);
     }
 }
 
@@ -471,6 +480,8 @@ fn native_rq_remove_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     // the local arg copies on every region exit. The JDK Common Cleaner
     // parks here (`remove(60_000)`) for the whole process lifetime.
     let mut largs: Vec<Value> = args.to_vec();
+    // Exponential-backoff park — see `native_rq_remove_blocking`.
+    let mut backoff_us: u64 = 200;
     loop {
         let result = native_rq_poll(ctx, &largs)?;
         if let Some(Value::Object(Some(_))) = result {
@@ -480,8 +491,9 @@ fn native_rq_remove_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
             return Ok(Some(Value::Object(None)));
         }
         ctx.begin_blocking_region();
-        std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_micros(backoff_us));
         ctx.end_blocking_region_refs(&mut largs);
+        backoff_us = (backoff_us * 2).min(10_000);
     }
 }
 
