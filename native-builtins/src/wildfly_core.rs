@@ -1441,6 +1441,62 @@ fn native_async_future_task_await(
 
 /// Register all WildFly Core kernel natives with the method registry.
 pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
+    // --- DIAGNOSTIC (CRATONVM_DBG_CAPVAL): trace the two inputs of
+    // OperationContextImpl.validateCapabilities' `tolerant` flag
+    // (`getRunningMode() == ADMIN_ONLY && (capabilitiesAlreadyBroken ||
+    // isBooting())`). On HotSpot the WildFly subsystem-test boots with
+    // valid=false but tolerant=true (WFLYCTL0362 logged, boot continues);
+    // under CratonVM tolerant evaluates false and boot fails. Both
+    // methods are trivial field getters — the overrides read the same
+    // field by name and log, so behavior is preserved.
+    if std::env::var_os("CRATONVM_DBG_CAPVAL").is_some() {
+        let aoc = "org/jboss/as/controller/AbstractOperationContext";
+        r.register(aoc, "isBooting", "()Z", |ctx, args| {
+            let this = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let v = ctx.get_field_by_name(this, "booting");
+            let b = matches!(v, Value::Int(n) if n != 0);
+            eprintln!("[CAPVAL] isBooting -> {b} (raw={v:?})");
+            Ok(Some(Value::Int(if b { 1 } else { 0 })))
+        });
+        r.register(
+            aoc,
+            "getRunningMode",
+            "()Lorg/jboss/as/controller/RunningMode;",
+            |ctx, args| {
+                let this = match args.first() {
+                    Some(Value::Object(Some(o))) => *o,
+                    _ => return Ok(Some(Value::Object(None))),
+                };
+                let v = ctx.get_field_by_name(this, "runningMode");
+                let name = if let Value::Object(Some(m)) = v {
+                    match ctx.get_field_by_name(m, "name") {
+                        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                        _ => "<no-name>".to_string(),
+                    }
+                } else {
+                    "<null>".to_string()
+                };
+                // Identity check against the live RunningMode.ADMIN_ONLY static —
+                // validateCapabilities compares with if_acmpne, so a name match
+                // with a pointer mismatch IS the bug.
+                let static_admin = ctx
+                    .class_id_by_name("org/jboss/as/controller/RunningMode")
+                    .and_then(|cid| {
+                        ctx.static_field_index_by_name(cid, "ADMIN_ONLY")
+                            .map(|idx| ctx.get_static_field(cid, idx))
+                    });
+                let same = matches!((v, static_admin), (Value::Object(Some(a)), Some(Value::Object(Some(b)))) if a == b);
+                eprintln!(
+                    "[CAPVAL] getRunningMode -> {name} ({v:?}) static_ADMIN_ONLY={static_admin:?} identical={same}"
+                );
+                Ok(Some(v))
+            },
+        );
+    }
+
     // --- Services ---
     let services = "org/jboss/as/server/deployment/Services";
     r.register(
