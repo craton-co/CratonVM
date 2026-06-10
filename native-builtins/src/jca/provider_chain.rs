@@ -1638,36 +1638,38 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         );
     }
 
-    // BouncyCastle X509/cert-parsing extras — only the full real-JCA path
-    // (`CRATONVM_REAL_JCA`) drives real BC providers that need these. The SunEC
-    // keygen/sign/verify path used by EC-scoped default routing never touches
-    // `Provider.getProperty` or the JFR security-event helper, so leave these
-    // wired to full real-JCA mode to avoid shadowing real `Provider.getProperty`
-    // for unrelated default-mode apps.
-    if crate::real_jca_mode() {
-        // Provider.getProperty — return captured put/alias values, bypassing the
-        // real getProperty's checkInitialized() (which NPEs on our synthetic
-        // providers). Used by BC's X509SignatureUtil.lookupAlg to map signature
-        // OIDs back to names during cert parsing.
-        r.register(
-            prov,
-            "getProperty",
-            "(Ljava/lang/String;)Ljava/lang/String;",
-            provider_get_property,
-        );
-        // jdk.internal.event.EventHelper.isLoggingSecurity() — JFR security-event
-        // logging gate. Its real body dereferences the static `JUJA`
-        // (`SharedSecrets.getJavaUtilJarAccess()`), which is null in our VM, so it
-        // NPEs ("Cannot invoke isInitializing on null") on the
-        // CertificateFactory.generateCertificate -> JCAUtil.tryCommitCertEvent
-        // path. We don't emit JFR security events, so report logging-off (false).
-        r.register(
-            "jdk/internal/event/EventHelper",
-            "isLoggingSecurity",
-            "()Z",
-            |_ctx, _args| Ok(Some(Value::Int(0))),
-        );
-    }
+    // BouncyCastle X509/cert-parsing extras. These were previously gated to the
+    // full real-JCA path, but the bug they fix also bites DEFAULT mode: every
+    // provider we hand out is a synthetic allocated by `make_provider` (the JDK
+    // `Provider` constructor never runs, so the inherited `initialized` boolean
+    // is false). BC's `X509SignatureUtil.lookupAlg` -> `Security.getProvider(
+    // "BC").getProperty("Alg.Alias.Signature.OID.<oid>")` then hits the real
+    // `Provider.getProperty`, whose `checkInitialized()` throws a bare
+    // `IllegalStateException`, which BC rewraps as `CertificateParsingException:
+    // cannot construct SigAlgName` — failing ALL BC X.509 cert parsing (keycloak
+    // PemUtils/cert/RSAVerifier suites). Registering our `getProperty` override
+    // unconditionally returns the captured put/alias value (or null, which BC
+    // handles via its `getId()` fallback) and never touches `checkInitialized`.
+    // Safe in default mode: the real path is already broken for synthetic
+    // providers, and the EC-scoped real-SunEC routing never calls getProperty.
+    r.register(
+        prov,
+        "getProperty",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        provider_get_property,
+    );
+    // jdk.internal.event.EventHelper.isLoggingSecurity() — JFR security-event
+    // logging gate. Its real body dereferences the static `JUJA`
+    // (`SharedSecrets.getJavaUtilJarAccess()`), which is null in our VM, so it
+    // NPEs ("Cannot invoke isInitializing on null") on the
+    // CertificateFactory.generateCertificate -> JCAUtil.tryCommitCertEvent
+    // path. We don't emit JFR security events, so report logging-off (false).
+    r.register(
+        "jdk/internal/event/EventHelper",
+        "isLoggingSecurity",
+        "()Z",
+        |_ctx, _args| Ok(Some(Value::Int(0))),
+    );
 
     let sec = "java/security/Security";
     r.register(sec, "getProviders", "()[Ljava/security/Provider;", security_get_providers);
