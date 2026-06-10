@@ -611,6 +611,41 @@ pub fn native_return_pushed_to_stack(shared: &SharedVm, thread: &mut JvmThread) 
     crate::runtime::interpreter::update_root_snapshot(shared, thread);
 }
 
+/// Acquire a Java monitor, blocking GC-SAFELY on contention.
+///
+/// The uncontended/re-entrant paths are a couple of CASes
+/// (`enter_or_contend` → `None`). On contention the current owner may be
+/// parked at a GC safepoint waiting for `gc_complete`; a contender that
+/// blocks while still counted in the STW barrier's `expected` then wedges
+/// the whole VM (owner waits GC, contender waits owner, GC initiator waits
+/// contender — the H2 TestScript three-way deadlock). So before blocking we
+/// run the full blocking-site protocol: deposit roots, mark GC-blocked
+/// (collections proceed without us and fold our frame fixups), block, then
+/// re-sync via `check_post_block_gc`.
+pub(crate) fn monitor_enter_blocking(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    obj: ObjectRef,
+) {
+    let Some(m) = shared.monitors.enter_or_contend(obj, thread.thread_id) else {
+        return;
+    };
+    let tid = thread.thread_id;
+    let mut ctx = NativeContextImpl { shared, thread };
+    ctx.deposit_root_snapshot();
+    {
+        let blk = shared.gc_barrier.enter_blocked();
+        if blk.pre_stw {
+            // A STW was already in progress when we became blocked —
+            // arrive at the barrier so its `wait_for_all` completes.
+            let _ = shared.gc_barrier.arrive_and_wait(tid);
+        }
+        m.block_enter(tid);
+        drop(blk);
+    }
+    ctx.check_post_block_gc();
+}
+
 // ---------------------------------------------------------------------------
 // Field name в†’ slot index resolution
 // ---------------------------------------------------------------------------
@@ -958,7 +993,7 @@ impl<'a> NativeContextImpl<'a> {
     /// - The flag is cleared LAST, after the snapshot refresh: a GC that
     ///   starts in between waits for us (expected), sees a fresh snapshot,
     ///   and folds nothing new.
-    fn check_post_block_gc(&mut self) {
+    pub(crate) fn check_post_block_gc(&mut self) {
         self.check_post_block_gc_refs(&mut []);
     }
 
@@ -2678,7 +2713,8 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn monitor_enter(&mut self, obj: ObjectRef) {
-        self.shared.monitors.enter(obj, self.thread.thread_id);
+        // GC-safe contended acquire — see `monitor_enter_blocking`.
+        monitor_enter_blocking(self.shared, self.thread, obj);
         // JEP 491: a virtual thread that holds a monitor is pinned to its
         // carrier and cannot be unmounted. Track the pin depth so that
         // subsequent park/sleep calls can emit `jdk.VirtualThreadPinned`.
@@ -3106,7 +3142,23 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // tail; constructing a frame here is overkill).  Errors are
             // swallowed вЂ” the worst case is a missed wakeup, which an
             // existing unparker / interrupt would still resolve.
-            shared_arc.monitors.enter(thread_obj_for_spawn, tid);
+            //
+            // GC-safety: a CONTENDED acquire here (a joiner holds the
+            // monitor) must be marked GC-blocked or it wedges a concurrent
+            // STW (this thread is already marked dead and has no Java
+            // frames, so no root deposit is needed — there is nothing to
+            // scan or fix up).
+            if let Some(m) = shared_arc
+                .monitors
+                .enter_or_contend(thread_obj_for_spawn, tid)
+            {
+                let blk = shared_arc.gc_barrier.enter_blocked();
+                if blk.pre_stw {
+                    let _ = shared_arc.gc_barrier.arrive_and_wait(tid);
+                }
+                m.block_enter(tid);
+                drop(blk);
+            }
             let _ = shared_arc
                 .monitors
                 .notify_all(thread_obj_for_spawn, tid);
@@ -9768,7 +9820,9 @@ fn invoke_on_class_shared_inner(
                 }
             }
         };
-        shared.monitors.enter(obj, thread.thread_id);
+        // GC-safe contended acquire (see monitor_enter_blocking): every
+        // synchronized Java method dispatch funnels through here.
+        monitor_enter_blocking(shared, thread, obj);
         Some(SynchronizedMethodGuard {
             monitor_pool: &shared.monitors,
             obj,

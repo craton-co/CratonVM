@@ -402,6 +402,36 @@ impl Monitor {
         }
     }
 
+    /// Non-blocking acquire: `true` ⇒ acquired (fresh or re-entrant),
+    /// `false` ⇒ owned by another thread (the caller must take the
+    /// GC-blocked contended path — see `MonitorTable::enter_or_contend`).
+    fn try_enter(&self, thread_id: ThreadId) -> bool {
+        let mut state = self.state.lock();
+        match state.owner {
+            None => {
+                state.owner = Some(thread_id);
+                state.entry_count = 1;
+                true
+            }
+            Some(owner) if owner == thread_id => {
+                state.entry_count += 1;
+                true
+            }
+            Some(_) => false,
+        }
+    }
+
+    /// Blocking acquire of a CONTENDED monitor handed out by
+    /// `MonitorTable::enter_or_contend`. The caller MUST have marked itself
+    /// GC-blocked first (deposit roots + `GcBarrier::enter_blocked`): the
+    /// current owner may be parked at a GC safepoint waiting for
+    /// `gc_complete`, so a contender that still counts in the barrier's
+    /// `expected` wedges the whole VM (the H2 TestScript three-way STW
+    /// deadlock: owner waits GC, contender waits owner, GC waits contender).
+    pub(crate) fn block_enter(&self, thread_id: ThreadId) {
+        self.enter(thread_id);
+    }
+
     /// Release this monitor for the given thread.
     ///
     /// Decrements the entry count. When it reaches 0, the monitor is released
@@ -794,23 +824,48 @@ impl MonitorTable {
 
     /// Acquire the monitor for the given object on behalf of the given thread.
     ///
+    /// Blocking variant — prefer `enter_or_contend` from interpreter/native
+    /// call sites so the contended wait can be wrapped in the GC-blocked
+    /// protocol (an unmarked contended wait is counted in the STW barrier's
+    /// `expected` and deadlocks the collector against a safepoint-parked
+    /// owner — the H2 TestScript three-way wedge).
+    pub fn enter(&self, obj_ref: ObjectRef, thread_id: ThreadId) {
+        if let Some(m) = self.enter_or_contend(obj_ref, thread_id) {
+            m.block_enter(thread_id);
+        }
+    }
+
+    /// Acquire the monitor if possible WITHOUT blocking; on contention,
+    /// return the inflated `Monitor` for the caller to block on (after
+    /// marking itself GC-blocked — see `Monitor::block_enter`).
+    ///
     /// Fast paths (no allocation):
     /// * NEUTRAL          → CAS to THIN_LOCKED (uncontended uncrossed lock).
     /// * THIN_LOCKED(self) → bump recursion (re-entrant single-thread lock).
     ///
     /// Slow paths (inflate to a real `Monitor`):
-    /// * THIN_LOCKED(other) → inflate transferring ownership, then `enter`.
-    /// * THIN_LOCKED(self) at recursion = 255 → inflate, then `enter`.
-    /// * INFLATED         → dispatch to the existing `Monitor::enter`.
-    pub fn enter(&self, obj_ref: ObjectRef, thread_id: ThreadId) {
+    /// * THIN_LOCKED(other) → inflate transferring ownership, then try-enter.
+    /// * THIN_LOCKED(self) at recursion = 255 → inflate, then try-enter.
+    /// * INFLATED         → dispatch to `Monitor::try_enter`.
+    ///
+    /// `None` ⇒ acquired. `Some(m)` ⇒ contended; caller must
+    /// `m.block_enter(thread_id)` (the monitor may have been released in
+    /// the interim — `block_enter` then acquires immediately).
+    pub(crate) fn enter_or_contend(
+        &self,
+        obj_ref: ObjectRef,
+        thread_id: ThreadId,
+    ) -> Option<Arc<Monitor>> {
         // Fall back to the legacy heavyweight path if the ThreadId doesn't fit
         // in the 32-bit thin-lock owner field.
         let tid32 = match tid_to_u32(thread_id) {
             Some(t) => t,
             None => {
                 let m = self.inflate_for_legacy(obj_ref);
-                m.enter(thread_id);
-                return;
+                if m.try_enter(thread_id) {
+                    return None;
+                }
+                return Some(m);
             }
         };
 
@@ -818,7 +873,7 @@ impl MonitorTable {
 
         // ── Fast path 1: NEUTRAL → THIN_LOCKED via single CAS. ─────────────
         match try_thin_lock(header, tid32) {
-            Ok(()) => return,
+            Ok(()) => return None,
             Err(_) => { /* fall through with up-to-date classification below */ }
         }
 
@@ -828,7 +883,7 @@ impl MonitorTable {
                 s if s == types::MARK_NEUTRAL => {
                     // Raced with another exit() — retry the fast path once.
                     if try_thin_lock(header, tid32).is_ok() {
-                        return;
+                        return None;
                     }
                     // Lost the race again → inflate to avoid livelock.
                     // `inflate_locked` only Errs on the impossible "mark
@@ -838,15 +893,17 @@ impl MonitorTable {
                     let m = self
                         .inflate_locked(obj_ref, header)
                         .expect("monitor inflation invariant: registry/mark-word desync");
-                    m.enter(thread_id);
-                    return;
+                    if m.try_enter(thread_id) {
+                        return None;
+                    }
+                    return Some(m);
                 }
                 s if s == types::MARK_THIN_LOCKED => {
                     let owner = ObjectHeader::thin_lock_owner(cur);
                     if owner == tid32 {
                         // ── Fast path 2: re-entrant thin lock. ──────────
                         match try_thin_recursive_lock(header, tid32) {
-                            Ok(_) => return,
+                            Ok(_) => return None,
                             Err(err_mark) => {
                                 if ObjectHeader::mark_state(err_mark)
                                     == types::MARK_THIN_LOCKED
@@ -857,13 +914,16 @@ impl MonitorTable {
                                     // pre-acquires with entry_count =
                                     // recursion+1 = 256, capturing our prior
                                     // re-entrant acquisitions. Now bump once
-                                    // more via reentrant `enter` to record the
-                                    // current attempted acquisition.
+                                    // more (re-entrant try_enter always
+                                    // succeeds) to record the current
+                                    // attempted acquisition.
                                     let m = self
                                         .inflate_locked(obj_ref, header)
                                         .expect("monitor inflation invariant: registry/mark-word desync");
-                                    m.enter(thread_id);
-                                    return;
+                                    if m.try_enter(thread_id) {
+                                        return None;
+                                    }
+                                    return Some(m);
                                 }
                                 // Otherwise the state changed under us; reclassify.
                                 continue;
@@ -874,22 +934,24 @@ impl MonitorTable {
                         // `inflate_locked` re-snapshots under its mutex and
                         // pre-acquires for whatever owner the mark word
                         // currently shows (or none if it has since gone
-                        // NEUTRAL). We then `enter` on behalf of ourselves;
-                        // if the inflated monitor is owned by the other
-                        // thread we will block until they release through
-                        // the heavyweight path.
+                        // NEUTRAL). try_enter succeeds if it has since been
+                        // released; otherwise the caller blocks GC-marked.
                         let m = self
                             .inflate_locked(obj_ref, header)
                             .expect("monitor inflation invariant: registry/mark-word desync");
-                        m.enter(thread_id);
-                        return;
+                        if m.try_enter(thread_id) {
+                            return None;
+                        }
+                        return Some(m);
                     }
                 }
                 s if s == types::MARK_INFLATED => {
                     // ── Slow path: already inflated → dispatch directly. ─
                     if let Some(m) = self.lookup_inflated(obj_ref) {
-                        m.enter(thread_id);
-                        return;
+                        if m.try_enter(thread_id) {
+                            return None;
+                        }
+                        return Some(m);
                     }
                     // Registry miss (should not happen): re-inflate. The
                     // window between the inflating thread's mark-word CAS
@@ -899,8 +961,10 @@ impl MonitorTable {
                     let m = self
                         .inflate_locked(obj_ref, header)
                         .expect("monitor inflation invariant: registry/mark-word desync");
-                    m.enter(thread_id);
-                    return;
+                    if m.try_enter(thread_id) {
+                        return None;
+                    }
+                    return Some(m);
                 }
                 _ => {
                     // Reserved state 0b11 — should never occur. Fall back to
@@ -908,8 +972,10 @@ impl MonitorTable {
                     let m = self
                         .inflate_locked(obj_ref, header)
                         .expect("monitor inflation invariant: registry/mark-word desync");
-                    m.enter(thread_id);
-                    return;
+                    if m.try_enter(thread_id) {
+                        return None;
+                    }
+                    return Some(m);
                 }
             }
         }

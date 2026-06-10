@@ -3,6 +3,32 @@
 
 //! Utility functions: class initialization, preparation, descriptor helpers,
 //! and the ClassStoreHierarchy adapter for the bytecode verifier.
+//!
+//! # `<clinit>` failure policy (JVMS §5.5)
+//!
+//! When a class's `<clinit>` throws, the **default** behavior of this module is
+//! the JVMS-conformant one: the class is transitioned to
+//! [`ClassState::InitializationError`] and the failure is propagated to the
+//! caller (an `Error` subclass propagates as-is; any other throwable is wrapped
+//! in `ExceptionInInitializerError`). **No** static state is fabricated. This is
+//! correct for an open-source JVM and avoids masking real initialization bugs in
+//! user code.
+//!
+//! For the framework "app gauntlet" (Quarkus / JBoss / Spring / WildFly /
+//! SLF4J-logback / ICU, …) some real `<clinit>` paths currently fail because of
+//! capability gaps (resource loading, module loading, logging-backend init).
+//! Setting **`CRATONVM_LENIENT_CLINIT=1`** restores the legacy lenient mode: for
+//! an allowlisted set of framework/JDK packages and a list of "recoverable"
+//! exception types, the failure is *swallowed*, the class is marked
+//! `Initialized` anyway, and [`post_clinit_fixup`] backfills the load-bearing
+//! statics that downstream framework code reads (these app-specific synthetic
+//! backfills are **only** reachable under this gate). Every swallow under the
+//! lenient gate emits a one-line `tracing::warn!` so the divergence is visible.
+//!
+//! This inverts the historical default (which was lenient, with
+//! `CRATONVM_STRICT_SWALLOWS=1` opting *into* the correct behavior). The strict
+//! escalation gate is still honoured where present, but it is now a no-op for
+//! the swallow path because swallowing no longer happens by default.
 
 use crate::classloading::{find_field_recursive, Class, ClassId, ClassState, ClassStore};
 use crate::error::{LinkageError, MethodCallFailed, RuntimeError, VmError};
@@ -12,6 +38,23 @@ use cratonvm_types::ArrayElementType;
 use cratonvm_types::ObjectRef;
 
 use super::SharedVm;
+
+/// `CRATONVM_LENIENT_CLINIT=1` re-enables the legacy lenient `<clinit>`-failure
+/// handling: swallow the failure for an allowlisted framework/JDK package set,
+/// mark the class `Initialized`, and run [`post_clinit_fixup`]'s app-specific
+/// synthetic backfills. **Default OFF** — when unset the JVMS-correct path runs
+/// (mark `InitializationError` + throw; no synthetic state). See the module doc
+/// comment. Cached once for the process lifetime; only the literal `"1"` enables
+/// it (mirroring the `CRATONVM_STRICT_SWALLOWS` convention).
+#[inline]
+fn lenient_clinit() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_LENIENT_CLINIT") {
+        Ok(v) => v == "1",
+        Err(_) => false,
+    })
+}
 
 /// Lazily allocate and cache the canonical `System.in` `FileInputStream` (stdin fd 0).
 ///
@@ -205,6 +248,24 @@ pub fn ensure_class_initialized_shared(
                     .cloned();
                 if let Some(pair) = waiter {
                     let (lock, cvar) = &*pair;
+                    // GC-safety (the H2 TestScript three-way STW deadlock):
+                    // the initializing thread may be parked at a GC
+                    // safepoint inside <clinit> waiting for gc_complete;
+                    // if WE park here while still counted in the barrier's
+                    // `expected`, the GC initiator wedges in wait_for_all
+                    // forever (and the 30s re-park loop never arrives).
+                    // Run the full blocking-site protocol: deposit roots,
+                    // mark GC-blocked (collections proceed and fold our
+                    // frame fixups), wait, then re-sync on wake.
+                    let mut ctx =
+                        crate::vm::vm_exec::NativeContextImpl { shared, thread };
+                    ctx.deposit_root_snapshot();
+                    let blk = shared.gc_barrier.enter_blocked();
+                    if blk.pre_stw {
+                        let _ = shared.gc_barrier.arrive_and_wait(
+                            crate::threading::jvm_thread::ThreadId(current_thread_id),
+                        );
+                    }
                     // Round-9 HIGH-4: parking_lot::Mutex + Condvar — no
                     // poison handling, wait_for returns a WaitTimeoutResult
                     // (no Result wrapper) since it cannot fail.
@@ -212,6 +273,9 @@ pub fn ensure_class_initialized_shared(
                     // Wait with timeout to avoid deadlock on misconfigured init
                     let _result = cvar
                         .wait_for(&mut guard, std::time::Duration::from_secs(30));
+                    drop(guard);
+                    drop(blk);
+                    ctx.check_post_block_gc();
                     // Loop back to re-check state (might be Initialized or Error)
                     continue;
                 }
@@ -771,7 +835,11 @@ fn initialize_class_shared(
                         || feature.contains("stack overflow")
                         || feature.contains("invokedynamic")
                 );
-                if is_stack_underflow {
+                if is_stack_underflow && lenient_clinit() {
+                    tracing::warn!(
+                        class = %class_name_for_jfr,
+                        "CRATONVM_LENIENT_CLINIT: swallowing <clinit> stack-error/invokedynamic failure and marking Initialized (JVMS-divergent)"
+                    );
                     crate::runtime::diagnostics::record_swallow(
                         shared,
                         "<clinit>",
@@ -869,7 +937,16 @@ fn initialize_class_shared(
                         ))
                     )
                 };
-                if is_swallowable {
+                // JVMS §5.5 default: a failing `<clinit>` is *not* swallowed —
+                // the class becomes Erroneous and the failure propagates (see
+                // the fall-through below). The lenient framework-bootstrap mode
+                // (swallow + `post_clinit_fixup` synthetic backfill) is opt-in
+                // via `CRATONVM_LENIENT_CLINIT=1`. See the module doc comment.
+                if is_swallowable && lenient_clinit() {
+                    tracing::warn!(
+                        class = %class_name_for_jfr,
+                        "CRATONVM_LENIENT_CLINIT: swallowing <clinit> failure, marking Initialized + running post_clinit_fixup (JVMS-divergent)"
+                    );
                     // Report the exception's class name AND its
                     // detailMessage (field 0 on Throwable subclasses).
                     // Earlier sessions avoided reading the message because
@@ -2818,5 +2895,31 @@ mod tests {
             Some(ClassState::Initialized),
             "expected Initialized after skip, got {final_state:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // <clinit>-failure policy gate (JVMS §5.5 default-strict inversion)
+    //
+    // The lenient swallow + post_clinit_fixup path must be OFF by default so
+    // a failing `<clinit>` propagates (Erroneous) instead of fabricating
+    // synthetic statics. The behavior is opt-in via `CRATONVM_LENIENT_CLINIT=1`.
+    // We can only deterministically assert the default here (the gate is a
+    // process-lifetime `OnceLock`, so mutating the env mid-test would be
+    // racy). When the env var is absent, the gate must read `false`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lenient_clinit_defaults_off() {
+        // Guard against a polluted CI env explicitly setting the opt-in.
+        if std::env::var("CRATONVM_LENIENT_CLINIT").as_deref() == Ok("1") {
+            // Opt-in is honored — gate reads true. Nothing else to assert.
+            assert!(lenient_clinit());
+        } else {
+            // Default / unset / any non-"1" value => strict (JVMS-correct).
+            assert!(
+                !lenient_clinit(),
+                "lenient <clinit> swallow must be OFF unless CRATONVM_LENIENT_CLINIT=1"
+            );
+        }
     }
 }

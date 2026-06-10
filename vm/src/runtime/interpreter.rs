@@ -2959,13 +2959,44 @@ pub fn execute(
                     } else {
                         false
                     };
+                    // Round-11 fix (AIOOBE leak): complete the NPE drain for the
+                    // pending-AIOOBE flag, drained AFTER the NPE (a frame cannot
+                    // have both pending at once, matching JVM semantics). A JIT
+                    // void-return store helper that hits an out-of-bounds index
+                    // sets `JIT_PENDING_AIOOBE` and returns normally (it cannot
+                    // use the i64::MIN sentinel), so without this drain the
+                    // ArrayIndexOutOfBoundsException would leak to the next
+                    // unrelated JIT helper call. Stash it into
+                    // `jit_early_exception` so the post-frame-push handler walker
+                    // (~line 2340) can catch it in the JIT'd method, mirroring
+                    // the NPE block above. The `create_exception_object` error
+                    // arm covers the rt.jar-not-loaded boot path (no AIOOBE class
+                    // yet).
+                    let aioobe_routed =
+                        if let Some((index, length)) = crate::jit::helpers::take_jit_pending_aioobe() {
+                            let msg = format!("Index {index} out of bounds for length {length}");
+                            match crate::runtime::exceptions::create_exception_object(
+                                shared,
+                                thread,
+                                "java/lang/ArrayIndexOutOfBoundsException",
+                                Some(&msg),
+                            ) {
+                                Ok(exc) => {
+                                    jit_early_exception = Some(exc);
+                                    true
+                                }
+                                Err(other) => return Err(other),
+                            }
+                        } else {
+                            false
+                        };
                     // Deopt sentinel: i64::MIN means the JIT method was deoptimized
                     // via jit_uncommon_trap.  Fall through to the interpreter to
                     // re-execute the method from scratch.
-                    // If an NPE was routed above, also fall through so the
-                    // post-frame-push exception handler walker (~line 2340)
+                    // If an NPE or AIOOBE was routed above, also fall through so
+                    // the post-frame-push exception handler walker (~line 2340)
                     // gets a chance to catch it in the JIT'd method.
-                    if !npe_routed && result != i64::MIN {
+                    if !npe_routed && !aioobe_routed && result != i64::MIN {
                     return match ret_type {
                         // Cast: JIT ABI -- i64 register convention
                         b'I' | b'Z' | b'B' | b'C' | b'S' => Ok(Some(Value::Int(result as i32))),
@@ -5470,6 +5501,26 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                 return Ok(value);
             }
             Err(MethodCallFailed::InternalError(VmError::Runtime(re))) => {
+                // B4 fix (audit `vm-runtime.md`): an operand-stack overflow is
+                // reported by `ValueStack::push` as
+                // `NotImplemented { feature: "operand stack overflow" }`, which
+                // `throw_runtime_error` maps to an *uncatchable* internal error
+                // (exceptions.rs) — so a JVM stack overflow on unverified
+                // bytecode (or a verifier gap) hard-unwinds the whole call stack
+                // instead of surfacing as a Java-catchable
+                // `java.lang.StackOverflowError`. Normalize it to the real
+                // `StackOverflowError` runtime variant here (the only point that
+                // converts runtime errors into Java exceptions) so the routing
+                // below builds a real throwable and an in-method
+                // `catch (StackOverflowError)` / `catch (Throwable)` observes it.
+                let re = match re {
+                    RuntimeError::NotImplemented { feature }
+                        if feature == "operand stack overflow" =>
+                    {
+                        RuntimeError::StackOverflowError
+                    }
+                    other => other,
+                };
                 // Convert VM-generated RuntimeErrors (AIOOBE, NPE, CCE, etc.)
                 // into real Java exception objects so they can be caught by
                 // Java try/catch blocks.
@@ -8225,7 +8276,11 @@ fn execute_instruction(
             } else {
                 None
             };
-            shared.monitors.enter(obj_ref, thread.thread_id);
+            // GC-safe contended acquire — an unmarked contended wait here is
+            // counted in the STW barrier's `expected` and deadlocks the
+            // collector against a safepoint-parked owner (see
+            // vm_exec::monitor_enter_blocking).
+            crate::vm::monitor_enter_blocking(shared, thread, obj_ref);
             if let Some(start) = mon_start {
                 let mon_dur = start.elapsed();
                 if mon_dur.as_micros() > 1000 {
@@ -13675,7 +13730,45 @@ fn try_osr(
         return None;
     }
     if let Some((index, length)) = crate::jit::helpers::take_jit_pending_aioobe() {
-        crate::jit::helpers::stash_jit_pending_aioobe(index, length);
+        // Round-11 fix: mirror the NPE block above for AIOOBE on the OSR bail
+        // path. Route the ArrayIndexOutOfBoundsException through the OSR'd
+        // method's own exception table first (the OSR target IS the method
+        // whose code raised it); if a handler whose `[start_pc, end_pc)`
+        // covers `entry_pc` is found, jump the interpreter PC there and resume
+        // in the catch block by returning `None`. Otherwise re-stash so the
+        // exception survives the OSR→interpreter handoff and is surfaced by
+        // the next JIT helper return drain rather than being silently lost.
+        let msg = format!("Index {index} out of bounds for length {length}");
+        match crate::runtime::exceptions::create_exception_object(
+            shared,
+            thread,
+            "java/lang/ArrayIndexOutOfBoundsException",
+            Some(&msg),
+        ) {
+            Ok(exc) => {
+                if let Some((handler_pc, exc_ref)) = find_exception_handler_any_pc(
+                    shared,
+                    &thread.frames[frame_idx],
+                    entry_pc,
+                    exc,
+                ) {
+                    let frame = &mut thread.frames[frame_idx];
+                    frame.stack.clear();
+                    let _ = frame.stack.push(Value::Object(Some(exc_ref)));
+                    frame.pc = handler_pc;
+                    fire_jvmti_exception_catch(frame, handler_pc);
+                    return None;
+                }
+                // No in-frame handler — re-stash so the AIOOBE is not lost.
+                crate::jit::helpers::stash_jit_pending_aioobe(index, length);
+            }
+            Err(_) => {
+                // Couldn't construct the Java object (e.g. rt.jar not loaded) —
+                // re-stash the raw flag as before so the next JIT drain still
+                // surfaces it.
+                crate::jit::helpers::stash_jit_pending_aioobe(index, length);
+            }
+        }
         return None;
     }
     let result_i64 = match result_i64 {
@@ -14778,21 +14871,27 @@ fn resolve_inline_site(
 
     let callee_class_info = cm.get_class(declaring_id)?;
 
-    let mut field_info = Vec::new();
+    // Lock-order discipline (audit follow-up to the H2 ABBA fix): collect
+    // the constant-pool facts for field ops HERE (they borrow `cm`), but
+    // DELAY every `resolve_field_ref` call until `cm` is dropped below —
+    // resolve_field_ref re-locks class_manager with a plain read() (wedges
+    // behind any queued writer while we hold this read), can take
+    // class_manager.write() via load_class_concurrent on a cold field
+    // class (same-thread self-deadlock), and writes resolution_cache (the
+    // cm→resolution_cache inversion).
+    let mut field_sites: Vec<(usize, u16, u8)> = Vec::new();
     if has_field_ops {
         let mut fpc = 0;
         while fpc < code_len {
             if matches!(code[fpc], 0xb4 | 0xb5) && fpc + 2 < code_len {
                 let cp_idx = ((code[fpc + 1] as u16) << 8) | code[fpc + 2] as u16; // Cast: bytecode operand decoding
-                if let Ok(resolved) = resolve_field_ref(shared, declaring_id, cp_idx) {
-                    let nat_idx = match callee_class_info.constant_pool.get(cp_idx) {
-                        Some(ConstantPoolEntry::FieldReference { name_and_type_index, .. }) => *name_and_type_index,
-                        _ => return None,
-                    };
-                    if let Some((_, desc)) = callee_class_info.constant_pool.get_name_and_type(nat_idx) {
-                        let type_tag = *desc.as_bytes().first().unwrap_or(&b'L');
-                        field_info.push((fpc, resolved.field_index, type_tag));
-                    }
+                let nat_idx = match callee_class_info.constant_pool.get(cp_idx) {
+                    Some(ConstantPoolEntry::FieldReference { name_and_type_index, .. }) => *name_and_type_index,
+                    _ => return None,
+                };
+                if let Some((_, desc)) = callee_class_info.constant_pool.get_name_and_type(nat_idx) {
+                    let type_tag = *desc.as_bytes().first().unwrap_or(&b'L');
+                    field_sites.push((fpc, cp_idx, type_tag));
                 }
                 fpc += 3;
             } else {
@@ -14801,21 +14900,19 @@ fn resolve_inline_site(
         }
     }
 
-    let mut static_field_info = Vec::new();
+    let mut static_sites: Vec<(usize, u16, u8)> = Vec::new();
     if has_static_field_ops {
         let mut fpc = 0;
         while fpc < code_len {
             if matches!(code[fpc], 0xb2 | 0xb3) && fpc + 2 < code_len {
                 let cp_idx = ((code[fpc + 1] as u16) << 8) | code[fpc + 2] as u16; // Cast: bytecode operand decoding
-                if let Ok(resolved) = resolve_field_ref(shared, declaring_id, cp_idx) {
-                    let nat_idx = match callee_class_info.constant_pool.get(cp_idx) {
-                        Some(ConstantPoolEntry::FieldReference { name_and_type_index, .. }) => *name_and_type_index,
-                        _ => return None,
-                    };
-                    if let Some((_, desc)) = callee_class_info.constant_pool.get_name_and_type(nat_idx) {
-                        let type_tag = *desc.as_bytes().first().unwrap_or(&b'L');
-                        static_field_info.push((fpc, resolved.declaring_class_id.as_u32(), resolved.field_index, type_tag, resolved.is_volatile));
-                    }
+                let nat_idx = match callee_class_info.constant_pool.get(cp_idx) {
+                    Some(ConstantPoolEntry::FieldReference { name_and_type_index, .. }) => *name_and_type_index,
+                    _ => return None,
+                };
+                if let Some((_, desc)) = callee_class_info.constant_pool.get_name_and_type(nat_idx) {
+                    let type_tag = *desc.as_bytes().first().unwrap_or(&b'L');
+                    static_sites.push((fpc, cp_idx, type_tag));
                 }
                 fpc += 3;
             } else {
@@ -14879,6 +14976,27 @@ fn resolve_inline_site(
     let padded = crate::runtime::frame::padded_bytecode(&code_bytes);
 
     drop(cm);
+
+    // Phase 2 — resolve field refs with NO class_manager guard held (see
+    // the lock-order comment above).
+    let mut field_info = Vec::new();
+    for (fpc, cp_idx, type_tag) in field_sites {
+        if let Ok(resolved) = resolve_field_ref(shared, declaring_id, cp_idx) {
+            field_info.push((fpc, resolved.field_index, type_tag));
+        }
+    }
+    let mut static_field_info = Vec::new();
+    for (fpc, cp_idx, type_tag) in static_sites {
+        if let Ok(resolved) = resolve_field_ref(shared, declaring_id, cp_idx) {
+            static_field_info.push((
+                fpc,
+                resolved.declaring_class_id.as_u32(),
+                resolved.field_index,
+                type_tag,
+                resolved.is_volatile,
+            ));
+        }
+    }
 
     Some(cratonvm_jit::InlineSite {
         callee_code: padded.to_vec(),
@@ -15147,10 +15265,44 @@ fn execute_jit_call(
         }
     }
 
+    // Round-11 fix (AIOOBE leak): complete the round-8/9 NPE drain for the
+    // pending-AIOOBE flag. A JIT void-return store helper
+    // (`jit_iastore`/`jit_bastore`/`jit_aastore`/...) that hits an
+    // out-of-bounds index sets `JIT_PENDING_AIOOBE` and returns normally —
+    // it cannot signal via the i64::MIN deopt sentinel — so the AIOOBE drain
+    // inside the `result == i64::MIN` arm below never observes it and the
+    // exception would silently leak to the next unrelated JIT helper call.
+    // Drain it here, on the same normal-return path as the NPE drain above
+    // and AFTER it (a frame cannot have both pending at once, matching JVM
+    // semantics), and route the ArrayIndexOutOfBoundsException through the
+    // JIT'd method's own exception table exactly like the NPE block — so an
+    // in-method `catch (ArrayIndexOutOfBoundsException ...)` actually
+    // observes the throw. `usize::MAX` for `throw_pc` mirrors the NPE path
+    // (skip catch-all `finally` entries, still match typed handlers).
+    if let Some((index, length)) = crate::jit::helpers::take_jit_pending_aioobe() {
+        let msg = format!("Index {index} out of bounds for length {length}");
+        match crate::runtime::exceptions::create_exception_object(
+            shared,
+            thread,
+            "java/lang/ArrayIndexOutOfBoundsException",
+            Some(&msg),
+        ) {
+            Ok(exc) => {
+                return route_jit_exception_through_method(
+                    shared, thread, frame_idx, cached, usize::MAX, exc,
+                );
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
     // Deopt sentinel: i64::MIN means the method was deoptimized — fall through
     // to the interpreter slow path to re-execute.
     if result == i64::MIN {
-        // Check for pending AIOOBE from JIT bounds check
+        // Check for pending AIOOBE from JIT bounds check (now unreachable in
+        // practice — the drain above takes the flag on every return path,
+        // including the i64::MIN deopt case — kept as a defensive belt; the
+        // routing above supersedes the old uncatchable InternalError below).
         if let Some((index, _length)) = crate::jit::helpers::take_jit_pending_aioobe() {
             if std::env::var_os("CRATONVM_DBG_AIOOBE").is_some() {
                 eprintln!("[AIOOBE-JIT] idx={index} len={_length} — JIT-compiled bounds check failed");

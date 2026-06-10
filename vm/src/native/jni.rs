@@ -2413,7 +2413,18 @@ extern "C" fn jni_monitor_enter(_env: JNIEnv, obj: JObject) -> JInt {
     }
     with_shared_vm(|shared| {
         let oref = jobject_to_obj(obj)?;
-        shared.monitors.enter(oref, ThreadId(0)); // thread_id 0 for JNI
+        // thread_id 0 for JNI. GC-safety: mark a CONTENDED acquire blocked
+        // so a concurrent STW proceeds without us (no JvmThread in this
+        // context; the calling thread's Java roots are covered by its own
+        // registry snapshot).
+        if let Some(m) = shared.monitors.enter_or_contend(oref, ThreadId(0)) {
+            let blk = shared.gc_barrier.enter_blocked();
+            if blk.pre_stw {
+                let _ = shared.gc_barrier.arrive_and_wait(ThreadId(0));
+            }
+            m.block_enter(ThreadId(0));
+            drop(blk);
+        }
         Some(JNI_OK)
     })
     .flatten()
