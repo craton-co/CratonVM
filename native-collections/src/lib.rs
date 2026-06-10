@@ -3554,23 +3554,14 @@ fn native_map_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    // S111r24-fix: Source may be a LinkedHashMap whose entries live in the
-    // Rust-side `lhm_overlay`. Walk its insertion-order list first; only
-    // fall back to HashMap bucket scanning when there is no LHM head
-    // pointer registered for `other`.
-    let mut entries: Vec<(Value, Value)> = Vec::new();
-    let lhm_head = lhm_get(ctx, other, "head", LHM_FIELD_HEAD);
-    if let Value::Object(Some(_)) = lhm_head {
-        let mut cur = lhm_head;
-        while let Value::Object(Some(node)) = cur {
-            let key = ctx.get_field(node, LHM_NODE_KEY);
-            let val = ctx.get_field(node, LHM_NODE_VALUE);
-            entries.push((key, val));
-            cur = ctx.get_field(node, LHM_NODE_AFTER);
-        }
-    } else {
-        entries = map_collect_entries(ctx, other);
-    }
+    // Collect entries from the source, dispatching on its concrete backend
+    // (LinkedHashMap overlay, TreeMap tree, HashMap/CHM buckets, or — via the
+    // `entrySet().iterator()` fallback — any other `Map` such as the real-JDK
+    // `Collections$Unmodifiable*Map` wrappers). Previously this only handled
+    // LinkedHashMap and fell back to HashMap-bucket scanning, so `putAll(tm)`
+    // for a TreeMap / unmodifiable-sorted-map source silently copied nothing
+    // (the Elasticsearch `Settings.Builder.put(Settings)` failure).
+    let entries = collect_entries_any(ctx, other);
     for (key, value) in entries {
         if let Value::Object(Some(k)) = key {
             // Call put on this map
@@ -3760,6 +3751,10 @@ fn source_map_remove(
 /// dispatching on the concrete backend so a LinkedHashMap's overlay / a
 /// TreeMap's tree are read correctly rather than as empty bucket tables.
 fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(Value, Value)> {
+    // See through CratonVM's synthetic unmodifiable wrapper first so a
+    // `Map.of(...)` / `Collections.unmodifiableMap(...)` source is read as its
+    // backing map (and the TreeMap/LHM dispatch below sees the real class).
+    let source = unwrap_unmod(ctx, source);
     let cls = ctx
         .class_name_of_id(ctx.class_id_of_object(source))
         .unwrap_or_default();
@@ -3771,7 +3766,106 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
     if is_tree_map_receiver(ctx, source) {
         return tm_collect_pairs(ctx, source);
     }
-    map_collect_entries(ctx, source)
+    let entries = map_collect_entries(ctx, source);
+    if !entries.is_empty() {
+        return entries;
+    }
+    // The HashMap/CHM bucket reader found nothing. That is either a genuinely
+    // empty map, or a `Map` whose internal layout CratonVM does not model
+    // natively — e.g. the real-JDK `Collections$Unmodifiable{Navigable,Sorted}Map`
+    // wrappers that `Settings.settings` uses (`new HashMap<>(settings.settings)`
+    // in `Settings.Builder.put(Settings)`), or any third-party `Map`. Consult
+    // the map's own `isEmpty()`; only if it actually has entries do we pay for
+    // the polymorphic `entrySet().iterator()` walk — the same contract the JDK's
+    // `HashMap.putMapEntries` relies on — so the copy works for ANY `Map`.
+    let nonempty = matches!(
+        ctx.invoke(
+            "java/util/Map",
+            "isEmpty",
+            "()Z",
+            &[Value::Object(Some(source))],
+        ),
+        Ok(Some(Value::Int(0)))
+    );
+    if nonempty {
+        return collect_entries_via_iterator(ctx, source);
+    }
+    entries
+}
+
+/// Walk an arbitrary `java.util.Map` via its polymorphic
+/// `entrySet().iterator()`, reading each entry's key/value through the real
+/// `Map.Entry` accessors. Layout-agnostic fallback used by
+/// [`collect_entries_any`] for `Map` implementations CratonVM does not model
+/// natively (real-JDK unmodifiable wrappers, third-party maps).
+fn collect_entries_via_iterator(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+) -> Vec<(Value, Value)> {
+    let mut out = Vec::new();
+    let set = match ctx.invoke(
+        "java/util/Map",
+        "entrySet",
+        "()Ljava/util/Set;",
+        &[Value::Object(Some(source))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return out,
+    };
+    let it = match ctx.invoke(
+        "java/util/Set",
+        "iterator",
+        "()Ljava/util/Iterator;",
+        &[Value::Object(Some(set))],
+    ) {
+        Ok(Some(Value::Object(Some(i)))) => i,
+        _ => return out,
+    };
+    loop {
+        let has_next = matches!(
+            ctx.invoke(
+                "java/util/Iterator",
+                "hasNext",
+                "()Z",
+                &[Value::Object(Some(it))],
+            ),
+            Ok(Some(Value::Int(n))) if n != 0
+        );
+        if !has_next {
+            break;
+        }
+        let entry = match ctx.invoke(
+            "java/util/Iterator",
+            "next",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(it))],
+        ) {
+            Ok(Some(Value::Object(Some(e)))) => e,
+            _ => break,
+        };
+        let key = ctx
+            .invoke(
+                "java/util/Map$Entry",
+                "getKey",
+                "()Ljava/lang/Object;",
+                &[Value::Object(Some(entry))],
+            )
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Object(None));
+        let value = ctx
+            .invoke(
+                "java/util/Map$Entry",
+                "getValue",
+                "()Ljava/lang/Object;",
+                &[Value::Object(Some(entry))],
+            )
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Object(None));
+        out.push((key, value));
+    }
+    out
 }
 
 /// Build a keySet/entrySet view: a `HashSet` snapshot whose backing remembers
@@ -10644,24 +10738,14 @@ fn native_map_init_from_map(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     set_map_size(ctx, this, 0);
     ctx.set_field(this, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
 
-    // Copy entries from source.
-    // S111r24-fix: When source is a LinkedHashMap, its entries live in the
-    // Rust-side `lhm_overlay`, not in HashMap-style buckets. Walk the LHM
-    // insertion-order list first, falling back to HashMap bucket scanning
-    // for plain HashMaps / CHMs / etc.
-    let mut entries: Vec<(Value, Value)> = Vec::new();
-    let lhm_head = lhm_get(ctx, source, "head", LHM_FIELD_HEAD);
-    if let Value::Object(Some(_)) = lhm_head {
-        let mut cur = lhm_head;
-        while let Value::Object(Some(node)) = cur {
-            let key = ctx.get_field(node, LHM_NODE_KEY);
-            let val = ctx.get_field(node, LHM_NODE_VALUE);
-            entries.push((key, val));
-            cur = ctx.get_field(node, LHM_NODE_AFTER);
-        }
-    } else {
-        entries = map_collect_entries(ctx, source);
-    }
+    // Copy entries from source, dispatching on its concrete backend
+    // (LinkedHashMap overlay, TreeMap tree, HashMap/CHM buckets, or — via the
+    // `entrySet().iterator()` fallback — any other `Map` such as the real-JDK
+    // `Collections$Unmodifiable*Map` wrappers). Previously this only handled
+    // LinkedHashMap and fell back to HashMap-bucket scanning, so
+    // `new HashMap<>(treeMap)` / `new HashMap<>(unmodifiableNavigableMap)`
+    // silently produced an empty map.
+    let entries = collect_entries_any(ctx, source);
     for (key, value) in entries {
         native_map_put(ctx, &[Value::Object(Some(this)), key, value])?;
     }
@@ -13697,46 +13781,14 @@ fn native_lhm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
 
-    // Collect entries from source map (walk either LHM insertion list or HashMap buckets).
-    // S111r24-fix: LHM keeps `head`/`tail`/`table` in the Rust-side overlay
-    // (`lhm_overlay`), NOT in Java field slots. Use `lhm_get` to retrieve
-    // them; `ctx.get_field(source, LHM_FIELD_HEAD)` always returns
-    // `Object(None)` for a real LHM allocated by our natives, which made
-    // `putAll` and `new LHM<>(map)` silently produce an empty map. This
-    // broke any downstream code that relied on copy-constructing a
-    // LinkedHashMap from another LinkedHashMap, e.g. Spring's
-    // `AnnotationAttributes(Map<String,Object>)`.
-    let mut entries = Vec::new();
-    let head = lhm_get(ctx, source, "head", LHM_FIELD_HEAD);
-    if let Value::Object(Some(_)) = head {
-        let mut cur = head;
-        while let Value::Object(Some(node)) = cur {
-            let key = ctx.get_field(node, LHM_NODE_KEY);
-            let val = ctx.get_field(node, LHM_NODE_VALUE);
-            entries.push((key, val));
-            cur = ctx.get_field(node, LHM_NODE_AFTER);
-        }
-    } else {
-        // Fall back to HashMap bucket scan when source isn't an LHM (e.g.
-        // a plain HashMap, ConcurrentHashMap, etc.).
-        let (buckets, _, cap) = map_state(ctx, source);
-        if let Some(b) = buckets {
-            for i in 0..(cap as usize) {
-                let mut nv = ctx.get_array_element(b, i);
-                while let Value::Object(Some(node)) = nv {
-                    let key = ctx.get_field(node, NODE_FIELD_KEY);
-                    let val = ctx.get_field(node, NODE_FIELD_VALUE);
-                    entries.push((key, val));
-                    nv = ctx.get_field(node, NODE_FIELD_NEXT);
-                }
-            }
-        } else {
-            // Last resort: route through map_collect_entries which has
-            // additional logic for TreeMap / ConcurrentHashMap / Properties.
-            entries.extend(map_collect_entries(ctx, source));
-        }
-    }
-
+    // Collect entries from the source, dispatching on its concrete backend
+    // (LinkedHashMap overlay, TreeMap tree, HashMap/CHM buckets, or — via the
+    // `entrySet().iterator()` fallback — any other `Map`). Earlier this only
+    // handled LHM + HashMap-bucket sources and fell back to a TreeMap-blind
+    // `map_collect_entries`, so `new LinkedHashMap<>(treeMap)` / `lhm.putAll(
+    // treeMap)` (and real-JDK unmodifiable-map sources) silently produced an
+    // empty map. `collect_entries_any` preserves LHM insertion order.
+    let entries = collect_entries_any(ctx, source);
     for (key, val) in entries {
         native_lhm_put(ctx, &[Value::Object(Some(this)), key, val])?;
     }
@@ -17153,48 +17205,19 @@ fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
     };
-    // TreeMap / TreeMap-subclass source: its state lives in the
-    // address-keyed side-tables, not object fields — copy via the
-    // sorted-pairs snapshot rather than reading raw slots.
-    if is_tree_map_receiver(ctx, source) {
-        let pairs = tm_collect_pairs(ctx, source);
-        for (k, v) in pairs {
-            native_tm_put(ctx, &[Value::Object(Some(this)), k, v])?;
-        }
-        return Ok(None);
-    }
-    // Read entries from source map (try HashMap layout first, then TreeMap)
-    let src_f0 = ctx.get_field(source, 0);
-    let src_f1 = ctx.get_field(source, 1);
-    let src_f2 = ctx.get_field(source, 2);
-    match (src_f1, src_f2) {
-        (Value::Int(src_size), Value::Int(_capacity)) => {
-            // HashMap/LinkedHashMap layout: field 0 = buckets, field 1 = size, field 2 = capacity
-            if let Value::Object(Some(buckets)) = src_f0 {
-                let num_buckets = ctx.array_length(buckets);
-                for b in 0..num_buckets {
-                    let mut node_val = ctx.get_array_element(buckets, b);
-                    while let Value::Object(Some(node)) = node_val {
-                        let k = ctx.get_field(node, 0); // NODE_FIELD_KEY
-                        let v = ctx.get_field(node, 1); // NODE_FIELD_VALUE
-                        native_tm_put(ctx, &[Value::Object(Some(this)), k, v])?;
-                        node_val = ctx.get_field(node, 3); // NODE_FIELD_NEXT
-                    }
-                }
-            }
-            let _ = src_size; // suppress warning
-        }
-        (Value::Int(src_size), _) => {
-            // TreeMap layout: field 0 = data array, field 1 = size, field 2 = comparator
-            if let Value::Object(Some(src_data)) = src_f0 {
-                for i in 0..(src_size as usize) {
-                    let k = ctx.get_array_element(src_data, i * 2);
-                    let v = ctx.get_array_element(src_data, i * 2 + 1);
-                    native_tm_put(ctx, &[Value::Object(Some(this)), k, v])?;
-                }
-            }
-        }
-        _ => {}
+    // Collect entries from the source map, dispatching on its concrete backend
+    // (TreeMap tree, HashMap/CHM buckets, LinkedHashMap overlay, or — via the
+    // `entrySet().iterator()` fallback — any other `Map`). The previous version
+    // hand-decoded the source's raw slots assuming a specific HashMap/TreeMap
+    // field layout (field 1 = size, field 2 = capacity, node field 3 = next);
+    // those indices did not match CratonVM's actual HashMap/Node layout, so
+    // `TreeMap.putAll(hashMap)` and `new TreeMap<>(map)` (which the JDK ctor
+    // implements via `putAll`) silently copied nothing — the second half of the
+    // Elasticsearch `Settings.Builder.put(Settings)` failure (its builder map is
+    // a TreeMap, so `output.map.putAll(settingsMap)` lands here).
+    let pairs = collect_entries_any(ctx, source);
+    for (k, v) in pairs {
+        native_tm_put(ctx, &[Value::Object(Some(this)), k, v])?;
     }
     Ok(None)
 }
@@ -19230,7 +19253,10 @@ fn native_chm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         _ => return Ok(None),
     };
     let _resize_flag = ChmResizeLockGuard::enter();
-    let entries = map_collect_entries(ctx, source);
+    // `collect_entries_any` (not the HashMap-only `map_collect_entries`) so a
+    // TreeMap / LinkedHashMap / real-JDK unmodifiable-map source is copied in
+    // full rather than read as an empty bucket table.
+    let entries = collect_entries_any(ctx, source);
     for (key, value) in entries {
         let hash = chm_key_hash(ctx, &key)?;
         if let Some(seg) = chm_segment_for(ctx, this, hash) {
