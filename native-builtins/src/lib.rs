@@ -565,6 +565,23 @@ pub fn route_ec_to_real() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_EC").is_none())
 }
 
+/// Route the post-quantum families (ML-DSA via the SUN provider, ML-KEM via
+/// SunJCE) to the real JDK 25 SPIs instead of the synthetic stubs. Default ON,
+/// same rationale as [`route_ec_to_real`]: the synthetic `KeyPairGenerator` /
+/// `KeyFactory` shims can only mint empty/dead PQC keys (no real lattice
+/// crypto), so apps that import or generate ML-DSA/ML-KEM keys (e.g. keycloak's
+/// AKP JWK parsing) get a genuine key from `sun.security.provider.ML_DSA_Impls`
+/// / `com.sun.crypto.provider.ML_KEM_Impls` — matching HotSpot. The keygen runs
+/// interpreted (no JDK intrinsics required), so it is slow but correct.
+///
+/// Kill-switch `CRATONVM_SYNTHETIC_PQC=1` restores the legacy synthetic-stub
+/// behaviour (which throws `NoSuchAlgorithmException` / `InvalidKeySpecException`).
+pub fn route_pqc_to_real() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_PQC").is_none())
+}
+
 pub mod deprecated_lang;
 pub mod deprecated_io_util;
 pub mod deprecated_util;
