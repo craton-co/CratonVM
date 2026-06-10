@@ -16613,6 +16613,32 @@ impl Compiler {
                         pc += 3;
                         continue;
                     }
+                    // Elide `invokespecial java/lang/Object.<init>()V` — the
+                    // terminal of every constructor chain. The method body is
+                    // a bare `return` and the VM-side registration is
+                    // `native_noop_with_this`, so the call has no observable
+                    // effect. The site can never become a direct call or an
+                    // inline site (`<init>` + native-shadow compile gates), so
+                    // without this it falls to `jit_invoke_dispatch`'s
+                    // interpreter slow path once per object allocation —
+                    // dominant on allocation-heavy code (bintrees18: ~69M
+                    // dispatches of an empty method).
+                    if op == 0xb7 {
+                        if let Some(&idx) = self.invoke_info_idx.get(&pc) {
+                            // SAFETY: invoke_info pointers are owned by the
+                            // enclosing try_compile scope and outlive codegen.
+                            let info = unsafe { &*self.invoke_info[idx].1 };
+                            if info.invoke_kind == 1
+                                && info.descriptor == "()V"
+                                && info.method_name == "<init>"
+                                && info.class_name == "java/lang/Object"
+                            {
+                                let _ = self.pop_stack(); // discard receiver
+                                pc += 3;
+                                continue;
+                            }
+                        }
+                    }
                     self.flush_scratch_registers();
 
                     // Check for inline site (invokespecial only — virtual/interface not eligible)

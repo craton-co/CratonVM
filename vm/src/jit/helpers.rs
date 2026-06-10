@@ -880,7 +880,7 @@ fn jit_newarray_oom(vm: &SharedVm, length: usize) -> i64 {
 #[inline]
 unsafe fn jit_newarray_finish(obj_ref: ObjectRef, atype: i64, length: i64) -> i64 {
     let raw = obj_ref.as_ptr();
-    if std::env::var_os("CRATON_JIT_NEWARRAY_TRACE").is_some() {
+    if crate::runtime::env_cache::jit_newarray_trace() {
         let class_id_raw = std::ptr::read(raw as *const u32);
         let kind_byte = *raw.add(4);
         let elem_byte = *raw.add(5);
@@ -1444,7 +1444,7 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) { return; }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
     let ptr = (obj_ptr as *mut u8).add(HEADER_SIZE + field_index as usize * SLOT_SIZE);
-    if std::env::var_os("CRATON_JIT_PFI_TRACE").is_some() {
+    if crate::runtime::env_cache::jit_pfi_trace() {
         // Read existing value to see if we're overwriting a ref with an int
         let existing = std::ptr::read(ptr as *const Value);
         let cid_off = obj_ptr as *const u8;
@@ -1512,14 +1512,14 @@ pub unsafe extern "C" fn jit_putfield_object(
     // that surfaced as a delayed SIGSEGV far from the offending putfield
     // (observed in Tomcat: JIT-compiled `Catalina.setParentClassLoader`).
     // Match the interpreter: drop the write instead of corrupting the heap.
-    {
-        let heap = heap_from_vm(vm_ptr);
-        let num_slots = heap.num_fields(obj_ref);
-        if field_index < 0 || field_index as usize >= num_slots {
-            return;
-        }
+    // Reads num_slots straight from the object header (same check
+    // `jit_putfield_int` uses) — the `heap.num_fields` virtual-dispatch
+    // route lands on the same header word at several times the cost, and
+    // this helper runs once per reference field store.
+    if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
+        return;
     }
-    if std::env::var_os("CRATON_JIT_PFO_TRACE").is_some() {
+    if crate::runtime::env_cache::jit_pfo_trace() {
         let cid_off = obj_ptr as *const u8;
         let obj_cid: u32 = std::ptr::read(cid_off as *const u32);
         // Surface only the suspect bit-patterns: invalid kind byte or

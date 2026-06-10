@@ -3689,7 +3689,11 @@ pub fn try_compile(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize)>>,
+    // CRIT-2 — returns (class_id, num_fields, has_primitive_init,
+    // has_finalizer). The two flags feed the inline-TLAB `new` fast path;
+    // resolvers that cannot compute them must return `(_, _, true, true)`
+    // so the post-init helper call stays in place.
+    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
     profile: Option<&profile::MethodProfile>,
@@ -3793,7 +3797,8 @@ fn try_compile_inner(
     cp_static_field_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, u8, bool)>>,
     cp_invoke_resolver: Option<&dyn Fn(u16) -> Option<(String, String, String)>>,
     callee_compiler: Option<&dyn Fn(&str, &str, &str) -> Option<(usize, bool)>>,
-    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize)>>,
+    // (class_id, num_fields, has_primitive_init, has_finalizer) — see `try_compile`.
+    cp_new_resolver: Option<&dyn Fn(u16) -> Option<(u32, usize, bool, bool)>>,
     cp_ldc_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
     cp_ldc2w_resolver: Option<&dyn Fn(u16) -> Option<i64>>,
     profile: Option<&profile::MethodProfile>,
@@ -4018,29 +4023,22 @@ fn try_compile_inner(
     //    has_finalizer)         // class overrides `finalize()` and must
     //                           // be registered with the finalizer queue
     //
-    // When both flags are `false` the inline TLAB fast path can skip the
-    // `jit_post_tlab_init` helper entirely (it just writes the
-    // identity-hash and num_slots fields, which the JIT inlines). The
-    // current `cp_new_resolver` signature returns only
-    // `(class_id, num_fields)` — extending it would touch the resolver
-    // callers in `vm/src/runtime/interpreter.rs`, which is out of scope
-    // for this fix. The defaults below (`true, true`) keep the helper
-    // call mandatory, preserving correctness. Future work: extend the
-    // resolver to return the real flags so JDK micro-objects
-    // (HashMap.Node, ArrayList$Itr) elide the helper.
+    // When both flags are `false` the inline TLAB fast path skips the
+    // `jit_post_tlab_init` helper entirely (class_id + num_slots are
+    // written inline; identity hash stays lazily-minted zero). The
+    // resolver computes the real flags from class metadata; a resolver
+    // that cannot determine them must return `(true, true)` so the
+    // helper call stays in place.
     let mut new_info: Vec<(usize, u32, usize, bool, bool)> = Vec::new();
     let mut anewarray_info: Vec<(usize, u32)> = Vec::new();
     if !scan.new_ops.is_empty() || !scan.anewarray_ops.is_empty() {
         let resolver = cp_new_resolver?;
         for &(pc, cp_idx) in &scan.new_ops {
-            let (class_id_raw, num_fields) = resolver(cp_idx)?;
-            // Conservative: assume both flags set until the resolver
-            // is extended to return them. See CRIT-2 follow-up note
-            // above.
-            new_info.push((pc, class_id_raw, num_fields, true, true));
+            let (class_id_raw, num_fields, has_prim_init, has_finalizer) = resolver(cp_idx)?;
+            new_info.push((pc, class_id_raw, num_fields, has_prim_init, has_finalizer));
         }
         for &(pc, cp_idx) in &scan.anewarray_ops {
-            let (class_id_raw, _) = resolver(cp_idx)?;
+            let (class_id_raw, ..) = resolver(cp_idx)?;
             anewarray_info.push((pc, class_id_raw));
         }
     }
