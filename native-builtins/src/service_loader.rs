@@ -93,6 +93,156 @@ fn build_service_loader(
     Ok(Some(Value::Object(Some(obj))))
 }
 
+/// Derive candidate IMPL-JARS module directory names from a service/class FQN.
+///
+/// ES stores provider JARs as `IMPL-JARS/<module>/<ver>.jar` inside the outer
+/// module JAR. The module name is kebab-case but the Java package component is
+/// camelCase/lowercase. We maintain a small known table for ES core modules and
+/// fall back to the first package component (lowercase) for unknown packages.
+///
+/// Example: `org.elasticsearch.xcontent.spi.XContentProvider` → `["x-content"]`
+pub(crate) fn derive_impl_jar_module_names(fqn: &str) -> Vec<String> {
+    const KNOWN: &[(&str, &str)] = &[
+        ("org.elasticsearch.xcontent",   "x-content"),
+        ("org.elasticsearch.xpack",      "x-pack"),
+        ("org.elasticsearch.transport",  "transport"),
+        ("org.elasticsearch.common",     "common"),
+        ("org.elasticsearch.core",       "core"),
+    ];
+    for (prefix, module) in KNOWN {
+        if fqn.starts_with(prefix) {
+            return vec![module.to_string()];
+        }
+    }
+    // Generic fallback: strip "org.elasticsearch.", take first component.
+    if let Some(rest) = fqn.strip_prefix("org.elasticsearch.") {
+        let first = rest.split('.').next().unwrap_or("").to_lowercase();
+        if !first.is_empty() {
+            return vec![first];
+        }
+    }
+    Vec::new()
+}
+
+/// Read a resource from an IMPL-JARS "inner JAR" path.
+///
+/// ES's IMPL-JARS layout stores inner JAR contents as individual ZIP entries
+/// using a path prefix: `IMPL-JARS/<module>/<jar_name>/<resource_path>`.
+/// The `<jar_name>` component (e.g. `x-content-impl-8.15.5.jar`) is a
+/// directory prefix in the outer JAR, NOT a binary JAR blob.
+pub(crate) fn try_read_from_inner_jar(
+    ctx: &mut dyn NativeContext,
+    module_name: &str,
+    jar_name: &str,
+    resource_path: &str,
+) -> Option<Vec<u8>> {
+    let direct_path = format!("IMPL-JARS/{module_name}/{jar_name}/{resource_path}");
+    ctx.find_all_resource_bytes(&direct_path)
+        .into_iter()
+        .next()
+        .or_else(|| ctx.find_resource(&direct_path))
+}
+
+/// Try to load a class from the IMPL-JARS flat-directory layout.
+///
+/// ES stores `IMPL-JARS/<module>/<jar_name>/<classfile>` as individual entries
+/// in the outer JAR. When a class is not on the flat classpath, this helper
+/// derives the module name, reads LISTING.TXT, and scans each listed jar
+/// directory for the class file. Returns the Class mirror on success.
+///
+/// Used from both `service_loader.rs` (load provider class) and
+/// `classloader.rs` (class resolution fallback for inner / helper classes).
+pub(crate) fn impl_jars_load_class(
+    ctx: &mut dyn NativeContext,
+    internal_name: &str,
+) -> Option<cratonvm_types::ObjectRef> {
+    let dotted = internal_name.replace('/', ".");
+    let class_file = format!("{internal_name}.class");
+    for module_name in derive_impl_jar_module_names(&dotted) {
+        let listing_path = format!("IMPL-JARS/{module_name}/LISTING.TXT");
+        let first_bytes = ctx.find_all_resource_bytes(&listing_path).into_iter().next();
+        let Some(listing_bytes) = first_bytes.or_else(|| ctx.find_resource(&listing_path)) else {
+            continue;
+        };
+        let listing_text = String::from_utf8_lossy(&listing_bytes).into_owned();
+        for jar_name in listing_text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && l.ends_with(".jar"))
+        {
+            if let Some(class_bytes) =
+                try_read_from_inner_jar(ctx, &module_name, jar_name, &class_file)
+            {
+                let opts =
+                    cratonvm_native_api::DefineClassFull { skip_verification: true, ..Default::default() };
+                if let Ok(cid) = ctx.define_class_full(internal_name, &class_bytes, 0, opts) {
+                    return Some(ctx.get_class_mirror(cid));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// If the ServiceLoader carries a non-builtin ClassLoader, return it so the
+/// caller can use `loader.loadClass(fqn)` to load provider classes that live
+/// inside embedded JARs and are invisible to the flat `Class.forName(fqn)` scan.
+fn sl_non_builtin_loader(
+    ctx: &mut dyn NativeContext,
+    sl: cratonvm_types::ObjectRef,
+) -> Option<cratonvm_types::ObjectRef> {
+    let v = match ctx.get_field_by_name(sl, "loader") {
+        Value::Object(Some(r)) => Some(r),
+        _ => match ctx.get_field(sl, 1) {
+            Value::Object(Some(r)) => Some(r),
+            _ => return None,
+        },
+    };
+    v.and_then(|r| {
+        let name = ctx.class_name_of_id(ctx.class_id_of_object(r)).unwrap_or_default();
+        if crate::classloader::is_builtin_loader_class(&name) {
+            None
+        } else {
+            Some(r)
+        }
+    })
+}
+
+/// Load a provider class by FQN, first via the flat `Class.forName(fqn)` scan
+/// and, if that fails, via `loader.loadClass(fqn)` for non-builtin loaders
+/// (e.g. ES's `EmbeddedImplClassLoader` which stores classes inside embedded
+/// JAR trees invisible to the flat classpath scan).
+fn load_provider_class(
+    ctx: &mut dyn NativeContext,
+    fqn: &str,
+    loader: Option<cratonvm_types::ObjectRef>,
+) -> Option<cratonvm_types::ObjectRef> {
+    let name = ctx.create_string(fqn);
+    if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke(
+        "java/lang/Class",
+        "forName",
+        "(Ljava/lang/String;)Ljava/lang/Class;",
+        &[Value::Object(Some(name))],
+    ) {
+        return Some(c);
+    }
+    // forName failed — try loader.loadClass(fqn) if we have a custom loader
+    // (e.g. EmbeddedImplClassLoader for embedded-JAR provider classes).
+    if let Some(loader_r) = loader {
+        let name2 = ctx.create_string(fqn);
+        if let Ok(Some(Value::Object(Some(c)))) = ctx.invoke_virtual(
+            loader_r,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[Value::Object(Some(name2))],
+        ) {
+            return Some(c);
+        }
+    }
+    // Final fallback: IMPL-JARS nested-JAR scan.
+    impl_jars_load_class(ctx, &fqn.replace('.', "/"))
+}
+
 /// Read provider FQNs for `sl.service` from every
 /// `META-INF/services/<fqcn>` resource visible on the classpath.
 /// Each line in each resource file contributes one provider name.
@@ -152,21 +302,275 @@ fn discover_providers(
     }
     let resource = format!("META-INF/services/{}", service_name);
 
-    // Fetch every classpath match's bytes in one call. The layered
-    // `find_all_resource_bytes` helper walks Directory / JarFile /
-    // NestedJar / JmodFile / JImageFile entries; classpath-flavour
-    // handling lives in `class_path.rs` so we do not need a local
-    // jar-cracker here.
     let mut providers: Vec<String> = Vec::new();
+
+    // When the ServiceLoader was created with a user-defined ClassLoader
+    // (e.g. ES's EmbeddedImplClassLoader which stores providers inside
+    // embedded jar trees like IMPL-JARS/<module>/<ver>.jar/<path>), the
+    // flat scan below won't find the descriptor at the top-level path.
+    //
+    // Delegate to loader.findResources(resource) → Enumeration<URL>,
+    // then for each URL extract the JAR-entry path and read bytes directly,
+    // mirroring what the real JDK ServiceLoader does via
+    // LazyClassPathLookupIterator → loader.getResources(name).
+    let loader_ref_opt: Option<cratonvm_types::ObjectRef> = {
+        let v = match ctx.get_field_by_name(sl, "loader") {
+            Value::Object(Some(r)) => Some(r),
+            _ => match ctx.get_field(sl, 1) {
+                Value::Object(Some(r)) => Some(r),
+                _ => None,
+            },
+        };
+        match v {
+            Some(r) => {
+                let cid = ctx.class_id_of_object(r);
+                let name = ctx.class_name_of_id(cid).unwrap_or_default();
+                if crate::classloader::is_builtin_loader_class(&name) {
+                    None
+                } else {
+                    Some(r)
+                }
+            }
+            None => None,
+        }
+    };
+
+    if let Some(loader_r) = loader_ref_opt {
+        let diag_sl = matches!(
+            std::env::var("CRATONVM_DIAG_SERVICELOADER").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+
+        // Primary path: call loader.findResources(resource) → Enumeration<URL>,
+        // then extract the entry path from each URL and read bytes directly.
+        let res_name_val = Value::Object(Some(ctx.create_string(&resource)));
+        let enum_res = ctx.invoke_virtual(
+            loader_r,
+            "findResources",
+            "(Ljava/lang/String;)Ljava/util/Enumeration;",
+            &[res_name_val],
+        );
+        if diag_sl {
+            match &enum_res {
+                Err(e) => eprintln!("[SL-LOADER-DBG] findResources Err: {e:?}"),
+                Ok(None) => eprintln!("[SL-LOADER-DBG] findResources -> Ok(None)"),
+                Ok(Some(Value::Object(None))) => {
+                    eprintln!("[SL-LOADER-DBG] findResources -> Ok(null)")
+                }
+                Ok(Some(v)) => eprintln!("[SL-LOADER-DBG] findResources -> Ok(Some({v:?}))"),
+            }
+        }
+        let found_via_enum = if let Ok(Some(Value::Object(Some(mut enum_r)))) = enum_res {
+            let enum_pin = ctx.pin_native_root(enum_r);
+            let mut count = 0usize;
+            loop {
+                enum_r = ctx.read_native_pin(enum_pin, enum_r);
+                let has_more = ctx.invoke_virtual(enum_r, "hasMoreElements", "()Z", &[]);
+                if diag_sl {
+                    eprintln!("[SL-LOADER-DBG] hasMoreElements -> {has_more:?}");
+                }
+                match has_more {
+                    Ok(Some(Value::Int(1))) => {}
+                    _ => break,
+                }
+                enum_r = ctx.read_native_pin(enum_pin, enum_r);
+                let url_r = match ctx.invoke_virtual(
+                    enum_r,
+                    "nextElement",
+                    "()Ljava/lang/Object;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(r)))) => r,
+                    other => {
+                        if diag_sl {
+                            eprintln!("[SL-LOADER-DBG] nextElement -> {other:?}");
+                        }
+                        break;
+                    }
+                };
+                // Get URL string and extract the JAR-entry path so we can
+                // read bytes via the Rust classpath walker, avoiding the
+                // JDK URL.openStream / InputStream chain.
+                //   jar:file:/...outer.jar!/entry/path -> entry/path
+                //   file:/path/to/file                -> path/to/file
+                //   classpath:entry/path              -> entry/path
+                let ext_str = match ctx.invoke_virtual(
+                    url_r,
+                    "toExternalForm",
+                    "()Ljava/lang/String;",
+                    &[],
+                ) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                    other => {
+                        if diag_sl {
+                            eprintln!("[SL-LOADER-DBG] toExternalForm -> {other:?}");
+                        }
+                        continue;
+                    }
+                };
+                if diag_sl {
+                    eprintln!("[SL-LOADER-DBG] URL: {ext_str}");
+                }
+                let entry_path = if let Some(pos) = ext_str.find("!/") {
+                    ext_str[pos + 2..].to_string()
+                } else if let Some(rest) = ext_str.strip_prefix("file:///") {
+                    rest.to_string()
+                } else if let Some(rest) = ext_str.strip_prefix("file://") {
+                    rest.to_string()
+                } else if let Some(rest) = ext_str.strip_prefix("file:/") {
+                    rest.to_string()
+                } else if let Some(rest) = ext_str.strip_prefix("classpath:") {
+                    rest.to_string()
+                } else {
+                    ext_str.clone()
+                };
+                if !entry_path.is_empty() {
+                    let bytes_list = ctx.find_all_resource_bytes(&entry_path);
+                    for bytes in &bytes_list {
+                        parse_provider_lines(bytes, &mut providers);
+                    }
+                    if bytes_list.is_empty() {
+                        if let Some(bytes) = ctx.find_resource(&entry_path) {
+                            parse_provider_lines(&bytes, &mut providers);
+                        }
+                    }
+                    count += 1;
+                }
+            }
+            ctx.unpin_native_roots(enum_pin);
+            count > 0
+        } else {
+            false
+        };
+
+        // Fallback: if findResources failed or returned an empty Enumeration,
+        // directly read the `jarMetas` field from the loader (an
+        // EmbeddedImplClassLoader-like object) and call prefix() on each
+        // JarMeta to construct the embedded resource path.  This bypasses the
+        // URL/ClassLoader/invokedynamic chain entirely.
+        if !found_via_enum {
+            if let Value::Object(Some(jm_list_r)) = ctx.get_field_by_name(loader_r, "jarMetas") {
+                let size = match ctx.invoke(
+                    "java/util/List",
+                    "size",
+                    "()I",
+                    &[Value::Object(Some(jm_list_r))],
+                ) {
+                    Ok(Some(Value::Int(n))) => n,
+                    _ => 0,
+                };
+                if diag_sl {
+                    eprintln!("[SL-LOADER-DBG] jarMetas.size() = {size}");
+                }
+                for i in 0..size {
+                    let jm = match ctx.invoke(
+                        "java/util/List",
+                        "get",
+                        "(I)Ljava/lang/Object;",
+                        &[Value::Object(Some(jm_list_r)), Value::Int(i)],
+                    ) {
+                        Ok(Some(Value::Object(Some(r)))) => r,
+                        _ => continue,
+                    };
+                    let prefix_str = match ctx.invoke_virtual(
+                        jm,
+                        "prefix",
+                        "()Ljava/lang/String;",
+                        &[],
+                    ) {
+                        Ok(Some(Value::Object(Some(s)))) => {
+                            ctx.read_string(s).unwrap_or_default()
+                        }
+                        _ => continue,
+                    };
+                    if prefix_str.is_empty() {
+                        continue;
+                    }
+                    let prefixed = format!("{}/{}", prefix_str, resource);
+                    if diag_sl {
+                        eprintln!("[SL-LOADER-DBG] jarMeta prefix path: {prefixed}");
+                    }
+                    let bytes_list = ctx.find_all_resource_bytes(&prefixed);
+                    for bytes in &bytes_list {
+                        parse_provider_lines(bytes, &mut providers);
+                    }
+                    if bytes_list.is_empty() {
+                        if let Some(bytes) = ctx.find_resource(&prefixed) {
+                            parse_provider_lines(&bytes, &mut providers);
+                        }
+                    }
+                }
+            } else if diag_sl {
+                eprintln!("[SL-LOADER-DBG] no jarMetas field found on loader");
+            }
+        }
+        // IMPL-JARS fallback: runs whenever providers is still empty after the
+        // findResources / jarMetas attempts.  Covers:
+        //   (a) findResources returned null/empty (found_via_enum=false, the common case
+        //       for EmbeddedImplClassLoader when jarMetas is empty), and
+        //   (b) findResources succeeded but the URL chain produced no bytes.
+        //
+        // Derive the module name from the service FQN, read LISTING.TXT via flat
+        // classpath, then open each inner JAR as ZIP and look for the service
+        // descriptor — bypassing the broken BufferedReader.lines().toList() path.
+        if providers.is_empty() {
+            let module_candidates = derive_impl_jar_module_names(&service_name);
+            if diag_sl {
+                eprintln!(
+                    "[SL-LOADER-DBG] IMPL-JARS fallback module_candidates={module_candidates:?}"
+                );
+            }
+            'modules: for module_name in &module_candidates {
+                let listing_path = format!("IMPL-JARS/{module_name}/LISTING.TXT");
+                if diag_sl {
+                    eprintln!("[SL-LOADER-DBG] reading LISTING.TXT: {listing_path}");
+                }
+                let first_bytes =
+                    ctx.find_all_resource_bytes(&listing_path).into_iter().next();
+                let listing_bytes =
+                    match first_bytes.or_else(|| ctx.find_resource(&listing_path)) {
+                        Some(b) => b,
+                        None => continue,
+                    };
+                if diag_sl {
+                    eprintln!(
+                        "[SL-LOADER-DBG] LISTING.TXT ({} bytes): {:?}",
+                        listing_bytes.len(),
+                        String::from_utf8_lossy(&listing_bytes)
+                    );
+                }
+                let listing_text = String::from_utf8_lossy(&listing_bytes).into_owned();
+                for jar_name in listing_text
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && l.ends_with(".jar"))
+                {
+                    if let Some(bytes) =
+                        try_read_from_inner_jar(ctx, module_name, jar_name, &resource)
+                    {
+                        if diag_sl {
+                            eprintln!(
+                                "[SL-LOADER-DBG] found svc descriptor in {module_name}/{jar_name}"
+                            );
+                        }
+                        parse_provider_lines(&bytes, &mut providers);
+                    }
+                }
+                if !providers.is_empty() {
+                    break 'modules;
+                }
+            }
+        }
+    }
+
+    // Flat classpath scan: providers listed directly at
+    // META-INF/services/<svc> on the classpath (normal case for
+    // non-embedded loaders and JDK built-in providers).
     let descriptors = ctx.find_all_resource_bytes(&resource);
     for bytes in &descriptors {
         parse_provider_lines(bytes, &mut providers);
     }
-
-    // Test mocks may stub `find_resource` without populating the
-    // bytes list (the trait's default `find_all_resource_bytes` impl
-    // returns empty); honour the single-resource fallback so a
-    // fixture pointing at one descriptor still walks.
+    // Test mocks may stub `find_resource` without populating the bytes list.
     if descriptors.is_empty() {
         if let Some(bytes) = ctx.find_resource(&resource) {
             parse_provider_lines(&bytes, &mut providers);
@@ -180,8 +584,9 @@ fn discover_providers(
         Ok("1") | Ok("true") | Ok("yes")
     ) {
         eprintln!(
-            "[SL-DBG] ServiceLoader.iterator service={} descriptors={} providers={} ({:?})",
+            "[SL-DBG] ServiceLoader service={} loader_delegation={} descriptors={} providers={} ({:?})",
             service_name,
+            loader_ref_opt.is_some(),
             descriptors.len(),
             providers.len(),
             providers
@@ -228,9 +633,13 @@ fn native_sl_iterator(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
+    // Extract and pin the non-builtin loader BEFORE discover_providers (which
+    // triggers GC via invoke). If the loader is not re-pinned it becomes stale.
+    let loader_pin_opt: Option<(_, cratonvm_types::ObjectRef)> = sl_non_builtin_loader(ctx, sl)
+        .map(|r| (ctx.pin_native_root(r), r));
     let providers = discover_providers(ctx, sl)?;
 
-    // Build an ArrayList and populate with Class.forName(provider).newInstance().
+    // Build an ArrayList and populate with load_provider_class(fqn).newInstance().
     let al_cls = "java/util/ArrayList";
     let al_cid = ctx
         .ensure_class_initialized(al_cls)
@@ -258,30 +667,16 @@ fn native_sl_iterator(
         if diag {
             eprintln!("[SL-DBG]   instantiate provider={fqn}");
         }
-        let name = ctx.create_string(&fqn);
-        let class_res = ctx.invoke(
-            "java/lang/Class",
-            "forName",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            &[Value::Object(Some(name))],
-        );
-        let class_opt = match &class_res {
-            Ok(v) => *v,
-            Err(e) => {
+        // Re-read the loader through the pin so it's valid after any GC triggered
+        // by the previous iteration's forName/newInstance/add calls.
+        let loader_cur = loader_pin_opt
+            .as_ref()
+            .map(|(pin, orig)| ctx.read_native_pin(*pin, *orig));
+        let class = match load_provider_class(ctx, &fqn, loader_cur) {
+            Some(c) => c,
+            None => {
                 if diag {
-                    eprintln!("[SL-DBG]   forName({fqn}) raised: {e:?}");
-                }
-                None
-            }
-        };
-        let class = match class_opt {
-            Some(Value::Object(Some(c))) => c,
-            other => {
-                if diag {
-                    eprintln!(
-                        "[SL-DBG]   skip (forName returned {:?}): {fqn}",
-                        other
-                    );
+                    eprintln!("[SL-DBG]   skip (class not found for {fqn})");
                 }
                 continue;
             }
@@ -370,8 +765,11 @@ fn native_sl_iterator(
         &[Value::Object(Some(list))],
     )?;
     // The returned iterator now keeps `list` reachable via the Java object
-    // graph, so the native pin can be released.
+    // graph, so the native pins can be released.
     ctx.unpin_native_roots(list_pin);
+    if let Some((pin, _)) = loader_pin_opt {
+        ctx.unpin_native_roots(pin);
+    }
     Ok(it)
 }
 
@@ -463,18 +861,18 @@ fn native_sl_stream(
     let list_pin = ctx.pin_native_root(list);
 
     for fqn in &providers {
-        // forName(<impl>) → the concrete provider Class (the `type`).
-        let name = ctx.create_string(fqn);
-        let type_class = match ctx.invoke(
-            "java/lang/Class",
-            "forName",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            &[Value::Object(Some(name))],
-        ) {
-            Ok(Some(Value::Object(Some(c)))) => c,
-            other => {
+        // Re-read sl through the pin so we have a fresh reference after
+        // GC may have moved it in a previous iteration.
+        let sl_cur = ctx.read_native_pin(sl_pin, sl);
+        // For embedded-JAR providers (e.g. ES EmbeddedImplClassLoader),
+        // Class.forName(fqn) uses the flat classpath and won't find the class.
+        // Pass the loader so load_provider_class can fall back to loadClass.
+        let loader_cur = sl_non_builtin_loader(ctx, sl_cur);
+        let type_class = match load_provider_class(ctx, fqn, loader_cur) {
+            Some(c) => c,
+            None => {
                 if diag {
-                    eprintln!("[SL-DBG]   stream skip (forName {fqn} → {other:?})");
+                    eprintln!("[SL-DBG]   stream skip (class not found for {fqn})");
                 }
                 continue;
             }
@@ -526,19 +924,21 @@ fn native_sl_stream(
         let type_final = ctx.read_native_pin(type_pin, type_class);
         let ctor_final = ctx.read_native_pin(ctor_pin, ctor);
 
-        // new ServiceLoader$ProviderImpl(service, type, ctor) — the
-        // classpath-flavour constructor (factoryMethod = null).
+        // new ServiceLoader$ProviderImpl(service, type, ctor, acc) — the
+        // classpath-flavour constructor (factoryMethod = null, acc = null).
+        // JDK 22: descriptor includes AccessControlContext as the 4th param.
         let provider = ctx.alloc_object(pi_cid, pi_fields);
         let provider_pin = ctx.pin_native_root(provider);
         if let Err(e) = ctx.invoke(
             PROVIDER_IMPL,
             "<init>",
-            "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/reflect/Constructor;)V",
+            "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/reflect/Constructor;Ljava/security/AccessControlContext;)V",
             &[
                 Value::Object(Some(provider)),
                 service,
                 Value::Object(Some(type_final)),
                 Value::Object(Some(ctor_final)),
+                Value::Object(None), // acc = null (deprecated in JDK 17+)
             ],
         ) {
             if diag {

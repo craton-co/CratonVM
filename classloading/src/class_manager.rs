@@ -35,6 +35,7 @@ use crate::class::{
     Class, ClassId, ClassLoaderId, ClassState, ClassStore, CodeSource, EnclosingMethodInfo,
     InnerClassEntry, RecordComponentInfo,
 };
+use crate::class_path::ClassPath;
 use crate::loaders::{
     ApplicationClassFinder, BootstrapClassFinder, ClassFinder, ExtensionClassFinder,
     BUILTIN_LOADER_DELEGATION_CHAIN,
@@ -2047,6 +2048,14 @@ impl ClassManager {
         }
         // Application last
         if let Ok(bytes) = self.application.find_class_bytes(name) {
+            return Ok((bytes, ClassLoaderId::Application));
+        }
+
+        // ES IMPL-JARS fallback: inner-jar classes stored as directory-prefixed
+        // ZIP entries (IMPL-JARS/<module>/<jar>/<path>.class) in outer module
+        // JARs; the interpreter's class resolution bypasses the ClassLoader
+        // native, so this must live here.
+        if let Some(bytes) = find_in_impl_jars(self.application.class_path(), name) {
             return Ok((bytes, ClassLoaderId::Application));
         }
 
@@ -5412,6 +5421,59 @@ fn is_jboss_logging_locale_lookup(name: &str) -> bool {
 
 /// Check if a class name belongs to the JDK (should get a synthetic stub
 /// when its .class file is not found).
+/// Scan ES IMPL-JARS flat layout for `internal_name` (slash-format).
+///
+/// ES outer module JARs store inner-jar contents as individual ZIP entries
+/// under `IMPL-JARS/<module>/<jar-name>/<path>`, NOT as binary JAR blobs.
+/// LISTING.TXT enumerates which inner JAR names are present.
+///
+/// For ES packages, a fast derivation maps the class prefix to the module.
+/// For third-party packages (e.g. `com/fasterxml/jackson`), we fall back to
+/// scanning all known IMPL-JARS modules (cheap: only 2 in ES 8.15.5).
+fn find_in_impl_jars(app_cp: &ClassPath, internal_name: &str) -> Option<Vec<u8>> {
+    const KNOWN_PREFIX_TO_MODULE: &[(&str, &str)] = &[
+        ("org/elasticsearch/xcontent", "x-content"),
+        ("org/elasticsearch/xpack",    "x-pack"),
+        ("org/elasticsearch/transport","transport"),
+        ("org/elasticsearch/common",   "common"),
+        ("org/elasticsearch/core",     "core"),
+    ];
+    // All IMPL-JARS modules present in ES 8.15.5; used for non-ES packages
+    // (e.g. com/fasterxml/jackson lives in x-content's IMPL-JARS).
+    const ALL_MODULES: &[&str] = &["x-content", "native-access-jna"];
+
+    // Derive candidate module(s) to search
+    let fast_module: Option<String> = KNOWN_PREFIX_TO_MODULE.iter()
+        .find(|(prefix, _)| internal_name.starts_with(prefix))
+        .map(|(_, m)| m.to_string())
+        .or_else(|| {
+            internal_name
+                .strip_prefix("org/elasticsearch/")
+                .and_then(|rest| rest.split('/').next())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_lowercase())
+        });
+
+    let class_file = format!("{internal_name}.class");
+    let modules: Vec<String> = match fast_module {
+        Some(m) => vec![m],
+        None    => ALL_MODULES.iter().map(|s| s.to_string()).collect(),
+    };
+
+    for module_name in &modules {
+        let listing_path = format!("IMPL-JARS/{module_name}/LISTING.TXT");
+        let Some(listing_bytes) = app_cp.find_resource(&listing_path) else { continue; };
+        let listing_text = String::from_utf8_lossy(&listing_bytes).into_owned();
+        for jar_name in listing_text.lines().map(str::trim).filter(|l| !l.is_empty() && l.ends_with(".jar")) {
+            let entry_path = format!("IMPL-JARS/{module_name}/{jar_name}/{class_file}");
+            if let Some(bytes) = app_cp.find_resource(&entry_path) {
+                return Some(bytes);
+            }
+        }
+    }
+    None
+}
+
 fn is_jdk_class(name: &str) -> bool {
     name.starts_with("java/")
         || name.starts_with("javax/")

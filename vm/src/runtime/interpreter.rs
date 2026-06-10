@@ -8001,6 +8001,7 @@ fn execute_instruction(
                             || lambda_proxy_satisfies(shared, obj_class_id, target_class_id)
                             || synthetic_implements(shared, obj_class_id, &target_class_name)
                             || proxy_instance_satisfies_target(shared, obj_ref, &target_class_name)
+                            || annotation_proxy_satisfies_target(shared, obj_ref, &target_class_name)
                     };
                     if !cast_ok {
                         let actual_class_id = shared.heap.class_id_of(obj_ref);
@@ -8139,6 +8140,7 @@ fn execute_instruction(
                             || lambda_proxy_satisfies(shared, obj_class_id, target_class_id)
                             || synthetic_implements(shared, obj_class_id, &target_class_name)
                             || proxy_instance_satisfies_target(shared, obj_ref, &target_class_name)
+                            || annotation_proxy_satisfies_target(shared, obj_ref, &target_class_name)
                         {
                             1
                         } else {
@@ -8336,6 +8338,49 @@ pub fn synthetic_implements_public(
     target_class_name: &str,
 ) -> bool {
     synthetic_implements(shared, obj_class_id, target_class_name)
+}
+
+/// Instance-aware `instanceof` / `checkcast` admission for an annotation proxy.
+///
+/// Every annotation proxy shares the synthetic
+/// `java/lang/annotation/AnnotationProxy` ClassId, so the class-only
+/// `synthetic_implements` path can only affirm the generic
+/// `java.lang.annotation.Annotation` supertype. The proxy's *actual* annotation
+/// interface lives on the heap object (slot 0 = the `Lpkg/Type;` descriptor),
+/// so a precise check requires the instance. Returns `true` iff `obj_ref` is an
+/// annotation proxy and `target_class_name` is `java/lang/annotation/Annotation`
+/// or the proxy's own annotation interface. This replaces the old blanket
+/// "proxy is instanceof every annotation" behaviour that broke Log4j2 plugin
+/// injection (a `@Required` proxy passed `instanceof @PluginBuilderAttribute`).
+pub fn annotation_proxy_satisfies_target(
+    shared: &SharedVm,
+    obj_ref: ObjectRef,
+    target_class_name: &str,
+) -> bool {
+    let cid = shared.heap.class_id_of(obj_ref);
+    let is_proxy = shared
+        .class_manager
+        .read()
+        .get_class(cid)
+        .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
+        .unwrap_or(false);
+    if !is_proxy {
+        return false;
+    }
+    if target_class_name == "java/lang/annotation/Annotation" {
+        return true;
+    }
+    // Slot 0 holds the annotation's type descriptor, e.g. `Lpkg/Type;`.
+    if let Value::Object(Some(desc_ref)) = shared.heap.get_field(obj_ref, 0) {
+        if let Some(desc) = read_java_string(&shared.heap, desc_ref) {
+            let internal = desc
+                .strip_prefix('L')
+                .and_then(|d| d.strip_suffix(';'))
+                .unwrap_or(&desc);
+            return internal == target_class_name;
+        }
+    }
+    false
 }
 
 /// `instanceof` / `checkcast` admission for a `Proxy$Instance` heap object.
@@ -8776,11 +8821,19 @@ fn synthetic_implements(
     // not per-class — every proxy lands on the same synthetic
     // `Proxy$Instance` ClassId.
 
-    // Annotation proxy — satisfies Annotation interface casts.
+    // Annotation proxy — name-based path only knows the shared
+    // `AnnotationProxy` ClassId, so it can only affirm the generic
+    // `java.lang.annotation.Annotation` supertype that EVERY proxy satisfies.
+    // The SPECIFIC annotation-interface check is instance-aware (the proxy's
+    // real type is stored on the heap object) and handled by
+    // `annotation_proxy_satisfies_target`. The previous `|| true` made a proxy
+    // `instanceof` EVERY annotation interface, so frameworks that distinguish
+    // annotation types via instanceof/cast misbehaved — e.g. Log4j2 plugin
+    // injection cast a `@Required` proxy to `@PluginBuilderAttribute`, read an
+    // empty `value()`, fell back to the field name, and produced a null
+    // attribute ("loggerName has invalid value null").
     if &*obj_name == "java/lang/annotation/AnnotationProxy" {
-        return target_class_name.contains("Annotation")
-            || target_class_name.contains("annotation")
-            || true; // annotations implement their own type interface
+        return target_class_name == "java/lang/annotation/Annotation";
     }
 
     // Object is always a valid target

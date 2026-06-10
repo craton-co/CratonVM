@@ -18,12 +18,18 @@
 
 use cratonvm_native_api::NativeMethodRegistry;
 
-/// Audit cleanup: no longer registers any natives. Previously short-
-/// circuited the Elasticsearch launcher `main` / `<clinit>` and the
-/// Log4j static-init chain.
-pub fn register_es_stubs(_registry: &mut NativeMethodRegistry) {
-    // Intentionally empty. Real Elasticsearch launcher bytecode runs.
-}
+/// Register ES-specific natives.
+///
+/// Currently a no-op: the Elasticsearch boot path runs entirely on real
+/// bytecode. (An earlier build registered a synthetic
+/// `InternalSettingsPreparer.loadOverrides` override to work around
+/// `path.home` not being applied, but the real root cause was a CratonVM
+/// `HashMap.putAll(Map)` / `new HashMap<>(Map)` bug that dropped entries when
+/// the source was a `TreeMap` / `Collections$UnmodifiableNavigableMap` rather
+/// than a `HashMap` — fixed generically in `native-collections`
+/// (`collect_entries_any`). The synthetic override was removed per the
+/// no-synthetic-stubs policy.)
+pub fn register_es_stubs(_registry: &mut NativeMethodRegistry) {}
 
 #[cfg(test)]
 mod tests {

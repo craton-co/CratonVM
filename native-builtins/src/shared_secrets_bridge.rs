@@ -316,7 +316,9 @@ fn jla_set_cause(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     // `cause` at a reflection-discoverable slot; use
     // `set_field_by_name` for robustness across synthetic vs
     // real-JDK layouts.
-    if let (Some(Value::Object(Some(t))), Some(c)) = (args.first(), args.get(1)) {
+    // INSTANCE method: args[0] = receiver (System$1), args[1] = t,
+    // args[2] = cause.
+    if let (Some(Value::Object(Some(t))), Some(c)) = (args.get(1), args.get(2)) {
         ctx.set_field_by_name(*t, "cause", *c);
     }
     Ok(None)
@@ -326,9 +328,9 @@ fn jla_get_enum_constants_shared(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Delegate to `Class.getEnumConstantsShared` which is
-    // already implemented in lang_class.rs.
-    if let Some(Value::Object(Some(cls))) = args.first() {
+    // args[0] = receiver (System$1 / JavaLangAccess object)
+    // args[1] = the Class<E> argument
+    if let Some(Value::Object(Some(cls))) = args.get(1) {
         ctx.invoke(
             "java/lang/Class",
             "getEnumConstantsShared",
@@ -338,6 +340,47 @@ fn jla_get_enum_constants_shared(
     } else {
         Ok(Some(Value::Object(None)))
     }
+}
+
+/// `JavaLangAccess.defineUnnamedModule(ClassLoader)` -> `Module`.
+///
+/// `jdk.internal.loader.BootLoader.<clinit>` calls this to build the boot
+/// loader's unnamed module:
+/// ```text
+/// UNNAMED_MODULE = SharedSecrets.getJavaLangAccess().defineUnnamedModule(null);
+/// ```
+/// Without this native the `invokeinterface` raised `NoSuchMethodError`, which
+/// failed `BootLoader.<clinit>`, parked `BootLoader` in `InitializationError`,
+/// and made every downstream reference (JMX `PlatformMBeanProvider`, the
+/// `URLClassPath` boot scan, ...) throw `NoClassDefFoundError: BootLoader`.
+///
+/// CratonVM does not model JPMS module layers, so we return a synthetic
+/// unnamed `java.lang.Module` (name field = null, matching the real unnamed
+/// module). The caller only stores it and passes it to the no-op
+/// `setBootLoaderUnnamedModule0` and to `addEnableNativeAccess`.
+fn jla_define_unnamed_module(
+    ctx: &mut dyn NativeContext,
+    _args: &[Value],
+) -> MethodCallResult {
+    // Mirror `Class.getModule()` shape: 2-field synthetic Module, field 0 =
+    // name (None = unnamed).
+    let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+    ctx.set_field(m_obj, 0, Value::Object(None));
+    Ok(Some(Value::Object(Some(m_obj))))
+}
+
+/// `JavaLangAccess.addEnableNativeAccess(Module)` -> `Module`.
+///
+/// Real JDK marks the module as allowed to call restricted native methods and
+/// returns the same module for chaining. `BootLoader.<clinit>` calls it on the
+/// unnamed module and discards the result. CratonVM does not enforce native
+/// access, so this is an identity passthrough returning the argument module.
+fn jla_add_enable_native_access(
+    _ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // args[0] = receiver (System$1), args[1] = the Module argument.
+    Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
 fn jla_new_string_utf8_no_repl(
@@ -351,7 +394,13 @@ fn jla_new_string_utf8_no_repl(
     // `CharacterCodingException` on malformed input; we fall back
     // to the replacement character so callers that already assume
     // well-formed bytes (the common case) keep working.
-    let (bytes, off, len) = match (args.first(), args.get(1), args.get(2)) {
+    //
+    // INSTANCE method: args[0] = receiver (System$1 / JavaLangAccess),
+    // args[1] = byte[], args[2] = int offset, args[3] = int length. Reading
+    // args[0] as the byte[] (the previous bug) made the pattern fail and the
+    // handler return null — surfacing as `ZipEntry.<init>` NPE "name" when
+    // `ZipCoder.UTF8.toString` decoded a jar entry name via this method.
+    let (bytes, off, len) = match (args.get(1), args.get(2), args.get(3)) {
         (Some(Value::Object(Some(b))), Some(Value::Int(o)), Some(Value::Int(l))) => {
             (*b, *o as usize, *l as usize)
         }
@@ -374,7 +423,8 @@ fn jla_get_bytes_utf8_no_repl(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let s = match args.first() {
+    // INSTANCE method: args[0] = receiver (System$1), args[1] = the String.
+    let s = match args.get(1) {
         Some(Value::Object(Some(r))) => ctx.read_string(*r).unwrap_or_default(),
         _ => String::new(),
     };
@@ -396,7 +446,9 @@ fn jla_new_stack_trace_element(
     // forward to `StackTraceElement.<init>(Ljava/lang/String;
     // Ljava/lang/String;Ljava/lang/String;I)V` with fields read
     // reflectively off the SFI.
-    let sfi = match args.first() {
+    // INSTANCE method: args[0] = receiver (System$1), args[1] = the
+    // StackFrameInfo.
+    let sfi = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
@@ -443,7 +495,9 @@ fn jla_get_declared_public_methods(
     // filter.  The real JDK path filters to public methods here;
     // we accept the slight over-return since callers (e.g.
     // annotation scanners) already filter by modifier.
-    if let Some(Value::Object(Some(cls))) = args.first() {
+    // INSTANCE method: args[0] = receiver (System$1), args[1] = the Class
+    // (the String/Class[] filter args of the 3-arg overload are ignored).
+    if let Some(Value::Object(Some(cls))) = args.get(1) {
         ctx.invoke(
             "java/lang/Class",
             "getDeclaredMethods",
@@ -459,7 +513,8 @@ fn jla_get_methods_or_null(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    if let Some(Value::Object(Some(cls))) = args.first() {
+    // INSTANCE method: args[0] = receiver (System$1), args[1] = the Class.
+    if let Some(Value::Object(Some(cls))) = args.get(1) {
         ctx.invoke(
             "java/lang/Class",
             "getMethods",
@@ -509,6 +564,14 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)[Ljava/lang/Object;",
         jla_get_enum_constants_shared,
     );
+    // Erased-type variant: callers with `Class<? extends Enum<E>>` see
+    // the return type as `[Ljava/lang/Enum;` rather than `[Ljava/lang/Object;`.
+    registry.register(
+        owner,
+        "getEnumConstantsShared",
+        "(Ljava/lang/Class;)[Ljava/lang/Enum;",
+        jla_get_enum_constants_shared,
+    );
     registry.register(
         owner,
         "newStringUtf8NoRepl",
@@ -518,6 +581,25 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
     registry.register(
         owner,
         "getBytesUtf8NoRepl",
+        "(Ljava/lang/String;)[B",
+        jla_get_bytes_utf8_no_repl,
+    );
+    // JDK 22 spells these `UTF8` (all-caps), not `Utf8`. The lowercase
+    // variants above were registered for an older method name; the real
+    // `jdk.internal.access.JavaLangAccess` declares `newStringUTF8NoRepl`
+    // / `getBytesUTF8NoRepl`. Elasticsearch's `Build.current()` version
+    // read path calls `newStringUTF8NoRepl` via `invokeinterface`, which
+    // raised `NoSuchMethodError` against `System$1`. Register the
+    // canonical casing too (keep both so any caller spelling resolves).
+    registry.register(
+        owner,
+        "newStringUTF8NoRepl",
+        "([BII)Ljava/lang/String;",
+        jla_new_string_utf8_no_repl,
+    );
+    registry.register(
+        owner,
+        "getBytesUTF8NoRepl",
         "(Ljava/lang/String;)[B",
         jla_get_bytes_utf8_no_repl,
     );
@@ -545,6 +627,19 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)[Ljava/lang/reflect/Method;",
         jla_get_methods_or_null,
     );
+    // BootLoader.<clinit> module bootstrap (see handler docs).
+    registry.register(
+        owner,
+        "defineUnnamedModule",
+        "(Ljava/lang/ClassLoader;)Ljava/lang/Module;",
+        jla_define_unnamed_module,
+    );
+    registry.register(
+        owner,
+        "addEnableNativeAccess",
+        "(Ljava/lang/Module;)Ljava/lang/Module;",
+        jla_add_enable_native_access,
+    );
     // Also register on the interface so direct invokeinterface
     // dispatch (when the receiver's concrete class lookup falls
     // back to the interface class) still hits these natives.
@@ -561,6 +656,19 @@ fn register_java_lang_access(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Thread;",
         jla_current_carrier_thread,
     );
+    // BootLoader.<clinit> invokes these via `invokeinterface JavaLangAccess`.
+    registry.register(
+        iface,
+        "defineUnnamedModule",
+        "(Ljava/lang/ClassLoader;)Ljava/lang/Module;",
+        jla_define_unnamed_module,
+    );
+    registry.register(
+        iface,
+        "addEnableNativeAccess",
+        "(Ljava/lang/Module;)Ljava/lang/Module;",
+        jla_add_enable_native_access,
+    );
 }
 
 // JavaLangInvokeAccess --------------------------------------------------------
@@ -574,7 +682,9 @@ fn jlia_find_method_handle_type(
     // bridge is a thin passthrough so SharedSecrets-dependent
     // callers at least get a non-null MethodType back before
     // WP1.6 lands the full lookup path.
-    if let (Some(ret), Some(params)) = (args.first(), args.get(1)) {
+    // INSTANCE method: args[0] = receiver (MethodHandleImpl$1),
+    // args[1] = rtype Class, args[2] = ptypes Class[].
+    if let (Some(ret), Some(params)) = (args.get(1), args.get(2)) {
         ctx.invoke(
             "java/lang/invoke/MethodType",
             "methodType",
@@ -675,21 +785,27 @@ fn jlrefa_copy_method(
     // cached prototype.  Our Method mirror is mutable-by-design
     // (SetAccessible edits the `override` field directly), so
     // returning the same reference preserves existing semantics.
-    Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+    // INSTANCE method: args[0] = receiver (ReflectAccess), args[1] = the
+    // Method to copy.
+    Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
 fn jlrefa_copy_field(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+    // INSTANCE method: args[0] = receiver (ReflectAccess), args[1] = the
+    // Field to copy.
+    Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
 fn jlrefa_copy_constructor(
     _ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+    // INSTANCE method: args[0] = receiver (ReflectAccess), args[1] = the
+    // Constructor to copy.
+    Ok(Some(args.get(1).copied().unwrap_or(Value::Object(None))))
 }
 
 fn jlrefa_new_parameter(
@@ -701,10 +817,12 @@ fn jlrefa_new_parameter(
     // slots (executable, index, name, modifiers).
     let param = ctx.new_object("java/lang/reflect/Parameter")?;
     if let Some(Value::Object(Some(obj))) = param.clone() {
-        let exec = args.first().copied().unwrap_or(Value::Object(None));
-        let index = args.get(1).copied().unwrap_or(Value::Int(0));
-        let name = args.get(2).copied().unwrap_or(Value::Object(None));
-        let modifiers = args.get(3).copied().unwrap_or(Value::Int(0));
+        // INSTANCE method: args[0] = receiver (ReflectAccess), then the
+        // (executable, index, name, modifiers) params at args[1..5].
+        let exec = args.get(1).copied().unwrap_or(Value::Object(None));
+        let index = args.get(2).copied().unwrap_or(Value::Int(0));
+        let name = args.get(3).copied().unwrap_or(Value::Object(None));
+        let modifiers = args.get(4).copied().unwrap_or(Value::Int(0));
         ctx.set_field_by_name(obj, "executable", exec);
         ctx.set_field_by_name(obj, "index", index);
         ctx.set_field_by_name(obj, "name", name);
@@ -807,14 +925,20 @@ fn jiorafa_open(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    // Signature: (String name, String mode) -> RandomAccessFile
-    ctx.invoke(
+    // Signature: (String name, String mode) -> RandomAccessFile.
+    // INSTANCE method: args[0] = receiver (JavaIORandomAccessFileAccess$1),
+    // args[1] = name, args[2] = mode. Allocate a fresh RandomAccessFile and
+    // run its (name, mode) constructor on THAT object. The old code passed
+    // the whole receiver-first `args` slice to `<init>` (so it initialised the
+    // access-bridge singleton as a RAF) and then returned a *different*,
+    // uninitialised RandomAccessFile from `new_object`.
+    let name = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mode = args.get(2).copied().unwrap_or(Value::Object(None));
+    ctx.new_object_initialized(
         "java/io/RandomAccessFile",
-        "<init>",
         "(Ljava/lang/String;Ljava/lang/String;)V",
-        args,
-    )?;
-    ctx.new_object("java/io/RandomAccessFile")
+        &[name, mode],
+    )
 }
 
 fn jiorafa_open_as_channel(
@@ -823,7 +947,8 @@ fn jiorafa_open_as_channel(
 ) -> MethodCallResult {
     // Return a FileChannel backed by the RAF.  The real RAF
     // getChannel() native already builds one.
-    if let Some(Value::Object(Some(raf))) = args.first() {
+    // INSTANCE method: args[0] = receiver, args[1] = the RandomAccessFile.
+    if let Some(Value::Object(Some(raf))) = args.get(1) {
         ctx.invoke(
             "java/io/RandomAccessFile",
             "getChannel",
@@ -955,7 +1080,8 @@ fn jniaa_get_host_from_name_service(
     args: &[Value],
 ) -> MethodCallResult {
     // Fall back to `getHostName` on the InetAddress.
-    if let Some(Value::Object(Some(addr))) = args.first() {
+    // INSTANCE method: args[0] = receiver (InetAddress$1), args[1] = addr.
+    if let Some(Value::Object(Some(addr))) = args.get(1) {
         ctx.invoke(
             "java/net/InetAddress",
             "getHostName",
@@ -971,7 +1097,8 @@ fn jniaa_get_original_host_name(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    if let Some(Value::Object(Some(addr))) = args.first() {
+    // INSTANCE method: args[0] = receiver (InetAddress$1), args[1] = addr.
+    if let Some(Value::Object(Some(addr))) = args.get(1) {
         // `holder.originalHostName` in real JDK.  We store the
         // name in slot `originalHostName` if present, otherwise
         // fall back to the host name.
@@ -1013,11 +1140,13 @@ fn jnuri_create(
     args: &[Value],
 ) -> MethodCallResult {
     // (String scheme, String ssp) -> URI: forwards to `URI.create(scheme:ssp)`.
-    let scheme = match args.first() {
+    // INSTANCE method: args[0] = receiver (JavaNetUriAccess$1),
+    // args[1] = scheme, args[2] = ssp.
+    let scheme = match args.get(1) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
-    let ssp = match args.get(1) {
+    let ssp = match args.get(2) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
         _ => String::new(),
     };
@@ -1331,7 +1460,9 @@ fn jsec_do_intersection_privilege(
     // Invokes action.run() ignoring the contexts (cratonvm has no
     // real SecurityManager — AC natives already degrade to
     // "always allow").
-    if let Some(Value::Object(Some(action))) = args.first() {
+    // INSTANCE method: args[0] = receiver (AccessController$1),
+    // args[1] = action, args[2..4] = the two AccessControlContexts.
+    if let Some(Value::Object(Some(action))) = args.get(1) {
         ctx.invoke(
             "java/security/PrivilegedAction",
             "run",
@@ -1351,7 +1482,8 @@ fn jsec_get_protect_domains(
     // We synthesise a single-element array with the PD from
     // `Class.getProtectionDomain0` on the caller's class — which
     // Session 92's N1 agent already landed.
-    if let Some(Value::Object(Some(acc))) = args.first() {
+    // INSTANCE method: args[0] = receiver (AccessController$1), args[1] = acc.
+    if let Some(Value::Object(Some(acc))) = args.get(1) {
         let _ = acc; // acc currently unused — session92 AC accepts any ACC.
         let pd = ctx.new_object("java/security/ProtectionDomain")?;
         let arr = ctx.new_ref_array(
@@ -1426,8 +1558,10 @@ fn juzf_get_entry(
 ) -> MethodCallResult {
     // (ZipFile zf, String name, Function<String,JarEntry> factory) -> ZipEntry
     // Delegate to ZipFile.getEntry(String).
+    // INSTANCE method: args[0] = receiver (ZipFile$1), args[1] = zf,
+    // args[2] = name (args[3] = the JarEntry factory Function, unused).
     if let (Some(Value::Object(Some(zf))), Some(Value::Object(Some(name)))) =
-        (args.first(), args.get(1))
+        (args.get(1), args.get(2))
     {
         ctx.invoke(
             "java/util/zip/ZipFile",
@@ -1485,7 +1619,9 @@ fn jnhc_parse_cookie(
     args: &[Value],
 ) -> MethodCallResult {
     // Thin passthrough to HttpCookie.parse(String).
-    if let Some(Value::Object(Some(header))) = args.first() {
+    // INSTANCE method: args[0] = receiver (JavaNetHttpCookieAccess$1),
+    // args[1] = the header String.
+    if let Some(Value::Object(Some(header))) = args.get(1) {
         ctx.invoke(
             "java/net/HttpCookie",
             "parse",
@@ -1537,7 +1673,9 @@ fn jurb_set_parent(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    if let (Some(Value::Object(Some(bundle))), Some(parent)) = (args.first(), args.get(1)) {
+    // INSTANCE method: args[0] = receiver (ResourceBundle$1),
+    // args[1] = bundle, args[2] = parent.
+    if let (Some(Value::Object(Some(bundle))), Some(parent)) = (args.get(1), args.get(2)) {
         ctx.set_field_by_name(*bundle, "parent", *parent);
     }
     Ok(None)
@@ -1547,7 +1685,8 @@ fn jurb_get_parent(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    if let Some(Value::Object(Some(bundle))) = args.first() {
+    // INSTANCE method: args[0] = receiver (ResourceBundle$1), args[1] = bundle.
+    if let Some(Value::Object(Some(bundle))) = args.get(1) {
         Ok(Some(ctx.get_field_by_name(*bundle, "parent")))
     } else {
         Ok(Some(Value::Object(None)))
@@ -1558,7 +1697,9 @@ fn jurb_set_locale(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    if let (Some(Value::Object(Some(bundle))), Some(locale)) = (args.first(), args.get(1)) {
+    // INSTANCE method: args[0] = receiver (ResourceBundle$1),
+    // args[1] = bundle, args[2] = locale.
+    if let (Some(Value::Object(Some(bundle))), Some(locale)) = (args.get(1), args.get(2)) {
         ctx.set_field_by_name(*bundle, "locale", *locale);
     }
     Ok(None)
