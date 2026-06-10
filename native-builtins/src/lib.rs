@@ -25818,6 +25818,37 @@ fn bd_layout(ctx: &dyn NativeContext) -> Option<(usize, usize, usize, usize)> {
     Some((iv, sc, pr, ic))
 }
 
+/// Recover the unscaled-integer digits from a plain decimal rendering +
+/// scale, and the JDK-true precision of that unscaled value.
+///
+/// For `scale >= 0` the unscaled is simply the rendering with the '.'
+/// removed. For `scale < 0` the plain rendering (from `apply_scale` /
+/// `bd_read`) has the |scale| trailing zeros BAKED IN — deriving the
+/// unscaled by dot-stripping alone would inflate the value by 10^|scale|
+/// (unscaled 5, scale -3 rendered "5000" read back as 5000×10³).
+///
+/// Precision is the JDK's: significant digits of the unscaled value — sign
+/// ignored, leading zeros never counted ("0.05" → 1, NOT 3), zero → 1.
+/// The old `value.replace(['-','.'],"").len()` overcounted exactly those
+/// leading zeros, which (together with the raw lazy-0 slot in
+/// `native_bd_precision`) fed real `compareTo`'s adjusted-exponent quick
+/// path garbage and produced strict comparison CYCLES (a<b<c<a) over H2
+/// DECIMAL values — the queryGroup GROUP-BY pseudo-hang.
+fn bd_unscaled_and_precision(value: &str, scale: i32) -> (String, i32) {
+    let mut unscaled = value.replace('.', "");
+    if scale < 0 {
+        let n = (-scale) as usize;
+        let abs_len = unscaled.strip_prefix('-').map_or(unscaled.len(), str::len);
+        if abs_len > n && unscaled.as_bytes()[unscaled.len() - n..unscaled.len()].iter().all(|&b| b == b'0') {
+            unscaled.truncate(unscaled.len() - n);
+        }
+    }
+    let abs = unscaled.strip_prefix('-').unwrap_or(&unscaled);
+    let trimmed = abs.trim_start_matches('0');
+    let precision = if trimmed.is_empty() { 1 } else { trimmed.len() as i32 };
+    (unscaled, precision)
+}
+
 fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/math/BigDecimal", 3);
     // GC-SAFETY (use-after-move — see `bi_alloc`/`bi_alloc_int`): pin `obj`
@@ -25827,12 +25858,11 @@ fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
     // is the forwarded one. Without this, a GC inside `bi_alloc` leaves `obj`
     // stale → `set_field` corrupts the heap (H2 TestScript BigDecimal SEGV).
     let h = ctx.pin_native_root(obj);
-    let precision = value.replace(['-', '.'], "").len() as i32;
+    let (unscaled_str, precision) = bd_unscaled_and_precision(value, scale);
     if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
         // Real-JDK layout: build the value as the scaled unscaled-integer
         // representation.  `value` may include a decimal point (e.g.
-        // "1.5", scale=1 → unscaled=15).  Strip the dot and parse.
-        let unscaled_str = value.replace('.', "");
+        // "1.5", scale=1 → unscaled=15).
         // Try a fast i64 path; fall back to inflated BigInteger.
         let bi_class_id = ctx.class_id_by_name("java/math/BigInteger");
         let int_compact = unscaled_str.parse::<i64>().unwrap_or(BD_INFLATED);
@@ -26083,9 +26113,8 @@ fn bd_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str, scal
     // that relocates it. Re-read the forwarded ref before the `set_field`s so we
     // initialize the LIVE copy of the receiver, not a stale (reused) slot.
     let h = ctx.pin_native_root(this);
-    let precision = value.replace(['-', '.'], "").len() as i32;
+    let (unscaled_str, precision) = bd_unscaled_and_precision(value, scale);
     if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
-        let unscaled_str = value.replace('.', "");
         let int_compact = unscaled_str.parse::<i64>().unwrap_or(BD_INFLATED);
         let bi = bi_alloc(ctx, &unscaled_str);
         let ic = if int_compact == BD_INFLATED {
@@ -26426,7 +26455,25 @@ fn native_bd_precision(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(bd_precision_of(ctx, this))))
+    let p = bd_precision_of(ctx, this);
+    if p > 0 {
+        return Ok(Some(Value::Int(p)));
+    }
+    // The slot's 0 is the JDK's lazy "not yet computed" sentinel
+    // (valueOf/real-bytecode arithmetic leave it 0). This native shadows
+    // `precision()` INSIDE the real `compareTo`'s compareMagnitude
+    // (adjusted-exponent quick exit); returning the raw 0 degrades that
+    // comparison to compare-by-scale, which is order-inconsistent across
+    // mixed-provenance values (the H2 GROUP-BY TreeMap pseudo-hang).
+    // Compute the true significant-digit count and cache it, like the JDK.
+    let (u, _s) = bd_unscaled_bigint(ctx, this);
+    let dec = u.to_decimal();
+    let abs = dec.strip_prefix('-').unwrap_or(&dec);
+    let trimmed = abs.trim_start_matches('0');
+    let computed = if trimmed.is_empty() { 1 } else { trimmed.len() as i32 };
+    let idx = bd_layout(ctx).map(|(_, _, pr, _)| pr).unwrap_or(BD_FIELD_PRECISION);
+    ctx.set_field(this, idx, Value::Int(computed));
+    Ok(Some(Value::Int(computed)))
 }
 
 fn native_bd_negate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -26434,16 +26481,18 @@ fn native_bd_negate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a = bd_read(ctx, this);
-    let scale = bd_scale_of(ctx, this);
-    let neg = if let Some(stripped) = a.strip_prefix('-') {
+    // Sign-flip on the exact unscaled value (the rendered string bakes
+    // negative-scale trailing zeros in — see `bd_unscaled_and_precision`).
+    let (u, scale) = bd_unscaled_bigint(ctx, this);
+    let dec = u.to_decimal();
+    let neg = if let Some(stripped) = dec.strip_prefix('-') {
         stripped.to_string()
-    } else if a == "0" {
-        "0".to_string()
+    } else if dec == "0" {
+        dec
     } else {
-        format!("-{}", a)
+        format!("-{}", dec)
     };
-    let result = bd_alloc(ctx, &neg, scale);
+    let result = bd_alloc_bigint(ctx, &crate::bigint::BigInt::from_decimal(&neg), scale);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -26452,14 +26501,10 @@ fn native_bd_abs(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a = bd_read(ctx, this);
-    let scale = bd_scale_of(ctx, this);
-    let abs = if let Some(rest) = a.strip_prefix('-') {
-        rest.to_string()
-    } else {
-        a
-    };
-    let result = bd_alloc(ctx, &abs, scale);
+    let (u, scale) = bd_unscaled_bigint(ctx, this);
+    let dec = u.to_decimal();
+    let abs = dec.strip_prefix('-').unwrap_or(&dec).to_string();
+    let result = bd_alloc_bigint(ctx, &crate::bigint::BigInt::from_decimal(&abs), scale);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -26468,13 +26513,17 @@ fn native_bd_signum(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let v: f64 = bd_read(ctx, this).parse().unwrap_or(0.0);
-    Ok(Some(Value::Int(if v > 0.0 {
-        1
-    } else if v < 0.0 {
+    // Exact sign from the unscaled value — this native shadows `signum()`
+    // inside the real `compareTo` bytecode, so an f64 parse (the old
+    // implementation; underflows past ~1e-324) must not decide ordering.
+    let (u, _scale) = bd_unscaled_bigint(ctx, this);
+    let dec = u.to_decimal();
+    Ok(Some(Value::Int(if dec == "0" {
+        0
+    } else if dec.starts_with('-') {
         -1
     } else {
-        0
+        1
     })))
 }
 
