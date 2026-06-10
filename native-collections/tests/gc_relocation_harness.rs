@@ -30,15 +30,19 @@ use common::MockCtx;
 use cratonvm_native_api::NativeContext;
 use cratonvm_native_collections::{
     __test_ll_get, __test_ll_set, __test_lhm_get, __test_lhm_set,
+    __test_tm_fast_get_str, __test_tm_fast_put_str,
     __test_tm_get_slot, __test_tm_set_slot, __test_ts_get_slot, __test_ts_set_slot,
+    gc_scan_collection_overlay_roots, gc_update_collection_overlay_refs,
 };
 use cratonvm_native_collections::identity_hash::obj_key;
-use cratonvm_types::Value;
+use cratonvm_types::{ObjectRef, Value};
+use std::collections::HashMap;
 
 // TreeMap / TreeSet slot indices — mirror the private consts in lib.rs.
 // (DATA / SIZE / COMPARATOR live at 0/1/2 in both side-tables.)
 const TM_FIELD_DATA: usize = 0;
 const TM_FIELD_SIZE: usize = 1;
+const TS_FIELD_DATA: usize = 0;
 const TS_FIELD_SIZE: usize = 1;
 
 /// Sanity check on the mock itself: `identity_hash_code` must be
@@ -188,6 +192,80 @@ fn treemap_overlay_survives_relocation() {
 }
 
 // ---------------------------------------------------------------------------
+// Fast-mode TreeMap value overlay (GC roots + remap) — finding B1/V1
+// ---------------------------------------------------------------------------
+//
+// A comparator-less `TreeMap<String,Object>` stores its entries in the
+// `tm_fast_table` BTreeMap (the array slot is left empty), so an object
+// VALUE is reachable only through that side-table. If the GC integration
+// functions skip the fast table, a moving young-gen GC reclaims the value
+// (use-after-free) or leaves a dangling pointer. These two tests pin the
+// fix: the value must be reported as a root, and remapped after a move.
+
+/// `gc_scan_collection_overlay_roots` must report a fast-mode TreeMap's
+/// object value so the collector keeps it live.
+#[test]
+fn fast_treemap_value_is_a_gc_root() {
+    let mut ctx = MockCtx::new();
+    let tm = ctx.alloc_object_simple(0);
+    let val = ctx.alloc_object_simple(0);
+
+    __test_tm_fast_put_str(&ctx, tm, "k", Value::Object(Some(val)));
+
+    let mut roots: Vec<ObjectRef> = Vec::new();
+    gc_scan_collection_overlay_roots(&mut roots);
+    assert!(
+        roots.iter().any(|r| r.as_ptr() == val.as_ptr()),
+        "fast-mode TreeMap object value must be reported as a GC root — \
+         otherwise a moving collector reclaims it as garbage (B1/V1 use-after-free)"
+    );
+}
+
+/// `gc_update_collection_overlay_refs` must repoint a fast-mode TreeMap's
+/// object value to its relocated address after a moving GC.
+#[test]
+fn fast_treemap_value_survives_relocation() {
+    let mut ctx = MockCtx::new();
+    let tm = ctx.alloc_object_simple(0);
+    let val = ctx.alloc_object_simple(0);
+
+    __test_tm_fast_put_str(&ctx, tm, "k", Value::Object(Some(val)));
+    assert_eq!(
+        __test_tm_fast_get_str(&ctx, tm, "k"),
+        Value::Object(Some(val)),
+        "baseline: fast-mode value visible before relocation"
+    );
+
+    // Simulate a moving GC relocating the VALUE (the TreeMap itself stays
+    // put, so its overlay key is unchanged). Build the pointer map the
+    // collector would hand us: old value address -> new value address.
+    let old_addr = val.as_ptr() as usize;
+    let val_post = ctx.relocate_object(val);
+    let new_addr = val_post.as_ptr() as usize;
+    assert_ne!(old_addr, new_addr, "relocate must hand back a fresh address");
+
+    let mut pm: HashMap<usize, usize> = HashMap::new();
+    pm.insert(old_addr, new_addr);
+    gc_update_collection_overlay_refs(&pm);
+
+    let got = __test_tm_fast_get_str(&ctx, tm, "k");
+    assert_eq!(
+        got,
+        Value::Object(Some(val_post)),
+        "fast-mode TreeMap value must be repointed to its relocated address — \
+         without the tm_fast_table remap it stays a stale dangling pointer (B1/V1)"
+    );
+    match got {
+        Value::Object(Some(r)) => assert_eq!(
+            r.as_ptr() as usize,
+            new_addr,
+            "remapped value must resolve to the new address"
+        ),
+        other => panic!("expected relocated object value, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TreeSet overlay
 // ---------------------------------------------------------------------------
 
@@ -232,4 +310,123 @@ fn all_four_overlays_survive_concurrent_relocation() {
     assert_eq!(__test_lhm_get(&ctx, lhm2, "size"), Value::Int(22));
     assert_eq!(__test_tm_get_slot(&ctx, tm2, TM_FIELD_SIZE), Value::Int(33));
     assert_eq!(__test_ts_get_slot(&ctx, ts2, TS_FIELD_SIZE), Value::Int(44));
+}
+
+// ---------------------------------------------------------------------------
+// Cross-table funnel coverage — `for_each_overlay_ref`
+// ---------------------------------------------------------------------------
+//
+// Both GC hooks are now defined in terms of the single `for_each_overlay_ref`
+// enumeration (the B1/V1 follow-up: the fast-table omission was possible only
+// because the table list was hand-duplicated across the scan and remap
+// functions). These two tests plant ONE object value in EACH of the five
+// overlays and assert the funnel reaches all of them — for both rooting and
+// remapping. If a future edit adds a 6th side-table but forgets to list it in
+// `for_each_overlay_ref`, or drops one of the five, the relevant assert fires.
+//   1. LinkedList overlay value      4. TreeMap fast-mode BTreeMap value
+//   2. LinkedHashMap overlay value   5. TreeSet array-mode `data`
+//   3. TreeMap array-mode `data`
+
+/// Plant one object value in each of the five overlays. Returns the five
+/// collection objects and their five (distinct) value objects, in funnel
+/// order: (ll, lhm, tm, tmf, ts) and (v_ll, v_lhm, v_tm, v_tmf, v_ts).
+#[allow(clippy::type_complexity)]
+fn plant_one_value_per_overlay(
+    ctx: &mut MockCtx,
+) -> ([ObjectRef; 5], [ObjectRef; 5]) {
+    let cols = [
+        ctx.alloc_object_simple(0),
+        ctx.alloc_object_simple(0),
+        ctx.alloc_object_simple(0),
+        ctx.alloc_object_simple(0),
+        ctx.alloc_object_simple(0),
+    ];
+    let vals = [
+        ctx.alloc_object_simple(0),
+        ctx.alloc_object_simple(0),
+        ctx.alloc_object_simple(0),
+        ctx.alloc_object_simple(0),
+        ctx.alloc_object_simple(0),
+    ];
+    __test_ll_set(ctx, cols[0], "head", Value::Object(Some(vals[0])));
+    __test_lhm_set(ctx, cols[1], "table", Value::Object(Some(vals[1])));
+    __test_tm_set_slot(ctx, cols[2], TM_FIELD_DATA, Value::Object(Some(vals[2])));
+    __test_tm_fast_put_str(ctx, cols[3], "k", Value::Object(Some(vals[3])));
+    __test_ts_set_slot(ctx, cols[4], TS_FIELD_DATA, Value::Object(Some(vals[4])));
+    (cols, vals)
+}
+
+const OVERLAY_LABELS: [&str; 5] = [
+    "LinkedList overlay value",
+    "LinkedHashMap overlay value",
+    "TreeMap array-mode data",
+    "TreeMap fast-mode value",
+    "TreeSet array-mode data",
+];
+
+/// `for_each_overlay_ref` (via `gc_scan_collection_overlay_roots`) must reach
+/// every overlay's object value, not just the collection objects' keys.
+#[test]
+fn all_overlay_object_values_are_roots() {
+    let mut ctx = MockCtx::new();
+    let (_cols, vals) = plant_one_value_per_overlay(&mut ctx);
+
+    let mut roots: Vec<ObjectRef> = Vec::new();
+    gc_scan_collection_overlay_roots(&mut roots);
+
+    for (i, v) in vals.iter().enumerate() {
+        assert!(
+            roots.iter().any(|r| r.as_ptr() == v.as_ptr()),
+            "{} missing from GC roots — for_each_overlay_ref skipped this \
+             overlay (B1/V1 class of bug)",
+            OVERLAY_LABELS[i]
+        );
+    }
+}
+
+/// `for_each_overlay_ref` (via `gc_update_collection_overlay_refs`) must
+/// remap every overlay's object value after a moving GC.
+#[test]
+fn all_overlay_object_values_survive_relocation() {
+    let mut ctx = MockCtx::new();
+    let (cols, vals) = plant_one_value_per_overlay(&mut ctx);
+
+    // Relocate the VALUE objects only — the collection objects (overlay keys)
+    // stay put so their reads still resolve. Build the pointer map the
+    // collector would hand us in one pass.
+    let mut pm: HashMap<usize, usize> = HashMap::new();
+    let mut moved = [vals[0]; 5];
+    for (i, v) in vals.iter().enumerate() {
+        let post = ctx.relocate_object(*v);
+        pm.insert(v.as_ptr() as usize, post.as_ptr() as usize);
+        moved[i] = post;
+    }
+
+    gc_update_collection_overlay_refs(&pm);
+
+    assert_eq!(
+        __test_ll_get(&ctx, cols[0], "head"),
+        Value::Object(Some(moved[0])),
+        "{} not remapped", OVERLAY_LABELS[0]
+    );
+    assert_eq!(
+        __test_lhm_get(&ctx, cols[1], "table"),
+        Value::Object(Some(moved[1])),
+        "{} not remapped", OVERLAY_LABELS[1]
+    );
+    assert_eq!(
+        __test_tm_get_slot(&ctx, cols[2], TM_FIELD_DATA),
+        Value::Object(Some(moved[2])),
+        "{} not remapped", OVERLAY_LABELS[2]
+    );
+    assert_eq!(
+        __test_tm_fast_get_str(&ctx, cols[3], "k"),
+        Value::Object(Some(moved[3])),
+        "{} not remapped", OVERLAY_LABELS[3]
+    );
+    assert_eq!(
+        __test_ts_get_slot(&ctx, cols[4], TS_FIELD_DATA),
+        Value::Object(Some(moved[4])),
+        "{} not remapped", OVERLAY_LABELS[4]
+    );
 }

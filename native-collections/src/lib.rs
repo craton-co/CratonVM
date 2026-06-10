@@ -16234,46 +16234,87 @@ fn ts_array_table() -> &'static Mutex<StdHashMap<usize, TsArrayState>> {
 // traces and updates the rest of the node graph (array elements + node fields)
 // through the normal heap walk.
 
+/// Visit — in place, mutably — every top-level `ObjectRef` stored in any
+/// collection overlay side-table, calling `f` on each.
+///
+/// This is the SINGLE funnel both GC hooks share. `gc_scan_collection_overlay_roots`
+/// passes a closure that copies each ref into the roots vector; `gc_update_collection_overlay_refs`
+/// passes one that rewrites each ref through the pointer map. Routing both
+/// through one enumeration is deliberate: the B1/V1 use-after-free arose
+/// precisely because `tm_fast_table` got wired into neither hook, and the
+/// older shape (two hand-maintained copies of the table list) made it easy
+/// to add a table to one and forget the other. With this funnel, a newly
+/// added overlay only has to be listed HERE once — both scanning and
+/// remapping pick it up automatically, and the
+/// `all_overlay_object_values_*` tests (gc_relocation_harness) assert each
+/// known table is reached.
+///
+/// Both `Value::Object(Some(_))` slots and bare `Option<ObjectRef>` slots
+/// (TreeMap/TreeSet `data`) are unified to a `&mut ObjectRef` — the only
+/// shape the GC actually cares about. `tm_fast_table` keys are owned
+/// `TreeKey`s (String/i32/i64), never ObjectRefs, so iterating values only
+/// is correct and never perturbs the BTreeMap ordering.
+fn for_each_overlay_ref(mut f: impl FnMut(&mut ObjectRef)) {
+    // Inner name -> Value overlays (LinkedList head/tail/size, LinkedHashMap
+    // table/head/tail/…).
+    if let Ok(mut ll) = ll_overlay().lock() {
+        for inner in ll.values_mut() {
+            for v in inner.values_mut() {
+                if let Value::Object(Some(r)) = v {
+                    f(r);
+                }
+            }
+        }
+    }
+    if let Ok(mut lhm) = lhm_overlay().lock() {
+        for inner in lhm.values_mut() {
+            for v in inner.values_mut() {
+                if let Value::Object(Some(r)) = v {
+                    f(r);
+                }
+            }
+        }
+    }
+    // TreeMap array mode: backing `data` array + comparator.
+    if let Ok(mut tm) = tm_array_table().lock() {
+        for st in tm.values_mut() {
+            if let Some(r) = &mut st.data {
+                f(r);
+            }
+            if let Value::Object(Some(r)) = &mut st.comparator {
+                f(r);
+            }
+        }
+    }
+    // TreeMap fast mode: the BTreeMap *is* the authoritative store (the array
+    // slot is left empty), so its `Value::Object` values are reachable only
+    // through this side-table.
+    if let Ok(mut tmf) = tm_fast_table().lock() {
+        for bt in tmf.values_mut() {
+            for v in bt.values_mut() {
+                if let Value::Object(Some(r)) = v {
+                    f(r);
+                }
+            }
+        }
+    }
+    // TreeSet array mode: backing `data` array + comparator.
+    if let Ok(mut ts) = ts_array_table().lock() {
+        for st in ts.values_mut() {
+            if let Some(r) = &mut st.data {
+                f(r);
+            }
+            if let Value::Object(Some(r)) = &mut st.comparator {
+                f(r);
+            }
+        }
+    }
+}
+
 /// Push every top-level ObjectRef held by the overlay-backed collections onto
 /// `roots` so a moving GC keeps the backing storage live and relocates it.
 pub fn gc_scan_collection_overlay_roots(roots: &mut Vec<ObjectRef>) {
-    fn push_val(roots: &mut Vec<ObjectRef>, v: &Value) {
-        if let Value::Object(Some(r)) = v {
-            roots.push(*r);
-        }
-    }
-    // LinkedList + LinkedHashMap: inner name -> Value maps (head/tail/table…).
-    if let Ok(ll) = ll_overlay().lock() {
-        for inner in ll.values() {
-            for v in inner.values() {
-                push_val(roots, v);
-            }
-        }
-    }
-    if let Ok(lhm) = lhm_overlay().lock() {
-        for inner in lhm.values() {
-            for v in inner.values() {
-                push_val(roots, v);
-            }
-        }
-    }
-    // TreeMap + TreeSet: backing array (`data`) + comparator.
-    if let Ok(tm) = tm_array_table().lock() {
-        for st in tm.values() {
-            if let Some(r) = st.data {
-                roots.push(r);
-            }
-            push_val(roots, &st.comparator);
-        }
-    }
-    if let Ok(ts) = ts_array_table().lock() {
-        for st in ts.values() {
-            if let Some(r) = st.data {
-                roots.push(r);
-            }
-            push_val(roots, &st.comparator);
-        }
-    }
+    for_each_overlay_ref(|r| roots.push(*r));
 }
 
 /// Repoint every top-level ObjectRef held by the overlay-backed collections to
@@ -16283,48 +16324,12 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
     if pointer_map.is_empty() {
         return;
     }
-    fn remap_val(v: &mut Value, pm: &StdHashMap<usize, usize>) {
-        if let Value::Object(Some(r)) = v {
-            if let Some(&new_addr) = pm.get(&(r.as_ptr() as usize)) {
-                debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                *r = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
-            }
+    for_each_overlay_ref(|r| {
+        if let Some(&new_addr) = pointer_map.get(&(r.as_ptr() as usize)) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *r = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
-    }
-    fn remap_ref(r: &mut Option<ObjectRef>, pm: &StdHashMap<usize, usize>) {
-        if let Some(obj) = r {
-            if let Some(&new_addr) = pm.get(&(obj.as_ptr() as usize)) {
-                debug_assert!(new_addr != 0, "GC pointer map contains null address");
-                *r = Some(unsafe { ObjectRef::from_raw(new_addr as *mut u8) });
-            }
-        }
-    }
-    if let Ok(mut ll) = ll_overlay().lock() {
-        for inner in ll.values_mut() {
-            for v in inner.values_mut() {
-                remap_val(v, pointer_map);
-            }
-        }
-    }
-    if let Ok(mut lhm) = lhm_overlay().lock() {
-        for inner in lhm.values_mut() {
-            for v in inner.values_mut() {
-                remap_val(v, pointer_map);
-            }
-        }
-    }
-    if let Ok(mut tm) = tm_array_table().lock() {
-        for st in tm.values_mut() {
-            remap_ref(&mut st.data, pointer_map);
-            remap_val(&mut st.comparator, pointer_map);
-        }
-    }
-    if let Ok(mut ts) = ts_array_table().lock() {
-        for st in ts.values_mut() {
-            remap_ref(&mut st.data, pointer_map);
-            remap_val(&mut st.comparator, pointer_map);
-        }
-    }
+    });
 }
 
 /// Read a TreeSet "slot" (`TS_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
@@ -25351,6 +25356,28 @@ pub fn __test_tm_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize)
 #[doc(hidden)]
 pub fn __test_tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
     tm_set_slot(ctx, this, slot, v);
+}
+/// Fast-mode TreeMap side-table write shim: insert `value` under a
+/// String key into the BTreeMap that backs a comparator-less TreeMap,
+/// exactly as `native_tm_put`'s fast path does (`bt.insert`). Exposes
+/// the fast store to the GC-relocation harness so it can prove
+/// `gc_scan_collection_overlay_roots`/`gc_update_collection_overlay_refs`
+/// root and remap fast-mode object values (finding B1/V1).
+#[doc(hidden)]
+pub fn __test_tm_fast_put_str(ctx: &dyn NativeContext, this: ObjectRef, key: &str, value: Value) {
+    tm_fast_with(ctx, this, |bt| {
+        bt.insert(TreeKey::Str(key.to_string()), value);
+    });
+}
+/// Fast-mode TreeMap side-table read shim. Mirror of
+/// `__test_tm_fast_put_str`.
+#[doc(hidden)]
+pub fn __test_tm_fast_get_str(ctx: &dyn NativeContext, this: ObjectRef, key: &str) -> Value {
+    tm_fast_with(ctx, this, |bt| {
+        bt.get(&TreeKey::Str(key.to_string()))
+            .copied()
+            .unwrap_or(Value::Object(None))
+    })
 }
 /// TreeSet array-mode side-table read shim.
 #[doc(hidden)]
