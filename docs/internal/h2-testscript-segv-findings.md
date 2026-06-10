@@ -130,17 +130,64 @@
 >   re-entrant invoke" warning — `resolve_method_ref`'s read_recursive
 >   at interpreter.rs:16529 protects only same-thread recursion, not
 >   guard-across-park).
-> Next steps: identify the exact lock (read `resolve_field_ref`'s
-> exclusive site + `alloc_java_string_object`'s write site — likely
-> class_manager or resolution_cache) and audit every path that can run
-> Java (invoke/execute/monitor_wait) under a held guard; fix = drop the
-> guard before re-entering Java. The rarer 0x7A34E5 SEGV face needs an
-> rwd capture once the deadlock no longer pre-empts it
-> (`capture-h2-segv-rwd.ps1`). Verification: `run-h2-verify.ps1 -Runs 5
-> -TimeoutSec 2400` (clean full run >900 s interpreted; HotSpot harness
-> ≈133 s) + the apps suite (2026-06-10 run: zero regressions vs baseline,
-> elasticsearch-version FAIL→PASS, wildfly-health known-FAIL mode change
-> attributed to the concurrent session's WildFly boot-latch work).
+> ### ✅ Blocker 3 RESOLVED in three commits (2026-06-10, all on dev):
+> - **39aaffe3** — the ABBA itself: `resolve_field_ref`'s own-fields path
+>   took `resolution_cache.write()` INSIDE its live `class_manager.read()`
+>   block (cm→rc), while `execute_invokedynamic` held
+>   `resolution_cache.read()` across the whole cached-call-site execution
+>   (StringConcat allocates → `alloc_java_string_object` takes
+>   `class_manager.write()` for `load_class("java/lang/String")`: rc→cm).
+>   Fixes: drop cm before the cache write (mirroring resolve_method_ref's
+>   documented rule); clone the cached site out of the rc guard (cheap —
+>   Arc<str> fields) before executing.
+> - **f080908b** — the STW triangles the lock-order audit found: contended
+>   `monitorenter` and class-init waiters parked WITHOUT GC-blocked
+>   marking (counted in `expected`, never arriving → owner-parked-at-
+>   safepoint + contender + GC = three-way wedge). New
+>   `MonitorTable::enter_or_contend`/`Monitor::try_enter`/`block_enter`
+>   split + `monitor_enter_blocking` blocking-site protocol; class-init
+>   waiter wrapped in the full protocol; `resolve_inline_site` (JIT
+>   inlining) phase-split so resolve_field_ref runs with no cm guard held
+>   (was a same-thread self-deadlock on a cold field class).
+> - **efd17806** — protocol-safety rework after the first verify run
+>   panicked ("monitor inflation invariant"): a GC completing during the
+>   GC-blocked contended wait left the caller's raw Rust `obj`/args copies
+>   stale/dead. The monitorenter arm now PINS obj in native_pin_roots
+>   (alive + remapped, popped back fixed); the sync-method prologue and
+>   `ctx.monitor_enter` deliberately REVERTED to expected-mutator blocking
+>   (their callers hold immutable unrooted `&[Value]` arg slices that
+>   cannot be remapped — the residual rare wedge there is documented; the
+>   proper fix needs interpreter-level STW participation that can remap
+>   the args).
+>
+> Verified: no deadlock, no panic across post-fix runs; progression
+> 24 s (pre-BD-fix) → 201 s → 241 s-crash → 6+ min of clean work. NOTE
+> the long FLAT stderr phases are REAL WORK: testScript.sql:5721 is
+> `select var(...) from system_range(1, 1000000)` — million-row
+> aggregates take minutes interpreted; full-script completion needs a
+> 1-2 h timeout (soak item).
+>
+> ### ⛔ REMAINING (the last known face): worker-thread stale-receiver
+> SEGV, read at 0x13 (payload 0x3 + 0x10 header = off-grid `Double`-cell
+> read through a stale receiver, per the §face-decoder), "Thread-6",
+> ~2/3 of runs, 4-6 min in (post-aggregate region, last marker SQL
+> ~5725). Excluded: Long-smuggle asymmetry (CRATONVM_DBG_LONGROOT
+> fires 0× in H2, strict mode changes nothing); cleaners (NO_CLEANERS
+> crash persisted pre-fix); the blocked-thread gap (fixes verified
+> active). CRATONVM_DBG_BADRECV run: 0 hits in 900 s (perturbs timing)
+> but exposed a SEPARATE lead — the aggregate region floods
+> `gen_heap::get_field: out-of-bounds field read dropped` WARNs at
+> ~millions/min (19 GB stderr in 15 min!): a per-row speculative
+> layout probe misfiring (receiver valid, index past layout) — both a
+> perf drag on exactly the slow region and a possible cousin of the
+> stale-receiver face. Next: identify the OOB-flood probe (which caller
+> probes fld[0..3] on 0-slot java/lang/Object receivers per aggregate
+> row), then MEMWATCH/instrumented get_field for the 0x13 face.
+> Verification recipe unchanged: `run-h2-verify.ps1 -Runs 5
+> -TimeoutSec 2400`+ + the apps suite (2026-06-10 run: zero regressions
+> vs baseline, elasticsearch-version FAIL→PASS, wildfly-health
+> known-FAIL mode change attributed to the concurrent session's WildFly
+> boot-latch work).
 >
 > Historical analysis below: the ReferenceProcessor re-emission (fixed at
 > dev a9bc91f6) was the FIRST writer; the superseded status + hunt log
