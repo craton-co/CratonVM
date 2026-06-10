@@ -1512,12 +1512,12 @@ pub unsafe extern "C" fn jit_putfield_object(
     // that surfaced as a delayed SIGSEGV far from the offending putfield
     // (observed in Tomcat: JIT-compiled `Catalina.setParentClassLoader`).
     // Match the interpreter: drop the write instead of corrupting the heap.
-    {
-        let heap = heap_from_vm(vm_ptr);
-        let num_slots = heap.num_fields(obj_ref);
-        if field_index < 0 || field_index as usize >= num_slots {
-            return;
-        }
+    // Reads num_slots straight from the object header (same check
+    // `jit_putfield_int` uses) — the `heap.num_fields` virtual-dispatch
+    // route lands on the same header word at several times the cost, and
+    // this helper runs once per reference field store.
+    if !jit_putfield_slot_in_bounds(obj_ptr, field_index) {
+        return;
     }
     if crate::runtime::env_cache::jit_pfo_trace() {
         let cid_off = obj_ptr as *const u8;
