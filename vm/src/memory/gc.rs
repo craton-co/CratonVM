@@ -319,6 +319,15 @@ pub fn update_all_roots(
         .thread_registry
         .fold_pointer_map_into_blocked(pointer_map);
 
+    // 21. Registry java.lang.Thread mirrors + the unpark(Thread) reverse
+    //     index (keyed by mirror address). Scanned as roots in roots.rs
+    //     step 10b; without the remap the registry serves stale mirrors
+    //     back into bytecode and `LockSupport.unpark(Thread)` lookups by
+    //     the relocated address silently miss (lost wakeups).
+    shared
+        .thread_registry
+        .update_thread_objs_after_gc(pointer_map);
+
     // Post-GC verification: check that no frame refs still point to relocated addresses.
     verify_no_stale_refs(thread, pointer_map);
     // Opt-in (CRATONVM_DBG_HEAP_STALE=1) deep heap-walk: catch un-forwarded /

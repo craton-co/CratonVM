@@ -1887,6 +1887,32 @@ pub fn cl_get_resource_essential(ctx: &mut dyn NativeContext, args: &[Value]) ->
     cl_get_resource(ctx, args)
 }
 
+/// True iff the object's class is `java/lang/ClassLoader` or a subclass.
+///
+/// The getResource/getResources natives ALSO serve the STATIC
+/// `getSystemResource(s)` forms (same handler registration), where args[0]
+/// is the resource-name String, not a receiver. The user-loader delegation
+/// must not treat that String as a ClassLoader: doing so dispatched
+/// `invoke_virtual(<String>, "findResource")` →
+/// `NoSuchMethodError java/lang/String.findResource` and broke every
+/// `getSystemResource` caller (kafka-codec / hadoop-conf / hbase-conf
+/// regression-pool probes).
+fn is_classloader_instance(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    let mut cur = ctx.class_id_of_object(obj);
+    for _ in 0..64 {
+        match ctx.class_name_of_id(cur) {
+            Some(n) if n == "java/lang/ClassLoader" => return true,
+            Some(n) if n == "java/lang/Object" => return false,
+            _ => {}
+        }
+        match ctx.superclass_of(cur) {
+            Some(p) if p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // ClassLoader.getResource(String) → URL
     //
@@ -1919,17 +1945,26 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // When the receiver is a non-builtin ClassLoader, invoke findResource()
     // via virtual dispatch so the user's override runs (e.g.
     // EmbeddedImplClassLoader.findResource reads from IMPL-JARS).
+    // `is_classloader_instance` gates out the STATIC getSystemResource form
+    // (args[0] is the name String there, not a receiver).
     if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
-        let class_id = ctx.class_id_of_object(this_ref);
-        if let Some(class_name) = ctx.class_name_of_id(class_id) {
-            if !is_builtin_loader_class(&class_name) {
-                let name_arg = Value::Object(Some(ctx.create_string(&name)));
-                return ctx.invoke_virtual(
-                    this_ref,
-                    "findResource",
-                    "(Ljava/lang/String;)Ljava/net/URL;",
-                    &[name_arg],
-                );
+        if is_classloader_instance(ctx, this_ref) {
+            let class_id = ctx.class_id_of_object(this_ref);
+            if let Some(class_name) = ctx.class_name_of_id(class_id) {
+                if !is_builtin_loader_class(&class_name) {
+                    // Pin the receiver across the allocating create_string —
+                    // a moving GC during it would stale `this_ref`.
+                    let pin = ctx.pin_native_root(this_ref);
+                    let name_arg = Value::Object(Some(ctx.create_string(&name)));
+                    let this_ref = ctx.read_native_pin(pin, this_ref);
+                    ctx.unpin_native_roots(pin);
+                    return ctx.invoke_virtual(
+                        this_ref,
+                        "findResource",
+                        "(Ljava/lang/String;)Ljava/net/URL;",
+                        &[name_arg],
+                    );
+                }
             }
         }
     }
@@ -2028,17 +2063,26 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     //    scan path below (is_builtin_loader_class check), not this branch;
     //  - non-builtin loaders whose findResources calls parent.getResources
     //    will hit this branch again only for the PARENT — which IS builtin.
+    //
+    // `is_classloader_instance` gates out the STATIC getSystemResources form
+    // (args[0] is the name String there, not a receiver).
     if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
-        let class_id = ctx.class_id_of_object(this_ref);
-        if let Some(class_name) = ctx.class_name_of_id(class_id) {
-            if !is_builtin_loader_class(&class_name) {
-                let name_arg = Value::Object(Some(ctx.create_string(&name)));
-                return ctx.invoke_virtual(
-                    this_ref,
-                    "findResources",
-                    "(Ljava/lang/String;)Ljava/util/Enumeration;",
-                    &[name_arg],
-                );
+        if is_classloader_instance(ctx, this_ref) {
+            let class_id = ctx.class_id_of_object(this_ref);
+            if let Some(class_name) = ctx.class_name_of_id(class_id) {
+                if !is_builtin_loader_class(&class_name) {
+                    // Pin the receiver across the allocating create_string.
+                    let pin = ctx.pin_native_root(this_ref);
+                    let name_arg = Value::Object(Some(ctx.create_string(&name)));
+                    let this_ref = ctx.read_native_pin(pin, this_ref);
+                    ctx.unpin_native_roots(pin);
+                    return ctx.invoke_virtual(
+                        this_ref,
+                        "findResources",
+                        "(Ljava/lang/String;)Ljava/util/Enumeration;",
+                        &[name_arg],
+                    );
+                }
             }
         }
     }

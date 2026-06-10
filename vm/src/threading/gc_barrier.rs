@@ -141,10 +141,22 @@ impl GcBarrier {
     /// `request_stw` may have counted this thread in `expected` before
     /// it became blocked.
     pub fn enter_blocked(&self) -> BlockedGuard<'_> {
+        // Serialize the transition against `request_stw` (which computes
+        // `expected` under the same lock): either our increment lands
+        // BEFORE the count read (we are excluded AND `pre_stw` reads the
+        // pre-request value `false`, so we park without arriving) or AFTER
+        // (we are counted and `pre_stw=true` makes the caller arrive —
+        // exactly once). Without the lock the two could interleave so that
+        // an EXCLUDED thread arrives anyway; `arrived` is a plain counter,
+        // so that spurious arrival releases `wait_for_all` while a counted
+        // mutator is still running — a moving GC racing live frames.
+        let inner = self.inner.lock();
         self.threads_blocked.fetch_add(1, Ordering::AcqRel);
+        let pre_stw = self.stw_requested.load(Ordering::Acquire);
+        drop(inner);
         BlockedGuard {
             barrier: self,
-            pre_stw: self.stw_requested.load(Ordering::Acquire),
+            pre_stw,
         }
     }
 
@@ -156,12 +168,31 @@ impl GcBarrier {
     /// Returns `true` if a stop-the-world pause is already in progress
     /// (caller should `arrive_and_wait`).
     pub fn mark_blocked_region_enter(&self) -> bool {
+        // Serialized against `request_stw` — see `enter_blocked` for the
+        // exact-counting rationale.
+        let inner = self.inner.lock();
         self.threads_blocked.fetch_add(1, Ordering::AcqRel);
-        self.stw_requested.load(Ordering::Acquire)
+        let pre_stw = self.stw_requested.load(Ordering::Acquire);
+        drop(inner);
+        pre_stw
     }
 
     /// T19.H1 — end a region opened by `mark_blocked_region_enter`.
+    ///
+    /// Exact-counting contract (see `enter_blocked`): a thread may NOT
+    /// transition blocked→running while a stop-the-world pause is active —
+    /// it was EXCLUDED from that pause's `expected`, so the initiator will
+    /// not wait for it, and arriving would inflate `arrived` for someone
+    /// else's quota. Instead we wait the pause out while still counted as
+    /// blocked (the GC maintains our roots via
+    /// `fold_pointer_map_into_blocked`), and only then decrement — any
+    /// LATER pause counts us in `expected` and we arrive exactly once via
+    /// `check_post_block_gc`.
     pub fn mark_blocked_region_leave(&self) {
+        let mut inner = self.inner.lock();
+        while self.stw_requested.load(Ordering::Acquire) {
+            self.gc_complete.wait(&mut inner);
+        }
         self.threads_blocked.fetch_sub(1, Ordering::AcqRel);
     }
 
@@ -266,6 +297,14 @@ pub struct BlockedGuard<'a> {
 
 impl Drop for BlockedGuard<'_> {
     fn drop(&mut self) {
+        // Checked leave — identical contract to `mark_blocked_region_leave`:
+        // wait out any active stop-the-world pause (we were excluded from
+        // its `expected`; arriving or running would both be wrong) before
+        // re-entering the mutator population.
+        let mut inner = self.barrier.inner.lock();
+        while self.barrier.stw_requested.load(Ordering::Acquire) {
+            self.barrier.gc_complete.wait(&mut inner);
+        }
         self.barrier
             .threads_blocked
             .fetch_sub(1, Ordering::AcqRel);
