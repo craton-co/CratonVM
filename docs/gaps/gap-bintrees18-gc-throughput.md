@@ -47,11 +47,14 @@ A/B builds, same box):
 
 | Variant | bt16 | bt18 | checksum |
 |---|---|---|---|
-| HotSpot JDK 25 (same load) | 135 ms | 549 ms | 68332206 |
-| dev e7e7d563 baseline | ~6.4 s | ~28 s | 68332206 ✓ |
+| HotSpot JDK 25 (same load) | 135 ms | 497 ms | 68332206 |
+| dev e7e7d563 baseline | ~6.4 s | 29.6 s | 68332206 ✓ |
 | + fix 1 (env-gate caching) | ~3.5 s | — | ✓ |
 | + fix 2 (Object.<init> elision) | ~1.6 s | ~11.5 s | ✓ |
-| final branch build (all 3 real fixes) | ~1.6 s | **~10.3 s** | ✓ all depths |
+| final branch build (all 3 real fixes) | ~1.6 s | **9.9 s** | ✓ all depths |
+
+(bt18 row: back-to-back same-load triple — dev 29,617 ms → final 9,936 ms →
+HotSpot 497 ms, i.e. **3.0× faster, 20× HotSpot**, was 60×.)
 
 bt10=135854, bt12=674478, bt14=3222190, bt16=14985902, bt18=68332206,
 sieve250k=22044 — all golden on the final build.
