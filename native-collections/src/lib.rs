@@ -2872,6 +2872,37 @@ fn is_chm_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
     false
 }
 
+/// True when `this`'s runtime class is `java/util/LinkedHashMap` or a subclass.
+///
+/// CratonVM's LHM natives store entries in a side-table overlay, not in the
+/// HashMap bucket array. A generic `java/util/Map.<method>` interface native
+/// dispatched on a LinkedHashMap receiver must route to the LHM natives so that
+/// entries written via `native_lhm_put` can be found. Without this routing,
+/// `native_map_get` / `native_map_contains_key` use the bucket code and return
+/// null/false for every key — causing e.g. JBoss DMR `ObjectModelValue.getChild`
+/// to return UNDEFINED for all ModelNode keys (the WildFly WFLYCTL0013 bug).
+fn is_lhm_receiver(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    let mut cur = ctx.class_id_of_object(this);
+    for _ in 0..32 {
+        match ctx.class_name_of_id(cur) {
+            Some(n) if n == "java/util/LinkedHashMap" => return true,
+            Some(n)
+                if n == "java/util/HashMap"
+                    || n == "java/util/TreeMap"
+                    || n == "java/lang/Object" =>
+            {
+                return false
+            }
+            _ => {}
+        }
+        match ctx.superclass_of(cur) {
+            Some(p) if p != cur => cur = p,
+            _ => return false,
+        }
+    }
+    false
+}
+
 fn native_map_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -3126,6 +3157,9 @@ fn native_map_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     if is_chm_receiver(ctx, this) {
         return native_chm_get(ctx, args);
     }
+    if is_lhm_receiver(ctx, this) {
+        return native_lhm_get(ctx, args);
+    }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
     let (key_ref, hash, is_null_key) = match key_val {
@@ -3203,6 +3237,9 @@ fn native_map_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
     if is_tree_map_receiver(ctx, this) {
         return native_tm_remove(ctx, args);
+    }
+    if is_lhm_receiver(ctx, this) {
+        return native_lhm_remove(ctx, args);
     }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
@@ -3291,6 +3328,9 @@ fn native_map_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     }
     if is_chm_receiver(ctx, this) {
         return native_chm_contains_key(ctx, args);
+    }
+    if is_lhm_receiver(ctx, this) {
+        return native_lhm_contains_key(ctx, args);
     }
     let key_val = args.get(1).copied().unwrap_or(Value::Object(None));
 
