@@ -12,6 +12,7 @@ use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::{ObjectRef, Value};
 use cratonvm_types::error::MethodCallResult;
 use crate::{obj_arg, alloc_concurrent_synthetic};
+use crate::service_loader::impl_jars_load_class;
 
 /// Monotonic counter for generating unique hidden class names.
 pub static HIDDEN_CLASS_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -593,18 +594,37 @@ fn cl_load_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     //    Guarded by `receiver_overrides_find_class` so this only fires for
     //    genuine non-builtin subclasses — a built-in loader has no override
     //    and the callback would recurse back into `cl_find_class`.
+    //
+    //    Note: unlike the original `return`, we fall through on failure so
+    //    the IMPL-JARS fallback (step 5) can still fire when `findClass`
+    //    throws ClassNotFoundException (e.g. EmbeddedImplClassLoader with
+    //    empty jarMetas).
     if receiver_overrides_find_class(ctx, this) {
         // `invoke_virtual` resolves on the receiver's actual class, so this
         // dispatches to the subclass's overriding `findClass` bytecode.
-        return ctx.invoke_virtual(
+        let result = ctx.invoke_virtual(
             this,
             "findClass",
             "(Ljava/lang/String;)Ljava/lang/Class;",
             &[Value::Object(Some(name_obj))],
         );
+        match result {
+            Ok(Some(Value::Object(Some(_)))) => return result,
+            // findClass threw (ClassNotFoundException) or returned null — fall through.
+            _ => {}
+        }
     }
 
-    // 5. Not found and no user override — class genuinely missing.
+    // 5. IMPL-JARS fallback: ES EmbeddedImplClassLoader stores provider
+    //    classes and all their inner/helper classes as individual ZIP entries
+    //    under IMPL-JARS/<module>/<jar_dir>/<classfile> inside the outer
+    //    module JAR. When neither the flat classpath nor findClass can locate
+    //    the class, try scanning those entries directly.
+    if let Some(mirror) = impl_jars_load_class(ctx, &internal) {
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+
+    // 6. Not found and no user override — class genuinely missing.
     Ok(Some(Value::Object(None)))
 }
 
@@ -1895,6 +1915,25 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     };
     let resource_name = name.trim_start_matches('/');
 
+    // User-defined classloader delegation (mirrors cl_get_resources).
+    // When the receiver is a non-builtin ClassLoader, invoke findResource()
+    // via virtual dispatch so the user's override runs (e.g.
+    // EmbeddedImplClassLoader.findResource reads from IMPL-JARS).
+    if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
+        let class_id = ctx.class_id_of_object(this_ref);
+        if let Some(class_name) = ctx.class_name_of_id(class_id) {
+            if !is_builtin_loader_class(&class_name) {
+                let name_arg = Value::Object(Some(ctx.create_string(&name)));
+                return ctx.invoke_virtual(
+                    this_ref,
+                    "findResource",
+                    "(Ljava/lang/String;)Ljava/net/URL;",
+                    &[name_arg],
+                );
+            }
+        }
+    }
+
     // Prefer the structured URL (jar:file:/... or jrt:/... or file:/...)
     // so getResource and getResources return the same URL form for the
     // same name. Fall back to "classpath:<name>" when only `find_resource`
@@ -1964,6 +2003,45 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         found.unwrap_or_default()
     };
     let resource_name = name.trim_start_matches('/');
+
+    // User-defined classloader delegation: if the receiver is a non-builtin
+    // ClassLoader subclass (e.g. EmbeddedImplClassLoader), delegate to its
+    // findResources() override instead of the flat classpath scan.
+    //
+    // The real JDK ClassLoader.getResources(name) calls:
+    //   1. parent.getResources(name)  (handled by our flat scan when parent is builtin)
+    //   2. this.findResources(name)   (the documented override hook)
+    //
+    // Our native completely replaces step 2, so custom classloaders that
+    // override findResources (like ES EmbeddedImplClassLoader, which reads
+    // embedded IMPL-JARS directory trees from the outer jar) never get
+    // their resources surfaced to ServiceLoader.
+    //
+    // Fix: when the receiver is a non-builtin ClassLoader, invoke
+    // findResources() via virtual dispatch. The callee runs real Java
+    // bytecode (e.g. EmbeddedImplClassLoader.findResources constructs an
+    // Enumeration that reads embedded jar entries via parent.getResource)
+    // and may recursively call our native for the builtin parent loader.
+    //
+    // Safety: infinite-recursion is avoided because:
+    //  - builtin loaders (URLClassLoader, AppClassLoader, …) take the flat
+    //    scan path below (is_builtin_loader_class check), not this branch;
+    //  - non-builtin loaders whose findResources calls parent.getResources
+    //    will hit this branch again only for the PARENT — which IS builtin.
+    if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
+        let class_id = ctx.class_id_of_object(this_ref);
+        if let Some(class_name) = ctx.class_name_of_id(class_id) {
+            if !is_builtin_loader_class(&class_name) {
+                let name_arg = Value::Object(Some(ctx.create_string(&name)));
+                return ctx.invoke_virtual(
+                    this_ref,
+                    "findResources",
+                    "(Ljava/lang/String;)Ljava/util/Enumeration;",
+                    &[name_arg],
+                );
+            }
+        }
+    }
 
     let mut urls = ctx.find_all_resource_urls(resource_name);
 

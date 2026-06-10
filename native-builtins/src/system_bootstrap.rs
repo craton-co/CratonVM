@@ -299,13 +299,32 @@ fn native_vm_properties(
     props.push(("jdk.nio.enableFastFileTransfer", "false".to_string()));
     props.push(("sun.nio.PageAlignDirectMemory", "true".to_string()));
 
+    // Collect user-defined -D properties (e.g. -Des.path.home=...) not
+    // already in the fixed list above. Without this, System.getProperty()
+    // returns null for CLI-supplied properties because vmProperties() is the
+    // sole source that populates System.props at JDK startup.
+    let already: std::collections::HashSet<&str> = props.iter().map(|(k, _)| *k).collect();
+    let user_props: Vec<(String, String)> = ctx
+        .list_system_properties()
+        .into_iter()
+        .filter(|(k, _)| !already.contains(k.as_str()))
+        .collect();
+
     // Build the interleaved String[] array: [key0, val0, key1, val1, ...]
-    let arr = ctx.new_array(ArrayElementType::Reference, props.len() * 2);
+    let total = props.len() + user_props.len();
+    let arr = ctx.new_array(ArrayElementType::Reference, total * 2);
     for (i, (key, val)) in props.iter().enumerate() {
         let k = ctx.create_string(key);
         let v = ctx.create_string(val);
         ctx.set_array_element(arr, i * 2, Value::Object(Some(k)));
         ctx.set_array_element(arr, i * 2 + 1, Value::Object(Some(v)));
+    }
+    let base = props.len();
+    for (i, (key, val)) in user_props.iter().enumerate() {
+        let k = ctx.create_string(key);
+        let v = ctx.create_string(val);
+        ctx.set_array_element(arr, (base + i) * 2, Value::Object(Some(k)));
+        ctx.set_array_element(arr, (base + i) * 2 + 1, Value::Object(Some(v)));
     }
 
     Ok(Some(Value::Object(Some(arr))))
