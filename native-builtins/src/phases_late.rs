@@ -15443,20 +15443,26 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(None)))
     });
 
-    // FileTime = 1-field (millis=0 Long)
+    // FileTime — see `filetime_alloc` / `filetime_read_millis`. The millis is
+    // stored in the real `long value` field (by name) so descriptor coercion
+    // doesn't destroy it; slot 0 of a real-JDK-bound FileTime is a *reference*
+    // field (`instant`/`unit` cache), so a raw `set_field(ft, 0, Long)` was
+    // coerced to null — `toMillis()` returned 0 (vs the real mtime on HotSpot).
     let ft = "java/nio/file/attribute/FileTime";
     r.register(ft, "toMillis", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Long(filetime_read_millis(ctx, this))))
     });
     r.register(
         ft,
         "fromMillis",
         "(J)Ljava/nio/file/attribute/FileTime;",
         |ctx, args| {
-            let millis = args.first().copied().unwrap_or(Value::Long(0));
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(obj, 0, millis);
+            let millis = match args.first() {
+                Some(Value::Long(v)) => *v,
+                _ => 0,
+            };
+            let obj = filetime_alloc(ctx, millis);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -15467,23 +15473,14 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let other = obj_arg(args, 1)?;
-            let a = match ctx.get_field(this, 0) {
-                Value::Long(v) => v,
-                _ => 0,
-            };
-            let b = match ctx.get_field(other, 0) {
-                Value::Long(v) => v,
-                _ => 0,
-            };
+            let a = filetime_read_millis(ctx, this);
+            let b = filetime_read_millis(ctx, other);
             Ok(Some(Value::Int(a.cmp(&b) as i32)))
         },
     );
     r.register(ft, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let millis = match ctx.get_field(this, 0) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
+        let millis = filetime_read_millis(ctx, this);
         let s = ctx.create_string(&format!("{millis}ms"));
         Ok(Some(Value::Object(Some(s))))
     });
@@ -15506,12 +15503,45 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
             } else {
                 0
             };
-            let ft = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(ft, 0, Value::Long(millis));
+            let ft = filetime_alloc(ctx, millis);
             Ok(Some(Value::Object(Some(ft))))
         },
     );
     r.set_category(__prev_cat);
+}
+
+/// Allocate a `java.nio.file.attribute.FileTime` carrying `millis`.
+///
+/// In real-JDK mode the object binds to the real `FileTime` class (so a
+/// `checkcast FileTime` / `instanceof FileTime` in `BasicFileAttributes`
+/// consumers holds). The millis is written into the real `long value` field
+/// **by name** so descriptor coercion keeps it a `Long`. A raw slot-0 write is
+/// only used as the synthetic-jdk-mode fallback (no named `value` field):
+/// slot 0 of a real FileTime is a *reference* field, so a `Long` written there
+/// is coerced to null — the overlay-on-real-class bug that made `toMillis()`
+/// return 0 instead of the file's mtime.
+fn filetime_alloc(ctx: &mut dyn NativeContext, millis: i64) -> ObjectRef {
+    let ft = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
+    ctx.set_field_by_name(ft, "value", Value::Long(millis));
+    // Only fall back to slot 0 when the real `value` field is absent
+    // (synthetic-jdk stub) — touching slot 0 of a real FileTime would clobber
+    // a reference cache field.
+    if !matches!(ctx.get_field_by_name(ft, "value"), Value::Long(_)) {
+        ctx.set_field(ft, 0, Value::Long(millis));
+    }
+    ft
+}
+
+/// Read the millis from a FileTime built by [`filetime_alloc`]: prefer the
+/// real `long value` field (real-JDK mode), else slot 0 (synthetic mode).
+fn filetime_read_millis(ctx: &dyn NativeContext, ft: ObjectRef) -> i64 {
+    if let Value::Long(v) = ctx.get_field_by_name(ft, "value") {
+        return v;
+    }
+    match ctx.get_field(ft, 0) {
+        Value::Long(v) => v,
+        _ => 0,
+    }
 }
 
 /// Extract path string from a Path argument (field 0 = String)
@@ -15545,8 +15575,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     // root as a zero-length regular file (JUnit5 jar scanning found nothing).
     if let Some((jar, entry)) = jarfs_decode(&path_str) {
         let bfa = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 5);
-        let ft = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-        ctx.set_field(ft, 0, Value::Long(0));
+        let ft = filetime_alloc(ctx, 0);
         ctx.set_field(bfa, 0, Value::Object(Some(ft)));
         ctx.set_field(bfa, 1, Value::Object(Some(ft)));
         ctx.set_field(bfa, 2, Value::Object(Some(ft)));
@@ -15584,18 +15613,15 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Ok(meta) => {
             // Creation time
             let creation_millis = meta.created().ok().map(system_time_to_millis).unwrap_or(0);
-            let ft_create = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(ft_create, 0, Value::Long(creation_millis));
+            let ft_create = filetime_alloc(ctx, creation_millis);
 
             // Last access time
             let access_millis = meta.accessed().ok().map(system_time_to_millis).unwrap_or(0);
-            let ft_access = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(ft_access, 0, Value::Long(access_millis));
+            let ft_access = filetime_alloc(ctx, access_millis);
 
             // Last modified time
             let mod_millis = meta.modified().ok().map(system_time_to_millis).unwrap_or(0);
-            let ft_mod = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(ft_mod, 0, Value::Long(mod_millis));
+            let ft_mod = filetime_alloc(ctx, mod_millis);
 
             ctx.set_field(bfa, 0, Value::Object(Some(ft_create)));
             ctx.set_field(bfa, 1, Value::Object(Some(ft_access)));
@@ -15605,8 +15631,7 @@ fn p59_files_read_attributes(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         }
         Err(_) => {
             // Return default zeros for non-existent files
-            let ft = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(ft, 0, Value::Long(0));
+            let ft = filetime_alloc(ctx, 0);
             ctx.set_field(bfa, 0, Value::Object(Some(ft)));
             ctx.set_field(bfa, 1, Value::Object(Some(ft)));
             ctx.set_field(bfa, 2, Value::Object(Some(ft)));
@@ -34049,7 +34074,8 @@ pub(crate) fn register_posix_file_permission_stub_clinit(r: &mut NativeMethodReg
 pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
-    // FileTime = 1-field (millis=0 Long)
+    // FileTime — millis stored in the real `long value` field (by name) so
+    // descriptor coercion preserves it; see `filetime_alloc`.
     let ft = "java/nio/file/attribute/FileTime";
     r.register(
         ft,
@@ -34060,8 +34086,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(obj, 0, Value::Long(millis));
+            let obj = filetime_alloc(ctx, millis);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -34074,8 +34099,7 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(obj, 0, Value::Long(val));
+            let obj = filetime_alloc(ctx, val);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -34084,14 +34108,13 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
         "from",
         "(Ljava/time/Instant;)Ljava/nio/file/attribute/FileTime;",
         |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
-            ctx.set_field(obj, 0, Value::Long(0));
+            let obj = filetime_alloc(ctx, 0);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.register(ft, "toMillis", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        Ok(Some(Value::Long(filetime_read_millis(ctx, this))))
     });
     r.register(ft, "toInstant", "()Ljava/time/Instant;", |_ctx, _args| {
         Ok(Some(Value::Object(None)))
@@ -34106,23 +34129,14 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
-            let a = match ctx.get_field(this, 0) {
-                Value::Long(v) => v,
-                _ => 0,
-            };
-            let b = match ctx.get_field(other, 0) {
-                Value::Long(v) => v,
-                _ => 0,
-            };
+            let a = filetime_read_millis(ctx, this);
+            let b = filetime_read_millis(ctx, other);
             Ok(Some(Value::Int(a.cmp(&b) as i32)))
         },
     );
     r.register(ft, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let millis = match ctx.get_field(this, 0) {
-            Value::Long(v) => v,
-            _ => 0,
-        };
+        let millis = filetime_read_millis(ctx, this);
         let s = ctx.create_string(&format!("{}ms", millis));
         Ok(Some(Value::Object(Some(s))))
     });
