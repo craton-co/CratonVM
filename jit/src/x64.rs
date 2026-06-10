@@ -5979,23 +5979,105 @@ impl Compiler {
         // across the relocation. We therefore intentionally leave
         // `stack_oop_marks` untouched here; the parallel vector remains in
         // lock-step by index and is still sound at the next safepoint.
+        //
+        // ALIAS SAFETY: a register-resident slot (CalleeSaved/Scratch/Xmm)
+        // occupies a stack position but no frame slot, so Frame slots pushed
+        // above it sit BELOW their canonical offset (`push_stack` hands out
+        // offsets per Frame push, not per position); `flush_scratch_registers`
+        // and `swap` can additionally leave offsets above/inverted. The old
+        // ascending walk stored position i to `base + i*8` and could clobber a
+        // higher position's still-unread source at that same offset (e.g.
+        // [CalleeSaved(R12), Frame(base+0)]: storing R12 to base+0 destroys
+        // position 1's value before it is relocated). Resolve the moves as a
+        // parallel-move problem instead: only emit a move whose target slot is
+        // not some other pending move's source, and break source/target cycles
+        // (a swapped Frame pair) by parking one value in RCX. RCX is a pure
+        // scratch register between bytecodes (never a StackSlot home), and at
+        // most one value is parked at a time: pending sources are distinct
+        // frame slots, so the parked move's own cycle fully drains — emitting
+        // the park target last — before any other all-blocked state can occur.
         let base = self.base_spill_offset;
-        for i in 0..self.stack.len() {
-            let canonical_off = base + (i as i32) * 8; // Cast: x86-64 immediate encoding
-            let slot = self.stack[i];
-            match slot {
-                StackSlot::Frame(off) if off == canonical_off => {
-                    // Already in the right place
+        let len = self.stack.len();
+        // Pending relocations: (position, source). `None` source = the value
+        // is parked in RCX awaiting its canonical slot.
+        let mut pending: Vec<(usize, Option<StackSlot>)> = (0..len)
+            .filter_map(|i| {
+                let canonical_off = base + (i as i32) * 8; // Cast: x86-64 immediate encoding
+                match self.stack[i] {
+                    StackSlot::Frame(off) if off == canonical_off => None, // already in place
+                    slot => Some((i, Some(slot))),
                 }
-                _ => {
-                    // Load value to RAX, then store to canonical offset
-                    self.load_slot_to_reg(RAX, slot);
+            })
+            .collect();
+        let mut parked = false;
+        while !pending.is_empty() {
+            let unblocked = pending.iter().position(|&(i, _)| {
+                let target = base + (i as i32) * 8; // Cast: x86-64 immediate encoding
+                !pending.iter().any(|&(j, src)| {
+                    j != i && matches!(src, Some(StackSlot::Frame(off)) if off == target)
+                })
+            });
+            match unblocked {
+                Some(k) => {
+                    let (i, src) = pending.remove(k);
+                    let canonical_off = base + (i as i32) * 8; // Cast: x86-64 immediate encoding
+                    match src {
+                        Some(slot) => self.load_slot_to_reg(RAX, slot),
+                        None => {
+                            self.emit_mov_reg_reg(RAX, RCX); // parked value
+                            parked = false;
+                        }
+                    }
                     self.emit_store_local(canonical_off, RAX);
                     self.stack[i] = StackSlot::Frame(canonical_off);
                 }
+                None => {
+                    // Every pending move's target holds another pending move's
+                    // source: the blocked-by relation (each move has at most
+                    // one blocker — sources are distinct frame slots) contains
+                    // a cycle of Frame-sourced moves. Walk blocker edges from
+                    // any pending move until a node repeats — that node is ON
+                    // the cycle — and park its value in RCX so the cycle can
+                    // drain. (Parked moves never block, so a second park
+                    // cannot be needed before the first parked move retires;
+                    // bail defensively rather than corrupt if that invariant
+                    // is ever broken.)
+                    if parked {
+                        self.failed = true;
+                        return;
+                    }
+                    let mut walk = pending[0].0;
+                    let mut seen = vec![false; len];
+                    loop {
+                        if seen[walk] {
+                            break; // `walk` is on a cycle
+                        }
+                        seen[walk] = true;
+                        let target = base + (walk as i32) * 8; // Cast: x86-64 immediate encoding
+                        match pending.iter().find(|&&(j, src)| {
+                            j != walk
+                                && matches!(src, Some(StackSlot::Frame(off)) if off == target)
+                        }) {
+                            Some(&(j, _)) => walk = j,
+                            None => {
+                                // No blocker found for an all-blocked move —
+                                // inconsistent state; bail safely.
+                                self.failed = true;
+                                return;
+                            }
+                        }
+                    }
+                    let entry = pending
+                        .iter_mut()
+                        .find(|(i, _)| *i == walk)
+                        .expect("cycle node is pending");
+                    let slot = entry.1.take().expect("cycle node has a real source");
+                    self.load_slot_to_reg(RCX, slot);
+                    parked = true;
+                }
             }
         }
-        self.next_spill_offset = base + (self.stack.len() as i32) * 8; // Cast: x86-64 immediate encoding
+        self.next_spill_offset = base + (len as i32) * 8; // Cast: x86-64 immediate encoding
     }
 
     // -----------------------------------------------------------------------
@@ -9769,9 +9851,15 @@ impl Compiler {
                 0x5f => {
                     let a = self.pop_stack();
                     let b = self.pop_stack();
+                    // Read BOTH operands before the first push: push_from_rax
+                    // reuses the just-reclaimed lower spill slot, which is
+                    // exactly `b`'s frame slot when both operands are
+                    // frame-resident — storing into it before reading `b`
+                    // duplicated value1 into both result slots.
                     self.load_slot_to_reg(RAX, a);
+                    self.load_slot_to_reg(RCX, b);
                     self.push_from_rax();
-                    self.load_slot_to_reg(RAX, b);
+                    self.emit_mov_reg_reg(RAX, RCX);
                     self.push_from_rax();
                     cpc += 1;
                 }
@@ -13068,23 +13156,41 @@ impl Compiler {
                     let b = self.pop_stack();
                     match (a, b) {
                         (StackSlot::Frame(off_a), StackSlot::Frame(off_b)) => {
-                            // Load both, store swapped
+                            // Physically exchange the two frame slots and keep
+                            // each slot ENTRY at its original position, so the
+                            // positions keep their original (ascending) frame
+                            // offsets: below-top stays Frame(off_b) and now
+                            // reads value1, top stays Frame(off_a) and reads
+                            // value2. The previous code exchanged the memory
+                            // but pushed the entries in (a, b) order, which
+                            // re-paired each entry with its original value —
+                            // the exchange and the reorder cancelled out and
+                            // swap was a NO-OP for two frame-resident values.
                             self.emit_load_local(RAX, off_a);
                             self.emit_load_local(RCX, off_b);
                             self.emit_store_local(off_a, RCX);
                             self.emit_store_local(off_b, RAX);
+                            self.stack.push(b);
+                            self.stack_oop_marks.push(a_oop); // off_b now holds value1
+                            self.stack.push(a);
+                            self.stack_oop_marks.push(b_oop); // off_a now holds value2
                         }
                         _ => {
-                            // Mixed or both CalleeSaved/Scratch — no memory swap needed,
-                            // just logical reordering via push order below
+                            // Mixed or register-resident — no memory traffic;
+                            // reorder the slot entries, each carrying its own
+                            // value and oop mark to its new position.
+                            self.stack.push(a);
+                            self.stack_oop_marks.push(a_oop);
+                            self.stack.push(b);
+                            self.stack_oop_marks.push(b_oop);
                         }
                     }
-                    // Push back in swapped order, carrying each operand's
-                    // original oop mark onto its new slot.
-                    self.stack.push(a);
-                    self.stack_oop_marks.push(a_oop);
-                    self.stack.push(b);
-                    self.stack_oop_marks.push(b_oop);
+                    // The two pops above may have reclaimed the operands' spill
+                    // slots (next_spill_offset rewound below the still-live
+                    // frame slots just pushed back); a later push would then be
+                    // handed a live slot and clobber it. Recompute the cursor
+                    // from the live stack.
+                    self.reset_spills();
                     pc += 1;
                 }
 
@@ -13699,11 +13805,17 @@ impl Compiler {
                         None => return false, // invalid branch target
                     };
 
-                    let slot = self.pop_stack();
-                    // Canonicalize remaining stack for forward merge points
-                    if target_pc > pc && !self.stack.is_empty() {
+                    // Canonicalize for forward merge points BEFORE popping the
+                    // operand, so it participates in the relocation. Popping
+                    // first left the operand's frame slot invisible to
+                    // canonicalize_stack(), which could store a remaining
+                    // register-resident slot to that same offset (register
+                    // slots shift the offsets of Frame slots above them down)
+                    // and clobber the operand before the TEST below read it.
+                    if target_pc > pc && self.stack.len() > 1 {
                         self.canonicalize_stack();
                     }
+                    let slot = self.pop_stack();
                     // TEST r32, r32 — sets ZF/SF for comparison against zero
                     let reg = self.slot_to_gpr(slot, RCX);
                     self.emit_test_r32_r32(reg);
@@ -13746,6 +13858,17 @@ impl Compiler {
                         None => return false, // invalid branch target
                     };
 
+                    // Canonicalize for forward merge points BEFORE popping the
+                    // operands (see ifeq..ifle above): with both operands still
+                    // on the simulated stack they are relocated above every
+                    // store target, so a remaining register-resident slot can
+                    // no longer be stored over a popped operand's frame slot.
+                    // Done before the cmov consult too — the peephole then sees
+                    // frame-canonical operands in this rare deep-stack shape,
+                    // which costs a reload but stays correct.
+                    if target_pc > pc && self.stack.len() > 2 {
+                        self.canonicalize_stack();
+                    }
                     let val2 = self.pop_stack(); // value2
                     let val1 = self.pop_stack(); // value1
 
@@ -13765,10 +13888,6 @@ impl Compiler {
                         continue;
                     }
 
-                    // Canonicalize remaining stack for forward merge points
-                    if target_pc > pc && !self.stack.is_empty() {
-                        self.canonicalize_stack();
-                    }
                     // Emit CMP with direct reg-reg when possible
                     let r1 = self.slot_to_gpr(val1, RAX);
                     let r2 = self.slot_to_gpr(val2, RCX);
@@ -18662,6 +18781,16 @@ impl Compiler {
                         None => return false, // invalid branch target
                     };
 
+                    // Canonicalize for forward merge points BEFORE popping the
+                    // operands (see ifeq..ifle). if_acmp historically skipped
+                    // both the canonicalization and the depth record, so a
+                    // taken edge with a non-empty remaining stack reached a
+                    // merge whose layout the two paths never agreed on
+                    // (surfacing as a simulated-stack underflow that bailed
+                    // the whole method to the interpreter).
+                    if target_pc > pc && self.stack.len() > 2 {
+                        self.canonicalize_stack();
+                    }
                     let val2 = self.pop_stack();
                     let val1 = self.pop_stack();
                     self.load_slot_to_reg(RCX, val2);
@@ -18677,6 +18806,9 @@ impl Compiler {
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
                     self.forward_patches.push((patch_offset, target_pc));
+                    self.branch_target_stack_depth
+                        .entry(target_pc)
+                        .or_insert(self.stack.len());
                     self.reset_spills();
                     pc += 3;
                 }
@@ -18690,6 +18822,11 @@ impl Compiler {
                         None => return false, // invalid branch target
                     };
 
+                    // Canonicalize for forward merge points BEFORE popping the
+                    // operands (see if_acmpeq above).
+                    if target_pc > pc && self.stack.len() > 2 {
+                        self.canonicalize_stack();
+                    }
                     let val2 = self.pop_stack();
                     let val1 = self.pop_stack();
                     self.load_slot_to_reg(RCX, val2);
@@ -18705,6 +18842,9 @@ impl Compiler {
                     self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
 
                     self.forward_patches.push((patch_offset, target_pc));
+                    self.branch_target_stack_depth
+                        .entry(target_pc)
+                        .or_insert(self.stack.len());
                     self.reset_spills();
                     pc += 3;
                 }
@@ -18821,6 +18961,13 @@ impl Compiler {
                         None => return false, // invalid branch target
                     };
 
+                    // Canonicalize for forward merge points BEFORE popping the
+                    // operand (see ifeq..ifle): popping first could let the
+                    // relocation of a remaining register-resident slot clobber
+                    // the operand's frame slot before the TEST reads it.
+                    if target_pc > pc && self.stack.len() > 1 {
+                        self.canonicalize_stack();
+                    }
                     let slot = self.pop_stack();
                     // HIGH-1 / Fix 1 — wire null-check elimination.
                     // If the value on top of stack came from an aload of a
@@ -18830,9 +18977,6 @@ impl Compiler {
                     // and the JE.
                     let proven_nonnull = preceding_aload_nonnull_local(code, pc)
                         .is_some_and(|l| self.is_local_nonnull(pc, l));
-                    if target_pc > pc && !self.stack.is_empty() {
-                        self.canonicalize_stack();
-                    }
                     if proven_nonnull {
                         // No-op: fall through. We still need a non-empty
                         // branch-target record so downstream merges see
@@ -18872,6 +19016,11 @@ impl Compiler {
                         None => return false, // invalid branch target
                     };
 
+                    // Canonicalize for forward merge points BEFORE popping the
+                    // operand (see ifeq..ifle / ifnull above).
+                    if target_pc > pc && self.stack.len() > 1 {
+                        self.canonicalize_stack();
+                    }
                     let slot = self.pop_stack();
                     // HIGH-1 / Fix 1 — null-check elimination. If the
                     // tested value is proven non-null, `ifnonnull` is
@@ -18881,9 +19030,6 @@ impl Compiler {
                     // proven site.
                     let proven_nonnull = preceding_aload_nonnull_local(code, pc)
                         .is_some_and(|l| self.is_local_nonnull(pc, l));
-                    if target_pc > pc && !self.stack.is_empty() {
-                        self.canonicalize_stack();
-                    }
                     if proven_nonnull {
                         // JMP rel32 (5 bytes; patched).
                         self.buf.emit_byte(0xE9);
@@ -21085,6 +21231,169 @@ mod tests {
         assert_eq!(unsafe { compiled.try_call(&[10, 3]).expect("test JIT call") }, 7);
         // SAFETY: same as above.
         assert_eq!(unsafe { compiled.try_call(&[-4, 6]).expect("test JIT call") }, -10);
+    }
+
+    /// A SINGLE swap of two frame-resident values must actually swap them.
+    /// The double-swap test above is identity-blind: the old (Frame, Frame)
+    /// arm exchanged the slot memory AND pushed the entries in (a, b) order,
+    /// which re-paired each entry with its original value — a net no-op that
+    /// two swaps cannot distinguish from correct code.
+    #[test]
+    fn test_swap_frame_frame_single() {
+        // iconst_5, iconst_2, swap, isub, ireturn
+        // [5, 2] → swap → [2, 5]; isub = 2 - 5 = -3. (No-op swap gives 3.)
+        let code: Vec<u8> = vec![0x08, 0x05, 0x5f, 0x64, 0xac, 0, 0];
+        let code_len = 5;
+        let compiled = compile(
+            &code, code_len, 1, 1, false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .expect("single swap must JIT-compile");
+        // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
+        assert_eq!(unsafe { compiled.try_call(&[0]).expect("test JIT call") }, -3);
+    }
+
+    /// After a swap, the spill cursor must not hand a later push a slot the
+    /// swapped values still occupy (the pops rewound `next_spill_offset`
+    /// below the re-pushed entries; without the post-swap reset a following
+    /// iconst landed on the below-top value's frame slot).
+    #[test]
+    fn test_swap_then_push_no_live_slot_reuse() {
+        // iconst_5, iconst_2, swap, iconst_1, isub, isub, ireturn
+        // [5,2] → swap → [2,5] → push 1 → [2,5,1] → isub → [2,4] → isub → -2.
+        let code: Vec<u8> = vec![0x08, 0x05, 0x5f, 0x04, 0x64, 0x64, 0xac, 0, 0];
+        let code_len = 7;
+        let compiled = compile(
+            &code, code_len, 1, 1, false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .expect("swap+push must JIT-compile");
+        // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
+        assert_eq!(unsafe { compiled.try_call(&[0]).expect("test JIT call") }, -2);
+    }
+
+    /// Mixed register/frame swap (register-allocated local below a
+    /// frame-resident constant) — exercises the pure entry-reorder arm.
+    #[test]
+    fn test_swap_mixed_reg_frame() {
+        // iload_0, iconst_3, swap, isub, ireturn
+        // [k, 3] → swap → [3, k]; isub = 3 - k. f(10) = -7.
+        let code: Vec<u8> = vec![0x1a, 0x06, 0x5f, 0x64, 0xac, 0, 0];
+        let code_len = 5;
+        let compiled = compile(
+            &code, code_len, 1, 1, false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .expect("mixed swap must JIT-compile");
+        // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
+        assert_eq!(unsafe { compiled.try_call(&[10]).expect("test JIT call") }, -7);
+        // SAFETY: same as above.
+        assert_eq!(unsafe { compiled.try_call(&[-4]).expect("test JIT call") }, 7);
+    }
+
+    /// if_icmp with a register-resident slot BELOW two frame-resident
+    /// operands: canonicalizing the remaining stack must not clobber the
+    /// popped operands. Pre-fix, the handler popped first and the
+    /// canonicalization stored the register local to canonical slot 0 —
+    /// exactly val1's frame slot (register slots shift the offsets of frame
+    /// slots above them down by one position) — so the CMP compared the
+    /// register local's value instead of val1.
+    #[test]
+    fn test_if_icmp_canonicalize_preserves_popped_operands() {
+        // int f(int k) { return k + (k+5 < k+3 ? 9 : 7); }
+        //  0: iload_0            [k]            (register-allocated → CalleeSaved)
+        //  1: iload_0            [k, k]
+        //  2: iconst_5
+        //  3: iadd               [k, k+5]       (frame slot base+0)
+        //  4: iload_0
+        //  5: iconst_3
+        //  6: iadd               [k, k+5, k+3]  (frame slot base+8)
+        //  7: if_icmplt +8 → 15  [k]
+        // 10: bipush 7
+        // 12: goto +5 → 17
+        // 15: bipush 9
+        // 17: iadd               [k+7]   (k+5 < k+3 is always false)
+        // 18: ireturn
+        let code: Vec<u8> = vec![
+            0x1a, 0x1a, 0x08, 0x60, 0x1a, 0x06, 0x60, 0xa1, 0x00, 0x08, 0x10, 0x07, 0xa7, 0x00,
+            0x05, 0x10, 0x09, 0x60, 0xac, 0, 0,
+        ];
+        let code_len = 19;
+        let compiled = compile(
+            &code, code_len, 1, 1, false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .expect("deep-stack if_icmp must JIT-compile");
+        // k+5 < k+3 is false for every k → always the 7 arm. The clobbered
+        // compare read k itself as val1: k < k+3 is true → 9 arm.
+        // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
+        assert_eq!(unsafe { compiled.try_call(&[10]).expect("test JIT call") }, 17);
+        // SAFETY: same as above.
+        assert_eq!(unsafe { compiled.try_call(&[-2]).expect("test JIT call") }, 5);
+    }
+
+    /// Same shape for the one-operand ifXX family: [CalleeSaved, Frame]
+    /// at an ifle. Pre-fix the canonicalization stored the register local
+    /// over the just-popped operand's frame slot before the TEST read it.
+    #[test]
+    fn test_ifxx_canonicalize_preserves_popped_operand() {
+        // int f(int k) { return k + (k+3 <= 0 ? 9 : 7); }
+        //  0: iload_0           [k]
+        //  1: iload_0           [k, k]
+        //  2: iconst_3
+        //  3: iadd              [k, k+3]   (frame slot base+0)
+        //  4: ifle +8 → 12      [k]
+        //  7: bipush 7
+        //  9: goto +5 → 14
+        // 12: bipush 9
+        // 14: iadd
+        // 15: ireturn
+        let code: Vec<u8> = vec![
+            0x1a, 0x1a, 0x06, 0x60, 0x9e, 0x00, 0x08, 0x10, 0x07, 0xa7, 0x00, 0x05, 0x10, 0x09,
+            0x60, 0xac, 0, 0,
+        ];
+        let code_len = 16;
+        let compiled = compile(
+            &code, code_len, 1, 1, false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .expect("deep-stack ifle must JIT-compile");
+        // f(-1): k+3 = 2 > 0 → 7 arm → 6. The clobbered TEST read k = -1
+        // (≤ 0) → 9 arm → 8.
+        // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
+        assert_eq!(unsafe { compiled.try_call(&[-1]).expect("test JIT call") }, 6);
+        // SAFETY: same as above.
+        assert_eq!(unsafe { compiled.try_call(&[5]).expect("test JIT call") }, 12);
     }
 
     #[test]
