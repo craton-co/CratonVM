@@ -21791,6 +21791,47 @@ fn native_cond_signal_all(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
 
 // --- CountDownLatch ---
 
+// The real `java.util.concurrent.CountDownLatch` has a single field,
+// `sync: Ljava/util/concurrent/CountDownLatch$Sync;` — a REFERENCE slot. The
+// synthetic natives below own every public entry point (init/countDown/await/
+// getCount/toString), so the slot is exclusively theirs — but a bare
+// `set_field(this, 0, Int(count))` is silently coerced to `Object(None)` by
+// the descriptor-aware write path (`coerce_field_value_by_descriptor` maps a
+// primitive written to an `L` slot to null; same trap as the StringWriter
+// count, see native-io). Every later read then sees `Object(None)` → count 0 →
+// `await()` returns immediately and `countDown()` no-ops. Visible symptom:
+// WildFly's subsystem-test `waitForSetup()` fell through before the boot
+// thread assigned `bootSuccess`, so `isSuccessfulBoot()` read false and the
+// test failed with "Subsystem boot failed!" while boot later succeeded.
+// Store the count in a 1-element int[] holder instead — an object reference
+// matches the declared slot type, survives the coercion, and is traced and
+// relocated by the GC.
+fn cdl_count(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    match ctx.get_field(this, CDL_FIELD_COUNT) {
+        Value::Object(Some(holder)) => match ctx.get_array_element(holder, 0) {
+            Value::Int(v) => v,
+            _ => 0,
+        },
+        // Legacy synthetic objects (alloc_concurrent_synthetic, no real class
+        // layout → no descriptor → the raw Int write survives).
+        Value::Int(v) => v,
+        _ => 0,
+    }
+}
+
+fn cdl_set_count(ctx: &mut dyn NativeContext, this: ObjectRef, count: i32) {
+    if let Value::Object(Some(holder)) = ctx.get_field(this, CDL_FIELD_COUNT) {
+        ctx.set_array_element(holder, 0, Value::Int(count));
+        return;
+    }
+    // No holder yet (or a legacy Int slot): install one. The raw Int fallback
+    // path still works for synthetic allocations where set_field is uncoerced,
+    // but route everything through the holder for uniformity.
+    let holder = ctx.new_array(cratonvm_types::ArrayElementType::Int, 1);
+    ctx.set_array_element(holder, 0, Value::Int(count));
+    ctx.set_field(this, CDL_FIELD_COUNT, Value::Object(Some(holder)));
+}
+
 fn native_cdl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -21806,7 +21847,7 @@ fn native_cdl_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         }
         .into());
     }
-    ctx.set_field(this, CDL_FIELD_COUNT, Value::Int(count));
+    cdl_set_count(ctx, this, count);
     Ok(None)
 }
 
@@ -21815,19 +21856,22 @@ fn native_cdl_count_down(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let count = match ctx.get_field(this, CDL_FIELD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    // Serialize the read-modify-write against concurrent countDown() calls —
+    // two racing decrements must not lose one (the boot-thread/test-thread
+    // handshake counts on exactly-N decrements releasing the latch).
+    ctx.monitor_enter(this);
+    let count = cdl_count(ctx, this);
     if count > 0 {
-        ctx.set_field(this, CDL_FIELD_COUNT, Value::Int(count - 1));
+        cdl_set_count(ctx, this, count - 1);
         if count - 1 == 0 {
             // Count reached zero — wake all waiting threads
-            ctx.monitor_enter(this);
-            ctx.monitor_notify_all(this)?;
+            let notify_result = ctx.monitor_notify_all(this);
             ctx.monitor_exit(this);
+            notify_result?;
+            return Ok(None);
         }
     }
+    ctx.monitor_exit(this);
     Ok(None)
 }
 
@@ -21836,19 +21880,17 @@ fn native_cdl_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    let mut count = match ctx.get_field(this, CDL_FIELD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
-    while count > 0 {
-        // Yield to allow other threads to count down
-        std::thread::yield_now();
-        count = match ctx.get_field(this, CDL_FIELD_COUNT) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+    // Block on the monitor instead of spinning. The bounded wait (10ms)
+    // covers the lost-wakeup window between the count read and the wait.
+    loop {
+        if cdl_count(ctx, this) <= 0 {
+            return Ok(None);
+        }
+        ctx.monitor_enter(this);
+        let wait_result = ctx.monitor_wait(this, Some(10));
+        ctx.monitor_exit(this);
+        wait_result?;
     }
-    Ok(None)
 }
 
 fn native_cdl_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -21869,10 +21911,7 @@ fn native_cdl_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
 
     loop {
-        let count = match ctx.get_field(this, CDL_FIELD_COUNT) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
+        let count = cdl_count(ctx, this);
         if count == 0 {
             return Ok(Some(Value::Int(1))); // true — count reached zero
         }
@@ -21892,10 +21931,7 @@ fn native_cdl_get_count(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Long(0))),
     };
-    let count = match ctx.get_field(this, CDL_FIELD_COUNT) {
-        Value::Int(v) => v as i64,
-        _ => 0,
-    };
+    let count = cdl_count(ctx, this) as i64;
     Ok(Some(Value::Long(count)))
 }
 
@@ -21904,10 +21940,7 @@ fn native_cdl_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let count = match ctx.get_field(this, CDL_FIELD_COUNT) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let count = cdl_count(ctx, this);
     let s = format!(
         "java.util.concurrent.CountDownLatch@{:x}[Count = {count}]",
         this.as_ptr() as usize
