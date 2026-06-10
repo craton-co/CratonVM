@@ -2034,6 +2034,29 @@ pub fn execute(
                             return Ok(inner);
                         }
                     }
+                    // Receiver-is-annotation-proxy rescue. An annotation
+                    // member call (e.g. JUnit5's `ExtendWith.value()`)
+                    // resolves to the abstract interface declaration (no
+                    // Code), but the receiver is one of our synthetic
+                    // `java/lang/annotation/AnnotationProxy` objects whose
+                    // members live in its name/value element arrays — there
+                    // is no bytecode body to find anywhere. Route through
+                    // the annotation-proxy element dispatch (same handler
+                    // the direct invoke path at `execute_invoke` uses)
+                    // instead of throwing AbstractMethodError.
+                    if recv_kind == cratonvm_types::ObjectKind::Object
+                        && shared
+                            .class_manager
+                            .read()
+                            .get_class(recv_cid)
+                            .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
+                            .unwrap_or(false)
+                    {
+                        let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+                        return crate::vm::annotation_proxy_invoke_shared(
+                            shared, thread, recv_obj, method_name, rest,
+                        );
+                    }
                     // Path A — receiver carries a real (non-zero) class_id.
                     //   Walk its runtime-class chain for a same-signature
                     //   override that has Code (or a registered native) and

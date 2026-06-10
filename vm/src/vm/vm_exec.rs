@@ -9575,6 +9575,33 @@ fn invoke_on_class_shared_inner(
                     }
                     drop(cm_nat);
                 }
+                // Annotation-proxy rescue: reflective dispatch (e.g.
+                // `Method.invoke` on `ExtendWith::value`) resolves the
+                // receiver's runtime class directly — which for our
+                // synthetic annotation proxies is
+                // `java/lang/annotation/AnnotationProxy`, a class with no
+                // bytecode methods at all. Its members are served from the
+                // proxy's stored name/value element arrays, so route there
+                // as the last resort before surfacing NoSuchMethodError.
+                if let Some(Value::Object(Some(recv))) = args.first().copied() {
+                    let recv_is_ann_proxy = shared.heap.kind_of(recv)
+                        == cratonvm_types::ObjectKind::Object
+                        && shared
+                            .class_manager
+                            .read()
+                            .get_class(shared.heap.class_id_of(recv))
+                            .map(|c| &*c.name == "java/lang/annotation/AnnotationProxy")
+                            .unwrap_or(false);
+                    if recv_is_ann_proxy {
+                        return annotation_proxy_invoke_shared(
+                            shared,
+                            thread,
+                            recv,
+                            method_name,
+                            &args[1..],
+                        );
+                    }
+                }
                 tracing::warn!(
                     method = format!("{class_name}.{method_name}{descriptor}"),
                     "NoSuchMethodError"

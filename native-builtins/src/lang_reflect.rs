@@ -371,8 +371,17 @@ fn build_parameter_array(
             None => Vec::new(),
         };
 
+    // Size to the REAL `java.lang.reflect.Parameter` layout when loaded —
+    // its bytecode getters write cache fields (`parameterClassCache`,
+    // `parameterTypeCache`) that live beyond the 4 declared-value slots,
+    // so a 4-slot alloc would be an undersized object.
+    let alloc_fields = core::cmp::max(
+        PARAMETER_NUM_FIELDS,
+        ctx.class_num_total_fields(parameter_class_id),
+    );
+
     for (i, pdesc) in param_descs.iter().enumerate() {
-        let p = ctx.alloc_object(parameter_class_id, PARAMETER_NUM_FIELDS);
+        let p = ctx.alloc_object(parameter_class_id, alloc_fields);
 
         let (name_str, modifiers) = match parameter_meta.get(i) {
             Some((n, flags)) if !n.is_empty() => (n.clone(), *flags as i32),
@@ -382,10 +391,31 @@ fn build_parameter_array(
         let name = ctx.create_string(&name_str);
         let type_mirror = descriptor_to_class_mirror(ctx, pdesc);
 
-        ctx.set_field(p, 0, Value::Object(Some(name)));
-        ctx.set_field(p, 1, Value::Int(modifiers));
-        ctx.set_field(p, 2, Value::Object(Some(type_mirror)));
-        ctx.set_field(p, 3, Value::Object(Some(declaring_executable)));
+        // Real-JDK Parameter layout (name, modifiers, executable, index) —
+        // write by field name so the REAL Parameter bytecode works:
+        // `Parameter.getType()` is `executable.getSharedParameterTypes()[index]`.
+        // The old slot writes put the TYPE mirror where the real layout
+        // keeps `executable`, so getType() dispatched
+        // getSharedParameterTypes on a Class mirror → NoSuchMethodError
+        // (every JUnit5 @ParameterizedTest argument resolution died there).
+        ctx.set_field_by_name(p, "name", Value::Object(Some(name)));
+        ctx.set_field_by_name(p, "modifiers", Value::Int(modifiers));
+        ctx.set_field_by_name(p, "executable", Value::Object(Some(declaring_executable)));
+        ctx.set_field_by_name(p, "index", Value::Int(i as i32));
+        // Synthetic fallback — Parameter class has no named fields here
+        // (set_field_by_name no-ops): keep the legacy slot layout
+        // [0]=name, [1]=modifiers, [2]=type mirror, [3]=executable that the
+        // synthetic Parameter natives read.
+        let by_name_landed = matches!(
+            ctx.get_field_by_name(p, "executable"),
+            Value::Object(Some(e)) if e == declaring_executable
+        );
+        if !by_name_landed {
+            ctx.set_field(p, 0, Value::Object(Some(name)));
+            ctx.set_field(p, 1, Value::Int(modifiers));
+            ctx.set_field(p, 2, Value::Object(Some(type_mirror)));
+            ctx.set_field(p, 3, Value::Object(Some(declaring_executable)));
+        }
 
         ctx.set_array_element(arr, i, Value::Object(Some(p)));
     }
