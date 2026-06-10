@@ -18981,8 +18981,23 @@ impl Compiler {
         true
     }
 
-    /// Patch all forward branches and self-calls.
-    fn patch_branches(&mut self) {
+    /// Patch all forward branches and jump-table entries.
+    ///
+    /// Returns `false` when any recorded branch/table target has no native
+    /// offset (`pc_to_native[target_pc] < 0` or out of range). Every target
+    /// the scan pass collects is revived and emitted by the dead-code walk,
+    /// so an unresolved target means the bytecode branches to a PC that is
+    /// not an instruction boundary (e.g. into the middle of a `goto`'s
+    /// operand bytes) — malformed bytecode that a classfile verifier would
+    /// reject, but which CratonVM can still meet via unverified/synthetic
+    /// code. Previously such patches were silently SKIPPED, leaving the
+    /// emitted rel32 placeholder `0`: the branch fell through (or, when the
+    /// branch was the last emitted instruction, execution ran off the body
+    /// into the out-of-line stubs — observed as a STATUS_ACCESS_VIOLATION
+    /// from a hand-written test with an off-by-one target, 2026-06-09).
+    /// The caller must discard the method so it stays interpreted.
+    #[must_use]
+    fn patch_branches(&mut self) -> bool {
         // Patch conditional and unconditional branches
         for &(patch_offset, target_pc) in &self.forward_patches {
             let target_native = if target_pc < self.pc_to_native.len() {
@@ -18990,16 +19005,17 @@ impl Compiler {
             } else {
                 -1
             };
-            if target_native >= 0 {
-                // rel32 = target - (patch_offset + 4)
-                let rel = target_native - (patch_offset as i32 + 4); // Cast: x86-64 rel32 displacement
-                // `try_patch_i32` already sets the sticky `overflowed` flag and
-                // returns Err on an out-of-bounds offset. Honor the no-panic
-                // bail contract: drop the Err and let the driver's
-                // `if buf.overflowed() { return None; }` discard the method.
-                if self.buf.try_patch_i32(patch_offset, rel).is_err() {
-                    self.buf.mark_overflowed();
-                }
+            if target_native < 0 {
+                return false; // unresolved target — reject the method
+            }
+            // rel32 = target - (patch_offset + 4)
+            let rel = target_native - (patch_offset as i32 + 4); // Cast: x86-64 rel32 displacement
+            // `try_patch_i32` already sets the sticky `overflowed` flag and
+            // returns Err on an out-of-bounds offset. Honor the no-panic
+            // bail contract: drop the Err and let the driver's
+            // `if buf.overflowed() { return None; }` discard the method.
+            if self.buf.try_patch_i32(patch_offset, rel).is_err() {
+                self.buf.mark_overflowed();
             }
         }
         // Patch jump table entries: each entry is an i32 offset from table_base to target
@@ -19009,14 +19025,16 @@ impl Compiler {
             } else {
                 -1
             };
-            if target_native >= 0 {
-                let rel = target_native - table_base as i32; // Cast: x86-64 rel32 displacement
-                // See note above: bail via the overflowed flag, never panic.
-                if self.buf.try_patch_i32(entry_offset, rel).is_err() {
-                    self.buf.mark_overflowed();
-                }
+            if target_native < 0 {
+                return false; // unresolved table target — reject the method
+            }
+            let rel = target_native - table_base as i32; // Cast: x86-64 rel32 displacement
+            // See note above: bail via the overflowed flag, never panic.
+            if self.buf.try_patch_i32(entry_offset, rel).is_err() {
+                self.buf.mark_overflowed();
             }
         }
+        true
     }
 
     fn patch_self_calls(&mut self, entry_offset: usize) {
@@ -19506,8 +19524,13 @@ pub fn compile_with_param_slots(
         return None;
     }
 
-    // Patch branches (both forward and backward are handled)
-    compiler.patch_branches();
+    // Patch branches (both forward and backward are handled). A `false`
+    // return means some branch targeted a PC that was never emitted as an
+    // instruction boundary (malformed/unverified bytecode) — reject the
+    // method rather than leave an unpatched jump in executable code.
+    if !compiler.patch_branches() {
+        return None;
+    }
 
     // Patch self-recursive calls to point to entry
     compiler.patch_self_calls(entry_offset);
@@ -25098,7 +25121,12 @@ mod tests {
             0x36, 0x04, // 1: istore 4 (i = 0)
             0x15, 0x04, // 3: iload 4 — HEADER
             0x1D, // 5: iload_3 (n)
-            0xa2, 0x00, 0x14, // 6: if_icmpge +20 → 26
+            // Exit branch targets the `return` at pc 28. (Historical note:
+            // this was `+20 → 26`, the middle of the goto at 25 — never an
+            // instruction boundary. The unresolved patch was silently
+            // skipped before `patch_branches` learned to reject such
+            // targets; the compile-only assertions below never noticed.)
+            0xa2, 0x00, 0x16, // 6: if_icmpge +22 → 28
             0x2A, // 9:  aload_0 (out)
             0x15, 0x04, // 10: iload 4
             0x2B, // 12: aload_1 (a)
@@ -25429,7 +25457,14 @@ mod tests {
         }
         let back_edge = code.len();
         code.extend_from_slice(&[0x84, 0x02, 0x01]); // iinc
-        code.extend_from_slice(&[0xa7, 0xFF, 0xFF]); // goto
+        // Real back-edge to the loop header. (Historical note: this was a
+        // hardcoded `goto -1`, landing on the iinc's last operand byte —
+        // not an instruction boundary. The unresolved patch was silently
+        // skipped before `patch_branches` learned to reject such targets.)
+        let goto_pc = code.len();
+        let goto_off = (header as i32 - goto_pc as i32) as i16; // Cast: fits — tiny method
+        code.push(0xa7);
+        code.extend_from_slice(&goto_off.to_be_bytes());
         code.push(0xB1); // return
         code.push(0); // padding
         code.push(0);
@@ -28740,6 +28775,36 @@ mod tests {
         assert!(
             !try_compile_int_body(&code, code_len),
             "lookupswitch with truncated header must bail, not compile"
+        );
+    }
+
+    /// A branch whose target lands INSIDE another instruction (here: the
+    /// middle of a `goto`'s operand bytes) is never emitted as an
+    /// instruction boundary, so `pc_to_native[target]` stays -1.
+    /// `patch_branches` must reject the method (bail to the interpreter)
+    /// instead of leaving the rel32 placeholder 0 in executable code —
+    /// a zero rel32 silently falls through, and when the branch is the
+    /// last emitted instruction execution runs off the body into the
+    /// out-of-line stubs (observed as STATUS_ACCESS_VIOLATION from a
+    /// hand-written test with an off-by-one target, 2026-06-09). javac
+    /// output is verified and cannot contain this; unverified/synthetic
+    /// bytecode can.
+    #[test]
+    fn test_branch_target_mid_instruction_bails() {
+        //  0: iconst_3            [3]
+        //  1: iconst_0            [3, 0]
+        //  2: iconst_0            [3, 0, 0]
+        //  3: if_icmpeq +4 → 7    [3]   (7 = middle of the goto at 6..=8)
+        //  6: goto +4 → 10        [3]
+        //  9: iconst_0            (dead filler, never a target)
+        // 10: ireturn
+        let code: Vec<u8> = vec![
+            0x06, 0x03, 0x03, 0x9f, 0x00, 0x04, 0xa7, 0x00, 0x04, 0x03, 0xac,
+        ];
+        let code_len = code.len();
+        assert!(
+            !try_compile_int_body(&code, code_len),
+            "branch into the middle of an instruction must bail, not compile"
         );
     }
 }
