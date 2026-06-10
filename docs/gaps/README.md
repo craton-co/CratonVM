@@ -13,6 +13,7 @@ Each file is a self-contained bug report with reproduction steps and a fix direc
 | [gap-nio-basicfileattributes-isdirectory.md](gap-nio-basicfileattributes-isdirectory.md) | High | `Files.walkFileTree` / JUnit Platform classpath scanner / any NIO file walk | **Fixed** (BFA natives promoted to real-JDK mode) |
 | [gap-bc-math-ec-crypto-regression-timeout.md](gap-bc-math-ec-crypto-regression-timeout.md) | High | BC `math-ec` (F2m EC), BC `crypto-regression` (AES/RSA slow) | Open (pqc-crypto fixed) |
 | [gap-anonymous-object-getinputstream.md](gap-anonymous-object-getinputstream.md) | Medium | Anonymous class synthetic proxies missing `getInputStream()` | Open (non-fatal) |
+| [gap-jit-ternary-in-loop-increment.md](gap-jit-ternary-in-loop-increment.md) | Medium | Any code using `i += i == 0 ? a : b` (ternary in for-loop step) | Open (Tern3 repro) |
 
 ---
 
