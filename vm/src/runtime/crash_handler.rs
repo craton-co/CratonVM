@@ -391,6 +391,23 @@ mod windows_fault {
             displacement: *mut u64,
             symbol: *mut SymbolInfo,
         ) -> i32;
+        fn SymGetLineFromAddrW64(
+            process: *mut core::ffi::c_void,
+            address: u64,
+            displacement: *mut u32,
+            line: *mut ImagehlpLineW64,
+        ) -> i32;
+    }
+
+    // Matches DbgHelp.h IMAGEHLP_LINEW64. repr(C) reproduces the x64 padding
+    // (4 bytes after `size_of_struct` before the pointer, 4 after `line_number`).
+    #[repr(C)]
+    struct ImagehlpLineW64 {
+        size_of_struct: u32,
+        key: *mut core::ffi::c_void,
+        line_number: u32,
+        file_name: *mut u16,
+        address: u64,
     }
 
     // Matches DbgHelp.h SYMBOL_INFO (the trailing `name` is a flexible array;
@@ -439,11 +456,30 @@ mod windows_fault {
         let len = ((*sym).name_len as usize).min(2000);
         let bytes = core::slice::from_raw_parts(name_ptr, len);
         let s = String::from_utf8_lossy(bytes).into_owned();
-        Some(if disp != 0 {
+        let mut out = if disp != 0 {
             format!("{}+0x{:X}", s, disp)
         } else {
             s
-        })
+        };
+        // Best-effort file:line via the line table (line-tables-only builds
+        // still populate this). Disambiguates fat-LTO inlined frames where
+        // `function+0xDISP` alone points into inlined code.
+        let mut line: ImagehlpLineW64 = core::mem::zeroed();
+        line.size_of_struct = core::mem::size_of::<ImagehlpLineW64>() as u32;
+        let mut line_disp: u32 = 0;
+        if SymGetLineFromAddrW64(process, addr as u64, &mut line_disp, &mut line) != 0
+            && !line.file_name.is_null()
+        {
+            // file_name is a NUL-terminated wide string.
+            let mut n = 0usize;
+            while n < 4096 && *line.file_name.add(n) != 0 {
+                n += 1;
+            }
+            let wfile = core::slice::from_raw_parts(line.file_name, n);
+            let file = String::from_utf16_lossy(wfile);
+            out.push_str(&format!("  [{}:{}]", file, line.line_number));
+        }
+        Some(out)
     }
 
     // Win32 NTSTATUS exception codes we treat as fatal hardware faults.

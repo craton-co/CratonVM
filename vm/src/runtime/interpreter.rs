@@ -98,6 +98,95 @@ use crate::vm::{
 /// asn1.x9 holders). The class-name resolution happens once per class id;
 /// subsequent reference-field stores pay only a hashmap lookup, so the
 /// per-ref-putfield overhead stays negligible.
+/// Cached `CRATONVM_DBG_STRAYSTACK` gate (bc math-ec `0x4`): dump the Java
+/// stack at a putfield whose receiver header is the stray/stale signature.
+#[inline]
+fn straystack_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_STRAYSTACK").is_some())
+}
+
+/// Cached `CRATONVM_DBG_ARRSTORE` gate (bc math-ec 0x4 smear hunt): validate
+/// primitive-array-store receivers at the write.
+#[inline]
+fn arrstore_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_ARRSTORE").is_some())
+}
+
+/// Cached `CRATONVM_DBG_NO_REFPROC` gate (bc math-ec 0x4): skip ALL post-GC
+/// reference processing — subsystem-level exclusion experiment.
+#[inline]
+fn no_refproc() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_NO_REFPROC").is_some())
+}
+
+/// Cached `CRATONVM_DBG_NO_CLEANERS` gate (bc math-ec 0x4 bisect): skip ONLY
+/// `run_cleaner_actions` + `run_finalizers` (the Java invokes on queued —
+/// possibly stale — addresses), keeping `process_references_after_gc` live.
+/// Discriminates "the invokes corrupt" from "the refproc loops corrupt".
+#[inline]
+fn no_cleaners() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_NO_CLEANERS").is_some())
+}
+
+/// Validate a primitive-array-store receiver header; dump receiver + Java
+/// stack when it is not a plausible array (the stale-ref smear signature).
+/// Reads raw header BYTES (not enum fields) — a garbage `kind`/`element_type`
+/// byte outside the declared variants would be UB to materialize as the enum.
+fn arrstore_check(
+    _shared: &SharedVm,
+    thread: &JvmThread,
+    array_ref: cratonvm_types::ObjectRef,
+    index: i32,
+    op: &str,
+) {
+    let p = array_ref.as_ptr();
+    // SAFETY: `array_ref` was decoded from the operand stack as an in-heap
+    // pointer; reading the first 16 header bytes of managed memory is safe
+    // (arenas stay mapped) even if the contents are garbage.
+    let (class_id_raw, kind_byte, elem_byte, array_len) = unsafe {
+        (
+            (p as *const u32).read_unaligned(),
+            *p.add(4),
+            *p.add(5),
+            (p.add(12) as *const u32).read_unaligned(),
+        )
+    };
+    // ObjectKind::Array == 1; ArrayElementType has < 16 variants; a real
+    // array_length is <= i32::MAX. Anything else = garbage header = stale ref.
+    let plausible = kind_byte == 1 && elem_byte < 16 && array_len <= i32::MAX as u32;
+    if plausible {
+        return;
+    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let k = N.fetch_add(1, Ordering::Relaxed);
+    if k >= 8 {
+        return;
+    }
+    eprintln!(
+        "[arrstore] #{k} {op} through GARBAGE-HEADER receiver @0x{:x}: class_id_raw={} kind_byte={} elem_byte={} array_len={} index={}",
+        p as usize, class_id_raw, kind_byte, elem_byte, array_len, index,
+    );
+    eprintln!("[arrstore] Java stack (top first):");
+    for f in thread.frames.iter().rev().take(28) {
+        eprintln!(
+            "[arrstore]   {}.{}{} pc={}",
+            f.class_name(),
+            f.method_name(),
+            f.method_descriptor(),
+            f.pc,
+        );
+    }
+}
+
 fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool {
     use parking_lot::Mutex;
     use std::sync::OnceLock;
@@ -110,7 +199,18 @@ fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool 
     let v = {
         let cm = shared.class_manager.read();
         cm.get_class(cid)
-            .map(|c| c.name.contains("/asn1/x9/") || c.name.contains("Curve"))
+            .map(|c| {
+                c.name.contains("/asn1/x9/")
+                    || c.name.contains("Curve")
+                    // bc math-ec 0x4: the mutator-written victim VARIES across
+                    // runs and is often a small, frequently-allocated JDK class
+                    // (the pre-GC young 0x4 was measured on java/util/HexFormat
+                    // fld[1] and java/util/logging/Level). Watch those too so the
+                    // per-native detect (CRATONVM_DBG_ECWATCH_NATIVE) names the
+                    // writer whichever object the stray write lands on.
+                    || c.name.contains("java/util/HexFormat")
+                    || c.name.contains("java/util/logging/Level")
+            })
             .unwrap_or(false)
     };
     memo.lock().insert(key, v);
@@ -185,6 +285,28 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
                     );
                 }
             }
+            // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): post-GC poll of the
+            // watched absolute address — a HIT here (vs at a mutator
+            // safepoint) means the flip happened inside collect_garbage /
+            // reference processing.
+            crate::runtime::memwatch::poll("post-gc", || {
+                thread
+                    .frames
+                    .iter()
+                    .rev()
+                    .take(28)
+                    .map(|f| {
+                        format!(
+                            "  {}.{}{} pc={}",
+                            f.class_name(),
+                            f.method_name(),
+                            f.method_descriptor(),
+                            f.pc
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            });
             // DBG (env-gated): validate every young object's header size against
             // its class — pins a JIT `new` that wrote a wrong-size header.
             crate::memory::gc::validate_object_sizes(shared);
@@ -443,6 +565,10 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
 /// Per the `Cleaner` contract, exceptions thrown by an action are caught
 /// and logged — they must not propagate into the GC pipeline.
 fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
+    // bc math-ec 0x4 exclusion switches — see `process_references_after_gc`.
+    if no_refproc() || no_cleaners() {
+        return;
+    }
     // Re-entrancy safety: if a JIT helper currently holds the `&mut JvmThread`
     // (we were reached via `jit_invoke_dispatch` → `bail_to_interpreter` →
     // interpreter → `maybe_gc`), running a cleaner action's `run()` could
@@ -557,6 +683,10 @@ fn run_cleaner_actions(shared: &SharedVm, thread: &mut JvmThread) {
 
 /// Dequeue pending finalizable objects and invoke their finalize() method.
 fn run_finalizers(shared: &SharedVm, thread: &mut JvmThread) {
+    // bc math-ec 0x4 exclusion switches — see `process_references_after_gc`.
+    if no_refproc() || no_cleaners() {
+        return;
+    }
     // Same JIT-borrow re-entrancy guard as `run_cleaner_actions`: a `finalize()`
     // invoked while a JIT helper holds the `&mut JvmThread` could re-enter the
     // JIT and alias the borrow. Defer to the next top-level safepoint; the
@@ -600,6 +730,15 @@ fn process_references_after_gc(
     shared: &SharedVm,
     pointer_map: &std::collections::HashMap<usize, usize>,
 ) {
+    // bc math-ec 0x4 (CRATONVM_DBG_NO_REFPROC): subsystem-level exclusion
+    // switch — skip ALL post-GC reference processing (clears, enqueues,
+    // finalizer/cleaner submissions). If the corruption persists with this
+    // set, the whole reference subsystem is exonerated in one experiment;
+    // if it stops, the writer is in here. Diagnostic only (weak refs never
+    // clear; memory grows).
+    if no_refproc() {
+        return;
+    }
     let mut ref_proc = shared.ref_processor.lock();
 
     // An object is "marked" (survived GC) if:
@@ -612,13 +751,59 @@ fn process_references_after_gc(
 
     let result = ref_proc.process_references(&is_marked, 64, 0);
 
-    // Null referent field (field 0) on cleared weak/soft references
-    let cleared = ref_proc.cleared_ref_objects();
+    // bc math-ec 0x4 ROOT-CAUSE FIX (2026-06-09, hexdump-proven): the
+    // cleared/enqueue lists hold PRE-GC addresses; `pointer_map.get(..)
+    // .unwrap_or(addr)` keeps the STALE address for a Reference that was
+    // RECLAIMED this cycle (a live young object is ALWAYS in the pointer map
+    // after a moving young GC). Writing through that stale address corrupts
+    // whatever now occupies the memory: the measured corruption was THIS
+    // loop's `Object(None)` referent-clear landing mis-gridded — victim
+    // payload = 0x4 (the Object discriminant), next word nulled (hexdump in
+    // docs/internal/h2-testscript-segv-findings.md). The earlier
+    // `num_fields < 2` guard was too weak (a phantom header at the stale
+    // address can read num_slots >= 2). PRECISE criterion: a pre-GC address
+    // in EITHER young semispace that is NOT a pointer-map key did not
+    // survive — skip it entirely. Old-gen addresses don't move in a minor GC
+    // (major relocations ARE merged into the map) and stay processed.
+    let is_stale_young = |addr: usize| -> bool {
+        !pointer_map.contains_key(&addr) && shared.heap.is_in_young_addr(addr)
+    };
+
+    // Null referent field (field 0) on cleared weak/soft references.
+    // ROOT-CAUSE FIX (2026-06-10): once-only emission — the legacy
+    // `cleared_ref_objects()` re-emitted every ever-cleared Reference on
+    // EVERY GC; after the Reference died, the per-cycle null-write through
+    // its recycled (and then legitimately-remapped!) address corrupted the
+    // innocent object reusing the memory. A referent is nulled exactly once.
+    let cleared = ref_proc.take_newly_cleared();
     for ref_addr in cleared {
+        // ROOT-CAUSE guard (see `is_stale_young` above): a pre-GC young
+        // address absent from the pointer map did NOT survive this GC —
+        // writing the `Object(None)` clear through it would corrupt the
+        // memory's new occupant (the PROVEN bc-math-ec 0x4 writer).
+        if is_stale_young(ref_addr) {
+            if straystack_enabled() {
+                eprintln!("[refproc] SKIP dead CLEARED ref @0x{ref_addr:x} (young, not in map)");
+            }
+            continue;
+        }
         // The ref object itself may have been relocated
         let actual_addr = pointer_map.get(&ref_addr).copied().unwrap_or(ref_addr);
         // SAFETY: actual_addr was produced by process_references and points at a valid object header within the heap arena.
         let obj_ref = unsafe { ObjectRef::from_raw(actual_addr as *mut u8) };
+        // Belt-and-suspenders: a live `java.lang.ref.Reference` always has
+        // >= 2 instance fields (referent, queue); a reused/zeroed slot is a
+        // bare 0-field `Object`. (Kept in addition to the precise
+        // `is_stale_young` guard — also covers old-gen reuse after a major GC.)
+        if shared.heap.num_fields(obj_ref) < 2 {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP stale CLEARED ref @0x{:x} (num_fields={})",
+                    actual_addr, shared.heap.num_fields(obj_ref),
+                );
+            }
+            continue;
+        }
         shared.heap.set_field(obj_ref, 0, Value::Object(None));
     }
 
@@ -626,6 +811,18 @@ fn process_references_after_gc(
     // The linked-list protocol: push ref onto queue's head, use referent field as "next" ptr,
     // clear the ref's queue field (one-shot enqueue), increment queue size.
     for (ref_addr, queue_addr) in &result.to_enqueue {
+        // ROOT-CAUSE guard (see `is_stale_young` above): skip the whole
+        // enqueue when either the Reference or its queue did not survive —
+        // the head/size/next writes below through a stale address are the
+        // same proven corruption class as the cleared-referent write.
+        if is_stale_young(*ref_addr) || is_stale_young(*queue_addr) {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP dead ENQUEUE ref@0x{ref_addr:x}/q@0x{queue_addr:x} (young, not in map)"
+                );
+            }
+            continue;
+        }
         let actual_ref = pointer_map.get(ref_addr).copied().unwrap_or(*ref_addr);
         let actual_q = pointer_map.get(queue_addr).copied().unwrap_or(*queue_addr);
         // SAFETY: actual_ref and actual_q were produced by process_references (with pointer_map relocation) and point at valid object headers within the heap arena.
@@ -646,6 +843,23 @@ fn process_references_after_gc(
         if shared.heap.num_fields(q_obj) < 2 {
             continue;
         }
+        // bc math-ec 0x4 STALE-REF FIX: the same reclaimed-and-reused hazard
+        // applies to `ref_obj` (writes to its fields 0 and 1 below), which —
+        // unlike `q_obj` — was NOT liveness-checked. A `ref_addr` not present in
+        // `pointer_map` keeps its stale PRE-GC address via `unwrap_or`; if that
+        // Reference was reclaimed and its slot reused, `set_field(ref_obj, ..)`
+        // strays into the reusing object (and `set_field(q_obj,0,ref_obj)` would
+        // publish a dangling head). A live Reference has >= 2 fields; skip the
+        // whole enqueue otherwise (a dead ref has no consumer to poll it back).
+        if shared.heap.num_fields(ref_obj) < 2 {
+            if straystack_enabled() {
+                eprintln!(
+                    "[refproc] SKIP stale ENQUEUE ref @0x{:x} (num_fields={}) into q@0x{:x}",
+                    actual_ref, shared.heap.num_fields(ref_obj), actual_q,
+                );
+            }
+            continue;
+        }
         // Push onto queue's linked list head (field 0 = head, field 1 = size)
         let old_head = shared.heap.get_field(q_obj, 0); // RQ_FIELD_HEAD
         shared.heap.set_field(q_obj, 0, Value::Object(Some(ref_obj))); // new head
@@ -662,6 +876,15 @@ fn process_references_after_gc(
     // Enqueue objects for finalization (M8 fix: relocate via pointer_map
     // because the ref-processor holds pre-GC addresses).
     for obj_addr in &result.to_finalize {
+        // Finalizable objects are rooted via `finalizer_addrs`, so a LIVE one
+        // is always in the pointer map after a moving young GC; a stale young
+        // address here would be dereferenced later by `run_finalizers`.
+        if is_stale_young(*obj_addr) {
+            if straystack_enabled() {
+                eprintln!("[refproc] SKIP dead FINALIZE obj @0x{obj_addr:x} (young, not in map)");
+            }
+            continue;
+        }
         let actual = pointer_map.get(obj_addr).copied().unwrap_or(*obj_addr);
         shared.finalizer_thread.enqueue(actual);
     }
@@ -678,6 +901,13 @@ fn process_references_after_gc(
     // Without this, run_cleaner_actions later derefs a stale address
     // pointing at evacuated memory → SEGV at class_id_of (cleaner_probe).
     for action_addr in &result.cleaner_actions {
+        // Same staleness guard as the finalize loop above.
+        if is_stale_young(*action_addr) {
+            if straystack_enabled() {
+                eprintln!("[refproc] SKIP dead CLEANER action @0x{action_addr:x} (young, not in map)");
+            }
+            continue;
+        }
         let actual = pointer_map.get(action_addr).copied().unwrap_or(*action_addr);
         shared.cleaner_thread.submit_action(actual);
     }
@@ -1088,6 +1318,59 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
 /// then applies the pointer map to update its own frame references.
 fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
     use std::sync::atomic::Ordering;
+    // bc math-ec 0x4 (CRATONVM_DBG_MEMWATCH): O(1) poll of one absolute
+    // watched address at full safepoint frequency — catches the corrupting
+    // write within one safepoint window, with the live Java stack. Off ⇒
+    // a single predicted branch. On a HIT the dump includes the TOP frame's
+    // locals (raw bits + array header/extent for in-heap-shaped values) so
+    // the watched address can be placed inside/outside the frame's array
+    // receivers (legit-write-to-reused-slot vs stale/OOB receiver).
+    crate::runtime::memwatch::poll("safepoint", || {
+        let mut s = thread
+            .frames
+            .iter()
+            .rev()
+            .take(28)
+            .map(|f| {
+                format!(
+                    "  {}.{}{} pc={}",
+                    f.class_name(),
+                    f.method_name(),
+                    f.method_descriptor(),
+                    f.pc
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(top) = thread.frames.last() {
+            s.push_str("\n  -- top-frame locals --");
+            let n = top.locals_len().min(10);
+            for i in 0..n {
+                let raw = top.get_local_raw(i);
+                let p = (raw & 0x0000_7fff_ffff_ffff) as usize;
+                let mut extra = String::new();
+                if p != 0 && p % 8 == 0 && shared.heap.is_heap_addr(p).is_some() {
+                    // SAFETY: in-heap address; first 16 header bytes of managed
+                    // memory are always readable (raw bytes, not enum fields).
+                    let (kind_b, elem_b, alen) = unsafe {
+                        let q = p as *const u8;
+                        (
+                            *q.add(4),
+                            *q.add(5),
+                            (q.add(12) as *const u32).read_unaligned(),
+                        )
+                    };
+                    extra = format!(
+                        " [heap obj kind={kind_b} elem={elem_b} len={alen} data=0x{:x}..0x{:x}]",
+                        p + 40,
+                        p + 40 + (alen as usize) * 8,
+                    );
+                }
+                s.push_str(&format!("\n  local[{i}] = 0x{raw:x}{extra}"));
+            }
+        }
+        s
+    });
     if shared.gc_barrier.stw_requested.load(Ordering::Acquire) {
         // Round-5 fix (CRIT — UAF): drain this thread's per-thread SATB
         // buffer into the global queue BEFORE we park at the barrier.
@@ -5975,6 +6258,10 @@ fn execute_instruction(
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
             let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // bc math-ec 0x4 smear hunt — see the Lastore twin below.
+            if arrstore_enabled() {
+                arrstore_check(shared, thread, array_ref, index, "iastore");
+            }
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, value) // Widening: index conversion
@@ -5998,6 +6285,17 @@ fn execute_instruction(
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
             let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // bc math-ec 0x4 smear hunt (CRATONVM_DBG_ARRSTORE): validate the
+            // receiver's header AT THE WRITE. A stale (GC-moved) long[] ref
+            // points at reused memory whose "header" is garbage math data —
+            // kind byte (offset 4) is then almost never the Array(1) it must
+            // be. `set_array_element` would still bounds-check against the
+            // garbage array_length and SMEAR longs over neighboring objects
+            // (the headline corruption). Dump the receiver + Java stack at the
+            // first such store — theory-free attribution of the writer.
+            if arrstore_enabled() {
+                arrstore_check(shared, thread, array_ref, index, "lastore");
+            }
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Long(v))
@@ -6807,6 +7105,44 @@ fn execute_instruction(
                 ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
+            // CRATONVM_DBG_BADRECV — localize the H2 TestScript SEGV: a getfield
+            // whose receiver is a corrupted `Object(Some(ptr))` not pointing into
+            // any managed arena (e.g. ptr=6) faults in `get_field`'s header read.
+            // Log the Java frame stack + field + a Rust backtrace (to name the
+            // native that drove this method via invoke_virtual), then raise NPE
+            // instead of dereferencing the wild pointer.
+            if crate::runtime::env_cache::badrecv_dbg() {
+                let p = obj_ref.as_ptr() as usize;
+                if p != 0 && shared.heap.is_heap_addr(p).is_none() {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static N: AtomicUsize = AtomicUsize::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    if n < 8 {
+                        let cn = thread.frames[frame_idx].class_name().to_string();
+                        let mn = thread.frames[frame_idx].method_name().to_string();
+                        let pc = thread.frames[frame_idx].pc;
+                        eprintln!(
+                            "[BADRECV #{n}] getfield receiver=0x{p:x} field={field_name:?} \
+                             field_index={} is_ref={} in {cn}.{mn} pc={pc}",
+                            field.field_index, field.is_reference,
+                        );
+                        eprintln!("[BADRECV #{n}] Java frames (innermost first):");
+                        for f in thread.frames.iter().rev().take(24) {
+                            eprintln!("    {}.{}", f.class_name(), f.method_name());
+                        }
+                        eprintln!(
+                            "[BADRECV #{n}] Rust backtrace:\n{}",
+                            std::backtrace::Backtrace::force_capture()
+                        );
+                        use std::io::Write;
+                        let _ = std::io::stderr().flush();
+                    }
+                    return Err(RuntimeError::NullPointerException {
+                        message: Some(format!("[BADRECV] non-heap getfield receiver 0x{p:x}")),
+                    }
+                    .into());
+                }
+            }
             if std::env::var("CRATON_HASHTABLEOFINT_TRACE").is_ok() {
                 let cname = thread.frames[frame_idx].class_name();
                 let mname = thread.frames[frame_idx].method_name();
@@ -7016,6 +7352,39 @@ fn execute_instruction(
                 ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
+            // bc math-ec 0x4 (CRATONVM_DBG_STRAYSTACK): catch a STRAY/STALE
+            // receiver reaching putfield. The corruption's reliable face is the
+            // `set_field out-of-bounds` flood: a relocated-but-unremapped (or
+            // wild) `objectref` whose header reads `num_slots=0` (real obj NOT
+            // forwarded; class_id reads a Value-disc 0/1/4) or `num_slots` huge
+            // (real obj forwarded → forwarding_ptr low bits). Dump the Java
+            // stack + receiver so we can trace where the stale ref originates
+            // (operand-stack slot not remapped after a young GC). Rate-limited.
+            if straystack_enabled() {
+                let h = shared.heap.get_header(obj_ref);
+                let ns = h.num_slots as usize;
+                if field.field_index >= ns || h.num_slots > (1 << 24) {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static N: AtomicUsize = AtomicUsize::new(0);
+                    let k = N.fetch_add(1, Ordering::Relaxed);
+                    if k < 12 {
+                        eprintln!(
+                            "[straystack] #{k} STRAY putfield recv@0x{:x} cid={} num_slots={} array_len={} kind={} -> field '{}' idx={} is_ref={} value={:?}",
+                            obj_ref.as_ptr() as usize,
+                            h.class_id.as_u32(), h.num_slots, h.array_length, h.kind as u8,
+                            field_name.as_deref().unwrap_or("?"),
+                            field.field_index, field.is_reference, value,
+                        );
+                        eprintln!("[straystack] Java stack (top first):");
+                        for f in thread.frames.iter().rev().take(28) {
+                            eprintln!(
+                                "[straystack]   {}.{}{} pc={}",
+                                f.class_name(), f.method_name(), f.method_descriptor(), f.pc,
+                            );
+                        }
+                    }
+                }
+            }
             if std::env::var("CRATON_HASHTABLEOFINT_TRACE").is_ok() {
                 let cname = thread.frames[frame_idx].class_name();
                 let mname = thread.frames[frame_idx].method_name();
@@ -16151,7 +16520,13 @@ fn resolve_method_ref(
         ));
     }
 
-    let cm = shared.class_manager.read();
+    // read_recursive() instead of read() — resolve_method_ref can be called
+    // from ctx.invoke_virtual within a native, which may itself be dispatched
+    // by an interpreter frame that already holds class_manager.read() on this
+    // thread. parking_lot's write-preferring policy blocks new read() calls
+    // when a writer is queued, so a recursive plain read() → deadlock;
+    // read_recursive() succeeds immediately for an existing read-holder.
+    let cm = shared.class_manager.read_recursive();
     let class = cm
         .get_class(current_class_id)
         .ok_or_else(|| VmError::Internal {

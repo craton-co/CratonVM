@@ -10,11 +10,11 @@
 #   5. TornadoVM            — PolyEvalTornado.java via tornado launcher
 set +e
 
-ROOT=C:/craton/CratonVM/.claude/worktrees/angry-brown-38c5dc
+ROOT=C:/craton/CratonVM
 RJVM="$ROOT/target/release/cratonvm.exe"
 HOTSPOT="C:/Program Files/Java/jdk-25/bin/java.exe"
 TORNADO_DIR="$ROOT/bench-tornado"
-CRATON_GPU=$(ls -d "$ROOT/target/release/build/craton-gpu-"*/out/classes 2>/dev/null | head -1)
+CRATON_GPU=$(ls -d "$ROOT/target-gpu/release/cratonvm.exe"*/out/classes 2>/dev/null | head -1)
 BENCH_CLASSES="C:/craton/CratonVM/apps/gpu-bench/classes"
 LOG="$ROOT/applogs/bench-poly-4way-$(date +%H%M%S)"
 mkdir -p "$LOG"

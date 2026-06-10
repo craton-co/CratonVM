@@ -1,4 +1,0 @@
-written=24
-read=24
-content=filechannel-roundtrip-42
-OK

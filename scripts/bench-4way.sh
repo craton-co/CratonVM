@@ -10,7 +10,7 @@
 
 set +e
 
-ROOT=C:/craton/CratonVM/.claude/worktrees/angry-brown-38c5dc
+ROOT=C:/craton/CratonVM
 RJVM="$ROOT/target/release/cratonvm.exe"
 HOTSPOT="C:/Program Files/Java/jdk-25/bin/java.exe"
 TORNADO_SDK_SETUP="C:/craton/tornadovm/setvars.sh"

@@ -176,6 +176,26 @@ const KIND_UNKNOWN: u8 = 0;
 const KIND_LONG: u8 = 1;
 const KIND_DOUBLE: u8 = 2;
 
+/// Cached `CRATONVM_LONGROOT_STRICT` gate (bc math-ec 0x4): make the O1
+/// hybrid Long|Double smuggle-rooting branch kind-strict — a slot the kind
+/// side-array marks as a genuine primitive long/double is never rooted via
+/// the loose `is_heap_addr` path.
+#[inline]
+fn longroot_strict() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_LONGROOT_STRICT").is_some())
+}
+
+/// Cached `CRATONVM_DBG_LONGROOT` gate: log every rooting the O1 hybrid
+/// branch performs (value bits + kind mark).
+#[inline]
+fn longroot_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_LONGROOT").is_some())
+}
+
 #[derive(Debug)]
 pub struct ValueStack {
     slots: Vec<CompactValue>,
@@ -243,6 +263,29 @@ impl ValueStack {
             kinds,
             len: 0,
             max_size,
+        }
+    }
+
+    /// Grow the stack's capacity to at least `new_max` slots, returning `true`
+    /// if it actually grew.
+    ///
+    /// Used by tail-call frame reuse ([`Frame::reset_for_tail_call`]): the
+    /// reused frame's stack was sized for the PREVIOUS method's `max_stack`,
+    /// but the tail-called method may declare a LARGER `max_stack`. Without
+    /// this, the new method's pushes overflow the smaller backing Vecs — the
+    /// `push_compact` "index out of bounds: len == max_size" panic observed
+    /// in WildFly's `RegularEnumSet$EnumSetIterator` path (Long → Integer
+    /// `numberOfTrailingZeros` tail call). Only ever GROWS (a no-op when
+    /// already large enough), so it can never shrink a live stack or drop
+    /// in-use slots; newly added slots are zero / `KIND_UNKNOWN`.
+    pub fn ensure_max_size(&mut self, new_max: usize) -> bool {
+        if new_max > self.max_size {
+            self.slots.resize(new_max, CompactValue::zero());
+            self.kinds.resize(new_max, KIND_UNKNOWN);
+            self.max_size = new_max;
+            true
+        } else {
+            false
         }
     }
 
@@ -1126,8 +1169,38 @@ impl ValueStack {
                 // collector's MAX_SANE_OBJECT_SIZE guard in forward_object
                 // handles bogus roots gracefully — over-retention is the only
                 // cost, vs. WildFly SEGV with the strict is_object_address.
+                //
+                // bc math-ec 0x4 (2026-06-09): this branch is ASYMMETRIC — a
+                // rooted Long-tagged slot is NEVER remapped by
+                // `update_object_refs` (no Long arm), so a genuine smuggle goes
+                // STALE the moment the referent moves; and a genuine PRIMITIVE
+                // long (KIND_LONG by push-time context, e.g. a BC F2m word
+                // whose value lands in the heap range) gets rooted here and
+                // feeds `forward_object` an interior/garbage pointer → fake
+                // to-space objects / Cheney desync / unforwarded children.
+                // `CRATONVM_LONGROOT_STRICT=1` skips rooting for slots the
+                // kind side-array marks as genuine primitives (mirrors the
+                // 2026-06-04 kind-strict fix for the SUB_OBJECT branch above);
+                // `CRATONVM_DBG_LONGROOT` logs every rooting this branch does.
+                if longroot_strict() && (self.kinds[i] == KIND_LONG || self.kinds[i] == KIND_DOUBLE)
+                {
+                    continue;
+                }
                 if let Some(p) = jlong_bits_as_aligned_object_ptr(cv.to_bits()) {
                     if let Some(r) = heap.is_heap_addr(p) {
+                        if longroot_dbg() {
+                            use std::sync::atomic::{AtomicUsize, Ordering};
+                            static N: AtomicUsize = AtomicUsize::new(0);
+                            let k = N.fetch_add(1, Ordering::Relaxed);
+                            if k < 40 {
+                                eprintln!(
+                                    "[longroot] #{k} rooting tagged-{:?} slot[{i}] bits=0x{:x} kind={} (loose is_heap_addr pass)",
+                                    cv.tag(),
+                                    cv.to_bits(),
+                                    self.kinds[i],
+                                );
+                            }
+                        }
                         roots.push(r);
                     }
                 }

@@ -1,3 +1,0 @@
-SolrInputDocument fields: [id, title, count]
-Binder: org.apache.solr.client.solrj.beans.DocumentObjectBinder@<id>
-OK

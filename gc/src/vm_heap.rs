@@ -241,6 +241,15 @@ impl VmHeap {
         }
     }
 
+    /// DBG (bc math-ec `0x4`): scan young from-space for the first `0x4` seed
+    /// slot. See [`GenerationalHeap::dbg_first_young_small_ref`]. G1 unsupported.
+    pub fn dbg_first_young_small_ref(&self) -> Option<(usize, u32, usize, usize, u64)> {
+        match self {
+            VmHeap::Generational(h) => h.dbg_first_young_small_ref(),
+            VmHeap::G1(_) => None,
+        }
+    }
+
     /// Allocate a new Java object and initialize primitive-typed slots to
     /// their spec-mandated typed zero based on JVM field descriptor bytes.
     ///
@@ -1068,8 +1077,25 @@ impl VmHeap {
     /// live objects in non-collected regions from dead objects.
     pub fn is_addr_live(&self, addr: usize) -> bool {
         match self {
-            VmHeap::Generational(_) => false,
+            // A minor (young) GC never collects the old generation, so any
+            // old-gen address is live. Reference processing uses this to avoid
+            // clearing weak/soft refs whose referent was tenured in an earlier
+            // cycle (see `GenerationalHeap::is_old_gen_addr`). Returning `false`
+            // here unconditionally — the prior behavior — cleared every weak
+            // reference to a promoted object on the next young GC.
+            VmHeap::Generational(h) => h.is_old_gen_addr(addr),
             VmHeap::G1(h) => h.is_addr_in_live_region(addr),
+        }
+    }
+
+    /// Generational: is `addr` inside EITHER young semispace? Used by
+    /// reference processing to detect stale PRE-GC Reference addresses
+    /// (young + absent from the pointer map ⇒ did not survive the GC).
+    /// G1: `false` (no semispace; staleness is handled by `is_addr_live`).
+    pub fn is_in_young_addr(&self, addr: usize) -> bool {
+        match self {
+            VmHeap::Generational(h) => h.is_in_young_either(addr as *const u8),
+            VmHeap::G1(_) => false,
         }
     }
 

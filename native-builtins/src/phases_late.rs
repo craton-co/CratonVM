@@ -15266,6 +15266,16 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, 4)))
     });
+    // `fileKey()` returns an object that uniquely identifies the file, or
+    // `null` if a file key is not available. The JDK Windows file system
+    // returns null when running on FAT-class volumes / network shares; we
+    // return null unconditionally — this is the documented JDK contract,
+    // not a fabricated value, and it lets `FileTreeWalker.wouldLoop`
+    // (the only `fileKey` consumer in the JDK walker) skip its identity
+    // comparison instead of throwing `AbstractMethodError`.
+    r.register(bfa, "fileKey", "()Ljava/lang/Object;", |_ctx, _args| {
+        Ok(Some(Value::Object(None)))
+    });
 
     // FileTime = 1-field (millis=0 Long)
     let ft = "java/nio/file/attribute/FileTime";
@@ -15743,7 +15753,13 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
         "getModule",
         "()Ljava/lang/Module;",
         |ctx, args| {
+            // GC-safety: pin m_obj across the `create_string` allocation below;
+            // otherwise a moving GC reclaims/relocates the unpinned local and
+            // getModule() returns a stale ref (a reused slot → String →
+            // `String.isNamed()` NoSuchMethodError). Mirror of the real-JDK
+            // getModule in lib.rs. Same bug class as reference_classloader_gc_root_gap.
             let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+            let pin = ctx.pin_native_root(m_obj);
             let module_name_val = if let Some(Value::Object(Some(mirror))) = args.first() {
                 let class_id = ctx.class_id_of_object(*mirror);
                 ctx.module_name_of_class(class_id)
@@ -15752,7 +15768,9 @@ pub(crate) fn register_p59_module(r: &mut NativeMethodRegistry) {
             } else {
                 Value::Object(None)
             };
+            let m_obj = ctx.read_native_pin(pin, m_obj);
             ctx.set_field(m_obj, 0, module_name_val);
+            ctx.unpin_native_roots(pin);
             Ok(Some(Value::Object(Some(m_obj))))
         },
     );
@@ -18357,9 +18375,9 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
             };
             let new_pos = cur_pos + start;
             let new_lim = cur_pos + end;
-            // Allocate a fresh CharBuffer pointing at the same char[]
+            // Allocate a fresh HeapCharBuffer pointing at the same char[]
             // — JDK's HeapCharBuffer.subSequence does the same.
-            let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
+            let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
             ctx.set_field_by_name(buf, "hb", Value::Object(Some(arr)));
             ctx.set_field_by_name(buf, "offset", Value::Int(cur_off));
             ctx.set_field_by_name(buf, "isReadOnly", Value::Int(0));
@@ -18606,7 +18624,9 @@ pub(crate) fn register_p62_char_buffer(r: &mut NativeMethodRegistry) {
 
 fn p62_alloc_char_buffer(ctx: &mut dyn NativeContext, cap: usize) -> ObjectRef {
     let arr = ctx.new_array(cratonvm_types::ArrayElementType::Char, cap);
-    let buf = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", 5);
+    // Use HeapCharBuffer (concrete) not CharBuffer (abstract) so real-JDK
+    // bytecode methods like compact() dispatch correctly.
+    let buf = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", 5);
     cb_write_hb(ctx, buf, arr, cap as i32);
     buf
 }

@@ -818,18 +818,19 @@ fn register_printstream_fallback_natives(registry: &mut NativeMethodRegistry) {
     // PrintStream registration and the long-standing fd-stream flush contract.
     registry.register("java/io/PrintStream", "flush", "()V", native_printstream_flush);
     registry.register("java/io/PrintStream", "close", "()V", native_printstream_close);
-    // PrintWriter
+    // PrintWriter — use dedicated variants that route through the underlying
+    // Writer when the backing is non-fd (e.g. StringWriter in ModelNode.toString()).
     registry.register(
         "java/io/PrintWriter",
         "write",
         "(Ljava/lang/String;II)V",
-        native_printstream_write_string_range,
+        native_printwriter_write_string_range,
     );
     registry.register(
         "java/io/PrintWriter",
         "write",
         "(Ljava/lang/String;)V",
-        native_printstream_write_string,
+        native_printwriter_write_string,
     );
     registry.register("java/io/PrintWriter", "println", "(Ljava/lang/String;)V", native_println_string);
     registry.register("java/io/PrintWriter", "println", "()V", native_println_void);
@@ -2982,6 +2983,15 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/Module;",
         |ctx, args| {
             let m_obj = alloc_concurrent_synthetic(ctx, "java/lang/Module", 2);
+            // GC-safety: `create_string` below allocates (String + char[]) and
+            // can trigger a moving GC. `m_obj` lives only in this Rust local —
+            // not a GC root — so without pinning it would be relocated/reclaimed
+            // and returned STALE, resolving to a reused slot (observed as
+            // getModule() handing back a String → `String.isNamed()`
+            // NoSuchMethodError during WildFly ResourceBundle.checkNamedModule).
+            // Pin across the allocation and read the forwarded ref back. Same
+            // bug class as reference_classloader_gc_root_gap.
+            let pin = ctx.pin_native_root(m_obj);
             let module_name_val = if let Some(Value::Object(Some(mirror))) = args.first() {
                 let class_id = ctx.class_id_of_object(*mirror);
                 ctx.module_name_of_class(class_id)
@@ -2990,7 +3000,9 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             } else {
                 Value::Object(None)
             };
+            let m_obj = ctx.read_native_pin(pin, m_obj);
             ctx.set_field(m_obj, 0, module_name_val);
+            ctx.unpin_native_roots(pin);
             Ok(Some(Value::Object(Some(m_obj))))
         },
     );
@@ -7509,6 +7521,31 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // null-resource JDK provider path. The allow-list entry at
     // `vm/src/vm/vm_exec.rs` (BREAKITER) promotes these over the JDK bytecode.
     crate::phases_late::register_p66_break_iterator(registry);
+
+    // NIO file-attribute bridge (real-JDK mode): `BasicFileAttributes` is a
+    // pure interface in `java.base` — its methods (`isDirectory`, `size`,
+    // `lastModifiedTime`, …) have no `Code` attribute. The JDK code path that
+    // produces a concrete `BasicFileAttributes` runs through
+    // `WindowsFileSystemProvider.readAttributes` → `WindowsNativeDispatcher`
+    // which CratonVM has not wired up. Without an intercept, real JDK bytecode
+    // for `Files.walkFileTree` → `FileTreeWalker.visit` → `attrs.isDirectory()`
+    // dispatches to the abstract interface declaration and throws
+    // `AbstractMethodError: BasicFileAttributes.isDirectory()Z has no Code
+    // attribute` — fatal for any `Files.walkFileTree` / `Files.walk` /
+    // `Files.find` caller, including JUnit Platform's `ClasspathScanner`
+    // (which uses `--select-package` discovery to find tests).
+    //
+    // `register_p59_file_attributes` registers `Files.readAttributes(Path,
+    // Class, LinkOption[])` to allocate a synthetic 5-field BFA populated
+    // from real `std::fs::metadata` (no fabricated values), and registers
+    // `BasicFileAttributes.{isDirectory,isRegularFile,size,…}` natives that
+    // read those fields. The native is found via the abstract-declaration
+    // rescue at `interpreter::execute` (the path that looks for a native
+    // registered directly on the resolved interface class before throwing
+    // AbstractMethodError). Historically the registration shipped only via
+    // `register_synthetic_overrides`; promote it here so real-JDK CLI builds
+    // get the same coverage.
+    crate::phases_late::register_p59_file_attributes(registry);
 }
 
 #[cfg(feature = "synthetic-jdk")]
@@ -8533,7 +8570,7 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "java/io/PrintWriter",
         "write",
         "(I)V",
-        native_noop_with_this,
+        native_printwriter_write_int,
     );
 
     // --- java.lang.StringBuilder ---
@@ -11932,6 +11969,86 @@ fn native_printstream_write_string_range(
     let text = String::from_utf16_lossy(&units[start..end]);
     ctx.record_printed_line(text.clone());
     stream_write(ctx, args, &text);
+    Ok(None)
+}
+
+/// Return the underlying `Writer` from a `PrintWriter` object when it is a
+/// non-fd-backed Writer (e.g. `StringWriter` in `ModelNode.toString()`).
+///
+/// Strategy: try `get_field_by_name("out")` first (set by real JDK bytecode in
+/// `PrintWriter(Writer,boolean)` ctor), then slot-0 (synthetic convention from
+/// `native_printwriter_init_outputstream`).  Returns `None` when the sink is a
+/// `BufferedWriter` (the JDK-wrapping chain for `PrintWriter(OutputStream)` →
+/// those still belong to the fd-table path) or when no Writer backing is found.
+fn printwriter_get_backing_writer(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<ObjectRef> {
+    let by_name = ctx.get_field_by_name(this, "out");
+    let candidate = if matches!(by_name, Value::Object(Some(_))) {
+        by_name
+    } else {
+        ctx.get_field(this, 0)
+    };
+    if let Value::Object(Some(out_obj)) = candidate {
+        if matches!(sink_is_writer(ctx, out_obj), Some(true)) {
+            // Exclude BufferedWriter: it is the JDK wrapper placed by
+            // PrintWriter(OutputStream) → those connect to stdout/stderr and
+            // must keep using the fd-table path.
+            let cid = ctx.class_id_of_object(out_obj);
+            let cn = ctx.class_name_of_id(cid).unwrap_or_default();
+            if cn != "java/io/BufferedWriter" {
+                return Some(out_obj);
+            }
+        }
+    }
+    None
+}
+
+/// `PrintWriter.write(String)V` — routes through the underlying `Writer out`
+/// for real-JDK `PrintWriter(Writer)` constructions such as `ModelNode.toString()`
+/// wrapping a `StringWriter`.  Falls back to the fd path for PrintStream-backed
+/// writers (e.g. JUnit's `PrintWriter(System.out)`).
+fn native_printwriter_write_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        if let Some(out_obj) = printwriter_get_backing_writer(ctx, this) {
+            // Pass the EXISTING Java String arg directly to out.write(String).
+            // Do NOT call write_string_to_writer (which does ctx.create_string → GC hazard:
+            // create_string allocates, potentially triggering a compacting GC that moves
+            // `out_obj` before it is passed to invoke_virtual).
+            let str_val = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let _ = ctx.invoke_virtual(out_obj, "write", "(Ljava/lang/String;)V", &[str_val]);
+            return Ok(None);
+        }
+    }
+    native_printstream_write_string(ctx, args)
+}
+
+/// `PrintWriter.write(String,II)V` — routes through the underlying Writer;
+/// falls back to the fd path for PrintStream-backed writers.
+fn native_printwriter_write_string_range(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        if let Some(out_obj) = printwriter_get_backing_writer(ctx, this) {
+            // Pass the original String + range args directly — no allocation, no GC hazard.
+            let str_val = args.get(1).cloned().unwrap_or(Value::Object(None));
+            let off_val = args.get(2).cloned().unwrap_or(Value::Int(0));
+            let len_val = args.get(3).cloned().unwrap_or(Value::Int(0));
+            let _ = ctx.invoke_virtual(out_obj, "write", "(Ljava/lang/String;II)V", &[str_val, off_val, len_val]);
+            return Ok(None);
+        }
+    }
+    native_printstream_write_string_range(ctx, args)
+}
+
+/// `PrintWriter.write(int c)V` — routes through the underlying `Writer out`
+/// so single-char writes (e.g. JSON-quoting `"` from `ModelNode.toString()`)
+/// reach the Writer.  No-op for fd-backed streams (those are handled by
+/// `print*`/`println*` natives).
+fn native_printwriter_write_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        if let Some(out_obj) = printwriter_get_backing_writer(ctx, this) {
+            let ch = args.get(1).cloned().unwrap_or(Value::Int(0));
+            let _ = ctx.invoke_virtual(out_obj, "write", "(I)V", &[ch]);
+            return Ok(None);
+        }
+    }
     Ok(None)
 }
 
@@ -23627,6 +23744,14 @@ fn decimal_to_mag_words(decimal: &str) -> Vec<u32> {
 
 pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/math/BigInteger", 2);
+    // GC-SAFETY (use-after-move — mirrors the `bi_alloc_int` fix): `obj` is
+    // freshly allocated and not yet reachable from any Java root. The
+    // `new_array` / `create_string` allocations below can trigger a minor GC
+    // that relocates `obj`; the bare local would then be STALE (resolving to a
+    // reused java.lang.Object slot) and the subsequent `set_field` would corrupt
+    // the heap — the H2 TestScript BigDecimal SEGV + `set_field` OOB flood. Pin
+    // `obj` across the allocation and re-read the forwarded ref before writing.
+    let h = ctx.pin_native_root(obj);
     let signum = if value.starts_with('-') {
         -1
     } else if value == "0" {
@@ -23639,18 +23764,23 @@ pub(crate) fn bi_alloc(ctx: &mut dyn NativeContext, value: &str) -> ObjectRef {
         // representation that bytecode reads via `getfield`.
         let mag_words = decimal_to_mag_words(value);
         let mag_arr = ctx.new_array(cratonvm_types::ArrayElementType::Int, mag_words.len());
+        let obj = ctx.read_native_pin(h, obj);
         for (i, w) in mag_words.iter().enumerate() {
             ctx.set_array_element(mag_arr, i, Value::Int(*w as i32));
         }
         ctx.set_field(obj, sig_i, Value::Int(signum));
         ctx.set_field(obj, mag_i, Value::Object(Some(mag_arr)));
+        ctx.unpin_native_roots(h);
+        obj
     } else {
         // Synthetic-stub fallback.
         let s = ctx.create_string(value);
+        let obj = ctx.read_native_pin(h, obj);
         ctx.set_field(obj, BI_FIELD_VALUE, Value::Object(Some(s)));
         ctx.set_field(obj, BI_FIELD_SIGNUM, Value::Int(signum));
+        ctx.unpin_native_roots(h);
+        obj
     }
-    obj
 }
 
 /// Read a `BigInteger` instance directly into the limb-based [`crate::bigint::BigInt`]
@@ -25529,6 +25659,13 @@ fn bd_layout(ctx: &dyn NativeContext) -> Option<(usize, usize, usize, usize)> {
 
 fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, "java/math/BigDecimal", 3);
+    // GC-SAFETY (use-after-move — see `bi_alloc`/`bi_alloc_int`): pin `obj`
+    // across the `bi_alloc` / `create_string` allocations below, which can
+    // trigger a minor GC that relocates the not-yet-rooted `obj`. Each branch
+    // re-reads the forwarded ref before its `set_field`s, and the returned ref
+    // is the forwarded one. Without this, a GC inside `bi_alloc` leaves `obj`
+    // stale → `set_field` corrupts the heap (H2 TestScript BigDecimal SEGV).
+    let h = ctx.pin_native_root(obj);
     let precision = value.replace(['-', '.'], "").len() as i32;
     if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
         // Real-JDK layout: build the value as the scaled unscaled-integer
@@ -25543,30 +25680,37 @@ fn bd_alloc(ctx: &mut dyn NativeContext, value: &str, scale: i32) -> ObjectRef {
             // treat as inflated to keep the sentinel pure).  Allocate an
             // intVal BigInteger.
             let bi = bi_alloc(ctx, &unscaled_str);
+            let obj = ctx.read_native_pin(h, obj);
             ctx.set_field(obj, iv_i, Value::Object(Some(bi)));
             ctx.set_field(obj, ic_i, Value::Long(BD_INFLATED));
+            ctx.set_field(obj, sc_i, Value::Int(scale));
+            ctx.set_field(obj, pr_i, Value::Int(precision));
         } else {
             // Compact path: leave `intVal` null (or, when non-null, the JDK
             // expects it to mirror `intCompact`).  Allocate a backing
             // BigInteger so reflective reads of `intVal` still see a real
             // object — matches HotSpot's behaviour for `BigDecimal.ONE`
             // where `intVal != null` even though `intCompact == 1`.
-            if bi_class_id.is_some() {
-                let bi = bi_alloc(ctx, &unscaled_str);
-                ctx.set_field(obj, iv_i, Value::Object(Some(bi)));
+            let bi = if bi_class_id.is_some() {
+                Some(bi_alloc(ctx, &unscaled_str))
             } else {
-                ctx.set_field(obj, iv_i, Value::Object(None));
-            }
+                None
+            };
+            let obj = ctx.read_native_pin(h, obj);
+            ctx.set_field(obj, iv_i, Value::Object(bi));
             ctx.set_field(obj, ic_i, Value::Long(int_compact));
+            ctx.set_field(obj, sc_i, Value::Int(scale));
+            ctx.set_field(obj, pr_i, Value::Int(precision));
         }
-        ctx.set_field(obj, sc_i, Value::Int(scale));
-        ctx.set_field(obj, pr_i, Value::Int(precision));
     } else {
         let s = ctx.create_string(value);
+        let obj = ctx.read_native_pin(h, obj);
         ctx.set_field(obj, BD_FIELD_VALUE, Value::Object(Some(s)));
         ctx.set_field(obj, BD_FIELD_SCALE, Value::Int(scale));
         ctx.set_field(obj, BD_FIELD_PRECISION, Value::Int(precision));
     }
+    let obj = ctx.read_native_pin(h, obj);
+    ctx.unpin_native_roots(h);
     obj
 }
 
@@ -25773,27 +25917,34 @@ fn native_bd_init_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 /// Picks the layout (real-JDK intVal/scale/precision/intCompact vs. legacy
 /// synthetic value/scale/precision) automatically.
 fn bd_write_into(ctx: &mut dyn NativeContext, this: ObjectRef, value: &str, scale: i32) {
+    // GC-SAFETY (use-after-move — see `bi_alloc`): pin `this` across the
+    // `bi_alloc` / `create_string` allocations, which can trigger a minor GC
+    // that relocates it. Re-read the forwarded ref before the `set_field`s so we
+    // initialize the LIVE copy of the receiver, not a stale (reused) slot.
+    let h = ctx.pin_native_root(this);
     let precision = value.replace(['-', '.'], "").len() as i32;
     if let Some((iv_i, sc_i, pr_i, ic_i)) = bd_layout(ctx) {
         let unscaled_str = value.replace('.', "");
         let int_compact = unscaled_str.parse::<i64>().unwrap_or(BD_INFLATED);
-        if int_compact == BD_INFLATED {
-            let bi = bi_alloc(ctx, &unscaled_str);
-            ctx.set_field(this, iv_i, Value::Object(Some(bi)));
-            ctx.set_field(this, ic_i, Value::Long(BD_INFLATED));
+        let bi = bi_alloc(ctx, &unscaled_str);
+        let ic = if int_compact == BD_INFLATED {
+            BD_INFLATED
         } else {
-            let bi = bi_alloc(ctx, &unscaled_str);
-            ctx.set_field(this, iv_i, Value::Object(Some(bi)));
-            ctx.set_field(this, ic_i, Value::Long(int_compact));
-        }
+            int_compact
+        };
+        let this = ctx.read_native_pin(h, this);
+        ctx.set_field(this, iv_i, Value::Object(Some(bi)));
+        ctx.set_field(this, ic_i, Value::Long(ic));
         ctx.set_field(this, sc_i, Value::Int(scale));
         ctx.set_field(this, pr_i, Value::Int(precision));
     } else {
         let val_str = ctx.create_string(value);
+        let this = ctx.read_native_pin(h, this);
         ctx.set_field(this, BD_FIELD_VALUE, Value::Object(Some(val_str)));
         ctx.set_field(this, BD_FIELD_SCALE, Value::Int(scale));
         ctx.set_field(this, BD_FIELD_PRECISION, Value::Int(precision));
     }
+    ctx.unpin_native_roots(h);
 }
 
 fn native_bd_init_double(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -25859,6 +26010,60 @@ fn native_bd_value_of_double(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     Ok(Some(Value::Object(Some(result))))
 }
 
+/// Read a `BigDecimal` as `(unscaled BigInteger, scale)` for EXACT decimal
+/// arithmetic. Replaces the old `f64` round-trip that silently dropped both
+/// scale (Rust `{}`-formatting strips trailing zeros: `10.0` → "10") and
+/// precision (an `f64` holds ~15-16 significant digits). Prefers the real-JDK
+/// `intCompact`/`intVal` layout, falling back to the synthetic decimal string.
+fn bd_unscaled_bigint(ctx: &dyn NativeContext, this: ObjectRef) -> (crate::bigint::BigInt, i32) {
+    use crate::bigint::BigInt;
+    let scale = bd_scale_of(ctx, this);
+    if let Some((iv_i, _sc_i, _pr_i, ic_i)) = bd_layout(ctx) {
+        let ic = match ctx.get_field(this, ic_i) {
+            Value::Long(l) => l,
+            _ => BD_INFLATED,
+        };
+        if ic != BD_INFLATED {
+            return (BigInt::from_decimal(&ic.to_string()), scale);
+        }
+        if let Value::Object(Some(bi)) = ctx.get_field(this, iv_i) {
+            return (bi_read_int(ctx, bi), scale);
+        }
+        return (BigInt::zero(), scale);
+    }
+    let s = match ctx.get_field(this, BD_FIELD_VALUE) {
+        Value::Object(Some(o)) => ctx.read_string(o).unwrap_or_else(|| "0".to_string()),
+        _ => "0".to_string(),
+    };
+    (BigInt::from_decimal(&s.replace('.', "")), scale)
+}
+
+/// Multiply an unscaled `BigInt` by `10^n` (n >= 0) — used to align scales for
+/// `add`/`subtract` (BigDecimal rescales the smaller-scale operand up to the
+/// larger scale before adding the unscaled integers).
+fn bigint_mul_pow10(bi: &crate::bigint::BigInt, n: i32) -> crate::bigint::BigInt {
+    if n <= 0 {
+        return bi.clone();
+    }
+    let mut p = String::with_capacity(1 + n as usize);
+    p.push('1');
+    for _ in 0..n {
+        p.push('0');
+    }
+    bi.mul(&crate::bigint::BigInt::from_decimal(&p))
+}
+
+/// Construct a `BigDecimal` from an exact `(unscaled, scale)` pair (the inverse
+/// of `bd_unscaled_bigint`).
+fn bd_alloc_bigint(
+    ctx: &mut dyn NativeContext,
+    unscaled: &crate::bigint::BigInt,
+    scale: i32,
+) -> ObjectRef {
+    let value = apply_scale(&unscaled.to_decimal(), scale);
+    bd_alloc(ctx, &value, scale)
+}
+
 fn native_bd_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
@@ -25868,11 +26073,12 @@ fn native_bd_add(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a: f64 = bd_read(ctx, this).parse().unwrap_or(0.0);
-    let b: f64 = bd_read(ctx, other).parse().unwrap_or(0.0);
-    let s = format!("{}", a + b);
-    let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    let result = bd_alloc(ctx, &s, scale);
+    // Exact: result scale = max(sa, sb); rescale both unscaled to it, then add.
+    let (ua, sa) = bd_unscaled_bigint(ctx, this);
+    let (ub, sb) = bd_unscaled_bigint(ctx, other);
+    let s = sa.max(sb);
+    let sum = bigint_mul_pow10(&ua, s - sa).add(&bigint_mul_pow10(&ub, s - sb));
+    let result = bd_alloc_bigint(ctx, &sum, s);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -25885,11 +26091,12 @@ fn native_bd_subtract(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a: f64 = bd_read(ctx, this).parse().unwrap_or(0.0);
-    let b: f64 = bd_read(ctx, other).parse().unwrap_or(0.0);
-    let s = format!("{}", a - b);
-    let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    let result = bd_alloc(ctx, &s, scale);
+    // Exact: result scale = max(sa, sb); rescale both unscaled to it, then subtract.
+    let (ua, sa) = bd_unscaled_bigint(ctx, this);
+    let (ub, sb) = bd_unscaled_bigint(ctx, other);
+    let s = sa.max(sb);
+    let diff = bigint_mul_pow10(&ua, s - sa).sub(&bigint_mul_pow10(&ub, s - sb));
+    let result = bd_alloc_bigint(ctx, &diff, s);
     Ok(Some(Value::Object(Some(result))))
 }
 
@@ -25902,11 +26109,12 @@ fn native_bd_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let a: f64 = bd_read(ctx, this).parse().unwrap_or(0.0);
-    let b: f64 = bd_read(ctx, other).parse().unwrap_or(0.0);
-    let s = format!("{}", a * b);
-    let scale = s.find('.').map(|p| (s.len() - p - 1) as i32).unwrap_or(0);
-    let result = bd_alloc(ctx, &s, scale);
+    // Exact: result scale = sa + sb; multiply the unscaled integers directly.
+    let (ua, sa) = bd_unscaled_bigint(ctx, this);
+    let (ub, sb) = bd_unscaled_bigint(ctx, other);
+    let s = sa + sb;
+    let prod = ua.mul(&ub);
+    let result = bd_alloc_bigint(ctx, &prod, s);
     Ok(Some(Value::Object(Some(result))))
 }
 

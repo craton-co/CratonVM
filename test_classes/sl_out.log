@@ -1,6 +1,0 @@
-[2m2026-04-19T03:13:16.102404Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m <clinit> failed with non-critical exception — marking as initialized [3mclass[0m[2m=[0mjdk/internal/loader/BootLoader [3merror[0m[2m=[0mjava/lang/NullPointerException
-[2m2026-04-19T03:13:16.159718Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m <clinit> failed with non-critical exception — marking as initialized [3mclass[0m[2m=[0mjdk/internal/loader/URLClassPath [3merror[0m[2m=[0mjava/lang/NullPointerException
-[2m2026-04-19T03:13:16.204879Z[0m [33m WARN[0m [2mrustjvm_vm::vm::vm_util[0m[2m:[0m <clinit> failed with non-critical exception — marking as initialized [3mclass[0m[2m=[0mjdk/internal/loader/ClassLoaders [3merror[0m[2m=[0mjava/lang/NullPointerException
-total providers: 0
-utf8=UTF-8
-OK

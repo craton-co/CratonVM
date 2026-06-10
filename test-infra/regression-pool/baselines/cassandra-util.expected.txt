@@ -1,4 +1,0 @@
-Cassandra release: 4.1.4
-UUID round-trip OK
-ByteBufferUtil round-trip OK
-OK

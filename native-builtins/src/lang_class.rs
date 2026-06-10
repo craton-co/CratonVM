@@ -1372,7 +1372,7 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
             // org.jboss.modules.ModuleClassLoader — for those, CNFE is the
             // authoritative answer about module visibility. Detect Spring Boot's
             // LaunchedURLClassLoader by class name prefix.
-            Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(_)) => {
+            Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref)) => {
                 // Check if this is a LaunchedURLClassLoader (Spring Boot 2/3)
                 // or a URLClassLoader subclass that might have the same issues.
                 // For these, bootstrap fallback is safe. For module loaders, propagate.
@@ -1402,9 +1402,14 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                         );
                         return Ok(Some(Value::Object(Some(mirror))));
                     }
-                    return Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
-                        class_name: dotted_name,
-                    }.into());
+                    // The loader threw a Java exception — propagate it as-is.
+                    // For a class-load failure it already names the missing
+                    // class (CNFE/NCDFE), and for any other failure type the
+                    // raw exception is more informative than a synthesized
+                    // CNFE(dotted_name). Matches HotSpot's behaviour.
+                    return Err(
+                        cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc_ref),
+                    );
                 }
             }
             // Propagate internal VM errors without re-wrapping.
@@ -1463,6 +1468,22 @@ pub(crate) fn native_class_for_name(ctx: &mut dyn NativeContext, args: &[Value])
                 );
                 return Ok(Some(Value::Object(Some(mirror))));
             }
+            // If a Java exception was raised during load/link/init, it is the
+            // authoritative diagnostic — propagate it unchanged. JVMS lets
+            // `Class.forName` surface the underlying `LinkageError` (commonly
+            // `NoClassDefFoundError` naming the missing transitive class), and
+            // HotSpot does exactly that. The previous behaviour of synthesizing
+            // a fresh `ClassNotFoundException(dotted_name)` discarded the
+            // actually-missing class name and forced users to guess at the
+            // classpath gap.
+            if matches!(
+                e,
+                cratonvm_types::error::MethodCallFailed::ExceptionThrown(_)
+            ) {
+                return Err(e);
+            }
+            // No Java exception was raised — the class file simply could not
+            // be located on any source on the classpath. Throw `CNFE(dotted)`.
             Err(cratonvm_types::error::RuntimeError::ClassNotFoundException {
                 class_name: dotted_name,
             }

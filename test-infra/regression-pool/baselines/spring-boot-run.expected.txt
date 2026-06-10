@@ -1,2 +1,0 @@
-Bean: hello from probe
-OK

@@ -1,6 +1,0 @@
-Tomcat: Apache Tomcat/10.1.31
-Server number: 10.1.31.0
-Server built: Oct 3 2024 19:02:38 UTC
-WebXml version=5.0 distributable=true
-URL decode OK: hello world!
-OK

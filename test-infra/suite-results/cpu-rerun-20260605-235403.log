@@ -1,0 +1,140 @@
+=== CPU rerun — build + bench + apps ===
+Log: C:/craton/CratonVM/test-infra/suite-results/cpu-rerun-20260605-235403.log
+--- compile bench + harness ---
+-rwxr-xr-x 2 Victor 197121 18060288 Jun  5 23:54 C:/craton/CratonVM/target/release/cratonvm.exe
+--- CPU micro-benchmarks (CratonVM-CPU vs HotSpot) ---
+VM comparison harness — sections: bench render
+  CratonVM : C:/craton/CratonVM/target/release/cratonvm.exe
+  HotSpot  : C:/Program Files/Java/jdk-25/bin/java.exe
+  TornadoVM: C:/craton/tornadovm/jdk-25.0.3/bin/java.exe
+
+------------------------------------------------------------------------------
+## benchmark: arith1500M
+------------------------------------------------------------------------------
+  cratonvm-cpu    rc=0   OK           8549 ms  chk=2812500002999999995 
+  hotspot         rc=0   OK           4425 ms  chk=2812500002999999995 
+
+------------------------------------------------------------------------------
+## benchmark: fib44
+------------------------------------------------------------------------------
+  cratonvm-cpu    rc=0   OK           7582 ms  chk=701408733 
+  hotspot         rc=0   OK           4640 ms  chk=701408733 
+
+------------------------------------------------------------------------------
+## benchmark: sieve250k
+------------------------------------------------------------------------------
+  cratonvm-cpu    rc=0   OK           2479 ms  chk=22044 
+  hotspot         rc=0   OK           1810 ms  chk=22044 
+
+------------------------------------------------------------------------------
+## benchmark: matrix600
+------------------------------------------------------------------------------
+  cratonvm-cpu    rc=0   OK           1199 ms  chk=6479950792 
+  hotspot         rc=0   OK            565 ms  chk=6479950792 
+
+------------------------------------------------------------------------------
+## benchmark: bintrees18
+------------------------------------------------------------------------------
+  cratonvm-cpu    rc=0   OK          53949 ms  chk=68332206 
+  hotspot         rc=0   OK            663 ms  chk=68332206 
+
+------------------------------------------------------------------------------
+## benchmark: vadd2_28
+------------------------------------------------------------------------------
+  cratonvm-cpu    rc=0   OK           2620 ms  chk=108086390654238720 
+  hotspot         rc=0   OK           1977 ms  chk=108086390654238720 
+
+------------------------------------------------------------------------------
+## COMPARISON TABLES
+------------------------------------------------------------------------------
+
+### Micro-benchmarks — wall time (ms)
+
+  benchmark  | cratonvm-cpu | hotspot
+  -----------+--------------+--------
+  arith1500M | 8549         | 4425   
+  fib44      | 7582         | 4640   
+  sieve250k  | 2479         | 1810   
+  matrix600  | 1199         | 565    
+  bintrees18 | 53949        | 663    
+  vadd2_28   | 2620         | 1977   
+
+### Micro-benchmarks — state (OK/CRASH/TIMEOUT)
+
+  benchmark  | cratonvm-cpu | hotspot
+  -----------+--------------+--------
+  arith1500M | OK           | OK     
+  fib44      | OK           | OK     
+  sieve250k  | OK           | OK     
+  matrix600  | OK           | OK     
+  bintrees18 | OK           | OK     
+  vadd2_28   | OK           | OK     
+
+### Micro-benchmarks — checksum (must be identical across a row)
+
+  benchmark  | cratonvm-cpu        | hotspot            
+  -----------+---------------------+--------------------
+  arith1500M | 2812500002999999995 | 2812500002999999995
+  fib44      | 701408733           | 701408733          
+  sieve250k  | 22044               | 22044              
+  matrix600  | 6479950792          | 6479950792         
+  bintrees18 | 68332206            | 68332206           
+  vadd2_28   | 108086390654238720  | 108086390654238720 
+
+------------------------------------------------------------------------------
+Raw TSVs:
+  bench:        C:/craton/CratonVM/test-infra/suite-results/cmp-bench-20260605-235407.tsv
+------------------------------------------------------------------------------
+--- apps test suites ---
+== h2-testall-fast ==
+  cratonvm rc=0 PASS     3.0s  2026-06-06T02:56:00.317412Z  WARN cratonvm_vm::vm::vm_util: Post-clinit fixup: B
+  hotspot  rc=0 PASS     0.7s  00:00.039 total
+
+== wildfly-health ==
+  cratonvm rc=1 FAIL     17.9s  FAIL testSchema[0](org.wildfly.extension.health.HealthSubsystemTestCase) :: fatal error: Premature end of file.
+  hotspot  (skipped — CratonVM did not PASS)
+
+== elasticsearch-version ==
+  cratonvm rc=70 FAIL 8.4s Exception
+  hotspot  (skipped)
+
+== gpu-bench-cpu ==
+  cratonvm rc=0 PASS     2.0s  [cratonvm] System.exit(0) called — process terminating
+  hotspot  rc=0 PASS     0.3s  correctness=OK
+
+== gpu-offload-probe ==
+  cratonvm rc=0 PASS     2.7s  OUT0=0 OUTN=1048600
+  hotspot  rc=0 PASS     0.3s  OUT0=0 OUTN=1048600
+
+== bc-asn1-regression ==
+  cratonvm rc=0 PASS     56.2s  All tests successful.
+  hotspot  rc=0 PASS     1.3s  All tests successful.
+
+== bc-crypto-prng ==
+  cratonvm rc=0 PASS     63.4s  All tests successful.
+  hotspot  rc=0 PASS     0.8s  All tests successful.
+
+== commons-math-junit-probe ==
+  cratonvm rc=1 FAIL     1.7s  Exception in thread "main" java/lang/NoClassDefFoundError: org/junit/platform/launcher/core/LauncherDiscoveryRequestBuil
+  hotspot  (skipped — CratonVM did not PASS)
+
+== dacapo-avrora ==
+  cratonvm rc=0 PASS 9.6s PASSED
+  hotspot  rc=127 1.4s FAILED
+
+== pool:kafka-codec ==
+  cratonvm rc=- MISS_PROBE -s  regression-pool: total=1 pass=0 regress=0 slow=0 no_base=1 no_stage=0 results: /c/craton/CratonVM/test-infra/regression
+  hotspot  (skipped)
+
+== pool:spring-boot-run ==
+  cratonvm rc=- MISS_PROBE -s  regression-pool: total=1 pass=0 regress=0 slow=0 no_base=1 no_stage=0 results: /c/craton/CratonVM/test-infra/regression
+  hotspot  (skipped)
+
+== pool:tomcat-server-info ==
+  cratonvm rc=- MISS_PROBE -s  regression-pool: total=1 pass=0 regress=0 slow=0 no_base=1 no_stage=0 results: /c/craton/CratonVM/test-infra/regression
+  hotspot  (skipped)
+
+Wrote C:/craton/CratonVM/apps/APPS_SUITE_RESULTS.md
+TSV: C:/craton/CratonVM/test-infra/suite-results/apps-all-20260605-235553/results.tsv
+Done.
+=== Done ===
