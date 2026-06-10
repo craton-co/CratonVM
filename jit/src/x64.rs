@@ -12997,6 +12997,30 @@ impl Compiler {
 
                 // swap
                 0x5f => {
+                    // EC oop-map fix (round 2): the previous round paired the
+                    // pushes with `stack_oop_marks` (fixing a desync) but pushed
+                    // hard-coded `false` on the conservative-frame-sweep argument.
+                    // That justification only covers `StackSlot::Frame` — the
+                    // conservative scan walks frame qwords, not registers — so a
+                    // register-resident oop (`StackSlot::Scratch`/`CalleeSaved`)
+                    // swapped here lost its precise mark and would not be remapped
+                    // by a moving GC at the next safepoint; the next deref would
+                    // read stale from-space. Mirror the existing `dup`/`dup2`
+                    // mark-propagation: snapshot each operand's mark BEFORE the
+                    // pops (`pop_stack` discards them) and carry it onto the
+                    // swapped position so the precise oop map matches the values
+                    // the slots actually hold.
+                    let ml = self.stack_oop_marks.len();
+                    let a_oop = self
+                        .stack_oop_marks
+                        .get(ml.wrapping_sub(1))
+                        .copied()
+                        .unwrap_or(false); // top before swap
+                    let b_oop = self
+                        .stack_oop_marks
+                        .get(ml.wrapping_sub(2))
+                        .copied()
+                        .unwrap_or(false); // below-top before swap
                     let a = self.pop_stack();
                     let b = self.pop_stack();
                     match (a, b) {
@@ -13012,22 +13036,12 @@ impl Compiler {
                             // just logical reordering via push order below
                         }
                     }
-                    // Push back in swapped order. EC oop-map fix: the previous
-                    // code pushed to `self.stack` WITHOUT pairing
-                    // `stack_oop_marks`, desyncing the two vectors (every
-                    // subsequent slot's precise oop mark shifted by one). Keep
-                    // the vectors in lockstep. We push conservative `false`
-                    // marks here (the UNDER-marked direction is safe: the
-                    // conservative frame-region sweep in
-                    // `conservative_roots::scan_one_frame_precise` re-validates
-                    // every frame qword via `heap.is_object_address`, so a
-                    // swapped oop missed by the precise map is still found and
-                    // remapped; OVER-marking a non-oop would be unsafe, so we
-                    // do not do it).
+                    // Push back in swapped order, carrying each operand's
+                    // original oop mark onto its new slot.
                     self.stack.push(a);
-                    self.stack_oop_marks.push(false);
+                    self.stack_oop_marks.push(a_oop);
                     self.stack.push(b);
-                    self.stack_oop_marks.push(false);
+                    self.stack_oop_marks.push(b_oop);
                     pc += 1;
                 }
 
@@ -20977,6 +20991,34 @@ mod tests {
         // produced by the JIT compiler from valid bytecode and the mmap region is executable.
         let result = unsafe { compiled.try_call(&[10, 7]).expect("test JIT call") };
         assert_eq!(result, 34);
+    }
+
+    #[test]
+    fn test_compile_swap_arithmetic() {
+        // int f(int a, int b) { return a - b; }, computed via swap:
+        // [a, b] → swap → [b, a] → isub → [b - a] … but we want `a - b`, so:
+        // [a, b] → swap → [b, a] → swap → [a, b] → isub → [a - b]. Two swaps
+        // exercise the codegen twice and verify the operand identities survive
+        // unchanged. f(10, 3) = 7; f(-4, 6) = -10.
+        // iload_0 (0x1a), iload_1 (0x1b), swap (0x5f), swap (0x5f),
+        // isub (0x64), ireturn (0xac)
+        let code: Vec<u8> = vec![0x1a, 0x1b, 0x5f, 0x5f, 0x64, 0xac, 0, 0];
+        let code_len = 6;
+        let compiled = compile(
+            &code, code_len, 2, 2, false,
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), Vec::new(), Vec::new(), Vec::new(),
+            Vec::new(), // pic_slots
+            Vec::new(), Vec::new(), HashMap::new(), HashMap::new(), &test_helpers(),
+            std::collections::HashSet::new(),
+            HashMap::new(),
+            None, // string_layout
+        )
+        .expect("swap must JIT-compile");
+        // SAFETY: Calling JIT-compiled machine code in a test; produced from valid bytecode.
+        assert_eq!(unsafe { compiled.try_call(&[10, 3]).expect("test JIT call") }, 7);
+        // SAFETY: same as above.
+        assert_eq!(unsafe { compiled.try_call(&[-4, 6]).expect("test JIT call") }, -10);
     }
 
     #[test]
