@@ -2559,6 +2559,15 @@ fn map_collect_keys(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     if is_chm_receiver(ctx, this) {
         return chm_collect_all_keys(ctx, this);
     }
+    // LinkedHashMap-family receivers (incl. subclasses like Spring's
+    // AnnotationAttributes) store entries in the LHM overlay, not the
+    // HashMap bucket array — reading the buckets returns NOTHING. The
+    // prior exact-name dispatch in callers missed subclasses, so e.g.
+    // `keySet()`/`entrySet()` views over an AnnotationAttributes looked
+    // empty while size()/get() saw the data (SB-04 fallout).
+    if is_lhm_receiver(ctx, this) {
+        return lhm_collect_keys(ctx, this);
+    }
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut keys = Vec::new();
     if let Some(b) = buckets {
@@ -2583,6 +2592,10 @@ fn map_collect_values(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<Value> {
     if is_chm_receiver(ctx, this) {
         return chm_collect_all_values(ctx, this);
     }
+    // LHM-family receivers: read the overlay (see map_collect_keys).
+    if is_lhm_receiver(ctx, this) {
+        return lhm_collect_values(ctx, this);
+    }
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut values = Vec::new();
     if let Some(b) = buckets {
@@ -2606,6 +2619,12 @@ fn map_collect_entries(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<(Value, 
     }
     if is_chm_receiver(ctx, this) {
         return chm_collect_all_entries(ctx, this);
+    }
+    // LHM-family receivers: read the overlay (see map_collect_keys).
+    if is_lhm_receiver(ctx, this) {
+        let ks = lhm_collect_keys(ctx, this);
+        let vs = lhm_collect_values(ctx, this);
+        return ks.into_iter().zip(vs).collect();
     }
     let (buckets, _size, cap) = map_state(ctx, this);
     let mut entries = Vec::new();
@@ -3895,10 +3914,10 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
     // `Map.of(...)` / `Collections.unmodifiableMap(...)` source is read as its
     // backing map (and the TreeMap/LHM dispatch below sees the real class).
     let source = unwrap_unmod(ctx, source);
-    let cls = ctx
-        .class_name_of_id(ctx.class_id_of_object(source))
-        .unwrap_or_default();
-    if cls == "java/util/LinkedHashMap" {
+    // Ancestry-aware: LinkedHashMap SUBCLASSES (Spring AnnotationAttributes,
+    // LinkedMultiValueMap internals, ...) store entries in the LHM overlay
+    // too — an exact-name check here read their (empty) HashMap buckets.
+    if is_lhm_receiver(ctx, source) {
         let ks = lhm_collect_keys(ctx, source);
         let vs = lhm_collect_values(ctx, source);
         return ks.into_iter().zip(vs).collect();
@@ -4089,10 +4108,8 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
 /// Collect keys from any natively-modelled map (HashMap / LinkedHashMap /
 /// TreeMap / CHM), dispatching on the concrete backend.
 fn collect_keys_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<Value> {
-    let cls = ctx
-        .class_name_of_id(ctx.class_id_of_object(source))
-        .unwrap_or_default();
-    if cls == "java/util/LinkedHashMap" {
+    // Ancestry-aware LHM check — see collect_entries_any.
+    if is_lhm_receiver(ctx, source) {
         return lhm_collect_keys(ctx, source);
     }
     if is_tree_map_receiver(ctx, source) {
