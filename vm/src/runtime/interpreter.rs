@@ -13827,6 +13827,16 @@ fn try_osr(
             compiled.entry_ptr(), compiled.code_bytes().len()
         );
     }
+    if !osr_reused {
+        crate::jit::disasm::maybe_dump(
+            "osr",
+            &class_name_arc,
+            &method_name_arc,
+            &descriptor_arc,
+            compiled.entry_ptr(),
+            compiled.code_bytes(),
+        );
+    }
 
     // Convert interpreter locals to i64 for JIT frame (raw u64 → i64 reinterpret)
     let frame = &thread.frames[frame_idx];
@@ -14365,11 +14375,20 @@ fn try_jit_upgrade_with_gate(
     let ldc2w_resolver = |cp_idx: u16| -> Option<i64> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(class_id)?;
-        match class.constant_pool.get(cp_idx)? {
+        let val = match class.constant_pool.get(cp_idx)? {
             ConstantPoolEntry::Long(v) => Some(*v),
             ConstantPoolEntry::Double(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
             _ => None,
+        };
+        if std::env::var_os("CRATONVM_DBG_JIT_LDC").is_some() {
+            eprintln!(
+                "[cratonvm-ldc2w] upgrade idx={} -> {:?} (f64 {})",
+                cp_idx,
+                val,
+                val.map(|v| f64::from_bits(v as u64)).unwrap_or(f64::NAN)
+            );
         }
+        val
     };
 
     // RBC.2 — `ldc`/`ldc_w` int/float constants. This resolver was never
@@ -14677,6 +14696,14 @@ fn try_jit_upgrade_with_gate(
             compiled_arc.entry_ptr(), compiled_arc.code_bytes().len()
         );
     }
+    crate::jit::disasm::maybe_dump(
+        "upgrade",
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+        compiled_arc.entry_ptr(),
+        compiled_arc.code_bytes(),
+    );
 
     Some(CachedInvokeTarget::Jit {
         compiled: compiled_arc,
@@ -14921,11 +14948,20 @@ pub fn try_jit_compile_callee(
     let ldc2w_resolver = |cp_idx: u16| -> Option<i64> {
         let cm = shared.class_manager.read();
         let class = cm.get_class(cid)?;
-        match class.constant_pool.get(cp_idx)? {
+        let val = match class.constant_pool.get(cp_idx)? {
             ConstantPoolEntry::Long(v) => Some(*v),
             ConstantPoolEntry::Double(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
             _ => None,
+        };
+        if std::env::var_os("CRATONVM_DBG_JIT_LDC").is_some() {
+            eprintln!(
+                "[cratonvm-ldc2w] full idx={} -> {:?} (f64 {})",
+                cp_idx,
+                val,
+                val.map(|v| f64::from_bits(v as u64)).unwrap_or(f64::NAN)
+            );
         }
+        val
     };
 
     // RBC.2 — `ldc`/`ldc_w` int/float constants; see the matching resolver
@@ -15001,6 +15037,14 @@ pub fn try_jit_compile_callee(
             compiled.entry_ptr(), compiled.code_bytes().len()
         );
     }
+    crate::jit::disasm::maybe_dump(
+        "full",
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+        compiled.entry_ptr(),
+        compiled.code_bytes(),
+    );
     let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
     let needs_ctx = compiled.needs_context();
     let compile_duration_ns = compile_start.elapsed().as_nanos() as u64; // Cast: duration to u64 nanoseconds
