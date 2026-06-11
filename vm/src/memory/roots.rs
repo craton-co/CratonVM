@@ -263,6 +263,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     (`gc_update_logmanager_refs`).
     cratonvm_native_builtins::logmanager::gc_scan_logmanager_roots(&mut roots);
 
+    // 20. Class-level annotation-proxy identity cache. The per-class
+    //     `getAnnotation(X)` / `getDeclaredAnnotations()` proxies are cached in
+    //     a process-global side-table in `native-builtins/src/lang_class.rs`
+    //     (so repeated reads return the same instance, matching HotSpot's
+    //     `Class.annotationData`), invisible to the field scan above. Root them
+    //     so a moving young GC cannot reclaim/relocate a cached proxy out from
+    //     under a later `getAnnotation` read (use-after-free). Remap companion
+    //     in `gc.rs` (`gc_update_annotation_proxy_refs`).
+    cratonvm_native_builtins::lang_class::gc_scan_annotation_proxy_roots(&mut roots);
+
     roots
 }
 

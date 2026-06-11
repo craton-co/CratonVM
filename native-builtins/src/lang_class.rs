@@ -6886,6 +6886,86 @@ fn annotation_desc_to_class_name(desc: &str) -> Option<&str> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Class-level annotation-proxy identity cache
+//
+// HotSpot caches annotation instances per class (`Class.annotationData`), so
+// repeated `getAnnotation(X)` / `getDeclaredAnnotations()` on the SAME class
+// return the SAME instance (`a1 == a2`). CratonVM previously rebuilt a fresh
+// proxy on every call, so `getAnnotation(X) != getAnnotation(X)` — breaking
+// identity-sensitive callers (annotations used as `IdentityHashMap` keys, or
+// caches keyed on the annotation instance).
+//
+// We cache the proxy keyed by (queried class id, annotation type descriptor),
+// mirroring HotSpot's per-class `annotationData`. The cached `ObjectRef`s live
+// only in this process-global side-table, invisible to the heap field scan, so
+// they MUST be GC-rooted and remapped — see `gc_scan_annotation_proxy_roots`
+// (roots.rs) and `gc_update_annotation_proxy_refs` (gc.rs). Without that, a
+// moving young GC would relocate a cached proxy and the next read would return
+// a stale `ObjectRef` (use-after-free).
+// ---------------------------------------------------------------------------
+
+fn annotation_proxy_cache() -> &'static Mutex<FxHashMap<(u32, String), ObjectRef>> {
+    static C: OnceLock<Mutex<FxHashMap<(u32, String), ObjectRef>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+/// Build-or-fetch the cached annotation proxy for `ann` as seen on
+/// `queried_class_id`. The cache lock is NEVER held across
+/// `create_annotation_proxy` (which allocates and may trigger a GC whose root
+/// scan re-locks this cache — that would deadlock). On a concurrent first-build
+/// race the loser's proxy is dropped (still reachable from the caller's stack
+/// until the next GC), exactly as `OscCache` documents.
+fn cached_annotation_proxy(
+    ctx: &mut dyn NativeContext,
+    queried_class_id: ClassId,
+    ann: &cratonvm_native_api::AnnotationData,
+) -> ObjectRef {
+    let key = (queried_class_id.as_u32(), ann.type_descriptor.clone());
+    if let Some(&cached) = annotation_proxy_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        return cached;
+    }
+    let proxy = create_annotation_proxy(ctx, ann);
+    *annotation_proxy_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .or_insert(proxy)
+}
+
+/// GC root scan for the annotation-proxy cache (companion to
+/// [`gc_update_annotation_proxy_refs`]). Pushes every cached proxy so a moving
+/// young GC keeps them live and records their relocation.
+pub fn gc_scan_annotation_proxy_roots(out: &mut Vec<ObjectRef>) {
+    let guard = annotation_proxy_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    out.extend(guard.values().copied());
+}
+
+/// Post-GC remap for the annotation-proxy cache (companion to
+/// [`gc_scan_annotation_proxy_roots`]). Repoints each cached `ObjectRef` to its
+/// new address after a moving collection.
+pub fn gc_update_annotation_proxy_refs(pointer_map: &HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut guard = annotation_proxy_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for obj_ref in guard.values_mut() {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+}
+
 /// Create an annotation proxy object from annotation data.
 /// Fills in default values for elements not explicitly provided.
 fn create_annotation_proxy(
@@ -7313,10 +7393,27 @@ fn build_annotation_array(
     ctx: &mut dyn NativeContext,
     annotations: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
-    use cratonvm_types::ClassId;
     let arr = ctx.new_ref_array(ClassId::new(0), annotations.len());
     for (i, ann) in annotations.iter().enumerate() {
         let proxy = create_annotation_proxy(ctx, ann);
+        ctx.set_array_element(arr, i, Value::Object(Some(proxy)));
+    }
+    arr
+}
+
+/// Like [`build_annotation_array`] but routes each proxy through the per-class
+/// identity cache, so `getDeclaredAnnotations()` / `getAnnotations()` return the
+/// SAME instances `getAnnotation()` returns for `queried_class_id`. Used only by
+/// the CLASS-level annotation natives (field/method annotation arrays keep the
+/// fresh-build path — their key space is different).
+fn build_class_annotation_array(
+    ctx: &mut dyn NativeContext,
+    queried_class_id: ClassId,
+    annotations: &[cratonvm_native_api::AnnotationData],
+) -> ObjectRef {
+    let arr = ctx.new_ref_array(ClassId::new(0), annotations.len());
+    for (i, ann) in annotations.iter().enumerate() {
+        let proxy = cached_annotation_proxy(ctx, queried_class_id, ann);
         ctx.set_array_element(arr, i, Value::Object(Some(proxy)));
     }
     arr
@@ -7346,7 +7443,7 @@ pub(crate) fn native_class_get_declared_annotations(ctx: &mut dyn NativeContext,
             for a in &annotations { eprintln!("    {}", a.type_descriptor); }
         }
     }
-    let arr = build_annotation_array(ctx, &annotations);
+    let arr = build_class_annotation_array(ctx, class_id, &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -7388,7 +7485,7 @@ pub(crate) fn native_class_get_annotations(ctx: &mut dyn NativeContext, args: &[
         current = ctx.superclass_of(super_id);
     }
 
-    let arr = build_annotation_array(ctx, &annotations);
+    let arr = build_class_annotation_array(ctx, class_id, &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -7439,7 +7536,7 @@ pub(crate) fn native_class_get_declared_annotation(ctx: &mut dyn NativeContext, 
     let annotations = ctx.class_annotations(class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = create_annotation_proxy(ctx, ann);
+            let proxy = cached_annotation_proxy(ctx, class_id, ann);
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }
@@ -7474,7 +7571,7 @@ pub(crate) fn native_class_get_annotation(ctx: &mut dyn NativeContext, args: &[V
     let annotations = ctx.class_annotations(class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = create_annotation_proxy(ctx, ann);
+            let proxy = cached_annotation_proxy(ctx, class_id, ann);
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }
@@ -7486,7 +7583,9 @@ pub(crate) fn native_class_get_annotation(ctx: &mut dyn NativeContext, args: &[V
             let super_anns = ctx.class_annotations(super_id);
             for ann in &super_anns {
                 if ann.type_descriptor == target_desc {
-                    let proxy = create_annotation_proxy(ctx, ann);
+                    // Key by the queried class (class_id), matching HotSpot's
+                    // per-class annotationData for inherited annotations.
+                    let proxy = cached_annotation_proxy(ctx, class_id, ann);
                     return Ok(Some(Value::Object(Some(proxy))));
                 }
             }
