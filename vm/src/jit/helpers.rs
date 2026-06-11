@@ -3222,6 +3222,13 @@ impl DeoptimizationController {
         };
         let action = vm.record_deoptimization(&method_key, event, &tiered_key);
 
+        if std::env::var_os("CRATONVM_DBG_DEOPT").is_some() {
+            eprintln!(
+                "[cratonvm-deopt] {} reason={:?} bci={} action={:?}",
+                method_key, reason, bci, action
+            );
+        }
+
         // Invalidate the compiled method from the JIT cache
         {
             let mut jit_cache = vm.jit_cache.write();

@@ -1226,6 +1226,17 @@ impl CompiledMethod {
             .expect("call_with_heap: invalid JIT entry or arg count (use try_call_with_context for the fallible variant)")
     }
 
+    /// True when this artifact recorded an OSR entry point for `entry_pc`
+    /// (i.e. [`osr_enter`](Self::osr_enter) at that pc would not bail).
+    /// Lets the interpreter's OSR trigger reuse a cached compile instead of
+    /// re-running the whole x64 pipeline on every trigger.
+    pub fn can_osr_enter(&self, entry_pc: usize) -> bool {
+        self.osr_pc_to_native
+            .as_ref()
+            .and_then(|t| t.get(entry_pc).copied())
+            .map_or(false, |off| off >= 0)
+    }
+
     /// OSR entry: enter JIT code at an arbitrary bytecode PC with interpreter locals.
     ///
     /// # Safety
@@ -3647,7 +3658,7 @@ fn jit_bail_list() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<u64>> {
 /// Whether the given method has been added to the JIT bail-list by a
 /// prior permanent-bail compilation attempt.  Checked at the top of
 /// `try_compile` to short-circuit re-attempts.
-fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+pub fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) -> bool {
     let h = compute_jit_key_hash(class_name, method_name, descriptor);
     jit_bail_list().read().contains(&h)
 }
@@ -3655,7 +3666,7 @@ fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) -> 
 /// Mark the method as permanently bail-listed.  Called when the heavy
 /// `x64::compile` path returns None (typically because of an unsupported
 /// backend pattern that won't change on retry).
-fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) {
+pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) {
     let h = compute_jit_key_hash(class_name, method_name, descriptor);
     jit_bail_list().write().insert(h);
 }
@@ -3753,6 +3764,12 @@ pub fn try_compile(
             &cached.class_name,
             &cached.method_name,
             &cached.method_descriptor,
+        );
+    }
+    if result.is_none() && std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] compile-bail {}.{}{} backend_attempted={}",
+            cached.class_name, cached.method_name, cached.method_descriptor, backend_attempted
         );
     }
     // DBG (env-gated): dump the emitted machine code for a specific method so
@@ -4043,12 +4060,18 @@ fn try_compile_inner(
         }
     }
 
-    // Resolve ldc/ldc_w constants (int/float from CP; strings → 0)
+    // Resolve ldc/ldc_w constants (int/float from CP). A `None` from the
+    // resolver means the constant is not representable as an immediate
+    // (String/Class/MethodHandle ldc) — bail the whole compile, mirroring
+    // the ldc2_w arm below. The previous `unwrap_or(0)` would have compiled
+    // `ldc "str"` as pushing constant 0 (a null reference) — wrong code.
+    // With no resolver at all, `ldc_info` stays empty and the 0x12/0x13
+    // codegen arm bails per-site instead.
     let mut ldc_info: Vec<(usize, i64)> = Vec::new();
     if !scan.ldc_ops.is_empty() {
         if let Some(resolver) = cp_ldc_resolver {
             for &(pc, cp_idx) in &scan.ldc_ops {
-                let val = resolver(cp_idx).unwrap_or(0);
+                let val = resolver(cp_idx)?;
                 ldc_info.push((pc, val));
             }
         }
@@ -4120,6 +4143,20 @@ fn try_compile_inner(
                 && method_name == &*cached.method_name
                 && descriptor == &*cached.method_descriptor;
 
+            // RBC.3 — a site planned for inlining MUST still get a
+            // `JitInvokeInfo` dispatch fallback (below). The codegen's
+            // `try_emit_inline` can bail mid-body and roll back, and its
+            // fall-through is direct_calls → invoke_info → else "assume
+            // self-recursive CALL to own entry". With the old `continue`
+            // here, a bailed inline site had neither, so the emitted CALL
+            // targeted the CALLER's own entry: BC's `Strings.fromByteArray`
+            // (invokestatic to same-class sibling `asCharArray`, planned for
+            // inline, bailed in codegen) recursed itself — one `new String`
+            // per level — until a native stack overflow killed the asn1
+            // RegressionTest at StringTest (1,365 self-frames in the cdb
+            // dump). Skip only the direct-call/intrinsic attempts, then fall
+            // through to the info construction.
+            let mut planned_inline = false;
             if !is_self_call && (invoke_kind == 3 || invoke_kind == 1) {
                 // Try inlining first (before direct calls — inlining is more profitable)
                 if inline_budget_remaining > 0 {
@@ -4137,12 +4174,13 @@ fn try_compile_inner(
                                     site.descriptor.clone(),
                                 ));
                                 inline_sites.insert(pc, site);
-                                continue;
+                                planned_inline = true;
                             }
                         }
                     }
                 }
 
+                if !planned_inline {
                 if let Some(compiler) = callee_compiler.as_ref() {
                     if let Some((entry, callee_needs_ctx)) =
                         compiler(&class_name, &method_name, &descriptor)
@@ -4186,6 +4224,7 @@ fn try_compile_inner(
                     ));
                     continue;
                 }
+                } // end !planned_inline (RBC.3)
             }
 
             // Call-site intrinsics for instance-method invokes

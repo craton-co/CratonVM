@@ -984,6 +984,14 @@ pub(crate) fn detect_loop_unswitch_candidates(
 /// Returns `Some(needs_heap)` if the method can be JIT-compiled, `None` otherwise.
 /// `needs_heap` is true if the method uses array/object opcodes that require
 /// a heap pointer as a hidden first argument.
+/// Kill-switch for the dup_x1/dup_x2 codegen arms (`CRATONVM_JIT_NO_DUPX=1`
+/// restores the historical "bail to interpreter" behaviour). Added for
+/// regression bisection while the arms are fresh.
+fn dupx_codegen_disabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_JIT_NO_DUPX").is_some())
+}
+
 pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitScanResult> {
     let mut needs_heap = false;
     let mut multianewarray_ops = Vec::new();
@@ -1450,6 +1458,9 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // Anything else: not JIT-compatible
             _ => {
+                if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                    eprintln!("[cratonvm-jitc] scan-bail op=0x{:02x} pc={}", op, pc);
+                }
                 return None;
             }
         }
@@ -4703,6 +4714,10 @@ struct Compiler {
     /// points *before* the hoisted preheader so an OSR entry executes the
     /// hoist initialisation exactly like a normal fall-through entry would.
     osr_entry_native: Vec<i32>,
+    /// DBG (env-gated diagnostics): last bytecode pc/op the main emit loop
+    /// dispatched, so a codegen bail can report where it gave up.
+    dbg_last_pc: usize,
+    dbg_last_op: u8,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
     /// Jump table patches: (native offset of i32 entry, table_base_native_offset, target bytecode PC).
@@ -5229,6 +5244,8 @@ impl Compiler {
             alloc_used_xmms,
             pc_to_native: Vec::new(),
             osr_entry_native: Vec::new(),
+            dbg_last_pc: 0,
+            dbg_last_op: 0,
             forward_patches: Vec::new(),
             jump_table_patches: Vec::new(),
             self_call_patches: Vec::new(),
@@ -12335,6 +12352,8 @@ impl Compiler {
             }
 
             let op = code[pc];
+            self.dbg_last_pc = pc;
+            self.dbg_last_op = op;
             match op {
                 // nop
                 0x00 => {
@@ -13140,6 +13159,81 @@ impl Compiler {
                         if let Some(m) = self.stack_oop_marks.last_mut() {
                             *m = true;
                         }
+                    }
+                    pc += 1;
+                }
+
+                // dup_x1 — `[…, b, a] → […, a, b, a]`. JVMS §6.5 guarantees both
+                // operands are category-1, so unlike dup2/dup_x2 no width proof
+                // is needed. javac emits this for a field post-increment used as
+                // a value (`xBuf[xBufOff++] = in` in BC's GeneralDigest.update —
+                // the per-byte digest hot path that kept every BC digest
+                // interpreter-bound while this opcode bailed).
+                //
+                // Implementation: materialize ONE copy of the top value into a
+                // fresh frame slot (fresh offsets only grow, so no aliasing with
+                // the live `b`/`a` slots), then rotate the top three MODEL
+                // entries so the copy sits below the original pair. Only the
+                // copy costs instructions. The rotated entries' frame offsets
+                // are momentarily non-canonical, which is fine:
+                // `canonicalize_stack` resolves arbitrary offset permutations as
+                // a parallel-move problem at the next branch/call boundary.
+                0x5a => {
+                    if dupx_codegen_disabled() || self.stack.len() < 2 {
+                        self.failed = true;
+                        let _ = self.push_stack();
+                    } else {
+                        let a_slot = self.peek_stack();
+                        let a_oop =
+                            self.stack_oop_marks.last().copied().unwrap_or(false);
+                        self.load_slot_to_reg(RAX, a_slot);
+                        self.push_from_rax(); // […, b, a, aC]
+                        if a_oop {
+                            self.mark_top_as_oop();
+                        }
+                        let n = self.stack.len();
+                        self.stack[n - 3..].rotate_right(1); // […, aC, b, a]
+                        self.stack_oop_marks[n - 3..].rotate_right(1);
+                    }
+                    pc += 1;
+                }
+
+                // dup_x2 — FORM-1 `[…, c, b, a] → […, a, c, b, a]` (all three
+                // category-1) vs FORM-2 `[…, w, a] → […, a, w, a]` (w is a
+                // category-2 long/double = ONE slot in this model). The form
+                // depends on the width of the values UNDER the top, which this
+                // model does not track — so restrict to the one shape that
+                // proves FORM-1 locally: the NEXT opcode is a category-1 array
+                // store, in which case the verifier guarantees the top three
+                // slots are [arrayref, index, cat1-value]. That is exactly
+                // javac's `++z[i]` / `--z[i]` value-producing pattern — BC's
+                // `Nat.inc`/`Nat.dec` DRBG block-counter helpers re-ran the
+                // whole compile pipeline 35,923× in one crypto-prng suite run
+                // bailing on this opcode. Any other shape stays interpreted.
+                0x5b => {
+                    let next_is_cat1_astore = pc + 1 < code_len
+                        && matches!(
+                            code[pc + 1],
+                            0x4f | 0x51 | 0x53 | 0x54 | 0x55 | 0x56
+                        );
+                    if dupx_codegen_disabled() || !next_is_cat1_astore || self.stack.len() < 3 {
+                        // Unprovable form (or malformed height) — stay
+                        // interpreted; placeholder keeps the model height
+                        // plausible until the post-loop `failed` check.
+                        self.failed = true;
+                        let _ = self.push_stack();
+                    } else {
+                        let a_slot = self.peek_stack();
+                        let a_oop =
+                            self.stack_oop_marks.last().copied().unwrap_or(false);
+                        self.load_slot_to_reg(RAX, a_slot);
+                        self.push_from_rax(); // […, c, b, a, aC]
+                        if a_oop {
+                            self.mark_top_as_oop();
+                        }
+                        let n = self.stack.len();
+                        self.stack[n - 4..].rotate_right(1); // […, aC, c, b, a]
+                        self.stack_oop_marks[n - 4..].rotate_right(1);
                     }
                     pc += 1;
                 }
@@ -19775,6 +19869,12 @@ pub fn compile_with_param_slots(
 
     // Compile bytecode
     if !compiler.compile_bytecode(code, code_len) {
+        if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+            eprintln!(
+                "[cratonvm-jitc] codegen-bail pc={} op=0x{:02x}",
+                compiler.dbg_last_pc, compiler.dbg_last_op
+            );
+        }
         return None;
     }
 
