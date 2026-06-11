@@ -3372,11 +3372,12 @@ fn detect_loops(code: &[u8], code_len: usize) -> Vec<(usize, usize)> {
                 }
                 pc += 3;
             }
-            // Other instructions: advance by instruction length
-            0x10 | 0x15..=0x19 | 0x36..=0x3a | 0xbc => pc += 2,
-            0x11 | 0x84 | 0xb4 | 0xb5 | 0xb8 | 0xc0 | 0xc1 => pc += 3,
-            0xc5 => pc += 4,
-            _ => pc += 1,
+            // Other instructions: advance by instruction length. Must use the
+            // canonical table — an ad-hoc copy here was missing ldc/ldc_w/
+            // ldc2_w (and the invoke/field/switch ops), so the walk stepped
+            // into operand bytes and could fabricate or miss backward branches
+            // (the CM-FASTMATH length-table desync family).
+            _ => pc += bytecode_len_at(code, pc),
         }
     }
     loops
@@ -20266,32 +20267,13 @@ fn estimate_max_stack(code: &[u8], code_len: usize) -> usize {
             }
             _ => {}
         }
-        // Advance PC
-        match op {
-            0x10 | 0x15..=0x19 | 0x36..=0x3a | 0xbc => pc += 2,
-            0x11
-            | 0x13
-            | 0x14
-            | 0x84
-            | 0x99..=0xa6
-            | 0xa7
-            | 0xb2
-            | 0xb3
-            | 0xb4
-            | 0xb5
-            | 0xb6
-            | 0xb7
-            | 0xb8
-            | 0xbb
-            | 0xbd
-            | 0xc0
-            | 0xc1
-            | 0xc6
-            | 0xc7 => pc += 3,
-            0xc5 => pc += 4, // multianewarray
-            0xb9 => pc += 5, // invokeinterface
-            _ => pc += 1,
-        }
+        // Advance PC via the canonical length table. The ad-hoc copy this
+        // replaces was missing `ldc` (0x12) and treated tableswitch/
+        // lookupswitch as 1-byte, so the walk stepped through operand bytes
+        // (incl. switch pad/offset tables) as phantom opcodes; a phantom
+        // return zeroed `depth` and could UNDER-estimate the frame's operand
+        // stack (the CM-FASTMATH length-table desync family).
+        pc += bytecode_len_at(code, pc);
     }
     // Add safety margin (conservative for invoke stack effects not tracked above)
     max_depth + 4

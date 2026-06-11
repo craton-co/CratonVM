@@ -13,7 +13,7 @@ description = "Java Virtual Machine implementation in Rust"
 readme = "README.md"
 # Compiled Java test fixtures (.class files and the resource/boot-fixture
 # trees that hold them) are committed for the integration tests but must
-# not ship in the published crate — they bloat `cargo package` with ~2.5 MB
+# not ship in the published crate ??? they bloat `cargo package` with ~2.5 MB
 # of opaque bytecode. Integration-test `.rs` sources live directly under
 # tests/ and are unaffected.
 exclude = [
@@ -44,14 +44,14 @@ experimental-jmx = ["cratonvm-native-builtins/experimental-jmx"]
 experimental-serialization = ["cratonvm-native-builtins/experimental-serialization"]
 experimental-aot = ["cratonvm-native-builtins/experimental-aot"]
 experimental-debug = []
-# T19.H7 diagnostic logger. Off by default — these warn-level traces are
+# T19.H7 diagnostic logger. Off by default ??? these warn-level traces are
 # bring-up scaffolding that fired on every class-load, opcode dispatch, and
 # native call; building with this feature flag re-enables them only when an
 # operator is explicitly debugging a Wave-7 hang. Sessions 93-94 had to
 # revert two silent re-enables; gating behind a feature ensures it cannot
 # leak back into the default build.
 experimental-t19-diag = []
-# GPU offload — Part C marshalling + (future Parts E/F) interpreter hook and
+# GPU offload ??? Part C marshalling + (future Parts E/F) interpreter hook and
 # safepoint coordination. Off by default. With this feature off, the VM crate
 # compiles no GPU code paths and does not link `cuda-bridge` or `jit-cuda`.
 gpu-offload = ["dep:cuda-bridge", "dep:jit-cuda", "cratonvm-gc/gpu-offload", "cratonvm-native-builtins/gpu-offload", "dep:bytemuck"]
@@ -65,6 +65,9 @@ cratonvm-native-io = { path = "../native-io", version = "0.3.0" }
 cratonvm-native-builtins = { path = "../native-builtins", version = "0.3.0" }
 cratonvm-jit-api = { path = "../jit-api", version = "0.3.0" }
 cratonvm-jit = { path = "../jit", version = "0.3.0" }
+# Decode-only x86-64 disassembler for the CRATONVM_DBG_JIT_DISASM diagnostic
+# (vm/src/jit/disasm.rs). Inert at runtime unless the env var is set.
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "nasm"] }
 cratonvm-classloading = { path = "../classloading", version = "0.3.0" }
 cratonvm-gc = { path = "../gc", version = "0.3.0" }
 cratonvm-jfr = { path = "../jfr", version = "0.3.0" }
@@ -112,7 +115,7 @@ path = "src/bin/bench_gate.rs"
 
 # T5.1.2: HotSpot C2 ratio comparator. Reads bench/baseline.json and
 # bench/hotspot-baseline.json, prints a per-metric ratio table plus
-# geomean, exits non-zero when the geomean exceeds the threshold (1.5×
+# geomean, exits non-zero when the geomean exceeds the threshold (1.5??
 # by default per T5.8.1).
 [[bin]]
 name = "bench-hotspot-compare"

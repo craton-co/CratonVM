@@ -84,10 +84,23 @@ struct BasicBlock {
 }
 
 /// Compute the length of a bytecode instruction at `pc`.
+///
+/// CM-FASTMATH root cause: `ldc` (0x12), `ldc_w` (0x13), and `ldc2_w` (0x14)
+/// were absent from this table (the x64.rs `bytecode_len_at` twin had them
+/// fixed; this copy was not kept in sync), so they fell through to `_ => 1`.
+/// Every liveness/CFG walk then read the constant-pool index operand bytes as
+/// opcodes. For classes with a small constant pool the bytes decode as benign
+/// 1-byte ops and the walk resyncs; once indices grow past ~0xAC the high byte
+/// decodes as a return/`athrow`/multi-byte op — a phantom block terminator that
+/// makes every later use of a local invisible to liveness. The allocator then
+/// coalesced two *live* doubles onto one XMM register (commons-math3
+/// `FastMath.polySine` compiled `p*x2*x` as `p*x2*x2`), which is the
+/// `FastMath.sin(3π/4) = 1.2252` transform-suite miscompile. Keep this table
+/// and `x64::bytecode_len_at` in lockstep.
 pub(crate) fn bc_len(code: &[u8], pc: usize) -> usize {
     match code[pc] {
-        0x10 | 0x15..=0x19 | 0x36..=0x3a | 0xbc => 2,
-        0x11 | 0x84 | 0x99..=0xa6 | 0xa7 | 0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8
+        0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => 2,
+        0x11 | 0x13 | 0x14 | 0x84 | 0x99..=0xa6 | 0xa7 | 0xa8 | 0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8
         | 0xbd | 0xc0 | 0xc1 | 0xc6 | 0xc7 => 3,
         0xbb => 3,
         0xc5 => 4,
@@ -1081,6 +1094,82 @@ mod tests {
         let interference = vec![0u64];
         let float_mask = 0; // local 0 is int but assigned an XMM
         assert!(!regalloc_invariants_hold(&gpr, &xmm, &interference, float_mask, 1));
+    }
+
+    // CM-FASTMATH — `ldc`/`ldc_w`/`ldc2_w` were missing from `bc_len` (the
+    // x64.rs `bytecode_len_at` twin had them; this copy didn't), so liveness
+    // walks read constant-pool index operand bytes as opcodes. Pin the
+    // constant-load lengths so the tables cannot drift apart again.
+    #[test]
+    fn bc_len_constant_loads() {
+        // opcode byte + dummy operand bytes; bc_len only looks at code[pc]
+        // for these arms.
+        assert_eq!(bc_len(&[0x12, 0xBB], 0), 2, "ldc");
+        assert_eq!(bc_len(&[0x13, 0x00, 0xBB], 0), 3, "ldc_w");
+        assert_eq!(bc_len(&[0x14, 0x00, 0xBB], 0), 3, "ldc2_w");
+        assert_eq!(bc_len(&[0x10, 0x7F], 0), 2, "bipush");
+        assert_eq!(bc_len(&[0x11, 0x12, 0x34], 0), 3, "sipush");
+        assert_eq!(bc_len(&[0xa8, 0x00, 0x10], 0), 3, "jsr");
+        assert_eq!(bc_len(&[0xa9, 0x04], 0), 2, "ret");
+    }
+
+    // CM-FASTMATH end-to-end regression: the exact bytecode shape of
+    // commons-math3 `FastMath.polySine(D)D` as compiled into the published
+    // 3.6.1 jar, where the `ldc2_w` constant-pool indices are large enough
+    // that their operand bytes decode as multi-byte opcodes / `athrow`
+    // (0xBB `new`, 0xBF `athrow`, ...). With the broken length table the
+    // liveness walk hit a phantom block terminator inside an operand, saw no
+    // further uses of local 0 (`x`), and coalesced it with local 2 (`x2`)
+    // onto one XMM register — so `p * x2 * x` compiled as `p * x2 * x2`
+    // (the FastMath.sin(3π/4)=1.2252 transform-suite miscompile). Locals 0
+    // and 2 interfere (both live at pc 41-43) and must never share a register.
+    #[test]
+    fn polysine_high_cp_indices_do_not_coalesce_live_doubles() {
+        #[rustfmt::skip]
+        let code: Vec<u8> = vec![
+            0x26,             // 0:  dload_0        x
+            0x26,             // 1:  dload_0        x
+            0x6b,             // 2:  dmul           x*x
+            0x49,             // 3:  dstore_2       x2 =
+            0x14, 0x00, 0xBB, // 4:  ldc2_w #187    (0xBB = `new` if misread)
+            0x39, 0x04,       // 7:  dstore 4       p =
+            0x18, 0x04,       // 9:  dload 4
+            0x28,             // 11: dload_2
+            0x6b,             // 12: dmul
+            0x14, 0x00, 0xBD, // 13: ldc2_w #189    (0xBD = `anewarray`)
+            0x63,             // 16: dadd
+            0x39, 0x04,       // 17: dstore 4
+            0x18, 0x04,       // 19: dload 4
+            0x28,             // 21: dload_2
+            0x6b,             // 22: dmul
+            0x14, 0x00, 0xBF, // 23: ldc2_w #191    (0xBF = `athrow`!)
+            0x63,             // 26: dadd
+            0x39, 0x04,       // 27: dstore 4
+            0x18, 0x04,       // 29: dload 4
+            0x28,             // 31: dload_2
+            0x6b,             // 32: dmul
+            0x14, 0x00, 0xC1, // 33: ldc2_w #193    (0xC1 = `instanceof`)
+            0x63,             // 36: dadd
+            0x39, 0x04,       // 37: dstore 4
+            0x18, 0x04,       // 39: dload 4
+            0x28,             // 41: dload_2        x2 — still live
+            0x6b,             // 42: dmul
+            0x26,             // 43: dload_0        x  — still live!
+            0x6b,             // 44: dmul
+            0x39, 0x04,       // 45: dstore 4
+            0x18, 0x04,       // 47: dload 4
+            0xaf,             // 49: dreturn
+        ];
+        let result = allocate_registers(&code, code.len(), 6, 2, &[]);
+        let x = result.xmm_assignments[0];
+        let x2 = result.xmm_assignments[2];
+        if let (Some(rx), Some(rx2)) = (x, x2) {
+            assert_ne!(
+                rx, rx2,
+                "locals 0 (x) and 2 (x2) are simultaneously live across pc 41-44 \
+                 and must not share an XMM register"
+            );
+        }
     }
 
     #[test]

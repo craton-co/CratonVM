@@ -10,5 +10,6 @@
 pub use cratonvm_jit::*;
 
 pub mod conservative_roots;
+pub mod disasm;
 pub mod helpers;
 pub mod skip_list;
