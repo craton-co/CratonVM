@@ -9641,6 +9641,19 @@ impl Compiler {
             None => return false,
         };
 
+        // An inlined callee emits arbitrary code that uses the caller-saved
+        // scratch GPRs (R8/R9) and FP temporaries (XMM0-7) — exactly the
+        // registers the deferred-spill operand model (`StackSlot::Scratch` /
+        // `StackSlot::Xmm`) parks live values in. Inlining is a call boundary,
+        // so flush every caller-live Scratch/Xmm operand to its frame slot
+        // BEFORE emitting the callee body — otherwise the callee clobbers a
+        // value still live on the caller's operand stack (e.g. a computed
+        // double argument or a result held across the call), silently
+        // corrupting it. Without this, `leaf(x) + leaf(x*0.5)` and the whole
+        // commons-math FastMath.sin family miscompiled under JIT. `try_emit_inline`
+        // snapshots+restores all state, so a later mid-body bail rolls this back.
+        self.flush_scratch_registers();
+
         let callee_code = &site.callee_code;
         let callee_len = site.callee_code_len;
         let callee_num_args = site.callee_num_args;
@@ -9675,6 +9688,7 @@ impl Compiler {
             self.emit_xor_reg_self(RAX);
             self.emit_store_local(local_off, RAX);
         }
+
 
         // Track forward branches within the inlined code: (patch_offset, target_callee_pc)
         let mut branch_patches: Vec<(usize, usize)> = Vec::new();
@@ -11655,6 +11669,10 @@ impl Compiler {
         let slot2 = self.pop_stack(); // value2 (top)
         let slot1 = self.pop_stack(); // value1 (deeper)
 
+        // See emit_double_binop: relocate any live XMM0 operand still on the
+        // remaining stack before this op clobbers XMM0/XMM1 as scratch.
+        self.flush_xmm0_slots();
+
         self.load_slot_to_reg(RCX, slot2);
         self.buf.emit(&[0x66, 0x0F, 0x6E, 0xC9]); // MOVD XMM1, ECX
         self.load_slot_to_reg(RAX, slot1);
@@ -11675,6 +11693,17 @@ impl Compiler {
     fn emit_double_binop(&mut self, sse_op: u8) {
         let slot2 = self.pop_stack(); // value2 (top)
         let slot1 = self.pop_stack(); // value1 (deeper)
+
+        // This op clobbers XMM0 (and XMM1) as scratch. A value still live DEEPER
+        // on the operand stack that is parked in XMM0 (the deferred-FP cache, e.g.
+        // a prior call result or `push_from_rax_as_xmm0`) would be destroyed by the
+        // `load slot1 -> XMM0` below before it is ever consumed. Relocate any such
+        // live XMM0 operand to a scratch XMM / frame first. slot1/slot2 are already
+        // popped, so this only touches the *remaining* stack. (emit_fcmp already
+        // does this; emit_double/float_binop did not — that gap silently corrupted
+        // `f(x) + f(g(x))`-shaped code and the whole commons-math FastMath.sin family
+        // under JIT, where a call result sat in XMM0 across the next arg's FP math.)
+        self.flush_xmm0_slots();
 
         self.load_slot_to_reg(RCX, slot2);
         self.buf.emit(&[0x66, 0x48, 0x0F, 0x6E, 0xC9]); // MOVQ XMM1, RCX

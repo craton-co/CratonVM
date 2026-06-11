@@ -6295,6 +6295,16 @@ fn annotation_proxy_invoke(
 
 /// Shared-interpreter version of `proxy_invoke_handler` вЂ” callable from the
 /// iterative interpreter without a `NativeContextImpl`.
+/// Whether `obj`'s runtime class has the given internal name.
+fn class_name_is(shared: &SharedVm, obj: ObjectRef, name: &str) -> bool {
+    shared
+        .class_manager
+        .read()
+        .get_class(shared.heap.class_id_of(obj))
+        .map(|c| &*c.name == name)
+        .unwrap_or(false)
+}
+
 pub(crate) fn proxy_invoke_handler_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -6310,6 +6320,30 @@ pub(crate) fn proxy_invoke_handler_shared(
             return Err(RuntimeError::NullPointerException { message: None }.into());
         }
     };
+
+    // Real-annotation-proxy path (CRATONVM_REAL_ANNOTATIONS): an annotation
+    // instance is a real `$ProxyN` proxy whose InvocationHandler is the
+    // synthetic `AnnotationProxy` carrying the member data. Route its method
+    // calls straight to the existing annotation dispatch so every annotation
+    // semantic (value()/annotationType()/equals/hashCode/toString) is reused
+    // unchanged. getClass() is intercepted earlier (the proxy hook returns the
+    // real `$ProxyN` mirror), so it never reaches here.
+    if class_name_is(shared, handler_ref, "java/lang/annotation/AnnotationProxy") {
+        // For equals(Object), unwrap a real-proxy argument to its
+        // AnnotationProxy handler so annotation equality compares member data,
+        // not proxy reference identity.
+        if method_name == "equals" {
+            if let Some(Value::Object(Some(other))) = args.first().copied() {
+                if let Value::Object(Some(other_handler)) = shared.heap.get_field(other, 0) {
+                    if class_name_is(shared, other_handler, "java/lang/annotation/AnnotationProxy") {
+                        let routed = [Value::Object(Some(other_handler))];
+                        return annotation_proxy_dispatch_impl(shared, handler_ref, method_name, &routed);
+                    }
+                }
+            }
+        }
+        return annotation_proxy_dispatch_impl(shared, handler_ref, method_name, args);
+    }
 
     // WP2.5 вЂ” build the Method object using **field-name-based** writes.
     // See `proxy_method_set_field_by_name` for the rationale; mirrors the
@@ -8181,6 +8215,8 @@ fn invoke_on_class_shared_inner(
                                 | "getProperty"
                                 | "setProperty"
                                 | "put"
+                                | "putAll"
+                                | "get"
                                 | "containsKey"
                                 | "stringPropertyNames"
                             ))

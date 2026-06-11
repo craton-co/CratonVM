@@ -310,6 +310,13 @@ pub fn update_all_roots(
     //      `roots.rs` step 19b.
     cratonvm_native_builtins::logmanager::gc_update_logmanager_refs(pointer_map);
 
+    // 19c. Class-level annotation-proxy identity cache in
+    //      `native-builtins/src/lang_class.rs` (per-class `getAnnotation` /
+    //      `getDeclaredAnnotations` proxies). Scanned as roots in `roots.rs`
+    //      step 20; repoint the stored ObjectRefs to their relocated addresses
+    //      after a moving GC so cached annotation instances stay live.
+    cratonvm_native_builtins::lang_class::gc_update_annotation_proxy_refs(pointer_map);
+
     // 20. Blocked-thread root maintenance (the H2 TestScript stale-receiver
     //     SEGV fix). Threads parked in a blocking native (Object.wait /
     //     Thread.join / LockSupport.park / ReferenceQueue.remove) are

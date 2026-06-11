@@ -8456,15 +8456,13 @@ fn native_stream_reduce_identity(ctx: &mut dyn NativeContext, args: &[Value]) ->
             "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
             &[acc, *elem],
         )?;
-        // T16.9 follow-up: The `BinaryOperator<T>` SAM descriptor returns
-        // `Object`, so primitive-returning lambdas (e.g. `Math::max` on
-        // `Integer`) get auto-boxed by the lambda-proxy `coerce_return`.
-        // Callers (and the stream's internal accumulator) expect the
-        // primitive form. Unbox single-field `Integer`/`Long`/`Float`/
-        // `Double` wrappers back to `Value::Int` / `Value::Long` / etc.
-        // Non-wrapper objects pass through unchanged.
-        let raw = result.unwrap_or(Value::Object(None));
-        acc = normalize_for_compare(ctx, &raw);
+        // Keep the operator result as-is. `coerce_return` inside invoke_virtual
+        // already boxes primitives to match the SAM's `Ljava/lang/Object;`
+        // return type, so `checkcast` in callers like JoinedList.<init> sees
+        // a proper object reference. Unboxing here (normalize_for_compare)
+        // was a T16.9 leftover that violated the `T reduce(T, BinaryOperator<T>)`
+        // contract and broke any caller that stores the result as a reference.
+        acc = result.unwrap_or(Value::Object(None));
     }
     Ok(Some(acc))
 }

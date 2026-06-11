@@ -10161,7 +10161,13 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(result, Value::Int(30));
+        // reduce(T identity, BinaryOperator<T>) returns T (object reference).
+        // coerce_return boxes the primitive result to Integer; verify it holds 30.
+        match result {
+            Value::Object(Some(r)) => assert_eq!(shared.heap.get_field(r, 0), Value::Int(30)),
+            Value::Int(n) => assert_eq!(n, 30), // tolerate already-unboxed path
+            other => panic!("unexpected reduce result: {:?}", other),
+        }
     }
 
     // -- Collectors tests --

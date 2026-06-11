@@ -845,23 +845,57 @@ fn native_properties_put(
         return Ok(Some(Value::Object(None)));
     };
     let ks = ctx.read_string(k).unwrap_or_default();
-    let vs = ctx.read_string(v).unwrap_or_default();
+    let vs_opt = ctx.read_string(v);
     if !ks.is_empty() {
-        let prev = get_kv(this, &ks);
-        put_kv(this, &ks, &vs);
-        // Mirror into the real JDK Properties backing (`map` ConcurrentHashMap)
-        // so generic Map walkers observe the entry — see fn-level note.
-        mirror_loaded_entries_to_properties_backend(ctx, this, &[(ks.clone(), vs.clone())]);
-        // Mirror to the VM system-property store so subsequent
-        // System.getProperty(ks) observes the write. Symmetric with
-        // native_properties_set_property; see fn-level docs above for
-        // the System.getProperties()-singleton rationale.
-        let _ = ctx.set_system_property(&ks, &vs);
-        if let Some(p) = prev {
-            return Ok(Some(Value::Object(Some(ctx.create_string(&p)))));
+        if let Some(vs) = vs_opt {
+            // String→String: store in side-table AND CHM (existing path).
+            let prev = get_kv(this, &ks);
+            put_kv(this, &ks, &vs);
+            mirror_loaded_entries_to_properties_backend(ctx, this, &[(ks.clone(), vs.clone())]);
+            let _ = ctx.set_system_property(&ks, &vs);
+            if let Some(p) = prev {
+                return Ok(Some(Value::Object(Some(ctx.create_string(&p)))));
+            }
+        } else {
+            // Non-String value (e.g. XProperty, MemberDetails): store ONLY in
+            // the real JDK CHM so get() can retrieve the actual object via
+            // CHM.get().  The Rust side-table is string-only — do not put a
+            // synthetic "" sentinel that would shadow the real object.
+            let prev = put_non_string_into_chm(ctx, this, key_v, val_v);
+            return Ok(Some(prev));
         }
     }
     Ok(Some(Value::Object(None)))
+}
+
+/// Put a non-String (key,value) pair directly into the Properties' real JDK
+/// ConcurrentHashMap backing store (`map` field).  Returns the previous value.
+fn put_non_string_into_chm(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    key_v: Value,
+    val_v: Value,
+) -> Value {
+    // Ensure the CHM exists (create it if Properties was freshly allocated).
+    let chm = match ctx.get_field_by_name(this, "map") {
+        Value::Object(Some(m)) => m,
+        _ => {
+            let Ok(Some(Value::Object(Some(m)))) = ctx.new_object("java/util/concurrent/ConcurrentHashMap") else {
+                return Value::Object(None);
+            };
+            let _ = ctx.invoke("java/util/concurrent/ConcurrentHashMap", "<init>", "()V",
+                &[Value::Object(Some(m))]);
+            ctx.set_field_by_name(this, "map", Value::Object(Some(m)));
+            m
+        }
+    };
+    let prev = ctx.invoke_virtual(
+        chm,
+        "put",
+        "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        &[key_v, val_v],
+    ).ok().flatten().unwrap_or(Value::Object(None));
+    prev
 }
 
 /// Native `Properties.remove(Object) Object` — symmetric with `put` /
@@ -992,8 +1026,24 @@ fn native_properties_get(
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = crate::property_key_from_java_string(ctx, key_obj);
+    // Check the Rust side-table (String→String only).
     if let Some(v) = get_kv(this, &key) {
         return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
+    }
+    // Non-String values (e.g. XProperty, MemberDetails) are stored only in
+    // the real JDK CHM backing (`map` field).  Check it before falling through
+    // to system properties so the caller receives the actual object.
+    if let Value::Object(Some(chm)) = ctx.get_field_by_name(this, "map") {
+        if let Ok(Some(v)) = ctx.invoke_virtual(
+            chm,
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(key_obj))],
+        ) {
+            if v != Value::Object(None) {
+                return Ok(Some(v));
+            }
+        }
     }
     match ctx
         .get_system_property(&key)
@@ -1584,7 +1634,12 @@ fn native_properties_put_all(
     //    its entries through the generic Map.entrySet() so we don't depend
     //    on internal field layouts, then store each (k,v) into `this`'s
     //    side-table and mirror them into the real `map` CHM backing.
-    let mut collected: Vec<(String, String)> = Vec::new();
+    //    Non-String values (e.g. XProperty, MemberDetails passed through
+    //    setTypeParameters) are stored ONLY in the CHM via
+    //    put_non_string_into_chm — never in the side-table.  Storing a ""
+    //    sentinel for non-String values would shadow the CHM in
+    //    native_properties_get, causing a String→XProperty CCE downstream.
+    let mut str_collected: Vec<(String, String)> = Vec::new();
     let entries_obj = match ctx.invoke(
         "java/util/Map",
         "entrySet",
@@ -1634,25 +1689,35 @@ fn native_properties_put_all(
             Ok(Some(Value::Object(Some(o)))) => o,
             _ => continue,
         };
-        let val_obj = match ctx.invoke(
+        let val_v = match ctx.invoke(
             "java/util/Map$Entry",
             "getValue",
             "()Ljava/lang/Object;",
             &[Value::Object(Some(entry))],
         ) {
-            Ok(Some(Value::Object(Some(o)))) => o,
+            Ok(Some(v)) => v,
             _ => continue,
         };
         let k = ctx.read_string(key_obj).unwrap_or_default();
-        let v = ctx.read_string(val_obj).unwrap_or_default();
-        if !k.is_empty() {
-            collected.push((k, v));
+        if k.is_empty() {
+            continue;
+        }
+        if let Some(v_str) = match val_v {
+            Value::Object(Some(val_obj)) => ctx.read_string(val_obj),
+            _ => None,
+        } {
+            // String→String: collect for batched side-table + CHM mirror.
+            str_collected.push((k, v_str));
+        } else {
+            // Non-String value: store directly in the real JDK CHM so
+            // native_properties_get can retrieve the actual object.
+            put_non_string_into_chm(ctx, this, Value::Object(Some(key_obj)), val_v);
         }
     }
-    for (k, v) in &collected {
+    for (k, v) in &str_collected {
         put_kv(this, k, v);
     }
-    mirror_loaded_entries_to_properties_backend(ctx, this, &collected);
+    mirror_loaded_entries_to_properties_backend(ctx, this, &str_collected);
     Ok(None)
 }
 

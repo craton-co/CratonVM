@@ -6889,6 +6889,119 @@ fn annotation_desc_to_class_name(desc: &str) -> Option<&str> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Class-level annotation-proxy identity cache
+//
+// HotSpot caches annotation instances per class (`Class.annotationData`), so
+// repeated `getAnnotation(X)` / `getDeclaredAnnotations()` on the SAME class
+// return the SAME instance (`a1 == a2`). CratonVM previously rebuilt a fresh
+// proxy on every call, so `getAnnotation(X) != getAnnotation(X)` — breaking
+// identity-sensitive callers (annotations used as `IdentityHashMap` keys, or
+// caches keyed on the annotation instance).
+//
+// We cache the proxy keyed by (queried class id, annotation type descriptor),
+// mirroring HotSpot's per-class `annotationData`. The cached `ObjectRef`s live
+// only in this process-global side-table, invisible to the heap field scan, so
+// they MUST be GC-rooted and remapped — see `gc_scan_annotation_proxy_roots`
+// (roots.rs) and `gc_update_annotation_proxy_refs` (gc.rs). Without that, a
+// moving young GC would relocate a cached proxy and the next read would return
+// a stale `ObjectRef` (use-after-free).
+// ---------------------------------------------------------------------------
+
+fn annotation_proxy_cache() -> &'static Mutex<FxHashMap<(u32, String), ObjectRef>> {
+    static C: OnceLock<Mutex<FxHashMap<(u32, String), ObjectRef>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+/// Build-or-fetch the cached annotation proxy for `ann` as seen on
+/// `queried_class_id`. The cache lock is NEVER held across
+/// `create_annotation_proxy` (which allocates and may trigger a GC whose root
+/// scan re-locks this cache — that would deadlock). On a concurrent first-build
+/// race the loser's proxy is dropped (still reachable from the caller's stack
+/// until the next GC), exactly as `OscCache` documents.
+fn cached_annotation_proxy(
+    ctx: &mut dyn NativeContext,
+    queried_class_id: ClassId,
+    ann: &cratonvm_native_api::AnnotationData,
+) -> ObjectRef {
+    let key = (queried_class_id.as_u32(), ann.type_descriptor.clone());
+    if let Some(&cached) = annotation_proxy_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+    {
+        return cached;
+    }
+    let proxy = create_annotation_proxy(ctx, ann);
+    *annotation_proxy_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(key)
+        .or_insert(proxy)
+}
+
+/// GC root scan for the annotation-proxy cache (companion to
+/// [`gc_update_annotation_proxy_refs`]). Pushes every cached proxy so a moving
+/// young GC keeps them live and records their relocation.
+pub fn gc_scan_annotation_proxy_roots(out: &mut Vec<ObjectRef>) {
+    let guard = annotation_proxy_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    out.extend(guard.values().copied());
+}
+
+/// Post-GC remap for the annotation-proxy cache (companion to
+/// [`gc_scan_annotation_proxy_roots`]). Repoints each cached `ObjectRef` to its
+/// new address after a moving collection.
+pub fn gc_update_annotation_proxy_refs(pointer_map: &HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    let mut guard = annotation_proxy_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for obj_ref in guard.values_mut() {
+        let old_addr = obj_ref.as_ptr() as usize;
+        if let Some(&new_addr) = pointer_map.get(&old_addr) {
+            debug_assert!(new_addr != 0, "GC pointer map contains null address");
+            *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+        }
+    }
+}
+
+/// CRATONVM_REAL_ANNOTATIONS (default-OFF): when set, annotation instances are
+/// materialised as REAL `$ProxyN` proxies that implement the annotation
+/// interface (so `annotation.getClass()` reports a `$ProxyN` class, matching
+/// HotSpot, instead of the annotation type), with the synthetic `AnnotationProxy`
+/// reused as the proxy's `InvocationHandler`. Gated because it re-shapes the
+/// representation of every annotation; needs wide soak before default-ON.
+fn real_annotations_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("CRATONVM_REAL_ANNOTATIONS").is_ok())
+}
+
+/// Wrap a synthetic `AnnotationProxy` data object (`handler`) in a real
+/// `$ProxyN` proxy of the annotation interface `ann_cid`. Returns `None` (so the
+/// caller falls back to the bare AnnotationProxy) if proxy-class generation
+/// fails. The generated proxy's field layout mirrors `Proxy$Instance`:
+/// field 0 = InvocationHandler, field 1 = `Class[]` interfaces, field 2 = id-hash.
+fn wrap_annotation_in_real_proxy(
+    ctx: &mut dyn NativeContext,
+    ann_cid: ClassId,
+    handler: ObjectRef,
+) -> Option<ObjectRef> {
+    let proxy_cid = crate::define_or_get_proxy_class(ctx, 0, &[ann_cid])?;
+    let n = ctx.class_num_total_fields(proxy_cid).max(3);
+    let real = ctx.alloc_object(proxy_cid, n);
+    ctx.set_field(real, 0, Value::Object(Some(handler)));
+    let type_mirror = ctx.get_class_mirror(ann_cid);
+    let iface_arr = ctx.new_ref_array(ClassId::new(0), 1);
+    ctx.set_array_element(iface_arr, 0, Value::Object(Some(type_mirror)));
+    ctx.set_field(real, 1, Value::Object(Some(iface_arr)));
+    ctx.set_field(real, 2, Value::Int(0));
+    Some(real)
+}
+
 /// Create an annotation proxy object from annotation data.
 /// Fills in default values for elements not explicitly provided.
 fn create_annotation_proxy(
@@ -7035,6 +7148,17 @@ fn create_annotation_proxy(
     }
     ctx.set_field(proxy, ANN_PROXY_ELEM_NAMES, Value::Object(Some(names_arr)));
     ctx.set_field(proxy, ANN_PROXY_ELEM_VALUES, Value::Object(Some(values_arr)));
+
+    // CRATONVM_REAL_ANNOTATIONS: hand back a real `$ProxyN` proxy that wraps
+    // this AnnotationProxy as its InvocationHandler (so `getClass()` is a
+    // `$ProxyN`). Falls back to the bare AnnotationProxy when generation fails.
+    if real_annotations_enabled() {
+        if let Some(ann_cid) = ann_class_id_opt {
+            if let Some(real) = wrap_annotation_in_real_proxy(ctx, ann_cid, proxy) {
+                return real;
+            }
+        }
+    }
     proxy
 }
 
@@ -7312,14 +7436,63 @@ pub(crate) fn annotation_element_to_java_typed(
 }
 
 /// Build an Annotation[] array from annotation data.
+/// Resolve the `ClassId` of `java/lang/annotation/Annotation` so annotation
+/// arrays are allocated with the correct component type. Returns `ClassId(0)`
+/// (Object component) only if the class somehow can't be resolved.
+///
+/// Without this, `getDeclaredAnnotations()` / `getParameterAnnotations()` etc.
+/// return `Object[]` / `Object[][]` instead of `Annotation[]` / `Annotation[][]`,
+/// so a downstream `(Annotation[][]) result` cast (e.g. ByteBuddy's
+/// `JavaDispatcher`-backed reflective `Executable.getParameterAnnotations()`
+/// used by Hibernate's `BytecodeProviderImpl`) throws a `ClassCastException`.
+fn annotation_component_class_id(ctx: &mut dyn NativeContext) -> ClassId {
+    ctx.class_id_by_name("java/lang/annotation/Annotation")
+        .or_else(|| ctx.ensure_class_initialized("java/lang/annotation/Annotation").ok())
+        .unwrap_or(ClassId::new(0))
+}
+
+/// Resolve the `ClassId` of `Annotation[]` (`[Ljava/lang/annotation/Annotation;`)
+/// — the component type of an `Annotation[][]` (the `getParameterAnnotations()`
+/// return type). See [`annotation_component_class_id`].
+///
+/// Array class names aren't always pre-loaded by `class_id_by_name`, so as a
+/// robust fallback we derive the id from a freshly-allocated `Annotation[0]`
+/// (whose runtime class IS `[Ljava/lang/annotation/Annotation;`).
+fn annotation_array_component_class_id(ctx: &mut dyn NativeContext) -> ClassId {
+    if let Some(cid) = ctx.class_id_by_name("[Ljava/lang/annotation/Annotation;") {
+        return cid;
+    }
+    let comp = annotation_component_class_id(ctx);
+    let sample = ctx.new_ref_array(comp, 0);
+    ctx.class_id_of_object(sample)
+}
+
 fn build_annotation_array(
     ctx: &mut dyn NativeContext,
     annotations: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
-    use cratonvm_types::ClassId;
-    let arr = ctx.new_ref_array(ClassId::new(0), annotations.len());
+    let comp = annotation_component_class_id(ctx);
+    let arr = ctx.new_ref_array(comp, annotations.len());
     for (i, ann) in annotations.iter().enumerate() {
         let proxy = create_annotation_proxy(ctx, ann);
+        ctx.set_array_element(arr, i, Value::Object(Some(proxy)));
+    }
+    arr
+}
+
+/// Like [`build_annotation_array`] but routes each proxy through the per-class
+/// identity cache, so `getDeclaredAnnotations()` / `getAnnotations()` return the
+/// SAME instances `getAnnotation()` returns for `queried_class_id`. Used only by
+/// the CLASS-level annotation natives (field/method annotation arrays keep the
+/// fresh-build path — their key space is different).
+fn build_class_annotation_array(
+    ctx: &mut dyn NativeContext,
+    queried_class_id: ClassId,
+    annotations: &[cratonvm_native_api::AnnotationData],
+) -> ObjectRef {
+    let arr = ctx.new_ref_array(ClassId::new(0), annotations.len());
+    for (i, ann) in annotations.iter().enumerate() {
+        let proxy = cached_annotation_proxy(ctx, queried_class_id, ann);
         ctx.set_array_element(arr, i, Value::Object(Some(proxy)));
     }
     arr
@@ -7349,7 +7522,7 @@ pub(crate) fn native_class_get_declared_annotations(ctx: &mut dyn NativeContext,
             for a in &annotations { eprintln!("    {}", a.type_descriptor); }
         }
     }
-    let arr = build_annotation_array(ctx, &annotations);
+    let arr = build_class_annotation_array(ctx, class_id, &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -7391,7 +7564,7 @@ pub(crate) fn native_class_get_annotations(ctx: &mut dyn NativeContext, args: &[
         current = ctx.superclass_of(super_id);
     }
 
-    let arr = build_annotation_array(ctx, &annotations);
+    let arr = build_class_annotation_array(ctx, class_id, &annotations);
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -7442,7 +7615,7 @@ pub(crate) fn native_class_get_declared_annotation(ctx: &mut dyn NativeContext, 
     let annotations = ctx.class_annotations(class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = create_annotation_proxy(ctx, ann);
+            let proxy = cached_annotation_proxy(ctx, class_id, ann);
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }
@@ -7477,7 +7650,7 @@ pub(crate) fn native_class_get_annotation(ctx: &mut dyn NativeContext, args: &[V
     let annotations = ctx.class_annotations(class_id);
     for ann in &annotations {
         if ann.type_descriptor == target_desc {
-            let proxy = create_annotation_proxy(ctx, ann);
+            let proxy = cached_annotation_proxy(ctx, class_id, ann);
             return Ok(Some(Value::Object(Some(proxy))));
         }
     }
@@ -7489,7 +7662,9 @@ pub(crate) fn native_class_get_annotation(ctx: &mut dyn NativeContext, args: &[V
             let super_anns = ctx.class_annotations(super_id);
             for ann in &super_anns {
                 if ann.type_descriptor == target_desc {
-                    let proxy = create_annotation_proxy(ctx, ann);
+                    // Key by the queried class (class_id), matching HotSpot's
+                    // per-class annotationData for inherited annotations.
+                    let proxy = cached_annotation_proxy(ctx, class_id, ann);
                     return Ok(Some(Value::Object(Some(proxy))));
                 }
             }
@@ -7942,29 +8117,36 @@ pub(crate) fn native_method_get_parameter_annotations(
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_array_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
     let (class_id, method_name, method_desc) = match method_class_name_desc(ctx, this) {
         Some(v) => v,
         None => {
-            let empty = ctx.new_ref_array(ClassId::new(0), 0);
+            let comp = annotation_array_component_class_id(ctx);
+            let empty = ctx.new_ref_array(comp, 0);
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
+    // The outer array must be typed `Annotation[][]` (component = `Annotation[]`)
+    // and each inner array `Annotation[]` (component = `Annotation`), so a
+    // reflective `(Annotation[][]) getParameterAnnotations()` cast succeeds.
+    let outer_comp = annotation_array_component_class_id(ctx);
+    let inner_comp = annotation_component_class_id(ctx);
     let param_annotations = ctx.method_parameter_annotations(class_id, &method_name, &method_desc);
     if param_annotations.is_empty() {
         // Return an Annotation[param_count][0] — count params from descriptor
         let param_count = count_method_params(&method_desc);
-        let outer = ctx.new_ref_array(ClassId::new(0), param_count);
+        let outer = ctx.new_ref_array(outer_comp, param_count);
         for i in 0..param_count {
-            let inner = ctx.new_ref_array(ClassId::new(0), 0);
+            let inner = ctx.new_ref_array(inner_comp, 0);
             ctx.set_array_element(outer, i, Value::Object(Some(inner)));
         }
         return Ok(Some(Value::Object(Some(outer))));
     }
-    let outer = ctx.new_ref_array(ClassId::new(0), param_annotations.len());
+    let outer = ctx.new_ref_array(outer_comp, param_annotations.len());
     for (i, anns) in param_annotations.iter().enumerate() {
         let inner = build_annotation_array(ctx, anns);
         ctx.set_array_element(outer, i, Value::Object(Some(inner)));

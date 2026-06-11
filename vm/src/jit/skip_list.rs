@@ -1039,11 +1039,34 @@ fn should_skip_jit_internal(
 fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
     matches!(
         (class_name, method_name),
+        // CM-FASTMATH (2026-06-11) — commons-math3 `FastMath` trig family is
+        // miscompiled by the JIT: `FastMath.sin(3*PI/4)` returns 1.2252 instead
+        // of 0.7071, ~97% of inputs wrong (interpreter is exact; HotSpot is
+        // exact). It corrupts the commons-math `transform` suite, whose tests
+        // sample `SIN = x -> new Sin().value(x)` -> FastMath.sin to build their
+        // input data, so every FFT/FST/FCT `testSinFunction` gets wrong samples.
+        // The defect is a DEEP, multi-method JIT codegen bug (spread across
+        // sin's argument reduction AND sinQ/cosQ — no single/pairwise method
+        // skip fixes it, only skipping the whole family does) that resisted
+        // synthetic reproduction and method-level localization; it is distinct
+        // from (and unfixed by) the emit_double_binop XMM0-flush fix that landed
+        // alongside this. Pinning it needs a JIT disassembler the codegen lacks.
+        // This targeted ban runs the real bytecode in the interpreter (exact,
+        // matches HotSpot) until the codegen bug is found. Lifted under
+        // `CRATONVM_JIT_ALLOW_PACKAGES=org/apache/commons/` for diagnosis.
+        ("org/apache/commons/math3/util/FastMath", "sin")
+        | ("org/apache/commons/math3/util/FastMath", "cos")
+        | ("org/apache/commons/math3/util/FastMath", "tan")
+        | ("org/apache/commons/math3/util/FastMath", "sinQ")
+        | ("org/apache/commons/math3/util/FastMath", "cosQ")
+        | ("org/apache/commons/math3/util/FastMath", "polySine")
+        | ("org/apache/commons/math3/util/FastMath", "polyCosine")
+        | ("org/apache/commons/math3/util/FastMath", "reducePayneHanek")
         // NEW-1.3 — hash-table hot loop miscompile, surfaces under
         // HashMap.put/get/resize. These three are the observed
         // failing methods from the `CRATONVM_JIT_ALLOW_PACKAGES=java/util`
         // test run; narrow other HashMap methods stay JIT-eligible.
-        ("java/util/HashMap", "put")
+        | ("java/util/HashMap", "put")
         | ("java/util/HashMap", "get")
         | ("java/util/HashMap", "resize")
         // SPB.1 (Session 112) — `apps/SportMe-master`'s Spring Boot
