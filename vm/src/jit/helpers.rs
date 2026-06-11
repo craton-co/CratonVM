@@ -2004,6 +2004,29 @@ pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64) -> i64 {
     i64::MIN // deopt sentinel — interpreter will detect and throw AIOOBE
 }
 
+/// RBC.6 (athrow codegen) — stash the thrown exception object as the
+/// pending JIT exception and return the `i64::MIN` deopt sentinel. The
+/// x64 `athrow` arm calls this and immediately runs the method epilogue;
+/// the interpreter's JIT-return drains (`take_jit_pending_exception` on
+/// every dispatch-aware return path) route the exception through the
+/// caller's handling. `exc_ptr == 0` (athrow on a null reference) sets
+/// the pending-NPE flag instead, per JVMS athrow semantics.
+///
+/// Same platform rationale as [`jit_throw_aioobe`]: JIT frames have no
+/// SEH unwind tables on Windows, so a Rust panic/unwind here would
+/// terminate the process; thread-local stashing sidesteps that.
+// SAFETY: Called from JIT-compiled code at an athrow site. `exc_ptr` is
+// either 0 or the heap pointer the JIT popped from the operand stack;
+// no dereference happens here — it is only wrapped and stored in a TLS.
+pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64) -> i64 {
+    if exc_ptr == 0 {
+        stash_jit_pending_npe();
+    } else {
+        stash_jit_pending_exception(ObjectRef::from_raw(exc_ptr as usize as *mut u8));
+    }
+    i64::MIN // deopt sentinel — interpreter drains the pending exception
+}
+
 // ---------------------------------------------------------------------------
 // Invoke dispatch helpers
 // ---------------------------------------------------------------------------
@@ -4103,6 +4126,8 @@ pub fn build_helpers() -> JitRuntimeHelpers {
         // as the inline push target. Always wired (harmless when codegen is off,
         // which gates emission on its own cached `CRATONVM_SHADOW_STACK` flag).
         shadow_stack_offset_in_thread: JvmThread::shadow_stack_offset(),
+        // RBC.6 — athrow lowering: stash pending exception + sentinel.
+        throw_exception: jit_throw_exception as *const () as usize,
     }
 }
 

@@ -1003,6 +1003,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut anewarray_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `anewarray` (0xbd)
     let mut ldc_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `ldc`/`ldc_w`
     let mut ldc2w_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `ldc2_w` (0x14)
+    let mut has_athrow = false; // RBC.6 — method contains 0xbf
     let mut pc = 0;
     while pc < code_len {
         let op = code[pc];
@@ -1456,6 +1457,18 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             0xC2 | 0xC3 => {
                 pc += 1;
             }
+            // RBC.6 — athrow. Accepted; `has_athrow` is recorded so callers
+            // can gate compilation to methods WITHOUT local exception
+            // handlers (the codegen lowers athrow to "stash pending
+            // exception + return the i64::MIN deopt sentinel", which cannot
+            // dispatch to an in-method handler) and so the OSR trigger can
+            // decline (its bail path resumes at the back-edge, which could
+            // re-run side effects). `analyze_escapes` already treats 0xbf
+            // as a full-escape barrier, so scalar replacement stays sound.
+            0xbf => {
+                has_athrow = true;
+                pc += 1;
+            }
             // Anything else: not JIT-compatible
             _ => {
                 if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
@@ -1513,6 +1526,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         non_escaping_new,
         ldc_ops,
         ldc2w_ops,
+        has_athrow,
     })
 }
 
@@ -1539,6 +1553,11 @@ pub struct JitScanResult {
     pub ldc_ops: Vec<(usize, u16)>,
     /// For each `ldc2_w` (0x14) instruction: (bytecode_pc, cp_index)
     pub ldc2w_ops: Vec<(usize, u16)>,
+    /// RBC.6 — the method contains `athrow` (0xbf). Compilable only when
+    /// the method has NO local exception handlers (the athrow codegen
+    /// stashes the exception and returns the deopt sentinel; it cannot
+    /// branch to an in-method handler), and never via OSR.
+    pub has_athrow: bool,
 }
 
 /// Check if a bytecode method can be JIT-compiled (backward-compatible wrapper).
@@ -4718,6 +4737,11 @@ struct Compiler {
     /// dispatched, so a codegen bail can report where it gave up.
     dbg_last_pc: usize,
     dbg_last_op: u8,
+    /// RBC.6 — an `athrow` (0xbf) was lowered in this method. Forces
+    /// `has_dispatch` so the interpreter's compiled-entry paths take the
+    /// dispatch-aware route that drains the pending JIT exception (the
+    /// `!has_dispatch` fast path returns the raw value without draining).
+    emitted_athrow: bool,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
     /// Jump table patches: (native offset of i32 entry, table_base_native_offset, target bytecode PC).
@@ -5246,6 +5270,7 @@ impl Compiler {
             osr_entry_native: Vec::new(),
             dbg_last_pc: 0,
             dbg_last_op: 0,
+            emitted_athrow: false,
             forward_patches: Vec::new(),
             jump_table_patches: Vec::new(),
             self_call_patches: Vec::new(),
@@ -14722,6 +14747,33 @@ impl Compiler {
                     pc += 1;
                 }
 
+                // athrow (RBC.6) — lower to "stash the exception object as
+                // the pending JIT exception, then return the i64::MIN deopt
+                // sentinel". The helper (`jit_throw_exception`) handles the
+                // JVMS athrow-on-null case by setting the pending-NPE flag
+                // instead. The interpreter's JIT-return drains route the
+                // exception to the caller; compilation is gated upstream to
+                // methods with NO local exception handlers (this lowering
+                // cannot branch to an in-method handler) and the OSR
+                // trigger declines athrow methods entirely (its bail path
+                // resumes at the back-edge and could re-run side effects).
+                // Mirrors the shared bounds-check stub, which calls
+                // `helpers.throw_aioobe` and epilogues with the sentinel.
+                0xbf => {
+                    self.flush_scratch_registers();
+                    // Exception ref → first argument register.
+                    let exc_slot = self.pop_stack();
+                    self.load_slot_to_reg(ARG_REGS[0], exc_slot);
+                    self.emit_call_absolute(self.helpers.throw_exception);
+                    // Helper returned the i64::MIN sentinel in RAX —
+                    // propagate it as the method's return value.
+                    self.emit_epilogue();
+                    self.reset_spills();
+                    self.emitted_athrow = true;
+                    dead = true;
+                    pc += 1;
+                }
+
                 // getstatic (0xb2) — always call helper for thread safety
                 //
                 // MED-2 (round-2 JIT review) — HotSpot inlines non-volatile
@@ -19923,13 +19975,34 @@ pub fn compile_with_param_slots(
     let has_dispatch = !compiler.invoke_info.is_empty()
         || !compiler.direct_calls.is_empty()
         || !compiler.bounds_check_stubs.is_empty()
-        || !compiler.null_check_store_stubs.is_empty();
+        || !compiler.null_check_store_stubs.is_empty()
+        // RBC.6 — an athrow stashes a pending JIT exception; the
+        // `!has_dispatch` fast entry paths return the raw value WITHOUT
+        // draining it, which would leak the exception (and mis-read the
+        // sentinel as a return value). Force the dispatch-aware route.
+        || compiler.emitted_athrow;
     let mut cm = if needs_heap {
         CompiledMethod::new_with_context(compiler.buf)
     } else {
         CompiledMethod::new(compiler.buf)
     };
     cm.has_dispatch = has_dispatch;
+
+    // RBC.5 — record the declaring classes of every getstatic/putstatic
+    // site (already resolved into `static_field_info` by the caller) so the
+    // interpreter's compiled-entry fast path can ensure-initialize them
+    // once per artifact instead of re-resolving the constant pool on every
+    // call (see `static_init_classes` on `CompiledMethod`).
+    cm.static_init_classes = {
+        let mut ids: Vec<u32> = compiler
+            .static_field_info
+            .iter()
+            .map(|&(_, class_id_raw, ..)| class_id_raw)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
 
     // Store OSR metadata for On-Stack Replacement entry.
     //
@@ -20355,6 +20428,7 @@ mod tests {
             tlab_post_init: 0,
             frame_record: 0,
             shadow_stack_offset_in_thread: 0,
+            throw_exception: sentinel,
         }
     }
 

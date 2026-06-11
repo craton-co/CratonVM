@@ -80,6 +80,7 @@ fn stub_helpers() -> JitRuntimeHelpers {
         tlab_post_init: 0,
         frame_record: 0,
         shadow_stack_offset_in_thread: 0,
+        throw_exception: s,
     }
 }
 

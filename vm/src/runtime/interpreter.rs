@@ -2374,30 +2374,44 @@ pub fn execute(
             // Method has known JIT issues — skip JIT.
         } else {
         {
-        let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
-        let code_len = code_attr.code.len();
-        let scan_opt = crate::jit::x64::jit_scan(&padded, code_len, method_descriptor);
-        if scan_opt.is_none() {
-            // RBC.4 — seal scan-rejected methods so this first-call path
-            // doesn't re-run jit_scan on EVERY uncached invocation. Under
-            // `CRATONVM_JIT_ALLOW_PACKAGES=org/bouncycastle/` the asn1
-            // RegressionTest spent 4× its ban-on wall time re-scanning the
-            // same athrow-bearing parser statics here (the blanket ban used
-            // to short-circuit them before this point; with it lifted every
-            // call paid a full linear bytecode scan).
-            shared.jit_skip_set.write().insert(skip_key.clone());
-        }
-        if let Some(scan) = scan_opt {
-            // Check JIT cache
-            let class_name_arc: Arc<str> = Arc::from(&*class_name_str);
-            let method_name_arc: Arc<str> = Arc::from(method_name);
-            let descriptor_arc: Arc<str> = Arc::from(method_descriptor);
-
+            // RBC.5 — consult the JIT cache FIRST. An already-compiled method
+            // needs NO `padded_bytecode` (alloc + memcpy), NO `jit_scan`
+            // (linear bytecode walk) and NO Arc key allocations —
+            // `JitCache::get` takes `&str`. The previous order paid all of
+            // that on EVERY uncached invocation of every JIT-eligible
+            // method. The org/bouncycastle blanket ban happened to
+            // short-circuit it for BC code at the `static_skip_reason` gate,
+            // which made LIFTING the ban look ~4.7× slower on the asn1
+            // RegressionTest even when not a single BC method was compiled
+            // (the ~190s CPU-bound anomaly in
+            // docs/bc-jit-ban-investigation.md).
             let compiled = {
                 let jit_cache = shared.jit_cache.read();
-                jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+                jit_cache.get(&class_name_str, method_name, method_descriptor)
             };
             let compiled = compiled.or_else(|| {
+                let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
+                let code_len = code_attr.code.len();
+                let scan = match crate::jit::x64::jit_scan(&padded, code_len, method_descriptor) {
+                    Some(s) => s,
+                    None => {
+                        // RBC.4 — seal scan-rejected methods so this path
+                        // doesn't re-run jit_scan on every uncached
+                        // invocation.
+                        shared.jit_skip_set.write().insert(skip_key.clone());
+                        return None;
+                    }
+                };
+                // RBC.6 — athrow methods need an EMPTY exception table
+                // (mirrors jit::try_compile_inner); seal otherwise so the
+                // probe isn't re-run per call.
+                if scan.has_athrow && !code_attr.exception_table.is_empty() {
+                    shared.jit_skip_set.write().insert(skip_key.clone());
+                    return None;
+                }
+                let class_name_arc: Arc<str> = Arc::from(&*class_name_str);
+                let method_name_arc: Arc<str> = Arc::from(method_name);
+                let descriptor_arc: Arc<str> = Arc::from(method_descriptor);
                 // Resolve multianewarray entries if present
                 let mut mna_info = Vec::new();
                 if !scan.multianewarray_ops.is_empty() {
@@ -2832,32 +2846,48 @@ pub fn execute(
             }
             if let Some(compiled) = compiled {
                 if crate::runtime::env_cache::jit_entry_dbg() {
-                    eprintln!("[JIT_ENTRY] {}.{}{}", class_name_arc, method_name_arc, descriptor_arc);
+                    eprintln!("[JIT_ENTRY] {}.{}{}", class_name_str, method_name, method_descriptor);
                 }
                 // Ensure all classes referenced by static field ops are initialized.
                 // The JIT directly accesses static field memory, bypassing the
                 // interpreter's ensure_class_initialized_shared call.
-                if !scan.static_field_ops.is_empty() {
-                    let mut init_class_ids = Vec::new();
-                    for &(_, cp_idx) in &scan.static_field_ops {
-                        if let Ok(field) = resolve_field_ref(shared, class_id, cp_idx) {
-                            init_class_ids.push(field.declaring_class_id);
-                        }
-                    }
-                    init_class_ids.sort_unstable_by_key(|id| id.as_u32());
-                    init_class_ids.dedup();
-                    for cid in init_class_ids {
-                        match ensure_class_initialized_shared(shared, thread, cid) {
+                //
+                // RBC.5 — the class-id list now comes from the artifact
+                // (`static_init_classes`, recorded by `x64::compile` from the
+                // already-resolved `static_field_info`), and the ensure-walk
+                // runs ONCE per artifact (`static_inits_done`) instead of
+                // re-resolving every constant-pool ref + re-taking the init
+                // locks on every single call. A failed init does NOT set the
+                // done-flag, so it is retried on the next call exactly like
+                // the per-call code it replaces.
+                if !compiled.static_init_classes.is_empty()
+                    && !compiled
+                        .static_inits_done
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    let mut all_ok = true;
+                    for &cid_raw in &compiled.static_init_classes {
+                        match ensure_class_initialized_shared(
+                            shared,
+                            thread,
+                            ClassId::new(cid_raw),
+                        ) {
                             Ok(()) => {}
                             Err(MethodCallFailed::ExceptionThrown(exc)) => {
                                 // Class init failed (e.g. ExceptionInInitializerError).
                                 // Don't propagate directly — fall through to interpreter
                                 // so the exception table can catch it.
                                 jit_early_exception = Some(exc);
+                                all_ok = false;
                                 break;
                             }
                             Err(e) => return Err(e),
                         }
+                    }
+                    if all_ok {
+                        compiled
+                            .static_inits_done
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
                 }
                 // Skip JIT execution if class init already produced an exception
@@ -3076,11 +3106,6 @@ pub fn execute(
                 }
             } // end else (jit_early_exception.is_none())
             }
-        } else {
-            // jit_scan returned None — cache the negative result so we never
-            // re-scan this method.
-            shared.jit_skip_set.write().insert(skip_key);
-        }
         }
         } // end if !already_skipped
     } // end JIT block
@@ -13358,6 +13383,15 @@ fn try_osr(
                 return None;
             }
         };
+        // RBC.6 — never OSR an athrow method: the OSR bail path resumes
+        // interpretation at the back-edge, so an athrow lowering that ran
+        // side effects natively before throwing could see them re-applied.
+        // Method-entry compilation (which propagates cleanly through the
+        // JIT-return exception drains) remains available, so do NOT
+        // bail-list here.
+        if scan.has_athrow {
+            return None;
+        }
 
         // Resolve multianewarray
         let mut mna_info = Vec::new();

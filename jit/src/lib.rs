@@ -821,6 +821,17 @@ pub struct CompiledMethod {
     /// into a hot loop forever (instead of one fresh OSR compile) routes
     /// every callee through the slow dispatch helper.
     pub compiled_via_osr: bool,
+    /// RBC.5 — raw class ids of the declaring classes of every
+    /// getstatic/putstatic site in this method, recorded at compile time
+    /// from the already-resolved `static_field_info`. JIT code reads static
+    /// storage directly, so these classes must be initialized before first
+    /// execution; recording them here lets the interpreter's compiled-entry
+    /// fast path run that check once per artifact instead of re-resolving
+    /// every constant-pool ref on every call.
+    pub static_init_classes: Vec<u32>,
+    /// RBC.5 — set once the ensure-initialized walk over
+    /// `static_init_classes` has fully succeeded for this artifact.
+    pub static_inits_done: std::sync::atomic::AtomicBool,
     /// NEW-12: cached flag — `true` once `oop_maps` is known to be
     /// sorted by `native_pc_offset`.
     ///
@@ -931,6 +942,8 @@ impl CompiledMethod {
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
             compiled_via_osr: false,
+            static_init_classes: Vec::new(),
+            static_inits_done: std::sync::atomic::AtomicBool::new(false),
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
         }
@@ -972,6 +985,8 @@ impl CompiledMethod {
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
             compiled_via_osr: false,
+            static_init_classes: Vec::new(),
+            static_inits_done: std::sync::atomic::AtomicBool::new(false),
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
         }
@@ -3934,6 +3949,15 @@ fn try_compile_inner(
         }
     };
 
+    // RBC.6 — a method containing `athrow` compiles only when it has NO
+    // local exception handlers: the athrow lowering stashes the exception
+    // and returns the deopt sentinel, which cannot dispatch to an
+    // in-method handler. Permanent for this bytecode → bail-list it.
+    if scan.has_athrow && !cached.exception_table.is_empty() {
+        *backend_attempted = true;
+        return None;
+    }
+
     // Try IR compilation for simple integer-only methods. The IR pipeline
     // types every value as 32-bit `IrType::Int` and lays parameters out by
     // JIT-argument index rather than JVM local slot, so it cannot represent
@@ -6063,20 +6087,28 @@ mod tests {
         );
     }
 
-    /// RG.5 — JIT must bail on explicit `athrow` so the interpreter's
-    /// exception-table lookup and frame unwinding run. Implicit exceptions
-    /// (NPE, AIOOBE) from JIT'd code are handled separately by the runtime
-    /// dispatch helpers and are not controlled by this scanner decision.
+    /// RG.5 (updated by RBC.6) — the scanner now ACCEPTS explicit `athrow`
+    /// and records `has_athrow`; the compile gates restrict compilation to
+    /// methods with NO local exception handlers (the codegen lowers athrow
+    /// to "stash pending exception + return the i64::MIN deopt sentinel",
+    /// which cannot dispatch to an in-method handler — see
+    /// `try_compile_inner`'s `exception_table.is_empty()` gate and the OSR
+    /// trigger's decline in `vm/src/runtime/interpreter.rs::try_osr`).
     #[test]
-    fn rg5_jit_rejects_explicit_athrow() {
-        // aconst_null (0x01), athrow (0xbf). A real method would never return
-        // after athrow but we append ireturn so the scanner sees a terminator
-        // before rejecting.
+    fn rg5_jit_scan_accepts_athrow_and_flags_it() {
+        // aconst_null (0x01), athrow (0xbf), then iconst_0/ireturn filler.
         let code = vec![0x01, 0xbf, 0x03, 0xac];
+        let scan = x64::jit_scan(&code, code.len(), "()I")
+            .expect("athrow method must pass jit_scan (RBC.6)");
         assert!(
-            !is_jit_compatible(&code, code.len(), "()I"),
-            "JIT must bail on explicit athrow — interpreter handles exception tables"
+            scan.has_athrow,
+            "jit_scan must record has_athrow so compile gates can apply"
         );
+        // A method without athrow must NOT set the flag.
+        let plain = vec![0x03, 0xac];
+        let scan = x64::jit_scan(&plain, plain.len(), "()I")
+            .expect("trivial method must pass jit_scan");
+        assert!(!scan.has_athrow);
     }
 
     /// RG.6 — JIT scanner accepts `monitorenter` (0xc2) and `monitorexit`

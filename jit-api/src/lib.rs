@@ -174,6 +174,15 @@ pub struct JitRuntimeHelpers {
     /// push as `[thread + shadow_stack_offset_in_thread + ShadowStack::TOP_OFFSET]`.
     /// `0` when the mechanism is off → no shadow codegen is emitted.
     pub shadow_stack_offset_in_thread: usize,
+    /// RBC.6 (athrow codegen) — `extern "C" fn(exc_ptr: i64) -> i64`.
+    /// Stashes the thrown exception object as the pending JIT exception
+    /// (or sets the pending-NPE flag when `exc_ptr == 0`, per JVMS athrow-
+    /// on-null semantics) and returns the `i64::MIN` deopt sentinel. The
+    /// 0xbf codegen arm calls this and immediately runs the method
+    /// epilogue; the interpreter's JIT-return drains surface the
+    /// exception. Appended at the END of the struct so all prior golden
+    /// offsets stay stable.
+    pub throw_exception: usize,
 }
 
 /// Classifies each field of [`JitRuntimeHelpers`] for the validator.
@@ -303,6 +312,7 @@ helper_fields! {
     (tlab_post_init,                 FieldKind::OptionalPtr),
     (frame_record,                   FieldKind::OptionalPtr),
     (shadow_stack_offset_in_thread,  FieldKind::Offset),
+    (throw_exception,                FieldKind::RequiredPtr),
 }
 
 // Compile-time integrity check: the macro-generated NUM_FIELDS must
@@ -328,7 +338,7 @@ const _: () = assert!(
 // struct field AND its macro entry simultaneously would still satisfy
 // the ratio assert above and silently change the JIT ABI.
 const _: () = assert!(
-    JitRuntimeHelpers::NUM_FIELDS == 40,
+    JitRuntimeHelpers::NUM_FIELDS == 41,
     "JitRuntimeHelpers field count changed — bump the literal here and update \
      the golden-offset test in mod tests if the change is intentional",
 );
@@ -473,6 +483,7 @@ mod tests {
             tlab_post_init: 0x1108,
             frame_record: 0x1110,
             shadow_stack_offset_in_thread: 0,
+            throw_exception: 0x1118,
         }
     }
 
