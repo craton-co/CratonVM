@@ -7362,6 +7362,57 @@ pub(crate) fn annotation_proxy_dispatch_impl(
     args: &[Value],
 ) -> MethodCallResult {
     match method_name {
+        // InvocationHandler.invoke(Object proxy, Method method, Object[] args):
+        // Under CRATONVM_REAL_ANNOTATIONS an annotation instance is a real
+        // `$ProxyN` whose InvocationHandler is this synthetic AnnotationProxy.
+        // Spring's `AnnotationUtils.invokeAnnotationMethod` does NOT call the
+        // generated proxy body — it reads the handler off the proxy directly
+        // (`Proxy.getInvocationHandler(ann).invoke(ann, method, null)`), which
+        // dispatches `invoke` straight onto the AnnotationProxy and lands here
+        // with `method_name == "invoke"`. The AnnotationProxy has no "invoke"
+        // element, so the element walk below returns null; Spring's
+        // `MergedAnnotation` then sees every attribute as absent and
+        // `getString(...)`/`getStringArray(...)` throw NoSuchElementException —
+        // silently dropping e.g. `@Scope("prototype")` (S03 proto.* regression).
+        // Route to the annotation method named by the passed `Method`, mirroring
+        // the `Proxy$Dispatch.invokeProxy` fix in `native_proxy_dispatch_invoke`
+        // (48128e1a). Guarded by arity + a real `Method` arg so a genuine
+        // annotation element literally named `invoke()` (0-arg) still resolves
+        // via the element walk.
+        "invoke" if args.len() == 3 => {
+            if let Some(Value::Object(Some(method_obj))) = args.get(1).copied() {
+                if class_name_is(shared, method_obj, "java/lang/reflect/Method") {
+                    let name_val = {
+                        let method_cid = shared.heap.class_id_of(method_obj);
+                        let cm = shared.class_manager.read();
+                        resolve_field_index_in_hierarchy(method_cid, "name", &cm.class_store)
+                            .map(|idx| shared.heap.get_field(method_obj, idx))
+                    };
+                    if let Some(Value::Object(Some(name_ref))) = name_val {
+                        if let Some(real_name) =
+                            super::read_java_string(&shared.heap, name_ref)
+                        {
+                            // Unpack the InvocationHandler args array (null for
+                            // a 0-arg annotation method like `value()`).
+                            let inner: Vec<Value> = match args.get(2).copied() {
+                                Some(Value::Object(Some(arr))) => {
+                                    let len = shared.heap.array_length(arr);
+                                    (0..len)
+                                        .filter_map(|i| {
+                                            shared.heap.get_array_element(arr, i).ok()
+                                        })
+                                        .collect()
+                                }
+                                _ => Vec::new(),
+                            };
+                            return annotation_proxy_dispatch_impl(
+                                shared, proxy, &real_name, &inner,
+                            );
+                        }
+                    }
+                }
+            }
+        }
         // annotationType() returns the cached Class mirror.
         "annotationType" => {
             return Ok(Some(shared.heap.get_field(proxy, 1)));
