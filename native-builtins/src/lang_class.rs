@@ -8591,6 +8591,27 @@ pub(crate) fn native_class_array_type(
         other if other.starts_with('[') => format!("[{other}"),
         other => format!("[L{};", other),
     };
+    // Return the CANONICAL array-class mirror — the same `ClassId`-backed
+    // mirror that the `T[].class` constant (`ldc`), `anewarray`, and an array
+    // object's `getClass()` all resolve to. The old path went straight to
+    // `primitive_class_mirror`, which mints a SEPARATE, non-interned mirror;
+    // that broke identity (`Object.class.arrayType() != Object[].class`) and
+    // in turn Spring's `GenericConversionService` converter registry, whose
+    // `ConvertiblePair` keys compare `Class` by identity (e.g. a `String ->
+    // String[]` conversion silently reported "no converter found"). Mirror
+    // exactly what `Object.getClass()` does for a live array (see
+    // `native_object_get_class`): resolve the array `ClassId` by name,
+    // loading it on demand, and only fall back to the synthetic mirror for
+    // degenerate names that fail to synthesise.
+    if let Some(arr_cid) = ctx.class_id_by_name(&array_name) {
+        let mirror = ctx.get_class_mirror(arr_cid);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
+    let _ = ctx.load_class(&array_name);
+    if let Some(arr_cid) = ctx.class_id_by_name(&array_name) {
+        let mirror = ctx.get_class_mirror(arr_cid);
+        return Ok(Some(Value::Object(Some(mirror))));
+    }
     let mirror = ctx.primitive_class_mirror(&array_name);
     Ok(Some(Value::Object(Some(mirror))))
 }

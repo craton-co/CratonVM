@@ -1917,6 +1917,39 @@ pub(crate) fn register_p60_callsite(r: &mut NativeMethodRegistry) {
 // Lookup = 2-field (lookupClass=0, allowedModes=1)
 // =============================================================================
 
+/// Write a `MethodHandles$Lookup`'s `allowedModes` so it lands on the correct
+/// field regardless of whether the object carries the **real** JDK 3-field
+/// layout (`lookupClass`, `prevLookupClass`, `allowedModes`) or the legacy
+/// **synthetic** 2-field layout (`lookupClass`=0, `allowedModes`=1).
+///
+/// The old code wrote the modes int to fixed slot 1. In the real layout slot 1
+/// is the *reference* field `prevLookupClass`, so `lookupModes()` (real
+/// bytecode reading the real `allowedModes` at slot 2) saw 0 — i.e. NO `PACKAGE`
+/// access — and Spring CGLIB's `ReflectUtils.defineClass` failed every concrete
+/// class proxy with "Lookup does not have PACKAGE access". Writing by name puts
+/// it in the real `allowedModes`; the slot-1 fallback only fires when the
+/// by-name write cannot resolve (pure synthetic class with no named fields).
+fn lk_write_allowed_modes(ctx: &mut dyn NativeContext, obj: ObjectRef, modes: i32) {
+    ctx.set_field_by_name(obj, "allowedModes", Value::Int(modes));
+    let landed = matches!(ctx.get_field_by_name(obj, "allowedModes"), Value::Int(m) if m == modes);
+    if !landed {
+        // Synthetic layout: allowedModes lives at slot 1.
+        ctx.set_field(obj, 1, Value::Int(modes));
+    }
+}
+
+/// Read a `Lookup`'s `allowedModes`, by name first (real layout slot 2),
+/// falling back to synthetic slot 1.
+fn lk_read_allowed_modes(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    if let Value::Int(m) = ctx.get_field_by_name(this, "allowedModes") {
+        return m;
+    }
+    if let Value::Int(m) = ctx.get_field(this, 1) {
+        return m;
+    }
+    0
+}
+
 pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -1954,15 +1987,27 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
             // because field-order varies between synthetic-only mode
             // and real-JDK mode. Field-by-name resolves to the
             // correct slot in either case.
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 2);
+            // Allocate with room for the real 3-field layout (lookupClass,
+            // prevLookupClass, allowedModes) so the by-name `allowedModes`
+            // write below actually lands.
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
             ctx.set_field_by_name(obj, "lookupClass", caller_class);
             ctx.set_field_by_name(obj, "prevLookupClass", Value::Object(None));
-            ctx.set_field_by_name(obj, "allowedModes", Value::Int(0x1F)); // FULL access
-            // Fallback: also write to slot 0/1 so the synthetic-only
-            // path (no real JDK loaded) still has a valid lookupClass
-            // at the synthetic offset 0.
+            // Slot-0 lookupClass fallback for the pure-synthetic layout.
             ctx.set_field(obj, 0, caller_class);
-            ctx.set_field(obj, 1, Value::Int(0x1F));
+            // FULL power, matching HotSpot's caller-sensitive lookup():
+            // PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE|ORIGINAL = 0x5F.
+            lk_write_allowed_modes(ctx, obj, 0x5F);
+            if std::env::var("CRATONVM_DBG_LOOKUP").is_ok() {
+                let cid = ctx.class_id_of_object(obj);
+                eprintln!(
+                    "[DBG_LOOKUP] lookup(): total_fields={} byname_allowedModes={:?} slot1={:?} slot2={:?}",
+                    ctx.class_num_total_fields(cid),
+                    ctx.get_field_by_name(obj, "allowedModes"),
+                    ctx.get_field(obj, 1),
+                    ctx.get_field(obj, 2),
+                );
+            }
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -1980,16 +2025,22 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
                 .ensure_class_initialized("java/lang/Object")
                 .unwrap_or(cratonvm_types::ClassId::new(0));
             let object_mirror = ctx.get_class_mirror(object_cid);
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 2);
+            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+            ctx.set_field_by_name(obj, "lookupClass", Value::Object(Some(object_mirror)));
             ctx.set_field(obj, 0, Value::Object(Some(object_mirror)));
-            ctx.set_field(obj, 1, Value::Int(0x01)); // PUBLIC only
+            lk_write_allowed_modes(ctx, obj, 0x01); // PUBLIC only
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.register(mh, "privateLookupIn", "(Ljava/lang/Class;Ljava/lang/invoke/MethodHandles$Lookup;)Ljava/lang/invoke/MethodHandles$Lookup;", |ctx, args| {
-        let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 2);
-        ctx.set_field(obj, 0, args.first().copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(obj, 1, Value::Int(0x1F));
+        let target = args.first().copied().unwrap_or(Value::Object(None));
+        let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+        ctx.set_field_by_name(obj, "lookupClass", target);
+        ctx.set_field(obj, 0, target);
+        // privateLookupIn grants full private access but drops ORIGINAL:
+        // PUBLIC|PRIVATE|PROTECTED|PACKAGE|MODULE = 0x1F (incl. PACKAGE 0x08,
+        // which Lookup.defineClass requires).
+        lk_write_allowed_modes(ctx, obj, 0x1F);
         Ok(Some(Value::Object(Some(obj))))
     });
 
@@ -2000,7 +2051,17 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
     });
     r.register(lk, "lookupModes", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 1)))
+        let modes = lk_read_allowed_modes(ctx, this);
+        if std::env::var("CRATONVM_DBG_LOOKUP").is_ok() {
+            eprintln!(
+                "[DBG_LOOKUP] lookupModes(): byname={:?} slot1={:?} slot2={:?} -> {:#x}",
+                ctx.get_field_by_name(this, "allowedModes"),
+                ctx.get_field(this, 1),
+                ctx.get_field(this, 2),
+                modes,
+            );
+        }
+        Ok(Some(Value::Int(modes)))
     });
 
     // Lookup.in(targetClass) — create Lookup with reduced access for a different class
@@ -2011,10 +2072,11 @@ pub fn register_p63_method_handles_lookup(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let _this = obj_arg(args, 0)?;
             let target_class = args.get(1).copied().unwrap_or(Value::Object(None));
-            let lookup = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 2);
+            let lookup = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandles$Lookup", 3);
+            ctx.set_field_by_name(lookup, "lookupClass", target_class);
             ctx.set_field(lookup, 0, target_class); // lookupClass = targetClass
             // Access reduced to PUBLIC + UNCONDITIONAL when crossing packages
-            ctx.set_field(lookup, 1, Value::Int(0x01 | 0x20));
+            lk_write_allowed_modes(ctx, lookup, 0x01 | 0x20);
             Ok(Some(Value::Object(Some(lookup))))
         },
     );

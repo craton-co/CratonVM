@@ -388,10 +388,35 @@ fn alloc_url_classloader(ctx: &mut dyn NativeContext) -> ObjectRef {
 fn alloc_lookup(ctx: &mut dyn NativeContext, modes: i32) -> ObjectRef {
     let obj = alloc_concurrent_synthetic(ctx, LK_CLASS, LK_FIELD_COUNT);
     ctx.set_field(obj, LK_LOOKUP_CLASS_REF, Value::Object(None));
-    ctx.set_field(obj, LK_ALLOWED_MODES, Value::Int(modes));
     ctx.set_field(obj, LK_PREVIOUS_LOOKUP_CLASS, Value::Object(None));
     ctx.set_field(obj, LK_LOOKUP_MODE, Value::Int(modes));
+    // Write `allowedModes` so it lands on the real JDK field (3-field layout
+    // puts it at slot 2, not the synthetic slot 1 = prevLookupClass). See
+    // `lk_modes_of` and `lang_invoke::lk_write_allowed_modes`.
+    lk_set_modes(ctx, obj, modes);
     obj
+}
+
+/// Write `allowedModes` by name (real layout), falling back to the synthetic
+/// slot if the named field cannot be resolved.
+fn lk_set_modes(ctx: &mut dyn NativeContext, obj: ObjectRef, modes: i32) {
+    ctx.set_field_by_name(obj, "allowedModes", Value::Int(modes));
+    let landed = matches!(ctx.get_field_by_name(obj, "allowedModes"), Value::Int(m) if m == modes);
+    if !landed {
+        ctx.set_field(obj, LK_ALLOWED_MODES, Value::Int(modes));
+    }
+}
+
+/// Read a Lookup's `allowedModes`, by name first (real layout), then the
+/// synthetic slot.
+fn lk_modes_of(ctx: &dyn NativeContext, this: ObjectRef) -> i32 {
+    if let Value::Int(m) = ctx.get_field_by_name(this, "allowedModes") {
+        return m;
+    }
+    if let Value::Int(m) = ctx.get_field(this, LK_ALLOWED_MODES) {
+        return m;
+    }
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -2733,25 +2758,19 @@ fn lk_previous_lookup_class(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
 
 fn lk_lookup_modes(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    Ok(Some(ctx.get_field(this, LK_ALLOWED_MODES)))
+    Ok(Some(Value::Int(lk_modes_of(ctx, this))))
 }
 
 fn lk_has_full_privilege_access(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let modes = match ctx.get_field(this, LK_ALLOWED_MODES) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let modes = lk_modes_of(ctx, this);
     let full = (modes & LK_PRIVATE) != 0 && (modes & LK_MODULE) != 0;
     Ok(Some(Value::Int(if full { 1 } else { 0 })))
 }
 
 fn lk_has_private_access(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
-    let modes = match ctx.get_field(this, LK_ALLOWED_MODES) {
-        Value::Int(v) => v,
-        _ => 0,
-    };
+    let modes = lk_modes_of(ctx, this);
     Ok(Some(Value::Int(if (modes & LK_PRIVATE) != 0 { 1 } else { 0 })))
 }
 
