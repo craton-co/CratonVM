@@ -984,6 +984,14 @@ pub(crate) fn detect_loop_unswitch_candidates(
 /// Returns `Some(needs_heap)` if the method can be JIT-compiled, `None` otherwise.
 /// `needs_heap` is true if the method uses array/object opcodes that require
 /// a heap pointer as a hidden first argument.
+/// Kill-switch for the dup_x1/dup_x2 codegen arms (`CRATONVM_JIT_NO_DUPX=1`
+/// restores the historical "bail to interpreter" behaviour). Added for
+/// regression bisection while the arms are fresh.
+fn dupx_codegen_disabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_JIT_NO_DUPX").is_some())
+}
+
 pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitScanResult> {
     let mut needs_heap = false;
     let mut multianewarray_ops = Vec::new();
@@ -995,6 +1003,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
     let mut anewarray_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `anewarray` (0xbd)
     let mut ldc_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `ldc`/`ldc_w`
     let mut ldc2w_ops: Vec<(usize, u16)> = Vec::new(); // (pc, cp_index) for `ldc2_w` (0x14)
+    let mut has_athrow = false; // RBC.6 — method contains 0xbf
     let mut pc = 0;
     while pc < code_len {
         let op = code[pc];
@@ -1448,8 +1457,23 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             0xC2 | 0xC3 => {
                 pc += 1;
             }
+            // RBC.6 — athrow. Accepted; `has_athrow` is recorded so callers
+            // can gate compilation to methods WITHOUT local exception
+            // handlers (the codegen lowers athrow to "stash pending
+            // exception + return the i64::MIN deopt sentinel", which cannot
+            // dispatch to an in-method handler) and so the OSR trigger can
+            // decline (its bail path resumes at the back-edge, which could
+            // re-run side effects). `analyze_escapes` already treats 0xbf
+            // as a full-escape barrier, so scalar replacement stays sound.
+            0xbf => {
+                has_athrow = true;
+                pc += 1;
+            }
             // Anything else: not JIT-compatible
             _ => {
+                if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                    eprintln!("[cratonvm-jitc] scan-bail op=0x{:02x} pc={}", op, pc);
+                }
                 return None;
             }
         }
@@ -1502,6 +1526,7 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
         non_escaping_new,
         ldc_ops,
         ldc2w_ops,
+        has_athrow,
     })
 }
 
@@ -1528,6 +1553,11 @@ pub struct JitScanResult {
     pub ldc_ops: Vec<(usize, u16)>,
     /// For each `ldc2_w` (0x14) instruction: (bytecode_pc, cp_index)
     pub ldc2w_ops: Vec<(usize, u16)>,
+    /// RBC.6 — the method contains `athrow` (0xbf). Compilable only when
+    /// the method has NO local exception handlers (the athrow codegen
+    /// stashes the exception and returns the deopt sentinel; it cannot
+    /// branch to an in-method handler), and never via OSR.
+    pub has_athrow: bool,
 }
 
 /// Check if a bytecode method can be JIT-compiled (backward-compatible wrapper).
@@ -4703,6 +4733,15 @@ struct Compiler {
     /// points *before* the hoisted preheader so an OSR entry executes the
     /// hoist initialisation exactly like a normal fall-through entry would.
     osr_entry_native: Vec<i32>,
+    /// DBG (env-gated diagnostics): last bytecode pc/op the main emit loop
+    /// dispatched, so a codegen bail can report where it gave up.
+    dbg_last_pc: usize,
+    dbg_last_op: u8,
+    /// RBC.6 — an `athrow` (0xbf) was lowered in this method. Forces
+    /// `has_dispatch` so the interpreter's compiled-entry paths take the
+    /// dispatch-aware route that drains the pending JIT exception (the
+    /// `!has_dispatch` fast path returns the raw value without draining).
+    emitted_athrow: bool,
     /// Forward branch patches: (native offset of rel32, target bytecode PC).
     forward_patches: Vec<(usize, usize)>,
     /// Jump table patches: (native offset of i32 entry, table_base_native_offset, target bytecode PC).
@@ -5229,6 +5268,9 @@ impl Compiler {
             alloc_used_xmms,
             pc_to_native: Vec::new(),
             osr_entry_native: Vec::new(),
+            dbg_last_pc: 0,
+            dbg_last_op: 0,
+            emitted_athrow: false,
             forward_patches: Vec::new(),
             jump_table_patches: Vec::new(),
             self_call_patches: Vec::new(),
@@ -12335,6 +12377,8 @@ impl Compiler {
             }
 
             let op = code[pc];
+            self.dbg_last_pc = pc;
+            self.dbg_last_op = op;
             match op {
                 // nop
                 0x00 => {
@@ -13140,6 +13184,81 @@ impl Compiler {
                         if let Some(m) = self.stack_oop_marks.last_mut() {
                             *m = true;
                         }
+                    }
+                    pc += 1;
+                }
+
+                // dup_x1 — `[…, b, a] → […, a, b, a]`. JVMS §6.5 guarantees both
+                // operands are category-1, so unlike dup2/dup_x2 no width proof
+                // is needed. javac emits this for a field post-increment used as
+                // a value (`xBuf[xBufOff++] = in` in BC's GeneralDigest.update —
+                // the per-byte digest hot path that kept every BC digest
+                // interpreter-bound while this opcode bailed).
+                //
+                // Implementation: materialize ONE copy of the top value into a
+                // fresh frame slot (fresh offsets only grow, so no aliasing with
+                // the live `b`/`a` slots), then rotate the top three MODEL
+                // entries so the copy sits below the original pair. Only the
+                // copy costs instructions. The rotated entries' frame offsets
+                // are momentarily non-canonical, which is fine:
+                // `canonicalize_stack` resolves arbitrary offset permutations as
+                // a parallel-move problem at the next branch/call boundary.
+                0x5a => {
+                    if dupx_codegen_disabled() || self.stack.len() < 2 {
+                        self.failed = true;
+                        let _ = self.push_stack();
+                    } else {
+                        let a_slot = self.peek_stack();
+                        let a_oop =
+                            self.stack_oop_marks.last().copied().unwrap_or(false);
+                        self.load_slot_to_reg(RAX, a_slot);
+                        self.push_from_rax(); // […, b, a, aC]
+                        if a_oop {
+                            self.mark_top_as_oop();
+                        }
+                        let n = self.stack.len();
+                        self.stack[n - 3..].rotate_right(1); // […, aC, b, a]
+                        self.stack_oop_marks[n - 3..].rotate_right(1);
+                    }
+                    pc += 1;
+                }
+
+                // dup_x2 — FORM-1 `[…, c, b, a] → […, a, c, b, a]` (all three
+                // category-1) vs FORM-2 `[…, w, a] → […, a, w, a]` (w is a
+                // category-2 long/double = ONE slot in this model). The form
+                // depends on the width of the values UNDER the top, which this
+                // model does not track — so restrict to the one shape that
+                // proves FORM-1 locally: the NEXT opcode is a category-1 array
+                // store, in which case the verifier guarantees the top three
+                // slots are [arrayref, index, cat1-value]. That is exactly
+                // javac's `++z[i]` / `--z[i]` value-producing pattern — BC's
+                // `Nat.inc`/`Nat.dec` DRBG block-counter helpers re-ran the
+                // whole compile pipeline 35,923× in one crypto-prng suite run
+                // bailing on this opcode. Any other shape stays interpreted.
+                0x5b => {
+                    let next_is_cat1_astore = pc + 1 < code_len
+                        && matches!(
+                            code[pc + 1],
+                            0x4f | 0x51 | 0x53 | 0x54 | 0x55 | 0x56
+                        );
+                    if dupx_codegen_disabled() || !next_is_cat1_astore || self.stack.len() < 3 {
+                        // Unprovable form (or malformed height) — stay
+                        // interpreted; placeholder keeps the model height
+                        // plausible until the post-loop `failed` check.
+                        self.failed = true;
+                        let _ = self.push_stack();
+                    } else {
+                        let a_slot = self.peek_stack();
+                        let a_oop =
+                            self.stack_oop_marks.last().copied().unwrap_or(false);
+                        self.load_slot_to_reg(RAX, a_slot);
+                        self.push_from_rax(); // […, c, b, a, aC]
+                        if a_oop {
+                            self.mark_top_as_oop();
+                        }
+                        let n = self.stack.len();
+                        self.stack[n - 4..].rotate_right(1); // […, aC, c, b, a]
+                        self.stack_oop_marks[n - 4..].rotate_right(1);
                     }
                     pc += 1;
                 }
@@ -14624,6 +14743,33 @@ impl Compiler {
                     self.buf.emit(&[0x31, 0xC0]);
                     self.emit_epilogue();
                     self.reset_spills();
+                    dead = true;
+                    pc += 1;
+                }
+
+                // athrow (RBC.6) — lower to "stash the exception object as
+                // the pending JIT exception, then return the i64::MIN deopt
+                // sentinel". The helper (`jit_throw_exception`) handles the
+                // JVMS athrow-on-null case by setting the pending-NPE flag
+                // instead. The interpreter's JIT-return drains route the
+                // exception to the caller; compilation is gated upstream to
+                // methods with NO local exception handlers (this lowering
+                // cannot branch to an in-method handler) and the OSR
+                // trigger declines athrow methods entirely (its bail path
+                // resumes at the back-edge and could re-run side effects).
+                // Mirrors the shared bounds-check stub, which calls
+                // `helpers.throw_aioobe` and epilogues with the sentinel.
+                0xbf => {
+                    self.flush_scratch_registers();
+                    // Exception ref → first argument register.
+                    let exc_slot = self.pop_stack();
+                    self.load_slot_to_reg(ARG_REGS[0], exc_slot);
+                    self.emit_call_absolute(self.helpers.throw_exception);
+                    // Helper returned the i64::MIN sentinel in RAX —
+                    // propagate it as the method's return value.
+                    self.emit_epilogue();
+                    self.reset_spills();
+                    self.emitted_athrow = true;
                     dead = true;
                     pc += 1;
                 }
@@ -19775,6 +19921,12 @@ pub fn compile_with_param_slots(
 
     // Compile bytecode
     if !compiler.compile_bytecode(code, code_len) {
+        if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+            eprintln!(
+                "[cratonvm-jitc] codegen-bail pc={} op=0x{:02x}",
+                compiler.dbg_last_pc, compiler.dbg_last_op
+            );
+        }
         return None;
     }
 
@@ -19823,13 +19975,34 @@ pub fn compile_with_param_slots(
     let has_dispatch = !compiler.invoke_info.is_empty()
         || !compiler.direct_calls.is_empty()
         || !compiler.bounds_check_stubs.is_empty()
-        || !compiler.null_check_store_stubs.is_empty();
+        || !compiler.null_check_store_stubs.is_empty()
+        // RBC.6 — an athrow stashes a pending JIT exception; the
+        // `!has_dispatch` fast entry paths return the raw value WITHOUT
+        // draining it, which would leak the exception (and mis-read the
+        // sentinel as a return value). Force the dispatch-aware route.
+        || compiler.emitted_athrow;
     let mut cm = if needs_heap {
         CompiledMethod::new_with_context(compiler.buf)
     } else {
         CompiledMethod::new(compiler.buf)
     };
     cm.has_dispatch = has_dispatch;
+
+    // RBC.5 — record the declaring classes of every getstatic/putstatic
+    // site (already resolved into `static_field_info` by the caller) so the
+    // interpreter's compiled-entry fast path can ensure-initialize them
+    // once per artifact instead of re-resolving the constant pool on every
+    // call (see `static_init_classes` on `CompiledMethod`).
+    cm.static_init_classes = {
+        let mut ids: Vec<u32> = compiler
+            .static_field_info
+            .iter()
+            .map(|&(_, class_id_raw, ..)| class_id_raw)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
 
     // Store OSR metadata for On-Stack Replacement entry.
     //
@@ -20255,6 +20428,7 @@ mod tests {
             tlab_post_init: 0,
             frame_record: 0,
             shadow_stack_offset_in_thread: 0,
+            throw_exception: sentinel,
         }
     }
 

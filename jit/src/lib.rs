@@ -814,6 +814,24 @@ pub struct CompiledMethod {
     /// simulated-stack type tracker; see the NEW-12 section of
     /// `docs/roadmap.md` for the migration plan.
     pub oop_maps: Vec<OopMapEntry>,
+    /// RBC.2 — `true` when this artifact was produced by the OSR compile
+    /// path (which eagerly compiles invokestatic callees and wires direct
+    /// calls). The OSR trigger only REUSES artifacts with this flag: a
+    /// first-call/upgrade artifact may lack that wiring, and pinning it
+    /// into a hot loop forever (instead of one fresh OSR compile) routes
+    /// every callee through the slow dispatch helper.
+    pub compiled_via_osr: bool,
+    /// RBC.5 — raw class ids of the declaring classes of every
+    /// getstatic/putstatic site in this method, recorded at compile time
+    /// from the already-resolved `static_field_info`. JIT code reads static
+    /// storage directly, so these classes must be initialized before first
+    /// execution; recording them here lets the interpreter's compiled-entry
+    /// fast path run that check once per artifact instead of re-resolving
+    /// every constant-pool ref on every call.
+    pub static_init_classes: Vec<u32>,
+    /// RBC.5 — set once the ensure-initialized walk over
+    /// `static_init_classes` has fully succeeded for this artifact.
+    pub static_inits_done: std::sync::atomic::AtomicBool,
     /// NEW-12: cached flag — `true` once `oop_maps` is known to be
     /// sorted by `native_pc_offset`.
     ///
@@ -923,6 +941,9 @@ impl CompiledMethod {
             // `push_oop_map`), so the first `find_oop_map_for_pc` call
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
+            compiled_via_osr: false,
+            static_init_classes: Vec::new(),
+            static_inits_done: std::sync::atomic::AtomicBool::new(false),
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
         }
@@ -963,6 +984,9 @@ impl CompiledMethod {
             // `push_oop_map`), so the first `find_oop_map_for_pc` call
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
+            compiled_via_osr: false,
+            static_init_classes: Vec::new(),
+            static_inits_done: std::sync::atomic::AtomicBool::new(false),
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
         }
@@ -1224,6 +1248,17 @@ impl CompiledMethod {
     pub unsafe fn call_with_heap(&self, heap_ptr: i64, args: &[i64]) -> i64 {
         self.try_call_with_context(heap_ptr, args)
             .expect("call_with_heap: invalid JIT entry or arg count (use try_call_with_context for the fallible variant)")
+    }
+
+    /// True when this artifact recorded an OSR entry point for `entry_pc`
+    /// (i.e. [`osr_enter`](Self::osr_enter) at that pc would not bail).
+    /// Lets the interpreter's OSR trigger reuse a cached compile instead of
+    /// re-running the whole x64 pipeline on every trigger.
+    pub fn can_osr_enter(&self, entry_pc: usize) -> bool {
+        self.osr_pc_to_native
+            .as_ref()
+            .and_then(|t| t.get(entry_pc).copied())
+            .map_or(false, |off| off >= 0)
     }
 
     /// OSR entry: enter JIT code at an arbitrary bytecode PC with interpreter locals.
@@ -3647,7 +3682,7 @@ fn jit_bail_list() -> &'static parking_lot::RwLock<rustc_hash::FxHashSet<u64>> {
 /// Whether the given method has been added to the JIT bail-list by a
 /// prior permanent-bail compilation attempt.  Checked at the top of
 /// `try_compile` to short-circuit re-attempts.
-fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) -> bool {
+pub fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) -> bool {
     let h = compute_jit_key_hash(class_name, method_name, descriptor);
     jit_bail_list().read().contains(&h)
 }
@@ -3655,7 +3690,7 @@ fn is_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) -> 
 /// Mark the method as permanently bail-listed.  Called when the heavy
 /// `x64::compile` path returns None (typically because of an unsupported
 /// backend pattern that won't change on retry).
-fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) {
+pub fn mark_jit_bail_listed(class_name: &str, method_name: &str, descriptor: &str) {
     let h = compute_jit_key_hash(class_name, method_name, descriptor);
     jit_bail_list().write().insert(h);
 }
@@ -3753,6 +3788,12 @@ pub fn try_compile(
             &cached.class_name,
             &cached.method_name,
             &cached.method_descriptor,
+        );
+    }
+    if result.is_none() && std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] compile-bail {}.{}{} backend_attempted={}",
+            cached.class_name, cached.method_name, cached.method_descriptor, backend_attempted
         );
     }
     // DBG (env-gated): dump the emitted machine code for a specific method so
@@ -3891,7 +3932,31 @@ fn try_compile_inner(
         return None;
     }
 
-    let scan = x64::jit_scan(code, code_len, &cached.method_descriptor)?;
+    let scan = match x64::jit_scan(code, code_len, &cached.method_descriptor) {
+        Some(s) => s,
+        None => {
+            // RBC.4 — a scan reject (unsupported opcode, e.g. `athrow`) is
+            // just as permanent as a backend bail: the bytecode never
+            // changes. Without marking it, a hot uncompilable method re-ran
+            // the whole upgrade gauntlet (skip-list + native-shadow
+            // hierarchy walks under the class_manager lock + this scan)
+            // every JIT_RETRY_STRIDE calls forever — observed 40,039
+            // attempts on `DefiniteLengthInputStream.readAllIntoByteArray`
+            // in ONE asn1 RegressionTest run. Route through the existing
+            // permanent bail-list machinery.
+            *backend_attempted = true;
+            return None;
+        }
+    };
+
+    // RBC.6 — a method containing `athrow` compiles only when it has NO
+    // local exception handlers: the athrow lowering stashes the exception
+    // and returns the deopt sentinel, which cannot dispatch to an
+    // in-method handler. Permanent for this bytecode → bail-list it.
+    if scan.has_athrow && !cached.exception_table.is_empty() {
+        *backend_attempted = true;
+        return None;
+    }
 
     // Try IR compilation for simple integer-only methods. The IR pipeline
     // types every value as 32-bit `IrType::Int` and lays parameters out by
@@ -4043,12 +4108,18 @@ fn try_compile_inner(
         }
     }
 
-    // Resolve ldc/ldc_w constants (int/float from CP; strings → 0)
+    // Resolve ldc/ldc_w constants (int/float from CP). A `None` from the
+    // resolver means the constant is not representable as an immediate
+    // (String/Class/MethodHandle ldc) — bail the whole compile, mirroring
+    // the ldc2_w arm below. The previous `unwrap_or(0)` would have compiled
+    // `ldc "str"` as pushing constant 0 (a null reference) — wrong code.
+    // With no resolver at all, `ldc_info` stays empty and the 0x12/0x13
+    // codegen arm bails per-site instead.
     let mut ldc_info: Vec<(usize, i64)> = Vec::new();
     if !scan.ldc_ops.is_empty() {
         if let Some(resolver) = cp_ldc_resolver {
             for &(pc, cp_idx) in &scan.ldc_ops {
-                let val = resolver(cp_idx).unwrap_or(0);
+                let val = resolver(cp_idx)?;
                 ldc_info.push((pc, val));
             }
         }
@@ -4120,6 +4191,20 @@ fn try_compile_inner(
                 && method_name == &*cached.method_name
                 && descriptor == &*cached.method_descriptor;
 
+            // RBC.3 — a site planned for inlining MUST still get a
+            // `JitInvokeInfo` dispatch fallback (below). The codegen's
+            // `try_emit_inline` can bail mid-body and roll back, and its
+            // fall-through is direct_calls → invoke_info → else "assume
+            // self-recursive CALL to own entry". With the old `continue`
+            // here, a bailed inline site had neither, so the emitted CALL
+            // targeted the CALLER's own entry: BC's `Strings.fromByteArray`
+            // (invokestatic to same-class sibling `asCharArray`, planned for
+            // inline, bailed in codegen) recursed itself — one `new String`
+            // per level — until a native stack overflow killed the asn1
+            // RegressionTest at StringTest (1,365 self-frames in the cdb
+            // dump). Skip only the direct-call/intrinsic attempts, then fall
+            // through to the info construction.
+            let mut planned_inline = false;
             if !is_self_call && (invoke_kind == 3 || invoke_kind == 1) {
                 // Try inlining first (before direct calls — inlining is more profitable)
                 if inline_budget_remaining > 0 {
@@ -4137,12 +4222,13 @@ fn try_compile_inner(
                                     site.descriptor.clone(),
                                 ));
                                 inline_sites.insert(pc, site);
-                                continue;
+                                planned_inline = true;
                             }
                         }
                     }
                 }
 
+                if !planned_inline {
                 if let Some(compiler) = callee_compiler.as_ref() {
                     if let Some((entry, callee_needs_ctx)) =
                         compiler(&class_name, &method_name, &descriptor)
@@ -4186,6 +4272,7 @@ fn try_compile_inner(
                     ));
                     continue;
                 }
+                } // end !planned_inline (RBC.3)
             }
 
             // Call-site intrinsics for instance-method invokes
@@ -6000,20 +6087,28 @@ mod tests {
         );
     }
 
-    /// RG.5 — JIT must bail on explicit `athrow` so the interpreter's
-    /// exception-table lookup and frame unwinding run. Implicit exceptions
-    /// (NPE, AIOOBE) from JIT'd code are handled separately by the runtime
-    /// dispatch helpers and are not controlled by this scanner decision.
+    /// RG.5 (updated by RBC.6) — the scanner now ACCEPTS explicit `athrow`
+    /// and records `has_athrow`; the compile gates restrict compilation to
+    /// methods with NO local exception handlers (the codegen lowers athrow
+    /// to "stash pending exception + return the i64::MIN deopt sentinel",
+    /// which cannot dispatch to an in-method handler — see
+    /// `try_compile_inner`'s `exception_table.is_empty()` gate and the OSR
+    /// trigger's decline in `vm/src/runtime/interpreter.rs::try_osr`).
     #[test]
-    fn rg5_jit_rejects_explicit_athrow() {
-        // aconst_null (0x01), athrow (0xbf). A real method would never return
-        // after athrow but we append ireturn so the scanner sees a terminator
-        // before rejecting.
+    fn rg5_jit_scan_accepts_athrow_and_flags_it() {
+        // aconst_null (0x01), athrow (0xbf), then iconst_0/ireturn filler.
         let code = vec![0x01, 0xbf, 0x03, 0xac];
+        let scan = x64::jit_scan(&code, code.len(), "()I")
+            .expect("athrow method must pass jit_scan (RBC.6)");
         assert!(
-            !is_jit_compatible(&code, code.len(), "()I"),
-            "JIT must bail on explicit athrow — interpreter handles exception tables"
+            scan.has_athrow,
+            "jit_scan must record has_athrow so compile gates can apply"
         );
+        // A method without athrow must NOT set the flag.
+        let plain = vec![0x03, 0xac];
+        let scan = x64::jit_scan(&plain, plain.len(), "()I")
+            .expect("trivial method must pass jit_scan");
+        assert!(!scan.has_athrow);
     }
 
     /// RG.6 — JIT scanner accepts `monitorenter` (0xc2) and `monitorexit`

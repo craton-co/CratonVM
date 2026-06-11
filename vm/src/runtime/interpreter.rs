@@ -2374,19 +2374,44 @@ pub fn execute(
             // Method has known JIT issues — skip JIT.
         } else {
         {
-        let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
-        let code_len = code_attr.code.len();
-        if let Some(scan) = crate::jit::x64::jit_scan(&padded, code_len, method_descriptor) {
-            // Check JIT cache
-            let class_name_arc: Arc<str> = Arc::from(&*class_name_str);
-            let method_name_arc: Arc<str> = Arc::from(method_name);
-            let descriptor_arc: Arc<str> = Arc::from(method_descriptor);
-
+            // RBC.5 — consult the JIT cache FIRST. An already-compiled method
+            // needs NO `padded_bytecode` (alloc + memcpy), NO `jit_scan`
+            // (linear bytecode walk) and NO Arc key allocations —
+            // `JitCache::get` takes `&str`. The previous order paid all of
+            // that on EVERY uncached invocation of every JIT-eligible
+            // method. The org/bouncycastle blanket ban happened to
+            // short-circuit it for BC code at the `static_skip_reason` gate,
+            // which made LIFTING the ban look ~4.7× slower on the asn1
+            // RegressionTest even when not a single BC method was compiled
+            // (the ~190s CPU-bound anomaly in
+            // docs/bc-jit-ban-investigation.md).
             let compiled = {
                 let jit_cache = shared.jit_cache.read();
-                jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+                jit_cache.get(&class_name_str, method_name, method_descriptor)
             };
             let compiled = compiled.or_else(|| {
+                let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
+                let code_len = code_attr.code.len();
+                let scan = match crate::jit::x64::jit_scan(&padded, code_len, method_descriptor) {
+                    Some(s) => s,
+                    None => {
+                        // RBC.4 — seal scan-rejected methods so this path
+                        // doesn't re-run jit_scan on every uncached
+                        // invocation.
+                        shared.jit_skip_set.write().insert(skip_key.clone());
+                        return None;
+                    }
+                };
+                // RBC.6 — athrow methods need an EMPTY exception table
+                // (mirrors jit::try_compile_inner); seal otherwise so the
+                // probe isn't re-run per call.
+                if scan.has_athrow && !code_attr.exception_table.is_empty() {
+                    shared.jit_skip_set.write().insert(skip_key.clone());
+                    return None;
+                }
+                let class_name_arc: Arc<str> = Arc::from(&*class_name_str);
+                let method_name_arc: Arc<str> = Arc::from(method_name);
+                let descriptor_arc: Arc<str> = Arc::from(method_descriptor);
                 // Resolve multianewarray entries if present
                 let mut mna_info = Vec::new();
                 if !scan.multianewarray_ops.is_empty() {
@@ -2809,34 +2834,60 @@ pub fn execute(
                 cached_result
             });
 
+            if compiled.is_none() {
+                // RBC.4 — seal first-call compile failures for the same
+                // reason as the scan-reject seal above: without it every
+                // uncached invocation of a backend-bailing method re-ran
+                // resolution + x64 codegen here. (A method sealed by a
+                // transient resolver miss can still be compiled later by
+                // the invocation-counter upgrade path; the cache fast-path
+                // then routes calls to it.)
+                shared.jit_skip_set.write().insert(skip_key.clone());
+            }
             if let Some(compiled) = compiled {
                 if crate::runtime::env_cache::jit_entry_dbg() {
-                    eprintln!("[JIT_ENTRY] {}.{}{}", class_name_arc, method_name_arc, descriptor_arc);
+                    eprintln!("[JIT_ENTRY] {}.{}{}", class_name_str, method_name, method_descriptor);
                 }
                 // Ensure all classes referenced by static field ops are initialized.
                 // The JIT directly accesses static field memory, bypassing the
                 // interpreter's ensure_class_initialized_shared call.
-                if !scan.static_field_ops.is_empty() {
-                    let mut init_class_ids = Vec::new();
-                    for &(_, cp_idx) in &scan.static_field_ops {
-                        if let Ok(field) = resolve_field_ref(shared, class_id, cp_idx) {
-                            init_class_ids.push(field.declaring_class_id);
-                        }
-                    }
-                    init_class_ids.sort_unstable_by_key(|id| id.as_u32());
-                    init_class_ids.dedup();
-                    for cid in init_class_ids {
-                        match ensure_class_initialized_shared(shared, thread, cid) {
+                //
+                // RBC.5 — the class-id list now comes from the artifact
+                // (`static_init_classes`, recorded by `x64::compile` from the
+                // already-resolved `static_field_info`), and the ensure-walk
+                // runs ONCE per artifact (`static_inits_done`) instead of
+                // re-resolving every constant-pool ref + re-taking the init
+                // locks on every single call. A failed init does NOT set the
+                // done-flag, so it is retried on the next call exactly like
+                // the per-call code it replaces.
+                if !compiled.static_init_classes.is_empty()
+                    && !compiled
+                        .static_inits_done
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    let mut all_ok = true;
+                    for &cid_raw in &compiled.static_init_classes {
+                        match ensure_class_initialized_shared(
+                            shared,
+                            thread,
+                            ClassId::new(cid_raw),
+                        ) {
                             Ok(()) => {}
                             Err(MethodCallFailed::ExceptionThrown(exc)) => {
                                 // Class init failed (e.g. ExceptionInInitializerError).
                                 // Don't propagate directly — fall through to interpreter
                                 // so the exception table can catch it.
                                 jit_early_exception = Some(exc);
+                                all_ok = false;
                                 break;
                             }
                             Err(e) => return Err(e),
                         }
+                    }
+                    if all_ok {
+                        compiled
+                            .static_inits_done
+                            .store(true, std::sync::atomic::Ordering::Release);
                     }
                 }
                 // Skip JIT execution if class init already produced an exception
@@ -3055,11 +3106,6 @@ pub fn execute(
                 }
             } // end else (jit_early_exception.is_none())
             }
-        } else {
-            // jit_scan returned None — cache the negative result so we never
-            // re-scan this method.
-            shared.jit_skip_set.write().insert(skip_key);
-        }
         }
         } // end if !already_skipped
     } // end JIT block
@@ -13110,7 +13156,14 @@ fn execute_invokestatic_cached(
             // the staleness binding — the JIT'd body executes the same
             // declaring class, so a future `redefine_class` must
             // invalidate this JIT entry too.
-            if let Some(jit_target) = try_jit_upgrade_with_gate(shared, cached, entry_gate.clone()) {
+            let upgrade_result = try_jit_upgrade_with_gate(shared, cached, entry_gate.clone());
+            if upgrade_result.is_none() && std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                eprintln!(
+                    "[cratonvm-jitc] upgrade-FAIL {}.{}{} invoc_count={}",
+                    cached.class_name, cached.method_name, cached.method_descriptor, invoc_count
+                );
+            }
+            if let Some(jit_target) = upgrade_result {
                 // Upgrade cache entry to Jit for future calls
                 thread
                     .invoke_cache
@@ -13319,14 +13372,60 @@ fn try_osr(
     let method_name_arc: Arc<str> = Arc::from(method_name.as_str());
     let descriptor_arc: Arc<str> = Arc::from(method_descriptor.as_str());
 
-    // Always recompile in OSR — the early-compile version may lack direct-call wiring
-    // for callees that were compiled after the initial first-call compilation.
-    let compiled = (|| -> Option<_> {
+    // RBC.2 — reuse a cached artifact when it can OSR-enter at this pc.
+    // The historical "always recompile in OSR" policy (kept because an
+    // early-compile artifact may lack direct-call wiring for callees
+    // compiled later) re-ran the FULL x64 pipeline on every OSR trigger of
+    // the same method: BC's `SecP521R1Curve$1.lookup` under DualECDRBG was
+    // recompiled 2,610× in one crypto-prng suite run (its interface call
+    // sites never promote it to method-entry JIT, so every call re-trips
+    // the back-edge threshold). A cached artifact exposing an OSR entry for
+    // this pc is at worst missing newer direct-call wiring — a throughput
+    // nuance, not correctness — so prefer it. Artifacts without an entry
+    // here (or no cached artifact) recompile exactly as before.
+    let cached_osr = {
+        let jit_cache = shared.jit_cache.read();
+        jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
+    };
+    // Only reuse artifacts the OSR path itself produced: those carry the
+    // eager invokestatic callee wiring (direct calls). A first-call/upgrade
+    // artifact can OSR-enter too, but pinning it into a hot loop forever
+    // routes its callees through the slow dispatch helper — reusing those
+    // regressed the DEFAULT (ban-on) BC suites ~2×. Such artifacts get one
+    // fresh OSR recompile below (replacing them in the cache), after which
+    // reuse kicks in.
+    let osr_reused = matches!(&cached_osr, Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc));
+    let compiled = if osr_reused {
+        cached_osr
+    } else {
+    (|| -> Option<_> {
+        // RBC.2 — honor the permanent bail-list here too. This OSR path
+        // calls `x64::compile` directly (not `jit::try_compile`), so it
+        // used to bypass the bail-list short-circuit and re-ran the FULL
+        // compile pipeline on every OSR trigger of a permanently
+        // uncompilable hot method (observed: 35,923 wasted pipelines on
+        // `Nat.inc`'s dup_x2 bail in one crypto-prng suite run).
+        if crate::jit::is_jit_bail_listed(&class_name, &method_name, &method_descriptor) {
+            return None;
+        }
         let code_len = code.len().saturating_sub(2); // padded_bytecode adds 2
         let scan = match crate::jit::x64::jit_scan(&code, code_len, &method_descriptor) {
             Some(s) => s,
-            None => return None,
+            None => {
+                // RBC.4 — scan rejects are permanent (see jit::try_compile_inner).
+                crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                return None;
+            }
         };
+        // RBC.6 — never OSR an athrow method: the OSR bail path resumes
+        // interpretation at the back-edge, so an athrow lowering that ran
+        // side effects natively before throwing could see them re-applied.
+        // Method-entry compilation (which propagates cleanly through the
+        // JIT-return exception drains) remains available, so do NOT
+        // bail-list here.
+        if scan.has_athrow {
+            return None;
+        }
 
         // Resolve multianewarray
         let mut mna_info = Vec::new();
@@ -13693,7 +13792,15 @@ fn try_osr(
             scan.non_escaping_new.clone(), // escape analysis results
             std::collections::HashMap::new(), // inline_sites
             None, // string_layout — String intrinsics land in a later wave
-        )?;
+        );
+        let Some(mut cm) = cm else {
+            // RBC.2 — a backend bail here is just as permanent as one in
+            // `jit::try_compile`; record it so neither this OSR path nor
+            // the invocation-counter path re-runs the pipeline.
+            crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+            return None;
+        };
+        cm.compiled_via_osr = true;
         cm._jit_strings = owned_jit_strings2;
         cm._jit_invoke_infos = owned_jit_invoke_infos2;
         let mut jit_cache = shared.jit_cache.write();
@@ -13704,7 +13811,8 @@ fn try_osr(
             cm,
         );
         jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
-    })();
+    })()
+    };
 
     let compiled = match compiled {
         Some(c) => c,
@@ -13713,8 +13821,10 @@ fn try_osr(
 
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
-            "[cratonvm-jitc] OSR-compile {}.{}{} entry_pc={}",
-            &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc
+            "[cratonvm-jitc] OSR-{} {}.{}{} entry_pc={} entry={:p} len={}",
+            if osr_reused { "reuse" } else { "compile" },
+            &*class_name_arc, &*method_name_arc, &*descriptor_arc, entry_pc,
+            compiled.entry_ptr(), compiled.code_bytes().len()
         );
     }
 
@@ -14011,6 +14121,19 @@ fn try_jit_upgrade_with_gate(
     if crate::runtime::env_cache::disable_jit() {
         return None;
     }
+    // RBC.4 — short-circuit permanently-uncompilable methods BEFORE the
+    // expensive gates below (two superclass-chain walks under the
+    // class_manager read lock). The retry stride re-enters this function
+    // every 64 calls for a hot method; with a scan-rejected (e.g. athrow)
+    // method that meant tens of thousands of full gate evaluations per
+    // suite run while `try_compile` would bail instantly anyway.
+    if crate::jit::is_jit_bail_listed(
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+    ) {
+        return None;
+    }
     // S111r15 — refuse to JIT a method that has a Rust native shadow.
     // Mirrors the equivalent gate in `try_jit_compile_callee` so the
     // caller-method-counter path doesn't bypass natives that the
@@ -14249,6 +14372,24 @@ fn try_jit_upgrade_with_gate(
         }
     };
 
+    // RBC.2 — `ldc`/`ldc_w` int/float constants. This resolver was never
+    // wired on the invocation-counter upgrade path, so ANY method containing
+    // an `ldc` opcode (BC's `Nat192/Nat256.gte` load Integer.MIN_VALUE via
+    // `ldc`, `SecP*Field` / `Mod` load reduction constants, the ASN.1 parser
+    // statics load limit masks) failed codegen at the 0x12/0x13 arm on every
+    // retry and stayed interpreted forever — the dominant cause of the
+    // BC-suite 34-64× interpreter gap. String/Class ldc returns None →
+    // compile bails (matches the OSR path's `_ => return None`).
+    let ldc_resolver = |cp_idx: u16| -> Option<i64> {
+        let cm = shared.class_manager.read();
+        let class = cm.get_class(class_id)?;
+        match class.constant_pool.get(cp_idx)? {
+            ConstantPoolEntry::Integer(v) => Some(*v as i64), // Cast: JIT ABI — i64 register convention
+            ConstantPoolEntry::Float(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+            _ => None,
+        }
+    };
+
     // Callee compiler: given (class_name, method_name, descriptor), try to JIT-compile
     // the callee and return (entry_ptr, needs_context). Used for cross-method direct calls.
     let callee_compiler =
@@ -14420,6 +14561,21 @@ fn try_jit_upgrade_with_gate(
                 }
             };
 
+            // RBC.2 — `ldc`/`ldc_w` int/float constants. Without this resolver
+            // every method containing an `ldc` (e.g. BC's `Nat*.gte` loading
+            // Integer.MIN_VALUE) failed codegen at the 0x12 arm and stayed
+            // interpreted forever. String/Class ldc returns None → compile
+            // bails (matches the OSR path's behaviour).
+            let c_ldc_resolver = |cp_idx: u16| -> Option<i64> {
+                let cm = shared.class_manager.read();
+                let class = cm.get_class(callee_cid)?;
+                match class.constant_pool.get(cp_idx)? {
+                    ConstantPoolEntry::Integer(v) => Some(*v as i64), // Cast: JIT ABI — i64 register convention
+                    ConstantPoolEntry::Float(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+                    _ => None,
+                }
+            };
+
             // Compile callee without recursive inlining (None for callee_compiler)
             let c_pgo_profile = {
                 let profile_key = crate::jit::profile::MethodKey {
@@ -14438,7 +14594,7 @@ fn try_jit_upgrade_with_gate(
                 Some(&c_invoke_resolver),
                 None, // no recursive inlining
                 Some(&c_new_resolver),
-                None, // cp_ldc_resolver
+                Some(&c_ldc_resolver),
                 Some(&c_ldc2w_resolver),
                 c_pgo_profile.as_ref(),
                 &c_helpers,
@@ -14486,7 +14642,7 @@ fn try_jit_upgrade_with_gate(
         Some(&invoke_resolver),
         Some(&callee_compiler),
         Some(&new_resolver),
-        None, // cp_ldc_resolver
+        Some(&ldc_resolver),
         Some(&ldc2w_resolver),
         pgo_profile.as_ref(),
         &helpers,
@@ -14514,6 +14670,13 @@ fn try_jit_upgrade_with_gate(
             &cached.method_descriptor,
         )?
     };
+    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+        eprintln!(
+            "[cratonvm-jitc] upgrade-OK {}.{}{} entry={:p} len={}",
+            cached.class_name, cached.method_name, cached.method_descriptor,
+            compiled_arc.entry_ptr(), compiled_arc.code_bytes().len()
+        );
+    }
 
     Some(CachedInvokeTarget::Jit {
         compiled: compiled_arc,
@@ -14581,6 +14744,11 @@ pub fn try_jit_compile_callee(
     // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
     if crate::runtime::env_cache::disable_jit() {
+        return None;
+    }
+    // RBC.4 — short-circuit permanently-uncompilable methods before the
+    // FJP/native-shadow hierarchy walks (see try_jit_upgrade_with_gate).
+    if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
         return None;
     }
     // RFJP.1 — never JIT a method whose declaring class transitively extends
@@ -14760,6 +14928,18 @@ pub fn try_jit_compile_callee(
         }
     };
 
+    // RBC.2 — `ldc`/`ldc_w` int/float constants; see the matching resolver
+    // in `try_jit_upgrade_with_gate`. String/Class ldc → None → compile bail.
+    let ldc_resolver = |cp_idx: u16| -> Option<i64> {
+        let cm = shared.class_manager.read();
+        let class = cm.get_class(cid)?;
+        match class.constant_pool.get(cp_idx)? {
+            ConstantPoolEntry::Integer(v) => Some(*v as i64), // Cast: JIT ABI — i64 register convention
+            ConstantPoolEntry::Float(v) => Some(v.to_bits() as i64), // Cast: JIT ABI -- float bits to i64
+            _ => None,
+        }
+    };
+
     let pgo_profile = {
         let profile_key = crate::jit::profile::MethodKey {
             class_id: cached.declaring_class_id.as_u32(),
@@ -14806,7 +14986,7 @@ pub fn try_jit_compile_callee(
         Some(&invoke_resolver),
         None, // no recursive callee compilation
         Some(&new_resolver),
-        None, // cp_ldc_resolver
+        Some(&ldc_resolver),
         Some(&ldc2w_resolver),
         pgo_profile.as_ref(),
         &helpers,
@@ -14816,8 +14996,9 @@ pub fn try_jit_compile_callee(
     )?;
     if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
         eprintln!(
-            "[cratonvm-jitc] full-compile {}.{}{}",
-            cached.class_name, cached.method_name, cached.method_descriptor
+            "[cratonvm-jitc] full-compile {}.{}{} entry={:p} len={}",
+            cached.class_name, cached.method_name, cached.method_descriptor,
+            compiled.entry_ptr(), compiled.code_bytes().len()
         );
     }
     let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address

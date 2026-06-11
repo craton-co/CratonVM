@@ -1032,6 +1032,12 @@ pub fn ir_compatible(scan: &super::x64::JitScanResult) -> bool {
     // still compilable via the x64 single-pass backend; we just decline to
     // route it through the IR pipeline until we've gained more confidence.
 
+    // RBC.6 — the IR pipeline has no athrow lowering; only the x64
+    // single-pass backend emits the stash-pending-exception sequence.
+    if scan.has_athrow {
+        return false;
+    }
+
     // Cap simple invokes (invokestatic / invokevirtual / invokespecial /
     // invokeinterface). Invokedynamic is rejected upstream by `jit_scan`.
     if scan.invoke_ops.len() > 5 {
@@ -1192,6 +1198,7 @@ mod tests {
             anewarray_ops: vec![],
             non_escaping_new: std::collections::HashSet::new(),
             ldc2w_ops: vec![],
+            has_athrow: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible(&scan));
@@ -1212,6 +1219,7 @@ mod tests {
             anewarray_ops: vec![],
             non_escaping_new: std::collections::HashSet::new(),
             ldc2w_ops: vec![],
+            has_athrow: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible(&scan));
@@ -1232,6 +1240,7 @@ mod tests {
             anewarray_ops: vec![],
             non_escaping_new: std::collections::HashSet::new(),
             ldc2w_ops: vec![],
+            has_athrow: false,
             ldc_ops: vec![],
         };
         // Too many invokes.
@@ -1257,6 +1266,7 @@ mod tests {
             anewarray_ops: vec![],
             non_escaping_new: std::collections::HashSet::new(),
             ldc2w_ops: vec![],
+            has_athrow: false,
             ldc_ops: vec![],
         };
         assert!(ir_compatible_sized(&scan, 200));
