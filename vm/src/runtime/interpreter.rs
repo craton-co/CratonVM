@@ -2376,7 +2376,18 @@ pub fn execute(
         {
         let padded = crate::runtime::frame::padded_bytecode(&code_attr.code);
         let code_len = code_attr.code.len();
-        if let Some(scan) = crate::jit::x64::jit_scan(&padded, code_len, method_descriptor) {
+        let scan_opt = crate::jit::x64::jit_scan(&padded, code_len, method_descriptor);
+        if scan_opt.is_none() {
+            // RBC.4 — seal scan-rejected methods so this first-call path
+            // doesn't re-run jit_scan on EVERY uncached invocation. Under
+            // `CRATONVM_JIT_ALLOW_PACKAGES=org/bouncycastle/` the asn1
+            // RegressionTest spent 4× its ban-on wall time re-scanning the
+            // same athrow-bearing parser statics here (the blanket ban used
+            // to short-circuit them before this point; with it lifted every
+            // call paid a full linear bytecode scan).
+            shared.jit_skip_set.write().insert(skip_key.clone());
+        }
+        if let Some(scan) = scan_opt {
             // Check JIT cache
             let class_name_arc: Arc<str> = Arc::from(&*class_name_str);
             let method_name_arc: Arc<str> = Arc::from(method_name);
@@ -2809,6 +2820,16 @@ pub fn execute(
                 cached_result
             });
 
+            if compiled.is_none() {
+                // RBC.4 — seal first-call compile failures for the same
+                // reason as the scan-reject seal above: without it every
+                // uncached invocation of a backend-bailing method re-ran
+                // resolution + x64 codegen here. (A method sealed by a
+                // transient resolver miss can still be compiled later by
+                // the invocation-counter upgrade path; the cache fast-path
+                // then routes calls to it.)
+                shared.jit_skip_set.write().insert(skip_key.clone());
+            }
             if let Some(compiled) = compiled {
                 if crate::runtime::env_cache::jit_entry_dbg() {
                     eprintln!("[JIT_ENTRY] {}.{}{}", class_name_arc, method_name_arc, descriptor_arc);
@@ -13307,7 +13328,14 @@ fn try_osr(
         let jit_cache = shared.jit_cache.read();
         jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
     };
-    let osr_reused = matches!(&cached_osr, Some(c) if c.can_osr_enter(entry_pc));
+    // Only reuse artifacts the OSR path itself produced: those carry the
+    // eager invokestatic callee wiring (direct calls). A first-call/upgrade
+    // artifact can OSR-enter too, but pinning it into a hot loop forever
+    // routes its callees through the slow dispatch helper — reusing those
+    // regressed the DEFAULT (ban-on) BC suites ~2×. Such artifacts get one
+    // fresh OSR recompile below (replacing them in the cache), after which
+    // reuse kicks in.
+    let osr_reused = matches!(&cached_osr, Some(c) if c.compiled_via_osr && c.can_osr_enter(entry_pc));
     let compiled = if osr_reused {
         cached_osr
     } else {
@@ -13324,7 +13352,11 @@ fn try_osr(
         let code_len = code.len().saturating_sub(2); // padded_bytecode adds 2
         let scan = match crate::jit::x64::jit_scan(&code, code_len, &method_descriptor) {
             Some(s) => s,
-            None => return None,
+            None => {
+                // RBC.4 — scan rejects are permanent (see jit::try_compile_inner).
+                crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
+                return None;
+            }
         };
 
         // Resolve multianewarray
@@ -13700,6 +13732,7 @@ fn try_osr(
             crate::jit::mark_jit_bail_listed(&class_name, &method_name, &method_descriptor);
             return None;
         };
+        cm.compiled_via_osr = true;
         cm._jit_strings = owned_jit_strings2;
         cm._jit_invoke_infos = owned_jit_invoke_infos2;
         let mut jit_cache = shared.jit_cache.write();
@@ -14018,6 +14051,19 @@ fn try_jit_upgrade_with_gate(
     // (the caller-method counter path here, and the dispatcher path there).
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
     if crate::runtime::env_cache::disable_jit() {
+        return None;
+    }
+    // RBC.4 — short-circuit permanently-uncompilable methods BEFORE the
+    // expensive gates below (two superclass-chain walks under the
+    // class_manager read lock). The retry stride re-enters this function
+    // every 64 calls for a hot method; with a scan-rejected (e.g. athrow)
+    // method that meant tens of thousands of full gate evaluations per
+    // suite run while `try_compile` would bail instantly anyway.
+    if crate::jit::is_jit_bail_listed(
+        &cached.class_name,
+        &cached.method_name,
+        &cached.method_descriptor,
+    ) {
         return None;
     }
     // S111r15 — refuse to JIT a method that has a Rust native shadow.
@@ -14630,6 +14676,11 @@ pub fn try_jit_compile_callee(
     // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
     if crate::runtime::env_cache::disable_jit() {
+        return None;
+    }
+    // RBC.4 — short-circuit permanently-uncompilable methods before the
+    // FJP/native-shadow hierarchy walks (see try_jit_upgrade_with_gate).
+    if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
         return None;
     }
     // RFJP.1 — never JIT a method whose declaring class transitively extends

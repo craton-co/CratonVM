@@ -814,6 +814,13 @@ pub struct CompiledMethod {
     /// simulated-stack type tracker; see the NEW-12 section of
     /// `docs/roadmap.md` for the migration plan.
     pub oop_maps: Vec<OopMapEntry>,
+    /// RBC.2 — `true` when this artifact was produced by the OSR compile
+    /// path (which eagerly compiles invokestatic callees and wires direct
+    /// calls). The OSR trigger only REUSES artifacts with this flag: a
+    /// first-call/upgrade artifact may lack that wiring, and pinning it
+    /// into a hot loop forever (instead of one fresh OSR compile) routes
+    /// every callee through the slow dispatch helper.
+    pub compiled_via_osr: bool,
     /// NEW-12: cached flag — `true` once `oop_maps` is known to be
     /// sorted by `native_pc_offset`.
     ///
@@ -923,6 +930,7 @@ impl CompiledMethod {
             // `push_oop_map`), so the first `find_oop_map_for_pc` call
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
+            compiled_via_osr: false,
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
         }
@@ -963,6 +971,7 @@ impl CompiledMethod {
             // `push_oop_map`), so the first `find_oop_map_for_pc` call
             // must verify/sort once. `push_oop_map` keeps the flag
             // precise for the incremental-build path.
+            compiled_via_osr: false,
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
         }
@@ -3908,7 +3917,22 @@ fn try_compile_inner(
         return None;
     }
 
-    let scan = x64::jit_scan(code, code_len, &cached.method_descriptor)?;
+    let scan = match x64::jit_scan(code, code_len, &cached.method_descriptor) {
+        Some(s) => s,
+        None => {
+            // RBC.4 — a scan reject (unsupported opcode, e.g. `athrow`) is
+            // just as permanent as a backend bail: the bytecode never
+            // changes. Without marking it, a hot uncompilable method re-ran
+            // the whole upgrade gauntlet (skip-list + native-shadow
+            // hierarchy walks under the class_manager lock + this scan)
+            // every JIT_RETRY_STRIDE calls forever — observed 40,039
+            // attempts on `DefiniteLengthInputStream.readAllIntoByteArray`
+            // in ONE asn1 RegressionTest run. Route through the existing
+            // permanent bail-list machinery.
+            *backend_attempted = true;
+            return None;
+        }
+    };
 
     // Try IR compilation for simple integer-only methods. The IR pipeline
     // types every value as 32-bit `IrType::Int` and lays parameters out by
