@@ -799,9 +799,14 @@ fn value_to_string(
                 return s;
             }
 
-            // Check for wrapper types (1-field objects with a primitive value)
+            // Check for wrapper types (1-field objects with a primitive value).
+            // Arrays must NOT take this path: num_slots is the array LENGTH,
+            // so a length-1 array would masquerade as a wrapper and packed
+            // primitive arrays would read a garbage Value slot.
+            let is_array = shared.heap.kind_of(*obj_ref)
+                == crate::memory::heap::ObjectKind::Array;
             let nf = shared.heap.get_header(*obj_ref).num_slots as usize;
-            if nf == 1 {
+            if nf == 1 && !is_array {
                 match shared.heap.get_field(*obj_ref, 0) {
                     Value::Int(v) => {
                         let class_id = shared.heap.class_id_of(*obj_ref);
@@ -835,14 +840,21 @@ fn value_to_string(
                 }
             }
 
-            // Final fallback: ClassName@hash
-            let class_id = shared.heap.class_id_of(*obj_ref);
-            let class_name = shared
-                .class_manager
-                .read()
-                .get_class(class_id)
-                .map(|c| c.name.to_string())
-                .unwrap_or_else(|| "?".to_string());
+            // Final fallback: ClassName@hash. For arrays the header's class_id
+            // is the COMPONENT class — render the JVMS array-class name
+            // ([Ljava.lang.Class; / [I) like HotSpot instead.
+            let class_name = if is_array {
+                crate::runtime::interpreter::array_descriptor_of(shared, *obj_ref)
+                    .unwrap_or_else(|| "[Ljava/lang/Object;".to_string())
+            } else {
+                let class_id = shared.heap.class_id_of(*obj_ref);
+                shared
+                    .class_manager
+                    .read()
+                    .get_class(class_id)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            };
             let dotted = class_name.replace('/', ".");
             let hash = shared.heap.identity_hash_code(*obj_ref);
             format!("{dotted}@{hash:x}")

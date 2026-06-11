@@ -579,11 +579,19 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
                     ctx.read_string(str_ref).unwrap_or_else(|| "null".to_string())
                 }
                 _ => {
-                    // Final fallback: ClassName@hash
-                    let class_id = ctx.class_id_of_object(*obj);
-                    let class_name = ctx
-                        .class_name_of_id(class_id)
-                        .unwrap_or_else(|| "?".to_string());
+                    // Final fallback: ClassName@hash. Arrays render the JVMS
+                    // array-class name (the header's class_id is the COMPONENT
+                    // class — mirrors lang_class::array_descriptor_for in
+                    // native-builtins).
+                    let class_name = if ctx.heap_kind_of(*obj)
+                        == cratonvm_types::ObjectKind::Array
+                    {
+                        display_array_class_name(ctx, *obj)
+                    } else {
+                        let class_id = ctx.class_id_of_object(*obj);
+                        ctx.class_name_of_id(class_id)
+                            .unwrap_or_else(|| "?".to_string())
+                    };
                     let hash = ctx.identity_hash_code(*obj);
                     format!("{}@{:x}", class_name.replace('/', "."), hash)
                 }
@@ -594,6 +602,36 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
         Value::Float(v) => format!("{}", v),
         Value::Double(v) => format!("{}", v),
         _ => "?".to_string(),
+    }
+}
+
+/// JVMS array-class name for a heap array (`[Ljava/lang/Class;`, `[I`,
+/// `[[I`, …). Local mirror of native-builtins' lang_class::array_descriptor_for
+/// (separate crate): primitive arrays carry ClassId(0) and are identified by
+/// the header's element type; reference arrays carry the COMPONENT class id.
+fn display_array_class_name(ctx: &dyn NativeContext, obj: ObjectRef) -> String {
+    use cratonvm_types::ArrayElementType;
+    match ctx.heap_element_type_of(obj) {
+        ArrayElementType::Boolean => "[Z".to_string(),
+        ArrayElementType::Char => "[C".to_string(),
+        ArrayElementType::Float => "[F".to_string(),
+        ArrayElementType::Double => "[D".to_string(),
+        ArrayElementType::Byte => "[B".to_string(),
+        ArrayElementType::Short => "[S".to_string(),
+        ArrayElementType::Int => "[I".to_string(),
+        ArrayElementType::Long => "[J".to_string(),
+        ArrayElementType::Reference => {
+            let comp = ctx
+                .class_name_of_id(ctx.class_id_of_object(obj))
+                .unwrap_or_default();
+            if comp.is_empty() {
+                "[Ljava/lang/Object;".to_string()
+            } else if comp.starts_with('[') {
+                format!("[{}", comp)
+            } else {
+                format!("[L{};", comp)
+            }
+        }
     }
 }
 

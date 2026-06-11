@@ -1663,7 +1663,10 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
 /// `[I`, `[[Ljava/lang/String;`) for an array heap object.  Mirrors the
 /// interpreter's `array_descriptor_of` (vm/src/runtime/interpreter.rs)
 /// but lives in NativeContext-land so reflection natives can use it.
-fn array_descriptor_for(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> String {
+/// pub(crate): also used by the Object.toString native (lib.rs) so the
+/// default `Name@hash` rendering of arrays matches HotSpot
+/// (`[Ljava.lang.Class;@…`, not the component class name).
+pub(crate) fn array_descriptor_for(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> String {
     use cratonvm_types::ArrayElementType;
     let et = ctx.heap_element_type_of(obj);
     match et {
