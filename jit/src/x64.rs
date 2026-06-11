@@ -16709,6 +16709,16 @@ impl Compiler {
                             arg_slots.push(self.pop_stack());
                         }
                         arg_slots.reverse();
+                        // Cursor at the popped-args depth — the reclaim after
+                        // the call restores THIS level (not `pre_pop_spill`).
+                        // Restoring to pre_pop left the return value parked
+                        // n slots above its semantic depth, permanently
+                        // inflating the cursor by n per non-void dispatch
+                        // site; across a long method the creep walked the
+                        // args buffer past `sub rsp, frame_size` into the
+                        // callee's stack (Bug 4: testAdHocData's FFT receiver
+                        // zeroed by the next helper call's frame).
+                        let post_pop_spill = self.next_spill_offset;
 
                         let args_base_offset = pre_pop_spill;
                         if n > 0 {
@@ -16761,8 +16771,9 @@ impl Compiler {
                         // exception through the method's exception table.
                         self.emit_post_invoke_exception_check();
 
-                        // Reclaim spill slots used for invoke args
-                        self.next_spill_offset = pre_pop_spill;
+                        // Reclaim spill slots used for invoke args AND the
+                        // popped arg values — see `post_pop_spill` above.
+                        self.next_spill_offset = post_pop_spill;
 
                         if info_ref.return_type != b'V' {
                             if matches!(info_ref.return_type, b'D' | b'F') {
@@ -18167,6 +18178,10 @@ impl Compiler {
                                 arg_slots.push(self.pop_stack());
                             }
                             arg_slots.reverse();
+                            // Post-pop cursor — the restore point after the
+                            // dispatch (see the invokestatic twin above for
+                            // the Bug-4 frame-creep rationale).
+                            let post_pop_spill = self.next_spill_offset;
 
                             let args_base_offset = pre_pop_spill;
                             if n > 0 {
@@ -18835,9 +18850,11 @@ impl Compiler {
                             // through this method's exception table.
                             self.emit_post_invoke_exception_check();
 
-                            // Reclaim spill slots used for invoke args — they are
-                            // no longer needed after the helper returns.
-                            self.next_spill_offset = pre_pop_spill;
+                            // Reclaim spill slots used for invoke args AND the
+                            // popped arg values — restoring to `pre_pop_spill`
+                            // here was the Bug-4 cursor creep (n slots per
+                            // non-void dispatch).
+                            self.next_spill_offset = post_pop_spill;
 
                             if info_ref.return_type != b'V' {
                                 if matches!(info_ref.return_type, b'D' | b'F') {
@@ -19613,6 +19630,23 @@ pub fn compile_with_param_slots(
 
     // Calculate max stack depth statically (simplified: use a generous upper bound)
     let max_stack = estimate_max_stack(code, code_len);
+    // Bug-4 frame sizing, part B: the invoke-dispatch sites carve their
+    // outgoing args buffer at the CURRENT spill watermark and extend it by
+    // n*8 bytes for the call's duration. At worst (operand stack at
+    // max_stack depth when the deepest-arity call is emitted) the buffer
+    // tops out n slots past the spill region — overlapping the callee-saved
+    // save area, or, past `frame_size`, the callee's own stack (where the
+    // next CALL's return-address push zeroes it). Reserve the worst-case
+    // arity on top of the estimate so the buffer always stays inside the
+    // reserved frame.
+    let max_invoke_args: usize = invoke_info
+        .iter()
+        // SAFETY: invoke_info pointers are kept alive by the caller for the
+        // duration of compilation (same contract as the emission sites).
+        .map(|(_, p)| unsafe { (**p).num_jit_args })
+        .max()
+        .unwrap_or(0);
+    let max_stack = max_stack + max_invoke_args;
 
     // LICM: detect loops and find invariant aaload sequences to hoist
     let loops = detect_loops(code, code_len);
