@@ -6861,7 +6861,17 @@ pub(crate) fn native_class_get_modifiers(ctx: &mut dyn NativeContext, args: &[Va
     } else {
         own_flags
     };
-    Ok(Some(Value::Int(effective_flags as i32)))
+    // Strip ACC_SUPER (0x0020): it is a JVM-internal class-file flag (legacy
+    // invokespecial semantics), set on virtually every modern class, but it is
+    // NOT a Java language modifier. HotSpot's JVM_GetClassModifiers masks it out
+    // (JVM_RECOGNIZED_CLASS_MODIFIERS excludes 0x0020), so `getModifiers()`
+    // returns e.g. 0x1 (public) not 0x21. ByteBuddy validates generated-subclass
+    // modifiers against its recognized set and throws "Illegal modifiers 33" when
+    // the 0x20 bit leaks through `Note.class.getModifiers()` — breaking
+    // Hibernate's ByteBuddy lazy-proxy generation. (ACC_SUPER never appears in
+    // InnerClasses access flags, so masking is safe on the nested-class path too.)
+    let masked = effective_flags & !0x0020u16;
+    Ok(Some(Value::Int(masked as i32)))
 }
 
 // ---------------------------------------------------------------------------
