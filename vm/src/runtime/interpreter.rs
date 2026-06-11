@@ -8175,20 +8175,20 @@ fn execute_instruction(
                         // Non-array object cannot be cast to an array type.
                         false
                     } else {
-                        let target_class_id = {
-                            let res = shared
-                                .class_manager
-                                .write()
-                                .load_class(&target_class_name);
-                            res.map_err(|e| {
+                        // Use load_class_concurrent (read-lock fast path) not
+                        // class_manager.write().load_class() — the write lock
+                        // would block if any JIT thread holds a read lock during
+                        // compilation, causing interpreter hangs under concurrent JIT.
+                        let target_class_id = shared
+                            .load_class_concurrent(&target_class_name)
+                            .map_err(|e| {
                                 convert_class_not_found(
                                     shared,
                                     thread,
                                     &target_class_name,
                                     VmError::from(e).into(),
                                 )
-                            })?
-                        };
+                            })?;
                         let obj_class_id = shared.heap.class_id_of(obj_ref);
                         shared
                             .class_manager
@@ -8314,20 +8314,16 @@ fn execute_instruction(
                         // Non-array object is not instanceof any array type.
                         0
                     } else {
-                        let target_class_id = {
-                            let res = shared
-                                .class_manager
-                                .write()
-                                .load_class(&target_class_name);
-                            res.map_err(|e| {
+                        let target_class_id = shared
+                            .load_class_concurrent(&target_class_name)
+                            .map_err(|e| {
                                 convert_class_not_found(
                                     shared,
                                     thread,
                                     &target_class_name,
                                     VmError::from(e).into(),
                                 )
-                            })?
-                        };
+                            })?;
                         let obj_class_id = shared.heap.class_id_of(obj_ref);
                         if shared
                             .class_manager
@@ -14855,6 +14851,43 @@ pub fn try_jit_compile_callee(
         is_static: method.is_static(),
     };
     drop(cm);
+
+    // S-HIB.1 — apply the static skip list to callee compilations triggered
+    // from JIT helper callbacks (jit_invoke_virtual_mic et al.).  Without this
+    // check any method — including complex `<init>`/`<clinit>` bodies with
+    // putfield/invokedynamic that the first-call and OSR paths correctly ban —
+    // could be compiled via this path, leading to JIT codegen bugs like the
+    // `JoinedList.<init>` checkcast-on-primitive crash.
+    {
+        let policy = if shared.config.jit_aggressive_compilation {
+            crate::jit::skip_list::SkipPolicy::Aggressive
+        } else {
+            crate::jit::skip_list::SkipPolicy::Conservative
+        };
+        let init_complexity = if method_name == "<init>" || method_name == "<clinit>" {
+            crate::jit::skip_list::classify_init_complexity(&cached.code)
+        } else {
+            crate::jit::skip_list::InitComplexity::Unknown
+        };
+        let is_iface_default = {
+            let cm2 = shared.class_manager.read();
+            cm2.get_class(cached.declaring_class_id)
+                .map_or(false, |c| c.is_interface())
+        };
+        if crate::jit::skip_list::should_skip_jit_with_init(
+            &cached.class_name,
+            method_name,
+            is_iface_default,
+            std::thread::current().name().is_some(),
+            policy,
+            crate::jit::skip_list::allow_packages_from_env(),
+            init_complexity,
+        )
+        .is_some()
+        {
+            return None;
+        }
+    }
 
     // Build resolvers for the callee's constant pool
     let cid = declaring_id;

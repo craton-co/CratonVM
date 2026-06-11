@@ -2106,7 +2106,13 @@ pub(crate) fn build_synthetic_url(ctx: &mut dyn NativeContext, spec: &str) -> Ob
     // above by name), and clobbering them with the full URL spec would make
     // `url.getProtocol()` return the entire string — exactly the bug this
     // helper fixes.
-    let _ = full;
+    //
+    // We DO write slot 5 (URL_FIELD_FULL) which is used by native_url_equals
+    // and native_url_hash_code for correct identity-neutral URL comparison.
+    // Slot 5 in real-JDK URL is `authority` (a String field distinct from
+    // the spec), so writing the full spec here shadows authority — that is
+    // acceptable because build_synthetic_url URLs never have authorities.
+    ctx.set_field(url, 5, Value::Object(Some(full)));
     url
 }
 

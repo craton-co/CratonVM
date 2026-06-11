@@ -125,10 +125,51 @@ fn register_basestream_mode_overrides(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
-/// Native helper: return a fresh empty `Collections$EmptyIterator`.
-/// Used by `BaseStream.iterator()` when the receiver is a bare/synthetic
-/// Stream interface that lost its concrete pipeline class.
-fn native_stream_empty_iterator(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// Native helper backing `BaseStream.iterator()`.
+///
+/// Our synthetic stream pipeline (in `cratonvm-native-collections` /
+/// `phases_late.rs`) is eager: every stage materialises its elements into a
+/// reference array stored at field slot 0 of the synthetic Stream object (the
+/// same array `collect()` / `count()` / `toList()` read — see
+/// `p64_stream_elements` / `native_p64_stream_to_list`). So when the receiver
+/// carries such a backing array we must return a *real* iterator over those
+/// elements — returning an empty iterator here silently drops the entire
+/// stream contents. That regression manifested as Hibernate's
+/// `PersistentClass.getProperties()` (which returns a `JoinedList` whose
+/// `iterator()` is `lists.stream().flatMap(List::stream).iterator()`) yielding
+/// zero properties even though `collect()` saw them all — every mapped entity
+/// lost all of its non-id attributes.
+///
+/// Only when the receiver has no backing element array (a bare/synthetic
+/// `Stream` interface object that lost its concrete pipeline class — the
+/// original Round-63 case for Spring's `stream().iterator()` default-method
+/// path) do we fall back to a fresh empty `Collections$EmptyIterator`.
+fn native_stream_empty_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // When the receiver carries its backing element array at field slot 0
+    // (every CratonVM synthetic Stream/IntStream/... — the same array
+    // `forEach`/`collect`/`count` read via `stream_elements`), return a real
+    // iterator over those elements. Mirrors the proven `ServiceLoader$Itr`
+    // (slot 0 = array, slot 1 = cursor) pattern whose hasNext/next natives are
+    // registered in `servlet.rs`. Returning an empty iterator here silently
+    // drops the whole stream — that regression made Hibernate's
+    // `PersistentClass.getProperties()` (a `JoinedList` whose `iterator()` is
+    // `lists.stream().flatMap(List::stream).iterator()`) yield zero properties
+    // even though `collect()` saw them all, so every mapped entity lost all of
+    // its non-id attributes.
+    if let Some(Value::Object(Some(this))) = args.first().copied() {
+        let arr = match ctx.get_field(this, 0) {
+            // Backing element array present → iterate it.
+            Value::Object(Some(a)) => a,
+            // Bare/synthetic Stream interface that lost its concrete pipeline
+            // class (the original Round-63 Spring `stream().iterator()` case):
+            // no backing array → empty iterator.
+            _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
+        };
+        let itr = alloc_concurrent_synthetic(ctx, "java/util/ServiceLoader$Itr", 2);
+        ctx.set_field(itr, 0, Value::Object(Some(arr)));
+        ctx.set_field(itr, 1, Value::Int(0));
+        return Ok(Some(Value::Object(Some(itr))));
+    }
     let iter = alloc_concurrent_synthetic(ctx, "java/util/Collections$EmptyIterator", 0);
     Ok(Some(Value::Object(Some(iter))))
 }
