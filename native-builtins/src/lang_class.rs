@@ -6966,6 +6966,39 @@ pub fn gc_update_annotation_proxy_refs(pointer_map: &HashMap<usize, usize>) {
     }
 }
 
+/// CRATONVM_REAL_ANNOTATIONS (default-OFF): when set, annotation instances are
+/// materialised as REAL `$ProxyN` proxies that implement the annotation
+/// interface (so `annotation.getClass()` reports a `$ProxyN` class, matching
+/// HotSpot, instead of the annotation type), with the synthetic `AnnotationProxy`
+/// reused as the proxy's `InvocationHandler`. Gated because it re-shapes the
+/// representation of every annotation; needs wide soak before default-ON.
+fn real_annotations_enabled() -> bool {
+    static E: OnceLock<bool> = OnceLock::new();
+    *E.get_or_init(|| std::env::var("CRATONVM_REAL_ANNOTATIONS").is_ok())
+}
+
+/// Wrap a synthetic `AnnotationProxy` data object (`handler`) in a real
+/// `$ProxyN` proxy of the annotation interface `ann_cid`. Returns `None` (so the
+/// caller falls back to the bare AnnotationProxy) if proxy-class generation
+/// fails. The generated proxy's field layout mirrors `Proxy$Instance`:
+/// field 0 = InvocationHandler, field 1 = `Class[]` interfaces, field 2 = id-hash.
+fn wrap_annotation_in_real_proxy(
+    ctx: &mut dyn NativeContext,
+    ann_cid: ClassId,
+    handler: ObjectRef,
+) -> Option<ObjectRef> {
+    let proxy_cid = crate::define_or_get_proxy_class(ctx, 0, &[ann_cid])?;
+    let n = ctx.class_num_total_fields(proxy_cid).max(3);
+    let real = ctx.alloc_object(proxy_cid, n);
+    ctx.set_field(real, 0, Value::Object(Some(handler)));
+    let type_mirror = ctx.get_class_mirror(ann_cid);
+    let iface_arr = ctx.new_ref_array(ClassId::new(0), 1);
+    ctx.set_array_element(iface_arr, 0, Value::Object(Some(type_mirror)));
+    ctx.set_field(real, 1, Value::Object(Some(iface_arr)));
+    ctx.set_field(real, 2, Value::Int(0));
+    Some(real)
+}
+
 /// Create an annotation proxy object from annotation data.
 /// Fills in default values for elements not explicitly provided.
 fn create_annotation_proxy(
@@ -7112,6 +7145,17 @@ fn create_annotation_proxy(
     }
     ctx.set_field(proxy, ANN_PROXY_ELEM_NAMES, Value::Object(Some(names_arr)));
     ctx.set_field(proxy, ANN_PROXY_ELEM_VALUES, Value::Object(Some(values_arr)));
+
+    // CRATONVM_REAL_ANNOTATIONS: hand back a real `$ProxyN` proxy that wraps
+    // this AnnotationProxy as its InvocationHandler (so `getClass()` is a
+    // `$ProxyN`). Falls back to the bare AnnotationProxy when generation fails.
+    if real_annotations_enabled() {
+        if let Some(ann_cid) = ann_class_id_opt {
+            if let Some(real) = wrap_annotation_in_real_proxy(ctx, ann_cid, proxy) {
+                return real;
+            }
+        }
+    }
     proxy
 }
 
