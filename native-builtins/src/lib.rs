@@ -3534,6 +3534,14 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
     });
 
+    // URL.equals / URL.hashCode — based on the URL string to avoid NPE from
+    // null `handler` in synthetic URL objects, and to ensure correct
+    // deduplication when the same resource URL appears from multiple classloaders
+    // (e.g. AggregatedClassLoader iterating N loaders all returning the same
+    // persistence.xml path — LinkedHashSet<URL> must deduplicate them).
+    registry.register("java/net/URL", "equals", "(Ljava/lang/Object;)Z", native_url_equals);
+    registry.register("java/net/URL", "hashCode", "()I", native_url_hash_code);
+
     // --- java.lang.Thread (native methods) ---
     registry.register("java/lang/Thread", "registerNatives", "()V", native_noop);
     registry.register("java/lang/Thread", "currentThread", "()Ljava/lang/Thread;", native_thread_current_thread);
@@ -34097,41 +34105,38 @@ pub fn register_reflect_proxy_natives(registry: &mut NativeMethodRegistry) {
 }
 
 fn native_proxy_is_proxy_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Return true if the Class object's name is "java/lang/reflect/Proxy$Instance".
-    //
-    // Class mirror layout: field 0 = class_id (Int), field 1 = name (String).
-    // We accept both the synthetic class name *and* any class id whose
-    // resolved name names the proxy class (in case the mirror was
-    // assembled by a different code path that left the name field
-    // empty).
-    let is_proxy = match args.first() {
-        Some(Value::Object(Some(class_mirror))) => {
-            // Primary path: explicit name field.
-            let by_name = match ctx.get_field(*class_mirror, 1) {
-                Value::Object(Some(name_ref)) => ctx
-                    .read_string(name_ref)
-                    .map(|n| n == "java/lang/reflect/Proxy$Instance")
-                    .unwrap_or(false),
-                _ => false,
-            };
-            if by_name {
-                true
-            } else {
-                // Secondary path: resolve through class_id.
-                match ctx.get_field(*class_mirror, 0) {
-                    Value::Int(cid_raw) if cid_raw >= 0 => {
-                        let cid = cratonvm_types::ClassId::new(cid_raw as u32);
-                        ctx.class_name_of_id(cid)
-                            .map(|n| n == "java/lang/reflect/Proxy$Instance")
-                            .unwrap_or(false)
-                    }
-                    _ => false,
-                }
-            }
-        }
-        _ => false,
+    // True iff the Class is a proxy class — the legacy shared
+    // `java/lang/reflect/Proxy$Instance`, OR a generated `$ProxyN` class
+    // (which extends `Proxy$Instance`). The generated classes carry their own
+    // name (`com/sun/proxy/$ProxyN` etc.), so a name-only check would wrongly
+    // report `false`; walk the superclass chain instead.
+    let class_mirror = match args.first() {
+        Some(Value::Object(Some(m))) => *m,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let is_proxy = match crate::lang_class::mirror_class_id(ctx, class_mirror) {
+        Some(cid) => proxy_chain_reaches_instance(ctx, cid),
+        None => false,
     };
     Ok(Some(Value::Int(if is_proxy { 1 } else { 0 })))
+}
+
+/// Whether `class_id` is (or descends from) the synthetic
+/// `java/lang/reflect/Proxy$Instance` super class — i.e. it is a proxy class.
+fn proxy_chain_reaches_instance(ctx: &dyn NativeContext, class_id: cratonvm_types::ClassId) -> bool {
+    let mut current = Some(class_id);
+    let mut guard = 0;
+    while let Some(cid) = current {
+        guard += 1;
+        if guard > 64 {
+            break; // defensive: never loop on a malformed hierarchy
+        }
+        if ctx.class_name_of_id(cid).as_deref() == Some("java/lang/reflect/Proxy$Instance") {
+            return true;
+        }
+        current = ctx.superclass_of(cid);
+    }
+    false
 }
 
 fn native_proxy_get_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -34430,8 +34435,21 @@ fn define_or_get_proxy_class(
     // on the second+ call.
     let _ = ctx.ensure_class_initialized("java/lang/reflect/Proxy$Instance");
 
-    let (gen_name, spec) = build_proxy_spec_for(ctx, &sorted)?;
-    let bytes = cratonvm_classloading::proxy_gen::emit_proxy_classfile(&spec).ok()?;
+    let dbg = std::env::var("CRATONVM_DBG_PROXY").is_ok();
+    let (gen_name, spec) = match build_proxy_spec_for(ctx, &sorted) {
+        Some(v) => v,
+        None => {
+            if dbg { eprintln!("[DBG_PROXY] build_proxy_spec_for returned None for ifaces={sorted:?}"); }
+            return None;
+        }
+    };
+    let bytes = match cratonvm_classloading::proxy_gen::emit_proxy_classfile(&spec) {
+        Ok(b) => b,
+        Err(e) => {
+            if dbg { eprintln!("[DBG_PROXY] emit_proxy_classfile({gen_name}) failed: {e:?}"); }
+            return None;
+        }
+    };
     let opts = cratonvm_native_api::DefineClassFull {
         // WP2.5-v3 item 4 — every method body emitted by `proxy_gen`
         // (constructor super-delegate, per-method dispatch shim, and
@@ -34447,12 +34465,16 @@ fn define_or_get_proxy_class(
     };
     match ctx.define_class_full(&gen_name, &bytes, loader_id, opts) {
         Ok(cid) => {
+            if dbg { eprintln!("[DBG_PROXY] define_class_full OK: {gen_name} -> {cid:?}"); }
             let mut guard = PROXY_CLASS_CACHE.write();
             let map = guard.get_or_insert_with(rustc_hash::FxHashMap::default);
             map.insert(cache_key, cid);
             Some(cid)
         }
-        Err(_) => None,
+        Err(e) => {
+            if dbg { eprintln!("[DBG_PROXY] define_class_full({gen_name}) failed: {e}"); }
+            None
+        }
     }
 }
 
@@ -34472,7 +34494,6 @@ fn build_proxy_spec_for(
     const ACC_ABSTRACT: u16 = 0x0400;
 
     let n = PROXY_CLASS_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let gen_class_name = format!("java/lang/reflect/$Proxy{n}");
 
     // Resolve iface internal names.
     let mut iface_names: Vec<String> = Vec::with_capacity(sorted_ifaces.len());
@@ -34482,6 +34503,32 @@ fn build_proxy_spec_for(
             None => return None,
         }
     }
+
+    // Choose the generated proxy class's package the way the JDK's
+    // `Proxy.ProxyBuilder` does, and — critically — NOT a protected platform
+    // package (`java/*`, `sun/*`, `jdk/internal/*`), which `define_class_full`
+    // rejects for a non-bootstrap loader ("Prohibited package name"). The old
+    // hard-coded `java/lang/reflect/$ProxyN` always failed that check, so every
+    // proxy silently fell back to the single shared `Proxy$Instance` (wrong
+    // `getClass().getName()` and a shared/stale `getInterfaces()`).
+    //
+    //   * If any proxied interface is non-public, the proxy must live in that
+    //     interface's package (matches the JDK; yields `$ProxyN` in the default
+    //     package for a package-private interface, exactly like HotSpot).
+    //   * Otherwise all interfaces are public → use `com/sun/proxy`.
+    let non_public_pkg = sorted_ifaces.iter().find_map(|cid| {
+        if ctx.class_access_flags(*cid) & ACC_PUBLIC == 0 {
+            let name = ctx.class_name_of_id(*cid)?;
+            Some(name.rfind('/').map(|i| name[..i].to_string()).unwrap_or_default())
+        } else {
+            None
+        }
+    });
+    let gen_class_name = match non_public_pkg {
+        Some(pkg) if pkg.is_empty() => format!("$Proxy{n}"),
+        Some(pkg) => format!("{pkg}/$Proxy{n}"),
+        None => format!("com/sun/proxy/$Proxy{n}"),
+    };
 
     // BFS over interface inheritance. Collect public, non-static,
     // non-`<init>`/`<clinit>` methods. Abstract beats default if the
