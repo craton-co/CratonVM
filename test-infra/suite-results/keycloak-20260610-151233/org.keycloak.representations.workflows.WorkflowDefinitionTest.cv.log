@@ -1,0 +1,39 @@
+JUnit version 4.13.2
+[2m2026-06-10T18:14:08.887387Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+.{
+  "id" : "workflow-id",
+  "name" : "my-name",
+  "enabled" : true,
+  "on" : "event",
+  "concurrency" : {
+    "cancel-in-progress" : "user-role-removed(admin)",
+    "restart-in-progress" : "true"
+  },
+  "if" : "condition-1(v1) AND (condition-2(key1:v1) OR condition-3(key2:v2,v3))",
+  "steps" : [ {
+    "uses" : "step-1",
+    "after" : "10",
+    "with" : {
+      "key1" : "v1"
+    }
+  }, {
+    "uses" : "step-2",
+    "with" : {
+      "key1" : [ "v1", "v2" ]
+    }
+  }, {
+    "uses" : "step-1",
+    "with" : {
+      "key1" : "v1"
+    }
+  } ]
+}
+.{
+  "on" : "event OR other-event"
+}
+
+Time: 3.901
+
+OK (2 tests)
+
+[cratonvm] System.exit(0) called — process terminating

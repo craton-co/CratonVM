@@ -1,0 +1,12 @@
+JUnit version 4.13.2
+[2m2026-06-10T19:26:07.138948Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m JDK cacerts=C:\Program Files\Java\jdk-25\lib\security\cacerts PKCS#12 parse failed: PKCS#12: bag decode failed
+[2m2026-06-10T19:26:07.139031Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T19:26:07.296339Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+INFO [org.keycloak.crypto.def.test.DefaultCryptoHmacTest] %s: Length of encoded content: %d, Length of secret key: %d
+INFO [org.keycloak.crypto.def.test.DefaultCryptoHmacTest] %s: Length of encoded content: %d, Length of secret key: %d
+..
+Time: 2.748
+
+OK (2 tests)
+
+[cratonvm] System.exit(0) called — process terminating

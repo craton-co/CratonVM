@@ -1,0 +1,21 @@
+JUnit version 4.13.2
+E
+Time: 0.051
+There was 1 failure:
+1) org.keycloak.sdjwt.sdjwtvp.SdJwtKeyBindingTest
+java.lang.IllegalStateException: Not able to load any cryptoProvider with the classLoader: jdk.internal.loader.ClassLoaders$AppClassLoader@ce9
+	at org.junit.runner.JUnitCore.main(JUnitCore.java:36)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.rules.ExternalResource$1.evaluate(ExternalResource.java:50)
+	at org.keycloak.common.crypto.CryptoIntegration.init(CryptoIntegration.java:33)
+	at org.keycloak.common.crypto.CryptoIntegration.detectProvider(CryptoIntegration.java:65)
+
+FAILURES!!!
+Tests run: 0,  Failures: 1
+
+[cratonvm] System.exit(1) called — process terminating

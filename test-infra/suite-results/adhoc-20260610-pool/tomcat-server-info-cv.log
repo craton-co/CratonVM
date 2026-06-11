@@ -1,0 +1,4 @@
+tomcat-server-info        | rc=0   |  1.73s | PASS       |
+
+regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0
+results: /c/craton/CratonVM/apps/probe/test-infra/regression-pool/results/20260610-011204.tsv

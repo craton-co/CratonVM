@@ -1,0 +1,4 @@
+n=1048576 iters=5 warmup=2
+best_ns=781300 mean_ns=848760 out[0]=0 out[n-1]=1048600
+correctness=OK
+[cratonvm] System.exit(0) called — process terminating

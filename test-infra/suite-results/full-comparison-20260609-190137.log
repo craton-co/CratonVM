@@ -1,0 +1,203 @@
+
+------------------------------------------------------------------------------
+## bench: arith1500M
+------------------------------------------------------------------------------
+  cratonvm-jit    rc=0   OK           4533 ms  chk=2812500002999999995 
+  hotspot         rc=0   OK           2339 ms  chk=2812500002999999995 
+  tornadovm       rc=0   OK           2384 ms  chk=2812500002999999995 
+
+------------------------------------------------------------------------------
+## bench: fib44
+------------------------------------------------------------------------------
+  cratonvm-jit    rc=0   OK           7410 ms  chk=701408733 
+  hotspot         rc=0   OK           5482 ms  chk=701408733 
+  tornadovm       rc=0   OK           5471 ms  chk=701408733 
+
+------------------------------------------------------------------------------
+## bench: sieve250k
+------------------------------------------------------------------------------
+  cratonvm-jit    rc=0   OK           2990 ms  chk=22044 
+  hotspot         rc=0   OK           2374 ms  chk=22044 
+  tornadovm       rc=0   OK           2254 ms  chk=22044 
+
+------------------------------------------------------------------------------
+## bench: matrix600
+------------------------------------------------------------------------------
+  cratonvm-jit    rc=0   OK           1508 ms  chk=6479950792 
+  hotspot         rc=0   OK            662 ms  chk=6479950792 
+  tornadovm       rc=0   OK            753 ms  chk=6479950792 
+
+------------------------------------------------------------------------------
+## bench: bintrees18
+------------------------------------------------------------------------------
+  cratonvm-jit    rc=0   OK          68462 ms  chk=68332206 
+  hotspot         rc=0   OK           1086 ms  chk=68332206 
+  tornadovm       rc=0   OK           1069 ms  chk=68332206 
+
+------------------------------------------------------------------------------
+## bench: vadd2_28
+------------------------------------------------------------------------------
+  cratonvm-jit    rc=0   OK           4234 ms  chk=108086390654238720 
+  hotspot         rc=0   OK           3345 ms  chk=108086390654238720 
+  tornadovm       rc=0   OK           3562 ms  chk=108086390654238720 
+
+------------------------------------------------------------------------------
+## bc: asn1-regression (heap=1g)
+------------------------------------------------------------------------------
+  cratonvm    rc=0   OK         64.7s  heap=1g   StreamLimit: Okay
+  hotspot     rc=0   OK          1.4s  heap=1g   StreamLimit: Okay
+  tornadovm   rc=0   OK          1.5s  heap=1g   StreamLimit: Okay
+
+------------------------------------------------------------------------------
+## bc: math-ec (heap=1g)
+------------------------------------------------------------------------------
+  cratonvm    rc=124 TIMEOUT   300.2s  heap=1g   
+  hotspot     rc=0   OK         51.3s  heap=1g   OK (14 tests)
+  tornadovm   rc=0   OK         52.4s  heap=1g   OK (14 tests)
+
+------------------------------------------------------------------------------
+## bc: math-raw (heap=1g)
+------------------------------------------------------------------------------
+  cratonvm    rc=0   OK          2.6s  heap=1g   OK (4 tests)
+  hotspot     rc=0   OK          0.5s  heap=1g   OK (4 tests)
+  tornadovm   rc=0   OK          0.5s  heap=1g   OK (4 tests)
+
+------------------------------------------------------------------------------
+## bc: math (heap=1g)
+------------------------------------------------------------------------------
+  cratonvm    rc=0   OK          9.5s  heap=1g   OK (5 tests)
+  hotspot     rc=0   OK          1.1s  heap=1g   OK (5 tests)
+  tornadovm   rc=0   OK          1.0s  heap=1g   OK (5 tests)
+
+------------------------------------------------------------------------------
+## bc: crypto-regression (heap=4g)
+------------------------------------------------------------------------------
+  cratonvm    rc=124 TIMEOUT   300.8s  heap=4g   AESWrapPad: Okay
+  hotspot     rc=0   OK        125.6s  heap=4g   =>  LEA: Exception: java.lang.StringIndexOutOfBoundsException: Range [0, -1) out of bounds for length 2
+  tornadovm   rc=0   OK        174.9s  heap=4g   =>  LEA: Exception: java.lang.StringIndexOutOfBoundsException: Range [0, -1) out of bounds for length 2
+
+------------------------------------------------------------------------------
+## bc: crypto-prng (heap=1g)
+------------------------------------------------------------------------------
+  cratonvm    rc=0   OK         36.5s  heap=1g   FixedSecureRandom: Okay
+  hotspot     rc=0   OK          0.6s  heap=1g   FixedSecureRandom: Okay
+  tornadovm   rc=0   OK          0.6s  heap=1g   FixedSecureRandom: Okay
+
+------------------------------------------------------------------------------
+## bc: pqc-crypto (heap=2g)
+------------------------------------------------------------------------------
+  cratonvm    rc=1   OK         58.7s  heap=2g   Sphincs256: Okay
+  hotspot     rc=0   OK          1.2s  heap=2g   NewHope: Okay
+  tornadovm   rc=0   OK          1.3s  heap=2g   NewHope: Okay
+
+------------------------------------------------------------------------------
+## bc: util-encoders (heap=1g)
+------------------------------------------------------------------------------
+  cratonvm    rc=127 FAIL        4.7s  heap=1g   
+  hotspot     rc=0   OK          0.5s  heap=1g   OK (15 tests)
+  tornadovm   rc=0   OK          0.6s  heap=1g   OK (15 tests)
+
+------------------------------------------------------------------------------
+## commons-math (JUnit Platform launcher)
+------------------------------------------------------------------------------
+  cratonvm    rc=1   RAN        86.9s  Caused by: java.lang.AbstractMethodError: method java/nio/file/attribute/BasicFileAttributes.isDirectory()Z has no Code attribute 2026-06-09T22:24:33.232187Z  WARN cratonvm_vm::vm::vm_exec: NoSuchMeth
+  hotspot     rc=127 RAN         0.8s  Caused by: java.lang.NoClassDefFoundError: org/apache/commons/rng/UniformRandomProvider Caused by: java.lang.ClassNotFoundException: org.apache.commons.rng.UniformRandomProvider 
+  tornadovm   rc=127 RAN         1.2s  Caused by: java.lang.NoClassDefFoundError: org/apache/commons/rng/UniformRandomProvider Caused by: java.lang.ClassNotFoundException: org.apache.commons.rng.UniformRandomProvider 
+
+------------------------------------------------------------------------------
+## extras: junit-help
+------------------------------------------------------------------------------
+  cratonvm-jit    rc=0   FAIL       13.4s  Usage: junit [OPTIONS] [COMMAND]
+  hotspot         rc=0   OK          0.5s  Usage: junit [OPTIONS] [COMMAND]
+  tornadovm       rc=0   OK          0.8s  Usage: junit [OPTIONS] [COMMAND]
+
+------------------------------------------------------------------------------
+## extras: dacapo-avrora
+------------------------------------------------------------------------------
+  cratonvm-jit    rc=0   N/S         5.7s  ===== DaCapo unknown avrora PASSED in 196 msec =====
+  hotspot         rc=127 N/S         0.8s  Validation FAILED for avrora default
+  tornadovm       rc=1   N/S         0.3s  Caused by: java.lang.module.InvalidModuleDescriptorException: Harness.class found in top-level directory (unnamed package not allowed in module)
+
+------------------------------------------------------------------------------
+## COMPARISON TABLES
+------------------------------------------------------------------------------
+
+=== §1 Micro-benchmarks — wall time (ms) ===
+
+  benchmark  | cratonvm-jit | hotspot | tornadovm
+  -----------+--------------+---------+----------
+  arith1500M | 4533         | 2339    | 2384     
+  fib44      | 7410         | 5482    | 5471     
+  sieve250k  | 2990         | 2374    | 2254     
+  matrix600  | 1508         | 662     | 753      
+  bintrees18 | 68462        | 1086    | 1069     
+  vadd2_28   | 4234         | 3345    | 3562     
+
+=== §1 Micro-benchmarks — state ===
+
+  benchmark  | cratonvm-jit | hotspot | tornadovm
+  -----------+--------------+---------+----------
+  arith1500M | OK           | OK      | OK       
+  fib44      | OK           | OK      | OK       
+  sieve250k  | OK           | OK      | OK       
+  matrix600  | OK           | OK      | OK       
+  bintrees18 | OK           | OK      | OK       
+  vadd2_28   | OK           | OK      | OK       
+
+=== §1 Micro-benchmarks — checksum ===
+
+  benchmark  | cratonvm-jit        | hotspot             | tornadovm          
+  -----------+---------------------+---------------------+--------------------
+  arith1500M | 2812500002999999995 | 2812500002999999995 | 2812500002999999995
+  fib44      | 701408733           | 701408733           | 701408733          
+  sieve250k  | 22044               | 22044               | 22044              
+  matrix600  | 6479950792          | 6479950792          | 6479950792         
+  bintrees18 | 68332206            | 68332206            | 68332206           
+  vadd2_28   | 108086390654238720  | 108086390654238720  | 108086390654238720 
+
+=== §2 Bouncy Castle — state ===
+
+  bc-suite          | cratonvm | hotspot | tornadovm
+  ------------------+----------+---------+----------
+  asn1-regression   | OK       | OK      | OK       
+  math-ec           | TIMEOUT  | OK      | OK       
+  math-raw          | OK       | OK      | OK       
+  math              | OK       | OK      | OK       
+  crypto-regression | TIMEOUT  | OK      | OK       
+  crypto-prng       | OK       | OK      | OK       
+  pqc-crypto        | OK       | OK      | OK       
+  util-encoders     | FAIL     | OK      | OK       
+
+=== §2 Bouncy Castle — wall time (s) ===
+
+  bc-suite          | cratonvm | hotspot | tornadovm
+  ------------------+----------+---------+----------
+  asn1-regression   | 64.7     | 1.4     | 1.5      
+  math-ec           | 300.2    | 51.3    | 52.4     
+  math-raw          | 2.6      | 0.5     | 0.5      
+  math              | 9.5      | 1.1     | 1.0      
+  crypto-regression | 300.8    | 125.6   | 174.9    
+  crypto-prng       | 36.5     | 0.6     | 0.6      
+  pqc-crypto        | 58.7     | 1.2     | 1.3      
+  util-encoders     | 4.7      | 0.5     | 0.6      
+
+=== §3 Commons Math (JUnit Platform launcher, transform module) ===
+
+  cratonvm    rc=1   wall=86.9   s RAN      Caused by: java.lang.AbstractMethodError: method java/nio/file/attribute/BasicFileAttributes.isDirectory()Z has no Code attribute 2026-06-09T22:24:33.232187Z  WARN cratonvm_vm::vm::vm_exec: NoSuchMeth
+  hotspot     rc=127 wall=0.8    s RAN      Caused by: java.lang.NoClassDefFoundError: org/apache/commons/rng/UniformRandomProvider Caused by: java.lang.ClassNotFoundException: org.apache.commons.rng.UniformRandomProvider 
+  tornadovm   rc=127 wall=1.2    s RAN      Caused by: java.lang.NoClassDefFoundError: org/apache/commons/rng/UniformRandomProvider Caused by: java.lang.ClassNotFoundException: org.apache.commons.rng.UniformRandomProvider 
+
+=== §4 Extras — state ===
+
+  item          | cratonvm-jit | hotspot | tornadovm
+  --------------+--------------+---------+----------
+  junit-help    | FAIL         | OK      | OK       
+  dacapo-avrora | N/S          | N/S     | N/S      
+------------------------------------------------------------------------------
+TSVs:
+  bench:  C:/craton/CratonVM/test-infra/suite-results/cmp-bench-20260609-190137.tsv
+  bc:     C:/craton/CratonVM/test-infra/suite-results/cmp-bc-20260609-190137.tsv
+  cm:     C:/craton/CratonVM/test-infra/suite-results/cmp-cm-20260609-190137.tsv
+  extras: C:/craton/CratonVM/test-infra/suite-results/cmp-extras-20260609-190137.tsv
+------------------------------------------------------------------------------
+Done — Tue Jun  9 19:25:55     2026

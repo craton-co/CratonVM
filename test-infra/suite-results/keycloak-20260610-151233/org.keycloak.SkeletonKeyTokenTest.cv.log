@@ -1,0 +1,12 @@
+JUnit version 4.13.2
+[2m2026-06-10T18:12:59.296099Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+INFO [org.keycloak.common.util.DelegatingSerializationFilter] Using OnJavaAfter8 serialization filter adapter
+WARN [org.keycloak.common.util.DelegatingSerializationFilter] Could not set ObjectFilter: null
+WARN [org.keycloak.common.util.DelegatingSerializationFilter] Could not set ObjectFilter: null
+.Size of serialized principal: 1210
+....
+Time: 16.106
+
+OK (5 tests)
+
+[cratonvm] System.exit(0) called — process terminating

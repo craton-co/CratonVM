@@ -1,0 +1,25 @@
+suite	vm	rc	state	wall_s	note
+h2-testall-fast	cratonvm	0	PASS	1.2	[2m2026-06-10T01:26:56.068000Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util
+h2-testall-fast	hotspot	0	PASS	0.3	00:00.020 total
+wildfly-health	cratonvm	1	FAIL	4.4	FAIL testSchema[0](org.wildfly.extension.health.HealthSubsystemTestCase) :: fatal error: Premature end of file.
+wildfly-health	hotspot	-	SKIP	-	CratonVM not PASS
+elasticsearch-version	cratonvm	70	FAIL	3.6	Exception
+elasticsearch-version	hotspot	-	SKIP	-	-
+gpu-bench-cpu	cratonvm	0	PASS	1.2	[cratonvm] System.exit(0) called — process terminating
+gpu-bench-cpu	hotspot	0	PASS	0.2	correctness=OK
+gpu-offload-probe	cratonvm	0	PASS	1.5	OUT0=0 OUTN=1048600
+gpu-offload-probe	hotspot	0	PASS	0.2	OUT0=0 OUTN=1048600
+bc-asn1-regression	cratonvm	1	PASS	13.6	GeneralName: Okay
+bc-asn1-regression	hotspot	0	PASS	1.8	All tests successful.
+bc-crypto-prng	cratonvm	0	PASS	45.4	All tests successful.
+bc-crypto-prng	hotspot	0	PASS	0.5	All tests successful.
+commons-math-junit-probe	cratonvm	0	FAIL	5.1	EXEC_FOUND=4 SUCCEEDED=4 FAILED=0
+commons-math-junit-probe	hotspot	-	SKIP	-	CratonVM not PASS
+dacapo-avrora	cratonvm	0	PASS	6.9	PASSED
+dacapo-avrora	hotspot	127	N/S	1.0	FAILED
+pool:kafka-codec	cratonvm	0	PASS	1.46	 regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+pool:kafka-codec	hotspot	1	REGRESS	0.12	-
+pool:spring-boot-run	cratonvm	0	PASS	3.41	 regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+pool:spring-boot-run	hotspot	1	REGRESS	0.10	-
+pool:tomcat-server-info	cratonvm	0	PASS	1.20	 regression-pool: total=1 pass=1 regress=0 slow=0 no_base=0 no_stage=0 results: /c/craton/CratonVM/apps/probe/test-infra
+pool:tomcat-server-info	hotspot	1	REGRESS	0.09	-

@@ -1,0 +1,754 @@
+JUnit version 4.13.2
+[2m2026-06-10T18:23:50.992148Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m JDK cacerts=C:\Program Files\Java\jdk-25\lib\security\cacerts PKCS#12 parse failed: PKCS#12: bag decode failed
+[2m2026-06-10T18:23:50.992279Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:50.999608Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.088833Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.095758Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.103603Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.112175Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.119837Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.132070Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.140838Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.148351Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.204611Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.212834Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.220489Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.227250Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.234767Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.242558Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.251100Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.257838Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.264984Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.272041Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.278736Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.286785Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.293592Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.301019Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.308926Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.328293Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.336379Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.356651Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.370331Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.383380Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.390841Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.400966Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.408392Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.416319Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.428198Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.482007Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.489773Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.498204Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.505654Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.513873Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.524497Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.532077Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.540494Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.553328Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.560881Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.568615Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.579294Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.586640Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.596060Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.603078Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.611357Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.618548Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.626879Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.634903Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.644098Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.659996Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.667129Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.675801Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.682474Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.691057Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.698376Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.708522Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.716097Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.728378Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.738107Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.755549Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.761749Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.768870Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.787656Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.794714Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.803668Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.811339Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.818860Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.828231Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.835656Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.843295Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.873461Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.880813Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.888892Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.896470Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.904079Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.923643Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.930474Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.937869Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.945479Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.953408Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.961104Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.969401Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.975949Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.984622Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.991607Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:51.998779Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.006760Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.015765Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.023886Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.031485Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.038589Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.046805Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.054032Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.062050Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.069501Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.077527Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.083839Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.091477Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.099504Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.109260Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.116188Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.124429Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.130928Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.138585Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.145410Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.148552Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+[2m2026-06-10T18:23:52.166426Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.173776Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.180958Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.187097Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.295609Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.303189Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.309888Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.317705Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.328277Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.338177Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.345050Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.352986Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.391501Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.458036Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.465414Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.474910Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.482550Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.489656Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.508594Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.515813Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.523524Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.530446Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.537194Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.551805Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.558990Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.566712Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.573988Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.582198Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.589247Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.597496Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.605406Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.615030Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.622486Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.632136Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.639336Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.647341Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.654668Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.661927Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.669198Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.676700Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.683780Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.690733Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.697373Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.704479Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.711764Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.719921Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.727183Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.736147Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.744079Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.754894Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.762765Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.770760Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.778522Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.786908Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.794200Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.801495Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.808497Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.816310Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.823560Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.830752Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.842355Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.849915Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.857988Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.879638Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.886822Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.894552Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.901796Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.909196Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.916300Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.926686Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.934818Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.942897Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.950314Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.958895Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.965767Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.973863Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.981171Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.988399Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:52.995272Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.002752Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.010056Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.017434Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.024547Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.031579Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.038398Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.045854Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.053696Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.070946Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.078896Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.087225Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.094804Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.103100Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.110668Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.118938Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.125923Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.134919Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.141794Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.149000Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.158277Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.166422Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.178465Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.197503Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.204125Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.243286Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.250824Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.258772Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.269854Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.277801Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.284951Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.294956Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.302826Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.328507Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.453963Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.462140Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.490740Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.503850Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.512427Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.524409Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.532414Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.547985Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.558527Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.567586Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.577297Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.626935Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.712722Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.934502Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.942205Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.951520Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.958788Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.970034Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.983976Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:53.991400Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.000622Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.008478Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.021568Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.031776Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.042510Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.050008Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.062079Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.071451Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.080922Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.090713Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.098816Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.107716Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.124582Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.132861Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.139621Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.146708Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.156290Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.166280Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.173432Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.181252Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.188265Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.258585Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.268015Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.275661Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.282667Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.298492Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.306857Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.315081Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.323898Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.332405Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.343519Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.351148Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.359088Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.366049Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.376572Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.385728Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.396486Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.405057Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.412917Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.419782Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.433438Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.442274Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.452442Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.470532Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.525483Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.533150Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.540943Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.547862Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.555046Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.562383Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.570267Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.577046Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.584653Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.593002Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.599453Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.607829Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.616543Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.628283Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.644880Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.652929Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.660608Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.668817Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.677640Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.686138Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.694448Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.706880Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.717968Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.728255Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.740024Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.756010Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.770758Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.983832Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:54.992709Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.001020Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.009756Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.716432Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.724224Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.733329Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.741541Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.749801Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.758713Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.766741Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.775374Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.784266Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.793737Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.802753Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.809893Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.816777Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.825310Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.834779Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.844111Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.851985Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.859901Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.868206Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.876882Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.885311Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.894254Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.904599Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.912020Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.920139Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.928461Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.938522Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.946830Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.955114Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.963868Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.976222Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.983843Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:55.992755Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.001666Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.012706Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.021751Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.030464Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.037344Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.044777Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.052993Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.066117Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.073756Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.082474Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.090319Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.100990Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.109629Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.117994Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.126303Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.135183Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.142704Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.150751Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.340627Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.348813Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.356911Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.364782Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.373096Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.381418Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.389628Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.397928Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.467149Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:56.479406Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.054843Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.062508Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.069570Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.078083Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.084574Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.091246Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.097915Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.105538Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.114633Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.121623Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.128483Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.131782Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.169097Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.654127Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.685778Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.693342Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.696301Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.700348Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.701922Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.753903Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.764986Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.774331Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.786009Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.810960Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.867563Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.904527Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:58.926439Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.060507Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.156112Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.159291Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.160478Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.247173Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.254302Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.265623Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.278384Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.285560Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.293954Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.301506Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.308601Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.327125Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.334647Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.342152Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.347286Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.348626Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.355333Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.362213Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.364719Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.368707Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.433340Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.435459Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+[2m2026-06-10T18:23:59.436817Z[0m [33m WARN[0m [2mcratonvm_classloading::jar_signer[0m[2m:[0m jar signer: rejecting signer block: SignerInfo is missing authenticatedAttributes — refusing to skip integrity check
+...E.E.E.E
+Time: 9.273
+There were 4 failures:
+1) testDecodeCertificateBundle(org.keycloak.crypto.def.test.PemUtilsBCTest)
+org.keycloak.common.util.PemException: org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory$ExCertificateException: parsing issue: cannot construct SigAlgName: java.lang.IllegalStateException
+	at org.junit.runner.JUnitCore.main(JUnitCore.java:36)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.rules.ExternalResource$1.evaluate(ExternalResource.java:54)
+	at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:293)
+	at org.junit.runners.ParentRunner.access$100(ParentRunner.java:66)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:79)
+	at org.junit.runners.ParentRunner$4.run(ParentRunner.java:331)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:63)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:103)
+	at org.junit.runners.ParentRunner.runLeaf(ParentRunner.java:366)
+	at org.junit.runners.BlockJUnit4ClassRunner$1.evaluate(BlockJUnit4ClassRunner.java:100)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:26)
+	at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:56)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:59)
+	at org.keycloak.util.PemUtilsTest.testDecodeCertificateBundle(PemUtilsTest.java:157)
+	at org.keycloak.common.util.PemUtils.decodeCertificates(PemUtils.java:68)
+	at org.keycloak.common.crypto.PemUtilsProvider.decodeCertificate(PemUtilsProvider.java:60)
+	at org.keycloak.common.util.PemException.<init>(PemException.java:26)
+Caused by: org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory$ExCertificateException: parsing issue: cannot construct SigAlgName: java.lang.IllegalStateException
+	at org.junit.runner.JUnitCore.main(JUnitCore.java:36)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.rules.ExternalResource$1.evaluate(ExternalResource.java:54)
+	at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:293)
+	at org.junit.runners.ParentRunner.access$100(ParentRunner.java:66)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:79)
+	at org.junit.runners.ParentRunner$4.run(ParentRunner.java:331)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:63)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:103)
+	at org.junit.runners.ParentRunner.runLeaf(ParentRunner.java:366)
+	at org.junit.runners.BlockJUnit4ClassRunner$1.evaluate(BlockJUnit4ClassRunner.java:100)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:26)
+	at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:56)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:59)
+	at org.keycloak.util.PemUtilsTest.testDecodeCertificateBundle(PemUtilsTest.java:157)
+	at org.keycloak.common.util.PemUtils.decodeCertificates(PemUtils.java:68)
+	at org.keycloak.common.crypto.PemUtilsProvider.decodeCertificate(PemUtilsProvider.java:58)
+	at org.keycloak.common.util.DerUtils.decodeCertificate(DerUtils.java:81)
+	at java.security.cert.CertificateFactory.generateCertificate(CertificateFactory.java:359)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory.doGenerateCertificate(Unknown Source)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory$ExCertificateException.<init>(Unknown Source)
+	at java.security.cert.CertificateException.<init>(CertificateException.java:58)
+	at java.security.GeneralSecurityException.<init>(GeneralSecurityException.java:58)
+Caused by: java.security.cert.CertificateParsingException: cannot construct SigAlgName: java.lang.IllegalStateException
+	at org.junit.runner.JUnitCore.main(JUnitCore.java:36)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.rules.ExternalResource$1.evaluate(ExternalResource.java:54)
+	at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:293)
+	at org.junit.runners.ParentRunner.access$100(ParentRunner.java:66)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:79)
+	at org.junit.runners.ParentRunner$4.run(ParentRunner.java:331)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:63)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:103)
+	at org.junit.runners.ParentRunner.runLeaf(ParentRunner.java:366)
+	at org.junit.runners.BlockJUnit4ClassRunner$1.evaluate(BlockJUnit4ClassRunner.java:100)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:26)
+	at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:56)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:59)
+	at org.keycloak.util.PemUtilsTest.testDecodeCertificateBundle(PemUtilsTest.java:157)
+	at org.keycloak.common.util.PemUtils.decodeCertificates(PemUtils.java:68)
+	at org.keycloak.common.crypto.PemUtilsProvider.decodeCertificate(PemUtilsProvider.java:58)
+	at org.keycloak.common.util.DerUtils.decodeCertificate(DerUtils.java:81)
+	at java.security.cert.CertificateFactory.generateCertificate(CertificateFactory.java:359)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory.doGenerateCertificate(Unknown Source)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory.getCertificate(Unknown Source)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.X509CertificateObject.<init>(Unknown Source)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.X509CertificateObject.createSigAlgName(Unknown Source)
+	at java.security.cert.CertificateParsingException.<init>(CertificateParsingException.java:58)
+	at java.security.cert.CertificateException.<init>(CertificateException.java:58)
+	at java.security.GeneralSecurityException.<init>(GeneralSecurityException.java:58)
+2) testEncodeAndDecodeGeneratedObjects(org.keycloak.crypto.def.test.PemUtilsBCTest)
+java.lang.RuntimeException: Error creating X509v1Certificate.
+	at org.junit.runner.JUnitCore.main(JUnitCore.java:36)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.rules.ExternalResource$1.evaluate(ExternalResource.java:54)
+	at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:293)
+	at org.junit.runners.ParentRunner.access$100(ParentRunner.java:66)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:79)
+	at org.junit.runners.ParentRunner$4.run(ParentRunner.java:331)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:63)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:103)
+	at org.junit.runners.ParentRunner.runLeaf(ParentRunner.java:366)
+	at org.junit.runners.BlockJUnit4ClassRunner$1.evaluate(BlockJUnit4ClassRunner.java:100)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:26)
+	at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:56)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:59)
+	at org.keycloak.util.PemUtilsTest.testEncodeAndDecodeGeneratedObjects(PemUtilsTest.java:44)
+	at org.keycloak.crypto.def.BCCertificateUtilsProvider.generateV1SelfSignedCertificate(BCCertificateUtilsProvider.java:183)
+Caused by: org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory$ExCertificateException: parsing issue: cannot construct SigAlgName: java.lang.IllegalStateException
+	at org.junit.runner.JUnitCore.main(JUnitCore.java:36)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.rules.ExternalResource$1.evaluate(ExternalResource.java:54)
+	at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:293)
+	at org.junit.runners.ParentRunner.access$100(ParentRunner.java:66)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:79)
+	at org.junit.runners.ParentRunner$4.run(ParentRunner.java:331)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:63)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:103)
+	at org.junit.runners.ParentRunner.runLeaf(ParentRunner.java:366)
+	at org.junit.runners.BlockJUnit4ClassRunner$1.evaluate(BlockJUnit4ClassRunner.java:100)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:26)
+	at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:56)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:59)
+	at org.keycloak.util.PemUtilsTest.testEncodeAndDecodeGeneratedObjects(PemUtilsTest.java:44)
+	at org.keycloak.crypto.def.BCCertificateUtilsProvider.generateV1SelfSignedCertificate(BCCertificateUtilsProvider.java:181)
+	at org.bouncycastle.cert.jcajce.JcaX509CertificateConverter.getCertificate(Unknown Source)
+	at java.security.cert.CertificateFactory.generateCertificate(CertificateFactory.java:359)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory.engineGenerateCertificate(Unknown Source)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory.doGenerateCertificate(Unknown Source)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory$ExCertificateException.<init>(Unknown Source)
+	at java.security.cert.CertificateException.<init>(CertificateException.java:58)
+	at java.security.GeneralSecurityException.<init>(GeneralSecurityException.java:58)
+Caused by: java.security.cert.CertificateParsingException: cannot construct SigAlgName: java.lang.IllegalStateException
+	at org.junit.runner.JUnitCore.main(JUnitCore.java:36)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.rules.ExternalResource$1.evaluate(ExternalResource.java:54)
+	at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:293)
+	at org.junit.runners.ParentRunner.access$100(ParentRunner.java:66)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:79)
+	at org.junit.runners.ParentRunner$4.run(ParentRunner.java:331)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:63)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:103)
+	at org.junit.runners.ParentRunner.runLeaf(ParentRunner.java:366)
+	at org.junit.runners.BlockJUnit4ClassRunner$1.evaluate(BlockJUnit4ClassRunner.java:100)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:26)
+	at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:56)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:59)
+	at org.keycloak.util.PemUtilsTest.testEncodeAndDecodeGeneratedObjects(PemUtilsTest.java:44)
+	at org.keycloak.crypto.def.BCCertificateUtilsProvider.generateV1SelfSignedCertificate(BCCertificateUtilsProvider.java:181)
+	at org.bouncycastle.cert.jcajce.JcaX509CertificateConverter.getCertificate(Unknown Source)
+	at java.security.cert.CertificateFactory.generateCertificate(CertificateFactory.java:359)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory.engineGenerateCertificate(Unknown Source)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory.doGenerateCertificate(Unknown Source)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory.readDERCertificate(Unknown Source)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.CertificateFactory.getCertificate(Unknown Source)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.X509CertificateObject.<init>(Unknown Source)
+	at org.bouncycastle.jcajce.provider.asymmetric.x509.X509CertificateObject.createSigAlgName(Unknown Source)
+	at java.security.cert.CertificateParsingException.<init>(CertificateParsingException.java:58)
+	at java.security.cert.CertificateException.<init>(CertificateException.java:58)
+	at java.security.GeneralSecurityException.<init>(GeneralSecurityException.java:58)
+3) testDecodeObjectsInPEMFormat(org.keycloak.crypto.def.test.PemUtilsBCTest)
+org.keycloak.common.util.PemException: java.security.spec.InvalidKeySpecException: Unable to decode the private key with supported algorithms: RSA, EC
+	at org.junit.runner.JUnitCore.main(JUnitCore.java:36)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.rules.ExternalResource$1.evaluate(ExternalResource.java:54)
+	at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:293)
+	at org.junit.runners.ParentRunner.access$100(ParentRunner.java:66)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:79)
+	at org.junit.runners.ParentRunner$4.run(ParentRunner.java:331)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:63)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:103)
+	at org.junit.runners.ParentRunner.runLeaf(ParentRunner.java:366)
+	at org.junit.runners.BlockJUnit4ClassRunner$1.evaluate(BlockJUnit4ClassRunner.java:100)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:26)
+	at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:56)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:59)
+	at org.keycloak.util.PemUtilsTest.testDecodeObjectsInPEMFormat(PemUtilsTest.java:90)
+	at org.keycloak.util.PemUtilsTest.testPrivateKeyEncodeDecode(PemUtilsTest.java:170)
+	at org.keycloak.crypto.def.BCPemUtilsProvider.decodePrivateKey(BCPemUtilsProvider.java:92)
+	at org.keycloak.common.util.PemException.<init>(PemException.java:26)
+Caused by: java.security.spec.InvalidKeySpecException: Unable to decode the private key with supported algorithms: RSA, EC
+	at org.junit.runner.JUnitCore.main(JUnitCore.java:36)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.rules.ExternalResource$1.evaluate(ExternalResource.java:54)
+	at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:293)
+	at org.junit.runners.ParentRunner.access$100(ParentRunner.java:66)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:79)
+	at org.junit.runners.ParentRunner$4.run(ParentRunner.java:331)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:63)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:103)
+	at org.junit.runners.ParentRunner.runLeaf(ParentRunner.java:366)
+	at org.junit.runners.BlockJUnit4ClassRunner$1.evaluate(BlockJUnit4ClassRunner.java:100)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:26)
+	at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:56)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:59)
+	at org.keycloak.util.PemUtilsTest.testDecodeObjectsInPEMFormat(PemUtilsTest.java:90)
+	at org.keycloak.util.PemUtilsTest.testPrivateKeyEncodeDecode(PemUtilsTest.java:170)
+	at org.keycloak.crypto.def.BCPemUtilsProvider.decodePrivateKey(BCPemUtilsProvider.java:90)
+	at org.keycloak.common.util.DerUtils.decodePrivateKey(DerUtils.java:97)
+	at java.security.spec.InvalidKeySpecException.<init>(InvalidKeySpecException.java:63)
+	at java.security.GeneralSecurityException.<init>(GeneralSecurityException.java:58)
+4) testPrivateKeyInPKCS8Format(org.keycloak.crypto.def.test.PemUtilsBCTest)
+org.keycloak.common.util.PemException: java.security.spec.InvalidKeySpecException: Unable to decode the private key with supported algorithms: RSA, EC
+	at org.junit.runner.JUnitCore.main(JUnitCore.java:36)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.rules.ExternalResource$1.evaluate(ExternalResource.java:54)
+	at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:293)
+	at org.junit.runners.ParentRunner.access$100(ParentRunner.java:66)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:79)
+	at org.junit.runners.ParentRunner$4.run(ParentRunner.java:331)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:63)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:103)
+	at org.junit.runners.ParentRunner.runLeaf(ParentRunner.java:366)
+	at org.junit.runners.BlockJUnit4ClassRunner$1.evaluate(BlockJUnit4ClassRunner.java:100)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:26)
+	at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:56)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:59)
+	at org.keycloak.util.PemUtilsTest.testPrivateKeyInPKCS8Format(PemUtilsTest.java:117)
+	at org.keycloak.common.util.PemUtils.decodePrivateKey(PemUtils.java:102)
+	at org.keycloak.crypto.def.BCPemUtilsProvider.decodePrivateKey(BCPemUtilsProvider.java:92)
+	at org.keycloak.common.util.PemException.<init>(PemException.java:26)
+Caused by: java.security.spec.InvalidKeySpecException: Unable to decode the private key with supported algorithms: RSA, EC
+	at org.junit.runner.JUnitCore.main(JUnitCore.java:36)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.rules.ExternalResource$1.evaluate(ExternalResource.java:54)
+	at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:293)
+	at org.junit.runners.ParentRunner.access$100(ParentRunner.java:66)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:79)
+	at org.junit.runners.ParentRunner$4.run(ParentRunner.java:331)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:63)
+	at org.junit.runners.BlockJUnit4ClassRunner.runChild(BlockJUnit4ClassRunner.java:103)
+	at org.junit.runners.ParentRunner.runLeaf(ParentRunner.java:366)
+	at org.junit.runners.BlockJUnit4ClassRunner$1.evaluate(BlockJUnit4ClassRunner.java:100)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.internal.runners.statements.RunBefores.evaluate(RunBefores.java:26)
+	at org.junit.internal.runners.statements.InvokeMethod.evaluate(InvokeMethod.java:17)
+	at org.junit.runners.model.FrameworkMethod.invokeExplosively(FrameworkMethod.java:56)
+	at org.junit.internal.runners.model.ReflectiveCallable.run(ReflectiveCallable.java:12)
+	at org.junit.runners.model.FrameworkMethod$1.runReflectiveCall(FrameworkMethod.java:59)
+	at org.keycloak.util.PemUtilsTest.testPrivateKeyInPKCS8Format(PemUtilsTest.java:117)
+	at org.keycloak.common.util.PemUtils.decodePrivateKey(PemUtils.java:102)
+	at org.keycloak.crypto.def.BCPemUtilsProvider.decodePrivateKey(BCPemUtilsProvider.java:90)
+	at org.keycloak.common.util.DerUtils.decodePrivateKey(DerUtils.java:97)
+	at java.security.spec.InvalidKeySpecException.<init>(InvalidKeySpecException.java:63)
+	at java.security.GeneralSecurityException.<init>(GeneralSecurityException.java:58)
+
+FAILURES!!!
+Tests run: 6,  Failures: 4
+
+[cratonvm] System.exit(1) called — process terminating

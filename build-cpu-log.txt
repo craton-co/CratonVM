@@ -1,0 +1,186 @@
+﻿cmd : 'vswhere.exe' is not recognized as an internal or external command,
+At line:1 char:1
++ cmd /c "C:\craton\CratonVM\build-cpu.bat" 2>&1 | Out-File -FilePath " ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: ('vswhere.exe' i...ternal command,:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+operable program or batch file.
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.0
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+warning: C:\craton\CratonVM\vm-cli\Cargo.toml: file `C:\craton\CratonVM\vm-cli\src\main.rs` found to be present in mult
+iple build targets:
+  * `bin` target `cratonvm`
+  * `bin` target `java`
+warning: C:\craton\CratonVM\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: unknown and unstable feature specified for `-Ctarget-feature`: `pclmul`
+  |
+  = note: it is still passed through to the codegen backend, but use of this feature might be unsound and the behavior 
+of this feature can change in the future
+  = help: you might have meant: `pclmulqdq`
+
+warning: `cratonvm-vm` (build script) generated 1 warning
+   Compiling cratonvm-vm v0.3.0 (C:\craton\CratonVM\vm)
+warning: `cratonvm-types` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-jfr` (lib) generated 1 warning (1 duplicate)
+warning: unused attribute
+    --> gc\src\gen_heap.rs:5058:1
+     |
+5058 | #[inline]
+     | ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> gc\src\gen_heap.rs:5054:1
+     |
+5054 | #[inline]
+     | ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a 
+future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: `cratonvm-native-api` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-reader` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-gc` (lib) generated 2 warnings (1 duplicate) (run `cargo fix --lib -p cratonvm-gc` to apply 1 sugges
+tion)
+warning: `cratonvm-jit-api` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-native-collections` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-native-io` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-native-awt` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-jit` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-classloading` (lib) generated 1 warning (1 duplicate)
+warning: type `RuntimeTlsIdentity` is more private than the item `set_runtime_tls_identity`
+   --> native-builtins\src\t27_tls.rs:127:1
+    |
+127 | pub fn set_runtime_tls_identity(identity: Option<RuntimeTlsIdentity>) {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `set_runtime_tls_identity` is reac
+hable at visibility `pub`
+    |
+note: but type `RuntimeTlsIdentity` is only usable at visibility `pub(crate)`
+   --> native-builtins\src\t27_tls.rs:108:1
+    |
+108 | pub(crate) struct RuntimeTlsIdentity {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: `cratonvm-native-builtins` (lib) generated 2 warnings (1 duplicate)
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:99:1
+    |
+ 99 | / /// `CRATON_JIT_PFO_TRACE` / `CRATON_JIT_PFI_TRACE` / `CRATON_JIT_NEWARRAY_TRACE`
+100 | | /// — suspect-pattern tracing in the JIT putfield/newarray helpers. These sit on
+101 | | /// the hottest allocation/store paths (`jit_putfield_object` runs once per
+102 | | /// reference field store), where an uncached `env::var_os` is a per-call
+103 | | /// environment-block scan under the process env lock — measured as a
+104 | | /// multi-second cost on allocation-heavy runs (bintrees18: ~69M ref stores).
+    | |_----------------------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:117:1
+    |
+117 | / /// `CRATONVM_DBG_OVERLAY` — a native `set_field`/`get_field` whose value tag
+118 | | /// is destructively cross-type with the bound class's declared field
+119 | | /// descriptor at that slot (a primitive written to a reference field, or a
+120 | | /// reference written to a primitive field). This is the "synthetic overlay
+...   |
+123 | | /// LinkedList$ListItr cursor bug). The hunter logs class + slot + value +
+124 | | /// descriptor + native caller so every instance can be enumerated in one run.
+    | |_-----------------------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:128:1
+    |
+128 | / /// `CRATONVM_DBG_BADRECV` — on a getfield/putfield/array/invoke receiver whose
+129 | | /// pointer is not a valid heap address (the H2 TestScript SEGV: a corrupted
+130 | | /// `Object(Some(ptr=6))` reaching `get_field` → header read faults), log the
+131 | | /// Java frame stack + field + Rust backtrace and raise an NPE instead of
+132 | | /// dereferencing the wild pointer, so the origin can be localized.
+    | |_------------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:134:1
+    |
+134 | / /// `CRATONVM_DBG_FIELDADDR` — trace put/get of specific instance fields
+135 | | /// (object address + resolved slot) to localize a write that does not reach
+136 | | /// the read site (e.g. the EnhancedQueueExecutor constructor field gap).
+    | |_------------------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:138:1
+    |
+138 | / /// `CRATONVM_DBG_JETTY` — trace dispatch into the `org/eclipse/jetty/start/`
+139 | | /// launcher package (every invokevirtual/invokespecial receiver + args) so
+140 | | /// the boot-test NPE at `Main.start(Main.java:397)` can be pinpointed.
+    | |_----------------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:151:1
+    |
+151 | / /// `CRATONVM_DBG_CHARSET=1` — targeted diagnostic for the bare
+152 | | /// `NullPointerException: charset` blocker (keycloak26 Picocli /
+153 | | /// Hazelcast JAXP-XPath). When set, the `Athrow` opcode handler and
+154 | | /// `throw_runtime_error` dump the full live Java thread stack
+155 | | /// (`class.method:pc` for every frame) the moment an NPE whose message
+156 | | /// is exactly `charset` is thrown — pinpointing the JDK method and app
+157 | | /// call site that dereferenced a null `Charset`.
+    | |_------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: `VirtualQuery` redeclared with a different signature
+   --> vm\src\runtime\crash_handler.rs:316:9
+    |
+316 | /         fn VirtualQuery(
+317 | |             address: *const core::ffi::c_void,
+318 | |             buffer: *mut MemoryBasicInformation,
+319 | |             length: usize,
+320 | |         ) -> usize;
+    | |___________________^ this signature doesn't match the previous declaration
+    |
+   ::: vm\src\runtime\memwatch.rs:63:9
+    |
+ 63 | /         fn VirtualQuery(
+ 64 | |             lp_address: *const u8,
+ 65 | |             lp_buffer: *mut MemoryBasicInformation,
+ 66 | |             dw_length: usize,
+ 67 | |         ) -> usize;
+    | |___________________- `VirtualQuery` previously declared here
+    |
+    = note: expected `unsafe extern "system" fn(*const u8, *mut probe_readable::MemoryBasicInformation, usize) -> usize
+`
+               found `unsafe extern "system" fn(*const c_void, *mut windows_fault::MemoryBasicInformation, usize) -> us
+ize`
+    = note: `#[warn(clashing_extern_declarations)]` on by default
+
+warning: `cratonvm-vm` (lib) generated 8 warnings (1 duplicate)
+   Compiling cratonvm-cli v0.3.0 (C:\craton\CratonVM\vm-cli)
+warning: `cratonvm-cli` (bin "cratonvm") generated 1 warning (1 duplicate)
+error: failed to remove file `C:\craton\CratonVM\target\release\cratonvm.exe`
+
+Caused by:
+  Отказано в доступе. (os error 5)

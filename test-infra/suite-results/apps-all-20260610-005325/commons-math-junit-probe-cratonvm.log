@@ -1,0 +1,12 @@
+[2m2026-06-10T03:54:42.813762Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+DISCOVER_FOUND=4
+ROOT: JUnit Vintage engine=[engine:junit-vintage]
+  - TransformUtilsTest test=false container=true
+    - testSampleWrongBounds test=true container=false
+    - testSample test=true container=false
+    - testSampleNegativeNumberOfPoints test=true container=false
+    - testSampleNullNumberOfPoints test=true container=false
+ROOT: JUnit Platform Suite engine=[engine:junit-platform-suite]
+ROOT: JUnit Jupiter engine=[engine:junit-jupiter]
+[2m2026-06-10T03:54:46.089015Z[0m [33m WARN[0m [2mcratonvm::gc::guard[0m[2m:[0m gen_heap::get_field: out-of-bounds field read dropped (caller used slot index past receiver's layout — class layout is correct; the bug is in the caller's slot computation, typically a speculative collection-layout probe dispatched on a non-matching receiver type) [3mobj[0m[2m=[0m0x1ab0b470 [3mindex[0m[2m=[0m2 [3mnum_slots[0m[2m=[0m2 [3mclass_id[0m[2m=[0mClassId(1092) [3mclass_name[0m[2m=[0mjava/util/Spliterators$EmptySpliterator [3mreal_field_count[0m[2m=[0mSome(0)
+EXEC_FOUND=4 SUCCEEDED=4 FAILED=0

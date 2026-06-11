@@ -1,0 +1,5 @@
+[cratonvm] stack-dump watchdog armed: will dump + abort after 120s
+[2m2026-06-10T05:04:15.561212Z[0m [33m WARN[0m [2mcratonvm::gc::guard[0m[2m:[0m gen_heap::get_field: out-of-bounds field read dropped (caller used slot index past receiver's layout — class layout is correct; the bug is in the caller's slot computation, typically a speculative collection-layout probe dispatched on a non-matching receiver type) [3mobj[0m[2m=[0m0x1024118c0 [3mindex[0m[2m=[0m0 [3mnum_slots[0m[2m=[0m0 [3mclass_id[0m[2m=[0mClassId(0) [3mclass_name[0m[2m=[0mjava/lang/Object [3mreal_field_count[0m[2m=[0mSome(0)
+===== DaCapo unknown avrora starting =====
+===== DaCapo unknown avrora PASSED in 318 msec =====
+[cratonvm] System.exit(0) called — process terminating

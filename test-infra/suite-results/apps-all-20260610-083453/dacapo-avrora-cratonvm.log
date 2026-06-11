@@ -1,0 +1,4 @@
+[cratonvm] stack-dump watchdog armed: will dump + abort after 120s
+===== DaCapo unknown avrora starting =====
+===== DaCapo unknown avrora PASSED in 351 msec =====
+[cratonvm] System.exit(0) called — process terminating

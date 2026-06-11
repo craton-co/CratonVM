@@ -1,0 +1,14 @@
+[2m2026-06-09T22:43:23.052446Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+DISCOVER_FOUND=4
+ROOT: JUnit Vintage engine=[engine:junit-vintage]
+  - TransformUtilsTest test=false container=true
+    - testSampleWrongBounds test=true container=false
+    - testSample test=true container=false
+    - testSampleNegativeNumberOfPoints test=true container=false
+    - testSampleNullNumberOfPoints test=true container=false
+ROOT: JUnit Platform Suite engine=[engine:junit-platform-suite]
+ROOT: JUnit Jupiter engine=[engine:junit-jupiter]
+Exception in thread "main" java/lang/InternalError: JIT dispatch into org/junit/platform/launcher/core/EngineExecutionOrchestrator.execute(Lorg/junit/platform/launcher/core/LauncherDiscoveryResult;Lorg/junit/platform/engine/EngineExecutionListener;)V failed: linkage error: no class def found: org/apache/commons/math4/transform/TransformUtilsTest
+	at JUnitProbe.main(JUnitProbe.java:22)
+	at org/junit/platform/launcher/core/SessionPerRequestLauncher.execute(SessionPerRequestLauncher.java:63)
+	at org/junit/platform/launcher/core/EngineExecutionOrchestrator.withInterceptedStreams(EngineExecutionOrchestrator.java:141)

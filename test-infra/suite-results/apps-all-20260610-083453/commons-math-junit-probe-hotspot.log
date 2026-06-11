@@ -1,0 +1,7 @@
+DISCOVER_FOUND=1
+ROOT: JUnit Jupiter engine=[engine:junit-jupiter]
+ROOT: JUnit Vintage engine=[engine:junit-vintage]
+  - TransformUtilsTest test=false container=true
+    - initializationError test=true container=false
+ROOT: JUnit Platform Suite engine=[engine:junit-platform-suite]
+EXEC_FOUND=1 SUCCEEDED=0 FAILED=1

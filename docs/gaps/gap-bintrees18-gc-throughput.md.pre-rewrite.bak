@@ -1,0 +1,108 @@
+# Gap: bintrees18 — 58× GC-throughput deficit vs HotSpot
+
+**Discovered:** 2026-06-09 (cross-VM comparison run)  
+**Severity:** High — a 4-5× slowdown is expected for a young JIT; 58× indicates a fundamental GC bottleneck, not JIT code quality  
+**Correctness:** ✓ Correct — checksum `68332206` = HotSpot on all variants  
+**Status:** Open — root cause understood; fix requires precise JIT stack maps (long-term work)
+
+---
+
+## Measurements (2026-06-09, dev `f98fbca8`, worktree CratonVM-run)
+
+| Variant | Time | Checksum | vs HotSpot |
+|---|---|---|---|
+| CratonVM CPU (JIT) | 28,020 ms | 68332206 ✓ | **58×** slower |
+| CratonVM GPU (--gpu) | 28,458 ms | 68332206 ✓ | 59× slower |
+| HotSpot JDK 25 | 480 ms | 68332206 | 1× |
+| TornadoVM | 517 ms | 68332206 | 1.1× |
+
+Smaller depths run correctly and fast:
+- bintrees10: matches HotSpot, fast
+- bintrees14: matches HotSpot, fast
+- bintrees16: matches HotSpot, fast
+- bintrees18: 58× slower; correct checksum
+
+The blowup is monotone — it appears exactly at depth 18 because the working set exceeds the young generation size.
+
+---
+
+## Root cause
+
+`bintrees18` allocates a complete binary tree of depth 18 (2^18 − 1 = 262,143 `make`/`check` node pairs = ~524K heap-allocated `TreeNode` objects per iteration), then traverses it for a checksum. The hot path creates millions of tree nodes that must be kept alive during traversal.
+
+**CratonVM GC design (non-moving young sweep):**
+
+CratonVM's collector is a non-moving mark-sweep over a bump-pointer young generation. Under JIT-compiled code, the GC is restricted to non-moving collection because:
+1. Moving (Cheney/compacting) collection would relocate objects referenced by JIT stack slots/registers.
+2. JIT-compiled frames don't report their root set precisely — live references in CPU registers or spill slots are invisible to the GC.
+3. Moving a referenced object would create a dangling reference in a JIT frame, causing silent corruption.
+
+**Why bintrees18 is slow:**
+
+1. **Working set overflows young heap**: at depth 18, the fully-allocated live tree is large enough to fill the young bump-pointer arena many times over. The GC fires constantly.
+2. **Non-moving = no tenuring**: each GC cycle scans the entire young arena, marks live nodes, and sweeps dead ones — but it cannot compact or promote live nodes to old generation. The same live set gets scanned on every GC.
+3. **GC frequency**: the allocator measured ~840 GC invocations/second during depth-18 tree construction. Each invocation pays a full mark+sweep cost.
+4. **Selective promotion (partial fix, unsafe)**: `CRATONVM_SELECTIVE_PROMOTE` was implemented and gives correct checksums for bt18, but it's fundamentally unsafe under conservative JIT roots — an object referenced only by a JIT register/stack slot gets evacuated, creating a stale reference. The `make()` function builds a tree that's partially alive in JIT registers, so evacuation yields a valid-but-wrong-size subtree → wrong checksum. This fix cannot be made safe without precise roots.
+
+**FORCE_MOVING (Cheney)** promotes the full tree in one pass and gives correct results but also requires no live JIT frames — it only runs safely in interpreter-only mode.
+
+---
+
+## Precise fix direction
+
+The fundamental fix is **precise JIT stack maps** — the JIT must emit a root-report table (GC map) alongside each compiled frame so the GC can identify exactly which stack slots hold live references at each safepoint. With precise roots:
+
+1. Moving (Cheney/compacting) collection becomes safe under JIT frames.
+2. The live bintrees tree can be tenured to an old generation in one evacuation.
+3. After depth-18 tree construction, the old generation holds the full tree; the young arena is nearly empty; GC cost drops to near-zero.
+
+**Shadow stack** (`CRATONVM_SHADOW_STACK`, feature `shadow-stack`): a partial approach — a parallel linked-list of heap-allocated records tracks references pushed to/popped from the JIT operand stack. It improves GC THROUGHPUT (fixes the operand-stack liveness window) but does NOT fix spill slots or registers, so selective promotion still under-counts live objects at safepoints. The shadow-stack approach alone cannot fix bintrees18 performance.
+
+**OSR-track** (`CRATONVM_SHADOW_OSR_TRACK`): tracks objects through OSR transitions; still not a complete precise-roots solution.
+
+**Full precise roots** requires emitting DWARF-style `.debug_info` or a custom side-table from the JIT (x64.rs) that covers:
+- All spill slots in every JIT frame at every safepoint
+- All live values in machine registers at each safepoint
+- OSR entry/exit root maps
+
+This is significant work (weeks–months) but is the correct path. The architecture is documented in `docs/precise-jit-stack-maps-design.md`.
+
+---
+
+## Workaround for benchmarking
+
+To run bintrees18 without the 58× penalty (for correctness verification or profiling), use:
+
+```bash
+# No-GC mode: disable collection entirely (works for small runs)
+CRATONVM_NO_GC=1 ./cratonvm --java-home "$JDK" -cp bench BenchSuite bintrees18
+
+# Force-moving (Cheney): correct, but only safe without live JIT frames
+CRATONVM_FORCE_MOVING=1 ./cratonvm --java-home "$JDK" --nojit -cp bench BenchSuite bintrees18
+```
+
+Neither workaround is suitable for production — they're for debugging.
+
+---
+
+## Performance context
+
+| Scenario | bintrees18 time | Notes |
+|---|---|---|
+| HotSpot JDK 25 | 480 ms | G1 + tiered JIT; promotes to old gen freely |
+| TornadoVM 4.0.1 | 517 ms | Identical to HotSpot (same G1/JIT) |
+| CratonVM (bintrees16) | ~150 ms | Fits in young gen; correct, fast |
+| CratonVM (bintrees18) | 28,020 ms | Young gen overflow; GC-bound |
+| CratonVM (bintrees20) | would TIMEOUT | Working set ×4 larger again |
+
+The 58× gap at depth-18 vs depth-16 (fast) is the signature of a working-set crossing a threshold rather than a uniform overhead — confirming the GC promotion bottleneck, not JIT code quality.
+
+---
+
+## Related work
+
+- `docs/precise-jit-stack-maps-design.md` — architecture for full precise roots
+- `docs/precise-jit-stack-maps-followups.md` — implementation phases
+- `docs/precise-jit-stack-maps-findings.md` — shadow-stack analysis and limits
+- Memory: `project_precise_jit_stack_maps.md` — current status of the shadow-stack work
+- `CRATONVM_SHADOW_STACK` feature (opt-in) — partial improvement, not a fix for bintrees18

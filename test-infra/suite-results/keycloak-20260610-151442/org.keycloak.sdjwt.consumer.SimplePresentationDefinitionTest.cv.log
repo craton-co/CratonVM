@@ -1,0 +1,8 @@
+JUnit version 4.13.2
+[2m2026-06-10T18:18:23.979508Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+...
+Time: 1.248
+
+OK (3 tests)
+
+[cratonvm] System.exit(0) called — process terminating

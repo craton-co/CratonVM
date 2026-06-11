@@ -1,0 +1,64 @@
+java.lang.reflect.InvocationTargetException
+	at org.elasticsearch.launcher.CliToolLauncher.main(CliToolLauncher.java:55)
+	at org.elasticsearch.launcher.CliToolLauncher.configureLoggingWithoutConfig(CliToolLauncher.java:114)
+	at org.elasticsearch.common.logging.LogConfigurator.configureWithoutConfig(LogConfigurator.java:105)
+	at org.elasticsearch.common.logging.LogConfigurator.configureStatusLogger(LogConfigurator.java:323)
+	at org.apache.logging.log4j.core.config.builder.impl.DefaultConfigurationBuilder.build(DefaultConfigurationBuilder.java:224)
+	at org.apache.logging.log4j.core.config.AbstractConfiguration.initialize(AbstractConfiguration.java:258)
+	at org.apache.logging.log4j.core.config.AbstractConfiguration.doConfigure(AbstractConfiguration.java:664)
+	at org.apache.logging.log4j.core.config.AbstractConfiguration.createConfiguration(AbstractConfiguration.java:1063)
+	at org.apache.logging.log4j.core.config.plugins.util.PluginBuilder.build(PluginBuilder.java:138)
+	at java.lang.reflect.InvocationTargetException.<init>(InvocationTargetException.java:68)
+	at java.lang.ReflectiveOperationException.<init>(ReflectiveOperationException.java:90)
+2026-06-10 03:53:34,968 main ERROR Unable to invoke factory method in class org.apache.logging.log4j.core.config.LoggersPlugin for element Loggers: java.lang.NullPointerException: arraylength null (in org/apache/logging/log4j/core/config/LoggersPlugin.createLoggers([Lorg/apache/logging/log4j/core/config/LoggerConfig;)Lorg/apache/logging/log4j/core/config/Loggers; pc=14) 
+java.lang.reflect.InvocationTargetException
+	at org.elasticsearch.launcher.CliToolLauncher.main(CliToolLauncher.java:55)
+	at org.elasticsearch.launcher.CliToolLauncher.configureLoggingWithoutConfig(CliToolLauncher.java:114)
+	at org.elasticsearch.common.logging.LogConfigurator.configureWithoutConfig(LogConfigurator.java:105)
+	at org.elasticsearch.common.logging.LogConfigurator.configureStatusLogger(LogConfigurator.java:323)
+	at org.apache.logging.log4j.core.config.builder.impl.DefaultConfigurationBuilder.build(DefaultConfigurationBuilder.java:224)
+	at org.apache.logging.log4j.core.config.AbstractConfiguration.initialize(AbstractConfiguration.java:258)
+	at org.apache.logging.log4j.core.config.AbstractConfiguration.doConfigure(AbstractConfiguration.java:664)
+	at org.apache.logging.log4j.core.config.AbstractConfiguration.createConfiguration(AbstractConfiguration.java:1063)
+	at org.apache.logging.log4j.core.config.AbstractConfiguration.createPluginObject(AbstractConfiguration.java:1138)
+	at org.apache.logging.log4j.core.config.plugins.util.PluginBuilder.build(PluginBuilder.java:138)
+	at java.lang.reflect.InvocationTargetException.<init>(InvocationTargetException.java:68)
+	at java.lang.ReflectiveOperationException.<init>(ReflectiveOperationException.java:90)
+2026-06-10 03:53:35,193 main ERROR Unable to invoke factory method in class org.apache.logging.log4j.core.config.AppendersPlugin for element Appenders: java.lang.NullPointerException 
+[2m2026-06-10T03:53:36.750529Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m <clinit> failed вЂ” wrapping in ExceptionInInitializerError [3mclass[0m[2m=[0morg/elasticsearch/xcontent/spi/XContentProvider$Holder [3mcause[0m[2m=[0mjava/lang/IllegalStateException cannot locate x-content provider
+[2m2026-06-10T03:53:36.750587Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 0] at org/elasticsearch/launcher/CliToolLauncher.main (CliToolLauncher.java:64) bci=75
+[2m2026-06-10T03:53:36.750593Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 1] at org/elasticsearch/cli/Command.main (Command.java:51) bci=4
+[2m2026-06-10T03:53:36.750598Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 2] at org/elasticsearch/common/cli/EnvironmentAwareCommand.execute (EnvironmentAwareCommand.java:54) bci=6
+[2m2026-06-10T03:53:36.750602Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 3] at org/elasticsearch/node/InternalSettingsPreparer.prepareEnvironment (InternalSettingsPreparer.java:52) bci=33
+[2m2026-06-10T03:53:36.750663Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 4] at org/elasticsearch/node/InternalSettingsPreparer.loadConfigWithSubstitutions (InternalSettingsPreparer.java:126) bci=283
+[2m2026-06-10T03:53:36.750670Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 5] at org/elasticsearch/common/settings/Settings$Builder.loadFromStream (Settings.java:1234) bci=38
+[2m2026-06-10T03:53:36.750674Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 6] at org/elasticsearch/xcontent/XContentType.<clinit> (XContentType.java:27) bci=8
+[2m2026-06-10T03:53:36.750679Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 7] at org/elasticsearch/xcontent/json/JsonXContent.<clinit> (JsonXContent.java:22) bci=0
+[2m2026-06-10T03:53:36.750683Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 8] at org/elasticsearch/xcontent/spi/XContentProvider.provider (XContentProvider.java:76) bci=0
+[2m2026-06-10T03:53:36.750687Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 9] at org/elasticsearch/xcontent/spi/XContentProvider$Holder.<clinit> (XContentProvider.java:95) bci=24
+[2m2026-06-10T03:53:36.750692Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 10] at org/elasticsearch/core/internal/provider/ProviderLocator.get (ProviderLocator.java:100) bci=8
+[2m2026-06-10T03:53:36.750696Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m   [CLINIT-TRACE 11] at org/elasticsearch/core/internal/provider/ProviderLocator.lambda$newIllegalStateException$1 (ProviderLocator.java:136) bci=21
+java.lang.ExceptionInInitializerError
+	at org.elasticsearch.launcher.CliToolLauncher.main(CliToolLauncher.java:64)
+	at org.elasticsearch.cli.Command.main(Command.java:51)
+	at org.elasticsearch.common.cli.EnvironmentAwareCommand.execute(EnvironmentAwareCommand.java:54)
+	at org.elasticsearch.node.InternalSettingsPreparer.prepareEnvironment(InternalSettingsPreparer.java:52)
+	at org.elasticsearch.node.InternalSettingsPreparer.loadConfigWithSubstitutions(InternalSettingsPreparer.java:126)
+	at org.elasticsearch.common.settings.Settings$Builder.loadFromStream(Settings.java:1234)
+	at org.elasticsearch.xcontent.XContentType.<clinit>(XContentType.java:27)
+	at org.elasticsearch.xcontent.json.JsonXContent.<clinit>(JsonXContent.java:22)
+	at org.elasticsearch.xcontent.spi.XContentProvider.provider(XContentProvider.java:76)
+Caused by: java.lang.IllegalStateException: cannot locate x-content provider
+	at org.elasticsearch.launcher.CliToolLauncher.main(CliToolLauncher.java:64)
+	at org.elasticsearch.cli.Command.main(Command.java:51)
+	at org.elasticsearch.common.cli.EnvironmentAwareCommand.execute(EnvironmentAwareCommand.java:54)
+	at org.elasticsearch.node.InternalSettingsPreparer.prepareEnvironment(InternalSettingsPreparer.java:52)
+	at org.elasticsearch.node.InternalSettingsPreparer.loadConfigWithSubstitutions(InternalSettingsPreparer.java:126)
+	at org.elasticsearch.common.settings.Settings$Builder.loadFromStream(Settings.java:1234)
+	at org.elasticsearch.xcontent.XContentType.<clinit>(XContentType.java:27)
+	at org.elasticsearch.xcontent.json.JsonXContent.<clinit>(JsonXContent.java:22)
+	at org.elasticsearch.xcontent.spi.XContentProvider.provider(XContentProvider.java:76)
+	at org.elasticsearch.xcontent.spi.XContentProvider$Holder.<clinit>(XContentProvider.java:95)
+	at org.elasticsearch.core.internal.provider.ProviderLocator.get(ProviderLocator.java:100)
+	at org.elasticsearch.core.internal.provider.ProviderLocator.lambda$newIllegalStateException$1(ProviderLocator.java:136)
+[cratonvm] System.exit(70) called — process terminating

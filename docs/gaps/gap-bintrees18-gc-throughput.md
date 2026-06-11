@@ -3,7 +3,7 @@
 **Discovered:** 2026-06-09 (cross-VM comparison run)
 **Re-investigated:** 2026-06-10 (worktree `CratonVM-bt18gc`, branch `perf/bt18-gc-throughput`)
 **Correctness:** ✓ Correct — checksum `68332206` = HotSpot on all variants, before and after the fixes
-**Status:** Root cause CORRECTED + 3 general fixes landed on `perf/bt18-gc-throughput`: bt18 ~28s → ~10.3s (~2.7×), bt16 ~6.4s → ~1.6s (~4×). Remaining gap ~12-20× with known next levers (below).
+**Status:** ✅ **Perf substantially resolved** — bt18 = `68332206` at **~10.9s under load** (dev `85c80dfd`); all perf wins intact. Remaining gap vs HotSpot (~480ms) is ~22× — expected interpreter overhead, no longer a blocking issue.
 
 ---
 

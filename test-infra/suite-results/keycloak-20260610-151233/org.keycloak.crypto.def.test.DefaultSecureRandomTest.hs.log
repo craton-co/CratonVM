@@ -1,0 +1,27 @@
+JUnit version 4.13.2
+.θών. 10, 2026 3:23:45 PM org.keycloak.crypto.def.test.DefaultSecureRandomTest testSecureRandom
+INFO: Java security providers: [ 
+ SUN version 25 - class sun.security.provider.Sun, 
+ SunRsaSign version 25 - class sun.security.rsa.SunRsaSign, 
+ SunEC version 25 - class sun.security.ec.SunEC, 
+ SunJSSE version 25 - class sun.security.ssl.SunJSSE, 
+ SunJCE version 25 - class com.sun.crypto.provider.SunJCE, 
+ SunJGSS version 25 - class sun.security.jgss.SunProvider, 
+ SunSASL version 25 - class com.sun.security.sasl.Provider, 
+ XMLDSig version 25 - class org.jcp.xml.dsig.internal.dom.XMLDSigRI, 
+ SunPCSC version 25 - class sun.security.smartcardio.SunPCSC, 
+ JdkLDAP version 25 - class sun.security.provider.certpath.ldap.JdkLDAP, 
+ JdkSASL version 25 - class com.sun.security.sasl.gsskerb.JdkSASL, 
+ SunMSCAPI version 25 - class sun.security.mscapi.SunMSCAPI, 
+ SunPKCS11 version 25 - class sun.security.pkcs11.SunPKCS11, 
+ BC version 1.84 - class org.bouncycastle.jce.provider.BouncyCastleProvider, 
+]
+θών. 10, 2026 3:23:45 PM org.keycloak.crypto.def.test.DefaultSecureRandomTest testSecureRandom
+INFO: new SecureRandom(): algorithm: DRBG, provider: SUN version 25, random numbers: 367, 59, 261, 91, 364, 
+θών. 10, 2026 3:23:45 PM org.keycloak.crypto.def.test.DefaultSecureRandomTest testSecureRandom
+INFO: SecureRandom.getInstance("SHA1PRNG"): algorithm: SHA1PRNG, provider: SUN version 25, random numbers: 478, 623, 858, 628, 73, 
+
+Time: 1,374
+
+OK (1 test)
+

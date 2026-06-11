@@ -1,0 +1,4 @@
+[2m2026-06-11T01:20:29.871692Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_exec[0m[2m:[0m NoSuchMethodError [3mmethod[0m[2m=[0m"java/util/ServiceLoader$ProviderImpl.<init>(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/reflect/Constructor;Ljava/security/AccessControlContext;)V"
+[2m2026-06-11T01:20:32.905033Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+WARN [org.apache.lucene.util.HotspotVMOptions] Lucene cannot access JVM internals to optimize algorithms or calculate object sizes, unless the 'jdk.management' Java module is readable [please add 'jdk.management' to modular application either by command line or its module descriptor].
+Version: 8.15.5, Build: unknown/b10896bcfe167cce44a84ba2771d101fb596d40d/2024-11-21T22:06:13.985834967Z, JVM: 25.0.1

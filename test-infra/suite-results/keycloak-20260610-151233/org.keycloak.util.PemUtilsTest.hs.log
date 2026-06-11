@@ -1,0 +1,30 @@
+JUnit version 4.13.2
+E
+Time: 0,06
+There was 1 failure:
+1) org.keycloak.util.PemUtilsTest
+java.lang.IllegalStateException: Not able to load any cryptoProvider with the classLoader: jdk.internal.loader.ClassLoaders$AppClassLoader@105be200
+	at org.keycloak.common.crypto.CryptoIntegration.detectProvider(CryptoIntegration.java:65)
+	at org.keycloak.common.crypto.CryptoIntegration.init(CryptoIntegration.java:33)
+	at org.keycloak.rule.CryptoInitRule.before(CryptoInitRule.java:15)
+	at org.junit.rules.ExternalResource$1.evaluate(ExternalResource.java:50)
+	at org.junit.rules.RunRules.evaluate(RunRules.java:20)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runners.Suite.runChild(Suite.java:128)
+	at org.junit.runners.Suite.runChild(Suite.java:27)
+	at org.junit.runners.ParentRunner$4.run(ParentRunner.java:331)
+	at org.junit.runners.ParentRunner$1.schedule(ParentRunner.java:79)
+	at org.junit.runners.ParentRunner.runChildren(ParentRunner.java:329)
+	at org.junit.runners.ParentRunner.access$100(ParentRunner.java:66)
+	at org.junit.runners.ParentRunner$2.evaluate(ParentRunner.java:293)
+	at org.junit.runners.ParentRunner$3.evaluate(ParentRunner.java:306)
+	at org.junit.runners.ParentRunner.run(ParentRunner.java:413)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:137)
+	at org.junit.runner.JUnitCore.run(JUnitCore.java:115)
+	at org.junit.runner.JUnitCore.runMain(JUnitCore.java:77)
+	at org.junit.runner.JUnitCore.main(JUnitCore.java:36)
+
+FAILURES!!!
+Tests run: 0,  Failures: 1
+

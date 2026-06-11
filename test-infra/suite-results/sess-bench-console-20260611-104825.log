@@ -1,0 +1,4 @@
+Session comparison — sections: bench junit-help render
+  CratonVM : C:/craton/CratonVM-bench/target/release/cratonvm.exe
+  HotSpot  : /c/Program Files/Common Files/Oracle/Java/javapath/java
+  TornadoVM: C:/craton/tornadovm/jdk-25.0.3/bin/java.exe

@@ -1,0 +1,7 @@
+error: unexpected argument '-m' found
+
+  tip: to pass '-m' as a value, use '-- -m'
+
+Usage: cratonvm.exe [OPTIONS] [CLASS_NAME] [ARGS]...
+
+For more information, try '--help'.

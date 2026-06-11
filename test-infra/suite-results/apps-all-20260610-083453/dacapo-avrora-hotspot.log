@@ -1,0 +1,4 @@
+===== DaCapo 9.12-MR1 avrora starting =====
+Digest validation failed for stderr.log, expecting 0xda39a3ee5e6b4b0d3255bfef95601890afd80709 found 0xef72dcbd80d3f5904cd47da763ad82e2d746eb16
+===== DaCapo 9.12-MR1 avrora FAILED =====
+Validation FAILED for avrora default

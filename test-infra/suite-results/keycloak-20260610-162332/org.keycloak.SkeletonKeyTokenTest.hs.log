@@ -1,0 +1,13 @@
+JUnit version 4.13.2
+.θών. 10, 2026 4:23:58 PM org.keycloak.common.util.DelegatingSerializationFilter createOnJavaAfter8Adapter
+INFO: Using OnJavaAfter8 serialization filter adapter
+θών. 10, 2026 4:23:58 PM org.keycloak.common.util.DelegatingSerializationFilter$OnJavaAfter8 setObjectInputFilter
+WARN: Could not set ObjectFilter: null
+θών. 10, 2026 4:23:58 PM org.keycloak.common.util.DelegatingSerializationFilter$OnJavaAfter8 setObjectInputFilter
+WARN: Could not set ObjectFilter: null
+Size of serialized principal: 1502
+....
+Time: 2,68
+
+OK (5 tests)
+

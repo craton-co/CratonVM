@@ -1,0 +1,29 @@
+JUnit version 4.13.2
+[2m2026-06-10T18:35:19.660562Z[0m [33m WARN[0m [2mcratonvm_vm::vm::vm_util[0m[2m:[0m Post-clinit fixup: BigInteger ZERO/ONE/TWO/NEGATIVE_ONE/TEN populated (5/5)
+..GROUP: ALIAS
+GROUP: CRAP
+ALIAS.CRAP
+......pdf no match
+foo.txt matches
+..java.lang.Double
+java.lang.Boolean
+java.lang.Integer
+java.util.ArrayList
+.{
+  "category" : "ID",
+  "email_verified" : "true",
+  "yo" : "true",
+  "phone_number" : "978-666-0000",
+  "nested" : {
+    "foo" : "bar"
+  }
+}
+email_verified property: true
+property: 978-666-0000
+map: null
+
+Time: 11.212
+
+OK (10 tests)
+
+[cratonvm] System.exit(0) called — process terminating
