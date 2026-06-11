@@ -9591,6 +9591,14 @@ pub(crate) fn native_class_get_class_loader(
             return Ok(Some(Value::Object(Some(cl))));
         }
     };
+    // A class defined through a user-defined `ClassLoader.defineClass` records
+    // its exact defining loader instance — return that, not the app-loader
+    // fallback below. Without this, ByteBuddy's `ByteArrayClassLoader.load`
+    // sanity check (`Class.forName(name, false, cl).getClassLoader() == cl`)
+    // fails with "Class already loaded" and Hibernate's proxy generation breaks.
+    if let Some(loader) = crate::classloader::defining_loader_for(class_id.as_u32()) {
+        return Ok(Some(Value::Object(Some(loader))));
+    }
     let loader_type = ctx.loader_id_of_class(class_id);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
     let is_jdk_pkg = class_name.starts_with("java/")

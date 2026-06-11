@@ -46,6 +46,7 @@ pub fn reset_loader_singletons() {
     *platform_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
     *app_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = None;
     class_data_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
+    defining_loader_store().lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// GC root scan for the singleton built-in class loaders.
@@ -67,6 +68,15 @@ pub fn gc_scan_loader_singleton_roots(out: &mut Vec<ObjectRef>) {
     }
     if let Some(o) = *platform_loader_store().lock().unwrap_or_else(|e| e.into_inner()) {
         out.push(o);
+    }
+    // Defining-loader side-table values are live ClassLoader objects reachable
+    // only from this map — root them too (cf. the singleton stores above).
+    for o in defining_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .values()
+    {
+        out.push(*o);
     }
 }
 
@@ -91,6 +101,17 @@ pub fn gc_update_loader_singleton_refs(
     };
     remap(&mut app_loader_store().lock().unwrap_or_else(|e| e.into_inner()));
     remap(&mut platform_loader_store().lock().unwrap_or_else(|e| e.into_inner()));
+    // Remap the defining-loader side-table values (relocated ClassLoader objects).
+    {
+        let mut map = defining_loader_store().lock().unwrap_or_else(|e| e.into_inner());
+        for obj_ref in map.values_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -114,6 +135,46 @@ fn class_data_store() -> &'static Mutex<std::collections::HashMap<ObjectRef, Val
     static INSTANCE: OnceLock<Mutex<std::collections::HashMap<ObjectRef, Value>>> =
         OnceLock::new();
     INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+// ---------------------------------------------------------------------------
+// Defining-loader side-table — `class_id -> user ClassLoader object`.
+//
+// `Class.getClassLoader()` (native_class_get_class_loader) otherwise returns the
+// app-loader singleton for EVERY non-bootstrap/non-platform class, because the
+// VM tracks only a loader *category* per class, not the defining loader
+// instance. A class defined by a user-defined `ClassLoader` subclass (e.g.
+// ByteBuddy's `ByteArrayClassLoader`, cglib, Hibernate proxies) must report
+// that exact instance: ByteBuddy's `ByteArrayClassLoader.load` does
+// `Class.forName(name, false, this).getClassLoader() != this` and throws
+// "Class already loaded" when the round-trip yields the app loader instead.
+//
+// Keyed by `class_id` (stable u32); the VALUE is a live `ObjectRef` reachable
+// only here, so it MUST be GC-rooted + remapped (see
+// `gc_scan_loader_singleton_roots` / `gc_update_loader_singleton_refs`).
+// ---------------------------------------------------------------------------
+fn defining_loader_store() -> &'static Mutex<std::collections::HashMap<u32, ObjectRef>> {
+    static INSTANCE: OnceLock<Mutex<std::collections::HashMap<u32, ObjectRef>>> = OnceLock::new();
+    INSTANCE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record the user-defined `ClassLoader` object that defined `class_id`, so
+/// `Class.getClassLoader()` returns the exact instance instead of the app-loader
+/// fallback.
+pub fn register_defining_loader(class_id: u32, loader: ObjectRef) {
+    defining_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(class_id, loader);
+}
+
+/// Look up the user-defined `ClassLoader` object that defined `class_id`.
+pub fn defining_loader_for(class_id: u32) -> Option<ObjectRef> {
+    defining_loader_store()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&class_id)
+        .copied()
 }
 
 /// Store `class_data` for a Class mirror. Returns the previous value if any.
