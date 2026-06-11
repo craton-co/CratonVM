@@ -129,6 +129,50 @@ treat "make allow ≥ ban" as a follow-up driven by a real profile:
 4. Route invokeinterface through the invoke-cache counter so hot interface
    targets (`lookup`) method-entry compile instead of per-call OSR.
 
+## Follow-up session (2026-06-11, commit `8d0f029e`) — anomaly root-caused
+
+The "needs a profiler" anomaly fell to plain code reading before any sampler
+ran: in `execute()` (the uncached method dispatch), `padded_bytecode`
+(alloc + memcpy), `jit_scan` (linear bytecode walk) and three `Arc` key
+allocations ran on EVERY invocation of every JIT-eligible method — BEFORE
+the JIT-cache lookup. The blanket BC ban short-circuited all of it at the
+`static_skip_reason` gate, which is exactly why ban-on looked fine and
+allow looked 4.7× worse with zero BC methods compiled.
+
+**RBC.5 (cache-first dispatch)**: `JitCache::get` takes `&str`, the cache
+is consulted first (hit = zero allocations, no scan), padding/scan/keys
+moved into the compile-miss closure, and the per-call
+"re-resolve getstatic CP refs + ensure-initialized" walk became a
+once-per-artifact check (`CompiledMethod::static_init_classes` +
+`static_inits_done`). Result: asn1-allow 245s → **151s**; ban-on at dev
+parity in a 3-way interleaved A/B (dev 26.2s avg, cache-first 26.6s,
++athrow 27.2s — within noise; note the machine drifts ±2× across hours,
+so only interleaved comparisons are meaningful).
+
+**RBC.6 (athrow codegen)** also landed: `jit_scan` accepts 0xbf
+(`has_athrow`), the x64 arm lowers it to "call `jit_throw_exception`
+(stash pending exception; null → pending-NPE) + return the `i64::MIN`
+sentinel + epilogue". Gated to methods with NO local exception handlers,
+never via OSR (its bail path could re-run side effects), forces
+`has_dispatch` so the drain-aware entry paths run, IR pipeline declines,
+and `analyze_escapes` already treated 0xbf as a full-escape barrier. The
+helper is a new `JitRuntimeHelpers` field appended at the struct end
+(golden offsets stable, NUM_FIELDS 40→41). The BC parser statics now
+compile; allow-mode asn1 timing was unchanged (148s) — they were not the
+remaining bottleneck.
+
+**Remaining allow-mode gap** (asn1 151s vs 26s ban-on, prng 36s vs 31s):
+with the eligibility overhead gone, what's left is the per-call
+interp↔JIT boundary on `execute()`-dispatched compiled BC methods
+(catch_unwind + set_jit_thread + JitEntryGuard + arg marshalling per
+call) — i.e. follow-up items 2 and 4 below. Verdict unchanged: keep the
+ban as default policy until boundary cost comes down.
+
+One harness trap for posterity: running the regression pool from a shell
+that exports `MSYS2_ARG_CONV_EXCL='*'` (needed for BC's semicolon
+classpaths) breaks the pool's `/c/...`-style path ARGUMENTS (3 modload
+probes "fail" with rc=1). Pool is 23/23 in a clean shell.
+
 ## Diagnostics added (all env-gated, in-tree)
 
 - `CRATONVM_DBG_JITC=1`: compile events with entry addresses/lengths
