@@ -1354,6 +1354,23 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("sun/reflect/generics/repository/ClassRepository", "getSuperclass")
         | ("sun/reflect/generics/repository/ClassRepository", "make")
         | ("sun/reflect/generics/repository/AbstractRepository", "getTree")
+        // HIB-PROXY (2026-06-11) — Hibernate ByteBuddy lazy-proxy generation.
+        // `ByteBuddyState.make` (invoked from the `lambda$load$0` Callable that
+        // `TypeCache.findOrInsert` runs) drives ByteBuddy's runtime subclass
+        // build. When BOTH this Hibernate caller AND the
+        // `net/bytebuddy/dynamic/*` build chain are JIT-compiled, a receiver is
+        // lost across the JIT->JIT call boundary deep in the build, surfacing as
+        // `NullPointerException: Cannot write field 'name'` (null `this`) in
+        // `InstrumentedType$Default.<init>` — which fails
+        // `SingleTableEntityPersister.<init>` and the whole SessionFactory
+        // build. Isolated via `CRATONVM_JIT_BISECT_ONLY` (needs both
+        // `org/hibernate/bytecode` and `net/bytebuddy/dynamic`) + `BISECT_SKIP`
+        // (skipping either `ByteBuddyState.make` or `lambda$load$0` fixes it).
+        // The whole ByteBuddy subclass build works with `CRATONVM_DISABLE_JIT=1`
+        // — same regalloc/calling-convention class as the bans above. Ban the
+        // build entry so Hibernate proxies generate correctly; the underlying
+        // codegen defect is tracked for a general fix.
+        | ("org/hibernate/bytecode/internal/bytebuddy/ByteBuddyState", "make")
         // SPB.3 (Session 111 r14) — `apps/SportMe-master`'s Spring Boot
         // bootstrap segfaults (rc=139) deep in Spring's
         // `ConfigurationPropertySources` cache-key build path. Per r13

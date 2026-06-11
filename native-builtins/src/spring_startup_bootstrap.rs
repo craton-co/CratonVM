@@ -146,6 +146,21 @@ fn noop_environment() -> &'static Mutex<Option<ObjectRef>> {
     S.get_or_init(|| Mutex::new(None))
 }
 
+/// Construct a fresh REAL `StandardEnvironment`. Its `<init>` calls
+/// `customizePropertySources` which uses `System.getProperties()`/`getenv()` —
+/// both of which CratonVM supports — yielding a fully functional environment
+/// with the canonical `systemProperties`/`systemEnvironment` sources.
+fn construct_real_standard_environment(ctx: &mut dyn NativeContext) -> Option<ObjectRef> {
+    let env_class = "org/springframework/core/env/StandardEnvironment";
+    let env = match ctx.new_object(env_class) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    ctx.invoke(env_class, "<init>", "()V", &[Value::Object(Some(env))])
+        .ok()?;
+    Some(env)
+}
+
 fn get_noop_environment(ctx: &mut dyn NativeContext) -> ObjectRef {
     if let Some(obj) = *noop_environment().lock() {
         return obj;
@@ -154,23 +169,7 @@ fn get_noop_environment(ctx: &mut dyn NativeContext) -> ObjectRef {
     let env_class = "org/springframework/core/env/StandardEnvironment";
     let mps_class = "org/springframework/core/env/MutablePropertySources";
 
-    // Try to construct a REAL StandardEnvironment first. Its <init> calls
-    // customizePropertySources which uses System.getProperties()/getenv() — both
-    // of which CratonVM supports. If this succeeds we get a fully functional
-    // environment with proper MutablePropertySources backing: the canonical
-    // `systemProperties` and `systemEnvironment` PropertySources are added by
-    // `StandardEnvironment.customizePropertySources` invoked from AbstractEnvironment.<init>.
-    let real_env = (|| -> Option<ObjectRef> {
-        let env = match ctx.new_object(env_class) {
-            Ok(Some(Value::Object(Some(o)))) => o,
-            _ => return None,
-        };
-        ctx.invoke(env_class, "<init>", "()V", &[Value::Object(Some(env))])
-            .ok()?;
-        Some(env)
-    })();
-
-    let obj = if let Some(env) = real_env {
+    let obj = if let Some(env) = construct_real_standard_environment(ctx) {
         env
     } else {
         // Fallback: synthetic allocation + inject a real MutablePropertySources
@@ -195,11 +194,41 @@ fn get_noop_environment(ctx: &mut dyn NativeContext) -> ObjectRef {
     obj
 }
 
-fn get_environment(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+/// `AbstractApplicationContext.getEnvironment()` — PER-CONTEXT, mirroring the
+/// real bytecode (`if (this.environment == null) this.environment =
+/// createEnvironment(); return this.environment;`).
+///
+/// The previous implementation returned the process-global
+/// `get_noop_environment` singleton for EVERY context. That made independent
+/// `ApplicationContext`s share one `MutablePropertySources` and one
+/// active-profiles set: a `MapPropertySource` added to context A's environment
+/// was visible to a freshly-constructed context B, and `setActiveProfiles` on
+/// one context leaked into all others. Surfaced as spring-boot bug report
+/// SB-04's residual `cond.featureOffAbsent` failure — a fresh context still
+/// saw `feature.flag=on` from the prior context and registered the
+/// `@Conditional` bean. The global singleton is kept ONLY as a last resort
+/// when the real `StandardEnvironment.<init>` fails (the partial-bootstrap
+/// scenario this shim was originally written for).
+fn get_environment(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first() {
+        // Real-bytecode semantics: return the cached per-context field.
+        if let Value::Object(Some(env)) = ctx.get_field_by_name(*this, "environment") {
+            return Ok(Some(Value::Object(Some(env))));
+        }
+        if let Some(env) = construct_real_standard_environment(ctx) {
+            ctx.set_field_by_name(*this, "environment", Value::Object(Some(env)));
+            return Ok(Some(Value::Object(Some(env))));
+        }
+    }
     Ok(Some(Value::Object(Some(get_noop_environment(ctx)))))
 }
 
+/// `AbstractApplicationContext.createEnvironment()` — a FRESH environment per
+/// call, like the real `return new StandardEnvironment();` body.
 fn create_environment(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    if let Some(env) = construct_real_standard_environment(ctx) {
+        return Ok(Some(Value::Object(Some(env))));
+    }
     Ok(Some(Value::Object(Some(get_noop_environment(ctx)))))
 }
 
@@ -440,14 +469,25 @@ fn spring_app_get_or_create_environment(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let env = get_noop_environment(ctx);
-    // Cache on `this.environment` so future Spring code that reads the field
-    // directly (not via this method) sees the same env. Best-effort — if the
-    // field doesn't exist on this Spring version, the SET silently no-ops.
+    // Per-instance, mirroring the real bytecode's
+    // `if (this.environment != null) return this.environment;` fast path —
+    // the previous global-singleton return leaked property sources and
+    // active profiles across independent SpringApplication runs (see
+    // get_environment above).
     if let Some(Value::Object(Some(this))) = args.first() {
-        ctx.set_field_by_name(*this, "environment", Value::Object(Some(env)));
+        if let Value::Object(Some(env)) = ctx.get_field_by_name(*this, "environment") {
+            return Ok(Some(Value::Object(Some(env))));
+        }
+        if let Some(env) = construct_real_standard_environment(ctx) {
+            // Cache on `this.environment` so future Spring code that reads
+            // the field directly (not via this method) sees the same env.
+            // Best-effort — if the field doesn't exist on this Spring
+            // version, the SET silently no-ops.
+            ctx.set_field_by_name(*this, "environment", Value::Object(Some(env)));
+            return Ok(Some(Value::Object(Some(env))));
+        }
     }
-    Ok(Some(Value::Object(Some(env))))
+    Ok(Some(Value::Object(Some(get_noop_environment(ctx)))))
 }
 
 // Environment.getProperty(String) → null (no properties in synthetic env, safe default)

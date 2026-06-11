@@ -1663,7 +1663,10 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
 /// `[I`, `[[Ljava/lang/String;`) for an array heap object.  Mirrors the
 /// interpreter's `array_descriptor_of` (vm/src/runtime/interpreter.rs)
 /// but lives in NativeContext-land so reflection natives can use it.
-fn array_descriptor_for(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> String {
+/// pub(crate): also used by the Object.toString native (lib.rs) so the
+/// default `Name@hash` rendering of arrays matches HotSpot
+/// (`[Ljava.lang.Class;@…`, not the component class name).
+pub(crate) fn array_descriptor_for(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> String {
     use cratonvm_types::ArrayElementType;
     let et = ctx.heap_element_type_of(obj);
     match et {
@@ -6858,7 +6861,17 @@ pub(crate) fn native_class_get_modifiers(ctx: &mut dyn NativeContext, args: &[Va
     } else {
         own_flags
     };
-    Ok(Some(Value::Int(effective_flags as i32)))
+    // Strip ACC_SUPER (0x0020): it is a JVM-internal class-file flag (legacy
+    // invokespecial semantics), set on virtually every modern class, but it is
+    // NOT a Java language modifier. HotSpot's JVM_GetClassModifiers masks it out
+    // (JVM_RECOGNIZED_CLASS_MODIFIERS excludes 0x0020), so `getModifiers()`
+    // returns e.g. 0x1 (public) not 0x21. ByteBuddy validates generated-subclass
+    // modifiers against its recognized set and throws "Illegal modifiers 33" when
+    // the 0x20 bit leaks through `Note.class.getModifiers()` — breaking
+    // Hibernate's ByteBuddy lazy-proxy generation. (ACC_SUPER never appears in
+    // InnerClasses access flags, so masking is safe on the nested-class path too.)
+    let masked = effective_flags & !0x0020u16;
+    Ok(Some(Value::Int(masked as i32)))
 }
 
 // ---------------------------------------------------------------------------
@@ -7305,10 +7318,20 @@ pub(crate) fn annotation_element_to_java_typed(
                     return val;
                 }
                 if iae_trace_cls { eprintln!("ANN-CLASS desc={desc} class={class_name} RETURNING-NULL"); }
-            } else if iae_trace_cls {
-                eprintln!("ANN-CLASS desc={desc} NO-CLASS-NAME");
+                // Unloadable object class — preserve the existing null return.
+                return Value::Object(None);
             }
-            Value::Object(None)
+            // `annotation_desc_to_class_name` returned None: the descriptor is
+            // a primitive (`I`/`J`/...), `void` (`V`), or an array (`[...`) —
+            // most notably `default void.class`, used by ByteBuddy's
+            // `@Advice.FieldValue.declaringType()`. Returning null here made the
+            // annotation member read back as null, so ByteBuddy's
+            // `declaringType.represents(void.class)` NPE'd (`getName()` on a
+            // null TypeDescription) inside Hibernate's BytecodeProvider init.
+            // `descriptor_to_class_mirror` maps `V` -> the `void` primitive
+            // Class mirror, `[I` -> the canonical `int[]` mirror, etc.
+            if iae_trace_cls { eprintln!("ANN-CLASS desc={desc} primitive/void/array -> descriptor_to_class_mirror"); }
+            Value::Object(Some(descriptor_to_class_mirror(ctx, desc)))
         }
         AnnotationElementValue::Annotation(nested) => {
             let proxy = create_annotation_proxy(ctx, nested);
@@ -9568,6 +9591,14 @@ pub(crate) fn native_class_get_class_loader(
             return Ok(Some(Value::Object(Some(cl))));
         }
     };
+    // A class defined through a user-defined `ClassLoader.defineClass` records
+    // its exact defining loader instance — return that, not the app-loader
+    // fallback below. Without this, ByteBuddy's `ByteArrayClassLoader.load`
+    // sanity check (`Class.forName(name, false, cl).getClassLoader() == cl`)
+    // fails with "Class already loaded" and Hibernate's proxy generation breaks.
+    if let Some(loader) = crate::classloader::defining_loader_for(class_id.as_u32()) {
+        return Ok(Some(Value::Object(Some(loader))));
+    }
     let loader_type = ctx.loader_id_of_class(class_id);
     let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
     let is_jdk_pkg = class_name.starts_with("java/")

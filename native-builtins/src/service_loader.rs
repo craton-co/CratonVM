@@ -1172,24 +1172,34 @@ fn native_sl_spliterator(
 /// Late-binding override for `StreamSupport.stream(Spliterator, boolean)`.
 ///
 /// Background — the prior `phases_late.rs::register_p69_spliterator`
-/// registration of the same triple is, for reasons specific to this binary
-/// (very large source file, incremental-compile interaction) not making it
-/// into the final `cratonvm.exe`: stress-checking the binary with `grep -ao`
-/// over the literal string `"[STREAM-SUPPORT-DBG]"` shows it absent, and
-/// runtime traces of `ServiceLoader.load(...).spliterator().stream()
-/// .filter(...)` from Elasticsearch's `CliToolProvider.load` never trigger
-/// the registered native — `Stream.filter` runs on real-JDK ReferencePipeline
-/// bytecode against an empty stream, surfacing as
-///   `AssertionError: CliToolProvider [server] not found, available names are []`
-/// even though our native `ServiceLoader.iterator()` had just yielded
-/// 13 providers.
+/// registration of the same triple only runs in synthetic-jdk builds
+/// (`register_builtins` is `cfg(feature = "synthetic-jdk")`), so in the
+/// real-JDK CLI binary THIS registration is the only live implementation.
+/// Re-registering here also ensures the closure is the LAST writer to the
+/// `NativeMethodRegistry` HashMap for the
+/// `(StreamSupport, stream, (Spliterator,Z)Stream)` triple.
 ///
-/// Re-registering here (from a small, less-noisy translation unit) ensures
-/// the closure is the LAST writer to the `NativeMethodRegistry` HashMap for
-/// the `(StreamSupport, stream, (Spliterator,Z)Stream)` triple. The body
-/// drains the supplied synthetic spliterator's backing Object[] into a fresh
-/// synthetic Stream so the downstream `Stream.filter` / `Stream.toList`
-/// natives see the real provider list.
+/// Dispatch:
+///  * CratonVM-synthetic spliterators — runtime class is the bare
+///    `java/util/Spliterator` interface; built by our
+///    `Collection.spliterator()` / `ServiceLoader.spliterator()` /
+///    `Spliterators.spliterator(...)` natives — carry a fully-materialised
+///    backing `Object[]` in field 0 plus `pos`/`fence` cursors. Snapshot
+///    that slice directly.
+///  * ANY other class is a real `Spliterator` implementation (JDK
+///    `Spliterators$IteratorSpliterator`, Spring's
+///    `TypeMappedAnnotations$AggregatesSpliterator`, log4j's
+///    `ServiceLoaderUtil$ServiceLoaderSpliterator`, ...). Its private field
+///    layout is not ours to read: the previous body speculatively treated
+///    field 0 as the backing array whenever it happened to hold an array
+///    (wrong elements + misread cursors) and otherwise gave up with an
+///    EMPTY stream. The empty stream silently dropped every annotation
+///    Spring's `MergedAnnotations.stream()` feeds through
+///    `getAllAnnotationAttributes` → the `MultiValueMap` finisher mapped
+///    empty→null → `ConditionEvaluator` found no condition classes →
+///    `@Conditional`/`@Profile` beans registered unconditionally
+///    (spring-boot bug report SB-04). Drain real spliterators through
+///    their public `tryAdvance(Consumer)` contract instead.
 fn native_stream_support_stream_from_spliterator(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -1201,16 +1211,26 @@ fn native_stream_support_stream_from_spliterator(
             return alloc_synthetic_stream(ctx, &[]);
         }
     };
-    // Read field 0 of the spliterator. Our `Spliterators.spliteratorUnknownSize`
-    // and `ServiceLoader.spliterator()` natives both place a fully-materialised
-    // Object[] in field 0 — read it directly. For real-JDK Spliterator subclasses
-    // whose field 0 isn't an array, fall back to draining via
-    // `forEachRemaining(Consumer)`.
+    let spl_class = ctx.class_name_of_id(ctx.class_id_of_object(spliterator));
+    if spl_class.as_deref() != Some("java/util/Spliterator") {
+        // Real Spliterator implementation — drain via its own tryAdvance.
+        let arr = drain_real_spliterator(ctx, spliterator)?;
+        let cid = ctx.ensure_class_initialized("java/util/stream/Stream")
+            .unwrap_or(cratonvm_types::ClassId::new(0));
+        let nfields = ctx.class_num_total_fields(cid).max(1);
+        let stream = ctx.alloc_object(cid, nfields);
+        ctx.set_field(stream, 0, Value::Object(Some(arr)));
+        return Ok(Some(Value::Object(Some(stream))));
+    }
+    // Synthetic spliterator: field 0 is the fully-materialised Object[]
+    // (2-field variants carry (array, cursor); 3-field ones (array, pos,
+    // fence)). A missing/non-array field 0 means an empty synthetic
+    // spliterator.
     let field0 = ctx.get_field(spliterator, 0);
     let arr = match field0 {
         Value::Object(Some(a))
             if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array => a,
-        _ => return drain_spliterator_to_stream(ctx, spliterator),
+        _ => return alloc_synthetic_stream(ctx, &[]),
     };
     let pos = match ctx.get_field(spliterator, 1) {
         Value::Int(v) => v as usize,
@@ -1252,20 +1272,139 @@ fn alloc_synthetic_stream(
     Ok(Some(Value::Object(Some(stream))))
 }
 
-fn drain_spliterator_to_stream(
+/// Synthetic consumer class used by [`drain_real_spliterator`]. Layout:
+///   field 0: Object[] storage (capacity == array_length)
+///   field 1: Int — current logical length
+/// Its `accept(Object)V` native (registered in
+/// `register_service_loader_natives`) appends, growing storage on demand.
+const STREAM_COLLECTOR_CLASS: &str = "cratonvm/internal/StreamCollector";
+
+fn native_stream_collector_accept(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let elem = args.get(1).copied().unwrap_or(Value::Object(None));
+    let mut len = match ctx.get_field(this, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let storage = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16),
+    };
+    let cap = ctx.array_length(storage);
+    let storage = if len >= cap {
+        let new_cap = (cap * 2).max(16);
+        let bigger = ctx.new_array(cratonvm_types::ArrayElementType::Reference, new_cap);
+        for i in 0..len {
+            let v = ctx.get_array_element(storage, i);
+            ctx.set_array_element(bigger, i, v);
+        }
+        ctx.set_field(this, 0, Value::Object(Some(bigger)));
+        bigger
+    } else {
+        storage
+    };
+    ctx.set_array_element(storage, len, elem);
+    len += 1;
+    ctx.set_field(this, 1, Value::Int(len as i32));
+    Ok(None)
+}
+
+/// Drain a real (non-synthetic) `Spliterator` implementation into a fresh
+/// exactly-sized `Object[]` by repeatedly invoking its public
+/// `tryAdvance(Consumer)` contract with a `cratonvm/internal/StreamCollector`
+/// consumer. `tryAdvance` is a concrete method on every conforming
+/// Spliterator implementation; `forEachRemaining` (frequently only the
+/// interface default, whose default-method dispatch is less dependable from
+/// native context) is kept as a fallback when the very first `tryAdvance`
+/// dispatch fails outright. A mid-drain Java exception propagates — HotSpot
+/// would surface it from the terminal stream operation too.
+fn drain_real_spliterator(
     ctx: &mut dyn NativeContext,
     spliterator: cratonvm_types::ObjectRef,
-) -> MethodCallResult {
-    // Best-effort drain via `tryAdvance(Consumer)` — bounded.
-    let mut collected: Vec<Value> = Vec::new();
+) -> Result<cratonvm_types::ObjectRef, MethodCallFailed> {
+    let collector = crate::alloc_concurrent_synthetic(ctx, STREAM_COLLECTOR_CLASS, 2);
+    let initial = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
+    ctx.set_field(collector, 0, Value::Object(Some(initial)));
+    ctx.set_field(collector, 1, Value::Int(0));
+
+    // Pin both objects — every `tryAdvance` re-enters Java and can trigger a
+    // moving GC that relocates them (same discipline as `native_sl_stream`).
+    let spl_pin = ctx.pin_native_root(spliterator);
+    let col_pin = ctx.pin_native_root(collector);
+
     const SAFETY_CAP: usize = 1_000_000;
-    // We can't pass a closure to JDK code; instead, repeatedly call
-    // `tryAdvance` and rely on the side-effect of advancing the spliterator's
-    // cursor while a no-op consumer absorbs the element. Since we don't have a
-    // way to inject a side-channel consumer here, fall through to an empty
-    // stream rather than risk infinite-looping a misbehaving spliterator.
-    let _ = (spliterator, &mut collected, SAFETY_CAP);
-    alloc_synthetic_stream(ctx, &[])
+    let mut produced = 0usize;
+    let mut try_advance_dispatched = false;
+    loop {
+        let spl = ctx.read_native_pin(spl_pin, spliterator);
+        let col = ctx.read_native_pin(col_pin, collector);
+        match ctx.invoke_virtual(
+            spl,
+            "tryAdvance",
+            "(Ljava/util/function/Consumer;)Z",
+            &[Value::Object(Some(col))],
+        ) {
+            Ok(Some(Value::Int(v))) if v != 0 => {
+                try_advance_dispatched = true;
+                produced += 1;
+                if produced >= SAFETY_CAP {
+                    break;
+                }
+            }
+            Ok(_) => {
+                // false (or void-ish) → spliterator exhausted.
+                break;
+            }
+            Err(e) => {
+                if try_advance_dispatched {
+                    // Genuine Java exception mid-drain — propagate.
+                    ctx.unpin_native_roots(spl_pin);
+                    ctx.unpin_native_roots(col_pin);
+                    return Err(e);
+                }
+                // First call failed (tryAdvance not dispatchable on this
+                // receiver) — fall back to forEachRemaining.
+                let spl = ctx.read_native_pin(spl_pin, spliterator);
+                let col = ctx.read_native_pin(col_pin, collector);
+                let _ = ctx.invoke_virtual(
+                    spl,
+                    "forEachRemaining",
+                    "(Ljava/util/function/Consumer;)V",
+                    &[Value::Object(Some(col))],
+                );
+                break;
+            }
+        }
+    }
+
+    // Snapshot to an exactly-sized array. Allocate the output FIRST, then
+    // re-read the (pinned) collector — the allocation may move the heap.
+    let col = ctx.read_native_pin(col_pin, collector);
+    let len = match ctx.get_field(col, 1) {
+        Value::Int(v) => v as usize,
+        _ => 0,
+    };
+    let out = ctx.new_array(cratonvm_types::ArrayElementType::Reference, len);
+    let col = ctx.read_native_pin(col_pin, collector);
+    let result = match ctx.get_field(col, 0) {
+        Value::Object(Some(storage)) => {
+            for i in 0..len {
+                let v = ctx.get_array_element(storage, i);
+                ctx.set_array_element(out, i, v);
+            }
+            out
+        }
+        _ => ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0),
+    };
+    ctx.unpin_native_roots(spl_pin);
+    ctx.unpin_native_roots(col_pin);
+    Ok(result)
 }
 
 pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
@@ -1296,12 +1435,22 @@ pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
     // Re-register `StreamSupport.stream(Spliterator, boolean)` — see the
     // header comment on `native_stream_support_stream_from_spliterator`. This
     // must run LAST to win the registration race against the prior phase69
-    // registration that doesn't survive linking in this binary.
+    // registration (which is synthetic-jdk-only and absent from real-JDK
+    // builds anyway).
     r.register(
         "java/util/stream/StreamSupport",
         "stream",
         "(Ljava/util/Spliterator;Z)Ljava/util/stream/Stream;",
         native_stream_support_stream_from_spliterator,
+    );
+    // The collecting consumer `drain_real_spliterator` hands to real
+    // spliterators' `tryAdvance`/`forEachRemaining`. Must be registered here
+    // (not only in phase69) so real-JDK builds can drain real spliterators.
+    r.register(
+        STREAM_COLLECTOR_CLASS,
+        "accept",
+        "(Ljava/lang/Object;)V",
+        native_stream_collector_accept,
     );
 }
 

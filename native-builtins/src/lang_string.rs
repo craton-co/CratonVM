@@ -1413,8 +1413,13 @@ pub(crate) fn invoke_to_string(
     // value is a primitive, format it directly. This handles Integer, Long,
     // Double, Float, Boolean, Character, Byte, Short — all wrapper types store
     // their primitive in field 0.
+    //
+    // MUST exclude arrays: a heap array's num_slots is its LENGTH, so a
+    // length-1 array masquerades as a wrapper here — and get_field(0) on a
+    // packed primitive array reads a full Value slot over 4/8-byte elements,
+    // yielding garbage (long[]{1} rendered as "0"/"6" instead of "[J@hash").
     let nf = ctx.object_num_fields(obj);
-    if nf == 1 {
+    if nf == 1 && ctx.heap_kind_of(obj) != cratonvm_types::ObjectKind::Array {
         match ctx.get_field(obj, 0) {
             Value::Int(v) => {
                 // Could be Integer, Boolean, Byte, Short, Character.
@@ -1448,7 +1453,16 @@ pub(crate) fn invoke_to_string(
         Ok(Some(Value::Object(Some(str_ref)))) => Ok(ctx
             .read_string(str_ref)
             .unwrap_or_else(|| "null".to_string())),
-        Ok(_) | Err(_) => Ok(format!("Object@{:x}", ctx.identity_hash_code(obj))),
+        Ok(_) | Err(_) => {
+            // Honest fallback name: arrays render their JVMS array-class name
+            // like HotSpot ([Ljava.lang.Class; / [I), not "Object".
+            let name = if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+                crate::lang_class::array_descriptor_for(ctx, obj).replace('/', ".")
+            } else {
+                "Object".to_string()
+            };
+            Ok(format!("{}@{:x}", name, ctx.identity_hash_code(obj)))
+        }
     }
 }
 
@@ -3349,8 +3363,14 @@ fn extract_float_value(ctx: &dyn NativeContext, val: &Value) -> f64 {
 
 /// Format a single argument for String.format.
 pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -> String {
-    // Helper: unbox wrapper object to primitive
+    // Helper: unbox wrapper object to primitive. Arrays are NEVER wrappers —
+    // num_slots is the array LENGTH and get_field(0) on packed primitive
+    // arrays reads garbage (String.format("%s", int[]) printed a bogus
+    // number instead of "[I@hash").
     fn unbox_obj(ctx: &dyn NativeContext, obj: cratonvm_types::ObjectRef) -> Value {
+        if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
+            return Value::Object(Some(obj));
+        }
         let nf = ctx.object_num_fields(obj);
         if nf >= 1 {
             let f = ctx.get_field(obj, 0);

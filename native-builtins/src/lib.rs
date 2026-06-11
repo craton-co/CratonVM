@@ -2653,10 +2653,23 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             _ => return Ok(Some(Value::Object(None))),
         };
         // Replicate: getClass().getName() + "@" + Integer.toHexString(hashCode())
-        let class_id = ctx.class_id_of_object(this);
-        let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
-        // Convert slash to dot
-        let dot_name = class_name.replace('/', ".");
+        //
+        // ARRAY receivers MUST render the array-class name ([Ljava.lang.Class;
+        // / [I / [[I …), not the header's class id: heap arrays store the
+        // COMPONENT class id (and ClassId(0) for primitive arrays), so the
+        // naive class_id_of read printed "java.lang.Class@46" where HotSpot
+        // prints "[Ljava.lang.Class;@hex". Every default-toString consumer
+        // (string concat, String.valueOf, StringBuilder.append, println,
+        // String.format %s, collection rendering) dispatches into this native
+        // for array receivers (arrays resolve methods on java/lang/Object and
+        // native-override priority shadows the real bytecode), so this single
+        // formatter caused the SB-04 "scalar Class" misdiagnosis.
+        let dot_name = if ctx.heap_kind_of(this) == cratonvm_types::ObjectKind::Array {
+            crate::lang_class::array_descriptor_for(ctx, this).replace('/', ".")
+        } else {
+            let class_id = ctx.class_id_of_object(this);
+            ctx.class_name_of_id(class_id).unwrap_or_default().replace('/', ".")
+        };
         let hash = ctx.identity_hash_code(this);
         let hex = format!("{:x}", hash as u32);
         let result = format!("{}@{}", dot_name, hex);
@@ -34140,12 +34153,37 @@ fn proxy_chain_reaches_instance(ctx: &dyn NativeContext, class_id: cratonvm_type
 }
 
 fn native_proxy_get_handler(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Return the InvocationHandler stored in field 0 of the proxy object.
-    let handler = match args.first() {
-        Some(Value::Object(Some(proxy))) => ctx.get_field(*proxy, 0),
-        _ => Value::Object(None),
+    // HotSpot contract: return the InvocationHandler (proxy field 0) only for
+    // genuine proxy instances; throw NPE for null and CATCHABLE
+    // IllegalArgumentException for non-proxies. The previous body returned
+    // field 0 of ANY object — for an AnnotationProxy that is its
+    // type-descriptor String, and a later handler.invoke(...) on that String
+    // raised an UNCATCHABLE Rust-level NoSuchMethodError that killed threads
+    // inside Java catch(Throwable) blocks (Spring's
+    // AnnotationUtils.invokeAnnotationMethod relies on catching and falling
+    // back to Method.invoke).
+    let proxy = match args.first() {
+        Some(Value::Object(Some(p))) => *p,
+        Some(Value::Object(None)) | None => {
+            return Err(cratonvm_types::error::RuntimeError::NullPointerException {
+                message: Some("proxy is null".to_string()),
+            }
+            .into());
+        }
+        _ => {
+            return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+                message: "not a proxy instance".to_string(),
+            }
+            .into());
+        }
     };
-    Ok(Some(handler))
+    if !proxy_chain_reaches_instance(ctx, ctx.class_id_of_object(proxy)) {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: "not a proxy instance".to_string(),
+        }
+        .into());
+    }
+    Ok(Some(ctx.get_field(proxy, 0)))
 }
 
 fn native_proxy_new_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -34294,6 +34332,41 @@ fn native_proxy_dispatch_invoke(
     let handler_class = ctx
         .class_name_of_id(handler_cid)
         .unwrap_or_else(|| "java/lang/reflect/InvocationHandler".to_string());
+
+    // CRATONVM_REAL_ANNOTATIONS: when the proxy's InvocationHandler is the
+    // synthetic AnnotationProxy carrying the member data, the generated `$ProxyN`
+    // method bodies reach here (the cached/dead-code dispatch path that a 2nd
+    // call site falls into, bypassing `proxy_invoke_handler_shared`). Calling
+    // `invoke` on an AnnotationProxy returns null (it has no `invoke` element);
+    // instead invoke the requested annotation method (value/annotationType/
+    // equals/hashCode/toString) on it BY NAME — the same routing applied to the
+    // generated-body path. Without this, the 2nd access of a given
+    // (proxyClass, method) returns null (e.g. repeatable `getAnnotationsByType`).
+    if handler_class == "java/lang/annotation/AnnotationProxy" {
+        let mname = match ctx.get_field_by_name(method_obj, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if !mname.is_empty() {
+            let mut ann_args = vec![Value::Object(Some(handler))];
+            if let Some(arr) = args_arr {
+                let len = ctx.array_length(arr);
+                for i in 0..len {
+                    ann_args.push(ctx.get_array_element(arr, i));
+                }
+            }
+            // Routing into the AnnotationProxy interception is by class+name; the
+            // descriptor only governs result unboxing, and the AnnotationProxy
+            // hands back an already-boxed value (Object) — exactly what
+            // invokeProxy must return.
+            return ctx.invoke(
+                "java/lang/annotation/AnnotationProxy",
+                &mname,
+                "()Ljava/lang/Object;",
+                &ann_args,
+            );
+        }
+    }
 
     let invoke_args = [
         Value::Object(Some(handler)),

@@ -2074,9 +2074,42 @@ pub fn execute(
                             .unwrap_or(false)
                     {
                         let rest = if args.is_empty() { &[][..] } else { &args[1..] };
-                        return crate::vm::annotation_proxy_invoke_shared(
+                        let result = crate::vm::annotation_proxy_invoke_shared(
                             shared, thread, recv_obj, method_name, rest,
-                        );
+                        )?;
+                        // Unbox primitive-returning members. The proxy stores
+                        // its element values as boxed wrappers, but an
+                        // `invokeinterface <Ann>.member()` whose declared return
+                        // is a primitive needs the UNBOXED value — otherwise the
+                        // wrapper reference is reinterpreted as the primitive
+                        // (e.g. ByteBuddy reads `@Advice.OnMethodEnter.skipOnIndex()`
+                        // and sees the Integer object pointer — a positive int —
+                        // instead of -1, so `RelocationHandler.ForType.of` throws
+                        // "void is not an array type but an index for a
+                        // relocation is defined" and Hibernate's BytecodeProvider
+                        // service-load fails). Mirror the direct AnnotationProxy
+                        // dispatch path in `execute_invoke`.
+                        if let Some(value) = result {
+                            let ret_char = method_descriptor
+                                .rsplit(')')
+                                .next()
+                                .unwrap_or("L")
+                                .chars()
+                                .next()
+                                .unwrap_or('L');
+                            let unboxed = match ret_char {
+                                'I' | 'Z' | 'B' | 'C' | 'S' | 'J' | 'F' | 'D' => {
+                                    if let Value::Object(Some(obj)) = value {
+                                        shared.heap.get_field(obj, 0)
+                                    } else {
+                                        value
+                                    }
+                                }
+                                _ => value,
+                            };
+                            return Ok(Some(unboxed));
+                        }
+                        return Ok(None);
                     }
                     // Path A — receiver carries a real (non-zero) class_id.
                     //   Walk its runtime-class chain for a same-signature

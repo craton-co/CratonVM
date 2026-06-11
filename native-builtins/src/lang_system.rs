@@ -2032,6 +2032,15 @@ pub(crate) fn native_classloader_define_class1(
     };
     match ctx.define_class_full(&name, &bytes, loader_id, opts) {
         Ok(class_id) => {
+            // Record the exact defining ClassLoader instance so
+            // `Class.getClassLoader()` returns it (not the app-loader fallback).
+            // ByteBuddy's `ByteArrayClassLoader.load` asserts
+            // `Class.forName(name, false, this).getClassLoader() == this` and
+            // throws "Class already loaded" otherwise — the blocker for
+            // Hibernate's ByteBuddy proxy generation.
+            if let Some(Value::Object(Some(loader_obj))) = args.first() {
+                crate::classloader::register_defining_loader(class_id.as_u32(), *loader_obj);
+            }
             let mirror = ctx.get_class_mirror(class_id);
             Ok(Some(Value::Object(Some(mirror))))
         }

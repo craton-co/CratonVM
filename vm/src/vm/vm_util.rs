@@ -201,6 +201,41 @@ pub fn ensure_class_initialized_shared(
         return Ok(());
     }
 
+    // Known JDK <clinit> order cycle (slow path only). Cold-starting
+    // `jdk/internal/constant/PrimitiveClassDescImpl` FIRST is fatal:
+    // its `CD_int = new PrimitiveClassDescImpl("I")` ctor reads
+    // `ConstantDescs.BSM_PRIMITIVE_CLASS`, which nests
+    // `ConstantDescs.<clinit>`; that clinit's own
+    // `CD_int = PrimitiveClassDescImpl.CD_int` (ConstantDescs.java:249)
+    // re-enters the in-progress PrimitiveClassDescImpl and reads null, and
+    // `ofConstantBootstrap(..., CD_int)` then dies in requireNonNull → NPE
+    // → ExceptionInInitializerError → both classes are poisoned
+    // (NoClassDefFoundError for the rest of the process). This is the
+    // JDK's own circularity: stock HotSpot only survives because CDS
+    // pre-initializes ConstantDescs (`java -Xshare:off` reproduces the
+    // identical EIIE on HotSpot 25). Surfaced by Spring 7's JDK-24+
+    // ClassFile MetadataReader (Utf8EntryImpl.methodTypeSymbol →
+    // MethodTypeDescImpl.ofDescriptor) during @Configuration parsing.
+    //
+    // Fix: before CLAIMING PrimitiveClassDescImpl, fully initialize
+    // ConstantDescs. Its clinit nests PrimitiveClassDescImpl in the
+    // benign order (BSM_PRIMITIVE_CLASS/CD_Class are assigned before the
+    // line-249 read, so the proxy ctors see non-null statics). The
+    // re-entrant hint fired from inside that nested init short-circuits
+    // on the same-thread Initializing check, so recursion terminates.
+    {
+        let is_primitive_class_desc = shared
+            .class_manager
+            .read()
+            .get_class(class_id)
+            .is_some_and(|c| &*c.name == "jdk/internal/constant/PrimitiveClassDescImpl");
+        if is_primitive_class_desc {
+            if let Ok(cd_id) = shared.load_class_concurrent("java/lang/constant/ConstantDescs") {
+                let _ = ensure_class_initialized_shared(shared, thread, cd_id);
+            }
+        }
+    }
+
     let current_thread_id = thread.thread_id.0;
 
     loop {
