@@ -1310,12 +1310,60 @@ pub fn native_al_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let elems = al_or_collection_elements(ctx, this);
+    let mut elems = al_or_collection_elements(ctx, this);
+    if elems.is_empty() {
+        // `collect_collection_elements` only knows fixed collection layouts and
+        // returns empty for any other Collection — but this native is also
+        // registered on `AbstractCollection.toArray()`, so it intercepts
+        // *every* Collection, including custom user/library subclasses (e.g.
+        // ByteBuddy's `TypeList$Generic$Explicit`, which backs the interface
+        // list of every generated class). For those, `toArray()` must honour
+        // the real `Collection` contract — drive the real `iterator()`. Unlike
+        // `collect_collection_elements` (called BY the iterator native, hence
+        // can't iterate without recursing), `toArray` is not on the iterator
+        // native's path, so this is safe. Guard on a non-zero real `size()` so
+        // genuinely-empty collections skip the extra invokes.
+        let real_size = match ctx.invoke_virtual(this, "size", "()I", &[]) {
+            Ok(Some(Value::Int(n))) => n,
+            _ => 0,
+        };
+        if real_size > 0 {
+            elems = collect_via_real_iterator(ctx, this);
+        }
+    }
     let result = alloc_ref_array(ctx, elems.len());
     for (i, val) in elems.iter().enumerate() {
         ctx.set_array_element(result, i, *val);
     }
     Ok(Some(Value::Object(Some(result))))
+}
+
+/// Last-resort element collection for a Collection whose layout
+/// `collect_collection_elements` doesn't model: drive the real `iterator()`
+/// via virtual dispatch. ONLY safe to call from paths the `iterator()` native
+/// does not itself route through (e.g. `toArray()`), since the iterator native
+/// snapshots non-list collections through `collect_collection_elements`.
+fn collect_via_real_iterator(ctx: &mut dyn NativeContext, coll: ObjectRef) -> Vec<Value> {
+    let it = match ctx.invoke_virtual(coll, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(it)))) => it,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    loop {
+        match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(n))) if n != 0 => {}
+            _ => break,
+        }
+        match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(v)) => out.push(v),
+            _ => break,
+        }
+        // Safety bound against a misbehaving iterator that never reports done.
+        if out.len() > 16_777_216 {
+            break;
+        }
+    }
+    out
 }
 
 /// Read elements for the `toArray` / `forEach` natives. These are registered on
