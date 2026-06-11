@@ -1,11 +1,37 @@
 # Gap: real `java.util.concurrent.Phaser` bytecode misexecutes (state reads 0, `root` reads null)
 
 ## Status
-OPEN — discovered 2026-06-10 during the j.u.c. descriptor-coercion audit
-(Semaphore/CyclicBarrier/Exchanger/Phaser holder fixes). Pre-existing: reproduces
-on unmodified dev (`target/release/cratonvm.exe` from merge `d559e21a`).
+✅ **FIXED 2026-06-11.** Root cause: a **partial** synthetic Phaser native shadow
+*was* registered in real-JDK builds — contradicting the original analysis below
+(which wrongly assumed the only `register_phaser_natives` was the synthetic-jdk
+one in `native-builtins/phases_early.rs`). The active shadow is the **second**
+`register_phaser_natives` in `native-collections/src/lib.rs`, called from the
+ungated `register_collections_natives`. It overrides `<init>`, `register`,
+`arrive*`, `getPhase`, `getRegisteredParties`, `getArrivedParties` with a
+synthetic 3-int layout (parties=0, arrived=1, phase=2) — but the real Phaser
+layout is `state(0, J)`, `parent(1, L)`, `root(2, L)`, `evenQ(3, L)`,
+`oddQ(4, L)`. So the synthetic `<init>(I)` writes `Int(parties)` to slot 0
+(real `state`, a `long`) → descriptor-aware coercion turns it into `Long`, and
+the `Int`-matching `getRegisteredParties` reads it back as **0**; slot 2 (real
+`root`) gets `Int(0)` coerced to a **null** ref. And `getUnarrivedParties` is
+*not* shadowed, so it runs real bytecode → `reconcileState` reads `root.state`
+→ **NPE**.
 
-## Symptom
+**Fix:** gate the `native-collections` `register_phaser_natives` call behind
+`#[cfg(feature = "synthetic-jdk")]` (commit on `register_collections_natives`),
+exactly mirroring the adjacent `register_blocking_queue_natives` which was
+already gated for the identical partial-shadow reason. In real-JDK mode all
+Phaser methods now run real bytecode against the correct 5-field layout.
+
+**Verified** (CratonVM == HotSpot): `new Phaser(2)` → `getRegisteredParties`=2,
+`getUnarrivedParties`=2 (was 0 / NPE); plus full functional run — register,
+arrive, phase advancement, `arriveAndDeregister`, and a **2-thread
+`arriveAndAwaitAdvance` barrier** (real QNode wait-queue + park/unpark) all match
+HotSpot.
+
+---
+
+## Symptom (original report)
 In real-JDK builds the synthetic Phaser natives are NOT registered
 (`register_phaser_natives` is only reachable from `register_synthetic_overrides`,
 which is `cfg(feature = "synthetic-jdk")`), so the REAL Phaser bytecode runs — and

@@ -1663,57 +1663,72 @@ pub fn register_wildfly_core_natives(r: &mut NativeMethodRegistry) {
     });
 
     // --- EnhancedQueueExecutor ---
-    r.register(
-        "org/jboss/threads/EnhancedQueueExecutor$Builder",
-        "build",
-        "()Lorg/jboss/threads/EnhancedQueueExecutor;",
-        native_exec_builder_build,
-    );
-    // Bypass `Builder.setKeepAliveTime` validation — WildFly 39's bootstrap
-    // path constructs Builder defaults that under CratonVM end up with a
-    // `null` (or non-positive) `keepAliveTime` Duration, which the real
-    // setter rejects with `JBTHR00109`. We don't actually use the
-    // keep-alive value (the pool is driven from our Rust-side
-    // `EnhancedQueueExecutor`), so swallow the arg and return `this`.
-    r.register(
-        "org/jboss/threads/EnhancedQueueExecutor$Builder",
-        "setKeepAliveTime",
-        "(Ljava/time/Duration;)Lorg/jboss/threads/EnhancedQueueExecutor$Builder;",
-        native_exec_builder_set_keep_alive_duration,
-    );
-    r.register(
-        "org/jboss/threads/EnhancedQueueExecutor$Builder",
-        "setKeepAliveTime",
-        "(JLjava/util/concurrent/TimeUnit;)Lorg/jboss/threads/EnhancedQueueExecutor$Builder;",
-        native_exec_builder_set_keep_alive_long,
-    );
-    r.register(
-        "org/jboss/threads/EnhancedQueueExecutor",
-        "execute",
-        "(Ljava/lang/Runnable;)V",
-        native_exec_execute,
-    );
+    // The synthetic Rust-backed executor below is a *partial* shadow and is
+    // BROKEN as a whole: `build()` allocates a 4-field synthetic stub and
+    // never runs the real `<init>(Builder)`, so the real `threadStatus` long
+    // (packing core/max pool size) stays 0. `getCorePoolSize()` /
+    // `getMaximumPoolSize()` are NOT shimmed → real bytecode reads 0 → the
+    // executor believes its max pool size is 0 and never spawns a worker, so
+    // tasks submitted via jboss-msc (every WildFly service lifecycle / boot
+    // operation) are never run → `ModelControllerService` never starts → the
+    // subsystem-test `waitForSetup` CountDownLatch is never counted down →
+    // testSubsystem hangs 300s. Default to the REAL jboss-threads bytecode,
+    // which initializes `threadStatus` and spawns real worker `Thread`s
+    // (verified working in isolation). Opt back into the synthetic shim with
+    // `CRATONVM_SYNTHETIC_EQE=1`. Same partial-shadow fix pattern as Phaser /
+    // BlockingQueue. See gap-phaser-real-bytecode-state.md + the WildFly
+    // testSubsystem write-up.
+    if std::env::var("CRATONVM_SYNTHETIC_EQE").is_ok() {
+        r.register(
+            "org/jboss/threads/EnhancedQueueExecutor$Builder",
+            "build",
+            "()Lorg/jboss/threads/EnhancedQueueExecutor;",
+            native_exec_builder_build,
+        );
+        // Bypass `Builder.setKeepAliveTime` validation — WildFly 39's bootstrap
+        // path constructs Builder defaults that under CratonVM end up with a
+        // `null` (or non-positive) `keepAliveTime` Duration, which the real
+        // setter rejects with `JBTHR00109`. We don't actually use the
+        // keep-alive value (the pool is driven from our Rust-side
+        // `EnhancedQueueExecutor`), so swallow the arg and return `this`.
+        r.register(
+            "org/jboss/threads/EnhancedQueueExecutor$Builder",
+            "setKeepAliveTime",
+            "(Ljava/time/Duration;)Lorg/jboss/threads/EnhancedQueueExecutor$Builder;",
+            native_exec_builder_set_keep_alive_duration,
+        );
+        r.register(
+            "org/jboss/threads/EnhancedQueueExecutor$Builder",
+            "setKeepAliveTime",
+            "(JLjava/util/concurrent/TimeUnit;)Lorg/jboss/threads/EnhancedQueueExecutor$Builder;",
+            native_exec_builder_set_keep_alive_long,
+        );
+        r.register(
+            "org/jboss/threads/EnhancedQueueExecutor",
+            "execute",
+            "(Ljava/lang/Runnable;)V",
+            native_exec_execute,
+        );
 
-    // EnhancedQueueExecutor shutdown lifecycle. Our executor is fully
-    // synthetic (Rust-backed, inline task drain — see native_exec_execute), so
-    // its `threadStatus` long field is never maintained. The stock
-    // `shutdown()` bytecode spins forever in `compareAndSetThreadStatus`
-    // (an `AtomicLongFieldUpdater.compareAndSet` on that field, which can never
-    // succeed against an unmaintained field) — observed as an infinite hang in
-    // the subsystem-test @After cleanup (SubsystemTestDelegate.cleanup →
-    // ModelTestKernelServicesImpl.shutdown → EnhancedQueueExecutor.shutdown).
-    // Shim the lifecycle to clean terminal values so cleanup completes.
-    let eqe = "org/jboss/threads/EnhancedQueueExecutor";
-    r.register(eqe, "shutdown", "()V", |_ctx, _args| Ok(None));
-    r.register(eqe, "shutdown", "(Z)V", |_ctx, _args| Ok(None));
-    r.register(eqe, "isShutdown", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
-    r.register(eqe, "isTerminated", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
-    r.register(
-        eqe,
-        "awaitTermination",
-        "(JLjava/util/concurrent/TimeUnit;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(1))),
-    );
+        // EnhancedQueueExecutor shutdown lifecycle. The synthetic executor is
+        // Rust-backed (inline task drain — see native_exec_execute), so its
+        // `threadStatus` long field is never maintained. The stock
+        // `shutdown()` bytecode spins forever in `compareAndSetThreadStatus`
+        // (an `AtomicLongFieldUpdater.compareAndSet` on that field, which can
+        // never succeed against an unmaintained field). Shim the lifecycle to
+        // clean terminal values so synthetic-mode cleanup completes.
+        let eqe = "org/jboss/threads/EnhancedQueueExecutor";
+        r.register(eqe, "shutdown", "()V", |_ctx, _args| Ok(None));
+        r.register(eqe, "shutdown", "(Z)V", |_ctx, _args| Ok(None));
+        r.register(eqe, "isShutdown", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+        r.register(eqe, "isTerminated", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+        r.register(
+            eqe,
+            "awaitTermination",
+            "(JLjava/util/concurrent/TimeUnit;)Z",
+            |_ctx, _args| Ok(Some(Value::Int(1))),
+        );
+    }
 
     // --- AsyncFutureTask ---
     // Short-circuit `await()` so the Keycloak boot path (`Main.main` ->
@@ -2023,13 +2038,9 @@ mod tests {
                 "(Ljava/lang/String;)Lorg/jboss/logmanager/Logger;",
             )
             .is_some());
-        assert!(r
-            .find(
-                "org/jboss/threads/EnhancedQueueExecutor$Builder",
-                "build",
-                "()Lorg/jboss/threads/EnhancedQueueExecutor;",
-            )
-            .is_some());
+        // NOTE: `EnhancedQueueExecutor$Builder.build` is now opt-in behind
+        // `CRATONVM_SYNTHETIC_EQE` (default = real jboss-threads bytecode), so
+        // it is intentionally NOT registered here.
         assert!(r
             .find(
                 "org/jboss/as/controller/ControlledProcessState",
