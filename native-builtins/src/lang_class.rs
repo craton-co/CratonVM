@@ -7308,10 +7308,20 @@ pub(crate) fn annotation_element_to_java_typed(
                     return val;
                 }
                 if iae_trace_cls { eprintln!("ANN-CLASS desc={desc} class={class_name} RETURNING-NULL"); }
-            } else if iae_trace_cls {
-                eprintln!("ANN-CLASS desc={desc} NO-CLASS-NAME");
+                // Unloadable object class — preserve the existing null return.
+                return Value::Object(None);
             }
-            Value::Object(None)
+            // `annotation_desc_to_class_name` returned None: the descriptor is
+            // a primitive (`I`/`J`/...), `void` (`V`), or an array (`[...`) —
+            // most notably `default void.class`, used by ByteBuddy's
+            // `@Advice.FieldValue.declaringType()`. Returning null here made the
+            // annotation member read back as null, so ByteBuddy's
+            // `declaringType.represents(void.class)` NPE'd (`getName()` on a
+            // null TypeDescription) inside Hibernate's BytecodeProvider init.
+            // `descriptor_to_class_mirror` maps `V` -> the `void` primitive
+            // Class mirror, `[I` -> the canonical `int[]` mirror, etc.
+            if iae_trace_cls { eprintln!("ANN-CLASS desc={desc} primitive/void/array -> descriptor_to_class_mirror"); }
+            Value::Object(Some(descriptor_to_class_mirror(ctx, desc)))
         }
         AnnotationElementValue::Annotation(nested) => {
             let proxy = create_annotation_proxy(ctx, nested);

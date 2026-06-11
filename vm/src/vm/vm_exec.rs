@@ -4392,7 +4392,41 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // When Java code calls annotation.value(), annotation.path(), etc.,
             // look up the element by method name in the proxy's stored elements.
             if class_name == "java/lang/annotation/AnnotationProxy" {
-                return annotation_proxy_invoke(self, receiver, method_name, args);
+                let result = annotation_proxy_invoke(self, receiver, method_name, args)?;
+                // Unbox primitive-returning members so `invoke_virtual`'s
+                // contract matches bytecode methods (which yield a raw
+                // primitive Value for a primitive return descriptor). The
+                // proxy stores members as BOXED wrappers; returning them boxed
+                // makes a re-entrant caller like `Method.invoke`'s `box_value`
+                // DOUBLE-box — it stores the wrapper reference in a fresh
+                // wrapper's value slot, so a later `intValue()` reads the
+                // pointer (a positive int) instead of the real value. That is
+                // exactly how ByteBuddy's `JavaDispatcher`-driven read of
+                // `@Advice.OnMethodEnter.skipOnIndex()` (declared `default -1`)
+                // saw a bogus `>= 0` index, throwing "void is not an array
+                // type but an index for a relocation is defined" and failing
+                // Hibernate's BytecodeProvider service-load.
+                if let Some(value) = result {
+                    let ret = descriptor
+                        .rsplit(')')
+                        .next()
+                        .unwrap_or("L")
+                        .chars()
+                        .next()
+                        .unwrap_or('L');
+                    let unboxed = match ret {
+                        'I' | 'Z' | 'B' | 'C' | 'S' | 'J' | 'F' | 'D' => {
+                            if let Value::Object(Some(obj)) = value {
+                                self.shared.heap.get_field(obj, 0)
+                            } else {
+                                value
+                            }
+                        }
+                        _ => value,
+                    };
+                    return Ok(Some(unboxed));
+                }
+                return Ok(None);
             }
 
             // Prepend receiver to args.
@@ -7402,8 +7436,71 @@ pub(crate) fn annotation_proxy_dispatch_impl(
             }
         }
     }
+    // Element not found in the proxy's parallel arrays. A proxy materialised
+    // before its annotation interface was loadable misses the backfilled
+    // defaults (`create_annotation_proxy` only backfills when the annotation
+    // ClassId resolves). For a PRIMITIVE-returning member that then surfaces as
+    // a coerced-null garbage int/long: e.g. ByteBuddy reads
+    // `@Advice.OnMethodEnter.skipOnIndex()` (declared `int ... default -1`) and
+    // a garbage `>= 0` makes `RelocationHandler.ForType.of` throw "void is not
+    // an array type but an index for a relocation is defined", failing
+    // Hibernate's BytecodeProvider service-load. Mirror the real JDK's
+    // AnnotationInvocationHandler: fall back to the interface's declared default.
+    // Primitive defaults are returned unboxed — the caller in `interpreter.rs`
+    // unboxes by the method's primitive return descriptor — while object-typed
+    // defaults keep the previous null behaviour (those are normally backfilled).
+    if let Some(elem) = annotation_member_declared_default(shared, proxy, method_name) {
+        use crate::native::registry::AnnotationElementValue;
+        match elem {
+            AnnotationElementValue::Int(v) => return Ok(Some(Value::Int(v))),
+            AnnotationElementValue::Long(v) => return Ok(Some(Value::Long(v))),
+            AnnotationElementValue::Float(v) => return Ok(Some(Value::Float(v))),
+            AnnotationElementValue::Double(v) => return Ok(Some(Value::Double(v))),
+            _ => {}
+        }
+    }
     // Element not found вЂ” return null/default.
     Ok(Some(Value::Object(None)))
+}
+
+/// Look up the declared default value of annotation member `method_name` for
+/// the annotation interface a proxy represents. Used as the absent-member
+/// fallback in [`annotation_proxy_dispatch_impl`] — mirrors the real-JDK
+/// `AnnotationInvocationHandler` default behaviour. Returns `None` if the proxy
+/// has no resolvable type descriptor, the interface isn't loaded, the member is
+/// absent, or it has no `AnnotationDefault` attribute.
+fn annotation_member_declared_default(
+    shared: &SharedVm,
+    proxy: ObjectRef,
+    method_name: &str,
+) -> Option<crate::native::registry::AnnotationElementValue> {
+    // Proxy field 0 holds the annotation type descriptor, e.g. `Lpkg/Ann;`.
+    let desc = match shared.heap.get_field(proxy, 0) {
+        Value::Object(Some(s)) => super::read_java_string(&shared.heap, s)?,
+        _ => return None,
+    };
+    let class_name = desc
+        .strip_prefix('L')
+        .and_then(|s| s.strip_suffix(';'))
+        .unwrap_or(&desc)
+        .to_string();
+    let cid = shared.class_manager.read().find_class_by_name(&class_name)?;
+    let cm = shared.class_manager.read();
+    let class = cm.get_class(cid)?;
+    for m in &class.methods {
+        // Annotation members are no-arg abstract methods.
+        if &*m.name == method_name && m.descriptor.starts_with("()") {
+            for attr in &m.attributes {
+                if let Some(cratonvm_reader::attribute::Attribute::AnnotationDefault(ev)) =
+                    attr.as_decoded()
+                {
+                    return convert_element_value(ev, &class.constant_pool);
+                }
+            }
+            return None;
+        }
+    }
+    None
 }
 
 /// Count the number of parameters in a JVM descriptor like `(ILjava/lang/String;)V`.
