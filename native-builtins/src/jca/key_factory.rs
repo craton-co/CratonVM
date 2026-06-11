@@ -474,14 +474,37 @@ fn pqc_spi_classes(algo: i32) -> Option<(String, String)> {
     Some((format!("{base}$KPG{suffix}"), format!("{base}$KF{suffix}")))
 }
 
-// NOTE: ML-DSA/ML-KEM *key generation* is deliberately NOT routed to the real
-// JDK SPI. The JDK keygen (`ML_DSA.generateKeyPairInternal`) produces degenerate
-// all-zero key material under CratonVM (a deep interpreter bug in the SHAKE/NTT
-// lattice math, compounded by `JCAUtil.getDefSecureRandom()` returning zero
-// bytes), so routing it would mint an INSECURE, predictable key. Until the
-// keygen math is fixed, `kpg_generate_key_pair` keeps PQC keygen fail-closed.
-// Only *import* (`KeyFactory.generate{Public,Private}`) is routed below — it is
-// pure decode (no randomness) and produces HotSpot-byte-identical keys.
+/// Drive the real JDK PQC `KeyPairGenerator` SPI: `new KPG<n>()` →
+/// `generateKeyPair()`. `NamedKeyPairGenerator.generateKeyPair()` self-seeds
+/// from `JCAUtil.getDefSecureRandom()` when uninitialized (which works under
+/// CratonVM), so no explicit `initialize` is needed. Returns a real
+/// `java.security.KeyPair` (privateKey@0, publicKey@1).
+///
+/// This is only correct because the native `SHA3.keccak` override (lib.rs)
+/// makes SHAKE256 produce real output; without it the JDK lattice keygen yields
+/// degenerate all-zero keys.
+fn drive_real_pqc_keypair(ctx: &mut dyn NativeContext, algo: i32) -> MethodCallResult {
+    let kpg_class = match pqc_spi_classes(algo) {
+        Some((kpg, _)) => kpg,
+        None => {
+            return Err(throw_no_such_algorithm(
+                ctx,
+                &format!("{} KeyPairGenerator not available", algo_name(algo)),
+            ))
+        }
+    };
+    let spi = match ctx.new_object_initialized(&kpg_class, "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        other => {
+            other?;
+            return Err(throw_no_such_algorithm(
+                ctx,
+                &format!("{} KeyPairGenerator not available", algo_name(algo)),
+            ));
+        }
+    };
+    ctx.invoke_virtual(spi, "generateKeyPair", "()Ljava/security/KeyPair;", &[])
+}
 
 /// Drive the real JDK PQC `KeyFactory` SPI's `engineGenerate{Public,Private}`
 /// over `spec`. `method`/`ret` select public vs private. Pins `spec` across the
@@ -660,14 +683,19 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return Ok(Some(Value::Object(Some(alloc_keypair(ctx, pub_obj, priv_obj)))));
     }
 
-    // Recognised but not implemented (ML-KEM, ML-DSA, Ed25519, X25519, or an
-    // unknown name). NOTE: ML-DSA/ML-KEM *import* IS routed to the real JDK SPI
-    // (see kf_generate_public), but *key generation* is NOT — the JDK lattice
-    // keygen (`ML_DSA.generateKeyPairInternal`) produces degenerate all-zero key
-    // material under CratonVM (a deep interpreter bug in the SHAKE/NTT math,
-    // compounded by `JCAUtil.getDefSecureRandom()` yielding zero bytes). Routing
-    // it would hand back an INSECURE, predictable key — worse than failing — so
-    // we keep it fail-closed (throw) until the underlying keygen math is fixed.
+    // ML-DSA / ML-KEM: drive the real JDK 25 PQC KeyPairGenerator SPI (SUN /
+    // SunJCE) for a genuine, HotSpot-equivalent keypair. Safe now that the
+    // native `SHA3.keccak` override makes SHAKE256 produce real output (without
+    // it the JDK lattice keygen yields degenerate all-zero keys).
+    if crate::route_pqc_to_real() && pqc_spi_classes(algo).is_some() {
+        return drive_real_pqc_keypair(ctx, algo);
+    }
+
+    // Recognised but not implemented (Ed25519, X25519, an unknown name, or PQC
+    // with routing disabled). Real key generation is unavailable, so honour the
+    // JDK contract and throw `NoSuchAlgorithmException` rather than minting a
+    // KeyPair with empty key material (no-synthetic-stubs policy). RSA and EC
+    // returned above with real keys.
     Err(throw_no_such_algorithm(
         ctx,
         &format!("{} KeyPairGenerator not available", algo_name(algo)),

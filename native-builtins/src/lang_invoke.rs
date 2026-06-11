@@ -129,6 +129,13 @@ const VH_FIELD_COUNT: usize = 6;
 const VH_KIND_INSTANCE: i32 = 0;
 const VH_KIND_STATIC: i32 = 1;
 const VH_KIND_ARRAY: i32 = 2;
+// Byte-array-view VarHandle (`MethodHandles.byteArrayViewVarHandle(<T>[].class,
+// order)`): views a `byte[]` as a wider primitive at a BYTE index, with the
+// element descriptor carried in `field_desc` ("J"/"I"/"S"/"C"/"D"/"F"). The
+// little/big-endian variants are distinct kinds so the byte order is encoded
+// without growing `VarHandleMeta`. See `byte_view_{get,set}`.
+const VH_KIND_BYTE_VIEW_LE: i32 = 3;
+const VH_KIND_BYTE_VIEW_BE: i32 = 4;
 
 // ---------------------------------------------------------------------------
 // WP4.2 — VarHandle metadata side table
@@ -660,6 +667,56 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(lookup))))
     });
 
+    // byteArrayViewVarHandle(<T>[].class, ByteOrder) — view a byte[] as a wider
+    // primitive at a BYTE index. The real JDK VarHandle's get/set route through
+    // our `varhandle_get`/`_set`, but those would mis-detect it as an
+    // array-ELEMENT access (same [vh, array, index] arg shape) and read/write a
+    // single byte — which silently zeroed SHA3/SHAKE XOF squeeze and thus
+    // ML-DSA/ML-KEM keygen. Return a synthetic VarHandle tagged with byte-view
+    // meta (element type from the array Class, endianness from the ByteOrder) so
+    // get/set do the correct multi-byte LE/BE conversion. Also fixes any other
+    // byteArrayViewVarHandle user (NIO-style serialization, crypto, …).
+    r.register(
+        mhs,
+        "byteArrayViewVarHandle",
+        "(Ljava/lang/Class;Ljava/nio/ByteOrder;)Ljava/lang/invoke/VarHandle;",
+        |ctx, args| {
+            let elem = match args.first() {
+                Some(Value::Object(Some(mirror))) => {
+                    let cid = ctx.class_id_from_mirror(*mirror);
+                    let name = cid.and_then(|c| ctx.class_name_of_id(c));
+                    // array class name is "[J" / "[I" / … → element descriptor is byte 1
+                    name.and_then(|n| n.as_bytes().get(1).copied()).unwrap_or(b'J')
+                }
+                _ => b'J',
+            };
+            let le = match args.get(1) {
+                Some(Value::Object(Some(bo))) => match ctx.get_field_by_name(*bo, "name") {
+                    Value::Object(Some(s)) => ctx
+                        .read_string(s)
+                        .map(|n| n.contains("LITTLE"))
+                        .unwrap_or(true),
+                    _ => true,
+                },
+                _ => true,
+            };
+            let vh = alloc_concurrent_synthetic(ctx, "java/lang/invoke/VarHandle", VH_FIELD_COUNT);
+            vh_meta_put(
+                ctx,
+                vh,
+                VarHandleMeta {
+                    kind: if le { VH_KIND_BYTE_VIEW_LE } else { VH_KIND_BYTE_VIEW_BE },
+                    class_name: String::new(),
+                    field_name: String::new(),
+                    field_desc: (elem as char).to_string(),
+                    field_index: -1,
+                    class_id: 0,
+                },
+            );
+            Ok(Some(Value::Object(Some(vh))))
+        },
+    );
+
     // --- MethodHandles.Lookup ---
     //
     // Note: findVirtual/findStatic/findGetter/findSetter/findConstructor and
@@ -687,6 +744,20 @@ pub fn register_phase54_method_handle(r: &mut NativeMethodRegistry) {
 
     // --- VarHandle real ops ---
     let vh = "java/lang/invoke/VarHandle";
+
+    // VarHandle.withInvokeExactBehavior() / withInvokeBehavior() — JDK builders
+    // that toggle exact-invocation mode and return a VarHandle. For our
+    // synthetic VarHandles (e.g. from byteArrayViewVarHandle) the behaviour flag
+    // is irrelevant, so return the same handle (`this`) unchanged — preserving
+    // its side-table meta. `sun.security.provider.SHA3.<clinit>` chains
+    // `byteArrayViewVarHandle(...).withInvokeExactBehavior()`, which would
+    // otherwise hit AbstractMethodError on our synthetic VarHandle.
+    r.register(vh, "withInvokeExactBehavior", "()Ljava/lang/invoke/VarHandle;", |_ctx, args| {
+        Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+    });
+    r.register(vh, "withInvokeBehavior", "()Ljava/lang/invoke/VarHandle;", |_ctx, args| {
+        Ok(Some(args.first().copied().unwrap_or(Value::Object(None))))
+    });
 
     // VarHandle.get(Object...) → Object
     // For instance fields: args = [receiver]; for static: args = []
@@ -906,11 +977,90 @@ fn vh_read_string(ctx: &mut dyn NativeContext, vh: ObjectRef, field: usize) -> O
     }
 }
 
+/// Byte width of a byte-array-view element descriptor.
+fn byte_view_width(elem: u8) -> usize {
+    match elem {
+        b'J' | b'D' => 8,
+        b'I' | b'F' => 4,
+        b'S' | b'C' => 2,
+        _ => 1,
+    }
+}
+
+/// Read `width` bytes of a `byte[]` at BYTE index `idx`, assembled per
+/// endianness, and box them as the view element type. This is the correct
+/// `byteArrayViewVarHandle` get — distinct from an array-element access (which
+/// would return a single signed byte). CratonVM stores `byte[]` elements as
+/// signed `Value::Int`.
+fn byte_view_get(ctx: &dyn NativeContext, arr: ObjectRef, idx: usize, elem: u8, le: bool) -> Value {
+    let w = byte_view_width(elem);
+    let mut raw: u64 = 0;
+    for i in 0..w {
+        let b = ctx.get_array_element(arr, idx + i).as_int().unwrap_or(0) as u8 as u64;
+        if le { raw |= b << (8 * i); } else { raw = (raw << 8) | b; }
+    }
+    match elem {
+        b'J' => Value::Long(raw as i64),
+        b'D' => Value::Double(f64::from_bits(raw)),
+        b'I' => Value::Int(raw as u32 as i32),
+        b'F' => Value::Float(f32::from_bits(raw as u32)),
+        b'S' => Value::Int((raw as u16) as i16 as i32), // short, sign-extended
+        b'C' => Value::Int((raw as u16) as i32),        // char, zero-extended
+        _ => Value::Int(raw as u8 as i8 as i32),
+    }
+}
+
+/// Decompose `value` into `width` bytes per endianness and write them into the
+/// `byte[]` at BYTE index `idx`. The correct `byteArrayViewVarHandle` set.
+fn byte_view_set(ctx: &dyn NativeContext, arr: ObjectRef, idx: usize, elem: u8, le: bool, value: &Value) {
+    let w = byte_view_width(elem);
+    let raw: u64 = match value {
+        Value::Long(v) => *v as u64,
+        Value::Double(v) => v.to_bits(),
+        Value::Int(v) => *v as u32 as u64,
+        Value::Float(v) => v.to_bits() as u64,
+        _ => 0,
+    };
+    for i in 0..w {
+        let shift = if le { 8 * i } else { 8 * (w - 1 - i) };
+        let b = ((raw >> shift) & 0xff) as u8 as i8 as i32;
+        ctx.set_array_element(arr, idx + i, Value::Int(b));
+    }
+}
+
+/// If `meta` is a byte-array-view VarHandle, return `(element_desc, little_endian)`.
+fn byte_view_kind(meta: Option<&VarHandleMeta>) -> Option<(u8, bool)> {
+    let m = meta?;
+    let le = match m.kind {
+        VH_KIND_BYTE_VIEW_LE => true,
+        VH_KIND_BYTE_VIEW_BE => false,
+        _ => return None,
+    };
+    Some((*m.field_desc.as_bytes().first().unwrap_or(&b'J'), le))
+}
+
 /// VarHandle.get(receiver) → value
 /// Signature-polymorphic: args arrive as individual values from the call-site,
 /// i.e. args = [vh_ref, receiver] for instance fields.
 fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Round-7 HIGH-2 fix: fetch the side-table meta exactly once and reuse
+    // the bound Arc for `kind`/`field_index`/`class_name`/`field_name`/
+    // `field_desc`. Previously each helper (`vh_meta_get`, `vh_type_desc`,
+    // the by-name resolve fallback) re-locked the table 2–3× per native.
+    let meta = vh_meta_get(ctx, this);
+    // byte-array-view (`asLittleEndian.get([BI)J` etc.): MUST be handled BEFORE
+    // the array-element fast path, because both have the [vh, array, index]
+    // arg shape — but a view reads `width` bytes at a BYTE index, whereas the
+    // array path would return a single signed byte.
+    if let Some((elem, le)) = byte_view_kind(meta.as_deref()) {
+        let arr = match args.get(1) {
+            Some(Value::Object(Some(a))) => *a,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let idx = match args.get(2) { Some(Value::Int(i)) => *i as usize, _ => 0 };
+        return Ok(Some(byte_view_get(ctx, arr, idx, elem, le)));
+    }
     // C38: Array-element VarHandle call — detected by args[1] being an array
     // and args[2] being an Int. Handles real-JDK VarHandleLongs$Array and the
     // other primitive-array VarHandle subclasses produced by
@@ -921,11 +1071,6 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
         return Ok(Some(ctx.get_array_element(arr, idx)));
     }
-    // Round-7 HIGH-2 fix: fetch the side-table meta exactly once and reuse
-    // the bound Arc for `kind`/`field_index`/`class_name`/`field_name`/
-    // `field_desc`. Previously each helper (`vh_meta_get`, `vh_type_desc`,
-    // the by-name resolve fallback) re-locked the table 2–3× per native.
-    let meta = vh_meta_get(ctx, this);
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),
         None => {
@@ -1010,6 +1155,21 @@ fn varhandle_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 /// i.e. args = [vh_ref, receiver, value] for instance fields.
 fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Round-7 HIGH-2 fix: bind the Arc once and reuse for kind / field_index
+    // / class+field lookups instead of re-locking `vh_meta_table` each branch.
+    let meta = vh_meta_get(ctx, this);
+    // byte-array-view (`asLittleEndian.set([BIJ)V` etc.): handle BEFORE the
+    // array-element fast path — a view writes `width` bytes at a BYTE index,
+    // not a single element. (Writing the wide value into one byte slot was the
+    // SHA3/SHAKE-zeros bug.)
+    if let Some((elem, le)) = byte_view_kind(meta.as_deref()) {
+        if let Some(Value::Object(Some(arr))) = args.get(1) {
+            let idx = match args.get(2) { Some(Value::Int(i)) => *i as usize, _ => 0 };
+            let value = args.get(3).cloned().unwrap_or(Value::Int(0));
+            byte_view_set(ctx, *arr, idx, elem, le, &value);
+        }
+        return Ok(None);
+    }
     // C38: Array-element VarHandle.set — args = [vh, array, idx, value]. Handles
     // real-JDK VarHandleLongs$Array / VarHandleInts$Array / etc.
     if let Some((arr, idx)) = vh_array_call(ctx, args) {
@@ -1017,9 +1177,6 @@ fn varhandle_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         ctx.set_array_element(arr, idx, value);
         return Ok(None);
     }
-    // Round-7 HIGH-2 fix: bind the Arc once and reuse for kind / field_index
-    // / class+field lookups instead of re-locking `vh_meta_table` each branch.
-    let meta = vh_meta_get(ctx, this);
     let (kind, field_idx) = match meta.as_deref() {
         Some(m) => (m.kind, m.field_index),
         None => {
