@@ -34333,6 +34333,41 @@ fn native_proxy_dispatch_invoke(
         .class_name_of_id(handler_cid)
         .unwrap_or_else(|| "java/lang/reflect/InvocationHandler".to_string());
 
+    // CRATONVM_REAL_ANNOTATIONS: when the proxy's InvocationHandler is the
+    // synthetic AnnotationProxy carrying the member data, the generated `$ProxyN`
+    // method bodies reach here (the cached/dead-code dispatch path that a 2nd
+    // call site falls into, bypassing `proxy_invoke_handler_shared`). Calling
+    // `invoke` on an AnnotationProxy returns null (it has no `invoke` element);
+    // instead invoke the requested annotation method (value/annotationType/
+    // equals/hashCode/toString) on it BY NAME — the same routing applied to the
+    // generated-body path. Without this, the 2nd access of a given
+    // (proxyClass, method) returns null (e.g. repeatable `getAnnotationsByType`).
+    if handler_class == "java/lang/annotation/AnnotationProxy" {
+        let mname = match ctx.get_field_by_name(method_obj, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            _ => String::new(),
+        };
+        if !mname.is_empty() {
+            let mut ann_args = vec![Value::Object(Some(handler))];
+            if let Some(arr) = args_arr {
+                let len = ctx.array_length(arr);
+                for i in 0..len {
+                    ann_args.push(ctx.get_array_element(arr, i));
+                }
+            }
+            // Routing into the AnnotationProxy interception is by class+name; the
+            // descriptor only governs result unboxing, and the AnnotationProxy
+            // hands back an already-boxed value (Object) — exactly what
+            // invokeProxy must return.
+            return ctx.invoke(
+                "java/lang/annotation/AnnotationProxy",
+                &mname,
+                "()Ljava/lang/Object;",
+                &ann_args,
+            );
+        }
+    }
+
     let invoke_args = [
         Value::Object(Some(handler)),
         Value::Object(Some(proxy)),
