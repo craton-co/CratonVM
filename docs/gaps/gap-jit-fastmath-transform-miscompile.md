@@ -297,3 +297,67 @@ The same desync family may explain other standing bans that were diagnosed as
 `java/util/HashMap` put/get/resize ban, the Spring `ClassUtils.<clinit>`
 crash, the BC RBC.1 blanket ban, and the JUnitCore.main stopgap. Each should
 be retested with the fixed length tables before assuming its root cause.
+
+---
+
+## RESOLVED — Bug 4 root cause (2026-06-11, same branch, follow-up session)
+
+`testAdHocData` (and the whole `FastFourierTransformerTest` class) now passes
+under JIT: suite is 54/56 across reruns with ONLY the Bug-5 `testTransformReal`
+interpreter-precision flakes remaining.
+
+### Root cause: JIT frame overflow from a spill-cursor ratchet
+
+The invoke-dispatch emission sites (`jit/src/x64.rs`, invokestatic and
+invokevirtual/special/interface) carve their outgoing args buffer at the
+current `next_spill_offset` watermark, then after the call "reclaimed" the
+cursor to `pre_pop_spill` — the WITH-ARGS depth — and pushed the return value
+on top. Net effect: every non-void dispatch left the cursor `n_args` slots
+above the true operand depth. Across testAdHocData's ~19 call sites the
+cursor crept ~12 slots past the spill region, so the FFT-constructor call's
+args buffer landed at `[rbp-0x178..0x188]` while the prologue had reserved
+only `sub rsp, 0x170`: the buffer sat BELOW RSP, where the dispatch helper's
+own CALL/prologue immediately overwrote it — the helper then read receiver=0
+from its own clobbered stack and the interpreted 2-arg ctor got an all-zero
+frame ("Cannot write field 'normalization' because the object is null").
+Proven by: `[JIT_ALLOC]` (alloc returned a valid object) vs `[JIT_DISPATCH]`
+(arg0=0x0 two loads later) + the `CRATONVM_DBG_JIT_DISASM` dump showing the
+buffer offsets past the prologue reservation.
+
+### Why it was so hard to see
+
+The method executed as JIT code through the FIRST-CALL compile path inside
+`invoke_method_shared` — which had NO `DBG_JITC` logging — so reflectively
+invoked test methods compiled and ran invisibly (5,400+ silent JIT entries in
+one ConsoleLauncher run). `BISECT_SKIP`-ing every *logged* compile changed
+nothing, which made the bug look like "JIT-infrastructure, not codegen".
+Three observability holes fixed alongside: first-call path and the
+upgrade-path `callee_compiler` closure now log (`first-compile` /
+`callee-compile`) and feed `CRATONVM_DBG_JIT_DISASM`; the closure also now
+applies the static skip list (S-HIB.1 twin — it previously compiled complex
+`<init>` bodies every other path bans, observed on `Pattern.<init>`).
+
+### The fix (both required)
+
+- **Cursor:** restore `next_spill_offset` to the POST-pop level after each
+  dispatch (the args buffer is dead once the helper returns; the return value
+  now lands at its semantic depth). Two sites.
+- **Frame sizing:** reserve `max_stack_estimate + max(num_jit_args over
+  invoke sites)` spill slots so the worst-case args buffer always fits inside
+  `sub rsp, frame_size` (it could previously also overlap the callee-saved
+  save area).
+
+### New diagnostics from this hunt
+
+`CRATONVM_DBG_NULLTHIS` (frame stack + locals on null-receiver putfield),
+`CRATONVM_DBG_JIT_ALLOC=<class_id>` (JIT allocation tracing),
+`[JIT_DISPATCH]` arg dumps (pre-existing `CRATONVM_DBG_JIT_DISPATCH`).
+
+### Validation
+
+FastFourierTransformerTest 10/10; transform suite 54/56 ×2 (remaining = Bug-5
+flakes); `cargo test -p cratonvm-jit` 698/0; bench checksums unchanged
+(bintrees18=68332206, sieve250k, matrix600, fib44); FastMath RealFm sweep
+still 0 fails; FillProbe/ChmScale/HashMapProbe/ParseProbe HotSpot-identical in
+DEFAULT env (NETTY.1 Arrays.fill + W2-CHM Integer/Long.valueOf bans lifted);
+pool probes kafka/spring/tomcat/felix/lucene PASS.

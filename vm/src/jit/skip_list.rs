@@ -1132,7 +1132,14 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // share the same bytecode shape and are skip-listed pre-emptively.
         // Other `java/util/Arrays` methods (sort, copyOf, hashCode) don't
         // exhibit this counted-loop shape and stay JIT-eligible.
-        | ("java/util/Arrays", "fill")
+        //
+        // NETTY.1 LIFTED (2026-06-11, CM-FASTMATH retest session): with the
+        // regalloc/lentable fixes in place, `bench/FillProbe` replays the
+        // exact repro shape (byte[65536] filled with -1, OSR at the backedge
+        // threshold, plus the long[]/char[] variants — `fill([II)V` is
+        // native-bridged and never compiles) — all OSR-compile, terminate,
+        // and match HotSpot's checksum. Ban removed; FillProbe is the
+        // regression witness.
         // JUNIT.1 (current session) — STOPGAP. JIT-compiling
         // `org/junit/runner/JUnitCore.main` under real-JCA produces severe
         // young-gen heap corruption: out-of-bounds heap writes overwrite live
@@ -1149,6 +1156,14 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // harness crashes. This ban unblocks JUnit-under-JIT until the
         // inline-new/TLAB root cause is fixed. See
         // docs/.. / memory `reference_jit_junitcore_corruption`.
+        //
+        // Retest (2026-06-11, CM-FASTMATH session): inconclusive — in
+        // realistic runs (keycloak crypto classes via JUnitCore, with
+        // `CRATONVM_JIT_UNBAN_JUNITCORE=1`) `main` never reaches a compile
+        // threshold (one invocation per process, no hot back-edges), so the
+        // ban could not be exercised; it is also zero-cost for the same
+        // reason. KEEP until the original heavy real-JCA harness conditions
+        // can be recreated.
         | ("org/junit/runner/JUnitCore", "main")
         // NEW-1.4 — regalloc parameter-mapping bug, surfaces as
         // `test_s46_exc_hierarchy` returning Int(0) instead of Int(1).
@@ -1169,9 +1184,17 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // Narrow: other `Integer` methods (`intValue` reads field 0;
         // `parseInt` parses a `String`) stay JIT-eligible because they
         // do not exercise the allocate-then-putfield sequence.
-        | ("java/lang/Integer", "valueOf")
+        //
+        // W2-CHM `valueOf` LIFTED (2026-06-11, CM-FASTMATH retest session):
+        // with the regalloc/lentable fixes, `bench/ChmScale` (recreated —
+        // the original apps/chm_basic reproducer is gone) + `HashMapProbe`
+        // + `ParseProbe` all compile `Integer.valueOf` (upgrade-OK) and
+        // match HotSpot exactly, including the historical k992..k999
+        // boundary. The `<init>` entries stay: constructors are banned by
+        // the generic `<init>` gate anyway (field-storing ctors are never
+        // `InitComplexity::Trivial`), so the entries are redundant but
+        // document the archetype.
         | ("java/lang/Integer", "<init>")
-        | ("java/lang/Long", "valueOf")
         | ("java/lang/Long", "<init>")
         // SPB.8 (Session 113 r2) — `java/lang/Long.parseLong(String,int)`
         // and friends. WildFly boot dispatch trace shows this method

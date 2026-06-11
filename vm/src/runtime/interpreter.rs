@@ -2816,6 +2816,31 @@ pub fn execute(
                     jit_cache.get(&class_name_arc, &method_name_arc, &descriptor_arc)
                     // `jit_cache` write-lock dropped here at end of scope.
                 };
+                // This first-call path compiles thousands of methods per run
+                // (everything reached via `invoke_method_shared`, incl. the
+                // reflective-invoke chain), and was the only compile site with
+                // NO success logging — which made the Bug-4 testAdHocData JIT
+                // execution invisible to CRATONVM_DBG_JITC-based bisection.
+                if let Some(c) = &cached_result {
+                    if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                        eprintln!(
+                            "[cratonvm-jitc] first-compile {}.{}{} entry={:p} len={}",
+                            class_name_arc,
+                            method_name_arc,
+                            descriptor_arc,
+                            c.entry_ptr(),
+                            c.code_bytes().len()
+                        );
+                    }
+                    crate::jit::disasm::maybe_dump(
+                        "first",
+                        &class_name_arc,
+                        &method_name_arc,
+                        &descriptor_arc,
+                        c.entry_ptr(),
+                        c.code_bytes(),
+                    );
+                }
                 // Record JFR compilation event — flight_recorder lock taken
                 // *after* the JIT cache write has been released.
                 //
@@ -7561,7 +7586,38 @@ fn execute_instruction(
                     "Cannot write field '{}' because the object is null",
                     field_name.as_deref().unwrap_or("?")
                 ),
-            )?;
+            );
+            // CRATONVM_DBG_NULLTHIS — dump the Java frame stack + current-frame
+            // locals when a putfield pops a null receiver. Diagnoses the
+            // "Cannot write field X because the object is null" family (a JIT'd
+            // or misdispatched caller losing the freshly allocated receiver,
+            // cf. gap-jit-fastmath-transform-miscompile.md Bug 4).
+            if obj_ref.is_err() && std::env::var_os("CRATONVM_DBG_NULLTHIS").is_some() {
+                let fr0 = &thread.frames[frame_idx];
+                eprintln!(
+                    "[nullthis] putfield '{}' on null receiver in {}.{}{} pc={}",
+                    field_name.as_deref().unwrap_or("?"),
+                    fr0.class_name(),
+                    fr0.method_name(),
+                    fr0.method_descriptor(),
+                    fr0.pc
+                );
+                for (i, fr) in thread.frames.iter().enumerate().rev().take(30) {
+                    eprintln!(
+                        "  [{}] {}.{}{} pc={}",
+                        i,
+                        fr.class_name(),
+                        fr.method_name(),
+                        fr.method_descriptor(),
+                        fr.pc
+                    );
+                }
+                let fr0 = &thread.frames[frame_idx];
+                for li in 0..fr0.locals_len().min(8) {
+                    eprintln!("  local[{}] = 0x{:x}", li, fr0.get_local_raw(li));
+                }
+            }
+            let obj_ref = obj_ref?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
             // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
             // fields — object address + resolved slot — to localize a write
@@ -14512,6 +14568,47 @@ fn try_jit_upgrade_with_gate(
             };
             drop(cm);
 
+            // S-HIB.1 twin — apply the static skip list to recursive callee
+            // compilations from THIS closure too. Before this check, the
+            // closure honored only the FJP blocklist + native-shadow gate, so
+            // a threshold compile could silently callee-compile methods every
+            // other path bans: complex `<init>`/`<clinit>` bodies (observed:
+            // `java/util/regex/Pattern.<init>` attempted during the
+            // `Pattern.compile` upgrade), `is_known_miscompile` entries, and
+            // anything in `CRATONVM_JIT_BISECT_SKIP` — which also made
+            // skip-based bisection silently unsound for any method reachable
+            // as a direct callee. Mirrors `try_jit_compile_callee`.
+            {
+                let policy = if shared.config.jit_aggressive_compilation {
+                    crate::jit::skip_list::SkipPolicy::Aggressive
+                } else {
+                    crate::jit::skip_list::SkipPolicy::Conservative
+                };
+                let init_complexity = if callee_method == "<init>" || callee_method == "<clinit>" {
+                    crate::jit::skip_list::classify_init_complexity(&callee_cached.code)
+                } else {
+                    crate::jit::skip_list::InitComplexity::Unknown
+                };
+                let is_iface_default = {
+                    let cm2 = shared.class_manager.read();
+                    cm2.get_class(callee_cached.declaring_class_id)
+                        .map_or(false, |c| c.is_interface())
+                };
+                if crate::jit::skip_list::should_skip_jit_with_init(
+                    &callee_cached.class_name,
+                    callee_method,
+                    is_iface_default,
+                    std::thread::current().name().is_some(),
+                    policy,
+                    crate::jit::skip_list::allow_packages_from_env(),
+                    init_complexity,
+                )
+                .is_some()
+                {
+                    return None;
+                }
+            }
+
             // Build resolvers for the callee's constant pool
             let callee_cid = declaring_id;
             let c_resolver = |cp_idx: u16| -> Option<String> {
@@ -14658,6 +14755,24 @@ fn try_jit_upgrade_with_gate(
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
             let needs_ctx = compiled.needs_context();
+            if std::env::var_os("CRATONVM_DBG_JITC").is_some() {
+                eprintln!(
+                    "[cratonvm-jitc] callee-compile {}.{}{} entry={:p} len={}",
+                    callee_cached.class_name,
+                    callee_cached.method_name,
+                    callee_cached.method_descriptor,
+                    compiled.entry_ptr(),
+                    compiled.code_bytes().len()
+                );
+            }
+            crate::jit::disasm::maybe_dump(
+                "callee",
+                &callee_cached.class_name,
+                &callee_cached.method_name,
+                &callee_cached.method_descriptor,
+                compiled.entry_ptr(),
+                compiled.code_bytes(),
+            );
 
             // Store in JIT cache
             {

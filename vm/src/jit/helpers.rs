@@ -979,6 +979,16 @@ pub unsafe extern "C" fn jit_post_tlab_init(
         vm.register_finalizable(obj_ref.as_ptr() as usize);
     }
 
+    if let Ok(filter) = std::env::var("CRATONVM_DBG_JIT_ALLOC") {
+        if let Ok(want) = filter.parse::<u32>() {
+            if class_id_raw as u32 == want {
+                eprintln!(
+                    "[JIT_ALLOC] post_tlab_init class_id={} obj=0x{:x}",
+                    class_id_raw, obj_ptr
+                );
+            }
+        }
+    }
     obj_ptr
 }
 
@@ -1031,6 +1041,17 @@ pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fiel
         .map_or(false, |c| c.has_finalizer);
     if has_fin {
         vm.register_finalizable(obj_ref.as_ptr() as usize);
+    }
+    if let Ok(filter) = std::env::var("CRATONVM_DBG_JIT_ALLOC") {
+        if let Ok(want) = filter.parse::<u32>() {
+            if class_id_raw as u32 == want {
+                eprintln!(
+                    "[JIT_ALLOC] new_object class_id={} obj=0x{:x}",
+                    class_id_raw,
+                    obj_ref.as_ptr() as usize
+                );
+            }
+        }
     }
     obj_ref.as_ptr() as i64
 }
