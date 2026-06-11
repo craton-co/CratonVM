@@ -64,6 +64,20 @@ pub fn signal_stack_dump_to_waiters() {
     STACK_DUMP_WAIT_FLAG.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// KC16-watchdog: gated diagnostic. When `CRATONVM_DBG_MONENTER` is set, the
+/// contended `Monitor::enter` loop polls the stack-dump flag and emits the
+/// blocked thread's frame snapshot (deposited by `monitor_enter` in
+/// `vm_exec`). This surfaces a thread deadlocked while acquiring a
+/// `synchronized` monitor — otherwise invisible to the watchdog, which only
+/// sees `Object.wait` / `LockSupport.park` waiters. **Default OFF**: the
+/// hot contended-enter path stays byte-for-byte unchanged in normal runs
+/// (plain `entry_condvar.wait`); the poll variant runs only under the flag.
+/// Read once and cached so the per-enter check is a single relaxed load.
+pub fn mon_enter_dump_enabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("CRATONVM_DBG_MONENTER").is_ok())
+}
+
 /// KC16-watchdog: callback installed by the VM that emits the current
 /// thread's frame chain from a wait-site context. Set by `SharedVm`
 /// during construction so `Monitor::wait` can reach the per-thread
@@ -385,9 +399,28 @@ impl Monitor {
     /// monitor is released.
     fn enter(&self, thread_id: ThreadId) {
         let mut state = self.state.lock();
-        // Wait until the monitor is either unowned or owned by us
-        while state.owner.is_some() && state.owner != Some(thread_id) {
-            self.entry_condvar.wait(&mut state);
+        // Wait until the monitor is either unowned or owned by us.
+        if mon_enter_dump_enabled() {
+            // Gated diagnostic only (CRATONVM_DBG_MONENTER): poll on a 5ms
+            // cadence so a watchdog stack-dump request can surface a thread
+            // deadlocked here. Emits the blocked thread's frames once (the
+            // snapshot was deposited by `monitor_enter` before this call).
+            let mut dumped = false;
+            while state.owner.is_some() && state.owner != Some(thread_id) {
+                self.entry_condvar
+                    .wait_for(&mut state, std::time::Duration::from_millis(5));
+                if !dumped
+                    && stack_dump_wait_flag().load(std::sync::atomic::Ordering::Acquire)
+                {
+                    emit_wait_site_frames(thread_id);
+                    dumped = true;
+                }
+            }
+        } else {
+            // Normal path — unchanged: block on the condvar until released.
+            while state.owner.is_some() && state.owner != Some(thread_id) {
+                self.entry_condvar.wait(&mut state);
+            }
         }
         match state.owner {
             None => {

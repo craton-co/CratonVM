@@ -206,6 +206,60 @@ impl ThreadRegistry {
         }
     }
 
+    /// T19.H1 watchdog — unpark every registered thread so threads parked
+    /// in `LockSupport.park` (e.g. AQS lock/latch waiters) wake, return
+    /// through the interpreter top-of-loop poll, and emit their stack dump.
+    /// Diagnostic-only: a spurious unpark is spec-legal (`park` may return
+    /// spuriously) and the process aborts immediately after the dump, so the
+    /// extra permits never affect correctness.
+    pub fn unpark_all_for_stack_dump(&self) {
+        let threads = self.threads.lock();
+        for entry in threads.values() {
+            entry.park_state.unpark();
+        }
+    }
+
+    /// T19.H1 watchdog — print a one-line summary of every registered thread
+    /// (name, liveness, daemon, deposited-root count) to stderr. Lets the
+    /// watchdog show threads that have NO dumpable interpreter frames — e.g.
+    /// a thread blocked in a Rust-level native lock, or one that never
+    /// started — which the frame-dump path cannot surface. A non-zero
+    /// `roots` on an otherwise-silent thread means it deposited roots before
+    /// blocking (it IS blocked in a native), distinguishing "blocked in
+    /// native" from "never ran".
+    pub fn dump_thread_summary_to_stderr(&self) {
+        use std::io::Write;
+        let threads = self.threads.lock();
+        let stderr = std::io::stderr();
+        let mut h = stderr.lock();
+        let _ = writeln!(
+            h,
+            "--- T19.H1 thread summary: {} registered thread(s) ---",
+            threads.len()
+        );
+        let mut rows: Vec<(u64, String, bool, bool, usize)> = threads
+            .iter()
+            .map(|(tid, e)| {
+                (
+                    tid.0,
+                    e.name.clone(),
+                    e.alive.load(std::sync::atomic::Ordering::Acquire),
+                    e.daemon.load(std::sync::atomic::Ordering::Acquire),
+                    e.root_snapshot.lock().len(),
+                )
+            })
+            .collect();
+        rows.sort_by_key(|r| r.0);
+        for (tid, name, alive, daemon, roots) in rows {
+            let _ = writeln!(
+                h,
+                "  tid={tid} name={name:?} alive={alive} daemon={daemon} roots={roots}"
+            );
+        }
+        let _ = writeln!(h, "--- T19.H1 end thread summary ---");
+        let _ = h.flush();
+    }
+
     /// T1.5.1 — Take the target thread's pending async exception (if any).
     /// Called from the target thread's `safepoint_check` — never
     /// cross-thread. The consumer is responsible for raising the

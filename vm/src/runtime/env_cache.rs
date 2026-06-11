@@ -131,6 +131,10 @@ cached_is_set!(resume_pc_dbg, "CRATONVM_DBG_RESUME_PC");
 /// Java frame stack + field + Rust backtrace and raise an NPE instead of
 /// dereferencing the wild pointer, so the origin can be localized.
 cached_is_set!(badrecv_dbg, "CRATONVM_DBG_BADRECV");
+/// `CRATONVM_DBG_FIELDADDR` — trace put/get of specific instance fields
+/// (object address + resolved slot) to localize a write that does not reach
+/// the read site (e.g. the EnhancedQueueExecutor constructor field gap).
+cached_is_set!(field_addr_dbg, "CRATONVM_DBG_FIELDADDR");
 /// `CRATONVM_DBG_JETTY` — trace dispatch into the `org/eclipse/jetty/start/`
 /// launcher package (every invokevirtual/invokespecial receiver + args) so
 /// the boot-test NPE at `Main.start(Main.java:397)` can be pinpointed.

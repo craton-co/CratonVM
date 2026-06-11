@@ -656,6 +656,15 @@ pub(crate) fn monitor_enter_blocking(
     let pin_base = ctx.thread.native_pin_roots.len();
     ctx.thread.native_pin_roots.push(obj);
     ctx.deposit_root_snapshot();
+    // Gated diagnostic only (CRATONVM_DBG_MONENTER, default OFF): deposit this
+    // thread's frame snapshot so the contended-`enter` poll loop can emit it
+    // if a watchdog stack-dump fires while we are blocked acquiring this
+    // `synchronized` monitor — the one blocking site otherwise invisible to
+    // the watchdog. No effect in normal runs (flag read once + cached).
+    let dbg_mon_dump = crate::threading::monitor::mon_enter_dump_enabled();
+    if dbg_mon_dump {
+        crate::vm::vm_init::set_wait_site_snapshot(ctx.thread);
+    }
     {
         let blk = shared.gc_barrier.enter_blocked();
         if blk.pre_stw {
@@ -665,6 +674,9 @@ pub(crate) fn monitor_enter_blocking(
         }
         m.block_enter(tid);
         drop(blk);
+    }
+    if dbg_mon_dump {
+        crate::vm::vm_init::clear_wait_site_snapshot();
     }
     ctx.check_post_block_gc();
     let fixed = ctx
@@ -2744,11 +2756,22 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn monitor_enter(&mut self, obj: ObjectRef) {
+        // Gated diagnostic only (CRATONVM_DBG_MONENTER, default OFF): deposit
+        // this thread's frame snapshot so the contended-`enter` poll loop can
+        // emit it if a watchdog stack-dump fires while we are blocked here.
+        // No cost in normal runs — the flag is read once and cached.
+        let dbg_mon_dump = crate::threading::monitor::mon_enter_dump_enabled();
+        if dbg_mon_dump {
+            crate::vm::vm_init::set_wait_site_snapshot(&*self.thread);
+        }
         // NOTE deliberately NOT monitor_enter_blocking: the calling native
         // holds raw `Value` copies (its args slice) that are neither rooted
         // nor remappable across a GC-blocked wait; block as an EXPECTED
         // mutator instead (a concurrent STW waits for us).
         self.shared.monitors.enter(obj, self.thread.thread_id);
+        if dbg_mon_dump {
+            crate::vm::vm_init::clear_wait_site_snapshot();
+        }
         // JEP 491: a virtual thread that holds a monitor is pinned to its
         // carrier and cannot be unmounted. Track the pin depth so that
         // subsequent park/sleep calls can emit `jdk.VirtualThreadPinned`.
@@ -3084,6 +3107,20 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // runtime class (e.g. BoundVirtualThread) and naturally finds
             // the override before falling back to Thread.run().
             let recv_cid = shared_arc.heap.class_id_of(thread_obj_for_spawn);
+            // Gated diagnostic (CRATONVM_DBG_THREADSTART): log each spawned
+            // thread's run-class on entry and its result on exit — surfaces
+            // threads that never start their target or block inside run().
+            let dbg_ts = std::env::var("CRATONVM_DBG_THREADSTART").is_ok();
+            if dbg_ts {
+                let cn = shared_arc
+                    .class_manager
+                    .read()
+                    .class_store
+                    .get(recv_cid)
+                    .map(|c| c.name.to_string())
+                    .unwrap_or_default();
+                eprintln!("[THREADSTART] tid={} name={:?} run-class={}", tid.0, name, cn);
+            }
             // Class is already loaded (heap entry exists); ensure init runs.
             let _ = super::ensure_class_initialized_shared(&shared_arc, &mut jvm_thread, recv_cid);
             let result = invoke_on_class_shared(
@@ -3094,6 +3131,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 "()V",
                 &[Value::Object(Some(thread_obj_for_spawn))],
             );
+            if dbg_ts {
+                eprintln!(
+                    "[THREADEND] tid={} name={:?} result={}",
+                    tid.0,
+                    name,
+                    if result.is_ok() { "ok" } else { "ERR" }
+                );
+            }
             if let Err(e) = result {
                 // W1-C: dispatch the per-Thread (or default)
                 // UncaughtExceptionHandler before dropping the exception.
@@ -4038,7 +4083,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // T19.H1 — mark GC-blocked across the park so a stop-the-world
         // GC does not wait for this (parked, GC-safe) thread. The
         // `BlockedGuard` clears the mark on drop regardless of how the
-        // park returns.
+        // park returns. A watchdog stack-dump request unparks this thread
+        // (see `request_stack_dump` → `unpark_all_for_stack_dump`); on
+        // return it re-enters the interpreter loop, whose top-of-loop poll
+        // emits its current frames — no per-park snapshot cost needed.
         {
             let blk = self.shared.gc_barrier.enter_blocked();
             if blk.pre_stw {
@@ -5300,8 +5348,11 @@ pub(super) fn extract_annotations_from_attributes(
             None => continue,
         };
         match attr {
-            Attribute::RuntimeVisibleAnnotations(annotations)
-            | Attribute::RuntimeInvisibleAnnotations(annotations) => {
+            // Reflection (Method/Field getAnnotation / isAnnotationPresent)
+            // must only see @Retention(RUNTIME) annotations. CLASS-retained
+            // annotations land in RuntimeInvisibleAnnotations and must stay
+            // invisible to match HotSpot — gap-annotation-retention-policy.md.
+            Attribute::RuntimeVisibleAnnotations(annotations) => {
                 for ann in annotations {
                     if let Some(data) = convert_annotation(ann, cp) {
                         result.push(data);

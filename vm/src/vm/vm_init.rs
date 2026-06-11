@@ -3406,6 +3406,15 @@ impl SharedVm {
         // poll exit the condvar and re-check its state, where the
         // standard top-of-loop ack path then fires.
         crate::threading::monitor::signal_stack_dump_to_waiters();
+        // Also unpark every thread blocked in `LockSupport.park` (AQS
+        // lock/latch/executor waiters). These never reach the condvar the
+        // line above signals, so without this they stay invisible to the
+        // watchdog. They wake, emit their park-site snapshot / current
+        // frames, and the process aborts right after.
+        self.thread_registry.unpark_all_for_stack_dump();
+        // Summarize every registered thread (incl. those with no dumpable
+        // interpreter frames — blocked in a native lock, or never started).
+        self.thread_registry.dump_thread_summary_to_stderr();
     }
 
     /// T19.H1 — fast-path check used by the interpreter hot loop.

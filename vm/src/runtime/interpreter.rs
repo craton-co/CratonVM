@@ -7221,6 +7221,22 @@ fn execute_instruction(
                 ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
+            if crate::runtime::env_cache::field_addr_dbg() {
+                if let Some(fname) = field_name.as_deref() {
+                    if matches!(fname, "unsharedLongs" | "threadFactory" | "runningThreads" | "submittedTaskCounter") {
+                        let raw = shared.heap.get_field(obj_ref, field.field_index);
+                        eprintln!(
+                            "[FIELDADDR] GET {} obj=0x{:x} slot={} num_slots={} readObj={} in {}",
+                            fname,
+                            obj_ref.as_ptr() as usize,
+                            field.field_index,
+                            shared.heap.get_header(obj_ref).num_slots,
+                            matches!(raw, Value::Object(Some(_))),
+                            thread.frames[frame_idx].class_name(),
+                        );
+                    }
+                }
+            }
             // CRATONVM_DBG_BADRECV — localize the H2 TestScript SEGV: a getfield
             // whose receiver is a corrupted `Object(Some(ptr))` not pointing into
             // any managed arena (e.g. ptr=6) faults in `get_field`'s header read.
@@ -7468,6 +7484,24 @@ fn execute_instruction(
                 ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
+            // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
+            // fields — object address + resolved slot — to localize a write
+            // that doesn't reach the read site.
+            if crate::runtime::env_cache::field_addr_dbg() {
+                if let Some(fname) = field_name.as_deref() {
+                    if matches!(fname, "unsharedLongs" | "threadFactory" | "runningThreads" | "submittedTaskCounter") {
+                        eprintln!(
+                            "[FIELDADDR] PUT {} obj=0x{:x} slot={} num_slots={} valObj={} in {}",
+                            fname,
+                            obj_ref.as_ptr() as usize,
+                            field.field_index,
+                            shared.heap.get_header(obj_ref).num_slots,
+                            matches!(value, Value::Object(Some(_))),
+                            thread.frames[frame_idx].class_name(),
+                        );
+                    }
+                }
+            }
             // bc math-ec 0x4 (CRATONVM_DBG_STRAYSTACK): catch a STRAY/STALE
             // receiver reaching putfield. The corruption's reliable face is the
             // `set_field out-of-bounds` flood: a relocated-but-unremapped (or

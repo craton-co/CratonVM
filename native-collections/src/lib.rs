@@ -274,6 +274,18 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // null CommandReader when setupBooter failed first).
     register_concurrent_skip_list_map_natives(registry);
     register_stamped_lock_natives(registry);
+    // Phaser is overridden with a synthetic 3-int layout (parties=0, arrived=1,
+    // phase=2) that conflicts with the real JDK field layout (state(0, J),
+    // parent(1, L), root(2, L), evenQ(3, L), oddQ(4, L)). In real-JDK mode the
+    // synthetic `<init>` writes Int(parties) to slot 0 — but the real `state`
+    // field is a `long`, so descriptor-aware coercion turns it into Long and
+    // the Int-matching `getRegisteredParties` reads it back as 0; slot 2 gets
+    // Int(0) coerced to a null `root`, so the un-shadowed `getUnarrivedParties`
+    // runs real bytecode and NPEs in `reconcileState` on `root.state`. Gate
+    // behind synthetic-jdk only so real Phaser bytecode runs in real-JDK mode
+    // (same fix pattern as register_blocking_queue_natives above) —
+    // docs/gaps/gap-phaser-real-bytecode-state.md.
+    #[cfg(feature = "synthetic-jdk")]
     register_phaser_natives(registry);
     register_priority_blocking_queue_natives(registry);
     register_executors_scheduled_natives(registry);
@@ -514,30 +526,50 @@ fn obj_to_display_string(ctx: &mut dyn NativeContext, val: &Value) -> String {
                 return s;
             }
 
-            // Fast path for wrapper types: if the object has exactly 1 field
-            // and its value is a primitive, format it directly.
+            // Fast path for wrapper types: if the object is a `java.lang.*`
+            // boxed primitive (exactly 1 field holding its value), format it
+            // directly. This MUST be gated on the class actually being a
+            // wrapper — a user class with a single primitive field (e.g. a
+            // `Comparable` value object with one `int`) has the same shape and
+            // would otherwise be rendered by its raw field value instead of
+            // dispatching its overridden `toString()` (HotSpot prints
+            // `element.toString()`; we were printing the field). See the
+            // TreeSet/TreeMap toString gap.
             let nf = ctx.object_num_fields(*obj);
             if nf == 1 {
-                match ctx.get_field(*obj, 0) {
-                    Value::Int(v) => {
-                        let class_id = ctx.class_id_of_object(*obj);
-                        let name = ctx.class_name_of_id(class_id).unwrap_or_default();
-                        return if name.contains("Boolean") {
-                            if v != 0 { "true" } else { "false" }.to_string()
-                        } else if name.contains("Character") {
-                            char::from_u32(v as u32).unwrap_or('?').to_string()
-                        } else if name.contains("Byte") {
-                            (v as i8).to_string()
-                        } else if name.contains("Short") {
-                            (v as i16).to_string()
-                        } else {
-                            v.to_string()
-                        };
+                let class_id = ctx.class_id_of_object(*obj);
+                let name = ctx.class_name_of_id(class_id).unwrap_or_default();
+                let is_wrapper = matches!(
+                    name.as_str(),
+                    "java/lang/Integer"
+                        | "java/lang/Long"
+                        | "java/lang/Short"
+                        | "java/lang/Byte"
+                        | "java/lang/Boolean"
+                        | "java/lang/Character"
+                        | "java/lang/Float"
+                        | "java/lang/Double"
+                );
+                if is_wrapper {
+                    match ctx.get_field(*obj, 0) {
+                        Value::Int(v) => {
+                            return if name.contains("Boolean") {
+                                if v != 0 { "true" } else { "false" }.to_string()
+                            } else if name.contains("Character") {
+                                char::from_u32(v as u32).unwrap_or('?').to_string()
+                            } else if name.contains("Byte") {
+                                (v as i8).to_string()
+                            } else if name.contains("Short") {
+                                (v as i16).to_string()
+                            } else {
+                                v.to_string()
+                            };
+                        }
+                        Value::Long(v) => return v.to_string(),
+                        Value::Float(v) => return format!("{}", v),
+                        Value::Double(v) => return format!("{}", v),
+                        _ => {}
                     }
-                    Value::Long(v) => return v.to_string(),
-                    Value::Float(v) => return format!("{}", v),
-                    Value::Double(v) => return format!("{}", v),
-                    _ => {}
                 }
             }
 
@@ -11121,24 +11153,40 @@ fn natural_compare(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> MethodC
             if let (Some(sa), Some(sb)) = (sa, sb) {
                 return Ok(Some(Value::Int(sa.cmp(&sb) as i32)));
             }
-            // Try as wrapper: compare field 0 values
-            let fa = ctx.get_field(*ra, 0);
-            let fb = ctx.get_field(*rb, 0);
-            match (fa, fb) {
-                (Value::Int(a), Value::Int(b)) => Ok(Some(Value::Int(a.cmp(&b) as i32))),
-                (Value::Long(a), Value::Long(b)) => Ok(Some(Value::Int(a.cmp(&b) as i32))),
-                (Value::Float(a), Value::Float(b)) => Ok(Some(Value::Int(a.total_cmp(&b) as i32))),
-                (Value::Double(a), Value::Double(b)) => {
-                    Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
+            // Try as wrapper: compare field 0 values — but ONLY when both
+            // receivers actually own a slot 0. Probing slot 0 on a zero-field
+            // object (e.g. WildFly's stateless `*$Factory` singletons, which
+            // extend `AbstractConstraintFactory` and declare no instance
+            // fields) trips the `gen_heap::get_field` out-of-bounds guard,
+            // emitting a spurious "out-of-bounds field read dropped" warning
+            // for every TreeSet/TreeMap comparison. Such objects must be
+            // compared via their real `Comparable.compareTo`, which is exactly
+            // the fallthrough below — so guarding the probe is behavior-neutral
+            // and just suppresses the noise (gap: WildFly $Factory get_field).
+            if ctx.object_num_fields(*ra) >= 1 && ctx.object_num_fields(*rb) >= 1 {
+                let fa = ctx.get_field(*ra, 0);
+                let fb = ctx.get_field(*rb, 0);
+                match (fa, fb) {
+                    (Value::Int(a), Value::Int(b)) => return Ok(Some(Value::Int(a.cmp(&b) as i32))),
+                    (Value::Long(a), Value::Long(b)) => {
+                        return Ok(Some(Value::Int(a.cmp(&b) as i32)))
+                    }
+                    (Value::Float(a), Value::Float(b)) => {
+                        return Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
+                    }
+                    (Value::Double(a), Value::Double(b)) => {
+                        return Ok(Some(Value::Int(a.total_cmp(&b) as i32)))
+                    }
+                    _ => {}
                 }
-                // Not a String and not a homogeneous primitive wrapper —
-                // dispatch the element's real `Comparable.compareTo`. Without
-                // this, comparator-less `TreeMap`/`TreeSet` of a custom
-                // `Comparable` key (the array-mode path → `tree_compare`)
-                // silently treated every element as equal (returned 0),
-                // collapsing the ordering and dropping/dedup-ing entries (B2).
-                _ => Ok(Some(Value::Int(compare_via_compare_to(ctx, a, b)?))),
             }
+            // Not a String and not a homogeneous primitive wrapper — dispatch
+            // the element's real `Comparable.compareTo`. Without this,
+            // comparator-less `TreeMap`/`TreeSet` of a custom `Comparable` key
+            // (the array-mode path → `tree_compare`) silently treated every
+            // element as equal (returned 0), collapsing the ordering and
+            // dropping/dedup-ing entries (B2).
+            Ok(Some(Value::Int(compare_via_compare_to(ctx, a, b)?)))
         }
         // Compare bare ints/longs/etc. (for comparingInt results)
         (Value::Int(a), Value::Int(b)) => Ok(Some(Value::Int(a.cmp(b) as i32))),

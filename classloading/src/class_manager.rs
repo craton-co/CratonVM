@@ -2415,8 +2415,12 @@ impl ClassManager {
                         bootstrap_methods = bms.clone();
                     }
                 }
-                Some(Attribute::RuntimeVisibleAnnotations(anns))
-                | Some(Attribute::RuntimeInvisibleAnnotations(anns)) => {
+                // Only `RuntimeVisibleAnnotations` (@Retention(RUNTIME)) are
+                // exposed via reflection. `RuntimeInvisibleAnnotations` carry
+                // @Retention(CLASS) types which JVMS requires NOT be visible
+                // through Class.getAnnotation / isAnnotationPresent — see
+                // docs/gaps/gap-annotation-retention-policy.md.
+                Some(Attribute::RuntimeVisibleAnnotations(anns)) => {
                     annotations.extend(anns.iter().cloned());
                 }
                 Some(Attribute::Signature(s)) => {
@@ -3727,8 +3731,9 @@ impl ClassManager {
         let mut new_annotations = Vec::new();
         for attr in &new_attributes {
             match attr.as_decoded() {
-                Some(Attribute::RuntimeVisibleAnnotations(anns))
-                | Some(Attribute::RuntimeInvisibleAnnotations(anns)) => {
+                // Reflection-visible only: skip RuntimeInvisibleAnnotations
+                // (@Retention(CLASS)) — see gap-annotation-retention-policy.md.
+                Some(Attribute::RuntimeVisibleAnnotations(anns)) => {
                     new_annotations.extend(anns.iter().cloned());
                 }
                 _ => {}
@@ -4752,12 +4757,13 @@ impl ClassManager {
             })
             .unwrap_or_default();
 
-        // Extract annotations
+        // Extract annotations (reflection-visible only: skip
+        // RuntimeInvisibleAnnotations / @Retention(CLASS) — see
+        // gap-annotation-retention-policy.md).
         let mut annotations = Vec::new();
         for attr in &class_file.attributes {
             match attr.as_decoded() {
-                Some(Attribute::RuntimeVisibleAnnotations(anns))
-                | Some(Attribute::RuntimeInvisibleAnnotations(anns)) => {
+                Some(Attribute::RuntimeVisibleAnnotations(anns)) => {
                     annotations.extend(anns.iter().cloned());
                 }
                 _ => {}
