@@ -3429,6 +3429,23 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
                     // Not a wrapper — fallback to string
                     ctx.read_string(*obj).unwrap_or_else(|| "null".to_string())
                 }
+                Value::Int(v) if matches!(spec, 'x' | 'X' | 'o') => {
+                    // Java's Formatter masks a Byte argument to 8 bits and a
+                    // Short to 16 bits for the unsigned conversions (%x/%X/%o);
+                    // an Integer keeps all 32. After unbox_obj all three collapse
+                    // to Value::Int, so a negative Byte would sign-extend
+                    // (String.format("%02x", (byte)-54) → "ffffffca" instead of
+                    // "ca"). Recover the width from the wrapper class.
+                    let cname = ctx
+                        .class_name_of_id(ctx.class_id_of_object(*obj))
+                        .unwrap_or_default();
+                    let masked = match cname.as_str() {
+                        "java/lang/Byte" => v & 0xFF,
+                        "java/lang/Short" => v & 0xFFFF,
+                        _ => v,
+                    };
+                    format_arg(ctx, &Value::Int(masked), spec)
+                }
                 _ => format_arg(ctx, &inner, spec),
             }
         }
