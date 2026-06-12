@@ -18805,7 +18805,11 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
 // different segments without contention.
 
 const CHM_FIELD_SEGMENTS: usize = 0;
-const CHM_FIELD_SEGMENT_MASK: usize = 1;
+// Slot 1 was historically used to cache `num_segments - 1`, but a real-JDK
+// ConcurrentHashMap's slot 1 is reference-typed and silently coerces `Int`
+// writes to `Object(None)`. The mask/count are now derived from the segments
+// array length instead (see `chm_segment_for`), so this slot is unused.
+const _CHM_FIELD_SEGMENT_MASK: usize = 1;
 const _CHM_NUM_FIELDS: usize = 2;
 const CHM_DEFAULT_SEGMENTS: usize = 16;
 const CHM_DEFAULT_SEGMENT_CAP: usize = 4;
@@ -18827,10 +18831,21 @@ fn chm_segment_for(ctx: &dyn NativeContext, this: ObjectRef, hash: i32) -> Optio
         Value::Object(Some(arr)) => arr,
         _ => return None,
     };
-    let mask = match ctx.get_field(this, CHM_FIELD_SEGMENT_MASK) {
-        Value::Int(m) => m as usize,
-        _ => CHM_DEFAULT_SEGMENTS - 1,
-    };
+    // Derive the segment mask from the segments array length — NOT from the
+    // `CHM_FIELD_SEGMENT_MASK` slot. Slot 1 of a real-JDK ConcurrentHashMap is a
+    // reference-typed field, so writing `Int(num_segments - 1)` there is silently
+    // descriptor-coerced to `Object(None)` (see `coerce_field_value_by_descriptor`
+    // `b'L'` arm). The stale fallback (`CHM_DEFAULT_SEGMENTS - 1` = 15) then only
+    // matched when there happened to be exactly 16 segments; any other count
+    // (e.g. concurrencyLevel=1 → 1 segment, as Hibernate's
+    // `EntityManagerFactoryBuilderImpl` uses for `configurationValues`) routed
+    // most hashes out of bounds, so `put` silently dropped them. The array length
+    // is always a power of two, so `len - 1` is the authoritative mask.
+    let seglen = ctx.array_length(segments) as usize;
+    if seglen == 0 {
+        return None;
+    }
+    let mask = seglen - 1;
     let idx = (hash as u32 as usize) & mask;
     match ctx.get_array_element(segments, idx) {
         Value::Object(Some(seg)) => Some(seg),
@@ -18844,11 +18859,9 @@ fn chm_all_segments(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<ObjectRef> 
         Value::Object(Some(arr)) => arr,
         _ => return Vec::new(),
     };
-    let mask = match ctx.get_field(this, CHM_FIELD_SEGMENT_MASK) {
-        Value::Int(m) => m as usize,
-        _ => CHM_DEFAULT_SEGMENTS - 1,
-    };
-    let count = mask + 1;
+    // Segment count = segments array length (authoritative). See `chm_segment_for`
+    // for why the `CHM_FIELD_SEGMENT_MASK` slot cannot be trusted.
+    let count = ctx.array_length(segments) as usize;
     let mut result = Vec::with_capacity(count);
     for i in 0..count {
         if let Value::Object(Some(seg)) = ctx.get_array_element(segments, i) {
@@ -18935,7 +18948,11 @@ fn chm_init_segments(
         let _ = ctx.set_array_element(segments, i, Value::Object(Some(seg)));
     }
     ctx.set_field(this, CHM_FIELD_SEGMENTS, Value::Object(Some(segments)));
-    ctx.set_field(this, CHM_FIELD_SEGMENT_MASK, Value::Int((num_segments - 1) as i32));
+    // NOTE: the segment count/mask is intentionally NOT persisted to a field.
+    // Slot 1 of a real-JDK ConcurrentHashMap is reference-typed, so an `Int`
+    // write there is descriptor-coerced to `Object(None)` and lost. Readers
+    // (`chm_segment_for`, `chm_all_segments`) derive the mask/count from the
+    // segments array length, which is always a power of two.
 }
 
 fn register_concurrent_hashmap_natives(r: &mut NativeMethodRegistry) {

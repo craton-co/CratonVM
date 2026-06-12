@@ -7456,13 +7456,42 @@ fn annotation_array_component_class_id(ctx: &mut dyn NativeContext) -> ClassId {
     ctx.class_id_of_object(sample)
 }
 
+/// Whether an annotation's declared type can be loaded. The JDK's
+/// `sun.reflect.annotation.AnnotationParser` OMITS any annotation whose type
+/// class is not resolvable (e.g. a compile-only annotation like
+/// `org.apiguardian.api.API`, whose jar isn't on the runtime classpath) — it
+/// does NOT surface a broken/null annotation. CratonVM must do the same;
+/// otherwise `getDeclaredAnnotations()` returns a proxy with a null type mirror
+/// (`annotationType()`/`getClass()` → null), which breaks every annotation
+/// walker (e.g. JUnit's `AnnotationUtils.findRepeatableAnnotations` NPEs on
+/// `annotationType().equals(...)` during test discovery → 0 tests found).
+fn annotation_type_loadable(
+    ctx: &mut dyn NativeContext,
+    ann: &cratonvm_native_api::AnnotationData,
+) -> bool {
+    match annotation_desc_to_class_name(&ann.type_descriptor) {
+        Some(name) => {
+            if ctx.class_id_by_name(name).is_some() {
+                return true;
+            }
+            let _ = ctx.load_class(name);
+            ctx.class_id_by_name(name).is_some()
+        }
+        None => false,
+    }
+}
+
 fn build_annotation_array(
     ctx: &mut dyn NativeContext,
     annotations: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
     let comp = annotation_component_class_id(ctx);
-    let arr = ctx.new_ref_array(comp, annotations.len());
-    for (i, ann) in annotations.iter().enumerate() {
+    let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
+        .iter()
+        .filter(|a| annotation_type_loadable(ctx, a))
+        .collect();
+    let arr = ctx.new_ref_array(comp, resolvable.len());
+    for (i, ann) in resolvable.iter().enumerate() {
         let proxy = create_annotation_proxy(ctx, ann);
         ctx.set_array_element(arr, i, Value::Object(Some(proxy)));
     }
@@ -7479,8 +7508,13 @@ fn build_class_annotation_array(
     queried_class_id: ClassId,
     annotations: &[cratonvm_native_api::AnnotationData],
 ) -> ObjectRef {
-    let arr = ctx.new_ref_array(ClassId::new(0), annotations.len());
-    for (i, ann) in annotations.iter().enumerate() {
+    // Omit annotations whose type isn't loadable — see `annotation_type_loadable`.
+    let resolvable: Vec<&cratonvm_native_api::AnnotationData> = annotations
+        .iter()
+        .filter(|a| annotation_type_loadable(ctx, a))
+        .collect();
+    let arr = ctx.new_ref_array(ClassId::new(0), resolvable.len());
+    for (i, ann) in resolvable.iter().enumerate() {
         let proxy = cached_annotation_proxy(ctx, queried_class_id, ann);
         ctx.set_array_element(arr, i, Value::Object(Some(proxy)));
     }
