@@ -1957,7 +1957,17 @@ fn build_object_stream_class(
 
     // ----- Legacy indexed-slot population (preserved for back-compat) -----
     let name_obj = ctx.create_string(&class_name);
-    let svuid = compute_default_svuid(&class_name);
+    // Use the explicit `static final long serialVersionUID` field if declared;
+    // only fall back to the computed SUID hash when no explicit value exists.
+    let svuid = ctx
+        .static_field_index_by_name(class_id, "serialVersionUID")
+        .and_then(|idx| {
+            match ctx.get_static_field(class_id, idx) {
+                Value::Long(v) => Some(v),
+                _ => None,
+            }
+        })
+        .unwrap_or_else(|| compute_default_svuid(&class_name));
     let class_mirror = ctx.get_class_mirror(class_id);
 
     // Collect declared instance fields in declaration order.
