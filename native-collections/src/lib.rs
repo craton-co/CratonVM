@@ -13377,9 +13377,17 @@ fn lhm_ptr_cache() -> &'static Mutex<StdHashMap<usize, usize>> {
     C.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
-const LHM_NODE_KEY: usize = 0;
-const LHM_NODE_VALUE: usize = 1;
-const LHM_NODE_HASH: usize = 2;
+// Real JDK LinkedHashMap$Node layout (extends HashMap$Node{hash,key,value,next}
+// and adds before,after): hash@0, key@1, value@2, next@3, before@4, after@5.
+// Using the real slot order (not the historical synthetic key@0/value@1/hash@2)
+// is required so inherited real-JDK `HashMap.writeObject`→`internalWriteEntries`
+// (Java serialization; NOT force-native) reads the right slots — the old order
+// serialized `{k=v}` as `{v=null}`, desyncing peers. Nodes bind to the real
+// LinkedHashMap$Node class, and slot 0 = hash:I now holds an Int, so the
+// descriptor-aware field writes/reads coincide with each slot's declared type.
+const LHM_NODE_HASH: usize = 0;
+const LHM_NODE_KEY: usize = 1;
+const LHM_NODE_VALUE: usize = 2;
 const LHM_NODE_NEXT: usize = 3;
 const LHM_NODE_BEFORE: usize = 4;
 const LHM_NODE_AFTER: usize = 5;
