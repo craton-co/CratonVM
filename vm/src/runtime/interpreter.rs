@@ -2250,7 +2250,20 @@ pub fn execute(
                 "method {class_name_owned}.{method_name}{method_descriptor} has no Code attribute"
             );
             if crate::runtime::env_cache::nocode_dbg() {
-                eprintln!("[DBG_NOCODE] {msg}");
+                let recv_info = match args.first().copied() {
+                    Some(Value::Object(Some(r))) => {
+                        let rc = shared.heap.class_id_of(r);
+                        let rn = shared
+                            .class_manager
+                            .read()
+                            .get_class(rc)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_else(|| format!("<cid {rc}>"));
+                        format!("recv_cid={rc} recv_class={rn}")
+                    }
+                    other => format!("recv={other:?}"),
+                };
+                eprintln!("[DBG_NOCODE] {msg} | {recv_info}");
             }
             match super::exceptions::create_exception_object(
                 shared,
