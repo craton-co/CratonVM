@@ -411,6 +411,54 @@ fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(k))) => *k,
         _ => return Ok(Some(Value::Object(None))),
     };
+
+    // CratonVM's synthetic bundles (built by the `getBundle` native) are raw
+    // `java/util/ResourceBundle` instances whose field 0 holds the backing map.
+    // A *real* ResourceBundle subclass instantiated from bytecode (e.g. a user
+    // `ListResourceBundle`) has the genuine field layout, so the map shortcut
+    // would read the wrong slot and return null. Resolve those via their real
+    // data instead.
+    let this_cid = ctx.class_id_of_object(this);
+    let is_synthetic =
+        ctx.class_name_of_id(this_cid).as_deref() == Some("java/util/ResourceBundle");
+    if !is_synthetic {
+        // ListResourceBundle subclasses expose their entries via the overridden
+        // `getContents()` (an `Object[][]` of `{key, value}` rows). Look the key
+        // up there. `getContents` has no native, so this cannot recurse back
+        // into this override. Other subclass shapes fall through to the map
+        // shortcut (behaviour no worse than before).
+        let key_str = ctx.read_string(key);
+        if let Ok(Some(Value::Object(Some(contents)))) =
+            ctx.invoke_virtual(this, "getContents", "()[[Ljava/lang/Object;", &[])
+        {
+            let rows = ctx.array_length(contents);
+            for i in 0..rows {
+                if let Value::Object(Some(row)) = ctx.get_array_element(contents, i) {
+                    if ctx.array_length(row) >= 2 {
+                        let rk = match ctx.get_array_element(row, 0) {
+                            Value::Object(Some(k)) => ctx.read_string(k),
+                            _ => None,
+                        };
+                        if rk.is_some() && rk == key_str {
+                            return Ok(Some(ctx.get_array_element(row, 1)));
+                        }
+                    }
+                }
+            }
+            // Key absent: throw MissingResourceException — ResourceBundle.getObject's
+            // contract, and jakarta.el.ResourceBundleELResolver.getValue catches it
+            // to produce the "???key???" sentinel.
+            let exc =
+                alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+            let msg = ctx.create_string(&format!(
+                "Can't find resource for key {}",
+                key_str.unwrap_or_default()
+            ));
+            ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg)));
+            return Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc));
+        }
+    }
+
     let map = match ctx.get_field(this, 0) {
         Value::Object(Some(m)) => m,
         _ => return Ok(Some(Value::Object(None))),
