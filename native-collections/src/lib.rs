@@ -16453,10 +16453,112 @@ fn tm_array_table() -> &'static Mutex<StdHashMap<usize, TmArrayState>> {
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
+/// Materialize a *deserialized* TreeMap's entries into the native side-table.
+///
+/// `TreeMap.readObject` (real bytecode) rebuilds the red-black tree via
+/// `buildFromSorted`, populating the real `root`/`size` fields and a graph of
+/// `TreeMap$Entry{key,value,left,right,...}` nodes — but it never touches our
+/// `tm_fast_table`/`tm_array_table` side-tables, so every native read op
+/// (`get`/`size`/`entrySet`/…) sees an empty map. This walks the real tree
+/// in-order and replays its entries into the fast-mode BTreeMap, so a
+/// round-tripped TreeMap reads back correct content.
+///
+/// Runs entirely on `&dyn NativeContext` (field/array/string reads are all
+/// `&self`; no Java allocation), so it can hook the shared read funnels
+/// (`tm_get_slot` / `tm_is_fast_mode`) and cover every read path at once.
+/// Idempotent: a no-op once side-table state exists or when the real `root`
+/// is null (a fresh or empty map). Covers the natural-order case
+/// (String/Integer/Long keys, null comparator) — exactly what serialization
+/// round-trips. A custom-comparator or non-extractable-key tree would need the
+/// array path (Java array allocation, unavailable here) and is left to the
+/// owning `&mut` native; such maps simply stay empty after deserialization,
+/// the pre-existing behavior.
+fn tm_materialize_deser_if_needed(ctx: &dyn NativeContext, this: ObjectRef) {
+    let key = tm_obj_key(ctx, this);
+    // Already have native state (built via put/init, or previously
+    // materialized) — nothing to do.
+    if tm_fast_table().lock().unwrap().contains_key(&key) {
+        return;
+    }
+    if let Some(st) = tm_array_table().lock().unwrap().get(&key) {
+        if st.size > 0 || st.data.is_some() {
+            return;
+        }
+    }
+    let nf = ctx.object_num_fields(this);
+    // Real red-black-tree root: null for native-managed/fresh maps (they never
+    // write the real field), non-null only after `buildFromSorted`.
+    let root = match ctx.resolve_field_index("java/util/TreeMap", "root") {
+        Some(i) if i < nf => match ctx.get_field(this, i) {
+            Value::Object(Some(r)) => r,
+            _ => return,
+        },
+        _ => return,
+    };
+    // Custom comparator → array path (needs Java alloc) — skip here.
+    let has_comparator = ctx
+        .resolve_field_index("java/util/TreeMap", "comparator")
+        .filter(|&i| i < nf)
+        .map(|i| !matches!(ctx.get_field(this, i), Value::Object(None)))
+        .unwrap_or(false);
+    if has_comparator {
+        return;
+    }
+    let ev = "java/util/TreeMap$Entry";
+    let (ki, vi, li, ri) = match (
+        ctx.resolve_field_index(ev, "key"),
+        ctx.resolve_field_index(ev, "value"),
+        ctx.resolve_field_index(ev, "left"),
+        ctx.resolve_field_index(ev, "right"),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => return,
+    };
+    let child = |n: ObjectRef, idx: usize| -> Option<ObjectRef> {
+        match ctx.get_field(n, idx) {
+            Value::Object(o) => o,
+            _ => None,
+        }
+    };
+    // Iterative in-order traversal (left, node, right).
+    let mut entries: Vec<(TreeKey, Value)> = Vec::new();
+    let mut stack: Vec<ObjectRef> = Vec::new();
+    let mut cur = Some(root);
+    while cur.is_some() || !stack.is_empty() {
+        while let Some(n) = cur {
+            stack.push(n);
+            cur = child(n, li);
+        }
+        let n = match stack.pop() {
+            Some(n) => n,
+            None => break,
+        };
+        let k = ctx.get_field(n, ki);
+        let v = ctx.get_field(n, vi);
+        match tree_key_from_value(ctx, &k) {
+            Some(tk) => entries.push((tk, v)),
+            // Non-extractable key (custom Comparable) → needs the array path.
+            None => return,
+        }
+        cur = child(n, ri);
+    }
+    let len = entries.len() as i32;
+    {
+        let mut ft = tm_fast_table().lock().unwrap();
+        let bt = ft.entry(key).or_default();
+        for (tk, v) in entries {
+            bt.insert(tk, v);
+        }
+    }
+    // native_tm_size reads the array-state `size` slot even in fast mode.
+    tm_array_table().lock().unwrap().entry(key).or_default().size = len;
+}
+
 /// Read a TreeMap "slot" (`TM_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
 /// address-keyed side-table. Returns layout-independent defaults when no
 /// entry exists yet. The object's own fields are never consulted.
 fn tm_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
+    tm_materialize_deser_if_needed(ctx, this);
     let key = tm_obj_key(ctx, this);
     let tbl = tm_array_table().lock().unwrap();
     if let Some(st) = tbl.get(&key) {
@@ -16523,6 +16625,7 @@ fn tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Val
 /// Empty TreeMaps with null comparator are tentatively "fast-eligible" —
 /// the first non-extractable key flips them to array mode.
 fn tm_is_fast_mode(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    tm_materialize_deser_if_needed(ctx, this);
     let key = tm_obj_key(ctx, this);
     tm_fast_table().lock().unwrap().contains_key(&key)
 }
@@ -18174,6 +18277,113 @@ fn native_ts_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     Ok(Some(Value::Int(size)))
 }
 
+/// `TreeSet.writeObject(ObjectOutputStream)` — serialize from `ts_state`.
+///
+/// Real `TreeSet.writeObject` writes `comparator`, `size`, then each element
+/// by iterating the backing `m` TreeMap's `keySet()`. CratonVM's native
+/// TreeSet keeps its elements in the `ts_array_table` side-table and never
+/// populates `m`, so the inherited real method serialized an empty set. This
+/// native reproduces the exact stream format (`defaultWriteObject`, comparator,
+/// size, elements in sorted order) directly from the side-table. Contained to
+/// the serialization path — the hot add/contains/size path is untouched.
+fn native_ts_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let oos = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let oos_cls = "java/io/ObjectOutputStream";
+    // s.defaultWriteObject() — TreeSet has no non-transient fields, so this
+    // writes nothing but keeps the stream's per-object context consistent.
+    ctx.invoke(oos_cls, "defaultWriteObject", "()V", &[Value::Object(Some(oos))])?;
+    // s.writeObject(comparator)
+    ctx.invoke(
+        oos_cls,
+        "writeObject",
+        "(Ljava/lang/Object;)V",
+        &[Value::Object(Some(oos)), comparator],
+    )?;
+    // s.writeInt(size)
+    ctx.invoke(
+        oos_cls,
+        "writeInt",
+        "(I)V",
+        &[Value::Object(Some(oos)), Value::Int(size)],
+    )?;
+    // Elements in sorted order (the data array is kept sorted by native_ts_add).
+    if let Some(data) = data_opt {
+        for i in 0..size as usize {
+            let e = ctx.get_array_element(data, i);
+            ctx.invoke(
+                oos_cls,
+                "writeObject",
+                "(Ljava/lang/Object;)V",
+                &[Value::Object(Some(oos)), e],
+            )?;
+        }
+    }
+    Ok(None)
+}
+
+/// `TreeSet.readObject(ObjectInputStream)` — deserialize into `ts_state`.
+///
+/// Mirrors `native_ts_write_object`. Real `TreeSet.readObject` rebuilds the
+/// backing `m` TreeMap's red-black tree, which CratonVM's native TreeSet never
+/// reads — so a round-tripped set read back empty. This reads the same format
+/// (`defaultReadObject`, comparator, size, elements) straight into the
+/// side-table via `native_ts_add` (which honors the comparator and keeps the
+/// array sorted; elements arrive already sorted so each insert appends).
+fn native_ts_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let ois = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let ois_cls = "java/io/ObjectInputStream";
+    ctx.invoke(ois_cls, "defaultReadObject", "()V", &[Value::Object(Some(ois))])?;
+    let comparator = ctx
+        .invoke(
+            ois_cls,
+            "readObject",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(ois))],
+        )?
+        .unwrap_or(Value::Object(None));
+    let size = match ctx.invoke(
+        ois_cls,
+        "readInt",
+        "()I",
+        &[Value::Object(Some(ois))],
+    )? {
+        Some(Value::Int(n)) => n,
+        _ => 0,
+    };
+    // Initialize a fresh backing array + comparator, then add each element.
+    let buf = alloc_ref_array(ctx, (size as usize).max(TS_DEFAULT_CAPACITY));
+    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, comparator);
+    for _ in 0..size {
+        let e = ctx
+            .invoke(
+                ois_cls,
+                "readObject",
+                "()Ljava/lang/Object;",
+                &[Value::Object(Some(ois))],
+            )?
+            .unwrap_or(Value::Object(None));
+        native_ts_add(ctx, &[Value::Object(Some(this)), e])?;
+    }
+    Ok(None)
+}
+
 fn native_ts_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -18867,6 +19077,21 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ts_add);
     registry.register(c, "remove", "(Ljava/lang/Object;)Z", native_ts_remove);
+    // Serialization: drive the stream from `ts_state` so a native TreeSet
+    // round-trips byte-correct (the inherited real methods go through the
+    // never-populated backing `m` TreeMap → an empty set).
+    registry.register(
+        c,
+        "writeObject",
+        "(Ljava/io/ObjectOutputStream;)V",
+        native_ts_write_object,
+    );
+    registry.register(
+        c,
+        "readObject",
+        "(Ljava/io/ObjectInputStream;)V",
+        native_ts_read_object,
+    );
     registry.register(c, "contains", "(Ljava/lang/Object;)Z", native_ts_contains);
     registry.register(c, "size", "()I", native_ts_size);
     registry.register(c, "isEmpty", "()Z", native_ts_is_empty);
