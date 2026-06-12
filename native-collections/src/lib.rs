@@ -4892,15 +4892,45 @@ fn alloc_backing_map(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.alloc_object(cid, n)
 }
 
+/// `true` for Set classes whose iteration must preserve *insertion* order
+/// (`LinkedHashSet`, `CopyOnWriteArraySet`). These share the HashSet native
+/// surface but must be backed by a `LinkedHashMap` so the shared iterator
+/// (which walks the backing map) yields insertion order, not bucket order.
+fn hs_is_insertion_ordered(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    matches!(
+        ctx.class_name_of_id(ctx.class_id_of_object(this)).as_deref(),
+        Some("java/util/LinkedHashSet") | Some("java/util/concurrent/CopyOnWriteArraySet")
+    )
+}
+
+/// Allocate + initialize a fresh backing map for a Set: a `LinkedHashMap`
+/// (insertion-ordered) for `LinkedHashSet`/`CopyOnWriteArraySet`, else a
+/// `HashMap`.
+fn alloc_hs_backing(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) -> ObjectRef {
+    if hs_is_insertion_ordered(ctx, this) {
+        let cid = ctx
+            .ensure_class_initialized("java/util/LinkedHashMap")
+            .unwrap_or_else(|_| {
+                ctx.class_id_by_name("java/util/LinkedHashMap").unwrap_or(ClassId::new(0))
+            });
+        let total = ctx.class_num_total_fields(cid);
+        let n = std::cmp::max(total, MAP_NUM_FIELDS);
+        let m = ctx.alloc_object(cid, n);
+        lhm_init_with_cap(ctx, m, cap.max(MAP_DEFAULT_CAPACITY));
+        m
+    } else {
+        let m = alloc_backing_map(ctx);
+        let _ = native_map_init_capacity(ctx, &[Value::Object(Some(m)), Value::Int(cap as i32)]);
+        m
+    }
+}
+
 fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let backing = alloc_backing_map(ctx);
-    // Initialize the backing HashMap
-    let init_args = [Value::Object(Some(backing))];
-    native_map_init(ctx, &init_args)?;
+    let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
     Ok(None)
 }
@@ -4910,13 +4940,11 @@ fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let cap = args
-        .get(1)
-        .copied()
-        .unwrap_or(Value::Int(MAP_DEFAULT_CAPACITY as i32));
-    let backing = alloc_backing_map(ctx);
-    let init_args = [Value::Object(Some(backing)), cap];
-    native_map_init_capacity(ctx, &init_args)?;
+    let cap = match args.get(1) {
+        Some(Value::Int(c)) if *c > 0 => *c as usize,
+        _ => MAP_DEFAULT_CAPACITY,
+    };
+    let backing = alloc_hs_backing(ctx, this, cap);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
     Ok(None)
 }
@@ -11110,28 +11138,16 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     let source = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            // Init empty HashSet
-            let backing = alloc_backing_map(ctx);
-            let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
-            ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-            set_map_size(ctx, backing, 0);
-            ctx.set_field(
-                backing,
-                MAP_FIELD_CAPACITY,
-                Value::Int(MAP_DEFAULT_CAPACITY as i32),
-            );
+            // Init empty set (LinkedHashMap backing for insertion-ordered sets).
+            let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
             ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
             return Ok(None);
         }
     };
 
-    // Create backing HashMap for this set
-    let backing = alloc_backing_map(ctx);
-    let cap = MAP_DEFAULT_CAPACITY;
-    let buckets = alloc_ref_array(ctx, cap);
-    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    set_map_size(ctx, backing, 0);
-    ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    // Create the backing map for this set (LinkedHashMap for insertion-ordered
+    // sets so iteration preserves order) and populate it.
+    let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
 
     // Round 49 fix: route through `collect_collection_elements` so we
@@ -15946,11 +15962,20 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
         }
     }
-    // S111r28: HashSet / LinkedHashSet — field 0 = backing HashMap.
-    // Walk the backing map's bucket nodes and collect keys.
+    // S111r28: HashSet / LinkedHashSet — field 0 = backing map. Collect the
+    // backing map's keys (in iteration order).
     if HS_FIELD_MAP < n_fields {
         if let Value::Object(Some(backing)) = ctx.get_field(coll, HS_FIELD_MAP) {
-            // Verify it actually is a HashMap-like (slot 0 = bucket array).
+            // An insertion-ordered set (LinkedHashSet / CopyOnWriteArraySet) is
+            // backed by a LinkedHashMap, which keeps its entries in the
+            // insertion-order overlay rather than the bucket array — so the
+            // bucket-array guard below would miss it. Detect it explicitly;
+            // `collect_view_snapshot_ordered` → `lhm_collect_keys` yields the
+            // keys in insertion order.
+            if is_lhm_receiver(ctx, backing) {
+                return collect_view_snapshot_ordered(ctx, backing);
+            }
+            // Otherwise verify it's a HashMap-like (slot 0 = bucket array).
             if MAP_FIELD_BUCKETS < ctx.object_num_fields(backing) {
                 let s0 = ctx.get_field(backing, MAP_FIELD_BUCKETS);
                 if let Value::Object(Some(arr)) = s0 {
