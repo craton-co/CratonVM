@@ -4007,7 +4007,10 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     return Ok(Some(Value::Object(Some(fs))));
                 }
             }
-            let fs = p57_alloc_default_filesystem(ctx);
+            // No owning FileSystem recorded: this is a default-filesystem
+            // path, so return THE default-FS singleton (identity checks
+            // against FileSystems.getDefault() must hold).
+            let fs = p57_default_filesystem_singleton(ctx);
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -4257,7 +4260,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "getDefault",
         "()Ljava/nio/file/FileSystem;",
         |ctx, _args| {
-            let fs = p57_alloc_default_filesystem(ctx);
+            let fs = p57_default_filesystem_singleton(ctx);
             Ok(Some(Value::Object(Some(fs))))
         },
     );
@@ -4480,6 +4483,34 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                 }
             }
             Ok(Some(Value::Object(Some(fs))))
+        },
+    );
+
+    // FileSystemProvider.getFileAttributeView(Path, Class, LinkOption[]) —
+    // the synthetic default provider has no native for this, so
+    // `Files.getFileAttributeView` dispatch lands on the abstract
+    // declaration: "AbstractMethodError ... has no Code attribute" (Gradle
+    // ProjectBuilder file writes in Spring Boot buildSrc
+    // GenerateAntoraPlaybookTests / DocumentAutoConfigurationClassesTests).
+    // The JDK contract returns null when the requested view type is not
+    // available — HotSpot on Windows itself returns null for the
+    // PosixFileAttributeView that Gradle's permission handling requests, and
+    // callers are required to handle that. Log the requested view under
+    // CRATONVM_DBG_FSP so unsupported-but-needed views (e.g. basic) surface
+    // during triage instead of silently degrading.
+    r.register(
+        fsp,
+        "getFileAttributeView",
+        "(Ljava/nio/file/Path;Ljava/lang/Class;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/FileAttributeView;",
+        |ctx, args| {
+            if std::env::var("CRATONVM_DBG_FSP").is_ok() {
+                let view = obj_arg(args, 2)
+                    .ok()
+                    .and_then(|m| crate::lang_class::mirror_class_name(ctx, m))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                eprintln!("[FSP-DBG] getFileAttributeView requested view={view} -> null");
+            }
+            Ok(Some(Value::Object(None)))
         },
     );
 
@@ -7064,6 +7095,40 @@ fn p57_alloc_default_filesystem(ctx: &mut dyn NativeContext) -> ObjectRef {
     let s = ctx.create_string(sep);
     ctx.set_field(fs, 0, Value::Object(Some(s)));
     fs
+}
+
+/// The per-VM default-FileSystem SINGLETON. Identity matters: callers
+/// compare `path.getFileSystem()` against `FileSystems.getDefault()` with
+/// `==`/`Object.equals` (JUnit's @TempDir File precondition, cassandra's
+/// File(Path) ctor). Allocating a fresh synthetic FileSystem per call broke
+/// that identity — every File-typed @TempDir died with "Failed to create
+/// default temp directory". Stash the singleton in the REAL
+/// `FileSystems$DefaultFileSystemHolder.defaultFileSystem` static field:
+/// static storage is a GC root (so the ref stays valid across moving
+/// collections), and the holder's real `<clinit>` never runs because
+/// `FileSystems.getDefault()` is intercepted. Falls back to a fresh
+/// allocation only if the holder class is unavailable.
+fn p57_default_filesystem_singleton(ctx: &mut dyn NativeContext) -> ObjectRef {
+    const HOLDER: &str = "java/nio/file/FileSystems$DefaultFileSystemHolder";
+    // `class_id_by_name` is lookup-only and nothing else loads the private
+    // holder class (its bytecode `<clinit>` never runs because getDefault is
+    // intercepted) — load it on first use so the static stash slot exists.
+    if ctx.class_id_by_name(HOLDER).is_none() {
+        let _ = ctx.load_class(HOLDER);
+    }
+    let slot = ctx.class_id_by_name(HOLDER).and_then(|cid| {
+        ctx.static_field_index_by_name(cid, "defaultFileSystem")
+            .map(|idx| (cid, idx))
+    });
+    if let Some((cid, idx)) = slot {
+        if let Value::Object(Some(fs)) = ctx.get_static_field(cid, idx) {
+            return fs;
+        }
+        let fs = p57_alloc_default_filesystem(ctx);
+        ctx.set_static_field(cid, idx, Value::Object(Some(fs)));
+        return fs;
+    }
+    p57_alloc_default_filesystem(ctx)
 }
 
 fn p57_alloc_enum(

@@ -4032,32 +4032,48 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
         // args[1] is an Object[] — unpack it
         let arr_ref = match args.get(1) {
             Some(Value::Object(Some(a))) => *a,
-            _ => return mh_dispatch(ctx, this, &[]),
+            _ => {
+                let desc = mh_read_desc(ctx, this).unwrap_or_default();
+                let kind = match ctx.get_field(this, MH_KIND) { Value::Int(k) => k, _ => MH_KIND_VIRTUAL };
+                let result = mh_dispatch(ctx, this, &[]);
+                return if kind == MH_KIND_CONSTRUCTOR { result } else { auto_box_return(ctx, result, &desc) };
+            }
         };
         let len = ctx.array_length(arr_ref);
         let unpacked: Vec<Value> = (0..len).map(|i| ctx.get_array_element(arr_ref, i)).collect();
-        mh_dispatch(ctx, this, &unpacked)
+        // invokeWithArguments ALWAYS returns Object: a void target must yield
+        // null (returning Ok(None) pushes NOTHING — the caller's areturn then
+        // underflows the operand stack and killed the VM; Gradle's
+        // MethodHandleBasedServiceMethod.invoke was the canonical victim) and
+        // primitive returns must be boxed.
+        let desc = mh_read_desc(ctx, this).unwrap_or_default();
+        let kind = match ctx.get_field(this, MH_KIND) { Value::Int(k) => k, _ => MH_KIND_VIRTUAL };
+        let result = mh_dispatch(ctx, this, &unpacked);
+        if kind == MH_KIND_CONSTRUCTOR { result } else { auto_box_return(ctx, result, &desc) }
     });
     r.register(mh, "invokeWithArguments", "(Ljava/util/List;)Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        // Unpack List by reading ArrayList internals (field 0 = data array, field 1 = size)
-        let list_ref = match args.get(1) {
-            Some(Value::Object(Some(l))) => *l,
-            _ => return mh_dispatch(ctx, this, &[]),
+        // Unpack the List via its own toArray() — layout-agnostic (the old
+        // direct slot reads assumed the ArrayList layout and silently saw 0
+        // args for any other List implementation).
+        let unpacked: Vec<Value> = match args.get(1) {
+            Some(Value::Object(Some(l))) => {
+                match ctx.invoke_virtual(*l, "toArray", "()[Ljava/lang/Object;", &[])? {
+                    Some(Value::Object(Some(arr))) => {
+                        let len = ctx.array_length(arr);
+                        (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
         };
-        let size = match ctx.get_field(list_ref, 1) {
-            Value::Int(s) => s as usize,
-            _ => 0,
-        };
-        if size == 0 {
-            return mh_dispatch(ctx, this, &[]);
-        }
-        let data = match ctx.get_field(list_ref, 0) {
-            Value::Object(Some(arr)) => arr,
-            _ => return mh_dispatch(ctx, this, &[]),
-        };
-        let unpacked: Vec<Value> = (0..size).map(|i| ctx.get_array_element(data, i)).collect();
-        mh_dispatch(ctx, this, &unpacked)
+        // Same Object-return contract as the Object[] overload above: box
+        // primitives, void → null.
+        let desc = mh_read_desc(ctx, this).unwrap_or_default();
+        let kind = match ctx.get_field(this, MH_KIND) { Value::Int(k) => k, _ => MH_KIND_VIRTUAL };
+        let result = mh_dispatch(ctx, this, &unpacked);
+        if kind == MH_KIND_CONSTRUCTOR { result } else { auto_box_return(ctx, result, &desc) }
     });
     r.register(mh, "bindTo", "(Ljava/lang/Object;)Ljava/lang/invoke/MethodHandle;", |ctx, args| {
         let this = obj_arg(args, 0)?;
