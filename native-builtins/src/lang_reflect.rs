@@ -1501,6 +1501,124 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
     // Same field-resolution issue affects TypeVariableImpl / WildcardTypeImpl /
     // GenericArrayTypeImpl. Provide field-by-name natives so they keep working
     // when reached via real-JDK reifier code paths.
+    //
+    // REIFY-AWARE bounds (WildcardTypeImpl): the `upperBounds`/`lowerBounds`
+    // fields hold UNREIFIED `sun.reflect.generics.tree.*` nodes until the
+    // real bytecode's lazy `reifyBounds` runs — which it never does, because
+    // these natives shadow it. Returning the field verbatim leaked tree
+    // nodes typed as `Type[]`; Gradle's
+    // `JavaPropertyReflectionUtil.hasTypeVariable` then CCE'd
+    // ("SimpleClassTypeSignature cannot be cast to Type") and the decorated
+    // class generator failed for every ProjectBuilder service. Resolve tree
+    // nodes to Class mirrors here (wildcard bounds are class/interface types
+    // in practice); pass already-reified entries through untouched.
+    fn wti_tree_node_to_mirror(
+        ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
+        node: cratonvm_types::ObjectRef,
+        node_class: &str,
+    ) -> Option<Value> {
+        // SimpleClassTypeSignature: `name` holds the dotted binary name.
+        // ClassTypeSignature: `path` is a List<SimpleClassTypeSignature>;
+        // join segment names with '$' after the first (inner classes).
+        let dotted = if node_class.ends_with("SimpleClassTypeSignature") {
+            match ctx.get_field_by_name(node, "name") {
+                Value::Object(Some(s)) => ctx.read_string(s)?,
+                _ => return None,
+            }
+        } else if node_class.ends_with("ClassTypeSignature") {
+            let list = match ctx.get_field_by_name(node, "path") {
+                Value::Object(Some(l)) => l,
+                _ => return None,
+            };
+            let arr = match ctx
+                .invoke_virtual(list, "toArray", "()[Ljava/lang/Object;", &[])
+                .ok()
+                .flatten()
+            {
+                Some(Value::Object(Some(a))) => a,
+                _ => return None,
+            };
+            let mut name = String::new();
+            for i in 0..ctx.array_length(arr) {
+                if let Value::Object(Some(seg)) = ctx.get_array_element(arr, i) {
+                    if let Value::Object(Some(s)) = ctx.get_field_by_name(seg, "name") {
+                        let part = ctx.read_string(s)?;
+                        if name.is_empty() {
+                            name = part;
+                        } else {
+                            name.push('$');
+                            name.push_str(&part);
+                        }
+                    }
+                }
+            }
+            if name.is_empty() {
+                return None;
+            }
+            name
+        } else {
+            return None;
+        };
+        let slashed = dotted.replace('.', "/");
+        let cid = match ctx.class_id_by_name(&slashed) {
+            Some(c) => Some(c),
+            None => match ctx.load_class(&slashed) {
+                Ok(Some(Value::Object(Some(_)))) => ctx.class_id_by_name(&slashed),
+                _ => None,
+            },
+        }?;
+        Some(Value::Object(Some(ctx.get_class_mirror(cid))))
+    }
+    fn wti_bounds_reified(
+        ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
+        this: cratonvm_types::ObjectRef,
+        field: &str,
+    ) -> Value {
+        let raw = ctx.get_field_by_name(this, field);
+        let Value::Object(Some(arr)) = raw else { return raw };
+        if ctx.heap_kind_of(arr) != cratonvm_types::ObjectKind::Array {
+            return raw;
+        }
+        let len = ctx.array_length(arr);
+        let mut out: Vec<Value> = Vec::with_capacity(len);
+        let mut any_tree = false;
+        for i in 0..len {
+            let elem = ctx.get_array_element(arr, i);
+            if let Value::Object(Some(node)) = elem {
+                let cid = ctx.class_id_of_object(node);
+                let cls = ctx.class_name_of_id(cid).unwrap_or_default();
+                if cls.starts_with("sun/reflect/generics/tree/") {
+                    any_tree = true;
+                    let reified = wti_tree_node_to_mirror(ctx, node, &cls)
+                        .or_else(|| {
+                            // Unresolvable exotic bound: degrade to Object
+                            // (the JDK's implicit upper bound) rather than
+                            // leaking a non-Type.
+                            ctx.class_id_by_name("java/lang/Object")
+                                .map(|c| Value::Object(Some(ctx.get_class_mirror(c))))
+                        })
+                        .unwrap_or(Value::Object(None));
+                    out.push(reified);
+                    continue;
+                }
+            }
+            out.push(elem);
+        }
+        if !any_tree {
+            return Value::Object(Some(arr));
+        }
+        let type_cid = ctx
+            .class_id_by_name("java/lang/reflect/Type")
+            .unwrap_or(cratonvm_types::ClassId::new(0));
+        let result = ctx.new_ref_array(type_cid, out.len());
+        for (i, v) in out.iter().enumerate() {
+            ctx.set_array_element(result, i, *v);
+        }
+        // Write back so subsequent reads (incl. real bytecode getfield) see
+        // reified values — mirrors the lazy write-back in the real impl.
+        ctx.set_field_by_name(this, field, Value::Object(Some(result)));
+        Value::Object(Some(result))
+    }
     let tvi_real = "sun/reflect/generics/reflectiveObjects/TypeVariableImpl";
     registry.register(
         tvi_real,
@@ -1518,7 +1636,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field_by_name(this, "upperBounds")))
+            Ok(Some(wti_bounds_reified(ctx, this, "upperBounds")))
         },
     );
     registry.register(
@@ -1527,7 +1645,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "()[Ljava/lang/reflect/Type;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field_by_name(this, "lowerBounds")))
+            Ok(Some(wti_bounds_reified(ctx, this, "lowerBounds")))
         },
     );
     let gat_real = "sun/reflect/generics/reflectiveObjects/GenericArrayTypeImpl";

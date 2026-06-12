@@ -5411,6 +5411,27 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/net/URL;",
         classloader::cl_get_resource_essential,
     );
+    // URLClassLoader.findResource/findResources — the real bytecode walks
+    // URLClassPath, whose essential-mode stubs return null/empty, so a
+    // direct findResource() call (or a getResource() override delegating to
+    // it, e.g. Gradle's VisitableURLClassLoader) NEVER finds anything even
+    // though getResource() (the structured walk above) does. Previously
+    // these natives were only registered via register_classloader_natives,
+    // which is synthetic-JDK-only — real-JDK mode silently lacked them
+    // ("Cannot find resource 'gradle-plugins.properties'", every Gradle
+    // ProjectBuilder bootstrap).
+    registry.register(
+        "java/net/URLClassLoader",
+        "findResource",
+        "(Ljava/lang/String;)Ljava/net/URL;",
+        classloader::ucl_find_resource,
+    );
+    registry.register(
+        "java/net/URLClassLoader",
+        "findResources",
+        "(Ljava/lang/String;)Ljava/util/Enumeration;",
+        classloader::ucl_find_resources,
+    );
     // Natives for the synthetic `java/util/Enumeration$Impl` helper the
     // getResources override returns.  These are idempotent (re-registered
     // by `register_classloader_natives` in synthetic-JDK mode).
@@ -7097,6 +7118,16 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // Registered last so they override any earlier null-stubs (like
     // the old `Class.getEnclosingClass` -> `native_return_null`).
     lang_reflect::register_wp2_1_natives(registry);
+
+    // WP2.3-B Lookup.defineClass/defineHiddenClass surface. Previously
+    // registered only via register_synthetic_overrides — real-JDK mode ran
+    // the real Lookup.defineClass bytecode instead, whose ClassLoader
+    // descent reached our defineClass1 native with a 0-length byte view
+    // ("class file too short"), null-ing the defined class. Canonical
+    // victim: Gradle's LookupClassDefiner injecting synthetic legacy
+    // interfaces ("Could not inject synthetic classes" + NPE "Cannot invoke
+    // getPackageName on null" in every ProjectBuilder bootstrap).
+    lookup_define::register_lookup_define_class(registry);
 
     // WP_CHM_SIZE: ConcurrentHashMap.addCount(JI)V atomic-baseCount override.
     //

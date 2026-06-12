@@ -60,9 +60,15 @@ fn extract_url_path(ctx: &dyn NativeContext, url_obj: ObjectRef) -> Option<Strin
 /// Register every URL in a `URL[]` array with the dynamic application
 /// classpath so classes inside those jars/dirs become loadable.
 fn register_url_array(ctx: &mut dyn NativeContext, urls: Value) {
+    let dbg = std::env::var_os("CRATONVM_DBG_UCLREG").is_some();
     let arr = match urls {
         Value::Object(Some(a)) => a,
-        _ => return,
+        _ => {
+            if dbg {
+                eprintln!("[UCLREG-DBG] <init> urls arg not an array: {urls:?}");
+            }
+            return;
+        }
     };
     let count = ctx.array_length(arr);
     let mut paths = Vec::with_capacity(count);
@@ -72,8 +78,15 @@ fn register_url_array(ctx: &mut dyn NativeContext, urls: Value) {
                 if !p.is_empty() {
                     paths.push(p);
                 }
+            } else if dbg {
+                eprintln!("[UCLREG-DBG]   url[{i}] extract_url_path -> None");
             }
+        } else if dbg {
+            eprintln!("[UCLREG-DBG]   url[{i}] not an object");
         }
+    }
+    if dbg {
+        eprintln!("[UCLREG-DBG] <init> count={count} extracted={:?}", paths);
     }
     if !paths.is_empty() {
         tracing::debug!(
@@ -723,40 +736,30 @@ fn cl_real_load_class(
 pub fn get_or_create_system_cl(
     ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
 ) -> Option<ObjectRef> {
-    let existing = *SYSTEM_CL.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(obj) = existing {
-        return Some(obj);
-    }
-    // Create platform loader first (parent of system loader)
-    let platform = get_or_create_platform_cl(ctx);
-    // Allocate a ClassLoader object
-    let obj_val = match ctx.new_object("java/lang/ClassLoader") {
-        Ok(Some(Value::Object(Some(obj)))) => obj,
-        _ => return None,
-    };
-    ctx.set_field_by_name(obj_val, "parent", Value::Object(platform));
-    let name = ctx.create_string("app");
-    ctx.set_field_by_name(obj_val, "name", Value::Object(Some(name)));
-    *SYSTEM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj_val);
-    Some(obj_val)
+    // IDENTITY-UNIFIED with the loader object `Class.getClassLoader()`
+    // returns (classloader.rs::get_or_create_app_loader). These used to be
+    // two distinct singletons — a plain "java/lang/ClassLoader" here vs the
+    // synthetic ClassLoaders$AppClassLoader there — so
+    // `someClass.getClassLoader() == ClassLoader.getSystemClassLoader()`
+    // was FALSE. Gradle's ClassLoaderVisitor uses exactly that identity
+    // check to decide "this is the system loader, read java.class.path";
+    // on the mismatch it extracted an EMPTY classpath, the module registry
+    // found no Gradle installation, and every ProjectBuilder bootstrap died
+    // ("Cannot find resource 'gradle-plugins.properties'"). One object,
+    // one identity. (The old SYSTEM_CL static stays only as a GC-rooted
+    // alias to whatever we hand out.)
+    let obj = crate::classloader::get_or_create_app_loader(ctx);
+    *SYSTEM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj);
+    Some(obj)
 }
 
 /// Get or create the platform class loader singleton.
 fn get_or_create_platform_cl(
     ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
 ) -> Option<ObjectRef> {
-    let existing = *PLATFORM_CL.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(obj) = existing {
-        return Some(obj);
-    }
-    let obj_val = match ctx.new_object("java/lang/ClassLoader") {
-        Ok(Some(Value::Object(Some(obj)))) => obj,
-        _ => return None,
-    };
-    // Platform loader's parent is null (bootstrap)
-    ctx.set_field_by_name(obj_val, "parent", Value::Object(None));
-    let name = ctx.create_string("platform");
-    ctx.set_field_by_name(obj_val, "name", Value::Object(Some(name)));
-    *PLATFORM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj_val);
-    Some(obj_val)
+    // Identity-unified with classloader.rs::get_or_create_platform_loader —
+    // same rationale as `get_or_create_system_cl` above.
+    let obj = crate::classloader::get_or_create_platform_loader(ctx);
+    *PLATFORM_CL.lock().unwrap_or_else(|e| e.into_inner()) = Some(obj);
+    Some(obj)
 }
