@@ -457,6 +457,18 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
     );
     registry.register(
         class,
+        "lastIndexOf",
+        "(Ljava/lang/String;)I",
+        native_sb_last_index_of,
+    );
+    registry.register(
+        class,
+        "lastIndexOf",
+        "(Ljava/lang/String;I)I",
+        native_sb_last_index_of_from,
+    );
+    registry.register(
+        class,
         "substring",
         "(I)Ljava/lang/String;",
         native_sb_substring,
@@ -1988,6 +2000,71 @@ pub(crate) fn native_sb_index_of_from(ctx: &mut dyn NativeContext, args: &[Value
         }
         None => Ok(Some(Value::Int(-1))),
     }
+}
+
+/// Last occurrence of `needle` in `haystack` at a start index <= `from`
+/// (UTF-16 code-unit indices), or -1. Matches String/AbstractStringBuilder
+/// `lastIndexOf` semantics, including the empty-needle case.
+fn u16_last_index_of(haystack: &[u16], needle: &[u16], from: i32) -> i32 {
+    let n = haystack.len() as i32;
+    let m = needle.len() as i32;
+    if m == 0 {
+        return from.clamp(0, n);
+    }
+    if m > n {
+        return -1;
+    }
+    let mut k = (n - m).min(from);
+    while k >= 0 {
+        let s = k as usize;
+        if &haystack[s..s + m as usize] == needle {
+            return k;
+        }
+        k -= 1;
+    }
+    -1
+}
+
+/// lastIndexOf(String) — last occurrence of substring, or -1.
+pub(crate) fn native_sb_last_index_of(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let target: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(obj))) => {
+            ctx.read_string(*obj).unwrap_or_default().encode_utf16().collect()
+        }
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let chars = sb_read_chars(ctx, this);
+    Ok(Some(Value::Int(u16_last_index_of(&chars, &target, chars.len() as i32))))
+}
+
+/// lastIndexOf(String, int) — last occurrence at a start index <= fromIndex.
+pub(crate) fn native_sb_last_index_of_from(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let target: Vec<u16> = match args.get(1) {
+        Some(Value::Object(Some(obj))) => {
+            ctx.read_string(*obj).unwrap_or_default().encode_utf16().collect()
+        }
+        _ => return Ok(Some(Value::Int(-1))),
+    };
+    let from = match args.get(2) {
+        Some(Value::Int(i)) => *i,
+        _ => 0,
+    };
+    let chars = sb_read_chars(ctx, this);
+    Ok(Some(Value::Int(u16_last_index_of(&chars, &target, from))))
 }
 
 /// substring(int) — substring from index to end
