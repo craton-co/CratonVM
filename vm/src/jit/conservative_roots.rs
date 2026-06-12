@@ -263,6 +263,8 @@ pub fn push_jit_entry_at(sp: usize) -> usize {
 /// [`JitEntryGuard::enter_with_compiled`] to register both the stack
 /// pointer and the precise-frame metadata in one atomic step.
 pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
+    // Chain mutation = JIT boundary: invalidate the per-thread scan cache.
+    note_jit_boundary();
     let depth = JIT_ENTRY_CHAIN.with(|c| {
         let mut v = c.borrow_mut();
         v.push(entry);
@@ -298,6 +300,8 @@ pub fn push_jit_entry() -> usize {
 /// success / failure / panic unwind. Returns the popped entry SP for
 /// diagnostic purposes.
 pub fn pop_jit_entry() -> Option<usize> {
+    // Chain mutation = JIT boundary: invalidate the per-thread scan cache.
+    note_jit_boundary();
     let popped = JIT_ENTRY_CHAIN.with(|c| c.borrow_mut().pop());
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
@@ -344,6 +348,10 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         v.retain(|e| e.entry_sp >= scanner_sp);
         before - v.len()
     });
+    if pruned > 0 {
+        // Chain mutation = JIT boundary: invalidate the per-thread scan cache.
+        note_jit_boundary();
+    }
     for _ in 0..pruned {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
         cratonvm_gc::gc_quiescence::leave();
@@ -440,6 +448,83 @@ impl Drop for JitEntryGuard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// WS1 (kafka JIT throughput): per-thread JIT-scan cache
+// ---------------------------------------------------------------------------
+//
+// `update_root_snapshot` runs on EVERY object-returning native call (twice:
+// `safe_native_call` + `native_return_pushed_to_stack`) and folds in
+// `scan_active_jit_frames`. The conservative range for a chain entry is
+// `[scanner_sp, entry_sp]` — when a long-running JIT frame sits near the
+// stack bottom (e.g. a compiled JUnit `withInterceptedStreams` lambda that
+// transitively runs the whole test plan), that range spans the ENTIRE
+// interpreter recursion above it, so every native call paid an O(megabytes)
+// word-by-word stack scan. Measured: a 6 s interpreted kafka test class ran
+// 60-100 s with one such frame live — cdb sampling put all wall time under
+// `scan_one_frame` / `is_object_address`. This was the dominant mechanism
+// behind "JIT-on is slower than the interpreter" on call-heavy suites.
+//
+// The cache: JIT spill slots can only change while compiled code executes.
+// Control re-enters compiled code exclusively through (a) a JIT entry
+// (`JitEntryGuard` push) or (b) a JIT runtime helper RETURNING — and before
+// any subsequent snapshot can happen, Rust must first be re-entered through
+// another helper call or the entry's drop. So a generation counter bumped at
+// every chain mutation AND at every JIT runtime-helper entry
+// (`note_jit_boundary`) precisely tracks "spills may have changed".
+// Between bumps, the previous scan's roots are reused verbatim.
+//
+// Soundness of reuse across differing `scanner_sp`: all live spill slots lie
+// within `[innermost-helper-entry SP, entry_sp]`, and the cached scan's range
+// covered that band (its scanner_sp was at or below the helper frame). Words
+// outside the band are interpreter/Rust junk — including or omitting them
+// only perturbs conservative over-retention, never drops a real JIT root.
+// Address stability: while any JIT frame is live, `gc_quiescence` forces the
+// NON-MOVING young sweep, so cached `ObjectRef` addresses cannot be
+// relocated. The two diagnostic modes that lift that guarantee
+// (`CRATONVM_DBG_FORCE_MOVING`, `CRATONVM_SHADOW_STACK`) disable the cache,
+// as does `CRATONVM_NO_JIT_SCAN_CACHE` (bisection).
+
+thread_local! {
+    /// Monotonic count of Rust↔JIT boundary crossings on this thread.
+    static JIT_BOUNDARY_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static JIT_SCAN_CACHE: std::cell::RefCell<JitScanCache> =
+        const { std::cell::RefCell::new(JitScanCache::empty()) };
+}
+
+struct JitScanCache {
+    /// Generation the cached roots were scanned at (`u64::MAX` = never).
+    filled_gen: u64,
+    chain_len: usize,
+    roots: Vec<ObjectRef>,
+}
+
+impl JitScanCache {
+    const fn empty() -> Self {
+        Self {
+            filled_gen: u64::MAX,
+            chain_len: usize::MAX,
+            roots: Vec::new(),
+        }
+    }
+}
+
+/// Record a Rust↔JIT boundary crossing: called at every JIT runtime-helper
+/// entry and at every JIT entry-chain mutation. Invalidates the JIT-scan
+/// cache (next `scan_active_jit_frames` rescans).
+#[inline]
+pub fn note_jit_boundary() {
+    JIT_BOUNDARY_GEN.with(|g| g.set(g.get().wrapping_add(1)));
+}
+
+fn jit_scan_cache_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("CRATONVM_NO_JIT_SCAN_CACHE").is_none()
+            && std::env::var_os("CRATONVM_DBG_FORCE_MOVING").is_none()
+            && std::env::var_os("CRATONVM_SHADOW_STACK").is_none()
+    })
+}
+
 /// Returns true if any thread anywhere in the process is currently inside a
 /// JIT call. Used by the GC to decide whether compaction is safe.
 #[inline]
@@ -519,7 +604,42 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     if std::env::var_os("CRATONVM_DBG_NO_PRUNE").is_none() {
         let _ = prune_returned_jit_entries(scanner_sp);
     }
+    let chain_len = JIT_ENTRY_CHAIN.with(|c| c.borrow().len());
+    if chain_len == 0 {
+        // No live JIT frames — nothing to scan (the overwhelmingly common
+        // case for `update_root_snapshot`'s per-native-call invocations).
+        return;
+    }
+    // WS1 JIT-scan cache (see the module-level comment at `JIT_SCAN_CACHE`):
+    // reuse the previous scan's roots verbatim unless a Rust↔JIT boundary
+    // was crossed since (generation bump), which is the only way a spill
+    // slot can have changed.
+    let gen = JIT_BOUNDARY_GEN.with(|g| g.get());
+    if jit_scan_cache_enabled() {
+        let hit = JIT_SCAN_CACHE.with(|c| {
+            let c = c.borrow();
+            if c.filled_gen == gen && c.chain_len == chain_len {
+                out.extend_from_slice(&c.roots);
+                true
+            } else {
+                false
+            }
+        });
+        if hit {
+            return;
+        }
+    }
+    let scan_start = out.len();
     scan_active_jit_frames_with_sp(scanner_sp, heap, out);
+    if jit_scan_cache_enabled() {
+        JIT_SCAN_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            c.filled_gen = gen;
+            c.chain_len = chain_len;
+            c.roots.clear();
+            c.roots.extend_from_slice(&out[scan_start..]);
+        });
+    }
 }
 
 /// Inner scanner: takes the caller-supplied scanner SP so it can be a

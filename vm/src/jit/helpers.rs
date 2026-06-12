@@ -21,6 +21,114 @@ use crate::threading::jvm_thread::JvmThread;
 use crate::vm::SharedVm;
 
 // ---------------------------------------------------------------------------
+// WS1 diagnostic profiling for the JIT dispatch helpers
+// (env-gated: CRATONVM_DBG_MIC_PROF=1; zero-cost when off beyond one cached
+// bool branch). Dumps cumulative path counts + rdtsc cycle totals to stderr
+// every 2^24 `jit_invoke_virtual_mic` entries, so the last dump before exit
+// approximates the run's totals.
+// ---------------------------------------------------------------------------
+
+pub mod mic_prof {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static MIC_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static MIC_HIT_ENTRY: AtomicU64 = AtomicU64::new(0);
+    pub static MIC_HIT_NOENTRY: AtomicU64 = AtomicU64::new(0);
+    pub static MIC_MISS: AtomicU64 = AtomicU64::new(0);
+    pub static MIC_LAMBDA: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_MIC_TOTAL: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_HIT_ENTRY_CALL: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_INVOKE: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_COMPILE_PROBE: AtomicU64 = AtomicU64::new(0);
+    pub static DISP_CALLS: AtomicU64 = AtomicU64::new(0);
+    pub static CYC_DISP_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+    pub fn enabled() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_MIC_PROF").is_some())
+    }
+
+    #[inline]
+    pub fn now() -> u64 {
+        // SAFETY: rdtsc is unprivileged on x86-64.
+        unsafe { core::arch::x86_64::_rdtsc() }
+    }
+
+    /// Cycle accumulator that survives early returns.
+    pub struct CycGuard {
+        t0: u64,
+        ctr: &'static AtomicU64,
+    }
+    impl CycGuard {
+        pub fn new(ctr: &'static AtomicU64) -> Option<Self> {
+            if enabled() {
+                Some(Self { t0: now(), ctr })
+            } else {
+                None
+            }
+        }
+    }
+    impl Drop for CycGuard {
+        fn drop(&mut self) {
+            self.ctr.fetch_add(now().wrapping_sub(self.t0), Ordering::Relaxed);
+        }
+    }
+
+    #[inline]
+    pub fn bump(ctr: &'static AtomicU64) {
+        if enabled() {
+            ctr.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Counterpart of [`dump_maybe`] driven from `jit_invoke_dispatch`, so a
+    /// workload that's hot through the dispatch helper but cold through the
+    /// MIC helper still produces dumps.
+    pub fn dump_maybe_disp() {
+        if !enabled() {
+            return;
+        }
+        let calls = DISP_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if calls & ((1 << 20) - 1) != 0 {
+            return;
+        }
+        dump_now();
+    }
+
+    pub fn dump_maybe() {
+        if !enabled() {
+            return;
+        }
+        let calls = MIC_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+        if calls & ((1 << 20) - 1) != 0 {
+            return;
+        }
+        dump_now();
+    }
+
+    pub fn dump_now() {
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        eprintln!(
+            "[MIC_PROF] quiesce_depth={} mic_calls={} hit_entry={} hit_noentry={} miss={} lambda={} \
+             cyc_mic_total={} cyc_hit_entry_call={} cyc_invoke={} cyc_compile_probe={} \
+             disp_calls={} cyc_disp_total={}",
+            cratonvm_gc::gc_quiescence::depth(),
+            g(&MIC_CALLS),
+            g(&MIC_HIT_ENTRY),
+            g(&MIC_HIT_NOENTRY),
+            g(&MIC_MISS),
+            g(&MIC_LAMBDA),
+            g(&CYC_MIC_TOTAL),
+            g(&CYC_HIT_ENTRY_CALL),
+            g(&CYC_INVOKE),
+            g(&CYC_COMPILE_PROBE),
+            g(&DISP_CALLS),
+            g(&CYC_DISP_TOTAL),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Thread-local JvmThread pointer for JIT helper access
 // ---------------------------------------------------------------------------
 
@@ -399,98 +507,6 @@ unsafe fn jit_thread_mut() -> Option<(&'static mut JvmThread, JitThreadGuard)> {
     }
 }
 
-/// Call a JIT-compiled Java method entry with the VM's extern "C" ABI.
-///
-/// `entry` must be a live code pointer from [`try_jit_compile_callee`] /
-/// `CompiledMethod::entry_ptr`. `args_slice` is the raw `i64` array the JIT
-/// stub passes (receiver + parameters in JVM order).
-///
-/// **Arity limits.** The transmuted call-tables below cover the System V
-/// AMD64 / win64 register-arg conventions for up to 4 Java args (plus an
-/// optional `vm_ptr` context slot). For methods with more arguments we do
-/// **not** silently return 0 — that was a HIGH-severity correctness bug
-/// that let any JIT-dispatched callsite with a 5+ arg method (e.g. many
-/// `java.util.concurrent` worker constructors, Spring `BeanWrapperImpl`
-/// setters) appear to return null/0 to its caller while never actually
-/// executing the body.
-///
-/// TODO(round-4-wave-3): emit stack arg setup for >4 arg JIT calls so we
-/// can stay on the compiled fast path. Until then, callees with too many
-/// args are routed through the interpreter via `bail_to_interpreter`. The
-/// caller passes `vm`, `thread`, `info`, and the decoded `Value` arg
-/// vector so the bailout can issue a real `invoke_or_native` and surface
-/// any thrown exception through `handle_jit_dispatch_error`.
-#[inline]
-unsafe fn call_jit_compiled_method_entry(
-    entry: usize,
-    needs_ctx: bool,
-    vm_ptr: i64,
-    args_slice: &[i64],
-    // Bailout context. `bail_args` are the Java-level `Value`s reconstructed
-    // by the caller; on too-many-args we hand them to `invoke_or_native`.
-    vm: &SharedVm,
-    thread: &mut JvmThread,
-    info: &JitInvokeInfo,
-    bail_args: &[Value],
-) -> i64 {
-    let n = args_slice.len();
-    // Register-arg coverage: ctx-ABI can pass 3 Java args plus vm_ptr (4 total
-    // System V regs); no-ctx ABI can pass 4 Java args. Beyond that we don't
-    // have stack-arg setup, so bail to the interpreter rather than calling
-    // through with truncated arguments.
-    let register_limit = if needs_ctx { 3 } else { 4 };
-    if n > register_limit {
-        return bail_to_interpreter(vm, thread, info, bail_args);
-    }
-    if needs_ctx {
-        match n {
-            0 => {
-                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
-                f(vm_ptr)
-            }
-            1 => {
-                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
-                f(vm_ptr, args_slice[0])
-            }
-            2 => {
-                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                f(vm_ptr, args_slice[0], args_slice[1])
-            }
-            3 => {
-                let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                f(vm_ptr, args_slice[0], args_slice[1], args_slice[2])
-            }
-            // Unreachable — guarded by `register_limit` check above.
-            _ => bail_to_interpreter(vm, thread, info, bail_args),
-        }
-    } else {
-        match n {
-            0 => {
-                let f: unsafe extern "C" fn() -> i64 = std::mem::transmute(entry);
-                f()
-            }
-            1 => {
-                let f: unsafe extern "C" fn(i64) -> i64 = std::mem::transmute(entry);
-                f(args_slice[0])
-            }
-            2 => {
-                let f: unsafe extern "C" fn(i64, i64) -> i64 = std::mem::transmute(entry);
-                f(args_slice[0], args_slice[1])
-            }
-            3 => {
-                let f: unsafe extern "C" fn(i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                f(args_slice[0], args_slice[1], args_slice[2])
-            }
-            4 => {
-                let f: unsafe extern "C" fn(i64, i64, i64, i64) -> i64 = std::mem::transmute(entry);
-                f(args_slice[0], args_slice[1], args_slice[2], args_slice[3])
-            }
-            // Unreachable — guarded by `register_limit` check above.
-            _ => bail_to_interpreter(vm, thread, info, bail_args),
-        }
-    }
-}
-
 /// Attempt to call a JIT-compiled entry through the register-only
 /// transmute tables. Returns `Some(rc)` on success, `None` when the arg
 /// count exceeds the table coverage (4 with no-ctx, 3 with-ctx). The
@@ -759,6 +775,9 @@ unsafe fn jit_safepoint_flush_satb(vm_ptr: i64) {
 // length is the requested array size. The returned i64 is a raw heap pointer to the new array.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_newarray(vm_ptr: i64, atype: i64, length: i64) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // Round-7 fix (CRIT, audit §3): drain THIS thread's per-thread SATB
     // buffer before any path that may park at the GC barrier or trigger
     // collection. Mirrors interpreter::safepoint_check (line 899).
@@ -943,6 +962,9 @@ pub unsafe extern "C" fn jit_post_tlab_init(
     class_id_raw: i64,
     num_fields: i64,
 ) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     let vm = &*(vm_ptr as *const SharedVm);
     let class_id = ClassId::new(class_id_raw as u32);
     let raw_ptr = obj_ptr as *mut u8;
@@ -1020,6 +1042,9 @@ pub unsafe extern "C" fn jit_post_tlab_init(
 // The returned i64 is a raw heap pointer to the newly allocated object.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_new_object(vm_ptr: i64, class_id_raw: i64, num_fields: i64) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // Round-7 fix (CRIT, audit §3): SATB safepoint flush.
     jit_safepoint_flush_satb(vm_ptr);
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
@@ -1118,6 +1143,9 @@ pub unsafe extern "C" fn jit_anewarray_object(
     component_class_id_raw: i64,
     length: i64,
 ) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // Round-7 fix (CRIT, audit §3): SATB safepoint flush.
     jit_safepoint_flush_satb(vm_ptr);
     // BUGFIX: see `jit_newarray` — narrow length to int payload and sign-extend.
@@ -1166,6 +1194,9 @@ pub unsafe extern "C" fn jit_anewarray_object(
 // pointer to a byte/boolean array object. Null triggers a pending NPE + `i64::MIN`
 // deopt sentinel; out-of-bounds is handled gracefully by the bounds check below.
 pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if array_ptr == 0 {
         // JVMS §baload: throw NullPointerException on null array reference.
         // Previously returned 0, which silently fabricated a zero byte and
@@ -1211,6 +1242,9 @@ pub unsafe extern "C" fn jit_baload(array_ptr: i64, index: i64) -> i64 {
 // null check away even if profiling shows nulls are rare, and do not change
 // the signature without also updating `emit_null_check_store_stubs` to match.
 pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if array_ptr == 0 {
         // JVMS §bastore: throw NullPointerException on null array reference.
         //
@@ -1254,6 +1288,9 @@ pub unsafe extern "C" fn jit_bastore(array_ptr: i64, index: i64, val: i64) {
 // pointer to an int array object. Null triggers a pending NPE + `i64::MIN` deopt
 // sentinel; out-of-bounds is handled gracefully by the bounds check below.
 pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if array_ptr == 0 {
         // JVMS §iaload: throw NullPointerException on null array reference.
         // Signal the interpreter via the pending-NPE flag + `i64::MIN` deopt
@@ -1280,6 +1317,9 @@ pub unsafe extern "C" fn jit_iaload(array_ptr: i64, index: i64) -> i64 {
 // pointer to an int array object. Null aborts the process — see `jit_bastore` for
 // the rationale. Out-of-bounds is handled gracefully.
 pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if array_ptr == 0 {
         // JVMS §iastore: throw NullPointerException on null array reference.
         // Round-8 CRIT fix: see `jit_bastore` for full rationale. Set the
@@ -1309,6 +1349,9 @@ pub unsafe extern "C" fn jit_iastore(array_ptr: i64, index: i64, val: i64) {
 // pointer to a reference array object. Null triggers a pending NPE + `i64::MIN`
 // deopt sentinel; out-of-bounds is handled gracefully by the bounds check below.
 pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if array_ptr == 0 {
         // JVMS §aaload: throw NullPointerException on null array reference.
         set_jit_pending_npe();
@@ -1335,6 +1378,9 @@ pub unsafe extern "C" fn jit_aaload(array_ptr: i64, index: i64) -> i64 {
 // for non-null stores to maintain generational GC card table invariants.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_aastore(vm_ptr: i64, array_ptr: i64, index: i64, val: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if array_ptr == 0 {
         // JVMS §aastore: throw NullPointerException on null array reference.
         // Round-8 CRIT fix: see `jit_bastore` for full rationale. Set the
@@ -1398,6 +1444,9 @@ pub unsafe extern "C" fn jit_multianewarray_2d(
     dim1: i64,
     dim2: i64,
 ) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // Round-7 fix (CRIT, audit §3): SATB safepoint flush.
     jit_safepoint_flush_satb(vm_ptr);
     let heap = heap_from_vm(vm_ptr);
@@ -1433,6 +1482,9 @@ pub unsafe extern "C" fn jit_multianewarray_2d(
 // pointer to any array object. Null triggers a pending NPE + `i64::MIN` deopt
 // sentinel (JVMS §arraylength requires NullPointerException on null).
 pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if array_ptr == 0 {
         // JVMS §arraylength: throw NullPointerException on null array reference.
         // Previously returned -1, which JIT'd Java would happily compare against
@@ -1455,6 +1507,9 @@ pub unsafe extern "C" fn jit_arraylength(array_ptr: i64) -> i64 {
 // to a live object. field_index is the resolved field slot index within the object layout.
 // ptr::read is used because Value may contain non-Copy variants (ObjectRef).
 pub unsafe extern "C" fn jit_getfield(obj_ptr: i64, field_index: i64) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if obj_ptr == 0 {
         // JVMS §getfield: throw NullPointerException on a null receiver.
         // Previously returned 0, which silently fabricated a zero/null field
@@ -1521,6 +1576,9 @@ unsafe fn jit_putfield_slot_in_bounds(obj_ptr: i64, field_index: i64) -> bool {
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if obj_ptr == 0 { return; }
     // DIAGNOSTIC (gated by CRATONVM_DBG_JIT_PUTFIELD, one-shot, zero release
     // cost when off): a JIT operand-stack miscompile can hand this helper a
@@ -1561,6 +1619,9 @@ pub unsafe extern "C" fn jit_putfield_int(obj_ptr: i64, field_index: i64, val: i
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if obj_ptr == 0 { return; }
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) { return; }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
@@ -1571,6 +1632,9 @@ pub unsafe extern "C" fn jit_putfield_long(obj_ptr: i64, field_index: i64, val: 
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if obj_ptr == 0 { return; }
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) { return; }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
@@ -1581,6 +1645,9 @@ pub unsafe extern "C" fn jit_putfield_float(obj_ptr: i64, field_index: i64, val:
 // SAFETY: Called from JIT-compiled code. obj_ptr must be 0 (null) or a valid heap pointer
 // to a live object. field_index was resolved at JIT compile time to a valid slot.
 pub unsafe extern "C" fn jit_putfield_double(obj_ptr: i64, field_index: i64, val: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if obj_ptr == 0 { return; }
     if !jit_putfield_slot_in_bounds(obj_ptr, field_index) { return; }
     // SAFETY: obj_ptr is non-null, field slot is within the object's allocated region.
@@ -1599,6 +1666,9 @@ pub unsafe extern "C" fn jit_putfield_object(
     field_index: i64,
     val: i64,
 ) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if obj_ptr == 0 { return; }
     let obj_ref = ObjectRef::from_raw(obj_ptr as usize as *mut u8);
     let value = if val == 0 {
@@ -1678,6 +1748,9 @@ pub unsafe extern "C" fn jit_putfield_object(
 // obj_ptr and val_ptr must be 0 (null) or valid heap pointers to live objects.
 // Records a generational write barrier so the GC tracks old-to-young references.
 pub unsafe extern "C" fn jit_write_barrier(vm_ptr: i64, obj_ptr: i64, val_ptr: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if obj_ptr == 0 { return; }
     if val_ptr == 0 {
         return;
@@ -1714,6 +1787,9 @@ pub unsafe extern "C" fn jit_write_barrier(vm_ptr: i64, obj_ptr: i64, val_ptr: i
 // safe but wasteful.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if vm_ptr == 0 || old_ref == 0 {
         return;
     }
@@ -1730,6 +1806,9 @@ pub unsafe extern "C" fn jit_satb_pre_write_barrier(vm_ptr: i64, old_ref: i64) {
 // class_id_raw and field_index were resolved at JIT compile time and refer to a valid static field.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_index: i64) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
     let class_id = ClassId::new(class_id_raw as u32);
@@ -1749,6 +1828,9 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
 // class_id_raw and field_index were resolved at JIT compile time and refer to a valid static field.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_putstatic_int(vm_ptr: i64, class_id_raw: i64, field_index: i64, val: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if vm_ptr == 0 {
         return;
     }
@@ -1762,6 +1844,9 @@ pub unsafe extern "C" fn jit_putstatic_int(vm_ptr: i64, class_id_raw: i64, field
 // class_id_raw and field_index were resolved at JIT compile time and refer to a valid static field.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_putstatic_long(vm_ptr: i64, class_id_raw: i64, field_index: i64, val: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
     let class_id = ClassId::new(class_id_raw as u32);
@@ -1772,6 +1857,9 @@ pub unsafe extern "C" fn jit_putstatic_long(vm_ptr: i64, class_id_raw: i64, fiel
 // class_id_raw and field_index were resolved at JIT compile time and refer to a valid static field.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_putstatic_float(vm_ptr: i64, class_id_raw: i64, field_index: i64, val: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
     let class_id = ClassId::new(class_id_raw as u32);
@@ -1782,6 +1870,9 @@ pub unsafe extern "C" fn jit_putstatic_float(vm_ptr: i64, class_id_raw: i64, fie
 // class_id_raw and field_index were resolved at JIT compile time and refer to a valid static field.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_putstatic_double(vm_ptr: i64, class_id_raw: i64, field_index: i64, val: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
     let class_id = ClassId::new(class_id_raw as u32);
@@ -1793,6 +1884,9 @@ pub unsafe extern "C" fn jit_putstatic_double(vm_ptr: i64, class_id_raw: i64, fi
 // pointer to a live heap object, converted to Value::Object for storage in the static field table.
 #[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub unsafe extern "C" fn jit_putstatic_object(vm_ptr: i64, class_id_raw: i64, field_index: i64, val: i64) {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
     let class_id = ClassId::new(class_id_raw as u32);
@@ -1961,6 +2055,9 @@ pub unsafe extern "C" fn jit_checkcast(
     class_name_ptr: *const u8,
     class_name_len: i64,
 ) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // Null reference is always a valid cast (matches JVMS §6.5.checkcast).
     if obj_ptr == 0 {
         return 0;
@@ -2003,6 +2100,9 @@ pub unsafe extern "C" fn jit_instanceof(
     class_name_ptr: *const u8,
     class_name_len: i64,
 ) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // Null reference is never an instance of anything (JVMS §6.5.instanceof).
     if obj_ptr == 0 {
         return 0;
@@ -2044,6 +2144,9 @@ pub unsafe extern "C" fn jit_instanceof(
 // SAFETY: Called from JIT-compiled code when an array bounds check fails.
 // Only stores two i64 values in a thread-local; no pointer dereferences.
 pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     JIT_PENDING_AIOOBE.with(|e| e.set(Some((index, length))));
     i64::MIN // deopt sentinel — interpreter will detect and throw AIOOBE
 }
@@ -2063,6 +2166,9 @@ pub unsafe extern "C" fn jit_throw_aioobe(index: i64, length: i64) -> i64 {
 // either 0 or the heap pointer the JIT popped from the operand stack;
 // no dereference happens here — it is only wrapped and stored in a TLS.
 pub unsafe extern "C" fn jit_throw_exception(exc_ptr: i64) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if exc_ptr == 0 {
         stash_jit_pending_npe();
     } else {
@@ -2405,10 +2511,43 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     args_ptr: i64,
     num_args: i64,
 ) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // Round-7 fix (CRIT, audit §3): SATB safepoint flush. A dispatched
     // call may transitively enter the GC barrier through callee
     // allocations or `Object.wait` paths.
     jit_safepoint_flush_satb(vm_ptr);
+    mic_prof::dump_maybe_disp();
+    let _cyc_disp = mic_prof::CycGuard::new(&mic_prof::CYC_DISP_TOTAL);
+    // WS1 diagnostic: per-call dispatch trace (the dispatch helper is cold
+    // enough on the kafka repro — ~15 calls — that an eprintln per call is
+    // affordable and names the callee that encloses the lost wall time).
+    let _disp_trace = if mic_prof::enabled() {
+        let info = &*(info_ptr as *const JitInvokeInfo);
+        struct DispTrace {
+            label: String,
+            t0: u64,
+        }
+        impl Drop for DispTrace {
+            fn drop(&mut self) {
+                eprintln!(
+                    "[DISP_TRACE] {} cycles={}",
+                    self.label,
+                    mic_prof::now().wrapping_sub(self.t0)
+                );
+            }
+        }
+        Some(DispTrace {
+            label: format!(
+                "{}.{}{} kind={}",
+                info.class_name, info.method_name, info.descriptor, info.invoke_kind
+            ),
+            t0: mic_prof::now(),
+        })
+    } else {
+        None
+    };
     // SAFETY: vm_ptr and info_ptr originate from JIT code; both point to valid, live objects.
     let vm = &*(vm_ptr as *const SharedVm);
     let info = &*(info_ptr as *const JitInvokeInfo);
@@ -2803,8 +2942,13 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     mic_ptr: i64,
     pic_ptr: i64,
 ) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     // Round-7 fix (CRIT, audit §3): SATB safepoint flush.
     jit_safepoint_flush_satb(vm_ptr);
+    mic_prof::dump_maybe();
+    let _cyc_total = mic_prof::CycGuard::new(&mic_prof::CYC_MIC_TOTAL);
     let vm = &*(vm_ptr as *const SharedVm);
     let info = &*(info_ptr as *const JitInvokeInfo);
     let _callee_guard = if crate::runtime::env_cache::jit_putfield_diag() {
@@ -2837,9 +2981,6 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         None => return 0,
     };
 
-    let mut values = Vec::with_capacity(num_args.max(0) as usize);
-    let mut desc_iter = DescriptorParamIter::new(info.descriptor);
-
     if args_slice.is_empty() {
         return 0;
     }
@@ -2860,37 +3001,49 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // 48-bit canonical address space — matches the invariants required by
     // ObjectRef::from_raw for live heap objects.
     let receiver_ref = ObjectRef::from_raw(receiver_raw as usize as *mut u8);
-    values.push(Value::Object(Some(receiver_ref)));
 
-    for &raw in &args_slice[1..] {
-        let val = match desc_iter.next() {
-            Some(b'I') | Some(b'B') | Some(b'C') | Some(b'S') | Some(b'Z') => {
-                Value::Int(raw as i32)
-            }
-            Some(b'J') => Value::Long(raw),
-            Some(b'F') => Value::Float(f32::from_bits(raw as u32)),
-            Some(b'D') => Value::Double(f64::from_bits(raw as u64)),
-            Some(b'L') | Some(b'[') => {
-                if raw == 0 {
-                    Value::Object(None)
-                } else {
-                    // Same defensive guard as the receiver decode above.
-                    // Tagged-long bits in an L/[ slot are downgraded to
-                    // null instead of panicking in ObjectRef::from_raw.
-                    let bits = raw as u64;
-                    if (bits & 0x7) == 0 && bits < (1u64 << 48) {
-                        // SAFETY: bits is non-zero, 8-byte aligned, and
-                        // within the 48-bit canonical address space.
-                        Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
-                    } else {
+    // WS1 (kafka JIT throughput): the `Value` decode is deferred. The MIC-hit
+    // fast path dispatches straight off the raw `args_slice` and never
+    // materializes `Value`s; only the lambda, register-overflow-bailout and
+    // full-resolution paths pay for the decode. Eagerly building this Vec
+    // (one heap alloc + a descriptor parse) on every call — including pure
+    // cache hits — was a measured contributor to JIT'd call-heavy code
+    // running slower than the interpreter.
+    let decode_values = || -> Vec<Value> {
+        let mut values = Vec::with_capacity(args_slice.len());
+        values.push(Value::Object(Some(receiver_ref)));
+        let mut desc_iter = DescriptorParamIter::new(info.descriptor);
+        for &raw in &args_slice[1..] {
+            let val = match desc_iter.next() {
+                Some(b'I') | Some(b'B') | Some(b'C') | Some(b'S') | Some(b'Z') => {
+                    Value::Int(raw as i32)
+                }
+                Some(b'J') => Value::Long(raw),
+                Some(b'F') => Value::Float(f32::from_bits(raw as u32)),
+                Some(b'D') => Value::Double(f64::from_bits(raw as u64)),
+                Some(b'L') | Some(b'[') => {
+                    if raw == 0 {
                         Value::Object(None)
+                    } else {
+                        // Same defensive guard as the receiver decode above.
+                        // Tagged-long bits in an L/[ slot are downgraded to
+                        // null instead of panicking in ObjectRef::from_raw.
+                        let bits = raw as u64;
+                        if (bits & 0x7) == 0 && bits < (1u64 << 48) {
+                            // SAFETY: bits is non-zero, 8-byte aligned, and
+                            // within the 48-bit canonical address space.
+                            Value::Object(Some(ObjectRef::from_raw(raw as usize as *mut u8)))
+                        } else {
+                            Value::Object(None)
+                        }
                     }
                 }
-            }
-            _ => Value::Int(raw as i32),
-        };
-        values.push(val);
-    }
+                _ => Value::Int(raw as i32),
+            };
+            values.push(val);
+        }
+        values
+    };
 
     let receiver_class_id = vm.heap.class_id_of(receiver_ref);
     let receiver_cid = receiver_class_id.as_u32();
@@ -2903,6 +3056,8 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     // died on the first compiled execution. Mirror the interpreter's
     // invokeinterface route: dispatch through the lambda's SAM impl_handle.
     if vm.lambda_proxies.read().contains_key(&receiver_class_id) {
+        mic_prof::bump(&mic_prof::MIC_LAMBDA);
+        let values = decode_values();
         let rest: Vec<Value> = values[1..].to_vec();
         match crate::runtime::interpreter::try_lambda_dispatch(
             vm,
@@ -2966,23 +3121,25 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             let needs_ctx = mic
                 .cached_needs_context
                 .load(std::sync::atomic::Ordering::Acquire);
-            // `values` already holds the full receiver + decoded param vector
-            // for this dispatch site (built above before the cache hit). It
-            // is forwarded as the bailout argument list so that callees with
-            // more than 4 args route through the interpreter instead of
-            // silently returning 0 from the truncated register-arg table.
-            return call_jit_compiled_method_entry(
-                entry as usize,
-                needs_ctx,
-                vm_ptr,
-                args_slice,
-                vm,
-                thread,
-                info,
-                &values,
-            );
+            // Register-table call straight off the raw arg slots — no `Value`
+            // decode on this hot path. `try_call_compiled_entry` returns
+            // `None` exactly when the callee has more args than the register
+            // tables cover (4 no-ctx / 3 with-ctx); only then decode the args
+            // and route through the interpreter instead of silently returning
+            // 0 from a truncated register-arg table.
+            mic_prof::bump(&mic_prof::MIC_HIT_ENTRY);
+            let rc_opt = {
+                let _g = mic_prof::CycGuard::new(&mic_prof::CYC_HIT_ENTRY_CALL);
+                try_call_compiled_entry(entry as usize, needs_ctx, vm_ptr, args_slice)
+            };
+            if let Some(rc) = rc_opt {
+                return rc;
+            }
+            let values = decode_values();
+            return bail_to_interpreter(vm, thread, info, &values);
         }
 
+        mic_prof::bump(&mic_prof::MIC_HIT_NOENTRY);
         // Entry not cached yet — use cached class name for fast dispatch.
         //
         // KC26 array.clone() bug: array receivers store the COMPONENT class
@@ -2993,10 +3150,10 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // `Enum.clone() → CloneNotSupportedException` for every array clone
         // of an enum type. Per JVMS §4.4.1, array classes inherit their
         // method table from `Object`; short-circuit accordingly.
-        let class_name: String = if vm.heap.kind_of(receiver_ref)
+        let class_name: std::sync::Arc<str> = if vm.heap.kind_of(receiver_ref)
             == cratonvm_types::ObjectKind::Array
         {
-            "java/lang/Object".to_string()
+            std::sync::Arc::from("java/lang/Object")
         } else {
             let guard = mic.cached_class_name.lock();
             match &*guard {
@@ -3005,18 +3162,18 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                     drop(guard);
                     let cm = vm.class_manager.read();
                     cm.get_class(receiver_class_id)
-                        .map(|c| c.name.to_string())
+                        .map(|c| c.name.clone())
                         // Same fallback as the miss path below: never
                         // dispatch on an empty class name.
-                        .unwrap_or_else(|| info.class_name.to_string())
+                        .unwrap_or_else(|| std::sync::Arc::from(info.class_name))
                 }
             }
         };
 
-        let method_args: Vec<Value> = values[1..].to_vec();
-        let mut full_args = Vec::with_capacity(1 + method_args.len());
-        full_args.push(Value::Object(Some(receiver_ref)));
-        full_args.extend_from_slice(&method_args);
+        // `decode_values` yields exactly `[receiver, args...]` — the full
+        // argument vector `invoke_or_native` expects. (This path previously
+        // rebuilt it twice via `values[1..].to_vec()` + a fresh prepend.)
+        let full_args = decode_values();
 
         // Try to compile callee for next time (populate cached_entry_ptr + needs_ctx).
         //
@@ -3032,12 +3189,16 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         // unequal (bc-java InterleaveTest, junit assertEquals(Object,Object)).
         // `find_method_recursive` (inside `try_jit_compile_callee`) walks up
         // from the receiver class to the real override.
-        if let Some((entry_ptr, needs_ctx)) = crate::runtime::interpreter::try_jit_compile_callee(
-            vm,
-            &class_name,
-            info.method_name,
-            info.descriptor,
-        ) {
+        let compile_res = {
+            let _g = mic_prof::CycGuard::new(&mic_prof::CYC_COMPILE_PROBE);
+            crate::runtime::interpreter::try_jit_compile_callee(
+                vm,
+                &class_name,
+                info.method_name,
+                info.descriptor,
+            )
+        };
+        if let Some((entry_ptr, needs_ctx)) = compile_res {
             mic.cached_entry_ptr
                 .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
             mic.cached_needs_context
@@ -3056,14 +3217,17 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             }
         }
 
-        let invoke_res = crate::vm::invoke_or_native(
-            vm,
-            thread,
-            &class_name,
-            info.method_name,
-            info.descriptor,
-            &full_args,
-        );
+        let invoke_res = {
+            let _g = mic_prof::CycGuard::new(&mic_prof::CYC_INVOKE);
+            crate::vm::invoke_or_native(
+                vm,
+                thread,
+                &class_name,
+                info.method_name,
+                info.descriptor,
+                &full_args,
+            )
+        };
         // S111r12 — JIT MIC fast-path rescue: same CP-class fallback
         // as the cache-miss branch below (see comment there).
         //
@@ -3133,16 +3297,21 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
             .unwrap_or_else(|| std::sync::Arc::from(info.class_name))
     };
 
+    mic_prof::bump(&mic_prof::MIC_MISS);
     // Try to compile callee for cached entry. Resolve by the RECEIVER's class
     // (`class_name`), not the static `info.class_name` — see the matching
     // VIRTUAL DISPATCH FIX in the cache-hit branch above. `class_name` here is
     // an `Arc<str>`; deref to `&str` for the resolver.
-    let (entry_ptr, needs_ctx) = match crate::runtime::interpreter::try_jit_compile_callee(
-        vm,
-        &class_name,
-        info.method_name,
-        info.descriptor,
-    ) {
+    let compile_res = {
+        let _g = mic_prof::CycGuard::new(&mic_prof::CYC_COMPILE_PROBE);
+        crate::runtime::interpreter::try_jit_compile_callee(
+            vm,
+            &class_name,
+            info.method_name,
+            info.descriptor,
+        )
+    };
+    let (entry_ptr, needs_ctx) = match compile_res {
         Some((ptr, nc)) => (ptr as u64, nc),
         None => (0, false),
     };
@@ -3164,19 +3333,21 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         pic.install(receiver_cid, &class_name, entry_ptr, needs_ctx);
     }
 
-    let method_args: Vec<Value> = values[1..].to_vec();
-    let mut full_args = Vec::with_capacity(1 + method_args.len());
-    full_args.push(Value::Object(Some(receiver_ref)));
-    full_args.extend_from_slice(&method_args);
+    // See the matching note in the cache-hit branch — `decode_values` already
+    // yields the `[receiver, args...]` vector `invoke_or_native` expects.
+    let full_args = decode_values();
 
-    let invoke_res = crate::vm::invoke_or_native(
-        vm,
-        thread,
-        &class_name,
-        info.method_name,
-        info.descriptor,
-        &full_args,
-    );
+    let invoke_res = {
+        let _g = mic_prof::CycGuard::new(&mic_prof::CYC_INVOKE);
+        crate::vm::invoke_or_native(
+            vm,
+            thread,
+            &class_name,
+            info.method_name,
+            info.descriptor,
+            &full_args,
+        )
+    };
     // S111r12 — JIT MIC virtual-dispatch rescue. When the receiver's
     // runtime class (e.g. `java/lang/Comparable` for a malformed
     // ClassLoader instance) does not declare the CP-resolved method,
@@ -3421,6 +3592,9 @@ pub unsafe extern "C" fn jit_uncommon_trap(
     reason: i64,
     bci: i64,
 ) -> i64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     if vm_ptr == 0 {
         return DEOPT_ACTION_REINTERPRET;
     }
@@ -4113,6 +4287,9 @@ mod tests {
 /// pointer as "skip the inline bump, fall through to slow path").
 #[no_mangle]
 pub unsafe extern "C" fn jit_get_current_thread() -> *mut JvmThread {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     JIT_THREAD.with(|t| t.get())
 }
 
@@ -4216,11 +4393,17 @@ extern "C" fn jit_frame_record(rbp: usize) {
 /// then round once".
 #[no_mangle]
 pub extern "C" fn jit_math_fma_double(a: f64, b: f64, c: f64) -> f64 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     a.mul_add(b, c)
 }
 
 /// T1.1.28 — Math.fma(float, float, float) runtime helper.
 #[no_mangle]
 pub extern "C" fn jit_math_fma_float(a: f32, b: f32, c: f32) -> f32 {
+    // WS1: Rust<->JIT boundary — invalidate the per-thread JIT-scan cache
+    // (see conservative_roots::note_jit_boundary).
+    crate::jit::conservative_roots::note_jit_boundary();
     a.mul_add(b, c)
 }

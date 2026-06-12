@@ -1,7 +1,64 @@
 # Workstream 1 — JIT throughput: JIT-compiled call-heavy code is slower than the interpreter
 
-**Status:** root-caused; partial mitigation shipped (env-configurable threshold); the
-durable cure is JIT codegen-quality work (large). **Not a crash — a performance bug.**
+**Status:** TRUE root cause found and FIXED (2026-06-12, see §0): the dominant
+inversion mechanism was the per-native-call **conservative JIT-frame stack scan** in
+`update_root_snapshot`, NOT the §2 dispatch-helper costs (those are real but
+second-order — the MIC helper measured **0 calls** on the repro). Fix = per-thread
+JIT-scan cache invalidated at Rust↔JIT boundaries. ConfigDefTest single-class repro:
+interp 6 s / JIT-on 66-96 s before → **8 s** after (bisect-isolated case) and 21 s
+with all compiles on. The remaining gap vs interpreter is the §6 codegen-quality
+work. **Not a crash — a performance bug.**
+
+---
+
+## 0. TRUE root cause (2026-06-12) — per-native-call conservative JIT-frame stack scan
+
+**Repro distilled** (single class, ~16× inversion): `RunCls
+org.apache.kafka.common.config.ConfigDefTest` — `--nojit` **6 s**, JIT-on **~96 s**.
+Bisect (`CRATONVM_JIT_BISECT_ONLY`/`_SKIP`) isolated ONE method whose compilation
+flips it: `EngineExecutionOrchestrator.lambda$execute$0` — JUnit 5.10's
+`withInterceptedStreams` wrapper lambda, whose body invokes the private
+`execute(...)` that **runs the entire test plan**. Skipping just that lambda → 6 s.
+
+**Why that lambda:** `try_lambda_dispatch` consults the JIT cache on *every* SAM
+dispatch (no warmup gate), so the lambda runs compiled from call #1. Its compiled
+frame then sits near the bottom of the native stack (a `JitEntryGuard` chain entry,
+`gc_quiescence` active) for the whole run.
+
+**The mechanism** (cdb stack sampling; all samples identical):
+`invoke_cached_native_callback` / `safe_native_call` → `update_root_snapshot` →
+`scan_active_jit_frames` → `scan_one_frame` → `GenerationalHeap::is_object_address`.
+`update_root_snapshot` runs on **every object-returning native call** (twice: once
+in `safe_native_call`, once in `native_return_pushed_to_stack`), and the
+conservative scan range for a non-precise chain entry is `[scanner_sp, entry_sp]` —
+i.e. from the *current* (deep) SP all the way up to the JIT entry near the stack
+bottom. With the whole interpreted test plan recursing above that frame, every
+native call paid an O(megabytes) word-by-word stack scan. Diagnostics that ruled
+everything else out: `mic_calls=0` (MIC helper never entered), `disp_calls=15`
+(dispatch helper near-cold), `gc_collections=0` **in both fast and slow runs**
+(GC mode/frequency irrelevant — `CRATONVM_DBG_FORCE_MOVING` changed nothing),
+identical intrinsic-dispatch counts (same Java work executed).
+
+**The fix — per-thread JIT-scan cache** (`vm/src/jit/conservative_roots.rs`):
+JIT spill slots can only change while compiled code executes, and control re-enters
+Rust exclusively through a JIT runtime helper or the entry guard's drop. A
+generation counter (`note_jit_boundary`) is bumped at every chain mutation
+(push/pop/prune) and at the entry of **every** `jit_*` runtime helper; between
+bumps, `scan_active_jit_frames` reuses the previous scan's roots verbatim.
+Soundness: spills live in `[innermost-helper-entry SP, entry_sp]`, which every
+cached scan covered; address stability holds because live JIT frames force the
+non-moving sweep (the cache is disabled under `CRATONVM_DBG_FORCE_MOVING` /
+`CRATONVM_SHADOW_STACK`, which lift that guarantee, and via
+`CRATONVM_NO_JIT_SCAN_CACHE` for bisection).
+
+**Follow-up (not done):** record the innermost helper-entry SP per chain entry so
+even cache-miss rescans are bounded to the real JIT band instead of
+`[scanner_sp, entry_sp]`; and consider a warmup gate for `try_lambda_dispatch`'s
+eager compiled-entry use.
+
+**New diagnostics** (all default-off): `CRATONVM_DBG_MIC_PROF=1` — dispatch-helper
+path counters + rdtsc cycle totals, per-call `[DISP_TRACE]` callee/cycles lines,
+and a shutdown `[MIC_PROF]` dump incl. `gc_collections`/`quiesce_depth`.
 
 This is the analysis behind bug-01 and the "slow" side of bug-05/bug-06: many
 kafka-clients unit packages *complete* but exceed CratonVM's **120 s default watchdog**
@@ -47,7 +104,15 @@ JIT'd call-heavy code then executes slower than interpreting it.
 
 ---
 
-## 2. Root cause
+## 2. Root cause — **SUPERSEDED by §0**
+
+> ⚠️ **2026-06-12 correction:** the attribution below is WRONG for the `config`
+> workload. Instrumented counters show `jit_invoke_virtual_mic` is entered **0
+> times** and `jit_invoke_dispatch` only ~15 times on the ConfigDefTest repro —
+> the helpers are nearly cold. The dominant cost was the per-native-call
+> conservative JIT-frame stack scan (§0). The per-call overheads described here
+> are real and were also fixed (negative compile cache + lazy arg decode, see
+> §6 item 1 status), but they are second-order for this suite.
 
 The 227 s is spent **executing JIT-compiled code**, specifically virtual/interface
 dispatch out of JIT'd call-heavy framework methods (JUnit `ReflectionUtils` /
@@ -209,6 +274,17 @@ In rough priority / risk order:
    parsed descriptor on `JitInvokeInfo` instead of re-parsing each call. *Pure win, no
    regression risk* — helps every JIT virtual call; lower-risk than the rest. (Touches a
    hot, safety-critical helper, so test carefully.)
+   **✅ DONE (2026-06-12), as part of the §0 fix series:** (a) the `Value` decode in
+   `jit_invoke_virtual_mic` is now lazy — the MIC-hit fast path dispatches straight
+   off the raw arg slots, and the redundant `method_args`/`full_args` rebuilds are
+   gone; (b) `try_jit_compile_callee` got a process-global **negative-result cache**
+   (FNV fingerprint, direct-mapped 32K) so callees that can never compile
+   (native-shadowed `HashMap.get`/reflection, skip-listed, FJP, backend bails) cost
+   one hash probe instead of two class-hierarchy walks + 3 `Arc` allocs + a
+   `padded_bytecode` copy + a compile attempt per call (JIT-cache probed FIRST so
+   late compilations are always picked up; periodic re-probe bounds staleness);
+   (c) `JitMICSlot::cached_class_name` is `Arc<str>` (per-hit refcount bump, not a
+   `String` copy).
 2. **Polymorphic dispatch that survives megamorphism** — a larger / profile-driven PIC
    (N≫3, or a fast megamorphic vtable/itable fallback) so >3-type sites stop falling to
    full `invoke_or_native` resolution. The current 3-entry PIC thrashes on real

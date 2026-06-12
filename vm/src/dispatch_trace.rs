@@ -50,6 +50,13 @@ pub fn is_enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// Total dispatches recorded so far (bytecode-method entries + native
+/// dispatches). Only advances while `CRATONVM_DBG_LETSGO=1`; used by the
+/// WS1 shutdown profile dump as a "how much was dispatched" discriminator.
+pub fn total_dispatches() -> u64 {
+    SEQ.load(Ordering::Relaxed) as u64
+}
+
 pub fn init_from_env() {
     let on = std::env::var_os("CRATONVM_DBG_LETSGO")
         .map(|v| v != "0" && !v.is_empty())

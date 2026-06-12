@@ -15051,6 +15051,51 @@ pub fn is_fjp_subclass_blocklisted(shared: &SharedVm, class_name: &str) -> bool 
     false
 }
 
+/// Negative-result cache for [`try_jit_compile_callee`]: direct-mapped table
+/// of 64-bit FNV-1a fingerprints of `(class, method, descriptor)` triples
+/// whose compile attempt returned `None`.
+///
+/// WS1 (kafka JIT throughput): the JIT dispatch helpers
+/// (`jit_invoke_virtual_mic` et al.) call `try_jit_compile_callee` on every
+/// dispatch whose MIC has no compiled entry. For a callee that can never
+/// compile — native-shadowed (`HashMap.get`, reflection), skip-listed,
+/// FJP-blocklisted, or a backend bail — every such call re-paid the full
+/// pipeline: two class-hierarchy walks with string-keyed native lookups per
+/// level, `find_method_recursive`, a full `padded_bytecode` copy of the
+/// method body, and a compile attempt. On call-heavy code this made JIT'd
+/// dispatch dramatically slower than the interpreter. One fingerprint probe
+/// replaces all of it.
+///
+/// Safety of staleness/collisions: a wrong "negative" answer only means the
+/// callee is invoked through `invoke_or_native` (interpreted) instead of a
+/// compiled entry — always correct, just slower. Recovery paths: the JIT
+/// cache is probed BEFORE this table (so a callee compiled later through the
+/// interpreter-upgrade or OSR path is picked up immediately), and a cached
+/// negative is re-verified every [`CALLEE_NEG_REPROBE_MASK`]+1'th hit.
+const CALLEE_NEG_CACHE_SLOTS: usize = 1 << 15;
+static CALLEE_NEG_CACHE: [std::sync::atomic::AtomicU64; CALLEE_NEG_CACHE_SLOTS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; CALLEE_NEG_CACHE_SLOTS];
+/// Counter of negative-cache hits, used to periodically re-run the full
+/// pipeline so a stale negative (e.g. a transient compile failure that
+/// would succeed now) cannot pin a hot callee to the interpreter forever.
+static CALLEE_NEG_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const CALLEE_NEG_REPROBE_MASK: u64 = 0xFFF;
+
+fn callee_neg_fingerprint(class_name: &str, method_name: &str, descriptor: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = FNV_OFFSET;
+    for part in [class_name, method_name, descriptor] {
+        for &b in part.as_bytes() {
+            h = (h ^ b as u64).wrapping_mul(FNV_PRIME);
+        }
+        // Separator so ("AB","C") and ("A","BC") fingerprint differently.
+        h = (h ^ 0xff).wrapping_mul(FNV_PRIME);
+    }
+    // 0 is the table's "empty slot" sentinel.
+    if h == 0 { 1 } else { h }
+}
+
 /// Compile a callee method by name, storing it in the JIT cache.
 /// Called from `jit_invoke_dispatch` when a callee becomes hot.
 /// Returns (entry_ptr, needs_context) on success.
@@ -15060,6 +15105,7 @@ pub fn try_jit_compile_callee(
     method_name: &str,
     descriptor: &str,
 ) -> Option<(usize, bool)> {
+    use std::sync::atomic::Ordering;
     // Kill-switch: CRATONVM_DISABLE_JIT=1 forces interpreter-only execution.
     // Useful for bisecting JIT-vs-interpreter bugs during bootstrap crashes.
     if crate::runtime::env_cache::disable_jit() {
@@ -15070,6 +15116,55 @@ pub fn try_jit_compile_callee(
     if crate::jit::is_jit_bail_listed(class_name, method_name, descriptor) {
         return None;
     }
+    // JIT-cache probe. Deliberately BEFORE the negative cache so a method
+    // compiled later through another path (interpreter invocation-count
+    // upgrade, OSR) is returned even when an earlier attempt through this
+    // function negative-cached. `JitCache::get` takes `&str` directly —
+    // the previous `Arc::from` per name was three wasted heap allocations
+    // on every dispatch-helper call.
+    {
+        let jit_cache = shared.jit_cache.read();
+        if let Some(compiled) = jit_cache.get(class_name, method_name, descriptor) {
+            return Some((compiled.entry_ptr() as usize, compiled.needs_context())); // Cast: JIT entry point to address
+        }
+    }
+    let fp = callee_neg_fingerprint(class_name, method_name, descriptor);
+    let slot = &CALLEE_NEG_CACHE[(fp as usize) & (CALLEE_NEG_CACHE_SLOTS - 1)];
+    if slot.load(Ordering::Relaxed) == fp {
+        let n = CALLEE_NEG_HITS.fetch_add(1, Ordering::Relaxed);
+        if n & CALLEE_NEG_REPROBE_MASK != 0 {
+            return None;
+        }
+        // Periodic re-probe: fall through and re-run the full pipeline.
+    }
+    let mut cache_negative = true;
+    let res = try_jit_compile_callee_slow(
+        shared,
+        class_name,
+        method_name,
+        descriptor,
+        &mut cache_negative,
+    );
+    match res {
+        None if cache_negative => slot.store(fp, Ordering::Relaxed),
+        // A re-probe that succeeded — drop the stale negative entry.
+        Some(_) if slot.load(Ordering::Relaxed) == fp => slot.store(0, Ordering::Relaxed),
+        _ => {}
+    }
+    res
+}
+
+/// The full (slow) compile pipeline behind [`try_jit_compile_callee`].
+/// Sets `*cache_negative = false` when a `None` return is for a reason that
+/// may change soon (currently: receiver class not loaded yet), so the caller
+/// does not negative-cache it.
+fn try_jit_compile_callee_slow(
+    shared: &SharedVm,
+    class_name: &str,
+    method_name: &str,
+    descriptor: &str,
+    cache_negative: &mut bool,
+) -> Option<(usize, bool)> {
     // RFJP.1 — never JIT a method whose declaring class transitively extends
     // `java/util/concurrent/ForkJoinTask`. The recursive `compute()` body
     // miscompiles under deep recursion (returns 0 from depth ~10), and the
@@ -15129,20 +15224,17 @@ pub fn try_jit_compile_callee(
                 class_name, method_name, descriptor);
         }
     }
-    // Check JIT cache first
-    let class_arc: Arc<str> = Arc::from(class_name);
-    let method_arc: Arc<str> = Arc::from(method_name);
-    let desc_arc: Arc<str> = Arc::from(descriptor);
-    {
-        let jit_cache = shared.jit_cache.read();
-        if let Some(compiled) = jit_cache.get(&class_arc, &method_arc, &desc_arc) {
-            return Some((compiled.entry_ptr() as usize, compiled.needs_context())); // Cast: JIT entry point to address
-        }
-    }
-
     // Look up the method bytecode
     let cm = shared.class_manager.read();
-    let callee_class_id = cm.find_class_by_name(class_name)?;
+    let callee_class_id = match cm.find_class_by_name(class_name) {
+        Some(id) => id,
+        None => {
+            // The receiver's class may simply not be loaded yet — a later
+            // attempt can succeed, so this `None` must not be cached.
+            *cache_negative = false;
+            return None;
+        }
+    };
     let store = cm.class_store();
     let (method, declaring_id) = crate::classloading::find_method_recursive(
         callee_class_id,
