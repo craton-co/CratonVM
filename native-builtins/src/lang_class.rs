@@ -7856,6 +7856,92 @@ pub(crate) fn native_class_get_annotations_by_type(
     Ok(Some(Value::Object(Some(arr))))
 }
 
+/// `Method.getAnnotationsByType(Class)` / `getDeclaredAnnotationsByType` —
+/// same direct-match + @Repeatable-container unwrap as
+/// `native_class_get_annotations_by_type`, but over METHOD annotations.
+/// Without this native the call falls through to the real
+/// `Executable.getAnnotationsByType` bytecode, whose `declaredAnnotations()`
+/// re-parses raw class-file annotation bytes via `AnnotationParser` — bytes
+/// our synthetic Method objects don't carry — and dies with
+/// `AnnotationFormatError: Unexpected end of annotations.` (JUnit's
+/// `findRepeatableAnnotations` walks this for @ParameterizedTest argument
+/// sources; Spring Boot buildSrc DependencyVersionUpgradeTests ran 0 of 63
+/// invocations).
+pub(crate) fn native_method_get_annotations_by_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let empty = |ctx: &mut dyn NativeContext| {
+        let arr = ctx.new_ref_array(ClassId::new(0), 0);
+        Ok(Some(Value::Object(Some(arr))))
+    };
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return empty(ctx),
+    };
+    let ann_class_mirror = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return empty(ctx),
+    };
+    let (class_id, method_name, method_desc) = match method_class_name_desc(ctx, this) {
+        Some(v) => v,
+        None => return empty(ctx),
+    };
+    let ann_class_id = match mirror_class_id(ctx, ann_class_mirror) {
+        Some(id) => id,
+        None => return empty(ctx),
+    };
+    let ann_class_name = match ctx.class_name_of_id(ann_class_id) {
+        Some(n) => n,
+        None => return empty(ctx),
+    };
+    let target_desc = format!("L{};", ann_class_name);
+    let annotations = ctx.method_annotations(class_id, &method_name, &method_desc);
+
+    let mut matching: Vec<_> = annotations
+        .iter()
+        .filter(|a| a.type_descriptor == target_desc)
+        .cloned()
+        .collect();
+
+    // @Repeatable container unwrapping (matches the Class variant above).
+    if matching.is_empty() {
+        let ann_type_annotations = ctx.class_annotations(ann_class_id);
+        let repeatable_desc = "Ljava/lang/annotation/Repeatable;";
+        if let Some(repeatable_ann) = ann_type_annotations
+            .iter()
+            .find(|a| a.type_descriptor == repeatable_desc)
+        {
+            if let Some((_, cratonvm_native_api::AnnotationElementValue::Class(container_desc))) =
+                repeatable_ann.elements.iter().find(|(name, _)| name == "value")
+            {
+                for ann in &annotations {
+                    if ann.type_descriptor == *container_desc {
+                        if let Some((_, cratonvm_native_api::AnnotationElementValue::Array(elems))) =
+                            ann.elements.iter().find(|(name, _)| name == "value")
+                        {
+                            for elem in elems {
+                                if let cratonvm_native_api::AnnotationElementValue::Annotation(nested) = elem {
+                                    if nested.type_descriptor == target_desc {
+                                        matching.push(nested.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let arr = ctx.new_ref_array(ClassId::new(0), matching.len());
+    for (i, ann) in matching.iter().enumerate() {
+        let proxy = create_annotation_proxy(ctx, ann);
+        ctx.set_array_element(arr, i, Value::Object(Some(proxy)));
+    }
+    Ok(Some(Value::Object(Some(arr))))
+}
+
 /// Helper: extract declaring class ID and field name from a Field reflection object.
 pub(crate) fn field_class_and_name(
     ctx: &dyn NativeContext,
