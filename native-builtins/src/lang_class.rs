@@ -1654,6 +1654,44 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
         }
     }
 
+    // Dynamic `java.lang.reflect.Proxy` instances: every proxy lands on the
+    // single synthetic `java/lang/reflect/Proxy$Instance` class, so the
+    // `is_subclass(Proxy$Instance, <iface>)` check below is always false even
+    // when the proxy was created implementing `<iface>`. The implemented
+    // interfaces are recorded per-instance in the `interfaces` slot (a
+    // `Class[]`). Mirror the interpreter's `proxy_instance_satisfies_target`
+    // (checkcast/instanceof admission) here so reflective `Class.isInstance` /
+    // `Class.cast` agree. Without this, `Class.cast` on a proxy throws a
+    // ClassCastException — e.g. Gradle's logging `ListenerBroadcast.getSource()`
+    // proxy cast to `OutputEventListener` killed every test worker.
+    if let Some(target_name) = ctx.class_name_of_id(target_class_id) {
+        if target_name == "java/lang/reflect/Proxy$Instance" {
+            // Object / Serializable are always satisfied per the Proxy spec.
+            if let Some(this_name) = ctx.class_name_of_id(this_class_id) {
+                if this_name == "java/lang/Object" || this_name == "java/io/Serializable" {
+                    return Ok(Some(Value::Int(1)));
+                }
+            }
+            const PROXY_FIELD_INTERFACES: usize = 1;
+            if let Value::Object(Some(ifaces)) = ctx.get_field(target, PROXY_FIELD_INTERFACES) {
+                let n = ctx.array_length(ifaces);
+                for i in 0..n {
+                    let mirror = match ctx.get_array_element(ifaces, i) {
+                        Value::Object(Some(m)) => m,
+                        _ => continue,
+                    };
+                    if let Some(iface_cid) = mirror_class_id(ctx, mirror) {
+                        if iface_cid == this_class_id
+                            || ctx.is_subclass(iface_cid, this_class_id)
+                        {
+                            return Ok(Some(Value::Int(1)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let result =
         target_class_id == this_class_id || ctx.is_subclass(target_class_id, this_class_id);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
