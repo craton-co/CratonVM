@@ -735,6 +735,21 @@ fn sc_is_connected(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     }
 }
 
+/// `SocketChannelImpl.isInputOpen()` / `isOutputOpen()` (package-private) —
+/// consulted by sun.nio.ch.SocketAdaptor's input/output streams (the streams
+/// returned by socket().getInputStream()/getOutputStream()). CratonVM does not
+/// track half-close separately, so report open whenever the channel is open and
+/// connected. Without these, SocketAdaptor.getOutputStream NoSuchMethodErrors.
+fn sc_io_open(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    match obj_or_none(args, 0) {
+        Some(o) => {
+            let open = matches!(cf_get(ctx, o, F_OPEN), Value::Int(1));
+            Ok(Some(Value::Int(if open { 1 } else { 0 })))
+        }
+        _ => Ok(Some(Value::Int(0))),
+    }
+}
+
 fn sc_configure_blocking(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match obj_or_none(args, 0) {
         Some(o) => o,
@@ -780,10 +795,35 @@ fn sc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 /// to the synthetic `java/net/Socket` natives and no-op gracefully (their
 /// stream id slot reads -1). Real I/O keeps flowing through the channel.
 fn sc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let _this = match obj_or_none(args, 0) {
+    let this = match obj_or_none(args, 0) {
         Some(o) => o,
         None => return Err(ioex("socket: null channel")),
     };
+    // Under CRATONVM_REAL_NET_SOCKETS the central registry filter drops every
+    // java/net/Socket native, so the real java.net.Socket bytecode runs. A bare
+    // `new java/net/Socket` allocated WITHOUT its <init> leaves `socketLock`
+    // (a `final Object` instance-initializer field) null, so the first real
+    // Socket method that does `synchronized (socketLock)` — e.g. getImpl() from
+    // Socket.connect() — throws "monitorenter ... null". This is exactly the
+    // path Gradle's TcpOutgoingConnector takes: socketChannel.socket().connect().
+    //
+    // Mirror the real SocketChannelImpl.socket() (return SocketAdaptor.create(this)):
+    // the adaptor is a proper java.net.Socket subclass whose connect/getInputStream/
+    // getOutputStream/options delegate to the channel, and whose construction runs
+    // the Socket instance initializers (socketLock = new Object()).
+    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+        match ctx.invoke(
+            "sun/nio/ch/SocketAdaptor",
+            "create",
+            "(Lsun/nio/ch/SocketChannelImpl;)Ljava/net/Socket;",
+            &[Value::Object(Some(this))],
+        ) {
+            Ok(Some(v @ Value::Object(Some(_)))) => return Ok(Some(v)),
+            // Fall through to the bare-Socket fallback on any failure so the
+            // non-real-net callers (Tomcat option getters) still get an object.
+            _ => {}
+        }
+    }
     let sock = ctx
         .new_object("java/net/Socket")
         .ok()
@@ -1055,6 +1095,29 @@ fn sc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let blocking = read_blocking_flag(ctx, this);
     let ok = sc_connect_inner(ctx, this, sa, blocking)?;
     Ok(Some(Value::Int(if ok { 1 } else { 0 })))
+}
+
+/// `SocketChannelImpl.blockingConnect(SocketAddress, long nanos)` (package-private)
+/// — what `sun.nio.ch.SocketAdaptor.connect()` delegates to (the object returned by
+/// `SocketChannel.socket()`). Performs a blocking connect and returns void; the
+/// nanos timeout is best-effort ignored (the blocking connect inner already waits).
+/// Without this, Gradle's TcpOutgoingConnector (socketChannel.socket().connect())
+/// NoSuchMethodErrors.
+fn sc_blocking_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+    let sa = match obj_or_none(args, 1) {
+        Some(o) => o,
+        None => return Err(ioex("blockingConnect: null SocketAddress")),
+    };
+    let ok = sc_connect_inner(ctx, this, sa, true)?;
+    if !ok {
+        return Err(ioex("blockingConnect: connection refused"));
+    }
+    cf_set(ctx, this, F_CONNECTED, Value::Int(1));
+    Ok(None)
 }
 
 fn sc_finish_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -1476,6 +1539,23 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "()Ljava/net/SocketAddress;",
             sc_local_address,
         );
+        // Package-private `localAddress()`/`remoteAddress()` — these are what
+        // sun.nio.ch.SocketAdaptor (the object returned by socket()) delegates
+        // to for getLocalSocketAddress()/getRemoteSocketAddress(). Without them,
+        // SocketAdaptor.getLocalSocketAddress NoSuchMethodErrors — which is the
+        // path Gradle's TcpOutgoingConnector.detectSelfConnect takes.
+        r.register(
+            c,
+            "localAddress",
+            "()Ljava/net/SocketAddress;",
+            sc_local_address,
+        );
+        r.register(
+            c,
+            "remoteAddress",
+            "()Ljava/net/SocketAddress;",
+            sc_remote_address,
+        );
         r.register(
             c,
             "configureBlocking",
@@ -1495,7 +1575,15 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "(Ljava/net/SocketAddress;)Z",
             sc_connect,
         );
+        r.register(
+            c,
+            "blockingConnect",
+            "(Ljava/net/SocketAddress;J)V",
+            sc_blocking_connect,
+        );
         r.register(c, "finishConnect", "()Z", sc_finish_connect);
+        r.register(c, "isInputOpen", "()Z", sc_io_open);
+        r.register(c, "isOutputOpen", "()Z", sc_io_open);
         r.register(c, "read", "(Ljava/nio/ByteBuffer;)I", sc_read);
         r.register(c, "write", "(Ljava/nio/ByteBuffer;)I", sc_write);
         r.register(
