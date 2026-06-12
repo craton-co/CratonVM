@@ -229,6 +229,24 @@ fn make_provider(
     ctx.set_field_by_name(p, "versionStr", Value::Object(Some(ver_str)));
     ctx.set_field_by_name(p, "info", Value::Object(Some(info)));
 
+    // The real `java.security.Provider` constructor never runs for our
+    // synthetic instances, so the inherited `initialized` boolean stays
+    // false.  Any caller that reaches a real `Provider` method guarded by
+    // `checkInitialized()` — `keys()`, `entrySet()`, `elements()`,
+    // `getService()`, and crucially `Security.getAlgorithms(type)` which
+    // iterates `provider.keys()` — then throws a bare `IllegalStateException`.
+    // Tomcat's `SessionIdGeneratorBase.<clinit>` calls
+    // `Security.getAlgorithms("SecureRandom")`, so the ISE is wrapped in an
+    // `ExceptionInInitializerError` and the class is poisoned
+    // (`NoClassDefFoundError` on every later use) — breaking session id
+    // generation across the whole server, i.e. nearly every Catalina/Coyote
+    // integration test.  Mark the provider initialized so those guards pass.
+    // The backing Hashtable is empty (count == 0), so `keys()` returns an
+    // empty enumeration and `getAlgorithms` yields an empty set rather than
+    // throwing — graceful degradation (callers fall back to platform
+    // defaults) instead of a hard failure.
+    ctx.set_field_by_name(p, "initialized", Value::Int(1));
+
     // Synthetic fallback — populate the legacy slots 0/1/2 too so
     // `phases_early::register_phase53_security` callers that haven't
     // migrated to the real-JDK accessors still see consistent state.

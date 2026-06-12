@@ -1747,11 +1747,22 @@ fn ssc_local_address(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     if id < 0 || port <= 0 {
         return Ok(Some(Value::Object(None)));
     }
-    let isa = alloc_obj(ctx, "java/net/InetSocketAddress", 2);
-    let host = ctx.create_string("0.0.0.0");
-    ctx.set_field(isa, 0, Value::Object(Some(host)));
-    ctx.set_field(isa, 1, Value::Int(port));
-    Ok(Some(Value::Object(Some(isa))))
+    // Build via the REAL `InetSocketAddress(String,int)` constructor (as
+    // `sc_local_address`/`sc_remote_address` already do) rather than a flat
+    // 2-slot synthetic. The real `getPort()`/`getHostString()` bytecode reads
+    // `this.holder.port` / `this.holder.hostname`; a flat object has a null
+    // `holder`, so `getPort()` returns garbage. Tomcat's
+    // `NioEndpoint.getLocalPort()` does
+    // `((InetSocketAddress) serverSock.getLocalAddress()).getPort()`, so the
+    // flat object made it return -1 — which is the port `TomcatBaseTest.getPort()`
+    // hands to `SimpleHttpClient`, so every embedded-server test connected to
+    // ":-1" and hung. The real ctor populates the holder and fixes getLocalPort.
+    let h = ctx.create_string("0.0.0.0");
+    ctx.new_object_initialized(
+        "java/net/InetSocketAddress",
+        "(Ljava/lang/String;I)V",
+        &[Value::Object(Some(h)), Value::Int(port)],
+    )
 }
 
 fn ss_wrapper_bind(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
