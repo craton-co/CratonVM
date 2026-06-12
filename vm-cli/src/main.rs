@@ -530,6 +530,114 @@ const VALUE_TAKING_OPTS: &[&str] = &[
     "--gpu-min-work",
 ];
 
+/// Expand Java argument files (`@<path>`).
+///
+/// When the JVM launcher sees an argument starting with `@` (not `@@`),
+/// it reads the file at that path and expands its contents as additional
+/// command-line arguments. This is Java's argument-file feature (JEP 293,
+/// available since Java 9). Gradle uses it to pass large classpaths via
+/// `@classpath-file.txt` to avoid command-line length limits.
+///
+/// The file format:
+/// - Arguments separated by whitespace (spaces, tabs, newlines)
+/// - `"..."` or `'...'` quoted strings (quotes stripped, content preserved)
+/// - `#` starts a comment to end of line
+/// - Backslash escapes the next character inside quotes
+/// - `@@path` is a literal `@path` (single-expansion escape)
+///
+/// Expansion is NOT recursive (nested `@file` references inside the
+/// expanded content are left as-is) to avoid runaway expansion.
+/// The `args[0]` element (program name) is never expanded.
+fn expand_argfiles(args: Vec<String>) -> Vec<String> {
+    if args.is_empty() {
+        return args;
+    }
+    let mut out = vec![args[0].clone()]; // preserve argv[0]
+    for arg in &args[1..] {
+        if let Some(path_str) = arg.strip_prefix('@') {
+            if path_str.starts_with('@') {
+                // `@@path` -> literal `@path`
+                out.push(path_str.to_string());
+                continue;
+            }
+            match std::fs::read_to_string(path_str) {
+                Ok(content) => {
+                    // Tokenize the file contents
+                    out.extend(tokenize_argfile(&content));
+                    if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
+                        eprintln!("[cratonvm] @-expanded {path_str}: {} tokens", out.len());
+                    }
+                }
+                Err(e) => {
+                    // If the file can't be read, leave the @arg as-is so
+                    // downstream stages can produce a clear error message.
+                    if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
+                        eprintln!("[cratonvm] @-file read error {path_str}: {e}");
+                    }
+                    out.push(arg.clone());
+                }
+            }
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    out
+}
+
+/// Tokenize the content of a Java argument file.
+///
+/// Splits on unquoted whitespace; `"..."` and `'...'` preserve whitespace
+/// and strip the outer quotes; `#` starts a comment to end of line;
+/// backslash inside quotes escapes the following character.
+fn tokenize_argfile(content: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut chars = content.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '#' => {
+                // Comment: skip to end of line
+                if current.is_empty() {
+                    // Flush any pending token
+                } else {
+                    tokens.push(std::mem::take(&mut current));
+                }
+                for ch2 in chars.by_ref() {
+                    if ch2 == '\n' { break; }
+                }
+            }
+            '"' | '\'' => {
+                // Quoted string: collect until matching quote
+                let quote = ch;
+                loop {
+                    match chars.next() {
+                        None => break,
+                        Some('\\') if quote == '"' => {
+                            // Backslash escape inside double-quotes
+                            if let Some(escaped) = chars.next() {
+                                current.push(escaped);
+                            }
+                        }
+                        Some(c) if c == quote => break,
+                        Some(c) => current.push(c),
+                    }
+                }
+            }
+            ' ' | '\t' | '\r' | '\n' => {
+                // Whitespace: flush token
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
 /// Enforce `java`-launcher positional semantics: every token *after* the
 /// program selector is a program argument and must be passed to the Java
 /// application verbatim -- even if it starts with `-`/`--` or equals
@@ -859,6 +967,28 @@ fn normalize_java_launcher_argv(args: Vec<String>) -> Vec<String> {
             }
             i += 1;
         }
+        // Assertion control flags: `-ea`/`-enableassertions[:<pkgname>...|:<classname>]`,
+        // `-da`/`-disableassertions[...]`, `-esa`/`-enablesystemassertions`,
+        // `-dsa`/`-disablesystemassertions`. CratonVM does not implement assertion
+        // checking; silently ignore so Gradle/Maven forks that pass `-ea`
+        // unconditionally don't crash clap (which would treat `-ea` as
+        // short-option bundling `-e -a` and abort with "unexpected argument '-e'").
+        else if a == "-ea"
+            || a == "-da"
+            || a == "-esa"
+            || a == "-dsa"
+            || a.starts_with("-ea:")
+            || a.starts_with("-da:")
+            || a.starts_with("-enableassertions")
+            || a.starts_with("-disableassertions")
+            || a.starts_with("-enablesystemassertions")
+            || a.starts_with("-disablesystemassertions")
+        {
+            if std::env::var_os("CRATONVM_DBG_ARGS").is_some() {
+                eprintln!("[cratonvm] ignoring assertion flag: {a}");
+            }
+            i += 1;
+        }
         else {
             out.push(args[i].clone());
             i += 1;
@@ -1006,7 +1136,8 @@ fn run() -> Result<()> {
     // `--list-modules`. Without this, clap would intercept those anywhere.
     // Runs first so the explicit `--` it parks is honoured by every
     // downstream stage.
-    let argv: Vec<String> = insert_program_args_separator(std::env::args().collect());
+    let raw_argv: Vec<String> = expand_argfiles(std::env::args().collect());
+    let argv: Vec<String> = insert_program_args_separator(raw_argv);
     // Extract -Dkey=value system properties before clap parsing
     let raw_args: Vec<String> = normalize_java_launcher_argv(argv);
     let (filtered_args, system_properties) = extract_system_properties(raw_args);
