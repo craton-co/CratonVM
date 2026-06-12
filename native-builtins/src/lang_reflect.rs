@@ -1396,6 +1396,36 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         crate::lang_class::native_field_get_generic_type,
     );
 
+    // --- Constructor.getGenericParameterTypes / RecordComponent.getGenericType ---
+    // Same rationale as Field.getGenericType above: real-JDK
+    // Constructor/RecordComponent generic accessors delegate to a
+    // sun.reflect.generics repository CratonVM doesn't implement, so they
+    // returned the RAW type (`List` not `List<TestSlice>`). These were only
+    // registered in `lib.rs::register_synthetic_overrides` (compiled out of
+    // the real-JDK CLI build), so real mode lost record/ctor generics —
+    // Jackson then deserialized a record's `List<TestSlice>` component into
+    // `List<LinkedHashMap>`. Promote to the essential path.
+    // `native_method_get_generic_param_types` already handles the `<init>`
+    // descriptor (see `method_class_name_desc`).
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getGenericParameterTypes",
+        "()[Ljava/lang/reflect/Type;",
+        crate::lang_class::native_method_get_generic_param_types,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getTypeParameters",
+        "()[Ljava/lang/reflect/TypeVariable;",
+        crate::lang_class::native_method_get_type_parameters,
+    );
+    registry.register(
+        "java/lang/reflect/RecordComponent",
+        "getGenericType",
+        "()Ljava/lang/reflect/Type;",
+        crate::lang_class::native_record_component_get_generic_type,
+    );
+
     // --- ParameterizedType / TypeVariable / WildcardType / GenericArrayType ---
     // accessor natives — required so the Type objects produced by
     // `getGenericType` actually expose `getRawType()`, `getActualTypeArguments()`,

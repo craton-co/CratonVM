@@ -9496,35 +9496,6 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "()Ljava/lang/reflect/Type;",
         lang_class::native_field_get_generic_type,
     );
-    // Constructors need the SAME generic-parameter resolution as methods —
-    // these were only registered for `java/lang/reflect/Method`, so a
-    // constructor's `getGenericParameterTypes()` (the path
-    // `Parameter.getParameterizedType()` and Jackson's record creator
-    // introspection take) fell through to real-JDK bytecode that delegates to
-    // an unimplemented generics repository → raw `List` instead of
-    // `List<TestSlice>`. `native_method_get_generic_param_types` already
-    // handles the `<init>` descriptor (see `method_class_name_desc`).
-    registry.register(
-        "java/lang/reflect/Constructor",
-        "getGenericParameterTypes",
-        "()[Ljava/lang/reflect/Type;",
-        lang_class::native_method_get_generic_param_types,
-    );
-    registry.register(
-        "java/lang/reflect/Constructor",
-        "getTypeParameters",
-        "()[Ljava/lang/reflect/TypeVariable;",
-        lang_class::native_method_get_type_parameters,
-    );
-    // RecordComponent.getGenericType() — parse the component's Signature so
-    // record introspectors (Jackson) recover the element type of a generic
-    // component (`List<TestSlice>`) instead of the raw `List`.
-    registry.register(
-        "java/lang/reflect/RecordComponent",
-        "getGenericType",
-        "()Ljava/lang/reflect/Type;",
-        lang_class::native_record_component_get_generic_type,
-    );
 
     // --- java.lang.reflect.Modifier ---
     registry.register(
