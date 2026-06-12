@@ -28,6 +28,27 @@ These may be distinct root causes; each needs its own bisection to the test clas
 and the spinning frame (re-run the package with a shorter watchdog and capture the
 deepest interpreter frame).
 
+## Update (2026-06-12) — same class as bug-06: throughput + thread-lifecycle
+
+Investigating the sibling package `consumer.internals` (bug-06) showed its
+"execution hang" is **not** an infinite loop: the test class *completes* with the
+watchdog disabled (CratonVM >120s vs HotSpot ~13s) and then the JVM stays alive on
+**non-daemon background threads** (consumer/network/metrics threads that HotSpot
+exits past) until the 120s watchdog kills it. The bug-05 packages
+(`common`, `common.network`, `common.metrics`, `common.compress`,
+`common.security.authenticator`) match the same `Launcher.execute` watchdog
+signature and almost certainly share the two root causes:
+
+1. **Throughput** — interpreter is ~10–50× slower than HotSpot's JIT; large/looping
+   tests exceed the 120s watchdog (same family as bug-01).
+2. **Thread lifecycle** — tests spawn background threads CratonVM treats as
+   non-daemon, so `main` returning doesn't end the JVM.
+
+A general perf contributor was fixed: the heap `get_field` OOB-read guard allocated
+a `String` + `warn!` on **every** benign speculative collection-layout probe (a hot
+path during discovery/execution); now rate-limited (see bug-06 / `gc/src/gen_heap.rs`).
+
 ## Status
 - [x] Reproduced; confirmed CVM-only (HotSpot completes).
-- [ ] Per-package frame localised / fixed (open).
+- [x] Re-classified as throughput + thread-lifecycle (via bug-06), not infinite loops.
+- [ ] Throughput (JIT/interpreter speed) + non-daemon-thread lifecycle: open workstreams.

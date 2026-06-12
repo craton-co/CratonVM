@@ -966,6 +966,25 @@ impl GenerationalHeap {
             // are distinguished by log level (error vs. warn) and message
             // text so the orchestrator's `grep undersized` continues to
             // flag (A) while (B) is triageable as a separate workstream.
+            //
+            // Rate-limit the diagnostics. `resolve_class_info` allocates a String
+            // and the warn!/error! formats on EVERY OOB read, but the benign
+            // case-(B) caller-side speculative probe (e.g. a collection-layout
+            // probe landing on `Collections$EmptyMap`) fires thousands of times per
+            // JUnit discovery — that unconditional per-call cost dominated kafka
+            // `consumer.internals` discovery wall time. Cap the diagnostics to the
+            // first N occurrences globally (a persistent case-(A) undersized-layout
+            // bug surfaces well within N); past the cap the OOB read still returns a
+            // benign null, just without the per-call logging. `CRATONVM_DBG_OOBFIELD`
+            // forces full diagnostics regardless.
+            static OOB_DIAG_COUNT: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(0);
+            const OOB_DIAG_CAP: u64 = 512;
+            let oob_dbg = std::env::var_os("CRATONVM_DBG_OOBFIELD").is_some();
+            if oob_dbg
+                || OOB_DIAG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    < OOB_DIAG_CAP
+            {
             let (class_name, real_fields) =
                 match crate::gc::resolve_class_info(header.class_id.as_u32()) {
                     Some((name, n)) => (name, Some(n)),
@@ -1021,6 +1040,7 @@ impl GenerationalHeap {
                     std::backtrace::Backtrace::force_capture()
                 );
             }
+            } // end rate-limited OOB-read diagnostics
             return Value::Object(None);
         }
         // SAFETY: `obj_ref` points to a valid heap object and `index` is within

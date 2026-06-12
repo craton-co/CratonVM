@@ -1,37 +1,47 @@
-# Bug 06 — Discovery crash in `AnnotationUtils.findRepeatableAnnotations` (deep recursion)
+# Bug 06 — `consumer.internals`: discovery recursion crash → now throughput + thread-lifecycle
 
-**Severity:** High — `org.apache.kafka.clients.consumer.internals` fails discovery
-and runs zero tests. `--nojit`. HotSpot runs the package clean.
-(The same crash also appears for `clients` and `clients.consumer`, but those also
-need a broker and HANG on HotSpot, so they are not counted as CVM-only there.)
+**Original symptom (sweep 2026-06-12, before dev merges):** `consumer.internals`
+failed discovery with a `JUnitException` out of recursive
+`AnnotationUtils.findRepeatableAnnotations` (`@Tag` resolution) — a hard crash.
 
-**Symptom:**
-```
-org.junit.platform.commons.JUnitException: TestEngine 'junit-jupiter' failed to discover tests
-  ... at org/junit/platform/commons/util/AnnotationUtils.findRepeatableAnnotations(AnnotationUtils.java:336)
-      at org/junit/platform/commons/util/AnnotationUtils.findRepeatableAnnotations(AnnotationUtils.java:320)
-      at org/junit/platform/commons/util/AnnotationUtils.findRepeatableAnnotations(AnnotationUtils.java:291)
-      at JupiterTestDescriptor.getTags ... ClassTestDescriptor.<init>
-```
+**Current status (after syncing dev + the bug-02/03/04 fixes): the crash is gone.**
+`consumer.internals` no longer throws in discovery. What remains is **not a discrete
+correctness bug** — it is a mix of throughput + thread-lifecycle:
 
-`findRepeatableAnnotations` recurses (336 → 320 → 291) while resolving
-`@Tag`/`@Tags` (repeatable) annotations on a test class. The recursion does not
-terminate / overflows on CratonVM, where HotSpot resolves the same annotations
-fine. Likely a CratonVM annotation-reflection defect: a meta-annotation cycle that
-HotSpot breaks (via a visited-set or correct `@Repeatable` container resolution)
-but CratonVM does not — possibly returning a self-referential annotation or a
-wrong `annotationType()` so the visited-set never matches.
+1. **Throughput.** `CooperativeConsumerCoordinatorTest` (the class that "hangs")
+   *completes* with the watchdog disabled (HotSpot runs 152 tests in ~13s; CratonVM
+   takes >120s and trips the 120s default watchdog). Same family as bug-01 / bug-05.
 
-Related prior work: `reference_sb09_annotation_invoke_handler`,
-`reference_constructor_annotation_reflection` — annotation proxy / reflection area.
+2. **Thread lifecycle (the watchdog trip).** After `RunCls.main` returns, CratonVM
+   reports *"VM held alive by 6 non-daemon thread(s)"* — the consumer-coordinator
+   background threads are treated as **non-daemon**, so the JVM never exits and the
+   watchdog kills it (rc=127). HotSpot exits cleanly in ~13s. Points at a thread
+   daemon-status / lifecycle gap, not the annotation path.
 
-## Next steps
-- Minimal repro: a test class annotated with `@Tag` (and/or a custom
-  `@Repeatable` annotation) → drive `AnnotationUtils.findRepeatableAnnotations` or
-  `AnnotationSupport.findRepeatableAnnotations`.
-- Inspect CratonVM `getAnnotations()` / `@Repeatable` container unwrapping for a
-  cycle that lacks the visited-guard HotSpot relies on.
+3. **Incomplete discovery.** CratonVM runs fewer tests than HotSpot (e.g. 22–58 vs
+   152) and the count varies run-to-run.
+
+### Annotation equals/hashCode is **not** the cause
+Probes confirmed CratonVM's annotation-proxy `equals`/`hashCode`/HashSet-dedup work
+correctly for single-value, array-valued, and primitive-array members, and for the
+`@Tag`/`@Retention` meta-annotation shapes — so the `findAnnotation` `visited` set
+dedups correctly; there is no infinite recursion.
+
+## Fix applied here (general perf, not a bug-06 cure)
+While diagnosing, the slow path was found to flood the heap `get_field`
+out-of-bounds guard: a benign **case-(B)** caller-side speculative collection-layout
+probe lands on `Collections$EmptyMap` (reads slot 2 of a 2-slot map) thousands of
+times per discovery, and the guard ran `resolve_class_info` (a `String` allocation)
+**plus** an unthrottled `warn!` on **every** call — pure unconditional overhead.
+
+**Fix** (`gc/src/gen_heap.rs`): rate-limit the OOB-read diagnostics to the first 512
+occurrences globally (a persistent case-(A) *true* undersized-layout bug surfaces
+well within that; `CRATONVM_DBG_OOBFIELD` forces full diagnostics). Past the cap the
+OOB read still returns a benign null — just without the per-call `String` alloc +
+`warn!`. General improvement for any workload that hits speculative layout probes.
 
 ## Status
-- [x] Reproduced (package `consumer.internals`, `--nojit`); CVM-only.
-- [ ] Minimal repro / root cause / fix (open).
+- [x] Original discovery-recursion crash: resolved (dev merges).
+- [x] General OOB-guard diagnostic overhead: rate-limited (this branch).
+- [ ] Throughput (interpreter speed) + non-daemon-thread-lifecycle: open — the
+      JIT/throughput + thread-lifecycle workstreams, not a discrete crash.
