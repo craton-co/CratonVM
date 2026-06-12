@@ -4132,6 +4132,11 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // by looking up in the thread registry.
         if let Some(park_state) = self.shared.find_park_state_for_thread_obj(thread_obj) {
             park_state.unpark();
+        } else if std::env::var_os("CRATONVM_DBG_UNPARK").is_some() {
+            eprintln!(
+                "[unpark MISS] no ParkState for thread_obj ptr={:#x}",
+                thread_obj.as_ptr() as usize
+            );
         }
     }
 
@@ -9619,9 +9624,23 @@ fn invoke_on_class_shared_inner(
                     || method_name == "getAndBitwiseXor"
                     || method_name == "getAndBitwiseXorAcquire" || method_name == "getAndBitwiseXorRelease"
                 {
-                    // Check if receiver is a MethodHandle or VarHandle
+                    // Check if receiver is a MethodHandle or VarHandle.
+                    // DirectMethodHandle / BoundMethodHandle / DelegatingMethodHandle
+                    // and their inner species (e.g. DirectMethodHandle$Constructor,
+                    // BoundMethodHandle$Species_L) are concrete MethodHandle
+                    // subclasses whose names do NOT start with "MethodHandle", so
+                    // the prefix check missed them — invokeExact on such a receiver
+                    // then fell through to normal resolution and threw
+                    // NoSuchMethodError ("DirectMethodHandle$Constructor.invokeExact
+                    // ()Ljava/lang/Object;"). Jackson 3 (tools.jackson) invokes a
+                    // record/POJO canonical constructor directly through a
+                    // DirectMethodHandle$Constructor, so its readValue silently
+                    // failed. Recognise any java/lang/invoke class carrying
+                    // "MethodHandle" in its name as a signature-polymorphic receiver.
                     let is_mh = class_name == "java/lang/invoke/MethodHandle"
-                        || class_name.starts_with("java/lang/invoke/MethodHandle");
+                        || class_name.starts_with("java/lang/invoke/MethodHandle")
+                        || (class_name.starts_with("java/lang/invoke/")
+                            && class_name.contains("MethodHandle"));
                     let is_vh = class_name == "java/lang/invoke/VarHandle"
                         || class_name.starts_with("java/lang/invoke/VarHandle");
                     if is_mh || is_vh {

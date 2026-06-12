@@ -3541,9 +3541,14 @@ pub(crate) fn mh_dispatch(
                 Err(_) => return Ok(Some(Value::Object(None))),
             };
             let new_obj = ctx.alloc_object(cid, 16); // generous field count
-            let mut init_args = Vec::with_capacity(1 + extra_args.len());
+            // Coerce/unbox args against the <init> descriptor. The constructor
+            // params align 1:1 with extra_args (no receiver), so this is exact.
+            // invokeExact does NOT pre-adapt, so unboxing here covers both the
+            // invoke and invokeExact paths (Jackson 3 uses invokeExact).
+            let adapted = adapt_invoke_args(ctx, extra_args, &desc);
+            let mut init_args = Vec::with_capacity(1 + adapted.len());
             init_args.push(Value::Object(Some(new_obj)));
-            init_args.extend_from_slice(extra_args);
+            init_args.extend_from_slice(&adapted);
             ctx.invoke(&class, "<init>", &desc, &init_args)?;
             Ok(Some(Value::Object(Some(new_obj))))
         }
@@ -3582,8 +3587,24 @@ pub(crate) fn mh_dispatch(
             // Field setter: static when descriptor has a single param,
             // instance when it has two (owner, value).
             let is_static = !desc_has_two_params(&desc);
+            // The field value is the LAST descriptor param; unbox a boxed
+            // wrapper to the field's primitive type (Jackson 3 POJO field
+            // injection passes boxed values via invokeExact). Without this a
+            // boxed Integer was stored into an `int` field as its pointer.
+            let value_type: Option<String> = {
+                if let (Some(o), Some(c)) = (desc.find('('), desc.find(')')) {
+                    parse_descriptor_types(&desc[o + 1..c])
+                        .last()
+                        .map(|c| c.to_string())
+                } else {
+                    None
+                }
+            };
             if is_static {
-                let value = extra_args.first().copied().unwrap_or(Value::Object(None));
+                let mut value = extra_args.first().copied().unwrap_or(Value::Object(None));
+                if let Some(vt) = &value_type {
+                    value = adapt_single_arg(ctx, value, vt);
+                }
                 let class_id = match ctx.ensure_class_initialized(&class) {
                     Ok(cid) => cid,
                     Err(_) => return Ok(None),
@@ -3593,7 +3614,7 @@ pub(crate) fn mh_dispatch(
                 }
                 Ok(None)
             } else {
-                let (receiver, value) = match bound {
+                let (receiver, mut value) = match bound {
                     Value::Object(Some(r)) => {
                         let v = extra_args.first().copied().unwrap_or(Value::Object(None));
                         (r, v)
@@ -3607,6 +3628,9 @@ pub(crate) fn mh_dispatch(
                         (r, v)
                     }
                 };
+                if let Some(vt) = &value_type {
+                    value = adapt_single_arg(ctx, value, vt);
+                }
                 match ctx.resolve_field_index(&class, &name) {
                     Some(idx) => ctx.set_field(receiver, idx, value),
                     None => ctx.set_field_by_name(receiver, &name, value),
@@ -3906,27 +3930,43 @@ fn adapt_invoke_args(
 }
 
 /// Adapt a single argument value to match the expected type.
+///
+/// Unboxes a boxed primitive wrapper (e.g. `Integer` → `int`) when the param
+/// is a primitive — callers that pass arguments through a generic `Object[]`
+/// (Jackson 3 invoking a record/POJO canonical constructor via
+/// `MethodHandle.invokeExact`) hand us boxed values; without unboxing a boxed
+/// `Integer` reached the `<init>` frame as an object reference and the int
+/// field was stored as the wrapper's pointer. `unbox_value` returns non-wrapper
+/// objects unchanged, so a misaligned receiver/object arg is left intact.
 fn adapt_single_arg(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     arg: Value,
     expected_type: &str,
 ) -> Value {
     match expected_type {
-        // Widening: int → long
+        // Unbox-only primitives (no widening from another primitive tag).
+        "int" | "short" | "byte" | "char" | "boolean" => match arg {
+            Value::Object(Some(obj)) => crate::lang_class::unbox_value(ctx, obj),
+            other => other,
+        },
+        // Widening: int → long (or unbox a Long/Integer wrapper).
         "long" => match arg {
             Value::Int(v) => Value::Long(v as i64),
+            Value::Object(Some(obj)) => crate::lang_class::unbox_value(ctx, obj),
             other => other,
         },
-        // Widening: int → float
+        // Widening: int → float (or unbox a Float/Integer wrapper).
         "float" => match arg {
             Value::Int(v) => Value::Float(v as f32),
+            Value::Object(Some(obj)) => crate::lang_class::unbox_value(ctx, obj),
             other => other,
         },
-        // Widening: int → double, long → double, float → double
+        // Widening: int → double, long → double, float → double (or unbox).
         "double" => match arg {
             Value::Int(v) => Value::Double(v as f64),
             Value::Long(v) => Value::Double(v as f64),
             Value::Float(v) => Value::Double(v as f64),
+            Value::Object(Some(obj)) => crate::lang_class::unbox_value(ctx, obj),
             other => other,
         },
         // Narrowing not done automatically (invoke is lenient but not that lenient)
@@ -4338,10 +4378,15 @@ pub fn register_t28_method_handle_completeness(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/reflect/Field;)Ljava/lang/invoke/MethodHandle;",
         lookup_unreflect_setter,
     );
+    // Real signature is `unreflectConstructor(Constructor)` — the previous
+    // `(Class, MethodType)` descriptor never matched the real call, so it fell
+    // through to real-JDK bytecode that built a real DirectMethodHandle$Constructor
+    // CratonVM's synthetic invoke native can't dispatch (→ invoke returned null;
+    // Jackson 3 record/POJO deserialization silently produced null).
     r.register(
         lk,
         "unreflectConstructor",
-        "(Ljava/lang/Class;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/MethodHandle;",
+        "(Ljava/lang/reflect/Constructor;)Ljava/lang/invoke/MethodHandle;",
         lookup_unreflect_constructor,
     );
 
@@ -4705,27 +4750,26 @@ fn lookup_unreflect_setter(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
 }
 
 fn lookup_unreflect_constructor(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // args[0] = Lookup, args[1] = Class, args[2] = MethodType
-    let class_obj = match args.get(1) {
+    // args[0] = Lookup, args[1] = java.lang.reflect.Constructor
+    let ctor_obj = match args.get(1) {
         Some(Value::Object(Some(c))) => *c,
         _ => {
             return Err(no_such_method_error("", "<init>", ""));
         }
     };
-    let mt_obj = match args.get(2) {
-        Some(Value::Object(Some(m))) => *m,
-        _ => {
+    // Read the declaring class + the `(...)V` constructor descriptor straight
+    // from the Constructor reflection object. `method_class_name_desc` handles
+    // the `<init>` name and coerces the return to V (a Constructor has no
+    // `returnType` field). Build a synthetic CONSTRUCTOR MethodHandle the same
+    // way `findConstructor` does, so the invoke/invokeExact native can dispatch
+    // it (vs the real-JDK DirectMethodHandle$Constructor it otherwise becomes).
+    let (class_id, _name, desc) = match crate::lang_class::method_class_name_desc(ctx, ctor_obj) {
+        Some(v) => v,
+        None => {
             return Err(no_such_method_error("", "<init>", ""));
         }
     };
-
-    let class_name = mirror_class_name(ctx, class_obj).unwrap_or_default();
-    let mut desc = descriptor_from_method_type(ctx, mt_obj);
-    // Constructor descriptor always returns V
-    if let Some(pos) = desc.rfind(')') {
-        desc.truncate(pos + 1);
-        desc.push('V');
-    }
+    let class_name = ctx.class_name_of_id(class_id).unwrap_or_default();
     let _ = ctx.ensure_class_initialized(&class_name);
     let mh = alloc_method_handle(ctx, &class_name, "<init>", &desc, MH_KIND_CONSTRUCTOR);
     Ok(Some(Value::Object(Some(mh))))
