@@ -1836,7 +1836,21 @@ fn al_eq_operand_is_list(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 
 // ===========================================================================
 // HashMap — field 0 = Object[] buckets, field 1 = Int size, field 2 = Int cap
-// HashMap$Node — field 0 = key, field 1 = value, field 2 = hash, field 3 = next
+// HashMap$Node — MATCHES the real JDK layout: hash=0, key=1, value=2, next=3.
+//
+// We deliberately use the REAL JDK field order (not the historical synthetic
+// key=0/value=1/hash=2 order) so that real-JDK bytecode that walks `this.table[]`
+// directly via `getfield HashMap$Node.{key,value}` — e.g. `HashMap.writeObject`
+// → `internalWriteEntries` during Java serialization, which is NOT on the
+// force-native override list — reads the correct slots. With the old synthetic
+// order, `getfield key` (real slot 1) read our `value`, and `getfield value`
+// (real slot 2) read our `hash` Int which the L-descriptor coerced to null,
+// serializing `{name=execute}` as `{execute=null}` and desyncing the Gradle
+// worker's message stream. Nodes are still allocated as `ClassId(0)` (see
+// `map_alloc_node`): slot 0 now holds `Int(hash)`, so there is no Object→int
+// descriptor coercion to worry about, and the layout-sniff in `get_node_key`/
+// `get_node_value` (Object@0 = legacy, Int@0 = JDK) routes our nodes through
+// the JDK branch automatically.
 // ===========================================================================
 
 const MAP_FIELD_BUCKETS: usize = 0;
@@ -1845,9 +1859,9 @@ const MAP_FIELD_CAPACITY: usize = 2;
 const MAP_NUM_FIELDS: usize = 3;
 const MAP_DEFAULT_CAPACITY: usize = 16;
 
-const NODE_FIELD_KEY: usize = 0;
-const NODE_FIELD_VALUE: usize = 1;
-const NODE_FIELD_HASH: usize = 2;
+const NODE_FIELD_HASH: usize = 0;
+const NODE_FIELD_KEY: usize = 1;
+const NODE_FIELD_VALUE: usize = 2;
 const NODE_FIELD_NEXT: usize = 3;
 const NODE_NUM_FIELDS: usize = 4;
 
@@ -2239,24 +2253,21 @@ fn map_bucket_index(hash: i32, capacity: i32) -> usize {
     ((hash as u32) & ((capacity as u32).wrapping_sub(1))) as usize
 }
 
-/// Allocate a HashMap$Node entry using the legacy synthetic layout
-/// (slot 0 = key, slot 1 = value, slot 2 = hash, slot 3 = next).
+/// Allocate a HashMap$Node entry using the REAL JDK field layout
+/// (slot 0 = hash:I, slot 1 = key, slot 2 = value, slot 3 = next).
 ///
-/// We deliberately allocate with `ClassId::new(0)` instead of binding the
-/// node to the real-JDK `java/util/HashMap$Node` class. The JDK declares
-/// fields in order `hash:I, key:Object, value:Object, next:HashMap$Node`,
-/// so binding to the real class causes descriptor-aware field coercion
-/// (see `coerce_field_value_by_descriptor`) to interpret slot 0 as `int`
-/// and rewrite our `Object(key)` write as `Int(<pointer-bits>)`. The
-/// downstream `get_node_key` layout-sniff then sees an `Int` in slot 0,
-/// concludes the node uses the JDK layout, and reads slot 1 as the key —
-/// but slot 1 was set to the sentinel `Int(1)` (for HashSet-backed maps),
-/// surfacing as `Iterator.next()` returning `Int(1)` and a downstream
-/// `checkcast Map.Entry` against an `Int`.
-///
-/// Matches `native_map_put`'s direct `alloc_object(ClassId::new(0), ...)`
-/// at the insert path; reads via `get_node_key`/`get_node_value` keep
-/// their layout-sniff for nodes produced by either site.
+/// We allocate with `ClassId::new(0)` (untyped) rather than binding to the
+/// real `java/util/HashMap$Node` class so no descriptor-aware coercion runs
+/// on our writes — but the SLOT ORDER deliberately matches the real JDK so
+/// that real-JDK bytecode walking `this.table[]` via `getfield
+/// HashMap$Node.{hash,key,value,next}` reads the right slots. The critical
+/// consumer is `HashMap.writeObject`→`internalWriteEntries` (Java
+/// serialization), which is NOT on the force-native override list and so runs
+/// real bytecode against our nodes; with the old synthetic order it read
+/// `value` as the key and the `hash` Int (L-coerced to null) as the value,
+/// serializing `{k=v}` as `{v=null}`. Slot 0 holds `Int(hash)`, so the
+/// `get_node_key`/`get_node_value` layout-sniff (Object@0 = legacy,
+/// Int@0 = JDK) routes our nodes through the JDK branch.
 fn map_alloc_node(
     ctx: &mut dyn NativeContext,
     key: ObjectRef,
@@ -2290,8 +2301,8 @@ fn get_node_key(ctx: &dyn NativeContext, node: ObjectRef) -> Value {
 /// S111r26: Layout-aware node value reader (see `get_node_key`).
 fn get_node_value(ctx: &dyn NativeContext, node: ObjectRef) -> Value {
     match ctx.get_field(node, 0) {
-        Value::Object(_) => ctx.get_field(node, NODE_FIELD_VALUE), // legacy: slot 1
-        _ => ctx.get_field(node, 2),                               // JDK: slot 2
+        Value::Object(_) => ctx.get_field(node, 1), // legacy: value at slot 1
+        _ => ctx.get_field(node, 2),                // JDK: value at slot 2 (our nodes)
     }
 }
 
@@ -3294,8 +3305,8 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 let old_value = get_node_value(ctx, node);
                 // Update value in-place using the detected layout
                 match ctx.get_field(node, 0) {
-                    Value::Object(_) => ctx.set_field(node, NODE_FIELD_VALUE, value), // legacy slot 1
-                    _ => ctx.set_field(node, 2, value), // JDK slot 2
+                    Value::Object(_) => ctx.set_field(node, 1, value), // legacy value slot 1
+                    _ => ctx.set_field(node, 2, value), // JDK value slot 2 (our nodes)
                 }
                 return Ok(Some(old_value));
             }
@@ -3307,8 +3318,8 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             if eq {
                 let old_value = get_node_value(ctx, node);
                 match ctx.get_field(node, 0) {
-                    Value::Object(_) => ctx.set_field(node, NODE_FIELD_VALUE, value), // legacy slot 1
-                    _ => ctx.set_field(node, 2, value), // JDK slot 2
+                    Value::Object(_) => ctx.set_field(node, 1, value), // legacy value slot 1
+                    _ => ctx.set_field(node, 2, value), // JDK value slot 2 (our nodes)
                 }
                 return Ok(Some(old_value));
             }
