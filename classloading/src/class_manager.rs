@@ -2022,6 +2022,26 @@ impl ClassManager {
                 }))
             }
             Err(_) if is_jdk_class(name) => {
+                // In real-JDK mode the boot jimage/jmods are authoritative for
+                // the standard JDK namespaces (java/, javax/, sun/, jdk/,
+                // com/sun/). A delegated miss there means the class genuinely
+                // does not exist, so we must surface ClassNotFoundException
+                // instead of fabricating a stub — otherwise `Class.forName`
+                // existence probes wrongly succeed (e.g. jakarta.el.ImportHandler
+                // resolving the simple name `ArrayList` against both java.util.*
+                // and java.net.* sees a bogus `java.net.ArrayList` and reports a
+                // spurious import conflict). Stubs are still created for array
+                // classes, the enterprise app prefixes that legitimately use the
+                // stub mechanism even with a real JDK, and all of synthetic-JDK
+                // mode. Internal synthetic helpers (`java/util/Enumeration$Impl`,
+                // …) reach the class store via `ensure_synthetic_class`, which
+                // registers directly when this load fails — so the CNFE here
+                // does not break them.
+                if is_standard_jdk_namespace(name) && self.has_real_boot_classes() {
+                    return Err(VmError::ClassFile(ClassFileError::ClassNotFound {
+                        class_name: name.to_string(),
+                    }));
+                }
                 // JDK class not found as a .class file — create a synthetic stub.
                 // Our VM handles JDK classes natively, so we just need a minimal
                 // entry in the ClassStore for the type system to work.
@@ -5478,6 +5498,19 @@ fn find_in_impl_jars(app_cp: &ClassPath, internal_name: &str) -> Option<Vec<u8>>
         }
     }
     None
+}
+
+/// The standard JDK namespaces for which a real boot jimage/jmods is the
+/// authoritative source of truth. A delegated miss for one of these in
+/// real-JDK mode means the class genuinely does not exist (→ CNFE), as opposed
+/// to the enterprise app prefixes in [`is_jdk_class`] (which use the synthetic
+/// stub mechanism) or array classes.
+fn is_standard_jdk_namespace(name: &str) -> bool {
+    name.starts_with("java/")
+        || name.starts_with("javax/")
+        || name.starts_with("sun/")
+        || name.starts_with("jdk/")
+        || name.starts_with("com/sun/")
 }
 
 fn is_jdk_class(name: &str) -> bool {
