@@ -700,16 +700,32 @@ fn read_inet_socket_address(
         }
         _ => "0.0.0.0".to_string(),
     };
-    // Port: synthetic legacy lives at slot 1; real-JDK lives at holder.slot 2.
-    let port = match ctx.get_field(sa, ISA_PORT) {
-        Value::Int(n) => n,
-        Value::Long(n) => n as i32,
-        _ => match holder_val {
-            Value::Object(Some(holder)) => match ctx.get_field(holder, 2) {
+    // Port: a real-JDK `InetSocketAddress` declares a single `holder` field at
+    // slot 0; the port lives at `holder.port` (slot 2). Its slot 1 (our legacy
+    // `ISA_PORT`) is therefore out of the declared layout and reads back as a
+    // stale `Int(0)` — which the previous "read ISA_PORT first" logic accepted,
+    // so `Socket.connect(new InetSocketAddress(host, port))` targeted port 0
+    // (`ConnectException: host:0`). Mirror the host branch above: when the
+    // slot-0 value is a real `InetSocketAddressHolder` object (i.e. not a
+    // String, which is the legacy-synthetic layout), read the port from
+    // `holder.port`; only fall back to the direct `ISA_PORT` slot for the
+    // legacy synthetic layout (host String at slot 0, port int at slot 1).
+    let port = match holder_val {
+        Value::Object(Some(holder)) if ctx.read_string(holder).is_none() => {
+            match ctx.get_field(holder, 2) {
                 Value::Int(n) => n,
                 Value::Long(n) => n as i32,
-                _ => 0,
-            },
+                // Holder carried no int port — fall back to the direct slot.
+                _ => match ctx.get_field(sa, ISA_PORT) {
+                    Value::Int(n) => n,
+                    Value::Long(n) => n as i32,
+                    _ => 0,
+                },
+            }
+        }
+        _ => match ctx.get_field(sa, ISA_PORT) {
+            Value::Int(n) => n,
+            Value::Long(n) => n as i32,
             _ => 0,
         },
     };
@@ -4171,18 +4187,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     fn ctx_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(None)
     }
-    r.register(
-        "org/apache/catalina/core/StandardContext",
-        "initInternal",
-        "()V",
-        ctx_noop,
-    );
-    r.register(
-        "org/apache/catalina/core/StandardContext",
-        "startInternal",
-        "()V",
-        ctx_noop,
-    );
+    // 2026-06-11 — REMOVED the base `org/apache/catalina/core/StandardContext`
+    // initInternal/startInternal no-ops. They were a Spring-Boot-era shim, but
+    // `StandardContext` is the concrete context the *Tomcat test suite* (and
+    // standalone Tomcat) uses, so no-opping it stopped every embedded server
+    // from actually starting its web application — the real bytecode runs fine
+    // here (verified via the apps/tomcat suite). Spring Boot stays short-
+    // circuited at `TomcatWebServer.start`/`initialize` (below) and via the
+    // `TomcatEmbeddedContext` subclass no-ops kept here, so this is Spring-Boot
+    // neutral while unblocking the Tomcat suite. See CRATONVM_BUGS/BUG-C-*.
     // Spring Boot's TomcatEmbeddedContext overrides startInternal — cover both
     // common package locations so the dispatch hits the native regardless of
     // which subclass the SB version uses.
@@ -4205,15 +4218,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // ("A child container failed during start") with the original cause
     // discarded. By making the Callable a no-op that returns null, the
     // Future completes successfully and the engine/host advance.
-    fn start_child_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        Ok(Some(Value::Object(None)))
-    }
-    r.register(
-        "org/apache/catalina/core/ContainerBase$StartChild",
-        "call",
-        "()Ljava/lang/Object;",
-        start_child_noop,
-    );
+    // 2026-06-11 — REMOVED the `ContainerBase$StartChild.call` no-op. It made
+    // every child-container start (Engine→Host→Context) a no-op when Tomcat
+    // uses the parallel start-stop executor, so the context/connector never
+    // actually started under the Tomcat test suite. The real Callable runs the
+    // child's lifecycle, which works under CratonVM. (Was a Spring-Boot shim;
+    // Spring Boot remains short-circuited at TomcatWebServer.start/initialize.)
 
     // 2026-05-28 — REMOVED synthetic Connector.startInternal / AbstractProtocol.start
     // no-op stubs that violated the no-synthetic-stubs policy
@@ -4261,14 +4271,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()V",
         tomcat_web_server_noop,
     );
-    // Also short-circuit Tomcat.start() at the Catalina root in case a
-    // different code path reaches it.
-    r.register(
-        "org/apache/catalina/startup/Tomcat",
-        "start",
-        "()V",
-        tomcat_web_server_noop,
-    );
+    // 2026-06-11 — REMOVED the `org/apache/catalina/startup/Tomcat.start()`
+    // no-op. This is the Catalina-root entry point the *Tomcat test suite*
+    // (`TomcatBaseTest`) and standalone Tomcat call directly; no-opping it made
+    // `tomcat.start()` return without starting the server/service/engine/
+    // connector (all stayed in lifecycle state NEW), so every embedded-server
+    // test hung connecting to a server that never bound. Spring Boot does not
+    // call `Tomcat.start()` (it drives `TomcatWebServer`, still no-op'd above),
+    // so removing this is Spring-Boot neutral. The real lifecycle runs fine
+    // under CratonVM. See CRATONVM_BUGS/BUG-C-*.
 
     // AbstractFileResolvingResource.customizeConnection(URLConnection) — no-op
     r.register(

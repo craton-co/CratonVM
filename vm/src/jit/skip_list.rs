@@ -1409,6 +1409,23 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/HashSet", "iterator")
         | ("java/util/AbstractCollection", "addAll")
         | ("java/util/AbstractCollection", "toArray")
+        // Tomcat Bug B (apps/tomcat suite) — `jakarta.el.TestExpressionFactoryCache`
+        // hangs in JIT mode but PASSES with `CRATONVM_DISABLE_JIT=1`. The hot
+        // loop is `WeakHashMap` copy-construction (`new WeakHashMap<>(cache)` ->
+        // `putAll` -> `entrySet().iterator()`), and the JIT mis-compiles the
+        // allocate-then-putfield-heavy iterator/entry methods exactly like the
+        // `HashMap$HashIterator` family above (`HashIterator.<init>` stores
+        // next/current/expectedModCount; `Entry.<init>` is new+putfield), so
+        // `HashIterator.hasNext()` never terminates. Mirror the HashMap ban for
+        // WeakHashMap. See CRATONVM_BUGS/BUG-B-*.
+        | ("java/util/WeakHashMap$HashIterator", "<init>")
+        | ("java/util/WeakHashMap$HashIterator", "hasNext")
+        | ("java/util/WeakHashMap$EntryIterator", "next")
+        | ("java/util/WeakHashMap$KeyIterator", "next")
+        | ("java/util/WeakHashMap$ValueIterator", "next")
+        | ("java/util/WeakHashMap$Entry", "<init>")
+        | ("java/util/WeakHashMap", "getTable")
+        | ("java/util/WeakHashMap", "expungeStaleEntries")
         // SPB.9d (Session 117) — eureka-server JIT-mode SEGFAULTs deep
         // inside `org/springframework/core/annotation/*` annotation
         // processing during BeanInfo introspection. Spring's
