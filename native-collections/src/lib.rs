@@ -3161,6 +3161,32 @@ fn is_unmod_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     )
 }
 
+/// Initialize a `Hashtable`/`Properties` instance's own `loadFactor` (and a
+/// sane `threshold`) the first time we see it unset (0.0). Hashtable extends
+/// Dictionary (not HashMap) and keeps its own fields; the shared native bucket
+/// path sets only `table`/`count`, leaving `loadFactor` at 0.0. Real-JDK
+/// `Hashtable.writeObject` then serializes loadFactor=0.0, and a peer's
+/// `Hashtable.readObject` throws `StreamCorruptedException: Illegal load factor:
+/// 0.0` — breaking any Properties / system-properties round-trip (e.g. the
+/// Gradle worker shipping its system properties to the daemon). The peer
+/// recomputes `threshold` from `loadFactor`, so the threshold value itself is
+/// irrelevant; we set 8 to avoid serializing uninitialized garbage. Resolved by
+/// the object's real class name so inherited (`Properties`) fields are found.
+fn ensure_hashtable_load_factor(ctx: &mut dyn NativeContext, this: ObjectRef, cname: &str) {
+    if let Some(lf) = ctx.resolve_field_index(cname, "loadFactor") {
+        if lf < ctx.object_num_fields(this)
+            && matches!(ctx.get_field(this, lf), Value::Float(f) if f == 0.0)
+        {
+            ctx.set_field(this, lf, Value::Float(0.75));
+            if let Some(th) = ctx.resolve_field_index(cname, "threshold") {
+                if th < ctx.object_num_fields(this) {
+                    ctx.set_field(this, th, Value::Int(8));
+                }
+            }
+        }
+    }
+}
+
 fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -3206,6 +3232,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             let mut cur = cid;
             let mut is_lhm = false;
             let mut is_tm = false;
+            let mut is_ht = false;
             while let Some(n) = ctx.class_name_of_id(cur) {
                 if n == "java/util/LinkedHashMap" {
                     is_lhm = true;
@@ -3213,6 +3240,10 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 }
                 if n == "java/util/TreeMap" {
                     is_tm = true;
+                    break;
+                }
+                if n == "java/util/Hashtable" {
+                    is_ht = true;
                     break;
                 }
                 if n == "java/util/HashMap" || n == "java/lang/Object" {
@@ -3228,6 +3259,12 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             }
             if is_tm {
                 return native_tm_put(ctx, args);
+            }
+            if is_ht {
+                // Hashtable/Properties run the plain-bucket path below (table +
+                // count get set), but their OWN loadFactor/threshold fields
+                // (they extend Dictionary, not HashMap) are never initialized.
+                ensure_hashtable_load_factor(ctx, this, &name);
             }
         }
     }
