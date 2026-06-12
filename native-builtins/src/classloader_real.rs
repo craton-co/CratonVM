@@ -223,6 +223,34 @@ fn init_urlclassloader_fields(ctx: &mut dyn NativeContext, this: ObjectRef) {
             );
         }
     }
+
+    // `ucp` — jdk.internal.loader.URLClassPath. The real-JDK
+    // `URLClassLoader.getURLs()` / `findResource()` bytecode dereferences this
+    // field (`return ucp.getURLs();`), so a null value throws
+    // `NullPointerException: Cannot invoke getURLs on null`. Concrete breakage:
+    // Tomcat's `WebappLoader.buildClassPath()` -> `URLClassLoader.getURLs()` ->
+    // NPE -> "Error starting the loader" -> StandardContext start fails -> the
+    // whole embedded server fails to start (every TomcatBaseTest server test
+    // hangs/errs). CratonVM serves class/resource loading from its global
+    // dynamic classpath (see `register_url_array`), NOT this `ucp` field, and
+    // installs shim `URLClassPath` natives (`getURLs` -> empty, `findResource`
+    // -> null) via `register_url_class_path_safe_stubs`. So a bare non-null
+    // `URLClassPath` instance is sufficient to keep the real bytecode from
+    // NPEing while leaving CratonVM's class loading unchanged.
+    let ucp_existing = ctx.get_field_by_name(this, "ucp");
+    if !matches!(ucp_existing, Value::Object(Some(_))) {
+        if let Ok(Some(Value::Object(Some(ucp)))) =
+            ctx.new_object("jdk/internal/loader/URLClassPath")
+        {
+            ctx.set_field_by_name(this, "ucp", Value::Object(Some(ucp)));
+            if diag {
+                eprintln!(
+                    "[DBG_URLCL] init_urlclassloader_fields: ucp(after)={:?}",
+                    ctx.get_field_by_name(this, "ucp"),
+                );
+            }
+        }
+    }
 }
 
 /// Register ClassLoader natives needed in real-JDK mode.

@@ -4187,18 +4187,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     fn ctx_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
         Ok(None)
     }
-    r.register(
-        "org/apache/catalina/core/StandardContext",
-        "initInternal",
-        "()V",
-        ctx_noop,
-    );
-    r.register(
-        "org/apache/catalina/core/StandardContext",
-        "startInternal",
-        "()V",
-        ctx_noop,
-    );
+    // 2026-06-11 — REMOVED the base `org/apache/catalina/core/StandardContext`
+    // initInternal/startInternal no-ops. They were a Spring-Boot-era shim, but
+    // `StandardContext` is the concrete context the *Tomcat test suite* (and
+    // standalone Tomcat) uses, so no-opping it stopped every embedded server
+    // from actually starting its web application — the real bytecode runs fine
+    // here (verified via the apps/tomcat suite). Spring Boot stays short-
+    // circuited at `TomcatWebServer.start`/`initialize` (below) and via the
+    // `TomcatEmbeddedContext` subclass no-ops kept here, so this is Spring-Boot
+    // neutral while unblocking the Tomcat suite. See CRATONVM_BUGS/BUG-C-*.
     // Spring Boot's TomcatEmbeddedContext overrides startInternal — cover both
     // common package locations so the dispatch hits the native regardless of
     // which subclass the SB version uses.
@@ -4221,15 +4218,12 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     // ("A child container failed during start") with the original cause
     // discarded. By making the Callable a no-op that returns null, the
     // Future completes successfully and the engine/host advance.
-    fn start_child_noop(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-        Ok(Some(Value::Object(None)))
-    }
-    r.register(
-        "org/apache/catalina/core/ContainerBase$StartChild",
-        "call",
-        "()Ljava/lang/Object;",
-        start_child_noop,
-    );
+    // 2026-06-11 — REMOVED the `ContainerBase$StartChild.call` no-op. It made
+    // every child-container start (Engine→Host→Context) a no-op when Tomcat
+    // uses the parallel start-stop executor, so the context/connector never
+    // actually started under the Tomcat test suite. The real Callable runs the
+    // child's lifecycle, which works under CratonVM. (Was a Spring-Boot shim;
+    // Spring Boot remains short-circuited at TomcatWebServer.start/initialize.)
 
     // 2026-05-28 — REMOVED synthetic Connector.startInternal / AbstractProtocol.start
     // no-op stubs that violated the no-synthetic-stubs policy
@@ -4277,14 +4271,15 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
         "()V",
         tomcat_web_server_noop,
     );
-    // Also short-circuit Tomcat.start() at the Catalina root in case a
-    // different code path reaches it.
-    r.register(
-        "org/apache/catalina/startup/Tomcat",
-        "start",
-        "()V",
-        tomcat_web_server_noop,
-    );
+    // 2026-06-11 — REMOVED the `org/apache/catalina/startup/Tomcat.start()`
+    // no-op. This is the Catalina-root entry point the *Tomcat test suite*
+    // (`TomcatBaseTest`) and standalone Tomcat call directly; no-opping it made
+    // `tomcat.start()` return without starting the server/service/engine/
+    // connector (all stayed in lifecycle state NEW), so every embedded-server
+    // test hung connecting to a server that never bound. Spring Boot does not
+    // call `Tomcat.start()` (it drives `TomcatWebServer`, still no-op'd above),
+    // so removing this is Spring-Boot neutral. The real lifecycle runs fine
+    // under CratonVM. See CRATONVM_BUGS/BUG-C-*.
 
     // AbstractFileResolvingResource.customizeConnection(URLConnection) — no-op
     r.register(
