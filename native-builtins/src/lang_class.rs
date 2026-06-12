@@ -7099,51 +7099,20 @@ fn create_annotation_proxy(
     }
 
     // ---------------------------------------------------------------------
-    // CGLIB-γ override — force Spring `@Configuration(proxyBeanMethods=false)`.
+    // (REMOVED) CGLIB-γ override that forced `@Configuration(proxyBeanMethods
+    // =false)`. That shim put Spring into "lite" mode globally because CratonVM
+    // had no CGLIB bytecode-rewriter, so the default "full" semantics (inter-
+    // `@Bean`-method calls returning the shared singleton) were not realisable
+    // and would otherwise produce duplicate beans.
     //
-    // CratonVM has no CGLIB bytecode-rewriter, so Spring's default
-    // CGLIB-enhanced "full" `@Configuration` semantics (where @Bean methods
-    // are intercepted and cached on repeat calls) are not realisable. With
-    // the CGLIB intercept stubbed, `@Bean` methods that call other `@Bean`
-    // methods would execute multiple times and produce duplicate beans.
-    //
-    // Setting `proxyBeanMethods=false` switches Spring into "lite" mode in
-    // `ConfigurationClassUtils.checkConfigurationClassCandidate`: @Bean
-    // methods are still registered, but no CGLIB enhancement is expected and
-    // no inter-bean caching is required. This is the same configuration
-    // mode that Spring Boot itself uses for `@SpringBootConfiguration` since
-    // 5.2, and it is a supported user-facing setting — we are just forcing
-    // the global default.
-    //
-    // The override is keyed strictly on the annotation type descriptor
-    // (`Lorg/springframework/context/annotation/Configuration;`) and the
-    // single element name `proxyBeanMethods`, so no other annotation is
-    // affected. Tradeoff: applications that rely on shared-singleton
-    // semantics across direct `@Bean`→`@Bean` calls (i.e. they call
-    // `this.beanMethod()` and expect the same instance back) will get a
-    // fresh instance instead. That is the documented price of lite mode
-    // and matches the contract users opt into when they set the flag
-    // explicitly. Authorised by user as a targeted Spring shim while
-    // CGLIB support is deferred.
-    if ann.type_descriptor == "Lorg/springframework/context/annotation/Configuration;" {
-        let force_false = cratonvm_native_api::AnnotationElementValue::Int(0);
-        let mut found = false;
-        for (name, val, ret_desc) in all_elements.iter_mut() {
-            if name == "proxyBeanMethods" {
-                *val = force_false.clone();
-                *ret_desc = Some("Z".to_string());
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            all_elements.push((
-                "proxyBeanMethods".to_string(),
-                force_false,
-                Some("Z".to_string()),
-            ));
-        }
-    }
+    // `cglib_enhancer.rs` now emits real `@Bean`-method interception on the
+    // enhanced subclass (the `$$beanFactory` field + per-method overrides that
+    // route inter-bean references through `beanFactory.getBean`), so full mode
+    // works. We therefore let `proxyBeanMethods` resolve to its real annotation
+    // value (default `true`) — Spring enhances the `@Configuration` class and
+    // our interceptor gives correct shared-singleton semantics (SB-03 /
+    // S03_ConfigProxy).
+    // ---------------------------------------------------------------------
 
     // Store element name→value pairs as parallel arrays
     let n = all_elements.len();
