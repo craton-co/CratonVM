@@ -35,6 +35,47 @@ use std::time::Duration;
 use rustc_hash::FxHashMap;
 
 // ---------------------------------------------------------------------------
+// Socket byte capture (debug). When CRATONVM_SOCKET_CAPTURE=<prefix> is set,
+// every byte read/written via net_read0/net_write0 is appended to a raw
+// per-fd, per-direction file: `<prefix>.r.<fd>` (bytes the VM READ, i.e. the
+// daemon→worker stream) and `<prefix>.w.<fd>` (bytes the VM WROTE). The raw
+// read stream can then be replayed through ObjectInputStream in isolation to
+// deterministically reproduce a deserialization desync without the full
+// Gradle/Hibernate stack. A textual index (`<prefix>.idx`) records op order
+// with direction/fd/length so the interleave can be reconstructed.
+// ---------------------------------------------------------------------------
+
+fn socket_capture_prefix() -> Option<&'static str> {
+    static PREFIX: OnceLock<Option<String>> = OnceLock::new();
+    PREFIX
+        .get_or_init(|| std::env::var("CRATONVM_SOCKET_CAPTURE").ok().filter(|s| !s.is_empty()))
+        .as_deref()
+}
+
+pub(crate) fn socket_capture(dir: char, fd: i32, data: &[u8]) {
+    let Some(prefix) = socket_capture_prefix() else { return };
+    if data.is_empty() {
+        return;
+    }
+    use std::io::Write as _;
+    // Serialize across the VM's concurrent socket reader/writer threads so the
+    // per-fd raw streams and the index never interleave mid-record.
+    static CAP_LOCK: Mutex<()> = Mutex::new(());
+    let _g = CAP_LOCK.lock();
+    // Raw per-fd, per-direction stream (concatenated, replayable).
+    let raw_path = format!("{prefix}.{dir}.{fd}");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&raw_path) {
+        let _ = f.write_all(data);
+    }
+    // Textual index of op order (direction/fd/length + first 16 bytes hex).
+    let idx_path = format!("{prefix}.idx");
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&idx_path) {
+        let head: String = data.iter().take(16).map(|b| format!("{b:02x}")).collect();
+        let _ = writeln!(f, "{dir} fd={fd} len={} {head}", data.len());
+    }
+}
+
+// ---------------------------------------------------------------------------
 // T16.5 — java.net.MulticastSocket overrides (pre-existing)
 // ---------------------------------------------------------------------------
 
@@ -676,6 +717,7 @@ fn net_read0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if n == 0 {
         return Ok(Some(Value::Int(-1)));
     }
+    socket_capture('r', fd, &buf[..n]);
     // Store the bytes into the caller's native buffer. `addr` may be a real
     // OS pointer OR an `Unsafe.allocateMemory` arena handle (DirectByteBuffer
     // from `Util.getTemporaryDirectBuffer`) — route through the context so an
@@ -724,6 +766,7 @@ fn net_write0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         let mut w = &*s;
         w.write(&buf).map_err(|e| net_err("write0", e))?
     };
+    socket_capture('w', fd, &buf[..n]);
     Ok(Some(Value::Int(n as i32)))
 }
 
