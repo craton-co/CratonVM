@@ -16924,8 +16924,52 @@ fn populate_virtual_invoke_cache(
             store,
         ) {
             let declaring_name = store.get(declaring_id).map(|c| &*c.name).unwrap_or("");
-            if let Some(kind) =
-                cratonvm_native_builtins::intrinsics::lookup(declaring_name, &method_name, &descriptor)
+            // WP0.1 soundness — a Rust native registered for the method on the
+            // RECEIVER's class (or any ancestor strictly below the resolved
+            // declaring class) outranks the intrinsic, exactly as it outranks
+            // bytecode (see the native-override block below and the matching
+            // guard in `execute_invokevirtual_vtable_fast`). Without this walk,
+            // a synthetic class with no bytecode (e.g.
+            // `cratonvm/internal/UnmodifiableList`, whose `hashCode` native
+            // implements the List contract) resolves to `java/lang/Object` and
+            // caches the identity-hash intrinsic — the FIRST call (slow path)
+            // honours the native, every later call through the poisoned IC
+            // returns the identity hash. Canonical victim: JUnit 6
+            // `Namespace.hashCode()` (a `List.of` parts list) became unstable,
+            // so `NamespacedHierarchicalStore` lookups missed and every
+            // @ParameterizedTest died in `getDeclarationContext` (NPE).
+            let native_override_below_declaring = {
+                let mut cid = receiver_class_id;
+                let mut hit = false;
+                loop {
+                    if cid == declaring_id {
+                        break;
+                    }
+                    let Some(class) = store.get(cid) else { break };
+                    if shared
+                        .native_methods
+                        .find(&class.name, &method_name, &descriptor)
+                        .is_some()
+                    {
+                        hit = true;
+                        break;
+                    }
+                    match class.superclass {
+                        Some(parent) => cid = parent,
+                        None => break,
+                    }
+                }
+                hit
+            };
+            if let Some(kind) = (!native_override_below_declaring)
+                .then(|| {
+                    cratonvm_native_builtins::intrinsics::lookup(
+                        declaring_name,
+                        &method_name,
+                        &descriptor,
+                    )
+                })
+                .flatten()
             {
                 // Gate bound to the receiver class — a redefine of the
                 // receiver swaps the dispatched body, mirroring the

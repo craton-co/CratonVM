@@ -1512,46 +1512,83 @@ fn execute_record_object_method(
             let other = thread.frames[frame_idx].stack.pop()?;
             let this = thread.frames[frame_idx].stack.pop()?;
 
-            #[allow(unreachable_patterns)]
             let result = match (&this, &other) {
+                (Value::Object(Some(a)), Value::Object(Some(b))) if a == b => Ok(1),
                 (Value::Object(Some(a)), Value::Object(Some(b))) => {
                     // Must be same class
                     let a_cid = shared.heap.class_id_of(*a);
                     let b_cid = shared.heap.class_id_of(*b);
                     if a_cid != b_cid {
-                        0
+                        Ok(0)
                     } else {
-                        // Compare each component field
-                        let mut equal = true;
+                        // Compare each component field. Reference components
+                        // must compare via their VIRTUAL equals (the JDK's
+                        // generated record equals calls Objects.equals per
+                        // component) — identity comparison broke e.g. JUnit 6's
+                        // record CompositeKey(namespace, key) in
+                        // NamespacedHierarchicalStore, so every store lookup
+                        // with an equal-but-distinct namespace missed. The
+                        // invokes can trigger a moving GC, so the record refs
+                        // are pinned and re-read per component.
+                        use cratonvm_native_api::NativeContext as _;
+                        let mut ctx = NativeContextImpl { shared, thread };
+                        let a_pin = ctx.pin_native_root(*a);
+                        let b_pin = ctx.pin_native_root(*b);
+                        let mut equal = Ok(1);
                         for &fi in field_indices {
-                            let va = shared.heap.get_field(*a, fi);
-                            let vb = shared.heap.get_field(*b, fi);
-                            if !values_equal(shared, &va, &vb) {
-                                equal = false;
-                                break;
+                            let aa = ctx.read_native_pin(a_pin, *a);
+                            let bb = ctx.read_native_pin(b_pin, *b);
+                            let va = ctx.get_field(aa, fi);
+                            let vb = ctx.get_field(bb, fi);
+                            match values_equal_deep(&mut ctx, &va, &vb) {
+                                Ok(true) => continue,
+                                Ok(false) => {
+                                    equal = Ok(0);
+                                    break;
+                                }
+                                Err(e) => {
+                                    equal = Err(e);
+                                    break;
+                                }
                             }
                         }
-                        if equal { 1 } else { 0 }
+                        ctx.unpin_native_roots(a_pin);
+                        ctx.unpin_native_roots(b_pin);
+                        equal
                     }
                 }
-                // this == other (both same ref)
-                (Value::Object(Some(a)), Value::Object(Some(b))) if a == b => 1,
                 // this.equals(null) → false
-                _ => 0,
+                _ => Ok(0),
             };
+            let result = result?;
             thread.frames[frame_idx].stack.push(Value::Int(result))?;
         }
         RecordMethodKind::HashCode => {
             let this = thread.frames[frame_idx].stack.pop()?;
             let hash = match this {
                 Value::Object(Some(obj)) => {
-                    let mut h: i32 = 0;
+                    // Reference components must hash via their VIRTUAL
+                    // hashCode (the identity fallback made record hashes
+                    // unstable across equal instances — see the Equals arm).
+                    use cratonvm_native_api::NativeContext as _;
+                    let mut ctx = NativeContextImpl { shared, thread };
+                    let obj_pin = ctx.pin_native_root(obj);
+                    let mut h: Result<i32, MethodCallFailed> = Ok(0);
                     for &fi in field_indices {
-                        let v = shared.heap.get_field(obj, fi);
-                        let vh = value_hash(shared, &v);
-                        h = h.wrapping_mul(31).wrapping_add(vh);
+                        let cur = ctx.read_native_pin(obj_pin, obj);
+                        let v = ctx.get_field(cur, fi);
+                        match value_hash_deep(&mut ctx, &v) {
+                            Ok(vh) => {
+                                h = Ok(h.unwrap().wrapping_mul(31).wrapping_add(vh));
+                            }
+                            Err(e) => {
+                                h = Err(e);
+                                break;
+                            }
+                        }
                     }
-                    h
+                    ctx.unpin_native_roots(obj_pin);
+                    h?
                 }
                 _ => 0,
             };
@@ -1602,6 +1639,76 @@ fn execute_record_object_method(
         }
     }
     Ok(())
+}
+
+/// Compare two record component values like the JDK's generated record
+/// `equals` does: primitives by value (`Float.equals`/`Double.equals` bit
+/// semantics), references via `Objects.equals` — i.e. the component's
+/// VIRTUAL `equals`. The String content fast path avoids a Java invoke for
+/// the overwhelmingly common case.
+fn values_equal_deep(
+    ctx: &mut NativeContextImpl<'_>,
+    a: &Value,
+    b: &Value,
+) -> Result<bool, MethodCallFailed> {
+    match (a, b) {
+        (Value::Object(Some(x)), Value::Object(Some(y))) => {
+            if x == y {
+                return Ok(true);
+            }
+            let x_cid = ctx.shared.heap.class_id_of(*x);
+            let x_name = ctx
+                .shared
+                .class_manager
+                .read()
+                .get_class(x_cid)
+                .map(|c| c.name.clone());
+            if x_name.as_deref() == Some("java/lang/String") {
+                let xs = read_java_string(&ctx.shared.heap, *x);
+                let ys = read_java_string(&ctx.shared.heap, *y);
+                return Ok(xs == ys);
+            }
+            use cratonvm_native_api::NativeContext as _;
+            match ctx.invoke_virtual(
+                *x,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(*y))],
+            )? {
+                Some(Value::Int(v)) => Ok(v != 0),
+                _ => Ok(false),
+            }
+        }
+        _ => Ok(values_equal(ctx.shared, a, b)),
+    }
+}
+
+/// Hash one record component like the JDK's generated record `hashCode`:
+/// primitives by their wrapper hash, references via the VIRTUAL `hashCode`.
+fn value_hash_deep(
+    ctx: &mut NativeContextImpl<'_>,
+    v: &Value,
+) -> Result<i32, MethodCallFailed> {
+    match v {
+        Value::Object(Some(obj)) => {
+            let cid = ctx.shared.heap.class_id_of(*obj);
+            let name = ctx
+                .shared
+                .class_manager
+                .read()
+                .get_class(cid)
+                .map(|c| c.name.clone());
+            if name.as_deref() == Some("java/lang/String") {
+                return Ok(value_hash(ctx.shared, v));
+            }
+            use cratonvm_native_api::NativeContext as _;
+            match ctx.invoke_virtual(*obj, "hashCode", "()I", &[])? {
+                Some(Value::Int(h)) => Ok(h),
+                _ => Ok(0),
+            }
+        }
+        _ => Ok(value_hash(ctx.shared, v)),
+    }
 }
 
 /// Compare two JVM values for equality (used by record equals).
