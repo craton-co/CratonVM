@@ -312,9 +312,29 @@ impl Tlab {
         let tail = end_addr - aligned;
         use crate::heap::{HEADER_SIZE, ArrayElementType, ObjectKind, ObjectHeader};
         if tail < HEADER_SIZE {
-            // Not enough room for a synthetic header; zero the residual.
-            // SAFETY: aligned..end is within the TLAB.
-            unsafe { std::ptr::write_bytes(aligned as *mut u8, 0, tail); }
+            // Bug-D fix (2026-06-12): a sub-`HEADER_SIZE` tail cannot hold a
+            // walkable `int[]` filler, and ZEROING it (the old behaviour) is
+            // unsafe — a zeroed sub-40 region is byte-identical to a live
+            // `new Object()` (class_id 0 / num_slots 0), so the non-moving
+            // young sweep's linear walk strides a phantom 40-byte object off
+            // the object grid (the `RemoteCIDRFilter` "implausible object
+            // size" desync that a later moving GC turns into a SIGSEGV).
+            //
+            // Stamp the GAP-filler sentinel instead: class_id at offset 0 and
+            // the exact gap length at offset 4 — both inside the smallest
+            // (8-byte) gap. The sweep walker reclaims the span in O(1) on the
+            // `class_id == GAP_FILLER_CLASS_ID` match. `aligned`/`end` are
+            // 8-aligned so `tail` is a non-zero multiple of 8 here (8/16/24/32).
+            debug_assert!(
+                tail >= 8 && tail % 8 == 0,
+                "sub-header tail must be an 8-aligned, >=8-byte span (tail={tail})",
+            );
+            // SAFETY: aligned..aligned+8 lies within [aligned, end) (tail>=8)
+            // and is 8-aligned for the two u32 writes.
+            unsafe {
+                std::ptr::write(aligned as *mut u32, GAP_FILLER_CLASS_ID.as_u32());
+                std::ptr::write((aligned + 4) as *mut u32, tail as u32);
+            }
             self.cursor = self.end;
             return;
         }
@@ -417,6 +437,24 @@ pub fn max_tlab_size() -> usize {
 /// classloader-issued id.
 pub const TLAB_FILLER_CLASS_ID: cratonvm_types::ClassId =
     cratonvm_types::ClassId::new(0xF111_E700);
+
+/// Bug-D fix (2026-06-12) — synthetic class id stamped into a
+/// **sub-`HEADER_SIZE`** TLAB tail (8/16/24/32 bytes) that is too small to
+/// hold a walkable `int[]` filler. A standard filler needs >= 40 bytes; a
+/// shorter tail cannot carry a full `ObjectHeader`, and zeroing it is unsafe
+/// because a zeroed sub-40 region is byte-identical to a live `new Object()`
+/// (class_id 0, num_slots 0 — its only non-zero header word, identity_hash at
+/// offset 8, lies past an 8-byte gap). The non-moving young sweep's linear
+/// walk then cannot distinguish the gap from a live object and desyncs.
+///
+/// The sentinel occupies only the first 8 bytes of the gap — `class_id` at
+/// offset 0, the exact gap length (bytes) as a `u32` at offset 4 — both of
+/// which fit in the smallest (8-byte) gap. The sweep walker recognises this
+/// class id, reads the length, and reclaims the span in O(1) with no
+/// heuristic re-sync. Distinct from `TLAB_FILLER_CLASS_ID` so the two filler
+/// kinds never alias. Sits in the same synthetic high-bit range.
+pub const GAP_FILLER_CLASS_ID: cratonvm_types::ClassId =
+    cratonvm_types::ClassId::new(0xF111_E701);
 
 /// Round-5 #9 / round-7 #9 — class id every TLAB tail filler should use.
 ///
