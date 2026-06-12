@@ -535,6 +535,56 @@ fn mirror_loaded_entries_to_properties_backend(
     }
 }
 
+/// Store entries parsed by a native `load` into the receiver.
+///
+/// HotSpot's `Properties.load0` hands every parsed pair to the VIRTUAL
+/// `put(Object,Object)`, so a subclass that overrides `put` observes each
+/// entry — Spring Boot's buildSrc `AntoraAsciidocAttributes` loads its
+/// attribute template through an anonymous Properties subclass whose
+/// `put` collects into a separate ordered map and never stores into the
+/// Properties object at all. The old tail (`put_kv` + backend mirror)
+/// bypassed that dispatch entirely, so subclass overrides silently saw
+/// zero entries. Keep the side-table fast path for receivers whose
+/// runtime class IS `java/util/Properties`; for genuine subclasses,
+/// dispatch each entry through `put` (a non-overriding subclass lands
+/// back on the registered Properties.put native, same net effect).
+fn store_parsed_entries(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    parsed: &[(String, String)],
+) {
+    let cid = ctx.class_id_of_object(this);
+    let is_exact = ctx
+        .class_name_of_id(cid)
+        .is_none_or(|n| n == "java/util/Properties");
+    if is_exact {
+        for (k, v) in parsed {
+            put_kv(this, k, v);
+        }
+        mirror_loaded_entries_to_properties_backend(ctx, this, parsed);
+        return;
+    }
+    // Subclass: every invoke below can trigger a moving GC, so re-read the
+    // receiver (and the key string, which is allocated before the value
+    // string) through pins on each iteration.
+    let this_pin = ctx.pin_native_root(this);
+    for (k, v) in parsed {
+        let k_obj = ctx.create_string(k);
+        let k_pin = ctx.pin_native_root(k_obj);
+        let v_obj = ctx.create_string(v);
+        let k_obj = ctx.read_native_pin(k_pin, k_obj);
+        let this_cur = ctx.read_native_pin(this_pin, this);
+        let _ = ctx.invoke_virtual(
+            this_cur,
+            "put",
+            "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Object(Some(k_obj)), Value::Object(Some(v_obj))],
+        );
+        ctx.unpin_native_roots(k_pin);
+    }
+    ctx.unpin_native_roots(this_pin);
+}
+
 /// Native `Properties.load(InputStream)` — drains the stream, parses
 /// the bytes as a Java `.properties` file, and populates the side-
 /// table for `this`.
@@ -564,9 +614,8 @@ fn native_properties_load(
             let preview_len = v.len().min(80);
             props_diag_eprintln!("[PROPS-DBG] KEY={} VALUE_LEN={} VALUE_START={}", k, v.len(), &v[..preview_len]);
         }
-        put_kv(this, k, v);
     }
-    mirror_loaded_entries_to_properties_backend(ctx, this, &parsed);
+    store_parsed_entries(ctx, this, &parsed);
     props_diag_eprintln!("[PROPS-DBG] native_properties_load: side-table now has {} entries for obj {:?}", count_kv(this), this);
     Ok(None)
 }
@@ -676,10 +725,7 @@ fn native_properties_load_reader(
         return Ok(None);
     }
     let parsed = parse_properties(&bytes);
-    for (k, v) in &parsed {
-        put_kv(this, k, v);
-    }
-    mirror_loaded_entries_to_properties_backend(ctx, this, &parsed);
+    store_parsed_entries(ctx, this, &parsed);
     Ok(None)
 }
 
