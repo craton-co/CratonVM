@@ -13332,11 +13332,32 @@ fn lhm_overlay_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     widened_obj_key(ctx, this)
 }
 fn lhm_get(ctx: &dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize) -> Value {
-    let m = lhm_overlay().lock().unwrap();
-    m.get(&lhm_overlay_key(ctx, this))
-        .and_then(|inner| inner.get(name))
-        .copied()
-        .unwrap_or(Value::Object(None))
+    {
+        let m = lhm_overlay().lock().unwrap();
+        if let Some(v) = m
+            .get(&lhm_overlay_key(ctx, this))
+            .and_then(|inner| inner.get(name))
+            .copied()
+        {
+            return v;
+        }
+    }
+    // Overlay MISS (entry never set): fall back to the real JDK heap field.
+    // This is the path for a LinkedHashMap populated by REAL bytecode that
+    // bypassed native_lhm_put — chiefly Java deserialization, whose
+    // HashMap.readObject → putVal → LinkedHashMap.newNode writes the real
+    // table + head/tail + node before/after but never our overlay. The
+    // mirrored writes in lhm_set keep the heap consistent for native-populated
+    // maps, so reading the heap here is correct for both cases (an explicitly
+    // null overlay entry is returned above as Object(None) before reaching here).
+    if matches!(name, "head" | "tail" | "size" | "table") {
+        if let Some(slot) = ctx.resolve_field_index("java/util/LinkedHashMap", name) {
+            if slot < ctx.object_num_fields(this) {
+                return ctx.get_field(this, slot);
+            }
+        }
+    }
+    Value::Object(None)
 }
 fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize, v: Value) {
     let key = lhm_overlay_key(ctx, this);
@@ -13346,10 +13367,28 @@ fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: 
         .lock()
         .unwrap()
         .insert(this.as_ptr() as usize, key);
-    let mut m = lhm_overlay().lock().unwrap();
-    m.entry(key)
-        .or_default()
-        .insert(name.to_string(), v);
+    {
+        let mut m = lhm_overlay().lock().unwrap();
+        m.entry(key)
+            .or_default()
+            .insert(name.to_string(), v);
+    }
+    // Mirror the structural pointers to the REAL JDK heap fields so that
+    // real-bytecode paths that bypass our natives — chiefly Java serialization:
+    // inherited `HashMap.writeObject` reads `size`/`table`, and
+    // `LinkedHashMap.internalWriteEntries` walks the real `head`→`after` links —
+    // observe the live state instead of the unset 0/null defaults (which
+    // serialized a populated LHM as `{}`, desyncing peers). The overlay stays
+    // the source of truth for reads; this keeps the heap consistent for the
+    // rare real-bytecode readers. The LHM$Node `before`/`after` links are
+    // already maintained on the real node fields by `lhm_alloc_node`/remove.
+    if matches!(name, "head" | "tail" | "size" | "table") {
+        if let Some(slot) = ctx.resolve_field_index("java/util/LinkedHashMap", name) {
+            if slot < ctx.object_num_fields(this) {
+                ctx.set_field(this, slot, v);
+            }
+        }
+    }
 }
 
 /// Copy the per-object LHM overlay from `src` to `dst`. Used by
