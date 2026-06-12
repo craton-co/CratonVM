@@ -15962,11 +15962,20 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
         }
     }
-    // S111r28: HashSet / LinkedHashSet — field 0 = backing HashMap.
-    // Walk the backing map's bucket nodes and collect keys.
+    // S111r28: HashSet / LinkedHashSet — field 0 = backing map. Collect the
+    // backing map's keys (in iteration order).
     if HS_FIELD_MAP < n_fields {
         if let Value::Object(Some(backing)) = ctx.get_field(coll, HS_FIELD_MAP) {
-            // Verify it actually is a HashMap-like (slot 0 = bucket array).
+            // An insertion-ordered set (LinkedHashSet / CopyOnWriteArraySet) is
+            // backed by a LinkedHashMap, which keeps its entries in the
+            // insertion-order overlay rather than the bucket array — so the
+            // bucket-array guard below would miss it. Detect it explicitly;
+            // `collect_view_snapshot_ordered` → `lhm_collect_keys` yields the
+            // keys in insertion order.
+            if is_lhm_receiver(ctx, backing) {
+                return collect_view_snapshot_ordered(ctx, backing);
+            }
+            // Otherwise verify it's a HashMap-like (slot 0 = bucket array).
             if MAP_FIELD_BUCKETS < ctx.object_num_fields(backing) {
                 let s0 = ctx.get_field(backing, MAP_FIELD_BUCKETS);
                 if let Value::Object(Some(arr)) = s0 {
