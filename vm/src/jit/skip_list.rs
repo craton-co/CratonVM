@@ -1027,31 +1027,6 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
-        // JD.1 (kafka-clients suite, 2026-06-12) — JUnit Platform discovery
-        // resolution package. With JIT enabled, compiling
-        // `EngineDiscoveryRequestResolution.lambda$resolve$2` (a 13-way
-        // instanceof/checkcast/invokeinterface dispatch over the overloaded
-        // `SelectorResolver.resolve(<SelectorType>, Context)` methods)
-        // miscompiles its return value, so the discovery work-queue in
-        // `EngineDiscoveryRequestResolution.resolve` never drains — an infinite
-        // loop that hangs *every* JUnit5 `selectPackage` discovery (kafka-clients,
-        // Spring, Tomcat, …) until the 120 s watchdog aborts. Isolated by method-
-        // level bisection (`CRATONVM_JIT_BISECT_SKIP`): skipping just that one
-        // lambda makes discovery complete; with `--nojit` discovery is fine.
-        // GC is not involved (`-Xmx8g` does not help; zero corruption warnings).
-        // Discovery runs exactly once per launch and is not throughput-sensitive,
-        // so this package exclusion is free in practice. Stopgap pending a
-        // root-cause of the instanceof-dispatch-chain codegen; minimal Java
-        // reproductions of the shape do not yet trigger it in isolation. Lifted
-        // by `CRATONVM_JIT_ALLOW_PACKAGES=org/junit/platform/engine/support/discovery/`.
-        if class_name.starts_with("org/junit/platform/engine/support/discovery/")
-            && !package_allowed(
-                "org/junit/platform/engine/support/discovery/",
-                allow_packages,
-            )
-        {
-            return Some(SkipReason::RustJvmTestFixture);
-        }
     }
 
     None
