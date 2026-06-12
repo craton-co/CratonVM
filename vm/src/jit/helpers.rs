@@ -643,6 +643,134 @@ unsafe fn bail_to_interpreter(
     }
 }
 
+/// BUG-H: does the statically-bound callee declare a non-empty exception
+/// table? Resolved from the class manager by `(class, method, descriptor)`.
+///
+/// Only meaningful for the statically-bound kinds (invokestatic/invokespecial),
+/// where `info.class_name`/`method_name`/`descriptor` name the exact callee —
+/// the virtual/interface kinds resolve on the runtime receiver type elsewhere.
+///
+/// SAFETY: `vm` must be a live `SharedVm`; `info` must point to a valid
+/// `JitInvokeInfo` whose name fields are live `&str`s.
+unsafe fn callee_has_exception_table(vm: &SharedVm, info: &JitInvokeInfo) -> bool {
+    let cm = vm.class_manager.read();
+    let Some(class_id) = cm.find_class_by_name(info.class_name) else {
+        return false;
+    };
+    let store = cm.class_store();
+    let Some((method, _declaring_id)) = crate::classloading::find_method_recursive(
+        class_id,
+        info.method_name,
+        info.descriptor,
+        store,
+    ) else {
+        return false;
+    };
+    method
+        .code()
+        .map_or(false, |c| !c.exception_table.is_empty())
+}
+
+/// BUG-H (virtual sibling of [`callee_has_exception_table`]): does the
+/// receiver-resolved virtual/interface callee declare a non-empty exception
+/// table? The MIC hit path knows the callee only by `(info.method_name,
+/// descriptor)` + the runtime receiver class, so resolution starts from the
+/// receiver's class id (the real override site).
+///
+/// SAFETY: as [`callee_has_exception_table`]; `receiver_class_id` must be a
+/// live class id obtained from the receiver object.
+unsafe fn mic_callee_has_exception_table(
+    vm: &SharedVm,
+    receiver_class_id: ClassId,
+    info: &JitInvokeInfo,
+) -> bool {
+    let cm = vm.class_manager.read();
+    let store = cm.class_store();
+    let Some((method, _decl)) = crate::classloading::find_method_recursive(
+        receiver_class_id,
+        info.method_name,
+        info.descriptor,
+        store,
+    ) else {
+        return false;
+    };
+    method
+        .code()
+        .map_or(false, |c| !c.exception_table.is_empty())
+}
+
+/// BUG-H fix: route an *implicit* runtime exception thrown by a directly
+/// invoked compiled callee through the CALLEE's own exception table.
+///
+/// When a JIT-compiled callee `B` is invoked directly — either via a
+/// machine-code `CALL` to its entry or through one of this helper's
+/// `try_call_compiled_entry` fast paths — and it throws an implicit runtime
+/// exception (`ArrayIndexOutOfBoundsException` / `NullPointerException`), `B`'s
+/// own in-method `catch` is never consulted: `B` returns the `i64::MIN` deopt
+/// sentinel with the thread-local pending-exception flag set, and that flag is
+/// only drained at the *outermost* interpreter↔JIT boundary — which routes it
+/// through the wrong method's exception table (the `TestHexUtils` /
+/// `HexUtils.getDec` escape: `T[i-'0']` inside `catch (AIOOBE)` returning -1).
+///
+/// If `rc` is the deopt sentinel, an implicit AIOOBE/NPE is pending, and the
+/// callee declares a non-empty exception table, re-execute the callee in the
+/// interpreter with the same args. The interpreter re-throws the same
+/// exception at the same bytecode and routes it through the callee's table —
+/// running its handler (which may swallow the exception and return a normal
+/// value) or re-propagating it to the caller via `handle_jit_dispatch_error`.
+/// Re-execution from the start mirrors the existing whole-method deopt
+/// semantics; it is confined to the (cold) exceptional path of a method that
+/// actually declares a handler region, so straight-line callees are untouched.
+///
+/// SAFETY: same contract as the surrounding `jit_invoke_dispatch` fast paths —
+/// `vm`/`info`/`args_slice` are the live values passed by the JIT caller, and
+/// no `jit_thread_mut` borrow is live at the call site.
+#[inline]
+unsafe fn route_implicit_exc_through_callee(
+    vm: &SharedVm,
+    info: &JitInvokeInfo,
+    args_slice: &[i64],
+    rc: i64,
+) -> i64 {
+    if rc != i64::MIN {
+        return rc;
+    }
+    // Did the callee raise an *implicit* runtime exception? (A general
+    // `JIT_PENDING_EXCEPTION` comes from `athrow`, whose methods-with-tables are
+    // not compiled — see the `try_compile_inner` gate — so it never reaches a
+    // direct compiled call and needs no re-route here.)
+    let aioobe = take_jit_pending_aioobe();
+    let npe = if aioobe.is_none() {
+        take_jit_pending_npe()
+    } else {
+        false
+    };
+    // Re-stash the consumed flag and propagate the sentinel unchanged. Used for
+    // the pure-deopt case (no flag) and the no-local-handler case (the callee
+    // cannot catch it, so existing outward propagation is already correct).
+    let restash_and_return = || {
+        if let Some((idx, len)) = aioobe {
+            stash_jit_pending_aioobe(idx, len);
+        } else if npe {
+            stash_jit_pending_npe();
+        }
+        rc
+    };
+    if aioobe.is_none() && !npe {
+        return rc;
+    }
+    if !callee_has_exception_table(vm, info) {
+        return restash_and_return();
+    }
+    // Re-execute the callee in the interpreter so the implicit exception routes
+    // through the callee's own exception table.
+    if let Some((thread, _guard)) = jit_thread_mut() {
+        let bail_args = decode_dispatch_values(vm, info, args_slice);
+        return bail_to_interpreter(vm, thread, info, &bail_args);
+    }
+    restash_and_return()
+}
+
 /// Decode a JIT dispatch helper's raw `i64` argument slice into the
 /// `Vec<Value>` the interpreter expects.  Centralised so that the slow
 /// path in `jit_invoke_dispatch` and the three `try_call_compiled_entry`
@@ -2656,7 +2784,10 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                     info.class_name, info.method_name, info.descriptor, rc,
                 );
             }
-            return rc;
+            // BUG-H: if the callee threw an implicit exception its own `catch`
+            // should handle, re-run it in the interpreter to route through its
+            // exception table.
+            return route_implicit_exc_through_callee(vm, info, args_slice, rc);
         }
         // Overflow: decode args once and hand off to the interpreter.
         if let Some((thread, _guard)) = jit_thread_mut() {
@@ -2702,7 +2833,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
                         info.class_name, info.method_name, info.descriptor, rc,
                     );
                 }
-                return rc;
+                // BUG-H: route a callee-thrown implicit exception through the
+                // callee's own exception table (see dcache site above).
+                return route_implicit_exc_through_callee(vm, info, args_slice, rc);
             }
             if let Some((thread, _guard)) = jit_thread_mut() {
                 let bail_args = decode_dispatch_values(vm, info, args_slice);
@@ -2738,7 +2871,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             // JIT entry pointer. CRIT round-5 fix: bail explicitly to the interpreter on
             // >ARG_REGS args via `bail_to_interpreter` (matches the MIC fast-path).
             if let Some(rc) = try_call_compiled_entry(entry, needs_ctx, vm_ptr, args_slice) {
-                return rc;
+                // BUG-H: route a callee-thrown implicit exception through the
+                // callee's own exception table (see dcache site above).
+                return route_implicit_exc_through_callee(vm, info, args_slice, rc);
             }
             if let Some((thread, _guard)) = jit_thread_mut() {
                 let bail_args = decode_dispatch_values(vm, info, args_slice);
@@ -3133,6 +3268,33 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 try_call_compiled_entry(entry as usize, needs_ctx, vm_ptr, args_slice)
             };
             if let Some(rc) = rc_opt {
+                // BUG-H: if the receiver-resolved callee threw an implicit
+                // exception (AIOOBE/NPE) its own `catch` should handle, the
+                // direct compiled call bypassed its exception table. Re-execute
+                // it in the interpreter so the exception routes through the
+                // callee's table (e.g. Tomcat `HttpParser.isNotRequestTarget
+                // Relaxed`: `IS_NOT_REQUEST_TARGET[c]` in `catch (AIOOBE)`).
+                if rc == i64::MIN {
+                    let aioobe = take_jit_pending_aioobe();
+                    let npe = if aioobe.is_none() {
+                        take_jit_pending_npe()
+                    } else {
+                        false
+                    };
+                    if aioobe.is_some() || npe {
+                        if mic_callee_has_exception_table(vm, receiver_class_id, info) {
+                            let values = decode_values();
+                            return bail_to_interpreter(vm, thread, info, &values);
+                        }
+                        // No local handler — re-stash the consumed flag and
+                        // propagate the sentinel unchanged (existing behavior).
+                        if let Some((idx, len)) = aioobe {
+                            stash_jit_pending_aioobe(idx, len);
+                        } else if npe {
+                            stash_jit_pending_npe();
+                        }
+                    }
+                }
                 return rc;
             }
             let values = decode_values();
@@ -3198,22 +3360,29 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
                 info.descriptor,
             )
         };
+        // BUG-H: as in the cache-miss branch below, do not publish a direct
+        // compiled entry for a callee with a local exception table — the inline
+        // machine-code cascade would bypass it. Keep dispatch on the
+        // `invoke_or_native` path so the exception routes through the callee's
+        // own table.
         if let Some((entry_ptr, needs_ctx)) = compile_res {
-            mic.cached_entry_ptr
-                .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
-            mic.cached_needs_context
-                .store(needs_ctx, std::sync::atomic::Ordering::Release);
-            // CRIT-1 — also populate the co-allocated PIC so the
-            // inline 3-way cascade in `jit/src/x64.rs` hits on the
-            // next invocation. Without this the cascade's empty
-            // (class_id == 0) slots always fail and every dispatch
-            // pays the full helper cost. We only install when we
-            // actually have an entry_ptr to publish; a 0 entry_ptr
-            // in a PIC slot would force the inline cascade to call
-            // through a null function pointer.
-            if pic_ptr != 0 && entry_ptr != 0 {
-                let pic = &*(pic_ptr as *const JitPICSlot);
-                pic.install(receiver_cid, &class_name, entry_ptr as u64, needs_ctx);
+            if !mic_callee_has_exception_table(vm, receiver_class_id, info) {
+                mic.cached_entry_ptr
+                    .store(entry_ptr as u64, std::sync::atomic::Ordering::Release);
+                mic.cached_needs_context
+                    .store(needs_ctx, std::sync::atomic::Ordering::Release);
+                // CRIT-1 — also populate the co-allocated PIC so the
+                // inline 3-way cascade in `jit/src/x64.rs` hits on the
+                // next invocation. Without this the cascade's empty
+                // (class_id == 0) slots always fail and every dispatch
+                // pays the full helper cost. We only install when we
+                // actually have an entry_ptr to publish; a 0 entry_ptr
+                // in a PIC slot would force the inline cascade to call
+                // through a null function pointer.
+                if pic_ptr != 0 && entry_ptr != 0 {
+                    let pic = &*(pic_ptr as *const JitPICSlot);
+                    pic.install(receiver_cid, &class_name, entry_ptr as u64, needs_ctx);
+                }
             }
         }
 
@@ -3316,21 +3485,33 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
         None => (0, false),
     };
 
-    // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
-    mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
+    // BUG-H: never publish a direct compiled entry for a callee that declares a
+    // local exception table. The inline machine-code MIC/PIC cascade emitted in
+    // `jit/src/x64.rs` would `CALL` it directly, bypassing the callee's own
+    // exception table — so an implicit AIOOBE/NPE the callee should catch
+    // locally escapes its `catch` (Tomcat `HttpParser.isNotRequestTarget
+    // Relaxed`, an *instance* method: `IS_NOT_REQUEST_TARGET[c]` inside
+    // `catch (AIOOBE)`). Leaving the cache empty keeps every dispatch on the
+    // helper's `invoke_or_native` path below, which routes the exception
+    // through the callee's table correctly. (The statically-bound sibling is
+    // gated in the `callee_compiler` closure in `interpreter.rs`.)
+    if !mic_callee_has_exception_table(vm, receiver_class_id, info) {
+        // Update all MIC fields atomically (needs_ctx must match compiled entry ABI)
+        mic.update(receiver_cid, &class_name, entry_ptr, needs_ctx);
 
-    // CRIT-1 — Populate the co-allocated PIC so the inline 3-way
-    // cascade emitted in `jit/src/x64.rs` actually hits on subsequent
-    // dispatches. Eager allocation made `pic_inline` always-true at
-    // codegen, so the cascade is always emitted but stays cold until
-    // the helper publishes entries here. Mirror the MIC update with
-    // a `pic.install(...)` so the next call with the same receiver
-    // class takes the inline fast path (5 cycles slot-0 hit vs the
-    // full helper call). LFU eviction inside `install` handles
-    // megamorphic spillover automatically.
-    if pic_ptr != 0 && entry_ptr != 0 {
-        let pic = &*(pic_ptr as *const JitPICSlot);
-        pic.install(receiver_cid, &class_name, entry_ptr, needs_ctx);
+        // CRIT-1 — Populate the co-allocated PIC so the inline 3-way
+        // cascade emitted in `jit/src/x64.rs` actually hits on subsequent
+        // dispatches. Eager allocation made `pic_inline` always-true at
+        // codegen, so the cascade is always emitted but stays cold until
+        // the helper publishes entries here. Mirror the MIC update with
+        // a `pic.install(...)` so the next call with the same receiver
+        // class takes the inline fast path (5 cycles slot-0 hit vs the
+        // full helper call). LFU eviction inside `install` handles
+        // megamorphic spillover automatically.
+        if pic_ptr != 0 && entry_ptr != 0 {
+            let pic = &*(pic_ptr as *const JitPICSlot);
+            pic.install(receiver_cid, &class_name, entry_ptr, needs_ctx);
+        }
     }
 
     // See the matching note in the cache-hit branch — `decode_values` already
