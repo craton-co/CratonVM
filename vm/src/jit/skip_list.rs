@@ -1026,7 +1026,6 @@ fn should_skip_jit_internal(
         {
             return Some(SkipReason::RustJvmTestFixture);
         }
-
     }
 
     None
