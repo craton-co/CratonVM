@@ -11427,6 +11427,15 @@ fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/Object;)I",
         native_comparator_compare_method,
     );
+    // Serialization substitution: replace the synthetic factory comparator with
+    // the real serializable JDK singleton (so reverse/natural-ordered
+    // TreeMap/TreeSet serialize byte-identically to HotSpot).
+    registry.register(
+        "java/util/Comparator$Native",
+        "writeReplace",
+        "()Ljava/lang/Object;",
+        native_comparator_write_replace,
+    );
     registry.register(
         "java/util/Comparator",
         "naturalOrder",
@@ -11492,6 +11501,71 @@ fn native_comparator_reverse_order(
 ) -> MethodCallResult {
     let cmp = make_comparator(ctx, CMP_TAG_REVERSE_ORDER);
     Ok(Some(Value::Object(Some(cmp))))
+}
+
+/// `Comparator$Native.writeReplace()` — serialization substitution.
+///
+/// CratonVM models `Comparator.naturalOrder()` / `reverseOrder()` as a
+/// synthetic tagged `Comparator$Native` object (so `comparator_compare` can
+/// dispatch on the tag without an `invoke_virtual`). That synthetic class is
+/// NOT Serializable and doesn't exist on a real JDK, so serializing it (e.g.
+/// a reverse-ordered TreeMap/TreeSet's comparator) threw `NotSerializableException`
+/// and aborted the stream. `ObjectOutputStream` honors `writeReplace()`: return
+/// the REAL serializable JDK singleton so the stream is byte-identical to
+/// HotSpot. `Collections.reverseOrder()` (not intercepted) yields the real
+/// `Collections$ReverseComparator`; `Comparators$NaturalOrderComparator.INSTANCE`
+/// is the natural-order singleton. Other tags (comparing/reversed/thenComparing)
+/// have no JDK singleton — left unreplaced (rarely serialized).
+/// If `cmp` is a synthetic `Comparator$Native` factory comparator, return its
+/// real serializable JDK singleton (via `native_comparator_write_replace`);
+/// otherwise return it unchanged. Used by collection `writeObject` natives that
+/// serialize a comparator through `OOS.writeObject` (which doesn't run the
+/// `writeReplace` reflection hook the way real `defaultWriteObject` does).
+fn replace_synthetic_comparator_for_ser(ctx: &mut dyn NativeContext, cmp: Value) -> Value {
+    if let Value::Object(Some(o)) = cmp {
+        let cn = ctx
+            .class_name_of_id(ctx.class_id_of_object(o))
+            .unwrap_or_default();
+        if cn == "java/util/Comparator$Native" {
+            if let Ok(Some(rep)) = native_comparator_write_replace(ctx, &[cmp]) {
+                return rep;
+            }
+        }
+    }
+    cmp
+}
+
+fn native_comparator_write_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let tag = if ctx.object_num_fields(this) >= CMP_NUM_FIELDS {
+        match ctx.get_field(this, CMP_FIELD_TAG) {
+            Value::Int(t) => t,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    match tag {
+        CMP_TAG_REVERSE_ORDER => {
+            ctx.invoke("java/util/Collections", "reverseOrder", "()Ljava/util/Comparator;", &[])
+        }
+        CMP_TAG_NATURAL_ORDER => {
+            if let Ok(cid) =
+                ctx.ensure_class_initialized("java/util/Comparators$NaturalOrderComparator")
+            {
+                if let Some(idx) = ctx.static_field_index_by_name(cid, "INSTANCE") {
+                    if let v @ Value::Object(Some(_)) = ctx.get_static_field(cid, idx) {
+                        return Ok(Some(v));
+                    }
+                }
+            }
+            Ok(Some(Value::Object(Some(this))))
+        }
+        _ => Ok(Some(Value::Object(Some(this)))),
+    }
 }
 
 fn native_comparator_comparing(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -16594,6 +16668,137 @@ fn tm_materialize_deser_if_needed(ctx: &dyn NativeContext, this: ObjectRef) {
     tm_array_table().lock().unwrap().entry(key).or_default().size = len;
 }
 
+/// Read a `TreeMap$Entry` child link (left/right) as an `Option<ObjectRef>`.
+fn tm_child(ctx: &dyn NativeContext, n: ObjectRef, idx: usize) -> Option<ObjectRef> {
+    match ctx.get_field(n, idx) {
+        Value::Object(o) => o,
+        _ => None,
+    }
+}
+
+/// `&mut` companion to `tm_materialize_deser_if_needed` for the cases it can't
+/// handle: a *deserialized* TreeMap whose ordering is a **custom Comparator**
+/// (or whose keys aren't fast-mode-extractable). Those need the array path —
+/// a real Java `Object[]` `data` array keyed for `tm_binary_search` — which
+/// requires allocation and so can't run from the `&dyn` read funnels. Called
+/// at the top of the TreeMap content natives (which all hold `&mut`).
+///
+/// GC-safe: the allocation may move the tree, so we walk ONCE to count (storing
+/// no object refs across the alloc), allocate, then re-read the (possibly
+/// moved) `root`/`comparator` and walk AGAIN, storing each key/value straight
+/// into the array — no allocation between read and store. Idempotent; a no-op
+/// unless there is a real red-black tree and the side-table is still empty.
+fn tm_materialize_deser_array(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let key = tm_obj_key(ctx, this);
+    if tm_fast_table().lock().unwrap().contains_key(&key) {
+        return;
+    }
+    if let Some(st) = tm_array_table().lock().unwrap().get(&key) {
+        if st.size > 0 || st.data.is_some() {
+            return;
+        }
+    }
+    let nf = ctx.object_num_fields(this);
+    let root_idx = match ctx.resolve_field_index("java/util/TreeMap", "root") {
+        Some(i) if i < nf => i,
+        _ => return,
+    };
+    let root = match ctx.get_field(this, root_idx) {
+        Value::Object(Some(r)) => r,
+        _ => return,
+    };
+    let cmp_idx = ctx
+        .resolve_field_index("java/util/TreeMap", "comparator")
+        .filter(|&i| i < nf);
+    let has_comparator = cmp_idx
+        .map(|i| !matches!(ctx.get_field(this, i), Value::Object(None)))
+        .unwrap_or(false);
+    let ev = "java/util/TreeMap$Entry";
+    let (ki, vi, li, ri) = match (
+        ctx.resolve_field_index(ev, "key"),
+        ctx.resolve_field_index(ev, "value"),
+        ctx.resolve_field_index(ev, "left"),
+        ctx.resolve_field_index(ev, "right"),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => return,
+    };
+
+    // PASS 1: count + detect whether any key is non-fast-extractable. No
+    // ObjectRef is retained past this point (the upcoming alloc may move them).
+    let mut count: usize = 0;
+    let mut all_extractable = true;
+    {
+        let mut stack: Vec<ObjectRef> = Vec::new();
+        let mut cur = Some(root);
+        while cur.is_some() || !stack.is_empty() {
+            while let Some(n) = cur {
+                stack.push(n);
+                cur = tm_child(ctx, n, li);
+            }
+            let n = match stack.pop() {
+                Some(n) => n,
+                None => break,
+            };
+            let k = ctx.get_field(n, ki);
+            if tree_key_from_value(ctx, &k).is_none() {
+                all_extractable = false;
+            }
+            count += 1;
+            cur = tm_child(ctx, n, ri);
+        }
+    }
+    if count == 0 {
+        return;
+    }
+    // Natural-order + all keys extractable is the `&dyn` fast path's job; leave
+    // it (avoids racing two stores into the same map).
+    if !has_comparator && all_extractable {
+        return;
+    }
+
+    // ARRAY PATH. Allocate first (may GC), then re-read fresh and fill.
+    let buf = alloc_ref_array(ctx, (count * 2).max(TM_DEFAULT_CAPACITY * 2));
+    let root2 = match ctx.get_field(this, root_idx) {
+        Value::Object(Some(r)) => r,
+        _ => return,
+    };
+    let comparator = cmp_idx
+        .map(|i| ctx.get_field(this, i))
+        .unwrap_or(Value::Object(None));
+    let mut idx: usize = 0;
+    let mut stack: Vec<ObjectRef> = Vec::new();
+    let mut cur = Some(root2);
+    while cur.is_some() || !stack.is_empty() {
+        while let Some(n) = cur {
+            stack.push(n);
+            cur = tm_child(ctx, n, li);
+        }
+        let n = match stack.pop() {
+            Some(n) => n,
+            None => break,
+        };
+        let k = ctx.get_field(n, ki);
+        let v = ctx.get_field(n, vi);
+        if idx * 2 + 1 < ctx.array_length(buf) {
+            ctx.set_array_element(buf, idx * 2, k);
+            ctx.set_array_element(buf, idx * 2 + 1, v);
+            idx += 1;
+        }
+        cur = tm_child(ctx, n, ri);
+    }
+    {
+        let mut tbl = tm_array_table().lock().unwrap();
+        let st = tbl.entry(key).or_default();
+        st.data = Some(buf);
+        st.size = idx as i32;
+        st.comparator = comparator;
+    }
+    // Keep this map on the array path permanently (its keys/comparator can't
+    // go through the fast BTreeMap).
+    tm_set_force_array(ctx, this);
+}
+
 /// Read a TreeMap "slot" (`TM_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
 /// address-keyed side-table. Returns layout-independent defaults when no
 /// entry exists yet. The object's own fields are never consulted.
@@ -16651,6 +16856,25 @@ fn tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Val
                 if real < ctx.object_num_fields(this) {
                     ctx.set_field(this, real, Value::Int(n));
                 }
+            }
+        }
+    }
+    // Mirror the comparator to the real JDK `comparator` field. Real-bytecode
+    // `TreeMap.writeObject`→`defaultWriteObject` serializes this field directly;
+    // without the mirror a custom-comparator TreeMap serialized `comparator=null`
+    // (the synthetic comparator lived only in the side-table), so a peer read it
+    // back as a natural-order map with a mis-ordered tree. We mirror the *real
+    // serializable* form (a synthetic `Comparator$Native` substituted by its JDK
+    // singleton — `defaultWriteObject`'s field serialization does NOT run the
+    // `writeReplace` hook, so the substitution must happen here). The side-table
+    // keeps the original (synthetic) comparator so `comparator_compare` retains
+    // its fast tag dispatch; only the real field — read solely by serialization
+    // — holds the singleton.
+    if slot == TM_FIELD_COMPARATOR {
+        if let Some(real) = ctx.resolve_field_index("java/util/TreeMap", "comparator") {
+            if real < ctx.object_num_fields(this) {
+                let serializable = replace_synthetic_comparator_for_ser(ctx, v);
+                ctx.set_field(this, real, serializable);
             }
         }
     }
@@ -17206,6 +17430,7 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
@@ -17271,6 +17496,7 @@ fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17296,6 +17522,7 @@ fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17329,6 +17556,7 @@ fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17351,6 +17579,7 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    tm_materialize_deser_array(ctx, this);
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         let values: Vec<Value> = tm_fast_with(ctx, this, |bt| bt.values().copied().collect());
@@ -17380,6 +17609,7 @@ fn native_tm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    tm_materialize_deser_array(ctx, this);
     let size = match tm_get_slot(ctx, this, TM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -17392,6 +17622,7 @@ fn native_tm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
+    tm_materialize_deser_array(ctx, this);
     let size = match tm_get_slot(ctx, this, TM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -17423,6 +17654,7 @@ fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             .into())
         }
     };
+    tm_materialize_deser_array(ctx, this);
     if tm_is_fast_mode(ctx, this) {
         let first = tm_fast_with(ctx, this, |bt| bt.keys().next().cloned());
         match first {
@@ -17460,6 +17692,7 @@ fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .into())
         }
     };
+    tm_materialize_deser_array(ctx, this);
     if tm_is_fast_mode(ctx, this) {
         let last = tm_fast_with(ctx, this, |bt| bt.keys().next_back().cloned());
         match last {
@@ -17492,6 +17725,7 @@ fn native_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17523,6 +17757,7 @@ fn native_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17556,6 +17791,7 @@ fn native_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17599,6 +17835,7 @@ fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17647,6 +17884,7 @@ fn native_tm_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     if tm_is_fast_mode(ctx, this) {
         let first = tm_fast_with(ctx, this, |bt| bt.iter().next().map(|(k, v)| (k.clone(), *v)));
         match first {
@@ -17675,6 +17913,7 @@ fn native_tm_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     if tm_is_fast_mode(ctx, this) {
         let last = tm_fast_with(ctx, this, |bt| bt.iter().next_back().map(|(k, v)| (k.clone(), *v)));
         match last {
@@ -17704,6 +17943,7 @@ fn native_tm_poll_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     if tm_is_fast_mode(ctx, this) {
         let removed = tm_fast_with(ctx, this, |bt| {
             let first = bt.iter().next().map(|(k, _)| k.clone())?;
@@ -17739,6 +17979,7 @@ fn native_tm_poll_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     if tm_is_fast_mode(ctx, this) {
         let removed = tm_fast_with(ctx, this, |bt| {
             let last = bt.iter().next_back().map(|(k, _)| k.clone())?;
@@ -17776,6 +18017,7 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let pairs = tm_collect_pairs(ctx, this);
     let size = pairs.len() as i32;
     let ts = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
@@ -17828,6 +18070,7 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     // Live view: the ArrayList stashes the source TreeMap so
     // `values().iterator().remove()` deletes the matching entry from the tree.
     let pairs = tm_collect_pairs(ctx, this);
@@ -17841,6 +18084,7 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let pairs = tm_collect_pairs(ctx, this);
     // Live view: build Map.Entry objects and stash the source TreeMap so
     // removing an entry through the list (or its iterator) deletes the key.
@@ -17857,6 +18101,7 @@ fn native_tm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    tm_materialize_deser_array(ctx, this);
     let action = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -17878,6 +18123,7 @@ fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
@@ -17903,6 +18149,7 @@ fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     // Fast-mode eligibility check mirrors `native_tm_put`.
@@ -17960,6 +18207,7 @@ fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    tm_materialize_deser_array(ctx, this);
     let source = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -17986,6 +18234,7 @@ fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let pairs = tm_collect_pairs(ctx, this);
     let mut buf = String::from("{");
     for (i, (k, v)) in pairs.iter().enumerate() {
@@ -18006,6 +18255,7 @@ fn native_tm_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     Ok(Some(tm_get_slot(ctx, this, TM_FIELD_COMPARATOR)))
 }
 
@@ -18336,6 +18586,12 @@ fn native_ts_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         _ => return Ok(None),
     };
     let (data_opt, size, comparator) = ts_state(ctx, this);
+    // Substitute a synthetic factory comparator with its real serializable JDK
+    // singleton: writing it directly via OOS.writeObject below bypasses the
+    // `writeReplace` reflection hook that real `defaultWriteObject` would apply
+    // (see native_comparator_write_replace), which would otherwise throw
+    // NotSerializableException on `Comparator$Native`.
+    let comparator = replace_synthetic_comparator_for_ser(ctx, comparator);
     let oos_cls = "java/io/ObjectOutputStream";
     // s.defaultWriteObject() — TreeSet has no non-transient fields, so this
     // writes nothing but keeps the stream's per-object context consistent.
