@@ -1426,6 +1426,31 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/WeakHashMap$Entry", "<init>")
         | ("java/util/WeakHashMap", "getTable")
         | ("java/util/WeakHashMap", "expungeStaleEntries")
+        // Tomcat Bug D (apps/tomcat suite) — `org.apache.catalina.filters.
+        // TestRemoteCIDRFilter` SIGSEGVs in JIT mode but completes cleanly with
+        // `CRATONVM_DISABLE_JIT=1`. Root cause (CRATONVM_BUGS/BUG-D-*): a JIT
+        // GC-interaction defect in the `new X; …; invokespecial <init>` sequence
+        // when the constructor is itself a GC-capable allocation site — its
+        // `<init>` allocates (e.g. `HeapByteBuffer.<init>` news a 16 KiB `byte[]`),
+        // triggering a young GC while the freshly-`new`'d object is live in the
+        // JIT frame. The corrupting write is an allocation-overlap (the heap walker
+        // re-syncs over an 8-byte size desync), NOT a field store: the emitted code
+        // spills the return ref to a frame slot across the safepoint and
+        // `num_fields` matches the (clean) interpreter, and every putfield/array
+        // store is bounds-guarded — so this is the shared deep-`<init>` archetype,
+        // not a per-method codegen error. `ByteBuffer.allocate` is the confirmed
+        // corruptor via keep-only `CRATONVM_JIT_BISECT_SKIP` bisection (skipping
+        // these → 0 corruption across 6 runs vs ~100% baseline crash); the others
+        // share the pattern. `Integer.valueOf` (trivial ctor) is NOT a corruptor —
+        // keep-only-Integer.valueOf was clean — so it is deliberately left
+        // JIT-eligible. Liftable per-package once a heap-write watchpoint pins the
+        // exact overlapping store.
+        | ("java/nio/ByteBuffer", "allocate")
+        | ("org/apache/tomcat/util/buf/MessageBytes", "newInstance")
+        | ("org/apache/tomcat/util/buf/MessageBytes$MessageBytesFactory", "newInstance")
+        | ("java/util/logging/Level$KnownLevel", "lambda$add$0")
+        | ("java/util/logging/Level$KnownLevel", "lambda$add$1")
+        | ("java/util/logging/SimpleFormatter", "getLoggingProperty")
         // SPB.9d (Session 117) — eureka-server JIT-mode SEGFAULTs deep
         // inside `org/springframework/core/annotation/*` annotation
         // processing during BeanInfo introspection. Spring's
