@@ -6382,10 +6382,37 @@ fn native_al_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // routed here through the AbstractCollection/Iterable interface natives are
     // materialised via their real iterator instead of seeing an empty backing.
     let elems = al_or_collection_elements(ctx, this);
-    for elem in &elems {
-        ctx.invoke_virtual(action, "accept", "(Ljava/lang/Object;)V", &[*elem])?;
+    // GC-safety: each `accept()` body runs arbitrary Java bytecode via
+    // invoke_virtual and can allocate → moving young GC relocates `action` and
+    // any object-typed element. The raw ObjectRefs captured here are NOT GC
+    // roots, so without pinning they go stale and the *next* invoke_virtual
+    // faults in `class_id_of` (kafka GarbageCollectedMemoryPoolTest SIGSEGV).
+    // Pin `action` + the object elements and re-read the forwarded refs from
+    // the pin slots on every iteration.
+    let pin_base = ctx.pin_native_root(action);
+    let elem_pins: Vec<(Value, Option<(usize, ObjectRef)>)> = elems
+        .iter()
+        .map(|v| match v {
+            Value::Object(Some(r)) => (*v, Some((ctx.pin_native_root(*r), *r))),
+            _ => (*v, None),
+        })
+        .collect();
+    let mut result: MethodCallResult = Ok(None);
+    for (orig, handle) in &elem_pins {
+        let action_cur = ctx.read_native_pin(pin_base, action);
+        let elem_val = match handle {
+            Some((h, fallback)) => Value::Object(Some(ctx.read_native_pin(*h, *fallback))),
+            None => *orig,
+        };
+        if let Err(e) =
+            ctx.invoke_virtual(action_cur, "accept", "(Ljava/lang/Object;)V", &[elem_val])
+        {
+            result = Err(e);
+            break;
+        }
     }
-    Ok(None)
+    ctx.unpin_native_roots(pin_base);
+    result
 }
 
 fn native_map_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
