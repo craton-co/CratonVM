@@ -10317,18 +10317,39 @@ fn invoke_on_class_shared_inner(
         // This handles JDK methods that are Java code but depend on JVM-internal
         // state we haven't set up (e.g. VM.getSavedProperty checks savedProps
         // which requires System.initPhase2 to have run).
-        let class_name_for_override = shared
-            .class_manager
-            .read()
-            .get_class(declaring_class_id)
-            .map(|c| c.name.to_string())
-            .unwrap_or_default();
+        //
+        // EXCEPTION — interface DEFAULT methods (declaring class is an
+        // interface, instance method with code): natives registered on
+        // interface names (`java/util/Collection`, `java/util/List`, …) are
+        // bridges for synthetic receivers with no real hierarchy; a real
+        // receiver that resolved default-method bytecode must run it. Twin of
+        // the guard in `try_stackless_invoke` step 6 (interpreter.rs) — this
+        // arm serves `invoke_or_native` / lambda method-ref dispatch /
+        // `ctx.invoke_virtual`, so without it `List::stream` applied to a
+        // foreign collection (Hibernate `JoinedList` inside `flatMap`)
+        // dispatched the Collection bridge and materialised an empty stream
+        // while the plain `coll.stream()` call site ran the real bytecode.
+        // Deliberate interface-default overrides belong in
+        // `force_native_over_real_jdk_bytecode`.
+        let (class_name_for_override, declaring_is_interface) = {
+            let cm = shared.class_manager.read();
+            let cls = cm.get_class(declaring_class_id);
+            (
+                cls.map(|c| c.name.to_string()).unwrap_or_default(),
+                cls.map(|c| c.is_interface()).unwrap_or(false),
+            )
+        };
         if crate::runtime::env_cache::bd_debug() && method_name == "intValue" {
             let found = shared.native_methods.find(&class_name_for_override, method_name, descriptor).is_some();
             eprintln!("[invoke_on_class_shared L5271] class_name_for_override={} method={} desc={} found={}",
                       class_name_for_override, method_name, descriptor, found);
         }
-        if let Some(callback) = shared.native_methods.find(&class_name_for_override, method_name, descriptor) {
+        let override_cb = if declaring_is_interface && !is_static {
+            None
+        } else {
+            shared.native_methods.find(&class_name_for_override, method_name, descriptor)
+        };
+        if let Some(callback) = override_cb {
             safe_native_call(shared, thread, callback, args)
         } else {
             // Execute bytecode via interpreter

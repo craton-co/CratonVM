@@ -12377,20 +12377,41 @@ fn try_stackless_invoke(
     };
     let source_file: Option<Arc<str>> = class.source_file.as_deref().map(Arc::from);
     let class_name_arc: Arc<str> = Arc::from(&*class.name);
+    let declaring_is_interface = class.is_interface();
     drop(cm);
 
-    // 6. Check for native override on bytecode method (same as invoke_on_class_shared)
-    if let Some(callback) = shared.native_methods.find(&class_name_arc, method_name, descriptor) {
-        let result = safe_native_call(shared, thread, callback, args)?;
-        if let Some(value) = result {
-            // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
-            push_invoke_return_value(
-                &mut thread.frames[frame_idx].stack,
-                coerce_value_for_return(value, ret_type),
-            )?;
-            native_return_pushed_to_stack(shared, thread);
+    // 6. Check for native override on bytecode method (same as invoke_on_class_shared).
+    //
+    // EXCEPTION — interface DEFAULT methods (declaring class is an interface,
+    // instance method with code): natives registered on interface names
+    // (`java/util/Collection`, `java/util/List`, …) are bridges for synthetic
+    // receivers with no real class hierarchy — and synthetic receivers never
+    // reach this step (synthetic stubs bail at step 3; abstract methods at
+    // step 5). A real-bytecode receiver that resolved a default method must
+    // run that bytecode, matching `populate_virtual_invoke_cache` which caches
+    // `VirtualBytecode` for this exact site. Without this guard the first,
+    // uncached call at each site dispatched the interface bridge while every
+    // later (cached) call ran the bytecode — e.g. `Collection.stream()` on a
+    // custom `AbstractList` (Hibernate's `JoinedList`) materialised an EMPTY
+    // stream exactly once per call site (OrderProbe: count#1=0, count#2=3),
+    // collapsing `AbstractEntityPersister`'s property closure to length 0.
+    // Deliberate interface-default overrides (e.g. `Iterator.remove`) belong
+    // in `force_native_over_real_jdk_bytecode`, which fires before this path.
+    // Static interface methods keep the native check (mirrors invokestatic
+    // promotion in `populate_invoke_cache`, which keys on the CP class).
+    if !(declaring_is_interface && !is_static) {
+        if let Some(callback) = shared.native_methods.find(&class_name_arc, method_name, descriptor) {
+            let result = safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, ret_type),
+                )?;
+                native_return_pushed_to_stack(shared, thread);
+            }
+            return Ok(CachedCallResult::Handled);
         }
-        return Ok(CachedCallResult::Handled);
     }
 
     // 7. Handle synchronized: acquire monitor before pushing frame
