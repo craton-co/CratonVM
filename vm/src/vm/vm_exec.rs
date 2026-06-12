@@ -7892,7 +7892,25 @@ fn invoke_on_class_shared_inner(
                 let recv_is_concrete = cm.get_class(rc)
                     .map(|c| !c.is_interface())
                     .unwrap_or(false);
-                if this_is_iface_or_abs && recv_is_concrete && cm.is_subclass_of(rc, class_id) {
+                // Never retarget a STATIC method. A method reference to a static
+                // interface method (`Iface::staticMethod`, e.g. JUnit's
+                // `TestDescriptor::containsTests`) reaches here with the
+                // interface as `class_id` and the first SAM argument as
+                // `args[0]`. That argument is a plain parameter, not a dispatch
+                // receiver — retargeting onto its concrete class mis-resolves
+                // (static interface methods are not inherited by implementors)
+                // and recurses into the lambda SAM → StackOverflow. Resolve the
+                // method on the original `class_id` first to detect this.
+                let original_is_static = crate::classloading::find_method_recursive(
+                    class_id, method_name, descriptor, &cm.class_store,
+                )
+                .map(|(m, _)| m.is_static())
+                .unwrap_or(false);
+                if !original_is_static
+                    && this_is_iface_or_abs
+                    && recv_is_concrete
+                    && cm.is_subclass_of(rc, class_id)
+                {
                     rc
                 } else {
                     class_id

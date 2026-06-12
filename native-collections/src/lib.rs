@@ -23042,14 +23042,34 @@ fn register_iterator_protocol_natives(r: &mut NativeMethodRegistry) {
         native_spliterator_for_each_remaining,
     );
 
-    // Spliterators factory
-    let spls = "java/util/Spliterators";
-    r.register(
-        spls,
-        "emptySpliterator",
-        "()Ljava/util/Spliterator;",
-        native_spliterators_empty,
-    );
+    // Spliterators factory.
+    //
+    // Real-JDK gate: `native_spliterators_empty` returns a synthetic instance
+    // of the ABSTRACT base `java/util/Spliterators$EmptySpliterator`. The real
+    // `Spliterators.emptySpliterator()` returns the concrete subclass
+    // `EmptySpliterator$OfRef`, on which the `tryAdvance(Consumer)Z` /
+    // `forEachRemaining(Consumer)V` *bridge* methods are declared (the abstract
+    // base only declares the erased `tryAdvance(Object)Z`). A caller doing
+    // `emptySpliterator().tryAdvance(consumer)` against the synthetic abstract
+    // instance therefore fails interface dispatch with
+    //   NoSuchMethodError: ...EmptySpliterator.tryAdvance(Ljava/util/function/Consumer;)Z
+    // which broke kafka-clients `clients.admin` / `clients.producer*` test
+    // discovery (and any empty-spliterator consumer). In real-JDK mode the real
+    // bytecode produces the correct `OfRef` (verified: bridge + super
+    // `EmptySpliterator.tryAdvance(Object)` run normally), so leave it alone and
+    // only install the synthetic factory in synthetic-jdk builds — mirroring the
+    // `register_blocking_queue_natives` gate above (synthetic layout vs. real
+    // JDK layout conflict).
+    #[cfg(feature = "synthetic-jdk")]
+    {
+        let spls = "java/util/Spliterators";
+        r.register(
+            spls,
+            "emptySpliterator",
+            "()Ljava/util/Spliterator;",
+            native_spliterators_empty,
+        );
+    }
 
     // Collections.emptyIterator / emptyListIterator / emptyEnumeration
     let colls = "java/util/Collections";
