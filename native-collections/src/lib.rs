@@ -13473,6 +13473,24 @@ fn lhm_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<String, Value>>>
         std::sync::OnceLock::new();
     OVERLAY.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
+/// Overlay keys whose structural `ObjectRef` fields (`head`/`tail`/`table`)
+/// were successfully mirrored into the REAL JDK heap fields by `lhm_set`.
+///
+/// For such a LinkedHashMap, the backing bucket array + head/tail nodes are
+/// reachable through the owner's normal heap fields, so the GC's field-tracing
+/// scan already keeps them alive (for a LIVE owner) and relocates/updates them.
+/// Re-rooting the overlay's *copies* of those refs is therefore redundant — and
+/// actively harmful: it pins a DEAD LinkedHashMap's (and LinkedHashSet's, which
+/// is LHM-backed) backing forever, because nothing else references it once the
+/// owner dies. That unbounded pinning exhausted the young gen under high
+/// collection churn (e.g. `WebXml.orderWebFragments` over 720 input
+/// permutations). `gc_scan_collection_overlay_roots` consults this set and
+/// skips rooting heap-backed entries; the remap path still repoints them.
+fn lhm_heap_backed() -> &'static Mutex<std::collections::HashSet<usize>> {
+    static HB: std::sync::OnceLock<Mutex<std::collections::HashSet<usize>>> =
+        std::sync::OnceLock::new();
+    HB.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
 // LHM overlay key: rekeyed onto `ctx.identity_hash_code(this)` (was
 // `this.as_ptr() as usize`). A moving GC preserves the identity-hash
 // word across relocation, so the overlay's bucket table, head/tail,
@@ -13535,6 +13553,14 @@ fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: 
         if let Some(slot) = ctx.resolve_field_index("java/util/LinkedHashMap", name) {
             if slot < ctx.object_num_fields(this) {
                 ctx.set_field(this, slot, v);
+                // The structural fields resolve to real heap slots (real-JDK
+                // layout), so every `ObjectRef` this overlay holds (`head`/
+                // `tail`/`table`) is now reachable through the owner's heap
+                // fields. Record the key so the GC root scan can skip rooting
+                // the overlay copies — otherwise dead LinkedHashMaps/Sets leak
+                // (their backing would stay pinned forever). Live owners keep
+                // their backing alive via heap-field tracing.
+                lhm_heap_backed().lock().unwrap().insert(key);
             }
         }
     }
@@ -17079,7 +17105,16 @@ fn ts_array_table() -> &'static Mutex<StdHashMap<usize, TsArrayState>> {
 /// shape the GC actually cares about. `tm_fast_table` keys are owned
 /// `TreeKey`s (String/i32/i64), never ObjectRefs, so iterating values only
 /// is correct and never perturbs the BTreeMap ordering.
-fn for_each_overlay_ref(mut f: impl FnMut(&mut ObjectRef)) {
+/// Walk every top-level `ObjectRef` held by the overlay-backed collections.
+///
+/// `for_rooting` selects the caller's intent:
+///   - `true`  (GC root scan): skip the `LinkedHashMap` entries whose structural
+///     refs are already heap-rooted (see [`lhm_heap_backed`]). Rooting them too
+///     would pin dead LHMs/LHSs forever and leak the young gen.
+///   - `false` (post-GC remap): visit ALL entries — the cached refs of *live*
+///     LHMs that relocated must still be repointed; dead entries are not in the
+///     `pointer_map` so their stale refs are left untouched (never read again).
+fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
     // Inner name -> Value overlays (LinkedList head/tail/size, LinkedHashMap
     // table/head/tail/…).
     if let Ok(mut ll) = ll_overlay().lock() {
@@ -17092,7 +17127,20 @@ fn for_each_overlay_ref(mut f: impl FnMut(&mut ObjectRef)) {
         }
     }
     if let Ok(mut lhm) = lhm_overlay().lock() {
-        for inner in lhm.values_mut() {
+        // Hold the heap-backed set across the loop (lock order: heap_backed is
+        // never taken while lhm_overlay is held elsewhere — `lhm_set` locks them
+        // sequentially, not nested — so this order can't deadlock).
+        let hb = if for_rooting {
+            lhm_heap_backed().lock().ok()
+        } else {
+            None
+        };
+        for (key, inner) in lhm.iter_mut() {
+            if let Some(hb) = &hb {
+                if hb.contains(key) {
+                    continue;
+                }
+            }
             for v in inner.values_mut() {
                 if let Value::Object(Some(r)) = v {
                     f(r);
@@ -17139,7 +17187,7 @@ fn for_each_overlay_ref(mut f: impl FnMut(&mut ObjectRef)) {
 /// Push every top-level ObjectRef held by the overlay-backed collections onto
 /// `roots` so a moving GC keeps the backing storage live and relocates it.
 pub fn gc_scan_collection_overlay_roots(roots: &mut Vec<ObjectRef>) {
-    for_each_overlay_ref(|r| roots.push(*r));
+    for_each_overlay_ref(true, |r| roots.push(*r));
 }
 
 /// Repoint every top-level ObjectRef held by the overlay-backed collections to
@@ -17149,7 +17197,7 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
     if pointer_map.is_empty() {
         return;
     }
-    for_each_overlay_ref(|r| {
+    for_each_overlay_ref(false, |r| {
         if let Some(&new_addr) = pointer_map.get(&(r.as_ptr() as usize)) {
             debug_assert!(new_addr != 0, "GC pointer map contains null address");
             *r = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
