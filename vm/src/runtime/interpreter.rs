@@ -3183,6 +3183,7 @@ pub fn execute(
 
     // Check stack overflow before pushing frame
     if thread.frames.len() >= shared.config.max_stack_depth {
+        dump_stack_on_soe(thread);
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::StackOverflowError,
         )));
@@ -11946,6 +11947,34 @@ fn invoke_cached_native_callback(
 /// Registered Rust natives that must win over real-JDK bytecode on the same
 /// declaring class (inline-cache / vtable fast paths skip `execute_invoke`).
 #[inline]
+/// CRATONVM_DBG_SOE — one-shot diagnostic: when the frame-depth ceiling is
+/// hit, dump the newest Java frames so the recursion CYCLE is visible. The
+/// Throwable stack capture keeps only a handful of frames, which hides which
+/// methods actually recurse (e.g. the H2 GROUP BY StackOverflowError).
+fn dump_stack_on_soe(thread: &JvmThread) {
+    if std::env::var_os("CRATONVM_DBG_SOE").is_none() {
+        return;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DUMPED: AtomicBool = AtomicBool::new(false);
+    if DUMPED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "[DBG_SOE] stack depth {} — newest 150 frames:",
+        thread.frames.len()
+    );
+    for (i, f) in thread.frames.iter().rev().take(150).enumerate() {
+        eprintln!(
+            "[DBG_SOE]   #{i} {}.{}{} pc={}",
+            f.class_name(),
+            f.method_name(),
+            f.method_descriptor(),
+            f.pc
+        );
+    }
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -12432,20 +12461,41 @@ fn try_stackless_invoke(
     };
     let source_file: Option<Arc<str>> = class.source_file.as_deref().map(Arc::from);
     let class_name_arc: Arc<str> = Arc::from(&*class.name);
+    let declaring_is_interface = class.is_interface();
     drop(cm);
 
-    // 6. Check for native override on bytecode method (same as invoke_on_class_shared)
-    if let Some(callback) = shared.native_methods.find(&class_name_arc, method_name, descriptor) {
-        let result = safe_native_call(shared, thread, callback, args)?;
-        if let Some(value) = result {
-            // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
-            push_invoke_return_value(
-                &mut thread.frames[frame_idx].stack,
-                coerce_value_for_return(value, ret_type),
-            )?;
-            native_return_pushed_to_stack(shared, thread);
+    // 6. Check for native override on bytecode method (same as invoke_on_class_shared).
+    //
+    // EXCEPTION — interface DEFAULT methods (declaring class is an interface,
+    // instance method with code): natives registered on interface names
+    // (`java/util/Collection`, `java/util/List`, …) are bridges for synthetic
+    // receivers with no real class hierarchy — and synthetic receivers never
+    // reach this step (synthetic stubs bail at step 3; abstract methods at
+    // step 5). A real-bytecode receiver that resolved a default method must
+    // run that bytecode, matching `populate_virtual_invoke_cache` which caches
+    // `VirtualBytecode` for this exact site. Without this guard the first,
+    // uncached call at each site dispatched the interface bridge while every
+    // later (cached) call ran the bytecode — e.g. `Collection.stream()` on a
+    // custom `AbstractList` (Hibernate's `JoinedList`) materialised an EMPTY
+    // stream exactly once per call site (OrderProbe: count#1=0, count#2=3),
+    // collapsing `AbstractEntityPersister`'s property closure to length 0.
+    // Deliberate interface-default overrides (e.g. `Iterator.remove`) belong
+    // in `force_native_over_real_jdk_bytecode`, which fires before this path.
+    // Static interface methods keep the native check (mirrors invokestatic
+    // promotion in `populate_invoke_cache`, which keys on the CP class).
+    if !(declaring_is_interface && !is_static) {
+        if let Some(callback) = shared.native_methods.find(&class_name_arc, method_name, descriptor) {
+            let result = safe_native_call(shared, thread, callback, args)?;
+            if let Some(value) = result {
+                // T18.K4 — tag-exact push for J/D native-override (on bytecode method) return values.
+                push_invoke_return_value(
+                    &mut thread.frames[frame_idx].stack,
+                    coerce_value_for_return(value, ret_type),
+                )?;
+                native_return_pushed_to_stack(shared, thread);
+            }
+            return Ok(CachedCallResult::Handled);
         }
-        return Ok(CachedCallResult::Handled);
     }
 
     // 7. Handle synchronized: acquire monitor before pushing frame
@@ -12575,6 +12625,7 @@ fn try_stackless_invoke(
 
     // 9. Stack overflow check
     if thread.frames.len() >= shared.config.max_stack_depth {
+        dump_stack_on_soe(thread);
         if let Some(obj) = monitor_obj {
             let _ = shared.monitors.exit(obj, thread.thread_id);
         }
@@ -13335,6 +13386,7 @@ fn execute_invokestatic_cached(
             // Fallback: interpreted execution
             // Check stack overflow before pushing frame
             if thread.frames.len() >= shared.config.max_stack_depth {
+                dump_stack_on_soe(thread);
                 return Err(MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::StackOverflowError,
                 )));
@@ -16286,6 +16338,7 @@ fn execute_invokevirtual_vtable_fast(
     // Step 5 — dispatch. Pop args, push a new frame, and populate
     // invoke_cache for subsequent sibling-class misses.
     if thread.frames.len() >= shared.config.max_stack_depth {
+        dump_stack_on_soe(thread);
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::StackOverflowError,
         )));
@@ -16528,6 +16581,7 @@ fn execute_invokevirtual_cached(
                     }
 
                     if thread.frames.len() >= shared.config.max_stack_depth {
+                        dump_stack_on_soe(thread);
                         return Err(MethodCallFailed::InternalError(VmError::Runtime(
                             RuntimeError::StackOverflowError,
                         )));
@@ -16806,6 +16860,7 @@ fn execute_invokevirtual_cached(
         // Static cache entries: invokespecial uses Bytecode/Native
         CachedInvokeTarget::Bytecode { cached, gate: _ } => {
             if thread.frames.len() >= shared.config.max_stack_depth {
+                dump_stack_on_soe(thread);
                 return Err(MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::StackOverflowError,
                 )));
