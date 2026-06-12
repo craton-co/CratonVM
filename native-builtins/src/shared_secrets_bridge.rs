@@ -127,11 +127,16 @@ const FACTORIES: &[(&str, &str, &str)] = &[
         "Ljdk/internal/access/JavaNetHttpCookieAccess;",
         "cratonvm/internal/ss/JavaNetHttpCookieAccess$1",
     ),
-    (
-        "getJavaObjectInputStreamAccess",
-        "Ljdk/internal/access/JavaObjectInputStreamAccess;",
-        "java/io/ObjectInputStream$1",
-    ),
+    // NOTE: getJavaObjectInputStreamAccess is intentionally NOT intercepted.
+    // In JDK 25 ObjectInputStream.<clinit> creates the access object via an
+    // `invokedynamic` (a `ObjectInputStream::checkArray` method-ref lambda) and
+    // stores it through the real SharedSecrets.setJavaObjectInputStreamAccess —
+    // there is no `ObjectInputStream$1` anonymous class. A synthetic singleton
+    // of a non-existent owner class fails invokeinterface resolution (the
+    // dispatch lands on the abstract `JavaObjectInputStreamAccess.checkArray`,
+    // raising AbstractMethodError "has no Code attribute"). Letting the real
+    // getter return the real lambda runs ObjectInputStream.checkArray correctly
+    // (needed by HashSet/HashMap/etc. readObject, e.g. the Gradle test worker).
     (
         "getJavaUtilResourceBundleAccess",
         "Ljdk/internal/access/JavaUtilResourceBundleAccess;",
@@ -1765,8 +1770,9 @@ mod tests {
 
     #[test]
     fn all_factories_listed() {
-        // 16th added: getJavaIOFileDescriptorAccess (real FileChannelImpl path).
-        assert_eq!(FACTORIES.len(), 16);
+        // getJavaObjectInputStreamAccess removed: JDK 25 uses an invokedynamic
+        // lambda (no ObjectInputStream$1), so the real getter must run.
+        assert_eq!(FACTORIES.len(), 15);
     }
 
     #[test]
