@@ -4284,6 +4284,33 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     // i/l/f/d-return; areturn still normalizes jobject-as-Long
                     // handles via `coerce_value_for_return`. See
                     // docs/bc-ec-mod-mododdinverse-investigation.md.
+                    //
+                    // Underflow guard: an empty operand stack at a value
+                    // return means earlier execution desynced the stack
+                    // (valid bytecode can't reach here empty). The unchecked
+                    // pop would wrap `len` to usize::MAX and PANIC the whole
+                    // VM (observed: Gradle ProjectBuilder classes in the
+                    // Spring Boot buildSrc suite; kafka bug-03 is the same
+                    // family). Surface a diagnosable error instead.
+                    if frame.stack.is_empty() {
+                        let mname = frame.method_name().to_string();
+                        let mdesc = frame.method_descriptor().to_string();
+                        let cname = shared
+                            .class_manager
+                            .read()
+                            .get_class(frame.class_id)
+                            .map(|c| c.name.to_string())
+                            .unwrap_or_default();
+                        eprintln!(
+                            "[cratonvm] operand-stack underflow at value return: {}.{}{} pc={} opcode=0x{:x}",
+                            cname, mname, mdesc, saved_pc, opcode
+                        );
+                        return Err(MethodCallFailed::InternalError(VmError::Internal {
+                            message: format!(
+                                "operand-stack underflow at value return in {cname}.{mname}{mdesc} pc={saved_pc}"
+                            ),
+                        }));
+                    }
                     let (cv, is_long) = frame.stack.pop_compact_with_long_mark_unchecked();
                     let desc_byte = match opcode {
                         0xad => b'J', // lreturn
