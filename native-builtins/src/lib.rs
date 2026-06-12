@@ -5664,20 +5664,24 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // ("null::serialVersionUID cannot be accessed reflectively before
     //  java.lang.invoke is initialized"). In modern OpenJDK initNative() is
     // a no-op (legacy native state migrated to Java). hasStaticInitializer
-    // returns false conservatively — worst case the SUID computation omits
-    // <clinit>, matching behavior when the class truly has none.
+    // must report the TRUTH: ObjectStreamClass.computeDefaultSUID folds
+    // "<clinit>"/STATIC/"()V" into the SHA-1 digest iff the class declares a
+    // static initializer. Returning a blanket false produces a serialVersionUID
+    // that disagrees with the real JDK for any class that HAS a <clinit>,
+    // breaking cross-VM deserialization (e.g. the Gradle test worker reading a
+    // HotSpot-written WorkerConfig stream).
     registry.register("java/io/ObjectStreamClass", "initNative", "()V", native_noop);
     registry.register(
         "java/io/ObjectStreamClass",
         "hasStaticInitializer",
         "(Ljava/lang/Class;Z)Z",
-        native_return_false,
+        |ctx, args| Ok(Some(Value::Int(serialization::class_has_static_initializer(ctx, args) as i32))),
     );
     registry.register(
         "java/io/ObjectStreamClass",
         "hasStaticInitializer",
         "(Ljava/lang/Class;)Z",
-        native_return_false,
+        |ctx, args| Ok(Some(Value::Int(serialization::class_has_static_initializer(ctx, args) as i32))),
     );
 
     // Force VM.isJavaLangInvokeInited() to return true. In a normal JVM,

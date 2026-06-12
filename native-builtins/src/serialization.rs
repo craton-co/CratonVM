@@ -1961,11 +1961,9 @@ fn build_object_stream_class(
     // only fall back to the computed SUID hash when no explicit value exists.
     let svuid = ctx
         .static_field_index_by_name(class_id, "serialVersionUID")
-        .and_then(|idx| {
-            match ctx.get_static_field(class_id, idx) {
-                Value::Long(v) => Some(v),
-                _ => None,
-            }
+        .and_then(|idx| match ctx.get_static_field(class_id, idx) {
+            Value::Long(v) => Some(v),
+            _ => None,
         })
         .unwrap_or_else(|| compute_default_svuid(&class_name));
     let class_mirror = ctx.get_class_mirror(class_id);
@@ -2145,6 +2143,25 @@ fn class_id_of_mirror(ctx: &dyn NativeContext, mirror: ObjectRef) -> Option<Clas
     None
 }
 
+/// True iff the class identified by the mirror in `args[0]` declares a
+/// `<clinit>` static initializer. Used by `hasStaticInitializer` to feed the
+/// real-JDK `computeDefaultSUID` digest. Fails safe to `false` if the mirror or
+/// class can't be resolved (matching the conservative legacy behavior, but only
+/// when we genuinely can't tell).
+pub(crate) fn class_has_static_initializer(ctx: &mut dyn NativeContext, args: &[Value]) -> bool {
+    let mirror = match obj_arg(args, 0) {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let class_id = match class_id_of_mirror(ctx, mirror) {
+        Some(id) => id,
+        None => return false,
+    };
+    ctx.declared_methods(class_id)
+        .iter()
+        .any(|m| &*m.name == "<clinit>")
+}
+
 fn register_object_stream_class(r: &mut NativeMethodRegistry) {
     let cls = "java/io/ObjectStreamClass";
 
@@ -2154,15 +2171,21 @@ fn register_object_stream_class(r: &mut NativeMethodRegistry) {
     r.register(cls, "initNative", "()V", |_ctx, _args| Ok(None));
 
     // hasStaticInitializer(Class, boolean) -> boolean
-    // Conservative: return false (0). Callers only use this to decide whether
-    // to include the static initializer in serialVersionUID computation.
-    r.register(cls, "hasStaticInitializer", "(Ljava/lang/Class;Z)Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    // Returns true iff the class declares a `<clinit>` (static initializer).
+    // ObjectStreamClass.computeDefaultSUID uses this to decide whether to fold
+    // `<clinit>`/STATIC/`()V` into the SHA-1 digest. Returning a constant false
+    // when the class DOES have a static initializer yields a serialVersionUID
+    // that disagrees with the real JDK (and HotSpot), breaking cross-VM
+    // deserialization (e.g. the Gradle test worker reading a HotSpot-written
+    // WorkerConfig stream). The second arg (`checkSuperclass`) is irrelevant for
+    // the declared-only check the spec performs here.
+    r.register(cls, "hasStaticInitializer", "(Ljava/lang/Class;Z)Z", |ctx, args| {
+        Ok(Some(Value::Int(class_has_static_initializer(ctx, args) as i32)))
     });
 
     // Older single-arg form seen in some JDKs.
-    r.register(cls, "hasStaticInitializer", "(Ljava/lang/Class;)Z", |_ctx, _args| {
-        Ok(Some(Value::Int(0)))
+    r.register(cls, "hasStaticInitializer", "(Ljava/lang/Class;)Z", |ctx, args| {
+        Ok(Some(Value::Int(class_has_static_initializer(ctx, args) as i32)))
     });
 
     // lookup(Class) -> ObjectStreamClass (static)
