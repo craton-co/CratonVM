@@ -15623,6 +15623,29 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
         // `new ArrayList<>(enumSet)` (e.g. JUnit @Parameters over an EnumSet,
         // WildFly subsystem tests) see the real members. JumboEnumSet (>64
         // constants) stores a `long[] elements`; handle both.
+        // ArrayDeque — synthetic circular buffer (slot 0 = Object[] data,
+        // slot 1 = head, slot 2 = tail, slot 3 = size; see AD_FIELD_*). The
+        // generic "f0 = array, f1 = int size" ArrayList heuristic below
+        // misreads `head` as the size and returns `data[0..head)` — e.g. two
+        // addFirst() on a fresh deque leave head=14, so `deque.stream()`
+        // yielded 14 nulls (JUnit 6 ResourceLockAware streams a deque of
+        // ancestor descriptors and died on the null receivers). Walk the ring
+        // buffer from `head` in deque order instead.
+        if cls_name == "java/util/ArrayDeque" && ctx.object_num_fields(coll) > AD_FIELD_SIZE {
+            let (data, head, _tail, size) = ad_state(ctx, coll);
+            if let Some(buf) = data {
+                let cap = ctx.array_length(buf);
+                if cap > 0 && size >= 0 && (size as usize) <= cap {
+                    let mut out = Vec::with_capacity(size as usize);
+                    for i in 0..(size as usize) {
+                        let idx = (head as usize + i) % cap;
+                        out.push(ctx.get_array_element(buf, idx));
+                    }
+                    return out;
+                }
+            }
+            return Vec::new();
+        }
         if cls_name == "java/util/RegularEnumSet" || cls_name == "java/util/JumboEnumSet" {
             if let Value::Object(Some(universe)) = ctx.get_field_by_name(coll, "universe") {
                 // Membership: walk the inherited `universe` (all constants of the
