@@ -19442,6 +19442,16 @@ fn register_t19_h2_lookup_clinit_deps(registry: &mut NativeMethodRegistry) {
 }
 
 pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
+    // CRATONVM_REAL_AQS: skip the synthetic ReentrantLock/Lock/Condition natives
+    // so the REAL java.util.concurrent AQS bytecode runs instead. The synthetic
+    // implementation (rl_state side-table + object-monitor conditions) deadlocks
+    // under the blocking producer/consumer pattern (ArrayBlockingQueue.take/put
+    // with waiters that actually block), which gates the Gradle test worker. Real
+    // AQS uses Unsafe CAS + LockSupport.park/unpark, all of which CratonVM already
+    // implements. Gated (opt-in) for now pending a wider soak before flipping the
+    // default. CountDownLatch/CyclicBarrier/Semaphore natives below are unaffected.
+    let real_aqs = std::env::var_os("CRATONVM_REAL_AQS").is_some();
+    if !real_aqs {
     // --- ReentrantLock ---
     let rl = "java/util/concurrent/locks/ReentrantLock";
     registry.register(rl, "<init>", "()V", native_rl_init);
@@ -19498,6 +19508,7 @@ pub fn register_concurrent_natives(registry: &mut NativeMethodRegistry) {
     registry.register(cond, "awaitNanos", "(J)J", native_cond_await_nanos);
     registry.register(cond, "signal", "()V", native_cond_signal);
     registry.register(cond, "signalAll", "()V", native_cond_signal_all);
+    } // end if !real_aqs
 
     // --- CountDownLatch ---
     let cdl = "java/util/concurrent/CountDownLatch";

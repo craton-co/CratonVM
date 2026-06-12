@@ -4132,11 +4132,6 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // by looking up in the thread registry.
         if let Some(park_state) = self.shared.find_park_state_for_thread_obj(thread_obj) {
             park_state.unpark();
-        } else if std::env::var_os("CRATONVM_DBG_UNPARK").is_some() {
-            eprintln!(
-                "[unpark MISS] no ParkState for thread_obj ptr={:#x}",
-                thread_obj.as_ptr() as usize
-            );
         }
     }
 
