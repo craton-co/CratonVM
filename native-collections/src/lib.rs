@@ -12295,30 +12295,74 @@ fn ll_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<&'static str, Val
 // side-table survives a moving-GC relocation. Originally
 // `this.as_ptr() as usize`, which a moving GC invalidates the instant
 // it relocates the LinkedList — silently dropping head/tail/size.
-fn ll_get(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str) -> Value {
-    ll_overlay()
-        .lock()
-        .unwrap()
-        .get(&widened_obj_key(ctx, this))
-        .and_then(|m| m.get(name))
-        .copied()
-        .unwrap_or(Value::Object(None))
+/// Map the LinkedList overlay key name to the real JDK heap field name
+/// (the overlay uses head/tail; the JDK fields are first/last/size).
+fn ll_real_field(name: &str) -> Option<&'static str> {
+    match name {
+        "head" => Some("first"),
+        "tail" => Some("last"),
+        "size" => Some("size"),
+        _ => None,
+    }
 }
-fn ll_set(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str, v: Value) {
+
+fn ll_get(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str) -> Value {
+    {
+        let ov = ll_overlay().lock().unwrap();
+        if let Some(v) = ov
+            .get(&widened_obj_key(ctx, this))
+            .and_then(|m| m.get(name))
+            .copied()
+        {
+            return v;
+        }
+    }
+    // Overlay MISS: fall back to the real JDK heap field. This is the path for a
+    // LinkedList populated by real bytecode that bypassed native_ll_* — chiefly
+    // Java deserialization (LinkedList.readObject -> linkLast writes the real
+    // first/last/size + node next/prev, never our overlay). Mirrored writes in
+    // ll_set keep the heap consistent for native-populated lists.
+    if let Some(real) = ll_real_field(name) {
+        if let Some(slot) = ctx.resolve_field_index("java/util/LinkedList", real) {
+            if slot < ctx.object_num_fields(this) {
+                return ctx.get_field(this, slot);
+            }
+        }
+    }
+    Value::Object(None)
+}
+fn ll_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &'static str, v: Value) {
     ll_overlay()
         .lock()
         .unwrap()
         .entry(widened_obj_key(ctx, this))
         .or_default()
         .insert(name, v);
+    // Mirror the structural pointers to the REAL JDK heap fields so real-bytecode
+    // Java serialization works: LinkedList.writeObject reads `size` and walks the
+    // real `first`->`next` links (the node next/prev live on the real node fields
+    // already). Without this a populated LinkedList serialized as size=0 + zero
+    // elements. Overlay stays the read source of truth for native callers.
+    if let Some(real) = ll_real_field(name) {
+        if let Some(slot) = ctx.resolve_field_index("java/util/LinkedList", real) {
+            if slot < ctx.object_num_fields(this) {
+                ctx.set_field(this, slot, v);
+            }
+        }
+    }
 }
 
 const LL_FIELD_HEAD: usize = 0;
 const LL_FIELD_TAIL: usize = 1;
 const LL_FIELD_SIZE: usize = 2;
-const LL_NODE_PREV: usize = 0;
+// Real JDK LinkedList$Node layout: item@0, next@1, prev@2 (java.util.LinkedList
+// .Node declares them in that order). Use the real order so real-bytecode
+// LinkedList.writeObject (`for (Node x = first; x != null; x = x.next)
+// s.writeObject(x.item)`) reads the right slots — the old synthetic order
+// (prev@0/next@1/elem@2) made `getfield item` read prev.
+const LL_NODE_ELEM: usize = 0;
 const LL_NODE_NEXT: usize = 1;
-const LL_NODE_ELEM: usize = 2;
+const LL_NODE_PREV: usize = 2;
 
 fn ll_alloc_node(ctx: &mut dyn NativeContext, element: Value) -> ObjectRef {
     let node = alloc_synthetic(ctx, "java/util/LinkedList$Node", 3);
