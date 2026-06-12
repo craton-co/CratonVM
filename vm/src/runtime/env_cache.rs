@@ -73,6 +73,26 @@ pub fn disable_jit() -> bool {
     })
 }
 
+/// `CRATONVM_JIT_THRESHOLD` — invocation count at which a method becomes
+/// JIT-compilation eligible (default 500). Read once and cached. Used by both
+/// the interpreter's per-method upgrade gate and the dispatch-helper gate so a
+/// single knob controls JIT eagerness. Raising it keeps short-lived / call-heavy
+/// code interpreted (HotSpot's interpreter-first behaviour); genuinely-hot
+/// compute loops cross any reasonable threshold and still compile. Invalid /
+/// unset values fall back to 500. A value of 0 is clamped to 1 (0 would compile
+/// on the first call, defeating warmup).
+#[inline]
+pub fn jit_invocation_threshold() -> u32 {
+    static CACHE: OnceLock<u32> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("CRATONVM_JIT_THRESHOLD")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .map(|v| v.max(1))
+            .unwrap_or(500)
+    })
+}
+
 /// `CRATONVM_DISABLE_INTRINSICS` — kill-switch that prevents the interpreter
 /// from ever populating a `CachedInvokeTarget::Intrinsic` inline-cache entry,
 /// forcing every call through the ordinary native/bytecode dispatch path.

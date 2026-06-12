@@ -95,6 +95,35 @@ code** — each a substantial JIT-quality change, validated against the bench su
 > clean dev binary** (no local changes). A dev commit merged since then appears to
 > have regressed JIT-on discovery throughput/stability — worth a dedicated bisect.
 
+## Validated lever: env-configurable JIT threshold (`CRATONVM_JIT_THRESHOLD`)
+
+The JIT warmup threshold (hardcoded `500` invocations in two places — the interpreter
+upgrade gate and the dispatch-helper gate) is now read from `CRATONVM_JIT_THRESHOLD`
+(default **500**, so default behaviour is unchanged). Raising it keeps medium-hot
+call-heavy code interpreted instead of paying CratonVM's slower JIT'd dispatch.
+
+Measured (in-JVM ms / wall; machine under some concurrent load, hence noise):
+
+| Workload | thr=500 (default) | thr=5000 | thr=50000 |
+|---|---|---|---|
+| **bintrees18** (compute benchmark) | 10418 ms | — | **10007 ms** (no regression) |
+| kafka `common.config` (call-heavy) | 227 s | ~112 s | ~120 s |
+
+**Key validation:** the compute benchmark is **unaffected** by a 100× higher
+threshold — its hot recursion crosses any threshold within the first few k calls and
+still compiles, so steady-state JIT throughput is identical. Meanwhile kafka's
+call-heavy JIT penalty roughly halves.
+
+**Limits (honest):** config still plateaus ~120 s — it has genuinely-hot framework
+methods (>50k calls) whose JIT'd code is *itself* slower than interpreting them, which
+no threshold can fix (those methods cross any threshold and compile). So this knob is
+a **partial mitigation**, not a cure; the cure is the JIT codegen-quality work above.
+
+**Default left at 500** (zero behavioural change / zero regression risk): only
+`bintrees18` was validated here, not the full app suite. Flipping the default to a
+higher value should follow a full bench-suite + app-smoke run; the knob lets that be
+trialed without a rebuild.
+
 ## Practical status
 - The whole kafka-clients unit suite runs correctly under **`--nojit`** (the three
   genuine correctness bugs — bug-02/03/04 — are fixed). JIT-on is a throughput/quality

@@ -13321,20 +13321,25 @@ fn execute_invokestatic_cached(
             // reached and there is no ongoing re-spam. Normal warmup is
             // preserved: cold methods still wait for `JIT_INVOCATION_THRESHOLD`
             // calls before any compile attempt.
-            const JIT_INVOCATION_THRESHOLD: u32 = 500;
+            // Warmup threshold (default 500), overridable via CRATONVM_JIT_THRESHOLD.
+            // Raising it keeps short-lived / call-heavy code interpreted (HotSpot's
+            // interpreter-first behaviour) instead of paying CratonVM's
+            // currently-slower JIT'd dispatch for code that never amortizes the
+            // switch; genuinely-hot compute loops still cross it and compile.
+            let jit_invocation_threshold = crate::runtime::env_cache::jit_invocation_threshold();
             /// Re-attempt stride once a method is past the warmup threshold but
             /// not yet successfully compiled. Small so a transient upgrade-gate
             /// failure is retried within a few hundred calls rather than after
-            /// another full `JIT_INVOCATION_THRESHOLD`.
+            /// another full warmup threshold.
             const JIT_RETRY_STRIDE: u32 = 64;
             let invoc_count = shared.profile_store.increment_invocation(invoc_key);
             // Fire on the first crossing of the threshold, then re-attempt every
             // `JIT_RETRY_STRIDE` calls until the upgrade succeeds (after which
             // the invoke cache routes through JIT and this block is bypassed).
-            let past_threshold = invoc_count >= JIT_INVOCATION_THRESHOLD;
+            let past_threshold = invoc_count >= jit_invocation_threshold;
             let should_attempt = past_threshold
-                && (invoc_count == JIT_INVOCATION_THRESHOLD
-                    || (invoc_count - JIT_INVOCATION_THRESHOLD) % JIT_RETRY_STRIDE == 0);
+                && (invoc_count == jit_invocation_threshold
+                    || (invoc_count - jit_invocation_threshold) % JIT_RETRY_STRIDE == 0);
             if should_attempt {
             // Consult tiered compilation manager for recommended tier
             let tiered_key = crate::jit::tiered::MethodKey::new(

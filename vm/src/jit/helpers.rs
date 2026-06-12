@@ -2093,8 +2093,6 @@ thread_local! {
         = std::cell::RefCell::new(rustc_hash::FxHashMap::default());
 }
 
-/// Invocation threshold for triggering JIT compilation from the dispatch helper.
-const DISPATCH_JIT_THRESHOLD: u32 = 500;
 
 // ===========================================================================
 // BUG-1 fix: native-stack recursion guard for the JIT→JIT dispatch path.
@@ -2583,7 +2581,7 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         let mut map = dc.borrow_mut();
         let count = map.entry(info_key).or_insert(0);
         *count += 1;
-        *count == DISPATCH_JIT_THRESHOLD
+        *count == crate::runtime::env_cache::jit_invocation_threshold()
     });
     if should_compile {
         // Try to compile the callee and cache it
