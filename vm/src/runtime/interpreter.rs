@@ -3287,6 +3287,13 @@ pub fn execute(
             } else {
                 "unknown panic in bytecode execution".to_string()
             };
+            if let Some(f) = thread.frames.last() {
+                eprintln!(
+                    "[PANIC_IN] {}.{}{} pc={} max_stack={} :: {}",
+                    f.class_name(), f.method_name(), f.method_descriptor(),
+                    f.pc, f.max_stack, msg
+                );
+            }
             Err(MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::NotImplemented { feature: msg },
             )))
