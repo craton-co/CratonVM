@@ -7005,6 +7005,23 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Class;)Ljava/lang/annotation/Annotation;",
         native_method_get_annotation,
     );
+    // Without these, the real Executable.getAnnotationsByType bytecode
+    // re-parses raw annotation bytes our synthetic Method doesn't carry →
+    // AnnotationFormatError ("Unexpected end of annotations") and JUnit's
+    // repeatable-annotation lookups die (see
+    // native_method_get_annotations_by_type).
+    registry.register(
+        "java/lang/reflect/Method",
+        "getAnnotationsByType",
+        "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+        lang_class::native_method_get_annotations_by_type,
+    );
+    registry.register(
+        "java/lang/reflect/Method",
+        "getDeclaredAnnotationsByType",
+        "(Ljava/lang/Class;)[Ljava/lang/annotation/Annotation;",
+        lang_class::native_method_get_annotations_by_type,
+    );
     registry.register(
         "java/lang/reflect/Method",
         "getParameterAnnotations",

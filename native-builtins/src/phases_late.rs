@@ -4483,6 +4483,34 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // FileSystemProvider.getFileAttributeView(Path, Class, LinkOption[]) —
+    // the synthetic default provider has no native for this, so
+    // `Files.getFileAttributeView` dispatch lands on the abstract
+    // declaration: "AbstractMethodError ... has no Code attribute" (Gradle
+    // ProjectBuilder file writes in Spring Boot buildSrc
+    // GenerateAntoraPlaybookTests / DocumentAutoConfigurationClassesTests).
+    // The JDK contract returns null when the requested view type is not
+    // available — HotSpot on Windows itself returns null for the
+    // PosixFileAttributeView that Gradle's permission handling requests, and
+    // callers are required to handle that. Log the requested view under
+    // CRATONVM_DBG_FSP so unsupported-but-needed views (e.g. basic) surface
+    // during triage instead of silently degrading.
+    r.register(
+        fsp,
+        "getFileAttributeView",
+        "(Ljava/nio/file/Path;Ljava/lang/Class;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/FileAttributeView;",
+        |ctx, args| {
+            if std::env::var("CRATONVM_DBG_FSP").is_ok() {
+                let view = obj_arg(args, 2)
+                    .ok()
+                    .and_then(|m| crate::lang_class::mirror_class_name(ctx, m))
+                    .unwrap_or_else(|| "<unknown>".to_string());
+                eprintln!("[FSP-DBG] getFileAttributeView requested view={view} -> null");
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
+
     r.register(fsp, "installedProviders", "()Ljava/util/List;", |ctx, _args| {
         use cratonvm_types::ArrayElementType;
         let file_p = alloc_concurrent_synthetic(ctx, "java/nio/file/spi/FileSystemProvider", 1);
