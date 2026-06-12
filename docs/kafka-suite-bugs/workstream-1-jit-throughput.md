@@ -54,6 +54,35 @@ Net: JIT'd call-heavy code is slower than interpreted call-heavy code.
   - optionally, **async/background compilation** so even a wrong compile decision
     never stalls the running thread (HotSpot's model).
 
+## Attempt (a): make the dispatch helper polymorphic — investigated, reverted
+
+A polymorphic inline cache is in fact **already implemented**: `JitPICSlot` (3 entries),
+an inline 3-way class cascade emitted at each `invokevirtual`/`invokeinterface` site
+(`jit/src/x64.rs`), MIC→PIC→megamorphic promotion thresholds, and helper-side PIC
+population. The remaining gap was that `jit_invoke_virtual_mic`, on a MIC miss, went
+straight to full `invoke_or_native` resolution **without consulting the PIC's 3
+entries** — so for `needs_context==false` callees (which bypass the inline cascade)
+and cascade spillover, the helper was effectively monomorphic.
+
+I added a PIC `lookup` in the helper's miss path (dispatch directly on a PIC hit).
+Measured result: **net-negative / no help** —
+- `common.config` JIT-on did **not** improve (still >280 s): its discovery dispatch is
+  genuinely **>3-way megamorphic**, so a 3-entry PIC thrashes (LFU evicts every round)
+  and the added per-call `lookup` scan is pure overhead with ~no hits.
+- so the change was **reverted** rather than shipped (it could only hurt
+  megamorphic-heavy paths and didn't help the target). Correctness was unaffected
+  (polymorphic dispatch probe stayed correct).
+
+**Conclusion:** the config case is beyond a 3-entry PIC. The durable levers remain a
+**larger / profile-driven PIC**, **eliminating per-call marshalling** (Vec alloc +
+descriptor re-parse in the helper), and **inlining interpreter intrinsics into JIT'd
+code** — each a substantial JIT-quality change, validated against the bench suite.
+
+> **Separate observation (not from this work):** `common.serialization` JIT-on
+> *completed* right after dev `3ccd0bef` earlier this session but now **times out on a
+> clean dev binary** (no local changes). A dev commit merged since then appears to
+> have regressed JIT-on discovery throughput/stability — worth a dedicated bisect.
+
 ## Practical status
 - The whole kafka-clients unit suite runs correctly under **`--nojit`** (the three
   genuine correctness bugs — bug-02/03/04 — are fixed). JIT-on is a throughput/quality
