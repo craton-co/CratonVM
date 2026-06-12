@@ -6539,7 +6539,8 @@ fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let dis = "java/io/DataInputStream";
-    registry.register(dis, "<init>", "(Ljava/io/InputStream;)V", native_dis_init);
+    // <init> intentionally not registered: real JDK bytecode correctly initializes
+    // FilterInputStream.in (slot 0) via super(in) and readBuffer = new byte[8].
     registry.register(dis, "read", "()I", native_dis_read);
     registry.register(dis, "read", "([BII)I", native_dis_read_bytes);
     registry.register(dis, "readBoolean", "()Z", native_dis_read_boolean);
@@ -6626,14 +6627,6 @@ fn dis_read_one(
     }
 }
 
-fn native_dis_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(None),
-    };
-    ctx.set_field(this, DIS_FIELD_IN, args[1]);
-    Ok(None)
-}
 
 fn native_dis_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
@@ -6752,6 +6745,13 @@ fn native_dis_read_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let mut val: i32 = 0;
     for _ in 0..4 {
         let b = dis_read_one(ctx, this)?;
+        if b < 0 {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::EOFException {
+                    message: "Unexpected EOF".to_string(),
+                },
+            )));
+        }
         val = (val << 8) | (b & 0xFF);
     }
     Ok(Some(Value::Int(val)))
@@ -7036,8 +7036,15 @@ fn native_dis_read_fully_off(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     dis_read_fully_impl(ctx, this, buf, off, len)
 }
 
+fn eof_exception() -> MethodCallFailed {
+    MethodCallFailed::InternalError(VmError::Runtime(RuntimeError::EOFException {
+        message: "Unexpected EOF".to_string(),
+    }))
+}
+
 /// Shared implementation for readFully — tries bulk read on inner stream first,
-/// falls back to byte-by-byte.
+/// falls back to byte-by-byte.  Throws EOFException if the stream ends before
+/// all requested bytes have been read, matching the Java specification.
 fn dis_read_fully_impl(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -7047,9 +7054,8 @@ fn dis_read_fully_impl(
 ) -> MethodCallResult {
     let inner = match ctx.get_field(this, DIS_FIELD_IN) {
         Value::Object(Some(s)) => s,
-        _ => return Ok(None),
+        _ => return Err(eof_exception()),
     };
-    // Try bulk read first
     let mut filled = 0usize;
     while filled < len {
         let remaining = (len - filled) as i32;
@@ -7067,18 +7073,14 @@ fn dis_read_fully_impl(
             Some(Value::Int(v)) if v > 0 => {
                 filled += v as usize;
             }
-            Some(Value::Int(v)) if v == 0 => {
-                // Zero bytes read — fall back to byte-by-byte for remaining
-                for i in filled..len {
-                    let b = dis_read_one(ctx, this)?;
-                    ctx.set_array_element(buf, off + i, Value::Int(b));
-                }
-                return Ok(None);
-            }
             _ => {
-                // EOF or error — fill remaining with byte-by-byte (readFully must fill or throw)
+                // EOF (0 or -1) before all bytes were delivered → byte-by-byte fallback.
+                // dis_read_one returns -1 on EOF; we throw EOFException if that happens.
                 for i in filled..len {
                     let b = dis_read_one(ctx, this)?;
+                    if b < 0 {
+                        return Err(eof_exception());
+                    }
                     ctx.set_array_element(buf, off + i, Value::Int(b));
                 }
                 return Ok(None);
@@ -13928,7 +13930,8 @@ mod io_tests {
         let r = io_registry();
         let dis = "java/io/DataInputStream";
         let dos = "java/io/DataOutputStream";
-        assert!(r.find(dis, "<init>", "(Ljava/io/InputStream;)V").is_some());
+        // <init> intentionally NOT registered (real JDK bytecode handles it)
+        assert!(r.find(dis, "<init>", "(Ljava/io/InputStream;)V").is_none());
         assert!(r.find(dis, "readInt", "()I").is_some());
         assert!(r.find(dis, "readLong", "()J").is_some());
         assert!(r.find(dis, "readUTF", "()Ljava/lang/String;").is_some());

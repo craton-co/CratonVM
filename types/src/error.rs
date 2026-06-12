@@ -246,6 +246,9 @@ pub enum RuntimeError {
     #[error("IOException: {message}")]
     IOException { message: String },
 
+    #[error("EOFException: {message}")]
+    EOFException { message: String },
+
     /// `java.net.UnknownHostException` — a host name could not be resolved or
     /// is malformed. A subclass of IOException; must be thrown as the concrete
     /// type because real code catches it specifically (e.g. Tomcat

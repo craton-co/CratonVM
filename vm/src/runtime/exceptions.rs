@@ -432,6 +432,7 @@ pub fn throw_runtime_error(
             ("java/lang/IllegalArgumentException", Some(message.as_str()))
         }
         RuntimeError::IOException { message } => ("java/io/IOException", Some(message.as_str())),
+        RuntimeError::EOFException { message } => ("java/io/EOFException", Some(message.as_str())),
         RuntimeError::UnknownHostException { message } => {
             ("java/net/UnknownHostException", Some(message.as_str()))
         }
