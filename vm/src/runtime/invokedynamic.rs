@@ -1612,20 +1612,43 @@ fn execute_record_object_method(
                         .unwrap_or(&class_name)
                         .rsplit('$')
                         .next()
-                        .unwrap_or(&class_name);
+                        .unwrap_or(&class_name)
+                        .to_string();
 
+                    // Reference components must render via their VIRTUAL
+                    // toString (the JDK's generated record toString formats
+                    // each component with String.valueOf) — the previous
+                    // identity fallback printed `object@hash` for any non-String
+                    // reference component (e.g. a List/Map/nested record),
+                    // breaking record toString everywhere. The toString invoke
+                    // can trigger a moving GC, so the record ref is pinned and
+                    // re-read per component (mirrors the Equals/HashCode arms).
+                    use cratonvm_native_api::NativeContext as _;
+                    let mut ctx = NativeContextImpl { shared, thread };
+                    let obj_pin = ctx.pin_native_root(obj);
                     let mut result = format!("{simple}[");
+                    let mut err: Option<MethodCallFailed> = None;
                     for (i, name) in component_names.iter().enumerate() {
                         if i > 0 {
                             result.push_str(", ");
                         }
                         let fi = field_indices.get(i).copied().unwrap_or(i);
                         let desc = field_descriptors.get(i).map(|s| &**s).unwrap_or("I");
-                        let v = shared.heap.get_field(obj, fi);
-                        let vs = format_field_value(shared, &v, desc);
+                        let cur = ctx.read_native_pin(obj_pin, obj);
+                        let v = ctx.get_field(cur, fi);
                         result.push_str(name);
                         result.push('=');
-                        result.push_str(&vs);
+                        match value_to_string_deep(&mut ctx, &v, desc) {
+                            Ok(vs) => result.push_str(&vs),
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                    ctx.unpin_native_roots(obj_pin);
+                    if let Some(e) = err {
+                        return Err(e);
                     }
                     result.push(']');
                     result
@@ -1708,6 +1731,35 @@ fn value_hash_deep(
             }
         }
         _ => Ok(value_hash(ctx.shared, v)),
+    }
+}
+
+/// Render one record component like the JDK's generated record `toString`:
+/// primitives via their textual form, references via the VIRTUAL `toString`
+/// (`String.valueOf`, i.e. `null` → "null", else `component.toString()`). The
+/// String content fast path avoids a Java invoke for the common case.
+fn value_to_string_deep(
+    ctx: &mut NativeContextImpl<'_>,
+    v: &Value,
+    descriptor: &str,
+) -> Result<String, MethodCallFailed> {
+    match v {
+        Value::Object(Some(obj)) => {
+            // String fast path — read the chars directly.
+            if let Some(s) = read_java_string(&ctx.shared.heap, *obj) {
+                return Ok(s);
+            }
+            use cratonvm_native_api::NativeContext as _;
+            match ctx.invoke_virtual(*obj, "toString", "()Ljava/lang/String;", &[])? {
+                Some(Value::Object(Some(s))) => {
+                    Ok(read_java_string(&ctx.shared.heap, s).unwrap_or_else(|| "null".to_string()))
+                }
+                // toString returned null (legal) → JDK prints "null".
+                _ => Ok("null".to_string()),
+            }
+        }
+        // Primitives and the null reference: descriptor-aware textual form.
+        _ => Ok(format_field_value(ctx.shared, v, descriptor)),
     }
 }
 
