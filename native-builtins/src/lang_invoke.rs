@@ -4022,7 +4022,20 @@ pub fn register_t4_method_handle_invoke(r: &mut NativeMethodRegistry) {
         let extra = &args[1..];
         let desc = mh_read_desc(ctx, this).unwrap_or_default();
         let kind = match ctx.get_field(this, MH_KIND) { Value::Int(k) => k, _ => MH_KIND_VIRTUAL };
-        let adapted = adapt_invoke_args(ctx, extra, &desc);
+        // For virtual/special handles the first extra arg is the RECEIVER, not
+        // a descriptor param — adapting it against param_types[0] would misalign
+        // every param by one and (now that adapt unboxes) could wrongly unbox a
+        // wrapper receiver. Skip the receiver, then adapt the params 1:1.
+        let needs_receiver = kind == MH_KIND_VIRTUAL || kind == MH_KIND_SPECIAL;
+        let has_bound = matches!(ctx.get_field(this, MH_BOUND), Value::Object(Some(_)));
+        let adapted = if needs_receiver && !has_bound && !extra.is_empty() {
+            let mut v = Vec::with_capacity(extra.len());
+            v.push(extra[0]);
+            v.extend(adapt_invoke_args(ctx, &extra[1..], &desc));
+            v
+        } else {
+            adapt_invoke_args(ctx, extra, &desc)
+        };
         let result = mh_dispatch(ctx, this, &adapted);
         // Constructor MH already returns the new object; skip auto_box_return
         // which would incorrectly convert the result to null (desc ends in V).
