@@ -1407,6 +1407,54 @@ fn drain_real_spliterator(
     Ok(result)
 }
 
+/// `Iterable.forEach(Consumer)` with a `ServiceLoader` receiver. Without this
+/// registration the call lands on the generic Collection-interface bridge
+/// (`native_al_for_each`), which only understands list-like field layouts and
+/// silently iterates ZERO providers — JUnit 6's
+/// `LauncherFactory.collectTestEngines` consumes the engine registry via
+/// `Iterable.forEach(engines::add)` and then fails with "Cannot create
+/// Launcher without at least one TestEngine" even though `iterator()` /
+/// `stream()` on the same loader yield the provider. Drive the provider
+/// iterator (the same machinery as `native_sl_iterator`) instead.
+fn native_sl_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let action = match args.get(1) {
+        Some(Value::Object(Some(a))) => *a,
+        _ => return Ok(None),
+    };
+    let action_pin = ctx.pin_native_root(action);
+    let it = match native_sl_iterator(ctx, &args[..1])? {
+        Some(Value::Object(Some(i))) => i,
+        _ => {
+            ctx.unpin_native_roots(action_pin);
+            return Ok(None);
+        }
+    };
+    let it_pin = ctx.pin_native_root(it);
+    let result = loop {
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        match ctx.invoke_virtual(it_cur, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(v))) if v != 0 => {}
+            Ok(_) => break Ok(None),
+            Err(e) => break Err(e),
+        }
+        let it_cur = ctx.read_native_pin(it_pin, it);
+        let elem = match ctx.invoke_virtual(it_cur, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(v)) => v,
+            Ok(None) => Value::Object(None),
+            Err(e) => break Err(e),
+        };
+        let action_cur = ctx.read_native_pin(action_pin, action);
+        if let Err(e) =
+            ctx.invoke_virtual(action_cur, "accept", "(Ljava/lang/Object;)V", &[elem])
+        {
+            break Err(e);
+        }
+    };
+    ctx.unpin_native_roots(it_pin);
+    ctx.unpin_native_roots(action_pin);
+    result
+}
+
 pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
     let sl = "java/util/ServiceLoader";
     r.register(
@@ -1428,6 +1476,12 @@ pub fn register_service_loader_natives(r: &mut NativeMethodRegistry) {
         native_sl_load_class,
     );
     r.register(sl, "iterator", "()Ljava/util/Iterator;", native_sl_iterator);
+    r.register(
+        sl,
+        "forEach",
+        "(Ljava/util/function/Consumer;)V",
+        native_sl_for_each,
+    );
     r.register(sl, "stream", "()Ljava/util/stream/Stream;", native_sl_stream);
     r.register(sl, "spliterator", "()Ljava/util/Spliterator;", native_sl_spliterator);
     r.register(sl, "findFirst", "()Ljava/util/Optional;", native_sl_find_first);
