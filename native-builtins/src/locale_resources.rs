@@ -390,6 +390,110 @@ fn build_bundle(ctx: &mut dyn NativeContext, bundle_name: &str) -> ObjectRef {
     obj
 }
 
+/// Decode `java.util.Properties` escapes in a key or value: `\uXXXX`,
+/// `\t`/`\n`/`\r`/`\f`, and `\<char>` (`\\`, `\=`, `\:`, `\ `, `\#`, …). Needed
+/// so e.g. the Spanish `Número` decodes to `Número` (one char, not six) —
+/// otherwise downstream width/alignment math is wrong.
+fn unescape_props(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.next() {
+            Some('u') => {
+                let hex: String = (0..4).filter_map(|_| it.next()).collect();
+                if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    out.push(ch);
+                }
+            }
+            Some('t') => out.push('\t'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('f') => out.push('\u{0C}'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+/// Parse a `.properties` byte slice and put each `key=value` into `map`,
+/// overwriting earlier entries (so a more-specific locale variant wins).
+/// Handles trailing-backslash line continuation and `\u`/escape decoding;
+/// the value keeps its significant internal/trailing whitespace (only leading
+/// whitespace after the separator is stripped).
+fn parse_props_into_map(ctx: &mut dyn NativeContext, map: ObjectRef, bytes: &[u8]) {
+    let content = match std::str::from_utf8(bytes) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let mut pending = String::new();
+    let mut continuing = false;
+    for raw in content.lines() {
+        // Leading whitespace of every physical line is insignificant.
+        let seg = raw.trim_start();
+        if !continuing && (seg.is_empty() || seg.starts_with('#') || seg.starts_with('!')) {
+            continue;
+        }
+        // A line continues when it ends with an odd number of backslashes.
+        let trailing_bs = seg.chars().rev().take_while(|&c| c == '\\').count();
+        if trailing_bs % 2 == 1 {
+            pending.push_str(&seg[..seg.len() - 1]);
+            continuing = true;
+            continue;
+        }
+        pending.push_str(seg);
+        continuing = false;
+
+        // Separator: first unescaped '=' or ':'; else first unescaped whitespace.
+        let bytes_p = pending.as_bytes();
+        let mut sep: Option<usize> = None;
+        let mut esc = false;
+        for (i, &b) in bytes_p.iter().enumerate() {
+            if esc {
+                esc = false;
+                continue;
+            }
+            match b {
+                b'\\' => esc = true,
+                b'=' | b':' => {
+                    sep = Some(i);
+                    break;
+                }
+                b' ' | b'\t' | 0x0C if sep.is_none() => sep = Some(i),
+                _ => {}
+            }
+        }
+        if let Some(pos) = sep {
+            let key = unescape_props(pending[..pos].trim_end());
+            let val = unescape_props(pending[pos + 1..].trim_start());
+            let k = ctx.create_string(&key);
+            let v = ctx.create_string(&val);
+            cratonvm_native_collections::native_map_put_pub(
+                ctx,
+                &[Value::Object(Some(map)), Value::Object(Some(k)), Value::Object(Some(v))],
+            )
+            .ok();
+        }
+        pending.clear();
+    }
+}
+
+/// `true` for JDK-internal bundle base names that CratonVM synthesizes (locale
+/// data) or must not fail on during partial bootstrap — these keep the
+/// empty-bundle fallback. App bundles that are genuinely absent throw
+/// MissingResourceException instead (the spec-correct behaviour).
+fn is_jdk_internal_bundle(name: &str) -> bool {
+    name.starts_with("sun.")
+        || name.starts_with("jdk.")
+        || name.starts_with("com.sun.")
+        || name.starts_with("java.")
+        || name.starts_with("javax.")
+}
+
 fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let bundle_name = match args.first() {
         Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
@@ -398,8 +502,87 @@ fn rb_get_bundle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     if std::env::var("CRATONVM_DBG_CATALINA").is_ok() {
         eprintln!("CATALINA-DBG: ResourceBundle.getBundle native — name={bundle_name:?}");
     }
-    let obj = build_bundle(ctx, &bundle_name);
-    Ok(Some(Value::Object(Some(obj))))
+
+    // Resolve the requested locale from a Locale argument (getBundle(String,
+    // Locale[, ClassLoader|Control])). Other shapes (or a Control in slot 1)
+    // fall back to the ROOT chain.
+    let (lang, country) = match args.get(1) {
+        Some(Value::Object(Some(loc))) => {
+            let cid = ctx.class_id_of_object(*loc);
+            if ctx.class_name_of_id(cid).as_deref() == Some("java/util/Locale") {
+                // Read via getLanguage()/getCountry() so it works for both our
+                // synthetic Locales and the JDK's predefined constants
+                // (Locale.FRENCH, …) whose codes live in BaseLocale, not the
+                // synthetic side table.
+                let lang = match ctx.invoke_virtual(*loc, "getLanguage", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let country = match ctx.invoke_virtual(*loc, "getCountry", "()Ljava/lang/String;", &[]) {
+                    Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                (lang, country)
+            } else {
+                (String::new(), String::new())
+            }
+        }
+        _ => (String::new(), String::new()),
+    };
+
+    // Candidate chain, LEAST specific (ROOT) first, merged in order so a
+    // more-specific locale variant overrides — and inherited keys present only
+    // in a parent bundle still resolve (the JDK parent-chain fallback, flattened
+    // into one map). The most-specific variant that actually exists tags the
+    // bundle's locale (so getLocale() reports it).
+    let mut chain: Vec<(String, String, String)> = Vec::new();
+    chain.push((bundle_name.clone(), String::new(), String::new()));
+    if !lang.is_empty() {
+        chain.push((format!("{bundle_name}_{lang}"), lang.clone(), String::new()));
+    }
+    if !lang.is_empty() && !country.is_empty() {
+        chain.push((format!("{bundle_name}_{lang}_{country}"), lang.clone(), country.clone()));
+    }
+
+    let obj = alloc_concurrent_synthetic(ctx, "java/util/ResourceBundle", 2);
+    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
+    cratonvm_native_collections::native_map_init(ctx, &[Value::Object(Some(map))]).ok();
+    ctx.set_field(obj, 0, Value::Object(Some(map)));
+    ctx.set_field(obj, 1, Value::Object(None));
+
+    let mut matched: Option<(String, String)> = None;
+    for (cand, m_lang, m_country) in &chain {
+        let path = format!("{}.properties", cand.replace('.', "/"));
+        if let Some(bytes) = ctx.find_resource(&path) {
+            parse_props_into_map(ctx, map, &bytes);
+            matched = Some((m_lang.clone(), m_country.clone()));
+        }
+    }
+
+    if let Some((m_lang, m_country)) = matched {
+        let locale = crate::locale_alloc(ctx, &m_lang, &m_country);
+        if let Some(loc_idx) = ctx.resolve_field_index("java/util/ResourceBundle", "locale") {
+            ctx.set_field(obj, loc_idx, Value::Object(Some(locale)));
+        } else {
+            ctx.set_field(obj, 1, Value::Object(Some(locale)));
+        }
+        return Ok(Some(Value::Object(Some(obj))));
+    }
+
+    // No .properties on the classpath. JDK-internal base names keep the
+    // synthesized / empty-bundle fallback; a genuinely-absent app bundle gets
+    // MissingResourceException (java.util.ResourceBundle.getBundle's contract,
+    // which callers such as Tomcat's StringManager rely on).
+    if is_jdk_internal_bundle(&bundle_name) {
+        let obj = build_bundle(ctx, &bundle_name);
+        return Ok(Some(Value::Object(Some(obj))));
+    }
+    let exc = alloc_concurrent_synthetic(ctx, "java/util/MissingResourceException", 8);
+    let msg = ctx.create_string(&format!(
+        "Can't find bundle for base name {bundle_name}, locale {lang}"
+    ));
+    ctx.set_field_by_name(exc, "detailMessage", Value::Object(Some(msg)));
+    Err(cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc))
 }
 
 fn rb_get_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -654,11 +837,15 @@ pub fn register(registry: &mut NativeMethodRegistry) {
     // to false, and `ServletWebServerFactoryConfiguration$EmbeddedTomcat`
     // never registers a ServletWebServerFactory bean →
     // MissingWebServerFactoryBeanException at app startup.
-    registry.register(rb, "getLocale", "()Ljava/util/Locale;", |ctx, _args| {
-        if std::env::var("CRATONVM_DBG_CATALINA").is_ok() {
-            eprintln!(
-                "CATALINA-DBG: ResourceBundle.getLocale native HIT — returning non-null empty Locale"
-            );
+    registry.register(rb, "getLocale", "()Ljava/util/Locale;", |ctx, args| {
+        // Return the bundle's own `locale` field (set when it was built, to the
+        // locale it resolved for). Per the ResourceBundle Javadoc this must
+        // never be null on a loaded bundle, so fall back to an empty/ROOT
+        // Locale when the field is somehow unset.
+        if let Some(Value::Object(Some(this))) = args.first() {
+            if let Value::Object(Some(loc)) = ctx.get_field_by_name(*this, "locale") {
+                return Ok(Some(Value::Object(Some(loc))));
+            }
         }
         Ok(Some(Value::Object(Some(crate::locale_alloc(ctx, "", "")))))
     });
