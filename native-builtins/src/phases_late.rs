@@ -12659,19 +12659,53 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         p59_jar_file_entries,
     );
 
-    // JarEntry extends ZipEntry — 4-field (name, size, compressedSize, method)
+    // JarEntry extends ZipEntry. Two layouts coexist:
+    //   * the 4-field SYNTHETIC stub (name=0, size=1, compressedSize=2,
+    //     method=3) produced by `alloc_concurrent_synthetic(... "JarEntry", 4)`
+    //     on the synthetic JarFile path, and
+    //   * the REAL-JDK layout (14 inherited ZipEntry fields + 3 JarEntry
+    //     fields) produced by `new JarEntry(...)` running real bytecode.
+    // These natives shadow the real JarEntry methods, so they MUST handle both
+    // layouts. A real JarEntry has many more than 4 instance fields; on that
+    // layout the synthetic slot indices (1/2/3) point at `xdostime`/`mtime`/
+    // `atime`, NOT `size`/`compressedSize`/`method`, so raw-slot access reads
+    // and writes the wrong fields. Concretely, the old slot-3 `<init>` left the
+    // real `method` field (slot 9) at 0 = STORED, so a default JarOutputStream
+    // entry threw `ZipException: attempt to write past end of STORED entry`
+    // (Mockito's inline-mock-maker bootstrap JAR, JaCoCo, etc.). Detect the
+    // real layout by field count and use the by-name accessors there.
     let je = "java/util/jar/JarEntry";
+    fn je_is_real_layout(ctx: &mut dyn NativeContext, this: ObjectRef) -> bool {
+        ctx.object_num_fields(this) > 4
+    }
     r.register(je, "<init>", "(Ljava/lang/String;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 0, args[1]);
-        ctx.set_field(this, 1, Value::Long(-1));
-        ctx.set_field(this, 2, Value::Long(-1));
-        ctx.set_field(this, 3, Value::Int(-1));
+        if je_is_real_layout(ctx, this) {
+            // Mirror real ZipEntry.<init>(String): set `name` and the field
+            // initializer defaults (xdostime/crc/size/csize/method = -1).
+            ctx.set_field_by_name(this, "name", args[1]);
+            ctx.set_field_by_name(this, "xdostime", Value::Long(-1));
+            ctx.set_field_by_name(this, "crc", Value::Long(-1));
+            ctx.set_field_by_name(this, "size", Value::Long(-1));
+            ctx.set_field_by_name(this, "csize", Value::Long(-1));
+            ctx.set_field_by_name(this, "method", Value::Int(-1));
+        } else {
+            ctx.set_field(this, 0, args[1]);
+            ctx.set_field(this, 1, Value::Long(-1));
+            ctx.set_field(this, 2, Value::Long(-1));
+            ctx.set_field(this, 3, Value::Int(-1));
+        }
         Ok(None)
     });
     r.register(je, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        // `name` is slot 0 in both layouts, but read by name on the real layout
+        // for symmetry with the other accessors.
+        if je_is_real_layout(ctx, this) {
+            Ok(Some(ctx.get_field_by_name(this, "name")))
+        } else {
+            Ok(Some(ctx.get_field(this, 0)))
+        }
     });
     // JarEntry inherits ZipEntry accessors. Spring Boot's JarFileArchive
     // walks each entry via getName / isDirectory (for the include-filter)
@@ -12682,7 +12716,12 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     // jar/zip entry points) sees a non-null result.
     r.register(je, "isDirectory", "()Z", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let is_dir = match ctx.get_field(this, 0) {
+        let name_val = if je_is_real_layout(ctx, this) {
+            ctx.get_field_by_name(this, "name")
+        } else {
+            ctx.get_field(this, 0)
+        };
+        let is_dir = match name_val {
             Value::Object(Some(s)) => {
                 let name = ctx.read_string(s).unwrap_or_default();
                 name.ends_with('/')
@@ -12696,7 +12735,12 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     });
     r.register(je, "getSize", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(match ctx.get_field(this, 1) {
+        let v = if je_is_real_layout(ctx, this) {
+            ctx.get_field_by_name(this, "size")
+        } else {
+            ctx.get_field(this, 1)
+        };
+        Ok(Some(match v {
             Value::Long(v) => Value::Long(v),
             Value::Int(v) => Value::Long(v as i64),
             _ => Value::Long(-1),
@@ -12704,7 +12748,12 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     });
     r.register(je, "getCompressedSize", "()J", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(match ctx.get_field(this, 2) {
+        let v = if je_is_real_layout(ctx, this) {
+            ctx.get_field_by_name(this, "csize")
+        } else {
+            ctx.get_field(this, 2)
+        };
+        Ok(Some(match v {
             Value::Long(v) => Value::Long(v),
             Value::Int(v) => Value::Long(v as i64),
             _ => Value::Long(-1),
@@ -12712,7 +12761,12 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     });
     r.register(je, "getMethod", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(match ctx.get_field(this, 3) {
+        let v = if je_is_real_layout(ctx, this) {
+            ctx.get_field_by_name(this, "method")
+        } else {
+            ctx.get_field(this, 3)
+        };
+        Ok(Some(match v {
             Value::Int(v) => Value::Int(v),
             _ => Value::Int(-1),
         }))

@@ -5012,6 +5012,13 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .extend_application_classpath(paths);
     }
 
+    fn register_bootstrap_classpath(&mut self, paths: &[String]) {
+        self.shared
+            .class_manager
+            .write()
+            .extend_bootstrap_classpath(paths);
+    }
+
     fn define_class_from_bytes(
         &mut self,
         name: &str,

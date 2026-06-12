@@ -441,7 +441,7 @@ fn native_append_to_bootstrap_search0(
         },
         _ => return Ok(None),
     };
-    ctx.register_dynamic_classpath(&[path]);
+    ctx.register_bootstrap_classpath(&[path]);
     Ok(None)
 }
 
@@ -458,6 +458,38 @@ fn native_append_to_system_search0(
         _ => return Ok(None),
     };
     ctx.register_dynamic_classpath(&[path]);
+    Ok(None)
+}
+
+/// `void appendToClassLoaderSearch0(long jvmtiEnv, String jar, boolean isBootstrap)`.
+///
+/// JDK 25's `InstrumentationImpl` routes both
+/// `appendToBootstrapClassLoaderSearch(JarFile)` and
+/// `appendToSystemClassLoaderSearch(JarFile)` through this single native;
+/// the trailing boolean selects bootstrap (`true`) vs system (`false`).
+/// ByteBuddy's inline mock maker uses the bootstrap form to inject its
+/// `MockMethodDispatcher` helper so it is visible to redefined JDK classes.
+/// Either way we make the JAR's classes loadable by registering it on the
+/// dynamic classpath. Args: `[this, jvmtiEnv:long, jar:String, isBootstrap:bool]`.
+fn native_append_to_classloader_search0(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let path = match args.get(2) {
+        Some(Value::Object(Some(s))) => match ctx.read_string(*s) {
+            Some(t) => t,
+            None => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    let is_bootstrap = matches!(args.get(3), Some(Value::Int(v)) if *v != 0);
+    if is_bootstrap {
+        // Classes here MUST load with the bootstrap loader: Mockito asserts
+        // its injected MockMethodDispatcher has a null class loader.
+        ctx.register_bootstrap_classpath(&[path]);
+    } else {
+        ctx.register_dynamic_classpath(&[path]);
+    }
     Ok(None)
 }
 
@@ -861,6 +893,222 @@ fn mirror_classification(ctx: &dyn NativeContext, mirror: ObjectRef) -> (bool, b
 }
 
 // ---------------------------------------------------------------------------
+// Self-attach — com.sun.tools.attach.VirtualMachine (in-process dynamic agent)
+// ---------------------------------------------------------------------------
+//
+// Tools that ship as a `java.lang.instrument` agent but are launched *without*
+// `-javaagent:` (Mockito's inline mock maker, JaCoCo, several profilers) load
+// their agent at runtime by *attaching to their own JVM*. ByteBuddy's
+// `ByteBuddyAgent.install()` drives this: when `jdk.attach.allowAttachSelf` is
+// `true` (CratonVM defaults it on — see `vm_init.rs`) it takes the in-process
+// branch `Attacher.install(VirtualMachine.class, pid, agentJar, false, arg)`,
+// which reflectively calls, on `com.sun.tools.attach.VirtualMachine`:
+//
+//   1. static `attach(String pid)`            -> a VirtualMachine handle
+//   2. instance `loadAgent(String jar, String options)`
+//   3. instance `detach()`
+//
+// HotSpot's real implementation speaks an out-of-process socket/pipe protocol
+// to the target VM's attach listener. CratonVM has no attach listener and the
+// target is always *this* process, so we intercept those three methods with
+// natives that perform the agent load directly in-process: parse the agent
+// JAR's manifest for its `Agent-Class`/`Launcher-Agent-Class`, make its
+// classes loadable, build an `Instrumentation` mirror (the same one the
+// `-javaagent:` premain path uses), and invoke the agent's
+// `agentmain(String, Instrumentation)`. For ByteBuddy that runs
+// `net.bytebuddy.agent.Installer.agentmain`, which stores the Instrumentation
+// in a static field that `ByteBuddyAgent.doGetInstrumentation()` then reads
+// back — completing self-attach so the inline mock maker initializes.
+
+const VM_ATTACH_CLASS: &str = "com/sun/tools/attach/VirtualMachine";
+
+/// `static VirtualMachine attach(String id)`. Args (static): `[idString]`.
+///
+/// We support only self-attach, so the requested process id is irrelevant:
+/// return a bare `VirtualMachine` handle whose `loadAgent`/`detach` are the
+/// natives below. The real `attach` static body (which spins up the
+/// `AttachProvider` SPI and fails on CratonVM) is shadowed by this native.
+fn native_vm_attach(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    ctx.new_object(VM_ATTACH_CLASS)
+}
+
+/// `void loadAgent(String agentJar, String options)` /
+/// `void loadAgent(String agentJar)`. Args: `[this, agentJar, options?]`.
+fn native_vm_load_agent(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let agent_jar = match args.get(1) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s),
+        _ => None,
+    };
+    let agent_jar = match agent_jar {
+        Some(p) if !p.is_empty() => p,
+        _ => {
+            tracing::warn!("self-attach loadAgent: null/empty agent JAR path");
+            return Ok(None);
+        }
+    };
+    let options = match args.get(2) {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    run_self_attach(ctx, &agent_jar, &options)
+}
+
+/// `void detach()`. No out-of-process connection to tear down.
+fn native_vm_detach(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+    Ok(None)
+}
+
+/// Load the agent JAR at `agent_jar` into the running VM and invoke its
+/// `agentmain`, mirroring the JVM's dynamic-attach agent-load sequence.
+fn run_self_attach(
+    ctx: &mut dyn NativeContext,
+    agent_jar: &str,
+    options: &str,
+) -> MethodCallResult {
+    use std::path::Path;
+
+    // 1. Parse the agent JAR manifest. Dynamic attach resolves the agent
+    //    entry point from `Launcher-Agent-Class` (JEP 330 style) or, more
+    //    commonly, `Agent-Class`.
+    let manifest = cratonvm_classloading::ClassPath::read_jar_manifest(Path::new(agent_jar));
+    let (agent_class, can_redefine, can_retransform) = match &manifest {
+        Some(m) => {
+            let class = m
+                .attributes
+                .get("Launcher-Agent-Class")
+                .or_else(|| m.attributes.get("Agent-Class"))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let bool_attr = |k: &str| {
+                m.attributes
+                    .get(k)
+                    .map(|v| v.trim().eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+            };
+            (
+                class,
+                bool_attr("Can-Redefine-Classes"),
+                bool_attr("Can-Retransform-Classes"),
+            )
+        }
+        None => (None, false, false),
+    };
+    let agent_class = match agent_class {
+        Some(c) => c,
+        None => {
+            tracing::warn!(
+                "self-attach loadAgent: `{agent_jar}` has no Agent-Class/Launcher-Agent-Class \
+                 manifest attribute"
+            );
+            return Ok(None);
+        }
+    };
+
+    // 2. Make the agent's classes loadable. The agent JAR is frequently the
+    //    library's own JAR (already on the app classpath) but may be a temp
+    //    JAR that ByteBuddy extracted; add it either way (idempotent).
+    ctx.register_dynamic_classpath(&[agent_jar.to_string()]);
+
+    let agent_internal = agent_class.replace('.', "/");
+    if let Err(e) = ctx.load_class(&agent_internal) {
+        tracing::warn!("self-attach loadAgent: cannot load Agent-Class `{agent_class}`: {e:?}");
+        return Ok(None);
+    }
+
+    // 3. Build the Instrumentation mirror (sun.instrument.InstrumentationImpl),
+    //    pinning it across the allocating calls that follow.
+    let inst = match ctx.new_object("sun/instrument/InstrumentationImpl")? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            tracing::warn!("self-attach loadAgent: could not allocate InstrumentationImpl");
+            return Ok(None);
+        }
+    };
+    let pin = ctx.pin_native_root(inst);
+
+    // Best-effort init: ctor is (jvmtiEnv:long, agentArgs:String,
+    // isRedefineClasses:bool, isRetransformClasses:bool). The mirror's
+    // observable behaviour comes from the natives we register, so a failed
+    // ctor is non-fatal.
+    {
+        let args_str = ctx.create_string(options);
+        let inst_now = ctx.read_native_pin(pin, inst);
+        let _ = ctx.invoke(
+            "sun/instrument/InstrumentationImpl",
+            "<init>",
+            "(JLjava/lang/String;ZZ)V",
+            &[
+                Value::Object(Some(inst_now)),
+                Value::Long(0),
+                Value::Object(Some(args_str)),
+                Value::Int(if can_redefine { 1 } else { 0 }),
+                Value::Int(if can_retransform { 1 } else { 0 }),
+            ],
+        );
+    }
+
+    // 4. Invoke agentmain(String, Instrumentation), falling back to the
+    //    single-arg agentmain(String) form per the instrument spec.
+    let two_arg = "(Ljava/lang/String;Ljava/lang/instrument/Instrumentation;)V";
+    let one_arg = "(Ljava/lang/String;)V";
+    let has_two = ctx.method_exists(&agent_internal, "agentmain", two_arg);
+    let has_one = !has_two && ctx.method_exists(&agent_internal, "agentmain", one_arg);
+
+    let opts_obj = ctx.create_string(options);
+    let inst_now = ctx.read_native_pin(pin, inst);
+    let result = if has_two {
+        ctx.invoke(
+            &agent_internal,
+            "agentmain",
+            two_arg,
+            &[Value::Object(Some(opts_obj)), Value::Object(Some(inst_now))],
+        )
+    } else if has_one {
+        ctx.invoke(
+            &agent_internal,
+            "agentmain",
+            one_arg,
+            &[Value::Object(Some(opts_obj))],
+        )
+    } else {
+        tracing::warn!(
+            "self-attach loadAgent: Agent-Class `{agent_class}` has no agentmain(String[,Instrumentation])"
+        );
+        Ok(None)
+    };
+    ctx.unpin_native_roots(pin);
+
+    // Propagate a thrown agent exception (the real JVM would surface
+    // AgentInitializationException); a normal Installer.agentmain just stores
+    // the Instrumentation and returns void.
+    result.map(|_| None)
+}
+
+/// Register the in-process self-attach surface on
+/// `com.sun.tools.attach.VirtualMachine`.
+pub fn register_self_attach_natives(r: &mut NativeMethodRegistry) {
+    r.register(
+        VM_ATTACH_CLASS,
+        "attach",
+        "(Ljava/lang/String;)Lcom/sun/tools/attach/VirtualMachine;",
+        native_vm_attach,
+    );
+    r.register(
+        VM_ATTACH_CLASS,
+        "loadAgent",
+        "(Ljava/lang/String;Ljava/lang/String;)V",
+        native_vm_load_agent,
+    );
+    r.register(
+        VM_ATTACH_CLASS,
+        "loadAgent",
+        "(Ljava/lang/String;)V",
+        native_vm_load_agent,
+    );
+    r.register(VM_ATTACH_CLASS, "detach", "()V", native_vm_detach);
+}
+
+// ---------------------------------------------------------------------------
 // Registration entry points
 // ---------------------------------------------------------------------------
 
@@ -1065,6 +1313,16 @@ pub fn register_instrumentation_natives(r: &mut NativeMethodRegistry) {
         "appendToSystemClassLoaderSearch0",
         "(Ljava/lang/String;)V",
         native_append_to_system_search0,
+    );
+    // JDK 25 unified append: appendToClassLoaderSearch0(long jvmtiEnv,
+    // String jar, boolean isBootstrap). Drives both the bootstrap- and
+    // system-classloader append forms (Mockito inline mock maker injects its
+    // MockMethodDispatcher into the bootstrap loader via this path).
+    r.register(
+        impl_class,
+        "appendToClassLoaderSearch0",
+        "(JLjava/lang/String;Z)V",
+        native_append_to_classloader_search0,
     );
     r.register(
         impl_class,

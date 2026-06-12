@@ -18394,15 +18394,35 @@ const CB_FIELD_BROKEN: usize = 2;
 
 /// Convert a time value + TimeUnit ordinal to milliseconds.
 /// Ordinals: 0=NANOSECONDS 1=MICROSECONDS 2=MILLISECONDS 3=SECONDS 4=MINUTES 5=HOURS 6=DAYS
+///
+/// The scaling-UP cases (SECONDS/MINUTES/HOURS/DAYS) must SATURATE on overflow,
+/// exactly like `java.util.concurrent.TimeUnit.x(d, m, over)` — a plain `value *
+/// m` wraps. e.g. `TimeUnit.SECONDS.toMillis(Long.MAX_VALUE)` is `Long.MAX_VALUE`,
+/// not `-1000`. Kafka's `Sensor` derives `inactiveSensorExpirationTimeMs =
+/// SECONDS.toMillis(Long.MAX_VALUE)`; a wrapped negative value made every fresh
+/// sensor report `hasExpired() == true`, so `Sensor.add(...)` silently dropped
+/// every metric and `metrics.metric(name)` returned null.
 fn convert_time_unit_to_millis(value: i64, ordinal: i32) -> i64 {
+    // Saturating multiply mirroring TimeUnit.x: clamp to i64::MAX / i64::MIN
+    // when the magnitude would overflow.
+    fn sat_mul(value: i64, m: i64) -> i64 {
+        let over = i64::MAX / m;
+        if value > over {
+            i64::MAX
+        } else if value < -over {
+            i64::MIN
+        } else {
+            value * m
+        }
+    }
     match ordinal {
         0 => value / 1_000_000,
         1 => value / 1_000,
         2 => value,
-        3 => value * 1_000,
-        4 => value * 60_000,
-        5 => value * 3_600_000,
-        6 => value * 86_400_000,
+        3 => sat_mul(value, 1_000),
+        4 => sat_mul(value, 60_000),
+        5 => sat_mul(value, 3_600_000),
+        6 => sat_mul(value, 86_400_000),
         _ => value,
     }
 }

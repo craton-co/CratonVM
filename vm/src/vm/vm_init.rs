@@ -1245,6 +1245,10 @@ impl SharedVm {
                 // cratonvm.Instrument bridge used by the
                 // apps/instrument_probe smoke fixture.
                 crate::runtime::instrument::register_instrumentation_natives(&mut native_methods);
+                // In-process self-attach (com.sun.tools.attach.VirtualMachine)
+                // so runtime-attach agents (Mockito inline mock maker, JaCoCo)
+                // can load themselves without `-javaagent:`.
+                crate::runtime::instrument::register_self_attach_natives(&mut native_methods);
                 // RKC16N.10: sun.management.VMManagementImpl natives —
                 // ManagementFactory.<clinit> instantiates VMManagementImpl
                 // whose <clinit> calls native helpers; without these the
@@ -1736,6 +1740,11 @@ impl SharedVm {
             // companion call in the `feature = "synthetic-jdk"` branch
             // above.
             crate::runtime::instrument::register_instrumentation_natives(&mut native_methods);
+            // In-process self-attach (com.sun.tools.attach.VirtualMachine) so
+            // runtime-attach agents (Mockito inline mock maker, JaCoCo) can
+            // load themselves without `-javaagent:`. See companion call in the
+            // `feature = "synthetic-jdk"` branch above.
+            crate::runtime::instrument::register_self_attach_natives(&mut native_methods);
             // RKC16N.10: VMManagementImpl natives. See companion call
             // in the `feature = "synthetic-jdk"` branch above.
             cratonvm_native_builtins::jmx::register_vm_management_impl(&mut native_methods);
@@ -1882,6 +1891,27 @@ impl SharedVm {
         sys_props.insert(
             "sun.misc.unsafe.memory.access".to_string(),
             "allow".to_string(),
+        );
+
+        // Allow dynamic agents to attach to *this* running VM in-process.
+        // Tools that ship as a `java.lang.instrument` agent but are launched
+        // without `-javaagent:` (Mockito's inline mock maker, JaCoCo, several
+        // profilers) fall back to *self-attach*: at runtime they ask the
+        // attach API to load their agent into the current JVM. On a modern
+        // JDK self-attach is gated behind `-Djdk.attach.allowAttachSelf=true`
+        // (HotSpot defaults it to `false` and prints the familiar "Mockito is
+        // self-attaching …" warning). CratonVM implements the in-process leg
+        // of that path (see `com/sun/tools/attach/VirtualMachine` natives in
+        // `runtime/instrument.rs`) and has no separate-process attach listener,
+        // so the *only* attach mode we support is self-attach. Defaulting the
+        // property to `true` makes ByteBuddy/Mockito take the direct in-process
+        // `Attacher.install(...)` branch instead of trying to spawn an external
+        // attacher process (which cannot reach a CratonVM target). A user
+        // `-Djdk.attach.allowAttachSelf=...` on the command line still wins
+        // because CLI props are applied over these defaults.
+        sys_props.insert(
+            "jdk.attach.allowAttachSelf".to_string(),
+            "true".to_string(),
         );
 
         // ---- Tier 2: platform-derived keys ----

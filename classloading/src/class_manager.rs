@@ -4141,6 +4141,18 @@ impl ClassManager {
         }
     }
 
+    /// Append paths to the BOOTSTRAP class search path so the classes they
+    /// contain are loaded by the bootstrap loader (`ClassLoaderId::Bootstrap`,
+    /// i.e. a `null` `Class.getClassLoader()`). Drives
+    /// `Instrumentation.appendToBootstrapClassLoaderSearch`: Mockito's inline
+    /// mock maker injects `MockMethodDispatcher` here and then asserts it is
+    /// loaded by the bootstrap loader (so redefined JDK classes can reach it).
+    pub fn extend_bootstrap_classpath(&mut self, paths: &[String]) {
+        for path in paths {
+            self.bootstrap.add_path(path);
+        }
+    }
+
     /// Find a class by name. Searches all loaders in priority order
     /// (bootstrap → extension → application), then any user-defined
     /// loaders that have been observed in `loaded_classes`.
