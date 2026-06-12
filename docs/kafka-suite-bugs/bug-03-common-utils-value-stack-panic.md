@@ -46,17 +46,33 @@ Key facts established with targeted tracing (`Checksum.update` is dispatched via
   optimization). The accumulation is in that stackless callee chain spilling onto
   the caller frame's operand stack rather than being confined to per-callee stacks.
 
-So the defect is in CratonVM's **stackless-frame operand-stack handling** for the
-overloaded `Checksum.update` dispatch + the CRC32C class-init callee chain — not a
-simple off-by-one. (Same panic *signature* as the WildFly `RegularEnumSet` tail-call
-case that `ValueStack::ensure_max_size` papered over by growing; growing here would
-mask the leak, leaving garbage operands — not a correct fix.)
+## Root cause (FIXED)
+
+The cached **`VirtualNative` fast path** (`invoke_cached_native_callback`) pushed the
+native callback's return value **unconditionally** — even when the method's
+descriptor return type is `V` (void). `java/util/zip/Checksum.update` is backed by a
+native that returns `Some(_)` (natives commonly return the receiver / a status); the
+slow path (`execute_invoke_kind`) correctly *drops* that value for a void method, but
+the cached path pushed it, **leaking one operand per call**. The first call goes via
+the slow path (correct) and primes the inline cache; every subsequent call takes the
+leaking cached path — so the leak only appears once a `update` overload has primed the
+cache, matching the order-dependence. The operands accumulate on the caller's frame
+until they exceed its `max_stack` → `value_stack.rs` "len 24 index 24".
+
+**Fix** (`vm/src/runtime/interpreter.rs`, `invoke_cached_native_callback`): only push
+the native return value when `return_type != V`. This is a **general** correctness fix
+— it affects any void-returning native reached through the cached VirtualNative path,
+not just CRC32C.
+
+Verified: `Crc5`/`Crc3` repros produce CRC values identical to HotSpot;
+`Crc32CTest#testUpdate` passes; serialization/config packages unchanged (no
+regressions).
 
 ## Status
 - [x] Clean minimal repro; CratonVM-only.
-- [x] Pinned to `Crc32CTest.testUpdate` and localized to stackless-frame /
-      overloaded-`update` dispatch operand accumulation.
-- [ ] Fix (open — needs careful work in the stackless-frame operand model).
+- [x] Pinned to `Crc32CTest.testUpdate`; root-caused to the cached VirtualNative
+      void-return push.
+- [x] **Fixed** — cached path now drops void native returns (matches the slow path).
 
 ## Side note (not this bug, and HotSpot-shared)
 `new java.util.zip.CRC32C()` directly returns null on CratonVM (NPE on use), and
