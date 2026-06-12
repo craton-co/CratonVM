@@ -923,6 +923,32 @@ pub fn find_field_recursive<'a>(
 /// declaration must inspect `ClassFileMethod::is_abstract()` /
 /// `ClassFileMethod::code()` on the result (the bytecode-verifier and the
 /// interpreter's dispatch paths already do).
+/// Returns true when `sub` is a *strict* (proper) subinterface of `sup` — i.e.
+/// `sup` appears in `sub`'s transitive superinterface closure and `sub != sup`.
+/// Used for maximally-specific default-method selection (JVMS §5.4.3.3).
+fn is_strict_subinterface(sub: ClassId, sup: ClassId, store: &ClassStore) -> bool {
+    if sub == sup {
+        return false;
+    }
+    let mut stack: Vec<ClassId> = Vec::new();
+    let mut seen: FxHashSet<ClassId> = FxHashSet::default();
+    if let Some(c) = store.get(sub) {
+        stack.extend_from_slice(&c.interfaces);
+    }
+    while let Some(id) = stack.pop() {
+        if id == sup {
+            return true;
+        }
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(c) = store.get(id) {
+            stack.extend_from_slice(&c.interfaces);
+        }
+    }
+    false
+}
+
 pub fn find_method_recursive<'a>(
     class_id: ClassId,
     method_name: &str,
@@ -998,7 +1024,20 @@ pub fn find_method_recursive<'a>(
     // inherited abstract method (JVMS §5.4.3.4 — an abstract method is a valid
     // resolution result). Note: `abstract_fallback` is intentionally NOT
     // re-declared here so the Phase 1 result survives.
+    // Collect ALL concrete (default) interface-method candidates in the closure,
+    // then pick the maximally-specific one per JVMS §5.4.3.3 / §5.4.6: a default
+    // declared in interface I is maximally-specific iff no *subinterface* of I in
+    // the candidate set also declares a matching default. Returning the first
+    // concrete match in BFS order (the previous behaviour) wrongly picked a
+    // SUPERinterface's default over a more-specific override when the class
+    // directly listed both — e.g. Hibernate's `SessionImpl` lists
+    // `SharedSessionContractImplementor` (whose `asSessionImplementor` default
+    // throws ClassCastException) *and* `SessionImplementor` (the `return this`
+    // override); its superclass `AbstractSharedSessionContract` binds the
+    // throwing one first, so the BFS returned the throwing default and the
+    // flush/dirty-check path blew up with "session is not a SessionImplementor".
     let mut visited: FxHashSet<ClassId> = FxHashSet::default();
+    let mut default_candidates: Vec<(&'a ClassFileMethod, ClassId)> = Vec::new();
     let mut i = 0;
     while i < queue.len() {
         let iface_id = queue[i];
@@ -1008,19 +1047,43 @@ pub fn find_method_recursive<'a>(
         }
         if let Some(iface) = store.get(iface_id) {
             if let Some(method) = iface.find_method(method_name, method_descriptor) {
-                if !method.is_abstract() {
-                    // Concrete (default) interface method — preferred result.
-                    return Some((method, iface_id));
-                }
-                // Abstract declaration — remember it as a fallback but keep
-                // searching for a concrete default method elsewhere in the
-                // closure.
-                if abstract_fallback.is_none() && !method.is_static() {
+                if !method.is_abstract() && !method.is_static() {
+                    // Concrete (default) interface method — a candidate for the
+                    // maximally-specific selection below.
+                    default_candidates.push((method, iface_id));
+                } else if method.is_abstract() && abstract_fallback.is_none() && !method.is_static()
+                {
+                    // Abstract declaration — remember it as a fallback but keep
+                    // searching for a concrete default method elsewhere in the
+                    // closure.
                     abstract_fallback = Some((method, iface_id));
                 }
             }
             // Also search super-interfaces.
             queue.extend_from_slice(&iface.interfaces);
+        }
+    }
+
+    // Select the maximally-specific concrete default among the candidates.
+    match default_candidates.len() {
+        0 => {}
+        1 => return Some(default_candidates[0]),
+        _ => {
+            // I is maximally-specific iff no OTHER candidate J is a strict
+            // subinterface of I (i.e. I is not a proper superinterface of any
+            // other candidate). Return the first such candidate in BFS order.
+            // If the candidates are mutually unrelated (a genuine diamond with
+            // no single override) the JLS leaves the choice unspecified, so
+            // returning the first deterministically is acceptable.
+            for &(method, id) in &default_candidates {
+                let superseded = default_candidates
+                    .iter()
+                    .any(|&(_, other)| other != id && is_strict_subinterface(other, id, store));
+                if !superseded {
+                    return Some((method, id));
+                }
+            }
+            return Some(default_candidates[0]);
         }
     }
 
@@ -1805,6 +1868,76 @@ mod tests {
         let found = find_method_recursive(class_id, "shout", "(Ljava/lang/String;)Ljava/lang/String;", &store);
         assert!(found.is_some(), "default method shout should be found via interface");
         assert_eq!(found.unwrap().1, iface_id, "shout should resolve to the Greeting interface");
+    }
+
+    #[test]
+    fn m2_find_method_recursive_maximally_specific_default_wins_over_superinterface() {
+        // Mirrors Hibernate's SessionImpl shape: a superclass binds a
+        // superinterface's default method; the subclass adds the subinterface
+        // that overrides it AND re-lists the superinterface directly. The
+        // maximally-specific (subinterface) default must win. The previous
+        // first-BFS-match logic returned the superinterface's default — which
+        // for `SharedSessionContractImplementor.asSessionImplementor` throws
+        // ClassCastException in Hibernate's flush path.
+        let mut store = ClassStore::new();
+
+        let obj_id = store.next_id();
+        store.add(make_class(obj_id, "java/lang/Object", None, vec![], vec![], vec![], 0, 0));
+
+        // Shared interface: default f()
+        let shared_id = store.next_id();
+        store.add(make_interface(
+            shared_id,
+            "Shared",
+            obj_id,
+            vec![],
+            vec![make_default_method("f", "()V")],
+        ));
+
+        // Impl extends Shared, overriding the default f()
+        let impl_id = store.next_id();
+        store.add(make_interface(
+            impl_id,
+            "Impl",
+            obj_id,
+            vec![shared_id],
+            vec![make_default_method("f", "()V")],
+        ));
+
+        // AbstractShared (class) implements only Shared, declares no f().
+        let abs_id = store.next_id();
+        store.add(make_class(
+            abs_id,
+            "AbstractShared",
+            Some(obj_id),
+            vec![shared_id],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+
+        // Sess extends AbstractShared, implements [Shared, Impl] — the exact
+        // ordering that previously made the BFS return Shared.f() first.
+        let sess_id = store.next_id();
+        store.add(make_class(
+            sess_id,
+            "Sess",
+            Some(abs_id),
+            vec![shared_id, impl_id],
+            vec![],
+            vec![],
+            0,
+            0,
+        ));
+
+        let found = find_method_recursive(sess_id, "f", "()V", &store);
+        assert!(found.is_some(), "default f() must resolve");
+        assert_eq!(
+            found.unwrap().1,
+            impl_id,
+            "maximally-specific Impl.f() must win over the Shared.f() superinterface default"
+        );
     }
 
     #[test]
