@@ -906,7 +906,7 @@ pub fn register_phase_e_networking(registry: &mut NativeMethodRegistry) {
 /// then field 0 only when it looks like a complete URI (contains `:` after
 /// the scheme), so we don't mistake a bare `"file"` scheme token for the
 /// full `file:/C:/...` string.
-fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String {
+pub(crate) fn uri_raw_string(ctx: &dyn NativeContext, uri: ObjectRef) -> String {
     // Real-JDK `java.net.URI` caches its full text in the `string` field.
     // Reading it by NAME works regardless of the instance-field slot order
     // (real URI vs. our synthetic 7-slot URI), so this is tried first.
@@ -981,7 +981,7 @@ fn uri_percent_decode(input: &str) -> String {
 /// The scheme delimiter is the first `:` that precedes any `/`, `?` or `#`;
 /// otherwise the `:` sits inside a relative-reference path and there is no
 /// scheme. The path ends at the first `?` or `#`.
-fn uri_select_raw_path(raw: &str) -> Option<String> {
+pub(crate) fn uri_select_raw_path(raw: &str) -> Option<String> {
     let (is_absolute, ssp) = match raw.find(':') {
         Some(i) => {
             let scheme = &raw[..i];
@@ -1280,8 +1280,20 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         // fall back to the parsed path (which may legitimately be "" for an
         // authority-only URI like `http://h`). Then percent-decode — getPath()
         // returns the DECODED path (getRawPath() below returns it raw).
+        //
+        // Slot-collision guard: synthetic URIs (URL.toURI's 7-slot layout,
+        // raw string at slot 6) answer the by-name "path" read with the REAL
+        // class's field index — which lands on the raw-string slot. The
+        // symptom is the by-name value equalling the ENTIRE raw URI
+        // ("file:/C:/...") — a real hierarchical path can never contain the
+        // scheme prefix. Fall back to the parsed path in that case (Gradle's
+        // new File(url.toURI()) yielded "file:\C:\..." Files, emptying every
+        // ProjectBuilder module classpath).
         let raw_path = match ctx.get_field_by_name(this, "path") {
-            Value::Object(Some(s)) => ctx.read_string(s).filter(|v| !v.is_empty()).unwrap_or(parsed),
+            Value::Object(Some(s)) => ctx
+                .read_string(s)
+                .filter(|v| !v.is_empty() && *v != raw)
+                .unwrap_or(parsed),
             _ => parsed,
         };
         let decoded = uri_percent_decode(&raw_path);
@@ -1297,8 +1309,12 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
             None => return Ok(Some(Value::Object(None))),
             Some(p) => p,
         };
+        // Same slot-collision guard as getPath() above.
         let raw_path = match ctx.get_field_by_name(this, "path") {
-            Value::Object(Some(s)) => ctx.read_string(s).filter(|v| !v.is_empty()).unwrap_or(parsed),
+            Value::Object(Some(s)) => ctx
+                .read_string(s)
+                .filter(|v| !v.is_empty() && *v != raw)
+                .unwrap_or(parsed),
             _ => parsed,
         };
         Ok(Some(Value::Object(Some(ctx.create_string(&raw_path)))))
@@ -4972,6 +4988,13 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
     // `addrs` field is in a different slot than our synthetic layout,
     // resulting in `arraylength null` NPE inside NetworkInterface$1.
 
+    // `NetworkInterface.<clinit>` calls the JNI library initializer
+    // `init()V` — unregistered it surfaced as UnsatisfiedLinkError and
+    // killed any class-init touching NetworkInterface (Gradle's user-home
+    // services during ProjectBuilder bootstrap). The real init only caches
+    // JNI field IDs; a no-op is faithful.
+    r.register(ni, "init", "()V", |_ctx, _args| Ok(None));
+
     r.register(ni, "getHardwareAddress", "()[B", |ctx, _args| {
         let mac = ctx.new_array(ArrayElementType::Byte, 6);
         for i in 0..6 {
@@ -5013,7 +5036,73 @@ fn register_re8_network_interface(r: &mut NativeMethodRegistry) {
         "getAll",
         "()[Ljava/net/NetworkInterface;",
         |ctx, _args| {
-            let arr = ctx.new_ref_array(ClassId::new(0), 0);
+            // One REAL-layout loopback interface, built via the
+            // package-private NetworkInterface(String,int,InetAddress[])
+            // constructor so the real getInetAddresses()/toString bytecode
+            // reads the right fields (a synthetic 5-slot object breaks them
+            // — see the note above). An empty array here made
+            // getNetworkInterfaces() throw SocketException("No network
+            // interfaces configured"); most callers fall back, but Gradle's
+            // InetAddressFactory turns it into "Could not determine a usable
+            // wildcard IP for this machine" and every user-home-scope
+            // service dies (ProjectBuilder bootstrap).
+            let empty = |ctx: &mut dyn NativeContext| {
+                let arr = ctx.new_ref_array(ClassId::new(0), 0);
+                Ok(Some(Value::Object(Some(arr))))
+            };
+            let lo_addr = match ctx.invoke(
+                "java/net/InetAddress",
+                "getLoopbackAddress",
+                "()Ljava/net/InetAddress;",
+                &[],
+            ) {
+                Ok(Some(Value::Object(Some(a)))) => a,
+                _ => return empty(ctx),
+            };
+            let lo_pin = ctx.pin_native_root(lo_addr);
+            let addr_cid = ctx
+                .class_id_by_name("java/net/InetAddress")
+                .unwrap_or(ClassId::new(0));
+            let addrs = ctx.new_ref_array(addr_cid, 1);
+            let lo_addr = ctx.read_native_pin(lo_pin, lo_addr);
+            ctx.set_array_element(addrs, 0, Value::Object(Some(lo_addr)));
+            let addrs_pin = ctx.pin_native_root(addrs);
+            let name = ctx.create_string("lo");
+            let name_pin = ctx.pin_native_root(name);
+            let iface = match ctx.new_object("java/net/NetworkInterface") {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => {
+                    ctx.unpin_native_roots(lo_pin);
+                    ctx.unpin_native_roots(addrs_pin);
+                    ctx.unpin_native_roots(name_pin);
+                    return empty(ctx);
+                }
+            };
+            let iface_pin = ctx.pin_native_root(iface);
+            let name = ctx.read_native_pin(name_pin, name);
+            let addrs = ctx.read_native_pin(addrs_pin, addrs);
+            let _ = ctx.invoke(
+                "java/net/NetworkInterface",
+                "<init>",
+                "(Ljava/lang/String;I[Ljava/net/InetAddress;)V",
+                &[
+                    Value::Object(Some(iface)),
+                    Value::Object(Some(name)),
+                    Value::Int(1),
+                    Value::Object(Some(addrs)),
+                ],
+            );
+            let iface = ctx.read_native_pin(iface_pin, iface);
+            let ni_cid = ctx
+                .class_id_by_name("java/net/NetworkInterface")
+                .unwrap_or(ClassId::new(0));
+            let arr = ctx.new_ref_array(ni_cid, 1);
+            let iface = ctx.read_native_pin(iface_pin, iface);
+            ctx.set_array_element(arr, 0, Value::Object(Some(iface)));
+            ctx.unpin_native_roots(lo_pin);
+            ctx.unpin_native_roots(addrs_pin);
+            ctx.unpin_native_roots(name_pin);
+            ctx.unpin_native_roots(iface_pin);
             Ok(Some(Value::Object(Some(arr))))
         },
     );

@@ -12231,7 +12231,15 @@ fn try_stackless_invoke(
     // so `has_own_bytecode` is true, the `or_else` returns None, and we never consult
     // `java/lang/reflect/Method` in the registry. Force the registered
     // `native_method_invoke` (same triple as essentials) so reflection works.
-    if method_name == "invoke"
+    // Scoped to call sites that actually resolve on java/lang/reflect/Method
+    // (mirrors `native_override_for_cached_reflect_invoke`). Matching on
+    // name+descriptor ALONE hijacked every `invoke(Object,Object[])Object`
+    // in the wild — e.g. Gradle's `ServiceMethod.invoke` implementations,
+    // whose receivers then hit `native_method_invoke` and died with
+    // "Method.invoke: no declaring class" (ProjectBuilder bootstrap,
+    // Spring Boot buildSrc suite).
+    if class_name == "java/lang/reflect/Method"
+        && method_name == "invoke"
         && descriptor == "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"
     {
         if let Some(callback) = shared.native_methods.find(
@@ -12250,7 +12258,13 @@ fn try_stackless_invoke(
             return Ok(CachedCallResult::Handled);
         }
     }
-    if method_name == "newInstance" && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;" {
+    // Same class-scoping as the Method.invoke block above: an unscoped match
+    // hijacked every `newInstance(Object[])Object` (e.g. Objenesis
+    // ObjectInstantiator implementations).
+    if class_name == "java/lang/reflect/Constructor"
+        && method_name == "newInstance"
+        && descriptor == "([Ljava/lang/Object;)Ljava/lang/Object;"
+    {
         if let Some(callback) = shared.native_methods.find(
             "java/lang/reflect/Constructor",
             method_name,

@@ -4317,7 +4317,23 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
     // Get declaring class name
     let declaring_mirror = match ctx.get_field_by_name(this, "clazz") {
         Value::Object(Some(m)) => m,
-        _ => {
+        other => {
+            // CRATONVM_DBG_MINVOKE=1 — dump everything knowable about the
+            // degraded Method object so the producer can be identified
+            // (observed: Gradle DefaultServiceRegistry configure-method
+            // dispatch receiving a Method whose clazz slot reads null).
+            if std::env::var_os("CRATONVM_DBG_MINVOKE").is_some() {
+                let name = match ctx.get_field_by_name(this, "name") {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => "<no name>".to_string(),
+                };
+                let nslots = ctx.object_num_fields(this);
+                let cid = ctx.class_id_of_object(this);
+                let cls = ctx.class_name_of_id(cid).unwrap_or_default();
+                eprintln!(
+                    "[MINVOKE-DBG] clazz={other:?} name={name} obj_class={cls} nslots={nslots} modifiers={modifiers}"
+                );
+            }
             return Err(cratonvm_types::error::RuntimeError::NullPointerException {
                 message: Some("Method.invoke: no declaring class".to_string()),
             }

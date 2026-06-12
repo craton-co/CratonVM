@@ -8562,18 +8562,25 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
                 return Ok(None);
             }
         };
-        // Prefer the parsed `path` component.
+        // Prefer the parsed `path` component — with the slot-collision guard:
+        // synthetic 7-slot URIs (URL.toURI) answer the by-name "path" read
+        // with the REAL class's field index, which lands on the raw-string
+        // slot, so the value equals the ENTIRE URI text ("file:/C:/...").
+        // A real hierarchical path never carries the scheme prefix; treat
+        // that case as unset and parse from the raw text instead (the
+        // mangled "file:\C:\..." Files emptied Gradle's ClasspathUtil walk
+        // and with it every ProjectBuilder module classpath).
+        let raw = crate::net_phase_e::uri_raw_string(ctx, uri);
         let mut path = match ctx.get_field_by_name(uri, "path") {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            Value::Object(Some(s)) => ctx
+                .read_string(s)
+                .filter(|v| !v.is_empty() && *v != raw)
+                .unwrap_or_default(),
             _ => String::new(),
         };
         if path.is_empty() {
             // Parse from the full URI text:
             //   scheme:[//authority]path[?query][#fragment]
-            let raw = match ctx.get_field_by_name(uri, "string") {
-                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-                _ => String::new(),
-            };
             if !raw.is_empty() {
                 let after_scheme = match raw.find(':') {
                     Some(i) => &raw[i + 1..],
@@ -9147,6 +9154,22 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     r.register(file, "toURI", "()Ljava/net/URI;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let path = file_read_path(ctx, this);
+        // File.toURI() operates on getAbsoluteFile(): a RELATIVE File must be
+        // resolved against the working directory first. Skipping that turned
+        // `new File("runner").toURI()` into `file:/runner/` — a nonexistent
+        // root path that silently dropped relative classpath entries from
+        // Gradle's ClasspathUtil walk.
+        let path = {
+            let p = std::path::Path::new(&path);
+            if p.is_absolute() {
+                path.clone()
+            } else {
+                match std::env::current_dir() {
+                    Ok(cwd) => cwd.join(p).to_string_lossy().to_string(),
+                    Err(_) => path.clone(),
+                }
+            }
+        };
         // Per `File.toURI()`, the result is `new URI("file", null, slashify(absPath, isDir), null)`,
         // which renders as `file:/C:/...` — a SINGLE slash before the path
         // (no `//authority`). Emitting `file://` + `/C:/...` produced the

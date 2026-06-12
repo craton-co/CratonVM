@@ -2669,13 +2669,28 @@ fn ucl_find_class(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     cl_load_class(ctx, args)
 }
 
-fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let name_obj = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
     let name = ctx.read_string(name_obj).unwrap_or_default();
     let resource_name = name.trim_start_matches('/');
+    // Mirror cl_get_resource's lookup order: structured URL walk FIRST.
+    // URLClassLoader-constructor URLs are registered into the global walk
+    // but NOT into the raw-bytes `find_resource` store, so consulting only
+    // the latter made findResource return null for any resource living in a
+    // loader-supplied jar while getResource (the walk) found it. Canonical
+    // victim: Gradle's VisitableURLClassLoader("runtime-api-info") looking
+    // up gradle-plugins.properties from gradle-runtime-api-info.jar —
+    // "Cannot find resource ... in classloader" killed every ProjectBuilder
+    // bootstrap (Spring Boot buildSrc suite). Returning the walk's URL also
+    // keeps findResource/getResource spec-consistent (same URL form).
+    let urls = ctx.find_all_resource_urls(resource_name);
+    if let Some(first) = urls.first() {
+        let url = crate::jboss_module_loader::build_synthetic_url(ctx, first);
+        return Ok(Some(Value::Object(Some(url))));
+    }
     match ctx.find_resource(resource_name) {
         Some(_) => {
             let spec = format!("classpath:{name}");
@@ -2686,7 +2701,7 @@ fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     }
 }
 
-fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // Delegate to cl_get_resources logic
     cl_get_resources(ctx, args)
 }
