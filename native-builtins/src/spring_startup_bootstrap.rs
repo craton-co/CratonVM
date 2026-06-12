@@ -853,10 +853,12 @@ fn standard_config_data_resolve_profile_specific(
 // downstream code reads from individual property sources directly.
 // ──────────────────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 const SICP_CACHE: &str =
     "org/springframework/boot/context/properties/source/SpringIterableConfigurationPropertySource$Cache";
 const SICP_NAME: &str = "org/springframework/boot/context/properties/source/ConfigurationPropertyName";
 
+#[allow(dead_code)]
 fn cache_try_update(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     // tryUpdate(this, EnumerablePropertySource source) → void
     let this = match args.first() {
@@ -872,6 +874,7 @@ fn cache_try_update(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(None)
 }
 
+#[allow(dead_code)]
 fn install_empty_data(ctx: &mut dyn NativeContext, cache: ObjectRef) -> Option<()> {
     let data_class =
         "org/springframework/boot/context/properties/source/SpringIterableConfigurationPropertySource$Cache$Data";
@@ -1316,15 +1319,24 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         );
     }
 
-    // ── SpringIterableConfigurationPropertySource$Cache null-safe shims ──
-    // Guard `tryUpdate` against `getPropertyNames()` returning null in CratonVM's
-    // partial bootstrap (see comment block above the cache_try_update fn).
-    registry.register(
-        SICP_CACHE,
-        "tryUpdate",
-        "(Lorg/springframework/core/env/EnumerablePropertySource;)V",
-        cache_try_update,
-    );
+    // ── SpringIterableConfigurationPropertySource$Cache.tryUpdate (REMOVED) ──
+    // The former override unconditionally installed an EMPTY Cache$Data on every
+    // tryUpdate call (see `cache_try_update` below), which discards ALL of the
+    // iterable property-name→ConfigurationPropertyName mappings. That broke
+    // Spring Boot's relaxed/iterable binding: `MapConfigurationPropertySource`'s
+    // reverse mapping (e.g. source key `my.server.HOST` → name `my.server.host`)
+    // was never built, so `getConfigurationProperty(my.server.host)` returned
+    // null and the Binder threw "No value bound" (SB-06 / S05_Env).
+    //
+    // The original justification was an NPE: `tryUpdate` reads
+    // `source.getPropertyNames()` then does `arraylength`, and CratonVM's
+    // *synthetic* StandardEnvironment-backed sources returned null. Those
+    // synthetic env natives are now gated behind the default-OFF `app-stubs`
+    // feature (see block above), so the default build runs the REAL
+    // StandardEnvironment whose property sources return non-null names — the
+    // real `tryUpdate` bytecode builds the mappings correctly. Removing the
+    // override restores relaxed binding; any genuine null-getPropertyNames
+    // source is a separate real bug to fix at its source, not to mask here.
 
     // ── StandardConfigDataLocationResolver null-safe shim ──
     // See comment block above standard_config_data_resolve for rationale.

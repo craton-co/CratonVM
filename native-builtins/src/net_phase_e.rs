@@ -498,6 +498,121 @@ fn value_or_string(ctx: &dyn NativeContext, v: Value, default: &str) -> String {
     value_to_string(ctx, v).unwrap_or_else(|| default.to_string())
 }
 
+/// Parse a `jar:[file:]<path>!/<entry>` external form and return the entry's
+/// uncompressed size from the zip central directory, or `None` if the URL is
+/// not a resolvable jar-entry URL. Used by `JarURLConnection.getContentLength*`.
+fn jar_url_entry_size(ext: &str) -> Option<i64> {
+    let after = ext
+        .strip_prefix("jar:file:")
+        .or_else(|| ext.strip_prefix("jar:"))?;
+    let mut parts = after.splitn(2, "!/");
+    let jar_raw = parts.next()?.trim_start_matches("file:");
+    let entry_name = parts.next()?;
+    if entry_name.is_empty() {
+        return None;
+    }
+    // `file:` URLs prefix a leading `/` before a Windows drive letter
+    // (`/C:/…`); try the trimmed form first, then the raw form for POSIX.
+    let trimmed = jar_raw.trim_start_matches('/');
+    let disk = if std::path::Path::new(trimmed).exists() {
+        trimmed.to_string()
+    } else if std::path::Path::new(jar_raw).exists() {
+        jar_raw.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    let file = std::fs::File::open(&disk).ok()?;
+    let mut archive = zip::ZipArchive::new(file).ok()?;
+    let entry = archive.by_name(entry_name).ok()?;
+    Some(entry.size() as i64)
+}
+
+/// Recover the originating `jar:…!/entry` external form from a synthetic
+/// `JarURLConnection` (URL stored in field `HUC_URL`).
+fn jar_url_conn_ext(ctx: &mut dyn NativeContext, this: ObjectRef) -> String {
+    let url_obj = match ctx.get_field(this, HUC_URL) {
+        Value::Object(Some(o)) => o,
+        _ => return String::new(),
+    };
+    let mut ext = read_field_string_or(ctx, url_obj, 5, "");
+    if !ext.starts_with("jar:") {
+        if let Ok(Some(Value::Object(Some(o)))) =
+            ctx.invoke_virtual(url_obj, "toExternalForm", "()Ljava/lang/String;", &[])
+        {
+            ext = ctx.read_string(o).unwrap_or_default();
+        }
+    }
+    ext
+}
+
+/// `JarURLConnection.getJarEntry()` — build the `java/util/jar/JarEntry` for the
+/// entry named in the `jar:…!/entry` URL by reading the zip central directory.
+/// Returns `Value::Object(None)` when the URL has no entry or the jar/entry is
+/// missing. Spring's `AbstractFileResolvingResource.checkReadable()` reads this
+/// (then `JarEntry.isDirectory()`) for jar resources — not `getContentLength`.
+fn jar_url_lookup_entry(ctx: &mut dyn NativeContext, ext: &str) -> Value {
+    let after = match ext
+        .strip_prefix("jar:file:")
+        .or_else(|| ext.strip_prefix("jar:"))
+    {
+        Some(a) => a,
+        None => return Value::Object(None),
+    };
+    let mut parts = after.splitn(2, "!/");
+    let jar_raw = match parts.next() {
+        Some(p) => p.trim_start_matches("file:"),
+        None => return Value::Object(None),
+    };
+    let entry_name = match parts.next() {
+        Some(e) if !e.is_empty() => e,
+        _ => return Value::Object(None),
+    };
+    let trimmed = jar_raw.trim_start_matches('/');
+    let disk = if std::path::Path::new(trimmed).exists() {
+        trimmed.to_string()
+    } else if std::path::Path::new(jar_raw).exists() {
+        jar_raw.to_string()
+    } else {
+        trimmed.to_string()
+    };
+    let file = match std::fs::File::open(&disk) {
+        Ok(f) => f,
+        Err(_) => return Value::Object(None),
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(_) => return Value::Object(None),
+    };
+    // Extract the entry metadata into owned values, then drop the `archive`
+    // borrow before doing any `ctx` allocation (mirrors p59_jar_collect_entries).
+    let (name, size, csize, method) = match archive.by_name(entry_name) {
+        Ok(entry) => {
+            let name = entry.name().to_string();
+            let size = entry.size() as i64;
+            let csize = entry.compressed_size() as i64;
+            #[allow(deprecated)]
+            let method = entry.compression().to_u16() as i32;
+            (name, size, csize, method)
+        }
+        Err(_) => return Value::Object(None),
+    };
+    let je = alloc_concurrent_synthetic(ctx, "java/util/jar/JarEntry", 4);
+    let name_s = ctx.create_string(&name);
+    ctx.set_field(je, 0, Value::Object(Some(name_s)));
+    ctx.set_field(je, 1, Value::Long(size));
+    ctx.set_field(je, 2, Value::Long(csize));
+    ctx.set_field(je, 3, Value::Int(method));
+    Value::Object(Some(je))
+}
+
+/// Recover the originating `jar:…!/entry` URL from a synthetic
+/// `JarURLConnection` (field `HUC_URL`) and return the jar entry's size, or
+/// `-1` when it can't be resolved (matching `URLConnection` semantics).
+fn jar_url_conn_entry_size(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 {
+    let ext = jar_url_conn_ext(ctx, this);
+    jar_url_entry_size(&ext).unwrap_or(-1)
+}
+
 fn read_inet_socket_address(
     ctx: &dyn NativeContext,
     sa: ObjectRef,
@@ -3252,6 +3367,56 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(jar_file))))
         },
     );
+    // java/net/JarURLConnection.getContentLengthLong() / getContentLength() —
+    // return the jar ENTRY's uncompressed size. Our synthetic carrier has no
+    // JDK URLConnection header machinery, so the inherited URLConnection
+    // implementation returns -1. Spring's
+    // `AbstractFileResolvingResource.isReadable()` treats `contentLength <= 0`
+    // (with no exception) as NOT readable, so a perfectly good jar class
+    // resource reported `isReadable=false`, `contentLength=-1`, and
+    // `classpath*:…/*.class` scanning matched 0 resources (SB-07 / S10_Resources).
+    // Recover the entry from the `jar:file:…!/entry` URL in HUC_URL and read
+    // its size straight from the zip central directory. The lookup walks the
+    // superclass chain starting at the receiver's JarURLConnection class, so it
+    // wins over the inherited URLConnection/HttpURLConnection registrations.
+    r.register(
+        "java/net/JarURLConnection",
+        "getContentLengthLong",
+        "()J",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            Ok(Some(Value::Long(jar_url_conn_entry_size(ctx, this))))
+        },
+    );
+    r.register(
+        "java/net/JarURLConnection",
+        "getContentLength",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let sz = jar_url_conn_entry_size(ctx, this);
+            // URLConnection.getContentLength() narrows to int, -1 when unknown
+            // or larger than Integer.MAX_VALUE.
+            let v = if sz < 0 || sz > i32::MAX as i64 { -1 } else { sz as i32 };
+            Ok(Some(Value::Int(v)))
+        },
+    );
+    // java/net/JarURLConnection.getJarEntry() — the no-arg accessor that
+    // Spring's checkReadable() and PathMatchingResourcePatternResolver use to
+    // probe a jar resource. Our synthetic carrier's runtime class is the
+    // ABSTRACT java/net/JarURLConnection, so the virtual dispatch would land on
+    // the abstract declaration (AbstractMethodError) without this native.
+    r.register(
+        "java/net/JarURLConnection",
+        "getJarEntry",
+        "()Ljava/util/jar/JarEntry;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let ext = jar_url_conn_ext(ctx, this);
+            Ok(Some(jar_url_lookup_entry(ctx, &ext)))
+        },
+    );
+
     // URLConnection.setUseCaches / setDefaultUseCaches / connect — Spring's
     // `ResourceUtils.useCachesIfNecessary` calls setUseCaches(false) on
     // file: URLs; without these no-op natives the call would fall through
@@ -3372,55 +3537,27 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
     );
 
     // -----------------------------------------------------------------------
-    // Bug 3 fix: AbstractBeanDefinition.getResolvedAutowireMode() override.
+    // (REMOVED) AbstractBeanDefinition.getResolvedAutowireMode() override.
     //
-    // The constructor writes `autowireMode = 0` (AUTOWIRE_NO) via
-    // `iconst_0; putfield #27`.  But under CratonVM the getfield reading
-    // that same slot later returns a non-zero value, sending
-    // `AbstractAutowireCapableBeanFactory.populateBean` down the
-    // autowireByType branch.  That branch calls every Setter on every
-    // property — including `setMetadataReaderFactory(null)` on
-    // `ConfigurationClassPostProcessor` — and throws
-    //   BeanCreationException: Error creating bean with name
-    //     'org.springframework.context.annotation.internalConfigurationAnnotationProcessor'.
+    // A former "Bug 3" workaround hardcoded getResolvedAutowireMode() to
+    // return 0 (AUTOWIRE_NO) for AbstractBeanDefinition + Root/Generic/Child
+    // subclasses, to mask a field-layout/slot bug where the `autowireMode`
+    // field misread as a spurious non-zero value (driving an unwanted
+    // autowireByType setter pass that crashed ConfigurationClassPostProcessor).
     //
-    // Diagnostic agent π traced the root cause to a field-layout / slot
-    // mismatch between read and write paths.  Pending a fix to the deeper
-    // layout bug, we return the correct default (0 = AUTOWIRE_NO) directly
-    // from a native override.  This matches the value the constructor
-    // tried to write and lets Spring's no-autowire branch run.
-    //
-    // The override is registered against `AbstractBeanDefinition`; Java
-    // dispatch via invokevirtual on a `RootBeanDefinition` will find this
-    // because RootBeanDefinition does not override `getResolvedAutowireMode`.
+    // That underlying field bug is FIXED: getAutowireMode() (which reads the
+    // same `autowireMode` slot) now returns the real value (0/2/3) identically
+    // to HotSpot for default / setAutowireMode(BY_TYPE) / setAutowireMode(
+    // CONSTRUCTOR) bean definitions. The constant-0 stub had become stale and
+    // actively wrong: it forced AUTOWIRE_NO onto @Bean factory methods, whose
+    // definitions are AUTOWIRE_CONSTRUCTOR (3). That sent
+    // ConstructorResolver.createArgumentArray down the `autowiring == false`
+    // branch, so a @Qualifier'd @Bean method parameter could not be autowired
+    // and Spring threw "Ambiguous argument values for parameter of type ..."
+    // (SB-05 / S02_Inject). Removing the stub restores the real bytecode:
+    // getResolvedAutowireMode() reads the (correct) field and returns it,
+    // matching HotSpot. Daemon apps using the default AUTOWIRE_NO still get 0.
     // -----------------------------------------------------------------------
-    r.register(
-        "org/springframework/beans/factory/support/AbstractBeanDefinition",
-        "getResolvedAutowireMode",
-        "()I",
-        |_ctx, _args| {
-            // AUTOWIRE_NO = 0. Returning 0 makes populateBean take the
-            // no-autowire branch (skip autowireByName / autowireByType).
-            // Applications that genuinely want autowiring set the value
-            // via setAutowireMode(...) which we'd need to honor — but
-            // Spring Boot's default config uses AUTOWIRE_NO; the bug only
-            // surfaces because the spurious non-zero read drives setter
-            // injection where none was requested.
-            Ok(Some(cratonvm_types::Value::Int(0)))
-        },
-    );
-    // K4 follow-up: also register on subclasses in case the bytecode binds
-    // invokevirtual to the concrete subclass instead of AbstractBeanDefinition
-    // (some Spring versions emit non-virtual dispatch on RootBeanDefinition).
-    for sub in &[
-        "org/springframework/beans/factory/support/RootBeanDefinition",
-        "org/springframework/beans/factory/support/GenericBeanDefinition",
-        "org/springframework/beans/factory/support/ChildBeanDefinition",
-    ] {
-        r.register(sub, "getResolvedAutowireMode", "()I", |_ctx, _args| {
-            Ok(Some(cratonvm_types::Value::Int(0)))
-        });
-    }
 
     // -----------------------------------------------------------------------
     // Spring Data Redis `RedisAccessor.afterPropertiesSet()`
