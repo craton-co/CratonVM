@@ -8627,6 +8627,47 @@ pub(crate) fn native_field_get_generic_type(
     Ok(Some(ctx.get_field_by_name(this, "type")))
 }
 
+/// RecordComponent.getGenericType() — returns Type from the component's
+/// Signature attribute.
+///
+/// A record component named `n` of type `T` shares its name and generic
+/// signature with the synthesized `private final T n` field, so we parse
+/// that field's JVMS §4.7.9 Signature directly (mirrors
+/// `native_field_get_generic_type`). The real-JDK `RecordComponent`
+/// bytecode delegates to a `sun.reflect.generics` repository CratonVM
+/// doesn't implement, so without this override `getGenericType()` collapsed
+/// e.g. `List<TestSlice>` to the raw `List` Class — which made Jackson (and
+/// any record introspector) lose the element type and deserialize a nested
+/// record list into `List<LinkedHashMap>`. Falls back to the raw `type`
+/// Class mirror when no Signature attribute is present.
+pub(crate) fn native_record_component_get_generic_type(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let class_id = match ctx.get_field_by_name(this, "clazz") {
+        Value::Object(Some(mirror)) => mirror_class_id(ctx, mirror),
+        _ => None,
+    };
+    let name = match ctx.get_field_by_name(this, "name") {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => None,
+    };
+    if let (Some(class_id), Some(name)) = (class_id, name) {
+        if let Some(sig_str) = ctx.field_signature(class_id, &name) {
+            if let Some(field_sig) = crate::generics::parse_field_signature(&sig_str) {
+                let val = crate::generics::type_sig_to_java(ctx, &field_sig);
+                return Ok(Some(val));
+            }
+        }
+    }
+    // Fallback: getGenericType() ≡ getType().
+    Ok(Some(ctx.get_field_by_name(this, "type")))
+}
+
 // --- java.lang.reflect.Modifier ---
 
 pub(crate) fn modifier_check(_ctx: &mut dyn NativeContext, args: &[Value], mask: i32) -> MethodCallResult {
@@ -9750,8 +9791,10 @@ pub(crate) fn native_class_descriptor_string(ctx: &mut dyn NativeContext, args: 
         "char" => "C".to_string(),
         "short" => "S".to_string(),
         "void" => "V".to_string(),
-        _ if name.starts_with('[') => name,
-        _ => format!("L{};", name),
+        // Array class names are already in descriptor form ("[I",
+        // "[Ljava.lang.String;"); normalize any package dots to slashes.
+        _ if name.starts_with('[') => name.replace('.', "/"),
+        _ => format!("L{};", name.replace('.', "/")),
     };
     Ok(Some(Value::Object(Some(ctx.create_string(&desc)))))
 }

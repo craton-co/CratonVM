@@ -3063,6 +3063,22 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Class", "forName", "(Ljava/lang/String;)Ljava/lang/Class;", native_class_for_name);
     registry.register("java/lang/Class", "forName", "(Ljava/lang/String;ZLjava/lang/ClassLoader;)Ljava/lang/Class;", lang_class::native_class_for_name_3);
     registry.register("java/lang/Class", "forName", "(Ljava/lang/Module;Ljava/lang/String;)Ljava/lang/Class;", lang_class::native_class_for_name_module);
+    // Class.descriptorString(): JDK 25's bytecode reads the private
+    // `componentType` field directly for array classes ("[" + componentType
+    // .descriptorString()). CratonVM array mirrors leave that field null (the
+    // value is computed lazily by the getComponentType native), so the real
+    // bytecode NPEs on any array class — which breaks ObjectStreamClass's
+    // serial-field computation (ObjectStreamField.<init> -> descriptorString)
+    // for any serializable class with an array field. Bind the faithful native
+    // (descriptor derived from the class name) in the essential path so the
+    // real-JDK CLI build (which never calls register_synthetic_overrides) uses
+    // it instead of the NPE-prone bytecode.
+    registry.register(
+        "java/lang/Class",
+        "descriptorString",
+        "()Ljava/lang/String;",
+        lang_class::native_class_descriptor_string,
+    );
     // isInterface/isPrimitive/isArray are bytecode in JDK 25 but registered
     // here for compatibility with older JDKs and as native fallbacks.
     registry.register("java/lang/Class", "isInterface", "()Z", native_class_is_interface);
@@ -9479,6 +9495,35 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
         "getGenericType",
         "()Ljava/lang/reflect/Type;",
         lang_class::native_field_get_generic_type,
+    );
+    // Constructors need the SAME generic-parameter resolution as methods —
+    // these were only registered for `java/lang/reflect/Method`, so a
+    // constructor's `getGenericParameterTypes()` (the path
+    // `Parameter.getParameterizedType()` and Jackson's record creator
+    // introspection take) fell through to real-JDK bytecode that delegates to
+    // an unimplemented generics repository → raw `List` instead of
+    // `List<TestSlice>`. `native_method_get_generic_param_types` already
+    // handles the `<init>` descriptor (see `method_class_name_desc`).
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getGenericParameterTypes",
+        "()[Ljava/lang/reflect/Type;",
+        lang_class::native_method_get_generic_param_types,
+    );
+    registry.register(
+        "java/lang/reflect/Constructor",
+        "getTypeParameters",
+        "()[Ljava/lang/reflect/TypeVariable;",
+        lang_class::native_method_get_type_parameters,
+    );
+    // RecordComponent.getGenericType() — parse the component's Signature so
+    // record introspectors (Jackson) recover the element type of a generic
+    // component (`List<TestSlice>`) instead of the raw `List`.
+    registry.register(
+        "java/lang/reflect/RecordComponent",
+        "getGenericType",
+        "()Ljava/lang/reflect/Type;",
+        lang_class::native_record_component_get_generic_type,
     );
 
     // --- java.lang.reflect.Modifier ---
