@@ -434,6 +434,10 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     let this = arg_obj(args, 0)?;
     let bb = arg_obj(args, 1)?;
     let cb = arg_obj(args, 2)?;
+    // args[3] = boolean endOfInput (passed as Int 0/1). When false, a
+    // truncated trailing multi-byte sequence is UNDERFLOW (wait for more
+    // input), not MALFORMED — matching java.nio.charset.CharsetDecoder.decode.
+    let end_of_input = matches!(args.get(3), Some(Value::Int(v)) if *v != 0);
 
     let (barr, bpos, blim) = match buf_state(ctx, bb) {
         Some(s) => s,
@@ -451,8 +455,26 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         return Ok(Some(Value::Object(Some(r))));
     }
 
-    let decoded = match engine::decode_bytes(&name, &bytes) {
-        Ok(chars) => chars,
+    // `input_len` = how many input bytes the `decoded` units represent
+    // (== bytes.len() except when we stop early at a truncated trailing
+    // sequence, leaving its bytes buffered for the next call).
+    let (decoded, input_len) = match engine::decode_bytes(&name, &bytes) {
+        Ok(chars) => (chars, bytes.len()),
+        Err(e)
+            if e.kind == engine::CodingErrorKind::Incomplete && !end_of_input =>
+        {
+            // Decode only the valid prefix; the partial trailing bytes stay in
+            // the buffer (position advances only past the prefix) and the
+            // decoder reports UNDERFLOW.
+            match engine::decode_bytes(&name, &bytes[..e.offset]) {
+                Ok(chars) => (chars, e.offset),
+                Err(_) => {
+                    set_pos(ctx, bb, bpos + e.offset as i32);
+                    let r = alloc_coder_result(ctx, CR_MALFORMED);
+                    return Ok(Some(Value::Object(Some(r))));
+                }
+            }
+        }
         Err(e) => {
             set_pos(ctx, bb, bpos + e.offset as i32);
             let r = alloc_coder_result(ctx, CR_MALFORMED);
@@ -466,13 +488,14 @@ fn native_decoder_decode(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     set_pos(ctx, cb, cpos + written as i32);
 
     if to_write < decoded.len() {
-        // Partial decode; we have to stop short of the full input too.
-        let consumed = proportional_input_consumed_bytes(&bytes, &decoded, to_write);
+        // Output buffer full before all decoded chars were written → OVERFLOW;
+        // consume a proportional slice of the (prefix) input.
+        let consumed = proportional_input_consumed_bytes(&bytes[..input_len], &decoded, to_write);
         set_pos(ctx, bb, bpos + consumed as i32);
         let r = alloc_coder_result(ctx, CR_OVERFLOW);
         Ok(Some(Value::Object(Some(r))))
     } else {
-        set_pos(ctx, bb, bpos + bytes.len() as i32);
+        set_pos(ctx, bb, bpos + input_len as i32);
         let r = alloc_coder_result(ctx, CR_UNDERFLOW);
         Ok(Some(Value::Object(Some(r))))
     }
