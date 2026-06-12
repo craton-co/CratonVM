@@ -584,14 +584,37 @@ unsafe fn bail_to_interpreter(
     info: &JitInvokeInfo,
     args: &[Value],
 ) -> i64 {
-    let res = crate::vm::invoke_or_native(
-        vm,
-        thread,
-        info.class_name,
-        info.method_name,
-        info.descriptor,
-        args,
-    );
+    // invokespecial (kind=1) must NOT virtually re-target onto the receiver's
+    // runtime class — same rationale as the kind=1 arm of the dispatch slow
+    // path below. `invoke_or_native` → `invoke_on_class_shared` applies the
+    // abstract→receiver retarget, which turns a compiled super-call bridge
+    // into a self-call loop: H2's `ValueVarchar.compareTypeSafe` is
+    // `invokespecial ValueStringBase.compareTypeSafe` (4 args + ctx, so
+    // `try_call_compiled_entry`'s register table always bails it here);
+    // retargeting the abstract `ValueStringBase` back to the `ValueVarchar`
+    // receiver re-enters the bridge → dispatch → bail → ∞, surfacing as the
+    // GROUP BY `StackOverflowError` from the JIT depth guard (every H2
+    // TreeMap<ValueRow> comparator walk dies). `invoke_special_shared`
+    // preserves super-call semantics with native-override priority.
+    let res = if info.invoke_kind == 1 {
+        crate::vm::invoke_special_shared(
+            vm,
+            thread,
+            info.class_name,
+            info.method_name,
+            info.descriptor,
+            args,
+        )
+    } else {
+        crate::vm::invoke_or_native(
+            vm,
+            thread,
+            info.class_name,
+            info.method_name,
+            info.descriptor,
+            args,
+        )
+    };
     match res {
         Ok(Some(Value::Int(v))) => v as i64,
         Ok(Some(Value::Long(v))) => v,
@@ -2426,8 +2449,9 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
             }
         }
         eprintln!(
-            "[JIT_DISPATCH] {}.{}{} kind={} num_args={}{}",
+            "[JIT_DISPATCH] {}.{}{} kind={} num_args={}{} info_ptr=0x{:x}",
             info.class_name, info.method_name, info.descriptor, info.invoke_kind, num_args, buf,
+            info_ptr,
         );
     }
     if num_args < 0 || (num_args > 0 && (args_ptr as *const i64).is_null()) {
@@ -2475,6 +2499,12 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         None
     };
     if let Some((entry, needs_ctx)) = cached_entry {
+        if crate::runtime::env_cache::jit_dispatch_dbg() {
+            eprintln!(
+                "[JIT_DISPATCH_ARM/dcache] {}.{} entry=0x{:x}",
+                info.class_name, info.method_name, entry,
+            );
+        }
         // SAFETY: entry is a JIT-compiled function pointer cached from a previous successful
         // compilation. `try_call_compiled_entry` selects the correct extern "C" fn signature
         // based on arg count; on overflow it returns None and we bail to the interpreter.
@@ -2511,6 +2541,12 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
         if let Some(compiled) = jit_cache.get(info.class_name, info.method_name, info.descriptor) {
             let entry = compiled.entry_ptr() as usize;
             let needs_ctx = compiled.needs_context();
+            if crate::runtime::env_cache::jit_dispatch_dbg() {
+                eprintln!(
+                    "[JIT_DISPATCH_ARM/jcache] {}.{} entry=0x{:x}",
+                    info.class_name, info.method_name, entry,
+                );
+            }
             // Cache for future calls
             DISPATCH_CACHE.with(|dc| {
                 dc.borrow_mut().insert(info_key, DispatchCache { entry, needs_context: needs_ctx });
@@ -2552,6 +2588,12 @@ pub unsafe extern "C" fn jit_invoke_dispatch(
     if should_compile {
         // Try to compile the callee and cache it
         if let Some((entry, needs_ctx)) = try_compile_callee(vm, info) {
+            if crate::runtime::env_cache::jit_dispatch_dbg() {
+                eprintln!(
+                    "[JIT_DISPATCH_ARM/compile] {}.{} entry=0x{:x}",
+                    info.class_name, info.method_name, entry,
+                );
+            }
             DISPATCH_CACHE.with(|dc| {
                 dc.borrow_mut().insert(info_key, DispatchCache { entry, needs_context: needs_ctx });
             });

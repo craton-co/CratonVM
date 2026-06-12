@@ -3183,6 +3183,7 @@ pub fn execute(
 
     // Check stack overflow before pushing frame
     if thread.frames.len() >= shared.config.max_stack_depth {
+        dump_stack_on_soe(thread);
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::StackOverflowError,
         )));
@@ -11904,6 +11905,34 @@ fn invoke_cached_native_callback(
 /// Registered Rust natives that must win over real-JDK bytecode on the same
 /// declaring class (inline-cache / vtable fast paths skip `execute_invoke`).
 #[inline]
+/// CRATONVM_DBG_SOE — one-shot diagnostic: when the frame-depth ceiling is
+/// hit, dump the newest Java frames so the recursion CYCLE is visible. The
+/// Throwable stack capture keeps only a handful of frames, which hides which
+/// methods actually recurse (e.g. the H2 GROUP BY StackOverflowError).
+fn dump_stack_on_soe(thread: &JvmThread) {
+    if std::env::var_os("CRATONVM_DBG_SOE").is_none() {
+        return;
+    }
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static DUMPED: AtomicBool = AtomicBool::new(false);
+    if DUMPED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "[DBG_SOE] stack depth {} — newest 150 frames:",
+        thread.frames.len()
+    );
+    for (i, f) in thread.frames.iter().rev().take(150).enumerate() {
+        eprintln!(
+            "[DBG_SOE]   #{i} {}.{}{} pc={}",
+            f.class_name(),
+            f.method_name(),
+            f.method_descriptor(),
+            f.pc
+        );
+    }
+}
+
 fn force_native_over_real_jdk_bytecode(
     class_name: &str,
     method_name: &str,
@@ -12554,6 +12583,7 @@ fn try_stackless_invoke(
 
     // 9. Stack overflow check
     if thread.frames.len() >= shared.config.max_stack_depth {
+        dump_stack_on_soe(thread);
         if let Some(obj) = monitor_obj {
             let _ = shared.monitors.exit(obj, thread.thread_id);
         }
@@ -13314,6 +13344,7 @@ fn execute_invokestatic_cached(
             // Fallback: interpreted execution
             // Check stack overflow before pushing frame
             if thread.frames.len() >= shared.config.max_stack_depth {
+                dump_stack_on_soe(thread);
                 return Err(MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::StackOverflowError,
                 )));
@@ -16265,6 +16296,7 @@ fn execute_invokevirtual_vtable_fast(
     // Step 5 — dispatch. Pop args, push a new frame, and populate
     // invoke_cache for subsequent sibling-class misses.
     if thread.frames.len() >= shared.config.max_stack_depth {
+        dump_stack_on_soe(thread);
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::StackOverflowError,
         )));
@@ -16507,6 +16539,7 @@ fn execute_invokevirtual_cached(
                     }
 
                     if thread.frames.len() >= shared.config.max_stack_depth {
+                        dump_stack_on_soe(thread);
                         return Err(MethodCallFailed::InternalError(VmError::Runtime(
                             RuntimeError::StackOverflowError,
                         )));
@@ -16785,6 +16818,7 @@ fn execute_invokevirtual_cached(
         // Static cache entries: invokespecial uses Bytecode/Native
         CachedInvokeTarget::Bytecode { cached, gate: _ } => {
             if thread.frames.len() >= shared.config.max_stack_depth {
+                dump_stack_on_soe(thread);
                 return Err(MethodCallFailed::InternalError(VmError::Runtime(
                     RuntimeError::StackOverflowError,
                 )));
