@@ -16478,23 +16478,39 @@ fn tm_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
 /// side-table is the sole authoritative store (see `TmArrayState`).
 fn tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
     let key = tm_obj_key(ctx, this);
-    let mut tbl = tm_array_table().lock().unwrap();
-    let st = tbl.entry(key).or_default();
-    match slot {
-        TM_FIELD_DATA => {
-            st.data = match v {
-                Value::Object(o) => o,
-                _ => None,
+    {
+        let mut tbl = tm_array_table().lock().unwrap();
+        let st = tbl.entry(key).or_default();
+        match slot {
+            TM_FIELD_DATA => {
+                st.data = match v {
+                    Value::Object(o) => o,
+                    _ => None,
+                }
+            }
+            TM_FIELD_SIZE => {
+                st.size = match v {
+                    Value::Int(n) => n,
+                    _ => 0,
+                }
+            }
+            TM_FIELD_COMPARATOR => st.comparator = v,
+            _ => {}
+        }
+    }
+    // Mirror the entry count to the real JDK `size` field (resolved by name — the
+    // synthetic slot would corrupt an unrelated real field, see tm_obj_key doc).
+    // Real-bytecode TreeMap.writeObject does `s.writeInt(size)` reading this
+    // field directly; without the mirror it stayed 0, so a populated TreeMap
+    // serialized as size=0 + the entries, which a peer read back as empty.
+    if slot == TM_FIELD_SIZE {
+        if let Value::Int(n) = v {
+            if let Some(real) = ctx.resolve_field_index("java/util/TreeMap", "size") {
+                if real < ctx.object_num_fields(this) {
+                    ctx.set_field(this, real, Value::Int(n));
+                }
             }
         }
-        TM_FIELD_SIZE => {
-            st.size = match v {
-                Value::Int(n) => n,
-                _ => 0,
-            }
-        }
-        TM_FIELD_COMPARATOR => st.comparator = v,
-        _ => {}
     }
 }
 
