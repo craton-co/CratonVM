@@ -53420,9 +53420,10 @@ mod tests {
     }
 
     #[test]
-    fn type_switch_null_returns_labels_len() {
+    fn type_switch_null_returns_minus_one() {
         // Test the execute_type_switch function with a null target.
-        // null should return labels.len() (the null case index).
+        // Per the SwitchBootstraps.typeSwitch contract, null returns -1
+        // (the `case null` arm).
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
@@ -53458,9 +53459,9 @@ mod tests {
         let result =
             crate::runtime::invokedynamic::execute_type_switch(&shared, &mut thread, 0, &labels);
         assert!(result.is_ok());
-        // Result should be labels.len() = 2 for null
+        // Result should be -1 for null (the `case null` arm).
         let val = thread.frames[0].stack.pop().unwrap();
-        assert_eq!(val, Value::Int(2));
+        assert_eq!(val, Value::Int(-1));
     }
 
     #[test]
@@ -53576,7 +53577,7 @@ mod tests {
     }
 
     #[test]
-    fn type_switch_no_match_returns_negative_one() {
+    fn type_switch_no_match_returns_labels_len() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
@@ -53618,7 +53619,8 @@ mod tests {
             crate::runtime::invokedynamic::execute_type_switch(&shared, &mut thread, 0, &labels);
         assert!(result.is_ok());
         let val = thread.frames[0].stack.pop().unwrap();
-        assert_eq!(val, Value::Int(-1));
+        // No label matches a non-null target → labels.len() (default arm).
+        assert_eq!(val, Value::Int(2));
     }
 
     #[test]
@@ -53669,7 +53671,8 @@ mod tests {
         assert!(result.is_ok());
         let val = thread.frames[0].stack.pop().unwrap();
         // "hello" is at index 1 but startIndex=2 skips it РІвЂ вЂ™ no match
-        assert_eq!(val, Value::Int(-1));
+        // "hello" is at index 1 but startIndex=2 skips it -> no match -> labels.len()
+        assert_eq!(val, Value::Int(3));
     }
 
     #[test]
@@ -53723,7 +53726,7 @@ mod tests {
     }
 
     #[test]
-    fn enum_switch_null_returns_labels_len() {
+    fn enum_switch_null_returns_minus_one() {
         let shared = Arc::new(SharedVm::new(VmConfig::default()));
         let mut thread = JvmThread::new(ThreadId(0), "test");
 
@@ -53751,7 +53754,7 @@ mod tests {
             crate::runtime::invokedynamic::execute_enum_switch(&shared, &mut thread, 0, &labels);
         assert!(result.is_ok());
         let val = thread.frames[0].stack.pop().unwrap();
-        assert_eq!(val, Value::Int(2)); // null РІвЂ вЂ™ labels.len()
+        assert_eq!(val, Value::Int(-1)); // null -> -1 (case null arm)
     }
 
     // =========================================================================
