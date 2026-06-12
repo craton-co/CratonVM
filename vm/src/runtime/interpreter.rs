@@ -3287,6 +3287,13 @@ pub fn execute(
             } else {
                 "unknown panic in bytecode execution".to_string()
             };
+            if let Some(f) = thread.frames.last() {
+                eprintln!(
+                    "[PANIC_IN] {}.{}{} pc={} max_stack={} :: {}",
+                    f.class_name(), f.method_name(), f.method_descriptor(),
+                    f.pc, f.max_stack, msg
+                );
+            }
             Err(MethodCallFailed::InternalError(VmError::Runtime(
                 RuntimeError::NotImplemented { feature: msg },
             )))
@@ -11917,13 +11924,21 @@ fn invoke_cached_native_callback(
     let result = result?;
     if let Some(value) = result {
         let ret = crate::jit::return_type(method_descriptor);
-        let value = if ret != b'V' {
-            coerce_value_for_return(value, ret)
-        } else {
-            value
-        };
-        push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
-        crate::vm::native_return_pushed_to_stack(shared, thread);
+        // A void method must not leave anything on the caller's operand stack,
+        // even if its native happens to return `Some(_)` (many natives return
+        // the receiver / a status for convenience). The slow path
+        // (`execute_invoke_kind`) already drops the value for `V`; the cached
+        // VirtualNative fast path historically pushed it unconditionally,
+        // leaking one operand per call. With an overloaded void method whose
+        // first call primes this cache (e.g. `java/util/zip/Checksum.update`),
+        // the leak accumulates until the caller frame's operand stack overflows
+        // its `max_stack` — kafka-clients `Crc32CTest.testUpdate` panicked at
+        // `value_stack.rs` "len 24 index 24". Only push for non-void returns.
+        if ret != b'V' {
+            let value = coerce_value_for_return(value, ret);
+            push_invoke_return_value(&mut thread.frames[frame_idx].stack, value)?;
+            crate::vm::native_return_pushed_to_stack(shared, thread);
+        }
     }
     Ok(())
 }
