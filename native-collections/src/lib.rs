@@ -272,7 +272,22 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // every runnable immediately, which breaks Surefire ForkedBooter.exit1
     // (it schedules kill() as a delayed backup; immediate kill NPEs on a
     // null CommandReader when setupBooter failed first).
-    register_concurrent_skip_list_map_natives(registry);
+    // ConcurrentSkipListMap: the native "sorted array" impl is BROKEN in
+    // real-JDK mode — it stores state in synthetic object slots 0/1/2 that
+    // don't exist in the real CSLM layout, AND it ignores a custom Comparator
+    // (binary search is hardcoded to natural ordering), AND it never intercepts
+    // the `(Comparator)` constructor. A `new ConcurrentSkipListMap(cmp)` with
+    // non-Comparable keys (e.g. `Class` keyed by a name-comparator, as Gradle's
+    // DefaultSerializerRegistry does) silently drops every put → size 0. Run the
+    // real java.util.concurrent.ConcurrentSkipListMap bytecode instead (it works
+    // under CratonVM's real java.u.c support — Unsafe/VarHandle CAS + the
+    // comparator). This unblocks the Gradle test worker: its
+    // WorkerLoggingSerializer registers LogEvent/StyledText/LogLevelChange
+    // serializers into such a map; with the native dropping them, canSerialize
+    // returned false → LogEvent fell back to (failing) Java serialization →
+    // worker→daemon stream desync. (Disabled, not deleted; impl kept for
+    // reference. native-builtins' copy is synthetic-jdk-gated, already inert.)
+    let _ = register_concurrent_skip_list_map_natives;
     register_stamped_lock_natives(registry);
     // Phaser is overridden with a synthetic 3-int layout (parties=0, arrived=1,
     // phase=2) that conflicts with the real JDK field layout (state(0, J),
