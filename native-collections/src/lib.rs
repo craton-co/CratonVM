@@ -15893,34 +15893,29 @@ fn native_al_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(b) => b,
         None => return Ok(Some(Value::Int(0))),
     };
-    let dbg = std::env::var("CRATONVM_DBG_RA").is_ok();
-    if dbg {
-        eprintln!("[DBG_RA] removeAll size={} coll_elems.len={}", size, coll_elems.len());
-        for (k, ce) in coll_elems.iter().enumerate().take(4) {
-            let cn = if let Value::Object(Some(o)) = ce { ctx.class_name_of_id(ctx.class_id_of_object(*o)) } else { None };
-            eprintln!("[DBG_RA]   ce[{k}]={ce:?} class={cn:?}");
-        }
-    }
-    // Compact: keep elements NOT in collection
-    let mut write_idx = 0usize;
+    // Two-pass: read ALL elements + decide keep/remove FIRST, then write the kept
+    // ones back. The previous single-pass in-place compaction (read buf[i], write
+    // buf[w<i] in the same loop) over-removed *everything* whenever the backing
+    // array was exactly full (`capacity == size`) — `removeAll(...)` then returned
+    // an empty list (e.g. `new ArrayList<>(Arrays.asList(Errors.values())).removeAll(x)`
+    // wiped all 121 elements, emptying a `@MethodSource` stream → bug-14). Doing all
+    // reads before any write removes that interleaving.
+    let mut kept: Vec<Value> = Vec::with_capacity(size as usize);
     let mut modified = false;
     for read_idx in 0..(size as usize) {
         let elem = ctx.get_array_element(buf, read_idx);
-        let should_remove = coll_elems.iter().any(|ce| values_equal(ctx, &elem, ce));
-        if dbg && read_idx < 4 {
-            let en = if let Value::Object(Some(o)) = &elem { ctx.class_name_of_id(ctx.class_id_of_object(*o)) } else { None };
-            eprintln!("[DBG_RA]   elem[{read_idx}]={elem:?} class={en:?} should_remove={should_remove}");
-        }
-        if should_remove {
+        if coll_elems.iter().any(|ce| values_equal(ctx, &elem, ce)) {
             modified = true;
         } else {
-            if write_idx != read_idx {
-                ctx.set_array_element(buf, write_idx, elem);
-            }
-            write_idx += 1;
+            kept.push(elem);
         }
     }
-    al_set_size(ctx, this, write_idx as i32);
+    if modified {
+        for (i, e) in kept.iter().enumerate() {
+            ctx.set_array_element(buf, i, *e);
+        }
+        al_set_size(ctx, this, kept.len() as i32);
+    }
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
 
@@ -15939,21 +15934,24 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(b) => b,
         None => return Ok(Some(Value::Int(0))),
     };
-    let mut write_idx = 0usize;
+    // Two-pass (see native_al_remove_all): read+decide before writing, so a full
+    // backing array (capacity == size) is handled correctly.
+    let mut kept: Vec<Value> = Vec::with_capacity(size as usize);
     let mut modified = false;
     for read_idx in 0..(size as usize) {
         let elem = ctx.get_array_element(buf, read_idx);
-        let should_keep = coll_elems.iter().any(|ce| values_equal(ctx, &elem, ce));
-        if should_keep {
-            if write_idx != read_idx {
-                ctx.set_array_element(buf, write_idx, elem);
-            }
-            write_idx += 1;
+        if coll_elems.iter().any(|ce| values_equal(ctx, &elem, ce)) {
+            kept.push(elem);
         } else {
             modified = true;
         }
     }
-    al_set_size(ctx, this, write_idx as i32);
+    if modified {
+        for (i, e) in kept.iter().enumerate() {
+            ctx.set_array_element(buf, i, *e);
+        }
+        al_set_size(ctx, this, kept.len() as i32);
+    }
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
 }
 

@@ -2895,6 +2895,28 @@ fn native_baos_close(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCal
     Ok(None) // no-op
 }
 
+/// `java.io.FilterOutputStream.close()` — flush this stream, then close the
+/// wrapped `out` (slot 0). Mirrors the real JDK implementation so wrapper streams
+/// (DataOutputStream, BufferedOutputStream, …) propagate close()/finish() to the
+/// stream they wrap. Idempotent via the `closed` boolean at slot 1.
+fn native_filteros_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    if matches!(ctx.get_field(this, 1), Value::Int(v) if v != 0) {
+        return Ok(None); // already closed
+    }
+    ctx.set_field(this, 1, Value::Int(1));
+    // flush() (DataOutputStream/BufferedOutputStream flush their own buffer), then
+    // close the wrapped stream so its close()/finish() runs.
+    let _ = ctx.invoke_virtual(this, "flush", "()V", &[]);
+    if let Value::Object(Some(out)) = ctx.get_field(this, 0) {
+        let _ = ctx.invoke_virtual(out, "close", "()V", &[]);
+    }
+    Ok(None)
+}
+
 fn native_baos_flush(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None) // no-op
 }
@@ -4228,6 +4250,16 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register("java/io/OutputStream", "flush", "()V", native_baos_flush);
     registry.register("java/io/OutputStream", "close", "()V", native_baos_close);
+    // FilterOutputStream.close() MUST flush and then close the wrapped stream
+    // (`out`, slot 0). Without this, a `DataOutputStream`/`BufferedOutputStream`
+    // wrapping e.g. a `GZIPOutputStream` resolved its inherited `close()` to the
+    // base `OutputStream.close` no-op above — so closing the DataOutputStream
+    // never reached `GZIPOutputStream.finish()`, and only the 10-byte gzip header
+    // was emitted (the deflated body + trailer were dropped). That truncated every
+    // kafka compressed record batch built through `MemoryRecordsBuilder`'s
+    // `DataOutputStream(compressionStream)` → "Unexpected end of ZLIB input stream"
+    // on read-back (bug-15). `closed` is at slot 1 (idempotency).
+    registry.register("java/io/FilterOutputStream", "close", "()V", native_filteros_close);
 
     // --- java.util.Scanner ---
     register_scanner_natives(registry);
