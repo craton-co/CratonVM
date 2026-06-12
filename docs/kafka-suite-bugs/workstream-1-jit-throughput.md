@@ -9,12 +9,24 @@ workstream, not a discrete crash.
 
 | Configuration | Wall time |
 |---|---|
-| HotSpot 25 | ~9 s |
+| HotSpot 25 tiered (default) | **~0.8 s** (compiles 2845 methods, but **async/background**) |
+| HotSpot 25 `-Xint` (interpreter only) | **~1.3 s** |
 | CratonVM `--nojit` (pure interpreter) | **9.5 s** |
 | CratonVM JIT-on (default) | **227 s** |
 
-So **JIT-on is ~24× *slower* than the interpreter** for this workload — the opposite
-of what JIT should do.
+Two separate gaps:
+- **JIT inversion (the catastrophe):** CratonVM JIT-on is **~24× *slower* than
+  CratonVM's own interpreter** — the opposite of what JIT should do. HotSpot's JIT'd
+  code is *faster* than its interpreter; CratonVM's is *slower* for call-heavy code.
+- **Interpreter gap (secondary):** CratonVM's interpreter (9.5 s) is ~7× slower than
+  HotSpot's (`-Xint` 1.3 s).
+
+HotSpot stays fast because it is **interpreter-first with asynchronous (background)
+compilation**: short-lived code is interpreted, hot methods are compiled off-thread
+and swapped in, so the JIT never *slows* a workload. CratonVM compiles eagerly and
+its JIT'd call-heavy code executes slower than interpreting it → the 24× penalty.
+The HotSpot-aligned fix is to not JIT code where the JIT'd version isn't faster
+(higher/smarter threshold or async compile), validated against the compute benchmarks.
 
 ### What it is *not* (ruled out by instrumentation)
 - **Not compile-time:** with `CRATONVM_DBG_JITC` timing, **0** of the 101 compiles
