@@ -9756,6 +9756,21 @@ pub(crate) fn native_class_get_class_loader(
         // Bootstrap loader → null per JVM spec.
         return Ok(Some(Value::Object(None)));
     }
+    if loader_type == 0 && !is_jdk_pkg {
+        // A bootstrap-tagged class outside the JDK packages is one of:
+        //   (a) a class genuinely injected into the bootstrap search via
+        //       `Instrumentation.appendToBootstrapClassLoaderSearch`
+        //       (Mockito's inline mock maker injects `MockMethodDispatcher`
+        //       there and then asserts `getClassLoader() == null`), or
+        //   (b) a synthetic stub of an app-level class (those default to the
+        //       bootstrap loader id but are really application placeholders).
+        // For (a) — a real, fully-loaded class — the spec says the loader is
+        // null. For (b) keep the app-loader fallback below so a stubbed app
+        // class never spuriously reports a null loader.
+        if !ctx.is_class_synthetic_stub(&class_name) {
+            return Ok(Some(Value::Object(None)));
+        }
+    }
     if loader_type == 1 {
         // Platform/extension loader — return singleton.
         let cl = crate::classloader::get_or_create_platform_loader(ctx);

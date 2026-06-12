@@ -1750,6 +1750,15 @@ pub trait NativeContext {
     /// subsequent `ensure_class_initialized` and `find_resource` calls search them.
     fn register_dynamic_classpath(&mut self, paths: &[String]);
 
+    /// Append paths to the BOOTSTRAP class search path so their classes load
+    /// with the bootstrap loader (null `Class.getClassLoader()`). Drives
+    /// `Instrumentation.appendToBootstrapClassLoaderSearch`. The default
+    /// implementation falls back to the application classpath; the VM's
+    /// `NativeContext` overrides it to target the bootstrap loader.
+    fn register_bootstrap_classpath(&mut self, paths: &[String]) {
+        self.register_dynamic_classpath(paths);
+    }
+
     /// Define a new class from raw bytecode (Phase 23.2).
     ///
     /// Parses the class bytes, registers the class with the ClassManager under

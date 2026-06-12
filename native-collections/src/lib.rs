@@ -11014,7 +11014,21 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
 
     // Fast path: a genuine ArrayList-shaped source (field-layout match) with
     // elements — copy the backing array directly.
-    let (src_data, src_size) = al_state(ctx, source);
+    //
+    // BUT skip it for org.apache.kafka.common.utils.ImplicitLinkedHashCollection
+    // (and subclasses): its `elements` is an open-addressing hash array with
+    // NULL holes, so the ArrayList-layout read would copy `elements[0..size]`
+    // and carry the holes (e.g. `new ArrayList<>(apiVersionCollection)` got 5
+    // null elements). Fall through to `collect_collection_elements`, which has
+    // a dedicated null-skipping branch for these.
+    let source_is_ilhc = ctx
+        .class_id_by_name("org/apache/kafka/common/utils/ImplicitLinkedHashCollection")
+        .is_some_and(|ilhc| ctx.is_subclass(ctx.class_id_of_object(source), ilhc));
+    let (src_data, src_size) = if source_is_ilhc {
+        (None, 0)
+    } else {
+        al_state(ctx, source)
+    };
     if let (Some(arr), size) = (src_data, src_size) {
         if size > 0 {
             let cap = std::cmp::max(size as usize, AL_DEFAULT_CAPACITY);
@@ -15701,6 +15715,39 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
         }
     }
+    // org.apache.kafka.common.utils.ImplicitLinkedHashCollection (and its
+    // subclasses — ImplicitLinkedHashMultiCollection, the generated message
+    // *Collection types like ApiVersionsResponseData$ApiVersionCollection):
+    // an open-addressing hash array `elements` with NULL holes for empty
+    // buckets plus a `size` count. The generic ArrayList heuristic below reads
+    // `elements[0..size]` and so surfaces those null holes — e.g.
+    // `ApiVersionCollection.toArray()` returned 5 nulls, so
+    // `new LinkedList<>(coll)` carried nulls and `NodeApiVersions.<init>` NPE'd
+    // on `apiVersion.apiKey()`. The real `iterator()` walks an embedded linked
+    // list and skips holes; mirror that by reading the backing array and
+    // dropping nulls. (Membership is exact; element ordering is hash-bucket
+    // order rather than the LinkedHash insertion order — toArray callers in
+    // this suite don't depend on order, and serialization uses iterator(), not
+    // this native.)
+    if let Some(ilhc_cid) =
+        ctx.class_id_by_name("org/apache/kafka/common/utils/ImplicitLinkedHashCollection")
+    {
+        if ctx.is_subclass(cid, ilhc_cid) {
+            if let Value::Object(Some(arr)) = ctx.get_field_by_name(coll, "elements") {
+                if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                    let len = ctx.array_length(arr);
+                    let mut out = Vec::new();
+                    for i in 0..len {
+                        let v = ctx.get_array_element(arr, i);
+                        if !matches!(v, Value::Object(None)) {
+                            out.push(v);
+                        }
+                    }
+                    return out;
+                }
+            }
+        }
+    }
     // KC-Charset fix (2026-05-25): receiver-layout guard for the speculative
     // probe sequence below. `collect_collection_elements` is invoked through
     // generic Collection-interface natives (`addAll`, `retainAll`, `HashSet`
@@ -15846,12 +15893,24 @@ fn native_al_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(b) => b,
         None => return Ok(Some(Value::Int(0))),
     };
+    let dbg = std::env::var("CRATONVM_DBG_RA").is_ok();
+    if dbg {
+        eprintln!("[DBG_RA] removeAll size={} coll_elems.len={}", size, coll_elems.len());
+        for (k, ce) in coll_elems.iter().enumerate().take(4) {
+            let cn = if let Value::Object(Some(o)) = ce { ctx.class_name_of_id(ctx.class_id_of_object(*o)) } else { None };
+            eprintln!("[DBG_RA]   ce[{k}]={ce:?} class={cn:?}");
+        }
+    }
     // Compact: keep elements NOT in collection
     let mut write_idx = 0usize;
     let mut modified = false;
     for read_idx in 0..(size as usize) {
         let elem = ctx.get_array_element(buf, read_idx);
         let should_remove = coll_elems.iter().any(|ce| values_equal(ctx, &elem, ce));
+        if dbg && read_idx < 4 {
+            let en = if let Value::Object(Some(o)) = &elem { ctx.class_name_of_id(ctx.class_id_of_object(*o)) } else { None };
+            eprintln!("[DBG_RA]   elem[{read_idx}]={elem:?} class={en:?} should_remove={should_remove}");
+        }
         if should_remove {
             modified = true;
         } else {
@@ -23499,7 +23558,84 @@ fn register_scheduled_executor_natives(r: &mut NativeMethodRegistry) {
         "(Ljava/util/concurrent/Callable;)Ljava/util/concurrent/Future;",
         native_stpe_submit_callable,
     );
+
+    // ScheduledFuture instance methods. `schedule(...)` returns an object whose
+    // runtime class is the `ScheduledFuture` interface (see alloc_completed_future
+    // / native_stpe_schedule). Without these natives, a caller that holds the
+    // result as `Future` and calls `cancel`/`isCancelled`/`isDone`/`get` resolves
+    // to the abstract `Future` declaration (no Code) and throws AbstractMethodError.
+    // The canonical tripwire is JUnit Jupiter's `@Timeout` support, which schedules
+    // an interrupt task and calls `future.cancel(false)` in its `finally` block —
+    // that single call previously failed *every* test in a `@Timeout`-annotated
+    // class (the bulk of the kafka suite). Field layout (alloc_completed_future /
+    // native_stpe_schedule): 0 = result value, 1 = state (0=pending, 1=done, 2=cancelled).
+    let sf = "java/util/concurrent/ScheduledFuture";
+    r.register(sf, "cancel", "(Z)Z", native_sf_cancel);
+    r.register(sf, "isCancelled", "()Z", native_sf_is_cancelled);
+    r.register(sf, "isDone", "()Z", native_sf_is_done);
+    r.register(sf, "get", "()Ljava/lang/Object;", native_sf_get);
+    r.register(
+        sf,
+        "get",
+        "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+        native_sf_get,
+    );
     r.set_category(__prev_cat);
+}
+
+/// ScheduledFuture state held in field 1.
+const SF_STATE_PENDING: i32 = 0;
+const SF_STATE_DONE: i32 = 1;
+const SF_STATE_CANCELLED: i32 = 2;
+
+fn sf_state(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
+    match ctx.get_field(this, 1) {
+        Value::Int(v) => v,
+        _ => SF_STATE_DONE,
+    }
+}
+
+/// `Future.cancel(boolean)` — cancel iff the task has not already run/completed.
+/// Returns whether this call performed the transition. JUnit's `@Timeout` reads
+/// this: `true` => the scheduled interrupt never fired (no timeout) => test ran
+/// to completion normally; `false` => the task already ran => timeout.
+fn native_sf_cancel(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    if sf_state(ctx, this) == SF_STATE_PENDING {
+        ctx.set_field(this, 1, Value::Int(SF_STATE_CANCELLED));
+        Ok(Some(Value::Int(1)))
+    } else {
+        Ok(Some(Value::Int(0)))
+    }
+}
+
+fn native_sf_is_cancelled(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int(
+        (sf_state(ctx, this) == SF_STATE_CANCELLED) as i32,
+    )))
+}
+
+fn native_sf_is_done(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    Ok(Some(Value::Int((sf_state(ctx, this) != SF_STATE_PENDING) as i32)))
+}
+
+fn native_sf_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    Ok(Some(ctx.get_field(this, 0)))
 }
 
 /// Allocate a completed ScheduledFuture that wraps a result value.
@@ -23528,7 +23664,7 @@ fn native_stpe_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
 }
 
 fn native_stpe_schedule(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // args: this, Runnable, long delay (2 slots), TimeUnit
+    // args: this, Runnable, long delay, TimeUnit
     let runnable = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
@@ -23536,10 +23672,37 @@ fn native_stpe_schedule(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
             return Ok(Some(Value::Object(Some(future))));
         }
     };
-    // Execute immediately (simplified)
+    // The generic operand-stack pop type-erases Long -> Double bit-pattern.
+    let delay = match args.get(2) {
+        Some(Value::Long(v)) => *v,
+        Some(Value::Double(d)) => d.to_bits() as i64,
+        Some(Value::Int(v)) => *v as i64,
+        _ => 0,
+    };
+    if delay > 0 {
+        // Delayed task: we have no real timer thread, so do NOT fire the task.
+        // Return a *pending*, cancellable future. This is exactly the contract
+        // JUnit `@Timeout` relies on: the test finishes well before the delay,
+        // then `future.cancel(false)` succeeds (returns true => no timeout).
+        // Firing the runnable immediately would (a) interrupt the test thread
+        // and (b) make cancel() return false => spurious TimeoutException.
+        let future = alloc_pending_future(ctx);
+        return Ok(Some(Value::Object(Some(future))));
+    }
+    // Zero/negative delay: run immediately (existing simplified behaviour) and
+    // return a completed (non-cancellable) future.
     ctx.invoke_virtual(runnable, "run", "()V", &[])?;
     let future = alloc_completed_future(ctx, Value::Object(None));
     Ok(Some(Value::Object(Some(future))))
+}
+
+/// Allocate a pending (not-yet-run, cancellable) ScheduledFuture.
+/// Fields: 0 = result (null), 1 = state (0 = pending).
+fn alloc_pending_future(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let future = alloc_synthetic(ctx, "java/util/concurrent/ScheduledFuture", 2);
+    ctx.set_field(future, 0, Value::Object(None));
+    ctx.set_field(future, 1, Value::Int(SF_STATE_PENDING));
+    future
 }
 
 fn native_stpe_schedule_fixed_rate(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -24780,6 +24943,27 @@ fn register_executors_scheduled_natives(r: &mut NativeMethodRegistry) {
         "(Z)V",
         native_stpe_ignore_policy_setter,
     );
+    // ScheduledFuture instance methods. `schedule(...)` (native_stpe_schedule)
+    // returns an object whose runtime class is the `ScheduledFuture` interface.
+    // Without these, a caller holding the result as `Future` and calling
+    // `cancel`/`isCancelled`/`isDone`/`get` resolves to the abstract `Future`
+    // declaration (no Code) and throws `AbstractMethodError`. Canonical tripwire:
+    // JUnit Jupiter's `@Timeout` schedules an interrupt task and calls
+    // `future.cancel(false)` in its `finally` block — that single call previously
+    // failed *every* test in a `@Timeout`-annotated class (the bulk of the kafka
+    // suite). Field layout (alloc_pending_future / alloc_completed_future):
+    // 0 = result value, 1 = state (0=pending, 1=done, 2=cancelled).
+    let sf = "java/util/concurrent/ScheduledFuture";
+    r.register(sf, "cancel", "(Z)Z", native_sf_cancel);
+    r.register(sf, "isCancelled", "()Z", native_sf_is_cancelled);
+    r.register(sf, "isDone", "()Z", native_sf_is_done);
+    r.register(sf, "get", "()Ljava/lang/Object;", native_sf_get);
+    r.register(
+        sf,
+        "get",
+        "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;",
+        native_sf_get,
+    );
     r.set_category(__prev_cat);
 }
 
@@ -24916,6 +25100,13 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
         native_cf_any_of,
     );
 
+    // complete — needed because the real CompletableFuture.complete(null) relies on
+    // the static `NIL` AltResult sentinel, which is effectively null on CratonVM, so
+    // `complete(null)` leaves `result == null` (isDone() stays false). That breaks
+    // e.g. KafkaFuture.allOf(...) whose result is completed with `complete(null)`,
+    // leaving it pending forever (get() hangs).
+    r.register(cf, "complete", "(Ljava/lang/Object;)Z", native_cf_complete);
+
     // completeExceptionally
     r.register(
         cf,
@@ -24934,6 +25125,18 @@ fn register_concurrent_completeness_natives(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Int(0))),
             };
+            // Real encoding (set by real `complete`/`obtrudeException`, including
+            // our routed `completeExceptionally`): exceptionally completed iff
+            // `result` (slot 0) is an `AltResult` whose `ex` is non-null.
+            if let Value::Object(Some(r)) = ctx.get_field(this, 0) {
+                if cf_is_alt_result(ctx, r) {
+                    let ex = ctx.get_field(r, 0);
+                    return Ok(Some(Value::Int(
+                        i32::from(!matches!(ex, Value::Object(None))),
+                    )));
+                }
+            }
+            // Legacy synthetic `DONE` marker (CratonVM-chained CFs).
             let done = match ctx.get_field(this, CF_FIELD_DONE) {
                 Value::Int(d) => d,
                 _ => 0,
@@ -25471,43 +25674,28 @@ fn native_cf_exceptionally(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let handler = match args.get(1) {
         Some(Value::Object(Some(o))) => *o,
         _ => {
-            // No handler — just copy the CF
-            let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-            let val = ctx.get_field(this, CF_FIELD_RESULT);
-            let done = ctx.get_field(this, CF_FIELD_DONE);
-            ctx.set_field(cf, CF_FIELD_RESULT, val);
-            ctx.set_field(cf, CF_FIELD_DONE, done);
-            return Ok(Some(Value::Object(Some(cf))));
+            // No handler — mirror the source completion.
+            let st = cf_read_state(ctx, this);
+            return Ok(Some(cf_make_completed(ctx, st)));
         }
     };
-    let done = match ctx.get_field(this, CF_FIELD_DONE) {
-        Value::Int(d) => d,
-        _ => 0,
-    };
-    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-    if done == 2 {
-        // Already exceptionally completed — call the handler immediately
-        let exc = ctx.get_field(this, CF_FIELD_RESULT);
-        let result = ctx.invoke_virtual(
-            handler,
-            "apply",
-            "(Ljava/lang/Object;)Ljava/lang/Object;",
-            &[exc],
-        )?;
-        ctx.set_field(cf, CF_FIELD_RESULT, result.unwrap_or(Value::Object(None)));
-        ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1)); // recovery = normal completion
-    } else if done == 0 {
-        // Source not yet complete — defer: store source + handler, mark done=-1
-        ctx.set_field(cf, CF_FIELD_DONE, Value::Int(-1)); // deferred
-        ctx.set_field(cf, CF_FIELD_SOURCE, Value::Object(Some(this)));
-        ctx.set_field(cf, CF_FIELD_HANDLER, Value::Object(Some(handler)));
-    } else {
-        // Normally completed — pass through the result unchanged
-        let val = ctx.get_field(this, CF_FIELD_RESULT);
-        ctx.set_field(cf, CF_FIELD_RESULT, val);
-        ctx.set_field(cf, CF_FIELD_DONE, Value::Int(done));
+    match cf_read_state(ctx, this) {
+        CfState::Exceptional(exc) => {
+            // Recover: apply the handler to the throwable; result = normal value.
+            let result = ctx.invoke_virtual(
+                handler,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[exc],
+            )?;
+            Ok(Some(cf_make_completed(
+                ctx,
+                CfState::Normal(result.unwrap_or(Value::Object(None))),
+            )))
+        }
+        // Normal (or still pending → treat as its current value) → pass through.
+        state => Ok(Some(cf_make_completed(ctx, state))),
     }
-    Ok(Some(Value::Object(Some(cf))))
 }
 
 fn native_cf_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -25519,18 +25707,23 @@ fn native_cf_handle(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let val = ctx.get_field(this, CF_FIELD_RESULT);
-    // In our simplified model, exception is always null
+    // handle(BiFunction(result, exception)) — pass the real (value, exception) pair.
+    let (val, exc) = match cf_read_state(ctx, this) {
+        CfState::Normal(v) => (v, Value::Object(None)),
+        CfState::Exceptional(e) => (Value::Object(None), e),
+        CfState::Pending => (Value::Object(None), Value::Object(None)),
+    };
     let result = ctx.invoke_virtual(
         bi_func,
         "apply",
         "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
-        &[val, Value::Object(None)],
+        &[val, exc],
     )?;
-    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-    ctx.set_field(cf, CF_FIELD_RESULT, result.unwrap_or(Value::Object(None)));
-    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-    Ok(Some(Value::Object(Some(cf))))
+    // handle always produces a normal completion with the function's result.
+    Ok(Some(cf_make_completed(
+        ctx,
+        CfState::Normal(result.unwrap_or(Value::Object(None))),
+    )))
 }
 
 fn native_cf_when_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -25542,29 +25735,52 @@ fn native_cf_when_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let val = ctx.get_field(this, CF_FIELD_RESULT);
-    // Call BiConsumer(result, exception) — exception is null in our model
+    // Pass the real (result, exception) pair to the BiConsumer. Reading the source
+    // state layout-agnostically is what makes KafkaFuture.all()/allOf complete its
+    // dependent KafkaFutureImpl exceptionally instead of leaving it pending (which
+    // made get() block forever — bug-08). The returned CF mirrors the source.
+    let (val, exc) = match cf_read_state(ctx, this) {
+        CfState::Normal(v) => (v, Value::Object(None)),
+        CfState::Exceptional(e) => (Value::Object(None), e),
+        CfState::Pending => (Value::Object(None), Value::Object(None)),
+    };
     let _ = ctx.invoke_virtual(
         consumer,
         "accept",
         "(Ljava/lang/Object;Ljava/lang/Object;)V",
-        &[val.clone(), Value::Object(None)],
+        &[val.clone(), exc.clone()],
     );
-    // Return a new CF with the same result (whenComplete does not transform)
-    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-    ctx.set_field(cf, CF_FIELD_RESULT, val);
-    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-    Ok(Some(Value::Object(Some(cf))))
+    let mirror = if matches!(exc, Value::Object(None)) {
+        CfState::Normal(val)
+    } else {
+        CfState::Exceptional(exc)
+    };
+    Ok(Some(cf_make_completed(ctx, mirror)))
 }
 
 fn native_cf_all_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // In our model all CFs are already completed synchronously.
-    // allOf returns a CF<Void> that is done.
-    let _arr = args.first(); // the CompletableFuture[] argument
-    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-    ctx.set_field(cf, CF_FIELD_RESULT, Value::Object(None));
-    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-    Ok(Some(Value::Object(Some(cf))))
+    // In our synchronous model all input CFs are already completed. allOf returns a
+    // CF<Void> that is normally done UNLESS any input completed exceptionally, in
+    // which case allOf is exceptional with that throwable (real JDK semantics — and
+    // required so KafkaFuture.allOf().whenComplete() propagates the failure).
+    let mut exc: Option<Value> = None;
+    if let Some(Value::Object(Some(arr))) = args.first() {
+        let arr = *arr;
+        let len = ctx.array_length(arr);
+        for i in 0..len {
+            if let Value::Object(Some(cf_obj)) = ctx.get_array_element(arr, i) {
+                if let CfState::Exceptional(e) = cf_read_state(ctx, cf_obj) {
+                    exc = Some(e);
+                    break;
+                }
+            }
+        }
+    }
+    let state = match exc {
+        Some(e) => CfState::Exceptional(e),
+        None => CfState::Normal(Value::Object(None)),
+    };
+    Ok(Some(cf_make_completed(ctx, state)))
 }
 
 fn native_cf_any_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -25594,22 +25810,182 @@ fn native_cf_any_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     Ok(Some(Value::Object(Some(cf))))
 }
 
+const CF_ALT_RESULT_CLASS: &str = "java/util/concurrent/CompletableFuture$AltResult";
+
+/// Read the real static `CompletableFuture.NIL` sentinel (`new AltResult(null)`),
+/// used to represent a completion whose value is `null`. Returns null only if the
+/// field can't be resolved (degraded — leaves the future pending).
+fn cf_nil(ctx: &mut dyn NativeContext) -> Value {
+    if let Ok(cid) = ctx.ensure_class_initialized("java/util/concurrent/CompletableFuture") {
+        if let Some(idx) = ctx.static_field_index_by_name(cid, "NIL") {
+            return ctx.get_static_field(cid, idx);
+        }
+    }
+    Value::Object(None)
+}
+
+/// True if `obj`'s runtime class is `CompletableFuture$AltResult`.
+fn cf_is_alt_result(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(obj);
+    matches!(ctx.class_name_of_id(cid).as_deref(), Some(CF_ALT_RESULT_CLASS))
+}
+
+/// Completion state of a CompletableFuture, read in a layout-agnostic way so the
+/// chaining natives behave correctly on BOTH CratonVM-synthetic 4-slot CFs (state
+/// encoded as a `DONE` Int in slot 1) and real JDK CFs / app subclasses such as
+/// `KafkaCompletableFuture` (state encoded in `result` (slot 0): null = pending,
+/// `AltResult(ex)` = exceptional, any other value = normal).
+enum CfState {
+    Pending,
+    Normal(Value),
+    Exceptional(Value),
+}
+
+fn cf_read_state(ctx: &dyn NativeContext, this: ObjectRef) -> CfState {
+    let r = ctx.get_field(this, CF_FIELD_RESULT);
+    // Real encoding: result is an AltResult (exceptional, or NIL = normal null).
+    if let Value::Object(Some(ro)) = r {
+        if cf_is_alt_result(ctx, ro) {
+            let ex = ctx.get_field(ro, 0);
+            return if matches!(ex, Value::Object(None)) {
+                CfState::Normal(Value::Object(None))
+            } else {
+                CfState::Exceptional(ex)
+            };
+        }
+    }
+    // Synthetic encoding: DONE marker (Int) in slot 1.
+    match ctx.get_field(this, CF_FIELD_DONE) {
+        Value::Int(2) | Value::Int(3) => CfState::Exceptional(r),
+        Value::Int(1) => CfState::Normal(r),
+        Value::Int(_) => CfState::Pending, // 0 = pending, -1 = deferred
+        // slot 1 is a reference (the real `stack` field) → real layout: done iff
+        // result is non-null (the AltResult/exceptional case was handled above).
+        _ => {
+            if matches!(r, Value::Object(None)) {
+                CfState::Pending
+            } else {
+                CfState::Normal(r)
+            }
+        }
+    }
+}
+
+/// Allocate a REAL `java.util.concurrent.CompletableFuture` already completed with
+/// `state`, using the un-intercepted `complete`/`obtrudeException` bytecode (which
+/// store genuine values/`AltResult`s) so the result is fully compatible with the
+/// real `get()`/`join()`/`isDone()` bytecode. Falls back to a synthetic CF only if
+/// the real object cannot be constructed.
+fn cf_make_completed(ctx: &mut dyn NativeContext, state: CfState) -> Value {
+    match ctx.new_object_initialized("java/util/concurrent/CompletableFuture", "()V", &[]) {
+        Ok(Some(Value::Object(Some(cf)))) => {
+            match state {
+                CfState::Normal(v) => {
+                    let _ = ctx.invoke_virtual(cf, "complete", "(Ljava/lang/Object;)Z", &[v]);
+                }
+                CfState::Exceptional(e) => {
+                    let _ = ctx.invoke_virtual(
+                        cf,
+                        "obtrudeException",
+                        "(Ljava/lang/Throwable;)V",
+                        &[e],
+                    );
+                }
+                CfState::Pending => {}
+            }
+            Value::Object(Some(cf))
+        }
+        _ => {
+            let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
+            match state {
+                CfState::Normal(v) => {
+                    ctx.set_field(cf, CF_FIELD_RESULT, v);
+                    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
+                }
+                CfState::Exceptional(e) => {
+                    ctx.set_field(cf, CF_FIELD_RESULT, e);
+                    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(2));
+                }
+                CfState::Pending => {
+                    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(0));
+                }
+            }
+            Value::Object(Some(cf))
+        }
+    }
+}
+
+fn native_cf_complete(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let value = args.get(1).cloned().unwrap_or(Value::Object(None));
+
+    // Already completed? (real: result != null; synthetic: DONE marker Int != 0)
+    let result = ctx.get_field(this, CF_FIELD_RESULT);
+    let synth_done = matches!(ctx.get_field(this, CF_FIELD_DONE), Value::Int(d) if d != 0);
+    if !matches!(result, Value::Object(None)) || synth_done {
+        return Ok(Some(Value::Int(0)));
+    }
+
+    // Store the value directly. For a NULL value we must store the JDK's `NIL`
+    // sentinel — a real `AltResult(null)` — so the un-intercepted `isDone()`/`get()`
+    // bytecode sees `result != null` (done, value = null) instead of leaving the
+    // future pending. A non-null value is stored as-is.
+    let stored = if matches!(value, Value::Object(None)) {
+        cf_nil(ctx)
+    } else {
+        value
+    };
+    ctx.set_field(this, CF_FIELD_RESULT, stored);
+    // Keep the synthetic DONE marker coherent for synthetic CFs (harmless on real
+    // objects: slot 1 is the `stack` reference and isDone()/get() use `result`).
+    if ctx.object_num_fields(this) >= 4 {
+        ctx.set_field(this, CF_FIELD_DONE, Value::Int(1));
+    }
+    Ok(Some(Value::Int(1)))
+}
+
 fn native_cf_complete_exceptionally(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    let done = match ctx.get_field(this, CF_FIELD_DONE) {
-        Value::Int(d) => d,
-        _ => 0,
-    };
-    if done != 0 {
+    let exc = args.get(1).cloned().unwrap_or(Value::Object(None));
+
+    // Already completed? `result` (slot 0) non-null means a real completion
+    // (a value or an AltResult); a synthetic `DONE` marker (Int in slot 1) means
+    // a CratonVM-chained CF already completed. Either way, return false.
+    let result = ctx.get_field(this, 0);
+    let synth_done = matches!(ctx.get_field(this, CF_FIELD_DONE), Value::Int(d) if d != 0);
+    if !matches!(result, Value::Object(None)) || synth_done {
         return Ok(Some(Value::Int(0)));
     }
-    // Mark as exceptionally completed (done=2), store exception as result
-    let exc = args.get(1).cloned().unwrap_or(Value::Object(None));
-    ctx.set_field(this, CF_FIELD_RESULT, exc);
-    ctx.set_field(this, CF_FIELD_DONE, Value::Int(2)); // 2 = exceptional
+
+    // Drive the real (un-intercepted) `obtrudeException` bytecode, which stores a
+    // genuine `CompletableFuture$AltResult(ex)` in `result` — exactly the way real
+    // `complete()` (which works on CratonVM) stores values/NIL. This keeps the
+    // un-intercepted `get()`/`join()`/`isDone()` bytecode and our
+    // `isCompletedExceptionally` native consistent, and works regardless of the
+    // object's slot layout (real `new CompletableFuture()` objects are allocated
+    // with 4 slots, so a field-count layout check cannot distinguish them; the old
+    // code wrote an Int `DONE` marker into the real `stack` *reference* field where
+    // it was dropped, and stored the raw throwable in `result` so `get()` returned
+    // it instead of throwing — bug-08).
+    // Use `invoke_special` to call the *base* `CompletableFuture.obtrudeException`
+    // exactly, bypassing any subclass override. `KafkaCompletableFuture` overrides
+    // `obtrudeException` (and `complete`/`completeExceptionally`) to throw
+    // "User code should not complete futures returned from Kafka clients"; a virtual
+    // call would hit that override. The internal kafka path
+    // (`kafkaCompleteExceptionally` -> `super.completeExceptionally` == this native)
+    // legitimately needs the base behaviour.
+    ctx.invoke_special(
+        "java/util/concurrent/CompletableFuture",
+        "obtrudeException",
+        "(Ljava/lang/Throwable;)V",
+        &[Value::Object(Some(this)), exc],
+    )?;
     Ok(Some(Value::Int(1)))
 }
 
@@ -25622,17 +25998,29 @@ fn native_cf_then_apply_p31(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let val = ctx.get_field(this, CF_FIELD_RESULT);
-    let result = ctx.invoke_virtual(
-        func,
-        "apply",
-        "(Ljava/lang/Object;)Ljava/lang/Object;",
-        &[val],
-    )?;
-    let cf = alloc_synthetic(ctx, "java/util/concurrent/CompletableFuture", 4);
-    ctx.set_field(cf, CF_FIELD_RESULT, result.unwrap_or(Value::Object(None)));
-    ctx.set_field(cf, CF_FIELD_DONE, Value::Int(1));
-    Ok(Some(Value::Object(Some(cf))))
+    // thenApply: if the source completed exceptionally, propagate the exception
+    // WITHOUT calling the function (real CompletionStage semantics); otherwise
+    // apply the function to the source value.
+    match cf_read_state(ctx, this) {
+        CfState::Exceptional(e) => Ok(Some(cf_make_completed(ctx, CfState::Exceptional(e)))),
+        state => {
+            let val = match state {
+                CfState::Normal(v) => v,
+                CfState::Pending => Value::Object(None),
+                CfState::Exceptional(_) => unreachable!(),
+            };
+            let result = ctx.invoke_virtual(
+                func,
+                "apply",
+                "(Ljava/lang/Object;)Ljava/lang/Object;",
+                &[val],
+            )?;
+            Ok(Some(cf_make_completed(
+                ctx,
+                CfState::Normal(result.unwrap_or(Value::Object(None))),
+            )))
+        }
+    }
 }
 
 fn native_cf_then_accept_p31(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

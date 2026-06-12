@@ -100,6 +100,13 @@ impl BootstrapClassFinder {
     pub fn class_path(&self) -> &ClassPath {
         &self.class_path
     }
+    /// Append a path (jar or directory) to the bootstrap search path.
+    /// Used by `Instrumentation.appendToBootstrapClassLoaderSearch` so a
+    /// dynamically-attached agent (e.g. Mockito's inline mock maker) can
+    /// inject helper classes that MUST be visible to the bootstrap loader.
+    pub fn add_path(&mut self, path: &str) {
+        self.class_path.add_path(path);
+    }
 }
 
 impl ClassFinder for BootstrapClassFinder {

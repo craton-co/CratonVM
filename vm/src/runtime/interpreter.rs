@@ -2133,6 +2133,58 @@ pub fn execute(
                         }
                         return Ok(None);
                     }
+                    // Receiver-own-class native rescue (general). When the
+                    // resolved method has no Code, but a native is registered
+                    // on the receiver's OWN runtime class (or a superclass) for
+                    // the same name+descriptor, dispatch to it — provided the
+                    // receiver has no real bytecode override (those are handled
+                    // by Path A below). This covers synthetic objects stamped
+                    // with an interface/abstract runtime class that carry their
+                    // method natives on that exact name, regardless of whether
+                    // the class store flags it `interface` — e.g. the
+                    // scheduled-executor shim's `ScheduledFuture` object, whose
+                    // `cancel(Z)Z` native is what JUnit's `@Timeout` finally
+                    // block needs (the cp dispatch resolved to the abstract
+                    // `Future.cancel`, so the resolved-class native check above
+                    // missed it). Without this, every `@Timeout` test throws
+                    // `AbstractMethodError: Future.cancel(Z)Z has no Code`.
+                    if recv_cid != ClassId::new(0) {
+                        let (recv_native_cb, has_bytecode) = {
+                            let cm2 = shared.class_manager.read();
+                            let bytecode = crate::classloading::find_method_recursive(
+                                recv_cid,
+                                method_name,
+                                method_descriptor,
+                                &cm2.class_store,
+                            )
+                            .map(|(m, _)| m.code().is_some())
+                            .unwrap_or(false);
+                            let mut cb = None;
+                            let mut walk = Some(recv_cid);
+                            while let Some(cid) = walk {
+                                if let Some(cls) = cm2.class_store.get(cid) {
+                                    if let Some(found) = shared.native_methods.find(
+                                        &cls.name,
+                                        method_name,
+                                        method_descriptor,
+                                    ) {
+                                        cb = Some(found);
+                                        break;
+                                    }
+                                    walk = cls.superclass;
+                                } else {
+                                    break;
+                                }
+                            }
+                            (cb, bytecode)
+                        };
+                        if !has_bytecode {
+                            if let Some(cb) = recv_native_cb {
+                                let r = crate::vm::safe_native_call(shared, thread, cb, args)?;
+                                return Ok(r);
+                            }
+                        }
+                    }
                     // Path A — receiver carries a real (non-zero) class_id.
                     //   Walk its runtime-class chain for a same-signature
                     //   override that has Code (or a registered native) and
