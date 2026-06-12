@@ -2621,9 +2621,10 @@ pub struct JitMICSlot {
     /// Cache miss counter (diagnostic).
     pub misses: std::sync::atomic::AtomicU64,
     /// Cached receiver class name (avoids class_manager read lock on hit).
-    /// Moved to the tail: `parking_lot::Mutex<Option<String>>` has an
-    /// unstable layout we must not expose to JIT codegen.
-    pub cached_class_name: parking_lot::Mutex<Option<String>>,
+    /// Moved to the tail: the mutex has an unstable layout we must not
+    /// expose to JIT codegen. `Arc<str>` so the per-hit clone in the
+    /// dispatch helper is a refcount bump, not a `String` heap copy.
+    pub cached_class_name: parking_lot::Mutex<Option<std::sync::Arc<str>>>,
 }
 
 impl JitMICSlot {
@@ -2668,7 +2669,7 @@ impl JitMICSlot {
     ) {
         self.cached_class_id
             .store(class_id, std::sync::atomic::Ordering::Release);
-        *self.cached_class_name.lock() = Some(class_name.to_string());
+        *self.cached_class_name.lock() = Some(std::sync::Arc::from(class_name));
         self.cached_entry_ptr
             .store(entry_ptr, std::sync::atomic::Ordering::Release);
         self.cached_needs_context
@@ -2891,7 +2892,10 @@ impl JitPICSlot {
         let needs_ctx = mic
             .cached_needs_context
             .load(std::sync::atomic::Ordering::Relaxed);
-        let class_name = mic.cached_class_name.lock().clone();
+        // PIC slots keep `String` names; the MIC caches `Arc<str>` (cheap
+        // per-hit clones in the dispatch helper) — convert on this rare
+        // promotion path.
+        let class_name = mic.cached_class_name.lock().as_deref().map(String::from);
         self.class_ids[0].store(class_id, std::sync::atomic::Ordering::Release);
         self.entry_ptrs[0].store(entry_ptr, std::sync::atomic::Ordering::Release);
         self.needs_context[0].store(needs_ctx, std::sync::atomic::Ordering::Relaxed);

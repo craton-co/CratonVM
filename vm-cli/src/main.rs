@@ -2224,6 +2224,17 @@ fn run() -> Result<()> {
         );
     }
 
+    // WS1 diagnostic: final JIT-dispatch-helper profile dump on shutdown
+    // (env-gated inside `dump_now` callers; `enabled()` re-checked here).
+    if cratonvm_vm::jit::helpers::mic_prof::enabled() {
+        cratonvm_vm::jit::helpers::mic_prof::dump_now();
+        eprintln!(
+            "[MIC_PROF] gc_collections={} total_dispatches={}",
+            vm.shared.heap.collection_count(),
+            cratonvm_vm::dispatch_trace::total_dispatches()
+        );
+    }
+
     // B6: Silent-exit guard. If main() returned Ok but the VM has recorded
     // one or more swallowed errors during class init / invokedynamic / native
     // calls, surface a WARN to stderr so users (and CI) don't mistake a
