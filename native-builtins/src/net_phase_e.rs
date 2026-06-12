@@ -700,16 +700,32 @@ fn read_inet_socket_address(
         }
         _ => "0.0.0.0".to_string(),
     };
-    // Port: synthetic legacy lives at slot 1; real-JDK lives at holder.slot 2.
-    let port = match ctx.get_field(sa, ISA_PORT) {
-        Value::Int(n) => n,
-        Value::Long(n) => n as i32,
-        _ => match holder_val {
-            Value::Object(Some(holder)) => match ctx.get_field(holder, 2) {
+    // Port: a real-JDK `InetSocketAddress` declares a single `holder` field at
+    // slot 0; the port lives at `holder.port` (slot 2). Its slot 1 (our legacy
+    // `ISA_PORT`) is therefore out of the declared layout and reads back as a
+    // stale `Int(0)` — which the previous "read ISA_PORT first" logic accepted,
+    // so `Socket.connect(new InetSocketAddress(host, port))` targeted port 0
+    // (`ConnectException: host:0`). Mirror the host branch above: when the
+    // slot-0 value is a real `InetSocketAddressHolder` object (i.e. not a
+    // String, which is the legacy-synthetic layout), read the port from
+    // `holder.port`; only fall back to the direct `ISA_PORT` slot for the
+    // legacy synthetic layout (host String at slot 0, port int at slot 1).
+    let port = match holder_val {
+        Value::Object(Some(holder)) if ctx.read_string(holder).is_none() => {
+            match ctx.get_field(holder, 2) {
                 Value::Int(n) => n,
                 Value::Long(n) => n as i32,
-                _ => 0,
-            },
+                // Holder carried no int port — fall back to the direct slot.
+                _ => match ctx.get_field(sa, ISA_PORT) {
+                    Value::Int(n) => n,
+                    Value::Long(n) => n as i32,
+                    _ => 0,
+                },
+            }
+        }
+        _ => match ctx.get_field(sa, ISA_PORT) {
+            Value::Int(n) => n,
+            Value::Long(n) => n as i32,
             _ => 0,
         },
     };
