@@ -1093,6 +1093,28 @@ fn tlab_alloc_object(
         n.max(cratonvm_gc::tlab::min_tlab_size())
     };
 
+    // Bug-D fix (TLAB tail-filler on refill, 2026-06-12): retire the OUTGOING
+    // TLAB *before* replacing it. The fast path above returned `None` because
+    // `total_size` did not fit the TLAB's REMAINING tail — not because the TLAB
+    // was fully consumed. That leftover tail (up to `total_size - 1` bytes, and
+    // for a large object/array refill potentially many KiB) is zeroed arena
+    // memory inside the young from-space's live `[base, used)` range. Replacing
+    // `thread.tlab` without retiring drops that tail un-tracked: it is neither a
+    // walkable object nor a free-list hole. The moving collector never notices
+    // (it traces live roots, not a linear walk), but the **non-moving young
+    // sweep** that runs while JIT frames are active walks young linearly — it
+    // strides into the zeroed tail, decodes it as a run of 40-byte all-zero
+    // "objects", and desyncs off the object grid when the tail length is not a
+    // multiple of 40, mis-reading a later object's payload as a header. That is
+    // the `RemoteCIDRFilter` / `bintrees` "implausible object size" corruption
+    // (a subsequent moving GC then SIGSEGVs walking the wrecked heap).
+    //
+    // `retire()` installs a synthetic `int[]` filler over `[cursor, end)` so the
+    // walker strides the tail in O(1); it is a no-op on an empty (first-alloc)
+    // TLAB. `requested` (read from the outgoing TLAB's pressure tracker above)
+    // is already computed, so retiring here does not disturb the sizer.
+    thread.tlab.retire();
+
     let refill = shared.heap.refill_tlab(requested);
     if let Some((buf, size)) = refill {
         shared.tlab_refill_count.fetch_add(1, Ordering::Relaxed);

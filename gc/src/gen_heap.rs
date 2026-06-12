@@ -3176,6 +3176,20 @@ impl GenerationalHeap {
                     let src = (from_base + cursor) as *mut u8;
                     // SAFETY: `cursor` within `used`; from-space is mapped.
                     let header = unsafe { &*(src as *const ObjectHeader) };
+                    // Bug-D fix (2026-06-12): skip a GAP-filler sentinel (a
+                    // sub-`HEADER_SIZE` TLAB tail) before `gen_object_total_size`.
+                    // This selective-promotion walk runs before the main sweep
+                    // reclaims gaps, so sentinels are still in place here.
+                    if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+                        // SAFETY: offset 4 lies within the >=8-byte gap.
+                        let gap = unsafe {
+                            std::ptr::read((src as *const u8).add(4) as *const u32)
+                        } as usize;
+                        if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= used {
+                            cursor += gap;
+                            continue;
+                        }
+                    }
                     let total_size = gen_object_total_size(header);
                     if total_size < HEADER_SIZE || cursor + total_size > used {
                         break;
@@ -3320,6 +3334,18 @@ impl GenerationalHeap {
                         let obj = (from_base + cursor) as *mut u8;
                         // SAFETY: cursor within used; from-space mapped.
                         let header = unsafe { &*(obj as *const ObjectHeader) };
+                        // Bug-D fix (2026-06-12): skip a GAP-filler sentinel (a
+                        // sub-`HEADER_SIZE` TLAB tail) before `gen_object_total_size`.
+                        if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+                            // SAFETY: offset 4 lies within the >=8-byte gap.
+                            let gap = unsafe {
+                                std::ptr::read((obj as *const u8).add(4) as *const u32)
+                            } as usize;
+                            if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= used {
+                                cursor += gap;
+                                continue;
+                            }
+                        }
                         let total_size = gen_object_total_size(header);
                         if total_size < HEADER_SIZE || cursor + total_size > used {
                             break;
@@ -3655,6 +3681,30 @@ impl GenerationalHeap {
             // on the next line requires `unsafe`.
             let obj_ptr = (from_base + cursor) as *mut u8;
             let header = unsafe { &mut *(obj_ptr as *const ObjectHeader as *mut ObjectHeader) };
+            // Bug-D fix (2026-06-12): a GAP-filler sentinel marks a
+            // sub-`HEADER_SIZE` TLAB tail (`install_tail_filler`) that is too
+            // small to hold a walkable `int[]`. It carries its exact byte
+            // length at offset 4. Reclaim the span and continue — this MUST
+            // run before `gen_object_total_size`, whose `num_slots` read
+            // (offset 16) would fall outside an 8-byte gap. We SKIP rather
+            // than free it: a sub-`HEADER_SIZE` span can never satisfy an
+            // allocation (the smallest object/array is `HEADER_SIZE` bytes),
+            // so adding it to the free list only bloats the linear free-list
+            // scan with permanently-unusable tiny blocks. Skipping keeps the
+            // walk exactly on the object grid; the span is reclaimed wholesale
+            // when the next moving (Cheney) cycle resets from-space.
+            if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+                // SAFETY: offset 4 lies within the >=8-byte gap.
+                let gap = unsafe {
+                    std::ptr::read((obj_ptr as *const u8).add(4) as *const u32)
+                } as usize;
+                if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= used {
+                    cursor += gap;
+                    continue;
+                }
+                // Malformed sentinel (should be impossible) — fall through to
+                // the corrupt-header re-sync path below.
+            }
             let total_size = gen_object_total_size(header);
             // Defensive: a corrupt / zero-size header would desynchronise
             // the linear walk. Stop rather than risk freeing live data.
@@ -4013,6 +4063,21 @@ impl GenerationalHeap {
             // SAFETY: `cursor` is within `young_from.used()`; pointer arithmetic stays in the arena.
             let obj_ptr = unsafe { young_from.base_ptr().add(cursor) as *mut u8 };
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            // Bug-D fix (2026-06-12): stride over a GAP-filler sentinel (a
+            // sub-`HEADER_SIZE` TLAB tail) — dead filler with no refs to scan.
+            // Must precede `gen_object_total_size` (its offset-16 `num_slots`
+            // read falls outside an 8-byte gap). Like the holes skipped above,
+            // an un-reclaimed sentinel here would desync this from-space walk.
+            if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+                // SAFETY: offset 4 lies within the >=8-byte gap.
+                let gap = unsafe {
+                    std::ptr::read((obj_ptr as *const u8).add(4) as *const u32)
+                } as usize;
+                if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= young_from.used() {
+                    cursor += gap;
+                    continue;
+                }
+            }
             let total_size = gen_object_total_size(header);
             if total_size < HEADER_SIZE {
                 break;
@@ -4130,6 +4195,21 @@ impl GenerationalHeap {
             // SAFETY: `cursor` is within `young_from.used()`; pointer arithmetic stays in the arena.
             let obj_ptr = unsafe { young_from.base_ptr().add(cursor) as *mut u8 };
             let header = unsafe { &*(obj_ptr as *const ObjectHeader) };
+            // Bug-D fix (2026-06-12): stride over a GAP-filler sentinel (a
+            // sub-`HEADER_SIZE` TLAB tail) — dead filler with no refs to scan.
+            // Must precede `gen_object_total_size` (its offset-16 `num_slots`
+            // read falls outside an 8-byte gap). Like the holes skipped above,
+            // an un-reclaimed sentinel here would desync this from-space walk.
+            if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+                // SAFETY: offset 4 lies within the >=8-byte gap.
+                let gap = unsafe {
+                    std::ptr::read((obj_ptr as *const u8).add(4) as *const u32)
+                } as usize;
+                if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= young_from.used() {
+                    cursor += gap;
+                    continue;
+                }
+            }
             let total_size = gen_object_total_size(header);
             if total_size < HEADER_SIZE {
                 break;
@@ -5303,6 +5383,22 @@ fn clear_all_mark_bits_in_arena(arena: &mut Arena) {
         // SAFETY: `obj_ptr` is 8-byte-aligned (bump arena) and points at the
         // start of an object header within the live region.
         let header = unsafe { &mut *(obj_ptr as *mut ObjectHeader) };
+        // Bug-D fix (2026-06-12): stride over a GAP-filler sentinel (a
+        // sub-`HEADER_SIZE` TLAB tail) the same way the sweep does. Normally
+        // these are already on the free list (skipped above), but if the
+        // sweep broke out early one may remain in place; recognise it here so
+        // this mark-clearing walk does not desync on it. No mark bit to clear
+        // (it is dead filler).
+        if header.class_id.as_u32() == crate::tlab::GAP_FILLER_CLASS_ID.as_u32() {
+            // SAFETY: offset 4 lies within the >=8-byte gap.
+            let gap = unsafe {
+                std::ptr::read((obj_ptr as *const u8).add(4) as *const u32)
+            } as usize;
+            if gap >= 8 && gap < HEADER_SIZE && cursor + gap <= used {
+                cursor += gap;
+                continue;
+            }
+        }
         let total_size = gen_object_total_size(header);
         if total_size < HEADER_SIZE || cursor + total_size > used {
             // Corruption — same defence as the sweep loop. Stop rather than
