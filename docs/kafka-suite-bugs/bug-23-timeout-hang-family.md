@@ -64,3 +64,26 @@ HS=LOADERR (4): `KafkaConsumerTest`, `AsyncKafkaConsumerTest`, `KafkaProducerTes
 > concurrent-session CPU contention documented in `RUN-2026-06-13-summary.md`; the
 > leaf-frame verdicts above come from the 120 s watchdog dumps, which are valid
 > regardless of contention.
+
+## Update (2026-06-13) — throughput lever delivered; AbstractCoordinatorTest is a real hang
+
+1. **Throughput cluster is largely a bug-24 win.** The Mockito/ByteBuddy mock-gen
+   classes timed out because the suite ran `--nojit` (forced by bug-24, the
+   JIT-inline-cache use-after-free crash on Mockito). **bug-24 is now fixed**
+   (JIT+Mockito works), so these classes can run JIT-on — the throughput win the
+   recommendation called for. Re-measuring the exact clearance needs a clean,
+   uncontended box (a concurrent CratonVM session here holds the cargo lock and
+   starves CPU, so wall-clock numbers are unreliable right now).
+2. **`AbstractCoordinatorTest` is a genuine hang, not just slow.** HotSpot runs
+   it 47/47 OK in **4.3 s**; CratonVM JIT-on did **not** complete within **250 s**.
+   An ~8× interpreter would finish a 4 s test in ~35 s, so 250 s with no result is
+   a block, not throughput. Its `Object.wait` leaf frame puts it in the
+   **[bug-19](bug-19-bufferpool-blocking-hang.md) family** — a blocking-primitive /
+   GC-quiescence + cross-thread wakeup deadlock under a coordinator's heartbeat /
+   network thread, NOT a per-class defect. Fix it where bug-19 is fixed (the
+   shared `monitor_wait`/`park` + quiescence machinery), and this clears with it.
+
+NET: bug-23 is not a list of distinct fixable bugs. The slow majority is the
+known interpreter-throughput gap that bug-24/JIT now mitigates; the one true hang
+(`AbstractCoordinatorTest`) is the bug-19 blocking-primitive deadlock. No
+separate code fix lands here.
