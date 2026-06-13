@@ -16,6 +16,20 @@ tests across 13 classes**, all protocol request/response serialization. HotSpot 
 > `addSize` use. Reproduces under `--nojit` (so NOT the bug-21/22 JIT register-root
 > issue). Next: reproduce a single `CreateAclsRequestTest.shouldRoundTripV0`, dump the
 > `size()`/`addSize()` `cache` arg, and check `new ObjectSerializationCache()`.
+>
+> **UPDATE — not reproducible standalone (2026-06-13):** a standalone `CacheProbe`
+> matching the test — `new ObjectSerializationCache()`, direct `Data.size/write`, full
+> serialize→parse→re-size round trip, AND `new CreateAclsRequest.Builder(d).build(v)` →
+> `request.serialize()` with multiple creations — **all succeed** on the current binary
+> (cache non-null, no null array elements, correct byte sizes). So the core serialization
+> path is sound; the null cache only manifests **inside the JUnit harness**
+> (`shouldRoundTripV0/V1` still fail there). Most likely a **GC-timing / instrumentation
+> interaction** under the harness's heavier allocation load (Mockito self-attach, JUnit
+> reflection) that loses the `cache` local mid-serialization — NOT a deterministic
+> serialization bug. Next: instrument the interpreter "invoke … on null" throw site to
+> dump the caller method+pc when the method is `cacheSerializedValue` (frame-capped
+> `DBG_ATHROW` only reaches the JUnit rethrow), run the real test, and capture the GC
+> event around the throw. Remaining open item for the bug-25 cluster.
 
 ## Symptom
 ```
