@@ -119,7 +119,7 @@ if [ -d "$WF/target/test-classes" ] && [ -f "$ROOT/apps/_test-harness/RunDirTest
   run_suite "wildfly-health" "2g" "$WFCP" RunDirTests "$WF/target/test-classes"
 fi
 
-FIX="$ROOT/.smoke-cache/hibernate-ri10"
+FIX="$ROOT/apps/probe/.smoke-cache/hibernate-ri10"
 if [ -f "$FIX/fixture/HibernateSmoke.class" ]; then
   HIB_CP=$(ls "$FIX"/*.jar 2>/dev/null | tr '\n' ';')
   run_suite "hibernate-smoke" "1g" "$FIX/fixture;${HIB_CP%;}" HibernateSmoke ""
