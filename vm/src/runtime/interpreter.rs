@@ -1416,6 +1416,20 @@ fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         s
     });
     if shared.gc_barrier.stw_requested.load(Ordering::Acquire) {
+        // CRIT (TLAB UAF) — retire this thread's TLAB before parking for GC,
+        // exactly as the GC initiator does in `maybe_gc`. The moving collector
+        // run by the initiator can `grow()` (realloc) the young arena while we
+        // are parked, freeing the old backing buffer; a TLAB that still held
+        // `[cursor,end)` into that buffer would then be dangling, so the first
+        // post-GC fast-path bump on this thread writes the object header into
+        // freed/unmapped memory → EXCEPTION_ACCESS_VIOLATION in
+        // `init_object_header` (deterministic once a grow frees the old buffer;
+        // reproduces with JIT off because that path always uses the moving
+        // collector). Retiring empties the TLAB so the next allocation refills
+        // from the current arena, and installs a walkable filler over
+        // `[cursor,end)` so the collector's from-space walk doesn't desync on
+        // the unfilled tail (the same reason the initiator retires).
+        thread.tlab.retire();
         // Round-5 fix (CRIT — UAF): drain this thread's per-thread SATB
         // buffer into the global queue BEFORE we park at the barrier.
         // The thread-local buffer holds up to 256 overwritten references;
