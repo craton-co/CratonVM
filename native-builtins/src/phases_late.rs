@@ -27419,23 +27419,26 @@ fn mac_extract_key_bytes(ctx: &mut dyn NativeContext, key_obj: ObjectRef) -> Vec
     }
 }
 
-/// Helper: append bytes to the Mac's data accumulator (field 3)
-fn mac_append_data(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
-    let old_data = match ctx.get_field(this, 3) {
-        Value::Object(Some(o)) => o,
-        _ => return,
-    };
-    let old_len = ctx.array_length(old_data);
-    let new_len = old_len + bytes.len();
-    let new_data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, new_len);
-    for i in 0..old_len {
-        let v = ctx.get_array_element(old_data, i);
-        ctx.set_array_element(new_data, i, v);
-    }
-    for (i, &b) in bytes.iter().enumerate() {
-        ctx.set_array_element(new_data, old_len + i, Value::Int(b as i8 as i32));
-    }
-    ctx.set_field(this, 3, Value::Object(Some(new_data)));
+
+/// Off-object state for the synthetic `javax.crypto.Mac` (bug-26 L3). Storing the
+/// algorithm / key / accumulated data / init-flag in raw slots of a REAL
+/// `javax.crypto.Mac` object aliases that class's real fields and gets corrupted
+/// under the allocation-heavy `ScramFormatter.hi()` init-once/doFinal-many reuse
+/// loop's GC (manifesting as wrong HMAC bytes — e.g. rfc7677 vector failures).
+/// Keep all state in a process-wide table keyed by the object's identity hash
+/// (stable across GC); the `Mac` handle itself stays opaque.
+#[derive(Default, Clone)]
+struct MacState {
+    algo: String,
+    key: Vec<u8>,
+    data: Vec<u8>,
+    initialized: bool,
+}
+
+fn mac_state_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, MacState>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, MacState>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
@@ -27447,23 +27450,22 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;)Ljavax/crypto/Mac;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
-            // bug-26 residual: the algorithm String is the first reference arg.
-            // Static-native dispatch passes NO receiver placeholder (args[0] is the
-            // algorithm — cf. md_get_instance), so reading args.get(1) stored null in
-            // slot 0; getAlgorithm() then returned null and `new SecretKeySpec(key,
-            // null)` in ScramFormatter.hi() threw "null object argument". Pick the
-            // first non-null reference so both call conventions store the real algo.
-            let algo_val = args
+            // The algorithm String is the first reference arg (static natives have
+            // no receiver placeholder — cf. md_get_instance). State lives off-object
+            // in mac_state_table, keyed by identity hash (bug-26 L3).
+            let algo = args
                 .iter()
-                .find(|v| matches!(v, Value::Object(Some(_))))
-                .copied()
-                .unwrap_or(Value::Object(None));
-            ctx.set_field(obj, 0, algo_val);
-            ctx.set_field(obj, 1, Value::Object(None));
-            ctx.set_field(obj, 2, Value::Int(0));
-            let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-            ctx.set_field(obj, 3, Value::Object(Some(data)));
+                .find_map(|v| match v {
+                    Value::Object(Some(o)) => ctx.read_string(*o),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
+            let id = ctx.identity_hash_code(obj);
+            mac_state_table().lock().unwrap().insert(
+                id,
+                MacState { algo, key: Vec::new(), data: Vec::new(), initialized: false },
+            );
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -27472,33 +27474,37 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         "getInstance",
         "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;",
         |ctx, args| {
-            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
-            // bug-26 residual: the algorithm String is the first reference arg.
-            // Static-native dispatch passes NO receiver placeholder (args[0] is the
-            // algorithm — cf. md_get_instance), so reading args.get(1) stored null in
-            // slot 0; getAlgorithm() then returned null and `new SecretKeySpec(key,
-            // null)` in ScramFormatter.hi() threw "null object argument". Pick the
-            // first non-null reference so both call conventions store the real algo.
-            let algo_val = args
+            // The algorithm String is the first reference arg (static natives have
+            // no receiver placeholder — cf. md_get_instance). State lives off-object
+            // in mac_state_table, keyed by identity hash (bug-26 L3).
+            let algo = args
                 .iter()
-                .find(|v| matches!(v, Value::Object(Some(_))))
-                .copied()
-                .unwrap_or(Value::Object(None));
-            ctx.set_field(obj, 0, algo_val);
-            ctx.set_field(obj, 1, Value::Object(None));
-            ctx.set_field(obj, 2, Value::Int(0));
-            let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-            ctx.set_field(obj, 3, Value::Object(Some(data)));
+                .find_map(|v| match v {
+                    Value::Object(Some(o)) => ctx.read_string(*o),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
+            let id = ctx.identity_hash_code(obj);
+            mac_state_table().lock().unwrap().insert(
+                id,
+                MacState { algo, key: Vec::new(), data: Vec::new(), initialized: false },
+            );
             Ok(Some(Value::Object(Some(obj))))
         },
     );
     r.register(mac, "init", "(Ljava/security/Key;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        ctx.set_field(this, 1, args.get(1).copied().unwrap_or(Value::Object(None)));
-        ctx.set_field(this, 2, Value::Int(1));
-        // Reset the data accumulator on (re)init
-        let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        ctx.set_field(this, 3, Value::Object(Some(data)));
+        let key_bytes = match args.get(1) {
+            Some(Value::Object(Some(k))) => mac_extract_key_bytes(ctx, *k),
+            _ => Vec::new(),
+        };
+        let id = ctx.identity_hash_code(this);
+        let mut t = mac_state_table().lock().unwrap();
+        let st = t.entry(id).or_default();
+        st.key = key_bytes;
+        st.initialized = true;
+        st.data.clear();
         Ok(None)
     });
     // update([B)V — append byte array to accumulator
@@ -27506,7 +27512,8 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(arr))) = args.get(1) {
             let bytes = mac_read_byte_array(ctx, *arr);
-            mac_append_data(ctx, this, &bytes);
+            let id = ctx.identity_hash_code(this);
+            mac_state_table().lock().unwrap().entry(id).or_default().data.extend_from_slice(&bytes);
         }
         Ok(None)
     });
@@ -27522,7 +27529,8 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
                     bytes.push(b as u8);
                 }
             }
-            mac_append_data(ctx, this, &bytes);
+            let id = ctx.identity_hash_code(this);
+            mac_state_table().lock().unwrap().entry(id).or_default().data.extend_from_slice(&bytes);
         }
         Ok(None)
     });
@@ -27530,144 +27538,122 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
     r.register(mac, "update", "(B)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
-        mac_append_data(ctx, this, &[b]);
+        let id = ctx.identity_hash_code(this);
+        mac_state_table().lock().unwrap().entry(id).or_default().data.push(b);
         Ok(None)
     });
     // doFinal()[B — compute HMAC, return result, reset accumulator
     r.register(mac, "doFinal", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let init = match ctx.get_field(this, 2) {
-            Value::Int(v) => v,
-            _ => 0,
+        let id = ctx.identity_hash_code(this);
+        let (algo, key, data, ready) = {
+            let t = mac_state_table().lock().unwrap();
+            match t.get(&id) {
+                Some(st) => (
+                    st.algo.clone(),
+                    st.key.clone(),
+                    st.data.clone(),
+                    st.initialized || !st.key.is_empty(),
+                ),
+                None => (String::new(), Vec::new(), Vec::new(), false),
+            }
         };
-        // bug-26 residual L2: ScramFormatter.hi() reuses one Mac across an
-        // init-once / doFinal-many loop. The synthetic init flag (slot 2, an int
-        // stored in a real javax.crypto.Mac object) can be clobbered between
-        // doFinals (real-field aliasing/GC), spuriously raising "MAC not
-        // initialized" mid-loop. Treat a Mac that still holds its key (slot 1) as
-        // initialized — init() set the key and JDK doFinal keeps the Mac usable.
-        let has_key = matches!(ctx.get_field(this, 1), Value::Object(Some(_)));
-        if init == 0 && !has_key {
+        if !ready {
             return Err(RuntimeError::IllegalStateException {
                 message: "MAC not initialized".into(),
             }
             .into());
         }
-        // Extract key bytes
-        let key_bytes = match ctx.get_field(this, 1) {
-            Value::Object(Some(key_obj)) => mac_extract_key_bytes(ctx, key_obj),
-            _ => Vec::new(),
-        };
-        // Extract accumulated data
-        let data_bytes = match ctx.get_field(this, 3) {
-            Value::Object(Some(data_arr)) => mac_read_byte_array(ctx, data_arr),
-            _ => Vec::new(),
-        };
-        // Compute HMAC based on algorithm name
-        let algo = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let hmac_result = mac_compute_hmac(&algo, &key_bytes, &data_bytes);
-        // Create result byte array
+        let hmac_result = mac_compute_hmac(&algo, &key, &data);
+        // JDK doFinal resets the buffer but keeps the Mac initialized for reuse.
+        if let Some(st) = mac_state_table().lock().unwrap().get_mut(&id) {
+            st.data.clear();
+        }
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, hmac_result.len());
         for (i, &b) in hmac_result.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
-        // Reset accumulator
-        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        ctx.set_field(this, 3, Value::Object(Some(empty)));
         Ok(Some(Value::Object(Some(arr))))
     });
     // doFinal([B)[B — update with input bytes, then compute HMAC
     r.register(mac, "doFinal", "([B)[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let init = match ctx.get_field(this, 2) {
-            Value::Int(v) => v,
-            _ => 0,
+        let id = ctx.identity_hash_code(this);
+        // Append the input bytes first (read via ctx before taking the lock).
+        if let Some(Value::Object(Some(input_arr))) = args.get(1) {
+            let bytes = mac_read_byte_array(ctx, *input_arr);
+            mac_state_table().lock().unwrap().entry(id).or_default().data.extend_from_slice(&bytes);
+        }
+        let (algo, key, data, ready) = {
+            let t = mac_state_table().lock().unwrap();
+            match t.get(&id) {
+                Some(st) => (
+                    st.algo.clone(),
+                    st.key.clone(),
+                    st.data.clone(),
+                    st.initialized || !st.key.is_empty(),
+                ),
+                None => (String::new(), Vec::new(), Vec::new(), false),
+            }
         };
-        // bug-26 residual L2: ScramFormatter.hi() reuses one Mac across an
-        // init-once / doFinal-many loop. The synthetic init flag (slot 2, an int
-        // stored in a real javax.crypto.Mac object) can be clobbered between
-        // doFinals (real-field aliasing/GC), spuriously raising "MAC not
-        // initialized" mid-loop. Treat a Mac that still holds its key (slot 1) as
-        // initialized — init() set the key and JDK doFinal keeps the Mac usable.
-        let has_key = matches!(ctx.get_field(this, 1), Value::Object(Some(_)));
-        if init == 0 && !has_key {
+        if !ready {
             return Err(RuntimeError::IllegalStateException {
                 message: "MAC not initialized".into(),
             }
             .into());
         }
-        // Append the input bytes first
-        if let Some(Value::Object(Some(input_arr))) = args.get(1) {
-            let bytes = mac_read_byte_array(ctx, *input_arr);
-            mac_append_data(ctx, this, &bytes);
+        let hmac_result = mac_compute_hmac(&algo, &key, &data);
+        if let Some(st) = mac_state_table().lock().unwrap().get_mut(&id) {
+            st.data.clear();
         }
-        // Extract key bytes
-        let key_bytes = match ctx.get_field(this, 1) {
-            Value::Object(Some(key_obj)) => mac_extract_key_bytes(ctx, key_obj),
-            _ => Vec::new(),
-        };
-        // Extract accumulated data
-        let data_bytes = match ctx.get_field(this, 3) {
-            Value::Object(Some(data_arr)) => mac_read_byte_array(ctx, data_arr),
-            _ => Vec::new(),
-        };
-        // Compute HMAC based on algorithm name
-        let algo = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let hmac_result = mac_compute_hmac(&algo, &key_bytes, &data_bytes);
         let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, hmac_result.len());
         for (i, &b) in hmac_result.iter().enumerate() {
             ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
         }
-        // Reset accumulator
-        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        ctx.set_field(this, 3, Value::Object(Some(empty)));
         Ok(Some(Value::Object(Some(arr))))
     });
     // reset()V — clear the accumulator
     r.register(mac, "reset", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let empty = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
-        ctx.set_field(this, 3, Value::Object(Some(empty)));
+        let id = ctx.identity_hash_code(this);
+        if let Some(st) = mac_state_table().lock().unwrap().get_mut(&id) {
+            st.data.clear();
+        }
         Ok(None)
     });
     r.register(mac, "getMacLength", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let algo = match ctx.get_field(this, 0) {
-            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-            _ => String::new(),
-        };
-        let len = mac_output_length(&algo);
-        Ok(Some(Value::Int(len as i32)))
+        let id = ctx.identity_hash_code(this);
+        let algo = mac_state_table()
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|s| s.algo.clone())
+            .unwrap_or_default();
+        Ok(Some(Value::Int(mac_output_length(&algo) as i32)))
     });
     r.register(mac, "getAlgorithm", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        let id = ctx.identity_hash_code(this);
+        let algo = mac_state_table()
+            .lock()
+            .unwrap()
+            .get(&id)
+            .map(|s| s.algo.clone())
+            .unwrap_or_default();
+        Ok(Some(Value::Object(Some(ctx.create_string(&algo)))))
     });
     r.register(mac, "clone", "()Ljava/lang/Object;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        let src_state = mac_state_table()
+            .lock()
+            .unwrap()
+            .get(&ctx.identity_hash_code(this))
+            .cloned()
+            .unwrap_or_default();
         let clone = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
-        ctx.set_field(clone, 0, ctx.get_field(this, 0));
-        ctx.set_field(clone, 1, ctx.get_field(this, 1));
-        ctx.set_field(clone, 2, ctx.get_field(this, 2));
-        // Deep copy the data accumulator
-        let data_copy = match ctx.get_field(this, 3) {
-            Value::Object(Some(src)) => {
-                let len = ctx.array_length(src);
-                let dst = ctx.new_array(cratonvm_types::ArrayElementType::Byte, len);
-                for i in 0..len {
-                    ctx.set_array_element(dst, i, ctx.get_array_element(src, i));
-                }
-                Value::Object(Some(dst))
-            }
-            other => other,
-        };
-        ctx.set_field(clone, 3, data_copy);
+        let cid = ctx.identity_hash_code(clone);
+        mac_state_table().lock().unwrap().insert(cid, src_state);
         Ok(Some(Value::Object(Some(clone))))
     });
     r.set_category(__prev_cat);
