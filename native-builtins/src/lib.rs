@@ -20412,7 +20412,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1)))
     });
     registry.register(lbq, "take", "()Ljava/lang/Object;", |ctx, args| {
-        let this = match args.first() {
+        let mut this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
@@ -20425,7 +20425,8 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                 ctx.monitor_exit(this);
                 return Ok(Some(result));
             }
-            ctx.monitor_wait(this, Some(10))?;
+            // GC-SAFEPOINT FIX: the wait can relocate `this`; pin + read back.
+            this = monitor_wait_keepalive(ctx, this, Some(10))?;
             ctx.monitor_exit(this);
         }
     });
@@ -20441,7 +20442,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
         Ok(Some(result))
     });
     registry.register(lbq, "poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;", |ctx, args| {
-        let this = match args.first() {
+        let mut this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
@@ -20471,7 +20472,8 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(None))); // timed out
             }
             let wait_ms = remaining.as_millis().min(10) as u64;
-            ctx.monitor_wait(this, Some(wait_ms))?;
+            // GC-SAFEPOINT FIX: the wait can relocate `this`; pin + read back.
+            this = monitor_wait_keepalive(ctx, this, Some(wait_ms))?;
             ctx.monitor_exit(this);
         }
     });
@@ -21758,6 +21760,29 @@ fn rl_release_for_await(key: i32, tid: i64) -> Option<i32> {
         st.hold = 0;
         Some(saved)
     })
+}
+
+/// `monitor_wait` while keeping `obj` valid across the wait.
+///
+/// `monitor_wait` parks this thread — a GC safepoint — so a relocating
+/// collection (the moving collector, or the non-moving young sweep's selective
+/// promotion) can move `obj` while we are blocked, leaving a raw `ObjectRef`
+/// stale and the following `monitor_exit`/`get_field` doing `header_of` a dead
+/// address → EXCEPTION_ACCESS_VIOLATION. Pin `obj` as a native root across the
+/// wait (the collector remaps `native_pin_roots`, see vm/src/memory/gc.rs
+/// `update_all_roots`) and return its post-GC address. Unpins even on the error
+/// path.
+fn monitor_wait_keepalive(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    timeout_ms: Option<u64>,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let pin = ctx.pin_native_root(obj);
+    let wr = ctx.monitor_wait(obj, timeout_ms);
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.unpin_native_roots(pin);
+    wr?;
+    Ok(obj)
 }
 
 // --- Condition ---
