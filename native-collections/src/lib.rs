@@ -15205,16 +15205,54 @@ fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // ArrayDeque$Itr: field 0 = snapshot array, field 1 = cursor
+    // ArrayDeque$Itr: field 0 = snapshot array, field 1 = cursor,
+    // field 2 = backing ArrayDeque (so Iterator.remove() can mutate it).
     let elems = ad_collect_elements(ctx, this);
     let arr = alloc_ref_array(ctx, elems.len());
     for (i, e) in elems.iter().enumerate() {
         ctx.set_array_element(arr, i, *e);
     }
-    let itr = alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 2);
+    let itr = alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 3);
     ctx.set_field(itr, 0, Value::Object(Some(arr)));
     ctx.set_field(itr, 1, Value::Int(0));
+    ctx.set_field(itr, 2, Value::Object(Some(this)));
     Ok(Some(Value::Object(Some(itr))))
+}
+
+/// `ArrayDeque$Itr.remove()` — remove the element returned by the last `next()`
+/// from the BACKING deque (field 2). Without this native, `remove()` falls to
+/// the `java/util/Iterator` default, which throws `UnsupportedOperationException`
+/// — the kafka `NetworkClientDelegate` unsent-request cleanup
+/// (`iterator.remove()` over an `ArrayDeque`) hit exactly that. The iterator is
+/// snapshot-backed (field 0 = array, field 1 = cursor), so we remove the first
+/// occurrence of the just-returned element from the live deque (correct for the
+/// forward, unique-element iteration these call sites use); the snapshot is left
+/// intact so continued iteration matches JDK semantics.
+fn native_ad_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0);
+    if cursor <= 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "next() has not been called, or remove() already called after the last next()"
+                .to_string(),
+        }
+        .into());
+    }
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(None),
+    };
+    let backing = match ctx.get_field(this, 2) {
+        Value::Object(Some(b)) => b,
+        // Older 2-field iterators (no backing ref): nothing to mutate.
+        _ => return Ok(None),
+    };
+    let last = ctx.get_array_element(arr, (cursor - 1) as usize);
+    native_ad_remove_first_occurrence(ctx, &[Value::Object(Some(backing)), last])?;
+    Ok(None)
 }
 
 fn native_ad_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -16595,6 +16633,12 @@ fn register_queue_deque_interface_natives(registry: &mut NativeMethodRegistry) {
             native_snapshot_itr_next,
         );
     }
+    // `ArrayDeque$Itr.remove()` removes the last-returned element from the
+    // backing deque (field 2). Otherwise remove() falls to the Iterator default
+    // → UnsupportedOperationException (kafka NetworkClientDelegate). Only the
+    // ArrayDeque iterator carries the backing-deque ref; the PriorityQueue
+    // iterator does not, so it is left as-is.
+    registry.register("java/util/ArrayDeque$Itr", "remove", "()V", native_ad_itr_remove);
     registry.set_category(__prev_cat);
 }
 
