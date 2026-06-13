@@ -156,7 +156,13 @@ fn write_char_array(ctx: &dyn NativeContext, arr: ObjectRef, off: usize, chars: 
 /// newly-allocated byte[] containing `bytes`.
 pub(crate) fn alloc_byte_buffer(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
     let cap = bytes.len();
-    let obj = alloc_concurrent_synthetic(ctx, "java/nio/ByteBuffer", BUF_NUM_FIELDS);
+    // Allocate the CONCRETE `HeapByteBuffer`, not the abstract `ByteBuffer`:
+    // the abstract base leaves `isDirect()`/`isReadOnly()`/`base()` unbound
+    // (AbstractMethodError "has no Code attribute"), which trips real-JDK
+    // consumers that call them — e.g. `sun.security.util.PBEUtil.encodePassword`
+    // reads `isReadOnly()` on the `CharsetEncoder.encode(...)` result. The
+    // named-field writes below match HeapByteBuffer's real layout.
+    let obj = alloc_concurrent_synthetic(ctx, "java/nio/HeapByteBuffer", BUF_NUM_FIELDS);
     let arr = ctx.new_array(ArrayElementType::Byte, cap);
     for (i, &b) in bytes.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
@@ -182,6 +188,17 @@ pub(crate) fn alloc_byte_buffer(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Ob
     ctx.set_field(obj, BUF_FIELD_LIMIT, Value::Int(cap as i32));
     ctx.set_field(obj, BUF_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(obj, BUF_FIELD_MARK, Value::Int(-1));
+    // `java.nio.Buffer.address` (long). A real `HeapByteBuffer` sets it to
+    // `ARRAY_BYTE_BASE_OFFSET + offset` (= 16 + 0). Without it the inherited
+    // bulk-get bytecode (`ByteBuffer.get(byte[])` → `getArray` →
+    // `ScopedMemoryAccess.copyMemory`) computes a source offset of
+    // `address(0) + position(0) = 0`, below `arrayBaseOffset` (16), which fails
+    // the `Unsafe.copyMemory` array-offset decode → AIOOBE. Surfaced by
+    // `CharsetEncoder.encode(...).get(byte[])` in `sun.security.util.PBEUtil`
+    // (real SunJCE PBKDF2). 16 == `Unsafe.arrayBaseOffset(byte[])` here. Written
+    // LAST, by name, so the indexed BUF_FIELD_* writes above (which can alias the
+    // real `address` slot) can't clobber it.
+    ctx.set_field_by_name(obj, "address", Value::Long(16));
     obj
 }
 
@@ -200,7 +217,8 @@ pub(crate) fn alloc_byte_buffer(ctx: &mut dyn NativeContext, bytes: &[u8]) -> Ob
 /// synthetic mode) continues to see consistent state.
 pub(crate) fn alloc_char_buffer(ctx: &mut dyn NativeContext, chars: &[u16]) -> ObjectRef {
     let cap = chars.len();
-    let obj = alloc_concurrent_synthetic(ctx, "java/nio/CharBuffer", BUF_NUM_FIELDS);
+    // Concrete `HeapCharBuffer` (not abstract `CharBuffer`) — see alloc_byte_buffer.
+    let obj = alloc_concurrent_synthetic(ctx, "java/nio/HeapCharBuffer", BUF_NUM_FIELDS);
     let arr = ctx.new_array(ArrayElementType::Char, cap);
     for (i, &c) in chars.iter().enumerate() {
         ctx.set_array_element(arr, i, Value::Int(c as i32));
@@ -218,6 +236,14 @@ pub(crate) fn alloc_char_buffer(ctx: &mut dyn NativeContext, chars: &[u16]) -> O
     ctx.set_field(obj, BUF_FIELD_LIMIT, Value::Int(cap as i32));
     ctx.set_field(obj, BUF_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(obj, BUF_FIELD_MARK, Value::Int(-1));
+    // `java.nio.Buffer.address` — see `alloc_byte_buffer`. A real
+    // `HeapCharBuffer` sets `ARRAY_CHAR_BASE_OFFSET + (offset<<1)` (= 16 + 0);
+    // without it the inherited bulk-get bytecode strides off-grid. Written last.
+    ctx.set_field_by_name(obj, "address", Value::Long(16));
+    // ByteBuffer default order is BIG_ENDIAN (`bigEndian=true`); a 0 default
+    // would make multi-byte views little-endian. Harmless for byte get/array
+    // but kept correct for `asCharBuffer`/`getInt` consumers.
+    ctx.set_field_by_name(obj, "bigEndian", Value::Int(1));
     obj
 }
 
