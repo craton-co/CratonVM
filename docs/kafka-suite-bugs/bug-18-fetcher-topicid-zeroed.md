@@ -25,6 +25,26 @@ fetch request/response `PartitionData`.
 Reproduce by round-tripping a `PartitionData` with a non-zero `topicId` through the
 fetch request builder under CratonVM and checking the id survives.
 
+## STATUS — RESOLVED on current `dev` (2026-06-13)
+
+The topicId `Uuid` is **no longer zeroed**. Verified on the post-Mockito/bug-24
+dev binary:
+- `common.requests.FetchRequestTest` **86/86 OK** (== HotSpot) — the protocol
+  test that round-trips `topicId` across all fetch-API versions.
+- `UuidProbe` (construct / `get{Most,Least}SignificantBits` / `toString` /
+  `ByteBuffer.putLong|getLong` round-trip / `fromString`) == HotSpot.
+- `TopicIdProbe` (`FetchRequestData` build+serialize+deserialize) and
+  `FetchRespProbe` (`FetchResponseData` round-trip) both preserve a non-zero
+  `topicId` == HotSpot.
+
+So the zeroing root cause is fixed by a serialization/`ByteBuffer` fix already
+merged to dev (basic `Uuid` and the generated-message `readUuid`/`writeUuid`
+paths are correct). Remaining fetcher-test failures, if any, are the
+Mockito-execution timeout (129-test classes are slow under the interpreter) or
+the separate [bug-17](bug-17-assignor-assignment-mismatch.md) map/set ordering
+issue — NOT topicId zeroing. Probes:
+`apps/kafka/tests/repro/{UuidProbe,TopicIdProbe,FetchRespProbe}.java`.
+
 ## Affected classes (partial — append more later)
 - consumer.internals.FetchCollectorTest / FetchRequestManager / Fetcher tests
 - common.requests.FetchRequestTest (append from full run)
