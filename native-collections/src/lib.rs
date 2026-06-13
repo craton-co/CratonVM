@@ -5114,7 +5114,23 @@ fn native_hs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         ctx.invoke_virtual(source, "clear", "()V", &[])?;
     }
     let clear_args = [Value::Object(Some(backing))];
-    native_map_clear(ctx, &clear_args)
+    // LinkedHashSet (and CopyOnWriteArraySet) back onto a LinkedHashMap, whose
+    // state lives in different field slots (size/head/tail + its own table) than
+    // the plain HashMap layout `native_map_clear` resets. Using `native_map_clear`
+    // on an LHM backing left the LHM `size`/`head`/`tail` intact, so the set's
+    // size/iteration still reported the pre-clear entries — and re-adding the same
+    // elements DUPLICATED them (JUnit's discovery reorders a descriptor's children
+    // by clear()+re-add → duplicate test descriptors → "returned a cyclic graph").
+    // Route to `native_lhm_clear` when the backing really is a LinkedHashMap.
+    let backing_is_lhm = matches!(
+        ctx.class_name_of_id(ctx.class_id_of_object(backing)).as_deref(),
+        Some("java/util/LinkedHashMap")
+    );
+    if backing_is_lhm {
+        native_lhm_clear(ctx, &clear_args)
+    } else {
+        native_map_clear(ctx, &clear_args)
+    }
 }
 
 fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
