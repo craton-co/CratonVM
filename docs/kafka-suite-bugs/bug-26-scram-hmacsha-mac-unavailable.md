@@ -17,6 +17,23 @@
 > only reach the JUnit rethrow). Likely the synthetic `Mac.doFinal()` returns null on a
 > later loop iteration after its accumulator reset, or a `SecretKeySpec(key, algo)`
 > path passes a null. Separate from the getInstance gap fixed here.
+>
+> **UPDATE — residual resolved in 2 of 3 layers (commit `09a7b4e3` / dev `016c8a88`):**
+> - **L1 (getAlgorithm null):** `Mac.getInstance` read the algorithm from `args[1]`, but
+>   static natives have no receiver placeholder (algo is `args[0]`, cf. `md_get_instance`)
+>   → slot 0 null → `SecretKeySpec(key, null)` NPE. Fixed: pick the first non-null ref arg.
+> - **L2 (MAC not initialized in the Hi() reuse loop):** the synthetic int init-flag
+>   (slot 2, stored in a real `javax.crypto.Mac`) gets clobbered across init-once/
+>   doFinal-many. Fixed: treat a Mac that still holds its key (slot 1) as initialized.
+>   → **`ScramCredentialUtilsTest` 0/6 → 6/6**; `ScramMessagesTest` 8/8 (still green).
+> - **L3 (OPEN — wrong HMAC bytes):** `ScramFormatterTest.rfc7677Example` now *runs* but
+>   fails an exact RFC-7677 vector: `array contents differ at index [0], expected 116 but
+>   was -71`. The synthetic Mac's raw-slot state (key/data) is corrupted by the
+>   allocation-heavy Hi() loop's GC / real-field aliasing → wrong `saltedPassword`.
+>   **Fix direction:** stop storing Mac state in raw slots of a real `javax.crypto.Mac`
+>   object; keep it in an **identity-keyed side-table** (as done for the PBKDF2 PRF, see
+>   `reference_pemfile_pbe_crypto`) so GC/aliasing can't corrupt it. CredentialUtils
+>   passes because it doesn't assert exact HMAC bytes; rfc7677Example does.
 
 **Severity:** High (for SCRAM) — **4 classes fail every test (0-pass)**. HotSpot OK.
 
