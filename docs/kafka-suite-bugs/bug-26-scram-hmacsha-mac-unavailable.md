@@ -35,8 +35,8 @@
 >   object's identity hash (stable across GC); the Mac handle is now opaque. Reworked
 >   getInstance/init/update×3/doFinal×2/reset/getMacLength/getAlgorithm/clone.
 >   **Result: `ScramFormatterTest` 1/2 → 2/2** (rfc7677 RFC vector passes); ScramMessages
->   8/8 and ScramCredentialUtils 6/6 still green. **3 of 4 SCRAM classes now fully green**
->   (from 0 at session start); ScramSaslServerTest re-checking.
+>   8/8 and ScramCredentialUtils 6/6 still green. **all 4 SCRAM classes now fully green** (Formatter 2/2, Messages 8/8, CredentialUtils 6/6, SaslServer 3/3)
+>   (from 0 at session start); ScramSaslServerTest 0/3 -> 3/3.
 
 **Severity:** High (for SCRAM) — **4 classes fail every test (0-pass)**. HotSpot OK.
 
