@@ -27262,7 +27262,13 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         "get",
         "(Ljava/lang/Class;)Ljava/lang/Object;",
         |_ctx, _args| {
-            // Simplified: always return null (real impl calls computeValue)
+            // Simplified: always return null (real impl calls computeValue).
+            // NOTE (BUG-W, 2026-06-13): dispatching to the subclass
+            // `computeValue(type)` was tried and is the right direction, but
+            // does NOT fix the motivating case — `MethodHandleImpl$ArrayAccessor$1.
+            // computeValue` itself returns null because the deeper
+            // MethodHandle-intrinsics path (`getAccessor`/`makeIntrinsic`) is
+            // not implemented. Left as the null stub pending that work.
             Ok(Some(Value::Object(None)))
         },
     );

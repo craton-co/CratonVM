@@ -205,6 +205,9 @@ pub(crate) fn get_or_create_platform_loader(ctx: &mut dyn NativeContext) -> Obje
     let obj = alloc_classloader(ctx, LOADER_PLATFORM);
     let name = ctx.create_string("platform");
     ctx.set_field(obj, CL_NAME_REF, Value::Object(Some(name)));
+    // Also populate the REAL `name` field by name: the active getName native
+    // (classloader_real) reads the real field slot, not CL_NAME_REF.
+    ctx.set_field_by_name(obj, "name", Value::Object(Some(name)));
     // Platform's parent is bootstrap (null) — already set by alloc_classloader
     *platform_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = Some(obj);
     obj
@@ -221,6 +224,21 @@ pub fn get_or_create_app_loader(ctx: &mut dyn NativeContext) -> ObjectRef {
     let name = ctx.create_string("app");
     ctx.set_field(obj, CL_NAME_REF, Value::Object(Some(name)));
     ctx.set_field(obj, CL_PARENT_REF, Value::Object(Some(platform)));
+    // Also populate the REAL `name`/`parent` fields by name: the active
+    // getName/getParent natives (classloader_real) read the real field slots,
+    // not CL_NAME_REF/CL_PARENT_REF. Without the real `parent`, the app
+    // loader's getParent() returned null and Tomcat's
+    // WebappClassLoaderBase.<init> javase-loader walk
+    // (`while (j.getParent() != null) j = j.getParent()`) misbehaved.
+    ctx.set_field_by_name(obj, "name", Value::Object(Some(name)));
+    ctx.set_field_by_name(obj, "parent", Value::Object(Some(platform)));
+    // Populate the REAL static `java.lang.ClassLoader.scl` so the real-JDK
+    // `ClassLoader.getSystemClassLoader()` bytecode (reached when a call site
+    // does not resolve to our native — observed in
+    // WebappClassLoaderBase.<init> at pc=174) returns this loader instead of
+    // null. A null there made the subsequent `j.getParent()` NPE and aborted
+    // every embedded-server webapp deploy ("Error starting the loader").
+    ctx.set_static_field_by_name("java/lang/ClassLoader", "scl", Value::Object(Some(obj)));
     *app_loader_store().lock().unwrap_or_else(|e| e.into_inner()) = Some(obj);
     obj
 }

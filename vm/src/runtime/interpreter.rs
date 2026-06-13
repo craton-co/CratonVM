@@ -1751,6 +1751,16 @@ const MIN_EXEC_DEPTH_CEILING: u32 = 256;
 /// stack is `native_stack_bytes` large.
 #[inline]
 fn derive_exec_depth_ceiling(native_stack_bytes: usize) -> u32 {
+    // Diagnostic / safety override: `CRATONVM_EXEC_DEPTH_CEILING=<n>` forces the
+    // `execute` recursion ceiling. Useful to (a) confirm a runaway recursion goes
+    // through `execute` by forcing an early *catchable* StackOverflowError (whose
+    // Java stack trace reveals the cycle), and (b) cap deep frames whose real
+    // per-level native-stack cost exceeds NATIVE_STACK_BYTES_PER_EXEC_LEVEL.
+    if let Ok(v) = std::env::var("CRATONVM_EXEC_DEPTH_CEILING") {
+        if let Ok(n) = v.trim().parse::<u32>() {
+            return n.max(1);
+        }
+    }
     let usable = native_stack_bytes / NATIVE_STACK_SAFETY_DIVISOR;
     let levels = usable / NATIVE_STACK_BYTES_PER_EXEC_LEVEL;
     // Clamp into u32 and apply the floor.

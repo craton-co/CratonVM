@@ -994,6 +994,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // never touched at runtime.
     register_biginteger_arithmetic_overrides(registry);
     register_bigdecimal_arithmetic_overrides(registry);
+    // bug-26 (kafka SCRAM): `javax.crypto.Mac` (getInstance/init/update/doFinal)
+    // was only registered inside `register_synthetic_overrides`, which real-JDK
+    // mode never calls — so `Mac.getInstance("HmacSHA256")` fell through to the
+    // real JDK bytecode and threw `NoSuchAlgorithmException: Algorithm HmacSHA256
+    // not available` (the real provider chain has no working HMAC MacSpi). The
+    // synthetic Mac native computes a real, RFC-4231-correct HMAC over the
+    // key+data accumulated via init/update, so promote it to the universal
+    // essential path (matching how Cipher/MessageDigest are wired). Fixes the
+    // SCRAM Formatter/Messages/CredentialUtils/SaslServer suite (0-pass → pass).
+    crate::phases_late::register_p68_crypto_mac(registry);
     // `Long.parseLong(String)J` / `Integer.parseInt(String)I` — in real-JDK
     // mode, these fall through to JDK bytecode whose loop multiplies-and-adds
     // digit-by-digit (`result = result * 10 + digit`). Bounds-check arithmetic
@@ -5088,6 +5098,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        // Real-JDK `java.util.logging.Logger` objects (created by the JDK's
+        // demandLogger / 2-arg getLogger path and handed to e.g.
+        // `org.apache.juli.ClassLoaderLogManager.addLogger`) keep the name in
+        // their real `name` field, NOT at slot 0 (slot 0 is `config`, a
+        // `Logger$ConfigurationData`). Reading slot 0 unconditionally returned
+        // that ConfigurationData, so the caller's `getName().lastIndexOf('.')`
+        // threw NoSuchMethodError and aborted the VM. Prefer the real `name`
+        // field; fall back to slot 0 for synthetic loggers our getLogger
+        // natives create (which stash the name there).
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "name") {
+            return Ok(Some(Value::Object(Some(s))));
+        }
         match ctx.get_field(this, 0) {
             Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
             _ => {
@@ -11297,6 +11319,48 @@ pub(crate) fn locale_data_get(obj: ObjectRef) -> (String, String, String) {
         .get(&obj)
         .cloned()
         .unwrap_or_default()
+}
+
+/// GC root scan for all process-global Locale caches (this module's
+/// `locale_default` + `locale_data`, plus the `locale_bootstrap` caches). These
+/// hold live synthetic `java/util/Locale` objects reachable only from Rust-side
+/// mutexes; without rooting+remapping they go stale after a moving young GC and
+/// a later `Locale` method dispatch SIGSEGVs ("Stale pointer … java/util/Locale").
+pub fn gc_scan_locale_roots(out: &mut Vec<ObjectRef>) {
+    if let Some(o) = *locale_default().lock() {
+        out.push(o);
+    }
+    for k in locale_data().lock().keys() {
+        out.push(*k);
+    }
+    crate::locale_bootstrap::gc_scan_locale_roots(out);
+}
+
+/// Post-GC remap companion to [`gc_scan_locale_roots`].
+pub fn gc_update_locale_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    {
+        let mut slot = locale_default().lock();
+        if let Some(obj) = slot.as_mut() {
+            if let Some(&new_addr) = pointer_map.get(&(obj.as_ptr() as usize)) {
+                *obj = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+    {
+        let mut map = locale_data().lock();
+        let drained: Vec<_> = map.drain().collect();
+        for (k, v) in drained {
+            let nk = pointer_map
+                .get(&(k.as_ptr() as usize))
+                .map(|&n| unsafe { ObjectRef::from_raw(n as *mut u8) })
+                .unwrap_or(k);
+            map.insert(nk, v);
+        }
+    }
+    crate::locale_bootstrap::gc_update_locale_refs(pointer_map);
 }
 
 pub(crate) fn native_noop_with_this(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
