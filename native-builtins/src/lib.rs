@@ -21805,7 +21805,23 @@ fn native_cond_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     ctx.monitor_notify(lock_ref)?;
     ctx.monitor_exit(lock_ref);
     // Atomically release the condition monitor and wait for a signal.
-    ctx.monitor_wait(this, None)?;
+    //
+    // GC-SAFEPOINT FIX: `monitor_wait` parks this thread, so a collection can
+    // run while we are blocked — the moving collector, or the non-moving
+    // young sweep's selective promotion — and relocate both `this` and
+    // `lock_ref`. The raw ObjectRefs captured at entry would then be stale, and
+    // the `monitor_exit` / `reacquire` below would `header_of` a dead address →
+    // EXCEPTION_ACCESS_VIOLATION (TestSwallowAbortedUploads SIGSEGV in
+    // MonitorTable::exit). Pin both across the wait and read back their post-GC
+    // addresses; `native_pin_roots` is remapped by the collector (see
+    // vm/src/memory/gc.rs `update_all_roots`). Unpin even on the error path.
+    let this_pin = ctx.pin_native_root(this);
+    let lock_pin = ctx.pin_native_root(lock_ref);
+    let wr = ctx.monitor_wait(this, None);
+    let this = ctx.read_native_pin(this_pin, this);
+    let lock_ref = ctx.read_native_pin(lock_pin, lock_ref);
+    ctx.unpin_native_roots(this_pin);
+    wr?;
     ctx.monitor_exit(this);
     reacquire_lock_after_await(ctx, lock_ref, lock_key, tid, saved_hold)?;
     Ok(None)
@@ -21849,7 +21865,15 @@ fn native_cond_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     ctx.monitor_notify(lock_ref)?;
     ctx.monitor_exit(lock_ref);
     let start = std::time::Instant::now();
-    ctx.monitor_wait(this, Some(timeout_ms))?;
+    // GC-SAFEPOINT FIX (see native_cond_await): pin `this`/`lock_ref` across
+    // the blocking wait so a relocating GC can't leave them stale.
+    let this_pin = ctx.pin_native_root(this);
+    let lock_pin = ctx.pin_native_root(lock_ref);
+    let wr = ctx.monitor_wait(this, Some(timeout_ms));
+    let this = ctx.read_native_pin(this_pin, this);
+    let lock_ref = ctx.read_native_pin(lock_pin, lock_ref);
+    ctx.unpin_native_roots(this_pin);
+    wr?;
     ctx.monitor_exit(this);
     let timed_out = start.elapsed().as_millis() as u64 >= timeout_ms;
     reacquire_lock_after_await(ctx, lock_ref, lock_key, tid, saved_hold)?;
@@ -21861,7 +21885,7 @@ fn native_cond_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// wait) until the lock is free.
 fn reacquire_lock_after_await(
     ctx: &mut dyn NativeContext,
-    lock_ref: ObjectRef,
+    mut lock_ref: ObjectRef,
     lock_key: i32,
     tid: i64,
     saved_hold: i32,
@@ -21879,9 +21903,17 @@ fn reacquire_lock_after_await(
         if claimed {
             return Ok(None);
         }
+        // GC-SAFEPOINT FIX (see native_cond_await): the 5 ms re-check wait
+        // parks this thread, so a relocating GC could leave `lock_ref` stale.
+        // Pin it across the wait and read back the post-GC address; unpin even
+        // on the error path.
+        let pin = ctx.pin_native_root(lock_ref);
         ctx.monitor_enter(lock_ref);
-        ctx.monitor_wait(lock_ref, Some(5))?;
+        let wr = ctx.monitor_wait(lock_ref, Some(5));
+        lock_ref = ctx.read_native_pin(pin, lock_ref);
         ctx.monitor_exit(lock_ref);
+        ctx.unpin_native_roots(pin);
+        wr?;
     }
 }
 
@@ -21919,7 +21951,15 @@ fn native_cond_await_nanos(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     ctx.monitor_notify(lock_ref)?;
     ctx.monitor_exit(lock_ref);
     let start = std::time::Instant::now();
-    ctx.monitor_wait(this, Some(timeout_ms))?;
+    // GC-SAFEPOINT FIX (see native_cond_await): pin `this`/`lock_ref` across
+    // the blocking wait so a relocating GC can't leave them stale.
+    let this_pin = ctx.pin_native_root(this);
+    let lock_pin = ctx.pin_native_root(lock_ref);
+    let wr = ctx.monitor_wait(this, Some(timeout_ms));
+    let this = ctx.read_native_pin(this_pin, this);
+    let lock_ref = ctx.read_native_pin(lock_pin, lock_ref);
+    ctx.unpin_native_roots(this_pin);
+    wr?;
     ctx.monitor_exit(this);
     let elapsed_nanos = start.elapsed().as_nanos() as i64;
     let remaining = nanos.saturating_sub(elapsed_nanos).max(0);
