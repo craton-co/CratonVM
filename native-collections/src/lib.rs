@@ -717,6 +717,39 @@ fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Compare two grouping/keying values using the SAME semantics a real
+/// `HashMap` key would: identity, then the object's own Java `equals()`.
+///
+/// `values_equal` only knows about identity, `String`, and enum constants and
+/// returns `false` for any other two distinct object instances — so a
+/// `Collectors.groupingBy` / `toMap` whose key is e.g. a `LinkedHashMap`,
+/// record, or any value class would treat two equal-but-distinct keys as
+/// different groups. The Rust-side group list then ends up with one entry per
+/// element, and `make_map_of` (which keys on real Java `equals`) collapses them
+/// to a single key keeping only the LAST value — silently dropping the rest
+/// (the kafka `RangeAssignor.assignWithRackMatching` `groupingBy(consumers)`
+/// bug: all topic states share one consumer-set key, so only the last topic was
+/// grouped → rack-aware assignment skipped for the others). Invoking the real
+/// `equals` closes the gap for arbitrary key types.
+fn group_key_equal(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> bool {
+    if let (Value::Object(Some(oa)), Value::Object(Some(ob))) = (a, b) {
+        if std::ptr::eq(oa.as_ptr(), ob.as_ptr()) {
+            return true;
+        }
+        if let Ok(Some(Value::Int(v))) = ctx.invoke_virtual(
+            *oa,
+            "equals",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(*ob))],
+        ) {
+            return v != 0;
+        }
+        return false;
+    }
+    // Primitives / null: the cheap structural comparison is exact.
+    values_equal(&*ctx, a, b)
+}
+
 // ===========================================================================
 // ArrayList — synthetic-jdk layout: field 0 = Object[] elementData, field 1 = Int size
 // Real-JDK layout: AbstractList.modCount(I) at slot 0, ArrayList.elementData at slot 1,
@@ -9543,17 +9576,20 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                         &[*elem],
                     )?
                     .unwrap_or(Value::Object(None));
-                // Find existing group
-                let mut found = false;
-                for (gk, gv) in &mut groups {
-                    if values_equal(ctx, gk, &key) {
-                        gv.push(*elem);
-                        found = true;
+                // Find existing group. Use real Java `equals` (not the
+                // identity/String/enum-only `values_equal`) so equal-but-
+                // distinct object keys (e.g. a `LinkedHashMap` group key) land
+                // in the SAME group rather than one group per element.
+                let mut found_idx = None;
+                for (i, (gk, _)) in groups.iter().enumerate() {
+                    if group_key_equal(ctx, gk, &key) {
+                        found_idx = Some(i);
                         break;
                     }
                 }
-                if !found {
-                    groups.push((key, vec![*elem]));
+                match found_idx {
+                    Some(i) => groups[i].1.push(*elem),
+                    None => groups.push((key, vec![*elem])),
                 }
             }
             // Build HashMap<K, ArrayList<V>>
@@ -9615,16 +9651,18 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                         &[*elem],
                     )?
                     .unwrap_or(Value::Object(None));
-                let mut found = false;
-                for (gk, gv) in &mut groups {
-                    if values_equal(ctx, gk, &key) {
-                        gv.push(*elem);
-                        found = true;
+                // Real Java `equals` for object keys (see the GROUPING_BY
+                // branch above) so equal-but-distinct keys share a group.
+                let mut found_idx = None;
+                for (i, (gk, _)) in groups.iter().enumerate() {
+                    if group_key_equal(ctx, gk, &key) {
+                        found_idx = Some(i);
                         break;
                     }
                 }
-                if !found {
-                    groups.push((key, vec![*elem]));
+                match found_idx {
+                    Some(i) => groups[i].1.push(*elem),
+                    None => groups.push((key, vec![*elem])),
                 }
             }
 
@@ -9703,16 +9741,18 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                         &[*elem],
                     )?
                     .unwrap_or(Value::Object(None));
-                let mut found = false;
-                for (gk, gv) in &mut groups {
-                    if values_equal(ctx, gk, &key) {
-                        gv.push(*elem);
-                        found = true;
+                // Real Java `equals` for object keys (see the GROUPING_BY
+                // branch above) so equal-but-distinct keys share a group.
+                let mut found_idx = None;
+                for (i, (gk, _)) in groups.iter().enumerate() {
+                    if group_key_equal(ctx, gk, &key) {
+                        found_idx = Some(i);
                         break;
                     }
                 }
-                if !found {
-                    groups.push((key, vec![*elem]));
+                match found_idx {
+                    Some(i) => groups[i].1.push(*elem),
+                    None => groups.push((key, vec![*elem])),
                 }
             }
 
