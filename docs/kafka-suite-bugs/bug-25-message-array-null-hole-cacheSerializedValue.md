@@ -51,6 +51,26 @@ tests across 13 classes**, all protocol request/response serialization. HotSpot 
 > it is JUnit-harness-only. **Next:** dump the `Object[] args` (and the resolved target
 > Method) inside CratonVM's `Method.invoke` native for the failing call to see where the
 > `ObjectSerializationCache` argument becomes null / the wrong method is dispatched.
+>
+> **UPDATE 2 — genuine null confirmed; degraded-Method ruled out:**
+> - Code-path analysis of the throw site (interpreter.rs ~10868) shows it is the `_`
+>   arm where the receiver is `Value::Object(None)` — a **genuine null**, definitively
+>   NOT a GC-collected stale all-zero-header object (that path salvages at ~10440).
+> - `CRATONVM_DBG_MINVOKE=1` + `CRATONVM_DBG_METHOD_INVOKE_BOX=1` on the failing test
+>   produced **no degraded-Method hits** → the reflective dispatch resolves the right
+>   `Method`; it is not a clazz-null Method bug.
+> - The absent `serialize()`/test-method frames between `invokeMethod` and `Message.size`
+>   indicate those calls run through CratonVM's **stackless cached-dispatch**
+>   (`execute_invokevirtual_cached`/`execute_invokestatic_cached`), which does not push a
+>   full scannable frame. **Leading hypothesis:** the `ObjectSerializationCache` local
+>   created in `RequestUtils.serialize` is lost (read back as null) because the
+>   stackless-dispatched serialize path's locals aren't GC-rooted/preserved under the
+>   harness's allocation pressure — the interpreter-side analogue of bug-21/22, but on
+>   the stackless path. **Next:** instrument `execute_invokevirtual_cached` (or disable
+>   stackless dispatch for the serialize path via the existing bisect gate) and re-run;
+>   if the cache survives with stackless dispatch off, the fix is to root/spill locals
+>   across the cached-dispatch boundary. This is the remaining bug-25 work; the cluster
+>   is otherwise byte-correct (proven by standalone probes).
 
 ## Symptom
 ```
