@@ -1265,6 +1265,7 @@ fn sc_read(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         None => return Ok(Some(Value::Int(0))), // EAGAIN — JDK convention
     };
     if n > 0 {
+        crate::net::socket_capture('r', id, &buf[..n as usize]);
         let written = buffer_write_bytes(ctx, bb, &buf[..n as usize]);
         buffer_advance(ctx, bb, written);
     }
@@ -1300,6 +1301,7 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
         None => return Ok(Some(Value::Int(0))), // EAGAIN
     };
     if n > 0 {
+        crate::net::socket_capture('w', id, &data[..n as usize]);
         buffer_advance(ctx, bb, n);
     }
     Ok(Some(Value::Int(n)))

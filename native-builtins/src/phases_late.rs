@@ -39149,10 +39149,48 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         eprintln!("BI-TRACE: class_id resolved -> {}", cn);
     }
 
-    // Discover properties from getters/setters across the class + superclasses.
-    // Stored as (name, getter_method_mirror, setter_method_mirror, propertyType_mirror).
-    let mut properties: Vec<(String, Option<ObjectRef>, Option<ObjectRef>, Option<ObjectRef>)> =
-        Vec::new();
+    // Discover properties from getters/setters across the class + superclasses,
+    // replicating jakarta.el.BeanSupportStandalone — which itself mirrors the
+    // JDK java.beans.Introspector property-merge rules that the Tomcat suite
+    // (TestBeanSupport) asserts:
+    //   * read method = getXxx()/isXxx(); a boolean isXxx() locks out getXxx();
+    //   * among overloaded setXxx(T) the write method is chosen by walking the
+    //     assignable chain, seeded by the getter's return type (or, with no
+    //     getter, by the lexicographically-smallest parameter type name);
+    //   * property type = read method return type, else the chosen setter's
+    //     parameter type.
+    // Convert a field/param descriptor to Class.getName() form for sorting.
+    fn desc_to_binary_name(desc: &str) -> String {
+        match desc.chars().next() {
+            Some('L') => desc[1..desc.len().saturating_sub(1)].replace('/', "."),
+            Some('[') => desc.replace('/', "."),
+            Some('Z') => "boolean".to_string(),
+            Some('B') => "byte".to_string(),
+            Some('C') => "char".to_string(),
+            Some('S') => "short".to_string(),
+            Some('I') => "int".to_string(),
+            Some('J') => "long".to_string(),
+            Some('F') => "float".to_string(),
+            Some('D') => "double".to_string(),
+            _ => desc.to_string(),
+        }
+    }
+    struct PropAcc {
+        name: String,
+        read_method: Option<ObjectRef>,
+        read_ret_mirror: Option<ObjectRef>,
+        read_ret_desc: Option<String>,
+        read_ret_cid: Option<cratonvm_types::ClassId>,
+        uses_is: bool,
+        // (method_mirror, param_desc, param_mirror, param_class_id)
+        write_methods: Vec<(
+            ObjectRef,
+            String,
+            ObjectRef,
+            Option<cratonvm_types::ClassId>,
+        )>,
+    }
+    let mut props: Vec<PropAcc> = Vec::new();
 
     let mut current = Some(class_id);
     let mut seen_method_keys: std::collections::HashSet<(String, String)> =
@@ -39163,16 +39201,16 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         let declaring_mirror = ctx.get_class_mirror(cid);
 
         let methods = ctx.declared_methods(cid);
-        if trace {
-            let cn = ctx.class_name_of_id(cid).unwrap_or_default();
-            eprintln!("BI-TRACE:   walking {} ({} methods)", cn, methods.len());
-        }
         for method in &methods {
             let name = &method.name;
             let desc = &method.descriptor;
             // Dedupe across inheritance: subclass override wins.
             let key = (name.clone(), desc.clone());
             if !seen_method_keys.insert(key) {
+                continue;
+            }
+            // JavaBeans properties come from instance methods only.
+            if method.access_flags & 0x0008 != 0 {
                 continue;
             }
 
@@ -39186,6 +39224,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 let ret_desc = desc.split(')').nth(1).unwrap_or("Ljava/lang/Object;").to_string();
                 let ret_mirror =
                     crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(ctx, &ret_desc);
+                let ret_cid = crate::lang_class::mirror_class_id(ctx, ret_mirror);
                 let mm = crate::jmx_openmbean::build_method_mirror(
                     ctx,
                     declaring_mirror,
@@ -39193,24 +39232,40 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                     desc,
                     method.access_flags,
                 );
-                if let Some(existing) =
-                    properties.iter_mut().find(|(n, _, _, _)| *n == prop_name)
-                {
-                    if existing.1.is_none() {
-                        existing.1 = Some(mm);
+                let idx = match props.iter().position(|p| p.name == prop_name) {
+                    Some(i) => i,
+                    None => {
+                        props.push(PropAcc {
+                            name: prop_name.clone(),
+                            read_method: None,
+                            read_ret_mirror: None,
+                            read_ret_desc: None,
+                            read_ret_cid: None,
+                            uses_is: false,
+                            write_methods: Vec::new(),
+                        });
+                        props.len() - 1
                     }
-                    if existing.3.is_none() {
-                        existing.3 = Some(ret_mirror);
-                    }
-                } else {
-                    properties.push((prop_name, Some(mm), None, Some(ret_mirror)));
+                };
+                let p = &mut props[idx];
+                if is_is {
+                    // A boolean isXxx() always wins and locks out plain getters.
+                    p.read_method = Some(mm);
+                    p.read_ret_mirror = Some(ret_mirror);
+                    p.read_ret_desc = Some(ret_desc);
+                    p.read_ret_cid = ret_cid;
+                    p.uses_is = true;
+                } else if !p.uses_is && p.read_method.is_none() {
+                    // First plain getter (subclass is walked first) wins.
+                    p.read_method = Some(mm);
+                    p.read_ret_mirror = Some(ret_mirror);
+                    p.read_ret_desc = Some(ret_desc);
+                    p.read_ret_cid = ret_cid;
                 }
             }
 
             // setter: setXxx(T) -> void with exactly one parameter.
             if name.starts_with("set") && name.len() > 3 && desc.ends_with(")V") {
-                // Validate it's a single-parameter setter and extract that
-                // parameter's descriptor token.
                 let (params, _ret) =
                     crate::jmx_openmbean::parse_method_descriptor_pub(desc);
                 if params.len() != 1 {
@@ -39219,6 +39274,7 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                 let prop_name = decapitalize(&name[3..]);
                 let param_mirror =
                     crate::jmx_openmbean::type_descriptor_to_class_mirror_pub(ctx, &params[0]);
+                let param_cid = crate::lang_class::mirror_class_id(ctx, param_mirror);
                 let mm = crate::jmx_openmbean::build_method_mirror(
                     ctx,
                     declaring_mirror,
@@ -39226,21 +39282,68 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                     desc,
                     method.access_flags,
                 );
-                if let Some(existing) =
-                    properties.iter_mut().find(|(n, _, _, _)| *n == prop_name)
-                {
-                    if existing.2.is_none() {
-                        existing.2 = Some(mm);
+                let idx = match props.iter().position(|p| p.name == prop_name) {
+                    Some(i) => i,
+                    None => {
+                        props.push(PropAcc {
+                            name: prop_name.clone(),
+                            read_method: None,
+                            read_ret_mirror: None,
+                            read_ret_desc: None,
+                            read_ret_cid: None,
+                            uses_is: false,
+                            write_methods: Vec::new(),
+                        });
+                        props.len() - 1
                     }
-                    if existing.3.is_none() {
-                        existing.3 = Some(param_mirror);
-                    }
-                } else {
-                    properties.push((prop_name, None, Some(mm), Some(param_mirror)));
-                }
+                };
+                props[idx]
+                    .write_methods
+                    .push((mm, params[0].clone(), param_mirror, param_cid));
             }
         }
         current = ctx.superclass_of(cid);
+    }
+
+    // Resolve each accumulated property into the (name, readMethod, writeMethod,
+    // propertyType) tuple the PropertyDescriptor builder below expects.
+    let mut properties: Vec<(String, Option<ObjectRef>, Option<ObjectRef>, Option<ObjectRef>)> =
+        Vec::with_capacity(props.len());
+    for p in &mut props {
+        let mut write_method: Option<ObjectRef> = None;
+        let mut write_param_mirror: Option<ObjectRef> = None;
+        if !p.write_methods.is_empty() {
+            // Seed type: getter return type, else smallest parameter type name.
+            let (mut type_desc, mut type_cid) = if p.read_method.is_some() {
+                (p.read_ret_desc.clone().unwrap_or_default(), p.read_ret_cid)
+            } else {
+                p.write_methods
+                    .sort_by(|a, b| desc_to_binary_name(&a.1).cmp(&desc_to_binary_name(&b.1)));
+                (p.write_methods[0].1.clone(), p.write_methods[0].3)
+            };
+            for (mm, pdesc, pmirror, pcid) in &p.write_methods {
+                let assignable = if type_desc == *pdesc {
+                    true
+                } else if let (Some(t), Some(c)) = (type_cid, *pcid) {
+                    c == t || ctx.is_subclass(c, t)
+                } else {
+                    false
+                };
+                if assignable {
+                    type_desc = pdesc.clone();
+                    type_cid = *pcid;
+                    write_method = Some(*mm);
+                    write_param_mirror = Some(*pmirror);
+                }
+            }
+        }
+        // Property type: read method return type, else chosen setter param type.
+        let type_mirror = if p.read_method.is_some() {
+            p.read_ret_mirror
+        } else {
+            write_param_mirror
+        };
+        properties.push((p.name.clone(), p.read_method, write_method, type_mirror));
     }
 
     // Always include the synthetic "class" property (java.beans includes it

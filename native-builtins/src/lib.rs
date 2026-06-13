@@ -25052,7 +25052,7 @@ fn register_bigdecimal_arithmetic_overrides(registry: &mut NativeMethodRegistry)
     registry.register(bd, "scale", "()I", native_bd_scale);
     registry.register(bd, "precision", "()I", native_bd_precision);
     registry.register(bd, "toString", "()Ljava/lang/String;", native_bd_to_string);
-    registry.register(bd, "toPlainString", "()Ljava/lang/String;", native_bd_to_string);
+    registry.register(bd, "toPlainString", "()Ljava/lang/String;", native_bd_to_plain_string);
     registry.register(bd, "intValue", "()I", native_bd_int_value);
     registry.register(bd, "longValue", "()J", native_bd_long_value);
     registry.register(bd, "doubleValue", "()D", native_bd_double_value);
@@ -26144,28 +26144,47 @@ fn register_bigdecimal_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(__prev_cat);
 }
 
+/// Read a `BigDecimal`'s `(unscaled-digits, scale)` in real-JDK layout, or
+/// `None` for the synthetic-stub layout (which stores a ready decimal string).
+fn bd_read_parts(ctx: &dyn NativeContext, this: ObjectRef) -> Option<(String, i32)> {
+    let (iv_i, sc_i, _pr_i, ic_i) = bd_layout(ctx)?;
+    let scale = match ctx.get_field(this, sc_i) {
+        Value::Int(s) => s,
+        _ => 0,
+    };
+    let int_compact = match ctx.get_field(this, ic_i) {
+        Value::Long(l) => l,
+        _ => BD_INFLATED,
+    };
+    let unscaled = if int_compact != BD_INFLATED {
+        int_compact.to_string()
+    } else {
+        match ctx.get_field(this, iv_i) {
+            Value::Object(Some(bi)) => bi_read(ctx, bi),
+            _ => "0".to_string(),
+        }
+    };
+    Some((unscaled, scale))
+}
+
+/// Plain (`toPlainString`-style, round-trippable) rendering — also the internal
+/// arithmetic form.
 fn bd_read(ctx: &dyn NativeContext, this: ObjectRef) -> String {
-    if let Some((iv_i, sc_i, _pr_i, ic_i)) = bd_layout(ctx) {
-        // Real-JDK layout — prefer the compact long unless inflated.
-        let scale = match ctx.get_field(this, sc_i) {
-            Value::Int(s) => s,
-            _ => 0,
-        };
-        let int_compact = match ctx.get_field(this, ic_i) {
-            Value::Long(l) => l,
-            _ => BD_INFLATED,
-        };
-        let unscaled = if int_compact != BD_INFLATED {
-            int_compact.to_string()
-        } else {
-            match ctx.get_field(this, iv_i) {
-                Value::Object(Some(bi)) => bi_read(ctx, bi),
-                _ => "0".to_string(),
-            }
-        };
+    if let Some((unscaled, scale)) = bd_read_parts(ctx, this) {
         return apply_scale(&unscaled, scale);
     }
     // Synthetic-stub fallback — the value is already a decimal string.
+    match ctx.get_field(this, BD_FIELD_VALUE) {
+        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0".to_string()),
+        _ => "0".to_string(),
+    }
+}
+
+/// Canonical `toString()` rendering (scientific notation when appropriate).
+fn bd_read_canonical(ctx: &dyn NativeContext, this: ObjectRef) -> String {
+    if let Some((unscaled, scale)) = bd_read_parts(ctx, this) {
+        return bd_layout_chars(&unscaled, scale);
+    }
     match ctx.get_field(this, BD_FIELD_VALUE) {
         Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "0".to_string()),
         _ => "0".to_string(),
@@ -26221,6 +26240,46 @@ fn apply_scale(unscaled: &str, scale: i32) -> String {
     } else {
         // Negative scale = trailing zeros.
         format!("{}{}{}", sign, abs, "0".repeat((-scale) as usize))
+    }
+}
+
+/// `BigDecimal.toString()` canonical layout (java.math.BigDecimal.toString):
+/// scientific notation when the scale is negative OR the adjusted exponent is
+/// `< -6`; plain decimal otherwise. (`toPlainString()` keeps the plain
+/// `apply_scale` rendering, and `apply_scale` is also used unchanged for the
+/// internal round-trippable arithmetic form.)
+fn bd_layout_chars(unscaled: &str, scale: i32) -> String {
+    if scale == 0 {
+        return unscaled.to_string();
+    }
+    let (neg, abs) = if let Some(stripped) = unscaled.strip_prefix('-') {
+        (true, stripped.to_string())
+    } else {
+        (false, unscaled.to_string())
+    };
+    let sign = if neg { "-" } else { "" };
+    let coeff_len = abs.len() as i64;
+    // Adjusted exponent of the leftmost digit: (digits - 1) - scale.
+    let adjusted = coeff_len - 1 - scale as i64;
+    if scale > 0 && adjusted >= -6 {
+        // Plain decimal (positive scale, not too small).
+        let s = scale as usize;
+        if abs.len() > s {
+            let split = abs.len() - s;
+            format!("{}{}.{}", sign, &abs[..split], &abs[split..])
+        } else {
+            let pad = s - abs.len();
+            format!("{}0.{}{}", sign, "0".repeat(pad), abs)
+        }
+    } else {
+        // Scientific notation: one digit before the point, signed exponent.
+        let mantissa = if abs.len() == 1 {
+            abs.clone()
+        } else {
+            format!("{}.{}", &abs[..1], &abs[1..])
+        };
+        let exp_sign = if adjusted >= 0 { "+" } else { "-" };
+        format!("{}{}E{}{}", sign, mantissa, exp_sign, adjusted.abs())
     }
 }
 
@@ -26532,8 +26591,20 @@ fn native_bd_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // RBIGDEC.1 — `bd_read` reconstructs the decimal from intCompact + scale
-    // in real-JDK mode, so synthesise a fresh Java string.
+    // toString() uses the canonical layout (scientific notation when the scale
+    // is negative or the adjusted exponent < -6); toPlainString() uses the
+    // plain form (native_bd_to_plain_string).
+    let s = bd_read_canonical(ctx, this);
+    let java_str = ctx.create_string(&s);
+    Ok(Some(Value::Object(Some(java_str))))
+}
+
+/// `BigDecimal.toPlainString()` — never uses exponential notation.
+fn native_bd_to_plain_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
     let s = bd_read(ctx, this);
     let java_str = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(java_str))))

@@ -1654,6 +1654,44 @@ pub(crate) fn native_class_is_instance(ctx: &mut dyn NativeContext, args: &[Valu
         }
     }
 
+    // Dynamic `java.lang.reflect.Proxy` instances: every proxy lands on the
+    // single synthetic `java/lang/reflect/Proxy$Instance` class, so the
+    // `is_subclass(Proxy$Instance, <iface>)` check below is always false even
+    // when the proxy was created implementing `<iface>`. The implemented
+    // interfaces are recorded per-instance in the `interfaces` slot (a
+    // `Class[]`). Mirror the interpreter's `proxy_instance_satisfies_target`
+    // (checkcast/instanceof admission) here so reflective `Class.isInstance` /
+    // `Class.cast` agree. Without this, `Class.cast` on a proxy throws a
+    // ClassCastException — e.g. Gradle's logging `ListenerBroadcast.getSource()`
+    // proxy cast to `OutputEventListener` killed every test worker.
+    if let Some(target_name) = ctx.class_name_of_id(target_class_id) {
+        if target_name == "java/lang/reflect/Proxy$Instance" {
+            // Object / Serializable are always satisfied per the Proxy spec.
+            if let Some(this_name) = ctx.class_name_of_id(this_class_id) {
+                if this_name == "java/lang/Object" || this_name == "java/io/Serializable" {
+                    return Ok(Some(Value::Int(1)));
+                }
+            }
+            const PROXY_FIELD_INTERFACES: usize = 1;
+            if let Value::Object(Some(ifaces)) = ctx.get_field(target, PROXY_FIELD_INTERFACES) {
+                let n = ctx.array_length(ifaces);
+                for i in 0..n {
+                    let mirror = match ctx.get_array_element(ifaces, i) {
+                        Value::Object(Some(m)) => m,
+                        _ => continue,
+                    };
+                    if let Some(iface_cid) = mirror_class_id(ctx, mirror) {
+                        if iface_cid == this_class_id
+                            || ctx.is_subclass(iface_cid, this_class_id)
+                        {
+                            return Ok(Some(Value::Int(1)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let result =
         target_class_id == this_class_id || ctx.is_subclass(target_class_id, this_class_id);
     Ok(Some(Value::Int(if result { 1 } else { 0 })))
@@ -6918,6 +6956,36 @@ pub(crate) fn native_class_get_modifiers(ctx: &mut dyn NativeContext, args: &[Va
         Some(id) => id,
         None => return Ok(Some(Value::Int(0))),
     };
+
+    // Array classes: HotSpot's JVM_GetClassModifiers returns the element type's
+    // accessibility (PUBLIC/PROTECTED/PRIVATE) OR'd with FINAL|ABSTRACT — every
+    // array class is `final abstract`. Our array Class mirrors carry only the
+    // PUBLIC|FINAL bits in their access_flags (ABSTRACT 0x400 is dropped), so
+    // `int[].class.getModifiers()` returned 0x11 vs HotSpot's 0x411. Because
+    // `getModifiers()` feeds `ObjectStreamClass.computeDefaultSUID`, the missing
+    // ABSTRACT bit produced a WRONG serialVersionUID for every array class —
+    // e.g. a worker writing a `byte[]`/`int[]`/`String[]` message field gets a
+    // SUID the peer rejects with InvalidClassException, desyncing the Gradle
+    // worker↔daemon stream. Synthesize the JVM-faithful value here.
+    if let Some(name) = mirror_class_name(ctx, this) {
+        if name.starts_with('[') {
+            let comp = name.trim_start_matches('[');
+            // Object element → use the element class's accessibility bits;
+            // primitive element (B/I/J/…) → public.
+            let access = if let Some(stripped) = comp
+                .strip_prefix('L')
+                .and_then(|s| s.strip_suffix(';'))
+            {
+                ctx.class_id_by_name(stripped)
+                    .map(|cid| ctx.class_access_flags(cid) & 0x0007)
+                    .unwrap_or(0x0001)
+            } else {
+                0x0001
+            };
+            // | ACC_FINAL (0x10) | ACC_ABSTRACT (0x400)
+            return Ok(Some(Value::Int((access | 0x0410) as i32)));
+        }
+    }
 
     // JVMS §4.7.6: for nested classes, Class.getModifiers() returns the
     // `inner_class_access_flags` from the InnerClasses attribute entry whose

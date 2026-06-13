@@ -268,6 +268,42 @@ fn drive_real_ec_keyfactory(
     result
 }
 
+/// Drive the real SunRsaSign `RSAKeyFactory$Legacy` SPI's `engineGenerate*`
+/// over the supplied RSA key spec (RSAPrivateCrtKeySpec / RSAPrivateKeySpec /
+/// RSAPublicKeySpec / PKCS8EncodedKeySpec / X509EncodedKeySpec), yielding a
+/// concrete `sun.security.rsa.RSAPrivate{Crt}KeyImpl` / `RSAPublicKeyImpl` that
+/// holds the spec's real components. Mirrors `drive_real_ec_keyfactory`. The
+/// caller falls back to `InvalidKeySpecException` if this returns an error, so
+/// behaviour is no worse than the synthetic fail-closed path.
+fn drive_real_rsa_keyfactory(
+    ctx: &mut dyn NativeContext,
+    spec: ObjectRef,
+    engine: &'static str,
+    ret_desc: &'static str,
+) -> MethodCallResult {
+    let pin = ctx.pin_native_root(spec);
+    let result = (|| {
+        let kf = match ctx.new_object_initialized(
+            "sun/security/rsa/RSAKeyFactory$Legacy",
+            "()V",
+            &[],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(RuntimeError::NotImplemented {
+                    feature: "sun.security.rsa.RSAKeyFactory$Legacy".into(),
+                }
+                .into())
+            }
+        };
+        let spec = ctx.read_native_pin(pin, spec);
+        let desc = format!("(Ljava/security/spec/KeySpec;){ret_desc}");
+        ctx.invoke_virtual(kf, engine, &desc, &[Value::Object(Some(spec))])
+    })();
+    ctx.unpin_native_roots(pin);
+    result
+}
+
 // Synthetic-slot offsets relative to `synthetic_base_offset(...)`.
 const KPG_OFF_ALGO: usize = 0;
 const KPG_OFF_KEYSIZE: usize = 1;
@@ -881,6 +917,23 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                 "engineGeneratePrivate",
                 "Ljava/security/PrivateKey;",
             );
+        }
+    }
+    // RSA: drive the real SunRsaSign RSAKeyFactory over the spec → a genuine
+    // RSAPrivate{Crt}KeyImpl holding the spec's real components (the spec
+    // already carries the modulus/exponents/CRT factors, so this is a real key
+    // import, not a synthetic stub). Falls back to InvalidKeySpecException if
+    // the real SPI is unavailable.
+    if algo == ALGO_RSA {
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            if let Ok(r) = drive_real_rsa_keyfactory(
+                ctx,
+                *spec,
+                "engineGeneratePrivate",
+                "Ljava/security/PrivateKey;",
+            ) {
+                return Ok(r);
+            }
         }
     }
     Err(throw_invalid_key_spec(

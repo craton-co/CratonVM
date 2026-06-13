@@ -363,6 +363,50 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
         }
         .into());
     }
+
+    // Route block-cipher CBC transformations the synthetic AES path can't do
+    // (CBC chaining; DES/DESede have no native impl) to the real SunJCE
+    // CipherSpi. Used by PEMFile to decrypt encrypted private keys
+    // (AES/CBC, DESede/CBC, DES/CBC). Done BEFORE the AES key_expansion below
+    // so 8-byte DES keys aren't rejected.
+    {
+        let (cn, cm, _pad) = parse_transformation(&algo);
+        let route = match (cn.to_ascii_uppercase().as_str(), cm.as_str()) {
+            ("AES", "CBC") => Some(("com/sun/crypto/provider/AESCipher$General", "AES")),
+            ("DESEDE", _) | ("TRIPLEDES", _) => {
+                Some(("com/sun/crypto/provider/DESedeCipher", "DESede"))
+            }
+            ("DES", _) => Some(("com/sun/crypto/provider/DESCipher", "DES")),
+            _ => None,
+        };
+        if let Some((spi_class, key_algo)) = route {
+            let pad_str = if algo
+                .split('/')
+                .nth(2)
+                .map(|p| p.eq_ignore_ascii_case("NoPadding"))
+                .unwrap_or(false)
+            {
+                "NoPadding"
+            } else {
+                "PKCS5Padding"
+            };
+            let out = crate::phases_early::drive_real_cipher(
+                ctx, spi_class, "CBC", pad_str, mode, &key_bytes, key_algo, &iv_bytes, &data,
+            )?;
+            // Reset accumulators for reuse — but FIRST capture the result so a
+            // moving GC during the reset alloc can't relocate it.
+            if let Some(Value::Object(Some(_))) = out {
+                with_table_write(|t| {
+                    if let Some(s) = t.get_mut(&key) {
+                        s.accumulated.clear();
+                        s.aad.clear();
+                    }
+                });
+            }
+            return Ok(out);
+        }
+    }
+
     let aes_key = match Aes::key_expansion(&key_bytes) {
         Ok(k) => k,
         Err(e) => {
@@ -854,6 +898,34 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         cipher_do_final_impl(ctx, this)
     });
+
+    // --- javax.crypto.SecretKeyFactory — PBKDF2 (real key derivation) ---
+    // The real JCA path throws "PBKDF2With… SecretKeyFactory not available"
+    // (no provider service) and the real PBKDF2KeyImpl trips a ByteBuffer bug.
+    // Compute PBKDF2 natively (see phases_early::pbkdf2_*). getInstance handles
+    // ONLY PBKDF2* algorithms; any other gets the same NoSuchAlgorithmException
+    // the real path would have thrown — no regression for non-PBKDF2 callers.
+    {
+        let skf = "javax/crypto/SecretKeyFactory";
+        r.register(
+            skf,
+            "getInstance",
+            "(Ljava/lang/String;)Ljavax/crypto/SecretKeyFactory;",
+            crate::phases_early::pbkdf2_get_instance,
+        );
+        r.register(
+            skf,
+            "getInstance",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/SecretKeyFactory;",
+            crate::phases_early::pbkdf2_get_instance,
+        );
+        r.register(
+            skf,
+            "generateSecret",
+            "(Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",
+            crate::phases_early::pbkdf2_generate_secret,
+        );
+    }
 
     r.register(
         cipher,

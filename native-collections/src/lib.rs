@@ -272,7 +272,22 @@ pub fn register_collections_natives(registry: &mut NativeMethodRegistry) {
     // every runnable immediately, which breaks Surefire ForkedBooter.exit1
     // (it schedules kill() as a delayed backup; immediate kill NPEs on a
     // null CommandReader when setupBooter failed first).
-    register_concurrent_skip_list_map_natives(registry);
+    // ConcurrentSkipListMap: the native "sorted array" impl is BROKEN in
+    // real-JDK mode — it stores state in synthetic object slots 0/1/2 that
+    // don't exist in the real CSLM layout, AND it ignores a custom Comparator
+    // (binary search is hardcoded to natural ordering), AND it never intercepts
+    // the `(Comparator)` constructor. A `new ConcurrentSkipListMap(cmp)` with
+    // non-Comparable keys (e.g. `Class` keyed by a name-comparator, as Gradle's
+    // DefaultSerializerRegistry does) silently drops every put → size 0. Run the
+    // real java.util.concurrent.ConcurrentSkipListMap bytecode instead (it works
+    // under CratonVM's real java.u.c support — Unsafe/VarHandle CAS + the
+    // comparator). This unblocks the Gradle test worker: its
+    // WorkerLoggingSerializer registers LogEvent/StyledText/LogLevelChange
+    // serializers into such a map; with the native dropping them, canSerialize
+    // returned false → LogEvent fell back to (failing) Java serialization →
+    // worker→daemon stream desync. (Disabled, not deleted; impl kept for
+    // reference. native-builtins' copy is synthetic-jdk-gated, already inert.)
+    let _ = register_concurrent_skip_list_map_natives;
     register_stamped_lock_natives(registry);
     // Phaser is overridden with a synthetic 3-int layout (parties=0, arrived=1,
     // phase=2) that conflicts with the real JDK field layout (state(0, J),
@@ -1836,7 +1851,21 @@ fn al_eq_operand_is_list(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
 
 // ===========================================================================
 // HashMap — field 0 = Object[] buckets, field 1 = Int size, field 2 = Int cap
-// HashMap$Node — field 0 = key, field 1 = value, field 2 = hash, field 3 = next
+// HashMap$Node — MATCHES the real JDK layout: hash=0, key=1, value=2, next=3.
+//
+// We deliberately use the REAL JDK field order (not the historical synthetic
+// key=0/value=1/hash=2 order) so that real-JDK bytecode that walks `this.table[]`
+// directly via `getfield HashMap$Node.{key,value}` — e.g. `HashMap.writeObject`
+// → `internalWriteEntries` during Java serialization, which is NOT on the
+// force-native override list — reads the correct slots. With the old synthetic
+// order, `getfield key` (real slot 1) read our `value`, and `getfield value`
+// (real slot 2) read our `hash` Int which the L-descriptor coerced to null,
+// serializing `{name=execute}` as `{execute=null}` and desyncing the Gradle
+// worker's message stream. Nodes are still allocated as `ClassId(0)` (see
+// `map_alloc_node`): slot 0 now holds `Int(hash)`, so there is no Object→int
+// descriptor coercion to worry about, and the layout-sniff in `get_node_key`/
+// `get_node_value` (Object@0 = legacy, Int@0 = JDK) routes our nodes through
+// the JDK branch automatically.
 // ===========================================================================
 
 const MAP_FIELD_BUCKETS: usize = 0;
@@ -1845,9 +1874,9 @@ const MAP_FIELD_CAPACITY: usize = 2;
 const MAP_NUM_FIELDS: usize = 3;
 const MAP_DEFAULT_CAPACITY: usize = 16;
 
-const NODE_FIELD_KEY: usize = 0;
-const NODE_FIELD_VALUE: usize = 1;
-const NODE_FIELD_HASH: usize = 2;
+const NODE_FIELD_HASH: usize = 0;
+const NODE_FIELD_KEY: usize = 1;
+const NODE_FIELD_VALUE: usize = 2;
 const NODE_FIELD_NEXT: usize = 3;
 const NODE_NUM_FIELDS: usize = 4;
 
@@ -2239,24 +2268,21 @@ fn map_bucket_index(hash: i32, capacity: i32) -> usize {
     ((hash as u32) & ((capacity as u32).wrapping_sub(1))) as usize
 }
 
-/// Allocate a HashMap$Node entry using the legacy synthetic layout
-/// (slot 0 = key, slot 1 = value, slot 2 = hash, slot 3 = next).
+/// Allocate a HashMap$Node entry using the REAL JDK field layout
+/// (slot 0 = hash:I, slot 1 = key, slot 2 = value, slot 3 = next).
 ///
-/// We deliberately allocate with `ClassId::new(0)` instead of binding the
-/// node to the real-JDK `java/util/HashMap$Node` class. The JDK declares
-/// fields in order `hash:I, key:Object, value:Object, next:HashMap$Node`,
-/// so binding to the real class causes descriptor-aware field coercion
-/// (see `coerce_field_value_by_descriptor`) to interpret slot 0 as `int`
-/// and rewrite our `Object(key)` write as `Int(<pointer-bits>)`. The
-/// downstream `get_node_key` layout-sniff then sees an `Int` in slot 0,
-/// concludes the node uses the JDK layout, and reads slot 1 as the key —
-/// but slot 1 was set to the sentinel `Int(1)` (for HashSet-backed maps),
-/// surfacing as `Iterator.next()` returning `Int(1)` and a downstream
-/// `checkcast Map.Entry` against an `Int`.
-///
-/// Matches `native_map_put`'s direct `alloc_object(ClassId::new(0), ...)`
-/// at the insert path; reads via `get_node_key`/`get_node_value` keep
-/// their layout-sniff for nodes produced by either site.
+/// We allocate with `ClassId::new(0)` (untyped) rather than binding to the
+/// real `java/util/HashMap$Node` class so no descriptor-aware coercion runs
+/// on our writes — but the SLOT ORDER deliberately matches the real JDK so
+/// that real-JDK bytecode walking `this.table[]` via `getfield
+/// HashMap$Node.{hash,key,value,next}` reads the right slots. The critical
+/// consumer is `HashMap.writeObject`→`internalWriteEntries` (Java
+/// serialization), which is NOT on the force-native override list and so runs
+/// real bytecode against our nodes; with the old synthetic order it read
+/// `value` as the key and the `hash` Int (L-coerced to null) as the value,
+/// serializing `{k=v}` as `{v=null}`. Slot 0 holds `Int(hash)`, so the
+/// `get_node_key`/`get_node_value` layout-sniff (Object@0 = legacy,
+/// Int@0 = JDK) routes our nodes through the JDK branch.
 fn map_alloc_node(
     ctx: &mut dyn NativeContext,
     key: ObjectRef,
@@ -2290,8 +2316,8 @@ fn get_node_key(ctx: &dyn NativeContext, node: ObjectRef) -> Value {
 /// S111r26: Layout-aware node value reader (see `get_node_key`).
 fn get_node_value(ctx: &dyn NativeContext, node: ObjectRef) -> Value {
     match ctx.get_field(node, 0) {
-        Value::Object(_) => ctx.get_field(node, NODE_FIELD_VALUE), // legacy: slot 1
-        _ => ctx.get_field(node, 2),                               // JDK: slot 2
+        Value::Object(_) => ctx.get_field(node, 1), // legacy: value at slot 1
+        _ => ctx.get_field(node, 2),                // JDK: value at slot 2 (our nodes)
     }
 }
 
@@ -3150,6 +3176,32 @@ fn is_unmod_wrapper(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
     )
 }
 
+/// Initialize a `Hashtable`/`Properties` instance's own `loadFactor` (and a
+/// sane `threshold`) the first time we see it unset (0.0). Hashtable extends
+/// Dictionary (not HashMap) and keeps its own fields; the shared native bucket
+/// path sets only `table`/`count`, leaving `loadFactor` at 0.0. Real-JDK
+/// `Hashtable.writeObject` then serializes loadFactor=0.0, and a peer's
+/// `Hashtable.readObject` throws `StreamCorruptedException: Illegal load factor:
+/// 0.0` — breaking any Properties / system-properties round-trip (e.g. the
+/// Gradle worker shipping its system properties to the daemon). The peer
+/// recomputes `threshold` from `loadFactor`, so the threshold value itself is
+/// irrelevant; we set 8 to avoid serializing uninitialized garbage. Resolved by
+/// the object's real class name so inherited (`Properties`) fields are found.
+fn ensure_hashtable_load_factor(ctx: &mut dyn NativeContext, this: ObjectRef, cname: &str) {
+    if let Some(lf) = ctx.resolve_field_index(cname, "loadFactor") {
+        if lf < ctx.object_num_fields(this)
+            && matches!(ctx.get_field(this, lf), Value::Float(f) if f == 0.0)
+        {
+            ctx.set_field(this, lf, Value::Float(0.75));
+            if let Some(th) = ctx.resolve_field_index(cname, "threshold") {
+                if th < ctx.object_num_fields(this) {
+                    ctx.set_field(this, th, Value::Int(8));
+                }
+            }
+        }
+    }
+}
+
 fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -3195,6 +3247,7 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             let mut cur = cid;
             let mut is_lhm = false;
             let mut is_tm = false;
+            let mut is_ht = false;
             while let Some(n) = ctx.class_name_of_id(cur) {
                 if n == "java/util/LinkedHashMap" {
                     is_lhm = true;
@@ -3202,6 +3255,10 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 }
                 if n == "java/util/TreeMap" {
                     is_tm = true;
+                    break;
+                }
+                if n == "java/util/Hashtable" {
+                    is_ht = true;
                     break;
                 }
                 if n == "java/util/HashMap" || n == "java/lang/Object" {
@@ -3217,6 +3274,12 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             }
             if is_tm {
                 return native_tm_put(ctx, args);
+            }
+            if is_ht {
+                // Hashtable/Properties run the plain-bucket path below (table +
+                // count get set), but their OWN loadFactor/threshold fields
+                // (they extend Dictionary, not HashMap) are never initialized.
+                ensure_hashtable_load_factor(ctx, this, &name);
             }
         }
     }
@@ -3294,8 +3357,8 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
                 let old_value = get_node_value(ctx, node);
                 // Update value in-place using the detected layout
                 match ctx.get_field(node, 0) {
-                    Value::Object(_) => ctx.set_field(node, NODE_FIELD_VALUE, value), // legacy slot 1
-                    _ => ctx.set_field(node, 2, value), // JDK slot 2
+                    Value::Object(_) => ctx.set_field(node, 1, value), // legacy value slot 1
+                    _ => ctx.set_field(node, 2, value), // JDK value slot 2 (our nodes)
                 }
                 return Ok(Some(old_value));
             }
@@ -3307,8 +3370,8 @@ fn native_map_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
             if eq {
                 let old_value = get_node_value(ctx, node);
                 match ctx.get_field(node, 0) {
-                    Value::Object(_) => ctx.set_field(node, NODE_FIELD_VALUE, value), // legacy slot 1
-                    _ => ctx.set_field(node, 2, value), // JDK slot 2
+                    Value::Object(_) => ctx.set_field(node, 1, value), // legacy value slot 1
+                    _ => ctx.set_field(node, 2, value), // JDK value slot 2 (our nodes)
                 }
                 return Ok(Some(old_value));
             }
@@ -4844,15 +4907,45 @@ fn alloc_backing_map(ctx: &mut dyn NativeContext) -> ObjectRef {
     ctx.alloc_object(cid, n)
 }
 
+/// `true` for Set classes whose iteration must preserve *insertion* order
+/// (`LinkedHashSet`, `CopyOnWriteArraySet`). These share the HashSet native
+/// surface but must be backed by a `LinkedHashMap` so the shared iterator
+/// (which walks the backing map) yields insertion order, not bucket order.
+fn hs_is_insertion_ordered(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    matches!(
+        ctx.class_name_of_id(ctx.class_id_of_object(this)).as_deref(),
+        Some("java/util/LinkedHashSet") | Some("java/util/concurrent/CopyOnWriteArraySet")
+    )
+}
+
+/// Allocate + initialize a fresh backing map for a Set: a `LinkedHashMap`
+/// (insertion-ordered) for `LinkedHashSet`/`CopyOnWriteArraySet`, else a
+/// `HashMap`.
+fn alloc_hs_backing(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) -> ObjectRef {
+    if hs_is_insertion_ordered(ctx, this) {
+        let cid = ctx
+            .ensure_class_initialized("java/util/LinkedHashMap")
+            .unwrap_or_else(|_| {
+                ctx.class_id_by_name("java/util/LinkedHashMap").unwrap_or(ClassId::new(0))
+            });
+        let total = ctx.class_num_total_fields(cid);
+        let n = std::cmp::max(total, MAP_NUM_FIELDS);
+        let m = ctx.alloc_object(cid, n);
+        lhm_init_with_cap(ctx, m, cap.max(MAP_DEFAULT_CAPACITY));
+        m
+    } else {
+        let m = alloc_backing_map(ctx);
+        let _ = native_map_init_capacity(ctx, &[Value::Object(Some(m)), Value::Int(cap as i32)]);
+        m
+    }
+}
+
 fn native_hs_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let backing = alloc_backing_map(ctx);
-    // Initialize the backing HashMap
-    let init_args = [Value::Object(Some(backing))];
-    native_map_init(ctx, &init_args)?;
+    let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
     Ok(None)
 }
@@ -4862,13 +4955,11 @@ fn native_hs_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    let cap = args
-        .get(1)
-        .copied()
-        .unwrap_or(Value::Int(MAP_DEFAULT_CAPACITY as i32));
-    let backing = alloc_backing_map(ctx);
-    let init_args = [Value::Object(Some(backing)), cap];
-    native_map_init_capacity(ctx, &init_args)?;
+    let cap = match args.get(1) {
+        Some(Value::Int(c)) if *c > 0 => *c as usize,
+        _ => MAP_DEFAULT_CAPACITY,
+    };
+    let backing = alloc_hs_backing(ctx, this, cap);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
     Ok(None)
 }
@@ -11076,28 +11167,16 @@ fn native_hs_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     let source = match args.get(1) {
         Some(Value::Object(Some(obj))) => *obj,
         _ => {
-            // Init empty HashSet
-            let backing = alloc_backing_map(ctx);
-            let buckets = alloc_ref_array(ctx, MAP_DEFAULT_CAPACITY);
-            ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-            set_map_size(ctx, backing, 0);
-            ctx.set_field(
-                backing,
-                MAP_FIELD_CAPACITY,
-                Value::Int(MAP_DEFAULT_CAPACITY as i32),
-            );
+            // Init empty set (LinkedHashMap backing for insertion-ordered sets).
+            let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
             ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
             return Ok(None);
         }
     };
 
-    // Create backing HashMap for this set
-    let backing = alloc_backing_map(ctx);
-    let cap = MAP_DEFAULT_CAPACITY;
-    let buckets = alloc_ref_array(ctx, cap);
-    ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    set_map_size(ctx, backing, 0);
-    ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
+    // Create the backing map for this set (LinkedHashMap for insertion-ordered
+    // sets so iteration preserves order) and populate it.
+    let backing = alloc_hs_backing(ctx, this, MAP_DEFAULT_CAPACITY);
     ctx.set_field(this, HS_FIELD_MAP, Value::Object(Some(backing)));
 
     // Round 49 fix: route through `collect_collection_elements` so we
@@ -11362,6 +11441,15 @@ fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;Ljava/lang/Object;)I",
         native_comparator_compare_method,
     );
+    // Serialization substitution: replace the synthetic factory comparator with
+    // the real serializable JDK singleton (so reverse/natural-ordered
+    // TreeMap/TreeSet serialize byte-identically to HotSpot).
+    registry.register(
+        "java/util/Comparator$Native",
+        "writeReplace",
+        "()Ljava/lang/Object;",
+        native_comparator_write_replace,
+    );
     registry.register(
         "java/util/Comparator",
         "naturalOrder",
@@ -11427,6 +11515,71 @@ fn native_comparator_reverse_order(
 ) -> MethodCallResult {
     let cmp = make_comparator(ctx, CMP_TAG_REVERSE_ORDER);
     Ok(Some(Value::Object(Some(cmp))))
+}
+
+/// `Comparator$Native.writeReplace()` — serialization substitution.
+///
+/// CratonVM models `Comparator.naturalOrder()` / `reverseOrder()` as a
+/// synthetic tagged `Comparator$Native` object (so `comparator_compare` can
+/// dispatch on the tag without an `invoke_virtual`). That synthetic class is
+/// NOT Serializable and doesn't exist on a real JDK, so serializing it (e.g.
+/// a reverse-ordered TreeMap/TreeSet's comparator) threw `NotSerializableException`
+/// and aborted the stream. `ObjectOutputStream` honors `writeReplace()`: return
+/// the REAL serializable JDK singleton so the stream is byte-identical to
+/// HotSpot. `Collections.reverseOrder()` (not intercepted) yields the real
+/// `Collections$ReverseComparator`; `Comparators$NaturalOrderComparator.INSTANCE`
+/// is the natural-order singleton. Other tags (comparing/reversed/thenComparing)
+/// have no JDK singleton — left unreplaced (rarely serialized).
+/// If `cmp` is a synthetic `Comparator$Native` factory comparator, return its
+/// real serializable JDK singleton (via `native_comparator_write_replace`);
+/// otherwise return it unchanged. Used by collection `writeObject` natives that
+/// serialize a comparator through `OOS.writeObject` (which doesn't run the
+/// `writeReplace` reflection hook the way real `defaultWriteObject` does).
+fn replace_synthetic_comparator_for_ser(ctx: &mut dyn NativeContext, cmp: Value) -> Value {
+    if let Value::Object(Some(o)) = cmp {
+        let cn = ctx
+            .class_name_of_id(ctx.class_id_of_object(o))
+            .unwrap_or_default();
+        if cn == "java/util/Comparator$Native" {
+            if let Ok(Some(rep)) = native_comparator_write_replace(ctx, &[cmp]) {
+                return rep;
+            }
+        }
+    }
+    cmp
+}
+
+fn native_comparator_write_replace(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let tag = if ctx.object_num_fields(this) >= CMP_NUM_FIELDS {
+        match ctx.get_field(this, CMP_FIELD_TAG) {
+            Value::Int(t) => t,
+            _ => 0,
+        }
+    } else {
+        0
+    };
+    match tag {
+        CMP_TAG_REVERSE_ORDER => {
+            ctx.invoke("java/util/Collections", "reverseOrder", "()Ljava/util/Comparator;", &[])
+        }
+        CMP_TAG_NATURAL_ORDER => {
+            if let Ok(cid) =
+                ctx.ensure_class_initialized("java/util/Comparators$NaturalOrderComparator")
+            {
+                if let Some(idx) = ctx.static_field_index_by_name(cid, "INSTANCE") {
+                    if let v @ Value::Object(Some(_)) = ctx.get_static_field(cid, idx) {
+                        return Ok(Some(v));
+                    }
+                }
+            }
+            Ok(Some(Value::Object(Some(this))))
+        }
+        _ => Ok(Some(Value::Object(Some(this)))),
+    }
 }
 
 fn native_comparator_comparing(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -12261,30 +12414,74 @@ fn ll_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<&'static str, Val
 // side-table survives a moving-GC relocation. Originally
 // `this.as_ptr() as usize`, which a moving GC invalidates the instant
 // it relocates the LinkedList — silently dropping head/tail/size.
-fn ll_get(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str) -> Value {
-    ll_overlay()
-        .lock()
-        .unwrap()
-        .get(&widened_obj_key(ctx, this))
-        .and_then(|m| m.get(name))
-        .copied()
-        .unwrap_or(Value::Object(None))
+/// Map the LinkedList overlay key name to the real JDK heap field name
+/// (the overlay uses head/tail; the JDK fields are first/last/size).
+fn ll_real_field(name: &str) -> Option<&'static str> {
+    match name {
+        "head" => Some("first"),
+        "tail" => Some("last"),
+        "size" => Some("size"),
+        _ => None,
+    }
 }
-fn ll_set(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str, v: Value) {
+
+fn ll_get(ctx: &dyn NativeContext, this: ObjectRef, name: &'static str) -> Value {
+    {
+        let ov = ll_overlay().lock().unwrap();
+        if let Some(v) = ov
+            .get(&widened_obj_key(ctx, this))
+            .and_then(|m| m.get(name))
+            .copied()
+        {
+            return v;
+        }
+    }
+    // Overlay MISS: fall back to the real JDK heap field. This is the path for a
+    // LinkedList populated by real bytecode that bypassed native_ll_* — chiefly
+    // Java deserialization (LinkedList.readObject -> linkLast writes the real
+    // first/last/size + node next/prev, never our overlay). Mirrored writes in
+    // ll_set keep the heap consistent for native-populated lists.
+    if let Some(real) = ll_real_field(name) {
+        if let Some(slot) = ctx.resolve_field_index("java/util/LinkedList", real) {
+            if slot < ctx.object_num_fields(this) {
+                return ctx.get_field(this, slot);
+            }
+        }
+    }
+    Value::Object(None)
+}
+fn ll_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &'static str, v: Value) {
     ll_overlay()
         .lock()
         .unwrap()
         .entry(widened_obj_key(ctx, this))
         .or_default()
         .insert(name, v);
+    // Mirror the structural pointers to the REAL JDK heap fields so real-bytecode
+    // Java serialization works: LinkedList.writeObject reads `size` and walks the
+    // real `first`->`next` links (the node next/prev live on the real node fields
+    // already). Without this a populated LinkedList serialized as size=0 + zero
+    // elements. Overlay stays the read source of truth for native callers.
+    if let Some(real) = ll_real_field(name) {
+        if let Some(slot) = ctx.resolve_field_index("java/util/LinkedList", real) {
+            if slot < ctx.object_num_fields(this) {
+                ctx.set_field(this, slot, v);
+            }
+        }
+    }
 }
 
 const LL_FIELD_HEAD: usize = 0;
 const LL_FIELD_TAIL: usize = 1;
 const LL_FIELD_SIZE: usize = 2;
-const LL_NODE_PREV: usize = 0;
+// Real JDK LinkedList$Node layout: item@0, next@1, prev@2 (java.util.LinkedList
+// .Node declares them in that order). Use the real order so real-bytecode
+// LinkedList.writeObject (`for (Node x = first; x != null; x = x.next)
+// s.writeObject(x.item)`) reads the right slots — the old synthetic order
+// (prev@0/next@1/elem@2) made `getfield item` read prev.
+const LL_NODE_ELEM: usize = 0;
 const LL_NODE_NEXT: usize = 1;
-const LL_NODE_ELEM: usize = 2;
+const LL_NODE_PREV: usize = 2;
 
 fn ll_alloc_node(ctx: &mut dyn NativeContext, element: Value) -> ObjectRef {
     let node = alloc_synthetic(ctx, "java/util/LinkedList$Node", 3);
@@ -13381,6 +13578,24 @@ fn lhm_overlay() -> &'static Mutex<StdHashMap<usize, StdHashMap<String, Value>>>
         std::sync::OnceLock::new();
     OVERLAY.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
+/// Overlay keys whose structural `ObjectRef` fields (`head`/`tail`/`table`)
+/// were successfully mirrored into the REAL JDK heap fields by `lhm_set`.
+///
+/// For such a LinkedHashMap, the backing bucket array + head/tail nodes are
+/// reachable through the owner's normal heap fields, so the GC's field-tracing
+/// scan already keeps them alive (for a LIVE owner) and relocates/updates them.
+/// Re-rooting the overlay's *copies* of those refs is therefore redundant — and
+/// actively harmful: it pins a DEAD LinkedHashMap's (and LinkedHashSet's, which
+/// is LHM-backed) backing forever, because nothing else references it once the
+/// owner dies. That unbounded pinning exhausted the young gen under high
+/// collection churn (e.g. `WebXml.orderWebFragments` over 720 input
+/// permutations). `gc_scan_collection_overlay_roots` consults this set and
+/// skips rooting heap-backed entries; the remap path still repoints them.
+fn lhm_heap_backed() -> &'static Mutex<std::collections::HashSet<usize>> {
+    static HB: std::sync::OnceLock<Mutex<std::collections::HashSet<usize>>> =
+        std::sync::OnceLock::new();
+    HB.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
 // LHM overlay key: rekeyed onto `ctx.identity_hash_code(this)` (was
 // `this.as_ptr() as usize`). A moving GC preserves the identity-hash
 // word across relocation, so the overlay's bucket table, head/tail,
@@ -13389,11 +13604,32 @@ fn lhm_overlay_key(ctx: &dyn NativeContext, this: ObjectRef) -> usize {
     widened_obj_key(ctx, this)
 }
 fn lhm_get(ctx: &dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize) -> Value {
-    let m = lhm_overlay().lock().unwrap();
-    m.get(&lhm_overlay_key(ctx, this))
-        .and_then(|inner| inner.get(name))
-        .copied()
-        .unwrap_or(Value::Object(None))
+    {
+        let m = lhm_overlay().lock().unwrap();
+        if let Some(v) = m
+            .get(&lhm_overlay_key(ctx, this))
+            .and_then(|inner| inner.get(name))
+            .copied()
+        {
+            return v;
+        }
+    }
+    // Overlay MISS (entry never set): fall back to the real JDK heap field.
+    // This is the path for a LinkedHashMap populated by REAL bytecode that
+    // bypassed native_lhm_put — chiefly Java deserialization, whose
+    // HashMap.readObject → putVal → LinkedHashMap.newNode writes the real
+    // table + head/tail + node before/after but never our overlay. The
+    // mirrored writes in lhm_set keep the heap consistent for native-populated
+    // maps, so reading the heap here is correct for both cases (an explicitly
+    // null overlay entry is returned above as Object(None) before reaching here).
+    if matches!(name, "head" | "tail" | "size" | "table") {
+        if let Some(slot) = ctx.resolve_field_index("java/util/LinkedHashMap", name) {
+            if slot < ctx.object_num_fields(this) {
+                return ctx.get_field(this, slot);
+            }
+        }
+    }
+    Value::Object(None)
 }
 fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: usize, v: Value) {
     let key = lhm_overlay_key(ctx, this);
@@ -13403,10 +13639,36 @@ fn lhm_set(ctx: &mut dyn NativeContext, this: ObjectRef, name: &str, _fallback: 
         .lock()
         .unwrap()
         .insert(this.as_ptr() as usize, key);
-    let mut m = lhm_overlay().lock().unwrap();
-    m.entry(key)
-        .or_default()
-        .insert(name.to_string(), v);
+    {
+        let mut m = lhm_overlay().lock().unwrap();
+        m.entry(key)
+            .or_default()
+            .insert(name.to_string(), v);
+    }
+    // Mirror the structural pointers to the REAL JDK heap fields so that
+    // real-bytecode paths that bypass our natives — chiefly Java serialization:
+    // inherited `HashMap.writeObject` reads `size`/`table`, and
+    // `LinkedHashMap.internalWriteEntries` walks the real `head`→`after` links —
+    // observe the live state instead of the unset 0/null defaults (which
+    // serialized a populated LHM as `{}`, desyncing peers). The overlay stays
+    // the source of truth for reads; this keeps the heap consistent for the
+    // rare real-bytecode readers. The LHM$Node `before`/`after` links are
+    // already maintained on the real node fields by `lhm_alloc_node`/remove.
+    if matches!(name, "head" | "tail" | "size" | "table") {
+        if let Some(slot) = ctx.resolve_field_index("java/util/LinkedHashMap", name) {
+            if slot < ctx.object_num_fields(this) {
+                ctx.set_field(this, slot, v);
+                // The structural fields resolve to real heap slots (real-JDK
+                // layout), so every `ObjectRef` this overlay holds (`head`/
+                // `tail`/`table`) is now reachable through the owner's heap
+                // fields. Record the key so the GC root scan can skip rooting
+                // the overlay copies — otherwise dead LinkedHashMaps/Sets leak
+                // (their backing would stay pinned forever). Live owners keep
+                // their backing alive via heap-field tracing.
+                lhm_heap_backed().lock().unwrap().insert(key);
+            }
+        }
+    }
 }
 
 /// Copy the per-object LHM overlay from `src` to `dst`. Used by
@@ -13471,9 +13733,17 @@ fn lhm_ptr_cache() -> &'static Mutex<StdHashMap<usize, usize>> {
     C.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
-const LHM_NODE_KEY: usize = 0;
-const LHM_NODE_VALUE: usize = 1;
-const LHM_NODE_HASH: usize = 2;
+// Real JDK LinkedHashMap$Node layout (extends HashMap$Node{hash,key,value,next}
+// and adds before,after): hash@0, key@1, value@2, next@3, before@4, after@5.
+// Using the real slot order (not the historical synthetic key@0/value@1/hash@2)
+// is required so inherited real-JDK `HashMap.writeObject`→`internalWriteEntries`
+// (Java serialization; NOT force-native) reads the right slots — the old order
+// serialized `{k=v}` as `{v=null}`, desyncing peers. Nodes bind to the real
+// LinkedHashMap$Node class, and slot 0 = hash:I now holds an Int, so the
+// descriptor-aware field writes/reads coincide with each slot's declared type.
+const LHM_NODE_HASH: usize = 0;
+const LHM_NODE_KEY: usize = 1;
+const LHM_NODE_VALUE: usize = 2;
 const LHM_NODE_NEXT: usize = 3;
 const LHM_NODE_BEFORE: usize = 4;
 const LHM_NODE_AFTER: usize = 5;
@@ -15945,11 +16215,20 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
         }
     }
-    // S111r28: HashSet / LinkedHashSet — field 0 = backing HashMap.
-    // Walk the backing map's bucket nodes and collect keys.
+    // S111r28: HashSet / LinkedHashSet — field 0 = backing map. Collect the
+    // backing map's keys (in iteration order).
     if HS_FIELD_MAP < n_fields {
         if let Value::Object(Some(backing)) = ctx.get_field(coll, HS_FIELD_MAP) {
-            // Verify it actually is a HashMap-like (slot 0 = bucket array).
+            // An insertion-ordered set (LinkedHashSet / CopyOnWriteArraySet) is
+            // backed by a LinkedHashMap, which keeps its entries in the
+            // insertion-order overlay rather than the bucket array — so the
+            // bucket-array guard below would miss it. Detect it explicitly;
+            // `collect_view_snapshot_ordered` → `lhm_collect_keys` yields the
+            // keys in insertion order.
+            if is_lhm_receiver(ctx, backing) {
+                return collect_view_snapshot_ordered(ctx, backing);
+            }
+            // Otherwise verify it's a HashMap-like (slot 0 = bucket array).
             if MAP_FIELD_BUCKETS < ctx.object_num_fields(backing) {
                 let s0 = ctx.get_field(backing, MAP_FIELD_BUCKETS);
                 if let Value::Object(Some(arr)) = s0 {
@@ -16462,10 +16741,243 @@ fn tm_array_table() -> &'static Mutex<StdHashMap<usize, TmArrayState>> {
     T.get_or_init(|| Mutex::new(StdHashMap::new()))
 }
 
+/// Materialize a *deserialized* TreeMap's entries into the native side-table.
+///
+/// `TreeMap.readObject` (real bytecode) rebuilds the red-black tree via
+/// `buildFromSorted`, populating the real `root`/`size` fields and a graph of
+/// `TreeMap$Entry{key,value,left,right,...}` nodes — but it never touches our
+/// `tm_fast_table`/`tm_array_table` side-tables, so every native read op
+/// (`get`/`size`/`entrySet`/…) sees an empty map. This walks the real tree
+/// in-order and replays its entries into the fast-mode BTreeMap, so a
+/// round-tripped TreeMap reads back correct content.
+///
+/// Runs entirely on `&dyn NativeContext` (field/array/string reads are all
+/// `&self`; no Java allocation), so it can hook the shared read funnels
+/// (`tm_get_slot` / `tm_is_fast_mode`) and cover every read path at once.
+/// Idempotent: a no-op once side-table state exists or when the real `root`
+/// is null (a fresh or empty map). Covers the natural-order case
+/// (String/Integer/Long keys, null comparator) — exactly what serialization
+/// round-trips. A custom-comparator or non-extractable-key tree would need the
+/// array path (Java array allocation, unavailable here) and is left to the
+/// owning `&mut` native; such maps simply stay empty after deserialization,
+/// the pre-existing behavior.
+fn tm_materialize_deser_if_needed(ctx: &dyn NativeContext, this: ObjectRef) {
+    let key = tm_obj_key(ctx, this);
+    // Already have native state (built via put/init, or previously
+    // materialized) — nothing to do.
+    if tm_fast_table().lock().unwrap().contains_key(&key) {
+        return;
+    }
+    if let Some(st) = tm_array_table().lock().unwrap().get(&key) {
+        if st.size > 0 || st.data.is_some() {
+            return;
+        }
+    }
+    let nf = ctx.object_num_fields(this);
+    // Real red-black-tree root: null for native-managed/fresh maps (they never
+    // write the real field), non-null only after `buildFromSorted`.
+    let root = match ctx.resolve_field_index("java/util/TreeMap", "root") {
+        Some(i) if i < nf => match ctx.get_field(this, i) {
+            Value::Object(Some(r)) => r,
+            _ => return,
+        },
+        _ => return,
+    };
+    // Custom comparator → array path (needs Java alloc) — skip here.
+    let has_comparator = ctx
+        .resolve_field_index("java/util/TreeMap", "comparator")
+        .filter(|&i| i < nf)
+        .map(|i| !matches!(ctx.get_field(this, i), Value::Object(None)))
+        .unwrap_or(false);
+    if has_comparator {
+        return;
+    }
+    let ev = "java/util/TreeMap$Entry";
+    let (ki, vi, li, ri) = match (
+        ctx.resolve_field_index(ev, "key"),
+        ctx.resolve_field_index(ev, "value"),
+        ctx.resolve_field_index(ev, "left"),
+        ctx.resolve_field_index(ev, "right"),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => return,
+    };
+    let child = |n: ObjectRef, idx: usize| -> Option<ObjectRef> {
+        match ctx.get_field(n, idx) {
+            Value::Object(o) => o,
+            _ => None,
+        }
+    };
+    // Iterative in-order traversal (left, node, right).
+    let mut entries: Vec<(TreeKey, Value)> = Vec::new();
+    let mut stack: Vec<ObjectRef> = Vec::new();
+    let mut cur = Some(root);
+    while cur.is_some() || !stack.is_empty() {
+        while let Some(n) = cur {
+            stack.push(n);
+            cur = child(n, li);
+        }
+        let n = match stack.pop() {
+            Some(n) => n,
+            None => break,
+        };
+        let k = ctx.get_field(n, ki);
+        let v = ctx.get_field(n, vi);
+        match tree_key_from_value(ctx, &k) {
+            Some(tk) => entries.push((tk, v)),
+            // Non-extractable key (custom Comparable) → needs the array path.
+            None => return,
+        }
+        cur = child(n, ri);
+    }
+    let len = entries.len() as i32;
+    {
+        let mut ft = tm_fast_table().lock().unwrap();
+        let bt = ft.entry(key).or_default();
+        for (tk, v) in entries {
+            bt.insert(tk, v);
+        }
+    }
+    // native_tm_size reads the array-state `size` slot even in fast mode.
+    tm_array_table().lock().unwrap().entry(key).or_default().size = len;
+}
+
+/// Read a `TreeMap$Entry` child link (left/right) as an `Option<ObjectRef>`.
+fn tm_child(ctx: &dyn NativeContext, n: ObjectRef, idx: usize) -> Option<ObjectRef> {
+    match ctx.get_field(n, idx) {
+        Value::Object(o) => o,
+        _ => None,
+    }
+}
+
+/// `&mut` companion to `tm_materialize_deser_if_needed` for the cases it can't
+/// handle: a *deserialized* TreeMap whose ordering is a **custom Comparator**
+/// (or whose keys aren't fast-mode-extractable). Those need the array path —
+/// a real Java `Object[]` `data` array keyed for `tm_binary_search` — which
+/// requires allocation and so can't run from the `&dyn` read funnels. Called
+/// at the top of the TreeMap content natives (which all hold `&mut`).
+///
+/// GC-safe: the allocation may move the tree, so we walk ONCE to count (storing
+/// no object refs across the alloc), allocate, then re-read the (possibly
+/// moved) `root`/`comparator` and walk AGAIN, storing each key/value straight
+/// into the array — no allocation between read and store. Idempotent; a no-op
+/// unless there is a real red-black tree and the side-table is still empty.
+fn tm_materialize_deser_array(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    let key = tm_obj_key(ctx, this);
+    if tm_fast_table().lock().unwrap().contains_key(&key) {
+        return;
+    }
+    if let Some(st) = tm_array_table().lock().unwrap().get(&key) {
+        if st.size > 0 || st.data.is_some() {
+            return;
+        }
+    }
+    let nf = ctx.object_num_fields(this);
+    let root_idx = match ctx.resolve_field_index("java/util/TreeMap", "root") {
+        Some(i) if i < nf => i,
+        _ => return,
+    };
+    let root = match ctx.get_field(this, root_idx) {
+        Value::Object(Some(r)) => r,
+        _ => return,
+    };
+    let cmp_idx = ctx
+        .resolve_field_index("java/util/TreeMap", "comparator")
+        .filter(|&i| i < nf);
+    let has_comparator = cmp_idx
+        .map(|i| !matches!(ctx.get_field(this, i), Value::Object(None)))
+        .unwrap_or(false);
+    let ev = "java/util/TreeMap$Entry";
+    let (ki, vi, li, ri) = match (
+        ctx.resolve_field_index(ev, "key"),
+        ctx.resolve_field_index(ev, "value"),
+        ctx.resolve_field_index(ev, "left"),
+        ctx.resolve_field_index(ev, "right"),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => return,
+    };
+
+    // PASS 1: count + detect whether any key is non-fast-extractable. No
+    // ObjectRef is retained past this point (the upcoming alloc may move them).
+    let mut count: usize = 0;
+    let mut all_extractable = true;
+    {
+        let mut stack: Vec<ObjectRef> = Vec::new();
+        let mut cur = Some(root);
+        while cur.is_some() || !stack.is_empty() {
+            while let Some(n) = cur {
+                stack.push(n);
+                cur = tm_child(ctx, n, li);
+            }
+            let n = match stack.pop() {
+                Some(n) => n,
+                None => break,
+            };
+            let k = ctx.get_field(n, ki);
+            if tree_key_from_value(ctx, &k).is_none() {
+                all_extractable = false;
+            }
+            count += 1;
+            cur = tm_child(ctx, n, ri);
+        }
+    }
+    if count == 0 {
+        return;
+    }
+    // Natural-order + all keys extractable is the `&dyn` fast path's job; leave
+    // it (avoids racing two stores into the same map).
+    if !has_comparator && all_extractable {
+        return;
+    }
+
+    // ARRAY PATH. Allocate first (may GC), then re-read fresh and fill.
+    let buf = alloc_ref_array(ctx, (count * 2).max(TM_DEFAULT_CAPACITY * 2));
+    let root2 = match ctx.get_field(this, root_idx) {
+        Value::Object(Some(r)) => r,
+        _ => return,
+    };
+    let comparator = cmp_idx
+        .map(|i| ctx.get_field(this, i))
+        .unwrap_or(Value::Object(None));
+    let mut idx: usize = 0;
+    let mut stack: Vec<ObjectRef> = Vec::new();
+    let mut cur = Some(root2);
+    while cur.is_some() || !stack.is_empty() {
+        while let Some(n) = cur {
+            stack.push(n);
+            cur = tm_child(ctx, n, li);
+        }
+        let n = match stack.pop() {
+            Some(n) => n,
+            None => break,
+        };
+        let k = ctx.get_field(n, ki);
+        let v = ctx.get_field(n, vi);
+        if idx * 2 + 1 < ctx.array_length(buf) {
+            ctx.set_array_element(buf, idx * 2, k);
+            ctx.set_array_element(buf, idx * 2 + 1, v);
+            idx += 1;
+        }
+        cur = tm_child(ctx, n, ri);
+    }
+    {
+        let mut tbl = tm_array_table().lock().unwrap();
+        let st = tbl.entry(key).or_default();
+        st.data = Some(buf);
+        st.size = idx as i32;
+        st.comparator = comparator;
+    }
+    // Keep this map on the array path permanently (its keys/comparator can't
+    // go through the fast BTreeMap).
+    tm_set_force_array(ctx, this);
+}
+
 /// Read a TreeMap "slot" (`TM_FIELD_DATA`/`SIZE`/`COMPARATOR`) from the
 /// address-keyed side-table. Returns layout-independent defaults when no
 /// entry exists yet. The object's own fields are never consulted.
 fn tm_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
+    tm_materialize_deser_if_needed(ctx, this);
     let key = tm_obj_key(ctx, this);
     let tbl = tm_array_table().lock().unwrap();
     if let Some(st) = tbl.get(&key) {
@@ -16487,23 +16999,58 @@ fn tm_get_slot(ctx: &dyn NativeContext, this: ObjectRef, slot: usize) -> Value {
 /// side-table is the sole authoritative store (see `TmArrayState`).
 fn tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Value) {
     let key = tm_obj_key(ctx, this);
-    let mut tbl = tm_array_table().lock().unwrap();
-    let st = tbl.entry(key).or_default();
-    match slot {
-        TM_FIELD_DATA => {
-            st.data = match v {
-                Value::Object(o) => o,
-                _ => None,
+    {
+        let mut tbl = tm_array_table().lock().unwrap();
+        let st = tbl.entry(key).or_default();
+        match slot {
+            TM_FIELD_DATA => {
+                st.data = match v {
+                    Value::Object(o) => o,
+                    _ => None,
+                }
+            }
+            TM_FIELD_SIZE => {
+                st.size = match v {
+                    Value::Int(n) => n,
+                    _ => 0,
+                }
+            }
+            TM_FIELD_COMPARATOR => st.comparator = v,
+            _ => {}
+        }
+    }
+    // Mirror the entry count to the real JDK `size` field (resolved by name — the
+    // synthetic slot would corrupt an unrelated real field, see tm_obj_key doc).
+    // Real-bytecode TreeMap.writeObject does `s.writeInt(size)` reading this
+    // field directly; without the mirror it stayed 0, so a populated TreeMap
+    // serialized as size=0 + the entries, which a peer read back as empty.
+    if slot == TM_FIELD_SIZE {
+        if let Value::Int(n) = v {
+            if let Some(real) = ctx.resolve_field_index("java/util/TreeMap", "size") {
+                if real < ctx.object_num_fields(this) {
+                    ctx.set_field(this, real, Value::Int(n));
+                }
             }
         }
-        TM_FIELD_SIZE => {
-            st.size = match v {
-                Value::Int(n) => n,
-                _ => 0,
+    }
+    // Mirror the comparator to the real JDK `comparator` field. Real-bytecode
+    // `TreeMap.writeObject`→`defaultWriteObject` serializes this field directly;
+    // without the mirror a custom-comparator TreeMap serialized `comparator=null`
+    // (the synthetic comparator lived only in the side-table), so a peer read it
+    // back as a natural-order map with a mis-ordered tree. We mirror the *real
+    // serializable* form (a synthetic `Comparator$Native` substituted by its JDK
+    // singleton — `defaultWriteObject`'s field serialization does NOT run the
+    // `writeReplace` hook, so the substitution must happen here). The side-table
+    // keeps the original (synthetic) comparator so `comparator_compare` retains
+    // its fast tag dispatch; only the real field — read solely by serialization
+    // — holds the singleton.
+    if slot == TM_FIELD_COMPARATOR {
+        if let Some(real) = ctx.resolve_field_index("java/util/TreeMap", "comparator") {
+            if real < ctx.object_num_fields(this) {
+                let serializable = replace_synthetic_comparator_for_ser(ctx, v);
+                ctx.set_field(this, real, serializable);
             }
         }
-        TM_FIELD_COMPARATOR => st.comparator = v,
-        _ => {}
     }
 }
 
@@ -16516,6 +17063,7 @@ fn tm_set_slot(ctx: &mut dyn NativeContext, this: ObjectRef, slot: usize, v: Val
 /// Empty TreeMaps with null comparator are tentatively "fast-eligible" —
 /// the first non-extractable key flips them to array mode.
 fn tm_is_fast_mode(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
+    tm_materialize_deser_if_needed(ctx, this);
     let key = tm_obj_key(ctx, this);
     tm_fast_table().lock().unwrap().contains_key(&key)
 }
@@ -16705,7 +17253,16 @@ fn ts_array_table() -> &'static Mutex<StdHashMap<usize, TsArrayState>> {
 /// shape the GC actually cares about. `tm_fast_table` keys are owned
 /// `TreeKey`s (String/i32/i64), never ObjectRefs, so iterating values only
 /// is correct and never perturbs the BTreeMap ordering.
-fn for_each_overlay_ref(mut f: impl FnMut(&mut ObjectRef)) {
+/// Walk every top-level `ObjectRef` held by the overlay-backed collections.
+///
+/// `for_rooting` selects the caller's intent:
+///   - `true`  (GC root scan): skip the `LinkedHashMap` entries whose structural
+///     refs are already heap-rooted (see [`lhm_heap_backed`]). Rooting them too
+///     would pin dead LHMs/LHSs forever and leak the young gen.
+///   - `false` (post-GC remap): visit ALL entries — the cached refs of *live*
+///     LHMs that relocated must still be repointed; dead entries are not in the
+///     `pointer_map` so their stale refs are left untouched (never read again).
+fn for_each_overlay_ref(for_rooting: bool, mut f: impl FnMut(&mut ObjectRef)) {
     // Inner name -> Value overlays (LinkedList head/tail/size, LinkedHashMap
     // table/head/tail/…).
     if let Ok(mut ll) = ll_overlay().lock() {
@@ -16718,7 +17275,20 @@ fn for_each_overlay_ref(mut f: impl FnMut(&mut ObjectRef)) {
         }
     }
     if let Ok(mut lhm) = lhm_overlay().lock() {
-        for inner in lhm.values_mut() {
+        // Hold the heap-backed set across the loop (lock order: heap_backed is
+        // never taken while lhm_overlay is held elsewhere — `lhm_set` locks them
+        // sequentially, not nested — so this order can't deadlock).
+        let hb = if for_rooting {
+            lhm_heap_backed().lock().ok()
+        } else {
+            None
+        };
+        for (key, inner) in lhm.iter_mut() {
+            if let Some(hb) = &hb {
+                if hb.contains(key) {
+                    continue;
+                }
+            }
             for v in inner.values_mut() {
                 if let Value::Object(Some(r)) = v {
                     f(r);
@@ -16765,7 +17335,7 @@ fn for_each_overlay_ref(mut f: impl FnMut(&mut ObjectRef)) {
 /// Push every top-level ObjectRef held by the overlay-backed collections onto
 /// `roots` so a moving GC keeps the backing storage live and relocates it.
 pub fn gc_scan_collection_overlay_roots(roots: &mut Vec<ObjectRef>) {
-    for_each_overlay_ref(|r| roots.push(*r));
+    for_each_overlay_ref(true, |r| roots.push(*r));
 }
 
 /// Repoint every top-level ObjectRef held by the overlay-backed collections to
@@ -16775,7 +17345,7 @@ pub fn gc_update_collection_overlay_refs(pointer_map: &StdHashMap<usize, usize>)
     if pointer_map.is_empty() {
         return;
     }
-    for_each_overlay_ref(|r| {
+    for_each_overlay_ref(false, |r| {
         if let Some(&new_addr) = pointer_map.get(&(r.as_ptr() as usize)) {
             debug_assert!(new_addr != 0, "GC pointer map contains null address");
             *r = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
@@ -17056,6 +17626,7 @@ fn native_tm_put(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
 
@@ -17121,6 +17692,7 @@ fn native_tm_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17146,6 +17718,7 @@ fn native_tm_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17179,6 +17752,7 @@ fn native_tm_contains_key(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17201,6 +17775,7 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    tm_materialize_deser_array(ctx, this);
     let target = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         let values: Vec<Value> = tm_fast_with(ctx, this, |bt| bt.values().copied().collect());
@@ -17230,6 +17805,7 @@ fn native_tm_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+    tm_materialize_deser_array(ctx, this);
     let size = match tm_get_slot(ctx, this, TM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -17242,6 +17818,7 @@ fn native_tm_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(1))),
     };
+    tm_materialize_deser_array(ctx, this);
     let size = match tm_get_slot(ctx, this, TM_FIELD_SIZE) {
         Value::Int(v) => v,
         _ => 0,
@@ -17273,6 +17850,7 @@ fn native_tm_first_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             .into())
         }
     };
+    tm_materialize_deser_array(ctx, this);
     if tm_is_fast_mode(ctx, this) {
         let first = tm_fast_with(ctx, this, |bt| bt.keys().next().cloned());
         match first {
@@ -17310,6 +17888,7 @@ fn native_tm_last_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             .into())
         }
     };
+    tm_materialize_deser_array(ctx, this);
     if tm_is_fast_mode(ctx, this) {
         let last = tm_fast_with(ctx, this, |bt| bt.keys().next_back().cloned());
         match last {
@@ -17342,6 +17921,7 @@ fn native_tm_ceiling_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17373,6 +17953,7 @@ fn native_tm_floor_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17406,6 +17987,7 @@ fn native_tm_higher_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17449,6 +18031,7 @@ fn native_tm_lower_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
         if let Some(tk) = tree_key_from_value(ctx, &key) {
@@ -17497,6 +18080,7 @@ fn native_tm_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     if tm_is_fast_mode(ctx, this) {
         let first = tm_fast_with(ctx, this, |bt| bt.iter().next().map(|(k, v)| (k.clone(), *v)));
         match first {
@@ -17525,6 +18109,7 @@ fn native_tm_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     if tm_is_fast_mode(ctx, this) {
         let last = tm_fast_with(ctx, this, |bt| bt.iter().next_back().map(|(k, v)| (k.clone(), *v)));
         match last {
@@ -17554,6 +18139,7 @@ fn native_tm_poll_first_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     if tm_is_fast_mode(ctx, this) {
         let removed = tm_fast_with(ctx, this, |bt| {
             let first = bt.iter().next().map(|(k, _)| k.clone())?;
@@ -17589,6 +18175,7 @@ fn native_tm_poll_last_entry(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     if tm_is_fast_mode(ctx, this) {
         let removed = tm_fast_with(ctx, this, |bt| {
             let last = bt.iter().next_back().map(|(k, _)| k.clone())?;
@@ -17626,6 +18213,7 @@ fn native_tm_key_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let pairs = tm_collect_pairs(ctx, this);
     let size = pairs.len() as i32;
     let ts = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
@@ -17678,6 +18266,7 @@ fn native_tm_values(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     // Live view: the ArrayList stashes the source TreeMap so
     // `values().iterator().remove()` deletes the matching entry from the tree.
     let pairs = tm_collect_pairs(ctx, this);
@@ -17691,6 +18280,7 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let pairs = tm_collect_pairs(ctx, this);
     // Live view: build Map.Entry objects and stash the source TreeMap so
     // removing an entry through the list (or its iterator) deletes the key.
@@ -17707,6 +18297,7 @@ fn native_tm_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    tm_materialize_deser_array(ctx, this);
     let action = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -17728,6 +18319,7 @@ fn native_tm_get_or_default(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let default = args.get(2).copied().unwrap_or(Value::Object(None));
     if tm_is_fast_mode(ctx, this) {
@@ -17753,6 +18345,7 @@ fn native_tm_put_if_absent(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let key = args.get(1).copied().unwrap_or(Value::Object(None));
     let value = args.get(2).copied().unwrap_or(Value::Object(None));
     // Fast-mode eligibility check mirrors `native_tm_put`.
@@ -17810,6 +18403,7 @@ fn native_tm_put_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    tm_materialize_deser_array(ctx, this);
     let source = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(None),
@@ -17836,6 +18430,7 @@ fn native_tm_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     let pairs = tm_collect_pairs(ctx, this);
     let mut buf = String::from("{");
     for (i, (k, v)) in pairs.iter().enumerate() {
@@ -17856,6 +18451,7 @@ fn native_tm_comparator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
+    tm_materialize_deser_array(ctx, this);
     Ok(Some(tm_get_slot(ctx, this, TM_FIELD_COMPARATOR)))
 }
 
@@ -18165,6 +18761,119 @@ fn native_ts_size(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
         _ => 0,
     };
     Ok(Some(Value::Int(size)))
+}
+
+/// `TreeSet.writeObject(ObjectOutputStream)` — serialize from `ts_state`.
+///
+/// Real `TreeSet.writeObject` writes `comparator`, `size`, then each element
+/// by iterating the backing `m` TreeMap's `keySet()`. CratonVM's native
+/// TreeSet keeps its elements in the `ts_array_table` side-table and never
+/// populates `m`, so the inherited real method serialized an empty set. This
+/// native reproduces the exact stream format (`defaultWriteObject`, comparator,
+/// size, elements in sorted order) directly from the side-table. Contained to
+/// the serialization path — the hot add/contains/size path is untouched.
+fn native_ts_write_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let oos = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    // Substitute a synthetic factory comparator with its real serializable JDK
+    // singleton: writing it directly via OOS.writeObject below bypasses the
+    // `writeReplace` reflection hook that real `defaultWriteObject` would apply
+    // (see native_comparator_write_replace), which would otherwise throw
+    // NotSerializableException on `Comparator$Native`.
+    let comparator = replace_synthetic_comparator_for_ser(ctx, comparator);
+    let oos_cls = "java/io/ObjectOutputStream";
+    // s.defaultWriteObject() — TreeSet has no non-transient fields, so this
+    // writes nothing but keeps the stream's per-object context consistent.
+    ctx.invoke(oos_cls, "defaultWriteObject", "()V", &[Value::Object(Some(oos))])?;
+    // s.writeObject(comparator)
+    ctx.invoke(
+        oos_cls,
+        "writeObject",
+        "(Ljava/lang/Object;)V",
+        &[Value::Object(Some(oos)), comparator],
+    )?;
+    // s.writeInt(size)
+    ctx.invoke(
+        oos_cls,
+        "writeInt",
+        "(I)V",
+        &[Value::Object(Some(oos)), Value::Int(size)],
+    )?;
+    // Elements in sorted order (the data array is kept sorted by native_ts_add).
+    if let Some(data) = data_opt {
+        for i in 0..size as usize {
+            let e = ctx.get_array_element(data, i);
+            ctx.invoke(
+                oos_cls,
+                "writeObject",
+                "(Ljava/lang/Object;)V",
+                &[Value::Object(Some(oos)), e],
+            )?;
+        }
+    }
+    Ok(None)
+}
+
+/// `TreeSet.readObject(ObjectInputStream)` — deserialize into `ts_state`.
+///
+/// Mirrors `native_ts_write_object`. Real `TreeSet.readObject` rebuilds the
+/// backing `m` TreeMap's red-black tree, which CratonVM's native TreeSet never
+/// reads — so a round-tripped set read back empty. This reads the same format
+/// (`defaultReadObject`, comparator, size, elements) straight into the
+/// side-table via `native_ts_add` (which honors the comparator and keeps the
+/// array sorted; elements arrive already sorted so each insert appends).
+fn native_ts_read_object(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let ois = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let ois_cls = "java/io/ObjectInputStream";
+    ctx.invoke(ois_cls, "defaultReadObject", "()V", &[Value::Object(Some(ois))])?;
+    let comparator = ctx
+        .invoke(
+            ois_cls,
+            "readObject",
+            "()Ljava/lang/Object;",
+            &[Value::Object(Some(ois))],
+        )?
+        .unwrap_or(Value::Object(None));
+    let size = match ctx.invoke(
+        ois_cls,
+        "readInt",
+        "()I",
+        &[Value::Object(Some(ois))],
+    )? {
+        Some(Value::Int(n)) => n,
+        _ => 0,
+    };
+    // Initialize a fresh backing array + comparator, then add each element.
+    let buf = alloc_ref_array(ctx, (size as usize).max(TS_DEFAULT_CAPACITY));
+    ts_set_slot(ctx, this, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, this, TS_FIELD_COMPARATOR, comparator);
+    for _ in 0..size {
+        let e = ctx
+            .invoke(
+                ois_cls,
+                "readObject",
+                "()Ljava/lang/Object;",
+                &[Value::Object(Some(ois))],
+            )?
+            .unwrap_or(Value::Object(None));
+        native_ts_add(ctx, &[Value::Object(Some(this)), e])?;
+    }
+    Ok(None)
 }
 
 fn native_ts_is_empty(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -18860,6 +19569,21 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ts_add);
     registry.register(c, "remove", "(Ljava/lang/Object;)Z", native_ts_remove);
+    // Serialization: drive the stream from `ts_state` so a native TreeSet
+    // round-trips byte-correct (the inherited real methods go through the
+    // never-populated backing `m` TreeMap → an empty set).
+    registry.register(
+        c,
+        "writeObject",
+        "(Ljava/io/ObjectOutputStream;)V",
+        native_ts_write_object,
+    );
+    registry.register(
+        c,
+        "readObject",
+        "(Ljava/io/ObjectInputStream;)V",
+        native_ts_read_object,
+    );
     registry.register(c, "contains", "(Ljava/lang/Object;)Z", native_ts_contains);
     registry.register(c, "size", "()I", native_ts_size);
     registry.register(c, "isEmpty", "()Z", native_ts_is_empty);

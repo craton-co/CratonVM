@@ -14721,6 +14721,36 @@ fn try_jit_upgrade_with_gate(
             {
                 return None;
             }
+            // BUG-H: refuse a *direct* JIT→JIT call into a callee that declares
+            // a non-empty exception table. The direct machine-code `CALL`
+            // bypasses the interpreter↔JIT boundary, so an implicit runtime
+            // exception (AIOOBE/NPE) the callee should catch locally escapes its
+            // own `catch` and is mis-routed through the caller's table
+            // (`TestHexUtils`/`HexUtils.getDec`: `T[i-'0']` in `catch (AIOOBE)`).
+            // Returning None here drops the site to the dispatch helper
+            // (`jit_invoke_dispatch`), which re-executes such a throwing callee
+            // in the interpreter so the exception routes through the callee's
+            // own exception table. Callees without a table keep the fast direct
+            // call (no perf change on the bench/gauntlet hot paths).
+            {
+                let cm = shared.class_manager.read();
+                if let Some(callee_cid) = cm.find_class_by_name(callee_class) {
+                    let store = cm.class_store();
+                    if let Some((method, _decl)) = crate::classloading::find_method_recursive(
+                        callee_cid,
+                        callee_method,
+                        callee_desc,
+                        store,
+                    ) {
+                        if method
+                            .code()
+                            .map_or(false, |c| !c.exception_table.is_empty())
+                        {
+                            return None;
+                        }
+                    }
+                }
+            }
             // Check JIT cache first
             let callee_class_arc: Arc<str> = Arc::from(callee_class);
             let callee_method_arc: Arc<str> = Arc::from(callee_method);

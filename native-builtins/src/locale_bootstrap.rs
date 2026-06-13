@@ -74,21 +74,46 @@ fn get_or_create_default(ctx: &mut dyn NativeContext) -> MethodCallResult {
     Ok(Some(Value::Object(Some(locale_obj))))
 }
 
-fn locale_language(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    if let Some(Value::Object(Some(this))) = args.first() {
-        if let Some(&(lang, _, _)) = synthetic_locale_data().lock().get(this) {
-            return Ok(Some(Value::Object(Some(ctx.create_string(lang)))));
+/// For a *real* JDK `Locale` (not one of our synthetic ones), read a String
+/// field off its `sun.util.locale.BaseLocale` — `language`, `region`,
+/// `script`, or `variant`. The predefined constants (`Locale.FRENCH`, …) are
+/// built by real JDK `<clinit>` bytecode, so their codes live there rather than
+/// in our synthetic side table.
+fn base_locale_field(
+    ctx: &dyn NativeContext,
+    this: cratonvm_types::ObjectRef,
+    field: &str,
+) -> Option<cratonvm_types::ObjectRef> {
+    if let Value::Object(Some(base)) = ctx.get_field_by_name(this, "baseLocale") {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(base, field) {
+            return Some(s);
         }
     }
-    // Fall through: not one of ours — try the real JDK field path.
-    // The JDK stores BaseLocale inside Locale; return empty string as safe fallback.
+    None
+}
+
+fn locale_language(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first() {
+        let syn = synthetic_locale_data().lock().get(this).map(|&(l, _, _)| l);
+        if let Some(lang) = syn {
+            return Ok(Some(Value::Object(Some(ctx.create_string(lang)))));
+        }
+        // Real JDK Locale (e.g. Locale.FRENCH): read its BaseLocale.language.
+        if let Some(s) = base_locale_field(ctx, *this, "language") {
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    }
     Ok(Some(Value::Object(Some(ctx.create_string("")))))
 }
 
 fn locale_country(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     if let Some(Value::Object(Some(this))) = args.first() {
-        if let Some(&(_, country, _)) = synthetic_locale_data().lock().get(this) {
+        let syn = synthetic_locale_data().lock().get(this).map(|&(_, c, _)| c);
+        if let Some(country) = syn {
             return Ok(Some(Value::Object(Some(ctx.create_string(country)))));
+        }
+        if let Some(s) = base_locale_field(ctx, *this, "region") {
+            return Ok(Some(Value::Object(Some(s))));
         }
     }
     Ok(Some(Value::Object(Some(ctx.create_string("")))))
@@ -103,11 +128,21 @@ fn locale_tag(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Object(Some(ctx.create_string("und")))))
 }
 
-fn locale_script(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn locale_script(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if let Some(s) = base_locale_field(ctx, *this, "script") {
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    }
     Ok(Some(Value::Object(Some(ctx.create_string("")))))
 }
 
-fn locale_variant(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
+fn locale_variant(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if let Some(Value::Object(Some(this))) = args.first() {
+        if let Some(s) = base_locale_field(ctx, *this, "variant") {
+            return Ok(Some(Value::Object(Some(s))));
+        }
+    }
     Ok(Some(Value::Object(Some(ctx.create_string("")))))
 }
 

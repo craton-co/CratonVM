@@ -98,13 +98,34 @@ fn opcode_dereferences_receiver(op: u8) -> bool {
     // sometimes documented as "throws CCE on bad type"; JVMS §6.5
     // additionally allows it to succeed-with-null (null can be cast
     // to any reference type), so it does NOT prove non-null either.
-    // We list only opcodes that throw NPE on a null receiver.
+    // We list ONLY opcodes that throw NPE on a null receiver AND whose
+    // receiver is the value on TOP of the operand stack — so the
+    // `aload N` immediately preceding the opcode (per `prev_inst_pc`) is
+    // exactly that receiver. The caller keys off a single preceding
+    // instruction, so any opcode whose receiver is NOT top-of-stack would
+    // attribute the non-null fact to the wrong local.
+    //
+    // BUG-I FIX: `putfield`, `invokevirtual`, `invokespecial` and
+    // `invokeinterface` are intentionally EXCLUDED:
+    //   * `putfield` (0xB5) stack is `[..., objectref, value]` — the
+    //     preceding push is the stored VALUE, never the receiver.
+    //   * `invoke*` (0xB6/0xB7/0xB9) stack is `[..., objectref, arg1..argN]`
+    //     — the preceding push is the last ARGUMENT for any non-zero-arg
+    //     callee (only a 0-arg callee has the receiver on top, and this
+    //     pass has no constant pool to tell the two apart).
+    // Listing them marked the stored value / last argument local non-null,
+    // a FALSE fact that let the JIT elide a subsequent `local == null`
+    // branch. Tomcat `MessageBytes.setString` (`strValue = s; if (s ==
+    // null) …`) took the non-null arm for a null argument, so `isNull()`
+    // wrongly returned false (`TestMessageBytesConversion.testConversion
+    // Null`, 432/864 under JIT); the `invoke*` form has the same shape
+    // (`sink.use(arg); if (arg == null) …`). These opcodes still NPE-check
+    // their receiver in codegen — we just cannot identify that receiver
+    // from the immediately-preceding instruction, so we forgo the fact
+    // rather than assert a wrong one. `getfield` is retained: its receiver
+    // IS the top-of-stack operand the preceding `aload` pushed.
     matches!(op,
         0xB4 | // getfield
-        0xB5 | // putfield
-        0xB6 | // invokevirtual
-        0xB7 | // invokespecial
-        0xB9 | // invokeinterface
         0xBE | // arraylength
         0xC2 | // monitorenter
         0xC3   // monitorexit

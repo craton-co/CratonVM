@@ -38,6 +38,12 @@ pub struct CodingError {
 pub enum CodingErrorKind {
     /// The input was not a valid encoding of any code point.
     Malformed,
+    /// The input ended in the middle of an otherwise-valid multi-byte
+    /// sequence (a *truncated trailing* sequence). With more input the
+    /// sequence could still complete, so a streaming decoder that has NOT
+    /// reached end-of-input should report this as UNDERFLOW rather than
+    /// MALFORMED. At end-of-input it is treated as MALFORMED.
+    Incomplete,
     /// The input decoded to a code point that the target charset cannot
     /// represent (encode-only).
     Unmappable,
@@ -51,6 +57,11 @@ impl fmt::Display for CodingError {
             CodingErrorKind::Malformed => write!(
                 f,
                 "malformed {} input at offset {} (len {})",
+                self.charset, self.offset, self.length
+            ),
+            CodingErrorKind::Incomplete => write!(
+                f,
+                "incomplete {} input at offset {} (len {})",
                 self.charset, self.offset, self.length
             ),
             CodingErrorKind::Unmappable => write!(
@@ -232,8 +243,15 @@ fn decode_utf8(bytes: &[u8]) -> Result<Vec<u16>, CodingError> {
         Ok(s) => Ok(s.encode_utf16().collect()),
         Err(e) => Err(CodingError {
             offset: e.valid_up_to(),
-            length: e.error_len().unwrap_or(1),
-            kind: CodingErrorKind::Malformed,
+            // `error_len() == None` means the input ended in the middle of a
+            // valid-so-far multi-byte sequence (truncated trailing sequence) —
+            // an incomplete, not malformed, encoding.
+            length: e.error_len().unwrap_or_else(|| bytes.len() - e.valid_up_to()),
+            kind: if e.error_len().is_none() {
+                CodingErrorKind::Incomplete
+            } else {
+                CodingErrorKind::Malformed
+            },
             charset: "UTF-8",
         }),
     }
