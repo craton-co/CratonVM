@@ -30,6 +30,27 @@ tests across 13 classes**, all protocol request/response serialization. HotSpot 
 > dump the caller method+pc when the method is `cacheSerializedValue` (frame-capped
 > `DBG_ATHROW` only reaches the JUnit rethrow), run the real test, and capture the GC
 > event around the throw. Remaining open item for the bug-25 cluster.
+>
+> **UPDATE — pinned via `CRATONVM_DBG_NPE_STACK=1` (existing gate, 30 frames):** the
+> null-cache call chain is
+> ```
+> [51] CreateAclsRequestData$AclCreation.addSize(MessageSizeAccumulator, ObjectSerializationCache, S) pc=86  // -> cache.cacheSerializedValue(field, bytes)
+> [50] CreateAclsRequestData.addSize(MessageSizeAccumulator, ObjectSerializationCache, S) pc=75
+> [49] org/apache/kafka/common/protocol/Message.size(ObjectSerializationCache, S)I pc=17
+> [48] org/junit/platform/commons/util/ReflectionUtils.invokeMethod(Method, Object, Object[]) pc=45
+> ```
+> Two hard facts: (1) the receiver is a **genuine null** — the interpreter's
+> stale/all-zero-header salvage (interpreter.rs ~10440) did NOT fire, so this is
+> `Value::Object(None)`, not a GC-collected stale pointer; (2) the test method's own
+> frames (`shouldRoundTripV0` → `AbstractRequest.serialize` → `RequestUtils.serialize`)
+> are **ABSENT** between JUnit's reflective `invokeMethod` [48] and `Message.size` [49]
+> — `size` is reached *directly* from the reflective invoke with a **null cache arg**.
+> So the bug is in CratonVM's **reflective invocation path** (`Method.invoke` /
+> `ReflectionUtils.invokeMethod` argument marshalling, or a Method-resolution/frame
+> anomaly), NOT in message serialization (which is byte-correct standalone). This is why
+> it is JUnit-harness-only. **Next:** dump the `Object[] args` (and the resolved target
+> Method) inside CratonVM's `Method.invoke` native for the failing call to see where the
+> `ObjectSerializationCache` argument becomes null / the wrong method is dispatched.
 
 ## Symptom
 ```
