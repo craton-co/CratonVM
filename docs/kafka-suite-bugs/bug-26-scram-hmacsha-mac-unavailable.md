@@ -26,14 +26,17 @@
 >   (slot 2, stored in a real `javax.crypto.Mac`) gets clobbered across init-once/
 >   doFinal-many. Fixed: treat a Mac that still holds its key (slot 1) as initialized.
 >   → **`ScramCredentialUtilsTest` 0/6 → 6/6**; `ScramMessagesTest` 8/8 (still green).
-> - **L3 (OPEN — wrong HMAC bytes):** `ScramFormatterTest.rfc7677Example` now *runs* but
->   fails an exact RFC-7677 vector: `array contents differ at index [0], expected 116 but
->   was -71`. The synthetic Mac's raw-slot state (key/data) is corrupted by the
->   allocation-heavy Hi() loop's GC / real-field aliasing → wrong `saltedPassword`.
->   **Fix direction:** stop storing Mac state in raw slots of a real `javax.crypto.Mac`
->   object; keep it in an **identity-keyed side-table** (as done for the PBKDF2 PRF, see
->   `reference_pemfile_pbe_crypto`) so GC/aliasing can't corrupt it. CredentialUtils
->   passes because it doesn't assert exact HMAC bytes; rfc7677Example does.
+> - **L3 (FIXED — commit `7bfbfa47` / dev `e254ac08`):** `ScramFormatterTest.rfc7677Example`
+>   failed an exact RFC-7677 vector (`array[0] expected 116, was -71`) because the
+>   synthetic Mac stored algorithm/key/data/init in raw slots 0–3 of a REAL
+>   `javax.crypto.Mac` object, aliasing that class's real fields and getting corrupted by
+>   the allocation-heavy Hi() init-once/doFinal-many loop's GC → wrong `saltedPassword`.
+>   **Fix:** moved all Mac state off-object into a process-wide table keyed by the
+>   object's identity hash (stable across GC); the Mac handle is now opaque. Reworked
+>   getInstance/init/update×3/doFinal×2/reset/getMacLength/getAlgorithm/clone.
+>   **Result: `ScramFormatterTest` 1/2 → 2/2** (rfc7677 RFC vector passes); ScramMessages
+>   8/8 and ScramCredentialUtils 6/6 still green. **3 of 4 SCRAM classes now fully green**
+>   (from 0 at session start); ScramSaslServerTest re-checking.
 
 **Severity:** High (for SCRAM) — **4 classes fail every test (0-pass)**. HotSpot OK.
 
