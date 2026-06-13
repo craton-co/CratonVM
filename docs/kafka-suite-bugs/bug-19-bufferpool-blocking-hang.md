@@ -48,13 +48,22 @@ young-sweep work (see memory: OSR main() corruptor, bug-D CIDR JIT/GC, selective
 promotion) — a multi-threaded blocking workload that holds JIT-frame roots across
 a native park, which the young sweep / quiescence gate doesn't handle.
 
-NEXT: (a) confirm with `--nojit` — if the hang persists with NO JIT frames
-(quiescence stays 0) the bug is purely in monitor/thread coordination; if it
-clears, it's the JIT-frame-root-across-park interaction. (b) The env is easily
-contaminated by leftover/cross-session `cratonvm.exe` processes (CPU starvation +
-`taskkill /IM` cross-kills give false rc=1 hangs) — run in isolation with no
-concurrent VMs and verify the process count is clean before trusting a hang.
-Needs a dedicated GC/threading session, not a quick Condition fix.
+`--nojit` **also hangs** (rc=124, 90 s) — so the core defect is **not**
+JIT-specific (with no JIT frames, quiescence stays 0, yet it still hangs). Net:
+the hang reproduces in *every* config (default JIT, `--nojit`, `REAL_AQS=1`),
+which rules out both the synthetic Condition and the JIT-frame interaction and
+points at a lower-level cross-thread blocking/wakeup or scheduler primitive
+(`monitor_wait`/`notify` cross-thread, or `LockSupport.park`/`unpark` since
+REAL_AQS uses those). The JIT run additionally trips the quiescence-imbalance +
+heap-corruption detector on top.
+
+⚠ ENV CAVEAT: this box runs a concurrent CratonVM session — 6+ leftover
+`cratonvm.exe` processes persist even after `taskkill /F /IM cratonvm.exe`
+(they respawn), causing heavy CPU starvation that can by itself wedge a
+multi-thread, timing-sensitive test. Before trusting any bug-19 hang, run in a
+genuinely isolated environment (no other VM processes) and confirm a clean
+process count. Needs a dedicated GC/threading session in a clean env, not a
+quick Condition fix.
 
 ## Affected classes (partial — append more later)
 - producer.internals.BufferPoolTest (TIMEOUT)
