@@ -27109,7 +27109,15 @@ pub(crate) fn register_p67_misc(r: &mut NativeMethodRegistry) {
         tv,
         "getGenericDeclaration",
         "()Ljava/lang/reflect/GenericDeclaration;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            // Field 2 = declaring Class/Executable (generics::type_param_to_java).
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) > 2 {
+                Ok(Some(ctx.get_field(this, 2)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        },
     );
 
     // WildcardType = 2-field (upperBounds=0, lowerBounds=1)
