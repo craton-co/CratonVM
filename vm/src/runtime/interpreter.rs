@@ -15064,6 +15064,15 @@ fn try_jit_upgrade_with_gate(
     let inline_resolver = |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<cratonvm_jit::InlineSite> {
         resolve_inline_site(shared, callee_class, callee_method, callee_desc)
     };
+    // Main-path small-method inlining is GATED default-OFF behind
+    // `CRATONVM_JIT_MAIN_INLINE=1`. Enabling it inlines tiny arith/getter/field
+    // leaves correctly (verified: `static int add(int,int){return a+b;}` emits no
+    // CALL), but broadly enabling it surfaced a `try_emit_inline_body` miscompile
+    // on some Spring boot paths (`ConcurrentReferenceHashMap$TaskOption not an
+    // enum` CCE — an inlined body clobbering a caller-live value), so it must not
+    // be default-ON until that is root-caused. The infrastructure was previously
+    // wired only into `try_jit_compile_callee_slow`. See the JIT-inlining notes.
+    let main_inline_on = crate::runtime::env_cache::jit_main_inline();
     let compiled = crate::jit::try_compile(
         cached,
         Some(&resolver),
@@ -15076,7 +15085,7 @@ fn try_jit_upgrade_with_gate(
         Some(&ldc2w_resolver),
         pgo_profile.as_ref(),
         &helpers,
-        Some(&inline_resolver),
+        if main_inline_on { Some(&inline_resolver) } else { None },
         // string_layout_resolver: None until the String call-site intrinsics
         // land — see the matching comment at the early-compile call site.
         None,
