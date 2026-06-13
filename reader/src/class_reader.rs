@@ -172,6 +172,66 @@ pub fn read_class_arc(source: Arc<[u8]>) -> Result<ClassFile, ClassReaderError> 
     })
 }
 
+/// Decode Java *modified UTF-8* bytes into UTF-16 code units, tolerating
+/// **lone surrogates**.
+///
+/// `cesu8::from_java_cesu8` rejects unpaired surrogates because the resulting
+/// code point is not a valid Unicode scalar value (a Rust `str` cannot hold
+/// it). This decoder instead emits every 3-byte group as its raw 16-bit value,
+/// so an unpaired surrogate (U+D800..U+DFFF) round-trips verbatim and a
+/// surrogate *pair* becomes two units — which is exactly the UTF-16 the JDK
+/// keeps in a `String`'s `char[]`. ANTLR-generated `_serializedATN` string
+/// constants are the common producer of lone surrogates.
+///
+/// Returns `Err(())` on genuinely malformed modified UTF-8 (bad continuation
+/// bytes, truncated sequences, a bare `0x00`, or a 4-byte sequence — which
+/// modified UTF-8 never uses).
+fn decode_java_mutf8_to_utf16(bytes: &[u8]) -> Result<Vec<u16>, ()> {
+    let mut out: Vec<u16> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        if b0 == 0x00 {
+            // Modified UTF-8 forbids a bare NUL — it is encoded as 0xC0 0x80.
+            return Err(());
+        } else if b0 < 0x80 {
+            out.push(b0 as u16);
+            i += 1;
+        } else if b0 & 0xE0 == 0xC0 {
+            // 2-byte: 110x xxxx  10xx xxxx  (also encodes NUL as 0xC0 0x80)
+            if i + 1 >= bytes.len() {
+                return Err(());
+            }
+            let b1 = bytes[i + 1];
+            if b1 & 0xC0 != 0x80 {
+                return Err(());
+            }
+            out.push((((b0 as u16) & 0x1F) << 6) | ((b1 as u16) & 0x3F));
+            i += 2;
+        } else if b0 & 0xF0 == 0xE0 {
+            // 3-byte: 1110 xxxx  10xx xxxx  10xx xxxx  (the surrogate range too)
+            if i + 2 >= bytes.len() {
+                return Err(());
+            }
+            let b1 = bytes[i + 1];
+            let b2 = bytes[i + 2];
+            if b1 & 0xC0 != 0x80 || b2 & 0xC0 != 0x80 {
+                return Err(());
+            }
+            out.push(
+                (((b0 as u16) & 0x0F) << 12)
+                    | (((b1 as u16) & 0x3F) << 6)
+                    | ((b2 as u16) & 0x3F),
+            );
+            i += 3;
+        } else {
+            // 4-byte UTF-8 is not valid modified UTF-8.
+            return Err(());
+        }
+    }
+    Ok(out)
+}
+
 fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassReaderError> {
     let count = buf.read_u16()?;
     // JVMS §4.1: constant_pool_count must be >= 1. The 0-th slot is a
@@ -190,6 +250,11 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
     let mut entries: Vec<ConstantPoolEntry> = Vec::with_capacity(count as usize);
     entries.push(ConstantPoolEntry::Tombstone); // Index 0
 
+    // Side table of exact UTF-16 units for the rare surrogate-bearing Utf8
+    // entries (populated only when `from_java_cesu8` rejects lone surrogates).
+    let mut wide_utf8: std::collections::HashMap<u16, Arc<[u16]>> =
+        std::collections::HashMap::new();
+
     let mut i = 1u16;
     while i < count {
         let tag = buf.read_u8()?;
@@ -206,9 +271,31 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
                 // each `Arc<str>` clone being a single refcount bump.
                 let length = buf.read_u16()?;
                 let bytes = buf.read_bytes(length as usize)?;
-                let string = cesu8::from_java_cesu8(bytes)
-                    .map_err(|_| ClassReaderError::InvalidCesu8String { index: i })?;
-                ConstantPoolEntry::Utf8(cratonvm_types::intern_arc(&string))
+                match cesu8::from_java_cesu8(bytes) {
+                    Ok(string) => {
+                        ConstantPoolEntry::Utf8(cratonvm_types::intern_arc(&string))
+                    }
+                    Err(_) => {
+                        // `from_java_cesu8` rejects lone surrogates. Recover that
+                        // specific case (e.g. ANTLR `_serializedATN`) by decoding
+                        // leniently into UTF-16 units; the units are stashed in
+                        // `wide_utf8` so the string constant materialises into the
+                        // correct `java.lang.String` char[], while the Utf8 entry
+                        // itself holds a lossy string for name/descriptor readers.
+                        // Only accept the recovery when the failure is genuinely
+                        // surrogate-caused (a surrogate unit is present); any other
+                        // malformed input keeps the original hard error.
+                        let units = decode_java_mutf8_to_utf16(bytes)
+                            .ok()
+                            .filter(|u| {
+                                u.iter().any(|&c| (0xD800..=0xDFFF).contains(&c))
+                            })
+                            .ok_or(ClassReaderError::InvalidCesu8String { index: i })?;
+                        let lossy = String::from_utf16_lossy(&units);
+                        wide_utf8.insert(i, Arc::from(units.into_boxed_slice()));
+                        ConstantPoolEntry::Utf8(cratonvm_types::intern_arc(&lossy))
+                    }
+                }
             }
             3 => {
                 // CONSTANT_Integer
@@ -365,7 +452,7 @@ fn read_constant_pool(buf: &mut ClassFileBuffer) -> Result<ConstantPool, ClassRe
         });
     }
 
-    Ok(ConstantPool::new(entries))
+    Ok(ConstantPool::new_with_wide(entries, wide_utf8))
 }
 
 fn read_field(
@@ -545,6 +632,75 @@ mod tests {
     fn push_u16(buf: &mut Vec<u8>, val: u16) {
         buf.push((val >> 8) as u8);
         buf.push(val as u8);
+    }
+
+    // ── Lone-surrogate modified-UTF-8 decode (SB-13) ─────────────────────
+
+    /// Encode a single UTF-16 code unit as a 3-byte modified-UTF-8 sequence
+    /// (the form HotSpot uses for surrogates and for U+0800..U+FFFF).
+    fn mutf8_3byte(u: u16) -> [u8; 3] {
+        [
+            0xE0 | ((u >> 12) as u8 & 0x0F),
+            0x80 | ((u >> 6) as u8 & 0x3F),
+            0x80 | (u as u8 & 0x3F),
+        ]
+    }
+
+    #[test]
+    fn decode_mutf8_lone_surrogate_roundtrips() {
+        // "A" + lone high surrogate U+D834 + "B"
+        let mut bytes = vec![b'A'];
+        bytes.extend_from_slice(&mutf8_3byte(0xD834));
+        bytes.push(b'B');
+        let units = decode_java_mutf8_to_utf16(&bytes).expect("decode ok");
+        assert_eq!(units, vec![0x41, 0xD834, 0x42]);
+        // cesu8 must reject this exact input — that is what triggers the path.
+        assert!(cesu8::from_java_cesu8(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_mutf8_surrogate_pair_becomes_two_units() {
+        // U+1D11E (G clef) = surrogate pair D834 DD1E in UTF-16.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&mutf8_3byte(0xD834));
+        bytes.extend_from_slice(&mutf8_3byte(0xDD1E));
+        let units = decode_java_mutf8_to_utf16(&bytes).expect("decode ok");
+        assert_eq!(units, vec![0xD834, 0xDD1E]);
+    }
+
+    #[test]
+    fn decode_mutf8_nul_and_two_byte() {
+        // Modified UTF-8 NUL (0xC0 0x80) and a 2-byte U+00E9.
+        let bytes = [0xC0, 0x80, 0xC3, 0xA9];
+        let units = decode_java_mutf8_to_utf16(&bytes).expect("decode ok");
+        assert_eq!(units, vec![0x0000, 0x00E9]);
+    }
+
+    #[test]
+    fn decode_mutf8_rejects_malformed() {
+        assert!(decode_java_mutf8_to_utf16(&[0x00]).is_err()); // bare NUL
+        assert!(decode_java_mutf8_to_utf16(&[0xE0, 0x80]).is_err()); // truncated 3-byte
+        assert!(decode_java_mutf8_to_utf16(&[0xC0]).is_err()); // truncated 2-byte
+        assert!(decode_java_mutf8_to_utf16(&[0xF0, 0x90, 0x80, 0x80]).is_err()); // 4-byte
+        assert!(decode_java_mutf8_to_utf16(&[0xE0, 0x20, 0x80]).is_err()); // bad cont
+    }
+
+    #[test]
+    fn constant_pool_carries_wide_units_for_surrogate_utf8() {
+        // Build a minimal class CP: [0]=Tombstone, [1]=Utf8 with a lone surrogate.
+        let mut data = Vec::new();
+        push_u16(&mut data, 2); // constant_pool_count (1 real entry at index 1)
+        data.push(1); // CONSTANT_Utf8 tag
+        let mut payload = vec![b'x'];
+        payload.extend_from_slice(&mutf8_3byte(0xDC00)); // lone low surrogate
+        push_u16(&mut data, payload.len() as u16);
+        data.extend_from_slice(&payload);
+
+        let mut buf = ClassFileBuffer::new(&data);
+        let cp = read_constant_pool(&mut buf).expect("cp parses despite surrogate");
+        // The Utf8 entry exists (lossy form) and the side table has exact units.
+        assert!(cp.get_utf8(1).is_some());
+        assert_eq!(cp.get_utf8_wide(1), Some([b'x' as u16, 0xDC00].as_slice()));
     }
 
     // ── Attribute parsing tests ──────────────────────────────────────────

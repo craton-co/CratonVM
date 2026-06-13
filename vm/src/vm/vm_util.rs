@@ -1374,6 +1374,9 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
     enum CvSeed {
         Primitive(Value),
         StringUtf8(String),
+        /// `ConstantValue` String whose Utf8 holds lone surrogates — exact
+        /// UTF-16 units (a Rust `String` cannot represent them).
+        StringUtf16(Vec<u16>),
     }
 
     let static_field_info: Vec<(String, Option<CvSeed>)> = {
@@ -1392,10 +1395,18 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
                         ConstantPoolEntry::Float(v) => Some(CvSeed::Primitive(Value::Float(*v))),
                         ConstantPoolEntry::Long(v) => Some(CvSeed::Primitive(Value::Long(*v))),
                         ConstantPoolEntry::Double(v) => Some(CvSeed::Primitive(Value::Double(*v))),
-                        ConstantPoolEntry::StringReference { string_index } => class
-                            .constant_pool
-                            .get_utf8(*string_index)
-                            .map(|s| CvSeed::StringUtf8(s.to_string())),
+                        ConstantPoolEntry::StringReference { string_index } => {
+                            if let Some(units) =
+                                class.constant_pool.get_utf8_wide(*string_index)
+                            {
+                                Some(CvSeed::StringUtf16(units.to_vec()))
+                            } else {
+                                class
+                                    .constant_pool
+                                    .get_utf8(*string_index)
+                                    .map(|s| CvSeed::StringUtf8(s.to_string()))
+                            }
+                        }
                         _ => None,
                     }
                 });
@@ -1419,6 +1430,11 @@ fn prepare_class_shared(shared: &SharedVm, class_id: ClassId) -> Result<(), VmEr
             Some(CvSeed::Primitive(v)) => statics[static_idx] = *v,
             Some(CvSeed::StringUtf8(text)) => {
                 let str_ref = super::vm_object::create_java_string(shared, text);
+                statics[static_idx] = Value::Object(Some(str_ref));
+            }
+            Some(CvSeed::StringUtf16(units)) => {
+                let str_ref =
+                    super::vm_object::create_java_string_from_units(shared, units);
                 statics[static_idx] = Value::Object(Some(str_ref));
             }
             None => {}

@@ -12363,8 +12363,16 @@ fn register_uuid_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "toString", "()Ljava/lang/String;", native_uuid_to_string);
     registry.register(c, "getMostSignificantBits", "()J", native_uuid_get_msb);
     registry.register(c, "getLeastSignificantBits", "()J", native_uuid_get_lsb);
-    registry.register(c, "equals", "(Ljava/lang/Object;)Z", native_uuid_equals);
-    registry.register(c, "hashCode", "()I", native_uuid_hash_code);
+    // NOTE: `equals`/`hashCode` are deliberately NOT shadowed. A Rust-native
+    // `equals` override on a non-String class is mis-dispatched when invoked via
+    // `invokevirtual Object.equals` from inside JDK bytecode such as
+    // `ArrayList.indexOfRange` (it falls back to identity), so
+    // `List<UUID>.contains/indexOf` returned -1 even for value-equal UUIDs —
+    // which broke ANTLR's `ATNDeserializer` (`SUPPORTED_UUIDS.contains(uuid)`)
+    // and hence Groovy's `GroovyLexer` (SB-13). The real `java.util.UUID`
+    // bytecode for `equals`/`hashCode` reads the same `mostSigBits`/`leastSigBits`
+    // slots this layer writes, so letting it run is both correct and collection-safe
+    // (cf. `Long.equals`, also java.base bytecode, which works through `indexOf`).
     registry.register(c, "version", "()I", native_uuid_version);
     registry.set_category(__prev_cat);
 }
@@ -12508,32 +12516,6 @@ fn native_uuid_get_lsb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Long(0))),
     };
     Ok(Some(Value::Long(uuid_get_lsb(ctx, this))))
-}
-
-fn native_uuid_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let other = match args.get(1) {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let eq = uuid_get_msb(ctx, this) == uuid_get_msb(ctx, other)
-        && uuid_get_lsb(ctx, this) == uuid_get_lsb(ctx, other);
-    Ok(Some(Value::Int(if eq { 1 } else { 0 })))
-}
-
-fn native_uuid_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let msb = uuid_get_msb(ctx, this);
-    let lsb = uuid_get_lsb(ctx, this);
-    let hilo = msb ^ lsb;
-    let hash = ((hilo >> 32) ^ hilo) as i32;
-    Ok(Some(Value::Int(hash)))
 }
 
 fn native_uuid_version(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

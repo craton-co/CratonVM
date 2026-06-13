@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2024-2026 Craton Software Company
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Represents an entry in the constant pool of a `.class` file.
@@ -99,11 +100,48 @@ pub enum ConstantPoolEntry {
 #[derive(Debug)]
 pub struct ConstantPool {
     entries: Vec<ConstantPoolEntry>,
+    /// Exact UTF-16 code units for the rare `CONSTANT_Utf8` entries that contain
+    /// **lone surrogates** (U+D800..U+DFFF), which a Rust `str` cannot hold.
+    /// Keyed by 1-based constant-pool index. The matching [`ConstantPoolEntry::Utf8`]
+    /// stores a lossy (U+FFFD-substituted) string so that name/descriptor
+    /// consumers keep working, while string-constant materialisation
+    /// (`ldc` / `ConstantValue`) consults this table via [`get_utf8_wide`] to
+    /// reproduce the precise `java.lang.String` `char[]`. Empty for the
+    /// overwhelming majority of class files (ANTLR-generated lexers/parsers are
+    /// the common case that populates it).
+    ///
+    /// [`get_utf8_wide`]: ConstantPool::get_utf8_wide
+    wide_utf8: HashMap<u16, Arc<[u16]>>,
 }
 
 impl ConstantPool {
     pub fn new(entries: Vec<ConstantPoolEntry>) -> Self {
-        Self { entries }
+        Self {
+            entries,
+            wide_utf8: HashMap::new(),
+        }
+    }
+
+    /// Construct a constant pool that carries a side table of exact UTF-16 code
+    /// units for surrogate-bearing `CONSTANT_Utf8` entries. See [`wide_utf8`].
+    ///
+    /// [`wide_utf8`]: ConstantPool::wide_utf8
+    pub fn new_with_wide(
+        entries: Vec<ConstantPoolEntry>,
+        wide_utf8: HashMap<u16, Arc<[u16]>>,
+    ) -> Self {
+        Self { entries, wide_utf8 }
+    }
+
+    /// Exact UTF-16 code units for a `CONSTANT_Utf8` entry that contained lone
+    /// surrogates, or `None` for ordinary entries (whose `Arc<str>` UTF-8 form
+    /// is lossless — use [`get_utf8`]). The returned units include any lone
+    /// surrogates verbatim, so callers materialising a `java.lang.String`
+    /// reproduce the original `char[]` byte-for-byte.
+    ///
+    /// [`get_utf8`]: ConstantPool::get_utf8
+    pub fn get_utf8_wide(&self, index: u16) -> Option<&[u16]> {
+        self.wide_utf8.get(&index).map(|a| a.as_ref())
     }
 
     pub fn len(&self) -> usize {
