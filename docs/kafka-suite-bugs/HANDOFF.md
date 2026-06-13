@@ -38,15 +38,15 @@ hangs, and wrong results.
 |---|-------|-----|--------|
 | [07](bug-07-timeout-scheduledfuture-cancel-ame.md) | `@Timeout` → `Future.cancel` AbstractMethodError (synthetic ScheduledFuture) | Critical | **FIXED** |
 | [09](bug-09-mockito-inline-mockmaker-selfattach.md) | Mockito inline mock-maker self-attach fails (307 fails, 15+ classes) | **Critical/Dominant** | **5 layers fixed** (self-attach works; remaining: retransform/redefine bytes) |
-| [08](bug-08-completablefuture-synthetic-layout-real-subclass.md) | `CompletableFuture` synthetic layout corrupts real `KafkaFuture` (admin/producer/consumer) | High | open |
+| [08](bug-08-completablefuture-synthetic-layout-real-subclass.md) | `CompletableFuture` synthetic layout corrupts real `KafkaFuture` (admin/producer/consumer) | High | **FIXED** (completeExceptionally/isCompletedExceptionally/complete(null)/chaining layout-agnostic; all 5 admin `*ResultTest` pass) |
 | [10](bug-10-metadatasnapshot-noclassdeffound-clinit.md) | `NoClassDefFoundError: MetadataSnapshot` (masked `<clinit>` failure) | High | **FIXED** (harness cp skew → kafka-clients 3.7.2; not a VM bug) |
 | [11](bug-11-metrics-metricvalue-npe.md) | metrics `metricValue on null` (metric lookup returns null) | High | **FIXED** (`TimeUnit.toMillis` overflow → saturate) |
-| [14](bug-14-parameterized-empty-stream-underrun.md) | `@ParameterizedTest` empty arg stream → test under-run (22 vs 129) | High | open |
+| [14](bug-14-parameterized-empty-stream-underrun.md) | `@ParameterizedTest` empty arg stream → test under-run (22 vs 129) — `ArrayList.removeAll` over-removal on a full backing array | High | **FIXED** (`8bb77a77`, two-pass removeAll/retainAll) |
 | [19](bug-19-bufferpool-blocking-hang.md) | `BufferPoolTest` hang (Condition.await lost wakeup) | High | open |
 | [20](bug-20-silent-abnormal-exit-rc127-rc1.md) | silent rc=127/rc=1 abnormal VM exit (no diagnostic) | High | open |
 | [12](bug-12-nodeapiversions-apikey-npe.md) | `apiKey on null` (enum `values()` / generated-enum null hole) | Medium | **FIXED** (`ImplicitLinkedHashCollection.toArray()` null holes) |
-| [13](bug-13-timeoutextension-double-proceed.md) | `TimeoutExtension` double-`proceed` JUnitException (post-bug-07) | Medium | open |
-| [15](bug-15-decompress-zlib-gzip.md) | record GZIP decompress failure (zlib EOF) | Medium | open |
+| [13](bug-13-timeoutextension-double-proceed.md) | `TimeoutExtension` double-`proceed` JUnitException (post-bug-07) | Medium | **FIXED** (by bug-08; FenceProducersHandlerTest 4/4) |
+| [15](bug-15-decompress-zlib-gzip.md) | record GZIP decompress failure — `FilterOutputStream.close()` didn't propagate to wrapped stream | Medium | **FIXED** (`8bb77a77`) |
 | [17](bug-17-assignor-assignment-mismatch.md) | consumer assignor wrong assignment (map/set ordering) | Medium | open |
 | [18](bug-18-fetcher-topicid-zeroed.md) | fetch `Uuid` topicId zeroed / `PartitionData` mismatch | Medium | open |
 | [16](bug-16-unsupportedop-remove-immutable.md) | `UnsupportedOperationException: remove` (wrong collection mutability) | Low | open |
