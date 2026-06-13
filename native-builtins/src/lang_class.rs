@@ -6841,11 +6841,79 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
     Ok(Some(Value::Object(Some(arr))))
 }
 
+/// True if `mirror` is a primitive-type or `void` Class mirror. Mirrors the
+/// robust two-step check in `native_class_is_primitive`: prefer the real-JDK
+/// layout's `primitive:boolean` field (instance slot 7), then fall back to the
+/// name string.
+fn class_mirror_is_primitive(ctx: &mut dyn NativeContext, mirror: ObjectRef) -> bool {
+    if let Value::Int(flag) = ctx.get_field(mirror, 7) {
+        if flag != 0 {
+            return true;
+        }
+    }
+    let name = mirror_class_name(ctx, mirror).unwrap_or_default();
+    matches!(
+        name.as_str(),
+        "int" | "long" | "float" | "double" | "boolean" | "char" | "byte" | "short" | "void"
+    )
+}
+
+/// The PUBLIC/PROTECTED/PRIVATE access bits an array class inherits from its
+/// element type (per JVM_GetClassModifiers). `name` is an array class name in
+/// descriptor form, e.g. `[I`, `[[Ljava/lang/String;`. Primitive element types
+/// are PUBLIC; reference element types contribute their own access bits.
+fn array_element_access_bits(ctx: &mut dyn NativeContext, name: &str) -> i32 {
+    const ACCESS_MASK: u16 = 0x0001 | 0x0002 | 0x0004; // PUBLIC|PRIVATE|PROTECTED
+    let elem = name.trim_start_matches('[');
+    if elem.starts_with('L') && elem.ends_with(';') {
+        // Reference element: L<internal-name>; — look up its access flags.
+        let internal = elem[1..elem.len() - 1].replace('.', "/");
+        if let Some(cid) = ctx.class_id_by_name(&internal) {
+            return (ctx.class_access_flags(cid) & ACCESS_MASK) as i32;
+        }
+        // Unresolved element type: default to PUBLIC (matches the common case
+        // and HotSpot for the public-element arrays that dominate).
+        0x0001
+    } else {
+        // Primitive element (I, Z, J, ...) — primitives are PUBLIC.
+        0x0001
+    }
+}
+
 pub(crate) fn native_class_get_modifiers(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Int(0))),
     };
+
+    // Primitive types and `void`: HotSpot's JVM_GetClassModifiers returns
+    // PUBLIC|FINAL|ABSTRACT (0x411). CratonVM's primitive mirrors carry no
+    // class access_flags, so without this they read back as 0 — i.e.
+    // "package-private". That breaks reflective callers that test the access
+    // of a method's primitive *return* or *parameter* types. Concretely,
+    // ByteBuddy's `isPackagePrivate()` element-matcher, which Mockito uses in
+    // `ignoreAlso(returns(isPackagePrivate()).or(hasParameters(whereAny(
+    // hasType(isPackagePrivate())))))`, was matching every primitive-signature
+    // method, so Mockito left them unimplemented on the generated mock →
+    // `AbstractMethodError` at first use (kafka suite bug-09).
+    const ACC_PUBLIC: i32 = 0x0001;
+    const ACC_FINAL: i32 = 0x0010;
+    const ACC_ABSTRACT: i32 = 0x0400;
+    if class_mirror_is_primitive(ctx, this) {
+        return Ok(Some(Value::Int(ACC_PUBLIC | ACC_FINAL | ACC_ABSTRACT)));
+    }
+
+    // Array classes: JVM_GetClassModifiers returns FINAL|ABSTRACT plus the
+    // element type's PUBLIC/PROTECTED/PRIVATE bits. (CratonVM previously
+    // returned the bare array flags 0x011 = public|final, missing ABSTRACT and
+    // not deriving access from the element type.)
+    if let Some(name) = mirror_class_name(ctx, this) {
+        if name.starts_with('[') {
+            let elem_access = array_element_access_bits(ctx, &name);
+            return Ok(Some(Value::Int(ACC_FINAL | ACC_ABSTRACT | elem_access)));
+        }
+    }
+
     let class_id = match mirror_class_id(ctx, this) {
         Some(id) => id,
         None => return Ok(Some(Value::Int(0))),

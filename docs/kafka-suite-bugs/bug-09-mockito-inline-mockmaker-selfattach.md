@@ -101,19 +101,70 @@ the next layer:
 With (1)–(7) the inline mock maker **generates and loads the mock subclass**
 (`...codegen/List$MockitoMock$…`).
 
-**Remaining (layer 8+, not yet fixed):** invoking the generated mock fails with
-`AbstractMethodError: MockAccess.setMockitoInterceptor … has no Code attribute`.
-The generated mock class is loaded but its method table is short ~12 methods,
-including `getMockitoInterceptor` (with code) but NOT its pair
-`setMockitoInterceptor` — so dispatch falls back to the abstract `MockAccess`
-interface method. Whether ByteBuddy's emitted class file actually contains
-`setMockitoInterceptor` (→ a CratonVM class-parser drop) or not was not finally
-confirmed (the diagnostic dumps were blocked by repeated `.exe`-link locks).
-Beyond this there are further layers (interceptor wiring, `MockMethodAdvice`
-dispatch, `when`/`thenReturn`/`verify` behaviour). Full Mockito inline mocking is
-a multi-layer capability; (1)–(7) are correct, general VM fixes that stand on
-their own. Repro: `apps/kafka/tests/repro/MockProbe.java`
-(`CRATONVM_DBG_NOCODE=1` shows the mock class + missing method).
+8. **`Class.getModifiers()` returned 0 for primitive types and `void`** (the
+   layer-8 root cause). `int.class.getModifiers()` was `0x000` on CratonVM vs
+   `0x411` (`PUBLIC|FINAL|ABSTRACT`) on HotSpot — all 9 primitives + `void`.
+   That made every primitive type read as *package-private*. Mockito's
+   `SubclassBytecodeGenerator.mockClass` ends its builder chain with
+   `ignoreAlso(isPackagePrivate().or(returns(isPackagePrivate())).or(
+   hasParameters(whereAny(hasType(isPackagePrivate())))))` — so ByteBuddy
+   *ignored* (left unimplemented) every method whose return type or any
+   parameter type was a primitive. The generated mock therefore had only its
+   all-reference-signature methods (`toString`, `iterator`, `toArray`,
+   `getMockitoInterceptor`, …) and was missing `size()→int`, `isEmpty()→boolean`,
+   `hashCode()→int`, `equals(Object)→boolean`, `get(int)`, `clear()→void`,
+   `setMockitoInterceptor(…)→void`, etc. Invoking any of them hit the inherited
+   abstract method → `AbstractMethodError: … has no Code attribute`. Fixed
+   `native_class_get_modifiers` (`native-builtins/src/lang_class.rs`) to return
+   `PUBLIC|FINAL|ABSTRACT` for primitive/`void` mirrors and
+   `FINAL|ABSTRACT|<element-access>` for array classes (arrays were also wrong:
+   `int[]` was `0x011`, missing `ABSTRACT`).
+
+   **How it was isolated (the method-by-method bisection):** the CratonVM mock
+   dumped 11 methods vs HotSpot's 32 (`-Dnet.bytebuddy.dump=DIR`). The drop was
+   NOT in ByteBuddy's `MethodGraph` (probe: 40 nodes both VMs), NOT in plain
+   subclass writing (`StubMethod` → 43 both), NOT in `MethodDelegation` binding
+   (`@RuntimeType` → 43 both), and NOT in the individual `ElementMatchers`
+   (`isHashCode`/`isEquals`/`returns(int.class)`/`takesArgument` all identical).
+   The discriminator was purely "primitive anywhere in the signature", which
+   pointed at a *type-level* predicate; decompiling Mockito's builder revealed
+   the `isPackagePrivate()` `ignoreAlso`, and `int.class.getModifiers()` was the
+   bug. Probes: `apps/kafka/tests/repro/{GraphProbe,SubProbe,DelProbe,
+   MatchProbe,ModProbe}.java`.
+
+With (1)–(8) `Mockito.mock(List.class)` is created and **stubbing**
+(`when(...).thenReturn(...)`) works. Two more fixes were needed for
+`verify(...)` / interaction-recording:
+
+9. **`new LinkedList<>(Collection)` dropped all elements.** No
+   `<init>(Ljava/util/Collection;)V` native was registered, so the copy
+   constructor ran real JDK bytecode (`this(); addAll(c)`) which links nodes
+   into the real `first`/`last`/`size` fields while CratonVM's overridden
+   `size()`/`iterator()` read the native overlay → the copy looked empty. Added
+   `native_ll_init_from_collection` (seeds the overlay, then `ll_link_last`s the
+   source's elements). (`native-collections/src/lib.rs`.)
+10. **`LinkedList.stream()` / `spliterator()` were empty on the overlay.** The
+    `Collection.stream()` default routes through the real `LinkedList.
+    spliterator()`, which reads the JDK `first`/`size` fields the overlay never
+    populates → an empty stream for a non-empty list. Added `native_ll_stream`
+    and `native_ll_spliterator` (array-backed, over the overlay snapshot).
+    (`native-collections/src/lib.rs`.)
+
+Fixes (9)+(10) were the last link in `verify(...)`: Mockito's
+`DefaultRegisteredInvocations.getAll()` does
+`new LinkedList<>(invocations)` then `copy.stream().filter(...)
+.collect(toList())`. With the broken copy/stream the recorded invocations
+vanished and every `verify(...)` failed with "zero interactions" even though the
+mock's `handle()`/`Answer` fired. Isolated by reflecting into the live
+`InvocationContainerImpl` (raw list size 3, `getAll()` 0) then bisecting the
+copy → stream → filter path. Probes: `apps/kafka/tests/repro/{LLProbe,
+StreamProbe,ItrRemProbe,ContProbe3,IgnProbe}.java`.
+
+**STATUS: bug-09 COMPLETE.** Full inline mocking works: creation, stubbing,
+`verify`/`times`, interface mocks with primitive-typed methods. Verified
+`MockFull.java` prints `ALL MOCK BEHAVIOR OK` and the previously-failing
+`FutureRecordMetadataTest` passes 2/2 (== HotSpot). Repro:
+`apps/kafka/tests/repro/{MockProbe,MockFull}.java`.
 
 ## Affected classes (partial sweep — append more as the full run completes)
 - clients.MetadataTest, clients.NetworkClientTest

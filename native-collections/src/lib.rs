@@ -12306,6 +12306,12 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     let c = "java/util/LinkedList";
     registry.register(c, "<init>", "()V", native_ll_init);
+    registry.register(
+        c,
+        "<init>",
+        "(Ljava/util/Collection;)V",
+        native_ll_init_from_collection,
+    );
     registry.register(c, "add", "(Ljava/lang/Object;)Z", native_ll_add);
     // Positional insert/removal — required so the overlay LinkedList stays the
     // single source of truth. Without these, real-JDK `add(int,E)` /
@@ -12351,6 +12357,8 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(c, "toString", "()Ljava/lang/String;", native_ll_to_string);
     registry.register(c, "iterator", "()Ljava/util/Iterator;", native_ll_iterator);
+    registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ll_stream);
+    registry.register(c, "spliterator", "()Ljava/util/Spliterator;", native_ll_spliterator);
     // SportMe r54: real-JDK LinkedList$ListItr reads `LinkedList.size` and `first`
     // fields via getfield; our overlay-based LL never writes those, so
     // `List.sort` default-method path crashes with NoSuchElementException
@@ -12640,6 +12648,89 @@ fn native_ll_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResu
     ll_set(ctx, this, "tail", Value::Object(None));
     ll_set(ctx, this, "size", Value::Int(0));
     Ok(None)
+}
+
+/// LinkedList.<init>(Collection) — seed the native overlay, then copy the
+/// source's elements into it. Without this native, `new LinkedList<>(c)` ran
+/// the real JDK bytecode (`this(); addAll(c)`) which links nodes into the real
+/// `first`/`last`/`size` fields, while our overridden `size()`/`iterator()`
+/// read the native overlay → the copy looked empty. This broke, among others,
+/// Mockito's `DefaultRegisteredInvocations.getAll()` (`new LinkedList<>(
+/// invocations)`), so `verify(...)`/`getInvocations()` saw zero interactions.
+fn native_ll_init_from_collection(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(None),
+    };
+    // Seed an empty overlay first (identity-hash header + head/tail/size).
+    ih_seed(ctx, this);
+    ll_set(ctx, this, "head", Value::Object(None));
+    ll_set(ctx, this, "tail", Value::Object(None));
+    ll_set(ctx, this, "size", Value::Int(0));
+
+    let source = match args.get(1) {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None), // null/empty collection — overlay stays empty
+    };
+    let elems = collect_collection_elements_or_real(ctx, source);
+    for val in elems {
+        ll_link_last(ctx, this, val);
+    }
+    Ok(None)
+}
+
+/// Snapshot the LinkedList overlay into a `Vec<Value>` (head → tail order).
+fn ll_overlay_elements(ctx: &mut dyn NativeContext, this: ObjectRef) -> Vec<Value> {
+    let arr = ll_snapshot_array(ctx, this);
+    let len = ctx.array_length(arr);
+    (0..len).map(|i| ctx.get_array_element(arr, i)).collect()
+}
+
+/// LinkedList.stream() — build a stream over the native overlay. Without this,
+/// `Collection.stream()`'s default routes through the real `LinkedList`'s own
+/// `spliterator()`, which reads the JDK `first`/`size` fields our overlay never
+/// populates → an empty stream for a non-empty list. (This was the last link in
+/// the Mockito chain: `DefaultRegisteredInvocations.getAll()` does
+/// `copy.stream().filter(...).collect(toList())`, so every recorded invocation
+/// vanished and `verify(...)` reported "zero interactions".)
+fn native_ll_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = ll_overlay_elements(ctx, this);
+    make_stream(ctx, &elements)
+}
+
+/// LinkedList.spliterator() — a synthetic array-backed Spliterator over the
+/// overlay (same shape as `native_stream_spliterator`), so direct
+/// `spliterator()` / `StreamSupport.stream(spliterator(), …)` callers also see
+/// the real elements.
+fn native_ll_spliterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let arr = alloc_ref_array(ctx, 0);
+            let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+            ctx.set_field(spl, 0, Value::Object(Some(arr)));
+            ctx.set_field(spl, 1, Value::Int(0));
+            ctx.set_field(spl, 2, Value::Int(0));
+            return Ok(Some(Value::Object(Some(spl))));
+        }
+    };
+    let elements = ll_overlay_elements(ctx, this);
+    let arr = alloc_ref_array(ctx, elements.len());
+    for (i, v) in elements.iter().enumerate() {
+        ctx.set_array_element(arr, i, *v);
+    }
+    let spl = alloc_synthetic(ctx, "java/util/Spliterator", 3);
+    ctx.set_field(spl, 0, Value::Object(Some(arr)));
+    ctx.set_field(spl, 1, Value::Int(0));
+    ctx.set_field(spl, 2, Value::Int(elements.len() as i32));
+    Ok(Some(Value::Object(Some(spl))))
 }
 
 fn ll_link_last(ctx: &mut dyn NativeContext, this: ObjectRef, element: Value) {
