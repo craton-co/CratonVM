@@ -8764,6 +8764,34 @@ pub(crate) fn register_phase53_crypto(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         cipher_do_final(ctx, this)
     });
+
+    // --- javax.crypto.SecretKeyFactory — PBKDF2 (real key derivation) ---
+    // The real JCA path throws "PBKDF2With… SecretKeyFactory not available"
+    // (no provider service) and the real PBKDF2KeyImpl trips a ByteBuffer bug.
+    // We compute PBKDF2 natively. getInstance handles ONLY PBKDF2* algorithms;
+    // any other algorithm gets the same NoSuchAlgorithmException the real path
+    // would have thrown, so this is no regression for non-PBKDF2 callers.
+    {
+        let skf = "javax/crypto/SecretKeyFactory";
+        r.register(
+            skf,
+            "getInstance",
+            "(Ljava/lang/String;)Ljavax/crypto/SecretKeyFactory;",
+            pbkdf2_get_instance,
+        );
+        r.register(
+            skf,
+            "getInstance",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/SecretKeyFactory;",
+            pbkdf2_get_instance,
+        );
+        r.register(
+            skf,
+            "generateSecret",
+            "(Ljava/security/spec/KeySpec;)Ljavax/crypto/SecretKey;",
+            pbkdf2_generate_secret,
+        );
+    }
     // getAlgorithm() -> String
     r.register(
         cipher,
@@ -9377,6 +9405,328 @@ fn cipher_append_aad(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8])
     ctx.set_field(this, CIPHER_AAD, Value::Object(Some(new_arr)));
 }
 
+/// Allocate a Java `byte[]` holding `bytes`.
+pub(crate) fn make_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+    for (i, &b) in bytes.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+    }
+    arr
+}
+
+/// Drive a real SunJCE `CipherSpi` (`com.sun.crypto.provider.*Cipher`) for a
+/// block-cipher transformation CratonVM's synthetic dispatch doesn't implement
+/// natively — chiefly the CBC modes (`AES/CBC`, `DESede/CBC`, `DES/CBC`) used
+/// by `PEMFile` to decrypt encrypted private keys. The synthetic path only
+/// covers AES-GCM/ECB and has no DES at all; rather than reimplement DES + CBC
+/// chaining we instantiate the genuine JDK SPI and drive
+/// `engineSetMode`/`engineSetPadding`/`engineInit`/`engineDoFinal`, which
+/// produce byte-identical output to HotSpot (verified). This is a real crypto
+/// computation, not a synthetic stub. Mirrors the SunRsaSign/SunEC SPI routing
+/// in `jca/key_factory.rs`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn drive_real_cipher(
+    ctx: &mut dyn NativeContext,
+    cipher_class: &'static str,
+    mode_str: &str,
+    pad_str: &str,
+    opmode: i32,
+    key_bytes: &[u8],
+    key_algo: &str,
+    iv_bytes: &[u8],
+    data: &[u8],
+) -> MethodCallResult {
+    // Construct the real CipherSpi. Pin it across every subsequent
+    // allocation (create_string / new array / new SecretKeySpec) so a moving
+    // GC can't leave the receiver stale.
+    let spi = match ctx.new_object_initialized(cipher_class, "()V", &[])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::NotImplemented {
+                feature: cipher_class.into(),
+            }
+            .into())
+        }
+    };
+    let pin = ctx.pin_native_root(spi);
+    let result = (|| -> MethodCallResult {
+        let mode_s = ctx.create_string(mode_str);
+        let spi_r = ctx.read_native_pin(pin, spi);
+        ctx.invoke_virtual(
+            spi_r,
+            "engineSetMode",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(mode_s))],
+        )?;
+        let pad_s = ctx.create_string(pad_str);
+        let spi_r = ctx.read_native_pin(pin, spi);
+        ctx.invoke_virtual(
+            spi_r,
+            "engineSetPadding",
+            "(Ljava/lang/String;)V",
+            &[Value::Object(Some(pad_s))],
+        )?;
+
+        // SecretKeySpec(key, algorithm)
+        let key_arr = make_byte_array(ctx, key_bytes);
+        let kpin = ctx.pin_native_root(key_arr);
+        let algo_s = ctx.create_string(key_algo);
+        let key_arr_r = ctx.read_native_pin(kpin, key_arr);
+        let secret_key = match ctx.new_object_initialized(
+            "javax/crypto/spec/SecretKeySpec",
+            "([BLjava/lang/String;)V",
+            &[Value::Object(Some(key_arr_r)), Value::Object(Some(algo_s))],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "SecretKeySpec construction failed".into(),
+                }
+                .into())
+            }
+        };
+        let skpin = ctx.pin_native_root(secret_key);
+
+        // IvParameterSpec(iv)
+        let iv_arr = make_byte_array(ctx, iv_bytes);
+        let ivapin = ctx.pin_native_root(iv_arr);
+        let iv_arr_r = ctx.read_native_pin(ivapin, iv_arr);
+        let iv_spec = match ctx.new_object_initialized(
+            "javax/crypto/spec/IvParameterSpec",
+            "([B)V",
+            &[Value::Object(Some(iv_arr_r))],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: "IvParameterSpec construction failed".into(),
+                }
+                .into())
+            }
+        };
+        let ivpin = ctx.pin_native_root(iv_spec);
+
+        // engineInit(opmode, key, params, null)
+        let spi_r = ctx.read_native_pin(pin, spi);
+        let sk_r = ctx.read_native_pin(skpin, secret_key);
+        let iv_r = ctx.read_native_pin(ivpin, iv_spec);
+        ctx.invoke_virtual(
+            spi_r,
+            "engineInit",
+            "(ILjava/security/Key;Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+            &[
+                Value::Int(opmode),
+                Value::Object(Some(sk_r)),
+                Value::Object(Some(iv_r)),
+                Value::Object(None),
+            ],
+        )?;
+
+        // engineDoFinal(data, 0, len) -> byte[]
+        let data_arr = make_byte_array(ctx, data);
+        let dlen = data.len() as i32;
+        let dpin = ctx.pin_native_root(data_arr);
+        let spi_r = ctx.read_native_pin(pin, spi);
+        let data_arr_r = ctx.read_native_pin(dpin, data_arr);
+        let out = ctx.invoke_virtual(
+            spi_r,
+            "engineDoFinal",
+            "([BII)[B",
+            &[
+                Value::Object(Some(data_arr_r)),
+                Value::Int(0),
+                Value::Int(dlen),
+            ],
+        )?;
+        Ok(out)
+    })();
+    ctx.unpin_native_roots(pin);
+    result
+}
+
+// ---------------------------------------------------------------------------
+// PBKDF2 (PKCS#5 v2.0) — real key derivation for `SecretKeyFactory`.
+//
+// `SecretKeyFactory.getInstance("PBKDF2WithHmacSHA1"/"...SHA256")` runs real
+// JCA bytecode that throws `NoSuchAlgorithmException` (no SunJCE provider
+// service in CratonVM's provider list), and the real `PBKDF2KeyImpl` path
+// trips a `ByteBuffer.get(byte[])` bug in `PBEUtil.encodePassword`. PEMFile
+// needs this to decrypt PKCS#8 (PBES2) encrypted private keys. We compute
+// PBKDF2 directly with HMAC over the `sha1`/`sha2` crates — a real,
+// RFC-2898-correct derivation, not a synthetic stub (verified byte-identical
+// to HotSpot). Only the 64-byte-block PRFs PEMFile uses are wired.
+// ---------------------------------------------------------------------------
+
+/// HMAC over a 64-byte-block hash (`SHA-1` / `SHA-224` / `SHA-256`).
+fn hmac_block64<D: sha2::Digest + Clone>(key: &[u8], msg: &[u8]) -> Vec<u8> {
+    const BLOCK: usize = 64;
+    let mut k = if key.len() > BLOCK {
+        let mut h = D::new();
+        h.update(key);
+        h.finalize().to_vec()
+    } else {
+        key.to_vec()
+    };
+    k.resize(BLOCK, 0);
+    let mut ipad = [0u8; BLOCK];
+    let mut opad = [0u8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] = k[i] ^ 0x36;
+        opad[i] = k[i] ^ 0x5c;
+    }
+    let mut hi = D::new();
+    hi.update(ipad);
+    hi.update(msg);
+    let inner = hi.finalize();
+    let mut ho = D::new();
+    ho.update(opad);
+    ho.update(inner);
+    ho.finalize().to_vec()
+}
+
+/// PBKDF2 (PKCS#5 v2.0) over a 64-byte-block PRF.
+fn pbkdf2_derive<D: sha2::Digest + Clone>(
+    pw: &[u8],
+    salt: &[u8],
+    iters: u32,
+    dklen: usize,
+) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(dklen);
+    let mut block_index: u32 = 1;
+    while out.len() < dklen {
+        let mut salt_i = salt.to_vec();
+        salt_i.extend_from_slice(&block_index.to_be_bytes());
+        let mut u = hmac_block64::<D>(pw, &salt_i);
+        let mut t = u.clone();
+        for _ in 1..iters.max(1) {
+            u = hmac_block64::<D>(pw, &u);
+            for (a, b) in t.iter_mut().zip(u.iter()) {
+                *a ^= *b;
+            }
+        }
+        out.extend_from_slice(&t);
+        block_index += 1;
+    }
+    out.truncate(dklen);
+    out
+}
+
+/// Map a `PBKDF2WithHmac*` algorithm name to a PRF code (the SHA bit length).
+/// Only 64-byte-block PRFs are supported (the ones PEMFile uses).
+pub(crate) fn pbkdf2_prf_code(alg: &str) -> Option<i32> {
+    match alg {
+        "PBKDF2WithHmacSHA1" => Some(1),
+        "PBKDF2WithHmacSHA224" => Some(224),
+        "PBKDF2WithHmacSHA256" => Some(256),
+        _ => None,
+    }
+}
+
+/// Identity-hash-keyed PRF table for PBKDF2 `SecretKeyFactory` synthetics.
+/// A heap field can't hold the PRF code reliably — `SecretKeyFactory`'s real
+/// slot 0 is an `Object` (`spi`), so an `Int` written there reads back wrong
+/// and every algorithm collapsed to the SHA-256 default. Keying by
+/// `identity_hash_code` (stable across GC) is the same pattern the Cipher
+/// dispatch uses for its state.
+fn pbkdf2_prf_table() -> &'static std::sync::Mutex<std::collections::HashMap<i32, i32>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, i32>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `SecretKeyFactory.getInstance(algorithm[, provider])` for PBKDF2.
+/// Recognises only `PBKDF2WithHmacSHA1/224/256`; any other algorithm throws
+/// the same `NoSuchAlgorithmException` (mapped to `SecurityException`) the real
+/// JCA path would have thrown.
+pub(crate) fn pbkdf2_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    // Static method: args[0] is the algorithm String (no `this`).
+    let alg = match args.first() {
+        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+        _ => String::new(),
+    };
+    match pbkdf2_prf_code(&alg) {
+        Some(code) => {
+            let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/SecretKeyFactory", 1);
+            let key = ctx.identity_hash_code(obj);
+            pbkdf2_prf_table().lock().unwrap().insert(key, code);
+            Ok(Some(Value::Object(Some(obj))))
+        }
+        None => Err(RuntimeError::SecurityException {
+            message: format!("{alg} SecretKeyFactory not available"),
+        }
+        .into()),
+    }
+}
+
+/// `SecretKeyFactory.generateSecret(PBEKeySpec)` for a PBKDF2 synthetic.
+/// Reads the spec's password/salt/iterations/keyLength, runs PBKDF2, and
+/// returns a real `SecretKeySpec(derivedBytes, "PBKDF2With…")` whose
+/// `getEncoded()` yields the derived key (what `PEMFile` reads).
+pub(crate) fn pbkdf2_generate_secret(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let key = ctx.identity_hash_code(this);
+    let prf = pbkdf2_prf_table()
+        .lock()
+        .unwrap()
+        .get(&key)
+        .copied()
+        .unwrap_or(256);
+    let spec = obj_arg(args, 1)?;
+    // PBEKeySpec layout: 0=password(char[]), 1=salt(byte[]), 2=iterationCount,
+    // 3=keyLength (bits).
+    let pw_bytes: Vec<u8> = match ctx.get_field(spec, 0) {
+        Value::Object(Some(chars)) => {
+            let n = ctx.array_length(chars);
+            let mut s = String::with_capacity(n);
+            for i in 0..n {
+                if let Value::Int(c) = ctx.get_array_element(chars, i) {
+                    if let Some(ch) = char::from_u32((c as u32) & 0xffff) {
+                        s.push(ch);
+                    }
+                }
+            }
+            s.into_bytes() // UTF-8, matching modern SunJCE PBEUtil.encodePassword
+        }
+        _ => Vec::new(),
+    };
+    let salt: Vec<u8> = match ctx.get_field(spec, 1) {
+        Value::Object(Some(arr)) => cipher_read_bytes(ctx, arr),
+        _ => Vec::new(),
+    };
+    let iters = match ctx.get_field(spec, 2) {
+        Value::Int(i) => i as u32,
+        _ => 0,
+    };
+    let key_bits = match ctx.get_field(spec, 3) {
+        Value::Int(i) => i,
+        _ => 0,
+    };
+    if iters == 0 || key_bits <= 0 {
+        return Err(RuntimeError::IllegalArgumentException {
+            message: "PBKDF2: iterationCount and keyLength must be positive".into(),
+        }
+        .into());
+    }
+    let dklen = (key_bits as usize) / 8;
+    let dk = match prf {
+        1 => pbkdf2_derive::<sha1::Sha1>(&pw_bytes, &salt, iters, dklen),
+        224 => pbkdf2_derive::<sha2::Sha224>(&pw_bytes, &salt, iters, dklen),
+        _ => pbkdf2_derive::<sha2::Sha256>(&pw_bytes, &salt, iters, dklen),
+    };
+    // Build a real SecretKeySpec(dk, "PBKDF2With…") so getEncoded() returns dk.
+    let key_arr = make_byte_array(ctx, &dk);
+    let kpin = ctx.pin_native_root(key_arr);
+    let algo_s = ctx.create_string("PBKDF2");
+    let key_arr_r = ctx.read_native_pin(kpin, key_arr);
+    let sk = ctx.new_object_initialized(
+        "javax/crypto/spec/SecretKeySpec",
+        "([BLjava/lang/String;)V",
+        &[Value::Object(Some(key_arr_r)), Value::Object(Some(algo_s))],
+    );
+    ctx.unpin_native_roots(kpin);
+    sk
+}
+
 /// Execute doFinal: encrypt or decrypt accumulated data using the configured algorithm
 fn cipher_do_final(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
     let mode = ctx.get_field(this, CIPHER_MODE).as_int().unwrap_or(0);
@@ -9430,6 +9780,38 @@ fn cipher_do_final(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallRe
         }
         .into());
     }
+
+    // Route block-cipher CBC transformations the synthetic dispatch can't do
+    // natively (CBC chaining; DES/DESede have no native impl at all) to the
+    // real SunJCE CipherSpi. Exercised by `PEMFile` decrypting encrypted
+    // private keys (AES/CBC, DESede/CBC, DES/CBC). Done BEFORE the AES-only
+    // key-length check below so 8-byte DES keys aren't rejected.
+    {
+        let (cn, cm, _pad) = parse_cipher_algo(&algo_str);
+        let route = match (cn.to_ascii_uppercase().as_str(), cm.to_ascii_uppercase().as_str()) {
+            ("AES", "CBC") => Some(("com/sun/crypto/provider/AESCipher$General", "AES")),
+            ("DESEDE", _) | ("TRIPLEDES", _) => {
+                Some(("com/sun/crypto/provider/DESedeCipher", "DESede"))
+            }
+            ("DES", _) => Some(("com/sun/crypto/provider/DESCipher", "DES")),
+            _ => None,
+        };
+        if let Some((spi_class, key_algo)) = route {
+            let pad_str = if algo_str.split('/').nth(2).map(|p| p.eq_ignore_ascii_case("NoPadding")).unwrap_or(false) {
+                "NoPadding"
+            } else {
+                "PKCS5Padding"
+            };
+            // NOTE: do not allocate (e.g. to reset accumulators) after this
+            // returns — `out` holds a freshly-allocated byte[] a moving GC
+            // could relocate. PEMFile uses one-shot decrypt, so no reset is
+            // needed.
+            return drive_real_cipher(
+                ctx, spi_class, "CBC", pad_str, mode, &key_bytes, key_algo, &iv_bytes, &data,
+            );
+        }
+    }
+
     match key_bytes.len() {
         16 | 24 | 32 => {} // AES-128, AES-192, AES-256
         _ => {
