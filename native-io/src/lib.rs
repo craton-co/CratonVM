@@ -6118,7 +6118,7 @@ fn register_string_rw_natives(registry: &mut NativeMethodRegistry) {
         sw,
         "getBuffer",
         "()Ljava/lang/StringBuffer;",
-        native_sw_to_string,
+        native_sw_get_buffer,
     );
     registry.register(sw, "flush", "()V", native_noop_void);
     registry.register(sw, "close", "()V", native_noop_void);
@@ -6544,6 +6544,35 @@ fn native_sw_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let s = String::from_utf16_lossy(&chars);
     let result = ctx.create_string(&s);
     Ok(Some(Value::Object(Some(result))))
+}
+
+/// `StringWriter.getBuffer()` — must return a `java.lang.StringBuffer`, NOT a
+/// String. It was previously aliased to `native_sw_to_string` (returns a
+/// String), so callers like Derby's `ErrorStringBuilder.reset()`
+/// (`stringWriter.getBuffer().setLength(0)`) dispatched `setLength` on a String
+/// → `NoSuchMethodError: java/lang/String.setLength(I)V` (4 DataSource test
+/// classes). Build a real `StringBuffer` from the current content.
+fn native_sw_get_buffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let count = sw_count(ctx, this);
+    let mut chars = Vec::with_capacity(count);
+    if let Value::Object(Some(buf)) = ctx.get_field(this, SW_FIELD_BUF) {
+        for i in 0..count {
+            if let Value::Int(ch) = ctx.get_array_element(buf, i) {
+                chars.push(ch as u16);
+            }
+        }
+    }
+    let s = String::from_utf16_lossy(&chars);
+    let str_obj = ctx.create_string(&s);
+    ctx.new_object_initialized(
+        "java/lang/StringBuffer",
+        "(Ljava/lang/String;)V",
+        &[Value::Object(Some(str_obj))],
+    )
 }
 
 fn native_sw_append_char(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

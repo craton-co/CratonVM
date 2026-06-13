@@ -295,6 +295,13 @@ pub fn update_all_roots(
     //     stale-ClassLoader → `String.loadClass` cryptoProvider failure).
     cratonvm_native_builtins::classloader::gc_update_loader_singleton_refs(pointer_map);
 
+    // 18b. Process-global Locale caches (companion to roots.rs step 18b).
+    //      Repoint the cached default Locale + synthetic Locale side-table keys
+    //      to their relocated addresses so `Locale.getDefault()` keeps returning
+    //      the live object after a moving GC (fixes the intermittent stale
+    //      Locale → SIGSEGV).
+    cratonvm_native_builtins::gc_update_locale_refs(pointer_map);
+
     // 19. JBoss MSC container-held service objects (the `Service` instance,
     //     synthetic `ServiceController` mirror, child `ServiceTarget`, in-flight
     //     `StartContext`) cached in a process-global side-table in
