@@ -2114,10 +2114,27 @@ fn cl_get_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 /// Public re-export of the `getResources` native for `register_essential_natives`
 /// so the override is available in real-JDK mode regardless of feature flag.
 pub fn cl_get_resources_essential(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    cl_get_resources(ctx, args)
+    // `getResources` MAY delegate a non-builtin loader to its `findResources`.
+    cl_get_resources_impl(ctx, args, true)
 }
 
 fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    cl_get_resources_impl(ctx, args, true)
+}
+
+/// `allow_delegate` = whether a non-builtin `ClassLoader` receiver may be
+/// dispatched to its `findResources(String)` override. It MUST be `false` when we
+/// are already serving `findResources` (see `ucl_find_resources`): a loader that
+/// subclasses `URLClassLoader` *without* overriding `findResources` (e.g.
+/// `groovy.lang.GroovyClassLoader`) inherits the intercepted
+/// `URLClassLoader.findResources` → `ucl_find_resources` → back here; re-delegating
+/// would call `findResources` again, recursing until the native stack overflows
+/// (the recursion bypasses the `execute()` depth guard). See SB-13.
+fn cl_get_resources_impl(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    allow_delegate: bool,
+) -> MethodCallResult {
     // ClassLoader.getResources(String) → Enumeration<URL>
     // Walks EVERY classpath entry (directories, JARs, JMODs, jimage) and
     // returns a URL per match. This is the B3 fix: URLClassPath.<clinit> in
@@ -2170,22 +2187,24 @@ fn cl_get_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     //
     // `is_classloader_instance` gates out the STATIC getSystemResources form
     // (args[0] is the name String there, not a receiver).
-    if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
-        if is_classloader_instance(ctx, this_ref) {
-            let class_id = ctx.class_id_of_object(this_ref);
-            if let Some(class_name) = ctx.class_name_of_id(class_id) {
-                if !is_builtin_loader_class(&class_name) {
-                    // Pin the receiver across the allocating create_string.
-                    let pin = ctx.pin_native_root(this_ref);
-                    let name_arg = Value::Object(Some(ctx.create_string(&name)));
-                    let this_ref = ctx.read_native_pin(pin, this_ref);
-                    ctx.unpin_native_roots(pin);
-                    return ctx.invoke_virtual(
-                        this_ref,
-                        "findResources",
-                        "(Ljava/lang/String;)Ljava/util/Enumeration;",
-                        &[name_arg],
-                    );
+    if allow_delegate {
+        if let Some(Value::Object(Some(this_ref))) = args.first().copied() {
+            if is_classloader_instance(ctx, this_ref) {
+                let class_id = ctx.class_id_of_object(this_ref);
+                if let Some(class_name) = ctx.class_name_of_id(class_id) {
+                    if !is_builtin_loader_class(&class_name) {
+                        // Pin the receiver across the allocating create_string.
+                        let pin = ctx.pin_native_root(this_ref);
+                        let name_arg = Value::Object(Some(ctx.create_string(&name)));
+                        let this_ref = ctx.read_native_pin(pin, this_ref);
+                        ctx.unpin_native_roots(pin);
+                        return ctx.invoke_virtual(
+                            this_ref,
+                            "findResources",
+                            "(Ljava/lang/String;)Ljava/util/Enumeration;",
+                            &[name_arg],
+                        );
+                    }
                 }
             }
         }
@@ -2720,8 +2739,10 @@ pub(crate) fn ucl_find_resource(ctx: &mut dyn NativeContext, args: &[Value]) -> 
 }
 
 pub(crate) fn ucl_find_resources(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    // Delegate to cl_get_resources logic
-    cl_get_resources(ctx, args)
+    // `findResources` is the terminal flat-classpath scan — it must NOT re-delegate
+    // to `findResources` (which would recurse forever for a URLClassLoader subclass
+    // that doesn't override it, e.g. GroovyClassLoader). See SB-13.
+    cl_get_resources_impl(ctx, args, false)
 }
 
 fn ucl_get_urls(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

@@ -27448,7 +27448,18 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljavax/crypto/Mac;",
         |ctx, args| {
             let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
-            ctx.set_field(obj, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            // bug-26 residual: the algorithm String is the first reference arg.
+            // Static-native dispatch passes NO receiver placeholder (args[0] is the
+            // algorithm — cf. md_get_instance), so reading args.get(1) stored null in
+            // slot 0; getAlgorithm() then returned null and `new SecretKeySpec(key,
+            // null)` in ScramFormatter.hi() threw "null object argument". Pick the
+            // first non-null reference so both call conventions store the real algo.
+            let algo_val = args
+                .iter()
+                .find(|v| matches!(v, Value::Object(Some(_))))
+                .copied()
+                .unwrap_or(Value::Object(None));
+            ctx.set_field(obj, 0, algo_val);
             ctx.set_field(obj, 1, Value::Object(None));
             ctx.set_field(obj, 2, Value::Int(0));
             let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
@@ -27462,7 +27473,18 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;",
         |ctx, args| {
             let obj = alloc_concurrent_synthetic(ctx, "javax/crypto/Mac", 4);
-            ctx.set_field(obj, 0, args.get(1).copied().unwrap_or(Value::Object(None)));
+            // bug-26 residual: the algorithm String is the first reference arg.
+            // Static-native dispatch passes NO receiver placeholder (args[0] is the
+            // algorithm — cf. md_get_instance), so reading args.get(1) stored null in
+            // slot 0; getAlgorithm() then returned null and `new SecretKeySpec(key,
+            // null)` in ScramFormatter.hi() threw "null object argument". Pick the
+            // first non-null reference so both call conventions store the real algo.
+            let algo_val = args
+                .iter()
+                .find(|v| matches!(v, Value::Object(Some(_))))
+                .copied()
+                .unwrap_or(Value::Object(None));
+            ctx.set_field(obj, 0, algo_val);
             ctx.set_field(obj, 1, Value::Object(None));
             ctx.set_field(obj, 2, Value::Int(0));
             let data = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
@@ -27518,7 +27540,14 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
             Value::Int(v) => v,
             _ => 0,
         };
-        if init == 0 {
+        // bug-26 residual L2: ScramFormatter.hi() reuses one Mac across an
+        // init-once / doFinal-many loop. The synthetic init flag (slot 2, an int
+        // stored in a real javax.crypto.Mac object) can be clobbered between
+        // doFinals (real-field aliasing/GC), spuriously raising "MAC not
+        // initialized" mid-loop. Treat a Mac that still holds its key (slot 1) as
+        // initialized — init() set the key and JDK doFinal keeps the Mac usable.
+        let has_key = matches!(ctx.get_field(this, 1), Value::Object(Some(_)));
+        if init == 0 && !has_key {
             return Err(RuntimeError::IllegalStateException {
                 message: "MAC not initialized".into(),
             }
@@ -27557,7 +27586,14 @@ pub(crate) fn register_p68_crypto_mac(r: &mut NativeMethodRegistry) {
             Value::Int(v) => v,
             _ => 0,
         };
-        if init == 0 {
+        // bug-26 residual L2: ScramFormatter.hi() reuses one Mac across an
+        // init-once / doFinal-many loop. The synthetic init flag (slot 2, an int
+        // stored in a real javax.crypto.Mac object) can be clobbered between
+        // doFinals (real-field aliasing/GC), spuriously raising "MAC not
+        // initialized" mid-loop. Treat a Mac that still holds its key (slot 1) as
+        // initialized — init() set the key and JDK doFinal keeps the Mac usable.
+        let has_key = matches!(ctx.get_field(this, 1), Value::Object(Some(_)));
+        if init == 0 && !has_key {
             return Err(RuntimeError::IllegalStateException {
                 message: "MAC not initialized".into(),
             }

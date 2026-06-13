@@ -2667,13 +2667,16 @@ impl JitMICSlot {
         entry_ptr: u64,
         needs_context: bool,
     ) {
-        self.cached_class_id
-            .store(class_id, std::sync::atomic::Ordering::Release);
-        *self.cached_class_name.lock() = Some(std::sync::Arc::from(class_name));
+        // BUG-24: publish entry_ptr BEFORE class_id so the inline cache reader
+        // (which checks class_id first, then loads entry_ptr) can never observe
+        // the new class id paired with a stale entry_ptr.
         self.cached_entry_ptr
             .store(entry_ptr, std::sync::atomic::Ordering::Release);
+        *self.cached_class_name.lock() = Some(std::sync::Arc::from(class_name));
         self.cached_needs_context
             .store(needs_context, std::sync::atomic::Ordering::Relaxed);
+        self.cached_class_id
+            .store(class_id, std::sync::atomic::Ordering::Release);
     }
 
     /// Record a cache hit.
@@ -2896,10 +2899,20 @@ impl JitPICSlot {
         // per-hit clones in the dispatch helper) — convert on this rare
         // promotion path.
         let class_name = mic.cached_class_name.lock().as_deref().map(String::from);
-        self.class_ids[0].store(class_id, std::sync::atomic::Ordering::Release);
+        // BUG-24: publish entry_ptr / needs_context / name BEFORE the class_id,
+        // exactly as `write_entry` does. The inline PIC cascade
+        // (`jit/src/x64.rs`) reads `class_ids[i]` first and, on a match, loads
+        // `entry_ptrs[i]` and `CALL`s it — all with plain (acquire-on-x86) MOVs.
+        // The previous order stored `class_ids[0]` first, so a reader that
+        // observed the new class id could still load the slot's *previous*
+        // `entry_ptrs[0]` (a stale/garbage pointer left from an earlier
+        // occupant) and call through it → the Mockito-under-JIT
+        // `EXCEPTION_ACCESS_VIOLATION at 0x0000033E…` (a packed-class-id-looking
+        // value). Storing the entry first closes the window.
         self.entry_ptrs[0].store(entry_ptr, std::sync::atomic::Ordering::Release);
         self.needs_context[0].store(needs_ctx, std::sync::atomic::Ordering::Relaxed);
         *self.class_names[0].lock() = class_name;
+        self.class_ids[0].store(class_id, std::sync::atomic::Ordering::Release);
         // Carry the hit count so adaptive recompilation keeps the
         // cumulative picture.
         self.hits[0].store(
@@ -4515,8 +4528,19 @@ fn try_compile_inner(
 
     compiled._jit_strings = owned_strings;
     compiled._jit_invoke_infos = owned_invoke_infos;
-    compiled._jit_mic_slots = owned_mic_slots;
-    compiled._jit_pic_slots = owned_pic_slots;
+    // BUG-24: `compile(...)` already moved the loop-unroll *cloned* MIC/PIC
+    // slots into `compiled._jit_{mic,pic}_slots` (see the `extend` in
+    // `x64.rs::compile`, whose contract states the caller attaches its owned
+    // slots ADDITIVELY). Assigning here would DROP those cloned boxes while the
+    // unrolled machine code still holds baked pointers into them → use-after-
+    // free: the freed `Box<JitPICSlot>` memory gets reused by the allocator for
+    // Java objects, so the inline PIC cascade later reads class-id-pair garbage
+    // out of `entry_ptrs[i]` and `CALL`s it (the Mockito-under-JIT
+    // `EXCEPTION_ACCESS_VIOLATION at 0x0000033E0000033B`, a packed-class-id
+    // value). Extend, don't overwrite, so both the cloned and owned slots stay
+    // alive for the lifetime of the compiled code.
+    compiled._jit_mic_slots.extend(owned_mic_slots);
+    compiled._jit_pic_slots.extend(owned_pic_slots);
     compiled.inlined_methods = inlined_methods;
 
     if let Ok(want) = std::env::var("CRATONVM_DBG_JIT_CODE") {

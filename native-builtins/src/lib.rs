@@ -1004,6 +1004,53 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // essential path (matching how Cipher/MessageDigest are wired). Fixes the
     // SCRAM Formatter/Messages/CredentialUtils/SaslServer suite (0-pass → pass).
     crate::phases_late::register_p68_crypto_mac(registry);
+    // bug-27 (kafka FileLog/RemoteLog/UnalignedFile record reads): only the
+    // *abstract* `java/nio/channels/FileChannel.truncate` was overridden, so on a
+    // real `sun.nio.ch.FileChannelImpl` (built by the reconcile-with-real path)
+    // `FileRecords.truncateTo(...)` runs the JDK `FileChannelImpl.truncate`
+    // bytecode, whose position bookkeeping issues a *negative* seek →
+    // `IOException: seek0: …before start of file (os error 131)`. Override the
+    // concrete subclass so truncate clamps the new length ≥ 0, truncates via the
+    // fd table, and only moves the file pointer back when it sits past the new end
+    // — never seeking < 0. fd is read from `this.fd` (a real FileDescriptor whose
+    // `fd`/`handle` is the fd-table id, exactly how the read/write paths resolve it).
+    registry.register(
+        "sun/nio/ch/FileChannelImpl",
+        "truncate",
+        "(J)Ljava/nio/channels/FileChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fd_id: Option<u32> = match ctx.get_field_by_name(this, "fd") {
+                Value::Object(Some(fd_obj)) => match ctx.get_field_by_name(fd_obj, "fd") {
+                    Value::Int(v) if v >= 0 => Some(v as u32),
+                    _ => match ctx.get_field_by_name(fd_obj, "handle") {
+                        Value::Long(v) if v >= 0 => Some(v as u32),
+                        _ => None,
+                    },
+                },
+                _ => None,
+            };
+            let new_len = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
+                _ => 0,
+            }
+            .max(0) as u64;
+            if let Some(fd) = fd_id {
+                let cur = ctx
+                    .fd_table()
+                    .rw_seek(fd, std::io::SeekFrom::Current(0))
+                    .unwrap_or(0);
+                ctx.fd_table().rw_set_length(fd, new_len).map_err(|e| {
+                    cratonvm_types::error::RuntimeError::IOException { message: e.to_string() }
+                })?;
+                if cur > new_len {
+                    let _ = ctx.fd_table().rw_seek(fd, std::io::SeekFrom::Start(new_len));
+                }
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
     // `Long.parseLong(String)J` / `Integer.parseInt(String)I` — in real-JDK
     // mode, these fall through to JDK bytecode whose loop multiplies-and-adds
     // digit-by-digit (`result = result * 10 + digit`). Bounds-check arithmetic
@@ -12316,8 +12363,16 @@ fn register_uuid_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "toString", "()Ljava/lang/String;", native_uuid_to_string);
     registry.register(c, "getMostSignificantBits", "()J", native_uuid_get_msb);
     registry.register(c, "getLeastSignificantBits", "()J", native_uuid_get_lsb);
-    registry.register(c, "equals", "(Ljava/lang/Object;)Z", native_uuid_equals);
-    registry.register(c, "hashCode", "()I", native_uuid_hash_code);
+    // NOTE: `equals`/`hashCode` are deliberately NOT shadowed. A Rust-native
+    // `equals` override on a non-String class is mis-dispatched when invoked via
+    // `invokevirtual Object.equals` from inside JDK bytecode such as
+    // `ArrayList.indexOfRange` (it falls back to identity), so
+    // `List<UUID>.contains/indexOf` returned -1 even for value-equal UUIDs —
+    // which broke ANTLR's `ATNDeserializer` (`SUPPORTED_UUIDS.contains(uuid)`)
+    // and hence Groovy's `GroovyLexer` (SB-13). The real `java.util.UUID`
+    // bytecode for `equals`/`hashCode` reads the same `mostSigBits`/`leastSigBits`
+    // slots this layer writes, so letting it run is both correct and collection-safe
+    // (cf. `Long.equals`, also java.base bytecode, which works through `indexOf`).
     registry.register(c, "version", "()I", native_uuid_version);
     registry.set_category(__prev_cat);
 }
@@ -12461,32 +12516,6 @@ fn native_uuid_get_lsb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Long(0))),
     };
     Ok(Some(Value::Long(uuid_get_lsb(ctx, this))))
-}
-
-fn native_uuid_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let other = match args.get(1) {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let eq = uuid_get_msb(ctx, this) == uuid_get_msb(ctx, other)
-        && uuid_get_lsb(ctx, this) == uuid_get_lsb(ctx, other);
-    Ok(Some(Value::Int(if eq { 1 } else { 0 })))
-}
-
-fn native_uuid_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let msb = uuid_get_msb(ctx, this);
-    let lsb = uuid_get_lsb(ctx, this);
-    let hilo = msb ^ lsb;
-    let hash = ((hilo >> 32) ^ hilo) as i32;
-    Ok(Some(Value::Int(hash)))
 }
 
 fn native_uuid_version(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

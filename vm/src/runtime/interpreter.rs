@@ -72,6 +72,7 @@ use crate::threading::jvm_thread::JvmThread;
 use crate::types::{CompactTag, CompactValue, ObjectRef, Value};
 use crate::vm::{
     coerce_value_for_return, coerce_value_for_return_validated, create_java_string,
+    create_java_string_from_units,
     ensure_class_initialized_shared, ensure_system_stdin_object, get_or_create_class_mirror,
     get_static_shared, invoke_on_class_shared, invoke_or_native, invoke_shared, read_java_string,
     set_static_shared, SharedVm,
@@ -9316,6 +9317,9 @@ fn execute_ldc(
         Int(i32),
         Float(f32),
         Str(String),
+        /// String constant whose Utf8 entry contains lone surrogates — carried
+        /// as exact UTF-16 units (a Rust `String` cannot hold them).
+        WideStr(Vec<u16>),
         ClassRef(String),
         Dynamic {
             bsm_index: u16,
@@ -9348,15 +9352,21 @@ fn execute_ldc(
             ConstantPoolEntry::Integer(v) => LdcValue::Int(*v),
             ConstantPoolEntry::Float(v) => LdcValue::Float(*v),
             ConstantPoolEntry::StringReference { string_index } => {
-                let s = class
-                    .constant_pool
-                    .get_utf8(*string_index)
-                    .ok_or_else(|| VmError::Linkage(LinkageError::ClassFormatError {
-                        class_name: class.name.to_string(),
-                        message: format!("ldc: invalid string_index {string_index}"),
-                    }))?
-                    .to_string();
-                LdcValue::Str(s)
+                // Surrogate-bearing constants (e.g. ANTLR `_serializedATN`)
+                // carry exact UTF-16 units in the pool's side table.
+                if let Some(units) = class.constant_pool.get_utf8_wide(*string_index) {
+                    LdcValue::WideStr(units.to_vec())
+                } else {
+                    let s = class
+                        .constant_pool
+                        .get_utf8(*string_index)
+                        .ok_or_else(|| VmError::Linkage(LinkageError::ClassFormatError {
+                            class_name: class.name.to_string(),
+                            message: format!("ldc: invalid string_index {string_index}"),
+                        }))?
+                        .to_string();
+                    LdcValue::Str(s)
+                }
             }
             ConstantPoolEntry::ClassReference { name_index } => {
                 let name = class
@@ -9404,6 +9414,10 @@ fn execute_ldc(
         LdcValue::Float(v) => thread.frames[frame_idx].stack.push(Value::Float(v))?,
         LdcValue::Str(s) => {
             let obj_ref = create_java_string(shared, &s);
+            thread.frames[frame_idx].stack.push(Value::Object(Some(obj_ref)))?;
+        }
+        LdcValue::WideStr(units) => {
+            let obj_ref = create_java_string_from_units(shared, &units);
             thread.frames[frame_idx].stack.push(Value::Object(Some(obj_ref)))?;
         }
         LdcValue::ClassRef(class_name) => {
@@ -15037,6 +15051,19 @@ fn try_jit_upgrade_with_gate(
         shared.profile_store.get_profile(&profile_key)
     };
     let helpers = crate::jit::helpers::build_helpers();
+    // Small-method inlining for the main tier-up compile. Without it, even a
+    // trivial leaf like `static int add(int,int){return a+b;}` compiled to a
+    // CALL per use, so call-heavy JDK-internal code (xalan/xerces DTM walks:
+    // SuballocatedIntVector.elementAt, DTMDefaultBase._exptype, …) paid full
+    // call overhead per node — ~1000x HotSpot, which inlines these to a few
+    // instructions. The resolver only admits tiny, exception-free, call-free
+    // leaves (see `resolve_inline_site` / MAX_INLINE_BYTECODE_SIZE), and the
+    // codegen (`try_emit_inline`) snapshots+rolls back on any unsupported
+    // bytecode, so a bail falls through to the existing direct-call/dispatch
+    // path. Previously wired only into `try_jit_compile_callee_slow`.
+    let inline_resolver = |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<cratonvm_jit::InlineSite> {
+        resolve_inline_site(shared, callee_class, callee_method, callee_desc)
+    };
     let compiled = crate::jit::try_compile(
         cached,
         Some(&resolver),
@@ -15049,7 +15076,7 @@ fn try_jit_upgrade_with_gate(
         Some(&ldc2w_resolver),
         pgo_profile.as_ref(),
         &helpers,
-        None, // no inlining in this compile path
+        Some(&inline_resolver),
         // string_layout_resolver: None until the String call-site intrinsics
         // land — see the matching comment at the early-compile call site.
         None,
@@ -15721,6 +15748,16 @@ fn resolve_inline_site(
             0xb6 | 0xb9 => return None, // invokevirtual, invokeinterface
             0xb7 | 0xb8 => return None, // invokespecial, invokestatic
             0xba => return None, // invokedynamic
+            // Array loads/stores + arraylength need a bounds check (and AIOOBE
+            // path) that the inline codegen (`x64::try_emit_inline_body`) does
+            // NOT emit — it bails on these. Rejecting them HERE keeps the
+            // resolver and codegen consistent: a method that would only bail
+            // mid-inline instead stays on the cheaper direct-call path rather
+            // than being planned, rolled back, and downgraded to the
+            // dispatch-helper fallback. (Array-load inlining is a follow-up.)
+            0x2e..=0x35 => return None, // iaload..saload
+            0x4f..=0x56 => return None, // iastore..sastore
+            0xbe => return None, // arraylength
             0xb4 | 0xb5 => { has_field_ops = true; scan_pc += 3; continue; }
             0xb2 | 0xb3 => { has_static_field_ops = true; scan_pc += 3; continue; }
             0x12 => { has_ldc = true; scan_pc += 2; continue; }

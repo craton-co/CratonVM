@@ -889,6 +889,41 @@ fn seed_sunec_services() {
     }
 }
 
+/// Mirror the real SunJSSE + SUN provider TLS service tables so that the
+/// no-provider `getInstance` search resolves the genuine JDK SPI classes for
+/// the TLS engines Tomcat's JSSE connector needs (`KeyManagerFactory`,
+/// `TrustManagerFactory`, `SSLContext`) plus `KeyStore` (JKS/PKCS12). Without
+/// these, `KeyManagerFactory.getInstance("SunX509")` etc. dead-ended in
+/// "no <type> <algo> implementation in any provider" and every HTTPS test
+/// aborted. The SPI class names are verified against JDK 25; each has the
+/// public no-arg ctor JCA requires, so `build_jca_instance`'s
+/// `new_object_initialized(cls, "()V", &[])` runs real provider bytecode.
+fn seed_sunjsse_services() {
+    const J: &str = "SunJSSE";
+    // KeyManagerFactory
+    put_service(J, "KeyManagerFactory", "SunX509", "sun.security.ssl.KeyManagerFactoryImpl$SunX509");
+    put_service(J, "KeyManagerFactory", "NewSunX509", "sun.security.ssl.KeyManagerFactoryImpl$X509");
+    put_alias(J, "KeyManagerFactory", "PKIX", "NewSunX509");
+    // TrustManagerFactory
+    put_service(J, "TrustManagerFactory", "SunX509", "sun.security.ssl.TrustManagerFactoryImpl$SimpleFactory");
+    put_service(J, "TrustManagerFactory", "PKIX", "sun.security.ssl.TrustManagerFactoryImpl$PKIXFactory");
+    put_alias(J, "TrustManagerFactory", "SunPKIX", "PKIX");
+    put_alias(J, "TrustManagerFactory", "X509", "PKIX");
+    put_alias(J, "TrustManagerFactory", "X.509", "PKIX");
+    // SSLContext
+    put_service(J, "SSLContext", "TLS", "sun.security.ssl.SSLContextImpl$TLSContext");
+    put_service(J, "SSLContext", "TLSv1.2", "sun.security.ssl.SSLContextImpl$TLS12Context");
+    put_service(J, "SSLContext", "TLSv1.3", "sun.security.ssl.SSLContextImpl$TLS13Context");
+    put_service(J, "SSLContext", "Default", "sun.security.ssl.SSLContextImpl$DefaultSSLContext");
+    put_alias(J, "SSLContext", "SSL", "TLS");
+    // KeyStore lives in the SUN provider (JKS/CaseExactJKS) and PKCS12 too.
+    const S: &str = "SUN";
+    put_service(S, "KeyStore", "JKS", "sun.security.provider.JavaKeyStore$JKS");
+    put_service(S, "KeyStore", "CaseExactJKS", "sun.security.provider.JavaKeyStore$CaseExactJKS");
+    put_service(S, "KeyStore", "PKCS12", "sun.security.pkcs12.PKCS12KeyStore");
+    put_alias(S, "KeyStore", "PKCS#12", "PKCS12");
+}
+
 /// Internal API: register an alias (Alg.Alias.<type>.<alias> → canonical).
 fn put_alias(provider: &str, type_str: &str, alias: &str, canonical: &str) {
     let type_n = normalize_engine(type_str);
@@ -1604,6 +1639,10 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
         // Mirror SunEC's EC service table into our map so the no-provider
         // `getInstance("EC")` search resolves the real pure-Java SunEC SPIs.
         seed_sunec_services();
+        // Mirror SunJSSE/SUN TLS service tables (KeyManagerFactory /
+        // TrustManagerFactory / SSLContext / KeyStore) so the JSSE connector's
+        // getInstance calls resolve real provider SPIs instead of dead-ending.
+        seed_sunjsse_services();
         let gi = "sun/security/jca/GetInstance";
         r.register(
             gi,

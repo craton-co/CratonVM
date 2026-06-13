@@ -572,6 +572,40 @@ pub fn register_keystore_real(r: &mut NativeMethodRegistry) {
     // helpers it can call into through `crate::keystore::*` once the
     // wave coordinator wires this module.
 
+    // `engine_aliases` returns a synthetic `java/util/IteratorEnumeration`
+    // (array at slot 0, position at slot 1). Its `hasMoreElements`/`nextElement`
+    // were only registered in the synthetic-JDK path
+    // (`phases_early::register_phase53_security`, via `register_synthetic_overrides`),
+    // which real-JDK mode never calls — so in real-JDK mode the TLS
+    // `KeyManagerFactory`/`TrustManagerFactory` init that walks `ks.aliases()`
+    // hit `NoSuchMethodError IteratorEnumeration.hasMoreElements()`. Register
+    // them here (real-JDK path), co-located with the producer.
+    r.register("java/util/IteratorEnumeration", "hasMoreElements", "()Z", |ctx, args| {
+        let this = this_arg(args)?;
+        let pos = match ctx.get_field(this, 1) { Value::Int(v) => v as usize, _ => 0 };
+        let len = match ctx.get_field(this, 0) {
+            Value::Object(Some(arr)) => ctx.array_length(arr),
+            _ => 0,
+        };
+        Ok(Some(Value::Int(if pos < len { 1 } else { 0 })))
+    });
+    r.register("java/util/IteratorEnumeration", "nextElement", "()Ljava/lang/Object;", |ctx, args| {
+        let this = this_arg(args)?;
+        let pos = match ctx.get_field(this, 1) { Value::Int(v) => v as usize, _ => 0 };
+        let elem = match ctx.get_field(this, 0) {
+            Value::Object(Some(arr)) => {
+                if pos < ctx.array_length(arr) {
+                    ctx.set_field(this, 1, Value::Int((pos + 1) as i32));
+                    ctx.get_array_element(arr, pos)
+                } else {
+                    Value::Object(None)
+                }
+            }
+            _ => Value::Object(None),
+        };
+        Ok(Some(elem))
+    });
+
     let _ = SUN_KEYSTORE_FQN;
     r.set_category(__prev_cat);
 }
