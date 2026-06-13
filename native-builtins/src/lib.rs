@@ -994,6 +994,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // never touched at runtime.
     register_biginteger_arithmetic_overrides(registry);
     register_bigdecimal_arithmetic_overrides(registry);
+    // bug-26 (kafka SCRAM): `javax.crypto.Mac` (getInstance/init/update/doFinal)
+    // was only registered inside `register_synthetic_overrides`, which real-JDK
+    // mode never calls — so `Mac.getInstance("HmacSHA256")` fell through to the
+    // real JDK bytecode and threw `NoSuchAlgorithmException: Algorithm HmacSHA256
+    // not available` (the real provider chain has no working HMAC MacSpi). The
+    // synthetic Mac native computes a real, RFC-4231-correct HMAC over the
+    // key+data accumulated via init/update, so promote it to the universal
+    // essential path (matching how Cipher/MessageDigest are wired). Fixes the
+    // SCRAM Formatter/Messages/CredentialUtils/SaslServer suite (0-pass → pass).
+    crate::phases_late::register_p68_crypto_mac(registry);
     // `Long.parseLong(String)J` / `Integer.parseInt(String)I` — in real-JDK
     // mode, these fall through to JDK bytecode whose loop multiplies-and-adds
     // digit-by-digit (`result = result * 10 + digit`). Bounds-check arithmetic
