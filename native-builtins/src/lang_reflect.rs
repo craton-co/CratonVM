@@ -743,8 +743,14 @@ pub(crate) fn native_method_get_generic_exception_types(
     if let Some(sig_str) = ctx.method_signature(class_id, &method_name, &descriptor) {
         if let Some(method_sig) = crate::generics::parse_method_signature(&sig_str) {
             if !method_sig.throws.is_empty() {
+                let decl = if method_sig.type_params.is_empty() {
+                    Value::Object(Some(ctx.get_class_mirror(class_id)))
+                } else {
+                    Value::Object(Some(this))
+                };
                 let arr = ctx.new_ref_array(ClassId::new(0), method_sig.throws.len());
                 for (i, t) in method_sig.throws.iter().enumerate() {
+                    let _gscope = crate::generics::GenericDeclScope::new(decl);
                     let v = crate::generics::type_sig_to_java(ctx, t);
                     ctx.set_array_element(arr, i, v);
                 }
@@ -1710,7 +1716,17 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "java/lang/reflect/TypeVariable",
         "getGenericDeclaration",
         "()Ljava/lang/reflect/GenericDeclaration;",
-        |_ctx, _args| Ok(Some(Value::Object(None))),
+        |ctx, args| {
+            // Field 2 = the declaring Class/Executable (set in
+            // generics::type_param_to_java). ByteBuddy's mock generation
+            // requires this to be non-null.
+            let this = obj_arg(args, 0)?;
+            if ctx.object_num_fields(this) > 2 {
+                Ok(Some(ctx.get_field(this, 2)))
+            } else {
+                Ok(Some(Value::Object(None)))
+            }
+        },
     );
     registry.register(
         "java/lang/reflect/WildcardType",

@@ -9,7 +9,50 @@
 //! GenericArrayType}` heap objects via `NativeContext`.
 
 use cratonvm_native_api::registry::NativeContext;
-use cratonvm_types::Value;
+use cratonvm_types::{ObjectRef, Value};
+
+use std::cell::Cell;
+
+thread_local! {
+    /// The `GenericDeclaration` (Class / Method / Constructor mirror) that owns
+    /// the type parameters referenced by type-variable USES in the signature
+    /// currently being converted. A type-variable use (`E` inside `Iterator<E>`)
+    /// has no declaration site of its own; ByteBuddy's mock generation calls
+    /// `TypeVariable.getGenericDeclaration()` and throws
+    /// `IllegalStateException: Unknown declaration: null` if it is null. The
+    /// enclosing reflection native (`Method.getGenericReturnType`,
+    /// `Class.getGenericInterfaces`, …) sets this to the declaring class/method
+    /// for the duration of its conversion via [`GenericDeclScope`].
+    static GENERIC_DECL_SCOPE: Cell<Option<ObjectRef>> = const { Cell::new(None) };
+}
+
+/// RAII guard installing the current [`GENERIC_DECL_SCOPE`] and restoring the
+/// previous value on drop (so nested conversions don't leak scope).
+pub struct GenericDeclScope(Option<ObjectRef>);
+
+impl GenericDeclScope {
+    pub fn new(decl: Value) -> Self {
+        let r = match decl {
+            Value::Object(Some(o)) => Some(o),
+            _ => None,
+        };
+        GenericDeclScope(GENERIC_DECL_SCOPE.with(|c| c.replace(r)))
+    }
+}
+
+impl Drop for GenericDeclScope {
+    fn drop(&mut self) {
+        GENERIC_DECL_SCOPE.with(|c| c.set(self.0));
+    }
+}
+
+/// The current generic-declaration scope as a `Value` (null when unset).
+fn current_generic_decl() -> Value {
+    GENERIC_DECL_SCOPE
+        .with(|c| c.get())
+        .map(|o| Value::Object(Some(o)))
+        .unwrap_or(Value::Object(None))
+}
 
 // Re-export the AST + parser entry points so existing callers can keep
 // importing from `crate::generics::...`. Internally everything routes
@@ -115,8 +158,12 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             Value::Object(Some(pt))
         }
         TypeSig::TypeVar(name) => {
-            // TypeVariable: field 0 = name (String), field 1 = bounds (Type[])
-            let tv = alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 2);
+            // TypeVariable: field 0 = name (String), field 1 = bounds (Type[]),
+            // field 2 = genericDeclaration (Class/Executable, null here — a
+            // type-variable *use* in a signature has no resolvable declaration
+            // site). Always 3 fields so the `getGenericDeclaration` native's
+            // slot-2 read is in bounds for every TypeVariable instance.
+            let tv = alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3);
             let name_str = ctx.create_string(name);
             ctx.set_field(tv, 0, Value::Object(Some(name_str)));
             // Bounds: default to Object if no bounds known
@@ -126,6 +173,7 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
                 ctx.set_array_element(bounds_arr, 0, Value::Object(Some(obj_mirror)));
             }
             ctx.set_field(tv, 1, Value::Object(Some(bounds_arr)));
+            ctx.set_field(tv, 2, current_generic_decl());
             Value::Object(Some(tv))
         }
         TypeSig::Array(component) => {
@@ -202,10 +250,25 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
 }
 
 /// Convert a TypeParam into a TypeVariable runtime object, using its bounds.
-pub fn type_param_to_java(ctx: &mut dyn NativeContext, tp: &TypeParam) -> Value {
-    let tv = alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 2);
+///
+/// `generic_decl` is the declaring `Class`/`Executable` mirror (the
+/// `GenericDeclaration` that owns this type parameter). It is stored in field 2
+/// and returned by `TypeVariable.getGenericDeclaration()`; ByteBuddy's mock
+/// generation (`OfTypeVariable$ForLoadedType.getTypeVariableSource`) requires a
+/// non-null declaration or it throws `IllegalStateException: Unknown
+/// declaration: null`.
+pub fn type_param_to_java(
+    ctx: &mut dyn NativeContext,
+    tp: &TypeParam,
+    generic_decl: Value,
+) -> Value {
+    // Bounds may reference type variables (e.g. `<T extends Comparable<T>>`);
+    // their declaration is this same generic declaration.
+    let _scope = GenericDeclScope::new(generic_decl);
+    let tv = alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3);
     let name_str = ctx.create_string(&tp.name);
     ctx.set_field(tv, 0, Value::Object(Some(name_str)));
+    ctx.set_field(tv, 2, generic_decl);
 
     // Collect bounds
     let mut bound_sigs: Vec<&TypeSig> = Vec::new();

@@ -4510,17 +4510,21 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         },
     );
     // Same for the newer getExecutableTypeAnnotationBytes — most bootstrap
-    // code that touches annotations on an Executable ends up here.  Return
-    // an empty byte[] (no type annotations present) so callers don't NPE.
+    // code that touches annotations on an Executable ends up here. Return
+    // NULL (not an empty byte[]) when no RuntimeVisibleTypeAnnotations are
+    // present: `sun.reflect.annotation.TypeAnnotationParser.parseTypeAnnotations`
+    // treats `null` as "no annotations" (returns the empty result) but does
+    // `ByteBuffer.wrap(bytes).getShort()` on a non-null buffer — so a
+    // zero-length array throws `BufferUnderflowException`. ByteBuddy's mock
+    // creation reads `TypeVariable.getDeclaredAnnotations()` on the mocked
+    // type's generic methods, which routes here; the empty-array form broke
+    // Mockito's inline mock maker ("could not instrument all classes within
+    // the mock's type hierarchy").
     registry.register(
         "jdk/internal/reflect/ReflectionFactory",
         "getExecutableTypeAnnotationBytes",
         "(Ljava/lang/reflect/Executable;)[B",
-        |ctx, _args| {
-            Ok(Some(Value::Object(Some(
-                ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0),
-            ))))
-        },
+        |_ctx, _args| Ok(Some(Value::Object(None))),
     );
     // getConstantPool — returns null (we don't expose ConstantPool to
     // reflection users; callers fall back to the bytecode path).
