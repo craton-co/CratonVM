@@ -1,9 +1,21 @@
 # Bug 10 — TestPageContext "contains on null" is the embedded-server serving wall (NOT a JSP/EL bug)
 
-**Status:** OPEN — **re-diagnosed**. Real CratonVM gap, but **not** what the
-original hypothesis assumed. This is a manifestation of the embedded-server
-HTTP-serving wall (see [04](04-embedded-server-throughput-wall-OPEN.md)), **not**
-a `PageContext`/EL bug.
+**Status:** PARTIAL — re-diagnosed + layer-1 FIXED. **Not** a `PageContext`/EL bug
+(the original hypothesis). Two functional layers, neither is "pure perf":
+- **Layer 1 — connector reset (FIXED, `fix/tomcat-suite-bugs-09-10`).** The NIO
+  connector reset every accepted request before reading it, because
+  `NioEndpoint.setSocketOptions` → `SocketChannel.setOption` hit an
+  `AbstractMethodError` (the `sc_set_option` native was registered only with the
+  `NetworkChannel` covariant-return descriptor, not the `SocketChannel` one). Fix
+  in `native-io/src/socket_channel.rs`. Verified: a minimal programmatic embedded
+  server now serves (servlet `doGet` invoked + response written).
+- **Layer 2 — webapp-directory request processing (OPEN).** With layer 1 fixed,
+  an `addWebapp` context reports `ctxState=STARTED` and accepts the connection,
+  but the request — even to a **static** file (DefaultServlet) — hangs/returns
+  empty (flaky: sometimes an immediate connector `Pausing` +
+  `StandardWrapperValve[Container is null]` + reset). `TestPageContext` still
+  FAILs. This is the remaining embedded-server serving issue, tracked under
+  [group 04](04-embedded-server-throughput-wall-OPEN.md).
 **Severity:** Medium (blocks every embedded-server HTTP test, not just this one).
 **Repro class:** `jakarta.servlet.jsp.TestPageContext` — `Tests run: 1, Failures: 1`.
 
