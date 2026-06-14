@@ -41,11 +41,16 @@ struct Args {
     jar: Option<String>,
 
     /// Classpath: directories and JAR files to search for classes.
-    #[arg(short = 'c', long = "classpath", alias = "cp")]
+    // `overrides_with` (self) makes a repeated flag last-wins instead of a hard
+    // error, matching the real `java` launcher. Maven Surefire/the WildFly
+    // testsuite fork with `-Xmx512m` twice (surefire memory args + jvm.args);
+    // without this clap aborts with "cannot be used multiple times" (exit 2),
+    // which Surefire reports as "forked VM terminated without saying goodbye".
+    #[arg(short = 'c', long = "classpath", alias = "cp", overrides_with = "classpath")]
     classpath: Option<String>,
 
     /// Maximum heap size (e.g., 256m, 1g).
-    #[arg(long = "Xmx", value_name = "SIZE")]
+    #[arg(long = "Xmx", value_name = "SIZE", overrides_with = "max_heap")]
     max_heap: Option<String>,
 
     /// Print verbose class loading information.

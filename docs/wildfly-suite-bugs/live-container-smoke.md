@@ -25,7 +25,7 @@ end-to-end and the server/provisioning are healthy.
 The goal of running the Arquillian **client** under CratonVM (server stays HotSpot) hit two
 distinct CratonVM limitations. Both are **CratonVM findings**, tracked here.
 
-### Gap A — CratonVM cannot be a Surefire-forked test JVM
+### Gap A — CratonVM as a Surefire-forked test JVM — dup-`-Xmx` **FIXED** ([bug-04](bug-04-surefire-jvm-dup-xmx.md)); booter-init exit-1 remaining
 Surefire's `-Djvm=` requires the path to end with `…/bin/java[.exe]`. The build's
 `java`-named bin alias (`-F java-bin-alias`) satisfies the *name* check, but it is the **same
 clap-based CLI** as `cratonvm.exe` — it does **not** parse real `java` CLI syntax:
@@ -35,8 +35,11 @@ java.exe -version  ->  error: unexpected argument '-v' found
 Surefire forks the test JVM with `java -jar/-cp -Dprop -X… org.apache.maven.surefire.booter.ForkedBooter …`;
 CratonVM rejects those args and exits, so Surefire reports
 `The forked VM terminated without properly saying goodbye. VM crash or System.exit called?`.
-**Fix direction:** give the `java` bin a java-compatible argument mode (accept `-jar`, `-cp`,
-`-D<k>=<v>`, `-X…`, `--add-opens`, positional main-class + args) when invoked as `java`.
+**Update:** the `java` bin already normalizes most JDK single-dash args; the real blocker was
+that Surefire passes `-Xmx512m` **twice** and clap's single-value `--Xmx` aborted (exit 2).
+**FIXED** in `vm-cli/src/main.rs` via `overrides_with` (last-wins, like `java`) — see
+[bug-04](bug-04-surefire-jvm-dup-xmx.md). The fork now parses + starts; a deeper
+ForkedBooter-init exit-1 remains (and Gap C blocks the path regardless).
 
 ### Gap B — CratonVM client: `NullPointerException: hasMoreElements on null` — **FIXED** ([bug-02](bug-02-zipfile-entries-null.md))
 Bypassing Surefire with the proven per-class `KRun` harness (`cratonvm.exe -cp … KRun`,
@@ -50,14 +53,15 @@ completes under the CratonVM client. **Fix direction:** audit the resource/enume
 natives (`getResources`/`findResources`/`getSystemResources`) to return an empty
 `Enumeration`, never `null`.
 
-### Gap C — CratonVM client hangs in the deploy/management-connect phase (open)
-With Gap B fixed, the cratonvm client gets **past** ShrinkWrap package scanning, but the
-in-container test still does not complete: a 600 s run prints `BEGIN` + the two startup
-WARNs and then nothing — no NPE, no crash, just silence. So after building the deployment
-it hangs (or is impossibly slow) somewhere in the deploy → JBoss management/DMR connect →
-remote-run handshake under CratonVM. This is a **separate, deeper gap** from Gap B and is
-the next blocker for CratonVM-as-Arquillian-client. (Likely a CratonVM remoting/management-
-client or heavy-deployment-build issue; needs its own investigation.)
+### Gap C — CratonVM client too slow to build the deployment archive ([bug-03](bug-03-regex-perf-deployment-build.md))
+With Gap B fixed, the cratonvm client gets **past** ShrinkWrap package scanning but never
+finishes. A `--stack-dump-on-timeout` dump shows it **executing** (not blocked) deep in
+ShrinkWrap deployment-archive building — `AssetUtil.getFullPathForClassResource` →
+`java.util.regex.Matcher.replaceAll`, called per class while packaging the large JUnit-5
+container archive. Measured: CratonVM's regex is **~50× slower** (`String.replaceAll`) to
+**~600× slower** (precompiled `Matcher`) than HotSpot, so the archive build takes
+minutes-to-never. **Performance issue, not a deadlock** — see bug-03 for the fix direction
+(JIT coverage of the `Pattern.match` hot loop).
 
 ## Status
 - Live-container rerun **works** (smoke: 111/111 on HotSpot).

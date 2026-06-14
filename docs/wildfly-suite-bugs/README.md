@@ -44,3 +44,5 @@ java-CLI args; null `Enumeration` in the client) — both documented there.
 |---|-------|-----|--------|
 | [01](bug-01-stream-foreachordered-abstractmethoderror.md) | `Stream.forEachOrdered` → `AbstractMethodError` "no Code attribute" (CratonVM-only; 27+ classes) | High | **FIXED** — repro'd + verified |
 | [02](bug-02-zipfile-entries-null.md) | `ZipFile.entries()`/getName/size return null/0 (CratonVM-only; NPEs ShrinkWrap's package scanner — blocked the live-container client) | High | **FIXED** — repro'd + verified |
+| [03](bug-03-regex-perf-deployment-build.md) | `java.util.regex` ~50–600× slower than HotSpot (Gap C: cratonvm client too slow to build the ShrinkWrap deployment archive) | Med | open — perf (root-caused) |
+| [04](bug-04-surefire-jvm-dup-xmx.md) | CratonVM rejected as Surefire `-Djvm=` fork — duplicate `-Xmx` (Gap A) | Med | **FIXED** (dup-Xmx); booter-init exit-1 remains |
