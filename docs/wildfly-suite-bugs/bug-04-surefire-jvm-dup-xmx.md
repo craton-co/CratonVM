@@ -55,35 +55,44 @@ the `surefirebooter.jar` directly under CratonVM:
   ```
   …though `jboss-modules.jar` **exists** there.
 
-## Layer 3 (root blocker, open) — CratonVM native `Path` uses UNIX separator semantics
+## Layer 3 — `Path.toAbsolutePath()` mangled an existing Windows path — FIXED
 CratonVM presents as Windows (`os.name=Windows 11`, `file.separator=\`), but its
-`java.nio.file.Path` natives delegate to Rust `std::path`, which in this build uses
-**UNIX** semantics (`MAIN_SEPARATOR='/'`: `/` splits, `\` is an ordinary char). So
-Windows-style paths mis-parse. Measured ([`SepTest`](../../wildfly-suite/repro/SepTest.java),
-[`MixedSep2`](../../wildfly-suite/repro/MixedSep2.java)):
+`java.nio.file.Path` natives run on Rust `std::path`, which in this build uses **UNIX**
+semantics (`MAIN_SEPARATOR='/'`). The concrete break: the active `toAbsolutePath`
+native (`native-builtins/src/phases_late.rs`) called `std::fs::canonicalize()` on the
+receiver. For an **existing** path that returns a Windows `\\?\C:\…` verbatim path,
+which the native rendered as `//?/C:/…` (the `\\?\` prefix was not stripped, unlike
+`toRealPath`). WildFly's `Environment.validateWildFlyDir` does
+`home.toAbsolutePath().normalize().resolve("jboss-modules.jar")` on the mixed-separator
+`jboss.dist` → CratonVM produced `/?/C:/…` → `Files.notExists(...)` → the bogus
+"invalid directory" (though `jboss-modules.jar` exists).
 
-| input | op | HotSpot | CratonVM |
-|-------|----|---------|----------|
-| `aa\bb\cc` | `getNameCount` | 3 | **1** |
-| `C:\x\y/z/w` | `normalize` | `C:\x\y\z\w` | `C:\x\y/z/w` |
-| `…smoke/target/wildfly` (mixed) | `getNameCount` | 9 | **3** |
-| `…smoke/target/wildfly` | `toAbsolutePath().normalize()` | `C:\…\wildfly` | **`/?/C:/…/wildfly`** (mangled) |
+**Fix:** the JDK's `toAbsolutePath()` never resolves symlinks or requires existence
+(that is `toRealPath`) — it only makes a *relative* path absolute. So drop the
+`canonicalize()`: return drive-letter / UNC / leading-separator paths unchanged, and
+anchor a relative path to the CWD. Verified ([`MixedSep2`](../../wildfly-suite/repro/MixedSep2.java),
+[`AbsCheck`](../../wildfly-suite/repro/AbsCheck.java)): `toAbsolutePath().normalize()`
+now yields a clean path, `Files.exists(...resolve("jboss-modules.jar"))` is **true**,
+and `validateWildFlyDir` passes (the `WFLYLNCHR0003` "invalid directory" error is gone).
+`toAbsolutePath` now matches HotSpot for relative / `..` / absolute inputs (modulo `/`
+vs `\`, CratonVM's existing internal convention). No suite regression on sampled classes.
 
-WildFly's `Environment.validateWildFlyDir` does `home.toAbsolutePath().normalize()`
-on the mixed-separator `jboss.dist` → CratonVM mangles it → `Files.notExists(...)` →
-the bogus "invalid directory".
+(Residual: `getNameCount`/`getName` still under-count `\`-separated paths under UNIX-mode
+`std::path` — `getNameCount("a\\b\\c")=1` vs 3 — but those aren't on WildFly's launcher
+path; left as follow-up.)
 
-**Fix direction (dedicated work, not a one-liner):** CratonVM's `Path` natives
-(`getNameCount`, `getName`, `getParent`, `getRoot`, `isAbsolute`, `normalize`,
-`toAbsolutePath`, `resolve`) must implement **Windows** path semantics when the guest
-is Windows (split on both `/` and `\`, recognise the `X:` drive root) instead of
-delegating to UNIX `std::path`. This is core NIO shared by the whole suite and several
-other apps (with accumulated `/?/` / `/C:/` URI workarounds), so it needs its own
-change + full re-test — deferred rather than rushed here.
-
-Note: even with this fixed, the managed/KRom client path then hits
-[Gap C / bug-03](bug-03-regex-perf-deployment-build.md) (regex too slow to build the
-deployment archive).
+## Layer 4 (open) — `java.net.ServerSocket.getImpl` NPE on the managed-container port check
+With Layer 3 fixed, the managed container starts up, provisions the server config
+(`Copying resources … to target\wildfly\standalone\configuration`), and reaches its
+port-availability check, where CratonVM throws:
+```
+NullPointerException: monitorenter in java/net/ServerSocket.getImpl pc=14
+  at CommonManagedDeployableContainer.isPortAvailable / waitOnPorts
+```
+i.e. `ServerSocket.getImpl()`'s synchronized block has a null monitor (the `impl`/lock
+is not initialised by CratonVM's `ServerSocket` natives). A separate CratonVM bug — the
+next blocker on this path. (And [Gap C / bug-03](bug-03-regex-perf-deployment-build.md)
+— the slow deployment-archive build — still gates the eventual deploy.)
 
 ## Note — even fully fixed, Gap C still blocks this path
 The Surefire fork runs the Arquillian **client** under CratonVM, which builds the
