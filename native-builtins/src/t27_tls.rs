@@ -176,6 +176,84 @@ pub(crate) fn parse_private_key_pem(pem: &str) -> Result<PrivateKeyDer<'static>,
 }
 
 // -----------------------------------------------------------------------------
+// Keystore → runtime identity / trust bridge (JSSE server connector)
+// -----------------------------------------------------------------------------
+//
+// Tomcat's JSSE connector loads its server cert/key from a JKS/PKCS12 keystore
+// and its trust anchors from a truststore, then drives the rustls-backed
+// SSLEngine. The keystore natives (keystore.rs) parse the DER; these helpers
+// convert that DER into the PEM the rustls config builders consume and register
+// the certs as extra client trust roots. For Tomcat's in-process loopback HTTPS
+// tests (test client + embedded server in one VM) this makes the client trust
+// the server's (self-signed/test-CA) cert automatically.
+
+/// Standard base64 (RFC 4648) encoder — dependency-free so we don't add a crate
+/// just to render DER as PEM.
+fn b64_encode(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[((n >> 18) & 63) as usize] as char);
+        out.push(T[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Wrap DER bytes in a PEM block with 64-char base64 lines.
+fn der_to_pem(label: &str, der: &[u8]) -> String {
+    let b64 = b64_encode(der);
+    let mut body = String::new();
+    for line in b64.as_bytes().chunks(64) {
+        body.push_str(std::str::from_utf8(line).unwrap_or(""));
+        body.push('\n');
+    }
+    format!("-----BEGIN {label}-----\n{body}-----END {label}-----\n")
+}
+
+/// Extra client trust roots (DER) gathered from loaded keystores/truststores.
+static EXTRA_TRUST_ROOTS: OnceLock<Mutex<Vec<Vec<u8>>>> = OnceLock::new();
+fn extra_trust_roots() -> &'static Mutex<Vec<Vec<u8>>> {
+    EXTRA_TRUST_ROOTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register a cert (DER) as an additional client trust anchor. Called from the
+/// keystore load path for every cert in a key/trust store.
+pub fn add_extra_trust_root_der(der: Vec<u8>) {
+    if der.is_empty() {
+        return;
+    }
+    let mut roots = extra_trust_roots().lock();
+    if !roots.iter().any(|r| r == &der) {
+        roots.push(der);
+    }
+}
+
+/// Install the runtime server identity from a PKCS#8 private key DER + DER cert
+/// chain (leaf first), converting to the PEM the rustls server-config builder
+/// consumes. Called from the keystore load path when a key entry is present.
+pub fn install_identity_from_der(key_pkcs8_der: &[u8], chain_der: &[Vec<u8>]) {
+    if key_pkcs8_der.is_empty() || chain_der.is_empty() {
+        return;
+    }
+    let mut cert_pem = String::new();
+    for c in chain_der {
+        cert_pem.push_str(&der_to_pem("CERTIFICATE", c));
+    }
+    let key_pem = der_to_pem("PRIVATE KEY", key_pkcs8_der);
+    set_runtime_tls_identity(Some(RuntimeTlsIdentity {
+        cert_pem,
+        key_pem,
+        client_ca_pem: None,
+    }));
+}
+
+// -----------------------------------------------------------------------------
 // T2.7.4 — Real system trust store
 // -----------------------------------------------------------------------------
 
@@ -2371,6 +2449,59 @@ pub(crate) const HS_NEED_UNWRAP_R: i32 = 4;
 /// bytesProduced). Status fields are stored as ints (Java-side accessors
 /// turn them into the appropriate enum constants — see
 /// `tls.rs::register_ssl_engine_result`).
+/// Fetch a REAL enum constant via the enum's generated `valueOf(String)` so the
+/// returned reference is the singleton — `==` comparisons in JSSE/connector code
+/// (e.g. `result.getStatus() == OK`, `engine.getHandshakeStatus() == NEED_WRAP`)
+/// then work. Returns `Object(None)` if the enum can't be resolved.
+fn enum_const(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    cls: &str,
+    name: &str,
+    valueof_desc: &str,
+) -> Value {
+    let n = ctx.create_string(name);
+    match ctx.invoke(cls, "valueOf", valueof_desc, &[Value::Object(Some(n))]) {
+        Ok(Some(v)) => v,
+        _ => Value::Object(None),
+    }
+}
+
+/// Real `SSLEngineResult$Status` constant for our SR_* code.
+pub(crate) fn real_status_enum(ctx: &mut dyn cratonvm_native_api::NativeContext, sr: i32) -> Value {
+    let name = match sr {
+        SR_BUFFER_OVERFLOW => "BUFFER_OVERFLOW",
+        SR_BUFFER_UNDERFLOW => "BUFFER_UNDERFLOW",
+        SR_CLOSED => "CLOSED",
+        _ => "OK",
+    };
+    enum_const(
+        ctx,
+        "javax/net/ssl/SSLEngineResult$Status",
+        name,
+        "(Ljava/lang/String;)Ljavax/net/ssl/SSLEngineResult$Status;",
+    )
+}
+
+/// Real `SSLEngineResult$HandshakeStatus` constant for our HS_* code.
+pub(crate) fn real_handshake_status_enum(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    hs: i32,
+) -> Value {
+    let name = match hs {
+        HS_FINISHED_R => "FINISHED",
+        HS_NEED_TASK_R => "NEED_TASK",
+        HS_NEED_WRAP_R => "NEED_WRAP",
+        HS_NEED_UNWRAP_R => "NEED_UNWRAP",
+        _ => "NOT_HANDSHAKING",
+    };
+    enum_const(
+        ctx,
+        "javax/net/ssl/SSLEngineResult$HandshakeStatus",
+        name,
+        "(Ljava/lang/String;)Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;",
+    )
+}
+
 fn alloc_engine_result(
     ctx: &mut dyn cratonvm_native_api::NativeContext,
     status: i32,
@@ -2378,6 +2509,22 @@ fn alloc_engine_result(
     consumed: i32,
     produced: i32,
 ) -> ObjectRef {
+    // Build a REAL SSLEngineResult via its public ctor with REAL enum constants,
+    // so `getStatus()`/`getHandshakeStatus()` return singletons the connector
+    // can `==`-compare. (The old synthetic int-slot object made every enum
+    // comparison fail → the NIO handshake state machine spun → native SO.)
+    let st = real_status_enum(ctx, status);
+    let hss = real_handshake_status_enum(ctx, hs);
+    if matches!(st, Value::Object(Some(_))) && matches!(hss, Value::Object(Some(_))) {
+        if let Ok(Some(Value::Object(Some(o)))) = ctx.new_object_initialized(
+            "javax/net/ssl/SSLEngineResult",
+            "(Ljavax/net/ssl/SSLEngineResult$Status;Ljavax/net/ssl/SSLEngineResult$HandshakeStatus;II)V",
+            &[st, hss, Value::Int(consumed), Value::Int(produced)],
+        ) {
+            return o;
+        }
+    }
+    // Fallback: synthetic int-slot object (enum resolution failed).
     let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLEngineResult", 4);
     ctx.set_field(obj, 0, Value::Int(status));
     ctx.set_field(obj, 1, Value::Int(hs));
@@ -2484,7 +2631,13 @@ fn bb_write_from(
 /// Build a default rustls ClientConfig for engine paths that didn't have an
 /// SSLContext attach a real one. Uses native roots + ALPN list from state.
 fn default_engine_client_config(alpn: &[Vec<u8>]) -> Result<Arc<ClientConfig>, String> {
-    let roots = load_native_root_store().unwrap_or_else(|_| RootCertStore::empty());
+    let mut roots = load_native_root_store().unwrap_or_else(|_| RootCertStore::empty());
+    // Add trust anchors gathered from loaded keystores/truststores so an
+    // in-process loopback client trusts the embedded server's (self-signed or
+    // test-CA) cert — Tomcat's JSSE HTTPS tests run both ends in one VM.
+    for der in extra_trust_roots().lock().iter() {
+        let _ = roots.add(CertificateDer::from(der.clone()));
+    }
     let mut config = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
@@ -2945,13 +3098,9 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let id = engine_id_or_alloc(this);
             let hs = with_engine(id, |s| handshake_status_of(s)).unwrap_or(HS_NOT_HANDSHAKING_R);
-            let obj = alloc_concurrent_synthetic(
-                ctx,
-                "javax/net/ssl/SSLEngineResult$HandshakeStatus",
-                1,
-            );
-            ctx.set_field(obj, 0, Value::Int(hs));
-            Ok(Some(Value::Object(Some(obj))))
+            // Return the REAL enum singleton so `engine.getHandshakeStatus() ==
+            // NEED_WRAP` etc. in the connector's handshake loop work.
+            Ok(Some(real_handshake_status_enum(ctx, hs)))
         },
     );
 

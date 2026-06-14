@@ -382,8 +382,14 @@ pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStor
 
         match tag {
             1 => {
-                // PrivateKeyEntry
+                // PrivateKeyEntry. The stored bytes are the JKS-protected key
+                // (an EncryptedPrivateKeyInfo); decrypt it to plaintext PKCS#8
+                // via the JKS KeyProtector so downstream consumers (rustls TLS)
+                // get a parseable key. If decryption fails (e.g. a per-key
+                // password we don't have), keep the raw bytes rather than drop
+                // the entry — callers that don't need the key still see it.
                 let enc_key = r.bytes_u32len()?;
+                let key_der = jks_recover_key(&enc_key, password).unwrap_or(enc_key);
                 let chain_count = r.u32_be()? as usize;
                 let mut chain = Vec::with_capacity(chain_count);
                 for _ in 0..chain_count {
@@ -396,7 +402,7 @@ pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStor
                     KeyStoreEntry {
                         alias,
                         creation_time_ms,
-                        kind: EntryKind::PrivateKey { key_der: enc_key, chain },
+                        kind: EntryKind::PrivateKey { key_der, chain },
                     },
                 );
             }
@@ -459,6 +465,106 @@ fn jks_password_mac(password_bytes: &[u8], body: &[u8]) -> [u8; 20] {
     let mut tag = [0u8; 20];
     tag.copy_from_slice(&out);
     tag
+}
+
+/// Encode a password (bytes treated as Latin-1 codepoints) as UTF-16BE, the
+/// form JKS feeds to SHA-1 (high byte 0, low byte original).
+fn jks_passwd_utf16be(password_bytes: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(password_bytes.len() * 2);
+    for b in password_bytes {
+        v.push(0u8);
+        v.push(*b);
+    }
+    v
+}
+
+/// Minimal DER walker: read a length field at `pos`, returning (length, new_pos).
+fn der_read_len(data: &[u8], mut pos: usize) -> Option<(usize, usize)> {
+    let first = *data.get(pos)?;
+    pos += 1;
+    if first < 0x80 {
+        return Some((first as usize, pos));
+    }
+    let n = (first & 0x7f) as usize;
+    if n == 0 || n > 4 {
+        return None;
+    }
+    let mut len = 0usize;
+    for _ in 0..n {
+        len = (len << 8) | (*data.get(pos)? as usize);
+        pos += 1;
+    }
+    Some((len, pos))
+}
+
+/// Extract the `encryptedData` OCTET STRING from an `EncryptedPrivateKeyInfo`
+/// DER: `SEQUENCE { AlgorithmIdentifier, OCTET STRING }`. Returns the octet
+/// content (for JKS: `salt(20) || encryptedKey || digest(20)`).
+fn der_extract_epki_octets(der: &[u8]) -> Option<Vec<u8>> {
+    let mut pos = 0usize;
+    if *der.get(pos)? != 0x30 {
+        return None;
+    }
+    pos += 1;
+    let (_, p) = der_read_len(der, pos)?;
+    pos = p;
+    // AlgorithmIdentifier SEQUENCE — skip whole.
+    if *der.get(pos)? != 0x30 {
+        return None;
+    }
+    pos += 1;
+    let (alg_len, p) = der_read_len(der, pos)?;
+    pos = p + alg_len;
+    // OCTET STRING.
+    if *der.get(pos)? != 0x04 {
+        return None;
+    }
+    pos += 1;
+    let (oct_len, p) = der_read_len(der, pos)?;
+    pos = p;
+    der.get(pos..pos + oct_len).map(|s| s.to_vec())
+}
+
+/// Recover a JKS-protected private key into its plaintext PKCS#8 DER.
+///
+/// JKS wraps the PKCS#8 key in an `EncryptedPrivateKeyInfo` whose OCTET STRING
+/// is `salt(20) || (plainPkcs8 XOR keystream) || SHA1(passwd||plainPkcs8)`,
+/// where the keystream is `Wi = SHA1(passwdUtf16be || W(i-1))`, `W0 = salt`
+/// (Sun's frozen JDK-1.2 `KeyProtector`). Returns the plaintext PKCS#8 DER, or
+/// `None` if the structure / integrity check doesn't hold.
+fn jks_recover_key(epki_der: &[u8], password_bytes: &[u8]) -> Option<Vec<u8>> {
+    use sha1::{Digest, Sha1};
+    let protected = der_extract_epki_octets(epki_der)?;
+    if protected.len() < 40 {
+        return None;
+    }
+    let salt = &protected[..20];
+    let encr_len = protected.len() - 40;
+    let encr_key = &protected[20..20 + encr_len];
+    let check = &protected[20 + encr_len..];
+    let pw = jks_passwd_utf16be(password_bytes);
+
+    let mut xor_key = Vec::with_capacity(encr_len);
+    let mut digest: Vec<u8> = salt.to_vec();
+    while xor_key.len() < encr_len {
+        let mut h = Sha1::new();
+        h.update(&pw);
+        h.update(&digest);
+        digest = h.finalize().to_vec();
+        xor_key.extend_from_slice(&digest);
+    }
+    let plain: Vec<u8> = encr_key.iter().zip(xor_key.iter()).map(|(a, b)| a ^ b).collect();
+
+    // Integrity: SHA1(passwd || plain) must equal the trailing digest.
+    let mut hc = Sha1::new();
+    hc.update(&pw);
+    hc.update(&plain);
+    let computed = hc.finalize();
+    if !constant_time_eq(&computed, check) {
+        tracing::warn!(target: "keystore", "JKS key integrity check failed (wrong password?)");
+        return None;
+    }
+    Some(plain)
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -797,6 +903,24 @@ fn engine_load(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
             }
         }
     };
+
+    // Bridge the parsed keystore into the rustls-backed TLS engine: install the
+    // first key entry as the server identity, and register every cert as an
+    // extra client trust anchor (so an in-process loopback HTTPS client trusts
+    // the embedded server). Harmless for non-TLS keystore uses.
+    for entry in store.entries.values() {
+        match &entry.kind {
+            EntryKind::PrivateKey { key_der, chain } => {
+                crate::t27_tls::install_identity_from_der(key_der, chain);
+                for c in chain {
+                    crate::t27_tls::add_extra_trust_root_der(c.clone());
+                }
+            }
+            EntryKind::TrustedCert { cert_der } => {
+                crate::t27_tls::add_extra_trust_root_der(cert_der.clone());
+            }
+        }
+    }
 
     let id = keystore_register(store);
     set_store_id(ctx, this, id);
