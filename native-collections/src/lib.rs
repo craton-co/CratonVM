@@ -6038,10 +6038,56 @@ fn native_opt_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Int(0))),
     };
+    // Real `Optional.equals`: `this == obj` short-circuit.
+    if this.as_ptr() == other.as_ptr() {
+        return Ok(Some(Value::Int(1)));
+    }
+    // `obj instanceof Optional` — `Optional` is final, so identical class id
+    // is the exact instanceof test. A non-Optional `other` is not equal (and
+    // reading its slot 0 would be meaningless).
+    if ctx.class_id_of_object(this) != ctx.class_id_of_object(other) {
+        return Ok(Some(Value::Int(0)));
+    }
     let this_val = ctx.get_field(this, OPT_FIELD_VALUE);
     let other_val = ctx.get_field(other, OPT_FIELD_VALUE);
-    let eq = values_equal(ctx, &this_val, &other_val);
+    // `Objects.equals(value, other.value)` — must dispatch to the contained
+    // value's *real* `equals`, not the structural `values_equal` (which only
+    // knows identity/String/enum/wrapper and so reports value-equal lists,
+    // records, and user value-classes as unequal). Mirrors the real-JDK
+    // `Optional.equals` bytecode, which routes through `Objects.equals`.
+    let eq = opt_value_equals(ctx, this_val, other_val)?;
     Ok(Some(Value::Int(if eq { 1 } else { 0 })))
+}
+
+/// Null-safe `Objects.equals(a, b)`: both-null → true; one-null → false;
+/// otherwise dispatch to `a.equals(b)` so the contained value's real
+/// equality contract is honoured.
+fn opt_value_equals(
+    ctx: &mut dyn NativeContext,
+    a: Value,
+    b: Value,
+) -> Result<bool, MethodCallFailed> {
+    match (a, b) {
+        (Value::Object(None), Value::Object(None)) => Ok(true),
+        (Value::Object(None), _) | (_, Value::Object(None)) => Ok(false),
+        (Value::Object(Some(ra)), Value::Object(Some(rb))) => {
+            if ra.as_ptr() == rb.as_ptr() {
+                return Ok(true);
+            }
+            match ctx.invoke_virtual(
+                ra,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(rb))],
+            )? {
+                Some(Value::Int(v)) => Ok(v != 0),
+                _ => Ok(false),
+            }
+        }
+        // Primitive-valued Optionals never occur (Optional<T> boxes), but a
+        // structural compare is exact for any non-object slot.
+        (x, y) => Ok(x == y),
+    }
 }
 
 fn native_opt_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -6050,8 +6096,17 @@ fn native_opt_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         _ => return Ok(Some(Value::Int(0))),
     };
     let val = ctx.get_field(this, OPT_FIELD_VALUE);
+    // Real `Optional.hashCode` is `Objects.hashCode(value)` =
+    // `value == null ? 0 : value.hashCode()`. Dispatch to the value's real
+    // `hashCode` rather than returning its identity hash (which made
+    // `Optional.hashCode` non-value-based and broke hash-keyed lookups).
     match val {
-        Value::Object(Some(obj)) => Ok(Some(Value::Int(ctx.identity_hash_code(obj)))),
+        Value::Object(Some(obj)) => {
+            match ctx.invoke_virtual(obj, "hashCode", "()I", &[])? {
+                Some(Value::Int(h)) => Ok(Some(Value::Int(h))),
+                _ => Ok(Some(Value::Int(0))),
+            }
+        }
         _ => Ok(Some(Value::Int(0))),
     }
 }
