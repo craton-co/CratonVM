@@ -1502,6 +1502,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    fn register_var_handle_root(&mut self, vh: ObjectRef) {
+        // B-J: keep VarHandles alive (and copied into the GC pointer-map) so
+        // their `static final` holder slots remap correctly across a move.
+        // Keyed by identity hash (stable across moves) for dedup.
+        let key = self.identity_hash_code(vh);
+        self.shared.var_handle_roots.write().insert(key, vh);
+    }
+
     fn record_printed_value(&mut self, value: Value) {
         self.thread.printed.push(value);
     }
