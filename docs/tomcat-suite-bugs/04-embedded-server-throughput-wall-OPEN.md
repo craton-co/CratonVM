@@ -27,6 +27,26 @@ O(depth) remains: ~45µs × tens of millions = minutes per deploy. At the defaul
 heap it is further inflated by constant GC (native old-gen spill keeps the heap
 full → memory-bandwidth contention).
 
+## Update — rootsnap cache landed (helps, but does NOT clear the wall)
+
+The opt-in **`CRATONVM_ROOTSNAP_CACHE`** frozen-lower-frame cache (dev
+`d7ede099`, fix/hibernate-open-bugs) was measured on a real TestSsl deploy:
+per-`update_root_snapshot` cost dropped **~45µs → 3.9µs (~11×)** at constant
+depth ~53 (frozen-frame reuse removes the O(depth) re-scan). bt18 unchanged
+(68332206), no SEGV. So rootsnap is no longer the dominant deploy cost.
+
+**Server classes STILL HANG at the 180s cap**, for two remaining reasons:
+1. **General interpreter throughput** on cold deployment code (jar/TLD/annotation
+   scanning, classloading, reflection) — the broad ~20× interpreter-vs-HotSpot
+   gap. With the cache, rootsnap is only ~4s of ~33s for ONE deploy; the rest is
+   ordinary bytecode execution.
+2. **Per-class method multiplication** — each server test method does a FULL
+   `tomcat.start()` (deploy webapp) + serve + stop. TestSsl has 21 methods → 21
+   deploys; even at tens of seconds each that is far past 180s.
+
+So the wall is now interpreter speed × method count, not a single hotspot. The
+rerun2 (cache on) still shows server classes HANG.
+
 ## Mitigations / next steps
 
 - **Operational (works now):** run with `-Xmx2g` (the harness now passes it) —
