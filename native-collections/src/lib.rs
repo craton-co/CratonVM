@@ -16453,7 +16453,25 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     }
     // S111r28: HashSet / LinkedHashSet — field 0 = backing map. Collect the
     // backing map's keys (in iteration order).
-    if HS_FIELD_MAP < n_fields {
+    //
+    // GATE (ATNConfig CCE fix): only treat field-0-is-a-HashMap as "this is a
+    // HashSet whose elements are the map's keys" when the receiver actually IS a
+    // HashSet/subclass. A custom `Set` (or any Collection) can legitimately hold
+    // an unrelated `HashMap` at slot 0 whose KEYS are NOT the collection's
+    // elements — e.g. Groovy's ANTLR4 `ATNConfigSet` (field 0 =
+    // `HashMap<Long,ATNConfig> mergedConfigs`). Without this gate, `toArray()` /
+    // `new ArrayList<>(atnConfigSet)` returned the Long keys, so `List.sort` over
+    // a STATE_ALT_SORT_COMPARATOR passed a Long to the ATNConfig comparator
+    // (ClassCastException Long→ATNConfig; getState() NSME under --nojit) and every
+    // Groovy script failed to compile (SpringRepositoriesExtensionTests). For a
+    // non-HashSet custom collection we fall through to empty, and the caller
+    // (`native_al_to_array` / `collect_collection_elements_or_real`) drives the
+    // real overridden `iterator()`/`toArray()`.
+    let is_hashset_like = ctx
+        .class_id_by_name("java/util/HashSet")
+        .map(|hs| cid == hs || ctx.is_subclass(cid, hs))
+        .unwrap_or(false);
+    if is_hashset_like && HS_FIELD_MAP < n_fields {
         if let Value::Object(Some(backing)) = ctx.get_field(coll, HS_FIELD_MAP) {
             // An insertion-ordered set (LinkedHashSet / CopyOnWriteArraySet) is
             // backed by a LinkedHashMap, which keeps its entries in the
