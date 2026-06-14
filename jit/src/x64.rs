@@ -14022,9 +14022,18 @@ impl Compiler {
                                        // CMP rax, rcx
                     self.rex_w();
                     self.buf.emit(&[0x39, 0xC8]); // cmp rax, rcx
-                                                  // Produce -1, 0, or 1 using SETG/SETL (avoids RBX)
-                    self.buf.emit(&[0x0F, 0x97, 0xC0]); // SETG AL
-                    self.buf.emit(&[0x0F, 0x9C, 0xC1]); // SETL CL
+                                                  // Produce -1, 0, or 1 using SETG/SETL (avoids RBX).
+                                                  // lcmp is a SIGNED comparison: use SETG (0F 9F),
+                                                  // not SETA (0F 97, unsigned-above). With SETA, a
+                                                  // negative operand reads as a huge unsigned value,
+                                                  // so e.g. `ts == -6L` JIT-compiled as `lcmp; ifne`
+                                                  // returned "equal" for every ts >= 0 (sign-bit
+                                                  // clear) — Kafka ListOffsetsHandler computed
+                                                  // request version 11 instead of 1 for normal
+                                                  // timestamps. The other two lcmp sites already use
+                                                  // SETG; this one was the lone unsigned outlier.
+                    self.buf.emit(&[0x0F, 0x9F, 0xC0]); // SETG AL (signed)
+                    self.buf.emit(&[0x0F, 0x9C, 0xC1]); // SETL CL (signed)
                     self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
                     self.buf.emit(&[0x0F, 0xB6, 0xC9]); // MOVZX ECX, CL
                     self.buf.emit(&[0x29, 0xC8]); // SUB EAX, ECX
