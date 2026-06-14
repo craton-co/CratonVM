@@ -2691,23 +2691,52 @@ impl GenerationalHeap {
         let mut objects_promoted_cycle: u64 = 0;
         let mut bytes_copied_young_cycle: u64 = 0;
         let mut objects_copied_young_cycle: u64 = 0;
-        for &new_addr in pointer_map.values() {
+        let mut bad_forward_count: u64 = 0;
+        let mut bad_forward_sample: (usize, usize) = (0, 0);
+        for (&old_addr, &new_addr) in pointer_map.iter() {
             let new_ptr = new_addr as *const u8;
-            // SAFETY: `new_addr` is a pointer returned by forward_object,
-            // which either allocated in young_to or in old_gen. Both
+            let in_old = old_gen.contains(new_ptr);
+            let in_young = young_to.contains(new_ptr);
+            // BUG-Z safety: every `pointer_map` value must be a forwarding
+            // address inside young_to or old_gen. Under heavy multi-threaded
+            // churn (TestFileStoreConcurrency) `forward_object` has been observed
+            // to record a *garbage* value (e.g. a small integer) for a valid
+            // young_from source — a heap-corruption bug tracked in BUG-Z.
+            // Dereferencing such a value here SIGSEGVs in the GC's post-copy
+            // stats walk. Skip it (the stats are advisory counters) and record a
+            // sample so a single summary can be logged, rather than crashing or
+            // spamming a line per entry. NOTE: this does not repair the bad
+            // forward — `update_all_roots` still remaps through `pointer_map`;
+            // see BUG-Z for the underlying fix.
+            if !in_old && !in_young {
+                bad_forward_count += 1;
+                if bad_forward_sample == (0, 0) {
+                    bad_forward_sample = (old_addr, new_addr);
+                }
+                continue;
+            }
+            // SAFETY: `new_addr` is confirmed inside young_to or old_gen; both
             // allocations begin with a valid ObjectHeader.
             let header = unsafe { &*(new_addr as *const ObjectHeader) };
             // `gen_object_total_size` is the sum of HEADER_SIZE and the
             // variable-length object body, computed from the header
             // exactly as the copy path does.
             let sz = gen_object_total_size(header) as u64;
-            if old_gen.contains(new_ptr) {
+            if in_old {
                 bytes_promoted_cycle += sz;
                 objects_promoted_cycle += 1;
             } else {
                 bytes_copied_young_cycle += sz;
                 objects_copied_young_cycle += 1;
             }
+        }
+        if bad_forward_count > 0 {
+            // BUG-Z: surface the corruption once per cycle (not per entry).
+            eprintln!(
+                "[gc] WARNING: {} pointer_map forward(s) pointed outside the heap \
+                 (corruption — see BUG-Z); skipped in stats. sample old=0x{:x} -> new=0x{:x}",
+                bad_forward_count, bad_forward_sample.0, bad_forward_sample.1,
+            );
         }
 
         // Phase 3: Clear card table and reset young from-space
@@ -4541,7 +4570,21 @@ impl GenerationalHeap {
             // returning it. A stale forwarding pointer left over from a prior
             // GC cycle that wasn't cleared by session 73's fix would send
             // callers to freed memory.
-            if fwd.is_null() || (fwd as usize) % 8 != 0 {
+            //
+            // BUG-Z fix: the null/alignment check below is NOT enough — under
+            // heavy multi-threaded churn (TestFileStoreConcurrency) the
+            // `forwarding_ptr` field of a young_from source has been observed
+            // holding 8-aligned non-null GARBAGE (small integers like 0x10/0x1110,
+            // or `old - small_offset`) that passes those two checks and then gets
+            // recorded into `pointer_map`, sending the GC's post-copy walk (and
+            // `update_all_roots`) into a wild pointer → SIGSEGV. A real
+            // forwarding address must land inside the to-space (`young_to`) or
+            // the old gen; reject anything else as a stale/corrupt forward
+            // (return `old_ptr` unmoved, exactly as the null/unaligned arm does)
+            // rather than trusting the bogus pointer and recording it.
+            let fwd_in_heap =
+                young_to.contains(fwd as *const u8) || old_gen.contains(fwd as *const u8);
+            if fwd.is_null() || (fwd as usize) % 8 != 0 || !fwd_in_heap {
                 tracing::debug!(
                     target: "cratonvm::gc::guard",
                     fwd = ?fwd,
