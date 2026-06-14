@@ -4684,6 +4684,73 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
             Ok(Some(ctx.get_field(this, 0)))
         },
     );
+    // getSupportedSSLParameters() — Tomcat's JSSEUtil.initialise() reads the
+    // supported protocols + cipher suites here. The synthetic SSLContext has no
+    // contextSpi, so the inherited javax bytecode NPEs; return a REAL
+    // javax.net.ssl.SSLParameters (plain data holder) with the protocol/cipher
+    // lists the rustls-backed engine negotiates.
+    r.register(
+        ctx_cls,
+        "getSupportedSSLParameters",
+        "()Ljavax/net/ssl/SSLParameters;",
+        |ctx, _args| {
+            let protocols = ["TLSv1.3", "TLSv1.2"];
+            let ciphers = [
+                "TLS_AES_128_GCM_SHA256",
+                "TLS_AES_256_GCM_SHA384",
+                "TLS_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+            ];
+            let mk = |ctx: &mut dyn NativeContext, items: &[&str]| {
+                let arr = ctx.new_array(cratonvm_types::ArrayElementType::Reference, items.len());
+                for (i, &s) in items.iter().enumerate() {
+                    let so = ctx.create_string(s);
+                    ctx.set_array_element(arr, i, Value::Object(Some(so)));
+                }
+                Value::Object(Some(arr))
+            };
+            let carr = mk(ctx, &ciphers);
+            let parr = mk(ctx, &protocols);
+            // SSLParameters(String[] cipherSuites, String[] protocols)
+            ctx.new_object_initialized(
+                "javax/net/ssl/SSLParameters",
+                "([Ljava/lang/String;[Ljava/lang/String;)V",
+                &[carr, parr],
+            )
+        },
+    );
+    // createSSLEngine() — return a rustls-backed sun.security.ssl.SSLEngineImpl
+    // (its wrap/unwrap/handshake natives live in t27_tls::register_sslengine_real,
+    // keyed by ObjectRef via engine_id_or_alloc, so a bare object suffices).
+    for desc in ["()Ljavax/net/ssl/SSLEngine;", "(Ljava/lang/String;I)Ljavax/net/ssl/SSLEngine;"] {
+        r.register(ctx_cls, "createSSLEngine", desc, |ctx, _args| {
+            let eng = alloc_concurrent_synthetic(ctx, "sun/security/ssl/SSLEngineImpl", 4);
+            Ok(Some(Value::Object(Some(eng))))
+        });
+    }
+    // getServerSessionContext() — Tomcat caches it and may set cache size /
+    // timeout; return a synthetic SSLSessionContext (setters are no-ops).
+    r.register(
+        ctx_cls,
+        "getServerSessionContext",
+        "()Ljavax/net/ssl/SSLSessionContext;",
+        |ctx, _args| {
+            let obj = alloc_concurrent_synthetic(ctx, "javax/net/ssl/SSLSessionContext", 0);
+            Ok(Some(Value::Object(Some(obj))))
+        },
+    );
+    // SSLSessionContext setters Tomcat's SSLHostConfig drives — no-op (the
+    // rustls engine manages its own session cache).
+    let ssc = "javax/net/ssl/SSLSessionContext";
+    r.register(ssc, "setSessionCacheSize", "(I)V", |_ctx, _args| Ok(None));
+    r.register(ssc, "setSessionTimeout", "(I)V", |_ctx, _args| Ok(None));
+    r.register(ssc, "getSessionCacheSize", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
+    r.register(ssc, "getSessionTimeout", "()I", |_ctx, _args| Ok(Some(Value::Int(0))));
 
     let sf = "javax/net/ssl/SSLSocketFactory";
     r.register(
