@@ -106,3 +106,5 @@ test-infra/suite-results/_cm-*.log
 hs_err_pid*.log
 build-wt.*
 build-*.out
+check-wt.*
+build-wt.*
