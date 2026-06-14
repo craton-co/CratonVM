@@ -1048,7 +1048,24 @@ fn native_method_invoke_boxed(
     // inside a closure and capture its Result so we can decrement before
     // propagating.
     let result = (|| -> MethodCallResult {
-    // Delegate to the canonical implementation first.
+    // GC-safety: capture the Method's declared descriptor BEFORE running the
+    // target method. `native_method_invoke` below executes arbitrary Java
+    // that can trigger a GC and MOVE the `Method` mirror. `args` is a
+    // pre-call snapshot of operand-stack `Value`s held on the native's Rust
+    // stack — NOT a GC root — so after the inner invoke `args.first()` is a
+    // stale pointer, and reading fields off it (`method_descriptor_for_invoke`
+    // → `get_field_by_name` → `class_id_of`) dereferences freed/moved memory.
+    // That is the intermittent, load-dependent SIGSEGV seen running JUnit
+    // suites (e.g. TestServerInfo) under CPU contention, where a GC is far
+    // more likely to land inside the inner invoke. The descriptor is
+    // invariant (the method's signature), so capture it now while the mirror
+    // is still valid and reuse it afterwards.
+    let pre_descriptor = match args.first() {
+        Some(Value::Object(Some(o))) => Some(method_descriptor_for_invoke(ctx, *o)),
+        _ => None,
+    };
+
+    // Delegate to the canonical implementation.
     let raw = native_method_invoke(ctx, args)?;
 
     let raw_val = match raw {
@@ -1056,16 +1073,15 @@ fn native_method_invoke_boxed(
         None => return Ok(None),
     };
 
-    // Recover the declared return descriptor from the Method mirror so we
+    // Recover the declared return descriptor (captured pre-invoke above) so we
     // can sanity-check the return shape against what the JDK contract
     // requires (primitive returns must come back as wrapper objects, never
     // as raw `Value::Int`/`Value::Long`/etc. and never as a primitive
     // `Class<int>` mirror).
-    let method_obj = match args.first() {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(raw_val)),
+    let descriptor = match pre_descriptor {
+        Some(d) => d,
+        None => return Ok(Some(raw_val)),
     };
-    let descriptor = method_descriptor_for_invoke(ctx, method_obj);
     let (_params, ret_desc) = parse_descriptor_param_and_return(&descriptor);
     let primitive_ret = matches!(
         ret_desc.as_str(),

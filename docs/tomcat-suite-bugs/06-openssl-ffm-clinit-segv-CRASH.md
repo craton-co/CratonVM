@@ -66,14 +66,95 @@ when the native library is absent.
   (the Gradle worker path depends on FFM). So this is **deferred** as a dedicated
   foreign-function effort, NOT a quick edit.
 
-## Next steps
+## Re-diagnosis (branch `fix/tomcat-ffm-module-bugs`) — NOT an openssl-FFM logic bug
 
-- Symbolize the faulting RVA `0x9359DC` and the JIT frames with
-  `CRATONVM_SYMBOLIZE` on a release-with-debug build to pin the exact crash site.
-- Check the FFM `downcallHandle`/`SymbolLookup` path for absent symbols — make it
-  return a throwing handle (or skip the openssl_h binding) instead of null.
-- Re-test with `CRATONVM_DISABLE_JIT=1` to confirm whether the SEGV is the JIT
-  exception-path handling vs the FFM layer itself.
+The "Refined finding" above is **wrong about the mechanism**. Verified this session:
+
+- **The synthetic `panama.rs` FFM path is NOT active here.** `register_pe_panama`
+  lives in `register_synthetic_overrides`, which is `#[cfg(feature="synthetic-jdk")]`
+  — **off** in the default (real-JDK) build the suite runs. So the doc's
+  "`panama.rs` resolves a wrong-ABI symbol" cannot be the cause. The real JDK FFM
+  bytecode runs instead.
+- **`openssl_h` init is CLEAN and a red herring.** Calling
+  `org.apache.tomcat.util.net.openssl.panama.OpenSSLLibrary.init()` directly, or
+  `ServerInfo.main(new String[0])` directly, completes with **no SEGV**:
+  `openssl_h.<clinit>` fails with a *caught* `ExceptionInInitializerError`
+  (NPE "Cannot invoke printf on null" — CratonVM's real-JDK `SymbolLookup`
+  library-load path), exactly mirroring HotSpot's caught
+  `IllegalArgumentException: Cannot open library: ssl.dll`. `isAvailable()` returns
+  false either way. The logged `openssl_h <clinit> failed` line in the crash is
+  just this benign, caught failure.
+- **The SEGV is an intermittent, load/concurrency-dependent race**, not
+  deterministic and not openssl-specific:
+  - `JUnitCore TestServerInfo` run **sequentially in isolation passes** — `OK (22
+    tests)` (seen 5/5, then later 0/3 — the rate is environment-dependent).
+  - Run **6× concurrently** (CPU contention) it SEGVs **6/6**, crashing very early
+    (only `JUnit version 4.13.2` printed — *before* any test method, before
+    `openssl_h`). So the crash is during early class-loading/execution under load,
+    unrelated to the openssl path that runs later.
+  - It reproduces on the **unmodified `dev` binary** too — it is pre-existing, not
+    introduced by the module-finder work on this branch.
+- **Crash signature points to a stale reference after GC.** Always the same code
+  site `pc = exe+0x935F7C`, faulting on a **read at `0x…F150`** — the high bits
+  vary per run (`1BA0F150`, `1C9FF150`, `1CB5F150`) but the low 16 bits are
+  constant. That is a field read at a fixed offset (~`0xF150`) from a base pointer
+  that has moved/been freed — the classic stale-ref / moved-object pattern seen in
+  the project's other GC SIGSEGV fixes (cf. `BUG-Z FileStore`, join-wakeup
+  stale-ref, TLAB-tail desync). The backtrace's `external/jit` frames are
+  non-exe addresses (loaded DLL / code region), not necessarily libffi.
+
+So this is a **GC/concurrency stale-reference race surfaced under load**, in the
+same family as the other GC SIGSEGV fixes — *not* a foreign-function symbol bug.
+HotSpot is unaffected because its GC/threading is sound here.
+
+## Root cause (symbolized) + FIX
+
+Symbolized the crash on a release-with-debug build (6× concurrent repro). The
+faulting frame is **`vm_exec::get_field_by_name` (vm_exec.rs:1845)** —
+`class_id_of(obj)` on a stale object pointer — reached via:
+
+```
+get_field_by_name (vm_exec.rs:1845)            <- SIGSEGV
+  method_descriptor_for_invoke (lang_class.rs:4146)
+  native_method_invoke_boxed   (lang_reflect.rs:1068)   <- Method.invoke wrapper
+  safe_native_call -> interpreter -> Vm::invoke
+```
+
+`native_method_invoke_boxed` (the `java.lang.reflect.Method.invoke` wrapper) did:
+
+```
+let raw = native_method_invoke(ctx, args)?;     // runs the TARGET method (can GC!)
+...
+let method_obj = args.first() ...;              // STALE: args is a pre-call snapshot
+let descriptor = method_descriptor_for_invoke(ctx, method_obj);  // deref -> SIGSEGV
+```
+
+`native_method_invoke` executes arbitrary Java (the reflected target), which can
+trigger a GC that **moves the `Method` mirror**. `args` is a snapshot of
+operand-stack `Value`s held on the native's Rust stack — it is **not a GC root**,
+so it is never remapped. Afterwards `args.first()` is a dangling pointer and
+`method_descriptor_for_invoke` → `get_field_by_name` → `class_id_of` dereferences
+freed/moved memory. JUnit drives every test method through `Method.invoke`, so the
+window is hit constantly; under **CPU contention** (concurrent VMs / the suite
+harness) a GC is far more likely to land inside the inner invoke, which is why it
+presented as "intermittent, only under load". HotSpot keeps reflection args live
+across the call, so it never faults.
+
+**Fix** (`native-builtins/src/lang_reflect.rs`): capture the method descriptor
+*before* the inner invoke, while the `Method` mirror is still valid (the
+descriptor is invariant), and reuse it afterwards instead of re-reading the stale
+`args` pointer. No more post-GC stale dereference.
+
+This is **not** an FFM/openssl bug — the original "openssl-FFM symbol resolution"
+diagnosis was wrong. `openssl_h` init fails cleanly and is caught; it merely ran
+in the same early window where the GC race happened to fire.
+
+## Verification
+
+```
+JUnitCore TestServerInfo, 6× concurrent (reliably 6/6 SIGSEGV before the fix):
+  after fix -> 0 SIGSEGV, all OK (22 tests)            [see verification run]
+```
 
 ## Reproduction
 

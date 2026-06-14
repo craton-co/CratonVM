@@ -19339,90 +19339,34 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
     }
 
     // -----------------------------------------------------------------
-    // post-banner SB3: PMRPR.<clinit> Stream lambda NPE
+    // ModuleFinder.ofSystem() — lazy system-module finder
     // -----------------------------------------------------------------
     //
-    // After the JLMA Builder.* overrides above unblock SystemModuleFinders
-    // construction, PathMatchingResourcePatternResolver.<clinit>:216 still
-    // NPEs inside this Stream pipeline:
+    // The genuine `jdk.internal.module.SystemModuleFinders.ofSystem()` cannot
+    // run as-is in CratonVM:
+    //   * The fast path (`SystemModulesMap.allSystemModules()`) returns null —
+    //     the generated `SystemModules$all`/`$0..` classes only exist in the
+    //     linked `lib/modules` jimage, not in the `jmods/java.base.jmod`
+    //     CratonVM boots from (they are jlink-generated).
+    //   * The fallback `ofModuleInfos()` eagerly (a) builds every module's
+    //     descriptor through `JavaLangModuleAccess` (unwired here) and (b)
+    //     memory-maps the ~140 MiB run-time image — far too costly to pay on
+    //     every `ofSystem()` caller (Spring's PMRPR.<clinit> calls
+    //     `ofSystem().findAll()` at boot) and it would OOM the default heap.
     //
-    //     ModuleFinder.ofSystem().findAll().stream()
-    //         .map(ref -> ref.descriptor().name())     // <-- NPE here
-    //         .collect(Collectors.toSet());
-    //
-    // The synthetic ModuleReference instances handed back by our partial
-    // SystemModuleFinders impl carry a null `descriptor` field — the
-    // real-JDK `ModuleReference.descriptor()` is just `getfield descriptor`
-    // (the field is final, set by the protected constructor through
-    // Objects.requireNonNull). Our synthetics never went through that
-    // constructor, so the field stays null. Then `.name()` NPEs.
-    //
-    // Defensive override: register native impls for both the immediate
-    // dereference (`ModuleReference.descriptor()`) and the inner one
-    // (`ModuleDescriptor.name()`). Each reads its private field and, if
-    // null, lazily allocates / interns a synthetic placeholder so the
-    // Stream pipeline can run to completion. The descriptor placeholder
-    // is cached on the ModuleReference instance itself (so identity is
-    // stable across repeat calls); the name placeholder is cached on
-    // the ModuleDescriptor instance similarly.
-    //
-    // Spring's PMRPR only consumes the resulting Set<String> to seed
-    // a static cache — the actual module names don't influence
-    // resource resolution unless the user passes a `module:` URL. The
-    // generic placeholder name "synthetic" is therefore acceptable
-    // for boot. (Real-JDK module naming is exercised exhaustively in
-    // dedicated module-system tests, not here.)
-
-    // Approach: short-circuit `ModuleFinder.findAll()` to return an
-    // empty Set so the Stream pipeline never iterates and the lambda is
-    // never invoked. PMRPR then ends up with
-    // `systemModuleNames = Collections.emptySet()` which is exactly what
-    // the `inNativeImage` branch already does (line :11-:17 in PMRPR
-    // bytecode). Spring uses this set only to filter `module:` URIs out
-    // of resource scans — empty just means no filtering, which is
-    // semantically a no-op for fat-JAR Spring apps that don't use the
-    // module system.
-    //
-    // We also register fallbacks for `ModuleReference.descriptor()` and
-    // `ModuleDescriptor.name()` for any other code path that exercises
-    // the synthetic ModuleReferences directly (defence-in-depth — these
-    // were the original residual #4 from the JLMA agent's report).
-    registry.register(
-        "java/lang/module/ModuleFinder",
-        "findAll",
-        "()Ljava/util/Set;",
-        |ctx, _args| {
-            // Return an empty HashSet via the existing helper.
-            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
-            Ok(Some(Value::Object(Some(empty))))
-        },
-    );
-    // Concrete impl in case the dispatcher resolves through the receiver
-    // class first.
-    registry.register(
-        "jdk/internal/module/SystemModuleFinders$SystemModuleFinder",
-        "findAll",
-        "()Ljava/util/Set;",
-        |ctx, _args| {
-            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
-            Ok(Some(Value::Object(Some(empty))))
-        },
-    );
-
-    // ModuleFinder.ofSystem() is a static interface method. If the real
-    // bytecode threads through SystemModuleFinders.ofSystem() and any
-    // step returns null (for instance, our partial Path / Files impls),
-    // the chain `null.findAll()` will NPE before our findAll override
-    // is reached. Override ofSystem() to return a synthetic stub finder
-    // whose findAll() override (registered above) yields an empty Set.
+    // So we provide a *lazy* finder: `findAll()` stays empty (Spring's only
+    // use is to seed a `Set<String>`; empty is a semantic no-op, matching the
+    // long-standing behaviour) and `find(name)` returns a `ModuleReference`
+    // whose `open()` builds a *real* `SystemModuleReader` on demand. The
+    // image is therefore read only when code actually traverses module
+    // contents (`reader.list()/read()`), via the genuine JDK
+    // `ImageReader`/`BasicImageReader` (see `NativeImageBuffer.getNativeMap`
+    // in native-io). No descriptors, no eager image map, no JLMA.
     registry.register(
         "java/lang/module/ModuleFinder",
         "ofSystem",
         "()Ljava/lang/module/ModuleFinder;",
         |ctx, _args| {
-            // Try to allocate a real SystemModuleFinder; fall back to
-            // an abstract-base instance which still dispatches into our
-            // findAll() override via the registered base-class native.
             let finder = alloc_concurrent_synthetic(
                 ctx,
                 "jdk/internal/module/SystemModuleFinders$SystemModuleFinder",
@@ -19430,6 +19374,87 @@ fn register_module_builder_overrides(registry: &mut NativeMethodRegistry) {
             );
             Ok(Some(Value::Object(Some(finder))))
         },
+    );
+    for cls in [
+        "java/lang/module/ModuleFinder",
+        "jdk/internal/module/SystemModuleFinders$SystemModuleFinder",
+    ] {
+        registry.register(cls, "findAll", "()Ljava/util/Set;", |ctx, _args| {
+            let empty = cratonvm_native_collections::make_hashset_with_elements(ctx, &[]);
+            Ok(Some(Value::Object(Some(empty))))
+        });
+    }
+    // find(name) -> Optional<ModuleReference> backed by a lazy reader.
+    registry.register(
+        "jdk/internal/module/SystemModuleFinders$SystemModuleFinder",
+        "find",
+        "(Ljava/lang/String;)Ljava/util/Optional;",
+        |ctx, args| {
+            let name = match args.get(1).copied() {
+                Some(Value::Object(Some(s))) => s,
+                // null name → Optional.empty() (JDK contract is NPE, but
+                // empty is safer for a defensive finder).
+                _ => {
+                    return ctx.invoke(
+                        "java/util/Optional",
+                        "empty",
+                        "()Ljava/util/Optional;",
+                        &[],
+                    );
+                }
+            };
+            // A ModuleReferenceImpl whose `descriptor.name` carries the module
+            // name and whose `readerSupplier` is left null — `open()` below
+            // detects the null supplier and builds a SystemModuleReader.
+            let mref = alloc_concurrent_synthetic(
+                ctx,
+                "jdk/internal/module/ModuleReferenceImpl",
+                8,
+            );
+            let md = alloc_concurrent_synthetic(ctx, "java/lang/module/ModuleDescriptor", 16);
+            ctx.set_field_by_name(md, "name", Value::Object(Some(name)));
+            ctx.set_field_by_name(mref, "descriptor", Value::Object(Some(md)));
+            ctx.invoke(
+                "java/util/Optional",
+                "of",
+                "(Ljava/lang/Object;)Ljava/util/Optional;",
+                &[Value::Object(Some(mref))],
+            )
+        },
+    );
+    // open() -> ModuleReader. For a real ModuleReferenceImpl (non-null
+    // readerSupplier, e.g. a module-path finder's reference) delegate to the
+    // supplier, exactly as the JDK's `open()` does. For our lazy
+    // system-module references build a real SystemModuleReader for the module.
+    let module_ref_open: cratonvm_native_api::NativeCallback = |ctx, args| {
+        let this = match args.first().copied() {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        if let Value::Object(Some(rs)) = ctx.get_field_by_name(this, "readerSupplier") {
+            return ctx.invoke_virtual(rs, "get", "()Ljava/lang/Object;", &[]);
+        }
+        let name = match ctx.get_field_by_name(this, "descriptor") {
+            Value::Object(Some(d)) => match ctx.get_field_by_name(d, "name") {
+                Value::Object(Some(s)) => s,
+                _ => return Ok(Some(Value::Object(None))),
+            },
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let reader = alloc_concurrent_synthetic(
+            ctx,
+            "jdk/internal/module/SystemModuleFinders$SystemModuleReader",
+            4,
+        );
+        ctx.set_field_by_name(reader, "module", Value::Object(Some(name)));
+        ctx.set_field_by_name(reader, "closed", Value::Int(0));
+        Ok(Some(Value::Object(Some(reader))))
+    };
+    registry.register(
+        "jdk/internal/module/ModuleReferenceImpl",
+        "open",
+        "()Ljava/lang/module/ModuleReader;",
+        module_ref_open,
     );
 
     // Registered on BOTH the abstract base and the concrete impl. The
