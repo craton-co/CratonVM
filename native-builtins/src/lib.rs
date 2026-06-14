@@ -2141,6 +2141,11 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // Pre-populate the side-table with the current system
             // property snapshot so enumeration sees the live values.
             let props = crate::alloc_concurrent_synthetic(ctx, "java/util/Properties", 16);
+            // Mark this as the system-properties view so writes through it (e.g.
+            // `System.getProperties().setProperty(...)`) propagate to the global
+            // store — regular `new Properties()` objects must NOT (they'd pollute
+            // system properties and cross-contaminate other Properties).
+            crate::properties_sidetable::mark_system_props(ctx, props);
             for (k, v) in ctx.list_system_properties() {
                 crate::properties_sidetable::store_property_in_sidetable(ctx, props, &k, &v);
             }
