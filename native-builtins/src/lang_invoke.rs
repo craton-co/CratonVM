@@ -2657,37 +2657,54 @@ fn field_type_mirror_class(ctx: &mut dyn NativeContext, class_name: &str) -> Obj
 // MethodHandles extra factory methods
 // =============================================================================
 
+/// Bridge `MethodHandles.arrayElementGetter` / `arrayElementSetter` to a
+/// synthetic MethodHandle. Shared by synthetic-mode registration
+/// (`register_p65_method_handles_extra`) and the real-JDK essential path
+/// (promoted alongside the other real-JDK MethodHandle bridges in `lib.rs`).
+///
+/// In real-JDK mode the genuine `MethodHandleImpl.makeArrayElementAccessor`
+/// bytecode runs but, for primitive arrays, adapts the generic accessor via
+/// `MethodHandle.viewAsType` → `MethodHandle.copyWith`, which is abstract (no
+/// Code attribute) on CratonVM's synthetic MethodHandles → AbstractMethodError.
+/// `findStatic` / `findVirtual` already work via the real DirectMethodHandle
+/// path, so bridging just these two factories is enough for
+/// `ObjectStreamClass$RecordSupport.<clinit>` — which builds its
+/// `PRIM_VALUE_EXTRACTORS` map via `arrayElementGetter(byte[].class)` — to
+/// complete. Without it, that clinit aborts and ANY record-class
+/// (de)serialization dies with a bogus
+/// `no class def found: java/io/ObjectStreamClass$RecordSupport` linkage error.
+///
+/// NOTE: requires the matching `check_override` allow-list entry in
+/// `vm/src/vm/vm_exec.rs` so this native wins over the (broken) JDK bytecode.
+pub(crate) fn register_array_element_accessor_bridges(r: &mut NativeMethodRegistry) {
+    let __prev_cat = r.current_category();
+    r.set_category(cratonvm_native_api::NativeKind::Bridge);
+    let mh = "java/lang/invoke/MethodHandles";
+    for name in ["arrayElementGetter", "arrayElementSetter"] {
+        r.register(
+            mh,
+            name,
+            "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
+            |ctx, _args| {
+                // C19: allocate past the real-JDK instance-field count so the
+                // `type:MethodType` field at slot 0 is populated with a non-null
+                // MethodType. Synthesize `()V` — callers only need a non-null.
+                let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
+                if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
+                    ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
+                }
+                Ok(Some(Value::Object(Some(obj))))
+            },
+        );
+    }
+    r.set_category(__prev_cat);
+}
+
 pub(crate) fn register_p65_method_handles_extra(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::Bridge);
     let mh = "java/lang/invoke/MethodHandles";
-    r.register(
-        mh,
-        "arrayElementGetter",
-        "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, _args| {
-            // C19: allocate past the real-JDK instance-field count so the
-            // `type:MethodType` field at slot 0 is populated with a non-null
-            // MethodType. Synthesize `()V` — callers only need a non-null.
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
-            if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
-                ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
-            }
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
-    r.register(
-        mh,
-        "arrayElementSetter",
-        "(Ljava/lang/Class;)Ljava/lang/invoke/MethodHandle;",
-        |ctx, _args| {
-            let obj = alloc_concurrent_synthetic(ctx, "java/lang/invoke/MethodHandle", 17);
-            if let Some(mt) = build_method_type_from_descriptor(ctx, "()V") {
-                ctx.set_field_by_name(obj, "type", Value::Object(Some(mt)));
-            }
-            Ok(Some(Value::Object(Some(obj))))
-        },
-    );
+    register_array_element_accessor_bridges(r);
     r.register(
         mh,
         "identity",
@@ -3096,6 +3113,18 @@ pub(crate) const MH_KIND_STRING_CONCAT: i32 = 9;
 /// a proxy instance of the proxy class, and returns it — the interpreter's
 /// SAM dispatch then routes the proxy's abstract method to the impl handle.
 pub(crate) const MH_KIND_LAMBDA_FACTORY: i32 = 10;
+/// Record-deserialization constructor produced by our intercept of
+/// `java.io.ObjectStreamClass$RecordSupport.deserializationCtr(ObjectStreamClass)`.
+/// `MH_CLASS` holds the record class's internal name; `MH_BOUND` holds the
+/// `ObjectStreamClass` describing the stream layout. When `invokeExact(byte[]
+/// primValues, Object[] objValues)` is called by `ObjectInputStream.readRecord`,
+/// the dispatch arm reflectively maps each canonical record component (by name)
+/// to its slot in `primValues`/`objValues` and invokes the canonical
+/// constructor — bypassing the real `MethodHandles.foldArguments`/
+/// `insertArguments`/`arrayElementGetter` combinator chain, which CratonVM's
+/// synthetic MethodHandles cannot execute (see
+/// `register_array_element_accessor_bridges`).
+pub(crate) const MH_KIND_RECORD_DESER: i32 = 11;
 
 // ---------------------------------------------------------------------------
 // Round-9 perf: LambdaMetafactory CallSite cache.
@@ -3842,6 +3871,12 @@ pub(crate) fn mh_dispatch(
             }
             ctx.invoke_special(&class_for_dispatch, &name, &desc, &full_args)
         }
+        MH_KIND_RECORD_DESER => {
+            // Record deserialization constructor. extra_args =
+            // [primValues:byte[], objValues:Object[]] as passed by
+            // `ObjectInputStream.readRecord`. Reflectively rebuild the record.
+            record_deser_dispatch(ctx, mh, extra_args)
+        }
         _ => {
             // Virtual: first extra_arg is receiver (unless bound)
             match bound {
@@ -3857,6 +3892,218 @@ pub(crate) fn mh_dispatch(
                 },
             }
         }
+    }
+}
+
+// =============================================================================
+// Record deserialization (java.io.ObjectStreamClass$RecordSupport)
+// =============================================================================
+
+/// Native for `ObjectStreamClass$RecordSupport.deserializationCtr(ObjectStreamClass)`.
+///
+/// The real JDK builds a `MethodHandle` adapter out of `foldArguments` /
+/// `insertArguments` / `arrayElementGetter` combinators (see
+/// `ObjectStreamClass.RecordSupport.deserializationCtr`), then
+/// `ObjectInputStream.readRecord` invokes it as
+/// `(Object) ctrMH.invokeExact(byte[] primValues, Object[] objValues)`.
+/// CratonVM's synthetic MethodHandles cannot execute that combinator algebra
+/// (it bottoms out in `MethodHandle.copyWith`, abstract → AbstractMethodError),
+/// so instead we return a synthetic `MH_KIND_RECORD_DESER` handle that carries
+/// the record class (`MH_CLASS`) + the describing `ObjectStreamClass`
+/// (`MH_BOUND`); the dispatch arm rebuilds the record reflectively at invoke
+/// time. Without this, every record (de)serialization fails — e.g. Tomcat's
+/// `GenericPrincipal.writeReplace()` emits a `SerializablePrincipal` record
+/// (catalina `TestGenericPrincipal`).
+pub(crate) fn native_record_support_deserialization_ctr(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let desc = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let cls_mirror = match ctx.invoke_virtual(desc, "forClass", "()Ljava/lang/Class;", &[])? {
+        Some(Value::Object(Some(m))) => m,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let cls_name = crate::lang_class::mirror_class_name(ctx, cls_mirror).unwrap_or_default();
+    if cls_name.is_empty() {
+        return Ok(Some(Value::Object(None)));
+    }
+    let mh = alloc_method_handle(
+        ctx,
+        &cls_name,
+        "<init>",
+        "([B[Ljava/lang/Object;)Ljava/lang/Object;",
+        MH_KIND_RECORD_DESER,
+    );
+    ctx.set_field(mh, MH_BOUND, Value::Object(Some(desc)));
+    Ok(Some(Value::Object(Some(mh))))
+}
+
+/// Body of the `MH_KIND_RECORD_DESER` dispatch arm: rebuild a record instance
+/// from the deserialized field arrays. `mh` carries the record class
+/// (`MH_CLASS`) and describing `ObjectStreamClass` (`MH_BOUND`); `extra_args`
+/// are `[primValues:byte[], objValues:Object[]]` from `readRecord`.
+///
+/// Maps each canonical record component (declaration order, from
+/// `Class.getRecordComponents`) to its stream field BY NAME (the stream may
+/// reorder fields — primitives first, then objects), pulling reference values
+/// from `objValues` and decoding primitive values big-endian out of
+/// `primValues`, then invokes the canonical constructor.
+fn record_deser_dispatch(
+    ctx: &mut dyn NativeContext,
+    mh: ObjectRef,
+    extra_args: &[Value],
+) -> MethodCallResult {
+    let record_class = match mh_read_class(ctx, mh) {
+        Some(c) if !c.is_empty() => c,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let desc = match ctx.get_field(mh, MH_BOUND) {
+        Value::Object(Some(d)) => d,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let prim_values = match extra_args.first() {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+    let obj_values = match extra_args.get(1) {
+        Some(Value::Object(o)) => *o,
+        _ => None,
+    };
+
+    // Index the stream fields by name. `objValues` holds the non-primitive
+    // fields in stream order (k-th object field → objValues[k]); `primValues`
+    // holds primitive bytes at each field's reported offset.
+    let fields = match ctx.invoke_virtual(desc, "getFields", "()[Ljava/io/ObjectStreamField;", &[])? {
+        Some(Value::Object(Some(a))) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let nfields = ctx.array_length(fields);
+    // name -> (is_primitive, slot, type_code) where slot = objValues index
+    // (reference) or primValues byte offset (primitive).
+    let mut field_src: std::collections::HashMap<String, (bool, usize, char)> =
+        std::collections::HashMap::with_capacity(nfields);
+    let mut obj_index = 0usize;
+    for i in 0..nfields {
+        let f = match ctx.get_array_element(fields, i) {
+            Value::Object(Some(o)) => o,
+            _ => continue,
+        };
+        let fname = match ctx.invoke_virtual(f, "getName", "()Ljava/lang/String;", &[])? {
+            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+            _ => continue,
+        };
+        let is_prim = matches!(ctx.invoke_virtual(f, "isPrimitive", "()Z", &[])?, Some(Value::Int(1)));
+        let tc = match ctx.invoke_virtual(f, "getTypeCode", "()C", &[])? {
+            Some(Value::Int(c)) => char::from_u32(c as u32).unwrap_or('L'),
+            _ => 'L',
+        };
+        if is_prim {
+            let offset = match ctx.invoke_virtual(f, "getOffset", "()I", &[])? {
+                Some(Value::Int(n)) => n.max(0) as usize,
+                _ => 0,
+            };
+            field_src.insert(fname, (true, offset, tc));
+        } else {
+            field_src.insert(fname, (false, obj_index, tc));
+            obj_index += 1;
+        }
+    }
+
+    // Enumerate canonical components (declaration order) → build ctor args + desc.
+    let cls_mirror = match ctx.class_id_by_name(&record_class) {
+        Some(cid) => ctx.get_class_mirror(cid),
+        None => return Ok(Some(Value::Object(None))),
+    };
+    let comps = match ctx.invoke_virtual(cls_mirror, "getRecordComponents", "()[Ljava/lang/reflect/RecordComponent;", &[])? {
+        Some(Value::Object(Some(a))) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let ncomp = ctx.array_length(comps);
+    let mut ctor_desc = String::from("(");
+    let mut ctor_args: Vec<Value> = Vec::with_capacity(ncomp);
+    for j in 0..ncomp {
+        let comp = match ctx.get_array_element(comps, j) {
+            Value::Object(Some(o)) => o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let cname = match ctx.invoke_virtual(comp, "getName", "()Ljava/lang/String;", &[])? {
+            Some(Value::Object(Some(s))) => ctx.read_string(s).unwrap_or_default(),
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let ctype_mirror = match ctx.invoke_virtual(comp, "getType", "()Ljava/lang/Class;", &[])? {
+            Some(Value::Object(Some(m))) => m,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        let comp_desc = mirror_to_descriptor(ctx, ctype_mirror).into_owned();
+        ctor_desc.push_str(&comp_desc);
+
+        let value = match field_src.get(&cname) {
+            Some(&(false, idx, _)) => match obj_values {
+                Some(arr) if idx < ctx.array_length(arr) => ctx.get_array_element(arr, idx),
+                _ => Value::Object(None),
+            },
+            Some(&(true, offset, tc)) => match prim_values {
+                Some(arr) => record_decode_primitive(ctx, arr, offset, tc),
+                None => default_for_descriptor(&comp_desc),
+            },
+            None => default_for_descriptor(&comp_desc),
+        };
+        ctor_args.push(value);
+    }
+    ctor_desc.push_str(")V");
+
+    // Allocate + run the canonical constructor.
+    let cid = ctx.ensure_class_initialized(&record_class)?;
+    let new_obj = ctx.alloc_object(cid, ncomp.max(16));
+    let mut init_args = Vec::with_capacity(1 + ctor_args.len());
+    init_args.push(Value::Object(Some(new_obj)));
+    init_args.extend_from_slice(&ctor_args);
+    ctx.invoke(&record_class, "<init>", &ctor_desc, &init_args)?;
+    Ok(Some(Value::Object(Some(new_obj))))
+}
+
+/// Decode a single primitive value, big-endian, out of the record stream's
+/// `primValues` byte[] at `offset` per JVM type code (matches
+/// `jdk.internal.util.ByteArray` big-endian layout used by record serialization).
+fn record_decode_primitive(ctx: &dyn NativeContext, arr: ObjectRef, offset: usize, tc: char) -> Value {
+    let len = ctx.array_length(arr);
+    let b = |i: usize| -> u64 {
+        if offset + i < len {
+            match ctx.get_array_element(arr, offset + i) {
+                Value::Int(v) => (v as u8) as u64,
+                _ => 0,
+            }
+        } else {
+            0
+        }
+    };
+    match tc {
+        'Z' => Value::Int(if b(0) != 0 { 1 } else { 0 }),
+        'B' => Value::Int(b(0) as u8 as i8 as i32),
+        'C' => Value::Int((((b(0) << 8) | b(1)) as u16) as i32),
+        'S' => Value::Int(((((b(0) << 8) | b(1)) as u16) as i16) as i32),
+        'I' => Value::Int((((b(0) << 24) | (b(1) << 16) | (b(2) << 8) | b(3)) as u32) as i32),
+        'F' => Value::Float(f32::from_bits(((b(0) << 24) | (b(1) << 16) | (b(2) << 8) | b(3)) as u32)),
+        'J' => Value::Long((((b(0) << 56) | (b(1) << 48) | (b(2) << 40) | (b(3) << 32)
+            | (b(4) << 24) | (b(5) << 16) | (b(6) << 8) | b(7)) as u64) as i64),
+        'D' => Value::Double(f64::from_bits((b(0) << 56) | (b(1) << 48) | (b(2) << 40) | (b(3) << 32)
+            | (b(4) << 24) | (b(5) << 16) | (b(6) << 8) | b(7))),
+        _ => Value::Int(0),
+    }
+}
+
+/// Default (zero/null) value for a field descriptor, used when a record
+/// component has no matching stream field.
+fn default_for_descriptor(desc: &str) -> Value {
+    match desc.chars().next() {
+        Some('J') => Value::Long(0),
+        Some('F') => Value::Float(0.0),
+        Some('D') => Value::Double(0.0),
+        Some('L') | Some('[') => Value::Object(None),
+        _ => Value::Int(0),
     }
 }
 

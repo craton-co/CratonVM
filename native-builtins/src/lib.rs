@@ -7788,6 +7788,45 @@ fn register_annotation_overrides(registry: &mut NativeMethodRegistry) {
     // `register_synthetic_overrides`; promote it here so real-JDK CLI builds
     // get the same coverage.
     crate::phases_late::register_p59_file_attributes(registry);
+
+    // METHODHANDLES ARRAY ACCESSORS (real-JDK mode): `MethodHandles.
+    // arrayElementGetter` / `arrayElementSetter` run genuine JDK bytecode in
+    // real-JDK mode, but `MethodHandleImpl.makeArrayElementAccessor` adapts the
+    // generic accessor for primitive arrays via `MethodHandle.viewAsType` →
+    // `copyWith` — abstract on CratonVM's synthetic MethodHandles ("has no Code
+    // attribute" AbstractMethodError). `ObjectStreamClass$RecordSupport.<clinit>`
+    // builds `PRIM_VALUE_EXTRACTORS` with `arrayElementGetter(byte[].class)`, so
+    // that clinit aborts and every record-class (de)serialization dies with a
+    // bogus `no class def found: ObjectStreamClass$RecordSupport` linkage error
+    // (e.g. catalina TestGenericPrincipal). These bridges historically shipped
+    // only via `register_synthetic_overrides` (register_p65_method_handles_extra);
+    // promote them here so real-JDK CLI builds also get a non-null MethodHandle.
+    // The companion `check_override` allow-list entry in `vm/src/vm/vm_exec.rs`
+    // pins the native ahead of the (broken) JDK bytecode.
+    crate::lang_invoke::register_array_element_accessor_bridges(registry);
+
+    // RECORD DESERIALIZATION (real-JDK mode): `ObjectInputStream.readRecord`
+    // rebuilds a serialized record by invoking the `MethodHandle` returned by
+    // `ObjectStreamClass$RecordSupport.deserializationCtr(ObjectStreamClass)`,
+    // which the JDK assembles from `foldArguments`/`insertArguments`/
+    // `arrayElementGetter` combinators — an algebra CratonVM's synthetic
+    // MethodHandles cannot execute. Intercept `deserializationCtr` to return a
+    // synthetic `MH_KIND_RECORD_DESER` handle that rebuilds the record
+    // reflectively on `invokeExact(primValues, objValues)`. Needed for any app
+    // serializing a record (Tomcat `GenericPrincipal` → `SerializablePrincipal`
+    // record; catalina `TestGenericPrincipal`). Companion `check_override` entry
+    // in `vm/src/vm/vm_exec.rs` pins this over the JDK bytecode.
+    {
+        let __prev = registry.current_category();
+        registry.set_category(cratonvm_native_api::NativeKind::Bridge);
+        registry.register(
+            "java/io/ObjectStreamClass$RecordSupport",
+            "deserializationCtr",
+            "(Ljava/io/ObjectStreamClass;)Ljava/lang/invoke/MethodHandle;",
+            crate::lang_invoke::native_record_support_deserialization_ctr,
+        );
+        registry.set_category(__prev);
+    }
 }
 
 #[cfg(feature = "synthetic-jdk")]

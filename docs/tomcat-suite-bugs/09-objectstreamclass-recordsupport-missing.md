@@ -1,10 +1,55 @@
 # Bug 09 — ObjectStreamClass$RecordSupport missing → NOSUMMARY (VM death)
 
-**Status:** OPEN. Real CratonVM bug (HotSpot PASSes).
+**Status:** ✅ FIXED (branch `fix/tomcat-suite-bugs-09-10`).
+`org.apache.catalina.realm.TestGenericPrincipal` now `OK (3 tests)` == HotSpot.
 **Severity:** Medium-High — a `linkage error` kills the VM (NOSUMMARY); affects
 any test serializing a record (or a class whose serialization walks records).
-**Repro classes:** `org.apache.catalina.realm.TestGenericPrincipal` (NOSUMMARY),
-likely also `TestJNDIRealm` (NOSUMMARY).
+**Repro classes:** `org.apache.catalina.realm.TestGenericPrincipal` (was NOSUMMARY,
+now PASS). `TestJNDIRealm`'s NOSUMMARY was a *separate* issue (in-memory LDAP
+server / networking), NOT this bug — records now deserialize cleanly under it.
+
+## Fix summary
+
+Two layers, all in worktree `CratonVM-tcsuite0910`:
+
+1. **Bridge `MethodHandles.arrayElementGetter`/`arrayElementSetter` in real-JDK
+   mode.** They were registered only in synthetic mode
+   (`register_p65_method_handles_extra`), so in real-JDK mode the genuine
+   `MethodHandleImpl.makeArrayElementAccessor` bytecode ran and bottomed out in
+   the intrinsic / `viewAsType` → `MethodHandle.copyWith` LambdaForm machinery
+   (`copyWith` is abstract → "has no Code attribute" AbstractMethodError; for
+   `Object[]` it first NPE'd on `MethodTypeForm.cachedLambdaForm`'s null
+   `lambdaForms`). `findStatic`/`findVirtual` already work via the real
+   DirectMethodHandle path, so only these two factories needed bridging. New
+   shared helper `register_array_element_accessor_bridges` (lang_invoke.rs),
+   promoted into real-JDK essentials (lib.rs) + a `check_override` allow-list
+   entry (vm_exec.rs) so the native wins over the broken bytecode. This alone
+   clears the `RecordSupport` *linkage error* (clinit completes).
+
+2. **Real java.io record deserialization.** With (1), deser progressed into
+   `ObjectInputStream.readRecord` → `RecordSupport.deserializationCtr`, which the
+   JDK assembles from `foldArguments`/`insertArguments`/`arrayElementGetter`
+   combinators CratonVM's synthetic MethodHandles cannot execute (it threw
+   `IllegalArgumentException` at `insertArguments`). Intercept
+   `deserializationCtr` to return a synthetic `MH_KIND_RECORD_DESER` handle
+   carrying the record class + `ObjectStreamClass`; its `mh_dispatch` arm, on
+   `invokeExact(byte[] primValues, Object[] objValues)` from `readRecord`,
+   rebuilds the record reflectively — maps each canonical record component (from
+   `Class.getRecordComponents`) to its stream field **by name** (the stream
+   reorders fields, primitives-first), pulls reference values from `objValues`
+   and decodes primitive values big-endian out of `primValues`, then invokes the
+   canonical constructor. New native + dispatch arm + decode helpers
+   (lang_invoke.rs), real-JDK essential registration (lib.rs) + a `check_override`
+   entry (vm_exec.rs).
+
+Verified: `TestGenericPrincipal` OK(3); a `record Point(int,int)` round-trips
+(primitive-component path); non-record serialization unaffected; MethodHandle
+regression probe green (`findStatic`/`findVirtual`/`bindTo`); EL record/MH tests
+(`TestRecordELResolver`, `TestMethodReference`, …) still pass. The fix is additive
+(new MH kind + 2 allow-list entries + essential bridge registrations) — no JIT/GC
+paths touched.
+
+## Original diagnosis (for reference)
 
 ## Symptom
 
