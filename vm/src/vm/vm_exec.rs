@@ -656,6 +656,10 @@ pub(crate) fn monitor_enter_blocking(
     let pin_base = ctx.thread.native_pin_roots.len();
     ctx.thread.native_pin_roots.push(obj);
     ctx.deposit_root_snapshot();
+    // CRIT (TLAB UAF) — retire the TLAB before blocking on a contended
+    // `synchronized` acquire (see monitor_wait): a STW GC can grow/realloc the
+    // young arena while we are parked, freeing the buffer the TLAB points into.
+    ctx.thread.tlab.retire();
     // Gated diagnostic only (CRATONVM_DBG_MONENTER, default OFF): deposit this
     // thread's frame snapshot so the contended-`enter` poll loop can emit it
     // if a watchdog stack-dump fires while we are blocked acquiring this
@@ -2828,6 +2832,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // early-returns — so the barrier's `expected` accounting cannot
         // leak. The guard is dropped immediately after the wait so a
         // *subsequent* STW correctly waits for this now-running thread.
+        //
+        // CRIT (TLAB UAF) — retire the TLAB before going GC-blocked, while the
+        // young arena is still valid. A STW moving GC on another thread can
+        // grow() (realloc) the young arena while we are parked here, freeing the
+        // old backing buffer; a retained TLAB into it would dangle and the first
+        // post-wait fast-path bump would SIGSEGV in init_object_header. Object
+        // .wait/Condition.await/blocking-queue take all funnel through here, so
+        // this is the dominant blocking path under concurrency.
+        self.thread.tlab.retire();
         let was_interrupted = {
             let blk = self.shared.gc_barrier.enter_blocked();
             if blk.pre_stw {
@@ -3271,6 +3284,9 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         // T19.H1 — mark GC-blocked across the join so a stop-the-world
         // GC excludes this thread from `wait_for_all` (it is parked in
         // `JoinHandle::join` and cannot reach an interpreter safepoint).
+        // CRIT (TLAB UAF) — retire the TLAB before blocking (see monitor_wait):
+        // a STW GC can grow/realloc the young arena while we are joined.
+        self.thread.tlab.retire();
         {
             let blk = self.shared.gc_barrier.enter_blocked();
             if blk.pre_stw {
@@ -3668,6 +3684,20 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
     }
 
     fn begin_blocking_region(&mut self) {
+        // CRIT (TLAB UAF) — retire this thread's TLAB before entering the
+        // blocked region, while the young arena it points into is still valid.
+        // While we are GC-blocked a stop-the-world moving collection can run on
+        // another thread and `grow()` (realloc) the young arena, freeing the old
+        // backing buffer; a retained TLAB `[cursor,end)` into that buffer would
+        // then be dangling and the first post-block fast-path bump would write
+        // the object header into freed memory → EXCEPTION_ACCESS_VIOLATION in
+        // `init_object_header`. Retiring here (arena still mapped) fills the tail
+        // for the collector's walk and empties the TLAB so the next allocation,
+        // after the block, refills from the current arena. Symmetric to the
+        // parked-thread retire in `safepoint_check`; `check_post_block_gc` only
+        // remaps existing refs and runs after the buffer may already be freed,
+        // so the retire must happen here, before the block.
+        self.thread.tlab.retire();
         // T19.H1 — a native about to spin/poll or OS-wait for a long
         // time (e.g. `ReferenceQueue.remove`) must publish its roots and
         // mark itself GC-blocked, otherwise a concurrent stop-the-world
@@ -4047,6 +4077,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
         // Deposit root snapshot before blocking so GC can scan this thread
         self.deposit_root_snapshot();
+        // CRIT (TLAB UAF) — retire the TLAB before parking (see monitor_wait):
+        // a STW GC can grow/realloc the young arena while this thread is parked,
+        // freeing the buffer the TLAB points into.
+        self.thread.tlab.retire();
 
         // NEW-15.4: virtual-thread aware park.
         // Non-pinned VTs release their carrier permit so another VT can run.
