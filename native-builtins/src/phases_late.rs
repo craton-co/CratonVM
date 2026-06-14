@@ -1717,6 +1717,12 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
     );
     r.register(
         is,
+        "sorted",
+        "()Ljava/util/stream/IntStream;",
+        p56_int_stream_sorted,
+    );
+    r.register(
+        is,
         "boxed",
         "()Ljava/util/stream/Stream;",
         p56_int_stream_boxed,
@@ -2189,6 +2195,20 @@ fn p56_int_stream_drop_while(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
         result.push(v);
     }
     let s = p56_build_stream(ctx, result, "java/util/stream/IntStream");
+    Ok(Some(Value::Object(Some(s))))
+}
+
+// --- IntStream.sorted → IntStream (natural ascending order) ---
+// Without this native, the synthetic IntStream's `sorted()` dispatched to the
+// abstract `IntStream.sorted()` interface method → "has no Code attribute" AME.
+// Groovy's shaded ANTLR4 lexer (`LexerActionExecutor.execute`) calls it, so the
+// Groovy LEXER died → every Groovy script failed to compile
+// (SpringRepositoriesExtensionTests).
+fn p56_int_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let mut elems = p56_read_stream_elems(ctx, this);
+    elems.sort_by_key(|v| v.as_int().unwrap_or(0));
+    let s = p56_build_stream(ctx, elems, "java/util/stream/IntStream");
     Ok(Some(Value::Object(Some(s))))
 }
 

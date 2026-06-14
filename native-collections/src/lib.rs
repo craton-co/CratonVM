@@ -10064,6 +10064,12 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "toArray", "()[I", native_int_stream_to_array);
     r.register(
         c,
+        "sorted",
+        "()Ljava/util/stream/IntStream;",
+        native_int_stream_sorted,
+    );
+    r.register(
+        c,
         "boxed",
         "()Ljava/util/stream/Stream;",
         native_int_stream_boxed,
@@ -10246,6 +10252,25 @@ fn native_int_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         ctx.invoke_virtual(consumer, "accept", "(I)V", &[*elem])?;
     }
     Ok(None)
+}
+
+/// `IntStream.sorted()` — natural ascending order. The synthetic IntStream
+/// created by `range`/`rangeClosed`/`map`/etc. (this handler set) had no
+/// `sorted`, so it dispatched to the abstract `IntStream.sorted()` → "has no
+/// Code attribute" AME. Groovy's shaded ANTLR4 lexer (`LexerActionExecutor`)
+/// calls it, so every Groovy script failed to compile
+/// (SpringRepositoriesExtensionTests).
+fn native_int_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_int_stream(ctx, &[]),
+    };
+    let mut elements = int_stream_elements(ctx, this);
+    elements.sort_by_key(|v| match v {
+        Value::Int(i) => *i,
+        _ => 0,
+    });
+    make_int_stream(ctx, &elements)
 }
 
 fn native_int_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
