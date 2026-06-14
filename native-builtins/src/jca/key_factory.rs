@@ -137,6 +137,50 @@ fn get_kpg_keysize(this: ObjectRef) -> Option<i32> {
     kpg_keysize_table().lock().get(&this).copied()
 }
 
+/// Records whether a `KeyPairGenerator` was obtained via the BouncyCastle
+/// provider (`getInstance(alg, "BC")`). EC keygen then produces genuine BC keys
+/// (`BCECPrivate/PublicKey`) instead of SunEC `EC*KeyImpl`, so keycloak's
+/// BC-specific code (`BCECDSACryptoProvider.getPublicFromPrivate`, which casts to
+/// `org.bouncycastle.jce.interfaces.ECPrivateKey` and uses BC point math) works —
+/// while BC keys still sign/verify through our `Signature` natives.
+fn kpg_bcprov_table() -> &'static parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, bool>> {
+    use std::sync::OnceLock;
+    static T: OnceLock<parking_lot::Mutex<rustc_hash::FxHashMap<ObjectRef, bool>>> =
+        OnceLock::new();
+    T.get_or_init(|| parking_lot::Mutex::new(rustc_hash::FxHashMap::default()))
+}
+
+fn set_kpg_bcprov(this: ObjectRef, bc: bool) {
+    kpg_bcprov_table().lock().insert(this, bc);
+}
+
+fn get_kpg_bcprov(this: ObjectRef) -> bool {
+    kpg_bcprov_table().lock().get(&this).copied().unwrap_or(false)
+}
+
+/// Resolve the requested provider name from `getInstance`'s 2nd argument, which
+/// is either a `String` provider name or a `java.security.Provider` instance.
+fn requested_provider_name(ctx: &mut dyn NativeContext, args: &[Value]) -> String {
+    let Some(Value::Object(Some(o))) = args.get(1).copied() else {
+        return String::new();
+    };
+    let cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(o))
+        .unwrap_or_default();
+    if cls == "java/lang/String" {
+        return ctx.read_string(o).unwrap_or_default();
+    }
+    // A `Provider` instance → getName().
+    match ctx.invoke_virtual(o, "getName", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(ns)))) => ctx.read_string(ns).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+fn is_bc_provider(name: &str) -> bool {
+    name.eq_ignore_ascii_case("BC") || name.contains("BouncyCastle")
+}
+
 // ---------------------------------------------------------------------------
 // EC-scoped real-SunEC routing (crate::route_ec_to_real, default ON)
 // ---------------------------------------------------------------------------
@@ -172,6 +216,25 @@ fn is_synthetic_key_obj(ctx: &dyn NativeContext, v: &Value, class_name: &str) ->
 /// via `initialize`, it is forwarded so the real SunEC code resolves the curve
 /// (P-256/384/521); otherwise the stored keysize (default 256 → P-256) is used.
 fn drive_real_ec_keypair(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodCallResult {
+    // BouncyCastle was explicitly requested → drive BC's EC KeyPairGenerator so
+    // keycloak gets genuine `BCECPrivate/PublicKey` (its `getPublicFromPrivate`
+    // casts to BC's EC key interface + uses BC point math). BC keys still
+    // sign/verify through our `Signature` natives. Default = SunEC.
+    let spi_class = if get_kpg_bcprov(this) {
+        "org/bouncycastle/jcajce/provider/asymmetric/ec/KeyPairGeneratorSpi$EC"
+    } else {
+        "sun/security/ec/ECKeyPairGenerator"
+    };
+    drive_ec_keypair_spi(ctx, this, spi_class)
+}
+
+/// Drive a real EC `KeyPairGenerator` SPI (SunEC or BouncyCastle) honouring the
+/// stored keysize / `ECGenParameterSpec` curve, returning a real `KeyPair`.
+fn drive_ec_keypair_spi(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    spi_class: &'static str,
+) -> MethodCallResult {
     // Read the requested keysize + spec (curve) BEFORE any allocation.
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let keysize = get_kpg_keysize(this)
@@ -187,7 +250,7 @@ fn drive_real_ec_keypair(ctx: &mut dyn NativeContext, this: ObjectRef) -> Method
     };
     // Pin the spec (if any) FIRST so it survives the SPI allocation below.
     let spec_pin = spec0.map(|s| ctx.pin_native_root(s));
-    let spi = match ctx.new_object_initialized("sun/security/ec/ECKeyPairGenerator", "()V", &[]) {
+    let spi = match ctx.new_object_initialized(spi_class, "()V", &[]) {
         Ok(Some(Value::Object(Some(o)))) => o,
         other => {
             if let Some(p) = spec_pin {
@@ -195,7 +258,7 @@ fn drive_real_ec_keypair(ctx: &mut dyn NativeContext, this: ObjectRef) -> Method
             }
             other?;
             return Err(RuntimeError::NotImplemented {
-                feature: "sun.security.ec.ECKeyPairGenerator".into(),
+                feature: spi_class.into(),
             }
             .into());
         }
@@ -946,6 +1009,10 @@ fn drive_real_pqc_keyfactory(
 fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let alg = read_string(ctx, args, 0);
     let idx = algo_idx(&alg);
+    // Resolve the requested provider BEFORE allocating the synthetic (the
+    // Provider.getName() invoke can trigger GC, which would relocate the KPG and
+    // desync its raw-ObjectRef side-table entries).
+    let is_bc = is_bc_provider(&requested_provider_name(ctx, args));
     let base = synthetic_base_offset(ctx, "java/security/KeyPairGenerator");
     let kpg = alloc_concurrent_synthetic(
         ctx,
@@ -958,6 +1025,9 @@ fn kpg_get_instance(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     // the algorithm index reliably across the call chain, mirroring the
     // proven pattern in `message_digest::accumulators`.
     set_kpg_algo(kpg, idx);
+    // Record a BouncyCastle provider request (getInstance(alg, "BC"|BCprovider))
+    // so EC keygen can hand out genuine BC keys (see `kpg_bcprov_table`).
+    set_kpg_bcprov(kpg, is_bc);
     let default_bits = if idx == ALGO_RSA { 2048 } else if idx == ALGO_EC { 256 } else { 0 };
     set_kpg_keysize(kpg, default_bits);
     // Also write the algorithm string to the real-JDK named field so the

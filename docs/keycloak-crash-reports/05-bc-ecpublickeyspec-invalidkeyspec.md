@@ -1,27 +1,26 @@
 # 05 — BC `ECPublicKeySpec` not supported by `KeyFactory.generatePublic`
 
-**Status:** PARTIAL — the reported spec-rejection IS fixed; the test stays red on a
-DEEPER, separate provider-routing issue (below).
-**Affected:** BCECDSACryptoProviderTest (`getPublicFromPrivate[*]`, 3 failures)
+**Status:** ✅ FIXED — `BCECDSACryptoProviderTest` now `OK (3 tests)` (secp256r1/384r1/521r1);
+0 regressions across the crypto module (incl. JWKT cert gen+verify, ECDSA sign/verify, SdJwt).
 
-## What's fixed
-`KeyFactory.getInstance("EC").generatePublic(org.bouncycastle.jce.spec.ECPublicKeySpec)`
-no longer throws "ECPublicKeySpec not supported": when SunEC rejects a BC-specific spec,
-`key_factory.rs` now falls back to BC's own
-`ec.KeyFactorySpi$EC.engineGeneratePublic/Private` (which accepts the BC spec). Harmless —
-only triggers for BC-specific specs SunEC can't parse.
+## Fix (two parts — the spec was only half of it)
+1. **BC-specific spec rejected.** `KeyFactory.getInstance("EC").generatePublic(org.
+   bouncycastle.jce.spec.ECPublicKeySpec)` threw "ECPublicKeySpec not supported". `key_factory.rs`
+   now falls back to BC's own `ec.KeyFactorySpi$EC.engineGenerate{Public,Private}` when SunEC
+   rejects a spec (via the generic `drive_keyspec_spi`). Harmless — only fires for BC-specific
+   specs SunEC can't parse.
+2. **Provider-aware EC keygen (the real root cause).** keycloak's `getPublicFromPrivate`
+   casts `(BCECPrivateKey) testKey.getPrivate()` + uses BC point math. But under
+   `route_ec_to_real`, CratonVM's EC keygen ALWAYS produced **SunEC** keys regardless of the
+   requested provider, so the BC cast/math operated on the wrong key type → wrong point. Fix:
+   `kpg_get_instance` records a BouncyCastle provider request (`getInstance(alg,"BC"|BCprovider)`,
+   resolved by `requested_provider_name`), and EC `generateKeyPair` then drives BC's
+   `KeyPairGeneratorSpi$EC` (real `BCECPrivate/PublicKey`) instead of `sun.security.ec.
+   ECKeyPairGenerator`. **Crucially, BC EC keys still sign/verify through our `Signature`
+   natives** and BC's `G.multiply(d)` is correct under CratonVM (proven by probe), so
+   `getPublicFromPrivate` now matches. Default (no provider / non-BC) keeps SunEC.
 
-## Deeper residual (why the test is still red)
-The test casts `(BCECPrivateKey) testKey.getPrivate()` and derives the public key with BC's
-`getParameters().getG().multiply(getD())`. But under `route_ec_to_real` CratonVM's EC keygen
-ALWAYS produces **SunEC** `EC{Public,Private}KeyImpl` (via `sun.security.ec.
-ECKeyPairGenerator`), regardless of the requested BouncyCastle provider — so `testKey` is a
-SunEC key and the BC-specific `getPublicFromPrivate` operates on the wrong key type / BC
-point math, yielding a non-matching point (fails identically with `CRATONVM_DISABLE_JIT=1`,
-so not a JIT miscompile). A real fix needs **provider-aware EC keygen** (produce a real BC
-keypair when BC is requested) — a larger change to core EC routing with regression risk
-across the many EC tests that currently rely on the SunEC path. Scoped out here.
-**Symptom:**
+(historical) **Symptom:**
 ```
 RuntimeException: Received an invalid key spec.
 Caused by: java.security.spec.InvalidKeySpecException:
