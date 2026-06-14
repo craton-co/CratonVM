@@ -1266,20 +1266,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(out))))
         },
     );
+    // String.hashCode — use the layout-aware CACHING implementation (reads and
+    // writes the JDK `hash` field) rather than recomputing from scratch on every
+    // call. The previous inline closure here re-decoded the char array and
+    // re-ran the fold every time, with NO caching, so real-JDK String-keyed
+    // hashing was ~1950x slower than HotSpot (which caches in String.hash):
+    // a 5M-call microbench took 17.6s vs HotSpot's 9ms, and it dominated the
+    // Xerces XSD model build (XSElementDecl.hashCode / CMStateSet.hashCode were
+    // ~100% of self-time). `register_synthetic_overrides` already wired the
+    // caching impl, but real-JDK mode (`--java-home`) only runs
+    // `register_essential_natives`, so the cache never took effect there.
     registry.register(
         "java/lang/String", "hashCode", "()I",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Int(0))),
-            };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let mut h: i32 = 0;
-            for c in s.chars() {
-                h = h.wrapping_mul(31).wrapping_add(c as i32);
-            }
-            Ok(Some(Value::Int(h)))
-        },
+        native_string_hash_code,
     );
     registry.register(
         "java/lang/String", "indexOf", "(I)I",
