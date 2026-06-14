@@ -485,6 +485,29 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
+        // SUNEC-INTPOLY (2026-06-14) — blanket JIT ban for SunEC's field
+        // arithmetic (`sun/security/util/math/intpoly/`). For P-384 / P-521 a
+        // repeated keygen+sign+verify mix progressively corrupts the curve's
+        // field-element limb arrays (`long[]`), zeroing chunks of the cached
+        // generator point, so `ECOperations.multiply` then fails "point NOT ON
+        // CURVE" (keycloak DefaultCryptoJWKTest publicEs256P384/P521,
+        // BCECDSACryptoProviderTest secp384/521, SdJwtVP AltCurves). It is the
+        // JIT-only face of the documented cross-package JIT→JIT arg-marshalling
+        // miscompile (a primitive value lands in a reference/array slot — cf.
+        // docs/bc-math-ec-jit-miscompile-investigation.md): `CRATONVM_DISABLE_JIT=1`
+        // makes it 0/40, and bisection shows it needs BOTH `intpoly` AND
+        // `java/math` (BigInteger) JIT-compiled together — `intpoly` is the
+        // compiled caller, so banning it from the JIT (callee→interpreter) breaks
+        // the bad JIT→JIT call. P-256 is unaffected (smaller field) but is banned
+        // too for safety; EC field math is correctness-critical crypto, never a
+        // benchmarked hot path, so interpreter-only is the right trade. Lifted by
+        // `CRATONVM_JIT_ALLOW_PACKAGES=sun/security/util/math/intpoly/`.
+        if class_name.starts_with("sun/security/util/math/intpoly/")
+            && !package_allowed("sun/security/util/math/intpoly/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
         // HIB-BYTEBUDDY (2026-06-13) — provisional blanket ban for ByteBuddy's
         // runtime class-build chain (`net/bytebuddy/`). The narrow HIB-PROXY ban
         // on `ByteBuddyState.make` only covered the lazy-proxy path; Hibernate's

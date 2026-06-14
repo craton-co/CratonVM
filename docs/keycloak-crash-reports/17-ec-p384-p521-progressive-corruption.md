@@ -1,46 +1,42 @@
-# 17 — P-384 / P-521 EC: progressive heap corruption of SunEC field elements
+# 17 — P-384 / P-521 EC: progressive heap corruption (JIT miscompile)
 
-**Status:** OPEN — deep GC / memory-safety (or SunEC limb-arithmetic) bug. NOT a quick fix.
-**Affected:** DefaultCryptoJWKTest (`publicEs256P384`, `publicEs256P521`),
-BCECDSACryptoProviderTest (secp384r1/secp521r1 params),
-DefaultCryptoSdJwtVPVerificationTest (`AltCnfCurves`).
+**Status:** FIXED — JIT ban on `sun/security/util/math/intpoly/` (`vm/src/jit/skip_list.rs`).
+**Affected:** DefaultCryptoJWKTest (`publicEs256P384`/`P521`, now ✓);
+BCECDSACryptoProviderTest (secp384/521 — separate `ECPublicKeySpec` issue remains);
+DefaultCryptoSdJwtVPVerificationTest (`AltCnfCurves`, now ✓).
 **Symptom:** `IllegalArgumentException: native EC scalar multiply failed (bad point/scalar)`
-from `sun.security.ec.ECOperations.multiply` (in keygen `calculatePublicKey` and ECDSA
-`verifySignedDigest`).
+from `sun.security.ec.ECOperations.multiply` (keygen `calculatePublicKey`, ECDSA verify).
 
-## What it is NOT
-- Not a missing curve: `sunec_point.rs` implements P-256/384/521 via RustCrypto
-  `p256`/`p384`/`p521` crates.
-- Not the OID/cert-verify bug (#14, fixed).
-- Not value-specific scalars: a **single** P-384/P-521 keygen, sign, verify, cert-build,
-  cert-verify all PASS in isolation (apps/probe/kccert/{EcP384,CertP384,EcP384Ops}.java).
-
-## What it IS (isolated via apps/probe/kccert/EcLoop.java + CRATONVM_DBG_EC)
-Under a **repeated** mix of keygen + sign + verify, P-384 keygen fails ~35/40 and P-521
-keygen fails 40/40. Gated debug in `scalar_mul_*` shows the failure is **"point NOT ON
-CURVE"** with a **corrupted generator point**:
-
+## Root cause — a JIT miscompile
+A single P-384/P-521 keygen/sign/verify passes; under a **repeated** keygen+sign+verify mix
+the curve's field-element limb arrays (`long[]`) are progressively corrupted — chunks of the
+cached generator point's coordinates get zeroed, so `ECOperations.multiply` then reports
+**"point NOT ON CURVE"** (gated `CRATONVM_DBG_EC` debug confirmed):
 ```
-P-384 Gy (correct): …b5f0 b8c00a60b1ce1d7e819d7a4 31d7c90ea0e5f
-P-384 Gy (CratonVM):…b5f0 c0000000000000000000004 31d7c90ea0e5f   ← middle limbs zeroed
+P-384 Gy correct : …b5f0 b8c00a60b1ce1d7e819d7a4 31d7c90ea0e5f
+P-384 Gy CratonVM: …b5f0 c0000000000000000000004 31d7c90ea0e5f   ← limbs zeroed
 ```
-The corruption **accumulates** (later iterations zero even more of both X and Y). Since the
-generator is a fixed, cached point, its in-heap coordinate data (SunEC
-`ImmutableIntegerModuloP` montgomery-limb arrays, read back via `asBigInteger()`) is being
-progressively corrupted by repeated EC operations.
 
-## Likely locus
-A GC / memory-safety issue exercised by the heavy allocation + re-entrant-invoke pattern of
-`sunec_point.rs::native_ec_multiply` (each call does several `invoke`s and BigInteger/array
-allocations; P-384/P-521 field elements are larger than P-256, so more allocation churn),
-**or** a SunEC long/limb-arithmetic interpreter bug in the P-384/P-521 `asBigInteger`/
-montgomery conversion that writes outside the limb array. The zeroed-tail pattern resembles
-the young-gen/TLAB corruption family (cf. memory `reference_bug_d_cidr_jit_gc`). P-256 is
-unaffected (smaller field, possibly different limb layout / less churn).
+`CRATONVM_DISABLE_JIT=1` → **0/40 fail** ⇒ it is a JIT miscompile. Package bisection
+(`CRATONVM_JIT_BISECT_ONLY`, no rebuild) showed each package alone is clean but
+**`java/math` + `sun/security/util/math/intpoly` JIT-compiled together** reproduces 35/40.
+This is the JIT-only face of the documented cross-package JIT→JIT arg-marshalling miscompile
+(a primitive value lands in a reference/array slot — see
+`docs/bc-math-ec-jit-miscompile-investigation.md`): `intpoly` is the compiled *caller*, and a
+JIT→JIT call into compiled `BigInteger` mis-marshals an operand slot, writing a primitive
+into a limb. P-256 is unaffected (smaller field / fewer limbs).
 
-## Next steps (for a future pass)
-- Run `EcLoop` under the moving-GC / no-GC toggles and the stray-stack debug
-  (`CRATONVM_DBG_STRAYSTACK`) to confirm GC vs arithmetic.
-- Audit `native_ec_multiply` pinning of the intermediate `ImmutableIntegerModuloP` / BigInteger
-  refs across the `asBigInteger`/`toByteArray` re-entrant calls.
-- Compare P-256 vs P-384 `IntegerPolynomialP*` limb read-back for an out-of-bounds write.
+## Fix
+Ban `sun/security/util/math/intpoly/` from the JIT (interpret it) — the established codebase
+pattern for correctness-critical, non-benchmarked code with a JIT miscompile (cf. the
+`org/bouncycastle/` and `net/bytebuddy/` bans). With `intpoly` interpreted, the bad JIT→JIT
+call never forms. EC field math is never a benchmarked hot path, so interpreter-only is the
+right trade; overridable via `CRATONVM_JIT_ALLOW_PACKAGES=sun/security/util/math/intpoly/`.
+
+Verified: P-384/P-521 keygen+sign+verify 0/40 fail; DefaultCryptoJWKTest 10/10.
+
+## Note — the underlying general JIT bug remains
+The real defect is the cross-package JIT→JIT operand-slot/arg-marshalling miscompile in
+`jit/src/x64.rs` (suspected category-2/long arg slot accounting; see the BC-EC investigation
+doc). The ban suppresses its EC face; a proper codegen fix would also clear the
+`org/bouncycastle/math/ec` ban and other latent cases — a separate, larger JIT effort.
