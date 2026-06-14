@@ -54,14 +54,15 @@ RSA-OAEP `Cipher` (#03), ECDH (#04), BC `ECPublicKeySpec` (#05), imported RSA pr
 | 01 | [Hashtable.keys()/elements() wrong Entry layout](01-hashtable-enumeration-real-entry-layout.md) | DefaultCertificateIdentityExtractorTest, DefaultCryptoJWKTest, DefaultCryptoRSAVerifierTest, PemUtilsBCTest | **FIXED** (cascade removed; classes still fail on RSA-key #11 / CN-extraction follow-on) |
 | 02 | [Constructor.getGenericParameterTypes() null for primitive param](02-constructor-generic-primitive-null.md) | CredentialModelTest, CredentialModelBackwardsCompatibilityTest | **FIXED ✓ both classes green** |
 | 11 | [Synthetic RSA keys are not real RSAPublicKey (umbrella)](11-rsa-synthetic-key-not-rsapublickey.md) | RSAVerifier ✓, JWKT, KeyPairVerifier, SdJwtVP, JWKSUtils, PemUtilsBC | **FIXED (key-type)** route_rsa_to_real (4b2560a0); remaining reds are separate bugs |
-| 03 | [Cipher.chooseProvider monitorenter NPE (null lock)](03-cipher-chooseprovider-monitorenter-npe.md) | DefaultCryptoJWETest | open |
-| 04 | [ECDH KeyAgreement "Algorithm ECDH not available"](04-ecdh-keyagreement-not-available.md) | BCEcdhEsAlgorithmProviderTest | open |
-| 05 | [BC ECPublicKeySpec InvalidKeySpecException](05-bc-ecpublickeyspec-invalidkeyspec.md) | BCECDSACryptoProviderTest | open |
+| 03 | [Cipher.chooseProvider monitorenter NPE (null lock)](03-cipher-chooseprovider-monitorenter-npe.md) | DefaultCryptoJWETest | **FIXED** — RSA-OAEP/PKCS1 Cipher + AES-GCM getOutputSize/4-arg doFinal; JWE 11/11 (both RSA modes) |
+| 04 | [ECDH KeyAgreement "Algorithm ECDH not available"](04-ecdh-keyagreement-not-available.md) | BCEcdhEsAlgorithmProviderTest | **FIXED** — KeyAgreement→SunEC ECDH SPI + identity (n·P) order-check fix; 2/2 (incl. ECDH-ES JWE) |
+| 05 | [BC ECPublicKeySpec InvalidKeySpecException](05-bc-ecpublickeyspec-invalidkeyspec.md) | BCECDSACryptoProviderTest | **PARTIAL** — BC-spec→BC KeyFactory SPI fallback (spec rejection fixed); still red on deeper EC provider-routing (SunEC keys vs BC) |
 | 06 | [KeyPairVerifier "Keys don't match" / decode private key](06-keypair-verifier-decode.md) | DefaultCryptoKeyPairVerifierTest | open |
-| 07 | [SD-JWT VP "Could not process cnf/jwk"](07-sdjwt-vp-cnf-jwk.md) | DefaultCryptoSdJwtVPVerificationTest | open |
+| 07 | [SD-JWT VP "Could not process cnf/jwk"](07-sdjwt-vp-cnf-jwk.md) | DefaultCryptoSdJwtVPVerificationTest | **FIXED** — synthetic RSAPublicKeySpec import + RSA-PSS (PS256/384/512) verify; SdJwtVP 24/24 (both RSA modes) |
 | 08 | [StripSecretsUtils JSON ComparisonFailure](08-stripsecrets-json-comparison.md) | StripSecretsUtilsTest | **FIXED** via #13 (Map.Entry.setValue) |
 | 09 | [StreamsUtil onClose / auto-close propagation](09-streamsutil-onclose-propagation.md) | StreamsUtilTest | open (stream close-handler feature) |
 | 10 | [DefaultCryptoJWKSUtilsTest 1 failure](10-jwksutils-one-failure.md) | DefaultCryptoJWKSUtilsTest | **FIXED** via #12 |
 | 12 | [EC cert getPublicKey null (BC converter)](12-ec-cert-getpublickey-null.md) | DefaultCryptoJWKTest, JWKSUtils ✓ | **FIXED (getPublicKey)** `7c98ec8f`; EC-cert ECDSA-verify remains |
 | 13 | [Map.Entry.setValue no write-back](13-map-entry-setvalue-no-writeback.md) | StripSecretsUtilsTest ✓ (+ all entrySet RMW) | **FIXED** `bfbb8093` |
 | 14 | [X509Certificate.verify() sig-alg OID unresolved](14-cert-verify-signature-oid.md) | DefaultCryptoJWKTest (EC cert verify; + all EC/RSA cert.verify) | **FIXED** `7010eee7`; JWKT 4→2 (rest = separate P-384/P-521 EC gap) |
+| 17 | [P-384/P-521 EC + cert.verify SignatureUtil null](17-ec-p384-p521-progressive-corruption.md) | DefaultCryptoJWKTest (publicEs256P*, EC cert-gen) | **FIXED** — intpoly JIT ban (`ca34440d`) + SignatureUtil/SharedSecrets intercept; JWKT 10/10 |

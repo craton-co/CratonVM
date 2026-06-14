@@ -240,54 +240,58 @@ fn native_ec_multiply(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Curve::P521 => scalar_mul_p521(&bx, &by, &scalar_le),
     }
     .ok_or_else(|| internal_err("native EC scalar multiply failed (bad point/scalar)"))?;
+    // Empty coordinates = point-at-infinity (e.g. the `n·P` order check in
+    // `ECDHKeyAgreement.validate`). A freshly-constructed `ProjectivePoint
+    // $Mutable(field)` already has X=Y=Z=0, and `ECOperations.isNeutral` tests
+    // `Z == 0`, so the bare Mutable IS the neutral element — return it without
+    // `setValue` (which would set an affine Z=1, no longer neutral).
+    let is_identity = rx.is_empty() && ry.is_empty();
 
-    // ---- construct result: ProjectivePoint$Mutable from AffinePoint(rx,ry) ----
+    // ---- result = new ProjectivePoint$Mutable(field) ----
     let field = ctx.read_native_pin(p_field, field);
-    let rx_bi = make_bigint(ctx, &rx)?;
-    let p_rx = ctx.pin_native_root(rx_bi);
-    let ry_bi = make_bigint(ctx, &ry)?;
-    let rx_bi = ctx.read_native_pin(p_rx, rx_bi);
-    let field = ctx.read_native_pin(p_field, field);
-
-    let ecpoint = ctx.new_object_initialized(
-        "java/security/spec/ECPoint",
-        "(Ljava/math/BigInteger;Ljava/math/BigInteger;)V",
-        &[Value::Object(Some(rx_bi)), Value::Object(Some(ry_bi))],
-    )?;
-    let ecpoint = obj(ecpoint).ok_or_else(|| internal_err("new ECPoint null"))?;
-    let p_ecp = ctx.pin_native_root(ecpoint);
-    let field = ctx.read_native_pin(p_field, field);
-
-    // affine = AffinePoint.fromECPoint(ecpoint, field)  (static)
-    let affine_res = ctx.invoke(
-        "sun/security/ec/point/AffinePoint",
-        "fromECPoint",
-        "(Ljava/security/spec/ECPoint;Lsun/security/util/math/IntegerFieldModuloP;)Lsun/security/ec/point/AffinePoint;",
-        &[Value::Object(Some(ctx.read_native_pin(p_ecp, ecpoint))), Value::Object(Some(ctx.read_native_pin(p_field, field)))],
-    )?;
-    let affine = obj(affine_res).ok_or_else(|| internal_err("fromECPoint null"))?;
-    let p_aff = ctx.pin_native_root(affine);
-    let field = ctx.read_native_pin(p_field, field);
-
-    // result = new ProjectivePoint$Mutable(field)
     let result = ctx.new_object_initialized(
         "sun/security/ec/point/ProjectivePoint$Mutable",
         "(Lsun/security/util/math/IntegerFieldModuloP;)V",
-        &[Value::Object(Some(ctx.read_native_pin(p_field, field)))],
+        &[Value::Object(Some(field))],
     )?;
     let result = obj(result).ok_or_else(|| internal_err("new ProjectivePoint$Mutable null"))?;
     let p_res = ctx.pin_native_root(result);
-    let affine = ctx.read_native_pin(p_aff, affine);
 
-    // result.setValue(affine)
-    ctx.invoke(
-        "sun/security/ec/point/ProjectivePoint$Mutable",
-        "setValue",
-        "(Lsun/security/ec/point/AffinePoint;)Lsun/security/ec/point/ProjectivePoint$Mutable;",
-        &[Value::Object(Some(ctx.read_native_pin(p_res, result))), Value::Object(Some(affine))],
-    )?;
+    if !is_identity {
+        // result.setValue(AffinePoint.fromECPoint(ECPoint(rx,ry), field))
+        let field = ctx.read_native_pin(p_field, field);
+        let rx_bi = make_bigint(ctx, &rx)?;
+        let p_rx = ctx.pin_native_root(rx_bi);
+        let ry_bi = make_bigint(ctx, &ry)?;
+        let rx_bi = ctx.read_native_pin(p_rx, rx_bi);
+
+        let ecpoint = ctx.new_object_initialized(
+            "java/security/spec/ECPoint",
+            "(Ljava/math/BigInteger;Ljava/math/BigInteger;)V",
+            &[Value::Object(Some(rx_bi)), Value::Object(Some(ry_bi))],
+        )?;
+        let ecpoint = obj(ecpoint).ok_or_else(|| internal_err("new ECPoint null"))?;
+        let p_ecp = ctx.pin_native_root(ecpoint);
+        let field = ctx.read_native_pin(p_field, field);
+
+        let affine_res = ctx.invoke(
+            "sun/security/ec/point/AffinePoint",
+            "fromECPoint",
+            "(Ljava/security/spec/ECPoint;Lsun/security/util/math/IntegerFieldModuloP;)Lsun/security/ec/point/AffinePoint;",
+            &[Value::Object(Some(ctx.read_native_pin(p_ecp, ecpoint))), Value::Object(Some(field))],
+        )?;
+        let affine = obj(affine_res).ok_or_else(|| internal_err("fromECPoint null"))?;
+        let p_aff = ctx.pin_native_root(affine);
+
+        ctx.invoke(
+            "sun/security/ec/point/ProjectivePoint$Mutable",
+            "setValue",
+            "(Lsun/security/ec/point/AffinePoint;)Lsun/security/ec/point/ProjectivePoint$Mutable;",
+            &[Value::Object(Some(ctx.read_native_pin(p_res, result))), Value::Object(Some(ctx.read_native_pin(p_aff, affine)))],
+        )?;
+    }
+
     let result = ctx.read_native_pin(p_res, result);
-
     ctx.unpin_native_roots(pin_base);
     Ok(Some(Value::Object(Some(result))))
 }
@@ -319,18 +323,33 @@ macro_rules! impl_curve_scalar_mul {
             let affine = AffinePoint::from_encoded_point(&ep);
             let affine = if affine.is_some().into() { affine.unwrap() } else { return None };
 
-            // scalar: little-endian → big-endian (n bytes). SunEC scalars are < n,
-            // so from_repr always succeeds for valid inputs.
+            // scalar: little-endian → big-endian (n bytes).
             let mut be = [0u8; $nbytes];
             for (i, b) in s_le.iter().take($nbytes).enumerate() {
                 be[$nbytes - 1 - i] = *b;
             }
             let ct = Scalar::from_repr(GenericArray::clone_from_slice(&be));
-            let scalar = if ct.is_some().into() { ct.unwrap() } else { return None };
+            let scalar = if ct.is_some().into() {
+                ct.unwrap()
+            } else {
+                // A non-canonical scalar (>= the group order `n`). SunEC reaches
+                // this ONLY in `ECDHKeyAgreement.validate`'s public-key order
+                // check, which multiplies the (already on-curve, verified just
+                // above) point by `n` and expects the neutral element: `n·P = O`.
+                // Signal identity so the caller returns SunEC's neutral
+                // `MutablePoint`. (Keygen/sign/real-ECDH scalars are always < n
+                // and take the canonical branch above.)
+                return Some((Vec::new(), Vec::new()));
+            };
 
             let prod = (ProjectivePoint::from(affine) * scalar).to_affine();
             if prod.is_identity().into() {
-                return None;
+                // Point-at-infinity. This is the EXPECTED result of the order
+                // check `n·P` in `ECDHKeyAgreement.validate` (a valid public key
+                // satisfies `n·P = O`). Signal it with empty coordinate vecs so
+                // the caller returns SunEC's neutral `MutablePoint` (Z=0) instead
+                // of failing — only a truly invalid point/scalar yields `None`.
+                return Some((Vec::new(), Vec::new()));
             }
             let enc = prod.to_encoded_point(false);
             Some((enc.x()?.to_vec(), enc.y()?.to_vec()))

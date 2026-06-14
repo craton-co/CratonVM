@@ -135,6 +135,15 @@ struct CipherState {
     /// AEAD additional-authenticated-data accumulator, drained on
     /// `doFinal`.
     aad: Vec<u8>,
+    /// RSA modulus magnitude (big-endian), captured at `init` time when the
+    /// transformation is an `RSA/...` cipher. Empty for non-RSA ciphers. We
+    /// snapshot the raw components (not the Key ref) so the side-table holds no
+    /// heap reference — identical GC-safety rationale to `key_bytes`.
+    rsa_n: Vec<u8>,
+    /// RSA exponent magnitude (big-endian) appropriate to the `init` mode — the
+    /// public exponent for ENCRYPT/WRAP, the private exponent for DECRYPT/UNWRAP.
+    /// Empty for non-RSA ciphers.
+    rsa_exp: Vec<u8>,
 }
 
 static CIPHER_TABLE: RwLock<Option<FxHashMap<i32, CipherState>>> = RwLock::new(None);
@@ -238,6 +247,162 @@ fn read_bytes(ctx: &mut dyn NativeContext, arr: ObjectRef) -> Vec<u8> {
         }
     }
     out
+}
+
+/// `true` when the transformation names the RSA cipher (`"RSA/ECB/…"`).
+fn is_rsa_transformation(algo: &str) -> bool {
+    algo.split('/')
+        .next()
+        .map(|c| c.eq_ignore_ascii_case("RSA"))
+        .unwrap_or(false)
+}
+
+/// Invoke `key.method()` → `BigInteger`, then `BigInteger.toByteArray()` → the
+/// raw two's-complement big-endian magnitude. Returns `None` if either virtual
+/// call fails (e.g. a synthetic key with no `getModulus()` behaviour). The
+/// `BigInteger` is pinned across the `toByteArray()` call so a moving GC can't
+/// leave it stale.
+fn call_biginteger_bytes(
+    ctx: &mut dyn NativeContext,
+    key: ObjectRef,
+    method: &str,
+) -> Option<Vec<u8>> {
+    let bi = match ctx.invoke_virtual(key, method, "()Ljava/math/BigInteger;", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let pin = ctx.pin_native_root(bi);
+    let bi = ctx.read_native_pin(pin, bi);
+    let arr = ctx.invoke_virtual(bi, "toByteArray", "()[B", &[]);
+    ctx.unpin_native_roots(pin);
+    match arr {
+        Ok(Some(Value::Object(Some(a)))) => Some(read_bytes(ctx, a)),
+        _ => None,
+    }
+}
+
+/// Extract the RSA `(modulus, exponent)` magnitudes from a `Key` at init time.
+///
+/// Works for BOTH key flavours: genuine `sun.security.rsa.RSAPublic/PrivateKeyImpl`
+/// (the default `route_rsa_to_real` path) expose `getModulus()` /
+/// `get{Public,Private}Exponent()`; the bare synthetic keys
+/// (`CRATONVM_SYNTHETIC_RSA=1`) carry a `crypto_impl` `key_id` (slot 3 or the
+/// GC-stable identity bridge) from which the components are recovered. The
+/// exponent matches the `init` mode — private exponent for DECRYPT(2)/UNWRAP(4),
+/// public exponent otherwise.
+fn rsa_key_components(
+    ctx: &mut dyn NativeContext,
+    key: ObjectRef,
+    mode: i32,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let want_private = mode == 2 || mode == 4;
+    let exp_method = if want_private {
+        "getPrivateExponent"
+    } else {
+        "getPublicExponent"
+    };
+    // Real RSA keys — pin the key across the two virtual calls.
+    let pin = ctx.pin_native_root(key);
+    let key_r = ctx.read_native_pin(pin, key);
+    let n = call_biginteger_bytes(ctx, key_r, "getModulus");
+    let key_r = ctx.read_native_pin(pin, key);
+    let e = call_biginteger_bytes(ctx, key_r, exp_method);
+    ctx.unpin_native_roots(pin);
+    if let (Some(n), Some(e)) = (n, e) {
+        if !n.is_empty() && !e.is_empty() {
+            return Some((n, e));
+        }
+    }
+    // Synthetic keys — resolve via the crypto_impl key_id.
+    let id = crate::crypto_impl::rsa_realkey_map_get(ctx.identity_hash_code(key))
+        .or_else(|| match ctx.get_field(key, 3) {
+            Value::Long(i) => Some(i as u64),
+            Value::Int(i) => Some(i as u64),
+            _ => None,
+        })
+        .filter(|&i| i != 0)?;
+    if want_private {
+        crate::crypto_impl::rsa_key_get_priv(id)
+    } else {
+        crate::crypto_impl::rsa_key_get_pub(id)
+    }
+}
+
+/// Shared `Cipher.init` recorder: snapshot mode + key bytes + IV, and (for RSA
+/// transformations) the key's modulus/exponent components, into the side-table.
+fn cipher_init_record(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    mode: i32,
+    key: ObjectRef,
+    iv_bytes: Vec<u8>,
+) -> MethodCallResult {
+    let key_bytes = extract_key_bytes(ctx, key);
+    let tkey = obj_key(ctx, this);
+    let algo = with_table_read(|t| {
+        t.get(&tkey).map(|s| s.algorithm.clone()).unwrap_or_default()
+    });
+    let (rsa_n, rsa_exp) = if is_rsa_transformation(&algo) {
+        rsa_key_components(ctx, key, mode).unwrap_or_default()
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    with_table_write(|t| {
+        let s = t.entry(tkey).or_default();
+        s.mode = mode;
+        s.key_bytes = key_bytes;
+        s.iv_bytes = iv_bytes;
+        s.rsa_n = rsa_n;
+        s.rsa_exp = rsa_exp;
+        s.accumulated.clear();
+        s.aad.clear();
+    });
+    Ok(None)
+}
+
+/// Append `input[offset..offset+len]` (the offset/length form of `update` /
+/// `doFinal`) to the cipher's accumulator. No-op when the input arg is null.
+fn accumulate_slice(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    input: Option<&Value>,
+    offset: Option<&Value>,
+    len: Option<&Value>,
+) {
+    let Some(Value::Object(Some(arr))) = input else {
+        return;
+    };
+    let all = read_bytes(ctx, *arr);
+    let ofs = offset.and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let n = len.and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+    let slice = all.get(ofs..ofs.saturating_add(n)).unwrap_or(&[]).to_vec();
+    let tkey = obj_key(ctx, this);
+    with_table_write(|t| {
+        if let Some(s) = t.get_mut(&tkey) {
+            s.accumulated.extend_from_slice(&slice);
+        }
+    });
+}
+
+/// Build the result byte[] for a successful `doFinal`, reset the per-cipher
+/// accumulators (the JDK contract: `doFinal` resets the cipher to its
+/// post-`init` state), and return it.
+fn finish_cipher_bytes(
+    ctx: &mut dyn NativeContext,
+    table_key: i32,
+    bytes: &[u8],
+) -> MethodCallResult {
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+    for (i, &b) in bytes.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+    }
+    with_table_write(|t| {
+        if let Some(s) = t.get_mut(&table_key) {
+            s.accumulated.clear();
+            s.aad.clear();
+        }
+    });
+    Ok(Some(Value::Object(Some(arr))))
 }
 
 /// Allocate a freshly initialised Cipher synthetic and register an
@@ -356,6 +521,43 @@ fn cipher_do_final_impl(ctx: &mut dyn NativeContext, this: ObjectRef) -> MethodC
     let iv_bytes = state.iv_bytes.clone();
     let data = state.accumulated.clone();
     let aad = state.aad.clone();
+    let rsa_n = state.rsa_n.clone();
+    let rsa_exp = state.rsa_exp.clone();
+
+    // RSA cipher (`RSA/ECB/{PKCS1Padding, OAEPWith…}`). The symmetric AES path
+    // below would misread the RSA key encoding as an AES key (the historic
+    // "Invalid AES key: InvalidKeyLength(294)" bug), so route RSA through the
+    // real-crypto modexp + RFC-8017 padding in `crypto_impl`. Works for genuine
+    // and synthetic RSA keys alike (components captured at `init`).
+    if is_rsa_transformation(&algo) {
+        let padding = algo.split('/').nth(2).unwrap_or("PKCS1Padding");
+        let pad = match crate::crypto_impl::RsaCipherPadding::from_transformation(padding) {
+            Some(p) => p,
+            None => {
+                return Err(RuntimeError::IllegalStateException {
+                    message: format!("RSA cipher padding '{}' not supported", padding),
+                }
+                .into())
+            }
+        };
+        if rsa_n.is_empty() || rsa_exp.is_empty() {
+            return Err(RuntimeError::IllegalStateException {
+                message: "RSA cipher: key components unavailable (init did not capture modulus/exponent)".into(),
+            }
+            .into());
+        }
+        // 1 = ENCRYPT, 2 = DECRYPT, 3 = WRAP, 4 = UNWRAP.
+        let encrypt = mode == 1 || mode == 3;
+        let result = if encrypt {
+            crate::crypto_impl::rsa_cipher_encrypt(&rsa_n, &rsa_exp, pad, &data)
+        } else {
+            crate::crypto_impl::rsa_cipher_decrypt(&rsa_n, &rsa_exp, pad, &data)
+        };
+        return match result {
+            Ok(bytes) => finish_cipher_bytes(ctx, key, &bytes),
+            Err(msg) => Err(RuntimeError::IllegalStateException { message: msg }.into()),
+        };
+    }
 
     if key_bytes.is_empty() {
         return Err(RuntimeError::IllegalStateException {
@@ -766,16 +968,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         let mode = args[1].as_int().unwrap_or(0);
         let key = obj_arg(args, 2)?;
-        let key_bytes = extract_key_bytes(ctx, key);
-        let tkey = obj_key(ctx, this);
-        with_table_write(|t| {
-            let s = t.entry(tkey).or_default();
-            s.mode = mode;
-            s.key_bytes = key_bytes;
-            s.accumulated.clear();
-            s.aad.clear();
-        });
-        Ok(None)
+        cipher_init_record(ctx, this, mode, key, Vec::new())
     });
 
     r.register(
@@ -786,21 +979,11 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let mode = args[1].as_int().unwrap_or(0);
             let key = obj_arg(args, 2)?;
-            let key_bytes = extract_key_bytes(ctx, key);
             let iv_bytes = match args.get(3) {
                 Some(Value::Object(Some(spec))) => extract_iv_bytes(ctx, *spec),
                 _ => Vec::new(),
             };
-            let tkey = obj_key(ctx, this);
-            with_table_write(|t| {
-                let s = t.entry(tkey).or_default();
-                s.mode = mode;
-                s.key_bytes = key_bytes;
-                s.iv_bytes = iv_bytes;
-                s.accumulated.clear();
-                s.aad.clear();
-            });
-            Ok(None)
+            cipher_init_record(ctx, this, mode, key, iv_bytes)
         },
     );
 
@@ -812,21 +995,42 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let mode = args[1].as_int().unwrap_or(0);
             let key = obj_arg(args, 2)?;
-            let key_bytes = extract_key_bytes(ctx, key);
             let iv_bytes = match args.get(3) {
                 Some(Value::Object(Some(spec))) => extract_iv_bytes(ctx, *spec),
                 _ => Vec::new(),
             };
-            let tkey = obj_key(ctx, this);
-            with_table_write(|t| {
-                let s = t.entry(tkey).or_default();
-                s.mode = mode;
-                s.key_bytes = key_bytes;
-                s.iv_bytes = iv_bytes;
-                s.accumulated.clear();
-                s.aad.clear();
-            });
-            Ok(None)
+            cipher_init_record(ctx, this, mode, key, iv_bytes)
+        },
+    );
+
+    // OAEP-256 (keycloak `DefaultRsaKeyEncryption256JWEAlgorithmProvider`) calls
+    // `cipher.init(mode, key, AlgorithmParameters)` — note `AlgorithmParameters`,
+    // NOT `…spec.AlgorithmParameterSpec`. Without this overload the call fell
+    // through to the real `Cipher.init` bytecode → `chooseProvider` →
+    // `synchronized (initLock)` on the synthetic Cipher's null `initLock` → NPE
+    // (`monitorenter in Cipher.chooseProvider`). The OAEP digest is already
+    // encoded in the transformation string, so we ignore the params object.
+    r.register(
+        cipher,
+        "init",
+        "(ILjava/security/Key;Ljava/security/AlgorithmParameters;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let mode = args[1].as_int().unwrap_or(0);
+            let key = obj_arg(args, 2)?;
+            cipher_init_record(ctx, this, mode, key, Vec::new())
+        },
+    );
+
+    r.register(
+        cipher,
+        "init",
+        "(ILjava/security/Key;Ljava/security/AlgorithmParameters;Ljava/security/SecureRandom;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let mode = args[1].as_int().unwrap_or(0);
+            let key = obj_arg(args, 2)?;
+            cipher_init_record(ctx, this, mode, key, Vec::new())
         },
     );
 
@@ -838,16 +1042,7 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
             let this = obj_arg(args, 0)?;
             let mode = args[1].as_int().unwrap_or(0);
             let key = obj_arg(args, 2)?;
-            let key_bytes = extract_key_bytes(ctx, key);
-            let tkey = obj_key(ctx, this);
-            with_table_write(|t| {
-                let s = t.entry(tkey).or_default();
-                s.mode = mode;
-                s.key_bytes = key_bytes;
-                s.accumulated.clear();
-                s.aad.clear();
-            });
-            Ok(None)
+            cipher_init_record(ctx, this, mode, key, Vec::new())
         },
     );
 
@@ -897,6 +1092,73 @@ fn register_cipher_dispatch(r: &mut NativeMethodRegistry) {
     r.register(cipher, "doFinal", "()[B", |ctx, args| {
         let this = obj_arg(args, 0)?;
         cipher_do_final_impl(ctx, this)
+    });
+
+    // `doFinal(input, inputOffset, inputLen)` → byte[]. The offset/length
+    // variant keycloak's AES-GCM decrypt and several BC callers use.
+    r.register(cipher, "doFinal", "([BII)[B", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        accumulate_slice(ctx, this, args.get(1), args.get(2), args.get(3));
+        cipher_do_final_impl(ctx, this)
+    });
+
+    // `doFinal(input, inputOffset, inputLen, output)` → int (bytes written).
+    // keycloak's `AesGcmEncryptionProvider.encryptBytes` sizes `output` via
+    // `getOutputSize` then calls this 4-arg form. Neither was intercepted, so
+    // the call reached the real `Cipher` bytecode → `checkCipherState()` →
+    // "Cipher not initialized" (the synthetic Cipher's real SPI state is unset
+    // because we service `init` natively). Compute the result and copy it into
+    // the caller's `output` array.
+    r.register(cipher, "doFinal", "([BII[B)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        accumulate_slice(ctx, this, args.get(1), args.get(2), args.get(3));
+        let output = obj_arg(args, 4)?;
+        let opin = ctx.pin_native_root(output);
+        let res = cipher_do_final_impl(ctx, this);
+        let out_bytes = match res {
+            Ok(Some(Value::Object(Some(a)))) => read_bytes(ctx, a),
+            Ok(_) => Vec::new(),
+            Err(e) => {
+                ctx.unpin_native_roots(opin);
+                return Err(e);
+            }
+        };
+        let output = ctx.read_native_pin(opin, output);
+        ctx.unpin_native_roots(opin);
+        for (i, &b) in out_bytes.iter().enumerate() {
+            ctx.set_array_element(output, i, Value::Int(b as i8 as i32));
+        }
+        Ok(Some(Value::Int(out_bytes.len() as i32)))
+    });
+
+    // `getOutputSize(inputLen)` → the byte count `doFinal` will produce, so the
+    // caller can pre-size its output buffer. Must be EXACT for the AES-GCM
+    // encrypt path (the provider uses the whole array, not the returned count):
+    // GCM encrypt adds a 16-byte tag, GCM decrypt strips it.
+    r.register(cipher, "getOutputSize", "(I)I", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let input_len = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+        let tkey = obj_key(ctx, this);
+        let (algo, mode, acc) = with_table_read(|t| {
+            t.get(&tkey)
+                .map(|s| (s.algorithm.clone(), s.mode, s.accumulated.len()))
+                .unwrap_or_default()
+        });
+        let total = acc + input_len;
+        let (cipher_name, mode_str, _pad) = parse_transformation(&algo);
+        let encrypt = mode == 1 || mode == 3;
+        let out = if cipher_name.eq_ignore_ascii_case("RSA") {
+            // RSA output is always the modulus size; not on the JWE hot path.
+            total.max(256)
+        } else if mode_str == "GCM" {
+            if encrypt { total + 16 } else { total.saturating_sub(16) }
+        } else if encrypt {
+            // Block cipher with PKCS padding: round up to the next 16-byte block.
+            (total / 16 + 1) * 16
+        } else {
+            total
+        };
+        Ok(Some(Value::Int(out as i32)))
     });
 
     // --- javax.crypto.SecretKeyFactory — PBKDF2 (real key derivation) ---
