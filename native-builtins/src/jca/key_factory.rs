@@ -304,6 +304,75 @@ fn drive_real_rsa_keyfactory(
     result
 }
 
+/// Materialise a real `sun.security.rsa.RSAPublic/PrivateKeyImpl` from DER
+/// (X509 `SubjectPublicKeyInfo` for public, PKCS#8 for private) through the real
+/// SunRsaSign `RSAKeyFactory$Legacy` SPI, and register the GC-stable
+/// `identityHashCode(key) -> key_id` bridge so the `Signature` natives keep
+/// using the fast `crypto_impl` sign/verify even though the returned key carries
+/// no synthetic `key_id` slot. Gated by `crate::route_rsa_to_real()` at the
+/// call site. This is a *re-import of already-generated material* (the DER comes
+/// from our own fast Rust keygen), NOT a slow interpreter keygen.
+fn real_rsa_key_from_der(
+    ctx: &mut dyn NativeContext,
+    der: &[u8],
+    key_id: u64,
+    is_public: bool,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let (spec_class, engine, ret_desc) = if is_public {
+        (
+            "java/security/spec/X509EncodedKeySpec",
+            "engineGeneratePublic",
+            "Ljava/security/PublicKey;",
+        )
+    } else {
+        (
+            "java/security/spec/PKCS8EncodedKeySpec",
+            "engineGeneratePrivate",
+            "Ljava/security/PrivateKey;",
+        )
+    };
+    let arr = alloc_byte_array(ctx, der);
+    let spec = match ctx.new_object_initialized(spec_class, "([B)V", &[Value::Object(Some(arr))])? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::NotImplemented {
+                feature: spec_class.into(),
+            }
+            .into())
+        }
+    };
+    let key = match drive_real_rsa_keyfactory(ctx, spec, engine, ret_desc)? {
+        Some(Value::Object(Some(o))) => o,
+        _ => {
+            return Err(RuntimeError::NotImplemented {
+                feature: "RSAKeyFactory$Legacy produced no key".into(),
+            }
+            .into())
+        }
+    };
+    crypto_impl::rsa_realkey_map_set(ctx.identity_hash_code(key), key_id);
+    Ok(key)
+}
+
+/// Build BOTH real RSA key objects from already-generated DER, pinning the
+/// public key across the private-key allocation (which may move the heap).
+/// The crypto material is already stored under `key_id` by the caller, so
+/// sign/verify stay on the fast Rust path via the identity bridge.
+fn real_rsa_keypair_objs(
+    ctx: &mut dyn NativeContext,
+    pk_der: &[u8],
+    sk_der: &[u8],
+    key_id: u64,
+) -> Result<(ObjectRef, ObjectRef), MethodCallFailed> {
+    let pub_obj = real_rsa_key_from_der(ctx, pk_der, key_id, true)?;
+    let pin = ctx.pin_native_root(pub_obj);
+    let priv_res = real_rsa_key_from_der(ctx, sk_der, key_id, false);
+    let pub_obj = ctx.read_native_pin(pin, pub_obj);
+    ctx.unpin_native_roots(pin);
+    let priv_obj = priv_res?;
+    Ok((pub_obj, priv_obj))
+}
+
 // Synthetic-slot offsets relative to `synthetic_base_offset(...)`.
 const KPG_OFF_ALGO: usize = 0;
 const KPG_OFF_KEYSIZE: usize = 1;
@@ -680,6 +749,8 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         .unwrap_or(2048);
 
     if algo == ALGO_RSA {
+        // Fast Rust keygen (the actual optimisation — no slow interpreter prime
+        // generation). The resulting DER + crypto material are real.
         let (pk, sk) = crypto_impl::Rsa::generate_keypair(bits);
         let pk_der = crypto_impl::Rsa::public_key_to_der(&pk);
         let sk_der = crypto_impl::Rsa::private_key_to_der(&sk);
@@ -691,6 +762,20 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                 private_key: sk,
             },
         );
+        // Default: hand out GENUINE RSAPublic/PrivateKeyImpl objects (re-imported
+        // from our own DER via the real KeyFactory) so `(RSAPublicKey) k` casts,
+        // `getModulus()`, real `getEncoded()` and BC cert generation all work —
+        // while sign/verify stay on the fast crypto_impl path via the identity
+        // bridge. CRATONVM_SYNTHETIC_RSA=1 restores the bare-interface synthetic
+        // keys (faster alloc, but the cast/cert paths fail).
+        if crate::route_rsa_to_real() {
+            if let Ok((pub_obj, priv_obj)) =
+                real_rsa_keypair_objs(ctx, &pk_der, &sk_der, key_id)
+            {
+                return Ok(Some(Value::Object(Some(alloc_keypair(ctx, pub_obj, priv_obj)))));
+            }
+            // Fall through to the synthetic keys if the real SPI is unavailable.
+        }
         let pub_obj = alloc_public_key(ctx, ALGO_RSA, bits as i32, &pk_der, key_id);
         let priv_obj = alloc_private_key(ctx, ALGO_RSA, bits as i32, &sk_der, key_id);
         return Ok(Some(Value::Object(Some(alloc_keypair(ctx, pub_obj, priv_obj)))));
@@ -830,6 +915,14 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
                     },
                 },
             );
+            // Default: real RSAPublicKeyImpl (fixes `(RSAPublicKey)` casts and
+            // BC consumers); verify stays on the fast crypto_impl path via the
+            // identity bridge. CRATONVM_SYNTHETIC_RSA=1 → bare-interface key.
+            if crate::route_rsa_to_real() {
+                if let Ok(key) = real_rsa_key_from_der(ctx, &pk_der, key_id, true) {
+                    return Ok(Some(Value::Object(Some(key))));
+                }
+            }
             return Ok(Some(Value::Object(Some(alloc_public_key(
                 ctx, ALGO_RSA, 2048, &pk_der, key_id,
             )))));

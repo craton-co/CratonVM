@@ -597,6 +597,37 @@ pub fn route_pqc_to_real() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_PQC").is_none())
 }
 
+/// Hand out *real* RSA key objects (`sun.security.rsa.RSAPublic/PrivateKeyImpl`)
+/// from `KeyPairGenerator.generateKeyPair()` / `KeyFactory.generatePublic()`
+/// instead of the bare-interface synthetic `PublicKey`. Default ON.
+///
+/// ## Why this exists / what stays fast
+///
+/// The synthetic RSA path was an **optimization, not a stub**: it generates real
+/// key *material* with the fast Rust `crypto_impl::Rsa` (no slow interpreter
+/// prime generation — the dominant RSA cost) and signs/verifies via a
+/// `crypto_impl` `key_id` (no slow interpreter BigInteger modexp). Its only
+/// defect was the *wrapper type*: a bare `java/security/PublicKey` that fails
+/// `(RSAPublicKey) k` casts, `getModulus()`, real `getEncoded()`, and BC cert
+/// generation (`getAlgorithm` NPE).
+///
+/// This routing keeps BOTH fast paths and fixes the type: it still does the fast
+/// Rust keygen, but materialises the resulting DER into a genuine
+/// `RSAPublic/PrivateKeyImpl` via the real `RSAKeyFactory$Legacy` SPI, and
+/// bridges the real key back to its `crypto_impl` `key_id` through a GC-stable
+/// `identityHashCode` map (`crypto_impl::rsa_realkey_map_*`) so `Signature`
+/// sign/verify stay on the fast Rust path. Net: HotSpot-correct key objects with
+/// no loss of the original optimisation.
+///
+/// Kill-switch `CRATONVM_SYNTHETIC_RSA=1` restores the legacy bare-interface
+/// synthetic keys (faster object alloc, but the casts/cert paths fail) for
+/// debugging / regression bisecting.
+pub fn route_rsa_to_real() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_RSA").is_none())
+}
+
 pub mod deprecated_lang;
 pub mod deprecated_io_util;
 pub mod deprecated_util;
