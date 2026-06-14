@@ -67,6 +67,12 @@ pub struct ResolvedField {
     /// Whether this field's type is a reference (descriptor starts with `L` or `[`).
     /// Used to convert zero-initialized heap slots (`Int(0)`) to `Object(None)`.
     pub is_reference: bool,
+    /// First byte of the field's type descriptor (`I`/`J`/`D`/`L`/`[`/…), cached
+    /// here so the getfield/getstatic/putfield/putstatic opcode handlers pick the
+    /// correct category-2 (`J`/`D`) CompactValue push path WITHOUT a second
+    /// `class_manager` RwLock + constant-pool walk per access (the old
+    /// `resolve_field_descriptor_byte`). `0` if the descriptor is empty.
+    pub desc_byte: u8,
 }
 
 /// A resolved method reference.

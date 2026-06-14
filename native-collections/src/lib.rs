@@ -2996,23 +2996,20 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let cap = match args.get(1) {
         Some(Value::Int(c)) => {
-            // Bug 4 (round-9 native-misc HIGH): the JDK's
-            // `HashMap(int initialCapacity)` reads the requested value as
-            // a *minimum number of mappings to hold without resizing*,
-            // then internally allocates `ceil(c / loadFactor)` buckets so
-            // the threshold (loadFactor * buckets) >= requested capacity.
-            // With the default load factor of 0.75 that's `c * 4 / 3`,
-            // rounded up to the next power of two. Previously we rounded
-            // `c` itself to a power of two, which means
-            // `new HashMap<>(16)` allocated 16 buckets and resized on the
-            // 13th insert — defeating the entire purpose of the sizing
-            // hint and causing extra rehash work in the hot loop.
-            let requested = std::cmp::max(*c, 1) as u64;
-            // ceil(requested * 4 / 3), then cap to MAP_MAX_CAPACITY before
-            // next_power_of_two to avoid u32 overflow panic on absurdly
-            // large hints.
-            let needed = requested.saturating_mul(4).div_ceil(3);
-            let capped = std::cmp::min(needed, MAP_MAX_CAPACITY as u64).max(1) as u32;
+            // JDK `HashMap(int initialCapacity)` / `HashSet(int)` semantics:
+            // the initial table size is `tableSizeFor(initialCapacity)` — the
+            // smallest power of two >= the requested capacity. It is NOT
+            // inflated by the load factor: `new HashMap<>(16)` allocates a
+            // 16-bucket table (threshold 16*0.75 = 12) and DOES resize on the
+            // 13th insert. An earlier "hold N mappings without resizing"
+            // optimisation rounded `ceil(c*4/3)` up instead, so
+            // `new HashSet<>()` (whose backing passes cap 16) and
+            // `new HashMap<>(16)` allocated 32 buckets — which shifts every
+            // key's bucket index and makes HashSet/HashMap iteration order
+            // diverge from HotSpot (B-E: Kafka AdminApiDriver request-key and
+            // consumer-group ordering). Match the JDK exactly: tableSizeFor.
+            let requested = std::cmp::max(*c, 1) as u32;
+            let capped = std::cmp::min(requested, MAP_MAX_CAPACITY as u32);
             let n = capped.checked_next_power_of_two().unwrap_or(MAP_MAX_CAPACITY as u32);
             std::cmp::min(n as usize, MAP_MAX_CAPACITY as usize)
         }
@@ -3858,9 +3855,17 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // bootstrap the concrete nested class can be unresolved and degrade to
     // cid=0 (`java/lang/Object`), breaking downstream checkcasts.
     for (key, value) in &entries {
-        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
+        // 3-field Map$Entry: key@0, value@1, sourceMap@2. The source-map
+        // reference makes `Entry.setValue(v)` write back to the originating map
+        // (`native_entry_set_value`), matching the JDK live-entry contract
+        // (e.g. keycloak's StripSecretsUtils masks config values via
+        // `entrySet().iterator() ... entry.setValue(maskedList)`). It is a
+        // GC-scanned object field, so it survives relocation (a Rust side-table
+        // holding the ObjectRef would go stale).
+        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 3);
         ctx.set_field(entry_obj, 0, *key);
         ctx.set_field(entry_obj, 1, *value);
+        ctx.set_field(entry_obj, 2, Value::Object(Some(this)));
 
         // Add to the set's backing map
         let hash = ctx.identity_hash_code(entry_obj);
@@ -4175,7 +4180,53 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
 /// `Map.Entry` accessors. Layout-agnostic fallback used by
 /// [`collect_entries_any`] for `Map` implementations CratonVM does not model
 /// natively (real-JDK unmodifiable wrappers, third-party maps).
+thread_local! {
+    /// Source maps currently being walked by `collect_entries_via_iterator`.
+    /// Guards against infinite recursion when a view-set's `iterator()` resyncs
+    /// from its source map (`resync_view_set` → `collect_entries_any` →
+    /// `collect_entries_via_iterator` → `source.entrySet().iterator()` →
+    /// `native_hs_iterator` → `resync_view_set` …). Each `entrySet()` allocates
+    /// a fresh view object, so a per-view guard wouldn't catch it — key on the
+    /// stable source-map pointer instead. Observed as the JSSE-connector
+    /// stack-overflow during TLS init.
+    static ITER_COLLECT_GUARD: std::cell::RefCell<std::collections::HashSet<u64>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// RAII: removes our source key from `ITER_COLLECT_GUARD` on drop, including on
+/// panic/unwind — so a caught native panic can never leak a stale key (which
+/// would make a later, unrelated collection of a pointer-reused source wrongly
+/// return empty).
+struct IterCollectGuard {
+    key: u64,
+    inserted: bool,
+}
+impl Drop for IterCollectGuard {
+    fn drop(&mut self) {
+        if self.inserted {
+            ITER_COLLECT_GUARD.with(|g| {
+                g.borrow_mut().remove(&self.key);
+            });
+        }
+    }
+}
+
 fn collect_entries_via_iterator(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+) -> Vec<(Value, Value)> {
+    let guard_key = source.as_ptr() as u64;
+    let inserted = ITER_COLLECT_GUARD.with(|g| g.borrow_mut().insert(guard_key));
+    let _guard = IterCollectGuard { key: guard_key, inserted };
+    if !inserted {
+        // Re-entrant collection of the SAME source via its own entrySet view —
+        // walking it again would recurse forever. Break the cycle.
+        return Vec::new();
+    }
+    collect_entries_via_iterator_inner(ctx, source)
+}
+
+fn collect_entries_via_iterator_inner(
     ctx: &mut dyn NativeContext,
     source: ObjectRef,
 ) -> Vec<(Value, Value)> {
@@ -4310,9 +4361,15 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
     if kind == VIEW_KIND_ENTRYSET {
         let entries = collect_entries_any(ctx, source);
         for (k, v) in entries {
-            let entry = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
+            // 3-field entry (key@0, value@1, sourceMap@2) so `Entry.setValue`
+            // writes through to the live source map. This `resync` path runs on
+            // every entrySet `iterator()`/`size()` read, so without the source
+            // field here the iterator hands back detached 2-field entries and
+            // `setValue` is silently a no-op (cf. native_map_entry_set).
+            let entry = alloc_synthetic(ctx, "java/util/Map$Entry", 3);
             ctx.set_field(entry, 0, k);
             ctx.set_field(entry, 1, v);
+            ctx.set_field(entry, 2, Value::Object(Some(source)));
             let _ = native_map_put(ctx, &[Value::Object(Some(backing)), Value::Object(Some(entry)), sentinel]);
         }
     } else {
@@ -4364,10 +4421,13 @@ fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef
             return collect_entries_any(ctx, source)
                 .into_iter()
                 .map(|(k, v)| {
-                    let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
-                    ctx.set_field(entry, 0, k);
-                    ctx.set_field(entry, 1, v);
-                    Value::Object(Some(entry))
+                    Value::Object(Some(alloc_live_entry(
+                        ctx,
+                        "java/util/AbstractMap$SimpleEntry",
+                        k,
+                        v,
+                        source,
+                    )))
                 })
                 .collect();
         }
@@ -4429,8 +4489,13 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) {
         entries
             .into_iter()
             .map(|(k, v)| {
-                let entry = tm_make_entry(ctx, k, v);
-                Value::Object(Some(entry))
+                Value::Object(Some(alloc_live_entry(
+                    ctx,
+                    "java/util/HashMap$Entry",
+                    k,
+                    v,
+                    source,
+                )))
             })
             .collect()
     } else {
@@ -7003,6 +7068,32 @@ fn register_map_entry_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// Slot index of the optional back-reference to the source map carried by a
+/// *live* `entrySet()` entry. When present (field 2 is the source map),
+/// `setValue` writes through to that map — the JDK contract for
+/// `map.entrySet().iterator().next().setValue(v)`. Detached entries (a
+/// standalone `AbstractMap.SimpleEntry`, `firstEntry()`/`lastEntry()`
+/// snapshots, unmodifiable views) are allocated with only 2 fields, so a
+/// fail-safe out-of-range read of slot 2 returns `Object(None)` and no
+/// write-through happens — matching their non-live semantics.
+const ENTRY_FIELD_SOURCE: usize = 2;
+
+/// Allocate a live `entrySet()` entry: 3 fields = (key, value, source-map).
+/// `setValue` on it writes through to `source` (see [`ENTRY_FIELD_SOURCE`]).
+fn alloc_live_entry(
+    ctx: &mut dyn NativeContext,
+    class: &str,
+    key: Value,
+    value: Value,
+    source: ObjectRef,
+) -> ObjectRef {
+    let entry = alloc_synthetic(ctx, class, 3);
+    ctx.set_field(entry, 0, key);
+    ctx.set_field(entry, 1, value);
+    ctx.set_field(entry, ENTRY_FIELD_SOURCE, Value::Object(Some(source)));
+    entry
+}
+
 fn native_entry_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -7027,6 +7118,22 @@ fn native_entry_set_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let new_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let old_val = ctx.get_field(this, 1);
     ctx.set_field(this, 1, new_val);
+    // Live-entry write-through: a `Map$Entry` minted by `native_map_entry_set`
+    // carries its source map at slot 2 (3-field layout). `Map.Entry.setValue`
+    // must mutate the backing map, not just the detached entry copy — otherwise
+    // `entrySet().iterator()...setValue(v)` is silently a no-op (keycloak
+    // StripSecretsUtils masking, and any read-modify-write over a map). 2-field
+    // entries from other paths (TreeMap, SimpleEntry, ...) have no slot 2 and
+    // keep the detached-update behaviour.
+    if ctx.object_num_fields(this) >= 3 {
+        if let Value::Object(Some(src_map)) = ctx.get_field(this, 2) {
+            let key = ctx.get_field(this, 0);
+            native_map_put(
+                ctx,
+                &[Value::Object(Some(src_map)), key, new_val],
+            )?;
+        }
+    }
     Ok(Some(old_val))
 }
 
@@ -11425,6 +11532,17 @@ const CMP_TAG_REVERSE_ORDER: i32 = 2;
 const CMP_TAG_COMPARING: i32 = 3;
 const CMP_TAG_REVERSED: i32 = 4;
 const CMP_TAG_THEN_COMPARING: i32 = 5;
+// Primitive key-extractor comparators. `Comparator.comparingInt(ToIntFunction)`
+// (and Long/Double) must invoke the extractor's primitive SAM
+// (`applyAsInt`/`applyAsLong`/`applyAsDouble`), NOT `Function.apply` — the
+// CMP_TAG_COMPARING arm calls `apply(Object)Object`, which does not exist on a
+// `ToIntFunction` lambda. These distinct tags carry the SAM choice without
+// widening the comparator's field layout. (Groovy/ANTLR4's
+// `ParserATNSimulator.STATE_ALT_SORT_COMPARATOR = comparingInt(..).thenComparingInt(..)`
+// hits exactly this path.)
+const CMP_TAG_COMPARING_INT: i32 = 6;
+const CMP_TAG_COMPARING_LONG: i32 = 7;
+const CMP_TAG_COMPARING_DOUBLE: i32 = 8;
 
 fn make_comparator(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
     let cmp = alloc_synthetic(ctx, "java/util/Comparator$Native", CMP_NUM_FIELDS);
@@ -11444,7 +11562,7 @@ pub fn comparator_compare(
     // Lambda proxies may have 0 fields, so reading field 0 would panic.
     let tag = if ctx.object_num_fields(comparator) >= CMP_NUM_FIELDS {
         match ctx.get_field(comparator, CMP_FIELD_TAG) {
-            Value::Int(t) if (CMP_TAG_NATURAL_ORDER..=CMP_TAG_THEN_COMPARING).contains(&t) => {
+            Value::Int(t) if (CMP_TAG_NATURAL_ORDER..=CMP_TAG_COMPARING_DOUBLE).contains(&t) => {
                 Some(t)
             }
             _ => None,
@@ -11525,7 +11643,83 @@ pub fn comparator_compare(
                 other => Ok(other),
             }
         }
+        CMP_TAG_COMPARING_INT => {
+            let key_fn = match ctx.get_field(comparator, CMP_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let ia = comparing_key_as_i64(ctx, key_fn, "applyAsInt", "(Ljava/lang/Object;)I", a)?;
+            let ib = comparing_key_as_i64(ctx, key_fn, "applyAsInt", "(Ljava/lang/Object;)I", b)?;
+            Ok(Some(Value::Int(ia.cmp(&ib) as i32)))
+        }
+        CMP_TAG_COMPARING_LONG => {
+            let key_fn = match ctx.get_field(comparator, CMP_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let ia = comparing_key_as_i64(ctx, key_fn, "applyAsLong", "(Ljava/lang/Object;)J", a)?;
+            let ib = comparing_key_as_i64(ctx, key_fn, "applyAsLong", "(Ljava/lang/Object;)J", b)?;
+            Ok(Some(Value::Int(ia.cmp(&ib) as i32)))
+        }
+        CMP_TAG_COMPARING_DOUBLE => {
+            let key_fn = match ctx.get_field(comparator, CMP_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let da = comparing_key_as_f64(ctx, key_fn, a)?;
+            let db = comparing_key_as_f64(ctx, key_fn, b)?;
+            // Match java.lang.Double.compare ordering (NaN greatest, -0.0 < 0.0).
+            Ok(Some(Value::Int(double_compare(da, db))))
+        }
         _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+/// Invoke a primitive key-extractor SAM (`applyAsInt`/`applyAsLong`) on `arg`
+/// and coerce the result to `i64`. Used by the `comparingInt`/`comparingLong`
+/// comparator arms.
+fn comparing_key_as_i64(
+    ctx: &mut dyn NativeContext,
+    key_fn: ObjectRef,
+    sam: &str,
+    desc: &str,
+    arg: Value,
+) -> Result<i64, MethodCallFailed> {
+    match ctx.invoke_virtual(key_fn, sam, desc, &[arg])? {
+        Some(Value::Int(v)) => Ok(v as i64),
+        Some(Value::Long(v)) => Ok(v),
+        _ => Ok(0),
+    }
+}
+
+/// Invoke `ToDoubleFunction.applyAsDouble` on `arg` and coerce to `f64`.
+fn comparing_key_as_f64(
+    ctx: &mut dyn NativeContext,
+    key_fn: ObjectRef,
+    arg: Value,
+) -> Result<f64, MethodCallFailed> {
+    match ctx.invoke_virtual(key_fn, "applyAsDouble", "(Ljava/lang/Object;)D", &[arg])? {
+        Some(Value::Double(v)) => Ok(v),
+        Some(Value::Float(v)) => Ok(v as f64),
+        Some(Value::Int(v)) => Ok(v as f64),
+        Some(Value::Long(v)) => Ok(v as f64),
+        _ => Ok(0.0),
+    }
+}
+
+/// `java.lang.Double.compare` semantics: total ordering with NaN greatest and
+/// `-0.0 < 0.0` (so it is a valid `Comparator` even with NaN/zero keys).
+fn double_compare(a: f64, b: f64) -> i32 {
+    if a < b {
+        -1
+    } else if a > b {
+        1
+    } else {
+        // Equal under `<`/`>` (covers both zeros and both NaN cases): fall back
+        // to the bit pattern, exactly like Double.compare.
+        let ab = a.to_bits() as i64;
+        let bb = b.to_bits() as i64;
+        ab.cmp(&bb) as i32
     }
 }
 
@@ -11637,19 +11831,19 @@ fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
         "java/util/Comparator",
         "comparingInt",
         "(Ljava/util/function/ToIntFunction;)Ljava/util/Comparator;",
-        native_comparator_comparing,
+        native_comparator_comparing_int,
     );
     registry.register(
         "java/util/Comparator",
         "comparingLong",
         "(Ljava/util/function/ToLongFunction;)Ljava/util/Comparator;",
-        native_comparator_comparing,
+        native_comparator_comparing_long,
     );
     registry.register(
         "java/util/Comparator",
         "comparingDouble",
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/Comparator;",
-        native_comparator_comparing,
+        native_comparator_comparing_double,
     );
     registry.register(
         "java/util/Comparator",
@@ -11662,6 +11856,38 @@ fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
         "thenComparing",
         "(Ljava/util/Comparator;)Ljava/util/Comparator;",
         native_comparator_then_comparing,
+    );
+    // `thenComparing(Function)` default = `thenComparing(comparing(keyExtractor))`.
+    registry.register(
+        "java/util/Comparator",
+        "thenComparing",
+        "(Ljava/util/function/Function;)Ljava/util/Comparator;",
+        native_comparator_then_comparing_key,
+    );
+    // Primitive `thenComparing*` defaults = `thenComparing(comparing{Int,Long,Double}(keyExtractor))`.
+    // These were previously UNregistered: invoking them on a synthetic
+    // `Comparator$Native` (which has no real interface hierarchy or default-method
+    // bytecode) produced a tagless comparator → `comparator_compare` fell to the
+    // lambda branch → `invoke_virtual("compare")` resolved to the abstract
+    // `Comparator.compare` → `AbstractMethodError: ... has no Code attribute`
+    // (Groovy/ANTLR4 `ParserATNSimulator.STATE_ALT_SORT_COMPARATOR`).
+    registry.register(
+        "java/util/Comparator",
+        "thenComparingInt",
+        "(Ljava/util/function/ToIntFunction;)Ljava/util/Comparator;",
+        native_comparator_then_comparing_int,
+    );
+    registry.register(
+        "java/util/Comparator",
+        "thenComparingLong",
+        "(Ljava/util/function/ToLongFunction;)Ljava/util/Comparator;",
+        native_comparator_then_comparing_long,
+    );
+    registry.register(
+        "java/util/Comparator",
+        "thenComparingDouble",
+        "(Ljava/util/function/ToDoubleFunction;)Ljava/util/Comparator;",
+        native_comparator_then_comparing_double,
     );
     registry.set_category(__prev_cat);
 }
@@ -11747,14 +11973,35 @@ fn native_comparator_write_replace(ctx: &mut dyn NativeContext, args: &[Value]) 
     }
 }
 
-fn native_comparator_comparing(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// Build a key-extractor comparator (`comparing`/`comparingInt`/`comparingLong`/
+/// `comparingDouble`) tagged so `comparator_compare` invokes the right SAM.
+fn make_comparing(ctx: &mut dyn NativeContext, args: &[Value], tag: i32) -> MethodCallResult {
     let key_fn = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cmp = make_comparator(ctx, CMP_TAG_COMPARING);
+    let cmp = make_comparator(ctx, tag);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(key_fn)));
     Ok(Some(Value::Object(Some(cmp))))
+}
+
+fn native_comparator_comparing(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    make_comparing(ctx, args, CMP_TAG_COMPARING)
+}
+
+fn native_comparator_comparing_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    make_comparing(ctx, args, CMP_TAG_COMPARING_INT)
+}
+
+fn native_comparator_comparing_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    make_comparing(ctx, args, CMP_TAG_COMPARING_LONG)
+}
+
+fn native_comparator_comparing_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    make_comparing(ctx, args, CMP_TAG_COMPARING_DOUBLE)
 }
 
 fn native_comparator_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11767,22 +12014,73 @@ fn native_comparator_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(Some(Value::Object(Some(cmp))))
 }
 
-fn native_comparator_then_comparing(
+/// Build a `thenComparing*` comparator. `this` (arg 0) is the primary; the
+/// secondary depends on `inner_tag`:
+///   - `None`            → arg 1 IS already a `Comparator` (`thenComparing(Comparator)`).
+///   - `Some(key_tag)`   → arg 1 is a key extractor; wrap it as a fresh
+///     `comparing*`-tagged comparator (`thenComparing(Function)` /
+///     `thenComparingInt/Long/Double` — matching the JDK defaults, e.g.
+///     `thenComparingInt(f) == thenComparing(comparingInt(f))`).
+fn make_then_comparing(
     ctx: &mut dyn NativeContext,
     args: &[Value],
+    inner_tag: Option<i32>,
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let other = match args.get(1) {
+    let arg1 = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let secondary = match inner_tag {
+        None => arg1,
+        Some(key_tag) => {
+            let inner = make_comparator(ctx, key_tag);
+            ctx.set_field(inner, CMP_FIELD_ARG1, Value::Object(Some(arg1)));
+            inner
+        }
+    };
     let cmp = make_comparator(ctx, CMP_TAG_THEN_COMPARING);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(this)));
-    ctx.set_field(cmp, CMP_FIELD_ARG2, Value::Object(Some(other)));
+    ctx.set_field(cmp, CMP_FIELD_ARG2, Value::Object(Some(secondary)));
     Ok(Some(Value::Object(Some(cmp))))
+}
+
+fn native_comparator_then_comparing(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    make_then_comparing(ctx, args, None)
+}
+
+fn native_comparator_then_comparing_key(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    make_then_comparing(ctx, args, Some(CMP_TAG_COMPARING))
+}
+
+fn native_comparator_then_comparing_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    make_then_comparing(ctx, args, Some(CMP_TAG_COMPARING_INT))
+}
+
+fn native_comparator_then_comparing_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    make_then_comparing(ctx, args, Some(CMP_TAG_COMPARING_LONG))
+}
+
+fn native_comparator_then_comparing_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    make_then_comparing(ctx, args, Some(CMP_TAG_COMPARING_DOUBLE))
 }
 
 // ===========================================================================
@@ -14688,9 +14986,7 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
-        ctx.set_field(entry, 0, key);
-        ctx.set_field(entry, 1, val);
+        let entry = alloc_live_entry(ctx, "java/util/AbstractMap$SimpleEntry", key, val, this);
         entries.push(Value::Object(Some(entry)));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
     }
@@ -16546,6 +16842,11 @@ fn native_al_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         for (i, e) in kept.iter().enumerate() {
             ctx.set_array_element(buf, i, *e);
         }
+        // Null the vacated tail (ArrayList invariant: slots >= size are null);
+        // see native_al_retain_all for why stale tail elements are harmful.
+        for i in kept.len()..(size as usize) {
+            ctx.set_array_element(buf, i, Value::Object(None));
+        }
         al_set_size(ctx, this, kept.len() as i32);
     }
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
@@ -16589,6 +16890,15 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if modified {
         for (i, e) in kept.iter().enumerate() {
             ctx.set_array_element(buf, i, *e);
+        }
+        // Null the vacated tail so slots >= size are null (the real ArrayList
+        // invariant). Leaving stale non-null elements there breaks heuristics
+        // like `values_view_source`, which treats a non-null *last* buffer slot
+        // as a view-source sentinel — that misfired after retainAll and made a
+        // freshly-filtered list (e.g. the JSSE connector's enabled-cipher list)
+        // resync to empty, throwing "None of the [ciphers] ... supported".
+        for i in kept.len()..(size as usize) {
+            ctx.set_array_element(buf, i, Value::Object(None));
         }
         al_set_size(ctx, this, kept.len() as i32);
     }
@@ -18569,7 +18879,7 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // removing an entry through the list (or its iterator) deletes the key.
     let entries: Vec<Value> = pairs
         .into_iter()
-        .map(|(k, v)| Value::Object(Some(tm_make_entry(ctx, k, v))))
+        .map(|(k, v)| Value::Object(Some(alloc_live_entry(ctx, "java/util/HashMap$Entry", k, v, this))))
         .collect();
     let list = make_view_list_of(ctx, this, &entries);
     Ok(Some(Value::Object(Some(list))))
@@ -20998,9 +21308,7 @@ fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing)));
     for (key, value) in &entries {
-        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
-        ctx.set_field(entry_obj, 0, *key);
-        ctx.set_field(entry_obj, 1, *value);
+        let entry_obj = alloc_live_entry(ctx, "java/util/Map$Entry", *key, *value, this);
 
         let hash = ctx.identity_hash_code(entry_obj);
         let (b, size, c) = map_state(ctx, backing);
@@ -22972,19 +23280,19 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         "java/util/List",
         "copyOf",
         "(Ljava/util/Collection;)Ljava/util/List;",
-        native_collections_identity,
+        native_list_copy_of,
     );
     r.register(
         "java/util/Set",
         "copyOf",
         "(Ljava/util/Collection;)Ljava/util/Set;",
-        native_collections_identity,
+        native_set_copy_of,
     );
     r.register(
         "java/util/Map",
         "copyOf",
         "(Ljava/util/Map;)Ljava/util/Map;",
-        native_collections_identity,
+        native_map_copy_of,
     );
 
     // Enumeration interface
@@ -23018,6 +23326,36 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
 /// Identity — just returns the first argument (used for synchronized wrappers)
 fn native_collections_identity(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(args.first().cloned().unwrap_or(Value::Object(None))))
+}
+
+// `List.copyOf` / `Set.copyOf` / `Map.copyOf` — return an INDEPENDENT immutable
+// snapshot of the source (JDK contract), NOT the source itself. The previous
+// identity impl aliased the source: a later mutation of the source leaked into
+// the "copy". Surfaced as Kafka AdminApiDriver, whose `RequestSpec.keys` is
+// built via `Set.copyOf(scopeKeys)` — when the driver later mapped another key
+// to the same broker, the already-returned spec's key set gained that key
+// (`{bar}` -> `{bar, foo}`). Fix: build a fresh backing collection from the
+// source's elements, then wrap it unmodifiable so reads see the snapshot and
+// mutators throw.
+fn native_list_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let src = args.first().copied().unwrap_or(Value::Object(None));
+    let backing = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    native_al_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
+    Ok(Some(Value::Object(Some(alloc_unmod_wrapper(ctx, UNMOD_LIST_CLASS, backing)))))
+}
+
+fn native_set_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let src = args.first().copied().unwrap_or(Value::Object(None));
+    let backing = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    native_hs_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
+    Ok(Some(Value::Object(Some(alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, backing)))))
+}
+
+fn native_map_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let src = args.first().copied().unwrap_or(Value::Object(None));
+    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    native_map_init_from_map(ctx, &[Value::Object(Some(backing)), src])?;
+    Ok(Some(Value::Object(Some(alloc_unmod_wrapper(ctx, UNMOD_MAP_CLASS, backing)))))
 }
 
 /// `Collections.unmodifiableMap` — wrap the source map in a live read-only view.

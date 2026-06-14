@@ -189,7 +189,7 @@ pub fn ensure_class_initialized_shared(
     // the class manager + one `Arc<AtomicU8>::load(Acquire)`. The
     // load needs no lock because the embedded atomic lives inside the
     // `Class` we just borrowed.
-    if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok() {
+    if crate::runtime::env_cache::modstatic_dbg() {
         let nm = shared.class_manager.read().get_class(class_id).map(|c| c.name.to_string());
         if nm.as_deref() == Some("org/jboss/modules/Module") {
             let fast = is_class_initialized_via_manager(shared, class_id);
@@ -759,7 +759,7 @@ fn initialize_class_shared(
         }
     };
 
-    if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok()
+    if crate::runtime::env_cache::modstatic_dbg()
         && &*class_name_for_jfr == "org/jboss/modules/Module"
     {
         eprintln!("MODSTATIC: Module init reached, has_clinit={has_clinit}");
@@ -788,7 +788,7 @@ fn initialize_class_shared(
         match result {
             Ok(_) => {
                 finalize_init(shared, class_id, ClassState::Initialized);
-                if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok()
+                if crate::runtime::env_cache::modstatic_dbg()
                     && &*class_name_for_jfr == "org/jboss/modules/Module"
                 {
                     let cm = shared.class_manager.read();
@@ -885,7 +885,7 @@ fn initialize_class_shared(
                 Ok(())
             }
             Err(e) => {
-                if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok()
+                if crate::runtime::env_cache::modstatic_dbg()
                     && &*class_name_for_jfr == "org/jboss/modules/Module"
                 {
                     eprintln!("MODSTATIC: Module <clinit> FAILED: {:?}", &e);

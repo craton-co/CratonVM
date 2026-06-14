@@ -44,6 +44,8 @@ pub mod cipher;
 pub mod key_factory;
 // WP6.4 — `java.security.Signature` real-JDK natives. Pairs with key_factory.
 pub mod signature;
+// `javax.crypto.KeyAgreement` — ECDH, by driving the real SunEC ECDH SPI.
+pub mod key_agreement;
 // WP6.6 — `javax.security.auth.x500.X500Principal` DER + RFC 4514 round-trip.
 pub mod x500;
 // ASN.1 helper used by x500 (DER encode/decode primitives). No registrations
@@ -67,6 +69,8 @@ pub fn register_jca_natives(registry: &mut NativeMethodRegistry) {
     // bytecode never reaches `sun.security.jca.GetInstance.getServices`.
     key_factory::register(registry);
     signature::register(registry);
+    // `javax.crypto.KeyAgreement` ECDH → SunEC ECDH SPI.
+    key_agreement::register(registry);
     // WP6.6: DER + RFC 4514 round-trip for `X500Principal`.
     x500::register(registry);
 }

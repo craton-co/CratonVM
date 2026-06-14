@@ -356,6 +356,14 @@ pub trait NativeContext {
     /// Get the identity hash code of an ObjectRef.
     fn identity_hash_code(&self, obj: ObjectRef) -> i32;
 
+    /// B-J: register a `java.lang.invoke.VarHandle` as a permanent GC root.
+    /// VarHandles live in `static final` fields and are used for lock-free CAS;
+    /// without an explicit root a moving GC reclaimed them and left their static
+    /// holder slots stale (all-zero header → misdispatch). Default no-op for
+    /// non-VM contexts (tests/mocks); the interpreter overrides it to insert
+    /// into `SharedVm::var_handle_roots`.
+    fn register_var_handle_root(&mut self, _vh: ObjectRef) {}
+
     /// Store a value into the test output buffer (for `tempPrint`).
     fn record_printed_value(&mut self, value: Value);
 

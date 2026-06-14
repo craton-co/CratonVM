@@ -54,9 +54,12 @@ HS=LOADERR (4): `KafkaConsumerTest`, `AsyncKafkaConsumerTest`, `KafkaProducerTes
   (a) Mockito/ByteBuddy mock generation and (b) JUnit reflective discovery under the
   interpreter — i.e. the known throughput gap, not correctness defects.
 - The one item worth a focused look is **`AbstractCoordinatorTest`** (`Object.wait`
-  leaf): confirm it is a lost-wakeup deadlock vs just slow by running it with a much
-  larger timeout — if it completes given time, it is slow; if it never completes, it
-  joins the `BufferPool`/AQS blocking-primitive family (cf. bug-19, `CRATONVM_REAL_AQS`).
+  leaf): this is the **same root cause as [bug-19](bug-19-bufferpool-blocking-hang.md)**
+  — a waiter blocked on a notify from a `Runnable`-target worker thread that never
+  ran because CratonVM was booting a **JDK < 19** (`Thread$FieldHolder` absent →
+  `holder.task` unpopulated → `new Thread(runnable)` silently no-ops). **Fix: boot a
+  JDK ≥ 19** (e.g. `--java-home <JDK25>`); no VM code change needed. The genuine-hang
+  members of this family all clear under the correct boot JDK.
 - A throughput win on the Mockito mock-generation path (ByteBuddy `TypeDescription`
   construction) would clear the largest cluster of these timeouts.
 

@@ -216,6 +216,29 @@ pub struct GenerationalHeap {
     young_to: Mutex<Arena>,
     /// Old generation (promoted objects).
     old_gen: Mutex<OldGen>,
+    /// Lock-free cached address bounds `[base, end)` of the three storage
+    /// regions (young from-space, young to-space, old gen), published whenever
+    /// the regions are (re)allocated so [`is_object_address`] can do its
+    /// region-containment check WITHOUT taking the three arena mutexes.
+    ///
+    /// Motivation: `is_object_address` is called per operand-stack object on
+    /// every object-returning native call (via `update_root_snapshot`) — under
+    /// load that is millions of calls, and the old `young_from.lock() ||
+    /// young_to.lock() || old_gen.lock()` triple-lock contended hard with the
+    /// concurrent GC/allocator, blowing per-call cost up ~1000x during embedded
+    /// webapp deployment. Reading these atomics instead removes the contention.
+    ///
+    /// Correctness (NO false negatives — a missed live region would drop a root):
+    /// the bounds are refreshed (a) at construction and (b) at the start AND end
+    /// of every GC cycle (the only place the young arenas swap/grow; the old gen
+    /// never reallocates). Refreshing at GC start captures pre-collection bounds
+    /// for the marking phase; the single `young_to.grow` happens near GC end on
+    /// the *empty* to-space (no live objects to miss), after which the end
+    /// refresh republishes. Mutators only read between GC cycles (GC is STW), so
+    /// they always observe current bounds. Acquire/Release ordering pairs the
+    /// GC-side stores with the mutator-side loads. Initialised to the empty
+    /// range `[0,0)` so a load before the first publish matches nothing.
+    region_bounds: [(AtomicUsize, AtomicUsize); 3],
     /// Card table covering the old generation's address space.
     ///
     /// T5.5.2 (HIGH-1 fix): the table now uses interior mutability for
@@ -333,10 +356,15 @@ impl GenerationalHeap {
             if n < numa_num_nodes { n } else { 0 }
         };
 
-        Self {
+        let heap = Self {
             young_from: Mutex::new(Arena::new(young_semi_size)),
             young_to: Mutex::new(Arena::new(young_semi_size)),
             old_gen: Mutex::new(old_gen),
+            region_bounds: [
+                (AtomicUsize::new(0), AtomicUsize::new(0)),
+                (AtomicUsize::new(0), AtomicUsize::new(0)),
+                (AtomicUsize::new(0), AtomicUsize::new(0)),
+            ],
             card_table,
             next_hash_code: AtomicI32::new(1),
             young_gc_threshold: Mutex::new(threshold),
@@ -347,6 +375,40 @@ impl GenerationalHeap {
             numa_num_nodes,
             stats: HeapStats::default(),
             force_promote_all: std::sync::atomic::AtomicBool::new(false),
+        };
+        // Publish the initial region bounds so the lock-free
+        // `is_object_address` containment check is correct from the first
+        // allocation (before any GC has run to refresh them).
+        heap.refresh_region_bounds();
+        heap
+    }
+
+    /// Republish the lock-free [`region_bounds`] cache from the live arenas.
+    ///
+    /// Locks each region briefly to read its current `[base, base+capacity)`
+    /// and stores it with `Release` ordering. Called at construction and at the
+    /// start/end of every GC cycle — the only points where a young arena's
+    /// backing can move (swap/grow) or the heap is first sized. Cheap (3 short
+    /// lock/read/store), and never on the hot mutator path.
+    fn refresh_region_bounds(&self) {
+        let yf = self.young_from.lock();
+        let yt = self.young_to.lock();
+        let og = self.old_gen.lock();
+        self.store_region_bounds_locked(&yf, &yt, &og);
+    }
+
+    /// Store the three regions' `[base, end)` into [`region_bounds`] from
+    /// already-held guards (used inside GC, where the arenas are locked and
+    /// re-locking would deadlock). Mirror of [`refresh_region_bounds`].
+    fn store_region_bounds_locked(&self, yf: &Arena, yt: &Arena, og: &OldGen) {
+        let pairs = [
+            (yf.base_ptr() as usize, yf.capacity()),
+            (yt.base_ptr() as usize, yt.capacity()),
+            (og.base_ptr() as usize, og.capacity()),
+        ];
+        for (slot, (base, cap)) in self.region_bounds.iter().zip(pairs) {
+            slot.0.store(base, Ordering::Release);
+            slot.1.store(base.wrapping_add(cap), Ordering::Release);
         }
     }
 
@@ -464,7 +526,21 @@ impl GenerationalHeap {
             );
             std::process::abort();
         });
-        let ptr = self.alloc_young(total_size);
+        // Young fast path; on exhaustion spill to old gen (non-moving) BEFORE
+        // the hard abort. This panicking entry point is used by the native
+        // `ctx.new_*` allocators, which cannot safely GC-and-retry (a moving
+        // young GC would dangle their unrooted local ObjectRefs). See
+        // [`try_alloc_object_old`]. Only when old gen is also full does
+        // `alloc_young` fire the OOM diagnostic and abort.
+        let ptr = match self.try_alloc_young(total_size) {
+            Some(p) => p,
+            None => {
+                if let Some(obj) = self.try_alloc_object_old(class_id, num_fields) {
+                    return obj;
+                }
+                self.alloc_young(total_size)
+            }
+        };
 
         let header = ObjectHeader::new(
             class_id,
@@ -595,7 +671,24 @@ impl GenerationalHeap {
             // diagnostic would live here).
         }
 
-        let ptr = self.alloc_young(total_size);
+        // Young fast path; on exhaustion spill into old gen (non-moving) BEFORE
+        // the hard abort. The panicking `alloc_array` is used by the native
+        // `ctx.new_array`/`new_ref_array` allocators, which cannot safely
+        // GC-and-retry (a moving young GC would dangle their unrooted local
+        // ObjectRefs). `try_alloc_array_humongous` allocates in old gen
+        // regardless of size; only when old gen is also full does `alloc_young`
+        // fire the OOM diagnostic and abort. See [`try_alloc_object_old`].
+        let ptr = match self.try_alloc_young(total_size) {
+            Some(p) => p,
+            None => {
+                if let Some(obj) =
+                    self.try_alloc_array_humongous(class_id, element_type, length_u32)
+                {
+                    return obj;
+                }
+                self.alloc_young(total_size)
+            }
+        };
 
         let header = ObjectHeader::new(
             class_id,
@@ -763,6 +856,47 @@ impl GenerationalHeap {
         Some(unsafe { ObjectRef::from_raw(ptr) })
     }
 
+    /// Allocate a Java object DIRECTLY in the old generation (non-moving),
+    /// used as an overflow fallback when the young from-space is exhausted.
+    /// Returns `None` if the old gen is also full.
+    ///
+    /// This is the object analogue of [`try_alloc_array_humongous`] and exists
+    /// for the same safety reason that motivates routing the *panicking*
+    /// `alloc_object`/`alloc_array` here on young-full: those entry points are
+    /// used by the convenience native allocators (`ctx.new_object`/`new_array`/
+    /// `new_ref_array`, `alloc_concurrent_synthetic`, …). A native holds raw
+    /// `ObjectRef`s in Rust locals that are NOT in any GC root set, so we cannot
+    /// trigger a moving/promoting young GC from there (it would relocate those
+    /// objects and leave the native's locals dangling — exactly the stale-ref
+    /// class of SEGV). The old-gen allocator never relocates a live object, so
+    /// spilling the single allocation into old gen lets a young-full native call
+    /// succeed without GC instead of `std::process::abort()`-ing the whole VM.
+    /// The `GC_FLAG_OLD_GEN` mark keeps minor GC from trying to forward it.
+    fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+        let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
+        let ptr = {
+            let mut og = self.old_gen.lock();
+            og.alloc(total_size, 8)?
+        };
+        let mut header = ObjectHeader::new(
+            class_id,
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            self.next_hash(),
+            0,
+            u32::try_from(num_fields).ok()?,
+        );
+        header.gc_flags |= GC_FLAG_OLD_GEN;
+        // SAFETY: `OldGen::alloc` returned `total_size` bytes of zeroed,
+        // 8-byte-aligned memory exclusive to this allocation; writing the
+        // header is in-bounds and the resulting `ObjectRef` is fully valid.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+        }
+        self.stats.old_allocations.fetch_add(1, Ordering::Relaxed);
+        Some(unsafe { ObjectRef::from_raw(ptr) })
+    }
+
     // ----- Header access -----------------------------------------------------
 
     /// Read the object header from a heap reference.
@@ -822,12 +956,20 @@ impl GenerationalHeap {
         }
         let raw = addr as *const u8;
 
-        // Region check: must fall inside one of the three arenas. Holding
-        // the locks for the duration of the validation is fine — this is
-        // only called during stop-the-world root scanning.
-        let in_region = self.young_from.lock().contains(raw)
-            || self.young_to.lock().contains(raw)
-            || self.old_gen.lock().contains(raw);
+        // Region check: must fall inside one of the three arenas. LOCK-FREE —
+        // read the cached `[base, end)` bounds (published under lock at
+        // construction and at GC start/end; see `region_bounds`). The old
+        // triple-mutex check (`young_from.lock() || young_to.lock() ||
+        // old_gen.lock()`) ran per operand-stack object on every
+        // object-returning native call and contended catastrophically with the
+        // concurrent GC/allocator. The bounds can only change during a STW GC,
+        // when no mutator is reading; the `Acquire` loads pair with the GC's
+        // `Release` stores.
+        let in_region = self.region_bounds.iter().any(|(base, end)| {
+            let b = base.load(Ordering::Acquire);
+            let e = end.load(Ordering::Acquire);
+            addr >= b && addr < e
+        });
         if !in_region {
             return None;
         }
@@ -1945,6 +2087,12 @@ impl GenerationalHeap {
         let mut young_to = self.young_to.lock();
         let mut old_gen = self.old_gen.lock();
 
+        // Publish current (pre-collection) region bounds for the lock-free
+        // `is_object_address` used during this cycle's marking/scanning. The
+        // young arenas may swap/grow later in this function; the matching end
+        // refresh republishes the post-collection bounds.
+        self.store_region_bounds_locked(&young_from, &young_to, &old_gen);
+
         // bc math-ec 0x4 seed-phase bisect (CRATONVM_DBG_SEEDHUNT): count
         // `Object(Some(0<p<0x1000))` slots in old gen at GC ENTRY. Compared
         // against the post-Cheney and post-major counts below to localize the
@@ -2691,23 +2839,52 @@ impl GenerationalHeap {
         let mut objects_promoted_cycle: u64 = 0;
         let mut bytes_copied_young_cycle: u64 = 0;
         let mut objects_copied_young_cycle: u64 = 0;
-        for &new_addr in pointer_map.values() {
+        let mut bad_forward_count: u64 = 0;
+        let mut bad_forward_sample: (usize, usize) = (0, 0);
+        for (&old_addr, &new_addr) in pointer_map.iter() {
             let new_ptr = new_addr as *const u8;
-            // SAFETY: `new_addr` is a pointer returned by forward_object,
-            // which either allocated in young_to or in old_gen. Both
+            let in_old = old_gen.contains(new_ptr);
+            let in_young = young_to.contains(new_ptr);
+            // BUG-Z safety: every `pointer_map` value must be a forwarding
+            // address inside young_to or old_gen. Under heavy multi-threaded
+            // churn (TestFileStoreConcurrency) `forward_object` has been observed
+            // to record a *garbage* value (e.g. a small integer) for a valid
+            // young_from source — a heap-corruption bug tracked in BUG-Z.
+            // Dereferencing such a value here SIGSEGVs in the GC's post-copy
+            // stats walk. Skip it (the stats are advisory counters) and record a
+            // sample so a single summary can be logged, rather than crashing or
+            // spamming a line per entry. NOTE: this does not repair the bad
+            // forward — `update_all_roots` still remaps through `pointer_map`;
+            // see BUG-Z for the underlying fix.
+            if !in_old && !in_young {
+                bad_forward_count += 1;
+                if bad_forward_sample == (0, 0) {
+                    bad_forward_sample = (old_addr, new_addr);
+                }
+                continue;
+            }
+            // SAFETY: `new_addr` is confirmed inside young_to or old_gen; both
             // allocations begin with a valid ObjectHeader.
             let header = unsafe { &*(new_addr as *const ObjectHeader) };
             // `gen_object_total_size` is the sum of HEADER_SIZE and the
             // variable-length object body, computed from the header
             // exactly as the copy path does.
             let sz = gen_object_total_size(header) as u64;
-            if old_gen.contains(new_ptr) {
+            if in_old {
                 bytes_promoted_cycle += sz;
                 objects_promoted_cycle += 1;
             } else {
                 bytes_copied_young_cycle += sz;
                 objects_copied_young_cycle += 1;
             }
+        }
+        if bad_forward_count > 0 {
+            // BUG-Z: surface the corruption once per cycle (not per entry).
+            eprintln!(
+                "[gc] WARNING: {} pointer_map forward(s) pointed outside the heap \
+                 (corruption — see BUG-Z); skipped in stats. sample old=0x{:x} -> new=0x{:x}",
+                bad_forward_count, bad_forward_sample.0, bad_forward_sample.1,
+            );
         }
 
         // Phase 3: Clear card table and reset young from-space
@@ -2890,6 +3067,12 @@ impl GenerationalHeap {
                 *self.young_gc_threshold.lock() = new_cap * YOUNG_GC_THRESHOLD_PERCENT / 100;
             }
         }
+
+        // Republish region bounds: the arenas were swapped (and to-space may
+        // have been grown to a new backing) above, so the lock-free
+        // `is_object_address` cache must reflect the post-collection
+        // `[base, end)` before any mutator resumes. Guards still held.
+        self.store_region_bounds_locked(&young_from, &young_to, &old_gen);
 
         // Phase H (RH.1): commit per-cycle counters to the lifetime
         // accumulator. Do this at the end so tests can observe GC
@@ -4541,7 +4724,21 @@ impl GenerationalHeap {
             // returning it. A stale forwarding pointer left over from a prior
             // GC cycle that wasn't cleared by session 73's fix would send
             // callers to freed memory.
-            if fwd.is_null() || (fwd as usize) % 8 != 0 {
+            //
+            // BUG-Z fix: the null/alignment check below is NOT enough — under
+            // heavy multi-threaded churn (TestFileStoreConcurrency) the
+            // `forwarding_ptr` field of a young_from source has been observed
+            // holding 8-aligned non-null GARBAGE (small integers like 0x10/0x1110,
+            // or `old - small_offset`) that passes those two checks and then gets
+            // recorded into `pointer_map`, sending the GC's post-copy walk (and
+            // `update_all_roots`) into a wild pointer → SIGSEGV. A real
+            // forwarding address must land inside the to-space (`young_to`) or
+            // the old gen; reject anything else as a stale/corrupt forward
+            // (return `old_ptr` unmoved, exactly as the null/unaligned arm does)
+            // rather than trusting the bogus pointer and recording it.
+            let fwd_in_heap =
+                young_to.contains(fwd as *const u8) || old_gen.contains(fwd as *const u8);
+            if fwd.is_null() || (fwd as usize) % 8 != 0 || !fwd_in_heap {
                 tracing::debug!(
                     target: "cratonvm::gc::guard",
                     fwd = ?fwd,

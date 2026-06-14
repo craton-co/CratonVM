@@ -597,6 +597,37 @@ pub fn route_pqc_to_real() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_PQC").is_none())
 }
 
+/// Hand out *real* RSA key objects (`sun.security.rsa.RSAPublic/PrivateKeyImpl`)
+/// from `KeyPairGenerator.generateKeyPair()` / `KeyFactory.generatePublic()`
+/// instead of the bare-interface synthetic `PublicKey`. Default ON.
+///
+/// ## Why this exists / what stays fast
+///
+/// The synthetic RSA path was an **optimization, not a stub**: it generates real
+/// key *material* with the fast Rust `crypto_impl::Rsa` (no slow interpreter
+/// prime generation — the dominant RSA cost) and signs/verifies via a
+/// `crypto_impl` `key_id` (no slow interpreter BigInteger modexp). Its only
+/// defect was the *wrapper type*: a bare `java/security/PublicKey` that fails
+/// `(RSAPublicKey) k` casts, `getModulus()`, real `getEncoded()`, and BC cert
+/// generation (`getAlgorithm` NPE).
+///
+/// This routing keeps BOTH fast paths and fixes the type: it still does the fast
+/// Rust keygen, but materialises the resulting DER into a genuine
+/// `RSAPublic/PrivateKeyImpl` via the real `RSAKeyFactory$Legacy` SPI, and
+/// bridges the real key back to its `crypto_impl` `key_id` through a GC-stable
+/// `identityHashCode` map (`crypto_impl::rsa_realkey_map_*`) so `Signature`
+/// sign/verify stay on the fast Rust path. Net: HotSpot-correct key objects with
+/// no loss of the original optimisation.
+///
+/// Kill-switch `CRATONVM_SYNTHETIC_RSA=1` restores the legacy bare-interface
+/// synthetic keys (faster object alloc, but the casts/cert paths fail) for
+/// debugging / regression bisecting.
+pub fn route_rsa_to_real() -> bool {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_SYNTHETIC_RSA").is_none())
+}
+
 pub mod deprecated_lang;
 pub mod deprecated_io_util;
 pub mod deprecated_util;
@@ -1124,6 +1155,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // launcher initialization (`URL.<init>(String)` and friends).
     register_net_natives(registry);
 
+    // NIO2 asynchronous channels (AsynchronousSocketChannel / -ServerSocketChannel
+    // / -ChannelGroup / -FileChannel). These were only registered via
+    // `register_synthetic_overrides` (synthetic-JDK mode); in real-JDK mode the
+    // abstract `AsynchronousSocketChannel.open(...)` returns a synthetic instance
+    // whose `connect`/`read`/`write` resolved to the abstract (no-Code) methods —
+    // `AbstractMethodError` in the Tomcat WebSocket client
+    // (`WsWebSocketContainer.connectToServerRecursive`). Wire them into the
+    // universal essential path so the synthetic impl backs the abstract class in
+    // both modes. (No real IOCP/`sun.nio.ch` async stack exists in CratonVM, so
+    // the synthetic implementation is the only backing for these abstract
+    // classes.)
+    crate::phases_late::register_p67_async_channels(registry);
+
     // Surefire's forked JVM calls `ClassLoader.setDefaultAssertionStatus` on the
     // context loader before the JDK static `assertionLock` is assigned; the real
     // bytecode does `synchronized (assertionLock)` and NPEs. Full
@@ -1222,20 +1266,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(Some(out))))
         },
     );
+    // String.hashCode — use the layout-aware CACHING implementation (reads and
+    // writes the JDK `hash` field) rather than recomputing from scratch on every
+    // call. The previous inline closure here re-decoded the char array and
+    // re-ran the fold every time, with NO caching, so real-JDK String-keyed
+    // hashing was ~1950x slower than HotSpot (which caches in String.hash):
+    // a 5M-call microbench took 17.6s vs HotSpot's 9ms, and it dominated the
+    // Xerces XSD model build (XSElementDecl.hashCode / CMStateSet.hashCode were
+    // ~100% of self-time). `register_synthetic_overrides` already wired the
+    // caching impl, but real-JDK mode (`--java-home`) only runs
+    // `register_essential_natives`, so the cache never took effect there.
     registry.register(
         "java/lang/String", "hashCode", "()I",
-        |ctx, args| {
-            let this = match args.first() {
-                Some(Value::Object(Some(o))) => *o,
-                _ => return Ok(Some(Value::Int(0))),
-            };
-            let s = ctx.read_string(this).unwrap_or_default();
-            let mut h: i32 = 0;
-            for c in s.chars() {
-                h = h.wrapping_mul(31).wrapping_add(c as i32);
-            }
-            Ok(Some(Value::Int(h)))
-        },
+        native_string_hash_code,
     );
     registry.register(
         "java/lang/String", "indexOf", "(I)I",
@@ -11018,6 +11061,9 @@ fn native_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
     let hash = ctx.identity_hash_code(this);
+    if std::env::var_os("CRATONVM_DBG_VDISP").is_some() {
+        eprintln!("[vdisp] native_object_hash_code (IDENTITY) called -> {hash}");
+    }
     Ok(Some(Value::Int(hash)))
 }
 
@@ -16801,24 +16847,53 @@ fn register_objects_natives(r: &mut NativeMethodRegistry) {
 }
 
 /// Null-safe equality check for Objects.equals (duplicated from collections.rs values_equal)
-fn objects_values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
+fn objects_values_equal(
+    ctx: &mut dyn NativeContext,
+    a: &Value,
+    b: &Value,
+) -> Result<bool, MethodCallFailed> {
     match (a, b) {
-        (Value::Object(None), Value::Object(None)) => true,
-        (Value::Object(None), _) | (_, Value::Object(None)) => false,
+        (Value::Object(None), Value::Object(None)) => Ok(true),
+        (Value::Object(None), _) | (_, Value::Object(None)) => Ok(false),
         (Value::Object(Some(ra)), Value::Object(Some(rb))) => {
             if ra.as_ptr() == rb.as_ptr() {
-                return true;
+                return Ok(true);
             }
-            // Try string comparison
+            // String fast-path (the common case).
             if let (Some(sa), Some(sb)) = (ctx.read_string(*ra), ctx.read_string(*rb)) {
-                return sa == sb;
+                return Ok(sa == sb);
             }
-            // Compare by field 0 for wrapper types
-            let fa = ctx.get_field(*ra, 0);
-            let fb = ctx.get_field(*rb, 0);
-            fa == fb
+            // General `Objects.equals` contract: dispatch to the receiver's real
+            // `equals(Object)`. The previous "compare field 0" fallback is
+            // correct ONLY for primitive-wrapper boxes (Integer/Boolean/… whose
+            // slot 0 holds the primitive value). For an ArrayList / HashSet /
+            // record / any value class, slot 0 is a backing-array/element ref
+            // that differs between two equal-but-distinct instances, so
+            // `Objects.equals(list1, list2)` returned false — and since the JDK
+            // `Optional.equals`, record `equals`, and most hand-written
+            // `equals` route through `Objects.equals`, those all broke for
+            // value-equal objects. Surfaced as Kafka DescribeConsumerGroups:
+            // `ConsumerGroupDescription.equals` false for two value-equal
+            // objects (via `Optional<MemberAssignment>` / `Optional<List>`).
+            // Mirrors `values_equal` in native-collections.
+            if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
+                eprintln!("[objects-native] objects_values_equal -> invoke_virtual equals on ra={:?}", ra);
+            }
+            let r = ctx.invoke_virtual(
+                *ra,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(*rb))],
+            )?;
+            if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
+                eprintln!("[objects-native] objects_values_equal invoke_virtual returned {:?}", r);
+            }
+            match r {
+                Some(Value::Int(v)) => Ok(v != 0),
+                _ => Ok(false),
+            }
         }
-        _ => a == b,
+        _ => Ok(a == b),
     }
 }
 
@@ -16851,13 +16926,19 @@ fn native_objects_require_non_null_msg(
 }
 
 fn native_objects_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
+        eprintln!("[objects-native] native_objects_equals CALLED args={:?}", args);
+    }
     let a = args.first().copied().unwrap_or(Value::Object(None));
     let b = args.get(1).copied().unwrap_or(Value::Object(None));
-    let eq = objects_values_equal(ctx, &a, &b);
+    let eq = objects_values_equal(ctx, &a, &b)?;
     Ok(Some(Value::Int(if eq { 1 } else { 0 })))
 }
 
 fn native_objects_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
+        eprintln!("[objects-native] native_objects_hash_code CALLED args={:?}", args);
+    }
     match args.first() {
         Some(Value::Object(Some(obj))) => Ok(Some(Value::Int(ctx.identity_hash_code(*obj)))),
         _ => Ok(Some(Value::Int(0))),

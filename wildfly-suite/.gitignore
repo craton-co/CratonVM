@@ -1,0 +1,10 @@
+# Transient run output and compiled/build artifacts — not committed
+results/
+target/
+*.class
+*.log
+*.log.err
+.af*.txt
+.lock
+cvm-home/
+*.err

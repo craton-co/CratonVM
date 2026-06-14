@@ -1,70 +1,87 @@
-# Bug 19 — `BufferPoolTest` hangs (blocking buffer-pool `Condition.await` never wakes)
+# Bug 19 — `BufferPoolTest` hang — ROOT CAUSE: JDK-version mismatch at boot (NOT a VM defect)
 
-**Severity:** High (true hang) — `producer.internals.BufferPoolTest` TIMEOUT (rc=124,
-no output). Reproduces under `--nojit`. HotSpot runs it in well under a second.
+**Status: RESOLVED (environmental).** On a quiet machine with a matching JDK boot
+image, the hang does not reproduce. The earlier diagnoses in this doc (synthetic
+`Condition` lost-wakeup; GC-quiescence deadlock) were **both wrong** — artifacts of
+(a) CPU starvation from leftover `cratonvm.exe` processes and (b) running CratonVM
+against a **too-old JDK boot image (JDK 17)** while the workload expected JDK 19+.
 
-## Symptom
-The class produces no `RESULT` line and is killed by the external timeout. No
-exception, no panic — a genuine **block**: a thread waits on a
-`java.util.concurrent.locks.Condition` (the buffer pool's "more memory available"
-condition) that is never signalled.
+## TL;DR
 
-## Root cause (to pin down)
-`BufferPool.allocate(...)` blocks on `Condition.await()` when the pool is exhausted
-and is woken by `deallocate(...)` → `moreMemory.signal()`. The test
-(`testBlockTimeout`, `testBufferExhaustion`, …) drives this across threads. On
-CratonVM the waiter is never woken — points at a defect in
-`ReentrantLock`/`Condition` `await`/`signal` (lost wakeup), or in cross-thread
-scheduling of the producer/consumer threads. Related family: the documented
-blocked-thread / AQS work (`CRATONVM_REAL_AQS`) and `ArrayBlockingQueue` deadlocks.
+`BufferPoolTest` — like almost all of `java.util.concurrent` — creates worker
+threads with a **`Runnable` target** (`new Thread(runnable)` / thread pools), then
+blocks waiting for one of them to `signal`/`notify`/`unpark`. The hang is simply:
+**a `Runnable`-target thread never runs its target**, so the wakeup never comes.
 
-**To check:** run with `CRATONVM_REAL_AQS=1` (real `java.util.concurrent` AQS) and
-without; if the hang clears under real AQS, the synthetic `ReentrantLock`/`Condition`
-is the culprit. Capture a stack dump (let the default 120s watchdog fire, i.e. do
-NOT set `CRATONVM_DISABLE_DEFAULT_WATCHDOG`) to confirm the waiting frame.
+That happens **only when CratonVM boots from a JDK older than 19.** JDK ≥19 stores a
+Thread's `Runnable` in `Thread.holder.task` (`Thread$FieldHolder`, a class that does
+not exist before JDK 19). When CratonVM boots a JDK-17 `java.base`:
+- `Thread$FieldHolder` is absent → `ClassNotFoundException`,
+- CratonVM's real-JDK `Thread` layout is mismodelled (reflection surfaces only the
+  `name` field),
+- so `holder.task` can never be populated, and the native `Thread.run()`
+  (`native-builtins/src/lib.rs`, the `("java/lang/Thread","run","()V")` handler)
+  finds no task and **silently returns** — the target Runnable never executes.
 
-## Diagnosis update (2026-06-13) — NOT the Condition; it's a GC-quiescence / non-moving-sweep deadlock
+Insidiously, the VM still reports `java.version=25.0.1` even while booting JDK 17.
 
-`CRATONVM_REAL_AQS=1` does **NOT** clear the hang — so the synthetic
-`ReentrantLock`/`Condition` await/signal is **not** the root cause (the doc's
-original hypothesis is wrong). HotSpot runs the class 13/13 OK in ~6.5 s
-(it has real timing tests). On CratonVM the class hangs past the 120 s watchdog,
-and the watchdog's dump is **not** clean thread frames — it reports:
+## Fix
+
+Boot CratonVM from a JDK **≥ 19** (ideally the same JDK the tests are compiled
+against — here JDK 25). The launcher picks its boot image from
+`--java-home` › `CRATONVM_JAVA_HOME` › `JAVA_HOME` › `java` on `PATH`. On this box
+`JAVA_HOME` was stale (`temurin17-jdk`) while `PATH` had JDK 25, so the default
+boot was JDK 17. Either:
 
 ```
-[quiesce] FIRST corruption: quiescence depth=5 enter_count=43210 leave_count=43205
-<then a raw heap hex dump — the heap-corruption detector tripped>
+cratonvm --java-home "C:\Program Files\Eclipse Adoptium\jdk-25.0.2.10-hotspot" -cp . <Class>
+# or set CRATONVM_JAVA_HOME / fix JAVA_HOME to a JDK >= 19
 ```
 
-So the failure is in the **GC-quiescence machinery** (`vm/src/jit/
-conservative_roots.rs` + `gc::gc_quiescence`), not the lock: 5 threads have
-entered JIT-frame quiescence (`enter()`) without a matching `leave()` — they are
-parked in native `monitor_wait` (Condition.await) *inside a live JIT frame*, so
-quiescence is wedged at depth 5, AND the heap-corruption check fires (a moving
-collection appears to have run / scanned the parked threads' roots wrong despite
-the quiescence gate that is supposed to force the address-stable non-moving
-sweep). This is the same hard area as the precise-JIT-stack-maps / non-moving
-young-sweep work (see memory: OSR main() corruptor, bug-D CIDR JIT/GC, selective
-promotion) — a multi-threaded blocking workload that holds JIT-frame roots across
-a native park, which the young sweep / quiescence gate doesn't handle.
+**No VM code change is required** — verified by reverting all experimental code
+edits and re-running stock: stock VM + JDK 25 passes the entire matrix below.
 
-`--nojit` **also hangs** (rc=124, 90 s) — so the core defect is **not**
-JIT-specific (with no JIT frames, quiescence stays 0, yet it still hangs). Net:
-the hang reproduces in *every* config (default JIT, `--nojit`, `REAL_AQS=1`),
-which rules out both the synthetic Condition and the JIT-frame interaction and
-points at a lower-level cross-thread blocking/wakeup or scheduler primitive
-(`monitor_wait`/`notify` cross-thread, or `LockSupport.park`/`unpark` since
-REAL_AQS uses those). The JIT run additionally trips the quiescence-imbalance +
-heap-corruption detector on top.
+## Evidence (clean machine: 0 contending `cratonvm.exe`)
 
-⚠ ENV CAVEAT: this box runs a concurrent CratonVM session — 6+ leftover
-`cratonvm.exe` processes persist even after `taskkill /F /IM cratonvm.exe`
-(they respawn), causing heavy CPU starvation that can by itself wedge a
-multi-thread, timing-sensitive test. Before trusting any bug-19 hang, run in a
-genuinely isolated environment (no other VM processes) and confirm a clean
-process count. Needs a dedicated GC/threading session in a clean env, not a
-quick Condition fix.
+Minimal standalone repros in [`repro19/`](repro19/) (all PASS on HotSpot):
 
-## Affected classes (partial — append more later)
-- producer.internals.BufferPoolTest (TIMEOUT)
-- (other blocking-queue/lock tests likely: common.* network/selector, append from full run)
+| repro | exercises | JDK17 boot | JDK25 boot (stock) |
+|-------|-----------|:---------:|:------------------:|
+| `R0Sub` | subclass `run()` vs `new Thread(runnable)` | subclass ✅ / target ❌ | both ✅ |
+| `R0Group` | `new Thread(group, runnable, name)` | ❌ | ✅ |
+| `R0Basic` | plain thread body + volatile handoff | ❌ | ✅ |
+| `R2WaitNotify` | intrinsic `wait()`/`notify()` cross-thread | HANG | PASS |
+| `R3Park` | `LockSupport.park()`/`unpark()` cross-thread | HANG | PASS |
+| `R1Condition` | `ReentrantLock`+`Condition` (BufferPool shape) | HANG | PASS |
+
+Key discriminator: a `Thread` *subclass overriding `run()`* always worked (dispatch
+starts at the subclass, never reads `holder.task`); only the `Runnable`-target form
+failed — which is exactly what `java.util.concurrent` uses everywhere. The
+`R2/R3/R1` matrix hung identically across **all** configs (default JIT, `--nojit`,
+`CRATONVM_REAL_AQS=1`) because the defect is upstream of every blocking primitive:
+the thread that would wake the waiter never ran.
+
+Boot-JDK proof: under `--java-home <JDK17>` `Class.forName("java.lang.Thread$FieldHolder")`
+→ `ClassNotFoundException` and `Thread.class` reflects only `name`; under
+`--java-home <JDK25>` all 19 Thread fields incl. `holder:FieldHolder` appear,
+`FieldHolder` loads, `holder.task` is populated, and `CHILD RAN` prints.
+
+## Connection to bug-23
+
+This is the **same root cause** as the genuine-hang members of
+[bug-23](bug-23-timeout-hang-family.md) — notably `AbstractCoordinatorTest`
+(`Object.wait` leaf). Any test that waits on a notify/signal/unpark from a
+`Runnable`-target worker hangs under a <19 boot JDK. (The throughput-bound bug-23
+members — Mockito/ByteBuddy mock-gen, JUnit reflective discovery — are unrelated and
+remain a separate performance matter.)
+
+## Latent footgun (recommended hardening, separate from this bug)
+
+Running CratonVM against a boot JDK older than the workload's class-file version
+mismodels `java.lang.Thread` and makes `new Thread(runnable)` a silent no-op with
+**no diagnostic** — while `java.version` still reports the newer release. Worth a
+startup warning when the boot `java.base` release is older than expected, or when
+`Thread$FieldHolder` fails to resolve in real-JDK mode.
+
+## Affected classes (reclassified: all clear under JDK ≥19 boot)
+- producer.internals.BufferPoolTest — was TIMEOUT under JDK17 boot; not a VM defect.

@@ -2474,6 +2474,15 @@ pub struct FieldWatchpoint {
 static FIELD_WATCHPOINTS: RwLock<Option<HashMap<(u64, usize), FieldWatchpoint>>> =
     RwLock::new(None);
 
+/// Lock-free mirror of `!FIELD_WATCHPOINTS.is_empty()`, updated under the
+/// `FIELD_WATCHPOINTS` write lock on every register/clear. `any_field_watchpoint_active()`
+/// reads THIS (a relaxed-ish atomic) instead of taking the RwLock — it is polled
+/// per getfield/getstatic/putfield/putstatic (the most common opcodes in OO
+/// bytecode), so a per-access `RwLock::read` was pure overhead in the
+/// overwhelmingly-common no-JVMTI-agent case. Mirrors the existing
+/// `any_single_step_listener: AtomicBool` design.
+static FIELD_WATCHPOINTS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 fn watchpoints_read_inner() -> std::sync::RwLockReadGuard<'static, Option<HashMap<(u64, usize), FieldWatchpoint>>> {
     // Panic-safe: on poison we would otherwise block the interpreter; fall
     // back by returning an already-poisoned guard which tests consult with
@@ -2506,6 +2515,7 @@ pub fn set_field_watchpoint(
         });
     entry.access_watched = entry.access_watched || access;
     entry.modification_watched = entry.modification_watched || modification;
+    FIELD_WATCHPOINTS_ACTIVE.store(!map.is_empty(), Ordering::Release);
     Ok(())
 }
 
@@ -2528,6 +2538,7 @@ pub fn clear_field_watchpoint(
             map.remove(&key);
         }
     }
+    FIELD_WATCHPOINTS_ACTIVE.store(!map.is_empty(), Ordering::Release);
     Ok(())
 }
 
@@ -2549,8 +2560,8 @@ pub fn field_watchpoint_for(class_id: u64, field_index: usize) -> Option<FieldWa
 /// the zero-agent common case is a single Option::is_some check.
 #[inline]
 pub fn any_field_watchpoint_active() -> bool {
-    let guard = watchpoints_read_inner();
-    guard.as_ref().map(|m| !m.is_empty()).unwrap_or(false)
+    // Lock-free: read the atomic mirror maintained by set/clear_field_watchpoint.
+    FIELD_WATCHPOINTS_ACTIVE.load(Ordering::Acquire)
 }
 
 /// Validate that `field_index` is within bounds for the class identified by
@@ -2677,6 +2688,7 @@ pub(crate) fn reset_global_manager_for_tests() {
     if let Ok(mut w) = FIELD_WATCHPOINTS.write() {
         if let Some(m) = w.as_mut() { m.clear(); }
     }
+    FIELD_WATCHPOINTS_ACTIVE.store(false, Ordering::Release);
 }
 
 // ---------------------------------------------------------------------------

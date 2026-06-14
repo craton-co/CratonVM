@@ -163,6 +163,12 @@ const SIG_SHA1_RSA: i32 = 10;
 // SHA512withECDSA (ES512, typically P-521). Real SunEC drive only — there is no
 // synthetic crypto_impl fallback for it.
 const SIG_SHA512_ECDSA: i32 = 11;
+// RSASSA-PSS (JWA PS256/PS384/PS512). signature.rs-local indices > 6 so they
+// never collide with crypto.rs's `SIG_ALGORITHMS` (0..=6). Verified natively via
+// `crypto_impl::rsa_verify_pss_by_id` (the BC PSS SPI needs the provider list).
+const SIG_PSS_SHA256: i32 = 12;
+const SIG_PSS_SHA384: i32 = 13;
+const SIG_PSS_SHA512: i32 = 14;
 
 fn algo_idx(name: &str) -> i32 {
     let upper = name.to_ascii_uppercase();
@@ -171,11 +177,36 @@ fn algo_idx(name: &str) -> i32 {
         "SHA384WITHRSA" => SIG_SHA384_RSA,
         "SHA512WITHRSA" => SIG_SHA512_RSA,
         "SHA1WITHRSA" | "SHA-1WITHRSA" => SIG_SHA1_RSA,
+        // RSASSA-PSS (JWA PS256/384/512). keycloak's `JavaAlgorithm` resolves
+        // these to BouncyCastle's `SHA{256,384,512}withRSAandMGF1`; accept the
+        // `/PSS` aliases too. (Bare "RSASSA-PSS" carries its hash in a
+        // PSSParameterSpec we don't see here; default it to SHA-256.)
+        "SHA256WITHRSAANDMGF1" | "SHA256WITHRSA/PSS" | "SHA-256WITHRSA/PSS" | "RSASSA-PSS" => {
+            SIG_PSS_SHA256
+        }
+        "SHA384WITHRSAANDMGF1" | "SHA384WITHRSA/PSS" | "SHA-384WITHRSA/PSS" => SIG_PSS_SHA384,
+        "SHA512WITHRSAANDMGF1" | "SHA512WITHRSA/PSS" | "SHA-512WITHRSA/PSS" => SIG_PSS_SHA512,
         "SHA256WITHECDSA" | "SHA-256WITHECDSA" => SIG_SHA256_ECDSA,
         "SHA384WITHECDSA" | "SHA-384WITHECDSA" => SIG_SHA384_ECDSA,
         "SHA512WITHECDSA" | "SHA-512WITHECDSA" => SIG_SHA512_ECDSA,
         "ED25519" | "EDDSA" => SIG_ED25519,
         "SHA256WITHDSA" => SIG_SHA256_DSA,
+        // Signature-algorithm OIDs. X.509 `cert.verify()` resolves
+        // `Signature.getInstance(signatureAlgorithm.getId())` by OID, not the
+        // friendly name (e.g. BC's `X509CertificateObject.verify()`); without
+        // these the lookup returned -1 and EC/RSA cert verification silently
+        // returned false ("certificate does not verify with supplied key").
+        // ecdsa-with-SHA*:
+        "1.2.840.10045.4.3.2" => SIG_SHA256_ECDSA,
+        "1.2.840.10045.4.3.3" => SIG_SHA384_ECDSA,
+        "1.2.840.10045.4.3.4" => SIG_SHA512_ECDSA,
+        // sha*WithRSAEncryption:
+        "1.2.840.113549.1.1.5" => SIG_SHA1_RSA,
+        "1.2.840.113549.1.1.11" => SIG_SHA256_RSA,
+        "1.2.840.113549.1.1.12" => SIG_SHA384_RSA,
+        "1.2.840.113549.1.1.13" => SIG_SHA512_RSA,
+        // Ed25519:
+        "1.3.101.112" => SIG_ED25519,
         _ => -1,
     }
 }
@@ -191,6 +222,9 @@ fn algo_name(idx: i32) -> &'static str {
         SIG_SHA512_ECDSA => "SHA512withECDSA",
         SIG_ED25519 => "Ed25519",
         SIG_SHA256_DSA => "SHA256withDSA",
+        SIG_PSS_SHA256 => "SHA256withRSAandMGF1",
+        SIG_PSS_SHA384 => "SHA384withRSAandMGF1",
+        SIG_PSS_SHA512 => "SHA512withRSAandMGF1",
         _ => "Unknown",
     }
 }
@@ -262,6 +296,15 @@ fn key_id_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> u64 {
 }
 
 fn extract_key_id_from_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> u64 {
+    // Real RSA keys (`sun.security.rsa.RSAPublic/PrivateKeyImpl`, handed out when
+    // `route_rsa_to_real()` is on) carry no synthetic `key_id` slot — slot 3 is a
+    // real field (e.g. a BigInteger ref). They're bridged to their crypto_impl
+    // `key_id` via the GC-stable identity map registered at keygen/import, so the
+    // fast Rust sign/verify still applies. Check that FIRST; a synthetic key is
+    // never in the map and falls through to its slot-3 `key_id`.
+    if let Some(id) = crypto_impl::rsa_realkey_map_get(ctx.identity_hash_code(key)) {
+        return id;
+    }
     match ctx.get_field(key, 3) {
         Value::Long(id) => id as u64,
         Value::Int(id) => id as u64,
@@ -332,6 +375,15 @@ fn sign_dispatch(alg: i32, key_id: u64, data: &[u8]) -> Option<Vec<u8>> {
 fn verify_dispatch(alg: i32, key_id: u64, data: &[u8], sig: &[u8]) -> Option<bool> {
     match alg {
         SIG_SHA256_RSA => crypto_impl::rsa_verify(key_id, data, sig),
+        SIG_PSS_SHA256 => {
+            crypto_impl::rsa_verify_pss_by_id(key_id, crypto_impl::PssHash::Sha256, data, sig)
+        }
+        SIG_PSS_SHA384 => {
+            crypto_impl::rsa_verify_pss_by_id(key_id, crypto_impl::PssHash::Sha384, data, sig)
+        }
+        SIG_PSS_SHA512 => {
+            crypto_impl::rsa_verify_pss_by_id(key_id, crypto_impl::PssHash::Sha512, data, sig)
+        }
         SIG_SHA256_ECDSA => crypto_impl::ecdsa_verify_sha256(key_id, data, sig),
         SIG_SHA384_ECDSA => crypto_impl::ecdsa_verify(key_id, data, sig),
         SIG_ED25519 => crypto_impl::ed25519_verify(key_id, data, sig),
@@ -788,6 +840,89 @@ pub fn register(r: &mut NativeMethodRegistry) {
         sig_set_parameter,
     );
     r.register(cls, "setParameter", "(Ljava/lang/String;Ljava/lang/Object;)V", sig_set_parameter);
+
+    // `sun.security.util.SignatureUtil.{initVerify,initSign}WithParam` —
+    // the real JDK indirects through `SharedSecrets.getJavaSecuritySignatureAccess()`
+    // (set by `java.security.Signature.<clinit>`), but that clinit is no-op'd here
+    // (it also triggers `Debug.getInstance`→Security-file read, same as Cipher), so
+    // the accessor stays null → `X509CertImpl.verify` NPEs at
+    // `SignatureUtil.initVerifyWithParam` ("Cannot invoke initVerify on null").
+    // Intercept the helper to drive our registered `Signature.{initVerify,initSign,
+    // setParameter}` natives directly — bypassing the null accessor and the
+    // package-private `Signature.initVerify(key,params)` engine path. Used by
+    // every real `X509Certificate.verify(key)` (EC and RSA certs alike).
+    let sigutil = "sun/security/util/SignatureUtil";
+    r.register(
+        sigutil,
+        "initVerifyWithParam",
+        "(Ljava/security/Signature;Ljava/security/PublicKey;Ljava/security/spec/AlgorithmParameterSpec;)V",
+        sigutil_init_verify_key,
+    );
+    r.register(
+        sigutil,
+        "initVerifyWithParam",
+        "(Ljava/security/Signature;Ljava/security/cert/Certificate;Ljava/security/spec/AlgorithmParameterSpec;)V",
+        sigutil_init_verify_cert,
+    );
+    r.register(
+        sigutil,
+        "initSignWithParam",
+        "(Ljava/security/Signature;Ljava/security/PrivateKey;Ljava/security/spec/AlgorithmParameterSpec;Ljava/security/SecureRandom;)V",
+        sigutil_init_sign,
+    );
+}
+
+/// Shared body for the `SignatureUtil.{initVerify,initSign}WithParam` intercepts:
+/// invoke the receiver `Signature`'s registered `initVerify`/`initSign` native
+/// with `key`, then `setParameter(params)` when `params` is non-null. Pins the
+/// `Signature` and `params` across the (possibly GC-triggering) virtual calls.
+fn sigutil_drive(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    init_method: &str,
+    init_desc: &str,
+) -> MethodCallResult {
+    let sig = match args.first() {
+        Some(Value::Object(Some(s))) => *s,
+        _ => return Ok(None),
+    };
+    let key = match args.get(1) {
+        Some(Value::Object(Some(k))) => *k,
+        _ => return Ok(None),
+    };
+    let params = match args.get(2) {
+        Some(Value::Object(Some(p))) => Some(*p),
+        _ => None,
+    };
+    let sp = ctx.pin_native_root(sig);
+    let result = (|| -> MethodCallResult {
+        let sig_r = ctx.read_native_pin(sp, sig);
+        ctx.invoke_virtual(sig_r, init_method, init_desc, &[Value::Object(Some(key))])?;
+        if let Some(p) = params {
+            let sig_r = ctx.read_native_pin(sp, sig);
+            ctx.invoke_virtual(
+                sig_r,
+                "setParameter",
+                "(Ljava/security/spec/AlgorithmParameterSpec;)V",
+                &[Value::Object(Some(p))],
+            )?;
+        }
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(sp);
+    result
+}
+
+fn sigutil_init_verify_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    sigutil_drive(ctx, args, "initVerify", "(Ljava/security/PublicKey;)V")
+}
+
+fn sigutil_init_verify_cert(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    sigutil_drive(ctx, args, "initVerify", "(Ljava/security/cert/Certificate;)V")
+}
+
+fn sigutil_init_sign(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    sigutil_drive(ctx, args, "initSign", "(Ljava/security/PrivateKey;)V")
 }
 
 #[cfg(test)]

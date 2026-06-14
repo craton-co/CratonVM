@@ -121,6 +121,16 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         }
     }
 
+    // 8b. VarHandle permanent roots (B-J). VarHandles live in `static final`
+    //     fields and are used for lock-free CAS; without rooting them here a
+    //     moving GC reclaimed them and left their static holder slots stale.
+    {
+        let vhs = shared.var_handle_roots.read();
+        for obj_ref in vhs.values() {
+            roots.push(*obj_ref);
+        }
+    }
+
     // 9. JNI global references — prevent GC from collecting objects held by native code.
     {
         shared.jni_global_refs.lock().collect_roots(&mut roots);

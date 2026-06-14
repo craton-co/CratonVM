@@ -937,13 +937,35 @@ fn native_sl_stream(
         const CTOR_3ARG: &str =
             "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/reflect/Constructor;)V";
         static CTOR_FORM: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        // Pick the ctor by *querying* which one ProviderImpl declares, rather
+        // than invoke-and-catch. A failed invoke of the absent form emits a
+        // misleading `NoSuchMethodError ...ProviderImpl.<init>(...
+        // AccessControlContext)` WARN on every JDK-24+ run (that arg was dropped
+        // with the SecurityManager removal); querying first keeps the log clean
+        // and avoids a wasted allocation/GC window. Cached process-wide.
+        let mut form = CTOR_FORM.load(std::sync::atomic::Ordering::Relaxed);
+        if form == 0 {
+            form = if ctx.method_exists(PROVIDER_IMPL, "<init>", CTOR_4ARG) {
+                1
+            } else if ctx.method_exists(PROVIDER_IMPL, "<init>", CTOR_3ARG) {
+                2
+            } else {
+                0
+            };
+            CTOR_FORM.store(form, std::sync::atomic::Ordering::Relaxed);
+        }
         let provider = ctx.alloc_object(pi_cid, pi_fields);
         let provider_pin = ctx.pin_native_root(provider);
         let mut ctor_ok = false;
         let mut ctor_err = None;
-        for (tag, desc) in [(1u8, CTOR_4ARG), (2u8, CTOR_3ARG)] {
-            let remembered = CTOR_FORM.load(std::sync::atomic::Ordering::Relaxed);
-            if remembered != 0 && remembered != tag {
+        // Forms to try: the queried one first; fall back to the other only if the
+        // query was inconclusive (form==0) or the invoke unexpectedly fails.
+        let order: &[(u8, &str)] = match form {
+            2 => &[(2, CTOR_3ARG), (1, CTOR_4ARG)],
+            _ => &[(1, CTOR_4ARG), (2, CTOR_3ARG)],
+        };
+        for &(tag, desc) in order {
+            if form != 0 && tag != form {
                 continue;
             }
             // Re-read pins: a failed prior attempt may have allocated (GC).

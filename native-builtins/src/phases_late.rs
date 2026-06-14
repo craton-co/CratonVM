@@ -5225,8 +5225,28 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let dst = obj_arg(args, 1)?;
             let src_path = p57_read_path(ctx, src);
             let dst_path = p57_read_path(ctx, dst);
-            match std::fs::copy(&src_path, &dst_path) {
-                Ok(_) => Ok(Some(Value::Object(Some(dst)))),
+            // Java `Files.copy(Path,Path,CopyOption...)`: copying a DIRECTORY
+            // creates an (empty) directory at the target — it does NOT open the
+            // source as a file. `std::fs::copy` only handles regular files and on
+            // a directory fails ("Access denied / os error 5" on Windows), which
+            // broke every `TomcatBaseTest.recursiveCopy` (the whole
+            // `catalina.webresources` cluster — `preVisitDirectory` does
+            // `Files.copy(dir, …)`). Branch on the source kind; tolerate an
+            // already-existing target dir (mirrors the file path's overwrite).
+            let src_is_dir = std::fs::symlink_metadata(&src_path)
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            let result = if src_is_dir {
+                match std::fs::create_dir(&dst_path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                    Err(e) => Err(e),
+                }
+            } else {
+                std::fs::copy(&src_path, &dst_path).map(|_| ())
+            };
+            match result {
+                Ok(()) => Ok(Some(Value::Object(Some(dst)))),
                 Err(e) => Err(RuntimeError::IllegalStateException {
                     message: format!("IOException: {}", e),
                 }
@@ -8541,6 +8561,26 @@ fn file_normalise_path(path: &str) -> String {
     path.to_string()
 }
 
+/// Resolve `new File(parent, child)` the way the JDK's
+/// `WinNTFileSystem`/`UnixFileSystem.resolve` does, rather than `PathBuf::push`
+/// (whose `push("")` adds a trailing separator and `push("/")` discards the
+/// parent — both Java-incompatible). Strip leading/trailing separators from the
+/// child and a trailing one from the parent, join with one separator, then
+/// normalise. An empty child (including a lone "/" ) → just the normalised
+/// parent.
+fn file_join_parent_child(parent: &str, child: &str) -> String {
+    let is_sep = |c: char| c == '/' || c == '\\';
+    let child_trim = child.trim_matches(is_sep);
+    if child_trim.is_empty() {
+        return file_normalise_path(parent);
+    }
+    if parent.is_empty() {
+        return file_normalise_path(child_trim);
+    }
+    let parent_trim = parent.trim_end_matches(is_sep);
+    file_normalise_path(&format!("{parent_trim}/{child_trim}"))
+}
+
 /// Strip the Windows `\\?\` / `\\?\UNC\` extended-length prefix that
 /// `std::fs::canonicalize` prepends. The real JDK's `getCanonicalPath`
 /// never returns a verbatim/UNC-prefixed path; leaving `\\?\` in place
@@ -8647,18 +8687,16 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
         };
-        let path = if parent.is_empty() {
-            child
-        } else {
-            let mut p = std::path::PathBuf::from(&parent);
-            p.push(&child);
-            p.to_string_lossy().into_owned()
-        };
-        // Normalise separators (PathBuf::push leaves `/` inside `child`
-        // untouched on Windows → a mixed `C:\a\b/c` path that breaks
-        // File.getParentFile()/exists() consistency, e.g. Gradle GFileUtils.mkdirs
-        // "… is not a directory"). Matches the single-arg File(String) ctor.
-        let s = ctx.create_string(&file_normalise_path(&path));
+        // JDK `File(String parent, String child)` resolution — NOT `PathBuf::push`,
+        // whose semantics differ from Java and broke `File`-based resource lookup
+        // (the whole catalina.webresources cluster): `push("")` appends a trailing
+        // separator (path no longer denotes the file → exists() false) and
+        // `push("/")` treats the child as absolute and discards the parent. Match
+        // Java: strip leading/trailing separators from the child, a trailing one
+        // from the parent, join with a separator, then normalise (slash
+        // conversion + collapse). Empty child → just the normalised parent.
+        let path = file_join_parent_child(&parent, &child);
+        let s = ctx.create_string(&path);
         ctx.set_field(this, 0, Value::Object(Some(s)));
         Ok(None)
     });
@@ -8674,15 +8712,8 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
         };
-        let path = if parent_path.is_empty() {
-            child
-        } else {
-            let mut p = std::path::PathBuf::from(&parent_path);
-            p.push(&child);
-            p.to_string_lossy().into_owned()
-        };
-        // Normalise separators — see the (String,String) ctor above.
-        let s = ctx.create_string(&file_normalise_path(&path));
+        let path = file_join_parent_child(&parent_path, &child);
+        let s = ctx.create_string(&path);
         ctx.set_field(this, 0, Value::Object(Some(s)));
         Ok(None)
     });
@@ -12706,6 +12737,21 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     let jf = "java/util/jar/JarFile";
     r.register(jf, "<init>", "(Ljava/lang/String;)V", p59_jar_file_init);
     r.register(jf, "<init>", "(Ljava/io/File;)V", p59_jar_file_init_file);
+    // File-first overloads. `p59_jar_file_init_file` only reads args[1] (the
+    // File) and ignores the rest, so the verify/mode/Runtime.Version variants
+    // route through it unchanged. The 4-arg multi-release constructor
+    // `JarFile(File, boolean, int, Runtime.Version)` is the one Tomcat's
+    // AbstractArchiveResourceSet.openJarFile uses; without this it fell through
+    // to real ZipFile bytecode and failed with "ZipException: zip file is empty"
+    // (whole catalina.webresources JAR cluster).
+    r.register(jf, "<init>", "(Ljava/io/File;Z)V", p59_jar_file_init_file);
+    r.register(jf, "<init>", "(Ljava/io/File;ZI)V", p59_jar_file_init_file);
+    r.register(
+        jf,
+        "<init>",
+        "(Ljava/io/File;ZILjava/lang/Runtime$Version;)V",
+        p59_jar_file_init_file,
+    );
     r.register(
         jf,
         "getManifest",
@@ -12746,6 +12792,54 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
                 }
             }
             Ok(Some(Value::Object(None)))
+        },
+    );
+    // getInputStream(ZipEntry) — the synthetic JarFile has no real `jzfile`
+    // handle, so the real ZipFile.getInputStream returns null (then Tomcat's
+    // JarInputStreamWrapper.close NPEs on the null stream). Read the entry's
+    // bytes from the JAR (path in field 0) by entry name via the zip crate and
+    // hand back a ByteArrayInputStream. (catalina.webresources JAR resources.)
+    r.register(
+        jf,
+        "getInputStream",
+        "(Ljava/util/zip/ZipEntry;)Ljava/io/InputStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let entry_name = match args.get(1) {
+                Some(Value::Object(Some(e))) => match ctx.get_field(*e, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => return Ok(Some(Value::Object(None))),
+                },
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let bytes: Option<Vec<u8>> = (|| {
+                use std::io::Read;
+                let f = std::fs::File::open(&path).ok()?;
+                let mut a = zip::ZipArchive::new(f).ok()?;
+                let mut e = a.by_name(&entry_name).ok()?;
+                let mut buf = Vec::new();
+                e.read_to_end(&mut buf).ok()?;
+                Some(buf)
+            })();
+            let bytes = match bytes {
+                Some(b) => b,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            // ByteArrayInputStream: buf(0), pos(1), mark(2), count(3)
+            let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            }
+            ctx.set_field(bais, 0, Value::Object(Some(arr)));
+            ctx.set_field(bais, 1, Value::Int(0));
+            ctx.set_field(bais, 2, Value::Int(0));
+            ctx.set_field(bais, 3, Value::Int(bytes.len() as i32));
+            Ok(Some(Value::Object(Some(bais))))
         },
     );
     r.register(
@@ -26356,13 +26450,13 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         "(Ljava/net/SocketAddress;)Ljava/util/concurrent/Future;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            // Extract host:port from SocketAddress
+            // Extract host:port from the SocketAddress. The argument is a real
+            // `InetSocketAddress` (state behind a private `holder`), NOT a flat
+            // synthetic — reading slot 0/1 directly yielded a bogus host/port and
+            // the connect failed with WSAEADDRNOTAVAIL (os error 10049). Use the
+            // holder-aware reader shared with java.net.Socket.connect.
             let addr_str = if let Some(Value::Object(Some(sa))) = args.get(1) {
-                let host = match ctx.get_field(*sa, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into()),
-                    _ => "127.0.0.1".into(),
-                };
-                let port = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
+                let (host, port) = crate::net_phase_e::read_inet_socket_address(ctx, *sa)?;
                 format!("{}:{}", host, port)
             } else {
                 "127.0.0.1:80".into()

@@ -368,6 +368,18 @@ pub struct SharedVm {
     /// T10.9.B: FxHashMap — keys are fixed primitive type names, not user input.
     pub primitive_mirrors: RwLock<FxHashMap<String, ObjectRef>>,
 
+    /// B-J: permanent GC-root registry for `java.lang.invoke.VarHandle` objects.
+    /// VarHandles are long-lived singletons stored in `static final` fields
+    /// (e.g. `ConcurrentLinkedDeque.NEXT`) and used for lock-free CAS. They were
+    /// not being traced as live, so a moving GC left their static holder slots
+    /// pointing at a zeroed (all-zero header) location → `VarHandle.set` /
+    /// `compareAndSet` misdispatched onto `java/lang/Object` and the heap
+    /// appeared corrupt (kafka consumer-suite crashes — see B-J). Registering
+    /// each VarHandle here gets it copied into the GC pointer-map, which lets
+    /// the existing static-field remap fix the holder slot. Keyed by identity
+    /// hash (stable across moves); values are remapped in `update_all_roots`.
+    pub var_handle_roots: RwLock<FxHashMap<i32, ObjectRef>>,
+
     /// Weak self-reference so native methods can obtain `Arc<SharedVm>` for
     /// spawning new threads. Set by `Vm::new()` after wrapping in `Arc`.
     pub self_arc: RwLock<Option<Weak<SharedVm>>>,
@@ -2127,6 +2139,7 @@ impl SharedVm {
             next_lambda_id: AtomicU32::new(0x8000_0000),
             thread_registry: ThreadRegistry::new(),
             primitive_mirrors: RwLock::new(FxHashMap::default()),
+            var_handle_roots: RwLock::new(FxHashMap::default()),
             self_arc: RwLock::new(None),
             oom_dump_written: std::sync::atomic::AtomicBool::new(false),
             fd_table: FileDescriptorTable::new(),

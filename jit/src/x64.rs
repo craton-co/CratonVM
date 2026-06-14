@@ -2099,14 +2099,22 @@ fn oop_dataflow_transfer(code: &[u8], pc: usize, mask: u64, max_locals: usize) -
 /// not visible here) stay `unreached`; the caller emits no precise local
 /// entries there and the GC falls back to the conservative frame sweep.
 ///
-/// `> 64` locals → empty result (caller falls back to conservative). Parameter
-/// slots are seeded conservatively as non-oop for now (TODO before the Stage 5
-/// gate flip: first-execution-use param typing so oop params live at an early
-/// safepoint are precisely covered rather than left to the conservative sweep).
+/// `> 64` locals → empty result (caller falls back to conservative).
+///
+/// Stage A.4 (precise oop maps, B-K fix) — `param_oop_mask` seeds the entry
+/// state: bit `k` set ⇒ JVM local slot `k` holds a REFERENCE parameter on method
+/// entry (`this` + every `L…;`/`[…` declared param, per
+/// [`crate`]'s `compute_param_oop_mask`). This makes an oop parameter that is
+/// live across an EARLY safepoint — before any `astore` rewrites its slot —
+/// precisely covered rather than left to the conservative sweep, which is the
+/// last false-negative that blocked fully-covered status for reference-param
+/// methods. The caller passes `0` when the precise gate is off, so the default
+/// path is byte-identical (entry state empty, exactly as before).
 fn compute_local_oop_masks(
     code: &[u8],
     code_len: usize,
     max_locals: usize,
+    param_oop_mask: u64,
 ) -> (Vec<u64>, Vec<bool>) {
     if max_locals == 0 || max_locals > 64 || code_len == 0 {
         return (Vec::new(), Vec::new());
@@ -2114,8 +2122,10 @@ fn compute_local_oop_masks(
     const TOP: u64 = u64::MAX;
     let mut in_mask = vec![TOP; code_len];
     let mut reached = vec![false; code_len];
-    // Entry: conservative (no params assumed oop). See doc comment TODO.
-    in_mask[0] = 0;
+    // Entry: reference parameters are oops; everything else starts non-oop.
+    // `param_oop_mask` is 0 on the default (gate-off) path → identical to the
+    // historical conservative `in_mask[0] = 0` seed.
+    in_mask[0] = param_oop_mask;
     reached[0] = true;
     let mut work: Vec<usize> = vec![0];
     // Bound iterations defensively against any decoding pathology.
@@ -2889,6 +2899,34 @@ fn analyze_escapes(
             0xac | 0xad | 0xae | 0xaf | 0xb1 => {
                 escape_all!();
                 abs_stack.clear();
+                pc += bytecode_len_at(code, pc);
+            }
+            // nop — no stack effect; must NOT disturb tracked provenance.
+            0x00 => {
+                pc += 1;
+            }
+            // Primitive loads / constants / getstatic — each pushes exactly ONE
+            // untracked operand (a primitive, a constant-pool constant, or a
+            // static-field value; never a `new`-tracked object) and pops
+            // nothing. Push a single `None` slot WITHOUT touching the
+            // provenance of objects already on the operand stack.
+            //
+            // The catch-all `_` arm below forgets EVERY slot's provenance, which
+            // silently de-tracked an object loaded just before a primitive arg —
+            // the canonical `aload obj; iload prim; invoke(obj, prim)`. The
+            // `escape_all!` at the call then missed `obj`, so an object that
+            // truly escapes-to-callee was reported non-escaping and scalar-
+            // replaced. kafka bug-25: `MessageUtil.toByteBuffer` does
+            // `aload_2 cache; iload_1 version; invokeinterface Message.size`,
+            // and the `iload_1` erased `cache`'s provenance → the
+            // ObjectSerializationCache was scalar-replaced (never allocated) →
+            // `size()` received a null cache → "Cannot invoke cacheSerializedValue
+            // on null". (long/double are one 64-bit slot in this model — same as
+            // `dup2`'s FORM-2 handling — so lload/dload/lconst/dconst/ldc2_w push
+            // one slot too.) `aload`/`aload_n` and `getfield`/`new`/`dup` keep
+            // their own arms above; this range deliberately excludes them.
+            0x01..=0x18 | 0x1a..=0x29 | 0xb2 => {
+                abs_stack.push(None);
                 pc += bytecode_len_at(code, pc);
             }
             // For all other opcodes, use bytecode_len_at for PC advance.
@@ -5000,6 +5038,16 @@ struct Compiler {
     /// Stage 3 — frame offset (positive; slot at `[rbp - sp_id_slot_off]`) of
     /// the reserved safepoint-id slot. 0 when `precise_maps` is off.
     sp_id_slot_off: i32,
+    /// Stage A.2 (precise oop maps, B-K fix) — bytecode PCs at which a
+    /// GC-capable safepoint flushed register-locals via
+    /// `emit_pre_safepoint_spill`. Populated only under `precise_maps`. Used at
+    /// finalize to compute [`crate::CompiledMethod::fully_oop_covered`]: a method
+    /// is covered only when every spilled safepoint also recorded an oop map
+    /// (`safepoint_pcs ⊆ mapped_safepoint_pcs`).
+    safepoint_pcs: FxHashSet<u32>,
+    /// Stage A.2 — bytecode PCs at which `emit_oop_map_for_safepoint` recorded a
+    /// precise oop map (possibly empty). Populated only under `precise_maps`.
+    mapped_safepoint_pcs: FxHashSet<u32>,
     /// Shadow-stack precise roots (`CRATONVM_SHADOW_STACK`) — whether the
     /// per-safepoint live-oop push/reload codegen is emitted. Off →
     /// byte-identical default path.
@@ -5333,6 +5381,8 @@ impl Compiler {
             cur_bc_pc: 0,
             precise_maps,
             sp_id_slot_off,
+            safepoint_pcs: FxHashSet::default(),
+            mapped_safepoint_pcs: FxHashSet::default(),
             shadow_enabled,
             shadow_thread_slot_off,
             shadow_savetop_slot_off,
@@ -5728,6 +5778,10 @@ impl Compiler {
         if self.precise_maps && self.sp_id_slot_off != 0 {
             self.emit_mov_imm32_sx(RAX, self.cur_bc_pc as i32); // Cast: bytecode PC fits i32
             self.emit_store_local(self.sp_id_slot_off, RAX);
+            // Stage A.2 — this is a GC-capable safepoint that flushed its
+            // register-locals and stored an sp-id; record it so finalize can
+            // require a matching oop map (coverage = spilled ⊆ mapped).
+            self.safepoint_pcs.insert(self.cur_bc_pc as u32);
         }
         // Shadow-stack precise roots — push every live oop onto the thread's
         // shadow stack so a moving collector can rewrite it precisely. Paired
@@ -5985,7 +6039,18 @@ impl Compiler {
                 }
             }
         }
-        if !slots.is_empty() {
+        // Stage A.2 (precise oop maps, B-K fix) — under the precise gate, record
+        // an entry for EVERY safepoint, including ones with no live oops (empty
+        // `slots`). The default path keeps skipping empties (smaller metadata,
+        // GC falls back to the conservative sweep there). The empty entries make
+        // every safepoint's sp-id resolve to a definitive map, which is the
+        // precondition for `fully_oop_covered`: without them, a safepoint with
+        // zero live oops would look "un-mapped" and wrongly break coverage.
+        let push_map = !slots.is_empty() || self.precise_maps;
+        if push_map {
+            if self.precise_maps {
+                self.mapped_safepoint_pcs.insert(self.cur_bc_pc as u32);
+            }
             self.oop_maps.push(crate::OopMapEntry {
                 native_pc_offset: native_pc,
                 // Stage 3 — tag with the safepoint's bytecode PC so the GC root
@@ -13994,9 +14059,18 @@ impl Compiler {
                                        // CMP rax, rcx
                     self.rex_w();
                     self.buf.emit(&[0x39, 0xC8]); // cmp rax, rcx
-                                                  // Produce -1, 0, or 1 using SETG/SETL (avoids RBX)
-                    self.buf.emit(&[0x0F, 0x97, 0xC0]); // SETG AL
-                    self.buf.emit(&[0x0F, 0x9C, 0xC1]); // SETL CL
+                                                  // Produce -1, 0, or 1 using SETG/SETL (avoids RBX).
+                                                  // lcmp is a SIGNED comparison: use SETG (0F 9F),
+                                                  // not SETA (0F 97, unsigned-above). With SETA, a
+                                                  // negative operand reads as a huge unsigned value,
+                                                  // so e.g. `ts == -6L` JIT-compiled as `lcmp; ifne`
+                                                  // returned "equal" for every ts >= 0 (sign-bit
+                                                  // clear) — Kafka ListOffsetsHandler computed
+                                                  // request version 11 instead of 1 for normal
+                                                  // timestamps. The other two lcmp sites already use
+                                                  // SETG; this one was the lone unsigned outlier.
+                    self.buf.emit(&[0x0F, 0x9F, 0xC0]); // SETG AL (signed)
+                    self.buf.emit(&[0x0F, 0x9C, 0xC1]); // SETL CL (signed)
                     self.buf.emit(&[0x0F, 0xB6, 0xC0]); // MOVZX EAX, AL
                     self.buf.emit(&[0x0F, 0xB6, 0xC9]); // MOVZX ECX, CL
                     self.buf.emit(&[0x29, 0xC8]); // SUB EAX, ECX
@@ -16865,6 +16939,22 @@ impl Compiler {
                         let call_patch = self.buf.pos();
                         self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
                         self.self_call_patches.push(call_patch);
+                        // Stage A (precise oop maps, B-K fix) — a self-recursive
+                        // compiled call IS a GC-capable safepoint (the callee
+                        // allocates: this is exactly bintrees18's recursive
+                        // `make()`). The neighbour direct/dispatch invoke sites
+                        // already pair `emit_pre_safepoint_spill` with an oop map
+                        // at the return PC; this site historically spilled but
+                        // recorded NO map, so the precise relocation path could
+                        // not remap this frame (`remap_one_jit_frame` found no
+                        // entry for the active sp-id) — the documented gap #1.
+                        // Gated behind `precise_maps`: emits zero bytes and no
+                        // metadata on the default path, so it is byte-identical
+                        // gate-OFF; gate-ON it records the map AND the paired
+                        // post-safepoint register reload (Stage 4 / G5).
+                        if self.precise_maps {
+                            self.emit_oop_map_for_safepoint();
+                        }
                         self.emit_stack_arg_cleanup(total_sub);
                         // A self-recursive compiled call that throws (or
                         // deopts) returns the `i64::MIN` sentinel — same
@@ -18133,6 +18223,17 @@ impl Compiler {
                         // before any GC-triggering CALL.
                         self.emit_pre_safepoint_spill();
                         self.emit_call_absolute(callee_entry);
+                        // Stage A (precise oop maps, B-K fix) — a direct
+                        // invokespecial/virtual call to a compiled callee is a
+                        // GC-capable safepoint (the callee may allocate). Like
+                        // the self-recursive site above, it historically spilled
+                        // but recorded NO oop map (gap #1), so the precise path
+                        // could not remap this frame. Gated behind `precise_maps`
+                        // → byte-identical gate-OFF; gate-ON records the map and
+                        // the paired post-safepoint register reload.
+                        if self.precise_maps {
+                            self.emit_oop_map_for_safepoint();
+                        }
                         self.emit_stack_arg_cleanup(total_sub);
 
                         // A directly-called compiled callee that throws (or
@@ -19568,6 +19669,7 @@ pub fn compile(
         string_layout,
         &[],
         0,
+        0, // param_oop_mask: legacy/test path seeds no oop params (conservative)
     )
 }
 
@@ -19625,6 +19727,11 @@ pub fn compile_with_param_slots(
     string_layout: Option<crate::StringFieldLayout>,
     param_jvm_slots: &[usize],
     param_slot_span: usize,
+    // Stage A.4 (precise oop maps) — bitmask of JVM local slots holding a
+    // reference parameter on entry (bit `k` ⇒ slot `k` is an oop). Seeds the
+    // "must be oop" local dataflow so oop params live at an early safepoint are
+    // precisely covered. `0` on the default path → byte-identical codegen.
+    param_oop_mask: u64,
 ) -> Option<CompiledMethod> {
     // Estimate buffer size: extra for invoke dispatch calls (~40 bytes each).
     // This is a heuristic only — see the `buf.overflowed()` bailout below for
@@ -20001,7 +20108,8 @@ pub fn compile_with_param_slots(
     // default (non-moving) path: `conservative_roots::scan_one_frame_precise`
     // already sweeps the whole frame region, so the extra precise entries are
     // redundant there and re-validated via `heap.is_object_address`.
-    let (lo_masks, lo_reached) = compute_local_oop_masks(code, code_len, max_locals);
+    let (lo_masks, lo_reached) =
+        compute_local_oop_masks(code, code_len, max_locals, param_oop_mask);
     compiler.local_oop_masks = lo_masks;
     compiler.local_oop_reached = lo_reached;
 
@@ -20180,6 +20288,24 @@ pub fn compile_with_param_slots(
     // Stage 3 — the frame offset where this method stores the active
     // safepoint's bytecode PC (0 when the precise gate was off at compile).
     cm.sp_id_slot_off = compiler.sp_id_slot_off;
+    // Stage A.2 (precise oop maps, B-K fix) — a method is "fully precisely
+    // covered" only when EVERY GC-capable safepoint that flushed its
+    // register-locals (`safepoint_pcs`) also recorded a precise oop map
+    // (`mapped_safepoint_pcs`), the precise gate is on (so the sp-id slot
+    // exists and the per-safepoint id is stored), and there is no construct the
+    // current mapping cannot describe (inlined-callee safepoints, OSR entry).
+    // Stage B consults this to decide whether the GC may skip the conservative
+    // backstop for this frame and treat its precise oops as movable. It is a
+    // NECESSARY codegen precondition; the runtime `CRATONVM_DBG_VERIFY_OOP_MAPS`
+    // oracle (Stage G0) is the SUFFICIENT proof that must gate the actual
+    // backstop suppression before the moving path relies on it. Always `false`
+    // on the default path (`sp_id_slot_off == 0`), so it is inert until the gate
+    // is on AND Stage B lands.
+    cm.fully_oop_covered = compiler.precise_maps
+        && compiler.sp_id_slot_off != 0
+        && !cm.compiled_via_osr
+        && compiler.inline_sites.is_empty()
+        && compiler.safepoint_pcs.is_subset(&compiler.mapped_safepoint_pcs);
     // Shadow-stack — frame offsets + thread-struct offset, so the OSR trampoline
     // can replicate the prologue's shadow setup (cache the thread ptr + snapshot
     // the `top` watermark) for OSR-entered frames (follow-up §1). All 0 when the

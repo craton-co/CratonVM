@@ -223,6 +223,49 @@ fn is_within_sandbox(candidate: &Path, cwd_root: &Path) -> bool {
     roots.iter().any(|r| candidate.starts_with(r))
 }
 
+/// Returns `true` if `path`, after *lexical* normalization (collapsing an
+/// interior `a/../b` to `b`), still contains a `..` that climbs above its
+/// anchor — i.e. a relative path that escapes the directory it starts in.
+///
+/// This is the always-on traversal guard, and it is deliberately narrower
+/// than "rejects any `..` component": the JDK happily opens a path whose
+/// `..` segments merely cancel a preceding name (e.g.
+/// `apps/kafka/../config/consumer.properties` resolves to
+/// `apps/config/consumer.properties`), and CratonVM must do the same to be a
+/// faithful general-purpose JVM. Only a `..` with no preceding component to
+/// cancel — a *leading* `..` on a relative path — actually traverses out of
+/// the intended directory, and that is what we reject.
+///
+/// Absolute paths can never climb above the filesystem root (`/..` clamps to
+/// `/`, `C:\..` to `C:\`), so they never "escape" textually; an absolute
+/// path that resolves outside the sandbox is caught by the
+/// canonicalize-and-contain check in [`validate_path`] when CWD confinement
+/// is enabled.
+fn has_escaping_parent_segment(path: &str) -> bool {
+    let p = Path::new(path);
+    let is_absolute = p.is_absolute();
+    // `depth` counts how many real (`Normal`) components we are below the
+    // path's anchor. A `..` cancels one; a `..` taken at depth 0 on a
+    // relative path is a genuine escape above the start directory.
+    let mut depth: i64 = 0;
+    for c in p.components() {
+        match c {
+            std::path::Component::Normal(_) => depth += 1,
+            std::path::Component::ParentDir => {
+                if depth > 0 {
+                    depth -= 1;
+                } else if !is_absolute {
+                    return true;
+                }
+                // Absolute path at depth 0: `..` clamps at root, not an escape.
+            }
+            // Prefix / RootDir / CurDir don't change the climb depth.
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Whether to confine the *canonicalized* path to the current working
 /// directory. Default `false`.
 ///
@@ -234,10 +277,11 @@ fn is_within_sandbox(candidate: &Path, cwd_root: &Path) -> bool {
 /// which broke every app whose data files live outside the launch
 /// directory (Jetty's launcher being the canonical example).
 ///
-/// The genuine path-traversal protection — rejecting a `..` *segment* in
-/// the path string, and rejecting null bytes — always runs in
-/// [`validate_path`] regardless of this flag. CWD confinement is an
-/// additional, deployment-specific restriction that is therefore opt-in.
+/// The genuine path-traversal protection — rejecting a path whose `..`
+/// segments climb above its anchor (see [`has_escaping_parent_segment`]),
+/// and rejecting null bytes — always runs in [`validate_path`] regardless of
+/// this flag. CWD confinement is an additional, deployment-specific
+/// restriction that is therefore opt-in.
 static PATH_CONFINE_TO_CWD: AtomicBool = AtomicBool::new(false);
 
 /// Enable or disable confining canonicalized paths to the process CWD.
@@ -315,16 +359,17 @@ pub(crate) fn validate_path(path: &str) -> Result<String, MethodCallFailed> {
         return Ok(path.to_string());
     }
 
-    // Always-on traversal guard: reject any `..` *segment* in the path
-    // string. This stops the common path-traversal attack (a relative
-    // path that climbs out of an intended directory) without breaking
-    // legitimate absolute-path access. A literal `..` substring inside a
-    // single filename component (e.g. `foo..bar.txt`) is NOT a
-    // `ParentDir` component and is correctly accepted.
-    if Path::new(path)
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+    // Always-on traversal guard: reject a path whose `..` segments climb
+    // above the directory it starts in (a relative path that escapes its
+    // anchor — `../secret`, `../../etc/passwd`). This stops the common
+    // path-traversal attack without breaking legitimate access. It does
+    // NOT reject an *interior* `..` that merely cancels a preceding
+    // component (`apps/kafka/../config/x` → `apps/config/x`): the JDK opens
+    // those, so a faithful JVM must too (see B-C — Kafka's
+    // `ConsumerConfigTest` opens `apps/kafka/../config/consumer.properties`).
+    // A literal `..` substring inside a single filename component (e.g.
+    // `foo..bar.txt`) is NOT a `ParentDir` component and is also accepted.
+    if has_escaping_parent_segment(path) {
         return Err(MethodCallFailed::InternalError(VmError::Runtime(
             RuntimeError::SecurityException {
                 message: format!("Path traversal detected: {}", path),
@@ -697,10 +742,34 @@ fn native_file_init_string_string(ctx: &mut dyn NativeContext, args: &[Value]) -
     let sep = ctx
         .get_system_property("file.separator")
         .unwrap_or_else(|| "/".to_string());
-    let full = format!("{}{}{}", parent, sep, child);
+    let full = join_file_parent_child(&parent, &child, &sep);
     let path_obj = ctx.create_string(&full);
     ctx.set_field(this, 0, Value::Object(Some(path_obj)));
     Ok(None)
+}
+
+/// Resolve `new File(String parent, String child)` the way the JDK's
+/// `WinNTFileSystem`/`UnixFileSystem.resolve` does, rather than a raw
+/// `parent + sep + child` concat. A raw concat produced
+/// `"a/b/c.txt" + "\\" + "" = "a/b/c.txt\\"` (trailing separator → the path no
+/// longer denotes the file, `exists()` false) and `child == "/"` turned into a
+/// stray root — both broke `File`-based resource lookup across the whole
+/// `catalina.webresources` test cluster. Match the JDK: normalise OS separators,
+/// strip a trailing separator from the parent and leading/trailing separators
+/// from the child, and join with one separator (empty child → just the parent).
+fn join_file_parent_child(parent: &str, child: &str, sep: &str) -> String {
+    let is_sep = |c: char| c == '\\' || c == '/';
+    let parent = normalize_for_os(parent.to_string());
+    let child = normalize_for_os(child.to_string());
+    let parent_trim = parent.trim_end_matches(is_sep);
+    let child_trim = child.trim_matches(is_sep);
+    if child_trim.is_empty() {
+        parent_trim.to_string()
+    } else if parent_trim.is_empty() {
+        format!("{sep}{child_trim}")
+    } else {
+        format!("{parent_trim}{sep}{child_trim}")
+    }
 }
 
 fn native_file_init_file_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -724,7 +793,7 @@ fn native_file_init_file_string(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let sep = ctx
         .get_system_property("file.separator")
         .unwrap_or_else(|| "/".to_string());
-    let full = format!("{}{}{}", parent_path, sep, child);
+    let full = join_file_parent_child(&parent_path, &child, &sep);
     let path_obj = ctx.create_string(&full);
     ctx.set_field(this, 0, Value::Object(Some(path_obj)));
     Ok(None)
@@ -8274,7 +8343,26 @@ fn native_files_copy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => String::new(),
     };
     let dst = validated_path(&dst)?;
-    std::fs::copy(&src, &dst).map_err(io_err)?;
+    // Java `Files.copy(Path,Path,CopyOption...)` semantics: copying a DIRECTORY
+    // creates an (empty) directory at the target — it does NOT open the source
+    // as a file. `std::fs::copy` only handles regular files; on a directory it
+    // fails ("Access denied / os error 5" on Windows, because it opens the dir
+    // for reading), which broke every `TomcatBaseTest.recursiveCopy` (the whole
+    // `catalina.webresources` cluster — `preVisitDirectory` does
+    // `Files.copy(dir, …)`). Branch on the source kind; be lenient if the target
+    // dir already exists, mirroring the file path's overwrite behaviour.
+    let src_is_dir = std::fs::symlink_metadata(&src)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if src_is_dir {
+        match std::fs::create_dir(&dst) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io_err(e)),
+        }
+    } else {
+        std::fs::copy(&src, &dst).map_err(io_err)?;
+    }
     Ok(args.get(1).copied())
 }
 
@@ -14080,10 +14168,48 @@ mod io_tests {
     #[test]
     fn path_validation_rejects_dotdot() {
         set_path_validation_enabled(true);
-        // A `..` *segment* in the path string is always rejected — this
-        // is the always-on traversal guard, independent of CWD confinement.
+        // A *leading* `..` segment escapes the start directory and is always
+        // rejected — the always-on traversal guard, independent of CWD
+        // confinement.
         let result = validate_path("../escapes-sandbox.txt");
         assert!(result.is_err());
+        let err = format!("{:?}", result.unwrap_err());
+        assert!(err.contains("Path traversal detected"), "err = {err}");
+    }
+
+    /// B-C: an *interior* `..` that merely cancels a preceding component
+    /// (`apps/kafka/../config/x` → `apps/config/x`) does NOT escape and must
+    /// be accepted — the JDK opens such paths, so a faithful JVM must too.
+    /// Kafka's `ConsumerConfigTest.testValidateConfigPropertiesFile` reads
+    /// `apps/kafka/../config/consumer.properties`. Independent of CWD
+    /// confinement (off by default here).
+    #[test]
+    fn path_validation_accepts_interior_dotdot() {
+        let _g = crate::test_support::confine_test_lock().lock();
+        let prev = is_path_confine_to_cwd();
+        set_path_validation_enabled(true);
+        set_path_confine_to_cwd(false);
+        // Relative, interior `..` cancels `kafka`: nets to `apps/config/...`,
+        // never climbs above the start directory.
+        let rel = validate_path("apps/kafka/../config/consumer.properties");
+        assert!(rel.is_ok(), "interior `..` relative path rejected: {rel:?}");
+        // Absolute, interior `..`: cannot escape root, accepted unconfined.
+        #[cfg(windows)]
+        let abs = validate_path(r"C:\craton\CratonVM\apps\kafka\..\config\consumer.properties");
+        #[cfg(not(windows))]
+        let abs = validate_path("/craton/CratonVM/apps/kafka/../config/consumer.properties");
+        assert!(abs.is_ok(), "interior `..` absolute path rejected: {abs:?}");
+        set_path_confine_to_cwd(prev);
+    }
+
+    /// A relative path whose `..` segments net to climbing above the start
+    /// directory (more `..` than preceding names) is still rejected.
+    #[test]
+    fn path_validation_rejects_net_escaping_dotdot() {
+        set_path_validation_enabled(true);
+        // `a/../../b` → one name, two parents → escapes one level above start.
+        let result = validate_path("a/../../b.txt");
+        assert!(result.is_err(), "net-escaping `..` path accepted: {result:?}");
         let err = format!("{:?}", result.unwrap_err());
         assert!(err.contains("Path traversal detected"), "err = {err}");
     }
