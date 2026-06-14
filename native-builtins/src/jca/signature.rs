@@ -176,6 +176,22 @@ fn algo_idx(name: &str) -> i32 {
         "SHA512WITHECDSA" | "SHA-512WITHECDSA" => SIG_SHA512_ECDSA,
         "ED25519" | "EDDSA" => SIG_ED25519,
         "SHA256WITHDSA" => SIG_SHA256_DSA,
+        // Signature-algorithm OIDs. X.509 `cert.verify()` resolves
+        // `Signature.getInstance(signatureAlgorithm.getId())` by OID, not the
+        // friendly name (e.g. BC's `X509CertificateObject.verify()`); without
+        // these the lookup returned -1 and EC/RSA cert verification silently
+        // returned false ("certificate does not verify with supplied key").
+        // ecdsa-with-SHA*:
+        "1.2.840.10045.4.3.2" => SIG_SHA256_ECDSA,
+        "1.2.840.10045.4.3.3" => SIG_SHA384_ECDSA,
+        "1.2.840.10045.4.3.4" => SIG_SHA512_ECDSA,
+        // sha*WithRSAEncryption:
+        "1.2.840.113549.1.1.5" => SIG_SHA1_RSA,
+        "1.2.840.113549.1.1.11" => SIG_SHA256_RSA,
+        "1.2.840.113549.1.1.12" => SIG_SHA384_RSA,
+        "1.2.840.113549.1.1.13" => SIG_SHA512_RSA,
+        // Ed25519:
+        "1.3.101.112" => SIG_ED25519,
         _ => -1,
     }
 }
