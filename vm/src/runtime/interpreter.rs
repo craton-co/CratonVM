@@ -5503,10 +5503,19 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                     let cp_index = ((b1 as u16) << 8) | (b2 as u16); // Cast: bytecode operand decoding
                     let _ = frame;
                     thread.frames[frame_idx].pc = saved_pc + 3;
-                    // T10.9.A — fast path 0: VtableManager lock-free dispatch.
-                    // A hit here populates invoke_cache as a side effect
-                    // (see `execute_invokevirtual_vtable_fast`).
-                    match execute_invokevirtual_vtable_fast(shared, thread, frame_idx, cp_index, saved_pc) {
+                    // PERF: consult the cheap thread-local inline cache FIRST.
+                    // A warm monomorphic site hits here and dispatches with one
+                    // class-id compare + arg decode + frame push — no locks, no
+                    // hierarchy walk. Only on a miss (cold site, or the receiver
+                    // class changed) do we fall to the heavier `vtable_fast`
+                    // resolution, which re-populates the inline cache. (This is
+                    // the order the `execute_invokevirtual_vtable_fast` header
+                    // comment always described — "only invoked on its miss
+                    // path" — but the dispatch had it inverted, so `vtable_fast`'s
+                    // 3 RwLocks + 2 hierarchy walks ran on EVERY virtual call and
+                    // the inline cache was never consulted.)
+                    let cached_result = execute_invokevirtual_cached(shared, thread, frame_idx, cp_index, saved_pc, false);
+                    match cached_result {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;
@@ -5525,8 +5534,9 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
                         }
                         Err(e) => return Err(e),
                     }
-                    let cached_result = execute_invokevirtual_cached(shared, thread, frame_idx, cp_index, saved_pc, false);
-                    match cached_result {
+                    // Miss path — VtableManager lock-free dispatch; a hit here
+                    // populates invoke_cache for the next call.
+                    match execute_invokevirtual_vtable_fast(shared, thread, frame_idx, cp_index, saved_pc) {
                         Ok(CachedCallResult::FramePushed) => {
                             frame_idx = thread.frames.len() - 1;
                             continue;
@@ -7512,17 +7522,24 @@ fn execute_instruction(
         }
         Instruction::Getfield(index) => {
             let current_class_id = thread.frames[frame_idx].class_id;
-            let field_name = resolve_field_name(shared, current_class_id, *index);
+            // Perf: `resolve_field_name` takes a class_manager RwLock and
+            // allocates a `String` — but the name is only needed for the
+            // (rare) null-receiver NPE message and the (cached-off) debug
+            // blocks below. Resolve it LAZILY in those paths instead of on
+            // every getfield (the single most common opcode in OO bytecode).
             let obj_ref = pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
                 &shared.heap,
                 || format!(
                     "Cannot read field '{}' because the object is null",
-                    field_name.as_deref().unwrap_or("?")
+                    resolve_field_name(shared, current_class_id, *index)
+                        .as_deref()
+                        .unwrap_or("?")
                 ),
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
             if crate::runtime::env_cache::field_addr_dbg() {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
                 if let Some(fname) = field_name.as_deref() {
                     if matches!(fname, "unsharedLongs" | "threadFactory" | "runningThreads" | "submittedTaskCounter") {
                         let raw = shared.heap.get_field(obj_ref, field.field_index);
@@ -7551,6 +7568,7 @@ fn execute_instruction(
                     static N: AtomicUsize = AtomicUsize::new(0);
                     let n = N.fetch_add(1, Ordering::Relaxed);
                     if n < 8 {
+                        let field_name = resolve_field_name(shared, current_class_id, *index);
                         let cn = thread.frames[frame_idx].class_name().to_string();
                         let mn = thread.frames[frame_idx].method_name().to_string();
                         let pc = thread.frames[frame_idx].pc;
@@ -7576,10 +7594,11 @@ fn execute_instruction(
                     .into());
                 }
             }
-            if std::env::var("CRATON_HASHTABLEOFINT_TRACE").is_ok() {
+            if crate::runtime::env_cache::hashtableofint_trace() {
                 let cname = thread.frames[frame_idx].class_name();
                 let mname = thread.frames[frame_idx].method_name();
                 if cname.contains("HashtableOfInt") {
+                    let field_name = resolve_field_name(shared, current_class_id, *index);
                     let v = shared.heap.get_field(obj_ref, field.field_index);
                     let nf = shared.class_manager.read().get_class(field.declaring_class_id)
                         .map(|c| c.num_total_fields).unwrap_or(0);
@@ -7597,6 +7616,7 @@ fn execute_instruction(
                 let mname = thread.frames[frame_idx].method_name().to_string();
                 let cname = thread.frames[frame_idx].class_name().to_string();
                 if cname.contains("BigDecimal") && mname == "intValue" {
+                    let field_name = resolve_field_name(shared, current_class_id, *index);
                     let v = if field.is_volatile {
                         shared.heap.get_field_volatile(obj_ref, field.field_index)
                     } else {
@@ -7775,13 +7795,17 @@ fn execute_instruction(
                     }
                 }
             };
-            let field_name = resolve_field_name(shared, current_class_id, *index);
+            // Perf: resolve the field name LAZILY (it locks + allocates) — see
+            // the matching Getfield comment. Only the rare null-NPE message and
+            // cached-off debug blocks need it; putfield is a hot opcode.
             let obj_ref = pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
                 &shared.heap,
                 || format!(
                     "Cannot write field '{}' because the object is null",
-                    field_name.as_deref().unwrap_or("?")
+                    resolve_field_name(shared, current_class_id, *index)
+                        .as_deref()
+                        .unwrap_or("?")
                 ),
             );
             // CRATONVM_DBG_NULLTHIS — dump the Java frame stack + current-frame
@@ -7790,6 +7814,7 @@ fn execute_instruction(
             // or misdispatched caller losing the freshly allocated receiver,
             // cf. gap-jit-fastmath-transform-miscompile.md Bug 4).
             if obj_ref.is_err() && std::env::var_os("CRATONVM_DBG_NULLTHIS").is_some() {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
                 let fr0 = &thread.frames[frame_idx];
                 eprintln!(
                     "[nullthis] putfield '{}' on null receiver in {}.{}{} pc={}",
@@ -7820,6 +7845,7 @@ fn execute_instruction(
             // fields — object address + resolved slot — to localize a write
             // that doesn't reach the read site.
             if crate::runtime::env_cache::field_addr_dbg() {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
                 if let Some(fname) = field_name.as_deref() {
                     if matches!(fname, "unsharedLongs" | "threadFactory" | "runningThreads" | "submittedTaskCounter") {
                         eprintln!(
@@ -7850,6 +7876,7 @@ fn execute_instruction(
                     static N: AtomicUsize = AtomicUsize::new(0);
                     let k = N.fetch_add(1, Ordering::Relaxed);
                     if k < 12 {
+                        let field_name = resolve_field_name(shared, current_class_id, *index);
                         eprintln!(
                             "[straystack] #{k} STRAY putfield recv@0x{:x} cid={} num_slots={} array_len={} kind={} -> field '{}' idx={} is_ref={} value={:?}",
                             obj_ref.as_ptr() as usize,
@@ -7867,10 +7894,11 @@ fn execute_instruction(
                     }
                 }
             }
-            if std::env::var("CRATON_HASHTABLEOFINT_TRACE").is_ok() {
+            if crate::runtime::env_cache::hashtableofint_trace() {
                 let cname = thread.frames[frame_idx].class_name();
                 let mname = thread.frames[frame_idx].method_name();
                 if cname.contains("HashtableOfInt") {
+                    let field_name = resolve_field_name(shared, current_class_id, *index);
                     let nf = shared.class_manager.read().get_class(field.declaring_class_id)
                         .map(|c| c.num_total_fields).unwrap_or(0);
                     eprintln!(
@@ -7885,21 +7913,22 @@ fn execute_instruction(
                     );
                 }
             }
-            if std::env::var_os("CRATON_BAOS_DBG").is_some()
-                && matches!(field_name.as_deref(), Some("buf") | Some("count"))
-            {
-                let cm = shared.class_manager.read();
-                let recv_cid = shared.heap.class_id_of(obj_ref);
-                let rn = cm.get_class(recv_cid).map(|c| c.name.to_string()).unwrap_or_default();
-                let rnf = cm.get_class(recv_cid).map(|c| c.num_total_fields).unwrap_or(0);
-                let rffi = cm.get_class(recv_cid).map(|c| c.first_field_index).unwrap_or(0);
-                let dn = cm.get_class(field.declaring_class_id).map(|c| c.name.to_string()).unwrap_or_default();
-                let dnf = cm.get_class(field.declaring_class_id).map(|c| c.num_total_fields).unwrap_or(0);
-                let dffi = cm.get_class(field.declaring_class_id).map(|c| c.first_field_index).unwrap_or(0);
-                eprintln!(
-                    "[BAOS-DBG] putfield {fld:?} recv={rn}(nf={rnf},ffi={rffi}) decl={dn}(nf={dnf},ffi={dffi}) field_index={fi} value={v:?}",
-                    fld = field_name, fi = field.field_index, v = value,
-                );
+            if crate::runtime::env_cache::baos_dbg() {
+                let field_name = resolve_field_name(shared, current_class_id, *index);
+                if matches!(field_name.as_deref(), Some("buf") | Some("count")) {
+                    let cm = shared.class_manager.read();
+                    let recv_cid = shared.heap.class_id_of(obj_ref);
+                    let rn = cm.get_class(recv_cid).map(|c| c.name.to_string()).unwrap_or_default();
+                    let rnf = cm.get_class(recv_cid).map(|c| c.num_total_fields).unwrap_or(0);
+                    let rffi = cm.get_class(recv_cid).map(|c| c.first_field_index).unwrap_or(0);
+                    let dn = cm.get_class(field.declaring_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+                    let dnf = cm.get_class(field.declaring_class_id).map(|c| c.num_total_fields).unwrap_or(0);
+                    let dffi = cm.get_class(field.declaring_class_id).map(|c| c.first_field_index).unwrap_or(0);
+                    eprintln!(
+                        "[BAOS-DBG] putfield {fld:?} recv={rn}(nf={rnf},ffi={rffi}) decl={dn}(nf={dnf},ffi={dffi}) field_index={fi} value={v:?}",
+                        fld = field_name, fi = field.field_index, v = value,
+                    );
+                }
             }
             // T17.Δ.4 — JVMTI FieldModification watchpoint.
             {
@@ -10363,7 +10392,7 @@ fn execute_invoke_kind(
     tmp_cv.push(thread.frames[frame_idx].stack.pop_compact_with_long_mark()?); // receiver
     tmp_cv.reverse();
     let recv_val = tmp_cv[0].0.decode_by_descriptor(b'L');
-    if std::env::var_os("CRATONVM_DBG_JETTY2").is_some()
+    if crate::runtime::env_cache::dbg_jetty2()
         && &*method_name == "getClasspath"
     {
         eprintln!(
@@ -10737,7 +10766,7 @@ fn execute_invoke_kind(
                 }
             }
             Value::Object(None) => {
-                if std::env::var_os("CRATONVM_DBG_JETTY2").is_some() {
+                if crate::runtime::env_cache::dbg_jetty2() {
                     let cm = shared.class_manager.read();
                     eprintln!(
                         "[jetty2] NULL-RECEIVER invoke {}.{}{} — Java stack:",
@@ -16465,7 +16494,7 @@ fn execute_invokevirtual_vtable_fast(
     // down the operand stack from the top.
     let num_params = num_params_slots;
     let receiver_val = thread.frames[frame_idx].stack.peek_at(num_params);
-    if std::env::var_os("CRATONVM_DBG_JETTY2").is_some()
+    if crate::runtime::env_cache::dbg_jetty2()
         && &*method_name == "getClasspath"
     {
         eprintln!(

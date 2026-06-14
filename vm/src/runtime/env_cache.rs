@@ -163,6 +163,11 @@ cached_is_set!(field_addr_dbg, "CRATONVM_DBG_FIELDADDR");
 /// launcher package (every invokevirtual/invokespecial receiver + args) so
 /// the boot-test NPE at `Main.start(Main.java:397)` can be pinpointed.
 cached_is_set!(dbg_jetty, "CRATONVM_DBG_JETTY");
+/// `CRATONVM_DBG_JETTY2` — Jetty classpath dispatch trace, read with an
+/// UNCACHED `std::env::var_os(...).is_some()` inside `execute_invokevirtual_vtable_fast`
+/// (i.e. a `GetEnvironmentVariableW` syscall on the virtual-call dispatch path).
+/// Cached.
+cached_is_set!(dbg_jetty2, "CRATONVM_DBG_JETTY2");
 
 // ── Flags read via `env::var(...).is_ok()` ──────────────────────────────
 
@@ -181,6 +186,15 @@ cached_is_ok!(npe_invoke_dbg, "CRATONVM_DBG_NPE_INVOKE");
 /// dominated steady-state interpreter throughput (a getstatic-only loop
 /// measured ~567 ns/iter, most of it this call). Cached like its siblings.
 cached_is_ok!(modstatic_dbg, "CRATONVM_DBG_MODSTATIC");
+/// `CRATON_HASHTABLEOFINT_TRACE` — niche getfield/putfield diagnostic that was
+/// read with an UNCACHED `std::env::var(...).is_ok()` on EVERY getfield and
+/// putfield (the two most common opcodes in object-oriented bytecode) — a
+/// per-field-access `GetEnvironmentVariableW` syscall. Cached.
+cached_is_ok!(hashtableofint_trace, "CRATON_HASHTABLEOFINT_TRACE");
+/// `CRATON_BAOS_DBG` — ByteArrayOutputStream `buf`/`count` putfield diagnostic,
+/// read with an UNCACHED `std::env::var_os(...).is_some()` on EVERY putfield.
+/// Cached.
+cached_is_set!(baos_dbg, "CRATON_BAOS_DBG");
 
 /// `CRATONVM_DBG_CHARSET=1` — targeted diagnostic for the bare
 /// `NullPointerException: charset` blocker (keycloak26 Picocli /

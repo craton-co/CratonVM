@@ -1,0 +1,254 @@
+'vswhere.exe' is not recognized as an internal or external command,
+operable program or batch file.
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.0
+** Copyright (c) 2025 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+warning: C:\craton\CratonVM-sb1213\Cargo.toml: `panic` setting is ignored for `bench` profile
+warning: C:\craton\CratonVM-sb1213\vm-cli\Cargo.toml: file `C:\craton\CratonVM-sb1213\vm-cli\src\main.rs` found to be present in multiple build targets:
+  * `bin` target `cratonvm`
+  * `bin` target `java`
+   Compiling ring v0.17.14
+   Compiling libffi-sys v2.3.0
+   Compiling libsqlite3-sys v0.28.0
+warning: unknown and unstable feature specified for `-Ctarget-feature`: `pclmul`
+  |
+  = note: it is still passed through to the codegen backend, but use of this feature might be unsound and the behavior of this feature can change in the future
+  = help: you might have meant: `pclmulqdq`
+
+warning: `cratonvm-vm` (build script) generated 1 warning
+    Checking thiserror v2.0.18
+    Checking strum v0.26.3
+    Checking num-bigint-dig v0.8.6
+    Checking curve25519-dalek v4.1.3
+   Compiling cratonvm-vm v0.3.0 (C:\craton\CratonVM-sb1213\vm)
+    Checking serde v1.0.228
+    Checking windows v0.58.0
+    Checking cratonvm-jfr v0.3.0 (C:\craton\CratonVM-sb1213\jfr)
+    Checking cratonvm-types v0.3.0 (C:\craton\CratonVM-sb1213\types)
+    Checking zip v2.4.2
+warning: `cratonvm-types` (lib) generated 1 warning (1 duplicate)
+    Checking cratonvm-native-api v0.3.0 (C:\craton\CratonVM-sb1213\native-api)
+    Checking cratonvm-reader v0.3.0 (C:\craton\CratonVM-sb1213\reader)
+    Checking cratonvm-gc v0.3.0 (C:\craton\CratonVM-sb1213\gc)
+warning: `cratonvm-jfr` (lib) generated 1 warning (1 duplicate)
+    Checking dsa v0.6.3
+    Checking libffi v3.2.0
+    Checking ed25519-dalek v2.2.0
+warning: unused attribute
+    --> gc\src\gen_heap.rs:5370:1
+     |
+5370 | #[inline]
+     | ^^^^^^^^^ help: remove this attribute
+     |
+note: attribute also specified here
+    --> gc\src\gen_heap.rs:5366:1
+     |
+5366 | #[inline]
+     | ^^^^^^^^^
+     = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+     = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: `cratonvm-native-api` (lib) generated 1 warning (1 duplicate)
+    Checking cratonvm-native-collections v0.3.0 (C:\craton\CratonVM-sb1213\native-collections)
+    Checking cratonvm-native-io v0.3.0 (C:\craton\CratonVM-sb1213\native-io)
+warning: unused doc comment
+    --> native-collections\src\lib.rs:4178:1
+     |
+4178 | / /// Walk an arbitrary `java.util.Map` via its polymorphic
+4179 | | /// `entrySet().iterator()`, reading each entry's key/value through the real
+4180 | | /// `Map.Entry` accessors. Layout-agnostic fallback used by
+4181 | | /// [`collect_entries_any`] for `Map` implementations CratonVM does not model
+4182 | | /// natively (real-JDK unmodifiable wrappers, third-party maps).
+     | |_---------------------------------------------------------------^
+     |   |
+     |   rustdoc does not generate documentation for macro invocations
+     |
+     = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+     = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: `cratonvm-reader` (lib) generated 1 warning (1 duplicate)
+    Checking cratonvm-jit-api v0.3.0 (C:\craton\CratonVM-sb1213\jit-api)
+warning: `cratonvm-jit-api` (lib) generated 1 warning (1 duplicate)
+    Checking cratonvm-jit v0.3.0 (C:\craton\CratonVM-sb1213\jit)
+   Compiling rustls v0.23.38
+warning: `cratonvm-gc` (lib) generated 2 warnings (1 duplicate) (run `cargo fix --lib -p cratonvm-gc` to apply 1 suggestion)
+    Checking rusqlite v0.31.0
+warning: `cratonvm-native-collections` (lib) generated 2 warnings (1 duplicate)
+    Checking rustls-webpki v0.103.12
+warning: `cratonvm-native-io` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-jit` (lib) generated 1 warning (1 duplicate)
+    Checking cratonvm-classloading v0.3.0 (C:\craton\CratonVM-sb1213\classloading)
+    Checking cratonvm-native-awt v0.3.0 (C:\craton\CratonVM-sb1213\native-awt)
+warning: `cratonvm-native-awt` (lib) generated 1 warning (1 duplicate)
+warning: `cratonvm-classloading` (lib) generated 1 warning (1 duplicate)
+    Checking cratonvm-native-builtins v0.3.0 (C:\craton\CratonVM-sb1213\native-builtins)
+warning: type `RuntimeTlsIdentity` is more private than the item `set_runtime_tls_identity`
+   --> native-builtins\src\t27_tls.rs:127:1
+    |
+127 | pub fn set_runtime_tls_identity(identity: Option<RuntimeTlsIdentity>) {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `set_runtime_tls_identity` is reachable at visibility `pub`
+    |
+note: but type `RuntimeTlsIdentity` is only usable at visibility `pub(crate)`
+   --> native-builtins\src\t27_tls.rs:108:1
+    |
+108 | pub(crate) struct RuntimeTlsIdentity {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: `cratonvm-native-builtins` (lib) generated 2 warnings (1 duplicate)
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:123:1
+    |
+123 | / /// `CRATON_JIT_PFO_TRACE` / `CRATON_JIT_PFI_TRACE` / `CRATON_JIT_NEWARRAY_TRACE`
+124 | | /// — suspect-pattern tracing in the JIT putfield/newarray helpers. These sit on
+125 | | /// the hottest allocation/store paths (`jit_putfield_object` runs once per
+126 | | /// reference field store), where an uncached `env::var_os` is a per-call
+127 | | /// environment-block scan under the process env lock — measured as a
+128 | | /// multi-second cost on allocation-heavy runs (bintrees18: ~69M ref stores).
+    | |_----------------------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+    = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:141:1
+    |
+141 | / /// `CRATONVM_DBG_OVERLAY` — a native `set_field`/`get_field` whose value tag
+142 | | /// is destructively cross-type with the bound class's declared field
+143 | | /// descriptor at that slot (a primitive written to a reference field, or a
+144 | | /// reference written to a primitive field). This is the "synthetic overlay
+...   |
+147 | | /// LinkedList$ListItr cursor bug). The hunter logs class + slot + value +
+148 | | /// descriptor + native caller so every instance can be enumerated in one run.
+    | |_-----------------------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:152:1
+    |
+152 | / /// `CRATONVM_DBG_BADRECV` — on a getfield/putfield/array/invoke receiver whose
+153 | | /// pointer is not a valid heap address (the H2 TestScript SEGV: a corrupted
+154 | | /// `Object(Some(ptr=6))` reaching `get_field` → header read faults), log the
+155 | | /// Java frame stack + field + Rust backtrace and raise an NPE instead of
+156 | | /// dereferencing the wild pointer, so the origin can be localized.
+    | |_------------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:158:1
+    |
+158 | / /// `CRATONVM_DBG_FIELDADDR` — trace put/get of specific instance fields
+159 | | /// (object address + resolved slot) to localize a write that does not reach
+160 | | /// the read site (e.g. the EnhancedQueueExecutor constructor field gap).
+    | |_------------------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:162:1
+    |
+162 | / /// `CRATONVM_DBG_JETTY` — trace dispatch into the `org/eclipse/jetty/start/`
+163 | | /// launcher package (every invokevirtual/invokespecial receiver + args) so
+164 | | /// the boot-test NPE at `Main.start(Main.java:397)` can be pinpointed.
+    | |_----------------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:174:1
+    |
+174 | / /// `CRATONVM_DBG_MODSTATIC` — JBoss-Modules `<clinit>`/static-dispatch
+175 | | /// diagnostic. This was read with an UNCACHED `std::env::var(...).is_ok()`
+176 | | /// from `ensure_class_initialized_shared` (the per-barrier class-init gate
+177 | | /// fired on every getstatic/putstatic/new/invokestatic, *before* the
+...   |
+181 | | /// dominated steady-state interpreter throughput (a getstatic-only loop
+182 | | /// measured ~567 ns/iter, most of it this call). Cached like its siblings.
+    | |_--------------------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:184:1
+    |
+184 | / /// `CRATON_HASHTABLEOFINT_TRACE` — niche getfield/putfield diagnostic that was
+185 | | /// read with an UNCACHED `std::env::var(...).is_ok()` on EVERY getfield and
+186 | | /// putfield (the two most common opcodes in object-oriented bytecode) — a
+187 | | /// per-field-access `GetEnvironmentVariableW` syscall. Cached.
+    | |_--------------------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:189:1
+    |
+189 | / /// `CRATON_BAOS_DBG` — ByteArrayOutputStream `buf`/`count` putfield diagnostic,
+190 | | /// read with an UNCACHED `std::env::var_os(...).is_some()` on EVERY putfield.
+191 | | /// Cached.
+    | |_----------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused doc comment
+   --> vm\src\runtime\env_cache.rs:194:1
+    |
+194 | / /// `CRATONVM_DBG_CHARSET=1` — targeted diagnostic for the bare
+195 | | /// `NullPointerException: charset` blocker (keycloak26 Picocli /
+196 | | /// Hazelcast JAXP-XPath). When set, the `Athrow` opcode handler and
+197 | | /// `throw_runtime_error` dump the full live Java thread stack
+198 | | /// (`class.method:pc` for every frame) the moment an NPE whose message
+199 | | /// is exactly `charset` is thrown — pinpointing the JDK method and app
+200 | | /// call site that dereferenced a null `Charset`.
+    | |_------------------------------------------------^
+    |   |
+    |   rustdoc does not generate documentation for macro invocations
+    |
+    = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: `VirtualQuery` redeclared with a different signature
+   --> vm\src\runtime\crash_handler.rs:316:9
+    |
+316 | /         fn VirtualQuery(
+317 | |             address: *const core::ffi::c_void,
+318 | |             buffer: *mut MemoryBasicInformation,
+319 | |             length: usize,
+320 | |         ) -> usize;
+    | |___________________^ this signature doesn't match the previous declaration
+    |
+   ::: vm\src\runtime\memwatch.rs:63:9
+    |
+ 63 | /         fn VirtualQuery(
+ 64 | |             lp_address: *const u8,
+ 65 | |             lp_buffer: *mut MemoryBasicInformation,
+ 66 | |             dw_length: usize,
+ 67 | |         ) -> usize;
+    | |___________________- `VirtualQuery` previously declared here
+    |
+    = note: expected `unsafe extern "system" fn(*const u8, *mut probe_readable::MemoryBasicInformation, usize) -> usize`
+               found `unsafe extern "system" fn(*const c_void, *mut windows_fault::MemoryBasicInformation, usize) -> usize`
+    = note: `#[warn(clashing_extern_declarations)]` on by default
+
+warning: `cratonvm-vm` (lib) generated 11 warnings (1 duplicate)
+warning: `cratonvm-vm` (bin "bench-hotspot-compare") generated 1 warning (1 duplicate)
+warning: `cratonvm-vm` (bin "bench-gate") generated 1 warning (1 duplicate)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 01s
