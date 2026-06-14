@@ -3815,6 +3815,15 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
     // re-reads the global gate, so newly-enabled profiling picks up on the
     // next call rather than mid-loop.
     let pgo_enabled = crate::jit::profile::is_profiling_enabled();
+    // T17.Δ.3 — hoist the JVMTI single-step listener gate out of the per-bytecode
+    // loop (same contract as `pgo_enabled` above). `any_single_step_listener_active()`
+    // is a `GLOBAL_MANAGER` OnceLock load + an AtomicBool load; reading it on EVERY
+    // bytecode was pure overhead in the universal no-agent case. A single-step agent
+    // that subscribes mid-method is observed on the next `execute_frame` entry
+    // (call/return) — the accepted pgo-style tradeoff; per-thread step enablement is
+    // still re-checked per-bytecode inside `fire_jvmti_single_step` when a listener
+    // is active.
+    let single_step_active = crate::runtime::jvmti::any_single_step_listener_active();
     // When a fast-path bytecode needs to throw a RuntimeError (AIOOBE, NPE, etc.),
     // it sets this to Some(...) and breaks out of the fast-path match instead of
     // returning directly. The main loop then converts it to a catchable Java exception.
@@ -3963,10 +3972,13 @@ fn execute_frame(shared: &SharedVm, thread: &mut JvmThread) -> MethodCallResult 
         let saved_pc = thread.frames[frame_idx].pc;
         thread.frames[frame_idx].last_instr_pc = saved_pc;
 
-        // T17.Δ.3 — JVMTI single-step dispatch hook. Costs a single
-        // `AtomicBool::Acquire` load + one predicted branch when no agent
-        // is subscribed, which is the common case.
-        fire_jvmti_single_step(thread, &thread.frames[frame_idx], saved_pc);
+        // T17.Δ.3 — JVMTI single-step dispatch hook, gated by the hoisted
+        // `single_step_active` so the no-agent case (universal) does zero atomics
+        // and never materializes the frame borrow here. `fire_jvmti_single_step`
+        // re-checks the listener + per-thread step flag when a listener is active.
+        if single_step_active {
+            fire_jvmti_single_step(thread, &thread.frames[frame_idx], saved_pc);
+        }
 
         // --- Fast path: handle hot bytecodes directly from raw bytes ---
         // Pre-read opcode + 2 operand bytes to avoid borrow conflicts with frame.
