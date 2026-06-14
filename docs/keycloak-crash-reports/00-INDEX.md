@@ -58,3 +58,4 @@ RSA-OAEP `Cipher` (#03), ECDH (#04), BC `ECPublicKeySpec` (#05), imported RSA pr
 | 10 | [DefaultCryptoJWKSUtilsTest 1 failure](10-jwksutils-one-failure.md) | DefaultCryptoJWKSUtilsTest | **FIXED** via #12 |
 | 12 | [EC cert getPublicKey null (BC converter)](12-ec-cert-getpublickey-null.md) | DefaultCryptoJWKTest, JWKSUtils ✓ | **FIXED (getPublicKey)** `7c98ec8f`; EC-cert ECDSA-verify remains |
 | 13 | [Map.Entry.setValue no write-back](13-map-entry-setvalue-no-writeback.md) | StripSecretsUtilsTest ✓ (+ all entrySet RMW) | **FIXED** `bfbb8093` |
+| 14 | [X509Certificate.verify() sig-alg OID unresolved](14-cert-verify-signature-oid.md) | DefaultCryptoJWKTest (EC cert verify; + all EC/RSA cert.verify) | **FIXED** `7010eee7`; JWKT 4→2 (rest = separate P-384/P-521 EC gap) |
