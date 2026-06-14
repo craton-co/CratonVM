@@ -2085,7 +2085,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // property snapshot so enumeration sees the live values.
             let props = crate::alloc_concurrent_synthetic(ctx, "java/util/Properties", 16);
             for (k, v) in ctx.list_system_properties() {
-                crate::properties_sidetable::store_property_in_sidetable(props, &k, &v);
+                crate::properties_sidetable::store_property_in_sidetable(ctx, props, &k, &v);
             }
             Ok(Some(Value::Object(Some(props))))
         },
@@ -10253,7 +10253,8 @@ fn native_surefire_properties_wrapper_get_property_1(
             }
             Ok(_) | Err(_) => {}
         }
-        if let Some(v) = crate::properties_sidetable::get_property_from_sidetable(props_map, &property_key_from_java_string(ctx, key_obj)) {
+        let pk_st = property_key_from_java_string(ctx, key_obj);
+        if let Some(v) = crate::properties_sidetable::get_property_from_sidetable(ctx, props_map, &pk_st) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
         }
     }
@@ -10302,7 +10303,8 @@ fn native_surefire_properties_wrapper_get_property_2(
                 return Ok(Some(Value::Object(Some(v))));
             }
         }
-        if let Some(v) = crate::properties_sidetable::get_property_from_sidetable(props_map, &property_key_from_java_string(ctx, key_obj)) {
+        let pk_st = property_key_from_java_string(ctx, key_obj);
+        if let Some(v) = crate::properties_sidetable::get_property_from_sidetable(ctx, props_map, &pk_st) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
         }
     }
@@ -10396,7 +10398,7 @@ fn native_surefire_properties_wrapper_set_as_system_properties(
     // the contract by walking our wrapper-side side-table and seeding
     // each entry into the VM's system property store.
     if let Some(Value::Object(Some(this))) = args.first() {
-        let entries = crate::properties_sidetable::snapshot_sidetable(*this);
+        let entries = crate::properties_sidetable::snapshot_sidetable(ctx, *this);
         for (k, v) in entries {
             let _ = ctx.set_system_property(&k, &v);
         }
@@ -10461,7 +10463,7 @@ fn native_surefire_system_property_manager_load_properties(
         Value::Object(Some(placeholder)),
     );
     for (k, v) in &parsed {
-        crate::properties_sidetable::store_property_in_sidetable(wrapper, k, v);
+        crate::properties_sidetable::store_property_in_sidetable(ctx, wrapper, k, v);
         // `PropertiesWrapper.getProperty` is compiled as `this.properties.get(key)`.
         // If dispatch hits the real `HashMap` instead of our sidetable-backed
         // overrides, the map must still contain every booter entry — otherwise

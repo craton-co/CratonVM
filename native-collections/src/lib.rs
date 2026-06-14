@@ -5114,7 +5114,29 @@ fn native_hs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
         ctx.invoke_virtual(source, "clear", "()V", &[])?;
     }
     let clear_args = [Value::Object(Some(backing))];
-    native_map_clear(ctx, &clear_args)
+    // LinkedHashSet / CopyOnWriteArraySet back onto a LinkedHashMap, whose state
+    // (size/head/tail + bucket table) lives in the LHM overlay, NOT the plain
+    // HashMap-layout slots that `native_map_clear` resets. Calling
+    // `native_map_clear` on an LHM backing zeroed the bucket table + size field
+    // but left the LinkedHashMap `head`/`tail` insertion chain intact, so the
+    // set kept iterating the pre-clear entries and re-adding a previously
+    // present element DUPLICATED it. JUnit Jupiter reorders a class descriptor's
+    // method children via clear()+re-add, so this produced two identical method
+    // descriptors → discovery aborted with PreconditionViolationException
+    // "returned a cyclic graph", blocking discovery of EVERY Hibernate test
+    // class. Route to `native_lhm_clear` for insertion-ordered sets (the set's
+    // own type is authoritative — `alloc_hs_backing` always pairs them with a
+    // LinkedHashMap) or when the backing resolves as a LinkedHashMap.
+    let backing_is_lhm = hs_is_insertion_ordered(ctx, this)
+        || matches!(
+            ctx.class_name_of_id(ctx.class_id_of_object(backing)).as_deref(),
+            Some("java/util/LinkedHashMap")
+        );
+    if backing_is_lhm {
+        native_lhm_clear(ctx, &clear_args)
+    } else {
+        native_map_clear(ctx, &clear_args)
+    }
 }
 
 fn native_hs_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
