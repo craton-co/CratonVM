@@ -3005,6 +3005,26 @@ pub fn rsa_verify(id: u64, message: &[u8], signature: &[u8]) -> Option<bool> {
     })
 }
 
+/// Maps a *real* RSA key object's GC-stable `identityHashCode` to its
+/// `crypto_impl` `key_id`, so CratonVM's `Signature` natives keep using the
+/// fast Rust sign/verify even when `route_rsa_to_real()` hands out genuine
+/// `sun.security.rsa.RSAPublic/PrivateKeyImpl` objects (which carry no synthetic
+/// `key_id` slot). This is the bridge that lets us keep BOTH optimizations —
+/// fast Rust keygen AND fast Rust sign/verify — while returning spec-correct key
+/// objects. Same GC-stable-identity precedent as the signature payload table.
+static RSA_REALKEY_MAP: parking_lot::RwLock<Option<HashMap<i32, u64>>> =
+    parking_lot::RwLock::new(None);
+
+pub fn rsa_realkey_map_set(identity_hash: i32, key_id: u64) {
+    let mut guard = RSA_REALKEY_MAP.write();
+    guard.get_or_insert_with(HashMap::new).insert(identity_hash, key_id);
+}
+
+pub fn rsa_realkey_map_get(identity_hash: i32) -> Option<u64> {
+    let guard = RSA_REALKEY_MAP.read();
+    guard.as_ref().and_then(|m| m.get(&identity_hash).copied())
+}
+
 /// Global ECDSA key store.
 static ECDSA_KEY_STORE: parking_lot::RwLock<Option<HashMap<u64, EcdsaKeyPairData>>> =
     parking_lot::RwLock::new(None);

@@ -23,16 +23,25 @@ clean). Those are **not** CratonVM bugs and get no report.
 - Fixed: CredentialModelTest, CredentialModelBackwardsCompatibilityTest (now green).
 - Improved internally (cascade removed, still FAIL on RSA-key #11 follow-ons): the 4 BC
   cert classes.
-- Remaining 12 are dominated by the **synthetic-RSA-key** umbrella (#11, architectural)
+- Remaining failures dominated by the **synthetic-RSA-key** umbrella (#11)
   plus ECDH (#04), EC keyspec (#05), Cipher initLock (#03), stream close-handlers (#09),
-  JSON compare (#08) — each documented; full green is gated on the RSA→real-provider
-  routing, scoped out here to avoid VM-wide regression risk.
+  JSON compare (#08).
+
+## After RSA fix (iteration 3, commit `4b2560a0` + checkpoint)
+- **60 PASS / 32 FAIL**, **11 CratonVM-only** failures. **Zero regressions** (EC keypair
+  path intact despite the KeyPair-accessor changes).
+- `route_rsa_to_real()` (default ON, `CRATONVM_SYNTHETIC_RSA=1` toggle): RSA keygen stays
+  fast Rust but now yields **real `RSAPublicKeyImpl`** (sign/verify still fast via an
+  identity→key_id bridge). `DefaultCryptoRSAVerifierTest` FAIL→PASS. See #11.
+- The other RSA-touched classes are now blocked by **separate** bugs:
+  `X509Certificate.getPublicKey()` returns null (cert gen, hits EC too),
+  `RSAPublicKeySpec` import, and the missing `crypto_impl` private-key parser.
 
 | # | Report | Classes affected | Status |
 |---|--------|------------------|--------|
 | 01 | [Hashtable.keys()/elements() wrong Entry layout](01-hashtable-enumeration-real-entry-layout.md) | DefaultCertificateIdentityExtractorTest, DefaultCryptoJWKTest, DefaultCryptoRSAVerifierTest, PemUtilsBCTest | **FIXED** (cascade removed; classes still fail on RSA-key #11 / CN-extraction follow-on) |
 | 02 | [Constructor.getGenericParameterTypes() null for primitive param](02-constructor-generic-primitive-null.md) | CredentialModelTest, CredentialModelBackwardsCompatibilityTest | **FIXED ✓ both classes green** |
-| 11 | [Synthetic RSA keys are not real RSAPublicKey (umbrella)](11-rsa-synthetic-key-not-rsapublickey.md) | RSAVerifier, JWKT, KeyPairVerifier, SdJwtVP, JWKSUtils, PemUtilsBC | open (architectural; gates 06/07/10) |
+| 11 | [Synthetic RSA keys are not real RSAPublicKey (umbrella)](11-rsa-synthetic-key-not-rsapublickey.md) | RSAVerifier ✓, JWKT, KeyPairVerifier, SdJwtVP, JWKSUtils, PemUtilsBC | **FIXED (key-type)** route_rsa_to_real (4b2560a0); remaining reds are separate bugs |
 | 03 | [Cipher.chooseProvider monitorenter NPE (null lock)](03-cipher-chooseprovider-monitorenter-npe.md) | DefaultCryptoJWETest | open |
 | 04 | [ECDH KeyAgreement "Algorithm ECDH not available"](04-ecdh-keyagreement-not-available.md) | BCEcdhEsAlgorithmProviderTest | open |
 | 05 | [BC ECPublicKeySpec InvalidKeySpecException](05-bc-ecpublickeyspec-invalidkeyspec.md) | BCECDSACryptoProviderTest | open |

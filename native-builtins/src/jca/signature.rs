@@ -262,6 +262,15 @@ fn key_id_of(ctx: &mut dyn NativeContext, this: ObjectRef) -> u64 {
 }
 
 fn extract_key_id_from_key(ctx: &mut dyn NativeContext, key: ObjectRef) -> u64 {
+    // Real RSA keys (`sun.security.rsa.RSAPublic/PrivateKeyImpl`, handed out when
+    // `route_rsa_to_real()` is on) carry no synthetic `key_id` slot — slot 3 is a
+    // real field (e.g. a BigInteger ref). They're bridged to their crypto_impl
+    // `key_id` via the GC-stable identity map registered at keygen/import, so the
+    // fast Rust sign/verify still applies. Check that FIRST; a synthetic key is
+    // never in the map and falls through to its slot-3 `key_id`.
+    if let Some(id) = crypto_impl::rsa_realkey_map_get(ctx.identity_hash_code(key)) {
+        return id;
+    }
     match ctx.get_field(key, 3) {
         Value::Long(id) => id as u64,
         Value::Int(id) => id as u64,
