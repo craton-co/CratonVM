@@ -464,7 +464,21 @@ impl GenerationalHeap {
             );
             std::process::abort();
         });
-        let ptr = self.alloc_young(total_size);
+        // Young fast path; on exhaustion spill to old gen (non-moving) BEFORE
+        // the hard abort. This panicking entry point is used by the native
+        // `ctx.new_*` allocators, which cannot safely GC-and-retry (a moving
+        // young GC would dangle their unrooted local ObjectRefs). See
+        // [`try_alloc_object_old`]. Only when old gen is also full does
+        // `alloc_young` fire the OOM diagnostic and abort.
+        let ptr = match self.try_alloc_young(total_size) {
+            Some(p) => p,
+            None => {
+                if let Some(obj) = self.try_alloc_object_old(class_id, num_fields) {
+                    return obj;
+                }
+                self.alloc_young(total_size)
+            }
+        };
 
         let header = ObjectHeader::new(
             class_id,
@@ -595,7 +609,24 @@ impl GenerationalHeap {
             // diagnostic would live here).
         }
 
-        let ptr = self.alloc_young(total_size);
+        // Young fast path; on exhaustion spill into old gen (non-moving) BEFORE
+        // the hard abort. The panicking `alloc_array` is used by the native
+        // `ctx.new_array`/`new_ref_array` allocators, which cannot safely
+        // GC-and-retry (a moving young GC would dangle their unrooted local
+        // ObjectRefs). `try_alloc_array_humongous` allocates in old gen
+        // regardless of size; only when old gen is also full does `alloc_young`
+        // fire the OOM diagnostic and abort. See [`try_alloc_object_old`].
+        let ptr = match self.try_alloc_young(total_size) {
+            Some(p) => p,
+            None => {
+                if let Some(obj) =
+                    self.try_alloc_array_humongous(class_id, element_type, length_u32)
+                {
+                    return obj;
+                }
+                self.alloc_young(total_size)
+            }
+        };
 
         let header = ObjectHeader::new(
             class_id,
@@ -756,6 +787,47 @@ impl GenerationalHeap {
         // of zeroed, 8-byte-aligned memory exclusive to this allocation.
         // Writing the header is in-bounds and the resulting `ObjectRef`
         // wraps a fully-initialized header.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+        }
+        self.stats.old_allocations.fetch_add(1, Ordering::Relaxed);
+        Some(unsafe { ObjectRef::from_raw(ptr) })
+    }
+
+    /// Allocate a Java object DIRECTLY in the old generation (non-moving),
+    /// used as an overflow fallback when the young from-space is exhausted.
+    /// Returns `None` if the old gen is also full.
+    ///
+    /// This is the object analogue of [`try_alloc_array_humongous`] and exists
+    /// for the same safety reason that motivates routing the *panicking*
+    /// `alloc_object`/`alloc_array` here on young-full: those entry points are
+    /// used by the convenience native allocators (`ctx.new_object`/`new_array`/
+    /// `new_ref_array`, `alloc_concurrent_synthetic`, …). A native holds raw
+    /// `ObjectRef`s in Rust locals that are NOT in any GC root set, so we cannot
+    /// trigger a moving/promoting young GC from there (it would relocate those
+    /// objects and leave the native's locals dangling — exactly the stale-ref
+    /// class of SEGV). The old-gen allocator never relocates a live object, so
+    /// spilling the single allocation into old gen lets a young-full native call
+    /// succeed without GC instead of `std::process::abort()`-ing the whole VM.
+    /// The `GC_FLAG_OLD_GEN` mark keeps minor GC from trying to forward it.
+    fn try_alloc_object_old(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
+        let total_size = HEADER_SIZE.checked_add(num_fields.checked_mul(SLOT_SIZE)?)?;
+        let ptr = {
+            let mut og = self.old_gen.lock();
+            og.alloc(total_size, 8)?
+        };
+        let mut header = ObjectHeader::new(
+            class_id,
+            ObjectKind::Object,
+            ArrayElementType::Reference,
+            self.next_hash(),
+            0,
+            u32::try_from(num_fields).ok()?,
+        );
+        header.gc_flags |= GC_FLAG_OLD_GEN;
+        // SAFETY: `OldGen::alloc` returned `total_size` bytes of zeroed,
+        // 8-byte-aligned memory exclusive to this allocation; writing the
+        // header is in-bounds and the resulting `ObjectRef` is fully valid.
         unsafe {
             std::ptr::write(ptr as *mut ObjectHeader, header);
         }
