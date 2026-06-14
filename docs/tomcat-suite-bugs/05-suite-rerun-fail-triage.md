@@ -51,6 +51,23 @@ families NOT to count as CratonVM bugs:
   these). e.g. TestTcpFailureDetector, TestEncryptInterceptor*.
 - TLS/auth classes that need OpenSSL or full client-cert handshakes.
 
+## ⚠ NOSUMMARY can be a taskkill artifact, NOT a real bug
+
+A class is classified **NOSUMMARY** when the worker VM exits with `rc != TIMEOUT`
+and produced no JUnit summary. This includes the case where the worker was
+**killed externally mid-class** (e.g. `taskkill /F /IM cratonvm-tcsuite.exe` to
+free resources, or a peer session's kill) — a false death, not a VM bug. The
+rerun2 `catalina.core.TestApplicationContext*` / `TestApplicationDispatcher`
+NOSUMMARY cluster was VERIFIED to be exactly this: a clean standalone run of
+`TestApplicationContext` runs many test methods, serves HTTP, and shows NO crash
+/ linkage error / OOM — it is just slow (server throughput). Those NOSUMMARY
+entries are artifacts of an in-flight worker being killed, NOT a bug.
+
+**Rule:** never treat a rerun NOSUMMARY/CRASH as a real bug without a CLEAN
+standalone re-run (unique-named binary, no concurrent kills) reproducing it.
+Contrast bug 09 (`TestGenericPrincipal`) — that NOSUMMARY DID reproduce cleanly
+(`ObjectStreamClass$RecordSupport` linkage error) and is a real bug.
+
 ## How to triage (next session)
 
 1. Start with the CRASH (`TestServerInfo`) and the 2 NOSUMMARY realm classes —
