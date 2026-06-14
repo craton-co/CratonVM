@@ -1930,6 +1930,17 @@ impl SharedVm {
         sys_props.insert("os.name".to_string(), canonical_os_name());
         sys_props.insert("os.arch".to_string(), canonical_os_arch());
         sys_props.insert("os.version".to_string(), canonical_os_version());
+        // HotSpot always publishes the data model (pointer width in bits).
+        // Some JDK internals branch on it — e.g. `jdk.internal.jimage`'s
+        // `BasicImageReader` derives `IS_64_BIT`/`MAP_ALL` from it and, when
+        // it defaults to "32", opens a FileChannel over the run-time image
+        // instead of using the whole-image map. Without this key the module
+        // system takes a degraded path. Derive it from the target pointer
+        // width so it is correct on every arch.
+        sys_props.insert(
+            "sun.arch.data.model".to_string(),
+            (std::mem::size_of::<usize>() * 8).to_string(),
+        );
         sys_props.insert(
             "file.separator".to_string(),
             std::path::MAIN_SEPARATOR.to_string(),

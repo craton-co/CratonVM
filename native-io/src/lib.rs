@@ -3756,6 +3756,53 @@ fn native_scanner_skip(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
 // ---------------------------------------------------------------------------
 
 /// Register all I/O native methods.
+/// `jdk.internal.jimage.NativeImageBuffer.getNativeMap(String imagePath)`
+///
+/// In HotSpot this returns the buffer the JVM pre-mapped for the run-time
+/// image via libjimage, or `null` if the image was not opened that way
+/// (e.g. for jrt-fs tools). `BasicImageReader.<init>` treats a non-null
+/// return as the whole-image memory map (with `jdk.image.map.all`) and a
+/// `null` return as "fall back to a FileChannel mapping".
+///
+/// CratonVM does not pre-map the image through libjimage, and its
+/// `FileChannel.map` snapshot does not survive the typed/derived
+/// `ByteBuffer` reads `BasicImageReader` performs (absolute `getInt`,
+/// `asIntBuffer`, `slice`) — only a *heap* `ByteBuffer` reads those back
+/// correctly. So we faithfully provide the whole-image map by reading the
+/// image file into a real heap `ByteBuffer` (`ByteBuffer.wrap`): every
+/// downstream `ImageReader` traversal (`findNode` / `findLocation` /
+/// `getResourceBuffer`) then operates on the genuine jimage bytes. This is
+/// the real image content, not a stub. Returning `null` on any read error
+/// preserves the JDK's documented fall-back contract.
+fn native_jimage_get_native_map(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let path = match args.first() {
+        Some(Value::Object(Some(s))) => match ctx.read_string(*s) {
+            Some(p) => p,
+            None => return Ok(Some(Value::Object(None))),
+        },
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        // Image not readable here → let the caller use its FileChannel path.
+        Err(_) => return Ok(Some(Value::Object(None))),
+    };
+    // Build a real heap ByteBuffer: allocate a byte[] and bulk-copy the
+    // image bytes (per-element writes would be a multi-second hit for a
+    // 100 MiB+ image), then hand it to the genuine `ByteBuffer.wrap`.
+    let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+    ctx.write_byte_array_from(arr, 0, &bytes);
+    ctx.invoke(
+        "java/nio/ByteBuffer",
+        "wrap",
+        "([B)Ljava/nio/ByteBuffer;",
+        &[Value::Object(Some(arr))],
+    )
+}
+
 pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     let __prev_cat = registry.current_category();
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
@@ -3776,6 +3823,19 @@ pub fn register_io_natives(registry: &mut NativeMethodRegistry) {
     // take raw memory pointers and would segfault silently if
     // unregistered (the VM would try to dispatch to a null callback).
     nio_native::register_nio_natives_real(registry);
+
+    // jdk.internal.jimage.NativeImageBuffer.getNativeMap — the run-time
+    // image memory map. `BasicImageReader.<init>` calls this during boot of
+    // the module system (`ModuleFinder.ofSystem()` → `SystemModuleFinders`).
+    // Registered here (not inside the synthetic-jdk-gated `register_nio_natives`)
+    // so it is present in real-JDK mode, where the module finder runs the
+    // genuine JDK bytecode.
+    registry.register(
+        "jdk/internal/jimage/NativeImageBuffer",
+        "getNativeMap",
+        "(Ljava/lang/String;)Ljava/nio/ByteBuffer;",
+        native_jimage_get_native_map,
+    );
 
     // Phase B (RB.3 / RB.4): real-mode sun.nio.cs.StreamDecoder /
     // StreamEncoder shims.  These override the JDK bytecode that
