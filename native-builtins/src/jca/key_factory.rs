@@ -571,6 +571,71 @@ const KEY_FIELD_DER: usize = 4;
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Invoke a `()Ljava/math/BigInteger;` accessor on `key` and return the
+/// magnitude as unsigned big-endian bytes (stripping the two's-complement sign
+/// byte). Empty on any failure (e.g. a non-CRT key has no `getPublicExponent`).
+fn read_biginteger_magnitude(
+    ctx: &mut dyn NativeContext,
+    key: ObjectRef,
+    accessor: &str,
+) -> Vec<u8> {
+    let bi = match ctx.invoke_virtual(key, accessor, "()Ljava/math/BigInteger;", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Vec::new(),
+    };
+    let arr = match ctx.invoke_virtual(bi, "toByteArray", "()[B", &[]) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return Vec::new(),
+    };
+    let mut bytes = read_byte_array(ctx, arr);
+    // BigInteger.toByteArray() prepends a 0x00 sign byte for positive values
+    // whose high bit is set — strip leading zeros so the magnitude is unsigned.
+    while bytes.len() > 1 && bytes[0] == 0 {
+        bytes.remove(0);
+    }
+    bytes
+}
+
+/// Bridge a real *imported* RSA private key (`RSAPrivate{Crt}KeyImpl`) to a
+/// `crypto_impl` key_id by reading its modulus/exponents, so signing through
+/// CratonVM's `Signature` natives uses the fast Rust path. Without this an
+/// imported private key carries no synthetic `key_id` and `rsa_sign(0)` yields
+/// a garbage signature — keycloak's `KeyPairVerifier` (sign "content" then
+/// verify) then reports "Keys don't match".
+fn register_rsa_priv_sign_material(ctx: &mut dyn NativeContext, key: ObjectRef) {
+    let pin = ctx.pin_native_root(key);
+    let k = ctx.read_native_pin(pin, key);
+    let n = read_biginteger_magnitude(ctx, k, "getModulus");
+    let k = ctx.read_native_pin(pin, key);
+    let d = read_biginteger_magnitude(ctx, k, "getPrivateExponent");
+    let k = ctx.read_native_pin(pin, key);
+    let e = read_biginteger_magnitude(ctx, k, "getPublicExponent");
+    let k = ctx.read_native_pin(pin, key);
+    let ihash = ctx.identity_hash_code(k);
+    ctx.unpin_native_roots(pin);
+    if n.is_empty() || d.is_empty() {
+        return;
+    }
+    // Non-CRT private keys expose no public exponent — default to F4 (65537).
+    let e = if e.is_empty() { vec![0x01, 0x00, 0x01] } else { e };
+    let key_id = crypto_impl::rsa_key_next_id();
+    crypto_impl::rsa_key_store(
+        key_id,
+        crypto_impl::RsaKeyPairData {
+            public_key: crypto_impl::RsaPublicKey {
+                n: crypto_impl::BigUint::from_bytes_be(&n),
+                e: crypto_impl::BigUint::from_bytes_be(&e),
+            },
+            private_key: crypto_impl::RsaPrivateKey {
+                n: crypto_impl::BigUint::from_bytes_be(&n),
+                d: crypto_impl::BigUint::from_bytes_be(&d),
+                e: crypto_impl::BigUint::from_bytes_be(&e),
+            },
+        },
+    );
+    crypto_impl::rsa_realkey_map_set(ihash, key_id);
+}
+
 fn read_string(ctx: &mut dyn NativeContext, args: &[Value], idx: usize) -> String {
     match args.get(idx) {
         Some(Value::Object(Some(o))) => ctx.read_string(*o).unwrap_or_default(),
@@ -1215,13 +1280,48 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // the real SPI is unavailable.
     if algo == ALGO_RSA {
         if let Some(Value::Object(Some(spec))) = args.get(1) {
+            // Try the spec as-is (PKCS8EncodedKeySpec / RSAPrivateKeySpec).
             if let Ok(r) = drive_real_rsa_keyfactory(
                 ctx,
                 *spec,
                 "engineGeneratePrivate",
                 "Ljava/security/PrivateKey;",
             ) {
+                if let Some(Value::Object(Some(key))) = r {
+                    register_rsa_priv_sign_material(ctx, key);
+                }
                 return Ok(r);
+            }
+            // Fallback: the encoded spec may carry a PKCS#1 *traditional*
+            // RSAPrivateKey rather than a PKCS#8 PrivateKeyInfo. BouncyCastle's
+            // RSA KeyFactory accepts PKCS#1 directly (and BC writes RSA keys as
+            // "RSA PRIVATE KEY" PEM), and keycloak's DerUtils.decodePrivateKey
+            // relies on that leniency — but the strict SunRsaSign SPI we route
+            // to rejects it. Detect PKCS#1, wrap into PKCS#8, and retry.
+            let der = match ctx.get_field(*spec, 0) {
+                Value::Object(Some(arr)) => read_byte_array(ctx, arr),
+                _ => Vec::new(),
+            };
+            if is_pkcs1_rsa_private(&der) {
+                let pkcs8 = rsa_pkcs1_to_pkcs8(&der);
+                let arr = alloc_byte_array(ctx, &pkcs8);
+                if let Ok(Some(Value::Object(Some(new_spec)))) = ctx.new_object_initialized(
+                    "java/security/spec/PKCS8EncodedKeySpec",
+                    "([B)V",
+                    &[Value::Object(Some(arr))],
+                ) {
+                    if let Ok(r) = drive_real_rsa_keyfactory(
+                        ctx,
+                        new_spec,
+                        "engineGeneratePrivate",
+                        "Ljava/security/PrivateKey;",
+                    ) {
+                        if let Some(Value::Object(Some(key))) = r {
+                            register_rsa_priv_sign_material(ctx, key);
+                        }
+                        return Ok(r);
+                    }
+                }
             }
         }
     }
@@ -1232,6 +1332,70 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             algo_name(algo)
         ),
     ))
+}
+
+/// Number of bytes occupied by a DER length field at `der[pos]`.
+fn der_len_size(der: &[u8], pos: usize) -> usize {
+    match der.get(pos) {
+        Some(&b) if b < 0x80 => 1,
+        Some(&b) => 1 + (b & 0x7f) as usize,
+        None => 1,
+    }
+}
+
+/// True if `der` is a PKCS#1 `RSAPrivateKey` (`SEQUENCE { INTEGER version,
+/// INTEGER modulus, ... }`) rather than a PKCS#8 `PrivateKeyInfo` (`SEQUENCE {
+/// INTEGER version, SEQUENCE algId, OCTET STRING }`). Both start with the
+/// version `02 01 00`; the element after it is an INTEGER (`0x02`, the modulus)
+/// for PKCS#1 vs a SEQUENCE (`0x30`, the AlgorithmIdentifier) for PKCS#8.
+fn is_pkcs1_rsa_private(der: &[u8]) -> bool {
+    if der.first() != Some(&0x30) {
+        return false;
+    }
+    let cs = 1 + der_len_size(der, 1); // outer SEQUENCE content start
+    der.get(cs) == Some(&0x02)
+        && der.get(cs + 1) == Some(&0x01)
+        && der.get(cs + 2) == Some(&0x00)
+        && der.get(cs + 3) == Some(&0x02)
+}
+
+/// Append a DER definite-length encoding of `len` to `out`.
+fn der_push_len(out: &mut Vec<u8>, len: usize) {
+    if len < 0x80 {
+        out.push(len as u8);
+    } else {
+        let mut bytes = Vec::new();
+        let mut l = len;
+        while l > 0 {
+            bytes.push((l & 0xff) as u8);
+            l >>= 8;
+        }
+        bytes.reverse();
+        out.push(0x80 | bytes.len() as u8);
+        out.extend_from_slice(&bytes);
+    }
+}
+
+/// Wrap a PKCS#1 `RSAPrivateKey` DER into a PKCS#8 `PrivateKeyInfo` carrying the
+/// `rsaEncryption` AlgorithmIdentifier, so the strict SunRsaSign KeyFactory
+/// accepts it (it only parses PKCS#8).
+fn rsa_pkcs1_to_pkcs8(pkcs1: &[u8]) -> Vec<u8> {
+    // AlgorithmIdentifier rsaEncryption: SEQUENCE { OID 1.2.840.113549.1.1.1, NULL }
+    const ALG_ID: &[u8] = &[
+        0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
+    ];
+    // OCTET STRING { pkcs1 }
+    let mut octet = vec![0x04];
+    der_push_len(&mut octet, pkcs1.len());
+    octet.extend_from_slice(pkcs1);
+    // PrivateKeyInfo SEQUENCE { INTEGER 0, AlgorithmIdentifier, OCTET STRING }
+    let mut inner = vec![0x02, 0x01, 0x00]; // version v1 (0)
+    inner.extend_from_slice(ALG_ID);
+    inner.extend_from_slice(&octet);
+    let mut out = vec![0x30];
+    der_push_len(&mut out, inner.len());
+    out.extend_from_slice(&inner);
+    out
 }
 
 fn kf_get_algorithm(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
