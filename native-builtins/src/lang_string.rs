@@ -609,10 +609,34 @@ pub(crate) fn native_string_hash_code(ctx: &mut dyn NativeContext, args: &[Value
     };
 
     // Layout-aware: JDK 25 String has fields {value:[B, coder:B, hash:I,
-    // hashIsZero:Z}, our legacy synthetic-stub layout has {value:[C,
-    // hash:I}. Detect via the value-array element type and read the
-    // cached hash from the right slot. Writing the cache to the wrong
-    // slot would clobber `coder` and corrupt all subsequent reads.
+    // hashIsZero:Z} (hash at slot 2), our legacy synthetic-stub layout has
+    // {value:[C, hash:I} (hash at slot 1). The slot is determined by the
+    // value-array element type, which is constant for the whole process —
+    // so resolve it ONCE (from a real string's value array) and cache it.
+    // Then read the cached hash FIRST, before touching the value array, so a
+    // cache hit is a single field read like HotSpot. (Resolving the slot per
+    // call — either by class+field name or by re-reading the value array —
+    // was itself the bottleneck that kept cache hits ~20x slower than a plain
+    // field read, dwarfing the hashing win.)
+    static HASH_SLOT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let hash_field_index: usize = match HASH_SLOT.get() {
+        Some(i) => *i,
+        None => {
+            let slot = match string_char_array(ctx, this).map(|(arr, _)| ctx.heap_element_type_of(arr)) {
+                Some(cratonvm_types::ArrayElementType::Byte)
+                | Some(cratonvm_types::ArrayElementType::Boolean) => 2,
+                _ => 1,
+            };
+            let _ = HASH_SLOT.set(slot);
+            slot
+        }
+    };
+    if let Value::Int(cached) = ctx.get_field(this, hash_field_index) {
+        if cached != 0 {
+            return Ok(Some(Value::Int(cached)));
+        }
+    }
+
     let (arr, len) = match string_char_array(ctx, this) {
         Some(v) => v,
         None => return Ok(Some(Value::Int(0))),
@@ -622,13 +646,6 @@ pub(crate) fn native_string_hash_code(ctx: &mut dyn NativeContext, args: &[Value
         elem_type,
         cratonvm_types::ArrayElementType::Byte | cratonvm_types::ArrayElementType::Boolean,
     );
-    let hash_field_index: usize = if is_byte_array { 2 } else { 1 };
-
-    if let Value::Int(cached) = ctx.get_field(this, hash_field_index) {
-        if cached != 0 {
-            return Ok(Some(Value::Int(cached)));
-        }
-    }
 
     // For compact strings (byte[] value), inspect the `coder` byte
     // (field 1) to know whether the bytes are LATIN-1 (one byte per char,
