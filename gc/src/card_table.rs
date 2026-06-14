@@ -298,12 +298,35 @@ impl CardTable {
             .collect()
     }
 
-    /// Return the tracked list of dirty card indices and clear the tracking list.
+    /// Return the tracked list of dirty card indices and clear the tracking list
+    /// AND reset those cards' bitmap bytes to `CARD_CLEAN`.
     ///
     /// This is O(dirty cards) rather than O(total cards), making it much faster
     /// when only a small fraction of cards are dirty.
+    ///
+    /// B-K / bt18 fix (2026-06-14): the byte reset is load-bearing for the
+    /// NON-MOVING young sweep, which (unlike the moving Cheney path) NEVER calls
+    /// [`Self::clear_all`]. `mark_dirty`/`mark_dirty_bulk`/`drain_pending` only
+    /// push an index back onto the tracking list when its byte transitions
+    /// clean→dirty (`cards[index] != CARD_DIRTY`). If `take_dirty_cards` left the
+    /// consumed bytes DIRTY, the sweep's subsequent `mark_dirty_bulk(redirty_*)`
+    /// that re-establishes a surviving old→young edge would be a SILENT NO-OP —
+    /// the card stays dirty-in-bitmap but absent-from-list, so the next
+    /// `take_dirty_cards` never returns it and `scan_dirty_cards` never re-seeds
+    /// the edge → the live young child is swept (premature reclamation,
+    /// bt18 = 68273854 vs golden 68332206). Clearing the consumed bytes here
+    /// restores the bitmap↔list invariant so the re-dirty genuinely re-registers
+    /// the card. The moving path is unaffected: its `clear_all` wipes the whole
+    /// bitmap anyway, so the early per-card clear is redundant, never harmful.
     pub fn take_dirty_cards(&self) -> Vec<usize> {
-        std::mem::take(&mut self.cells.lock().dirty_cards)
+        let mut cells = self.cells.lock();
+        let taken = std::mem::take(&mut cells.dirty_cards);
+        for &index in &taken {
+            if index < cells.cards.len() {
+                cells.cards[index] = CARD_CLEAN;
+            }
+        }
+        taken
     }
 
     /// Get the start address of the region covered by `card_index`.

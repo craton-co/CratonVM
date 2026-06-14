@@ -3263,6 +3263,38 @@ impl GenerationalHeap {
         // next collection still sees these old→young references.
         self.card_table.mark_dirty_bulk(&redirty_cards);
 
+        // DBG (CRATONVM_DBG_SEED_ALL_OLD): decisive test for the sweep-edges
+        // verdict that bt18's leak is an old→young CLEAN-CARD miss. Seed the mark
+        // from EVERY old-gen object's young references (not just dirty cards). If
+        // this corrects the checksum, the bug is a card/barrier gap (a promotion
+        // that failed to dirty the promoted object's card); if it does NOT, the
+        // missed reference is not a clean-card old→young edge (older verdict).
+        if std::env::var_os("CRATONVM_DBG_SEED_ALL_OLD").is_some() {
+            for (op, _sz) in old_gen.walk_objects() {
+                // SAFETY: `op` is a live old-gen object header from walk_objects.
+                let oh = unsafe { &*(op as *const ObjectHeader) };
+                if oh.kind == ObjectKind::Array {
+                    if oh.element_type == ArrayElementType::Reference {
+                        for i in 0..oh.array_length as usize {
+                            let s = unsafe { op.add(HEADER_SIZE + i * REF_ELEMENT_SIZE) };
+                            let raw: u64 = unsafe { std::ptr::read(s as *const u64) };
+                            if raw != 0 {
+                                mark_young(raw as usize as *mut u8, &mut worklist);
+                            }
+                        }
+                    }
+                } else {
+                    for slot in 0..oh.num_slots as usize {
+                        let s = unsafe { op.add(HEADER_SIZE + slot * SLOT_SIZE) };
+                        let v = unsafe { std::ptr::read(s as *const Value) };
+                        if let Value::Object(Some(r)) = v {
+                            mark_young(r.as_ptr(), &mut worklist);
+                        }
+                    }
+                }
+            }
+        }
+
         // BFS: transitively mark every young object reachable from a root.
         while let Some(obj_ptr) = worklist.pop() {
             // SAFETY: `obj_ptr` was validated by `mark_young` before being
@@ -3338,6 +3370,7 @@ impl GenerationalHeap {
         if selective_on {
             let is_y = |a: usize| -> bool { a >= from_base && a < from_end && (a & 0x7) == 0 };
 
+            // (1) Pin set: every root / finalizer value that lands in young.
             // (1) Pin set: every root / finalizer value that lands in young.
             let mut pinned: FxHashSet<usize> = FxHashSet::default();
             for r in roots.iter() {
@@ -5008,9 +5041,13 @@ impl GenerationalHeap {
     ) {
         // Drain the O(dirty) tracking list rather than scanning the whole
         // bitmap with `dirty_card_indices()` — this is O(dirty) instead of
-        // O(total cards). `take_dirty_cards` also clears the tracking list,
-        // which is fine because `card_table.clear_all()` is called by the
-        // caller right after the dirty-card scan completes.
+        // O(total cards). `take_dirty_cards` clears BOTH the tracking list and
+        // the consumed cards' bitmap bytes (CARD_CLEAN), keeping the two in
+        // sync. This matters for the NON-MOVING sweep, which (unlike the moving
+        // path) never calls `clear_all()`: without the byte reset, the sweep's
+        // re-dirty of surviving old→young edges would no-op and the edge would
+        // be lost on the next GC (see `CardTable::take_dirty_cards` docs — the
+        // bt18 premature-reclamation fix).
         let mut dirty_indices = card_table.take_dirty_cards();
         if dirty_indices.is_empty() {
             return;
