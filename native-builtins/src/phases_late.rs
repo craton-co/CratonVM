@@ -12595,6 +12595,21 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     let jf = "java/util/jar/JarFile";
     r.register(jf, "<init>", "(Ljava/lang/String;)V", p59_jar_file_init);
     r.register(jf, "<init>", "(Ljava/io/File;)V", p59_jar_file_init_file);
+    // File-first overloads. `p59_jar_file_init_file` only reads args[1] (the
+    // File) and ignores the rest, so the verify/mode/Runtime.Version variants
+    // route through it unchanged. The 4-arg multi-release constructor
+    // `JarFile(File, boolean, int, Runtime.Version)` is the one Tomcat's
+    // AbstractArchiveResourceSet.openJarFile uses; without this it fell through
+    // to real ZipFile bytecode and failed with "ZipException: zip file is empty"
+    // (whole catalina.webresources JAR cluster).
+    r.register(jf, "<init>", "(Ljava/io/File;Z)V", p59_jar_file_init_file);
+    r.register(jf, "<init>", "(Ljava/io/File;ZI)V", p59_jar_file_init_file);
+    r.register(
+        jf,
+        "<init>",
+        "(Ljava/io/File;ZILjava/lang/Runtime$Version;)V",
+        p59_jar_file_init_file,
+    );
     r.register(
         jf,
         "getManifest",
