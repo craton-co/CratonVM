@@ -5797,10 +5797,26 @@ fn constructor_descriptor_for_new_instance(
     }
 
     if composed == "()V" {
-        if let Value::Object(Some(dm)) = ctx.get_field_by_name(ctor_obj, "clazz") {
-            if let Some(cid) = mirror_class_id(ctx, dm) {
-                if let Some(d) = unique_public_init_descriptor(ctx, cid) {
-                    return d;
+        // `compose_…` yields "()V" for BOTH a genuine no-arg constructor
+        // (present-but-empty `parameterTypes`) and a read-FAILURE (the field
+        // layout mismatch case this fallback targets). Only recover via the
+        // unique public `<init>` when `parameterTypes` was actually unreadable
+        // — otherwise `newInstance()` on a class's real no-arg constructor
+        // wrongly adopts the parameter list of its (unique public) OTHER
+        // constructor. Hibernate instantiates entities via the no-arg ctor, so
+        // any entity that also declares a unique public ctor (e.g. the
+        // `keymanytoone` `Card(String)`, composite-id `$PK`, enum-mapped
+        // entities) failed with "wrong number of arguments: expected 1, got 0".
+        let param_types_readable = matches!(
+            ctx.get_field_by_name(ctor_obj, "parameterTypes"),
+            Value::Object(Some(_))
+        );
+        if !param_types_readable {
+            if let Value::Object(Some(dm)) = ctx.get_field_by_name(ctor_obj, "clazz") {
+                if let Some(cid) = mirror_class_id(ctx, dm) {
+                    if let Some(d) = unique_public_init_descriptor(ctx, cid) {
+                        return d;
+                    }
                 }
             }
         }
@@ -9483,6 +9499,22 @@ pub(crate) fn native_class_get_package(
     write_optional(ctx, 4, "implTitle", impl_title);
     write_optional(ctx, 5, "implVersion", impl_version);
     write_optional(ctx, 6, "implVendor", impl_vendor);
+    // Wire the Package's `module` from the class's own module so the *real*
+    // `Package.getDeclaredAnnotations()` bytecode works. That JDK body does
+    // `packageInfo()` -> `module().getClassLoader()`; with a null module it
+    // throws `NullPointerException: Cannot invoke getClassLoader on null`,
+    // which aborted EVERY `orm.xml`/mapping-document parse (glassfish JAXB's
+    // `RuntimeInlineAnnotationReader.getPackageAnnotation` reads the package's
+    // `@XmlSchema`). With the module set, `packageInfo()` resolves the
+    // (usually absent) `<pkg>.package-info` -> sentinel -> `[]`, matching
+    // HotSpot. `Class.getModule()` already returns a valid (unnamed) module.
+    let module_val = match ctx.invoke_virtual(this, "getModule", "()Ljava/lang/Module;", &[]) {
+        Ok(Some(v @ Value::Object(Some(_)))) => v,
+        _ => Value::Object(None),
+    };
+    if matches!(module_val, Value::Object(Some(_))) {
+        ctx.set_field_by_name(pkg, "module", module_val);
+    }
     Ok(Some(Value::Object(Some(pkg))))
 }
 

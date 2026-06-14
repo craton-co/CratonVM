@@ -54,6 +54,45 @@ fn current_generic_decl() -> Value {
         .unwrap_or(Value::Object(None))
 }
 
+/// Resolve a type-variable USE named `name` to the REAL `TypeVariable` object
+/// declared by `decl` (a `Class`/`Method`/`Constructor` mirror) via its
+/// `getTypeParameters()`. The returned object is the same
+/// `sun.reflect…TypeVariableImpl` reflection hands out elsewhere, so a resolver
+/// substituting the variable across a hierarchy sees identity equality (as on
+/// HotSpot). Returns `None` when `decl` declares no parameter of that name
+/// (the variable belongs to an outer scope) — the caller falls back to a
+/// synthetic stand-in. `getTypeParameters()` runs the real JDK reflection
+/// (it returns real `TypeVariableImpl`s), so this does not re-enter the
+/// signature converter.
+fn resolve_declared_type_variable(
+    ctx: &mut dyn NativeContext,
+    decl: ObjectRef,
+    name: &str,
+) -> Option<Value> {
+    let arr = match ctx.invoke_virtual(
+        decl,
+        "getTypeParameters",
+        "()[Ljava/lang/reflect/TypeVariable;",
+        &[],
+    ) {
+        Ok(Some(Value::Object(Some(a)))) => a,
+        _ => return None,
+    };
+    let len = ctx.array_length(arr);
+    for i in 0..len {
+        if let Value::Object(Some(tv)) = ctx.get_array_element(arr, i) {
+            let tv_name = match ctx.get_field_by_name(tv, "name") {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            };
+            if tv_name.as_deref() == Some(name) {
+                return Some(Value::Object(Some(tv)));
+            }
+        }
+    }
+    None
+}
+
 // Re-export the AST + parser entry points so existing callers can keep
 // importing from `crate::generics::...`. Internally everything routes
 // through `cratonvm_reader::signature`.
@@ -162,11 +201,25 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             Value::Object(Some(pt))
         }
         TypeSig::TypeVar(name) => {
-            // TypeVariable: field 0 = name (String), field 1 = bounds (Type[]),
-            // field 2 = genericDeclaration (Class/Executable, null here — a
-            // type-variable *use* in a signature has no resolvable declaration
-            // site). Always 3 fields so the `getGenericDeclaration` native's
-            // slot-2 read is in bounds for every TypeVariable instance.
+            // A type-variable USE (`T` inside `ConstraintValidator<Max, T>`)
+            // refers to a type parameter DECLARED by the enclosing generic
+            // declaration. Resolve it to that declaration's REAL type-parameter
+            // object (the same `sun.reflect…TypeVariableImpl` that
+            // `getTypeParameters()` returns) so it is identity-equal to it,
+            // exactly as on HotSpot. A synthetic stand-in compares unequal to
+            // the real `TypeVariableImpl` and breaks any resolver that
+            // substitutes the variable across a class hierarchy — Hibernate
+            // Validator then fails to discover a constraint's validated type
+            // (`HV000030 No validator found` / `HV000150 multiple validators`).
+            if let Value::Object(Some(decl)) = current_generic_decl() {
+                if let Some(real) = resolve_declared_type_variable(ctx, decl, name) {
+                    return real;
+                }
+            }
+            // Fallback (no resolvable declaration in scope): synthetic
+            // TypeVariable — field 0 = name, field 1 = bounds (Type[]),
+            // field 2 = genericDeclaration. Always 3 fields so the
+            // `getGenericDeclaration` native's slot-2 read is in bounds.
             let tv = alloc_concurrent_synthetic(ctx, "java/lang/reflect/TypeVariable", 3);
             let name_str = ctx.create_string(name);
             ctx.set_field(tv, 0, Value::Object(Some(name_str)));
