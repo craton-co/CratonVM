@@ -7442,7 +7442,7 @@ fn execute_instruction(
             // raw bits; a later `to_value()` decodes those bits as
             // `Value::Double`, silently corrupting the long on every read.
             let desc_byte =
-                resolve_field_descriptor_byte(shared, current_class_id, *index);
+                Some(field.desc_byte);
             if let Some(ref fname) = field_name_for_intercept {
                 if fname == "out" || fname == "err" {
                     // Honor System.setOut/setErr: a user-installed stream wins
@@ -7537,7 +7537,7 @@ fn execute_instruction(
             // then re-encodes as a double on the next push — silently
             // corrupting every J/D static.
             let desc_byte =
-                resolve_field_descriptor_byte(shared, current_class_id, *index);
+                Some(field.desc_byte);
             let value = pop_static_field_value(
                 &mut thread.frames[frame_idx].stack,
                 desc_byte,
@@ -7665,7 +7665,7 @@ fn execute_instruction(
             // byte of the descriptor from the constant pool to choose the
             // direct CompactValue push path for J/D.  Two field loads — no
             // hashmap work on the fast path.
-            let desc_byte = resolve_field_descriptor_byte(shared, current_class_id, *index);
+            let desc_byte = Some(field.desc_byte);
             // T17.Δ.4 — JVMTI FieldAccess watchpoint.  Fast path: no
             // watchpoint registered ⇒ one HashMap read returning None.
             {
@@ -7769,6 +7769,11 @@ fn execute_instruction(
         }
         Instruction::Putfield(index) => {
             let current_class_id = thread.frames[frame_idx].class_id;
+            // Resolve the field early (cached) so its descriptor byte is in hand
+            // for the tag-exact value pop below. resolve_field_ref is
+            // stack-neutral, and surfacing a resolution error here (before the
+            // value/objectref pop) is spec-compliant for putfield.
+            let field = resolve_field_ref(shared, current_class_id, *index)?;
             // K2 (T10.9.E) — tag-exact pop for category-2 primitives.
             //
             // The stack top before putfield is [..., objectref, value] (with
@@ -7785,7 +7790,7 @@ fn execute_instruction(
             // panicking, matching the defensive pop_int/pop_long convention
             // in value_stack.rs; a truly bogus upstream producer is already
             // flagged by the verifier.
-            let desc_byte = resolve_field_descriptor_byte(shared, current_class_id, *index);
+            let desc_byte = Some(field.desc_byte);
             let value: Value = match desc_byte {
                 Some(b'J') => {
                     // Kinds-aware bit-exact pop: a slot marked KIND_LONG (the
@@ -7874,7 +7879,6 @@ fn execute_instruction(
                 }
             }
             let obj_ref = obj_ref?;
-            let field = resolve_field_ref(shared, current_class_id, *index)?;
             // Gated diagnostic (CRATONVM_DBG_FIELDADDR): trace put for specific
             // fields — object address + resolved slot — to localize a write
             // that doesn't reach the read site.
@@ -9891,6 +9895,7 @@ fn resolve_field_ref(
                         is_static,
                         is_volatile: f.is_volatile(),
                         is_reference: is_ref,
+                        desc_byte: f.descriptor.as_bytes().first().copied().unwrap_or(0),
                     });
                     break;
                 }
@@ -9913,7 +9918,7 @@ fn resolve_field_ref(
     }
 
     // Walk the superclass chain for inherited fields
-    let (idx, is_static, is_volatile, declaring_id, is_ref) = {
+    let (idx, is_static, is_volatile, declaring_id, is_ref, desc_byte) = {
         let cm = shared.class_manager.read();
         let (field_idx, field, decl_id) =
             find_field_recursive(field_class_id, &field_name, &cm.class_store).ok_or_else(
@@ -9932,7 +9937,8 @@ fn resolve_field_ref(
 
         // Extract what we need before dropping the lock
         let is_ref = field.descriptor.starts_with('L') || field.descriptor.starts_with('[');
-        (field_idx, field.is_static(), field.is_volatile(), decl_id, is_ref)
+        let desc_byte = field.descriptor.as_bytes().first().copied().unwrap_or(0);
+        (field_idx, field.is_static(), field.is_volatile(), decl_id, is_ref, desc_byte)
     };
 
     let resolved = ResolvedField {
@@ -9941,6 +9947,7 @@ fn resolve_field_ref(
         is_static,
         is_volatile,
         is_reference: is_ref,
+        desc_byte,
     };
     if std::env::var("CRATON_FIELD_TRACE").is_ok() && !is_static {
         let cm = shared.class_manager.read();
@@ -9996,36 +10003,6 @@ pub fn resolve_field_name(shared: &SharedVm, class_id: ClassId, cp_index: u16) -
             .constant_pool
             .get_name_and_type(*name_and_type_index)?;
         Some(name.to_string())
-    } else {
-        None
-    }
-}
-
-/// Extract the first byte of the field descriptor from a constant pool
-/// FieldReference — e.g. `b'J'` for a long, `b'D'` for a double, `b'I'`
-/// for an int, `b'L'` or `b'['` for a reference.
-///
-/// Used by getfield/putfield (K2) to choose the tag-exact CompactValue
-/// push/pop path for category-2 primitives (J/D).  Without this, the
-/// default `Value`-boundary coercion drops the long tag for zero-init
-/// slots, causing "expected long on stack, got <uninitialized>" bugs
-/// observed on the KC26 boot path.
-fn resolve_field_descriptor_byte(
-    shared: &SharedVm,
-    class_id: ClassId,
-    cp_index: u16,
-) -> Option<u8> {
-    let cm = shared.class_manager.read();
-    let class = cm.get_class(class_id)?;
-    if let Some(ConstantPoolEntry::FieldReference {
-        name_and_type_index,
-        ..
-    }) = class.constant_pool.get(cp_index)
-    {
-        let (_name, descriptor) = class
-            .constant_pool
-            .get_name_and_type(*name_and_type_index)?;
-        descriptor.as_bytes().first().copied()
     } else {
         None
     }
