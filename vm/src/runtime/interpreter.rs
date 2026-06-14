@@ -1329,14 +1329,24 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
         // `Frame::scan_local_objects` was already cleaned to drop the
         // pointer-shaped-Long heuristic; the operand-stack scanner is
         // restricted from edits, so filter at the boundary instead.
-        if snapshot.len() > before {
-            let added = snapshot.split_off(before);
-            for o in added {
-                let addr = o.as_ptr() as usize;
-                if shared.heap.is_object_address(addr).is_some() {
-                    snapshot.push(o);
+        //
+        // Done IN PLACE (compact valid entries down over the invalid ones,
+        // then truncate) rather than `split_off` — `update_root_snapshot` runs
+        // on every object-returning native call (tens of millions during an
+        // embedded-server deploy), and the old `split_off` allocated a fresh
+        // Vec for every frame that had operand-stack objects. The in-place
+        // retain is allocation-free and keeps identical semantics.
+        let len = snapshot.len();
+        if len > before {
+            let mut write = before;
+            for read in before..len {
+                let o = snapshot[read];
+                if shared.heap.is_object_address(o.as_ptr() as usize).is_some() {
+                    snapshot[write] = o;
+                    write += 1;
                 }
             }
+            snapshot.truncate(write);
         }
     }
     snapshot.extend(thread.native_pin_roots.iter().copied());
