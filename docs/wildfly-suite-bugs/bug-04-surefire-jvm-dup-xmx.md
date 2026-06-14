@@ -39,15 +39,51 @@ runs; the Surefire fork progresses past argument parsing (exit 2 → the fork st
 CratonVM's `-jar <jar> <args>` + `System.exit(0)` handshake also confirmed clean
 (rc=0, output flushed).
 
-## Remaining (open, deeper)
-After the arg fix the Surefire fork now exits **1** (was 2) — i.e. CratonVM parses
-the full arg set and starts the `surefirebooter.jar`, but the
-`org.apache.maven.surefire.booter.ForkedBooter` exits 1 during init (`Tests run: 0`,
-no `.dumpstream` written, so no fork output was captured). Basic `-jar`+`System.exit`
-works, so this is a booter-specific runtime gap (candidate: `ProcessHandle`-based
-parent-liveness `PpidChecker`, or a provider class CratonVM can't load). Diagnosing
-needs the fork's own stderr (the Surefire temp booter jar + prop files are deleted
-on exit — capture them before cleanup, or run the booter manually).
+## Layer 2 — Surefire ForkedBooter runs fine; managed-container start fails
+After the dup-`-Xmx` fix the fork starts but exits **1**. Diagnosed by capturing the
+Surefire temp booter jar + prop files mid-run (they're `deleteOnExit`-ed) and running
+the `surefirebooter.jar` directly under CratonVM:
+- The thin booter jar's manifest `Class-Path:` (relative `../../../../.m2/...`) is
+  resolved correctly **once the jar is at the original directory depth** (CratonVM's
+  `-jar` manifest Class-Path support works — a first manual run failed only because
+  the captured jar was moved, breaking the relative paths).
+- CratonVM then **successfully runs ForkedBooter → JUnit Platform → Arquillian** and
+  reaches managed-container startup, where it throws:
+  ```
+  IllegalArgumentException: WFLYLNCHR0003: Invalid directory, could not find
+  'jboss-modules.jar' in 'C:\craton\…\smoke/target/wildfly'
+  ```
+  …though `jboss-modules.jar` **exists** there.
+
+## Layer 3 (root blocker, open) — CratonVM native `Path` uses UNIX separator semantics
+CratonVM presents as Windows (`os.name=Windows 11`, `file.separator=\`), but its
+`java.nio.file.Path` natives delegate to Rust `std::path`, which in this build uses
+**UNIX** semantics (`MAIN_SEPARATOR='/'`: `/` splits, `\` is an ordinary char). So
+Windows-style paths mis-parse. Measured ([`SepTest`](../../wildfly-suite/repro/SepTest.java),
+[`MixedSep2`](../../wildfly-suite/repro/MixedSep2.java)):
+
+| input | op | HotSpot | CratonVM |
+|-------|----|---------|----------|
+| `aa\bb\cc` | `getNameCount` | 3 | **1** |
+| `C:\x\y/z/w` | `normalize` | `C:\x\y\z\w` | `C:\x\y/z/w` |
+| `…smoke/target/wildfly` (mixed) | `getNameCount` | 9 | **3** |
+| `…smoke/target/wildfly` | `toAbsolutePath().normalize()` | `C:\…\wildfly` | **`/?/C:/…/wildfly`** (mangled) |
+
+WildFly's `Environment.validateWildFlyDir` does `home.toAbsolutePath().normalize()`
+on the mixed-separator `jboss.dist` → CratonVM mangles it → `Files.notExists(...)` →
+the bogus "invalid directory".
+
+**Fix direction (dedicated work, not a one-liner):** CratonVM's `Path` natives
+(`getNameCount`, `getName`, `getParent`, `getRoot`, `isAbsolute`, `normalize`,
+`toAbsolutePath`, `resolve`) must implement **Windows** path semantics when the guest
+is Windows (split on both `/` and `\`, recognise the `X:` drive root) instead of
+delegating to UNIX `std::path`. This is core NIO shared by the whole suite and several
+other apps (with accumulated `/?/` / `/C:/` URI workarounds), so it needs its own
+change + full re-test — deferred rather than rushed here.
+
+Note: even with this fixed, the managed/KRom client path then hits
+[Gap C / bug-03](bug-03-regex-perf-deployment-build.md) (regex too slow to build the
+deployment archive).
 
 ## Note — even fully fixed, Gap C still blocks this path
 The Surefire fork runs the Arquillian **client** under CratonVM, which builds the

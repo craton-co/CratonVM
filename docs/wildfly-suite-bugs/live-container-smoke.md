@@ -35,11 +35,16 @@ java.exe -version  ->  error: unexpected argument '-v' found
 Surefire forks the test JVM with `java -jar/-cp -Dprop -X… org.apache.maven.surefire.booter.ForkedBooter …`;
 CratonVM rejects those args and exits, so Surefire reports
 `The forked VM terminated without properly saying goodbye. VM crash or System.exit called?`.
-**Update:** the `java` bin already normalizes most JDK single-dash args; the real blocker was
-that Surefire passes `-Xmx512m` **twice** and clap's single-value `--Xmx` aborted (exit 2).
-**FIXED** in `vm-cli/src/main.rs` via `overrides_with` (last-wins, like `java`) — see
-[bug-04](bug-04-surefire-jvm-dup-xmx.md). The fork now parses + starts; a deeper
-ForkedBooter-init exit-1 remains (and Gap C blocks the path regardless).
+**Update:** three layers (see [bug-04](bug-04-surefire-jvm-dup-xmx.md)):
+1. **dup-`-Xmx`** — Surefire passes `-Xmx512m` twice; clap aborted (exit 2). **FIXED**
+   (`vm-cli/src/main.rs`, `overrides_with`). The fork now parses + starts.
+2. CratonVM then **runs the Surefire ForkedBooter → JUnit → Arquillian** fine (the thin
+   booter jar's manifest `Class-Path` resolves).
+3. **Root blocker (open):** CratonVM presents as Windows but its native `java.nio.file.Path`
+   uses Rust **UNIX** separator semantics (`getNameCount("a\b\c")`=1 not 3;
+   `toAbsolutePath().normalize()` mangles a mixed-separator path to `/?/C:/…`), so WildFly's
+   `validateWildFlyDir` rejects a valid `jboss.dist`. Needs a Windows-path-semantics NIO fix
+   (core, shared by the whole suite — deferred, not rushed). Gap C also blocks this path.
 
 ### Gap B — CratonVM client: `NullPointerException: hasMoreElements on null` — **FIXED** ([bug-02](bug-02-zipfile-entries-null.md))
 Bypassing Surefire with the proven per-class `KRun` harness (`cratonvm.exe -cp … KRun`,
