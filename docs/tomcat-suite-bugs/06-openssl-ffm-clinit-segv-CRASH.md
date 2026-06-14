@@ -48,6 +48,24 @@ Two distinct defects likely compound:
 On HotSpot `TestServerInfo` PASSes: the APR/OpenSSL listener degrades gracefully
 when the native library is absent.
 
+## Refined finding (this session) — DEFERRED (deep FFM)
+
+- The SEGV **reproduces with `CRATONVM_DISABLE_JIT=1`** — it is NOT a JIT bug. The
+  "external/jit" frames in the backtrace are mislabeled FFM/libffi trampolines.
+- Root cause confirmed in `native-builtins/src/panama.rs`: `openssl_h`'s FFM
+  binding resolves OpenSSL symbols via `SymbolLookup` (`find` →
+  `find_native_symbol`). Some symbols return Optional.empty() (e.g. `printf` →
+  the null-handle NPE), but at least one resolves to a **valid-looking but
+  wrong-ABI address** (a same-named system symbol), and `Linker.downcallHandle` +
+  the libffi dispatch then **call that bad pointer → native SEGV**.
+  `validated_fn_ptr` only rejects null/misaligned, not "wrong" addresses.
+- A clean fix would require the OpenSSL FFM lookup to consistently FAIL when real
+  OpenSSL isn't present (so `openssl_h` clinit throws cleanly and Tomcat disables
+  OpenSSL, as HotSpot does on a no-OpenSSL box). But CratonVM's symbol resolution
+  finds partial/wrong symbols, and tightening it risks breaking legitimate FFM
+  (the Gradle worker path depends on FFM). So this is **deferred** as a dedicated
+  foreign-function effort, NOT a quick edit.
+
 ## Next steps
 
 - Symbolize the faulting RVA `0x9359DC` and the JIT frames with
