@@ -11246,6 +11246,45 @@ pub fn split_method_descriptor(descriptor: &str) -> (Vec<String>, String) {
     (params, ret)
 }
 
+/// Non-allocating equivalent of `split_method_descriptor(d).0[n].as_bytes().first()`:
+/// the FIRST byte of the n-th parameter's descriptor token (`b'['` for arrays —
+/// byte-identical to the old closures, and `decode_by_descriptor` treats `b'['`
+/// as a reference). The warm call-dispatch arms only ever need this tag byte (to
+/// pick the category-2 long/double pop path), so they previously paid a per-call
+/// `Vec<String>` + per-param `String` allocation in `split_method_descriptor`
+/// purely to read one byte each. Returns `b'L'` when `n` is out of range (the
+/// arms' existing default). Tokenization mirrors `split_method_descriptor`.
+fn nth_param_tag_byte(descriptor: &str, n: usize) -> u8 {
+    let bytes = descriptor.as_bytes();
+    let mut i = 1; // skip '('
+    let mut idx = 0;
+    while i < bytes.len() && bytes[i] != b')' {
+        let tag = bytes[i]; // first byte of this token ('[' for arrays)
+        while i < bytes.len() && bytes[i] == b'[' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        match bytes[i] {
+            b'L' => {
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                i += 1; // consume ';'
+            }
+            _ => {
+                i += 1; // single-char primitive
+            }
+        }
+        if idx == n {
+            return tag;
+        }
+        idx += 1;
+    }
+    b'L'
+}
+
 /// Unbox a boxed primitive wrapper object into its primitive `Value`.
 /// Returns the original value unchanged if it's not a recognized wrapper.
 fn unbox_wrapper(shared: &SharedVm, prim_char: char, v: Value) -> Value {
@@ -13623,13 +13662,7 @@ fn execute_invokestatic_cached(
             // way. See docs/bc-ec-mod-mododdinverse-investigation.md.
             const MAX_INLINE_ARGS: usize = 16;
             let num_params = cached.num_params as usize; // Widening: parameter count conversion
-            let (param_descs, _) = split_method_descriptor(&cached.method_descriptor);
-            let pd_byte = |i: usize| -> u8 {
-                param_descs
-                    .get(i)
-                    .and_then(|s| s.as_bytes().first().copied())
-                    .unwrap_or(b'L')
-            };
+            let pd_byte = |i: usize| -> u8 { nth_param_tag_byte(&cached.method_descriptor, i) };
             let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
             let mut args_vec: Vec<Value> = Vec::new();
             let args_slice: &[Value] = if num_params <= MAX_INLINE_ARGS {
@@ -16132,7 +16165,6 @@ fn execute_jit_call(
     //     the prior unconditional `to_value()` as `Value::Int`, truncating to
     //     the low 32 bits. `decode_by_descriptor(b'J')` reinterprets the raw
     //     i64 bit-exact. See docs/bc-ec-mod-mododdinverse-investigation.md.
-    let (param_descs, _) = split_method_descriptor(&cached.method_descriptor);
     let is_static = cached.is_static;
     // Save the raw popped slots (bit-exact + long mark) so the i64::MIN deopt
     // arm below can restore them before the slow path re-pops the args. See
@@ -16143,17 +16175,11 @@ fn execute_jit_call(
         let (cv, is_long) = thread.frames[frame_idx].stack.pop_compact_with_long_mark_unchecked();
         saved_args[i] = (cv, is_long);
         let desc_byte = if is_static {
-            param_descs
-                .get(i)
-                .and_then(|s| s.as_bytes().first().copied())
-                .unwrap_or(b'L')
+            nth_param_tag_byte(&cached.method_descriptor, i)
         } else if i == 0 {
             b'L' // receiver
         } else {
-            param_descs
-                .get(i - 1)
-                .and_then(|s| s.as_bytes().first().copied())
-                .unwrap_or(b'L')
+            nth_param_tag_byte(&cached.method_descriptor, i - 1)
         };
         let v = decode_arg_kind_aware(cv, is_long, desc_byte);
         jit_args[i] = match v {
@@ -16765,15 +16791,11 @@ fn execute_invokevirtual_vtable_fast(
     // category-2 long arg whose NaN-box bit pattern collides with a tagged
     // sub-tag (BC safegcd 0xFFFC_… accumulators). See
     // docs/bc-ec-mod-mododdinverse-investigation.md.
-    let (param_descs, _) = split_method_descriptor(&entry_cached.method_descriptor);
     let arg_desc_byte = |i: usize| -> u8 {
         if i == 0 {
             b'L'
         } else {
-            param_descs
-                .get(i - 1)
-                .and_then(|s| s.as_bytes().first().copied())
-                .unwrap_or(b'L')
+            nth_param_tag_byte(&entry_cached.method_descriptor, i - 1)
         }
     };
     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
@@ -16996,16 +17018,11 @@ fn execute_invokevirtual_cached(
                     // = 'L'); pop_unchecked()/to_value() dropped the high bits
                     // of collision-pattern long args. See
                     // docs/bc-ec-mod-mododdinverse-investigation.md.
-                    let (param_descs, _) =
-                        split_method_descriptor(&cached.method_descriptor);
                     let arg_desc_byte = |i: usize| -> u8 {
                         if i == 0 {
                             b'L'
                         } else {
-                            param_descs
-                                .get(i - 1)
-                                .and_then(|s| s.as_bytes().first().copied())
-                                .unwrap_or(b'L')
+                            nth_param_tag_byte(&cached.method_descriptor, i - 1)
                         }
                     };
                     let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];
@@ -17274,15 +17291,11 @@ fn execute_invokevirtual_cached(
             // Decode args bit-exact via parameter descriptors (receiver = 'L');
             // pop_unchecked()/to_value() dropped the high bits of collision-
             // pattern long args. See docs/bc-ec-mod-mododdinverse-investigation.md.
-            let (param_descs, _) = split_method_descriptor(&cached.method_descriptor);
             let arg_desc_byte = |i: usize| -> u8 {
                 if i == 0 {
                     b'L'
                 } else {
-                    param_descs
-                        .get(i - 1)
-                        .and_then(|s| s.as_bytes().first().copied())
-                        .unwrap_or(b'L')
+                    nth_param_tag_byte(&cached.method_descriptor, i - 1)
                 }
             };
             let mut args_buf = [Value::Uninitialized; MAX_INLINE_ARGS];

@@ -525,6 +525,23 @@ fn jit_scan_cache_enabled() -> bool {
     })
 }
 
+/// Cached `CRATONVM_DBG_NO_PRUNE` gate. `scan_active_jit_frames` runs on every
+/// object-returning native call (via `update_root_snapshot`); the previous
+/// uncached `env::var_os` was a `GetEnvironmentVariableW` syscall per native
+/// call — a kernel transition on the hottest dispatch path. Cached once.
+fn dbg_no_prune() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_NO_PRUNE").is_some())
+}
+
+/// Cached `CRATONVM_DBG_FULLSTACK_SCAN` gate (Windows-only diagnostic), same
+/// per-native-call hot-path rationale as [`dbg_no_prune`].
+#[cfg(target_os = "windows")]
+fn dbg_fullstack_scan() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_FULLSTACK_SCAN").is_some())
+}
+
 /// Returns true if any thread anywhere in the process is currently inside a
 /// JIT call. Used by the GC to decide whether compaction is safe.
 #[inline]
@@ -586,7 +603,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // outside the JIT chain's bounds (a range bug); if corruption persists,
     // the missed root is not on the stack at all. Validated by is_object_address.
     #[cfg(target_os = "windows")]
-    if std::env::var_os("CRATONVM_DBG_FULLSTACK_SCAN").is_some() {
+    if dbg_fullstack_scan() {
         let high = current_thread_stack_high();
         if high > scanner_sp {
             scan_one_frame(scanner_sp, high, heap, out);
@@ -601,7 +618,7 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // pruned — live frames (entry_sp >= scanner_sp) are always retained.
     // DBG: CRATONVM_DBG_NO_PRUNE disables the self-heal so the leak (and its
     // non-moving-sweep corruption) can be A/B-reproduced in the same binary.
-    if std::env::var_os("CRATONVM_DBG_NO_PRUNE").is_none() {
+    if !dbg_no_prune() {
         let _ = prune_returned_jit_entries(scanner_sp);
     }
     let chain_len = JIT_ENTRY_CHAIN.with(|c| c.borrow().len());
