@@ -742,10 +742,34 @@ fn native_file_init_string_string(ctx: &mut dyn NativeContext, args: &[Value]) -
     let sep = ctx
         .get_system_property("file.separator")
         .unwrap_or_else(|| "/".to_string());
-    let full = format!("{}{}{}", parent, sep, child);
+    let full = join_file_parent_child(&parent, &child, &sep);
     let path_obj = ctx.create_string(&full);
     ctx.set_field(this, 0, Value::Object(Some(path_obj)));
     Ok(None)
+}
+
+/// Resolve `new File(String parent, String child)` the way the JDK's
+/// `WinNTFileSystem`/`UnixFileSystem.resolve` does, rather than a raw
+/// `parent + sep + child` concat. A raw concat produced
+/// `"a/b/c.txt" + "\\" + "" = "a/b/c.txt\\"` (trailing separator → the path no
+/// longer denotes the file, `exists()` false) and `child == "/"` turned into a
+/// stray root — both broke `File`-based resource lookup across the whole
+/// `catalina.webresources` test cluster. Match the JDK: normalise OS separators,
+/// strip a trailing separator from the parent and leading/trailing separators
+/// from the child, and join with one separator (empty child → just the parent).
+fn join_file_parent_child(parent: &str, child: &str, sep: &str) -> String {
+    let is_sep = |c: char| c == '\\' || c == '/';
+    let parent = normalize_for_os(parent.to_string());
+    let child = normalize_for_os(child.to_string());
+    let parent_trim = parent.trim_end_matches(is_sep);
+    let child_trim = child.trim_matches(is_sep);
+    if child_trim.is_empty() {
+        parent_trim.to_string()
+    } else if parent_trim.is_empty() {
+        format!("{sep}{child_trim}")
+    } else {
+        format!("{parent_trim}{sep}{child_trim}")
+    }
 }
 
 fn native_file_init_file_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -769,7 +793,7 @@ fn native_file_init_file_string(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let sep = ctx
         .get_system_property("file.separator")
         .unwrap_or_else(|| "/".to_string());
-    let full = format!("{}{}{}", parent_path, sep, child);
+    let full = join_file_parent_child(&parent_path, &child, &sep);
     let path_obj = ctx.create_string(&full);
     ctx.set_field(this, 0, Value::Object(Some(path_obj)));
     Ok(None)
@@ -8319,7 +8343,26 @@ fn native_files_copy(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
         _ => String::new(),
     };
     let dst = validated_path(&dst)?;
-    std::fs::copy(&src, &dst).map_err(io_err)?;
+    // Java `Files.copy(Path,Path,CopyOption...)` semantics: copying a DIRECTORY
+    // creates an (empty) directory at the target — it does NOT open the source
+    // as a file. `std::fs::copy` only handles regular files; on a directory it
+    // fails ("Access denied / os error 5" on Windows, because it opens the dir
+    // for reading), which broke every `TomcatBaseTest.recursiveCopy` (the whole
+    // `catalina.webresources` cluster — `preVisitDirectory` does
+    // `Files.copy(dir, …)`). Branch on the source kind; be lenient if the target
+    // dir already exists, mirroring the file path's overwrite behaviour.
+    let src_is_dir = std::fs::symlink_metadata(&src)
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    if src_is_dir {
+        match std::fs::create_dir(&dst) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(io_err(e)),
+        }
+    } else {
+        std::fs::copy(&src, &dst).map_err(io_err)?;
+    }
     Ok(args.get(1).copied())
 }
 
