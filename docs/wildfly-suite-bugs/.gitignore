@@ -1,0 +1,3 @@
+# Build/run logs are large and machine-specific — not committed
+*.log
+*.log.err
