@@ -81,18 +81,40 @@ vs `\`, CratonVM's existing internal convention). No suite regression on sampled
 `std::path` — `getNameCount("a\\b\\c")=1` vs 3 — but those aren't on WildFly's launcher
 path; left as follow-up.)
 
-## Layer 4 (open) — `java.net.ServerSocket.getImpl` NPE on the managed-container port check
-With Layer 3 fixed, the managed container starts up, provisions the server config
-(`Copying resources … to target\wildfly\standalone\configuration`), and reaches its
-port-availability check, where CratonVM throws:
+## Layer 4 — `ServerSocket.setReuseAddress` NPE on the managed-container port check — FIXED
+With Layer 3 fixed, the managed container provisions the server config and reaches its
+port-availability check (`isPortAvailable` → `new ServerSocket(port); setReuseAddress(true)`),
+where CratonVM threw:
 ```
 NullPointerException: monitorenter in java/net/ServerSocket.getImpl pc=14
-  at CommonManagedDeployableContainer.isPortAvailable / waitOnPorts
+  at ServerSocket.setReuseAddress(773) at ServerSocket.getImpl(249)
 ```
-i.e. `ServerSocket.getImpl()`'s synchronized block has a null monitor (the `impl`/lock
-is not initialised by CratonVM's `ServerSocket` natives). A separate CratonVM bug — the
-next blocker on this path. (And [Gap C / bug-03](bug-03-regex-perf-deployment-build.md)
-— the slow deployment-archive build — still gates the eventual deploy.)
+**Root cause:** CratonVM's synthetic `java.net.ServerSocket` surface registers
+`<init>`/`bind`/`accept`/… but **not** `setReuseAddress`, so that call fell through to
+real JDK bytecode → `getImpl()` does `synchronized (this.socketLock)` (JDK 25,
+`getImpl` pc 8-13) on a `socketLock` the synthetic `<init>` never initialises → NPE.
+
+**Fix** (`native-builtins/src/net_phase_e.rs`): service `setReuseAddress`/`getReuseAddress`
+directly as no-ops on both `ServerSocket` and `DatagramSocket` (the synthetic stubs do
+not model SO_REUSEADDR; `isPortAvailable` calls both). Verified ([`SS3`](../../wildfly-suite/repro/SS3.java)):
+`new ServerSocket(0).setReuseAddress(true)` and the `DatagramSocket` equivalent now
+succeed. End-to-end, the managed container **passes the port check** and proceeds to
+launch the server.
+
+## Layer 5 (open) — `ProcessBuilder.start` rejects the quoted java path
+With Layer 4 fixed, the managed container builds the standalone-server command and
+launches it via `ProcessBuilder.start`, which fails:
+```
+IOException: ProcessBuilder.start failed:
+  program="\"C:\Program Files\Eclipse Adoptium\…\bin\java\"" : os error 123 (ERROR_INVALID_NAME)
+```
+CratonVM passes the program path **with literal surrounding double-quotes** to the OS
+`CreateProcess`, which treats the quotes as part of the filename (Windows error 123).
+The launcher quotes the space-containing java path; CratonVM's `ProcessBuilder.start`
+native should hand the program name to the OS **unquoted** (the OS API takes the program
+and args separately). The next blocker on this path. (And
+[Gap C / bug-03](bug-03-regex-perf-deployment-build.md) — the slow deployment-archive
+build — still gates the eventual deploy.)
 
 ## Note — even fully fixed, Gap C still blocks this path
 The Surefire fork runs the Arquillian **client** under CratonVM, which builds the

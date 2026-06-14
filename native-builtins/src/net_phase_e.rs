@@ -2152,6 +2152,18 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(re2_accept_timeout_for(lid))))
     });
 
+    // setReuseAddress / getReuseAddress: the synthetic `ServerSocket` has no
+    // real `SocketImpl`, so the JDK bytecode for these (`getImpl().setOption(
+    // SO_REUSEADDR, …)`) would NPE — `getImpl()` does `synchronized
+    // (socketLock)` on a `socketLock` the synthetic `<init>` never initialises
+    // (`NullPointerException: monitorenter in ServerSocket.getImpl`). This bites
+    // WildFly's managed-container port check (`isPortAvailable` →
+    // `new ServerSocket(port)` then `setReuseAddress(true)`). Service them as
+    // no-ops: the stub listener does not model SO_REUSEADDR. Default to the
+    // common `ServerSocket` value (true) for the getter.
+    r.register(ss, "setReuseAddress", "(Z)V", |_ctx, _args| Ok(None));
+    r.register(ss, "getReuseAddress", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
+
     r.register(ss, "close", "()V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let lid = ss_get(this).listener_id;
@@ -4965,6 +4977,14 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(ctx.get_field(this, DS_TIMEOUT)))
     });
+
+    // Same rationale as the `ServerSocket` setReuseAddress no-op: the synthetic
+    // `DatagramSocket` has no real impl, so the JDK `setReuseAddress` bytecode
+    // would NPE on uninitialised socket state. WildFly's `isPortAvailable` calls
+    // `new DatagramSocket(port); setReuseAddress(true)` right after the
+    // ServerSocket check.
+    r.register(ds, "setReuseAddress", "(Z)V", |_ctx, _args| Ok(None));
+    r.register(ds, "getReuseAddress", "()Z", |_ctx, _args| Ok(Some(Value::Int(1))));
 }
 
 // ===========================================================================
