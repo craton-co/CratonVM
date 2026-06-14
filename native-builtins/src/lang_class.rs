@@ -2063,6 +2063,21 @@ pub(crate) fn native_class_get_superclass(ctx: &mut dyn NativeContext, args: &[V
             return Ok(Some(Value::Object(None)));
         }
     };
+    // Synthetic lambda proxies (class id >= 0x8000_0000) are not in the class
+    // store, so `superclass_of` returns None → a null superclass. But a lambda's
+    // concrete runtime class extends Object; real JVMs never report a null
+    // superclass for a concrete (non-interface) class, and Gradle's listener
+    // type-walk does `listener.getClass().getSuperclass().isInterface()` →
+    // "Cannot invoke isInterface on null" (SB-14). Return Object.
+    if ctx.lambda_functional_interface(class_id).is_some() {
+        if let Some(obj_id) = ctx.class_id_by_name("java/lang/Object") {
+            let mirror = ctx.get_class_mirror(obj_id);
+            if dbg_bb {
+                eprintln!("[bb-dbg] getSuperclass({}) -> java/lang/Object [lambda]", this_name);
+            }
+            return Ok(Some(Value::Object(Some(mirror))));
+        }
+    }
     // bytebuddy_probe (agent-bb3) — second-line defence: even after name
     // resolution above, if the resolved ClassId IS Object's canonical id,
     // bail out null. This catches the case where `mirror_class_name`
@@ -6862,6 +6877,25 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
             return Ok(Some(Value::Object(Some(arr))));
         }
     };
+
+    // Synthetic lambda proxies aren't in the class store (so `class_interfaces`
+    // is empty), but a lambda's concrete class implements exactly its functional
+    // (SAM) interface. Return `[SAM]` so reflective type/listener matching that
+    // walks `getInterfaces()` finds it (matches HotSpot's `$$Lambda` class).
+    if let Some(iface_name) = ctx.lambda_functional_interface(class_id) {
+        if let Some(iface_id) = ctx.class_id_by_name(&iface_name) {
+            let mirror = ctx.get_class_mirror(iface_id);
+            let elem = ctx
+                .class_id_by_name("java/lang/Class")
+                .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
+            let arr = ctx.new_ref_array(elem, 1);
+            ctx.set_array_element(arr, 0, Value::Object(Some(mirror)));
+            if dbg_bb {
+                eprintln!("[bb-dbg] getInterfaces({}) -> [{}] [lambda]", this_name, iface_name);
+            }
+            return Ok(Some(Value::Object(Some(arr))));
+        }
+    }
 
     let iface_ids = ctx.class_interfaces(class_id);
     if dbg_bb {

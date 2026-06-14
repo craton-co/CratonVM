@@ -6516,7 +6516,13 @@ fn native_collections_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let (data, size) = al_state(ctx, list);
     let data = match data {
         Some(d) => d,
-        None => return Ok(None),
+        // Not an ArrayList-style backing (e.g. a LinkedList overlay, or any
+        // other List): fall back to a generic reverse driven by the list's own
+        // size()/get(int)/set(int,E). Without this, Collections.reverse was a
+        // silent no-op on every non-ArrayList List — e.g. Gradle
+        // GFileUtils.mkdirs reverses a LinkedList of parent dirs, so cache dirs
+        // were created child-before-parent ("… is not a directory").
+        None => return collections_reverse_generic(ctx, list),
     };
     let len = size as usize;
     // Read all elements
@@ -6527,6 +6533,41 @@ fn native_collections_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Write back in reverse
     for (i, val) in elems.iter().rev().enumerate() {
         ctx.set_array_element(data, i, *val);
+    }
+    Ok(None)
+}
+
+/// Generic `Collections.reverse` for any `List` that is not an ArrayList-style
+/// backing: read every element via `get(int)`, then write them back reversed via
+/// `set(int, E)`. Uses the list's own (native or bytecode) methods, so it works
+/// for LinkedList, sublists, etc.
+fn collections_reverse_generic(
+    ctx: &mut dyn NativeContext,
+    list: ObjectRef,
+) -> MethodCallResult {
+    // invoke_virtual dispatches on the receiver's actual class (LinkedList, …).
+    let size = match ctx.invoke_virtual(list, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) => n,
+        _ => return Ok(None),
+    };
+    if size <= 1 {
+        return Ok(None);
+    }
+    let len = size as usize;
+    let mut elems: Vec<Value> = Vec::with_capacity(len);
+    for i in 0..len {
+        let v = ctx
+            .invoke_virtual(list, "get", "(I)Ljava/lang/Object;", &[Value::Int(i as i32)])?
+            .unwrap_or(Value::Object(None));
+        elems.push(v);
+    }
+    for (i, val) in elems.iter().rev().enumerate() {
+        ctx.invoke_virtual(
+            list,
+            "set",
+            "(ILjava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Int(i as i32), *val],
+        )?;
     }
     Ok(None)
 }
@@ -12620,6 +12661,12 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "addFirst", "(Ljava/lang/Object;)V", native_ll_add_first);
     registry.register(c, "addLast", "(Ljava/lang/Object;)V", native_ll_add_last);
     registry.register(c, "get", "(I)Ljava/lang/Object;", native_ll_get);
+    registry.register(
+        c,
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+        native_ll_set,
+    );
     registry.register(c, "getFirst", "()Ljava/lang/Object;", native_ll_get_first);
     registry.register(c, "getLast", "()Ljava/lang/Object;", native_ll_get_last);
     registry.register(
@@ -13237,6 +13284,33 @@ fn native_ll_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     match ll_node_at(ctx, this, index) {
         Some(node) => Ok(Some(ctx.get_field(node, LL_NODE_ELEM))),
+        None => Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into()),
+    }
+}
+
+/// `LinkedList.set(int, E)` — set the element at `index` in the overlay,
+/// returning the previous element. Without this native, the real-JDK
+/// `LinkedList.set` bytecode ran against the never-populated `first`/`last`
+/// fields and silently did nothing — so `Collections.reverse(linkedList)` (which
+/// swaps via `set(i, set(j, get(i)))` for small non-RandomAccess lists) was a
+/// no-op, e.g. Gradle `GFileUtils.mkdirs` creating cache dirs child-before-parent
+/// → "… is not a directory".
+fn native_ll_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    match ll_node_at(ctx, this, index) {
+        Some(node) => {
+            let old = ctx.get_field(node, LL_NODE_ELEM);
+            ctx.set_field(node, LL_NODE_ELEM, new_val);
+            Ok(Some(old))
+        }
         None => Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into()),
     }
 }

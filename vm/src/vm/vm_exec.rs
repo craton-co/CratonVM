@@ -2572,6 +2572,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    fn lambda_functional_interface(&self, class_id: ClassId) -> Option<String> {
+        self.shared
+            .lambda_proxies
+            .read()
+            .get(&class_id)
+            .map(|cs| cs.functional_interface.to_string())
+    }
+
     fn is_subclass(&self, child: ClassId, parent: ClassId) -> bool {
         if self
             .shared

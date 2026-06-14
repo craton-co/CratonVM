@@ -4492,27 +4492,166 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     // declaration: "AbstractMethodError ... has no Code attribute" (Gradle
     // ProjectBuilder file writes in Spring Boot buildSrc
     // GenerateAntoraPlaybookTests / DocumentAutoConfigurationClassesTests).
-    // The JDK contract returns null when the requested view type is not
-    // available — HotSpot on Windows itself returns null for the
-    // PosixFileAttributeView that Gradle's permission handling requests, and
-    // callers are required to handle that. Log the requested view under
-    // CRATONVM_DBG_FSP so unsupported-but-needed views (e.g. basic) surface
-    // during triage instead of silently degrading.
+    //
+    // The JDK contract: `BasicFileAttributeView` is ALWAYS supported, so a
+    // request for it (or the `FileAttributeView` supertype) must return a real
+    // view — NOT null. Returning null for the basic view made Gradle's
+    // `FileMetadataAccessor`/`Stat` treat freshly-created cache dirs (e.g.
+    // `…/userHome/caches/9.5.0`) as "not a directory" → `UncheckedIOException`
+    // → the whole `BuildScopeServices` cascade failed (SB-14). We return a
+    // synthetic `BasicFileAttributeView` holding the Path; its `readAttributes()`
+    // reuses the canonical 5-field BFA builder. Unsupported views (Posix/Dos/…)
+    // still return null, matching HotSpot-on-Windows for those types.
     r.register(
         fsp,
         "getFileAttributeView",
         "(Ljava/nio/file/Path;Ljava/lang/Class;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/FileAttributeView;",
         |ctx, args| {
+            let view_name = obj_arg(args, 2)
+                .ok()
+                .and_then(|m| crate::lang_class::mirror_class_name(ctx, m))
+                .unwrap_or_default();
+            // Basic (+ the generic supertype) is always available; Dos is the
+            // view Gradle's file metadata uses on Windows (and Dos *extends*
+            // Basic). Posix and other views remain null (matching HotSpot on
+            // Windows for those types).
+            let is_dos = view_name.ends_with("DosFileAttributeView");
+            let is_basic = view_name.ends_with("BasicFileAttributeView")
+                || view_name.ends_with("/FileAttributeView")
+                || view_name == "java/nio/file/attribute/FileAttributeView";
+            let supported = is_dos || is_basic;
             if std::env::var("CRATONVM_DBG_FSP").is_ok() {
-                let view = obj_arg(args, 2)
-                    .ok()
-                    .and_then(|m| crate::lang_class::mirror_class_name(ctx, m))
-                    .unwrap_or_else(|| "<unknown>".to_string());
-                eprintln!("[FSP-DBG] getFileAttributeView requested view={view} -> null");
+                eprintln!(
+                    "[FSP-DBG] getFileAttributeView requested view={view_name} -> {}",
+                    if is_dos { "dos-view" } else if is_basic { "basic-view" } else { "null" }
+                );
+            }
+            if !supported {
+                return Ok(Some(Value::Object(None)));
+            }
+            let path_obj = match obj_arg(args, 1) {
+                Ok(p) => p,
+                Err(_) => return Ok(Some(Value::Object(None))),
+            };
+            let vclass = if is_dos {
+                "java/nio/file/attribute/DosFileAttributeView"
+            } else {
+                "java/nio/file/attribute/BasicFileAttributeView"
+            };
+            let view = alloc_concurrent_synthetic(ctx, vclass, 1);
+            ctx.set_field(view, 0, Value::Object(Some(path_obj)));
+            Ok(Some(Value::Object(Some(view))))
+        },
+    );
+
+    // Basic/Dos FileAttributeView.readAttributes() / name() for the synthetic
+    // views returned above. `readAttributes()` reuses the canonical 5-field BFA
+    // builder (same path as `Files.readAttributes`) so `isDirectory()` etc. are
+    // correct; the Dos variant copies those 5 slots into a `DosFileAttributes`.
+    r.register(
+        "java/nio/file/attribute/BasicFileAttributeView",
+        "readAttributes",
+        "()Ljava/nio/file/attribute/BasicFileAttributes;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path_obj = ctx.get_field(this, 0);
+            p59_files_read_attributes(ctx, &[path_obj])
+        },
+    );
+    r.register(
+        "java/nio/file/attribute/BasicFileAttributeView",
+        "name",
+        "()Ljava/lang/String;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("basic"))))),
+    );
+    r.register(
+        "java/nio/file/attribute/DosFileAttributeView",
+        "readAttributes",
+        "()Ljava/nio/file/attribute/DosFileAttributes;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path_obj = ctx.get_field(this, 0);
+            // Compute the basic attrs (5-field: creation,access,mod,isDir,size),
+            // then re-home them into a DosFileAttributes instance.
+            let bfa = p59_files_read_attributes(ctx, &[path_obj])?;
+            if let Some(Value::Object(Some(bfa_obj))) = bfa {
+                let dos = alloc_concurrent_synthetic(
+                    ctx,
+                    "java/nio/file/attribute/DosFileAttributes",
+                    5,
+                );
+                for i in 0..5 {
+                    let v = ctx.get_field(bfa_obj, i);
+                    ctx.set_field(dos, i, v);
+                }
+                return Ok(Some(Value::Object(Some(dos))));
             }
             Ok(Some(Value::Object(None)))
         },
     );
+    r.register(
+        "java/nio/file/attribute/DosFileAttributeView",
+        "name",
+        "()Ljava/lang/String;",
+        |ctx, _args| Ok(Some(Value::Object(Some(ctx.create_string("dos"))))),
+    );
+    // Attribute setters on the views. Gradle marks cache dirs read-only via
+    // `getFileAttributeView(dir, DosFileAttributeView.class).setReadOnly(true)`;
+    // an unregistered setter → AbstractMethodError aborted the cache-dir setup
+    // → the bogus "… is not a directory" leaf (SB-14). No-ops are sufficient
+    // (the JDK call only needs to not throw). `setTimes` applies to both views.
+    for vclass in [
+        "java/nio/file/attribute/BasicFileAttributeView",
+        "java/nio/file/attribute/DosFileAttributeView",
+    ] {
+        r.register(
+            vclass,
+            "setTimes",
+            "(Ljava/nio/file/attribute/FileTime;Ljava/nio/file/attribute/FileTime;Ljava/nio/file/attribute/FileTime;)V",
+            |_ctx, _args| Ok(None),
+        );
+    }
+    for setter in ["setReadOnly", "setHidden", "setSystem", "setArchive"] {
+        r.register(
+            "java/nio/file/attribute/DosFileAttributeView",
+            setter,
+            "(Z)V",
+            |_ctx, _args| Ok(None),
+        );
+    }
+    // DosFileAttributes — same 5-field layout as BasicFileAttributes
+    // (creation=0, lastAccess=1, lastMod=2, isDir=3, size=4) plus the four
+    // DOS-specific flags (all false in this VM).
+    {
+        let dfa = "java/nio/file/attribute/DosFileAttributes";
+        r.register(dfa, "creationTime", "()Ljava/nio/file/attribute/FileTime;", |ctx, args| {
+            let this = obj_arg(args, 0)?; Ok(Some(ctx.get_field(this, 0)))
+        });
+        r.register(dfa, "lastAccessTime", "()Ljava/nio/file/attribute/FileTime;", |ctx, args| {
+            let this = obj_arg(args, 0)?; Ok(Some(ctx.get_field(this, 1)))
+        });
+        r.register(dfa, "lastModifiedTime", "()Ljava/nio/file/attribute/FileTime;", |ctx, args| {
+            let this = obj_arg(args, 0)?; Ok(Some(ctx.get_field(this, 2)))
+        });
+        r.register(dfa, "isDirectory", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?; Ok(Some(ctx.get_field(this, 3)))
+        });
+        r.register(dfa, "isRegularFile", "()Z", |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let is_dir = matches!(ctx.get_field(this, 3), Value::Int(1));
+            Ok(Some(Value::Int(if is_dir { 0 } else { 1 })))
+        });
+        r.register(dfa, "isSymbolicLink", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+        r.register(dfa, "isOther", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+        r.register(dfa, "size", "()J", |ctx, args| {
+            let this = obj_arg(args, 0)?; Ok(Some(ctx.get_field(this, 4)))
+        });
+        r.register(dfa, "fileKey", "()Ljava/lang/Object;", |_ctx, _args| Ok(Some(Value::Object(None))));
+        r.register(dfa, "isReadOnly", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+        r.register(dfa, "isHidden", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+        r.register(dfa, "isArchive", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+        r.register(dfa, "isSystem", "()Z", |_ctx, _args| Ok(Some(Value::Int(0))));
+    }
 
     r.register(fsp, "installedProviders", "()Ljava/util/List;", |ctx, _args| {
         use cratonvm_types::ArrayElementType;
@@ -5307,30 +5446,13 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         "readAttributes",
         "(Ljava/nio/file/Path;Ljava/lang/Class;[Ljava/nio/file/LinkOption;)Ljava/nio/file/attribute/BasicFileAttributes;",
         |ctx, args| {
+            // Delegate to the canonical 5-field BasicFileAttributes builder
+            // (creation=0, lastAccess=1, lastMod=2, isDir=3, size=4). The old
+            // inline build used a 4-field layout (size@0, isDir@1, …) which the
+            // BasicFileAttributes.isDirectory() native — reading slot 3 — saw as
+            // the symlink flag (always 0) → every dir looked like a non-dir.
             let path_obj = obj_arg(args, 1)?;
-            let p = p57_read_path(ctx, path_obj);
-            let attrs = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/BasicFileAttributes", 4);
-            let (size, is_dir, is_file) = match jarfs_decode(&p) {
-                Some((jar, entry)) => match jarfs_classify(&jar, &entry) {
-                    JarFsKind::File => {
-                        let sz = jarfs_read_entry(&jar, &entry)
-                            .map(|b| b.len() as i64)
-                            .unwrap_or(0);
-                        (sz, false, true)
-                    }
-                    JarFsKind::Dir => (0i64, true, false),
-                    JarFsKind::Absent => (0i64, false, false),
-                },
-                None => match std::fs::metadata(&p) {
-                    Ok(m) => (m.len() as i64, m.is_dir(), m.is_file()),
-                    Err(_) => (0i64, false, false),
-                },
-            };
-            ctx.set_field(attrs, 0, Value::Long(size));
-            ctx.set_field(attrs, 1, Value::Int(if is_dir { 1 } else { 0 }));
-            ctx.set_field(attrs, 2, Value::Int(if is_file { 1 } else { 0 }));
-            ctx.set_field(attrs, 3, Value::Int(0)); // isSymbolicLink
-            Ok(Some(Value::Object(Some(attrs))))
+            p59_files_read_attributes(ctx, &[Value::Object(Some(path_obj))])
         },
     );
 
@@ -8512,7 +8634,11 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             p.push(&child);
             p.to_string_lossy().into_owned()
         };
-        let s = ctx.create_string(&path);
+        // Normalise separators (PathBuf::push leaves `/` inside `child`
+        // untouched on Windows → a mixed `C:\a\b/c` path that breaks
+        // File.getParentFile()/exists() consistency, e.g. Gradle GFileUtils.mkdirs
+        // "… is not a directory"). Matches the single-arg File(String) ctor.
+        let s = ctx.create_string(&file_normalise_path(&path));
         ctx.set_field(this, 0, Value::Object(Some(s)));
         Ok(None)
     });
@@ -8535,7 +8661,8 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             p.push(&child);
             p.to_string_lossy().into_owned()
         };
-        let s = ctx.create_string(&path);
+        // Normalise separators — see the (String,String) ctor above.
+        let s = ctx.create_string(&file_normalise_path(&path));
         ctx.set_field(this, 0, Value::Object(Some(s)));
         Ok(None)
     });
