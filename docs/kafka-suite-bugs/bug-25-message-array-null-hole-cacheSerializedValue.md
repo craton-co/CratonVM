@@ -1,5 +1,69 @@
 # Bug 25 — `NPE: Cannot invoke cacheSerializedValue on null` (null serialization cache)
 
+> **UPDATE 3 — JIT-ONLY now; precisely isolated to a JIT call-chain miscompile (2026-06-14, binary a2e3261f):**
+> After the dev merge (collection-intrinsic fixes), the cluster is **GREEN under `--nojit`**
+> (all 13 classes pass: RequestResponseTest 41/41, CreateAclsRequestTest 4/4, …). The remaining
+> failures are **JIT-ON only** — so the earlier "reproduces under --nojit" no longer holds; the
+> interpreter-side variant is fixed. Under JIT, the exact `cacheSerializedValue on null` NPE persists.
+>
+> **Root method (corrected):** `AbstractRequest.serialize()` calls
+> **`MessageUtil.toByteBuffer(data(), version)`** (NOT `RequestUtils.serialize` — that was wrong in
+> UPDATE 1/2). `toByteBuffer` is the method that does `ObjectSerializationCache cache = new …();
+> message.size(cache,ver); message.write(bytes,cache,ver)`. So `toByteBuffer` is the cache holder.
+>
+> **Bisect (via `CRATONVM_JIT_BISECT_ONLY` / `CRATONVM_JIT_BISECT_SKIP`, on CreateAclsRequestTest):**
+> - JIT-off / any single kafka package alone JIT'd → PASS.
+> - `requests` + `protocol` JIT'd → FAIL; narrowed to **`protocol/MessageUtil`** (req+MessageUtil FAIL;
+>   req+ObjectSerializationCache / +ByteBufferAccessor / +SendBuilder all PASS).
+> - Within MessageUtil: skipping JIT for **`MessageUtil.toByteBuffer`** → PASS (skipping
+>   `toVersionPrefixedByteBuffer` → still FAIL). So `toByteBuffer`'s compilation is the trigger.
+> - **But `RequestUtils+MessageUtil` alone → PASS.** The bug needs the **whole JIT call chain compiled**:
+>   minimal repro = `CreateAclsRequestTest` (shouldRoundTripV0) **+** `AbstractRequest` (serialize) **+**
+>   `CreateAclsRequest` (data) **+** `RequestUtils` **+** `MessageUtil.toByteBuffer`, all JIT-eligible.
+>   Any proper subset passes. → This is a **JIT→JIT call/inlining interaction**, not standalone
+>   `toByteBuffer` codegen (cf. bug-H "JIT→JIT call bypassed callee's local catch").
+>
+> **Not GC, not the usual suspects:** `-Xmx8g` (suppresses young GC) does NOT help → not young-gen
+> collection of the cache; the doc's "genuine null (Value::Object(None))" holds → a literal null slot,
+> not a stale/collected pointer. `CRATONVM_SHADOW_STACK`, `CRATONVM_PRECISE_JIT_MAPS`,
+> `CRATONVM_JIT_NO_INLINE_VCACHE`, `CRATONVM_JIT_DISABLE_INLINE_NEW`, `CRATONVM_JIT_MAIN_INLINE` — none fix it.
+>
+> **Disasm (`CRATONVM_DBG_JIT_DISASM=toByteBuffer`, failing config):** compiled `toByteBuffer`
+> (entry 0x1580000, 935 bytes) holds the cache in **r12** (callee-saved), spills it to GC slots
+> `[rbp-20h]`/`[rbp-28h]` before each invoke, and routes every Java call through a generic invoke
+> helper `0x7FF78A21B310` that returns the `i64::MIN` (0x8000000000000000) deopt/exception sentinel.
+> The `<init>` (incl. the inner `new IdentityHashMap`) is inlined. Suspicious: several
+> `mov r12,[rbp-48h]` reloads where `[rbp-48h]` is reused as a scratch temp across calls — needs
+> verification that r12 (cache) isn't overwritten with a wrong temp between create and the `size()`
+> marshalling. **Next:** single-step the operand-stack spill/reload for the `cache` slot across the
+> chained JIT→interpreter `size()` call; confirm whether the genuine null comes from (a) a clobbered
+> r12 reload in `toByteBuffer`, or (b) the deep JIT-caller chain not preserving the spill frame.
+> Repro env: `CRATONVM_JIT_BISECT_ONLY=org/apache/kafka/common/requests/RequestUtils,org/apache/kafka/common/protocol/MessageUtil,org/apache/kafka/common/requests/AbstractRequest,org/apache/kafka/common/requests/CreateAclsRequest,org/apache/kafka/common/requests/CreateAclsRequestTest`
+> then `KRun org.apache.kafka.common.requests.CreateAclsRequestTest` (2/4 fail). Stopgap available:
+> add `MessageUtil.toByteBuffer` to skip_list `is_known_miscompile` (runs real bytecode interpreted).
+>
+> **UPDATE 4 — NOT inlining; it is main-loop codegen / register allocation (2026-06-14):**
+> JIT inlining is **default-OFF** (`CRATONVM_JIT_MAIN_INLINE`), and the inline body bails on `new`
+> (0xbb has no handler → default arm at x64.rs:10610), so `ObjectSerializationCache.<init>` (which
+> does `new IdentityHashMap; <init>; putfield`) is **never inlined**. The bug reproduces anyway →
+> it is in the **main compile loop**, specifically the `new OSC; dup; invokespecial OSC.<init>;
+> astore_2; … aload_2; invokeinterface size(cache,ver)` sequence. `OSC.<init>` is a non-inlinable
+> **allocating** constructor (a real call-out). The `cache` local (local 2 in `toByteBuffer`,
+> graph-colored to a callee-saved reg) reads back as a stale-zero register at the `size()` arg load
+> — i.e. the freshly-`new`'d object held in a callee-saved register/operand slot is LOST across the
+> out-of-line allocating `<init>` call (or `astore_2` writes a different home than `aload_2` reads).
+> Clean UTF-8 disasm of compiled `toByteBuffer` (entry 0x1580000) confirms a `size`-shaped dispatch
+> with `cache`=`r13`=0 and a later `astore_2` writing `r12` from a clobbered `[rbp-48h]` — a
+> local-home / live-range inconsistency. Locus: `jit/src/x64.rs` main loop (aload/astore_n local
+> emission + the `new`/operand handling around an out-of-line call) and/or `jit/src/regalloc.rs`
+> interference across the call. **Blast radius = all JIT code**, so the fix needs ground-truth
+> bytecode-PC↔native-offset annotated disasm (the dumper at vm/src/jit/disasm.rs currently emits no
+> PC map) plus a minimal standalone repro of `new X(); dup; <init>(allocating); use(local)` before any
+> edit — speculative regalloc/dispatch changes risk broad regressions. **Recommended next step:** wire
+> `compiler.pc_to_native` into `disasm::maybe_dump` to label each native block with its bytecode PC,
+> rebuild once, then read the exact emit for `astore_2`/`aload_2`/the `size` call.
+
+
 **Severity:** High — the single largest CratonVM-only FAIL cluster: **~20 failing
 tests across 13 classes**, all protocol request/response serialization. HotSpot OK.
 
