@@ -430,6 +430,122 @@ fn real_rsa_keypair(
     assembled
 }
 
+/// Reconstruct a real EC/RSA `PublicKey` from a X.509 `SubjectPublicKeyInfo` DER
+/// blob, routing through the real KeyFactory SPIs (SunEC for EC under
+/// `route_ec_to_real`, real RSA under `route_rsa_to_real`). Returns `Object(None)`
+/// for any other algorithm (the caller then mirrors BouncyCastle's own
+/// "no converter -> null" behaviour). The RSA key is bridged for fast verify via
+/// the identity map; EC verifies through the real key object directly.
+fn real_public_key_from_x509_der(
+    ctx: &mut dyn NativeContext,
+    der: &[u8],
+) -> MethodCallResult {
+    // OID TLVs as they appear inside the AlgorithmIdentifier SEQUENCE.
+    const EC_OID: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01]; // 1.2.840.10045.2.1
+    const RSA_OID: &[u8] =
+        &[0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01]; // 1.2.840.113549.1.1.1
+    let has = |needle: &[u8]| der.windows(needle.len()).any(|w| w == needle);
+    if has(EC_OID) && crate::route_ec_to_real() {
+        let arr = alloc_byte_array(ctx, der);
+        let spec = match ctx.new_object_initialized(
+            "java/security/spec/X509EncodedKeySpec",
+            "([B)V",
+            &[Value::Object(Some(arr))],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        return drive_real_ec_keyfactory(
+            ctx,
+            spec,
+            "engineGeneratePublic",
+            "Ljava/security/PublicKey;",
+        );
+    }
+    if has(RSA_OID) && crate::route_rsa_to_real() {
+        if let Some(pk) = crypto_impl::parse_rsa_public_key(der) {
+            let n = pk.n.to_bytes_be();
+            let e = pk.e.to_bytes_be();
+            let key_id = crypto_impl::rsa_key_next_id();
+            crypto_impl::rsa_key_store(
+                key_id,
+                crypto_impl::RsaKeyPairData {
+                    public_key: pk,
+                    private_key: crypto_impl::RsaPrivateKey {
+                        n: crypto_impl::BigUint::from_bytes_be(&[1]),
+                        d: crypto_impl::BigUint::from_bytes_be(&[1]),
+                        e: crypto_impl::BigUint::from_bytes_be(&[1]),
+                    },
+                },
+            );
+            if let Ok(key) = real_rsa_key_from_components(ctx, &n, &e, key_id, true) {
+                return Ok(Some(Value::Object(Some(key))));
+            }
+        }
+    }
+    Ok(Some(Value::Object(None)))
+}
+
+/// `org.bouncycastle.jce.provider.BouncyCastleProvider.getPublicKey(SubjectPublicKeyInfo)`
+/// (static). BC's EC key-info-converter is never registered because CratonVM
+/// no-ops `EC$Mappings.configure` (to dodge the ~5-min `EC.<clinit>` curve-table
+/// walk), so BC's own `getPublicKey` returns null for EC certs — which makes
+/// `X509CertificateObject.getPublicKey()` null and blows up keycloak cert
+/// generation (`caCert.getPublicKey().getAlgorithm()` NPE, hits EC *and* RSA
+/// flows). Reconstruct EC/RSA keys from the SPKI's X.509 DER via the real
+/// KeyFactories instead. (RSA already worked via BC, but routing it here too is
+/// equivalent — a real `RSAPublicKeyImpl`, matching HotSpot's no-provider path.)
+fn bc_provider_get_public_key(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let spki = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let pin = ctx.pin_native_root(spki);
+    let out = (|| {
+        let spki = ctx.read_native_pin(pin, spki);
+        let der = match ctx.invoke_virtual(spki, "getEncoded", "()[B", &[])? {
+            Some(Value::Object(Some(arr))) => read_byte_array(ctx, arr),
+            _ => return Ok(Some(Value::Object(None))),
+        };
+        real_public_key_from_x509_der(ctx, &der)
+    })();
+    ctx.unpin_native_roots(pin);
+    out
+}
+
+/// Register a real imported RSA public key's verify material via its own X.509
+/// encoding, so `Signature.verify` stays on the fast crypto_impl path (the real
+/// key carries no synthetic `key_id` slot). Used by the `generatePublic` import
+/// path which may receive an `RSAPublicKeySpec` (not a DER we can pre-parse).
+fn register_rsa_pub_verify_material(ctx: &mut dyn NativeContext, key: ObjectRef) {
+    let pin = ctx.pin_native_root(key);
+    let key = ctx.read_native_pin(pin, key);
+    let enc = ctx.invoke_virtual(key, "getEncoded", "()[B", &[]);
+    let key = ctx.read_native_pin(pin, key);
+    ctx.unpin_native_roots(pin);
+    if let Ok(Some(Value::Object(Some(arr)))) = enc {
+        let der = read_byte_array(ctx, arr);
+        if let Some(pk) = crypto_impl::parse_rsa_public_key(&der) {
+            let key_id = crypto_impl::rsa_key_next_id();
+            crypto_impl::rsa_key_store(
+                key_id,
+                crypto_impl::RsaKeyPairData {
+                    public_key: pk,
+                    private_key: crypto_impl::RsaPrivateKey {
+                        n: crypto_impl::BigUint::from_bytes_be(&[1]),
+                        d: crypto_impl::BigUint::from_bytes_be(&[1]),
+                        e: crypto_impl::BigUint::from_bytes_be(&[1]),
+                    },
+                },
+            );
+            crypto_impl::rsa_realkey_map_set(ctx.identity_hash_code(key), key_id);
+        }
+    }
+}
+
 // Synthetic-slot offsets relative to `synthetic_base_offset(...)`.
 const KPG_OFF_ALGO: usize = 0;
 const KPG_OFF_KEYSIZE: usize = 1;
@@ -936,6 +1052,24 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             );
         }
     }
+    // RSA: drive the real KeyFactory over WHATEVER spec the caller passed —
+    // X509EncodedKeySpec OR RSAPublicKeySpec (the synthetic DER-parse path below
+    // only understands X509-encoded bytes, so `generatePublic(RSAPublicKeySpec)`
+    // otherwise dead-ends → "cannot generate a usable RSA public key"). The real
+    // key is then bridged for fast verify via its own X.509 encoding.
+    if algo == ALGO_RSA && crate::route_rsa_to_real() {
+        if let Some(Value::Object(Some(spec))) = args.get(1) {
+            if let Ok(Some(Value::Object(Some(key)))) = drive_real_rsa_keyfactory(
+                ctx,
+                *spec,
+                "engineGeneratePublic",
+                "Ljava/security/PublicKey;",
+            ) {
+                register_rsa_pub_verify_material(ctx, key);
+                return Ok(Some(Value::Object(Some(key))));
+            }
+        }
+    }
     let der = if let Some(Value::Object(Some(spec))) = args.get(1) {
         // X509EncodedKeySpec.encoded[B is at field 0 in the synthetic
         // KeySpec shape; for real-JDK KeySpec we read field 0 too —
@@ -1257,6 +1391,17 @@ pub fn register(r: &mut NativeMethodRegistry) {
     let kp = "java/security/KeyPair";
     r.register(kp, "getPublic", "()Ljava/security/PublicKey;", keypair_get_public);
     r.register(kp, "getPrivate", "()Ljava/security/PrivateKey;", keypair_get_private);
+
+    // BouncyCastle's static key reconstructor. Its EC converter is unregistered
+    // (EC$Mappings.configure is no-op'd), so the real BC getPublicKey returns
+    // null for EC certs → X509CertificateObject.getPublicKey() null. Rebuild
+    // EC/RSA keys from the SubjectPublicKeyInfo via the real KeyFactories.
+    r.register(
+        "org/bouncycastle/jce/provider/BouncyCastleProvider",
+        "getPublicKey",
+        "(Lorg/bouncycastle/asn1/x509/SubjectPublicKeyInfo;)Ljava/security/PublicKey;",
+        bc_provider_get_public_key,
+    );
 
     // Public/Private Key common accessors.  The synthetic `PublicKey` /
     // `PrivateKey` classes are interfaces in the JDK; we treat them as
