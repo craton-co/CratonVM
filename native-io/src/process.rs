@@ -237,6 +237,19 @@ pub fn spawn_and_wrap(
         .into());
     }
 
+    // Windows launchers wrap a space-containing program path in double quotes
+    // (e.g. WildFly's `StandaloneCommandBuilder` →
+    // `"C:\Program Files\…\bin\java"`). The OS `CreateProcess` takes the program
+    // and arguments separately, so a surrounding-quoted program is treated as a
+    // literal filename → `ERROR_INVALID_NAME` (os error 123). A `"` is illegal in
+    // a Windows filename, so a matched surrounding pair is unambiguously quoting,
+    // not part of the name — strip it, mirroring the JDK's `ProcessImpl`.
+    let program = program
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .filter(|s| !s.is_empty())
+        .unwrap_or(program);
+
     // SECURITY (V1, HIGH): vet the executable against the CWD-confinement
     // policy before spawning. Under confinement this rejects bare PATH-resolved
     // host binaries and any explicit path that escapes the sandbox root; with
