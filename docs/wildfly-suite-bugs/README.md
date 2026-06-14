@@ -33,7 +33,14 @@ each distinct signature is written up as `bug-NN-*.md` here.
 ## Live status
 See [STATUS.md](STATUS.md) for current exact numbers (updated as the run proceeds).
 
+## Live-container reruns
+See [live-container-smoke.md](live-container-smoke.md): with a live managed WildFly server
+the smoke group goes from all-FAIL (no container) to **111/111 pass** on HotSpot. Running the
+Arquillian **client under CratonVM** is currently blocked by two CratonVM gaps (Surefire
+java-CLI args; null `Enumeration` in the client) — both documented there.
+
 ## Bugs
 | # | Title | Sev | Status |
 |---|-------|-----|--------|
 | [01](bug-01-stream-foreachordered-abstractmethoderror.md) | `Stream.forEachOrdered` → `AbstractMethodError` "no Code attribute" (CratonVM-only; 27+ classes) | High | **FIXED** — repro'd + verified |
+| [02](bug-02-zipfile-entries-null.md) | `ZipFile.entries()`/getName/size return null/0 (CratonVM-only; NPEs ShrinkWrap's package scanner — blocked the live-container client) | High | **FIXED** — repro'd + verified |

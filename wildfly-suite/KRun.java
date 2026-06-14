@@ -70,6 +70,10 @@ public class KRun {
                 String msg = (t == null) ? "?" : (t.getClass().getName() + ": " + t.getMessage());
                 out.println("FAILCAUSE " + cls + " :: " + f.getTestIdentifier().getDisplayName()
                         + " :: " + msg);
+                if (t != null && System.getenv("KRUN_STACK") != null) {
+                    t.printStackTrace(out);
+                    out.flush();
+                }
             }
             out.flush();
         } catch (Throwable t) {
