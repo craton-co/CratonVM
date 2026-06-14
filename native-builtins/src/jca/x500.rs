@@ -243,11 +243,29 @@ pub fn decode_rdns(der: &[u8]) -> Result<Vec<(String, String)>, asn1::DerError> 
             attrs.push((oid, val));
             ap += atot;
         }
-        // Single-valued RDN — take the only attribute.  Multi-valued
-        // would join with `+`, but we don't need it.
-        if let Some((oid, val)) = attrs.into_iter().next() {
+        // Single-valued RDN → one (name, value) entry. Multi-valued RDN (a SET
+        // with >1 AttributeTypeAndValue — real X.509 certs use these, e.g. a
+        // subject of surname+givenName+CN) is rendered RFC 4514 §2.2 with the
+        // attributes joined by `+`, stored as a single pre-rendered entry with
+        // an empty key. Dropping all but the first attribute (the old behaviour)
+        // lost the CN, so keycloak's `new X500Name(getName()).getRDNs(CN)`
+        // returned null.
+        if attrs.len() == 1 {
+            let (oid, val) = attrs.into_iter().next().unwrap();
             let name = oid_to_name(&oid).map(|s| s.to_string()).unwrap_or(oid);
             rdns.push((name, val));
+        } else if !attrs.is_empty() {
+            let joined = attrs
+                .iter()
+                .map(|(oid, val)| {
+                    let name = oid_to_name(oid)
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| oid.clone());
+                    format!("{}={}", name.to_ascii_uppercase(), escape_value(val))
+                })
+                .collect::<Vec<_>>()
+                .join("+");
+            rdns.push((String::new(), joined));
         }
         pos += rdn_total;
     }
@@ -257,12 +275,26 @@ pub fn decode_rdns(der: &[u8]) -> Result<Vec<(String, String)>, asn1::DerError> 
     Ok(rdns)
 }
 
-/// Render an RDN list in canonical RFC 4514 form: `CN=Name, O=Org, C=US`.
+/// Render an RDN list in canonical RFC 4514 / RFC 2253 form: `CN=Name,O=Org,C=US`.
+///
+/// RFC 4514 §2.1 / RFC 2253 separate RDNs with a bare COMMA — **no space**.
+/// That is exactly what `X500Principal.getName()` (default RFC2253) returns on
+/// HotSpot. The previous `", "` join produced a space, which then broke BC's
+/// `new X500Name(principal.getName())` re-parse: the space-prefixed `" CN"`
+/// attribute didn't match `getRDNs(BCStyle.CN)`, so keycloak's
+/// `X500NameRDNExtractor` returned null for the cert's Common Name.
 pub fn render_canonical(rdns: &[(String, String)]) -> String {
     rdns.iter()
-        .map(|(k, v)| format!("{}={}", k.to_ascii_uppercase(), escape_value(v)))
+        .map(|(k, v)| {
+            if k.is_empty() {
+                // Pre-rendered multi-valued RDN (already `a=b+c=d`, escaped).
+                v.clone()
+            } else {
+                format!("{}={}", k.to_ascii_uppercase(), escape_value(v))
+            }
+        })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(",")
 }
 
 fn escape_value(v: &str) -> String {
@@ -522,7 +554,18 @@ pub fn register(r: &mut NativeMethodRegistry) {
                 Some(Value::Object(Some(o))) => *o,
                 _ => return Ok(Some(Value::Object(None))),
             };
+            let fmt = match args.get(1) {
+                Some(Value::Object(Some(f))) => ctx.read_string(*f).unwrap_or_default(),
+                _ => String::new(),
+            };
+            // Stored canonical is RFC2253 (comma, no space). RFC1779 separates
+            // RDNs with ", " (comma + space); RFC2253/CANONICAL keep no space.
             let s = get_canonical(ctx, this).unwrap_or_default();
+            let s = if fmt.eq_ignore_ascii_case("RFC1779") {
+                s.replace(',', ", ")
+            } else {
+                s
+            };
             let so = ctx.create_string(&s);
             Ok(Some(Value::Object(Some(so))))
         },

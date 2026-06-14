@@ -1887,19 +1887,16 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // refs off the queue and invokes their thunks. The bug also
         // fires under H2 TestAll (same root cause, different witness).
         | ("jdk/internal/ref/CleanerImpl", "run")
-        // HIB-XSD (2026-06-13) — Hibernate XML/XSD bootstrap hang. JDK Xerces'
-        // `XMLEntityScanner.skipString(String)` is a backward char-compare loop
-        // (two countdown induction vars `i`/`j`, `iload`-then-`iinc -1`, exit via
-        // `if_icmpne` against `position`). JIT-compiled it never returns, hanging
-        // `SchemaFactory.newSchema()` during `MappingXsdSupport.<clinit>` — every
-        // Hibernate test that compiles an XSD (LocalXmlResourceResolverTest and the
-        // XML-mapping bootstrap paths) freezes. `CRATONVM_DISABLE_JIT=1` and a
-        // per-method `CRATONVM_JIT_BISECT_SKIP=...XMLEntityScanner.skipString` both
-        // unblock it; a faithful standalone replica of the loop does NOT reproduce,
-        // so the trigger is specific to Xerces' exact block shape — same "JIT'd
-        // scan/fill loop never returns" family as NETTY.1 (`Arrays.fill`). Ban
-        // narrowly until the codegen defect is isolated.
-        | ("com/sun/org/apache/xerces/internal/impl/XMLEntityScanner", "skipString")
+        // HIB-CV-02 (2026-06-13/14) — the provisional ban on Xerces'
+        // `XMLEntityScanner.skipString` was REMOVED after re-verification:
+        // `LocalXmlResourceResolverTest` (the original witness) passes 23/23
+        // JIT-on with skipString compilable, and a faithful instance-method
+        // replica forced through the JIT (Rep5) compiles + runs correctly. The
+        // underlying "backward compare loop" miscompile is no longer
+        // reproducible on dev (fixed by intervening JIT codegen work — cf. the
+        // bug-H/I exception-routing + bug-24 inline-cache fixes); the only
+        // residual is JIT-helper *slowness*, a separate perf concern, not a
+        // hang. See apps/hibernate-orm/cratonvm-bug-reports/HIB-CV-02.
     )
 }
 
