@@ -171,6 +171,16 @@ cached_is_ok!(nsee_trace, "CRATONVM_NSEE_TRACE");
 cached_is_ok!(iae_trace, "CRATONVM_IAE_TRACE");
 cached_is_ok!(athrow_dbg, "CRATONVM_DBG_ATHROW");
 cached_is_ok!(npe_invoke_dbg, "CRATONVM_DBG_NPE_INVOKE");
+/// `CRATONVM_DBG_MODSTATIC` — JBoss-Modules `<clinit>`/static-dispatch
+/// diagnostic. This was read with an UNCACHED `std::env::var(...).is_ok()`
+/// from `ensure_class_initialized_shared` (the per-barrier class-init gate
+/// fired on every getstatic/putstatic/new/invokestatic, *before* the
+/// fast-path "already initialized" check) and from two method-resolution
+/// sites — i.e. a ~500 ns `GetEnvironmentVariableW` syscall on a large
+/// fraction of all executed bytecodes. That single uncached lookup
+/// dominated steady-state interpreter throughput (a getstatic-only loop
+/// measured ~567 ns/iter, most of it this call). Cached like its siblings.
+cached_is_ok!(modstatic_dbg, "CRATONVM_DBG_MODSTATIC");
 
 /// `CRATONVM_DBG_CHARSET=1` — targeted diagnostic for the bare
 /// `NullPointerException: charset` blocker (keycloak26 Picocli /

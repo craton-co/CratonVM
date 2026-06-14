@@ -11532,6 +11532,17 @@ const CMP_TAG_REVERSE_ORDER: i32 = 2;
 const CMP_TAG_COMPARING: i32 = 3;
 const CMP_TAG_REVERSED: i32 = 4;
 const CMP_TAG_THEN_COMPARING: i32 = 5;
+// Primitive key-extractor comparators. `Comparator.comparingInt(ToIntFunction)`
+// (and Long/Double) must invoke the extractor's primitive SAM
+// (`applyAsInt`/`applyAsLong`/`applyAsDouble`), NOT `Function.apply` — the
+// CMP_TAG_COMPARING arm calls `apply(Object)Object`, which does not exist on a
+// `ToIntFunction` lambda. These distinct tags carry the SAM choice without
+// widening the comparator's field layout. (Groovy/ANTLR4's
+// `ParserATNSimulator.STATE_ALT_SORT_COMPARATOR = comparingInt(..).thenComparingInt(..)`
+// hits exactly this path.)
+const CMP_TAG_COMPARING_INT: i32 = 6;
+const CMP_TAG_COMPARING_LONG: i32 = 7;
+const CMP_TAG_COMPARING_DOUBLE: i32 = 8;
 
 fn make_comparator(ctx: &mut dyn NativeContext, tag: i32) -> ObjectRef {
     let cmp = alloc_synthetic(ctx, "java/util/Comparator$Native", CMP_NUM_FIELDS);
@@ -11551,7 +11562,7 @@ pub fn comparator_compare(
     // Lambda proxies may have 0 fields, so reading field 0 would panic.
     let tag = if ctx.object_num_fields(comparator) >= CMP_NUM_FIELDS {
         match ctx.get_field(comparator, CMP_FIELD_TAG) {
-            Value::Int(t) if (CMP_TAG_NATURAL_ORDER..=CMP_TAG_THEN_COMPARING).contains(&t) => {
+            Value::Int(t) if (CMP_TAG_NATURAL_ORDER..=CMP_TAG_COMPARING_DOUBLE).contains(&t) => {
                 Some(t)
             }
             _ => None,
@@ -11632,7 +11643,83 @@ pub fn comparator_compare(
                 other => Ok(other),
             }
         }
+        CMP_TAG_COMPARING_INT => {
+            let key_fn = match ctx.get_field(comparator, CMP_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let ia = comparing_key_as_i64(ctx, key_fn, "applyAsInt", "(Ljava/lang/Object;)I", a)?;
+            let ib = comparing_key_as_i64(ctx, key_fn, "applyAsInt", "(Ljava/lang/Object;)I", b)?;
+            Ok(Some(Value::Int(ia.cmp(&ib) as i32)))
+        }
+        CMP_TAG_COMPARING_LONG => {
+            let key_fn = match ctx.get_field(comparator, CMP_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let ia = comparing_key_as_i64(ctx, key_fn, "applyAsLong", "(Ljava/lang/Object;)J", a)?;
+            let ib = comparing_key_as_i64(ctx, key_fn, "applyAsLong", "(Ljava/lang/Object;)J", b)?;
+            Ok(Some(Value::Int(ia.cmp(&ib) as i32)))
+        }
+        CMP_TAG_COMPARING_DOUBLE => {
+            let key_fn = match ctx.get_field(comparator, CMP_FIELD_ARG1) {
+                Value::Object(Some(r)) => r,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let da = comparing_key_as_f64(ctx, key_fn, a)?;
+            let db = comparing_key_as_f64(ctx, key_fn, b)?;
+            // Match java.lang.Double.compare ordering (NaN greatest, -0.0 < 0.0).
+            Ok(Some(Value::Int(double_compare(da, db))))
+        }
         _ => Ok(Some(Value::Int(0))),
+    }
+}
+
+/// Invoke a primitive key-extractor SAM (`applyAsInt`/`applyAsLong`) on `arg`
+/// and coerce the result to `i64`. Used by the `comparingInt`/`comparingLong`
+/// comparator arms.
+fn comparing_key_as_i64(
+    ctx: &mut dyn NativeContext,
+    key_fn: ObjectRef,
+    sam: &str,
+    desc: &str,
+    arg: Value,
+) -> Result<i64, MethodCallFailed> {
+    match ctx.invoke_virtual(key_fn, sam, desc, &[arg])? {
+        Some(Value::Int(v)) => Ok(v as i64),
+        Some(Value::Long(v)) => Ok(v),
+        _ => Ok(0),
+    }
+}
+
+/// Invoke `ToDoubleFunction.applyAsDouble` on `arg` and coerce to `f64`.
+fn comparing_key_as_f64(
+    ctx: &mut dyn NativeContext,
+    key_fn: ObjectRef,
+    arg: Value,
+) -> Result<f64, MethodCallFailed> {
+    match ctx.invoke_virtual(key_fn, "applyAsDouble", "(Ljava/lang/Object;)D", &[arg])? {
+        Some(Value::Double(v)) => Ok(v),
+        Some(Value::Float(v)) => Ok(v as f64),
+        Some(Value::Int(v)) => Ok(v as f64),
+        Some(Value::Long(v)) => Ok(v as f64),
+        _ => Ok(0.0),
+    }
+}
+
+/// `java.lang.Double.compare` semantics: total ordering with NaN greatest and
+/// `-0.0 < 0.0` (so it is a valid `Comparator` even with NaN/zero keys).
+fn double_compare(a: f64, b: f64) -> i32 {
+    if a < b {
+        -1
+    } else if a > b {
+        1
+    } else {
+        // Equal under `<`/`>` (covers both zeros and both NaN cases): fall back
+        // to the bit pattern, exactly like Double.compare.
+        let ab = a.to_bits() as i64;
+        let bb = b.to_bits() as i64;
+        ab.cmp(&bb) as i32
     }
 }
 
@@ -11744,19 +11831,19 @@ fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
         "java/util/Comparator",
         "comparingInt",
         "(Ljava/util/function/ToIntFunction;)Ljava/util/Comparator;",
-        native_comparator_comparing,
+        native_comparator_comparing_int,
     );
     registry.register(
         "java/util/Comparator",
         "comparingLong",
         "(Ljava/util/function/ToLongFunction;)Ljava/util/Comparator;",
-        native_comparator_comparing,
+        native_comparator_comparing_long,
     );
     registry.register(
         "java/util/Comparator",
         "comparingDouble",
         "(Ljava/util/function/ToDoubleFunction;)Ljava/util/Comparator;",
-        native_comparator_comparing,
+        native_comparator_comparing_double,
     );
     registry.register(
         "java/util/Comparator",
@@ -11769,6 +11856,38 @@ fn register_comparator_natives(registry: &mut NativeMethodRegistry) {
         "thenComparing",
         "(Ljava/util/Comparator;)Ljava/util/Comparator;",
         native_comparator_then_comparing,
+    );
+    // `thenComparing(Function)` default = `thenComparing(comparing(keyExtractor))`.
+    registry.register(
+        "java/util/Comparator",
+        "thenComparing",
+        "(Ljava/util/function/Function;)Ljava/util/Comparator;",
+        native_comparator_then_comparing_key,
+    );
+    // Primitive `thenComparing*` defaults = `thenComparing(comparing{Int,Long,Double}(keyExtractor))`.
+    // These were previously UNregistered: invoking them on a synthetic
+    // `Comparator$Native` (which has no real interface hierarchy or default-method
+    // bytecode) produced a tagless comparator → `comparator_compare` fell to the
+    // lambda branch → `invoke_virtual("compare")` resolved to the abstract
+    // `Comparator.compare` → `AbstractMethodError: ... has no Code attribute`
+    // (Groovy/ANTLR4 `ParserATNSimulator.STATE_ALT_SORT_COMPARATOR`).
+    registry.register(
+        "java/util/Comparator",
+        "thenComparingInt",
+        "(Ljava/util/function/ToIntFunction;)Ljava/util/Comparator;",
+        native_comparator_then_comparing_int,
+    );
+    registry.register(
+        "java/util/Comparator",
+        "thenComparingLong",
+        "(Ljava/util/function/ToLongFunction;)Ljava/util/Comparator;",
+        native_comparator_then_comparing_long,
+    );
+    registry.register(
+        "java/util/Comparator",
+        "thenComparingDouble",
+        "(Ljava/util/function/ToDoubleFunction;)Ljava/util/Comparator;",
+        native_comparator_then_comparing_double,
     );
     registry.set_category(__prev_cat);
 }
@@ -11854,14 +11973,35 @@ fn native_comparator_write_replace(ctx: &mut dyn NativeContext, args: &[Value]) 
     }
 }
 
-fn native_comparator_comparing(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+/// Build a key-extractor comparator (`comparing`/`comparingInt`/`comparingLong`/
+/// `comparingDouble`) tagged so `comparator_compare` invokes the right SAM.
+fn make_comparing(ctx: &mut dyn NativeContext, args: &[Value], tag: i32) -> MethodCallResult {
     let key_fn = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let cmp = make_comparator(ctx, CMP_TAG_COMPARING);
+    let cmp = make_comparator(ctx, tag);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(key_fn)));
     Ok(Some(Value::Object(Some(cmp))))
+}
+
+fn native_comparator_comparing(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    make_comparing(ctx, args, CMP_TAG_COMPARING)
+}
+
+fn native_comparator_comparing_int(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    make_comparing(ctx, args, CMP_TAG_COMPARING_INT)
+}
+
+fn native_comparator_comparing_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    make_comparing(ctx, args, CMP_TAG_COMPARING_LONG)
+}
+
+fn native_comparator_comparing_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    make_comparing(ctx, args, CMP_TAG_COMPARING_DOUBLE)
 }
 
 fn native_comparator_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -11874,22 +12014,73 @@ fn native_comparator_reversed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     Ok(Some(Value::Object(Some(cmp))))
 }
 
-fn native_comparator_then_comparing(
+/// Build a `thenComparing*` comparator. `this` (arg 0) is the primary; the
+/// secondary depends on `inner_tag`:
+///   - `None`            → arg 1 IS already a `Comparator` (`thenComparing(Comparator)`).
+///   - `Some(key_tag)`   → arg 1 is a key extractor; wrap it as a fresh
+///     `comparing*`-tagged comparator (`thenComparing(Function)` /
+///     `thenComparingInt/Long/Double` — matching the JDK defaults, e.g.
+///     `thenComparingInt(f) == thenComparing(comparingInt(f))`).
+fn make_then_comparing(
     ctx: &mut dyn NativeContext,
     args: &[Value],
+    inner_tag: Option<i32>,
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let other = match args.get(1) {
+    let arg1 = match args.get(1) {
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
+    let secondary = match inner_tag {
+        None => arg1,
+        Some(key_tag) => {
+            let inner = make_comparator(ctx, key_tag);
+            ctx.set_field(inner, CMP_FIELD_ARG1, Value::Object(Some(arg1)));
+            inner
+        }
+    };
     let cmp = make_comparator(ctx, CMP_TAG_THEN_COMPARING);
     ctx.set_field(cmp, CMP_FIELD_ARG1, Value::Object(Some(this)));
-    ctx.set_field(cmp, CMP_FIELD_ARG2, Value::Object(Some(other)));
+    ctx.set_field(cmp, CMP_FIELD_ARG2, Value::Object(Some(secondary)));
     Ok(Some(Value::Object(Some(cmp))))
+}
+
+fn native_comparator_then_comparing(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    make_then_comparing(ctx, args, None)
+}
+
+fn native_comparator_then_comparing_key(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    make_then_comparing(ctx, args, Some(CMP_TAG_COMPARING))
+}
+
+fn native_comparator_then_comparing_int(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    make_then_comparing(ctx, args, Some(CMP_TAG_COMPARING_INT))
+}
+
+fn native_comparator_then_comparing_long(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    make_then_comparing(ctx, args, Some(CMP_TAG_COMPARING_LONG))
+}
+
+fn native_comparator_then_comparing_double(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    make_then_comparing(ctx, args, Some(CMP_TAG_COMPARING_DOUBLE))
 }
 
 // ===========================================================================

@@ -10906,7 +10906,7 @@ fn execute_invoke_kind(
                     // and surface as `IllegalArgumentException: invalid
                     // version "null"` (Felix framework bootstrap). The hack
                     // is removed so the spec-compliant NPE below fires.
-                    if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok()
+                    if crate::runtime::env_cache::modstatic_dbg()
                         && &*method_name == "set"
                     {
                         let cm = shared.class_manager.read();
@@ -12874,7 +12874,7 @@ fn execute_invokestatic(
             }
             found
         });
-    if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok()
+    if crate::runtime::env_cache::modstatic_dbg()
         && (method_name.as_ref() == "initBootModuleLoader"
             || method_class_name.as_ref() == "org/jboss/modules/Module")
     {
@@ -13323,7 +13323,7 @@ fn execute_invokestatic_cached(
         Some(t) => t.clone(),
         None => return Ok(CachedCallResult::CacheMiss),
     };
-    if std::env::var("CRATONVM_DBG_MODSTATIC").is_ok() {
+    if crate::runtime::env_cache::modstatic_dbg() {
         if let Ok((mcn, mn, _, _)) = resolve_method_ref(shared, caller_class_id, cp_index) {
             if mn.as_ref() == "initBootModuleLoader" {
                 eprintln!("MODSTATIC: invokestatic_cached HIT {}.{}", mcn, mn);
