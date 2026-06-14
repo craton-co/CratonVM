@@ -17,6 +17,12 @@ is interpreter throughput on embedded-server deployment.
 | [03](03-gc-root-snapshot-contention-FIXED.md) | GC root-snapshot lock contention / per-call cost | **FIXED** (dev, partial) |
 | [04](04-embedded-server-throughput-wall-OPEN.md) | Embedded-server deployment throughput wall | **OPEN** (dominant) |
 | [05](05-suite-rerun-fail-triage.md) | Suite-rerun FAIL set — to triage | OPEN (preliminary) |
+| [06](06-openssl-ffm-clinit-segv-CRASH.md) | OpenSSL Panama/FFM clinit NPE → JIT SEGV | **OPEN** (CRASH) |
+| [07](07-beanelresolver-property-not-found-FAIL.md) | BeanELResolver bean property not discovered | OPEN (FAIL) |
+| [08](08-importhandler-standard-packages-npe-FAIL.md) | ImportHandler standard-package list NPE | OPEN (FAIL) |
+
+Groups 06-08 are individually-diagnosed (real per-class repro + trace) from the
+group-05 worklist; more will be added as triage continues.
 
 ## Current rerun status (with TLS/server env + `-Xmx2g`, 180s timeout)
 
