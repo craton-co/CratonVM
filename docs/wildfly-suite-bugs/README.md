@@ -44,5 +44,5 @@ java-CLI args; null `Enumeration` in the client) — both documented there.
 |---|-------|-----|--------|
 | [01](bug-01-stream-foreachordered-abstractmethoderror.md) | `Stream.forEachOrdered` → `AbstractMethodError` "no Code attribute" (CratonVM-only; 27+ classes) | High | **FIXED** — repro'd + verified |
 | [02](bug-02-zipfile-entries-null.md) | `ZipFile.entries()`/getName/size return null/0 (CratonVM-only; NPEs ShrinkWrap's package scanner — blocked the live-container client) | High | **FIXED** — repro'd + verified |
-| [03](bug-03-regex-perf-deployment-build.md) | `java.util.regex` ~50–600× slower than HotSpot (Gap C: cratonvm client too slow to build the ShrinkWrap deployment archive) | Med | open — perf (root-caused) |
+| [03](bug-03-regex-perf-deployment-build.md) | Char-by-char loops ~400–1000× slower (Gap C): hot String accessors (`charAt`/`length`) are native-bridged, not JIT-intrinsified, so regex/path/archive-build hot paths crawl — cratonvm client can't build the ShrinkWrap deployment archive | Med | open — JIT intrinsics (root-caused) |
 | [04](bug-04-surefire-jvm-dup-xmx.md) | CratonVM as Surefire `-Djvm=` fork (Gap A): dup-`-Xmx` **FIXED**; ForkedBooter+JUnit+Arquillian proven working; root blocker = native `Path` uses UNIX separator semantics on Windows (breaks WildFly `validateWildFlyDir`) | Med | dup-Xmx FIXED; path-semantics open |

@@ -33,22 +33,42 @@ whole archive build takes minutes-to-never.
 | `String.replaceAll("[.]","/")` ×2000 | 54 ms | 2691 ms | **~50×** |
 | precompiled `Matcher.replaceAll` ×2000 | 3 ms | 1830 ms | **~600×** |
 
-The precompiled case isolates the matcher inner loop (`Pattern$Node.match` per
-character): ~0.9 ms to match a 58-char string vs ~1.5 µs on HotSpot. A ~600× gap on
-a pre-compiled matcher is far beyond CratonVM's typical interpreter overhead
-(~10–50×), pointing at a regex-engine-specific inefficiency in the
-`Pattern`/`Matcher` match loop — not just general interpretation cost.
+## Deeper root cause — not regex-specific: native-bridged char accessors
+Further benchmarks (warm, JIT on) localise it to **per-char VM→native boundary
+crossings**, not regex or allocation:
+
+| benchmark (warm) | HotSpot | CratonVM | slowdown |
+|------------------|---------|----------|----------|
+| precompiled `Matcher.replaceAll` ×20000 | 27 ms | 10 398 ms | ~385× |
+| same, JIT **off** (`--nojit`) | — | 14 228 ms | (JIT helps only ~27%) |
+| `String.replace(char,char)` ×5000 (native) | 7 ms | 2 705 ms | ~386× |
+| **`charAt` loop, NO allocation** (11.6 M calls) | 17 ms | **18 081 ms** | **~1063×** |
+| `substring` (allocation) ×200000 | 10 ms | 501 ms | ~50× |
+
+The decisive one: a tight `charAt`/`length` loop **with no allocation** is ~1063×
+slower, while an allocation-heavy `substring` loop is only ~50×. So the cost is
+**not** allocation/GC and **not** regex-engine-specific — it is the per-call cost of
+the hot String accessors. CratonVM's JIT has OSR (1000-backedge) and an invocation
+threshold (2000), but `String.charAt`/`length` are **native-bridged** (they appear on
+the JIT skip-list / are serviced by Rust natives), so even a JIT/OSR-compiled loop
+must cross the VM→native boundary on **every** `charAt` (~1.5 µs) instead of HotSpot's
+intrinsified direct char-array read (~1.5 ns). The `java.util.regex.Pattern$Node.match`
+loop calls `charAt` per character per position, so it inherits the same ~400–1000×
+penalty; ShrinkWrap calls it per class.
 
 ## Status / fix direction
-Open — this is a **performance optimization**, not a one-line fix:
-- Most direct: get CratonVM's JIT to cover the `java.util.regex.Pattern$*.match`
-  hot loop. These methods run per-class during the archive build; if they stay
-  interpreted, the archive build is bound by interpreter speed. Investigate why the
-  JIT isn't compiling them (cold per-call Matchers, threshold, or regex methods
-  excluded from JIT).
-- Or profile the `Matcher.match` interpreted path for a CratonVM-specific O(n²) /
-  per-char allocation issue (the 600× gap suggests one exists).
+Open — a **JIT/intrinsics performance project**, not a one-line fix:
+- **Primary:** add JIT intrinsics for the hot String/char accessors
+  (`String.charAt`, `length`, `coder`/`value` access, `charSequence` reads) so
+  compiled code touches the String's backing array directly instead of calling the
+  native each iteration. This is what makes char-by-char loops (regex, path
+  manipulation, `replace`) fast on HotSpot.
+- Secondary: ensure the `Pattern$*.match` methods are JIT-compiled (not skip-listed)
+  once charAt is intrinsified, so the match loop runs as native code.
 
-Until then, the CratonVM Arquillian client cannot build the JUnit-5 deployment
-archive in reasonable time. (The no-container per-class suite is unaffected — it
-never builds a real deployment.)
+This is a sensitive area (the JIT carries a curated skip-list and threshold tuning),
+so it needs a focused change with full suite re-test — deferred, not rushed here.
+
+Until then the CratonVM Arquillian client cannot build the JUnit-5 deployment archive
+in reasonable time. (The no-container per-class suite is unaffected — it never builds
+a real deployment, so it never hits this hot path.)
