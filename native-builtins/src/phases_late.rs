@@ -12652,6 +12652,54 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
             Ok(Some(Value::Object(None)))
         },
     );
+    // getInputStream(ZipEntry) — the synthetic JarFile has no real `jzfile`
+    // handle, so the real ZipFile.getInputStream returns null (then Tomcat's
+    // JarInputStreamWrapper.close NPEs on the null stream). Read the entry's
+    // bytes from the JAR (path in field 0) by entry name via the zip crate and
+    // hand back a ByteArrayInputStream. (catalina.webresources JAR resources.)
+    r.register(
+        jf,
+        "getInputStream",
+        "(Ljava/util/zip/ZipEntry;)Ljava/io/InputStream;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let path = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let entry_name = match args.get(1) {
+                Some(Value::Object(Some(e))) => match ctx.get_field(*e, 0) {
+                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+                    _ => return Ok(Some(Value::Object(None))),
+                },
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let bytes: Option<Vec<u8>> = (|| {
+                use std::io::Read;
+                let f = std::fs::File::open(&path).ok()?;
+                let mut a = zip::ZipArchive::new(f).ok()?;
+                let mut e = a.by_name(&entry_name).ok()?;
+                let mut buf = Vec::new();
+                e.read_to_end(&mut buf).ok()?;
+                Some(buf)
+            })();
+            let bytes = match bytes {
+                Some(b) => b,
+                None => return Ok(Some(Value::Object(None))),
+            };
+            // ByteArrayInputStream: buf(0), pos(1), mark(2), count(3)
+            let bais = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+            let arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, bytes.len());
+            for (i, &b) in bytes.iter().enumerate() {
+                ctx.set_array_element(arr, i, Value::Int(b as i8 as i32));
+            }
+            ctx.set_field(bais, 0, Value::Object(Some(arr)));
+            ctx.set_field(bais, 1, Value::Int(0));
+            ctx.set_field(bais, 2, Value::Int(0));
+            ctx.set_field(bais, 3, Value::Int(bytes.len() as i32));
+            Ok(Some(Value::Object(Some(bais))))
+        },
+    );
     r.register(
         jf,
         "getJarEntry",
