@@ -6,3 +6,5 @@ target/
 *.log.err
 .af*.txt
 .lock
+cvm-home/
+*.err

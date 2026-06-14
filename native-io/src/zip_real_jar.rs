@@ -170,17 +170,55 @@ fn set_jar_handle(ctx: &mut dyn NativeContext, this: ObjectRef, handle: i64) {
     ctx.set_field(this, 1, Value::Long(handle));
 }
 
-fn get_jar_handle(ctx: &dyn NativeContext, this: ObjectRef) -> i64 {
+/// Identity-hash → handle fallback for `get_jar_handle`.
+///
+/// Field-based handle storage works for `JarFile` (a CratonVM-synthetic class
+/// whose object carries a usable Long slot) but NOT for a plain
+/// `java.util.zip.ZipFile`: that object is allocated with no writable handle
+/// slot, so `set_field`/`set_field_by_name` in `<init>` silently no-op (every
+/// field reads back `Object(None)`), `get_jar_handle` returns 0, and
+/// `entries()`/`getName()`/`size()` all fail — `ZipFile.entries()` famously
+/// returning `null`, which NPEs ShrinkWrap's `URLPackageScanner`. We can't put
+/// the handle on the object, so we key a side table on the object's stable
+/// identity hash instead.
+fn identity_handle_table() -> &'static Mutex<HashMap<i32, i64>> {
+    static T: OnceLock<Mutex<HashMap<i32, i64>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// `System.identityHashCode(this)` — stable per object across GC.
+fn identity_hash(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<i32> {
+    match ctx.invoke(
+        "java/lang/System",
+        "identityHashCode",
+        "(Ljava/lang/Object;)I",
+        &[Value::Object(Some(this))],
+    ) {
+        Ok(Some(Value::Int(h))) => Some(h),
+        _ => None,
+    }
+}
+
+fn get_jar_handle(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 {
+    // Fast path: the on-object handle slot (works for JarFile).
     if let Value::Long(v) = ctx.get_field_by_name(this, "jzfile") {
         if v != 0 {
             return v;
         }
     }
     match ctx.get_field(this, 1) {
-        Value::Long(v) => v,
-        Value::Int(v) => v as i64,
-        _ => 0,
+        Value::Long(v) if v != 0 => return v,
+        Value::Int(v) if v != 0 => return v as i64,
+        _ => {}
     }
+    // Plain ZipFile: the object has no writable handle slot — recover via the
+    // identity-keyed side table populated in `open_and_register`.
+    if let Some(id) = identity_hash(ctx, this) {
+        if let Some(h) = identity_handle_table().lock().get(&id).copied() {
+            return h;
+        }
+    }
+    0
 }
 
 fn read_file_abs_path(ctx: &mut dyn NativeContext, file_obj: ObjectRef) -> Option<String> {
@@ -311,6 +349,11 @@ fn open_and_register(
     let handle = next_handle();
     jar_table().lock().insert(handle, state);
     set_jar_handle(ctx, this, handle);
+    // Recovery key for `get_jar_handle` when the object has no writable handle
+    // slot (plain ZipFile): map its identity hash → handle.
+    if let Some(id) = identity_hash(ctx, this) {
+        identity_handle_table().lock().insert(id, handle);
+    }
     // Also store the name on the parent ZipFile's `name` field if present.
     let name_str = ctx.create_string(path_str);
     ctx.set_field_by_name(this, "name", Value::Object(Some(name_str)));
@@ -756,6 +799,13 @@ fn native_jarfile_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let handle = get_jar_handle(ctx, this);
     jar_table().lock().remove(&handle);
+    // Drop the identity→handle recovery entry if it still points at us.
+    if let Some(id) = identity_hash(ctx, this) {
+        let mut t = identity_handle_table().lock();
+        if t.get(&id).copied() == Some(handle) {
+            t.remove(&id);
+        }
+    }
     set_jar_handle(ctx, this, 0);
     Ok(None)
 }

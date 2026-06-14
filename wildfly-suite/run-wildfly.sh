@@ -15,7 +15,7 @@
 set -u
 ROOT="/c/craton/cratonvm/apps/wildfly/testsuite"
 HARNESS="/c/craton/CratonVM-wildfly/wildfly-suite"
-VM="/c/craton/cratonvm/target/release/cratonvm.exe"
+VM="${VM:-/c/craton/cratonvm/target/release/cratonvm.exe}"
 JDK25="C:\\Program Files\\Eclipse Adoptium\\jdk-25.0.2.10-hotspot"
 BATCH="${BATCH:-12}"; BATCH_TO="${BATCH_TO:-900}"; ONE_TO="${ONE_TO:-180}"
 OUT="$HARNESS/results"; mkdir -p "$OUT"
