@@ -1,6 +1,21 @@
 # 17 — P-384 / P-521 EC: progressive heap corruption (JIT miscompile)
 
-**Status:** FIXED — JIT ban on `sun/security/util/math/intpoly/` (`vm/src/jit/skip_list.rs`).
+**Status:** FIXED — two parts: (1) JIT ban on `sun/security/util/math/intpoly/`
+(`vm/src/jit/skip_list.rs`, commit `ca34440d`) cleared the "scalar multiply failed"
+corruption; (2) a SECOND, later JWKT failure — `X509Certificate.verify(key)` NPE'ing at
+`SignatureUtil.initVerifyWithParam` ("Cannot invoke initVerify on null") — is now also
+fixed. `DefaultCryptoJWKTest` = **OK (10/10)**.
+
+## Second cause + fix (`SignatureUtil` / `SharedSecrets`)
+`X509CertImpl.verify` calls `SignatureUtil.initVerifyWithParam(sig, key, params)`, which
+indirects through `SharedSecrets.getJavaSecuritySignatureAccess()`. That accessor is set
+by `java.security.Signature.<clinit>` — but CratonVM no-ops that clinit (it also triggers
+`Debug.getInstance`→Security-file read, same as Cipher), so the accessor stays **null** →
+NPE for EVERY real EC/RSA `cert.verify(key)`. Fix: intercept
+`sun.security.util.SignatureUtil.{initVerify,initSign}WithParam` (`jca/signature.rs`) to
+drive our registered `Signature.{initVerify,initSign,setParameter}` natives directly,
+bypassing the null accessor. (Original `intpoly` note below.)
+
 **Affected:** DefaultCryptoJWKTest (`publicEs256P384`/`P521`, now ✓);
 BCECDSACryptoProviderTest (secp384/521 — separate `ECPublicKeySpec` issue remains);
 DefaultCryptoSdJwtVPVerificationTest (`AltCnfCurves`, now ✓).

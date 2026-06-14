@@ -1803,6 +1803,411 @@ impl Rsa {
 }
 
 // ---------------------------------------------------------------------------
+// RSA encryption / decryption with PKCS#1 v1.5 (type 2) and OAEP (MGF1)
+// padding — drives the `javax.crypto.Cipher` "RSA/ECB/{PKCS1Padding,
+// OAEPWithSHA-1AndMGF1Padding, OAEPWithSHA-256AndMGF1Padding}" transformations.
+//
+// The caller supplies the raw big-endian `(modulus, exponent)` magnitudes
+// extracted from the `Key` object, so this works uniformly for genuine
+// `sun.security.rsa.RSAPublic/PrivateKeyImpl` keys (route_rsa_to_real, the
+// default) and for the bare synthetic keys (CRATONVM_SYNTHETIC_RSA=1) — both
+// honour `getModulus()`/`getPublic/PrivateExponent()` or carry a `key_id` the
+// caller resolves first. Padding is implemented per RFC 8017 (§7.1 OAEP, §7.2
+// RSAES-PKCS1-v1_5); the RSA primitive reuses the existing `BigUint::modpow`.
+// This avoids the JceSecurity provider-list machinery that the real
+// `RSACipher.engineSetPadding("OAEP…")` path needs (and which CratonVM's empty
+// provider list cannot satisfy → `getService on null`).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RsaCipherPadding {
+    Pkcs1,
+    OaepSha1,
+    OaepSha256,
+}
+
+impl RsaCipherPadding {
+    /// Parse the padding component of a `Cipher` transformation string
+    /// (the part after `RSA/ECB/`). Returns `None` for unsupported paddings.
+    pub fn from_transformation(padding: &str) -> Option<Self> {
+        let p = padding.trim();
+        if p.eq_ignore_ascii_case("PKCS1Padding") {
+            Some(RsaCipherPadding::Pkcs1)
+        } else if p.eq_ignore_ascii_case("OAEPWithSHA-1AndMGF1Padding")
+            || p.eq_ignore_ascii_case("OAEPWithSHA1AndMGF1Padding")
+            || p.eq_ignore_ascii_case("OAEPPadding")
+        {
+            Some(RsaCipherPadding::OaepSha1)
+        } else if p.eq_ignore_ascii_case("OAEPWithSHA-256AndMGF1Padding")
+            || p.eq_ignore_ascii_case("OAEPWithSHA256AndMGF1Padding")
+        {
+            Some(RsaCipherPadding::OaepSha256)
+        } else {
+            None
+        }
+    }
+
+    fn hlen(self) -> usize {
+        match self {
+            RsaCipherPadding::OaepSha1 => 20,
+            _ => 32,
+        }
+    }
+}
+
+/// Hash `data` with the OAEP padding's digest (SHA-1 or SHA-256).
+fn rsa_oaep_hash(pad: RsaCipherPadding, data: &[u8]) -> Vec<u8> {
+    match pad {
+        RsaCipherPadding::OaepSha1 => {
+            use sha1::Digest;
+            let mut h = sha1::Sha1::new();
+            h.update(data);
+            h.finalize().to_vec()
+        }
+        _ => {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(data);
+            h.finalize().to_vec()
+        }
+    }
+}
+
+/// MGF1 mask generation (RFC 8017 Appendix B.2.1) over the OAEP digest.
+fn rsa_mgf1(pad: RsaCipherPadding, seed: &[u8], len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + pad.hlen());
+    let mut counter: u32 = 0;
+    while out.len() < len {
+        let mut input = Vec::with_capacity(seed.len() + 4);
+        input.extend_from_slice(seed);
+        input.extend_from_slice(&counter.to_be_bytes());
+        out.extend_from_slice(&rsa_oaep_hash(pad, &input));
+        counter = counter.wrapping_add(1);
+    }
+    out.truncate(len);
+    out
+}
+
+/// EME-PKCS1-v1_5 encode (RFC 8017 §7.2.1): `00 02 || PS || 00 || M`.
+fn rsa_pkcs1_type2_pad(msg: &[u8], k: usize) -> Result<Vec<u8>, String> {
+    if k < 11 || msg.len() > k - 11 {
+        return Err(format!(
+            "RSA PKCS1: message too long for key ({} > {})",
+            msg.len(),
+            k.saturating_sub(11)
+        ));
+    }
+    let ps_len = k - msg.len() - 3;
+    let mut rng = SecureRandom::new();
+    let mut ps = Vec::with_capacity(ps_len);
+    while ps.len() < ps_len {
+        let mut b = [0u8; 16];
+        rng.next_bytes(&mut b);
+        for &x in b.iter() {
+            if x != 0 {
+                ps.push(x);
+                if ps.len() == ps_len {
+                    break;
+                }
+            }
+        }
+    }
+    let mut em = Vec::with_capacity(k);
+    em.push(0x00);
+    em.push(0x02);
+    em.extend_from_slice(&ps);
+    em.push(0x00);
+    em.extend_from_slice(msg);
+    Ok(em)
+}
+
+/// EME-PKCS1-v1_5 decode: strip `00 02 || PS || 00` and return `M`.
+fn rsa_pkcs1_type2_unpad(em: &[u8]) -> Result<Vec<u8>, String> {
+    if em.len() < 11 || em[0] != 0x00 || em[1] != 0x02 {
+        return Err("RSA PKCS1: decryption error".into());
+    }
+    // PS must be at least 8 bytes, then a single 0x00 separator.
+    let sep = em[2..].iter().position(|&b| b == 0x00).map(|i| i + 2);
+    match sep {
+        Some(s) if s >= 10 => Ok(em[s + 1..].to_vec()),
+        _ => Err("RSA PKCS1: decryption error".into()),
+    }
+}
+
+/// EME-OAEP encode (RFC 8017 §7.1.1) with an empty label.
+fn rsa_oaep_pad(pad: RsaCipherPadding, msg: &[u8], k: usize) -> Result<Vec<u8>, String> {
+    let hlen = pad.hlen();
+    if k < 2 * hlen + 2 || msg.len() > k - 2 * hlen - 2 {
+        return Err(format!(
+            "RSA OAEP: message too long for key ({} > {})",
+            msg.len(),
+            k.saturating_sub(2 * hlen + 2)
+        ));
+    }
+    let lhash = rsa_oaep_hash(pad, &[]);
+    let ps_len = k - msg.len() - 2 * hlen - 2;
+    // DB = lHash || PS(0x00 * ps_len) || 0x01 || M   (length k - hlen - 1)
+    let mut db = Vec::with_capacity(k - hlen - 1);
+    db.extend_from_slice(&lhash);
+    db.extend(std::iter::repeat(0u8).take(ps_len));
+    db.push(0x01);
+    db.extend_from_slice(msg);
+    let mut seed = vec![0u8; hlen];
+    SecureRandom::new().next_bytes(&mut seed);
+    let db_mask = rsa_mgf1(pad, &seed, k - hlen - 1);
+    let masked_db: Vec<u8> = db.iter().zip(db_mask.iter()).map(|(a, b)| a ^ b).collect();
+    let seed_mask = rsa_mgf1(pad, &masked_db, hlen);
+    let masked_seed: Vec<u8> = seed.iter().zip(seed_mask.iter()).map(|(a, b)| a ^ b).collect();
+    let mut em = Vec::with_capacity(k);
+    em.push(0x00);
+    em.extend_from_slice(&masked_seed);
+    em.extend_from_slice(&masked_db);
+    Ok(em)
+}
+
+/// EME-OAEP decode (RFC 8017 §7.1.2) with an empty label.
+fn rsa_oaep_unpad(pad: RsaCipherPadding, em: &[u8]) -> Result<Vec<u8>, String> {
+    let hlen = pad.hlen();
+    if em.len() < 2 * hlen + 2 || em[0] != 0x00 {
+        return Err("RSA OAEP: decryption error".into());
+    }
+    let masked_seed = &em[1..1 + hlen];
+    let masked_db = &em[1 + hlen..];
+    let seed_mask = rsa_mgf1(pad, masked_db, hlen);
+    let seed: Vec<u8> = masked_seed
+        .iter()
+        .zip(seed_mask.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+    let db_mask = rsa_mgf1(pad, &seed, masked_db.len());
+    let db: Vec<u8> = masked_db
+        .iter()
+        .zip(db_mask.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+    let lhash = rsa_oaep_hash(pad, &[]);
+    if db.len() < hlen || db[..hlen] != lhash[..] {
+        return Err("RSA OAEP: decryption error (lHash mismatch)".into());
+    }
+    // Skip the PS zero bytes, expect a single 0x01 marker, then the message.
+    let mut i = hlen;
+    while i < db.len() && db[i] == 0x00 {
+        i += 1;
+    }
+    if i >= db.len() || db[i] != 0x01 {
+        return Err("RSA OAEP: decryption error (no 0x01 marker)".into());
+    }
+    Ok(db[i + 1..].to_vec())
+}
+
+/// RSA public-key encryption (ENCRYPT/WRAP): pad then `m^e mod n`.
+pub fn rsa_cipher_encrypt(
+    n: &[u8],
+    e: &[u8],
+    pad: RsaCipherPadding,
+    msg: &[u8],
+) -> Result<Vec<u8>, String> {
+    let n_big = BigUint::from_bytes_be(n);
+    let e_big = BigUint::from_bytes_be(e);
+    let k = (n_big.bit_length() + 7) / 8;
+    if k == 0 {
+        return Err("RSA: invalid (zero) modulus".into());
+    }
+    let em = match pad {
+        RsaCipherPadding::Pkcs1 => rsa_pkcs1_type2_pad(msg, k)?,
+        _ => rsa_oaep_pad(pad, msg, k)?,
+    };
+    let m = BigUint::from_bytes_be(&em);
+    let c = m.modpow(&e_big, &n_big);
+    Ok(c.to_bytes_be_padded(k))
+}
+
+/// RSA private-key decryption (DECRYPT/UNWRAP): `c^d mod n` then unpad.
+pub fn rsa_cipher_decrypt(
+    n: &[u8],
+    d: &[u8],
+    pad: RsaCipherPadding,
+    ct: &[u8],
+) -> Result<Vec<u8>, String> {
+    let n_big = BigUint::from_bytes_be(n);
+    let d_big = BigUint::from_bytes_be(d);
+    let k = (n_big.bit_length() + 7) / 8;
+    if k == 0 {
+        return Err("RSA: invalid (zero) modulus".into());
+    }
+    if ct.len() != k {
+        return Err(format!(
+            "RSA decrypt: ciphertext length {} != modulus size {}",
+            ct.len(),
+            k
+        ));
+    }
+    let c = BigUint::from_bytes_be(ct);
+    let m = c.modpow(&d_big, &n_big);
+    let em = m.to_bytes_be_padded(k);
+    match pad {
+        RsaCipherPadding::Pkcs1 => rsa_pkcs1_type2_unpad(&em),
+        _ => rsa_oaep_unpad(pad, &em),
+    }
+}
+
+/// Resolve a synthetic key's `crypto_impl` private components `(n, d)`.
+pub fn rsa_key_get_priv(id: u64) -> Option<(Vec<u8>, Vec<u8>)> {
+    let guard = RSA_KEY_STORE.read();
+    guard
+        .as_ref()
+        .and_then(|m| m.get(&id))
+        .map(|kp| (kp.private_key.n.to_bytes_be(), kp.private_key.d.to_bytes_be()))
+}
+
+// ---------------------------------------------------------------------------
+// RSASSA-PSS signature verification (RFC 8017 §8.1.2 / §9.1.2, EMSA-PSS-VERIFY).
+//
+// JWA's PS256 / PS384 / PS512 map to RSASSA-PSS with MGF1 over the same hash and
+// a salt length equal to the hash length. Keycloak's `JavaAlgorithm` resolves
+// them to BouncyCastle's `SHA{256,384,512}withRSAandMGF1`; the empty CratonVM
+// provider list can't service the real BC SPI, so we verify natively. Verify
+// only (the SD-JWT key-binding path verifies a holder-signed JWT) — signing PSS
+// would need randomised salt and is not on any exercised path.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PssHash {
+    Sha256,
+    Sha384,
+    Sha512,
+}
+
+impl PssHash {
+    fn hlen(self) -> usize {
+        match self {
+            PssHash::Sha256 => 32,
+            PssHash::Sha384 => 48,
+            PssHash::Sha512 => 64,
+        }
+    }
+
+    fn hash(self, data: &[u8]) -> Vec<u8> {
+        match self {
+            PssHash::Sha256 => Sha256::digest(data).to_vec(),
+            PssHash::Sha384 => Sha384::digest(data).to_vec(),
+            PssHash::Sha512 => Sha512::digest(data).to_vec(),
+        }
+    }
+}
+
+/// MGF1 over the PSS digest.
+fn pss_mgf1(hash: PssHash, seed: &[u8], len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + hash.hlen());
+    let mut counter: u32 = 0;
+    while out.len() < len {
+        let mut input = Vec::with_capacity(seed.len() + 4);
+        input.extend_from_slice(seed);
+        input.extend_from_slice(&counter.to_be_bytes());
+        out.extend_from_slice(&hash.hash(&input));
+        counter = counter.wrapping_add(1);
+    }
+    out.truncate(len);
+    out
+}
+
+/// RSASSA-PSS verify with MGF1 and salt length == hLen (the JWA convention for
+/// PS256/PS384/PS512). Returns `false` for any malformed/invalid signature.
+pub fn rsa_verify_pss(
+    n: &[u8],
+    e: &[u8],
+    hash: PssHash,
+    message: &[u8],
+    signature: &[u8],
+) -> bool {
+    let n_big = BigUint::from_bytes_be(n);
+    let e_big = BigUint::from_bytes_be(e);
+    let mod_bits = n_big.bit_length();
+    if mod_bits == 0 {
+        return false;
+    }
+    let k = (mod_bits + 7) / 8;
+    if signature.len() != k {
+        return false;
+    }
+    let hlen = hash.hlen();
+    let slen = hlen; // JWA: salt length equals the hash length.
+
+    // RSAVP1: s^e mod n (reject s >= n).
+    let s = BigUint::from_bytes_be(signature);
+    if s.cmp(&n_big) != std::cmp::Ordering::Less {
+        return false;
+    }
+    let m = s.modpow(&e_big, &n_big);
+
+    // EMSA-PSS-VERIFY (emBits = modBits - 1).
+    let em_bits = mod_bits - 1;
+    let em_len = (em_bits + 7) / 8;
+    if em_len < hlen + slen + 2 {
+        return false;
+    }
+    let em = m.to_bytes_be_padded(em_len);
+    if em[em_len - 1] != 0xbc {
+        return false;
+    }
+    let masked_db = &em[..em_len - hlen - 1];
+    let h = &em[em_len - hlen - 1..em_len - 1];
+
+    // The leftmost (8*emLen - emBits) bits of the leftmost maskedDB byte must be 0.
+    let zero_bits = 8 * em_len - em_bits; // in 1..=8
+    if zero_bits < 8 {
+        if masked_db[0] & (0xFFu8 << (8 - zero_bits)) != 0 {
+            return false;
+        }
+    } else if masked_db[0] != 0 {
+        return false;
+    }
+
+    let db_mask = pss_mgf1(hash, h, em_len - hlen - 1);
+    let mut db: Vec<u8> = masked_db
+        .iter()
+        .zip(db_mask.iter())
+        .map(|(a, b)| a ^ b)
+        .collect();
+    // Clear the leftmost zero_bits bits of db[0].
+    if zero_bits == 8 {
+        db[0] = 0;
+    } else {
+        db[0] &= 0xFFu8 >> zero_bits;
+    }
+
+    // DB = PS(0x00…) || 0x01 || salt.
+    let ps_len = em_len - hlen - slen - 2;
+    if db[..ps_len].iter().any(|&b| b != 0) {
+        return false;
+    }
+    if db[ps_len] != 0x01 {
+        return false;
+    }
+    let salt = &db[db.len() - slen..];
+
+    // H' = Hash(0x00*8 || mHash || salt) must equal H.
+    let m_hash = hash.hash(message);
+    let mut m_prime = Vec::with_capacity(8 + hlen + slen);
+    m_prime.extend_from_slice(&[0u8; 8]);
+    m_prime.extend_from_slice(&m_hash);
+    m_prime.extend_from_slice(salt);
+    hash.hash(&m_prime) == h
+}
+
+/// RSASSA-PSS verify against a stored key id (real or synthetic). `None` only
+/// when the key id is unknown.
+pub fn rsa_verify_pss_by_id(
+    id: u64,
+    hash: PssHash,
+    message: &[u8],
+    signature: &[u8],
+) -> Option<bool> {
+    let (n, e) = rsa_key_get_pub(id)?;
+    Some(rsa_verify_pss(&n, &e, hash, message, signature))
+}
+
+// ---------------------------------------------------------------------------
 // ECDSA P-256 implementation
 // ---------------------------------------------------------------------------
 
@@ -4658,6 +5063,67 @@ mod tests {
         let mut bad = msg.to_vec();
         bad[0] ^= 1;
         assert!(!Rsa::verify_sha256(&pk, &bad, &sig), "tampered payload");
+    }
+
+    // RSA `Cipher` round-trip: encrypt with the public key, decrypt with the
+    // private key, for every supported padding. Exercises the EME-PKCS1-v1_5
+    // and EME-OAEP (SHA-1 / SHA-256) encode/decode paths used by the keycloak
+    // JWE RSA1_5 / RSA-OAEP / RSA-OAEP-256 transformations.
+    #[test]
+    fn rsa_cipher_roundtrip_all_paddings() {
+        let (pk, sk) = Rsa::generate_keypair(2048);
+        let n = pk.n.to_bytes_be();
+        let e = pk.e.to_bytes_be();
+        let d = sk.d.to_bytes_be();
+        for pad in [
+            RsaCipherPadding::Pkcs1,
+            RsaCipherPadding::OaepSha1,
+            RsaCipherPadding::OaepSha256,
+        ] {
+            let msg = b"0123456789abcdef"; // 16-byte AES CEK, like JWE
+            let ct = rsa_cipher_encrypt(&n, &e, pad, msg).expect("encrypt");
+            assert_eq!(ct.len(), 256, "{:?}: ciphertext is modulus-sized", pad);
+            let pt = rsa_cipher_decrypt(&n, &d, pad, &ct).expect("decrypt");
+            assert_eq!(pt, msg, "{:?}: round-trip", pad);
+        }
+    }
+
+    #[test]
+    fn rsa_cipher_padding_from_transformation() {
+        assert_eq!(
+            RsaCipherPadding::from_transformation("PKCS1Padding"),
+            Some(RsaCipherPadding::Pkcs1)
+        );
+        assert_eq!(
+            RsaCipherPadding::from_transformation("OAEPWithSHA-1AndMGF1Padding"),
+            Some(RsaCipherPadding::OaepSha1)
+        );
+        assert_eq!(
+            RsaCipherPadding::from_transformation("OAEPWithSHA-256AndMGF1Padding"),
+            Some(RsaCipherPadding::OaepSha256)
+        );
+        assert_eq!(RsaCipherPadding::from_transformation("NoPadding"), None);
+    }
+
+    #[test]
+    fn rsa_pss_verify_hotspot_vectors() {
+        // PS256/PS384/PS512 signatures produced by HotSpot's RSASSA-PSS SPI
+        // (salt length == hash length, MGF1 over the same hash) over a fixed
+        // 2048-bit key — validates EMSA-PSS-VERIFY against a real implementation.
+        let n = from_hex("00e2887dc7a26dee90a6811cb259ee83a027a132771e3811a33768a6ef96a1090e793c4d042bfd04f52e8ae497a40a1b71a6acd8d451f35c7f6804d3c46a30e1f00d03b8542397f87aec655447c33f11998a07bf505dfc1c623148cbc6e2a1a9d88f44ed77ecb5813ae51c2db6043077223da796509e4158f5fa2f97cbebd28ad78dc9a7c5c48ed6131ee3cd897605ed771c7cd55d91dfb14eddc27164840803d67c9cb0ec3d7077d91921a3ea0b44c791b1b06fa1de4ea39cadca9a982704b30b3f07e35d1edd1c56d11907b44e46986b9f2edfce56111a4ab21d441bd884c7442aed05b99502bbc0171ba74ca08abac0dda1376ddcda9dca78124f7ee2284619");
+        let e = from_hex("010001");
+        let msg = from_hex("74686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f67");
+        for (h, sig_hex) in [
+            (PssHash::Sha256, "e12b6161e1f1912f87d64e4face0199d9b95b74bac37e2e257dd129e56fc618094031beb07f888577af2749ed933d171111640f824dad6b55fb3175304d6ee44420dcef4e6a0be6c5ae1f750aa8352d7302ac75bb3f6201fe73d5ba667427c467d0e3a93ea9eac799a105f23f6dd04e0bcc240517ef3fb58cfb2ad3fd6d6bd37ca917dfc5b1e72aa42defc90780434745f36e9cb11f7b932a063ea3d821a8fd008580c0103ca35df29409539bd62d1c7cdb42e26f857f5c9abe65f3057306bae225918d13b1780fc87fbe35b338b27b40619a7928edce8b17427b5232315538e755f6bfb051210f8f2af14d0bebe39914be2f44c0c992a4b32e4acaf9689ef95"),
+            (PssHash::Sha384, "85a0d54722469e406e11391c33c0c63a5c931bc05c85f5e0e91c0f689dfdccf983e472eceae07e76f46b3643ae55a6b21e5595dfaefd2581d3f802146f785af290dbd08300a872a77883e16dbba5c6f2c43413ed9d6b6ba8406aed6c698f839acec64c6917d833f107b248afd1851074f80b535ac3c8f52dd4251d203d4b332e34d610ca86534305ea936798d1ca4313c1226f10da5f25bf3d99d2b7cb63e6d63990e3713284a3a746155ea8b1bd11c0fa44408aecf9bebb002b3c18d6cbe3fb03562c3d12d9c83127af0b2b48f1336f37dac7e8c904e83b897a2614eef1ba329cbca5183e661622b8f067dd9696568b5b24f9c38e56b704b6dd7d33c1c39bf7"),
+            (PssHash::Sha512, "1aa9ecf5d993ccd238f23b07f08ab30af2298bbe1b1a26d85efdef2550a02429b58d14a8a4d6a4f27e9fbfa36f51ddb46bbd5b1fdc3921f2031b0aecc3ea245f76e94a482fe232db7a5b1aa8515e24165bab95dd3fa4ec03d55e98a95201f7f858865d8dc96bc46b863db5f9c1e11d07d238faef3dd419c4fe970d07c7e1c5d8d252b956198e9358e6b37a50417a69cd5353a3dc74765568038769fa32ac0758b2161aa1399ef1c4101a465dfa517f70e1d23d158359fa52e0f6ddc4b3f54ece116f24d6478701e6ebf7e2dcf19e97af6b0542237ddcac5b81cce62b6467502de9421a469f4f43ba048e05589860b3b7e4a9004a7b99ca557e2e85ba2a871f7f"),
+        ] {
+            let sig = from_hex(sig_hex);
+            assert!(rsa_verify_pss(&n, &e, h, &msg, &sig), "{:?}: valid PSS sig", h);
+            let mut bad = msg.clone();
+            bad[0] ^= 1;
+            assert!(!rsa_verify_pss(&n, &e, h, &bad, &sig), "{:?}: tampered msg", h);
+        }
     }
 
     // RF.10: PKIX chain walker — helper unit coverage.

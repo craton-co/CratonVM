@@ -248,14 +248,28 @@ fn drive_real_ec_keyfactory(
     engine: &'static str,
     ret_desc: &'static str,
 ) -> MethodCallResult {
-    // Pin the KeySpec across the ECKeyFactory alloc.
+    drive_keyspec_spi(ctx, "sun/security/ec/ECKeyFactory", spec, engine, ret_desc)
+}
+
+/// Construct the real `KeyFactorySpi` named by `spi_class` and invoke its
+/// `engine{Generate,GetKeySpec}` method over `spec`. The KeySpec is pinned across
+/// the SPI allocation. Used for SunEC (the default EC path) and for BouncyCastle's
+/// `ec.KeyFactorySpi$EC` fallback that natively accepts BC-specific specs
+/// (`org.bouncycastle.jce.spec.EC{Public,Private}KeySpec`).
+fn drive_keyspec_spi(
+    ctx: &mut dyn NativeContext,
+    spi_class: &'static str,
+    spec: ObjectRef,
+    engine: &'static str,
+    ret_desc: &'static str,
+) -> MethodCallResult {
     let pin = ctx.pin_native_root(spec);
     let result = (|| {
-        let kf = match ctx.new_object_initialized("sun/security/ec/ECKeyFactory", "()V", &[])? {
+        let kf = match ctx.new_object_initialized(spi_class, "()V", &[])? {
             Some(Value::Object(Some(o))) => o,
             _ => {
                 return Err(RuntimeError::NotImplemented {
-                    feature: "sun.security.ec.ECKeyFactory".into(),
+                    feature: spi_class.into(),
                 }
                 .into())
             }
@@ -322,6 +336,49 @@ fn build_positive_biginteger(
             feature: "java.math.BigInteger(int,byte[])".into(),
         }
         .into()),
+    }
+}
+
+/// Invoke `obj.method()` → `BigInteger`, then `BigInteger.toByteArray()`, into a
+/// raw two's-complement big-endian magnitude. `None` if either virtual call
+/// fails. The intermediate `BigInteger` is pinned across `toByteArray()`.
+fn call_biginteger_to_bytes(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    method: &str,
+) -> Option<Vec<u8>> {
+    let bi = match ctx.invoke_virtual(obj, method, "()Ljava/math/BigInteger;", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return None,
+    };
+    let pin = ctx.pin_native_root(bi);
+    let bi = ctx.read_native_pin(pin, bi);
+    let arr = ctx.invoke_virtual(bi, "toByteArray", "()[B", &[]);
+    ctx.unpin_native_roots(pin);
+    match arr {
+        Ok(Some(Value::Object(Some(a)))) => Some(read_byte_array(ctx, a)),
+        _ => None,
+    }
+}
+
+/// Read `(modulus, publicExponent)` magnitudes from a `java.security.spec.
+/// RSAPublicKeySpec`. Used by the synthetic (`CRATONVM_SYNTHETIC_RSA=1`)
+/// `generatePublic` path — the counterpart to the real-KeyFactory drive used
+/// when `route_rsa_to_real()` is on — so keycloak's JWK→key conversion
+/// (`generatePublic(new RSAPublicKeySpec(n, e))`) works in both modes.
+fn rsa_pubspec_components(
+    ctx: &mut dyn NativeContext,
+    spec: ObjectRef,
+) -> Option<(Vec<u8>, Vec<u8>)> {
+    let pin = ctx.pin_native_root(spec);
+    let spec_r = ctx.read_native_pin(pin, spec);
+    let n = call_biginteger_to_bytes(ctx, spec_r, "getModulus");
+    let spec_r = ctx.read_native_pin(pin, spec);
+    let e = call_biginteger_to_bytes(ctx, spec_r, "getPublicExponent");
+    ctx.unpin_native_roots(pin);
+    match (n, e) {
+        (Some(n), Some(e)) if !n.is_empty() && !e.is_empty() => Some((n, e)),
+        _ => None,
     }
 }
 
@@ -1109,12 +1166,29 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // ECPublicKeyImpl (the synthetic path can't honour an ECPublicKeySpec).
     if algo == ALGO_EC && crate::route_ec_to_real() {
         if let Some(Value::Object(Some(spec))) = args.get(1) {
-            return drive_real_ec_keyfactory(
+            let r = drive_real_ec_keyfactory(
                 ctx,
                 *spec,
                 "engineGeneratePublic",
                 "Ljava/security/PublicKey;",
             );
+            // SunEC only understands `java.security.spec.*`; a BC-specific
+            // `org.bouncycastle.jce.spec.ECPublicKeySpec` (keycloak's
+            // `BCECDSACryptoProvider.getPublicFromPrivate`) makes it throw
+            // InvalidKeySpecException. Retry through BC's own EC KeyFactory SPI,
+            // which accepts the BC spec natively and returns a BCECPublicKey.
+            if r.is_err() {
+                if let Ok(ok @ Some(Value::Object(Some(_)))) = drive_keyspec_spi(
+                    ctx,
+                    "org/bouncycastle/jcajce/provider/asymmetric/ec/KeyFactorySpi$EC",
+                    *spec,
+                    "engineGeneratePublic",
+                    "Ljava/security/PublicKey;",
+                ) {
+                    return Ok(ok);
+                }
+            }
+            return r;
         }
     }
     // RSA: drive the real KeyFactory over WHATEVER spec the caller passed —
@@ -1148,7 +1222,28 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
 
     if algo == ALGO_RSA {
-        if let Some(pk) = crypto_impl::parse_rsa_public_key(&der) {
+        // Accept either an X509 `SubjectPublicKeyInfo` DER (parsed above) OR an
+        // `RSAPublicKeySpec` (modulus/publicExponent). The spec branch is the
+        // synthetic-mode path; in real mode the drive at the top of this fn has
+        // already returned a genuine `RSAPublicKeyImpl` for the spec.
+        let mut pk_opt = crypto_impl::parse_rsa_public_key(&der);
+        // Only consult the spec's BigInteger getters when there is NO encoded
+        // DER — an `RSAPublicKeySpec` carries `modulus`/`publicExponent` objects
+        // (field 0 is not a byte[], so `der` is empty), whereas an
+        // `X509EncodedKeySpec` always has its bytes at field 0. This avoids
+        // calling `getModulus()` on a non-RSAPublicKeySpec.
+        if pk_opt.is_none() && der.is_empty() {
+            if let Some(Value::Object(Some(spec))) = args.get(1) {
+                let spec = *spec;
+                if let Some((n, e)) = rsa_pubspec_components(ctx, spec) {
+                    pk_opt = Some(crypto_impl::RsaPublicKey {
+                        n: crypto_impl::BigUint::from_bytes_be(&n),
+                        e: crypto_impl::BigUint::from_bytes_be(&e),
+                    });
+                }
+            }
+        }
+        if let Some(pk) = pk_opt {
             let n_bytes = pk.n.to_bytes_be();
             let e_bytes = pk.e.to_bytes_be();
             let pk_der = crypto_impl::Rsa::public_key_to_der(&pk);
@@ -1252,12 +1347,25 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // ECPrivateKeyImpl (the only private-key import we can satisfy).
     if algo == ALGO_EC && crate::route_ec_to_real() {
         if let Some(Value::Object(Some(spec))) = args.get(1) {
-            return drive_real_ec_keyfactory(
+            let r = drive_real_ec_keyfactory(
                 ctx,
                 *spec,
                 "engineGeneratePrivate",
                 "Ljava/security/PrivateKey;",
             );
+            // BC-specific `org.bouncycastle.jce.spec.ECPrivateKeySpec` → BC SPI.
+            if r.is_err() {
+                if let Ok(ok @ Some(Value::Object(Some(_)))) = drive_keyspec_spi(
+                    ctx,
+                    "org/bouncycastle/jcajce/provider/asymmetric/ec/KeyFactorySpi$EC",
+                    *spec,
+                    "engineGeneratePrivate",
+                    "Ljava/security/PrivateKey;",
+                ) {
+                    return Ok(ok);
+                }
+            }
+            return r;
         }
     }
     // ML-DSA / ML-KEM: drive the real JDK 25 PQC KeyFactory SPI over the
