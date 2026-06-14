@@ -355,11 +355,18 @@ pub fn load_jks(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStor
     // RFC: JKS HMAC covers `(password as UTF-16BE) || "Mighty Aphrodite"
     // || body`, where body is everything before the final 20 bytes.
     let body_end = bytes.len() - 20;
-    let stored_mac = &bytes[body_end..];
-    let body = &bytes[..body_end];
-    let computed = jks_password_mac(password, body);
-    if !constant_time_eq(stored_mac, &computed) {
-        return Err(KeyStoreError::JksMacMismatch);
+    // Real-JDK JavaKeyStore only verifies the integrity HMAC when a password is
+    // supplied; a null/empty password loads the certs without the check (the
+    // standard way to read a truststore). Mirror that — otherwise loading e.g. a
+    // JSSE truststore with no password failed "JKS HMAC integrity check failed"
+    // and broke SSLContext creation.
+    if !password.is_empty() {
+        let stored_mac = &bytes[body_end..];
+        let body = &bytes[..body_end];
+        let computed = jks_password_mac(password, body);
+        if !constant_time_eq(stored_mac, &computed) {
+            return Err(KeyStoreError::JksMacMismatch);
+        }
     }
 
     let mut r = JksReader::new(bytes);
@@ -1099,6 +1106,27 @@ fn read_string_arg(ctx: &mut dyn NativeContext, v: &Value) -> Option<String> {
 }
 
 fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, cert_der: &[u8]) -> ObjectRef {
+    // Build the DER byte[] once — used either as the ctor arg for the real cert
+    // or stashed in the synthetic-mirror fallback.
+    let arr = ctx.new_array(ArrayElementType::Byte, cert_der.len());
+    for (i, b) in cert_der.iter().enumerate() {
+        ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
+    }
+    // Prefer a REAL `sun.security.x509.X509CertImpl` parsed from the DER. A bare
+    // synthetic `java/security/cert/X509Certificate` is the ABSTRACT class, so
+    // the SunX509 KeyManager's chain validation — `cert.checkValidity(Date)`
+    // during init — throws `AbstractMethodError` ("no Code attribute"). The real
+    // X509CertImpl implements the full X509Certificate API (checkValidity,
+    // getSubjectX500Principal, getPublicKey, getEncoded, …) via real bytecode.
+    if let Ok(Some(Value::Object(Some(real)))) = ctx.new_object_initialized(
+        "sun/security/x509/X509CertImpl",
+        "([B)V",
+        &[Value::Object(Some(arr))],
+    ) {
+        return real;
+    }
+    // Fallback: synthetic mirror (subject/issuer = alias, DER in slot 3). Reached
+    // only if the real DER parse fails (e.g. an unimplemented DerValue native).
     let cert_obj = alloc_concurrent_synthetic(ctx, "java/security/cert/X509Certificate", 4);
     // Field layout matches what `phases_early.rs` uses for the
     // `getCertificate` path: 0=subject string, 1=issuer string, 2=cert_id,
@@ -1111,14 +1139,24 @@ fn make_x509_mirror(ctx: &mut dyn NativeContext, alias: &str, cert_der: &[u8]) -
     ctx.set_field(cert_obj, 1, Value::Object(Some(alias_str)));
     ctx.set_field(cert_obj, 2, Value::Int(0));
 
-    // Stash the DER as a Java byte[] so consumers can call
+    // Stash the DER (reuse the byte[] built above) so consumers can call
     // `Certificate.getEncoded()` or pass the bytes to a TLS/`X509TrustManager`.
-    let arr = ctx.new_array(ArrayElementType::Byte, cert_der.len());
-    for (i, b) in cert_der.iter().enumerate() {
-        ctx.set_array_element(arr, i, Value::Int(*b as i8 as i32));
-    }
     ctx.set_field(cert_obj, 3, Value::Object(Some(arr)));
     cert_obj
+}
+
+/// Identity-keyed fallback for the store-id, used when the KeyStoreSpi object
+/// has no field to hold it. A real `sun.security.provider.JavaKeyStore$JKS` has
+/// a SINGLE instance field (`entries`), so neither the synthetic
+/// `cratonvm$keystore$storeId` field (which doesn't exist on the real class →
+/// `set_field_by_name` no-ops) nor slot `FIELD_STORE_ID=4` (out of range) can
+/// store it — `engineAliases` then looked up store 0 and reported an empty
+/// keystore, so KeyManagerFactory found "No aliases for private keys" and TLS
+/// init failed. `identity_hash_code` is stable across GC, so key on it.
+fn store_id_by_identity() -> &'static std::sync::Mutex<std::collections::HashMap<i32, i32>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<i32, i32>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 fn get_store_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
@@ -1126,7 +1164,7 @@ fn get_store_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     // means our `engine*` callbacks may run on either a real-JDK PKCS12KeyStore
     // mirror (with all the real fields) or a 5-field synthetic mirror that
     // `tls.rs` allocates. Probe by name first, fall back to the conventional
-    // slot index.
+    // slot index, then the identity side-table.
     let by_name = ctx.get_field_by_name(this, "cratonvm$keystore$storeId");
     if let Value::Int(i) = by_name {
         if i != 0 {
@@ -1141,9 +1179,16 @@ fn get_store_id(ctx: &mut dyn NativeContext, this: ObjectRef) -> i32 {
     let n = ctx.object_num_fields(this);
     if n > FIELD_STORE_ID {
         match ctx.get_field(this, FIELD_STORE_ID) {
-            Value::Int(i) => return i,
-            Value::Long(l) => return l as i32,
+            Value::Int(i) if i != 0 => return i,
+            Value::Long(l) if l != 0 => return l as i32,
             _ => {}
+        }
+    }
+    // Identity side-table fallback (real JKS objects have no field for it).
+    let ih = ctx.identity_hash_code(this);
+    if ih != 0 {
+        if let Some(&id) = store_id_by_identity().lock().unwrap_or_else(|e| e.into_inner()).get(&ih) {
+            return id;
         }
     }
     0
@@ -1154,6 +1199,12 @@ fn set_store_id(ctx: &mut dyn NativeContext, this: ObjectRef, id: i32) {
     let n = ctx.object_num_fields(this);
     if n > FIELD_STORE_ID {
         ctx.set_field(this, FIELD_STORE_ID, Value::Int(id));
+    }
+    // Always record in the identity side-table so retrieval works even when the
+    // KeyStoreSpi object has no usable field (real JavaKeyStore$JKS = 1 field).
+    let ih = ctx.identity_hash_code(this);
+    if ih != 0 {
+        store_id_by_identity().lock().unwrap_or_else(|e| e.into_inner()).insert(ih, id);
     }
 }
 

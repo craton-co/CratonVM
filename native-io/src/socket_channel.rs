@@ -1809,6 +1809,32 @@ fn ssc_socket(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
             return Ok(Some(Value::Object(Some(cached))));
         }
     }
+    // Under CRATONVM_REAL_NET_SOCKETS the central registry filter drops every
+    // java/net/ServerSocket native, so real ServerSocket bytecode runs. A bare
+    // `new java/net/ServerSocket` allocated WITHOUT its <init> leaves
+    // `socketLock` (a `final Object` instance-initializer field) null, so the
+    // first real method that does `synchronized (socketLock)` — e.g. getImpl()
+    // reached from ServerSocket.setSoTimeout() — throws "monitorenter ... null".
+    // This is exactly Tomcat's NioEndpoint.initServerSocket → setProperties →
+    // setSoTimeout path. Mirror the real ServerSocketChannelImpl.socket()
+    // (return ServerSocketAdaptor.create(this)): the adaptor is a proper
+    // java.net.ServerSocket subclass whose bind/accept/setSoTimeout delegate to
+    // the channel and whose construction runs the ServerSocket instance
+    // initializers (socketLock = new Object()), so getImpl() is never reached.
+    if std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some() {
+        if let Ok(Some(v @ Value::Object(Some(adaptor)))) = ctx.invoke(
+            "sun/nio/ch/ServerSocketAdaptor",
+            "create",
+            "(Lsun/nio/ch/ServerSocketChannelImpl;)Ljava/net/ServerSocket;",
+            &[Value::Object(Some(this))],
+        ) {
+            if ctx.object_num_fields(this) > SSC_SOCKET_CACHE {
+                ctx.set_field(this, SSC_SOCKET_CACHE, Value::Object(Some(adaptor)));
+            }
+            return Ok(Some(v));
+        }
+        // Fall through to the bare-ServerSocket fallback on any failure.
+    }
     // Allocate a real-layout ServerSocket and remember the channel back-ref
     // in a side-table; we cannot stash anything inside the wrapper itself
     // without clashing with JDK-private fields like `bound` or `impl`.
