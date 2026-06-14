@@ -1900,6 +1900,38 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // scan/fill loop never returns" family as NETTY.1 (`Arrays.fill`). Ban
         // narrowly until the codegen defect is isolated.
         | ("com/sun/org/apache/xerces/internal/impl/XMLEntityScanner", "skipString")
+        // SB-17 (2026-06-14) — Groovy `GroovyClassLoader.parseClass` JIT heap
+        // corruption. JIT-compiling `groovy/lang/GroovyClassLoader.doParseClass`
+        // deterministically writes the int `512` into the `array_length` header
+        // word (offset 12) of an unrelated live `kind=Object` heap object, which
+        // makes the non-moving young sweep bail on the "inconsistent header"
+        // (`array_length=512` on a kind=Object), re-sync at a wrong boundary, and
+        // reclaim live objects — surfacing downstream as either
+        // `AbstractMethodError: java/util/Deque.iterator()` (a reclaimed
+        // `LinkedList` in `CompilationUnit.phaseOperations[]`) or the
+        // `CompactValue::object: pointer 0x… exceeds 47-bit` panic
+        // (`AstBuilder.buildAST` dispatch reads a header whose lock-state bits are
+        // spuriously `Forwarded`). Isolated via `CRATONVM_JIT_BISECT_ONLY` /
+        // `BISECT_SKIP` bisection on a quiet machine (java/* clean, org/antlr
+        // clean, org/codehaus/groovy/{runtime,control,ast,classgen} clean,
+        // vmplugin/transform/MetaClassImpl clean) down to this single method:
+        // keep-only-skip of `GroovyClassLoader.doParseClass` → 0 corruption across
+        // runs vs 6 with it JIT-eligible. `doParseClass` itself emits NO direct
+        // heap stores (only `[rbp-…]` frame spills + indirect helper/method
+        // calls) and contains no longs / arrays / the value 512 in its bytecode —
+        // so the defect is a value-typing/regalloc/oop-map miscompile of this
+        // large method (reused local slot 6: url→collector; the run logs a
+        // "long↔object NaN-box collision degraded to Value::Long", i.e. a `long`
+        // slot read as an object). NOT bounds-check elimination (NO_BCE still
+        // corrupts), NOT inline-`new` (DISABLE_INLINE_NEW still corrupts), NOT
+        // loop unrolling, NOT selective promotion (NO_SELECTIVE_PROMOTE still
+        // corrupts). Same "JIT'd method corrupts a neighbour's int[] header"
+        // archetype as HashtableOfInt.rehash / CleanerImpl.run above. Ban narrowly
+        // (method runs correctly interpreted — skip → parse advances to the next
+        // phase exactly like `--nojit`) until the codegen defect is pinned with a
+        // header-write watchpoint. Liftable via
+        // `CRATONVM_JIT_ALLOW_PACKAGES=groovy/lang/`.
+        | ("groovy/lang/GroovyClassLoader", "doParseClass")
     )
 }
 
