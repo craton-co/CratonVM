@@ -1,5 +1,45 @@
 # Group 04 — Embedded-server deployment throughput wall  (OPEN, dominant)
 
+> ## ⚠ 2026-06-14 CORRECTION — a FUNCTIONAL connector bug was masquerading as throughput
+>
+> The premise below ("the server actually starts/serves/tears-down correctly,
+> just slowly") was **partly WRONG for the plain-HTTP NIO connector.** It was not
+> serving at all — it **reset every request** before reading it.
+>
+> Root cause (FIXED, dev — `fix/tomcat-suite-bugs-09-10`,
+> `native-io/src/socket_channel.rs`): `NioEndpoint.setSocketOptions` calls
+> `SocketChannel.setOption(SocketOption, Object)` on every accepted connection.
+> The `sc_set_option` native was registered only with the `NetworkChannel`
+> return-type descriptor, but `SocketChannel.setOption` **covariantly** returns
+> `SocketChannel`. The descriptor mismatch meant the native was missed and
+> dispatch hit the abstract `SocketChannel.setOption` (no Code attribute) →
+> `AbstractMethodError: "Error setting socket options"` → the accepted socket was
+> aborted **before the request was read** → connection reset / status -1 / empty
+> body. Fix: also register the covariant `SocketChannel` /
+> `ServerSocketChannel` return descriptors.
+>
+> **Verified:** a minimal embedded Tomcat (programmatic servlet, bound 127.0.0.1)
+> now accepts AND invokes the servlet `doGet` + writes the response. So a
+> significant fraction of the "server tests HANG" population was this functional
+> reset (each request reset → test stalls/retries → 180s cap), NOT pure
+> interpreter throughput.
+>
+> **Still open after the fix (two distinct remaining problems):**
+> 1. **Webapp-DIRECTORY request processing.** With the connector fixed, an
+>    `addWebapp(...)` context now reports `ctxState=STARTED` and accepts the
+>    connection, but the request (even to a **static** file via DefaultServlet)
+>    **hangs / returns empty** (flaky: sometimes the connector logs an immediate
+>    `Pausing` + `StandardWrapperValve[Container is null]` and resets;
+>    `TestPageContext` still FAILs "contains on null"). The accepted socket is not
+>    driven through read→process→write for webapp contexts. Needs poller/
+>    DefaultServlet/request-pipeline investigation (separate from `setOption`).
+> 2. **Interpreter throughput** (the original wall below) — still real for the
+>    cold deploy (jar/TLD/annotation scanning, classloading).
+>
+> Net: group 04 is "functional connector serving" (layer 1 FIXED) **+** "webapp
+> request processing" (layer 2 open) **+** "interpreter throughput" (below), not a
+> single throughput wall.
+
 **Status:** OPEN. The single biggest blocker to a green suite.
 **Affected:** ~all catalina/coyote embedded-server classes (the 145+ HANG in the
 rerun) — `TestSsl`, `TestHostConfigAutomaticDeployment*`, `catalina.startup.*`,
