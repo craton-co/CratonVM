@@ -200,6 +200,13 @@ fn vh_meta_table()
 }
 
 pub(crate) fn vh_meta_put(ctx: &mut dyn NativeContext, vh: ObjectRef, meta: VarHandleMeta) {
+    // B-J: register every VarHandle as a permanent GC root. Every VarHandle
+    // creation path (alloc_static_var_handle / alloc_instance_var_handle /
+    // findVarHandle) funnels through here, so this one call covers them all.
+    // Without it a moving GC reclaimed VarHandles held only by `static final`
+    // fields, leaving those slots with all-zero headers → `VarHandle.set`
+    // misdispatch and apparent heap corruption (kafka consumer crashes).
+    ctx.register_var_handle_root(vh);
     let key = ctx.identity_hash_code(vh);
     let mut t = vh_meta_table().lock();
     t.insert(key, Arc::new(meta));

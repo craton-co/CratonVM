@@ -157,6 +157,21 @@ pub fn update_all_roots(
         }
     }
 
+    // 6b. VarHandle permanent roots (B-J) — remap the registry entries so the
+    //     canonical VarHandle ref tracks the object across a move (the holder
+    //     `static final` slot is remapped via the `statics` block above using
+    //     the same pointer-map entry, now that the VarHandle is traced/copied).
+    {
+        let mut var_handle_roots = shared.var_handle_roots.write();
+        for obj_ref in var_handle_roots.values_mut() {
+            let old_addr = obj_ref.as_ptr() as usize;
+            if let Some(&new_addr) = pointer_map.get(&old_addr) {
+                debug_assert!(new_addr != 0, "GC pointer map contains null address");
+                *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+
     // 7. System streams (System.out, System.err)
     {
         let mut out = shared.system_out.write();

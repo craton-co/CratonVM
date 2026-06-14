@@ -22972,19 +22972,19 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
         "java/util/List",
         "copyOf",
         "(Ljava/util/Collection;)Ljava/util/List;",
-        native_collections_identity,
+        native_list_copy_of,
     );
     r.register(
         "java/util/Set",
         "copyOf",
         "(Ljava/util/Collection;)Ljava/util/Set;",
-        native_collections_identity,
+        native_set_copy_of,
     );
     r.register(
         "java/util/Map",
         "copyOf",
         "(Ljava/util/Map;)Ljava/util/Map;",
-        native_collections_identity,
+        native_map_copy_of,
     );
 
     // Enumeration interface
@@ -23018,6 +23018,36 @@ fn register_collections_extras_natives(r: &mut NativeMethodRegistry) {
 /// Identity — just returns the first argument (used for synchronized wrappers)
 fn native_collections_identity(_ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     Ok(Some(args.first().cloned().unwrap_or(Value::Object(None))))
+}
+
+// `List.copyOf` / `Set.copyOf` / `Map.copyOf` — return an INDEPENDENT immutable
+// snapshot of the source (JDK contract), NOT the source itself. The previous
+// identity impl aliased the source: a later mutation of the source leaked into
+// the "copy". Surfaced as Kafka AdminApiDriver, whose `RequestSpec.keys` is
+// built via `Set.copyOf(scopeKeys)` — when the driver later mapped another key
+// to the same broker, the already-returned spec's key set gained that key
+// (`{bar}` -> `{bar, foo}`). Fix: build a fresh backing collection from the
+// source's elements, then wrap it unmodifiable so reads see the snapshot and
+// mutators throw.
+fn native_list_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let src = args.first().copied().unwrap_or(Value::Object(None));
+    let backing = alloc_synthetic(ctx, "java/util/ArrayList", AL_NUM_FIELDS);
+    native_al_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
+    Ok(Some(Value::Object(Some(alloc_unmod_wrapper(ctx, UNMOD_LIST_CLASS, backing)))))
+}
+
+fn native_set_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let src = args.first().copied().unwrap_or(Value::Object(None));
+    let backing = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    native_hs_init_from_collection(ctx, &[Value::Object(Some(backing)), src])?;
+    Ok(Some(Value::Object(Some(alloc_unmod_wrapper(ctx, UNMOD_SET_CLASS, backing)))))
+}
+
+fn native_map_copy_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let src = args.first().copied().unwrap_or(Value::Object(None));
+    let backing = alloc_synthetic(ctx, "java/util/HashMap", MAP_NUM_FIELDS);
+    native_map_init_from_map(ctx, &[Value::Object(Some(backing)), src])?;
+    Ok(Some(Value::Object(Some(alloc_unmod_wrapper(ctx, UNMOD_MAP_CLASS, backing)))))
 }
 
 /// `Collections.unmodifiableMap` — wrap the source map in a live read-only view.
