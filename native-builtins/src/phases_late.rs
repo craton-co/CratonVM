@@ -6187,16 +6187,28 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
     r.register(path, "toAbsolutePath", "()Ljava/nio/file/Path;", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let p = p57_read_path(ctx, this);
-        let abs = std::path::Path::new(&p)
-            .canonicalize()
-            .map(|c| c.to_string_lossy().replace('\\', "/"))
-            .unwrap_or_else(|_| {
-                if p.starts_with('/') || (p.len() > 2 && p.as_bytes()[1] == b':') {
-                    p.clone()
-                } else {
-                    format!("{}/{}", std::env::current_dir().unwrap_or_default().to_string_lossy().replace('\\', "/"), p)
-                }
-            });
+        // JDK `Path.toAbsolutePath()` does NOT resolve symlinks or require the
+        // file to exist (that is `toRealPath`) — it only makes a *relative*
+        // path absolute. Must NOT `canonicalize()` here: this build runs UNIX-
+        // mode `std::path` on Windows, so `canonicalize` on an existing path
+        // returns a `\\?\C:\…` verbatim path that renders as `//?/C:/…` and
+        // breaks downstream string-based Path ops — e.g. WildFly's
+        // `Environment.validateWildFlyDir` then rejects a valid `jboss.dist`
+        // ("could not find jboss-modules.jar" though it exists). A drive-letter
+        // (`C:`), UNC (`\\`/`//`), or leading-separator path is already absolute
+        // and returned unchanged; a relative path is anchored to the CWD.
+        let b = p.as_bytes();
+        let is_abs = matches!(b.first(), Some(b'/') | Some(b'\\'))
+            || (b.len() >= 2 && b[1] == b':');
+        let abs = if is_abs {
+            p.clone()
+        } else {
+            format!(
+                "{}/{}",
+                std::env::current_dir().unwrap_or_default().to_string_lossy().replace('\\', "/"),
+                p
+            )
+        };
         let result = p57_alloc_path(ctx, &abs);
         Ok(Some(Value::Object(Some(result))))
     });
