@@ -9628,7 +9628,44 @@ fn invoke_on_class_shared_inner(
                                 | "getLineInstance"
                                 | "getSentenceInstance"
                                 | "getCharacterInstance"
-                            ));
+                            ))
+                        // METHODHANDLES ARRAY ACCESSORS: `MethodHandles.
+                        // arrayElementGetter` / `arrayElementSetter` are concrete
+                        // static factories whose JDK 25 bytecode routes through
+                        // `MethodHandleImpl.makeArrayElementAccessor`. For
+                        // primitive arrays that adapts the generic accessor via
+                        // `MethodHandle.viewAsType` → `copyWith`, which is
+                        // abstract on CratonVM's synthetic MethodHandles
+                        // ("copyWith ... has no Code attribute" AbstractMethodError).
+                        // `ObjectStreamClass$RecordSupport.<clinit>` builds its
+                        // `PRIM_VALUE_EXTRACTORS` map with
+                        // `arrayElementGetter(byte[].class)`, so without the
+                        // override that clinit aborts and every record-class
+                        // (de)serialization dies with a bogus
+                        // `no class def found: ObjectStreamClass$RecordSupport`
+                        // linkage error (e.g. catalina TestGenericPrincipal). Pin
+                        // the bridge natives (registered in real-JDK essentials via
+                        // `register_array_element_accessor_bridges`) ahead of the
+                        // broken JDK bytecode. `findStatic`/`findVirtual` keep
+                        // running real bytecode (the DirectMethodHandle path works).
+                        || (class_name == "java/lang/invoke/MethodHandles"
+                            && matches!(
+                                method_name,
+                                "arrayElementGetter"
+                                | "arrayElementSetter"
+                            ))
+                        // RECORD DESERIALIZATION: `ObjectInputStream.readRecord`
+                        // calls `ObjectStreamClass$RecordSupport.deserializationCtr`
+                        // (concrete bytecode) to get a record-rebuild MethodHandle
+                        // built from `foldArguments`/`insertArguments`/
+                        // `arrayElementGetter` combinators CratonVM cannot execute.
+                        // Pin our native (registered in real-JDK essentials) which
+                        // returns an `MH_KIND_RECORD_DESER` handle that rebuilds the
+                        // record reflectively. Without this, any record
+                        // (de)serialization fails (catalina TestGenericPrincipal:
+                        // GenericPrincipal.writeReplace → SerializablePrincipal record).
+                        || (class_name == "java/io/ObjectStreamClass$RecordSupport"
+                            && method_name == "deserializationCtr");
                     if check_override && shared.native_methods.find(class_name, method_name, descriptor).is_some() {
                         native = true;
                     }
