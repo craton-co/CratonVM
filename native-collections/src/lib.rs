@@ -3858,9 +3858,7 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // bootstrap the concrete nested class can be unresolved and degrade to
     // cid=0 (`java/lang/Object`), breaking downstream checkcasts.
     for (key, value) in &entries {
-        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
-        ctx.set_field(entry_obj, 0, *key);
-        ctx.set_field(entry_obj, 1, *value);
+        let entry_obj = alloc_live_entry(ctx, "java/util/Map$Entry", *key, *value, this);
 
         // Add to the set's backing map
         let hash = ctx.identity_hash_code(entry_obj);
@@ -4310,9 +4308,7 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
     if kind == VIEW_KIND_ENTRYSET {
         let entries = collect_entries_any(ctx, source);
         for (k, v) in entries {
-            let entry = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
-            ctx.set_field(entry, 0, k);
-            ctx.set_field(entry, 1, v);
+            let entry = alloc_live_entry(ctx, "java/util/Map$Entry", k, v, source);
             let _ = native_map_put(ctx, &[Value::Object(Some(backing)), Value::Object(Some(entry)), sentinel]);
         }
     } else {
@@ -4364,10 +4360,13 @@ fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef
             return collect_entries_any(ctx, source)
                 .into_iter()
                 .map(|(k, v)| {
-                    let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
-                    ctx.set_field(entry, 0, k);
-                    ctx.set_field(entry, 1, v);
-                    Value::Object(Some(entry))
+                    Value::Object(Some(alloc_live_entry(
+                        ctx,
+                        "java/util/AbstractMap$SimpleEntry",
+                        k,
+                        v,
+                        source,
+                    )))
                 })
                 .collect();
         }
@@ -4429,8 +4428,13 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) {
         entries
             .into_iter()
             .map(|(k, v)| {
-                let entry = tm_make_entry(ctx, k, v);
-                Value::Object(Some(entry))
+                Value::Object(Some(alloc_live_entry(
+                    ctx,
+                    "java/util/HashMap$Entry",
+                    k,
+                    v,
+                    source,
+                )))
             })
             .collect()
     } else {
@@ -6962,6 +6966,32 @@ fn register_map_entry_natives(r: &mut NativeMethodRegistry) {
     r.set_category(__prev_cat);
 }
 
+/// Slot index of the optional back-reference to the source map carried by a
+/// *live* `entrySet()` entry. When present (field 2 is the source map),
+/// `setValue` writes through to that map — the JDK contract for
+/// `map.entrySet().iterator().next().setValue(v)`. Detached entries (a
+/// standalone `AbstractMap.SimpleEntry`, `firstEntry()`/`lastEntry()`
+/// snapshots, unmodifiable views) are allocated with only 2 fields, so a
+/// fail-safe out-of-range read of slot 2 returns `Object(None)` and no
+/// write-through happens — matching their non-live semantics.
+const ENTRY_FIELD_SOURCE: usize = 2;
+
+/// Allocate a live `entrySet()` entry: 3 fields = (key, value, source-map).
+/// `setValue` on it writes through to `source` (see [`ENTRY_FIELD_SOURCE`]).
+fn alloc_live_entry(
+    ctx: &mut dyn NativeContext,
+    class: &str,
+    key: Value,
+    value: Value,
+    source: ObjectRef,
+) -> ObjectRef {
+    let entry = alloc_synthetic(ctx, class, 3);
+    ctx.set_field(entry, 0, key);
+    ctx.set_field(entry, 1, value);
+    ctx.set_field(entry, ENTRY_FIELD_SOURCE, Value::Object(Some(source)));
+    entry
+}
+
 fn native_entry_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(obj))) => *obj,
@@ -6986,6 +7016,16 @@ fn native_entry_set_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let new_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let old_val = ctx.get_field(this, 1);
     ctx.set_field(this, 1, new_val);
+    // Write through to the backing map for a *live* entrySet entry (field 2 =
+    // source map). `map.entrySet().iterator().next().setValue(v)` must update
+    // the mapping (JDK contract) — without this the change is lost on the
+    // detached snapshot. Surfaced as Kafka FetchSessionHandler's incremental
+    // diff keeping a stale PartitionData (logStartOffset 110 vs 120). For a
+    // 2-field detached entry the slot-2 read fails safe to Object(None).
+    if let Value::Object(Some(src)) = ctx.get_field(this, ENTRY_FIELD_SOURCE) {
+        let key = ctx.get_field(this, 0);
+        native_map_put(ctx, &[Value::Object(Some(src)), key, new_val])?;
+    }
     Ok(Some(old_val))
 }
 
@@ -14589,9 +14629,7 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
-        ctx.set_field(entry, 0, key);
-        ctx.set_field(entry, 1, val);
+        let entry = alloc_live_entry(ctx, "java/util/AbstractMap$SimpleEntry", key, val, this);
         entries.push(Value::Object(Some(entry)));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
     }
@@ -18452,7 +18490,7 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // removing an entry through the list (or its iterator) deletes the key.
     let entries: Vec<Value> = pairs
         .into_iter()
-        .map(|(k, v)| Value::Object(Some(tm_make_entry(ctx, k, v))))
+        .map(|(k, v)| Value::Object(Some(alloc_live_entry(ctx, "java/util/HashMap$Entry", k, v, this))))
         .collect();
     let list = make_view_list_of(ctx, this, &entries);
     Ok(Some(Value::Object(Some(list))))
@@ -20881,9 +20919,7 @@ fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing)));
     for (key, value) in &entries {
-        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
-        ctx.set_field(entry_obj, 0, *key);
-        ctx.set_field(entry_obj, 1, *value);
+        let entry_obj = alloc_live_entry(ctx, "java/util/Map$Entry", *key, *value, this);
 
         let hash = ctx.identity_hash_code(entry_obj);
         let (b, size, c) = map_state(ctx, backing);
