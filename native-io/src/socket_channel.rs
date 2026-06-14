@@ -1594,6 +1594,22 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/NetworkChannel;",
             sc_set_option,
         );
+        // `SocketChannel.setOption` covariantly narrows the return type to
+        // `SocketChannel` (vs `NetworkChannel.setOption`), so the abstract
+        // declaration + every concrete call site uses the
+        // `...)Ljava/nio/channels/SocketChannel;` descriptor. Without this
+        // overload the native is missed and dispatch hits the abstract
+        // `SocketChannel.setOption` (no Code attribute) → AbstractMethodError.
+        // Tomcat's `NioEndpoint.setSocketOptions` calls this on EVERY accepted
+        // connection ("Error setting socket options"), which aborts the socket
+        // before the request is read → the connector resets every request
+        // without responding (embedded-server serving wall; bug 10 / group 04).
+        r.register(
+            c,
+            "setOption",
+            "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/SocketChannel;",
+            sc_set_option,
+        );
         r.register(
             c,
             "getOption",
@@ -1638,6 +1654,17 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
             c,
             "setOption",
             "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/NetworkChannel;",
+            sc_set_option,
+        );
+        // Covariant return: `ServerSocketChannel.setOption` returns
+        // `ServerSocketChannel` (NioEndpoint sets options on the listening
+        // channel at bind time); register that descriptor too so the call does
+        // not fall through to the abstract declaration. See the SocketChannel
+        // note above.
+        r.register(
+            c,
+            "setOption",
+            "(Ljava/net/SocketOption;Ljava/lang/Object;)Ljava/nio/channels/ServerSocketChannel;",
             sc_set_option,
         );
         r.register(
