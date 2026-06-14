@@ -3217,6 +3217,21 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 crate::debug::events::EventKind::ThreadDeath,
                 tid.0 as u64,
             );
+            // CRIT (stale-ref UAF) — `thread_obj_for_spawn` is a raw ObjectRef
+            // captured at spawn and NEVER remapped. Over this thread's whole
+            // lifetime the GC relocates the Thread object (or a young-GC `grow`
+            // frees the arena buffer it last lived in), so by the time we run
+            // here the captured ref is stale and the `enter_or_contend` CAS on
+            // its header below would write into freed memory →
+            // EXCEPTION_ACCESS_VIOLATION (observed: a dying TaskThread worker).
+            // The thread registry's `java_thread_obj` IS remapped after every
+            // GC (`update_thread_objs_after_gc`), so read the current address
+            // from there while the thread is still registered (before
+            // `mark_dead`), falling back to the captured ref only if absent.
+            let wake_obj = shared_arc
+                .thread_registry
+                .java_thread_obj(tid)
+                .unwrap_or(thread_obj_for_spawn);
             shared_arc.thread_registry.mark_dead(tid);
 
             // WP4.1 вЂ” wake any thread waiting in `Thread.join()` for us.
@@ -3242,7 +3257,7 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // scan or fix up).
             if let Some(m) = shared_arc
                 .monitors
-                .enter_or_contend(thread_obj_for_spawn, tid)
+                .enter_or_contend(wake_obj, tid)
             {
                 let blk = shared_arc.gc_barrier.enter_blocked();
                 if blk.pre_stw {
@@ -3253,10 +3268,10 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             }
             let _ = shared_arc
                 .monitors
-                .notify_all(thread_obj_for_spawn, tid);
+                .notify_all(wake_obj, tid);
             let _ = shared_arc
                 .monitors
-                .exit(thread_obj_for_spawn, tid);
+                .exit(wake_obj, tid);
         })
         .expect("failed to spawn child Java thread (OS refused; check ulimit / thread count)");
 
