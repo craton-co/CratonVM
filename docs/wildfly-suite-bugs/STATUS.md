@@ -31,17 +31,31 @@ RESULT = **CratonVM crash** · `TIMEOUT` external timeout = **hang** · `POST-RE
 then crash. The **ABEND / TIMEOUT / POST-RESULT** and any **LOADERR/FAIL that HotSpot
 doesn't share** are the crash reports of interest.
 
-## Numbers (single-runner, trustworthy — updates as sweep proceeds)
-At 365/1541 classes (smoke + domain done, in `basic`), no duplicate rows = single runner:
+## FINAL numbers — complete run (1540 classes, no duplicate rows)
 
 | Status | Classes |
 |--------|---------|
-| OK | 1 |
-| FAIL | 331 |
-| LOADERR | 24 |
-| EMPTY | 9 |
-| ABEND (crash) | 0 |
-| TIMEOUT (hang) | 0 |
+| OK | 14 |
+| FAIL | 1409 |
+| LOADERR | 40 |
+| EMPTY | 77 |
+| **ABEND (crash)** | **0** |
+| **TIMEOUT (hang)** | **0** |
+
+Test-level: 3990 found, 1 succeeded, 1410 failed (rest not run — Arquillian aborts
+the class before its tests when no container is present).
+
+**Zero reproducible single-class VM crashes** across the whole suite. The only hard
+failures seen during the run were *batch-transient* — 1 `rc=139` SIGSEGV
+(microprofile.jwt batch) and 2 `rc=124` clustering batch timeouts — and every class
+in them re-ran clean individually, so none are recorded as ABEND/TIMEOUT. (A burst of
+139 `rc=127` "ABEND"s mid-run was an external artifact: the main `cratonvm.exe` was
+deleted by concurrent main-checkout rebuilds; those were purged and the affected
+classes re-run on a stable binary.)
+
+The dominant `FAIL` (1409) is the Arquillian no-container `ConfigurationException`
+— identical to HotSpot, not a VM defect. With a live container the smoke group is
+111/111 (see [live-container-smoke.md](live-container-smoke.md)).
 
 **Confirmed CratonVM-only defects: 1 (FIXED)**
 - **[bug-01](bug-01-stream-foreachordered-abstractmethoderror.md)** — `Stream.forEachOrdered`
