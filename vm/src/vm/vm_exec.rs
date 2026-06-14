@@ -5730,6 +5730,24 @@ pub fn invoke_or_native(
                   effective_class, bytes.len(), class_name, method_name, descriptor);
         eprintln!("[invoke_or_native] effective_class bytes: {:?}", bytes);
     }
+    if std::env::var_os("CRATONVM_DBG_VDISP").is_some()
+        && effective_class == "java/util/Optional"
+        && (method_name == "hashCode" || method_name == "equals")
+    {
+        let cm = shared.class_manager.read();
+        let recv_cid = match args.first() {
+            Some(Value::Object(Some(o))) => Some(shared.heap.class_id_of(*o)),
+            _ => None,
+        };
+        let name_cid = cm.get_loaded_class_id(effective_class);
+        let recv_stub = recv_cid.and_then(|c| cm.get_class(c)).map(|c| c.is_synthetic_stub);
+        let recv_has_method = recv_cid.and_then(|c| cm.get_class(c))
+            .map(|c| c.find_method(method_name, descriptor).is_some());
+        let name_stub = name_cid.and_then(|c| cm.get_class(c)).map(|c| c.is_synthetic_stub);
+        let name_has_method = name_cid.and_then(|c| cm.get_class(c))
+            .map(|c| c.find_method(method_name, descriptor).is_some());
+        eprintln!("[vdisp] INVOKE_OR_NATIVE Optional.{method_name}: recv_cid={recv_cid:?} name_cid={name_cid:?} recv_stub={recv_stub:?} recv_has_method={recv_has_method:?} name_stub={name_stub:?} name_has_method={name_has_method:?}");
+    }
     // Always check native registry first вЂ” this provides "native override"
     // for both synthetic stubs AND real JDK classes.  Many JDK Java methods
     // (e.g. VM.getSavedProperty) depend on JVM-internal state we haven't set up,
