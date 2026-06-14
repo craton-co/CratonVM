@@ -112,6 +112,10 @@ pub fn intrinsics_disabled() -> bool {
 }
 
 cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
+// Opt-in: enable small-method inlining in the main JIT tier-up compile path.
+// Default-OFF until a `try_emit_inline_body` miscompile (Spring boot enum CCE)
+// is root-caused. See `try_jit_upgrade_with_gate`.
+cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
 cached_is_set!(jit_mic_dbg, "CRATONVM_DBG_JIT_MIC");
 cached_is_set!(jit_entry_dbg, "CRATONVM_DBG_JIT_ENTRY");
 cached_is_set!(jit_putfield_diag, "CRATONVM_DBG_JIT_PUTFIELD");

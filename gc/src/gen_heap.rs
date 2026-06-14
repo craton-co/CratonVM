@@ -1923,6 +1923,21 @@ impl GenerationalHeap {
                 crate::gc_quiescence::depth(),
             );
             let result = self.sweep_young_non_moving(roots, finalizer_addrs);
+            // BUG-V fix: the non-moving sweep still *relocates* objects via
+            // selective promotion (young→old, see `selective_on` in
+            // `sweep_young_non_moving`). Those relocations land in
+            // `result.0.pointer_map`, and the moving path below remaps the
+            // monitor registry with exactly that map at the
+            // `monitors.remap_after_gc(&pointer_map)` call. This early return
+            // used to skip it, so a `synchronized`-inflated object that got
+            // selectively promoted kept its monitor-registry entry keyed to its
+            // *old* young address while its copied mark word (at the new old-gen
+            // address) still read INFLATED. The next `enter`/`lookup_inflated`
+            // at the new address missed the registry → `inflate_locked`
+            // returned the "mark inflated but registry entry missing" Err → the
+            // `.expect(...)` panicked (monitor.rs registry/mark-word desync).
+            // Re-key the registry here, identically to the moving path.
+            monitors.remap_after_gc(&result.0.pointer_map);
             return result;
         }
 

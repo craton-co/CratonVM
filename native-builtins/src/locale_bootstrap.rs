@@ -41,6 +41,50 @@ fn synthetic_locale_data() -> &'static Mutex<HashMap<ObjectRef, (&'static str, &
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// GC root scan for this module's cached synthetic Locale objects. The cached
+/// default Locale (returned by `Locale.getDefault()`) and every key of the
+/// synthetic-locale side-table are live `java/util/Locale` objects reachable
+/// ONLY from these process-global mutexes, so a moving young GC would reclaim
+/// or relocate them while the cache keeps handing back a stale `ObjectRef` —
+/// observed as "Stale pointer detected in invokevirtual receiver … java/util/Locale"
+/// followed by a SIGSEGV (TestServerInfo / TestSwallowAbortedUploads). Mirrors
+/// the classloader singleton root scan.
+pub fn gc_scan_locale_roots(out: &mut Vec<ObjectRef>) {
+    if let Some(o) = *cached_default_locale().lock() {
+        out.push(o);
+    }
+    for k in synthetic_locale_data().lock().keys() {
+        out.push(*k);
+    }
+}
+
+/// Post-GC remap companion to [`gc_scan_locale_roots`].
+pub fn gc_update_locale_refs(pointer_map: &HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    {
+        let mut slot = cached_default_locale().lock();
+        if let Some(obj) = slot.as_mut() {
+            if let Some(&new_addr) = pointer_map.get(&(obj.as_ptr() as usize)) {
+                *obj = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+    {
+        // Rebuild the ObjectRef-keyed side-table with relocated keys.
+        let mut map = synthetic_locale_data().lock();
+        let drained: Vec<_> = map.drain().collect();
+        for (k, v) in drained {
+            let nk = pointer_map
+                .get(&(k.as_ptr() as usize))
+                .map(|&n| unsafe { ObjectRef::from_raw(n as *mut u8) })
+                .unwrap_or(k);
+            map.insert(nk, v);
+        }
+    }
+}
+
 /// Construct (or return the cached) default Locale: synthetic `en_US`.
 ///
 /// We use `alloc_concurrent_synthetic` instead of `ctx.new_object` because

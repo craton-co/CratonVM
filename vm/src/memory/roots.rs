@@ -242,6 +242,15 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     (`gc_update_loader_singleton_refs`).
     cratonvm_native_builtins::classloader::gc_scan_loader_singleton_roots(&mut roots);
 
+    // 18b. Process-global Locale caches (cached default Locale + synthetic
+    //      Locale side-tables) in native-builtins. Same stale-pointer hazard as
+    //      the class loaders: a moving young GC reclaims/relocates the cached
+    //      synthetic `java/util/Locale` while `Locale.getDefault()` keeps
+    //      handing back the stale ObjectRef → "Stale pointer … java/util/Locale"
+    //      → SIGSEGV (TestServerInfo / TestSwallowAbortedUploads). Remap
+    //      companion in `gc.rs` (`gc_update_locale_refs`).
+    cratonvm_native_builtins::gc_scan_locale_roots(&mut roots);
+
     // 19. JBoss MSC container-held service objects. The `ServiceContainer` Rust
     //     state machine references Java objects (the `Service` instance whose
     //     `start()`/`stop()` we invoke, the synthetic `ServiceController`

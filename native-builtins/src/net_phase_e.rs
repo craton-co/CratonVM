@@ -3125,19 +3125,32 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 Some(w) => vec![w.clone(), path.to_string(), rest.to_string()],
                 None => vec![path.to_string(), rest.to_string()],
             };
-            let mut last_err: Option<std::io::Error> = None;
+            // Keep the FIRST (most-canonical) path's error: `try_paths` is
+            // ordered [win_path?, path, rest], and the least-canonical `rest`
+            // form (`/C:/...` on Windows) yields a spurious ERROR_INVALID_NAME
+            // (os error 123) that would otherwise mask the real not-found error
+            // from the canonical `C:/...` path.
+            let mut first_err: Option<std::io::Error> = None;
             let mut result: Option<Vec<u8>> = None;
             for p in &try_paths {
                 match std::fs::read(p) {
                     Ok(b) => { result = Some(b); break; }
-                    Err(e) => last_err = Some(e),
+                    Err(e) => { if first_err.is_none() { first_err = Some(e); } }
                 }
             }
             match result {
                 Some(b) => b,
                 None => {
-                    let e = last_err.unwrap_or_else(|| std::io::Error::other("no path tried"));
-                    return Err(ioex(format!("URL.openStream: read file {path}: {e}")));
+                    let e = first_err.unwrap_or_else(|| std::io::Error::other("no path tried"));
+                    // The JDK's `file:` URL stream (sun.net.www.protocol.file
+                    // FileURLConnection → FileInputStream) raises
+                    // FileNotFoundException — not a bare IOException — when the
+                    // target can't be opened (missing file, directory, or
+                    // permission). Callers assert on it specifically, e.g.
+                    // Spring Boot's PluginXmlParser via
+                    // `withCauseInstanceOf(FileNotFoundException.class)`. See
+                    // `apps/spring-boot/cratonvm-bug-reports/SB-12`.
+                    return Err(fnfex(format!("{path} ({e})")));
                 }
             }
         } else if let Some(name) = url_str.strip_prefix("classpath:") {

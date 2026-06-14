@@ -37,7 +37,7 @@ hangs, and wrong results.
 | # | Title | Sev | Status |
 |---|-------|-----|--------|
 | [07](bug-07-timeout-scheduledfuture-cancel-ame.md) | `@Timeout` → `Future.cancel` AbstractMethodError (synthetic ScheduledFuture) | Critical | **FIXED** |
-| [09](bug-09-mockito-inline-mockmaker-selfattach.md) | Mockito inline mock-maker self-attach fails (307 fails, 15+ classes) | **Critical/Dominant** | **5 layers fixed** (self-attach works; remaining: retransform/redefine bytes) |
+| [09](bug-09-mockito-inline-mockmaker-selfattach.md) | Mockito inline mock-maker self-attach fails (307 fails, 15+ classes) | **Critical/Dominant** | **FIXED** (10 layers; `7af98b29`). mock()+stub()+verify() all work. Finish = primitive/array `Class.getModifiers()`=0→`PUBLIC\|FINAL\|ABSTRACT` (ByteBuddy `isPackagePrivate` ignoreAlso dropped every primitive-sig method) + `LinkedList.<init>(Collection)`/`stream()`/`spliterator()` overlay. `FutureRecordMetadataTest` 2/2==HotSpot |
 | [08](bug-08-completablefuture-synthetic-layout-real-subclass.md) | `CompletableFuture` synthetic layout corrupts real `KafkaFuture` (admin/producer/consumer) | High | **FIXED** (completeExceptionally/isCompletedExceptionally/complete(null)/chaining layout-agnostic; all 5 admin `*ResultTest` pass) |
 | [10](bug-10-metadatasnapshot-noclassdeffound-clinit.md) | `NoClassDefFoundError: MetadataSnapshot` (masked `<clinit>` failure) | High | **FIXED** (harness cp skew → kafka-clients 3.7.2; not a VM bug) |
 | [11](bug-11-metrics-metricvalue-npe.md) | metrics `metricValue on null` (metric lookup returns null) | High | **FIXED** (`TimeUnit.toMillis` overflow → saturate) |

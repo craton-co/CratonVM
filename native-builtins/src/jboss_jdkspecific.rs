@@ -334,11 +334,14 @@ pub(crate) fn native_module_layer_modules(
     ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-    ctx.set_field(set, 0, Value::Object(None)); // backing array (empty)
-    ctx.set_field(set, 1, Value::Int(0));       // size
-    ctx.set_field(set, 2, Value::Int(16));      // capacity marker
-    Ok(Some(Value::Object(Some(set))))
+    // Build a REAL empty HashSet via its constructor. A synthetic HashSet with
+    // slot-based fields breaks in real-JDK mode: the real `HashSet.iterator()`
+    // bytecode reads `this.map` (a HashMap) which our synthetic object never
+    // populates, so `modules().iterator()` returned null and Tomcat's
+    // `for (ResolvedModule m : boot().configuration().modules())` web-fragment
+    // scan (StandardJarScanner.doScanClassPath) NPE'd on `iterator.hasNext()`,
+    // failing every embedded-server context start.
+    ctx.new_object_initialized("java/util/HashSet", "()V", &[])
 }
 
 /// `ModuleLayer.configuration()` — return a synthetic `Configuration`.

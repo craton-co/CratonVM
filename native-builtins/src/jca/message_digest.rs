@@ -260,6 +260,39 @@ fn md_update_bytes_off(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     Ok(None)
 }
 
+/// `MessageDigest.update(ByteBuffer)` — consume the buffer's remaining bytes
+/// (advancing its position to the limit, per the JDK contract) and feed them to
+/// the digest accumulator. Without this native, the real `update(ByteBuffer)`
+/// bytecode runs `engineUpdate(b, off, len)` on our synthetic bare
+/// `java.security.MessageDigest`, resolving to the abstract `MessageDigestSpi`
+/// method → `AbstractMethodError: engineUpdate([BII)V has no Code attribute`.
+/// Groovy hashes through this overload (it aborted every test in the `buildSrc`
+/// `SpringRepositoriesExtensionTests`). Reading through the buffer's own bulk
+/// `get([B)` works for both heap and direct buffers regardless of layout.
+/// See `apps/spring-boot/cratonvm-bug-reports/SB-13`.
+fn md_update_bytebuffer(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let buf = match args.get(1) {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let rem = match ctx.invoke_virtual(buf, "remaining", "()I", &[])? {
+        Some(Value::Int(n)) if n > 0 => n as usize,
+        _ => return Ok(None),
+    };
+    let tmp = ctx.new_array(cratonvm_types::ArrayElementType::Byte, rem);
+    // Bulk get reads `rem` bytes and advances position → limit (consumes input).
+    ctx.invoke_virtual(buf, "get", "([B)Ljava/nio/ByteBuffer;", &[Value::Object(Some(tmp))])?;
+    let mut bytes = Vec::with_capacity(rem);
+    for i in 0..rem {
+        if let Value::Int(b) = ctx.get_array_element(tmp, i) {
+            bytes.push(b as u8);
+        }
+    }
+    append_accumulator(ctx, this, &bytes);
+    Ok(None)
+}
+
 fn md_digest(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     // C14: surface side-table misses as a loud IllegalStateException rather
@@ -396,6 +429,7 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     r.register(md, "update", "([B)V", md_update_bytes);
     r.register(md, "update", "(B)V", md_update_byte);
     r.register(md, "update", "([BII)V", md_update_bytes_off);
+    r.register(md, "update", "(Ljava/nio/ByteBuffer;)V", md_update_bytebuffer);
     r.register(md, "digest", "()[B", md_digest);
     r.register(md, "digest", "([B)[B", md_digest_input);
     r.register(md, "reset", "()V", md_reset);

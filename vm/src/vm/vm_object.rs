@@ -24,12 +24,6 @@ const STRING_NUM_FIELDS_DEFAULT: usize = 2;
 const CODER_LATIN1: i32 = 0;
 const CODER_UTF16: i32 = 1;
 
-/// Check if a Rust string is entirely representable in Latin-1 (ISO 8859-1).
-/// Latin-1 maps exactly to Unicode code points U+0000..U+00FF.
-fn is_latin1(text: &str) -> bool {
-    text.chars().all(|c| (c as u32) <= 0xFF)
-}
-
 /// Create a Java String object from a Rust `&str`.
 ///
 /// Uses the VM's string pool for interning: if an identical string was already
@@ -76,9 +70,33 @@ pub fn create_java_string_uninterned(shared: &SharedVm, text: &str) -> ObjectRef
     alloc_java_string_object(shared, text)
 }
 
+/// Create a Java String object directly from UTF-16 code `units`, **without**
+/// pooling.
+///
+/// This is the constructor for string constants that contain **lone
+/// surrogates** (U+D800..U+DFFF) — e.g. ANTLR's `_serializedATN` — which a Rust
+/// `str` cannot represent. The constant pool carries the exact units in its
+/// side table (`ConstantPool::get_utf8_wide`); routing them here reproduces the
+/// original `char[]` byte-for-byte so `charAt`-based deserialisation
+/// round-trips. Such constants are not interned (their content cannot be a
+/// faithful Rust pool key, and string-literal identity is immaterial for them).
+pub fn create_java_string_from_units(shared: &SharedVm, units: &[u16]) -> ObjectRef {
+    alloc_java_string_object_from_units(shared, units)
+}
+
 /// Allocate and populate a fresh `java/lang/String` object for `text`.
 /// Performs no pool lookup or insertion — callers decide pooling policy.
 fn alloc_java_string_object(shared: &SharedVm, text: &str) -> ObjectRef {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    alloc_java_string_object_from_units(shared, &units)
+}
+
+/// Allocate and populate a fresh `java/lang/String` from UTF-16 code `units`.
+///
+/// Shared core of [`alloc_java_string_object`] (which simply `encode_utf16`s a
+/// Rust `&str`) and [`create_java_string_from_units`] (surrogate-bearing
+/// constants). Performs no pool lookup or insertion.
+fn alloc_java_string_object_from_units(shared: &SharedVm, units: &[u16]) -> ObjectRef {
     // Load java/lang/String class and resolve field count (cached after first call).
     // The field count is cached in an AtomicUsize to avoid lock contention:
     // once resolved, subsequent calls skip the class_manager lock entirely.
@@ -119,16 +137,15 @@ fn alloc_java_string_object(shared: &SharedVm, text: &str) -> ObjectRef {
         // Field 1: byte coder (0=LATIN1, 1=UTF16)
         // Field 2: int hash (0 = not yet computed)
         // Field 3: boolean hashIsZero (false)
-        if is_latin1(text) {
+        if units.iter().all(|&u| u <= 0xFF) {
             // LATIN1: one byte per char
-            let bytes: Vec<u8> = text.chars().map(|c| c as u8).collect();
             let byte_array = shared
                 .heap
-                .alloc_array(ClassId::new(0), ArrayElementType::Byte, bytes.len());
-            for (i, &b) in bytes.iter().enumerate() {
+                .alloc_array(ClassId::new(0), ArrayElementType::Byte, units.len());
+            for (i, &u) in units.iter().enumerate() {
                 let _ = shared
                     .heap
-                    .set_array_element(byte_array, i, Value::Int(b as i32));
+                    .set_array_element(byte_array, i, Value::Int((u & 0xFF) as i32));
             }
             shared.heap.set_field(str_obj, 0, Value::Object(Some(byte_array)));
             // write_barrier fires automatically inside set_field
@@ -143,12 +160,11 @@ fn alloc_java_string_object(shared: &SharedVm, text: &str) -> ObjectRef {
             // in lang_string.rs) and the native String readers; a mismatch
             // byte-swaps every non-LATIN-1 char and corrupts e.g.
             // `CharacterData00`'s packed lookup tables.
-            let utf16: Vec<u16> = text.encode_utf16().collect();
-            let byte_len = utf16.len() * 2;
+            let byte_len = units.len() * 2;
             let byte_array = shared
                 .heap
                 .alloc_array(ClassId::new(0), ArrayElementType::Byte, byte_len);
-            for (i, &unit) in utf16.iter().enumerate() {
+            for (i, &unit) in units.iter().enumerate() {
                 // Little-endian: low byte at even index, high byte at odd index.
                 let lo = (unit & 0xFF) as u8;
                 let hi = (unit >> 8) as u8;
@@ -169,11 +185,10 @@ fn alloc_java_string_object(shared: &SharedVm, text: &str) -> ObjectRef {
         // ---- Legacy / synthetic layout ----
         // Field 0: char[] value (UTF-16)
         // Field 1: int hash
-        let utf16: Vec<u16> = text.encode_utf16().collect();
         let char_array = shared
             .heap
-            .alloc_array(ClassId::new(0), ArrayElementType::Char, utf16.len());
-        for (i, &ch) in utf16.iter().enumerate() {
+            .alloc_array(ClassId::new(0), ArrayElementType::Char, units.len());
+        for (i, &ch) in units.iter().enumerate() {
             let _ = shared
                 .heap
                 .set_array_element(char_array, i, Value::Int(ch as i32));

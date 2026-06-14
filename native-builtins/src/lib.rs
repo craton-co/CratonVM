@@ -994,6 +994,63 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // never touched at runtime.
     register_biginteger_arithmetic_overrides(registry);
     register_bigdecimal_arithmetic_overrides(registry);
+    // bug-26 (kafka SCRAM): `javax.crypto.Mac` (getInstance/init/update/doFinal)
+    // was only registered inside `register_synthetic_overrides`, which real-JDK
+    // mode never calls — so `Mac.getInstance("HmacSHA256")` fell through to the
+    // real JDK bytecode and threw `NoSuchAlgorithmException: Algorithm HmacSHA256
+    // not available` (the real provider chain has no working HMAC MacSpi). The
+    // synthetic Mac native computes a real, RFC-4231-correct HMAC over the
+    // key+data accumulated via init/update, so promote it to the universal
+    // essential path (matching how Cipher/MessageDigest are wired). Fixes the
+    // SCRAM Formatter/Messages/CredentialUtils/SaslServer suite (0-pass → pass).
+    crate::phases_late::register_p68_crypto_mac(registry);
+    // bug-27 (kafka FileLog/RemoteLog/UnalignedFile record reads): only the
+    // *abstract* `java/nio/channels/FileChannel.truncate` was overridden, so on a
+    // real `sun.nio.ch.FileChannelImpl` (built by the reconcile-with-real path)
+    // `FileRecords.truncateTo(...)` runs the JDK `FileChannelImpl.truncate`
+    // bytecode, whose position bookkeeping issues a *negative* seek →
+    // `IOException: seek0: …before start of file (os error 131)`. Override the
+    // concrete subclass so truncate clamps the new length ≥ 0, truncates via the
+    // fd table, and only moves the file pointer back when it sits past the new end
+    // — never seeking < 0. fd is read from `this.fd` (a real FileDescriptor whose
+    // `fd`/`handle` is the fd-table id, exactly how the read/write paths resolve it).
+    registry.register(
+        "sun/nio/ch/FileChannelImpl",
+        "truncate",
+        "(J)Ljava/nio/channels/FileChannel;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let fd_id: Option<u32> = match ctx.get_field_by_name(this, "fd") {
+                Value::Object(Some(fd_obj)) => match ctx.get_field_by_name(fd_obj, "fd") {
+                    Value::Int(v) if v >= 0 => Some(v as u32),
+                    _ => match ctx.get_field_by_name(fd_obj, "handle") {
+                        Value::Long(v) if v >= 0 => Some(v as u32),
+                        _ => None,
+                    },
+                },
+                _ => None,
+            };
+            let new_len = match args.get(1) {
+                Some(Value::Long(v)) => *v,
+                Some(Value::Double(v)) => i64::from_le_bytes(v.to_le_bytes()),
+                _ => 0,
+            }
+            .max(0) as u64;
+            if let Some(fd) = fd_id {
+                let cur = ctx
+                    .fd_table()
+                    .rw_seek(fd, std::io::SeekFrom::Current(0))
+                    .unwrap_or(0);
+                ctx.fd_table().rw_set_length(fd, new_len).map_err(|e| {
+                    cratonvm_types::error::RuntimeError::IOException { message: e.to_string() }
+                })?;
+                if cur > new_len {
+                    let _ = ctx.fd_table().rw_seek(fd, std::io::SeekFrom::Start(new_len));
+                }
+            }
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
     // `Long.parseLong(String)J` / `Integer.parseInt(String)I` — in real-JDK
     // mode, these fall through to JDK bytecode whose loop multiplies-and-adds
     // digit-by-digit (`result = result * 10 + digit`). Bounds-check arithmetic
@@ -5088,6 +5145,18 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
+        // Real-JDK `java.util.logging.Logger` objects (created by the JDK's
+        // demandLogger / 2-arg getLogger path and handed to e.g.
+        // `org.apache.juli.ClassLoaderLogManager.addLogger`) keep the name in
+        // their real `name` field, NOT at slot 0 (slot 0 is `config`, a
+        // `Logger$ConfigurationData`). Reading slot 0 unconditionally returned
+        // that ConfigurationData, so the caller's `getName().lastIndexOf('.')`
+        // threw NoSuchMethodError and aborted the VM. Prefer the real `name`
+        // field; fall back to slot 0 for synthetic loggers our getLogger
+        // natives create (which stash the name there).
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "name") {
+            return Ok(Some(Value::Object(Some(s))));
+        }
         match ctx.get_field(this, 0) {
             Value::Object(Some(s)) => Ok(Some(Value::Object(Some(s)))),
             _ => {
@@ -11301,6 +11370,48 @@ pub(crate) fn locale_data_get(obj: ObjectRef) -> (String, String, String) {
         .unwrap_or_default()
 }
 
+/// GC root scan for all process-global Locale caches (this module's
+/// `locale_default` + `locale_data`, plus the `locale_bootstrap` caches). These
+/// hold live synthetic `java/util/Locale` objects reachable only from Rust-side
+/// mutexes; without rooting+remapping they go stale after a moving young GC and
+/// a later `Locale` method dispatch SIGSEGVs ("Stale pointer … java/util/Locale").
+pub fn gc_scan_locale_roots(out: &mut Vec<ObjectRef>) {
+    if let Some(o) = *locale_default().lock() {
+        out.push(o);
+    }
+    for k in locale_data().lock().keys() {
+        out.push(*k);
+    }
+    crate::locale_bootstrap::gc_scan_locale_roots(out);
+}
+
+/// Post-GC remap companion to [`gc_scan_locale_roots`].
+pub fn gc_update_locale_refs(pointer_map: &std::collections::HashMap<usize, usize>) {
+    if pointer_map.is_empty() {
+        return;
+    }
+    {
+        let mut slot = locale_default().lock();
+        if let Some(obj) = slot.as_mut() {
+            if let Some(&new_addr) = pointer_map.get(&(obj.as_ptr() as usize)) {
+                *obj = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+            }
+        }
+    }
+    {
+        let mut map = locale_data().lock();
+        let drained: Vec<_> = map.drain().collect();
+        for (k, v) in drained {
+            let nk = pointer_map
+                .get(&(k.as_ptr() as usize))
+                .map(|&n| unsafe { ObjectRef::from_raw(n as *mut u8) })
+                .unwrap_or(k);
+            map.insert(nk, v);
+        }
+    }
+    crate::locale_bootstrap::gc_update_locale_refs(pointer_map);
+}
+
 pub(crate) fn native_noop_with_this(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(None)
 }
@@ -12254,8 +12365,16 @@ fn register_uuid_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "toString", "()Ljava/lang/String;", native_uuid_to_string);
     registry.register(c, "getMostSignificantBits", "()J", native_uuid_get_msb);
     registry.register(c, "getLeastSignificantBits", "()J", native_uuid_get_lsb);
-    registry.register(c, "equals", "(Ljava/lang/Object;)Z", native_uuid_equals);
-    registry.register(c, "hashCode", "()I", native_uuid_hash_code);
+    // NOTE: `equals`/`hashCode` are deliberately NOT shadowed. A Rust-native
+    // `equals` override on a non-String class is mis-dispatched when invoked via
+    // `invokevirtual Object.equals` from inside JDK bytecode such as
+    // `ArrayList.indexOfRange` (it falls back to identity), so
+    // `List<UUID>.contains/indexOf` returned -1 even for value-equal UUIDs —
+    // which broke ANTLR's `ATNDeserializer` (`SUPPORTED_UUIDS.contains(uuid)`)
+    // and hence Groovy's `GroovyLexer` (SB-13). The real `java.util.UUID`
+    // bytecode for `equals`/`hashCode` reads the same `mostSigBits`/`leastSigBits`
+    // slots this layer writes, so letting it run is both correct and collection-safe
+    // (cf. `Long.equals`, also java.base bytecode, which works through `indexOf`).
     registry.register(c, "version", "()I", native_uuid_version);
     registry.set_category(__prev_cat);
 }
@@ -12399,32 +12518,6 @@ fn native_uuid_get_lsb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Long(0))),
     };
     Ok(Some(Value::Long(uuid_get_lsb(ctx, this))))
-}
-
-fn native_uuid_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let other = match args.get(1) {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let eq = uuid_get_msb(ctx, this) == uuid_get_msb(ctx, other)
-        && uuid_get_lsb(ctx, this) == uuid_get_lsb(ctx, other);
-    Ok(Some(Value::Int(if eq { 1 } else { 0 })))
-}
-
-fn native_uuid_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
-    let this = match args.first() {
-        Some(Value::Object(Some(r))) => *r,
-        _ => return Ok(Some(Value::Int(0))),
-    };
-    let msb = uuid_get_msb(ctx, this);
-    let lsb = uuid_get_lsb(ctx, this);
-    let hilo = msb ^ lsb;
-    let hash = ((hilo >> 32) ^ hilo) as i32;
-    Ok(Some(Value::Int(hash)))
 }
 
 fn native_uuid_version(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -20350,7 +20443,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
         Ok(Some(Value::Int(1)))
     });
     registry.register(lbq, "take", "()Ljava/lang/Object;", |ctx, args| {
-        let this = match args.first() {
+        let mut this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
@@ -20363,7 +20456,8 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                 ctx.monitor_exit(this);
                 return Ok(Some(result));
             }
-            ctx.monitor_wait(this, Some(10))?;
+            // GC-SAFEPOINT FIX: the wait can relocate `this`; pin + read back.
+            this = monitor_wait_keepalive(ctx, this, Some(10))?;
             ctx.monitor_exit(this);
         }
     });
@@ -20379,7 +20473,7 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
         Ok(Some(result))
     });
     registry.register(lbq, "poll", "(JLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;", |ctx, args| {
-        let this = match args.first() {
+        let mut this = match args.first() {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(Some(Value::Object(None))),
         };
@@ -20409,7 +20503,8 @@ fn register_m18_concurrent_fixes(registry: &mut NativeMethodRegistry) {
                 return Ok(Some(Value::Object(None))); // timed out
             }
             let wait_ms = remaining.as_millis().min(10) as u64;
-            ctx.monitor_wait(this, Some(wait_ms))?;
+            // GC-SAFEPOINT FIX: the wait can relocate `this`; pin + read back.
+            this = monitor_wait_keepalive(ctx, this, Some(wait_ms))?;
             ctx.monitor_exit(this);
         }
     });
@@ -21698,6 +21793,29 @@ fn rl_release_for_await(key: i32, tid: i64) -> Option<i32> {
     })
 }
 
+/// `monitor_wait` while keeping `obj` valid across the wait.
+///
+/// `monitor_wait` parks this thread — a GC safepoint — so a relocating
+/// collection (the moving collector, or the non-moving young sweep's selective
+/// promotion) can move `obj` while we are blocked, leaving a raw `ObjectRef`
+/// stale and the following `monitor_exit`/`get_field` doing `header_of` a dead
+/// address → EXCEPTION_ACCESS_VIOLATION. Pin `obj` as a native root across the
+/// wait (the collector remaps `native_pin_roots`, see vm/src/memory/gc.rs
+/// `update_all_roots`) and return its post-GC address. Unpins even on the error
+/// path.
+fn monitor_wait_keepalive(
+    ctx: &mut dyn NativeContext,
+    obj: ObjectRef,
+    timeout_ms: Option<u64>,
+) -> Result<ObjectRef, MethodCallFailed> {
+    let pin = ctx.pin_native_root(obj);
+    let wr = ctx.monitor_wait(obj, timeout_ms);
+    let obj = ctx.read_native_pin(pin, obj);
+    ctx.unpin_native_roots(pin);
+    wr?;
+    Ok(obj)
+}
+
 // --- Condition ---
 
 fn native_cond_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -21743,7 +21861,23 @@ fn native_cond_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     ctx.monitor_notify(lock_ref)?;
     ctx.monitor_exit(lock_ref);
     // Atomically release the condition monitor and wait for a signal.
-    ctx.monitor_wait(this, None)?;
+    //
+    // GC-SAFEPOINT FIX: `monitor_wait` parks this thread, so a collection can
+    // run while we are blocked — the moving collector, or the non-moving
+    // young sweep's selective promotion — and relocate both `this` and
+    // `lock_ref`. The raw ObjectRefs captured at entry would then be stale, and
+    // the `monitor_exit` / `reacquire` below would `header_of` a dead address →
+    // EXCEPTION_ACCESS_VIOLATION (TestSwallowAbortedUploads SIGSEGV in
+    // MonitorTable::exit). Pin both across the wait and read back their post-GC
+    // addresses; `native_pin_roots` is remapped by the collector (see
+    // vm/src/memory/gc.rs `update_all_roots`). Unpin even on the error path.
+    let this_pin = ctx.pin_native_root(this);
+    let lock_pin = ctx.pin_native_root(lock_ref);
+    let wr = ctx.monitor_wait(this, None);
+    let this = ctx.read_native_pin(this_pin, this);
+    let lock_ref = ctx.read_native_pin(lock_pin, lock_ref);
+    ctx.unpin_native_roots(this_pin);
+    wr?;
     ctx.monitor_exit(this);
     reacquire_lock_after_await(ctx, lock_ref, lock_key, tid, saved_hold)?;
     Ok(None)
@@ -21787,7 +21921,15 @@ fn native_cond_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     ctx.monitor_notify(lock_ref)?;
     ctx.monitor_exit(lock_ref);
     let start = std::time::Instant::now();
-    ctx.monitor_wait(this, Some(timeout_ms))?;
+    // GC-SAFEPOINT FIX (see native_cond_await): pin `this`/`lock_ref` across
+    // the blocking wait so a relocating GC can't leave them stale.
+    let this_pin = ctx.pin_native_root(this);
+    let lock_pin = ctx.pin_native_root(lock_ref);
+    let wr = ctx.monitor_wait(this, Some(timeout_ms));
+    let this = ctx.read_native_pin(this_pin, this);
+    let lock_ref = ctx.read_native_pin(lock_pin, lock_ref);
+    ctx.unpin_native_roots(this_pin);
+    wr?;
     ctx.monitor_exit(this);
     let timed_out = start.elapsed().as_millis() as u64 >= timeout_ms;
     reacquire_lock_after_await(ctx, lock_ref, lock_key, tid, saved_hold)?;
@@ -21799,7 +21941,7 @@ fn native_cond_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 /// wait) until the lock is free.
 fn reacquire_lock_after_await(
     ctx: &mut dyn NativeContext,
-    lock_ref: ObjectRef,
+    mut lock_ref: ObjectRef,
     lock_key: i32,
     tid: i64,
     saved_hold: i32,
@@ -21817,9 +21959,17 @@ fn reacquire_lock_after_await(
         if claimed {
             return Ok(None);
         }
+        // GC-SAFEPOINT FIX (see native_cond_await): the 5 ms re-check wait
+        // parks this thread, so a relocating GC could leave `lock_ref` stale.
+        // Pin it across the wait and read back the post-GC address; unpin even
+        // on the error path.
+        let pin = ctx.pin_native_root(lock_ref);
         ctx.monitor_enter(lock_ref);
-        ctx.monitor_wait(lock_ref, Some(5))?;
+        let wr = ctx.monitor_wait(lock_ref, Some(5));
+        lock_ref = ctx.read_native_pin(pin, lock_ref);
         ctx.monitor_exit(lock_ref);
+        ctx.unpin_native_roots(pin);
+        wr?;
     }
 }
 
@@ -21857,7 +22007,15 @@ fn native_cond_await_nanos(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     ctx.monitor_notify(lock_ref)?;
     ctx.monitor_exit(lock_ref);
     let start = std::time::Instant::now();
-    ctx.monitor_wait(this, Some(timeout_ms))?;
+    // GC-SAFEPOINT FIX (see native_cond_await): pin `this`/`lock_ref` across
+    // the blocking wait so a relocating GC can't leave them stale.
+    let this_pin = ctx.pin_native_root(this);
+    let lock_pin = ctx.pin_native_root(lock_ref);
+    let wr = ctx.monitor_wait(this, Some(timeout_ms));
+    let this = ctx.read_native_pin(this_pin, this);
+    let lock_ref = ctx.read_native_pin(lock_pin, lock_ref);
+    ctx.unpin_native_roots(this_pin);
+    wr?;
     ctx.monitor_exit(this);
     let elapsed_nanos = start.elapsed().as_nanos() as i64;
     let remaining = nanos.saturating_sub(elapsed_nanos).max(0);

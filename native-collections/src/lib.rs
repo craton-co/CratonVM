@@ -717,6 +717,39 @@ fn values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Compare two grouping/keying values using the SAME semantics a real
+/// `HashMap` key would: identity, then the object's own Java `equals()`.
+///
+/// `values_equal` only knows about identity, `String`, and enum constants and
+/// returns `false` for any other two distinct object instances — so a
+/// `Collectors.groupingBy` / `toMap` whose key is e.g. a `LinkedHashMap`,
+/// record, or any value class would treat two equal-but-distinct keys as
+/// different groups. The Rust-side group list then ends up with one entry per
+/// element, and `make_map_of` (which keys on real Java `equals`) collapses them
+/// to a single key keeping only the LAST value — silently dropping the rest
+/// (the kafka `RangeAssignor.assignWithRackMatching` `groupingBy(consumers)`
+/// bug: all topic states share one consumer-set key, so only the last topic was
+/// grouped → rack-aware assignment skipped for the others). Invoking the real
+/// `equals` closes the gap for arbitrary key types.
+fn group_key_equal(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> bool {
+    if let (Value::Object(Some(oa)), Value::Object(Some(ob))) = (a, b) {
+        if std::ptr::eq(oa.as_ptr(), ob.as_ptr()) {
+            return true;
+        }
+        if let Ok(Some(Value::Int(v))) = ctx.invoke_virtual(
+            *oa,
+            "equals",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(*ob))],
+        ) {
+            return v != 0;
+        }
+        return false;
+    }
+    // Primitives / null: the cheap structural comparison is exact.
+    values_equal(&*ctx, a, b)
+}
+
 // ===========================================================================
 // ArrayList — synthetic-jdk layout: field 0 = Object[] elementData, field 1 = Int size
 // Real-JDK layout: AbstractList.modCount(I) at slot 0, ArrayList.elementData at slot 1,
@@ -5126,7 +5159,8 @@ fn native_hs_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
     // "returned a cyclic graph", blocking discovery of EVERY Hibernate test
     // class. Route to `native_lhm_clear` for insertion-ordered sets (the set's
     // own type is authoritative — `alloc_hs_backing` always pairs them with a
-    // LinkedHashMap) or when the backing resolves as a LinkedHashMap.
+    // LinkedHashMap; the backing class-name probe alone can misfire) or when the
+    // backing resolves as a LinkedHashMap.
     let backing_is_lhm = hs_is_insertion_ordered(ctx, this)
         || matches!(
             ctx.class_name_of_id(ctx.class_id_of_object(backing)).as_deref(),
@@ -9549,17 +9583,20 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                         &[*elem],
                     )?
                     .unwrap_or(Value::Object(None));
-                // Find existing group
-                let mut found = false;
-                for (gk, gv) in &mut groups {
-                    if values_equal(ctx, gk, &key) {
-                        gv.push(*elem);
-                        found = true;
+                // Find existing group. Use real Java `equals` (not the
+                // identity/String/enum-only `values_equal`) so equal-but-
+                // distinct object keys (e.g. a `LinkedHashMap` group key) land
+                // in the SAME group rather than one group per element.
+                let mut found_idx = None;
+                for (i, (gk, _)) in groups.iter().enumerate() {
+                    if group_key_equal(ctx, gk, &key) {
+                        found_idx = Some(i);
                         break;
                     }
                 }
-                if !found {
-                    groups.push((key, vec![*elem]));
+                match found_idx {
+                    Some(i) => groups[i].1.push(*elem),
+                    None => groups.push((key, vec![*elem])),
                 }
             }
             // Build HashMap<K, ArrayList<V>>
@@ -9621,16 +9658,18 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                         &[*elem],
                     )?
                     .unwrap_or(Value::Object(None));
-                let mut found = false;
-                for (gk, gv) in &mut groups {
-                    if values_equal(ctx, gk, &key) {
-                        gv.push(*elem);
-                        found = true;
+                // Real Java `equals` for object keys (see the GROUPING_BY
+                // branch above) so equal-but-distinct keys share a group.
+                let mut found_idx = None;
+                for (i, (gk, _)) in groups.iter().enumerate() {
+                    if group_key_equal(ctx, gk, &key) {
+                        found_idx = Some(i);
                         break;
                     }
                 }
-                if !found {
-                    groups.push((key, vec![*elem]));
+                match found_idx {
+                    Some(i) => groups[i].1.push(*elem),
+                    None => groups.push((key, vec![*elem])),
                 }
             }
 
@@ -9709,16 +9748,18 @@ fn native_stream_collect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
                         &[*elem],
                     )?
                     .unwrap_or(Value::Object(None));
-                let mut found = false;
-                for (gk, gv) in &mut groups {
-                    if values_equal(ctx, gk, &key) {
-                        gv.push(*elem);
-                        found = true;
+                // Real Java `equals` for object keys (see the GROUPING_BY
+                // branch above) so equal-but-distinct keys share a group.
+                let mut found_idx = None;
+                for (i, (gk, _)) in groups.iter().enumerate() {
+                    if group_key_equal(ctx, gk, &key) {
+                        found_idx = Some(i);
                         break;
                     }
                 }
-                if !found {
-                    groups.push((key, vec![*elem]));
+                match found_idx {
+                    Some(i) => groups[i].1.push(*elem),
+                    None => groups.push((key, vec![*elem])),
                 }
             }
 
@@ -15171,16 +15212,54 @@ fn native_ad_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(Some(Value::Object(None))),
     };
-    // ArrayDeque$Itr: field 0 = snapshot array, field 1 = cursor
+    // ArrayDeque$Itr: field 0 = snapshot array, field 1 = cursor,
+    // field 2 = backing ArrayDeque (so Iterator.remove() can mutate it).
     let elems = ad_collect_elements(ctx, this);
     let arr = alloc_ref_array(ctx, elems.len());
     for (i, e) in elems.iter().enumerate() {
         ctx.set_array_element(arr, i, *e);
     }
-    let itr = alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 2);
+    let itr = alloc_synthetic(ctx, "java/util/ArrayDeque$Itr", 3);
     ctx.set_field(itr, 0, Value::Object(Some(arr)));
     ctx.set_field(itr, 1, Value::Int(0));
+    ctx.set_field(itr, 2, Value::Object(Some(this)));
     Ok(Some(Value::Object(Some(itr))))
+}
+
+/// `ArrayDeque$Itr.remove()` — remove the element returned by the last `next()`
+/// from the BACKING deque (field 2). Without this native, `remove()` falls to
+/// the `java/util/Iterator` default, which throws `UnsupportedOperationException`
+/// — the kafka `NetworkClientDelegate` unsent-request cleanup
+/// (`iterator.remove()` over an `ArrayDeque`) hit exactly that. The iterator is
+/// snapshot-backed (field 0 = array, field 1 = cursor), so we remove the first
+/// occurrence of the just-returned element from the live deque (correct for the
+/// forward, unique-element iteration these call sites use); the snapshot is left
+/// intact so continued iteration matches JDK semantics.
+fn native_ad_itr_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    let cursor = ctx.get_field(this, 1).as_int().unwrap_or(0);
+    if cursor <= 0 {
+        return Err(RuntimeError::IllegalStateException {
+            message: "next() has not been called, or remove() already called after the last next()"
+                .to_string(),
+        }
+        .into());
+    }
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(None),
+    };
+    let backing = match ctx.get_field(this, 2) {
+        Value::Object(Some(b)) => b,
+        // Older 2-field iterators (no backing ref): nothing to mutate.
+        _ => return Ok(None),
+    };
+    let last = ctx.get_array_element(arr, (cursor - 1) as usize);
+    native_ad_remove_first_occurrence(ctx, &[Value::Object(Some(backing)), last])?;
+    Ok(None)
 }
 
 fn native_ad_to_string(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -16561,6 +16640,12 @@ fn register_queue_deque_interface_natives(registry: &mut NativeMethodRegistry) {
             native_snapshot_itr_next,
         );
     }
+    // `ArrayDeque$Itr.remove()` removes the last-returned element from the
+    // backing deque (field 2). Otherwise remove() falls to the Iterator default
+    // → UnsupportedOperationException (kafka NetworkClientDelegate). Only the
+    // ArrayDeque iterator carries the backing-deque ref; the PriorityQueue
+    // iterator does not, so it is left as-is.
+    registry.register("java/util/ArrayDeque$Itr", "remove", "()V", native_ad_itr_remove);
     registry.set_category(__prev_cat);
 }
 

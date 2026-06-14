@@ -49,7 +49,72 @@ pub(crate) fn register_stream_overrides(registry: &mut NativeMethodRegistry) {
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     register_flow_subscription_overrides(registry);
     register_basestream_mode_overrides(registry);
+    register_service_loader_itr_overrides(registry);
     registry.set_category(__prev_cat);
+}
+
+/// `java/util/ServiceLoader$Itr.{hasNext,next}` — the array-backed synthetic
+/// iterator (field 0 = element array, field 1 = cursor) that
+/// [`native_stream_empty_iterator`] above (and the `ServiceLoader.iterator()`
+/// natives in `servlet.rs` / `phases_late.rs`) hand back.
+///
+/// These were previously registered ONLY inside the servlet-support
+/// registration, which runs lazily the first time servlet/Jakarta classes are
+/// touched. A plain app that never loads a servlet (e.g. the Kafka clients
+/// unit suite) therefore got a `NoSuchMethodError
+/// java/util/ServiceLoader$Itr.hasNext()Z` the moment any
+/// `stream().iterator()` / `ServiceLoader.iterator()` produced one of these
+/// synthetic iterators — which fired inside `ConsumerConfig.<clinit>`
+/// (serializer/deserializer discovery) and JUnit Jupiter extension discovery,
+/// failing the whole `<clinit>` and surfacing downstream as
+/// `NoClassDefFoundError: …/ConsumerConfig`. Registering them here in the
+/// always-run essential stream path makes the iterator usable everywhere.
+fn register_service_loader_itr_overrides(registry: &mut NativeMethodRegistry) {
+    let itr = "java/util/ServiceLoader$Itr";
+    registry.register(itr, "hasNext", "()Z", native_sl_itr_has_next);
+    registry.register(itr, "next", "()Ljava/lang/Object;", native_sl_itr_next);
+}
+
+/// `ServiceLoader$Itr.hasNext()` — true while the cursor (field 1) is before the
+/// end of the backing array (field 0).
+fn native_sl_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let idx = match ctx.get_field(this, 1) {
+        Value::Int(i) => i,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let len = ctx.array_length(arr) as i32;
+    Ok(Some(Value::Int(if idx < len { 1 } else { 0 })))
+}
+
+/// `ServiceLoader$Itr.next()` — return the element at the cursor and advance it.
+fn native_sl_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let arr = match ctx.get_field(this, 0) {
+        Value::Object(Some(a)) => a,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let idx = match ctx.get_field(this, 1) {
+        Value::Int(i) => i,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let len = ctx.array_length(arr) as i32;
+    if idx >= len {
+        return Ok(Some(Value::Object(None)));
+    }
+    let elem = ctx.get_array_element(arr, idx as usize);
+    ctx.set_field(this, 1, Value::Int(idx + 1));
+    Ok(Some(elem))
 }
 
 /// `BaseStream.sequential() / parallel() / unordered() / isParallel() / onClose(Runnable)`
@@ -122,6 +187,9 @@ fn register_basestream_mode_overrides(registry: &mut NativeMethodRegistry) {
     ] {
         registry.register(cls, "iterator", "()Ljava/util/Iterator;", native_stream_empty_iterator);
     }
+    // `ServiceLoader$Itr.{hasNext,next}` are registered by
+    // `register_service_loader_itr_overrides` (called from `register_stream_overrides`),
+    // so the synthetic iterator `native_stream_empty_iterator` hands back is usable.
     registry.set_category(__prev_cat);
 }
 
