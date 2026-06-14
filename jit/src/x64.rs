@@ -10646,8 +10646,21 @@ impl Compiler {
             }
         }
 
-        // Reclaim callee local spill slots (return values already pushed)
-        self.next_spill_offset = save_spill;
+        // Reclaim callee local spill slots. The `ireturn` handler pushed any
+        // return value AT `save_spill` (it set next_spill=save_spill then
+        // push_from_rax, leaving next_spill=save_spill+8). Resetting next_spill
+        // back to `save_spill` here would FREE that return-value slot, so the
+        // next push (e.g. a sibling call's argument) reused it and clobbered the
+        // value — `leaf(a) + leafBig(a)` miscompiled because `leaf(a)`'s result
+        // was overwritten by `iload a` for leafBig's argument. Keep next_spill
+        // above the live operand-stack top so the return value is preserved.
+        self.next_spill_offset = if self.stack.len() > caller_base_depth {
+            // A return value occupies one slot at `save_spill`.
+            save_spill + 8
+        } else {
+            // Void callee: nothing pushed, callee operand stack fully reclaimed.
+            save_spill
+        };
 
         true
     }
@@ -19646,7 +19659,21 @@ pub fn compile_with_param_slots(
         .map(|(_, p)| unsafe { (**p).num_jit_args })
         .max()
         .unwrap_or(0);
-    let max_stack = max_stack + max_invoke_args;
+    // Inlining allocates extra spill slots for each inlined callee's locals
+    // and operand stack ON TOP of the caller's `max_stack` (and, since the
+    // inline epilogue keeps the return value rather than reclaiming the callee
+    // locals, sequential inlines accumulate). `spill_size` is derived purely
+    // from `max_stack`, so without this reserve the inlined code writes past
+    // the spill region into the callee-saved / shadow area — corrupting live
+    // values (observed as a `ClassCastException: …$TaskOption not an enum` when
+    // a clobbered slot fed an enum-typed field). Reserve, per site,
+    // `callee_max_locals + callee_code_len` (the latter bounds the callee's own
+    // operand depth); the total is bounded by `MAX_INLINE_BUDGET`.
+    let inline_stack_reserve: usize = inline_sites
+        .values()
+        .map(|s| s.callee_max_locals.saturating_add(s.callee_code_len))
+        .sum();
+    let max_stack = max_stack + max_invoke_args + inline_stack_reserve;
 
     // LICM: detect loops and find invariant aaload sequences to hoist
     let loops = detect_loops(code, code_len);
