@@ -4175,7 +4175,53 @@ fn collect_entries_any(ctx: &mut dyn NativeContext, source: ObjectRef) -> Vec<(V
 /// `Map.Entry` accessors. Layout-agnostic fallback used by
 /// [`collect_entries_any`] for `Map` implementations CratonVM does not model
 /// natively (real-JDK unmodifiable wrappers, third-party maps).
+thread_local! {
+    /// Source maps currently being walked by `collect_entries_via_iterator`.
+    /// Guards against infinite recursion when a view-set's `iterator()` resyncs
+    /// from its source map (`resync_view_set` → `collect_entries_any` →
+    /// `collect_entries_via_iterator` → `source.entrySet().iterator()` →
+    /// `native_hs_iterator` → `resync_view_set` …). Each `entrySet()` allocates
+    /// a fresh view object, so a per-view guard wouldn't catch it — key on the
+    /// stable source-map pointer instead. Observed as the JSSE-connector
+    /// stack-overflow during TLS init.
+    static ITER_COLLECT_GUARD: std::cell::RefCell<std::collections::HashSet<u64>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// RAII: removes our source key from `ITER_COLLECT_GUARD` on drop, including on
+/// panic/unwind — so a caught native panic can never leak a stale key (which
+/// would make a later, unrelated collection of a pointer-reused source wrongly
+/// return empty).
+struct IterCollectGuard {
+    key: u64,
+    inserted: bool,
+}
+impl Drop for IterCollectGuard {
+    fn drop(&mut self) {
+        if self.inserted {
+            ITER_COLLECT_GUARD.with(|g| {
+                g.borrow_mut().remove(&self.key);
+            });
+        }
+    }
+}
+
 fn collect_entries_via_iterator(
+    ctx: &mut dyn NativeContext,
+    source: ObjectRef,
+) -> Vec<(Value, Value)> {
+    let guard_key = source.as_ptr() as u64;
+    let inserted = ITER_COLLECT_GUARD.with(|g| g.borrow_mut().insert(guard_key));
+    let _guard = IterCollectGuard { key: guard_key, inserted };
+    if !inserted {
+        // Re-entrant collection of the SAME source via its own entrySet view —
+        // walking it again would recurse forever. Break the cycle.
+        return Vec::new();
+    }
+    collect_entries_via_iterator_inner(ctx, source)
+}
+
+fn collect_entries_via_iterator_inner(
     ctx: &mut dyn NativeContext,
     source: ObjectRef,
 ) -> Vec<(Value, Value)> {
@@ -16429,6 +16475,11 @@ fn native_al_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         for (i, e) in kept.iter().enumerate() {
             ctx.set_array_element(buf, i, *e);
         }
+        // Null the vacated tail (ArrayList invariant: slots >= size are null);
+        // see native_al_retain_all for why stale tail elements are harmful.
+        for i in kept.len()..(size as usize) {
+            ctx.set_array_element(buf, i, Value::Object(None));
+        }
         al_set_size(ctx, this, kept.len() as i32);
     }
     Ok(Some(Value::Int(if modified { 1 } else { 0 })))
@@ -16472,6 +16523,15 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     if modified {
         for (i, e) in kept.iter().enumerate() {
             ctx.set_array_element(buf, i, *e);
+        }
+        // Null the vacated tail so slots >= size are null (the real ArrayList
+        // invariant). Leaving stale non-null elements there breaks heuristics
+        // like `values_view_source`, which treats a non-null *last* buffer slot
+        // as a view-source sentinel — that misfired after retainAll and made a
+        // freshly-filtered list (e.g. the JSSE connector's enabled-cipher list)
+        // resync to empty, throwing "None of the [ciphers] ... supported".
+        for i in kept.len()..(size as usize) {
+            ctx.set_array_element(buf, i, Value::Object(None));
         }
         al_set_size(ctx, this, kept.len() as i32);
     }

@@ -2980,6 +2980,35 @@ fn register_engine_impl_natives(r: &mut NativeMethodRegistry) {
         },
     );
 
+    // getSupportedCipherSuites() — the connector validates its configured cipher
+    // list against this; without it the engine reported zero supported ciphers
+    // and Tomcat threw "None of the [ciphers] specified are supported by the SSL
+    // engine". Return the rustls-negotiable suites (overlaps Tomcat's defaults).
+    r.register(
+        cls_impl,
+        "getSupportedCipherSuites",
+        "()[Ljava/lang/String;",
+        |ctx, _args| {
+            let suites = [
+                "TLS_AES_128_GCM_SHA256",
+                "TLS_AES_256_GCM_SHA384",
+                "TLS_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+                "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+                "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+                "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+            ];
+            let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), suites.len());
+            for (i, &s) in suites.iter().enumerate() {
+                let so = ctx.create_string(s);
+                ctx.set_array_element(arr, i, Value::Object(Some(so)));
+            }
+            Ok(Some(Value::Object(Some(arr))))
+        },
+    );
+
     r.register(
         cls_impl,
         "setEnabledCipherSuites",
