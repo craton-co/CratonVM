@@ -470,6 +470,40 @@ fn verifier_skip_eligible(class: &Class) -> bool {
 }
 
 /// Full class initialization sequence (JVM spec 5.5).
+/// JVMS §5.5 step 7: initializing a class `C` recursively initializes each
+/// superinterface (direct or indirect) of `C` that **declares a non-abstract,
+/// non-static (i.e. default) method** — NOT every superinterface, and NOT one
+/// that merely declares a static field. Returns true if `iface_id`'s transitive
+/// superinterface closure (including itself) declares such a method.
+///
+/// The previous criterion ("declares a non-constant static field") over-eagerly
+/// initialized interfaces like kotlin-reflect `KotlinTypeChecker` (static
+/// `DEFAULT` field, no default methods): when `NewKotlinTypeCheckerImpl` was
+/// constructed mid-`NewKotlinTypeChecker.<clinit>`, that re-entered
+/// `KotlinTypeChecker.<clinit>`, which read the not-yet-assigned
+/// `NewKotlinTypeChecker.Companion` as null → "Cannot invoke getDefault on null"
+/// (SB-15, ReleaseScheduleTests). HotSpot uses the default-method criterion and
+/// does not init `KotlinTypeChecker` there.
+fn interface_has_default_method(shared: &SharedVm, iface_id: ClassId) -> bool {
+    let cm = shared.class_manager.read();
+    let mut stack = vec![iface_id];
+    let mut seen = rustc_hash::FxHashSet::default();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(c) = cm.get_class(id) {
+            if c.methods.iter().any(|m| !m.is_abstract() && !m.is_static()) {
+                return true;
+            }
+            for &s in &c.interfaces {
+                stack.push(s);
+            }
+        }
+    }
+    false
+}
+
 fn initialize_class_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,
@@ -571,8 +605,12 @@ fn initialize_class_shared(
         }
     }
 
-    // Step 3.5: Initialize directly-implemented interfaces that declare
-    // non-constant static fields (JVM spec В§5.5 step 7).
+    // Step 3.5: Initialize directly-implemented superinterfaces that declare a
+    // non-abstract, non-static (default) method, per JVMS §5.5 step 7. The
+    // criterion is *default methods*, NOT static fields: a superinterface that
+    // only declares a static field is initialized lazily at the `getstatic`
+    // that reads the field, never eagerly here. (See `interface_has_default_method`
+    // doc — the old static-field criterion broke kotlin-reflect circular init.)
     {
         let iface_ids: Vec<ClassId> = shared
             .class_manager
@@ -581,20 +619,16 @@ fn initialize_class_shared(
             .map(|c| c.interfaces.clone())
             .unwrap_or_default();
         for iface_id in iface_ids {
-            let needs_init = shared
+            let not_inited = shared
                 .class_manager
                 .read()
                 .get_class(iface_id)
                 .map(|iface| {
                     iface.state != ClassState::Initialized
                         && iface.state != ClassState::Initializing
-                        && iface.fields.iter().any(|f| {
-                            f.is_static()
-                                && f.constant_value_index().is_none()
-                        })
                 })
                 .unwrap_or(false);
-            if needs_init {
+            if not_inited && interface_has_default_method(shared, iface_id) {
                 ensure_class_initialized_shared(shared, thread, iface_id)?;
             }
         }
