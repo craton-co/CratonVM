@@ -1,5 +1,33 @@
 # Bug 25 — `NPE: Cannot invoke cacheSerializedValue on null` (null serialization cache)
 
+> **✅ FIXED (2026-06-14) — JIT escape-analysis scalar-replaced an escaping object.**
+> Root cause is `jit/src/x64.rs::analyze_escapes` (the scalar-replacement escape pass). The
+> `ObjectSerializationCache` is created in `MessageUtil.toByteBuffer` and **escapes** as an argument
+> to `message.size(cache, version)` / `write(bytes, cache, version)`. The pass is a single linear
+> walk with an abstract operand stack carrying each slot's `new`-provenance; `invokevirtual/
+> interface/static` run `escape_all!()` to escape every tracked argument. BUT the catch-all `_` arm
+> **forgot the provenance of EVERY operand-stack slot** ("clear provenance, keep depth") on any
+> unmodeled opcode — including the primitive loads `iload`/`lload`/`fload`/`dload` and the
+> const/`ldc`/`getstatic` family. `toByteBuffer` does `aload_2 cache; iload_1 version;
+> invokeinterface size`: the `iload_1` between the cache load and the call erased `cache`'s
+> provenance, so `escape_all!` at the call missed it → `cache` reported non-escaping → scalar-
+> replaced (allocation elided, `<init>` skipped) → the JIT passed a null/zero where the cache should
+> be → "Cannot invoke cacheSerializedValue on null". Proven via PC-annotated disasm (added to
+> `vm/src/jit/disasm.rs`): local map `L2(cache)=r13`, and `bc@0 new OSC` emitted NO allocation while
+> `astore_2` stored `[rbp-48h]=0` into `r13`.
+>
+> FIX: give the primitive-load / const / `getstatic` family their own arm in `analyze_escapes`
+> (`0x00` nop; `0x01..=0x18 | 0x1a..=0x29 | 0xb2`) that pushes ONE untracked `None` slot WITHOUT
+> touching existing slots' provenance. This is strictly corrective — it only makes objects that
+> genuinely escape-via-a-later-call (with an intervening primitive arg) stay tracked → escape →
+> heap-allocate; it can never CREATE a scalar replacement, so it cannot de-opt a legitimately
+> non-escaping object. Verified: CreateAclsRequestTest 4/4, SimpleExampleMessageTest 21/21,
+> RequestResponseTest 40/41 (all JIT-on, was 2/4, 16/21, 29/41). Residual: `RequestResponseTest.
+> fetchResponseVersionTest` (expected 1, got 0) is a SEPARATE JIT bug — passes --nojit, not
+> cacheSerializedValue. NOTE latent: the `_` arm still forgets provenance for arithmetic/array ops
+> between an object-load and an escaping call (`aload o; iload a; iadd; invoke(o,..)`) — rarer; same
+> class, a follow-up could escape-on-unknown instead of forget.
+
 > **UPDATE 3 — JIT-ONLY now; precisely isolated to a JIT call-chain miscompile (2026-06-14, binary a2e3261f):**
 > After the dev merge (collection-intrinsic fixes), the cluster is **GREEN under `--nojit`**
 > (all 13 classes pass: RequestResponseTest 41/41, CreateAclsRequestTest 4/4, …). The remaining

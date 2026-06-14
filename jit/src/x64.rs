@@ -2891,6 +2891,34 @@ fn analyze_escapes(
                 abs_stack.clear();
                 pc += bytecode_len_at(code, pc);
             }
+            // nop — no stack effect; must NOT disturb tracked provenance.
+            0x00 => {
+                pc += 1;
+            }
+            // Primitive loads / constants / getstatic — each pushes exactly ONE
+            // untracked operand (a primitive, a constant-pool constant, or a
+            // static-field value; never a `new`-tracked object) and pops
+            // nothing. Push a single `None` slot WITHOUT touching the
+            // provenance of objects already on the operand stack.
+            //
+            // The catch-all `_` arm below forgets EVERY slot's provenance, which
+            // silently de-tracked an object loaded just before a primitive arg —
+            // the canonical `aload obj; iload prim; invoke(obj, prim)`. The
+            // `escape_all!` at the call then missed `obj`, so an object that
+            // truly escapes-to-callee was reported non-escaping and scalar-
+            // replaced. kafka bug-25: `MessageUtil.toByteBuffer` does
+            // `aload_2 cache; iload_1 version; invokeinterface Message.size`,
+            // and the `iload_1` erased `cache`'s provenance → the
+            // ObjectSerializationCache was scalar-replaced (never allocated) →
+            // `size()` received a null cache → "Cannot invoke cacheSerializedValue
+            // on null". (long/double are one 64-bit slot in this model — same as
+            // `dup2`'s FORM-2 handling — so lload/dload/lconst/dconst/ldc2_w push
+            // one slot too.) `aload`/`aload_n` and `getfield`/`new`/`dup` keep
+            // their own arms above; this range deliberately excludes them.
+            0x01..=0x18 | 0x1a..=0x29 | 0xb2 => {
+                abs_stack.push(None);
+                pc += bytecode_len_at(code, pc);
+            }
             // For all other opcodes, use bytecode_len_at for PC advance.
             // These ops don't move tracked references, so no escaping needed.
             _ => {
