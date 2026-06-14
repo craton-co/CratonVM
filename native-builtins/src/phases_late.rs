@@ -5066,8 +5066,28 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             let dst = obj_arg(args, 1)?;
             let src_path = p57_read_path(ctx, src);
             let dst_path = p57_read_path(ctx, dst);
-            match std::fs::copy(&src_path, &dst_path) {
-                Ok(_) => Ok(Some(Value::Object(Some(dst)))),
+            // Java `Files.copy(Path,Path,CopyOption...)`: copying a DIRECTORY
+            // creates an (empty) directory at the target — it does NOT open the
+            // source as a file. `std::fs::copy` only handles regular files and on
+            // a directory fails ("Access denied / os error 5" on Windows), which
+            // broke every `TomcatBaseTest.recursiveCopy` (the whole
+            // `catalina.webresources` cluster — `preVisitDirectory` does
+            // `Files.copy(dir, …)`). Branch on the source kind; tolerate an
+            // already-existing target dir (mirrors the file path's overwrite).
+            let src_is_dir = std::fs::symlink_metadata(&src_path)
+                .map(|m| m.is_dir())
+                .unwrap_or(false);
+            let result = if src_is_dir {
+                match std::fs::create_dir(&dst_path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+                    Err(e) => Err(e),
+                }
+            } else {
+                std::fs::copy(&src_path, &dst_path).map(|_| ())
+            };
+            match result {
+                Ok(()) => Ok(Some(Value::Object(Some(dst)))),
                 Err(e) => Err(RuntimeError::IllegalStateException {
                     message: format!("IOException: {}", e),
                 }
@@ -8399,6 +8419,26 @@ fn file_normalise_path(path: &str) -> String {
     path.to_string()
 }
 
+/// Resolve `new File(parent, child)` the way the JDK's
+/// `WinNTFileSystem`/`UnixFileSystem.resolve` does, rather than `PathBuf::push`
+/// (whose `push("")` adds a trailing separator and `push("/")` discards the
+/// parent — both Java-incompatible). Strip leading/trailing separators from the
+/// child and a trailing one from the parent, join with one separator, then
+/// normalise. An empty child (including a lone "/" ) → just the normalised
+/// parent.
+fn file_join_parent_child(parent: &str, child: &str) -> String {
+    let is_sep = |c: char| c == '/' || c == '\\';
+    let child_trim = child.trim_matches(is_sep);
+    if child_trim.is_empty() {
+        return file_normalise_path(parent);
+    }
+    if parent.is_empty() {
+        return file_normalise_path(child_trim);
+    }
+    let parent_trim = parent.trim_end_matches(is_sep);
+    file_normalise_path(&format!("{parent_trim}/{child_trim}"))
+}
+
 /// Strip the Windows `\\?\` / `\\?\UNC\` extended-length prefix that
 /// `std::fs::canonicalize` prepends. The real JDK's `getCanonicalPath`
 /// never returns a verbatim/UNC-prefixed path; leaving `\\?\` in place
@@ -8505,13 +8545,15 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
         };
-        let path = if parent.is_empty() {
-            child
-        } else {
-            let mut p = std::path::PathBuf::from(&parent);
-            p.push(&child);
-            p.to_string_lossy().into_owned()
-        };
+        // JDK `File(String parent, String child)` resolution — NOT `PathBuf::push`,
+        // whose semantics differ from Java and broke `File`-based resource lookup
+        // (the whole catalina.webresources cluster): `push("")` appends a trailing
+        // separator (path no longer denotes the file → exists() false) and
+        // `push("/")` treats the child as absolute and discards the parent. Match
+        // Java: strip leading/trailing separators from the child, a trailing one
+        // from the parent, join with a separator, then normalise (slash
+        // conversion + collapse). Empty child → just the normalised parent.
+        let path = file_join_parent_child(&parent, &child);
         let s = ctx.create_string(&path);
         ctx.set_field(this, 0, Value::Object(Some(s)));
         Ok(None)
@@ -8528,13 +8570,7 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
             _ => String::new(),
         };
-        let path = if parent_path.is_empty() {
-            child
-        } else {
-            let mut p = std::path::PathBuf::from(&parent_path);
-            p.push(&child);
-            p.to_string_lossy().into_owned()
-        };
+        let path = file_join_parent_child(&parent_path, &child);
         let s = ctx.create_string(&path);
         ctx.set_field(this, 0, Value::Object(Some(s)));
         Ok(None)
