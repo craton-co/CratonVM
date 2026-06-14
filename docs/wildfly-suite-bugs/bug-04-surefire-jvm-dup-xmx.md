@@ -101,20 +101,31 @@ not model SO_REUSEADDR; `isPortAvailable` calls both). Verified ([`SS3`](../../w
 succeed. End-to-end, the managed container **passes the port check** and proceeds to
 launch the server.
 
-## Layer 5 (open) — `ProcessBuilder.start` rejects the quoted java path
+## Layer 5 — `ProcessBuilder.start` rejected the quoted java path — FIXED
 With Layer 4 fixed, the managed container builds the standalone-server command and
-launches it via `ProcessBuilder.start`, which fails:
+launches it via `ProcessBuilder.start`, which failed:
 ```
 IOException: ProcessBuilder.start failed:
   program="\"C:\Program Files\Eclipse Adoptium\…\bin\java\"" : os error 123 (ERROR_INVALID_NAME)
 ```
-CratonVM passes the program path **with literal surrounding double-quotes** to the OS
-`CreateProcess`, which treats the quotes as part of the filename (Windows error 123).
-The launcher quotes the space-containing java path; CratonVM's `ProcessBuilder.start`
-native should hand the program name to the OS **unquoted** (the OS API takes the program
-and args separately). The next blocker on this path. (And
-[Gap C / bug-03](bug-03-regex-perf-deployment-build.md) — the slow deployment-archive
-build — still gates the eventual deploy.)
+WildFly's `StandaloneCommandBuilder` wraps the space-containing java path in double
+quotes (`"C:\Program Files\…\bin\java"`). The OS `CreateProcess` takes the program and
+args separately, so a surrounding-quoted program is a literal filename → Windows error
+123. **Fix** (`native-io/src/process.rs`, `spawn_and_wrap`): strip a matched surrounding
+quote pair from the program before spawning — a `"` is illegal in a Windows filename, so
+the pair is unambiguously quoting (mirrors the JDK's `ProcessImpl`). Verified
+([`PBQuote`](../../wildfly-suite/repro/PBQuote.java)): a quoted program path now launches
+(`rc=0`); unquoted unchanged ([`PBRepro`](../../wildfly-suite/repro/PBRepro.java), no
+regression).
+
+## End of the discrete-bug chain → Gap C (perf)
+With Layers 1–5 fixed, the CratonVM Arquillian **client** now runs end-to-end up to the
+deployment-archive build: a stack dump lands it in
+`DeploymentGenerator → loadAuxiliaryArchives → …ArquillianDeploymentAppender.buildArchive
+→ AssetUtil.getFullPathForClassResource` — i.e. **no more discrete bugs gate the path**;
+the remaining blocker is [Gap C / bug-03](bug-03-regex-perf-deployment-build.md), the
+ShrinkWrap archive build being ~400–1000× too slow (native-bridged char accessors). That
+is a JIT-intrinsics performance project, tracked separately.
 
 ## Note — even fully fixed, Gap C still blocks this path
 The Surefire fork runs the Arquillian **client** under CratonVM, which builds the
