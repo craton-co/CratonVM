@@ -1744,6 +1744,106 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
             }
         },
     );
+    // JDK `TypeVariableImpl.equals` compares by (genericDeclaration, name);
+    // `hashCode` is `genericDeclaration.hashCode() ^ name.hashCode()`. Our
+    // synthetic `TypeVariable` objects are distinct instances per signature
+    // conversion (the `T` from `getTypeParameters()` and the `T` reused in a
+    // `getGenericInterfaces()` parameterization are NOT the same object as they
+    // are on HotSpot), so without these natives they fall back to `Object`
+    // identity equality and never compare equal. That breaks any library that
+    // resolves a type variable across a class hierarchy — e.g. Hibernate
+    // Validator matching `ConstraintValidator<A,T>`'s `T` against the declaring
+    // class's type parameter to discover the validated type
+    // (`HV000030: No validator could be found ...`).
+    registry.register(
+        "java/lang/reflect/TypeVariable",
+        "equals",
+        "(Ljava/lang/Object;)Z",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let other = match args.get(1) {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            if this == other {
+                return Ok(Some(Value::Int(1)));
+            }
+            // `this` is a synthetic TypeVariable (name=field0, decl=field2).
+            let this_name = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx.read_string(s),
+                _ => None,
+            };
+            let this_decl = ctx.get_field(this, 2);
+            // `other` may be EITHER another synthetic TypeVariable OR the *real*
+            // `sun.reflect.generics.reflectiveObjects.TypeVariableImpl` — JDK 25's
+            // `Class.getTypeParameters()` returns the real impl while our
+            // `getGenericInterfaces()` parameterization returns the synthetic one,
+            // so a generics resolver (Hibernate Validator) compares the two. Read
+            // the other's name/declaration from whichever representation it is.
+            let other_cls = ctx
+                .class_name_of_id(ctx.class_id_of_object(other))
+                .unwrap_or_default();
+            let (other_name, other_decl) = if other_cls == "java/lang/reflect/TypeVariable" {
+                (
+                    match ctx.get_field(other, 0) {
+                        Value::Object(Some(s)) => ctx.read_string(s),
+                        _ => None,
+                    },
+                    ctx.get_field(other, 2),
+                )
+            } else {
+                // Real TypeVariableImpl (or anything exposing the JDK field names).
+                let n = match ctx.get_field_by_name(other, "name") {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                };
+                if n.is_none() {
+                    // Not a type variable we can compare against.
+                    return Ok(Some(Value::Int(0)));
+                }
+                (n, ctx.get_field_by_name(other, "genericDeclaration"))
+            };
+            // genericDeclaration: Class/Executable mirrors are canonical, so
+            // identity comparison matches JDK `TypeVariableImpl.equals`.
+            let decl_eq = match (this_decl, other_decl) {
+                (Value::Object(a), Value::Object(b)) => a == b && a.is_some(),
+                _ => false,
+            };
+            let name_eq = this_name.is_some() && this_name == other_name;
+            Ok(Some(Value::Int(if decl_eq && name_eq { 1 } else { 0 })))
+        },
+    );
+    registry.register(
+        "java/lang/reflect/TypeVariable",
+        "hashCode",
+        "()I",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let decl_hash = if ctx.object_num_fields(this) > 2 {
+                match ctx.get_field(this, 2) {
+                    Value::Object(Some(d)) => ctx.identity_hash_code(d),
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            let name_hash = match ctx.get_field(this, 0) {
+                Value::Object(Some(s)) => ctx
+                    .read_string(s)
+                    .map(|n| {
+                        // java.lang.String.hashCode over UTF-16 code units.
+                        let mut h: i32 = 0;
+                        for u in n.encode_utf16() {
+                            h = h.wrapping_mul(31).wrapping_add(u as i32);
+                        }
+                        h
+                    })
+                    .unwrap_or(0),
+                _ => 0,
+            };
+            Ok(Some(Value::Int(decl_hash ^ name_hash)))
+        },
+    );
     registry.register(
         "java/lang/reflect/WildcardType",
         "getUpperBounds",
