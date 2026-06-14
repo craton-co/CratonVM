@@ -2944,13 +2944,15 @@ pub fn execute(
                             c.code_bytes().len()
                         );
                     }
-                    crate::jit::disasm::maybe_dump(
+                    crate::jit::disasm::maybe_dump_annotated(
                         "first",
                         &class_name_arc,
                         &method_name_arc,
                         &descriptor_arc,
                         c.entry_ptr(),
                         c.code_bytes(),
+                        c.osr_pc_to_native.as_deref(),
+                        c.osr_local_assignments.as_deref(),
                     );
                 }
                 // Record JFR compilation event — flight_recorder lock taken
@@ -15033,13 +15035,15 @@ fn try_jit_upgrade_with_gate(
                     compiled.code_bytes().len()
                 );
             }
-            crate::jit::disasm::maybe_dump(
+            crate::jit::disasm::maybe_dump_annotated(
                 "callee",
                 &callee_cached.class_name,
                 &callee_cached.method_name,
                 &callee_cached.method_descriptor,
                 compiled.entry_ptr(),
                 compiled.code_bytes(),
+                compiled.osr_pc_to_native.as_deref(),
+                compiled.osr_local_assignments.as_deref(),
             );
 
             // Store in JIT cache
