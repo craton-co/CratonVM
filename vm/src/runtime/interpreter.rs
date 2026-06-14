@@ -475,6 +475,16 @@ pub fn maybe_gc_forced_pub(shared: &SharedVm, thread: &mut JvmThread) {
 }
 
 fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
+    // CRIT (TLAB UAF) — retire this thread's TLAB before initiating GC, exactly
+    // as `maybe_gc` and `force_gc_from_native` do. This forced path (allocation
+    // failure / `create_exception_object`) was the one GC initiator that did NOT
+    // retire: its TLAB `[cursor,end)` stays in young-from across the collection,
+    // so its unfilled tail is un-walkable to the sweep and, after the young
+    // swap+reset, the stale TLAB hands out memory the collector considers free —
+    // the same use-after-free / heap-desync class as the parked/blocked-thread
+    // TLAB bugs. Surfaced as a SIGSEGV in the moving collector's post-copy
+    // `pointer_map` walk under multi-threaded churn (TestFileStoreConcurrency).
+    thread.tlab.retire();
     // Round-5 fix (CRIT — UAF): see comment in `maybe_gc`. The forced
     // path is also an initiator path; drain its per-thread SATB buffer
     // before scanning roots.
