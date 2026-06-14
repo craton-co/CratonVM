@@ -304,44 +304,83 @@ fn drive_real_rsa_keyfactory(
     result
 }
 
-/// Materialise a real `sun.security.rsa.RSAPublic/PrivateKeyImpl` from DER
-/// (X509 `SubjectPublicKeyInfo` for public, PKCS#8 for private) through the real
-/// SunRsaSign `RSAKeyFactory$Legacy` SPI, and register the GC-stable
-/// `identityHashCode(key) -> key_id` bridge so the `Signature` natives keep
-/// using the fast `crypto_impl` sign/verify even though the returned key carries
-/// no synthetic `key_id` slot. Gated by `crate::route_rsa_to_real()` at the
-/// call site. This is a *re-import of already-generated material* (the DER comes
-/// from our own fast Rust keygen), NOT a slow interpreter keygen.
-fn real_rsa_key_from_der(
+/// Build a positive `java.math.BigInteger` from an unsigned big-endian
+/// magnitude. Uses `BigInteger(int signum, byte[] magnitude)` so a leading
+/// high bit is never misread as a negative two's-complement value.
+fn build_positive_biginteger(
     ctx: &mut dyn NativeContext,
-    der: &[u8],
+    magnitude: &[u8],
+) -> Result<ObjectRef, MethodCallFailed> {
+    let arr = alloc_byte_array(ctx, magnitude);
+    match ctx.new_object_initialized(
+        "java/math/BigInteger",
+        "(I[B)V",
+        &[Value::Int(1), Value::Object(Some(arr))],
+    )? {
+        Some(Value::Object(Some(o))) => Ok(o),
+        _ => Err(RuntimeError::NotImplemented {
+            feature: "java.math.BigInteger(int,byte[])".into(),
+        }
+        .into()),
+    }
+}
+
+/// Materialise a real `sun.security.rsa.RSAPublic/PrivateKeyImpl` from raw RSA
+/// components via `RSA{Public,Private}KeySpec` → real `RSAKeyFactory$Legacy`,
+/// and register the GC-stable `identityHashCode(key) -> key_id` bridge so the
+/// `Signature` natives keep using the fast `crypto_impl` sign/verify even though
+/// the returned key carries no synthetic `key_id` slot.
+///
+/// `second` is the public exponent `e` (public key) or the private exponent `d`
+/// (private key). `crypto_impl`'s RSA holds exactly `{n, e, d}` (no CRT primes),
+/// and the `RSA{Public,Private}KeySpec` path needs only modulus + one exponent —
+/// so this re-imports our *own* already-generated material, NOT a slow keygen.
+fn real_rsa_key_from_components(
+    ctx: &mut dyn NativeContext,
+    n_bytes: &[u8],
+    second: &[u8],
     key_id: u64,
     is_public: bool,
 ) -> Result<ObjectRef, MethodCallFailed> {
     let (spec_class, engine, ret_desc) = if is_public {
         (
-            "java/security/spec/X509EncodedKeySpec",
+            "java/security/spec/RSAPublicKeySpec",
             "engineGeneratePublic",
             "Ljava/security/PublicKey;",
         )
     } else {
         (
-            "java/security/spec/PKCS8EncodedKeySpec",
+            "java/security/spec/RSAPrivateKeySpec",
             "engineGeneratePrivate",
             "Ljava/security/PrivateKey;",
         )
     };
-    let arr = alloc_byte_array(ctx, der);
-    let spec = match ctx.new_object_initialized(spec_class, "([B)V", &[Value::Object(Some(arr))])? {
-        Some(Value::Object(Some(o))) => o,
-        _ => {
-            return Err(RuntimeError::NotImplemented {
-                feature: spec_class.into(),
+    // Build the two BigIntegers, pinning the modulus across the second
+    // allocation (the moving collector may relocate it).
+    let n_bi = build_positive_biginteger(ctx, n_bytes)?;
+    let p0 = ctx.pin_native_root(n_bi);
+    let built = (|| {
+        let s_bi = build_positive_biginteger(ctx, second)?;
+        let p1 = ctx.pin_native_root(s_bi);
+        let n_bi = ctx.read_native_pin(p0, n_bi);
+        let s_bi = ctx.read_native_pin(p1, s_bi);
+        let spec = match ctx.new_object_initialized(
+            spec_class,
+            "(Ljava/math/BigInteger;Ljava/math/BigInteger;)V",
+            &[Value::Object(Some(n_bi)), Value::Object(Some(s_bi))],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                return Err(RuntimeError::NotImplemented {
+                    feature: spec_class.into(),
+                }
+                .into())
             }
-            .into())
-        }
-    };
-    let key = match drive_real_rsa_keyfactory(ctx, spec, engine, ret_desc)? {
+        };
+        drive_real_rsa_keyfactory(ctx, spec, engine, ret_desc)
+    })();
+    ctx.unpin_native_roots(p0);
+    let key = match built? {
         Some(Value::Object(Some(o))) => o,
         _ => {
             return Err(RuntimeError::NotImplemented {
@@ -354,23 +393,41 @@ fn real_rsa_key_from_der(
     Ok(key)
 }
 
-/// Build BOTH real RSA key objects from already-generated DER, pinning the
-/// public key across the private-key allocation (which may move the heap).
-/// The crypto material is already stored under `key_id` by the caller, so
-/// sign/verify stay on the fast Rust path via the identity bridge.
-fn real_rsa_keypair_objs(
+/// Build both real RSA key objects from raw components and assemble them into a
+/// GENUINE `java.security.KeyPair` via its real constructor — so `getPublic()` /
+/// `getPrivate()` observe the correct `publicKey` / `privateKey` fields (the
+/// real layout is `privateKey@0, publicKey@1`, which the `keypair_get_*`
+/// accessors handle for real keys). Pins the public key across the private-key
+/// construction (which allocates and may relocate the heap). The crypto material
+/// is already stored under `key_id`, so sign/verify stay on the fast Rust path.
+fn real_rsa_keypair(
     ctx: &mut dyn NativeContext,
-    pk_der: &[u8],
-    sk_der: &[u8],
+    n_bytes: &[u8],
+    e_bytes: &[u8],
+    d_bytes: &[u8],
     key_id: u64,
-) -> Result<(ObjectRef, ObjectRef), MethodCallFailed> {
-    let pub_obj = real_rsa_key_from_der(ctx, pk_der, key_id, true)?;
+) -> Result<ObjectRef, MethodCallFailed> {
+    let pub_obj = real_rsa_key_from_components(ctx, n_bytes, e_bytes, key_id, true)?;
     let pin = ctx.pin_native_root(pub_obj);
-    let priv_res = real_rsa_key_from_der(ctx, sk_der, key_id, false);
-    let pub_obj = ctx.read_native_pin(pin, pub_obj);
+    let assembled = (|| {
+        let priv_obj = real_rsa_key_from_components(ctx, n_bytes, d_bytes, key_id, false)?;
+        // `new_object_initialized` is GC-safe for its init args (VM override), so
+        // `priv_obj` needs no separate pin; refresh `pub_obj` post-relocation.
+        let pub_obj = ctx.read_native_pin(pin, pub_obj);
+        match ctx.new_object_initialized(
+            "java/security/KeyPair",
+            "(Ljava/security/PublicKey;Ljava/security/PrivateKey;)V",
+            &[Value::Object(Some(pub_obj)), Value::Object(Some(priv_obj))],
+        )? {
+            Some(Value::Object(Some(o))) => Ok(o),
+            _ => Err(RuntimeError::NotImplemented {
+                feature: "java.security.KeyPair(PublicKey,PrivateKey)".into(),
+            }
+            .into()),
+        }
+    })();
     ctx.unpin_native_roots(pin);
-    let priv_obj = priv_res?;
-    Ok((pub_obj, priv_obj))
+    assembled
 }
 
 // Synthetic-slot offsets relative to `synthetic_base_offset(...)`.
@@ -750,8 +807,11 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 
     if algo == ALGO_RSA {
         // Fast Rust keygen (the actual optimisation — no slow interpreter prime
-        // generation). The resulting DER + crypto material are real.
+        // generation). The resulting components + crypto material are real.
         let (pk, sk) = crypto_impl::Rsa::generate_keypair(bits);
+        let n_bytes = pk.n.to_bytes_be();
+        let e_bytes = pk.e.to_bytes_be();
+        let d_bytes = sk.d.to_bytes_be();
         let pk_der = crypto_impl::Rsa::public_key_to_der(&pk);
         let sk_der = crypto_impl::Rsa::private_key_to_der(&sk);
         let key_id = crypto_impl::rsa_key_next_id();
@@ -763,16 +823,14 @@ fn kpg_generate_key_pair(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
             },
         );
         // Default: hand out GENUINE RSAPublic/PrivateKeyImpl objects (re-imported
-        // from our own DER via the real KeyFactory) so `(RSAPublicKey) k` casts,
-        // `getModulus()`, real `getEncoded()` and BC cert generation all work —
-        // while sign/verify stay on the fast crypto_impl path via the identity
-        // bridge. CRATONVM_SYNTHETIC_RSA=1 restores the bare-interface synthetic
-        // keys (faster alloc, but the cast/cert paths fail).
+        // from our own components via the real KeyFactory) so `(RSAPublicKey) k`
+        // casts, `getModulus()`, real `getEncoded()` and BC cert generation all
+        // work — while sign/verify stay on the fast crypto_impl path via the
+        // identity bridge. CRATONVM_SYNTHETIC_RSA=1 restores the bare-interface
+        // synthetic keys (faster alloc, but the cast/cert paths fail).
         if crate::route_rsa_to_real() {
-            if let Ok((pub_obj, priv_obj)) =
-                real_rsa_keypair_objs(ctx, &pk_der, &sk_der, key_id)
-            {
-                return Ok(Some(Value::Object(Some(alloc_keypair(ctx, pub_obj, priv_obj)))));
+            if let Ok(kp) = real_rsa_keypair(ctx, &n_bytes, &e_bytes, &d_bytes, key_id) {
+                return Ok(Some(Value::Object(Some(kp))));
             }
             // Fall through to the synthetic keys if the real SPI is unavailable.
         }
@@ -892,6 +950,8 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
 
     if algo == ALGO_RSA {
         if let Some(pk) = crypto_impl::parse_rsa_public_key(&der) {
+            let n_bytes = pk.n.to_bytes_be();
+            let e_bytes = pk.e.to_bytes_be();
             let pk_der = crypto_impl::Rsa::public_key_to_der(&pk);
             // We can't honour an external private-key counterpart from a
             // public-only spec, so we register a public-only handle by
@@ -919,7 +979,9 @@ fn kf_generate_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             // BC consumers); verify stays on the fast crypto_impl path via the
             // identity bridge. CRATONVM_SYNTHETIC_RSA=1 → bare-interface key.
             if crate::route_rsa_to_real() {
-                if let Ok(key) = real_rsa_key_from_der(ctx, &pk_der, key_id, true) {
+                if let Ok(key) =
+                    real_rsa_key_from_components(ctx, &n_bytes, &e_bytes, key_id, true)
+                {
                     return Ok(Some(Value::Object(Some(key))));
                 }
             }
@@ -1059,7 +1121,9 @@ fn keypair_get_public(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     // Our synthetic KeyPair stores publicKey@0 (a synthetic java/security/PublicKey).
     // A *real* java.security.KeyPair (from real EC keygen or `new KeyPair(pub,priv)`)
     // lays out privateKey@0, publicKey@1 — so for it the public key is at slot 1.
-    if crate::route_ec_to_real() && !is_synthetic_key_obj(ctx, &slot0, "java/security/PublicKey") {
+    if (crate::route_ec_to_real() || crate::route_rsa_to_real())
+        && !is_synthetic_key_obj(ctx, &slot0, "java/security/PublicKey")
+    {
         return Ok(Some(ctx.get_field(this, 1)));
     }
     Ok(Some(slot0))
@@ -1070,7 +1134,9 @@ fn keypair_get_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let slot1 = ctx.get_field(this, 1);
     // Synthetic KeyPair: privateKey@1 (synthetic java/security/PrivateKey). A real
     // java.security.KeyPair has publicKey@1, privateKey@0.
-    if crate::route_ec_to_real() && !is_synthetic_key_obj(ctx, &slot1, "java/security/PrivateKey") {
+    if (crate::route_ec_to_real() || crate::route_rsa_to_real())
+        && !is_synthetic_key_obj(ctx, &slot1, "java/security/PrivateKey")
+    {
         return Ok(Some(ctx.get_field(this, 0)));
     }
     Ok(Some(slot1))
