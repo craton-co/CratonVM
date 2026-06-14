@@ -2996,23 +2996,20 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let cap = match args.get(1) {
         Some(Value::Int(c)) => {
-            // Bug 4 (round-9 native-misc HIGH): the JDK's
-            // `HashMap(int initialCapacity)` reads the requested value as
-            // a *minimum number of mappings to hold without resizing*,
-            // then internally allocates `ceil(c / loadFactor)` buckets so
-            // the threshold (loadFactor * buckets) >= requested capacity.
-            // With the default load factor of 0.75 that's `c * 4 / 3`,
-            // rounded up to the next power of two. Previously we rounded
-            // `c` itself to a power of two, which means
-            // `new HashMap<>(16)` allocated 16 buckets and resized on the
-            // 13th insert — defeating the entire purpose of the sizing
-            // hint and causing extra rehash work in the hot loop.
-            let requested = std::cmp::max(*c, 1) as u64;
-            // ceil(requested * 4 / 3), then cap to MAP_MAX_CAPACITY before
-            // next_power_of_two to avoid u32 overflow panic on absurdly
-            // large hints.
-            let needed = requested.saturating_mul(4).div_ceil(3);
-            let capped = std::cmp::min(needed, MAP_MAX_CAPACITY as u64).max(1) as u32;
+            // JDK `HashMap(int initialCapacity)` / `HashSet(int)` semantics:
+            // the initial table size is `tableSizeFor(initialCapacity)` — the
+            // smallest power of two >= the requested capacity. It is NOT
+            // inflated by the load factor: `new HashMap<>(16)` allocates a
+            // 16-bucket table (threshold 16*0.75 = 12) and DOES resize on the
+            // 13th insert. An earlier "hold N mappings without resizing"
+            // optimisation rounded `ceil(c*4/3)` up instead, so
+            // `new HashSet<>()` (whose backing passes cap 16) and
+            // `new HashMap<>(16)` allocated 32 buckets — which shifts every
+            // key's bucket index and makes HashSet/HashMap iteration order
+            // diverge from HotSpot (B-E: Kafka AdminApiDriver request-key and
+            // consumer-group ordering). Match the JDK exactly: tableSizeFor.
+            let requested = std::cmp::max(*c, 1) as u32;
+            let capped = std::cmp::min(requested, MAP_MAX_CAPACITY as u32);
             let n = capped.checked_next_power_of_two().unwrap_or(MAP_MAX_CAPACITY as u32);
             std::cmp::min(n as usize, MAP_MAX_CAPACITY as usize)
         }
