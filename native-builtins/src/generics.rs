@@ -93,7 +93,15 @@ fn component_array_name(sig: &TypeSig) -> Option<String> {
 pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
     match sig {
         TypeSig::Base(ch) => {
-            // Primitive types -> Class mirror for the primitive
+            // Primitive types -> Class mirror for the primitive.
+            //
+            // Primitive mirrors have no regular `ClassId`, so `class_id_by_name`
+            // returns None for "int"/"long"/etc. — that previously collapsed a
+            // primitive parameter in a *generic* signature to `null` (e.g. the
+            // `int hashIterations` arg of a `@JsonCreator (int, String,
+            // Map<String,List<String>>)` ctor), and Jackson then threw
+            // "Unrecognized Type: [null]" deserializing the POJO. Use the
+            // dedicated primitive-mirror accessor instead (cf. jmx_openmbean.rs).
             let prim_name = match ch {
                 'B' => "byte",
                 'C' => "char",
@@ -106,12 +114,8 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
                 'V' => "void",
                 _ => return Value::Object(None),
             };
-            if let Some(cid) = ctx.class_id_by_name(prim_name) {
-                let mirror = ctx.get_class_mirror(cid);
-                Value::Object(Some(mirror))
-            } else {
-                Value::Object(None)
-            }
+            let mirror = ctx.primitive_class_mirror(prim_name);
+            Value::Object(Some(mirror))
         }
         TypeSig::Class { name, type_args } if type_args.is_empty() => {
             // Non-parameterized class -> Class mirror.

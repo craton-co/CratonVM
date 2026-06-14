@@ -723,8 +723,21 @@ fn collect_hashtable(ctx: &dyn NativeContext, this: ObjectRef, want_keys: bool) 
     for i in 0..cap {
         let mut node_val = ctx.get_array_element(buckets, i);
         while let Value::Object(Some(node)) = node_val {
-            // Node fields: key=0, value=1, hash=2, next=3
-            let v = if want_keys {
+            // Two possible bucket-node layouts — `next` is slot 3 in BOTH:
+            //   * real java.util.Hashtable$Entry: hash(0,int) key(1) value(2) next(3)
+            //   * native HashMap node:            key(0)      value(1) hash(2,int) next(3)
+            // In real-JDK mode `Hashtable.<init>`/`put` run real bytecode, so the
+            // receiver is a genuine Hashtable with real Entry nodes; reading slot 0
+            // as the key then yields the primitive `hash` (Value::Int) and the
+            // caller's `checkcast String` blows up with "not an object reference"
+            // (and BC's copyHashTable produces a corrupt per-instance defaultLookUp
+            // → every attrNameToOID("CN") throws "Unknown object id"). Discriminate
+            // on slot 0: a real Entry's `hash` is a primitive int; a native node's
+            // key is always an object reference.
+            let real_layout = matches!(ctx.get_field(node, 0), Value::Int(_));
+            let v = if real_layout {
+                if want_keys { ctx.get_field(node, 1) } else { ctx.get_field(node, 2) }
+            } else if want_keys {
                 ctx.get_field(node, 0)
             } else {
                 ctx.get_field(node, 1)

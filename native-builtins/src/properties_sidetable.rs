@@ -148,6 +148,37 @@ fn key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
     pack_obj_key(hash, generation)
 }
 
+// --- system-Properties marker -------------------------------------------------
+//
+// `Properties.setProperty`/`put` formerly mirrored EVERY write to the global
+// system-property store (`ctx.set_system_property`) so that
+// `System.getProperties().setProperty(k,v)` propagated (getProperties returns a
+// fresh synthetic Properties each call, so there is no stable system-props
+// object to target). That over-broad mirror meant ANY `new Properties()
+// .setProperty(...)` polluted system properties — and `getProperty` falls back
+// to the system store on a side-table miss, so distinct Properties objects
+// cross-contaminated. In Hibernate that corrupted the masked password
+// (`ConfigurationHelper.maskOut` clones the global props and sets the CLONE's
+// password to "****"; the "****" leaked into system props and back into the
+// real password -> "Wrong user name or password" on bootstrap).
+//
+// Now only the synthetic Properties objects produced by `System.getProperties()`
+// (marked here) mirror their writes to the system store.
+fn system_props_keys() -> &'static Mutex<std::collections::HashSet<usize>> {
+    static S: OnceLock<Mutex<std::collections::HashSet<usize>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Mark `obj` as a system-properties view (called from the `System.getProperties`
+/// native) so its `setProperty`/`put` writes propagate to the system store.
+pub fn mark_system_props(ctx: &dyn NativeContext, obj: ObjectRef) {
+    system_props_keys().lock().insert(key_for(ctx, obj));
+}
+
+fn is_system_props(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    system_props_keys().lock().contains(&key_for(ctx, obj))
+}
+
 /// Read all bytes from an InputStream by repeatedly invoking `read([B,
 /// I, I)I` on the input.  Returns `None` if the stream is null, the
 /// total exceeds `MAX_LOAD_BYTES`, or a read errors out.
@@ -981,7 +1012,11 @@ fn native_properties_set_property(
     // generic Map walkers observe the entry — see native_properties_put's
     // fn-level note for the full rationale (Hibernate's PU-properties merge).
     mirror_loaded_entries_to_properties_backend(ctx, this, &[(key.clone(), val.clone())]);
-    let _ = ctx.set_system_property(&key, &val);
+    // Only the system-properties view propagates to the global store — see
+    // `system_props_keys` for why a blanket mirror cross-contaminates.
+    if is_system_props(ctx, this) {
+        let _ = ctx.set_system_property(&key, &val);
+    }
     match old {
         Some(prev) => Ok(Some(Value::Object(Some(ctx.create_string(&prev))))),
         None => Ok(Some(Value::Object(None))),
@@ -1046,7 +1081,9 @@ fn native_properties_put(
             let prev = get_kv(ctx, this, &ks);
             put_kv(ctx, this, &ks, &vs);
             mirror_loaded_entries_to_properties_backend(ctx, this, &[(ks.clone(), vs.clone())]);
-            let _ = ctx.set_system_property(&ks, &vs);
+            if is_system_props(ctx, this) {
+                let _ = ctx.set_system_property(&ks, &vs);
+            }
             if let Some(p) = prev {
                 return Ok(Some(Value::Object(Some(ctx.create_string(&p)))));
             }
