@@ -16568,6 +16568,18 @@ fn execute_invokevirtual_vtable_fast(
         return Ok(CachedCallResult::CacheMiss);
     }
 
+    if std::env::var_os("CRATONVM_DBG_VDISP").is_some()
+        && (method_name.as_ref() == "hashCode" || method_name.as_ref() == "equals")
+    {
+        let cm = shared.class_manager.read();
+        let caller = cm.get_class(caller_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+        let rcv = cm.get_class(receiver_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+        let declaring = crate::classloading::find_method_recursive(
+            receiver_class_id, &method_name, &method_descriptor, &cm.class_store,
+        ).and_then(|(_m, did)| cm.class_store.get(did).map(|c| c.name.to_string())).unwrap_or_default();
+        eprintln!("[vdisp] VTFAST caller={caller} method={method_name}{method_descriptor} receiver_class={rcv} declaring={declaring}");
+    }
+
     // Interpreter intrinsic shadowing guard.
     //
     // This vtable fast path runs BEFORE `execute_invokevirtual_cached` (it is
@@ -17407,6 +17419,21 @@ fn populate_virtual_invoke_cache(
             Ok(r) => r,
             Err(_) => return,
         };
+
+    if std::env::var_os("CRATONVM_DBG_VDISP").is_some()
+        && (method_name.as_ref() == "hashCode" || method_name.as_ref() == "equals")
+    {
+        let cm = shared.class_manager.read();
+        let caller = cm.get_class(caller_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+        let rcv = cm.get_class(receiver_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+        let cp_static = cm.get_class(caller_class_id)
+            .and_then(|_| resolve_method_ref(shared, caller_class_id, cp_index).ok())
+            .map(|(cn, _, _, _)| cn.to_string()).unwrap_or_default();
+        let declaring = crate::classloading::find_method_recursive(
+            receiver_class_id, &method_name, &descriptor, &cm.class_store,
+        ).and_then(|(_m, did)| cm.class_store.get(did).map(|c| c.name.to_string())).unwrap_or_default();
+        eprintln!("[vdisp] POPULATE caller={caller} cp_static={cp_static} method={method_name}{descriptor} receiver_class={rcv} declaring={declaring}");
+    }
 
     // Interpreter intrinsic probe (invokevirtual/invokeinterface).
     //

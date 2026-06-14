@@ -853,6 +853,18 @@ pub struct CompiledMethod {
     /// compile time, so no safepoint-id slot exists and the walker uses
     /// the conservative path for this method.
     pub sp_id_slot_off: i32,
+    /// Stage A (precise oop maps, B-K fix) — `true` only when EVERY
+    /// GC-capable safepoint in this method has a precise oop map AND the
+    /// method has no coverage-breaking construct (OSR entry, un-mapped
+    /// inlined-callee safepoint). When `true` the GC root walker may
+    /// skip the conservative backstop sweep for this frame and treat its
+    /// precise oops as relocatable (movable) rather than pinned — the
+    /// change that lets selective promotion drain JIT-rooted young
+    /// objects without the B-K stale-slot corruption. `false` (the
+    /// default) preserves the conservative, pin-everything behaviour, so
+    /// it is always safe to leave unset. Only ever consulted on the
+    /// gated precise path (`CRATONVM_PRECISE_JIT_MAPS`).
+    pub fully_oop_covered: bool,
 }
 
 unsafe impl Send for CompiledMethod {}
@@ -946,6 +958,7 @@ impl CompiledMethod {
             static_inits_done: std::sync::atomic::AtomicBool::new(false),
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
+            fully_oop_covered: false,
         }
     }
 
@@ -989,6 +1002,7 @@ impl CompiledMethod {
             static_inits_done: std::sync::atomic::AtomicBool::new(false),
             oop_maps_sorted: false,
             sp_id_slot_off: 0,
+            fully_oop_covered: false,
         }
     }
 
@@ -4498,6 +4512,16 @@ fn try_compile_inner(
     let (param_jvm_slots, param_slot_span) =
         compute_param_jvm_slots(&cached.method_descriptor, cached.is_static);
 
+    // Stage A.4 (precise oop maps, B-K fix) — seed the local-oop dataflow with
+    // reference parameters, but ONLY when the precise gate is on. Off → `0`, so
+    // `compute_local_oop_masks` keeps its historical empty entry state and the
+    // emitted maps/codegen are byte-identical to the default path.
+    let param_oop_mask = if x64::precise_jit_maps_enabled() {
+        compute_param_oop_mask(&cached.method_descriptor, cached.is_static)
+    } else {
+        0
+    };
+
     let mut compiled = x64::compile_with_param_slots(
         code,
         code_len,
@@ -4524,6 +4548,7 @@ fn try_compile_inner(
         string_layout,
         &param_jvm_slots,
         param_slot_span,
+        param_oop_mask,
     )?;
 
     compiled._jit_strings = owned_strings;
@@ -4678,6 +4703,75 @@ fn compute_param_jvm_slots(descriptor: &str, is_static: bool) -> (Vec<usize>, us
         }
     }
     (slots, slot)
+}
+
+/// Stage A.4 (precise oop maps, B-K fix) — bitmask of JVM local slots that hold
+/// a REFERENCE parameter on method entry: bit `k` set ⇒ slot `k` is an oop.
+///
+/// Covers the implicit `this` (slot 0, instance methods) plus every declared
+/// `L…;` / `[…` parameter. Mirrors [`compute_param_jvm_slots`]'s slot walk
+/// EXACTLY — category-2 (`J`/`D`) parameters consume two slots and are non-oops,
+/// primitives consume one — so the returned bit positions line up with the local
+/// slot indices the method body reads. Slots ≥ 64 are out of the dataflow's
+/// 64-local model and are dropped (such a method cannot be fully-covered).
+///
+/// Used only on the precise gate to seed [`x64::compile_with_param_slots`]'s
+/// `param_oop_mask`; the caller passes `0` when the gate is off.
+fn compute_param_oop_mask(descriptor: &str, is_static: bool) -> u64 {
+    let mut mask = 0u64;
+    let mut slot = 0usize;
+    if !is_static {
+        // `this` is always a reference.
+        mask |= 1u64 << slot; // slot == 0 here
+        slot += 1;
+    }
+    let b = descriptor.as_bytes();
+    let mut i = 1;
+    while i < b.len() && b[i] != b')' {
+        match b[i] {
+            b'J' | b'D' => {
+                // category-2 scalar: two slots, non-oop.
+                slot += 2;
+                i += 1;
+            }
+            b'L' => {
+                if slot < 64 {
+                    mask |= 1u64 << slot;
+                }
+                slot += 1;
+                i += 1;
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                if slot < 64 {
+                    mask |= 1u64 << slot;
+                }
+                slot += 1;
+                i += 1;
+                while i < b.len() && b[i] == b'[' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    i += 1;
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                    i += 1;
+                } else if i < b.len() {
+                    i += 1;
+                }
+            }
+            _ => {
+                // I F B C S Z — category-1 primitive, non-oop.
+                slot += 1;
+                i += 1;
+            }
+        }
+    }
+    mask
 }
 
 /// Long/double bytecodes (category-2 operands or results). Used to keep such
@@ -4897,6 +4991,38 @@ pub fn return_type(descriptor: &str) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Stage A.4 (precise oop maps) — param oop mask ──────────────
+    //
+    // `compute_param_oop_mask` must mark exactly the JVM local slots that hold a
+    // reference parameter on entry, using the SAME slot walk as
+    // `compute_param_jvm_slots` (category-2 J/D consume two slots; arrays and
+    // `L…;` are references; primitives are not; instance `this` is slot 0). A
+    // wrong bit here would, under the eventual moving path, either rewrite a
+    // primitive (false positive) or miss an oop (false negative) — so pin it.
+    #[test]
+    fn test_compute_param_oop_mask() {
+        // static, all primitive → no oop slots.
+        assert_eq!(compute_param_oop_mask("(II)I", true), 0b00);
+        // instance, primitive params → only `this` (slot 0).
+        assert_eq!(compute_param_oop_mask("(II)I", false), 0b1);
+        // static, one reference param at slot 0.
+        assert_eq!(compute_param_oop_mask("(Ljava/lang/Object;I)V", true), 0b1);
+        // instance, one reference param → this (0) + param (1).
+        assert_eq!(compute_param_oop_mask("(Ljava/lang/Object;)V", false), 0b11);
+        // static, long (slots 0,1; non-oop) then reference at slot 2.
+        assert_eq!(compute_param_oop_mask("(JLjava/lang/Object;)V", true), 0b100);
+        // static, array ref (slot 0), long (slots 1,2), array-of-ref (slot 3).
+        assert_eq!(compute_param_oop_mask("([IJ[Ljava/lang/String;)V", true), 0b1001);
+        // bt18's `static Node make(int)` — the live oop is the LOCAL `n`, not a
+        // param, so the param mask is empty (the dataflow seeds it as `astore`d).
+        assert_eq!(compute_param_oop_mask("(I)Lpkg/Node;", true), 0b0);
+        // instance, double param (slots 1,2; non-oop) → only `this`.
+        assert_eq!(compute_param_oop_mask("(D)V", false), 0b1);
+        // no params: static → 0; instance → this only.
+        assert_eq!(compute_param_oop_mask("()V", true), 0b0);
+        assert_eq!(compute_param_oop_mask("()V", false), 0b1);
+    }
 
     // ── JitMICSlot layout tests (CRIT-8 prerequisite) ──────────────
     //
