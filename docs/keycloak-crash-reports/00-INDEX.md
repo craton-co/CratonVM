@@ -27,9 +27,10 @@ clean). Those are **not** CratonVM bugs and get no report.
   plus ECDH (#04), EC keyspec (#05), Cipher initLock (#03), stream close-handlers (#09),
   JSON compare (#08).
 
-## Latest (iteration 8) — **65 PASS / 27 FAIL, 6 CratonVM-only failures, 0 regressions**
-**Eight** classes flipped fully green over the effort, via fundamental VM fixes (each
+## Latest (iteration 9) — **66 PASS / 26 FAIL, 5 CratonVM-only failures, 0 regressions**
+**Nine** classes flipped fully green over the effort, via fundamental VM fixes (each
 verified with no regressions across the 92-class suite):
+- **DefaultCryptoJWKTest** — P-384/P-521 EC JIT-miscompile fix (#17, `ca34440d`).
 - **CredentialModelTest, CredentialModelBackwardsCompatibilityTest** — primitive generic
   param mirror (#02).
 - **DefaultCryptoRSAVerifierTest** — real RSA keys, `route_rsa_to_real` (#11, `4b2560a0`).
@@ -41,8 +42,7 @@ verified with no regressions across the 92-class suite):
   decode (#16, `74fa043c`).
 Plus the Hashtable-`$Entry`-enumeration fix (#01).
 
-Remaining 6 are deeper, mostly-independent issues: **P-384/P-521 EC progressive heap
-corruption** (#17, root-caused — blocks JWKT, BCECDSA, SdJwtVP AltCurves), RSA-OAEP `Cipher`
+Remaining 5 are deeper, mostly-independent issues: RSA-OAEP `Cipher`
 (#03), ECDH (#04), BC `ECPublicKeySpec`
 (#05), SD-JWT RSA cnf/jwk (#07), cert subject parsing (CertExtractor), stream `onClose` (#09):
 RSA-OAEP `Cipher` (#03), ECDH (#04), BC `ECPublicKeySpec` (#05), imported RSA private keys
