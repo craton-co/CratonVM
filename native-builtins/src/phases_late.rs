@@ -39461,10 +39461,42 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     }
     let mut props: Vec<PropAcc> = Vec::new();
 
-    let mut current = Some(class_id);
+    // Scan order: the class + its superclass chain first (so concrete overrides
+    // win the dedup), then ALL transitively-implemented interfaces — so interface
+    // DEFAULT methods (e.g. a `default String getValueC()`) are discovered as
+    // bean properties. This mirrors java.beans.Introspector, which works off
+    // Class.getMethods() (all public methods incl. inherited interface methods);
+    // the old code walked only `superclass_of` and missed default-method props
+    // (jakarta.el.TestBeanELResolver.testGetDefaultValue: property `valueC`).
+    let mut scan_cids: Vec<cratonvm_types::ClassId> = Vec::new();
+    let mut sc = Some(class_id);
+    while let Some(cid) = sc {
+        scan_cids.push(cid);
+        sc = ctx.superclass_of(cid);
+    }
+    {
+        let mut seen_if: std::collections::HashSet<cratonvm_types::ClassId> =
+            std::collections::HashSet::new();
+        let mut queue: Vec<cratonvm_types::ClassId> = scan_cids
+            .iter()
+            .flat_map(|&cid| ctx.class_interfaces(cid))
+            .collect();
+        let mut qi = 0;
+        while qi < queue.len() {
+            let icid = queue[qi];
+            qi += 1;
+            if !seen_if.insert(icid) {
+                continue;
+            }
+            scan_cids.push(icid);
+            for sup in ctx.class_interfaces(icid) {
+                queue.push(sup);
+            }
+        }
+    }
     let mut seen_method_keys: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
-    while let Some(cid) = current {
+    for cid in scan_cids {
         // Resolve the mirror for this declaring class so the Method mirror
         // points at the class that actually declares the method.
         let declaring_mirror = ctx.get_class_mirror(cid);
@@ -39571,7 +39603,6 @@ fn introspector_get_bean_info(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
                     .push((mm, params[0].clone(), param_mirror, param_cid));
             }
         }
-        current = ctx.superclass_of(cid);
     }
 
     // Resolve each accumulated property into the (name, readMethod, writeMethod,

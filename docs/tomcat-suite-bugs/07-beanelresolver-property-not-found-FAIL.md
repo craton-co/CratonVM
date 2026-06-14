@@ -1,6 +1,22 @@
-# Bug 07 — BeanELResolver: bean property not discovered  (FAIL)
+# Bug 07 — BeanELResolver: bean property not discovered  (FIXED)
 
-**Status:** OPEN. Real CratonVM semantic bug (HotSpot PASSes).
+**Status:** FIXED (commit on fix/tomcat-suite-loop). `TestBeanELResolver` now
+OK(156) (was Failures:1); `TestBeanSupport` OK(26) unchanged (no regression).
+
+## Fix
+
+`introspector_get_bean_info` (phases_late.rs) walked only the `superclass_of`
+chain, so getters that are interface **default methods** were never seen. It now
+also traverses all transitively-implemented interfaces (BFS via
+`class_interfaces`), appended after the class/superclass chain so concrete
+overrides still win the dedup — matching `java.beans.Introspector` /
+`Class.getMethods()`. The `valueC` property (a `default String getValueC()` on
+`MyInterface`) is now discovered.
+
+---
+_Original report:_
+
+**Was:** OPEN. Real CratonVM semantic bug (HotSpot PASSes).
 **Severity:** Medium — EL bean-property introspection gap; affects EL/JSP.
 **Repro class:** `jakarta.el.TestBeanELResolver` — `Tests run: 156, Failures: 1`
 (`testGetDefaultValue[0: useStandalone[false]]`).
