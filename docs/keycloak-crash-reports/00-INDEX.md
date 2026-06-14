@@ -27,15 +27,21 @@ clean). Those are **not** CratonVM bugs and get no report.
   plus ECDH (#04), EC keyspec (#05), Cipher initLock (#03), stream close-handlers (#09),
   JSON compare (#08).
 
-## After RSA fix (iteration 3, commit `4b2560a0` + checkpoint)
-- **60 PASS / 32 FAIL**, **11 CratonVM-only** failures. **Zero regressions** (EC keypair
-  path intact despite the KeyPair-accessor changes).
-- `route_rsa_to_real()` (default ON, `CRATONVM_SYNTHETIC_RSA=1` toggle): RSA keygen stays
-  fast Rust but now yields **real `RSAPublicKeyImpl`** (sign/verify still fast via an
-  identity→key_id bridge). `DefaultCryptoRSAVerifierTest` FAIL→PASS. See #11.
-- The other RSA-touched classes are now blocked by **separate** bugs:
-  `X509Certificate.getPublicKey()` returns null (cert gen, hits EC too),
-  `RSAPublicKeySpec` import, and the missing `crypto_impl` private-key parser.
+## Latest (iteration 5) — **62 PASS / 30 FAIL, 9 CratonVM-only failures, 0 regressions**
+Five classes flipped fully green over the effort, via fundamental VM fixes (each verified
+with no regressions across the 92-class suite):
+- **CredentialModelTest, CredentialModelBackwardsCompatibilityTest** — primitive generic
+  param mirror (#02).
+- **DefaultCryptoRSAVerifierTest** — real RSA keys, `route_rsa_to_real` (#11, `4b2560a0`).
+- **DefaultCryptoJWKSUtilsTest** — EC cert `getPublicKey` + `RSAPublicKeySpec` import (#12, `7c98ec8f`).
+- **StripSecretsUtilsTest** — `Map.Entry.setValue()` write-through (#13, `bfbb8093`).
+Plus the Hashtable-`$Entry`-enumeration fix (#01) and internal improvements to JWKT (8→4),
+SdJwtVP, PemUtilsBC, and the cert extractor.
+
+Remaining 9 are deeper, mostly-independent issues: EC-cert ECDSA verify (#12 tail),
+RSA-OAEP `Cipher` (#03), ECDH (#04), BC `ECPublicKeySpec` (#05), imported RSA private keys
+(#06), SD-JWT RSA cnf/jwk (#07), BC `getRDNs` CN extraction (#01 tail), and stream
+`onClose` handlers (#09).
 
 | # | Report | Classes affected | Status |
 |---|--------|------------------|--------|
@@ -47,6 +53,8 @@ clean). Those are **not** CratonVM bugs and get no report.
 | 05 | [BC ECPublicKeySpec InvalidKeySpecException](05-bc-ecpublickeyspec-invalidkeyspec.md) | BCECDSACryptoProviderTest | open |
 | 06 | [KeyPairVerifier "Keys don't match" / decode private key](06-keypair-verifier-decode.md) | DefaultCryptoKeyPairVerifierTest | open |
 | 07 | [SD-JWT VP "Could not process cnf/jwk"](07-sdjwt-vp-cnf-jwk.md) | DefaultCryptoSdJwtVPVerificationTest | open |
-| 08 | [StripSecretsUtils JSON ComparisonFailure](08-stripsecrets-json-comparison.md) | StripSecretsUtilsTest | open |
-| 09 | [StreamsUtil onClose / auto-close propagation](09-streamsutil-onclose-propagation.md) | StreamsUtilTest | open |
-| 10 | [DefaultCryptoJWKSUtilsTest 1 failure](10-jwksutils-one-failure.md) | DefaultCryptoJWKSUtilsTest | open |
+| 08 | [StripSecretsUtils JSON ComparisonFailure](08-stripsecrets-json-comparison.md) | StripSecretsUtilsTest | **FIXED** via #13 (Map.Entry.setValue) |
+| 09 | [StreamsUtil onClose / auto-close propagation](09-streamsutil-onclose-propagation.md) | StreamsUtilTest | open (stream close-handler feature) |
+| 10 | [DefaultCryptoJWKSUtilsTest 1 failure](10-jwksutils-one-failure.md) | DefaultCryptoJWKSUtilsTest | **FIXED** via #12 |
+| 12 | [EC cert getPublicKey null (BC converter)](12-ec-cert-getpublickey-null.md) | DefaultCryptoJWKTest, JWKSUtils ✓ | **FIXED (getPublicKey)** `7c98ec8f`; EC-cert ECDSA-verify remains |
+| 13 | [Map.Entry.setValue no write-back](13-map-entry-setvalue-no-writeback.md) | StripSecretsUtilsTest ✓ (+ all entrySet RMW) | **FIXED** `bfbb8093` |
