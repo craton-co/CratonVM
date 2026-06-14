@@ -788,6 +788,17 @@ pub trait NativeContext {
     /// Get the ClassId for a loaded class by name. Returns None if not loaded.
     fn class_id_by_name(&self, name: &str) -> Option<ClassId>;
 
+    /// For a synthetic lambda-proxy `ClassId` (created by `register_lambda_proxy`,
+    /// class id `>= 0x8000_0000`, not in the class store), return the internal
+    /// name of its functional (SAM) interface. Returns `None` for any non-lambda
+    /// class. Used by reflection natives so a lambda's mirror reports a sane
+    /// hierarchy (`getSuperclass()` = Object, `getInterfaces()` = [SAM]) instead
+    /// of null/empty — Gradle's listener type-walk calls
+    /// `concreteClass.getSuperclass().isInterface()` and a null superclass NPEs.
+    fn lambda_functional_interface(&self, _class_id: ClassId) -> Option<String> {
+        None
+    }
+
     /// Get the ClassLoaderId for a loaded class.
     /// Returns 0 = Bootstrap, 1 = Extension, 2 = Application, 3+ = UserDefined(id).
     fn loader_id_of_class(&self, class_id: ClassId) -> i32;

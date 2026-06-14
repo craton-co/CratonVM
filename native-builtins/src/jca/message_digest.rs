@@ -436,6 +436,25 @@ pub(crate) fn register(r: &mut NativeMethodRegistry) {
     r.register(md, "getAlgorithm", "()Ljava/lang/String;", md_get_algorithm);
     r.register(md, "getDigestLength", "()I", md_get_digest_length);
     r.register(md, "getProvider", "()Ljava/security/Provider;", md_get_provider);
+    r.register(md, "clone", "()Ljava/lang/Object;", md_clone);
+}
+
+/// `MessageDigest.clone()` — JDK `MessageDigest`s whose SPI is `Cloneable`
+/// support `clone()` to snapshot in-progress state (Gradle's
+/// `Hashing$MessageDigestHashFunction` clones a template digest per hash). Our
+/// synthetic MessageDigest is not `Cloneable`, so `Object.clone()` threw
+/// `CloneNotSupportedException`. Produce a fresh MessageDigest with the same
+/// algorithm and a COPY of the byte accumulator (snapshot semantics).
+fn md_clone(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let algo = read_algo(ctx, this);
+    let acc = read_accumulator(ctx, this);
+    let md = alloc_concurrent_synthetic(ctx, "java/security/MessageDigest", 4);
+    let algo_str = ctx.create_string(&algo);
+    ctx.set_field_by_name(md, "algorithm", Value::Object(Some(algo_str)));
+    ctx.set_field(md, FIELD_ALGO, Value::Object(Some(algo_str)));
+    write_accumulator(ctx, md, &acc);
+    Ok(Some(Value::Object(Some(md))))
 }
 
 #[cfg(test)]

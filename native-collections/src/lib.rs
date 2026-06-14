@@ -6581,7 +6581,13 @@ fn native_collections_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     let (data, size) = al_state(ctx, list);
     let data = match data {
         Some(d) => d,
-        None => return Ok(None),
+        // Not an ArrayList-style backing (e.g. a LinkedList overlay, or any
+        // other List): fall back to a generic reverse driven by the list's own
+        // size()/get(int)/set(int,E). Without this, Collections.reverse was a
+        // silent no-op on every non-ArrayList List — e.g. Gradle
+        // GFileUtils.mkdirs reverses a LinkedList of parent dirs, so cache dirs
+        // were created child-before-parent ("… is not a directory").
+        None => return collections_reverse_generic(ctx, list),
     };
     let len = size as usize;
     // Read all elements
@@ -6592,6 +6598,41 @@ fn native_collections_reverse(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     // Write back in reverse
     for (i, val) in elems.iter().rev().enumerate() {
         ctx.set_array_element(data, i, *val);
+    }
+    Ok(None)
+}
+
+/// Generic `Collections.reverse` for any `List` that is not an ArrayList-style
+/// backing: read every element via `get(int)`, then write them back reversed via
+/// `set(int, E)`. Uses the list's own (native or bytecode) methods, so it works
+/// for LinkedList, sublists, etc.
+fn collections_reverse_generic(
+    ctx: &mut dyn NativeContext,
+    list: ObjectRef,
+) -> MethodCallResult {
+    // invoke_virtual dispatches on the receiver's actual class (LinkedList, …).
+    let size = match ctx.invoke_virtual(list, "size", "()I", &[]) {
+        Ok(Some(Value::Int(n))) => n,
+        _ => return Ok(None),
+    };
+    if size <= 1 {
+        return Ok(None);
+    }
+    let len = size as usize;
+    let mut elems: Vec<Value> = Vec::with_capacity(len);
+    for i in 0..len {
+        let v = ctx
+            .invoke_virtual(list, "get", "(I)Ljava/lang/Object;", &[Value::Int(i as i32)])?
+            .unwrap_or(Value::Object(None));
+        elems.push(v);
+    }
+    for (i, val) in elems.iter().rev().enumerate() {
+        ctx.invoke_virtual(
+            list,
+            "set",
+            "(ILjava/lang/Object;)Ljava/lang/Object;",
+            &[Value::Int(i as i32), *val],
+        )?;
     }
     Ok(None)
 }
@@ -10130,6 +10171,12 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "toArray", "()[I", native_int_stream_to_array);
     r.register(
         c,
+        "sorted",
+        "()Ljava/util/stream/IntStream;",
+        native_int_stream_sorted,
+    );
+    r.register(
+        c,
         "boxed",
         "()Ljava/util/stream/Stream;",
         native_int_stream_boxed,
@@ -10312,6 +10359,25 @@ fn native_int_stream_for_each(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
         ctx.invoke_virtual(consumer, "accept", "(I)V", &[*elem])?;
     }
     Ok(None)
+}
+
+/// `IntStream.sorted()` — natural ascending order. The synthetic IntStream
+/// created by `range`/`rangeClosed`/`map`/etc. (this handler set) had no
+/// `sorted`, so it dispatched to the abstract `IntStream.sorted()` → "has no
+/// Code attribute" AME. Groovy's shaded ANTLR4 lexer (`LexerActionExecutor`)
+/// calls it, so every Groovy script failed to compile
+/// (SpringRepositoriesExtensionTests).
+fn native_int_stream_sorted(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_int_stream(ctx, &[]),
+    };
+    let mut elements = int_stream_elements(ctx, this);
+    elements.sort_by_key(|v| match v {
+        Value::Int(i) => *i,
+        _ => 0,
+    });
+    make_int_stream(ctx, &elements)
 }
 
 fn native_int_stream_filter(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -12727,6 +12793,12 @@ fn register_linked_list_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "addFirst", "(Ljava/lang/Object;)V", native_ll_add_first);
     registry.register(c, "addLast", "(Ljava/lang/Object;)V", native_ll_add_last);
     registry.register(c, "get", "(I)Ljava/lang/Object;", native_ll_get);
+    registry.register(
+        c,
+        "set",
+        "(ILjava/lang/Object;)Ljava/lang/Object;",
+        native_ll_set,
+    );
     registry.register(c, "getFirst", "()Ljava/lang/Object;", native_ll_get_first);
     registry.register(c, "getLast", "()Ljava/lang/Object;", native_ll_get_last);
     registry.register(
@@ -13344,6 +13416,33 @@ fn native_ll_get(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
     };
     match ll_node_at(ctx, this, index) {
         Some(node) => Ok(Some(ctx.get_field(node, LL_NODE_ELEM))),
+        None => Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into()),
+    }
+}
+
+/// `LinkedList.set(int, E)` — set the element at `index` in the overlay,
+/// returning the previous element. Without this native, the real-JDK
+/// `LinkedList.set` bytecode ran against the never-populated `first`/`last`
+/// fields and silently did nothing — so `Collections.reverse(linkedList)` (which
+/// swaps via `set(i, set(j, get(i)))` for small non-RandomAccess lists) was a
+/// no-op, e.g. Gradle `GFileUtils.mkdirs` creating cache dirs child-before-parent
+/// → "… is not a directory".
+fn native_ll_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let index = match args.get(1) {
+        Some(Value::Int(i)) => *i,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let new_val = args.get(2).copied().unwrap_or(Value::Object(None));
+    match ll_node_at(ctx, this, index) {
+        Some(node) => {
+            let old = ctx.get_field(node, LL_NODE_ELEM);
+            ctx.set_field(node, LL_NODE_ELEM, new_val);
+            Ok(Some(old))
+        }
         None => Err(cratonvm_types::error::RuntimeError::ArrayIndexOutOfBoundsException { index }.into()),
     }
 }
@@ -16459,7 +16558,25 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
     }
     // S111r28: HashSet / LinkedHashSet — field 0 = backing map. Collect the
     // backing map's keys (in iteration order).
-    if HS_FIELD_MAP < n_fields {
+    //
+    // GATE (ATNConfig CCE fix): only treat field-0-is-a-HashMap as "this is a
+    // HashSet whose elements are the map's keys" when the receiver actually IS a
+    // HashSet/subclass. A custom `Set` (or any Collection) can legitimately hold
+    // an unrelated `HashMap` at slot 0 whose KEYS are NOT the collection's
+    // elements — e.g. Groovy's ANTLR4 `ATNConfigSet` (field 0 =
+    // `HashMap<Long,ATNConfig> mergedConfigs`). Without this gate, `toArray()` /
+    // `new ArrayList<>(atnConfigSet)` returned the Long keys, so `List.sort` over
+    // a STATE_ALT_SORT_COMPARATOR passed a Long to the ATNConfig comparator
+    // (ClassCastException Long→ATNConfig; getState() NSME under --nojit) and every
+    // Groovy script failed to compile (SpringRepositoriesExtensionTests). For a
+    // non-HashSet custom collection we fall through to empty, and the caller
+    // (`native_al_to_array` / `collect_collection_elements_or_real`) drives the
+    // real overridden `iterator()`/`toArray()`.
+    let is_hashset_like = ctx
+        .class_id_by_name("java/util/HashSet")
+        .map(|hs| cid == hs || ctx.is_subclass(cid, hs))
+        .unwrap_or(false);
+    if is_hashset_like && HS_FIELD_MAP < n_fields {
         if let Value::Object(Some(backing)) = ctx.get_field(coll, HS_FIELD_MAP) {
             // An insertion-ordered set (LinkedHashSet / CopyOnWriteArraySet) is
             // backed by a LinkedHashMap, which keeps its entries in the
