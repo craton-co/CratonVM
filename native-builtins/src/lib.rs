@@ -16845,24 +16845,46 @@ fn register_objects_natives(r: &mut NativeMethodRegistry) {
 }
 
 /// Null-safe equality check for Objects.equals (duplicated from collections.rs values_equal)
-fn objects_values_equal(ctx: &dyn NativeContext, a: &Value, b: &Value) -> bool {
+fn objects_values_equal(
+    ctx: &mut dyn NativeContext,
+    a: &Value,
+    b: &Value,
+) -> Result<bool, MethodCallFailed> {
     match (a, b) {
-        (Value::Object(None), Value::Object(None)) => true,
-        (Value::Object(None), _) | (_, Value::Object(None)) => false,
+        (Value::Object(None), Value::Object(None)) => Ok(true),
+        (Value::Object(None), _) | (_, Value::Object(None)) => Ok(false),
         (Value::Object(Some(ra)), Value::Object(Some(rb))) => {
             if ra.as_ptr() == rb.as_ptr() {
-                return true;
+                return Ok(true);
             }
-            // Try string comparison
+            // String fast-path (the common case).
             if let (Some(sa), Some(sb)) = (ctx.read_string(*ra), ctx.read_string(*rb)) {
-                return sa == sb;
+                return Ok(sa == sb);
             }
-            // Compare by field 0 for wrapper types
-            let fa = ctx.get_field(*ra, 0);
-            let fb = ctx.get_field(*rb, 0);
-            fa == fb
+            // General `Objects.equals` contract: dispatch to the receiver's real
+            // `equals(Object)`. The previous "compare field 0" fallback is
+            // correct ONLY for primitive-wrapper boxes (Integer/Boolean/… whose
+            // slot 0 holds the primitive value). For an ArrayList / HashSet /
+            // record / any value class, slot 0 is a backing-array/element ref
+            // that differs between two equal-but-distinct instances, so
+            // `Objects.equals(list1, list2)` returned false — and since the JDK
+            // `Optional.equals`, record `equals`, and most hand-written
+            // `equals` route through `Objects.equals`, those all broke for
+            // value-equal objects. Surfaced as Kafka DescribeConsumerGroups:
+            // `ConsumerGroupDescription.equals` false for two value-equal
+            // objects (via `Optional<MemberAssignment>` / `Optional<List>`).
+            // Mirrors `values_equal` in native-collections.
+            match ctx.invoke_virtual(
+                *ra,
+                "equals",
+                "(Ljava/lang/Object;)Z",
+                &[Value::Object(Some(*rb))],
+            )? {
+                Some(Value::Int(v)) => Ok(v != 0),
+                _ => Ok(false),
+            }
         }
-        _ => a == b,
+        _ => Ok(a == b),
     }
 }
 
@@ -16897,7 +16919,7 @@ fn native_objects_require_non_null_msg(
 fn native_objects_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let a = args.first().copied().unwrap_or(Value::Object(None));
     let b = args.get(1).copied().unwrap_or(Value::Object(None));
-    let eq = objects_values_equal(ctx, &a, &b);
+    let eq = objects_values_equal(ctx, &a, &b)?;
     Ok(Some(Value::Int(if eq { 1 } else { 0 })))
 }
 

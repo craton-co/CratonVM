@@ -2996,23 +2996,20 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     let cap = match args.get(1) {
         Some(Value::Int(c)) => {
-            // Bug 4 (round-9 native-misc HIGH): the JDK's
-            // `HashMap(int initialCapacity)` reads the requested value as
-            // a *minimum number of mappings to hold without resizing*,
-            // then internally allocates `ceil(c / loadFactor)` buckets so
-            // the threshold (loadFactor * buckets) >= requested capacity.
-            // With the default load factor of 0.75 that's `c * 4 / 3`,
-            // rounded up to the next power of two. Previously we rounded
-            // `c` itself to a power of two, which means
-            // `new HashMap<>(16)` allocated 16 buckets and resized on the
-            // 13th insert — defeating the entire purpose of the sizing
-            // hint and causing extra rehash work in the hot loop.
-            let requested = std::cmp::max(*c, 1) as u64;
-            // ceil(requested * 4 / 3), then cap to MAP_MAX_CAPACITY before
-            // next_power_of_two to avoid u32 overflow panic on absurdly
-            // large hints.
-            let needed = requested.saturating_mul(4).div_ceil(3);
-            let capped = std::cmp::min(needed, MAP_MAX_CAPACITY as u64).max(1) as u32;
+            // JDK `HashMap(int initialCapacity)` / `HashSet(int)` semantics:
+            // the initial table size is `tableSizeFor(initialCapacity)` — the
+            // smallest power of two >= the requested capacity. It is NOT
+            // inflated by the load factor: `new HashMap<>(16)` allocates a
+            // 16-bucket table (threshold 16*0.75 = 12) and DOES resize on the
+            // 13th insert. An earlier "hold N mappings without resizing"
+            // optimisation rounded `ceil(c*4/3)` up instead, so
+            // `new HashSet<>()` (whose backing passes cap 16) and
+            // `new HashMap<>(16)` allocated 32 buckets — which shifts every
+            // key's bucket index and makes HashSet/HashMap iteration order
+            // diverge from HotSpot (B-E: Kafka AdminApiDriver request-key and
+            // consumer-group ordering). Match the JDK exactly: tableSizeFor.
+            let requested = std::cmp::max(*c, 1) as u32;
+            let capped = std::cmp::min(requested, MAP_MAX_CAPACITY as u32);
             let n = capped.checked_next_power_of_two().unwrap_or(MAP_MAX_CAPACITY as u32);
             std::cmp::min(n as usize, MAP_MAX_CAPACITY as usize)
         }
@@ -4424,16 +4421,13 @@ fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef
             return collect_entries_any(ctx, source)
                 .into_iter()
                 .map(|(k, v)| {
-                    // 3-field entry (key@0, value@1, sourceMap@2): this is the
-                    // path `entrySet().iterator()` actually returns entries from
-                    // (via native_hs_iterator). The source-map field lets
-                    // `Entry.setValue` write through to the live map instead of
-                    // mutating a detached copy (keycloak StripSecretsUtils etc.).
-                    let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 3);
-                    ctx.set_field(entry, 0, k);
-                    ctx.set_field(entry, 1, v);
-                    ctx.set_field(entry, 2, Value::Object(Some(source)));
-                    Value::Object(Some(entry))
+                    Value::Object(Some(alloc_live_entry(
+                        ctx,
+                        "java/util/AbstractMap$SimpleEntry",
+                        k,
+                        v,
+                        source,
+                    )))
                 })
                 .collect();
         }
@@ -4495,8 +4489,13 @@ fn resync_values_view(ctx: &mut dyn NativeContext, list: ObjectRef) {
         entries
             .into_iter()
             .map(|(k, v)| {
-                let entry = tm_make_entry(ctx, k, v);
-                Value::Object(Some(entry))
+                Value::Object(Some(alloc_live_entry(
+                    ctx,
+                    "java/util/HashMap$Entry",
+                    k,
+                    v,
+                    source,
+                )))
             })
             .collect()
     } else {
@@ -7026,6 +7025,32 @@ fn register_map_entry_natives(r: &mut NativeMethodRegistry) {
         native_entry_set_value,
     );
     r.set_category(__prev_cat);
+}
+
+/// Slot index of the optional back-reference to the source map carried by a
+/// *live* `entrySet()` entry. When present (field 2 is the source map),
+/// `setValue` writes through to that map — the JDK contract for
+/// `map.entrySet().iterator().next().setValue(v)`. Detached entries (a
+/// standalone `AbstractMap.SimpleEntry`, `firstEntry()`/`lastEntry()`
+/// snapshots, unmodifiable views) are allocated with only 2 fields, so a
+/// fail-safe out-of-range read of slot 2 returns `Object(None)` and no
+/// write-through happens — matching their non-live semantics.
+const ENTRY_FIELD_SOURCE: usize = 2;
+
+/// Allocate a live `entrySet()` entry: 3 fields = (key, value, source-map).
+/// `setValue` on it writes through to `source` (see [`ENTRY_FIELD_SOURCE`]).
+fn alloc_live_entry(
+    ctx: &mut dyn NativeContext,
+    class: &str,
+    key: Value,
+    value: Value,
+    source: ObjectRef,
+) -> ObjectRef {
+    let entry = alloc_synthetic(ctx, class, 3);
+    ctx.set_field(entry, 0, key);
+    ctx.set_field(entry, 1, value);
+    ctx.set_field(entry, ENTRY_FIELD_SOURCE, Value::Object(Some(source)));
+    entry
 }
 
 fn native_entry_get_key(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -14671,9 +14696,7 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
-        ctx.set_field(entry, 0, key);
-        ctx.set_field(entry, 1, val);
+        let entry = alloc_live_entry(ctx, "java/util/AbstractMap$SimpleEntry", key, val, this);
         entries.push(Value::Object(Some(entry)));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
     }
@@ -18548,7 +18571,7 @@ fn native_tm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     // removing an entry through the list (or its iterator) deletes the key.
     let entries: Vec<Value> = pairs
         .into_iter()
-        .map(|(k, v)| Value::Object(Some(tm_make_entry(ctx, k, v))))
+        .map(|(k, v)| Value::Object(Some(alloc_live_entry(ctx, "java/util/HashMap$Entry", k, v, this))))
         .collect();
     let list = make_view_list_of(ctx, this, &entries);
     Ok(Some(Value::Object(Some(list))))
@@ -20977,9 +21000,7 @@ fn native_chm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
     ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing)));
     for (key, value) in &entries {
-        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
-        ctx.set_field(entry_obj, 0, *key);
-        ctx.set_field(entry_obj, 1, *value);
+        let entry_obj = alloc_live_entry(ctx, "java/util/Map$Entry", *key, *value, this);
 
         let hash = ctx.identity_hash_code(entry_obj);
         let (b, size, c) = map_state(ctx, backing);
