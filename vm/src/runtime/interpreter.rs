@@ -1298,7 +1298,27 @@ fn gc_alloc_array(
 /// dereferences it. Locals (already cleaned), `native_pin_roots`, and
 /// `native_pending_return` come from validated paths and are appended
 /// after the filter.
+/// DBG (CRATONVM_DBG_ROOTSNAP): instrumentation for the per-native-call root
+/// snapshot cost. Confirms/quantifies whether `update_root_snapshot` is the
+/// embedded-server deployment hotspot (O(stack-depth) full-frame scan + the
+/// per-operand-stack-object `is_object_address` triple-lock validation, run on
+/// every object-returning native call). Prints a cumulative line every 200k
+/// calls. Default-off; zero cost when the gate is unset (cached OnceLock).
+fn rootsnap_dbg_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_ROOTSNAP").is_some())
+}
+static ROOTSNAP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROOTSNAP_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ROOTSNAP_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
+    let _rs_t0 = if rootsnap_dbg_enabled() {
+        Some((std::time::Instant::now(), thread.frames.len()))
+    } else {
+        None
+    };
     let mut snapshot = thread.root_snapshot.lock();
     snapshot.clear();
     for frame in &thread.frames {
@@ -1362,6 +1382,24 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
                 snapshot.push(obj_ref);
             }
         });
+    }
+    if let Some((t0, nframes)) = _rs_t0 {
+        use std::sync::atomic::Ordering::Relaxed;
+        drop(snapshot); // release the lock before the (rare) print
+        let calls = ROOTSNAP_CALLS.fetch_add(1, Relaxed) + 1;
+        ROOTSNAP_NANOS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+        ROOTSNAP_FRAMES.fetch_add(nframes as u64, Relaxed);
+        if calls % 200_000 == 0 {
+            let nanos = ROOTSNAP_NANOS.load(Relaxed);
+            let frames = ROOTSNAP_FRAMES.load(Relaxed);
+            eprintln!(
+                "[ROOTSNAP] calls={} total_ms={} avg_us={:.2} avg_frames={:.1}",
+                calls,
+                nanos / 1_000_000,
+                (nanos as f64 / calls as f64) / 1000.0,
+                frames as f64 / calls as f64,
+            );
+        }
     }
 }
 
