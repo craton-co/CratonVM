@@ -1155,6 +1155,19 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // launcher initialization (`URL.<init>(String)` and friends).
     register_net_natives(registry);
 
+    // NIO2 asynchronous channels (AsynchronousSocketChannel / -ServerSocketChannel
+    // / -ChannelGroup / -FileChannel). These were only registered via
+    // `register_synthetic_overrides` (synthetic-JDK mode); in real-JDK mode the
+    // abstract `AsynchronousSocketChannel.open(...)` returns a synthetic instance
+    // whose `connect`/`read`/`write` resolved to the abstract (no-Code) methods —
+    // `AbstractMethodError` in the Tomcat WebSocket client
+    // (`WsWebSocketContainer.connectToServerRecursive`). Wire them into the
+    // universal essential path so the synthetic impl backs the abstract class in
+    // both modes. (No real IOCP/`sun.nio.ch` async stack exists in CratonVM, so
+    // the synthetic implementation is the only backing for these abstract
+    // classes.)
+    crate::phases_late::register_p67_async_channels(registry);
+
     // Surefire's forked JVM calls `ClassLoader.setDefaultAssertionStatus` on the
     // context loader before the JDK static `assertionLock` is assigned; the real
     // bytecode does `synchronized (assertionLock)` and NPEs. Full

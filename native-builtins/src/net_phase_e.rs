@@ -613,7 +613,7 @@ fn jar_url_conn_entry_size(ctx: &mut dyn NativeContext, this: ObjectRef) -> i64 
     jar_url_entry_size(&ext).unwrap_or(-1)
 }
 
-fn read_inet_socket_address(
+pub(crate) fn read_inet_socket_address(
     ctx: &dyn NativeContext,
     sa: ObjectRef,
 ) -> Result<(String, i32), cratonvm_types::error::MethodCallFailed> {

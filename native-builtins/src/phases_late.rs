@@ -26308,13 +26308,13 @@ pub(crate) fn register_p67_async_channels(r: &mut NativeMethodRegistry) {
         "(Ljava/net/SocketAddress;)Ljava/util/concurrent/Future;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            // Extract host:port from SocketAddress
+            // Extract host:port from the SocketAddress. The argument is a real
+            // `InetSocketAddress` (state behind a private `holder`), NOT a flat
+            // synthetic — reading slot 0/1 directly yielded a bogus host/port and
+            // the connect failed with WSAEADDRNOTAVAIL (os error 10049). Use the
+            // holder-aware reader shared with java.net.Socket.connect.
             let addr_str = if let Some(Value::Object(Some(sa))) = args.get(1) {
-                let host = match ctx.get_field(*sa, 0) {
-                    Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_else(|| "127.0.0.1".into()),
-                    _ => "127.0.0.1".into(),
-                };
-                let port = ctx.get_field(*sa, 1).as_int().unwrap_or(0);
+                let (host, port) = crate::net_phase_e::read_inet_socket_address(ctx, *sa)?;
                 format!("{}:{}", host, port)
             } else {
                 "127.0.0.1:80".into()
