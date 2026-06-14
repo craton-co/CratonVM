@@ -216,6 +216,29 @@ pub struct GenerationalHeap {
     young_to: Mutex<Arena>,
     /// Old generation (promoted objects).
     old_gen: Mutex<OldGen>,
+    /// Lock-free cached address bounds `[base, end)` of the three storage
+    /// regions (young from-space, young to-space, old gen), published whenever
+    /// the regions are (re)allocated so [`is_object_address`] can do its
+    /// region-containment check WITHOUT taking the three arena mutexes.
+    ///
+    /// Motivation: `is_object_address` is called per operand-stack object on
+    /// every object-returning native call (via `update_root_snapshot`) — under
+    /// load that is millions of calls, and the old `young_from.lock() ||
+    /// young_to.lock() || old_gen.lock()` triple-lock contended hard with the
+    /// concurrent GC/allocator, blowing per-call cost up ~1000x during embedded
+    /// webapp deployment. Reading these atomics instead removes the contention.
+    ///
+    /// Correctness (NO false negatives — a missed live region would drop a root):
+    /// the bounds are refreshed (a) at construction and (b) at the start AND end
+    /// of every GC cycle (the only place the young arenas swap/grow; the old gen
+    /// never reallocates). Refreshing at GC start captures pre-collection bounds
+    /// for the marking phase; the single `young_to.grow` happens near GC end on
+    /// the *empty* to-space (no live objects to miss), after which the end
+    /// refresh republishes. Mutators only read between GC cycles (GC is STW), so
+    /// they always observe current bounds. Acquire/Release ordering pairs the
+    /// GC-side stores with the mutator-side loads. Initialised to the empty
+    /// range `[0,0)` so a load before the first publish matches nothing.
+    region_bounds: [(AtomicUsize, AtomicUsize); 3],
     /// Card table covering the old generation's address space.
     ///
     /// T5.5.2 (HIGH-1 fix): the table now uses interior mutability for
@@ -333,10 +356,15 @@ impl GenerationalHeap {
             if n < numa_num_nodes { n } else { 0 }
         };
 
-        Self {
+        let heap = Self {
             young_from: Mutex::new(Arena::new(young_semi_size)),
             young_to: Mutex::new(Arena::new(young_semi_size)),
             old_gen: Mutex::new(old_gen),
+            region_bounds: [
+                (AtomicUsize::new(0), AtomicUsize::new(0)),
+                (AtomicUsize::new(0), AtomicUsize::new(0)),
+                (AtomicUsize::new(0), AtomicUsize::new(0)),
+            ],
             card_table,
             next_hash_code: AtomicI32::new(1),
             young_gc_threshold: Mutex::new(threshold),
@@ -347,6 +375,40 @@ impl GenerationalHeap {
             numa_num_nodes,
             stats: HeapStats::default(),
             force_promote_all: std::sync::atomic::AtomicBool::new(false),
+        };
+        // Publish the initial region bounds so the lock-free
+        // `is_object_address` containment check is correct from the first
+        // allocation (before any GC has run to refresh them).
+        heap.refresh_region_bounds();
+        heap
+    }
+
+    /// Republish the lock-free [`region_bounds`] cache from the live arenas.
+    ///
+    /// Locks each region briefly to read its current `[base, base+capacity)`
+    /// and stores it with `Release` ordering. Called at construction and at the
+    /// start/end of every GC cycle — the only points where a young arena's
+    /// backing can move (swap/grow) or the heap is first sized. Cheap (3 short
+    /// lock/read/store), and never on the hot mutator path.
+    fn refresh_region_bounds(&self) {
+        let yf = self.young_from.lock();
+        let yt = self.young_to.lock();
+        let og = self.old_gen.lock();
+        self.store_region_bounds_locked(&yf, &yt, &og);
+    }
+
+    /// Store the three regions' `[base, end)` into [`region_bounds`] from
+    /// already-held guards (used inside GC, where the arenas are locked and
+    /// re-locking would deadlock). Mirror of [`refresh_region_bounds`].
+    fn store_region_bounds_locked(&self, yf: &Arena, yt: &Arena, og: &OldGen) {
+        let pairs = [
+            (yf.base_ptr() as usize, yf.capacity()),
+            (yt.base_ptr() as usize, yt.capacity()),
+            (og.base_ptr() as usize, og.capacity()),
+        ];
+        for (slot, (base, cap)) in self.region_bounds.iter().zip(pairs) {
+            slot.0.store(base, Ordering::Release);
+            slot.1.store(base.wrapping_add(cap), Ordering::Release);
         }
     }
 
@@ -894,12 +956,20 @@ impl GenerationalHeap {
         }
         let raw = addr as *const u8;
 
-        // Region check: must fall inside one of the three arenas. Holding
-        // the locks for the duration of the validation is fine — this is
-        // only called during stop-the-world root scanning.
-        let in_region = self.young_from.lock().contains(raw)
-            || self.young_to.lock().contains(raw)
-            || self.old_gen.lock().contains(raw);
+        // Region check: must fall inside one of the three arenas. LOCK-FREE —
+        // read the cached `[base, end)` bounds (published under lock at
+        // construction and at GC start/end; see `region_bounds`). The old
+        // triple-mutex check (`young_from.lock() || young_to.lock() ||
+        // old_gen.lock()`) ran per operand-stack object on every
+        // object-returning native call and contended catastrophically with the
+        // concurrent GC/allocator. The bounds can only change during a STW GC,
+        // when no mutator is reading; the `Acquire` loads pair with the GC's
+        // `Release` stores.
+        let in_region = self.region_bounds.iter().any(|(base, end)| {
+            let b = base.load(Ordering::Acquire);
+            let e = end.load(Ordering::Acquire);
+            addr >= b && addr < e
+        });
         if !in_region {
             return None;
         }
@@ -2017,6 +2087,12 @@ impl GenerationalHeap {
         let mut young_to = self.young_to.lock();
         let mut old_gen = self.old_gen.lock();
 
+        // Publish current (pre-collection) region bounds for the lock-free
+        // `is_object_address` used during this cycle's marking/scanning. The
+        // young arenas may swap/grow later in this function; the matching end
+        // refresh republishes the post-collection bounds.
+        self.store_region_bounds_locked(&young_from, &young_to, &old_gen);
+
         // bc math-ec 0x4 seed-phase bisect (CRATONVM_DBG_SEEDHUNT): count
         // `Object(Some(0<p<0x1000))` slots in old gen at GC ENTRY. Compared
         // against the post-Cheney and post-major counts below to localize the
@@ -2991,6 +3067,12 @@ impl GenerationalHeap {
                 *self.young_gc_threshold.lock() = new_cap * YOUNG_GC_THRESHOLD_PERCENT / 100;
             }
         }
+
+        // Republish region bounds: the arenas were swapped (and to-space may
+        // have been grown to a new backing) above, so the lock-free
+        // `is_object_address` cache must reflect the post-collection
+        // `[base, end)` before any mutator resumes. Guards still held.
+        self.store_region_bounds_locked(&young_from, &young_to, &old_gen);
 
         // Phase H (RH.1): commit per-cycle counters to the lifetime
         // accumulator. Do this at the end so tests can observe GC
