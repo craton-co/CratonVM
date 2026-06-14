@@ -922,6 +922,13 @@ fn seed_sunjsse_services() {
     put_service(S, "KeyStore", "CaseExactJKS", "sun.security.provider.JavaKeyStore$CaseExactJKS");
     put_service(S, "KeyStore", "PKCS12", "sun.security.pkcs12.PKCS12KeyStore");
     put_alias(S, "KeyStore", "PKCS#12", "PKCS12");
+    // CertificateFactory X.509 (SUN provider) — needed by the real
+    // X509CertImpl/Validator path: the SunX509 KeyManager + PKIX TrustManager
+    // build/validate cert chains via `CertificateFactory.getInstance("X.509")`.
+    // Without it `getInstance` fell through to "no CertificateFactory X.509
+    // implementation in any provider" and aborted SSLContext setup.
+    put_service(S, "CertificateFactory", "X.509", "sun.security.provider.X509Factory");
+    put_alias(S, "CertificateFactory", "X509", "X.509");
 }
 
 /// Internal API: register an alias (Alg.Alias.<type>.<alias> → canonical).
