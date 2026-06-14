@@ -576,6 +576,87 @@ fn count_kv(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
     table().lock().get(&k).map(|m| m.len()).unwrap_or(0)
 }
 
+/// The set of keys the String-only side-table holds for `obj`.  Used as the
+/// "already represented" skip set when merging in the CHM-backing entries —
+/// see [`chm_extra_entries`].
+fn side_key_set(ctx: &dyn NativeContext, obj: ObjectRef) -> std::collections::HashSet<String> {
+    match table().lock().get(&key_for(ctx, obj)) {
+        Some(m) => m.keys().cloned().collect(),
+        None => std::collections::HashSet::new(),
+    }
+}
+
+/// Collect entries from the Properties' real-JDK `map` ConcurrentHashMap
+/// backing whose key string is NOT in `skip`.  Returns `(key_obj, value,
+/// key_string)` triples; the value is the *real* stored object (which may be a
+/// non-String such as a `Class`), and `key_string` is `None` for the rare
+/// non-String key.
+///
+/// Why this exists: `native_properties_put`/`putAll` store **non-String
+/// values** ONLY in the CHM backing (the side-table is `String -> String`).
+/// Every read native that consults only the side-table therefore silently
+/// drops those entries — `size()` undercounts, `entrySet()`/`keySet()`/
+/// `values()` omit them, `containsKey()` returns false, `isEmpty()` reports
+/// empty. Kafka's `ConsumerConfig(Properties)` is the canonical victim: its
+/// required `key.deserializer` is supplied as a `Class` value, so
+/// `AbstractConfig`'s `originals.entrySet()` walk never sees it and it throws
+/// `Missing required configuration "key.deserializer"`.
+///
+/// Merging here is *additive* and *de-duplicated*: every String entry is
+/// mirrored into BOTH stores, so `skip` (the side-table keys) prevents
+/// double-counting; only the CHM-exclusive (non-String-valued) entries come
+/// back. When the receiver has no CHM backing (e.g. a Properties populated
+/// purely through the surefire `store_property_in_sidetable` path), this is a
+/// no-op and the side-table view stands alone.
+fn chm_extra_entries(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    skip: &std::collections::HashSet<String>,
+) -> Vec<(ObjectRef, Value, Option<String>)> {
+    let chm = match ctx.get_field_by_name(this, "map") {
+        Value::Object(Some(m)) => m,
+        _ => return Vec::new(),
+    };
+    let set = match ctx.invoke_virtual(chm, "entrySet", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return Vec::new(),
+    };
+    let it = match ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(i)))) => i,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    loop {
+        match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(n))) if n != 0 => {}
+            _ => break,
+        }
+        let entry = match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => break,
+        };
+        let key_obj = match ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => continue,
+        };
+        let value = match ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(v)) => v,
+            _ => continue,
+        };
+        let kstr = ctx.read_string(key_obj);
+        if let Some(ref s) = kstr {
+            if skip.contains(s) {
+                continue; // String entry already represented by the side-table
+            }
+        }
+        out.push((key_obj, value, kstr));
+        if out.len() >= MAX_PROPS_PER_OBJECT {
+            break;
+        }
+    }
+    out
+}
+
 /// After native `load` fills the side-table, mirror each (k,v) into the
 /// JDK `Properties` backing store.  Since JDK 17+, entries live in a
 /// `ConcurrentHashMap` field `map`; `stringPropertyNames()` (used by
@@ -1145,6 +1226,20 @@ fn native_properties_contains_key(
     if get_kv(ctx, this, &key).is_some() {
         return Ok(Some(Value::Int(1)));
     }
+    // Non-String-valued entries live only in the CHM backing — consult it so
+    // `containsKey` agrees with `get` (which already falls through to the CHM).
+    if let Value::Object(Some(chm)) = ctx.get_field_by_name(this, "map") {
+        if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(
+            chm,
+            "containsKey",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(key_obj))],
+        ) {
+            if n != 0 {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+    }
     Ok(Some(Value::Int(0)))
 }
 
@@ -1219,7 +1314,14 @@ fn native_properties_size(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(count_kv(ctx, this) as i32)))
+    // Side-table entries (String values) PLUS the CHM-exclusive entries
+    // (non-String values such as a `Class` deserializer) — see
+    // `chm_extra_entries`. Without the merge, a Properties whose values are
+    // non-String (e.g. Kafka's ConsumerConfig key.deserializer) reports a
+    // short size and breaks Map-size-driven enumeration.
+    let side = side_key_set(ctx, this);
+    let total = side.len() + chm_extra_entries(ctx, this, &side).len();
+    Ok(Some(Value::Int(total as i32)))
 }
 
 /// Native `Properties.isEmpty()Z` — symmetric companion to `size()`.
@@ -1231,7 +1333,13 @@ fn native_properties_is_empty(
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(1))),
     };
-    let empty = count_kv(ctx, this) == 0;
+    // Fast path: any String entry in the side-table means non-empty without
+    // touching the CHM. Only when the side-table is empty do we pay for the
+    // CHM scan to detect non-String-valued entries (which live only there).
+    if count_kv(ctx, this) > 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let empty = chm_extra_entries(ctx, this, &std::collections::HashSet::new()).is_empty();
     Ok(Some(Value::Int(if empty { 1 } else { 0 })))
 }
 
@@ -1372,6 +1480,18 @@ fn native_properties_key_set(
         }
     };
     let set = build_key_set(ctx, this);
+    // Add keys for CHM-exclusive (non-String-valued) entries so the key view
+    // matches the real map; `stringPropertyNames()` deliberately does NOT do
+    // this (it is specified to return only String-keyed/String-valued names).
+    let side = side_key_set(ctx, this);
+    for (key_obj, _value, _kstr) in chm_extra_entries(ctx, this, &side) {
+        let _ = ctx.invoke_virtual(
+            set,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(key_obj))],
+        );
+    }
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -1392,6 +1512,18 @@ fn native_properties_values(
         }
     };
     let list = build_value_list(ctx, this);
+    // Append CHM-exclusive (non-String) values so the value view matches the
+    // real map. Skip-set is the side-table keys, so mirrored String values are
+    // not duplicated.
+    let side = side_key_set(ctx, this);
+    for (_key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side) {
+        let _ = ctx.invoke_virtual(
+            list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[value],
+        );
+    }
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -1459,6 +1591,28 @@ fn native_properties_entry_set(
             &[Value::Object(Some(entry))],
         );
     }
+    // Merge CHM-exclusive entries (non-String values, e.g. a `Class`
+    // deserializer) so consumers that enumerate `entrySet()` — Kafka's
+    // `AbstractConfig` constructor, Spring's `SpringFactoriesLoader`,
+    // `HashMap.putAll(props)` via the generic Map iterator — observe the full
+    // map. The real stored value object is reused verbatim.
+    let side_keys: std::collections::HashSet<String> =
+        snapshot.iter().map(|(k, _v)| k.clone()).collect();
+    for (key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side_keys) {
+        let entry = crate::alloc_concurrent_synthetic(
+            ctx,
+            "java/util/AbstractMap$SimpleImmutableEntry",
+            2,
+        );
+        ctx.set_field_by_name(entry, "key", Value::Object(Some(key_obj)));
+        ctx.set_field_by_name(entry, "value", value);
+        let _ = ctx.invoke_virtual(
+            set,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(entry))],
+        );
+    }
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -1474,10 +1628,18 @@ fn native_properties_keys(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let keys: Vec<String> = match args.first() {
-        Some(Value::Object(Some(o))) => snapshot_kv(ctx, *o).into_iter().map(|(k, _v)| k).collect(),
-        _ => Vec::new(),
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(Some(build_enumeration(ctx, Vec::new()))))),
     };
+    let mut keys: Vec<String> = snapshot_kv(ctx, this).into_iter().map(|(k, _v)| k).collect();
+    // Include String keys of CHM-exclusive (non-String-valued) entries.
+    let side = side_key_set(ctx, this);
+    for (_key_obj, _value, kstr) in chm_extra_entries(ctx, this, &side) {
+        if let Some(s) = kstr {
+            keys.push(s);
+        }
+    }
     Ok(Some(Value::Object(Some(build_enumeration(ctx, keys)))))
 }
 
@@ -1512,7 +1674,24 @@ fn native_properties_contains(
     let needle = ctx.read_string(val_obj).unwrap_or_default();
     let snapshot = snapshot_kv(ctx, this);
     let hit = snapshot.iter().any(|(_k, v)| v == &needle);
-    Ok(Some(Value::Int(if hit { 1 } else { 0 })))
+    if hit {
+        return Ok(Some(Value::Int(1)));
+    }
+    // Non-String values live only in the CHM backing — delegate the value
+    // lookup so `contains`/`containsValue` agree with the real map.
+    if let Value::Object(Some(chm)) = ctx.get_field_by_name(this, "map") {
+        if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(
+            chm,
+            "containsValue",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(val_obj))],
+        ) {
+            if n != 0 {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+    }
+    Ok(Some(Value::Int(0)))
 }
 
 /// Native `Properties.containsValue(Object)Z` — alias for `contains`.
@@ -1555,6 +1734,17 @@ fn native_properties_for_each(
             "accept",
             "(Ljava/lang/Object;Ljava/lang/Object;)V",
             &[Value::Object(Some(ks)), Value::Object(Some(vs))],
+        )?;
+    }
+    // CHM-exclusive (non-String-valued) entries, with the real value object.
+    let side: std::collections::HashSet<String> =
+        snapshot.iter().map(|(k, _v)| k.clone()).collect();
+    for (key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side) {
+        ctx.invoke_virtual(
+            action,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[Value::Object(Some(key_obj)), value],
         )?;
     }
     Ok(None)
