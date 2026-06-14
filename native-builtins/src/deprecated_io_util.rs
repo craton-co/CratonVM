@@ -762,7 +762,17 @@ fn register_hashtable_enumerations(r: &mut NativeMethodRegistry) {
         for i in 0..cap {
             let mut node_val = ctx.get_array_element(buckets, i);
             while let Value::Object(Some(node)) = node_val {
-                let v = if want_keys {
+                // Layout-aware read — `next` is slot 3 in both layouts; only
+                // key/value slots differ. Real java.util.Hashtable$Entry is
+                // hash(0,int) key(1) value(2) next(3); the native HashMap node is
+                // key(0) value(1) hash(2,int) next(3). In real-JDK mode the table
+                // is a genuine Hashtable, so reading slot 0 as the key returns the
+                // primitive `hash` and breaks the caller's checkcast. Discriminate
+                // on slot 0 being a primitive int. (Mirrors deprecated_util::collect_hashtable.)
+                let real_layout = matches!(ctx.get_field(node, 0), Value::Int(_));
+                let v = if real_layout {
+                    if want_keys { ctx.get_field(node, 1) } else { ctx.get_field(node, 2) }
+                } else if want_keys {
                     ctx.get_field(node, 0)
                 } else {
                     ctx.get_field(node, 1)
