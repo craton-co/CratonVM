@@ -11062,6 +11062,9 @@ fn native_object_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         }
     };
     let hash = ctx.identity_hash_code(this);
+    if std::env::var_os("CRATONVM_DBG_VDISP").is_some() {
+        eprintln!("[vdisp] native_object_hash_code (IDENTITY) called -> {hash}");
+    }
     Ok(Some(Value::Int(hash)))
 }
 
@@ -16874,12 +16877,19 @@ fn objects_values_equal(
             // `ConsumerGroupDescription.equals` false for two value-equal
             // objects (via `Optional<MemberAssignment>` / `Optional<List>`).
             // Mirrors `values_equal` in native-collections.
-            match ctx.invoke_virtual(
+            if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
+                eprintln!("[objects-native] objects_values_equal -> invoke_virtual equals on ra={:?}", ra);
+            }
+            let r = ctx.invoke_virtual(
                 *ra,
                 "equals",
                 "(Ljava/lang/Object;)Z",
                 &[Value::Object(Some(*rb))],
-            )? {
+            )?;
+            if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
+                eprintln!("[objects-native] objects_values_equal invoke_virtual returned {:?}", r);
+            }
+            match r {
                 Some(Value::Int(v)) => Ok(v != 0),
                 _ => Ok(false),
             }
@@ -16917,6 +16927,9 @@ fn native_objects_require_non_null_msg(
 }
 
 fn native_objects_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
+        eprintln!("[objects-native] native_objects_equals CALLED args={:?}", args);
+    }
     let a = args.first().copied().unwrap_or(Value::Object(None));
     let b = args.get(1).copied().unwrap_or(Value::Object(None));
     let eq = objects_values_equal(ctx, &a, &b)?;
@@ -16924,6 +16937,9 @@ fn native_objects_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
 }
 
 fn native_objects_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    if std::env::var_os("CRATONVM_DBG_OBJECTS").is_some() {
+        eprintln!("[objects-native] native_objects_hash_code CALLED args={:?}", args);
+    }
     match args.first() {
         Some(Value::Object(Some(obj))) => Ok(Some(Value::Int(ctx.identity_hash_code(*obj)))),
         _ => Ok(Some(Value::Int(0))),
