@@ -1313,40 +1313,123 @@ static ROOTSNAP_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static ROOTSNAP_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ROOTSNAP_FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &JvmThread) {
+/// Scan ONE frame's GC roots (locals + operand stack, with the operand-stack
+/// pointer-shaped-Long validation) onto the end of `out`. This is exactly the
+/// per-frame body of `update_root_snapshot`'s loop, factored out so the opt-in
+/// root-snapshot cache can scan a single frame into a cache entry as well as
+/// into the live snapshot. Behaviour is byte-identical to the inline loop.
+#[inline]
+fn scan_frame_roots(frame: &Frame, out: &mut Vec<ObjectRef>, heap: &crate::memory::VmHeap) {
+    frame.scan_local_objects(out, heap);
+    let before = out.len();
+    frame.stack.scan_object_refs(out, heap);
+    let len = out.len();
+    if len > before {
+        let mut write = before;
+        for read in before..len {
+            let o = out[read];
+            if heap.is_object_address(o.as_ptr() as usize).is_some() {
+                out[write] = o;
+                write += 1;
+            }
+        }
+        out.truncate(write);
+    }
+}
+
+pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     let _rs_t0 = if rootsnap_dbg_enabled() {
         Some((std::time::Instant::now(), thread.frames.len()))
     } else {
         None
     };
-    let mut snapshot = thread.root_snapshot.lock();
+    // Lock via an Arc clone so the guard does not borrow `thread`, leaving the
+    // disjoint `frames` / `rs_cache` fields freely (mutably) borrowable below.
+    let snap_arc = thread.root_snapshot.clone();
+    let mut snapshot = snap_arc.lock();
     snapshot.clear();
-    for frame in &thread.frames {
-        frame.scan_local_objects(&mut snapshot, &shared.heap);
-        let before = snapshot.len();
-        frame.stack.scan_object_refs(&mut snapshot, &shared.heap);
-        // Validate every operand-stack-sourced root against the heap.
-        // `Frame::scan_local_objects` was already cleaned to drop the
-        // pointer-shaped-Long heuristic; the operand-stack scanner is
-        // restricted from edits, so filter at the boundary instead.
-        //
-        // Done IN PLACE (compact valid entries down over the invalid ones,
-        // then truncate) rather than `split_off` — `update_root_snapshot` runs
-        // on every object-returning native call (tens of millions during an
-        // embedded-server deploy), and the old `split_off` allocated a fresh
-        // Vec for every frame that had operand-stack objects. The in-place
-        // retain is allocation-free and keeps identical semantics.
-        let len = snapshot.len();
-        if len > before {
-            let mut write = before;
-            for read in before..len {
-                let o = snapshot[read];
-                if shared.heap.is_object_address(o.as_ptr() as usize).is_some() {
-                    snapshot[write] = o;
-                    write += 1;
-                }
+
+    if crate::runtime::env_cache::rootsnap_cache() {
+        // ── Opt-in cached path ──────────────────────────────────────────────
+        // Reuse the cached roots of the deep, continuously-frozen frames and
+        // re-scan only the churning top. Correctness rests on the LIFO stack
+        // discipline: if `frames[k]` is still the SAME instance (`seq`
+        // unchanged) it has never been popped, so by the stack property every
+        // frame *below* it (`0..k`) has been continuously present AND frozen
+        // (you cannot pop the middle of a stack) — their cached roots are still
+        // exact. A GC may have *moved/promoted* objects, changing addresses, so
+        // the whole cache is only valid while `collection_count()` is unchanged.
+        let gen = shared.heap.collection_count();
+        let len = thread.frames.len();
+        // Longest prefix whose frame instances are unchanged since the cache
+        // was built (prefix-closed: a matching `frames[p]` implies every frame
+        // below it matches too).
+        let mut p = 0usize;
+        if gen == thread.rs_cache_gen {
+            let maxk = thread.rs_cache.len().min(len);
+            while p < maxk
+                && thread.frames[p].seq != 0
+                && thread.frames[p].seq == thread.rs_cache[p].0
+            {
+                p += 1;
             }
-            snapshot.truncate(write);
+        }
+        // The deepest matching frame (`p-1`) VOUCHES for everything strictly
+        // below it, but its own above-neighbour is the divergence point, so its
+        // own roots may be stale — exclude it. Never reuse the current top
+        // (index `len-1`), which churns its operand stack between snapshots.
+        let reuse = p.saturating_sub(1).min(len.saturating_sub(1));
+
+        // Build the next cache as we go (frozen frames `0..len-1`); the top is
+        // never cached.
+        let mut new_cache: Vec<(u64, Vec<ObjectRef>)> =
+            Vec::with_capacity(len.saturating_sub(1));
+        // (a) reused frozen frames — copy their cached roots into the snapshot
+        //     and carry the entry forward (move, no re-alloc).
+        for i in 0..reuse {
+            snapshot.extend_from_slice(&thread.rs_cache[i].1);
+            new_cache.push(std::mem::take(&mut thread.rs_cache[i]));
+        }
+        // (b) re-scan `reuse..len`. Frozen ones (`< len-1`) are scanned into the
+        //     snapshot and cached; the top is scanned into the snapshot only.
+        for i in reuse..len {
+            let start = snapshot.len();
+            scan_frame_roots(&thread.frames[i], &mut snapshot, &shared.heap);
+            if i + 1 < len {
+                new_cache.push((thread.frames[i].seq, snapshot[start..].to_vec()));
+            }
+        }
+        thread.rs_cache = new_cache;
+        thread.rs_cache_gen = gen;
+    } else {
+        // ── Default path (unchanged) ────────────────────────────────────────
+        for frame in &thread.frames {
+            frame.scan_local_objects(&mut snapshot, &shared.heap);
+            let before = snapshot.len();
+            frame.stack.scan_object_refs(&mut snapshot, &shared.heap);
+            // Validate every operand-stack-sourced root against the heap.
+            // `Frame::scan_local_objects` was already cleaned to drop the
+            // pointer-shaped-Long heuristic; the operand-stack scanner is
+            // restricted from edits, so filter at the boundary instead.
+            //
+            // Done IN PLACE (compact valid entries down over the invalid ones,
+            // then truncate) rather than `split_off` — `update_root_snapshot` runs
+            // on every object-returning native call (tens of millions during an
+            // embedded-server deploy), and the old `split_off` allocated a fresh
+            // Vec for every frame that had operand-stack objects. The in-place
+            // retain is allocation-free and keeps identical semantics.
+            let len = snapshot.len();
+            if len > before {
+                let mut write = before;
+                for read in before..len {
+                    let o = snapshot[read];
+                    if shared.heap.is_object_address(o.as_ptr() as usize).is_some() {
+                        snapshot[write] = o;
+                        write += 1;
+                    }
+                }
+                snapshot.truncate(write);
+            }
         }
     }
     snapshot.extend(thread.native_pin_roots.iter().copied());

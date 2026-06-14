@@ -171,6 +171,14 @@ pub struct Frame {
     /// Hot — checked once per `execute_frame` entry.
     pub is_jdk_class: bool,
 
+    /// Per-frame-instance unique id, used ONLY by the opt-in root-snapshot
+    /// cache (`CRATONVM_ROOTSNAP_CACHE`). A frame still present at index `k`
+    /// with an unchanged `seq` proves — by the LIFO stack discipline — that
+    /// every frame below it has been continuously present and frozen, so its
+    /// cached GC roots are still valid. Zero (and never assigned) when the
+    /// cache gate is off, so the default build pays nothing.
+    pub seq: u64,
+
     // ── Cold fields (metadata, rarely-mutated state) ────────────────────
 
     /// Cold-path metadata (method name, descriptor, exception table, etc.).
@@ -233,6 +241,31 @@ pub struct Frame {
 const LKIND_OTHER: u8 = 0; // reference / int / float / null / uninit / retaddr
 const LKIND_LONG: u8 = 1;
 const LKIND_DOUBLE: u8 = 2;
+
+thread_local! {
+    /// Per-OS-thread monotonic frame-instance counter for [`Frame::seq`].
+    /// Per-thread (not a global atomic) so frame creation pays no cross-thread
+    /// cache-line contention. Uniqueness is only required within one thread's
+    /// own frame stack — the root-snapshot cache only ever compares this
+    /// thread's frames against this thread's cached seqs. Starts at 1 so a
+    /// freshly-default `seq = 0` (gate-off frames) never aliases a real id.
+    static FRAME_SEQ_CTR: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// Next unique frame-instance id, or 0 when the opt-in root-snapshot cache is
+/// disabled (the default) — so the default build pays only a cached-bool read
+/// per frame creation, not the thread-local bump.
+#[inline]
+fn next_frame_seq() -> u64 {
+    if !crate::runtime::env_cache::rootsnap_cache() {
+        return 0;
+    }
+    FRAME_SEQ_CTR.with(|c| {
+        let v = c.get();
+        c.set(v.wrapping_add(1).max(1));
+        v
+    })
+}
 
 /// Cached `CRATONVM_DBG_STALELONG` gate (bc math-ec 0x4 smear hunt): log
 /// LONG-kind locals whose bits match a `pointer_map` key at remap time —
@@ -561,6 +594,7 @@ impl Frame {
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
+            seq: next_frame_seq(),
         }
     }
 
@@ -631,6 +665,7 @@ impl Frame {
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
+            seq: next_frame_seq(),
         }
     }
 
@@ -680,6 +715,7 @@ impl Frame {
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
+            seq: next_frame_seq(),
         }
     }
 
@@ -719,6 +755,7 @@ impl Frame {
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: is_jdk,
+            seq: next_frame_seq(),
         }
     }
 
@@ -1183,6 +1220,7 @@ impl Frame {
             osr_attempt_counts: Vec::new(),
             monitor_on_exit: None,
             is_jdk_class: false,
+            seq: next_frame_seq(),
         }
     }
 
