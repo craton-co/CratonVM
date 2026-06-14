@@ -27,18 +27,21 @@ clean). Those are **not** CratonVM bugs and get no report.
   plus ECDH (#04), EC keyspec (#05), Cipher initLock (#03), stream close-handlers (#09),
   JSON compare (#08).
 
-## Latest (iteration 5) — **62 PASS / 30 FAIL, 9 CratonVM-only failures, 0 regressions**
-Five classes flipped fully green over the effort, via fundamental VM fixes (each verified
-with no regressions across the 92-class suite):
+## Latest (iteration 7) — **64 PASS / 28 FAIL, 7 CratonVM-only failures, 0 regressions**
+**Seven** classes flipped fully green over the effort, via fundamental VM fixes (each
+verified with no regressions across the 92-class suite):
 - **CredentialModelTest, CredentialModelBackwardsCompatibilityTest** — primitive generic
   param mirror (#02).
 - **DefaultCryptoRSAVerifierTest** — real RSA keys, `route_rsa_to_real` (#11, `4b2560a0`).
 - **DefaultCryptoJWKSUtilsTest** — EC cert `getPublicKey` + `RSAPublicKeySpec` import (#12, `7c98ec8f`).
 - **StripSecretsUtilsTest** — `Map.Entry.setValue()` write-through (#13, `bfbb8093`).
-Plus the Hashtable-`$Entry`-enumeration fix (#01) and internal improvements to JWKT (8→4),
-SdJwtVP, PemUtilsBC, and the cert extractor.
+- **PemUtilsBCTest, DefaultCryptoKeyPairVerifierTest** — PKCS#1 RSA private key + imported-key
+  sign bridge (#15, `b1a6fa4b`); cert-verify OID resolution (#14, `7010eee7`).
+Plus the Hashtable-`$Entry`-enumeration fix (#01) and internal improvements to JWKT.
 
-Remaining 9 are deeper, mostly-independent issues: EC-cert ECDSA verify (#12 tail),
+Remaining 7 are deeper, mostly-independent issues: EC-cert P-384/P-521 curves (JWKT;
+"native EC scalar multiply failed"), RSA-OAEP `Cipher` (#03), ECDH (#04), BC `ECPublicKeySpec`
+(#05), SD-JWT RSA cnf/jwk (#07), cert subject parsing (CertExtractor), stream `onClose` (#09):
 RSA-OAEP `Cipher` (#03), ECDH (#04), BC `ECPublicKeySpec` (#05), imported RSA private keys
 (#06), SD-JWT RSA cnf/jwk (#07), BC `getRDNs` CN extraction (#01 tail), and stream
 `onClose` handlers (#09).
