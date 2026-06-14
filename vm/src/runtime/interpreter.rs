@@ -2048,6 +2048,30 @@ pub fn execute(
             // case where the receiver's runtime class IS that abstract
             // class. A native is a concrete Rust fn — there is no
             // re-resolution loop — so dispatch straight to it.
+            // Stream.forEachOrdered(Consumer) gap: its only native registration
+            // lives in `register_phase56_stream_extras`, reachable solely from
+            // `register_synthetic_overrides` (synthetic-jdk feature, compiled out
+            // of the real-JDK CLI). So an `invokeinterface Stream.forEachOrdered`
+            // resolves to the abstract interface declaration (no Code) and the
+            // interface->concrete retarget that already makes `forEach` work does
+            // not fire for `forEachOrdered`, surfacing as
+            //   AbstractMethodError: Stream.forEachOrdered(...)V has no Code attribute
+            // (24+ WildFly `ejb.security` tests, plus any real-JDK code using it).
+            // For our sequential streams `forEachOrdered` is semantically identical
+            // to `forEach`; re-dispatch as `forEach`, whose receiver-walk rescue
+            // (Path A below) resolves the concrete override on the receiver.
+            if method_name == "forEachOrdered"
+                && method_descriptor == "(Ljava/util/function/Consumer;)V"
+            {
+                return execute(
+                    shared,
+                    thread,
+                    class_id,
+                    "forEach",
+                    method_descriptor,
+                    args,
+                );
+            }
             if method_name != "<init>" && method_name != "<clinit>" {
                 if let Some(cb) = shared.native_methods.find(
                     &class_name_owned,
