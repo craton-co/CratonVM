@@ -19,5 +19,33 @@ Candidates: `new ArrayList<>(...)` / `Collectors.toList()` / `Map.values()` /
 list reaching a `.remove()`. Pin to the exact call site in the failing method and
 compare the returned collection's mutability vs HotSpot.
 
+## ✅ FIXED (2026-06-13) — ArrayDeque iterator.remove()
+
+Pinned with `apps/kafka/tests/repro/MutProbe.java`, which exercises `iterator
+.remove()` across every candidate collection. Only ONE diverged:
+`new ArrayDeque<>(coll)` → CratonVM `iterator.remove UNSUPPORTED` vs HotSpot OK.
+(`new ArrayList/LinkedList/HashSet(coll)`, `Collectors.toList/toSet`,
+`Map.values/keySet`, `stream.collect` were all already mutable.)
+
+ROOT CAUSE: CratonVM's `ArrayDeque$Itr` is snapshot-backed (field 0 = array,
+field 1 = cursor) and registered only `hasNext`/`next` — no `remove`, and no
+backing-deque reference. So `remove()` fell to the `java/util/Iterator` default,
+which throws `UnsupportedOperationException`. Kafka `NetworkClientDelegate`
+cleans up unsent requests via `iterator.remove()` over an `ArrayDeque` — hit
+exactly that.
+
+FIX (`native-collections/src/lib.rs`): `native_ad_iterator` now stores the
+backing `ArrayDeque` in iterator field 2; a new `native_ad_itr_remove`
+(registered for `java/util/ArrayDeque$Itr`) removes the last-returned element
+from the live deque via the existing `removeFirstOccurrence` logic (snapshot
+left intact for continued iteration). Verified: `MutProbe` ArrayDeque now `OK`
+(all 11 cases match HotSpot, no regression); `NetworkClientDelegateTest` no
+longer throws `UnsupportedOperationException` (it now runs, 2/6 pass).
+
+RESIDUAL (separate bug, NOT bug-16): the remaining 4 `NetworkClientDelegateTest`
+failures are now `ConfigException: Missing required configuration
+"key.deserializer"` — a consumer-config-validation divergence unrelated to
+collection mutability (HotSpot supplies the default). Track separately.
+
 ## Affected classes (partial — append more later)
 - consumer.internals.NetworkClientDelegateTest

@@ -87,8 +87,65 @@ fn table() -> &'static Mutex<FxHashMap<usize, FxHashMap<String, String>>> {
     T.get_or_init(|| Mutex::new(FxHashMap::default()))
 }
 
-fn key_for(obj: ObjectRef) -> usize {
-    obj.as_ptr() as usize
+// --- GC-stable side-table key -------------------------------------------------
+//
+// The side-table was keyed by `obj.as_ptr()`, the raw heap address. Under a
+// moving GC that address is NOT a stable object identity: after a relocation a
+// fresh `Properties` can reuse the address a different `Properties` had, so two
+// distinct objects collide on the same side-table entry. The visible symptom is
+// catastrophic: `new Properties().setProperty(...)` bleeds into
+// `System.getProperties()` (they alias the same entry), so Hibernate's
+// `ConfigurationHelper.maskOut` — which clones the global props and masks the
+// CLONE's `hibernate.connection.password` to "****" — leaks "****" back into the
+// real password, and every EMF/SessionFactory bootstrap connects with the wrong
+// password ("Wrong user name or password"). That single defect disabled/failed
+// ~500 Hibernate ORM test classes.
+//
+// Fix: key by a GC-stable identity. `ctx.identity_hash_code(obj)` is stable
+// across relocations; a small per-hash generation registry (mirroring
+// `native-collections`' `widened_obj_key`) disambiguates genuine 32-bit hash
+// collisions among live objects.
+struct ObjKeyEntry {
+    last_ptr: usize,
+    generation: u32,
+}
+
+fn obj_key_registry() -> &'static Mutex<FxHashMap<u32, Vec<ObjKeyEntry>>> {
+    static R: OnceLock<Mutex<FxHashMap<u32, Vec<ObjKeyEntry>>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+#[inline]
+fn pack_obj_key(hash: u32, generation: u32) -> usize {
+    ((hash as usize) << 32) | (generation as usize)
+}
+
+fn key_for(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
+    let hash = ctx.identity_hash_code(obj) as u32;
+    let ptr = obj.as_ptr() as usize;
+    let mut reg = obj_key_registry().lock();
+    let slots = reg.entry(hash).or_default();
+    // 1. Same object seen again at the same address.
+    if let Some(slot) = slots.iter().find(|s| s.last_ptr == ptr) {
+        return pack_obj_key(hash, slot.generation);
+    }
+    // 2. Lone occupant whose address changed (moving GC relocated it): rebind.
+    //    Only safe when `hash` is a real assigned identity (non-zero): with a
+    //    real unique hash, a lone bucket occupant whose address changed must be
+    //    the same object after a GC move. When the hash is 0 (identity not yet
+    //    assigned — some synthetic/slow-path allocations leave the header hash
+    //    unset until `System.identityHashCode` is first called), DISTINCT
+    //    objects all hash to bucket 0, so rebinding would merge them — exactly
+    //    the cross-contamination this fix exists to prevent. Fall through to a
+    //    fresh per-address generation instead.
+    if hash != 0 && slots.len() == 1 {
+        slots[0].last_ptr = ptr;
+        return pack_obj_key(hash, slots[0].generation);
+    }
+    // 3. New object for this hash (or a genuine 32-bit collision): fresh slot.
+    let generation = slots.len() as u32;
+    slots.push(ObjKeyEntry { last_ptr: ptr, generation });
+    pack_obj_key(hash, generation)
 }
 
 /// Read all bytes from an InputStream by repeatedly invoking `read([B,
@@ -392,15 +449,16 @@ fn unescape(s: &str) -> String {
 
 /// Insert (or overwrite) a key/value pair in the side-table for a
 /// given Properties object.  Enforces per-object and global caps.
-fn put_kv(obj: ObjectRef, key: &str, value: &str) {
+fn put_kv(ctx: &dyn NativeContext, obj: ObjectRef, key: &str, value: &str) {
     if key.len() > MAX_KV_LEN || value.len() > MAX_KV_LEN {
         return;
     }
+    let k = key_for(ctx, obj);
     let mut t = table().lock();
-    if t.len() >= MAX_TOTAL_OBJECTS && !t.contains_key(&key_for(obj)) {
+    if t.len() >= MAX_TOTAL_OBJECTS && !t.contains_key(&k) {
         return;
     }
-    let entry = t.entry(key_for(obj)).or_default();
+    let entry = t.entry(k).or_default();
     if entry.len() < MAX_PROPS_PER_OBJECT || entry.contains_key(key) {
         entry.insert(key.to_string(), value.to_string());
     }
@@ -408,24 +466,30 @@ fn put_kv(obj: ObjectRef, key: &str, value: &str) {
 
 /// Look up a key in the side-table.  Returns `None` if either the
 /// object isn't tracked or the key is absent.
-fn get_kv(obj: ObjectRef, key: &str) -> Option<String> {
-    table().lock().get(&key_for(obj))?.get(key).cloned()
+fn get_kv(ctx: &dyn NativeContext, obj: ObjectRef, key: &str) -> Option<String> {
+    let k = key_for(ctx, obj);
+    table().lock().get(&k)?.get(key).cloned()
 }
 
 /// Remove a key from the side-table.  Returns the previous value if it
 /// was present, or `None` if either the object isn't tracked or the key
 /// was absent.  Used by `native_properties_remove` to back the JDK
 /// `Properties.remove(Object) Object` semantics.
-fn remove_kv(obj: ObjectRef, key: &str) -> Option<String> {
+fn remove_kv(ctx: &dyn NativeContext, obj: ObjectRef, key: &str) -> Option<String> {
+    let k = key_for(ctx, obj);
     let mut t = table().lock();
-    let entry = t.get_mut(&key_for(obj))?;
+    let entry = t.get_mut(&k)?;
     entry.remove(key)
 }
 
 /// Cross-module read access for callers that receive a `Properties` object
 /// behind an erased `Map` type (e.g. surefire `PropertiesWrapper`).
-pub(crate) fn get_property_from_sidetable(obj: ObjectRef, key: &str) -> Option<String> {
-    get_kv(obj, key)
+pub(crate) fn get_property_from_sidetable(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+    key: &str,
+) -> Option<String> {
+    get_kv(ctx, obj, key)
 }
 
 /// Public re-export of `put_kv` so other modules (e.g. the surefire
@@ -434,15 +498,20 @@ pub(crate) fn get_property_from_sidetable(obj: ObjectRef, key: &str) -> Option<S
 /// reference.  Used to back `PropertiesWrapper` lookups when the
 /// real-JDK CHM round-trip does not populate the wrapper's internal
 /// `properties` field correctly under our interpreter.
-pub fn store_property_in_sidetable(obj: ObjectRef, key: &str, value: &str) {
-    put_kv(obj, key, value);
+pub fn store_property_in_sidetable(
+    ctx: &dyn NativeContext,
+    obj: ObjectRef,
+    key: &str,
+    value: &str,
+) {
+    put_kv(ctx, obj, key, value);
 }
 
 /// Public snapshot of side-table entries for a given object, used by
 /// surefire `setAsSystemProperties` etc. to iterate entries without
 /// going through the inner Map field.
-pub fn snapshot_sidetable(obj: ObjectRef) -> Vec<(String, String)> {
-    snapshot_kv(obj)
+pub fn snapshot_sidetable(ctx: &dyn NativeContext, obj: ObjectRef) -> Vec<(String, String)> {
+    snapshot_kv(ctx, obj)
 }
 
 /// Public re-export of `drain_input_stream` for use from `lib.rs`.
@@ -462,20 +531,99 @@ pub fn parse_properties_pub(bytes: &[u8]) -> Vec<(String, String)> {
 /// an empty vector if the object isn't tracked.  Used by `keySet`,
 /// `entrySet`, `values`, `keys`, `elements` natives so the iteration
 /// view is decoupled from the live mutable side-table.
-fn snapshot_kv(obj: ObjectRef) -> Vec<(String, String)> {
-    match table().lock().get(&key_for(obj)) {
+fn snapshot_kv(ctx: &dyn NativeContext, obj: ObjectRef) -> Vec<(String, String)> {
+    let k = key_for(ctx, obj);
+    match table().lock().get(&k) {
         Some(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         None => Vec::new(),
     }
 }
 
 /// Number of entries the side-table holds for `obj` (0 if untracked).
-fn count_kv(obj: ObjectRef) -> usize {
-    table()
-        .lock()
-        .get(&key_for(obj))
-        .map(|m| m.len())
-        .unwrap_or(0)
+fn count_kv(ctx: &dyn NativeContext, obj: ObjectRef) -> usize {
+    let k = key_for(ctx, obj);
+    table().lock().get(&k).map(|m| m.len()).unwrap_or(0)
+}
+
+/// The set of keys the String-only side-table holds for `obj`.  Used as the
+/// "already represented" skip set when merging in the CHM-backing entries —
+/// see [`chm_extra_entries`].
+fn side_key_set(ctx: &dyn NativeContext, obj: ObjectRef) -> std::collections::HashSet<String> {
+    match table().lock().get(&key_for(ctx, obj)) {
+        Some(m) => m.keys().cloned().collect(),
+        None => std::collections::HashSet::new(),
+    }
+}
+
+/// Collect entries from the Properties' real-JDK `map` ConcurrentHashMap
+/// backing whose key string is NOT in `skip`.  Returns `(key_obj, value,
+/// key_string)` triples; the value is the *real* stored object (which may be a
+/// non-String such as a `Class`), and `key_string` is `None` for the rare
+/// non-String key.
+///
+/// Why this exists: `native_properties_put`/`putAll` store **non-String
+/// values** ONLY in the CHM backing (the side-table is `String -> String`).
+/// Every read native that consults only the side-table therefore silently
+/// drops those entries — `size()` undercounts, `entrySet()`/`keySet()`/
+/// `values()` omit them, `containsKey()` returns false, `isEmpty()` reports
+/// empty. Kafka's `ConsumerConfig(Properties)` is the canonical victim: its
+/// required `key.deserializer` is supplied as a `Class` value, so
+/// `AbstractConfig`'s `originals.entrySet()` walk never sees it and it throws
+/// `Missing required configuration "key.deserializer"`.
+///
+/// Merging here is *additive* and *de-duplicated*: every String entry is
+/// mirrored into BOTH stores, so `skip` (the side-table keys) prevents
+/// double-counting; only the CHM-exclusive (non-String-valued) entries come
+/// back. When the receiver has no CHM backing (e.g. a Properties populated
+/// purely through the surefire `store_property_in_sidetable` path), this is a
+/// no-op and the side-table view stands alone.
+fn chm_extra_entries(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    skip: &std::collections::HashSet<String>,
+) -> Vec<(ObjectRef, Value, Option<String>)> {
+    let chm = match ctx.get_field_by_name(this, "map") {
+        Value::Object(Some(m)) => m,
+        _ => return Vec::new(),
+    };
+    let set = match ctx.invoke_virtual(chm, "entrySet", "()Ljava/util/Set;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return Vec::new(),
+    };
+    let it = match ctx.invoke_virtual(set, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(i)))) => i,
+        _ => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    loop {
+        match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(n))) if n != 0 => {}
+            _ => break,
+        }
+        let entry = match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => break,
+        };
+        let key_obj = match ctx.invoke_virtual(entry, "getKey", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(o)))) => o,
+            _ => continue,
+        };
+        let value = match ctx.invoke_virtual(entry, "getValue", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(v)) => v,
+            _ => continue,
+        };
+        let kstr = ctx.read_string(key_obj);
+        if let Some(ref s) = kstr {
+            if skip.contains(s) {
+                continue; // String entry already represented by the side-table
+            }
+        }
+        out.push((key_obj, value, kstr));
+        if out.len() >= MAX_PROPS_PER_OBJECT {
+            break;
+        }
+    }
+    out
 }
 
 /// After native `load` fills the side-table, mirror each (k,v) into the
@@ -559,7 +707,7 @@ fn store_parsed_entries(
         .is_none_or(|n| n == "java/util/Properties");
     if is_exact {
         for (k, v) in parsed {
-            put_kv(this, k, v);
+            put_kv(ctx, this, k, v);
         }
         mirror_loaded_entries_to_properties_backend(ctx, this, parsed);
         return;
@@ -616,7 +764,7 @@ fn native_properties_load(
         }
     }
     store_parsed_entries(ctx, this, &parsed);
-    props_diag_eprintln!("[PROPS-DBG] native_properties_load: side-table now has {} entries for obj {:?}", count_kv(this), this);
+    props_diag_eprintln!("[PROPS-DBG] native_properties_load: side-table now has {} entries for obj {:?}", count_kv(ctx, this), this);
     Ok(None)
 }
 
@@ -753,7 +901,7 @@ fn native_properties_get_property_1(
         _ => return Ok(Some(Value::Object(None))),
     };
     let key = crate::property_key_from_java_string(ctx, key_obj);
-    if let Some(v) = get_kv(this, &key) {
+    if let Some(v) = get_kv(ctx, this, &key) {
         tracing::debug!(
             target: "cratonvm_vm::props_sidetable",
             ?this, key = %key, bytes = v.len(),
@@ -792,7 +940,7 @@ fn native_properties_get_property_2(
         _ => return Ok(Some(default)),
     };
     let key = crate::property_key_from_java_string(ctx, key_obj);
-    if let Some(v) = get_kv(this, &key) {
+    if let Some(v) = get_kv(ctx, this, &key) {
         return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
     }
     match ctx
@@ -827,8 +975,8 @@ fn native_properties_set_property(
     };
     let key = ctx.read_string(key_obj).unwrap_or_default();
     let val = ctx.read_string(val_obj).unwrap_or_default();
-    let old = get_kv(this, &key);
-    put_kv(this, &key, &val);
+    let old = get_kv(ctx, this, &key);
+    put_kv(ctx, this, &key, &val);
     // Mirror into the real JDK Properties backing (`map` ConcurrentHashMap) so
     // generic Map walkers observe the entry — see native_properties_put's
     // fn-level note for the full rationale (Hibernate's PU-properties merge).
@@ -895,8 +1043,8 @@ fn native_properties_put(
     if !ks.is_empty() {
         if let Some(vs) = vs_opt {
             // String→String: store in side-table AND CHM (existing path).
-            let prev = get_kv(this, &ks);
-            put_kv(this, &ks, &vs);
+            let prev = get_kv(ctx, this, &ks);
+            put_kv(ctx, this, &ks, &vs);
             mirror_loaded_entries_to_properties_backend(ctx, this, &[(ks.clone(), vs.clone())]);
             let _ = ctx.set_system_property(&ks, &vs);
             if let Some(p) = prev {
@@ -975,7 +1123,7 @@ fn native_properties_remove(
     if key.is_empty() {
         return Ok(Some(Value::Object(None)));
     }
-    let removed = remove_kv(this, &key);
+    let removed = remove_kv(ctx, this, &key);
     // Keep the real JDK `map` CHM backing in sync with the side-table: `put`/
     // `setProperty` mirror INTO it, so a `remove` that touched only the
     // side-table would let generic Map walkers (HashMap.putAll /
@@ -1016,7 +1164,7 @@ fn native_properties_clear(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(None),
     };
-    table().lock().remove(&key_for(this));
+    table().lock().remove(&key_for(ctx, this));
     if let Value::Object(Some(chm)) = ctx.get_field_by_name(this, "map") {
         let _ = ctx.invoke_virtual(chm, "clear", "()V", &[]);
     }
@@ -1038,8 +1186,22 @@ fn native_properties_contains_key(
         _ => return Ok(Some(Value::Int(0))),
     };
     let key = ctx.read_string(key_obj).unwrap_or_default();
-    if get_kv(this, &key).is_some() {
+    if get_kv(ctx, this, &key).is_some() {
         return Ok(Some(Value::Int(1)));
+    }
+    // Non-String-valued entries live only in the CHM backing — consult it so
+    // `containsKey` agrees with `get` (which already falls through to the CHM).
+    if let Value::Object(Some(chm)) = ctx.get_field_by_name(this, "map") {
+        if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(
+            chm,
+            "containsKey",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(key_obj))],
+        ) {
+            if n != 0 {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
     }
     Ok(Some(Value::Int(0)))
 }
@@ -1073,7 +1235,7 @@ fn native_properties_get(
     };
     let key = crate::property_key_from_java_string(ctx, key_obj);
     // Check the Rust side-table (String→String only).
-    if let Some(v) = get_kv(this, &key) {
+    if let Some(v) = get_kv(ctx, this, &key) {
         return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
     }
     // Non-String values (e.g. XProperty, MemberDetails) are stored only in
@@ -1108,26 +1270,39 @@ fn native_properties_get(
 /// synthetic Properties — the bytecode NPEs.  Route the read through
 /// the side-table; objects we never wrote to report 0.
 fn native_properties_size(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(0))),
     };
-    Ok(Some(Value::Int(count_kv(this) as i32)))
+    // Side-table entries (String values) PLUS the CHM-exclusive entries
+    // (non-String values such as a `Class` deserializer) — see
+    // `chm_extra_entries`. Without the merge, a Properties whose values are
+    // non-String (e.g. Kafka's ConsumerConfig key.deserializer) reports a
+    // short size and breaks Map-size-driven enumeration.
+    let side = side_key_set(ctx, this);
+    let total = side.len() + chm_extra_entries(ctx, this, &side).len();
+    Ok(Some(Value::Int(total as i32)))
 }
 
 /// Native `Properties.isEmpty()Z` — symmetric companion to `size()`.
 fn native_properties_is_empty(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Int(1))),
     };
-    let empty = count_kv(this) == 0;
+    // Fast path: any String entry in the side-table means non-empty without
+    // touching the CHM. Only when the side-table is empty do we pay for the
+    // CHM scan to detect non-String-valued entries (which live only there).
+    if count_kv(ctx, this) > 0 {
+        return Ok(Some(Value::Int(0)));
+    }
+    let empty = chm_extra_entries(ctx, this, &std::collections::HashSet::new()).is_empty();
     Ok(Some(Value::Int(if empty { 1 } else { 0 })))
 }
 
@@ -1172,7 +1347,7 @@ fn build_string_collection(
 /// given Properties object.  Returns an empty HashSet if the object isn't
 /// tracked.
 fn build_key_set(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
-    let keys: Vec<String> = snapshot_kv(this).into_iter().map(|(k, _v)| k).collect();
+    let keys: Vec<String> = snapshot_kv(ctx, this).into_iter().map(|(k, _v)| k).collect();
     build_string_collection(ctx, "java/util/HashSet", keys)
 }
 
@@ -1180,7 +1355,7 @@ fn build_key_set(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
 /// the given Properties object.  ArrayList is a `Collection` — sufficient for
 /// `Properties.values()`'s declared return type.
 fn build_value_list(ctx: &mut dyn NativeContext, this: ObjectRef) -> ObjectRef {
-    let vals: Vec<String> = snapshot_kv(this).into_iter().map(|(_k, v)| v).collect();
+    let vals: Vec<String> = snapshot_kv(ctx, this).into_iter().map(|(_k, v)| v).collect();
     build_string_collection(ctx, "java/util/ArrayList", vals)
 }
 
@@ -1268,6 +1443,18 @@ fn native_properties_key_set(
         }
     };
     let set = build_key_set(ctx, this);
+    // Add keys for CHM-exclusive (non-String-valued) entries so the key view
+    // matches the real map; `stringPropertyNames()` deliberately does NOT do
+    // this (it is specified to return only String-keyed/String-valued names).
+    let side = side_key_set(ctx, this);
+    for (key_obj, _value, _kstr) in chm_extra_entries(ctx, this, &side) {
+        let _ = ctx.invoke_virtual(
+            set,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(key_obj))],
+        );
+    }
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -1288,6 +1475,18 @@ fn native_properties_values(
         }
     };
     let list = build_value_list(ctx, this);
+    // Append CHM-exclusive (non-String) values so the value view matches the
+    // real map. Skip-set is the side-table keys, so mirrored String values are
+    // not duplicated.
+    let side = side_key_set(ctx, this);
+    for (_key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side) {
+        let _ = ctx.invoke_virtual(
+            list,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[value],
+        );
+    }
     Ok(Some(Value::Object(Some(list))))
 }
 
@@ -1305,7 +1504,7 @@ fn native_properties_entry_set(
             return Ok(Some(Value::Object(Some(empty))));
         }
     };
-    let snapshot = snapshot_kv(this);
+    let snapshot = snapshot_kv(ctx, this);
     props_diag_eprintln!("[PROPS-DBG] native_properties_entry_set: {} entries for obj {:?}", snapshot.len(), this);
     if snapshot.is_empty() {
         props_diag_eprintln!("[PROPS-DBG] WARNING: entrySet() called on empty side-table obj {:?}", this);
@@ -1355,6 +1554,28 @@ fn native_properties_entry_set(
             &[Value::Object(Some(entry))],
         );
     }
+    // Merge CHM-exclusive entries (non-String values, e.g. a `Class`
+    // deserializer) so consumers that enumerate `entrySet()` — Kafka's
+    // `AbstractConfig` constructor, Spring's `SpringFactoriesLoader`,
+    // `HashMap.putAll(props)` via the generic Map iterator — observe the full
+    // map. The real stored value object is reused verbatim.
+    let side_keys: std::collections::HashSet<String> =
+        snapshot.iter().map(|(k, _v)| k.clone()).collect();
+    for (key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side_keys) {
+        let entry = crate::alloc_concurrent_synthetic(
+            ctx,
+            "java/util/AbstractMap$SimpleImmutableEntry",
+            2,
+        );
+        ctx.set_field_by_name(entry, "key", Value::Object(Some(key_obj)));
+        ctx.set_field_by_name(entry, "value", value);
+        let _ = ctx.invoke_virtual(
+            set,
+            "add",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(entry))],
+        );
+    }
     Ok(Some(Value::Object(Some(set))))
 }
 
@@ -1370,10 +1591,18 @@ fn native_properties_keys(
     ctx: &mut dyn NativeContext,
     args: &[Value],
 ) -> MethodCallResult {
-    let keys: Vec<String> = match args.first() {
-        Some(Value::Object(Some(o))) => snapshot_kv(*o).into_iter().map(|(k, _v)| k).collect(),
-        _ => Vec::new(),
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(Some(build_enumeration(ctx, Vec::new()))))),
     };
+    let mut keys: Vec<String> = snapshot_kv(ctx, this).into_iter().map(|(k, _v)| k).collect();
+    // Include String keys of CHM-exclusive (non-String-valued) entries.
+    let side = side_key_set(ctx, this);
+    for (_key_obj, _value, kstr) in chm_extra_entries(ctx, this, &side) {
+        if let Some(s) = kstr {
+            keys.push(s);
+        }
+    }
     Ok(Some(Value::Object(Some(build_enumeration(ctx, keys)))))
 }
 
@@ -1384,7 +1613,7 @@ fn native_properties_elements(
     args: &[Value],
 ) -> MethodCallResult {
     let vals: Vec<String> = match args.first() {
-        Some(Value::Object(Some(o))) => snapshot_kv(*o).into_iter().map(|(_k, v)| v).collect(),
+        Some(Value::Object(Some(o))) => snapshot_kv(ctx, *o).into_iter().map(|(_k, v)| v).collect(),
         _ => Vec::new(),
     };
     Ok(Some(Value::Object(Some(build_enumeration(ctx, vals)))))
@@ -1406,9 +1635,26 @@ fn native_properties_contains(
         _ => return Ok(Some(Value::Int(0))),
     };
     let needle = ctx.read_string(val_obj).unwrap_or_default();
-    let snapshot = snapshot_kv(this);
+    let snapshot = snapshot_kv(ctx, this);
     let hit = snapshot.iter().any(|(_k, v)| v == &needle);
-    Ok(Some(Value::Int(if hit { 1 } else { 0 })))
+    if hit {
+        return Ok(Some(Value::Int(1)));
+    }
+    // Non-String values live only in the CHM backing — delegate the value
+    // lookup so `contains`/`containsValue` agree with the real map.
+    if let Value::Object(Some(chm)) = ctx.get_field_by_name(this, "map") {
+        if let Ok(Some(Value::Int(n))) = ctx.invoke_virtual(
+            chm,
+            "containsValue",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(val_obj))],
+        ) {
+            if n != 0 {
+                return Ok(Some(Value::Int(1)));
+            }
+        }
+    }
+    Ok(Some(Value::Int(0)))
 }
 
 /// Native `Properties.containsValue(Object)Z` — alias for `contains`.
@@ -1442,7 +1688,7 @@ fn native_properties_for_each(
         Some(Value::Object(Some(a))) => *a,
         _ => return Ok(None),
     };
-    let snapshot = snapshot_kv(this);
+    let snapshot = snapshot_kv(ctx, this);
     for (k, v) in &snapshot {
         let ks = ctx.create_string(k);
         let vs = ctx.create_string(v);
@@ -1451,6 +1697,17 @@ fn native_properties_for_each(
             "accept",
             "(Ljava/lang/Object;Ljava/lang/Object;)V",
             &[Value::Object(Some(ks)), Value::Object(Some(vs))],
+        )?;
+    }
+    // CHM-exclusive (non-String-valued) entries, with the real value object.
+    let side: std::collections::HashSet<String> =
+        snapshot.iter().map(|(k, _v)| k.clone()).collect();
+    for (key_obj, value, _kstr) in chm_extra_entries(ctx, this, &side) {
+        ctx.invoke_virtual(
+            action,
+            "accept",
+            "(Ljava/lang/Object;Ljava/lang/Object;)V",
+            &[Value::Object(Some(key_obj)), value],
         )?;
     }
     Ok(None)
@@ -1666,10 +1923,10 @@ fn native_properties_put_all(
     // 1) Side-table snapshot — covers Properties->Properties putAll (the
     //    dominant case that previously silently dropped all entries because
     //    Properties stores its data outside the inherited HashMap buckets).
-    let snapshot = snapshot_kv(other);
+    let snapshot = snapshot_kv(ctx, other);
     if !snapshot.is_empty() {
         for (k, v) in &snapshot {
-            put_kv(this, k, v);
+            put_kv(ctx, this, k, v);
         }
         // Mirror into `this`'s real `map` CHM backing too, so the destination
         // stays consistent for generic Map walkers (cf. native_properties_put).
@@ -1761,7 +2018,7 @@ fn native_properties_put_all(
         }
     }
     for (k, v) in &str_collected {
-        put_kv(this, k, v);
+        put_kv(ctx, this, k, v);
     }
     mirror_loaded_entries_to_properties_backend(ctx, this, &str_collected);
     Ok(None)

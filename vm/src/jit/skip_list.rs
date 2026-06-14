@@ -485,6 +485,26 @@ fn should_skip_jit_internal(
             return Some(SkipReason::RustJvmTestFixture);
         }
 
+        // HIB-BYTEBUDDY (2026-06-13) — provisional blanket ban for ByteBuddy's
+        // runtime class-build chain (`net/bytebuddy/`). The narrow HIB-PROXY ban
+        // on `ByteBuddyState.make` only covered the lazy-proxy path; Hibernate's
+        // bytecode-enhancement path (`EnhancerImpl.enhance` -> `ByteBuddyState.
+        // rewrite` -> `DynamicType...make` -> `MethodRegistry.prepare` -> deep
+        // `net/bytebuddy/description/type/TypeDescription*` resolution) hangs
+        // forever once those type-description methods are JIT-compiled
+        // (`SimpleEnhancerTests` rc=124; the stack spins in
+        // `TypeDefinition$Sort.describe` / `TypeDescription.represents`). It is
+        // the same "JIT'd build-chain receiver corruption / loop never returns"
+        // miscompile as HIB-PROXY, and `CRATONVM_DISABLE_JIT=1` makes the whole
+        // enhancer pass (ok=1). ByteBuddy is a one-shot code generator, never a
+        // benchmarked hot path, so interpreter-only is the right trade. Lifted
+        // by `CRATONVM_JIT_ALLOW_PACKAGES=net/bytebuddy/`.
+        if class_name.starts_with("net/bytebuddy/")
+            && !package_allowed("net/bytebuddy/", allow_packages)
+        {
+            return Some(SkipReason::RustJvmTestFixture);
+        }
+
         // SPB.1 (Session 112) — provisional blanket ban for the Spring
         // Framework `org/springframework/util/` package. `ClassUtils.
         // <clinit>` runs `registerCommonClasses(...)` ~10 times for
@@ -1867,6 +1887,19 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // refs off the queue and invokes their thunks. The bug also
         // fires under H2 TestAll (same root cause, different witness).
         | ("jdk/internal/ref/CleanerImpl", "run")
+        // HIB-XSD (2026-06-13) — Hibernate XML/XSD bootstrap hang. JDK Xerces'
+        // `XMLEntityScanner.skipString(String)` is a backward char-compare loop
+        // (two countdown induction vars `i`/`j`, `iload`-then-`iinc -1`, exit via
+        // `if_icmpne` against `position`). JIT-compiled it never returns, hanging
+        // `SchemaFactory.newSchema()` during `MappingXsdSupport.<clinit>` — every
+        // Hibernate test that compiles an XSD (LocalXmlResourceResolverTest and the
+        // XML-mapping bootstrap paths) freezes. `CRATONVM_DISABLE_JIT=1` and a
+        // per-method `CRATONVM_JIT_BISECT_SKIP=...XMLEntityScanner.skipString` both
+        // unblock it; a faithful standalone replica of the loop does NOT reproduce,
+        // so the trigger is specific to Xerces' exact block shape — same "JIT'd
+        // scan/fill loop never returns" family as NETTY.1 (`Arrays.fill`). Ban
+        // narrowly until the codegen defect is isolated.
+        | ("com/sun/org/apache/xerces/internal/impl/XMLEntityScanner", "skipString")
     )
 }
 

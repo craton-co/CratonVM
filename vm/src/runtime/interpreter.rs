@@ -11050,6 +11050,22 @@ fn execute_invoke_kind(
         return res;
     }
 
+    if std::env::var_os("CRATONVM_DBG_EQDISP").is_some()
+        && (&*method_name == "equals" || &*method_name == "hashCode")
+    {
+        let caller_mn = thread.frames[frame_idx].method_name().to_string();
+        let caller_cn = thread.frames[frame_idx].class_name().to_string();
+        if caller_mn.contains("indexOf") || caller_mn.contains("contains") || caller_cn.contains("ArrayList") {
+            let recv_cls = match args.first() {
+                Some(Value::Object(Some(o))) => shared.class_manager.read()
+                    .get_class(shared.heap.class_id_of(*o)).map(|c| c.name.to_string()).unwrap_or_default(),
+                _ => "non-obj".to_string(),
+            };
+            eprintln!("[EQDISP execute_invoke] caller={}.{} invoke_class={} method={} receiver_actual_class={} nargs={}",
+                caller_cn, caller_mn, &*invoke_class, &*method_name, recv_cls, args.len());
+        }
+    }
+
     // Try stackless frame push for bytecode methods (avoids Rust stack recursion)
     // For virtual/special calls, do NOT walk the native hierarchy — subclass
     // bytecode overrides must take priority over parent native overrides.
@@ -12479,7 +12495,22 @@ fn try_stackless_invoke(
                   native_cb.is_some());
     }
     if let Some(callback) = native_cb {
+        if std::env::var_os("CRATONVM_DBG_EQDISP").is_some()
+            && (method_name == "equals" || method_name == "hashCode")
+            && (class_name.contains("UUID") || class_name.contains("BigInteger"))
+        {
+            eprintln!("[EQDISP stackless-native] class={} method={} args={:?} -> calling native",
+                class_name, method_name,
+                args.iter().map(|a| format!("{:?}", a)).collect::<Vec<_>>());
+        }
         let result = safe_native_call(shared, thread, callback, args)?;
+        if std::env::var_os("CRATONVM_DBG_EQDISP").is_some()
+            && (method_name == "equals" || method_name == "hashCode")
+            && (class_name.contains("UUID") || class_name.contains("BigInteger"))
+        {
+            eprintln!("[EQDISP stackless-native] class={} method={} -> native result={:?}",
+                class_name, method_name, result);
+        }
         if let Some(value) = result {
             if std::env::var_os("CRATONVM_DBG_STACKLESS").is_some() {
                 eprintln!(
@@ -12545,6 +12576,15 @@ fn try_stackless_invoke(
     let is_native = method.is_native();
     let is_synchronized = method.is_synchronized();
     let is_static = method.is_static();
+
+    if std::env::var_os("CRATONVM_DBG_EQDISP").is_some()
+        && (method_name == "equals" || method_name == "hashCode")
+        && (class_name.contains("UUID") || class_name.contains("BigInteger"))
+    {
+        let decl = cm.get_class(declaring_id).map(|c| c.name.to_string()).unwrap_or_default();
+        eprintln!("[EQDISP stackless] recv_class={} method={} native_cb=miss resolved_decl={} is_native={}",
+            class_name, method_name, decl, is_native);
+    }
 
     if is_native {
         // Native method — look up in registry by declaring class
@@ -15078,6 +15118,15 @@ fn try_jit_upgrade_with_gate(
     let inline_resolver = |callee_class: &str, callee_method: &str, callee_desc: &str| -> Option<cratonvm_jit::InlineSite> {
         resolve_inline_site(shared, callee_class, callee_method, callee_desc)
     };
+    // Main-path small-method inlining is GATED default-OFF behind
+    // `CRATONVM_JIT_MAIN_INLINE=1`. Enabling it inlines tiny arith/getter/field
+    // leaves correctly (verified: `static int add(int,int){return a+b;}` emits no
+    // CALL), but broadly enabling it surfaced a `try_emit_inline_body` miscompile
+    // on some Spring boot paths (`ConcurrentReferenceHashMap$TaskOption not an
+    // enum` CCE — an inlined body clobbering a caller-live value), so it must not
+    // be default-ON until that is root-caused. The infrastructure was previously
+    // wired only into `try_jit_compile_callee_slow`. See the JIT-inlining notes.
+    let main_inline_on = crate::runtime::env_cache::jit_main_inline();
     let compiled = crate::jit::try_compile(
         cached,
         Some(&resolver),
@@ -15090,7 +15139,7 @@ fn try_jit_upgrade_with_gate(
         Some(&ldc2w_resolver),
         pgo_profile.as_ref(),
         &helpers,
-        Some(&inline_resolver),
+        if main_inline_on { Some(&inline_resolver) } else { None },
         // string_layout_resolver: None until the String call-site intrinsics
         // land — see the matching comment at the early-compile call site.
         None,
@@ -16430,6 +16479,16 @@ fn execute_invokevirtual_vtable_fast(
         return Ok(CachedCallResult::CacheMiss);
     }
 
+    if std::env::var_os("CRATONVM_DBG_EQDISP").is_some()
+        && (&*method_name == "equals" || &*method_name == "hashCode")
+    {
+        let rcv_name = shared.class_manager.read()
+            .get_class(receiver_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+        if rcv_name.contains("UUID") || rcv_name.contains("BigInteger") {
+            eprintln!("[EQDISP vtable_fast ENTER] receiver={} method={}", rcv_name, &*method_name);
+        }
+    }
+
     // Interpreter intrinsic shadowing guard.
     //
     // This vtable fast path runs BEFORE `execute_invokevirtual_cached` (it is
@@ -16610,6 +16669,17 @@ fn execute_invokevirtual_vtable_fast(
         (cached, entry.is_native)
     };
     let _ = entry_is_native; // silence unused
+
+    if std::env::var_os("CRATONVM_DBG_EQDISP").is_some()
+        && (&*method_name == "equals" || &*method_name == "hashCode")
+    {
+        let rcv_name = shared.class_manager.read()
+            .get_class(receiver_class_id).map(|c| c.name.to_string()).unwrap_or_default();
+        if rcv_name.contains("UUID") || rcv_name.contains("BigInteger") {
+            eprintln!("[EQDISP vtable_fast] receiver={} method={} -> dispatch body class={}",
+                rcv_name, &*method_name, &*entry_cached.class_name);
+        }
+    }
 
     // Step 5 — dispatch. Pop args, push a new frame, and populate
     // invoke_cache for subsequent sibling-class misses.
@@ -16798,6 +16868,22 @@ fn execute_invokevirtual_cached(
         Some(t) => t.clone(),
         None => return Ok(CachedCallResult::CacheMiss),
     };
+    if std::env::var_os("CRATONVM_DBG_EQDISP").is_some() {
+        let caller = thread.frames[frame_idx].class_name().to_string();
+        let mn = thread.frames[frame_idx].method_name().to_string();
+        if caller.contains("ArrayList") && (mn.contains("indexOf") || mn.contains("contains")) {
+            let kind = match &target {
+                CachedInvokeTarget::VirtualBytecode { receiver_class_id, cached, .. } =>
+                    format!("VirtualBytecode rc={} body={}.{}", receiver_class_id.as_u32(), cached.class_name, cached.method_name),
+                CachedInvokeTarget::VirtualNative { receiver_class_id, .. } => format!("VirtualNative rc={}", receiver_class_id.as_u32()),
+                CachedInvokeTarget::Intrinsic { .. } => "Intrinsic".to_string(),
+                CachedInvokeTarget::Native { .. } => "Native".to_string(),
+                CachedInvokeTarget::Bytecode { cached, .. } => format!("Bytecode {}.{}", cached.class_name, cached.method_name),
+                _ => "other".to_string(),
+            };
+            eprintln!("[EQDISP cached] caller={}.{} cp={} target={}", caller, mn, cp_index, kind);
+        }
+    }
     // [PB-DIAG] one-shot dump for InfoCmp.getInfoCmp at pc 38
     if std::env::var_os("CRATONVM_DBG_PBSTART").is_some() {
         let cn = thread.frames[frame_idx].class_name();

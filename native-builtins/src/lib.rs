@@ -2142,7 +2142,7 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
             // property snapshot so enumeration sees the live values.
             let props = crate::alloc_concurrent_synthetic(ctx, "java/util/Properties", 16);
             for (k, v) in ctx.list_system_properties() {
-                crate::properties_sidetable::store_property_in_sidetable(props, &k, &v);
+                crate::properties_sidetable::store_property_in_sidetable(ctx, props, &k, &v);
             }
             Ok(Some(Value::Object(Some(props))))
         },
@@ -10322,7 +10322,8 @@ fn native_surefire_properties_wrapper_get_property_1(
             }
             Ok(_) | Err(_) => {}
         }
-        if let Some(v) = crate::properties_sidetable::get_property_from_sidetable(props_map, &property_key_from_java_string(ctx, key_obj)) {
+        let pk_st = property_key_from_java_string(ctx, key_obj);
+        if let Some(v) = crate::properties_sidetable::get_property_from_sidetable(ctx, props_map, &pk_st) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
         }
     }
@@ -10371,7 +10372,8 @@ fn native_surefire_properties_wrapper_get_property_2(
                 return Ok(Some(Value::Object(Some(v))));
             }
         }
-        if let Some(v) = crate::properties_sidetable::get_property_from_sidetable(props_map, &property_key_from_java_string(ctx, key_obj)) {
+        let pk_st = property_key_from_java_string(ctx, key_obj);
+        if let Some(v) = crate::properties_sidetable::get_property_from_sidetable(ctx, props_map, &pk_st) {
             return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
         }
     }
@@ -10465,7 +10467,7 @@ fn native_surefire_properties_wrapper_set_as_system_properties(
     // the contract by walking our wrapper-side side-table and seeding
     // each entry into the VM's system property store.
     if let Some(Value::Object(Some(this))) = args.first() {
-        let entries = crate::properties_sidetable::snapshot_sidetable(*this);
+        let entries = crate::properties_sidetable::snapshot_sidetable(ctx, *this);
         for (k, v) in entries {
             let _ = ctx.set_system_property(&k, &v);
         }
@@ -10530,7 +10532,7 @@ fn native_surefire_system_property_manager_load_properties(
         Value::Object(Some(placeholder)),
     );
     for (k, v) in &parsed {
-        crate::properties_sidetable::store_property_in_sidetable(wrapper, k, v);
+        crate::properties_sidetable::store_property_in_sidetable(ctx, wrapper, k, v);
         // `PropertiesWrapper.getProperty` is compiled as `this.properties.get(key)`.
         // If dispatch hits the real `HashMap` instead of our sidetable-backed
         // overrides, the map must still contain every booter entry — otherwise
@@ -12363,16 +12365,8 @@ fn register_uuid_natives(registry: &mut NativeMethodRegistry) {
     registry.register(c, "toString", "()Ljava/lang/String;", native_uuid_to_string);
     registry.register(c, "getMostSignificantBits", "()J", native_uuid_get_msb);
     registry.register(c, "getLeastSignificantBits", "()J", native_uuid_get_lsb);
-    // NOTE: `equals`/`hashCode` are deliberately NOT shadowed. A Rust-native
-    // `equals` override on a non-String class is mis-dispatched when invoked via
-    // `invokevirtual Object.equals` from inside JDK bytecode such as
-    // `ArrayList.indexOfRange` (it falls back to identity), so
-    // `List<UUID>.contains/indexOf` returned -1 even for value-equal UUIDs —
-    // which broke ANTLR's `ATNDeserializer` (`SUPPORTED_UUIDS.contains(uuid)`)
-    // and hence Groovy's `GroovyLexer` (SB-13). The real `java.util.UUID`
-    // bytecode for `equals`/`hashCode` reads the same `mostSigBits`/`leastSigBits`
-    // slots this layer writes, so letting it run is both correct and collection-safe
-    // (cf. `Long.equals`, also java.base bytecode, which works through `indexOf`).
+    registry.register(c, "equals", "(Ljava/lang/Object;)Z", native_uuid_equals);
+    registry.register(c, "hashCode", "()I", native_uuid_hash_code);
     registry.register(c, "version", "()I", native_uuid_version);
     registry.set_category(__prev_cat);
 }
@@ -12516,6 +12510,32 @@ fn native_uuid_get_lsb(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
         _ => return Ok(Some(Value::Long(0))),
     };
     Ok(Some(Value::Long(uuid_get_lsb(ctx, this))))
+}
+
+fn native_uuid_equals(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let other = match args.get(1) {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let eq = uuid_get_msb(ctx, this) == uuid_get_msb(ctx, other)
+        && uuid_get_lsb(ctx, this) == uuid_get_lsb(ctx, other);
+    Ok(Some(Value::Int(if eq { 1 } else { 0 })))
+}
+
+fn native_uuid_hash_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return Ok(Some(Value::Int(0))),
+    };
+    let msb = uuid_get_msb(ctx, this);
+    let lsb = uuid_get_lsb(ctx, this);
+    let hilo = msb ^ lsb;
+    let hash = ((hilo >> 32) ^ hilo) as i32;
+    Ok(Some(Value::Int(hash)))
 }
 
 fn native_uuid_version(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
