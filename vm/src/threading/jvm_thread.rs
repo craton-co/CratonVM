@@ -271,6 +271,17 @@ pub struct JvmThread {
     /// Updated at safepoints and before blocking operations.
     pub root_snapshot: Arc<parking_lot::Mutex<Vec<ObjectRef>>>,
 
+    /// Opt-in root-snapshot cache (`CRATONVM_ROOTSNAP_CACHE`): per *frozen*
+    /// frame, `(frame.seq, that frame's scanned GC roots)`, indexed parallel to
+    /// `frames[0..rs_cache.len()]`. Lets `update_root_snapshot` reuse the deep,
+    /// continuously-frozen frames and re-scan only the churning top. Valid only
+    /// while `rs_cache_gen == heap.collection_count()` (a GC may have moved/
+    /// promoted objects, invalidating the cached addresses). Empty/unused when
+    /// the gate is off.
+    pub rs_cache: Vec<(u64, Vec<ObjectRef>)>,
+    /// GC collection count at which `rs_cache` was built (move/promote generation).
+    pub rs_cache_gen: u64,
+
     /// Blocked-region GC state: shared with ThreadRegistry so a GC initiator
     /// can maintain this thread's roots while it is parked in a blocking
     /// native (`Object.wait` / `Thread.join` / `LockSupport.park` /
@@ -442,6 +453,8 @@ impl JvmThread {
             java_thread_obj: None,
             park_state: Arc::new(ParkState::new()),
             root_snapshot: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            rs_cache: Vec::new(),
+            rs_cache_gen: 0,
             gc_block_state: Arc::new(GcBlockState::new()),
             native_pin_roots: Vec::new(),
             native_pending_return: None,

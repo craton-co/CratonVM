@@ -111,6 +111,13 @@ pub fn intrinsics_disabled() -> bool {
     })
 }
 
+// Opt-in: cache the per-native-call GC root snapshot's *frozen* lower frames
+// and re-scan only the churning top, keyed by per-frame `seq` + GC generation.
+// Default-OFF — it touches the GC root-publication path; correctness rests on
+// the LIFO stack discipline (a frame still present at index k with unchanged
+// seq proves [0..k) stayed continuously frozen). See `update_root_snapshot`.
+cached_is_set!(rootsnap_cache, "CRATONVM_ROOTSNAP_CACHE");
+
 cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
 // Opt-in: enable small-method inlining in the main JIT tier-up compile path.
 // Default-OFF until a `try_emit_inline_body` miscompile (Spring boot enum CCE)
