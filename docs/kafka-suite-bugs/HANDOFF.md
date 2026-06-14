@@ -42,7 +42,7 @@ hangs, and wrong results.
 | [10](bug-10-metadatasnapshot-noclassdeffound-clinit.md) | `NoClassDefFoundError: MetadataSnapshot` (masked `<clinit>` failure) | High | **FIXED** (harness cp skew → kafka-clients 3.7.2; not a VM bug) |
 | [11](bug-11-metrics-metricvalue-npe.md) | metrics `metricValue on null` (metric lookup returns null) | High | **FIXED** (`TimeUnit.toMillis` overflow → saturate) |
 | [14](bug-14-parameterized-empty-stream-underrun.md) | `@ParameterizedTest` empty arg stream → test under-run (22 vs 129) — `ArrayList.removeAll` over-removal on a full backing array | High | **FIXED** (`8bb77a77`, two-pass removeAll/retainAll) |
-| [19](bug-19-bufferpool-blocking-hang.md) | `BufferPoolTest` hang (Condition.await lost wakeup) | High | open |
+| [19](bug-19-bufferpool-blocking-hang.md) | `BufferPoolTest` hang — `new Thread(runnable)` no-ops | High | **RESOLVED (env)** — boot JDK was 17 (`JAVA_HOME`); `Thread$FieldHolder` is JDK 19+, so `holder.task` unset → Runnable-target threads never run → every wait/notify/park/Condition handoff hangs. Fix: boot JDK ≥19 (`--java-home <JDK25>`). No VM code change. Same cause as bug-23 `AbstractCoordinatorTest`. |
 | [20](bug-20-silent-abnormal-exit-rc127-rc1.md) | silent rc=127/rc=1 abnormal VM exit (no diagnostic) | High | open |
 | [12](bug-12-nodeapiversions-apikey-npe.md) | `apiKey on null` (enum `values()` / generated-enum null hole) | Medium | **FIXED** (`ImplicitLinkedHashCollection.toArray()` null holes) |
 | [13](bug-13-timeoutextension-double-proceed.md) | `TimeoutExtension` double-`proceed` JUnitException (post-bug-07) | Medium | **FIXED** (by bug-08; FenceProducersHandlerTest 4/4) |
