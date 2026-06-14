@@ -3858,9 +3858,17 @@ fn native_map_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // bootstrap the concrete nested class can be unresolved and degrade to
     // cid=0 (`java/lang/Object`), breaking downstream checkcasts.
     for (key, value) in &entries {
-        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
+        // 3-field Map$Entry: key@0, value@1, sourceMap@2. The source-map
+        // reference makes `Entry.setValue(v)` write back to the originating map
+        // (`native_entry_set_value`), matching the JDK live-entry contract
+        // (e.g. keycloak's StripSecretsUtils masks config values via
+        // `entrySet().iterator() ... entry.setValue(maskedList)`). It is a
+        // GC-scanned object field, so it survives relocation (a Rust side-table
+        // holding the ObjectRef would go stale).
+        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 3);
         ctx.set_field(entry_obj, 0, *key);
         ctx.set_field(entry_obj, 1, *value);
+        ctx.set_field(entry_obj, 2, Value::Object(Some(this)));
 
         // Add to the set's backing map
         let hash = ctx.identity_hash_code(entry_obj);
@@ -4356,9 +4364,15 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
     if kind == VIEW_KIND_ENTRYSET {
         let entries = collect_entries_any(ctx, source);
         for (k, v) in entries {
-            let entry = alloc_synthetic(ctx, "java/util/Map$Entry", 2);
+            // 3-field entry (key@0, value@1, sourceMap@2) so `Entry.setValue`
+            // writes through to the live source map. This `resync` path runs on
+            // every entrySet `iterator()`/`size()` read, so without the source
+            // field here the iterator hands back detached 2-field entries and
+            // `setValue` is silently a no-op (cf. native_map_entry_set).
+            let entry = alloc_synthetic(ctx, "java/util/Map$Entry", 3);
             ctx.set_field(entry, 0, k);
             ctx.set_field(entry, 1, v);
+            ctx.set_field(entry, 2, Value::Object(Some(source)));
             let _ = native_map_put(ctx, &[Value::Object(Some(backing)), Value::Object(Some(entry)), sentinel]);
         }
     } else {
@@ -4410,9 +4424,15 @@ fn collect_view_snapshot_ordered(ctx: &mut dyn NativeContext, backing: ObjectRef
             return collect_entries_any(ctx, source)
                 .into_iter()
                 .map(|(k, v)| {
-                    let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 2);
+                    // 3-field entry (key@0, value@1, sourceMap@2): this is the
+                    // path `entrySet().iterator()` actually returns entries from
+                    // (via native_hs_iterator). The source-map field lets
+                    // `Entry.setValue` write through to the live map instead of
+                    // mutating a detached copy (keycloak StripSecretsUtils etc.).
+                    let entry = alloc_synthetic(ctx, "java/util/AbstractMap$SimpleEntry", 3);
                     ctx.set_field(entry, 0, k);
                     ctx.set_field(entry, 1, v);
+                    ctx.set_field(entry, 2, Value::Object(Some(source)));
                     Value::Object(Some(entry))
                 })
                 .collect();
@@ -7032,6 +7052,22 @@ fn native_entry_set_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     let new_val = args.get(1).copied().unwrap_or(Value::Object(None));
     let old_val = ctx.get_field(this, 1);
     ctx.set_field(this, 1, new_val);
+    // Live-entry write-through: a `Map$Entry` minted by `native_map_entry_set`
+    // carries its source map at slot 2 (3-field layout). `Map.Entry.setValue`
+    // must mutate the backing map, not just the detached entry copy — otherwise
+    // `entrySet().iterator()...setValue(v)` is silently a no-op (keycloak
+    // StripSecretsUtils masking, and any read-modify-write over a map). 2-field
+    // entries from other paths (TreeMap, SimpleEntry, ...) have no slot 2 and
+    // keep the detached-update behaviour.
+    if ctx.object_num_fields(this) >= 3 {
+        if let Value::Object(Some(src_map)) = ctx.get_field(this, 2) {
+            let key = ctx.get_field(this, 0);
+            native_map_put(
+                ctx,
+                &[Value::Object(Some(src_map)), key, new_val],
+            )?;
+        }
+    }
     Ok(Some(old_val))
 }
 
