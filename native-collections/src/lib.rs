@@ -750,6 +750,42 @@ fn group_key_equal(ctx: &mut dyn NativeContext, a: &Value, b: &Value) -> bool {
     values_equal(&*ctx, a, b)
 }
 
+/// `List.contains`/`indexOf` element comparison with full JDK semantics.
+///
+/// `values_equal` only recognises identity, `String`, enum constants, and
+/// (1-field) wrapper/primitive values — for any *other* two distinct object
+/// instances it returns `false`. That silently breaks `List.contains` /
+/// `indexOf` for value classes whose equality is defined by a real `equals`
+/// override but whose object layout `values_equal` can't introspect: `UUID`,
+/// `BigInteger`, `BigDecimal`, `File`, `URI`, records, and arbitrary user
+/// classes. (ANTLR's `ATNDeserializer` does `SUPPORTED_UUIDS.contains(uuid)`
+/// over a `List<UUID>`; the structural-only check returned -1 even for a
+/// value-equal UUID, breaking Groovy's `GroovyLexer` — SB-13 blocker #4.)
+///
+/// Mirrors [`group_key_equal`] (which already does this for map keys): take the
+/// cheap structural check first, then fall back to the search target's real
+/// Java `equals`. JDK `List.indexOf` semantics call `o.equals(es[i])` — i.e.
+/// `target.equals(elem)` — so the real-equals receiver is the search `target`.
+fn list_element_matches(ctx: &mut dyn NativeContext, elem: &Value, target: &Value) -> bool {
+    // Cheap structural path: identity, unboxed primitives, String, enum, null.
+    if values_equal(&*ctx, elem, target) {
+        return true;
+    }
+    // Distinct objects whose value-equality the structural check can't see:
+    // defer to the target's real `equals(elem)`.
+    if let (Value::Object(Some(t)), Value::Object(Some(e))) = (target, elem) {
+        if let Ok(Some(Value::Int(v))) = ctx.invoke_virtual(
+            *t,
+            "equals",
+            "(Ljava/lang/Object;)Z",
+            &[Value::Object(Some(*e))],
+        ) {
+            return v != 0;
+        }
+    }
+    false
+}
+
 // ===========================================================================
 // ArrayList — synthetic-jdk layout: field 0 = Object[] elementData, field 1 = Int size
 // Real-JDK layout: AbstractList.modCount(I) at slot 0, ArrayList.elementData at slot 1,
@@ -1246,7 +1282,7 @@ pub fn native_al_remove_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let size = size as usize;
     for i in 0..size {
         let elem = ctx.get_array_element(data, i);
-        if values_equal(ctx, &elem, &target) {
+        if list_element_matches(ctx, &elem, &target) {
             // Close the gap: shift the tail [i+1..size) left by one into
             // [i..size-1). Use the bulk intrinsic (memmove-style overlap is
             // handled by the VM) with a per-element fallback, mirroring
@@ -1302,7 +1338,7 @@ pub fn native_al_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     for i in 0..(size as usize) {
         let elem = ctx.get_array_element(data, i);
-        if values_equal(ctx, &elem, &target) {
+        if list_element_matches(ctx, &elem, &target) {
             return Ok(Some(Value::Int(1)));
         }
     }
@@ -1322,7 +1358,7 @@ pub fn native_al_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Method
     };
     for i in 0..(size as usize) {
         let elem = ctx.get_array_element(data, i);
-        if values_equal(ctx, &elem, &target) {
+        if list_element_matches(ctx, &elem, &target) {
             return Ok(Some(Value::Int(i as i32)));
         }
     }
@@ -1343,7 +1379,7 @@ fn native_al_last_index_of(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let size = size as usize;
     for i in (0..size).rev() {
         let elem = ctx.get_array_element(data, i);
-        if values_equal(ctx, &elem, &target) {
+        if list_element_matches(ctx, &elem, &target) {
             return Ok(Some(Value::Int(i as i32)));
         }
     }
@@ -3681,7 +3717,7 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     if properties_backing_chm(ctx, this).is_some() {
         let values = map_collect_values(ctx, this);
         for val in &values {
-            if values_equal(ctx, val, &target) {
+            if list_element_matches(ctx, val, &target) {
                 return Ok(Some(Value::Int(1)));
             }
         }
@@ -3703,7 +3739,7 @@ fn native_map_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
                     break;
                 }
                 let value = get_node_value(ctx, node);
-                if values_equal(ctx, &value, &target) {
+                if list_element_matches(ctx, &value, &target) {
                     return Ok(Some(Value::Int(1)));
                 }
                 node_val = ctx.get_field(node, NODE_FIELD_NEXT);
@@ -4437,7 +4473,7 @@ fn remove_source_entry_by_value(
 ) -> Result<(), MethodCallFailed> {
     let entries = collect_entries_any(ctx, source);
     for (k, v) in entries {
-        if values_equal(ctx, &v, &value) {
+        if list_element_matches(ctx, &v, &value) {
             source_map_remove(ctx, source, k)?;
             break;
         }
@@ -13357,7 +13393,7 @@ fn native_ll_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     };
     while let Some(cur) = cur_opt {
         let elem = ctx.get_field(cur, LL_NODE_ELEM);
-        if values_equal(ctx, &elem, &target) {
+        if list_element_matches(ctx, &elem, &target) {
             return Ok(Some(Value::Int(1)));
         }
         cur_opt = match ctx.get_field(cur, LL_NODE_NEXT) {
@@ -14478,7 +14514,7 @@ fn native_lhm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        if values_equal(ctx, &val, &target) {
+        if list_element_matches(ctx, &val, &target) {
             return Ok(Some(Value::Int(1)));
         }
         cur = ctx.get_field(node, LHM_NODE_AFTER);
@@ -15011,7 +15047,7 @@ fn native_ad_remove_first_occurrence(
     for k in 0..size as usize {
         let idx = ((head + k as i32) % cap) as usize;
         let elem = ctx.get_array_element(buf, idx);
-        if values_equal(ctx, &elem, &target) {
+        if list_element_matches(ctx, &elem, &target) {
             ad_remove_at_logical(ctx, this, buf, head, size, cap, k);
             return Ok(Some(Value::Int(1)));
         }
@@ -15043,7 +15079,7 @@ fn native_ad_remove_last_occurrence(
     for k in (0..size as usize).rev() {
         let idx = ((head + k as i32) % cap) as usize;
         let elem = ctx.get_array_element(buf, idx);
-        if values_equal(ctx, &elem, &target) {
+        if list_element_matches(ctx, &elem, &target) {
             ad_remove_at_logical(ctx, this, buf, head, size, cap, k);
             return Ok(Some(Value::Int(1)));
         }
@@ -15157,7 +15193,7 @@ fn native_ad_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         for i in 0..(size as usize) {
             let idx = (head as usize + i) % cap;
             let elem = ctx.get_array_element(buf, idx);
-            if values_equal(ctx, &elem, &target) {
+            if list_element_matches(ctx, &elem, &target) {
                 return Ok(Some(Value::Int(1)));
             }
         }
@@ -15585,7 +15621,7 @@ fn native_pq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
     let mut found_idx = None;
     for i in 0..(size as usize) {
         let elem = ctx.get_array_element(buf, i);
-        if values_equal(ctx, &elem, &target) {
+        if list_element_matches(ctx, &elem, &target) {
             found_idx = Some(i);
             break;
         }
@@ -15617,7 +15653,7 @@ fn native_pq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
     if let Some(buf) = data {
         for i in 0..(size as usize) {
             let elem = ctx.get_array_element(buf, i);
-            if values_equal(ctx, &elem, &target) {
+            if list_element_matches(ctx, &elem, &target) {
                 return Ok(Some(Value::Int(1)));
             }
         }
@@ -15957,7 +15993,7 @@ fn native_stack_search(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     if let Some(buf) = data {
         for i in (0..(size as usize)).rev() {
             let elem = ctx.get_array_element(buf, i);
-            if values_equal(ctx, &elem, &target) {
+            if list_element_matches(ctx, &elem, &target) {
                 return Ok(Some(Value::Int((size as usize - i) as i32)));
             }
         }
@@ -16375,7 +16411,15 @@ fn native_al_remove_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let mut modified = false;
     for read_idx in 0..(size as usize) {
         let elem = ctx.get_array_element(buf, read_idx);
-        if coll_elems.iter().any(|ce| values_equal(ctx, &elem, ce)) {
+        // `c.contains(elem)` — real element equality (see `list_element_matches`).
+        let mut in_coll = false;
+        for ce in &coll_elems {
+            if list_element_matches(ctx, ce, &elem) {
+                in_coll = true;
+                break;
+            }
+        }
+        if in_coll {
             modified = true;
         } else {
             kept.push(elem);
@@ -16411,7 +16455,15 @@ fn native_al_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     let mut modified = false;
     for read_idx in 0..(size as usize) {
         let elem = ctx.get_array_element(buf, read_idx);
-        if coll_elems.iter().any(|ce| values_equal(ctx, &elem, ce)) {
+        // `c.contains(elem)` — real element equality (see `list_element_matches`).
+        let mut in_coll = false;
+        for ce in &coll_elems {
+            if list_element_matches(ctx, ce, &elem) {
+                in_coll = true;
+                break;
+            }
+        }
+        if in_coll {
             kept.push(elem);
         } else {
             modified = true;
@@ -16483,7 +16535,14 @@ fn native_hs_retain_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     };
     let mut modified = false;
     for e in &current {
-        let should_keep = coll_elems.iter().any(|ce| values_equal(ctx, e, ce));
+        // `coll.contains(e)` — real element equality (see `list_element_matches`).
+        let mut should_keep = false;
+        for ce in &coll_elems {
+            if list_element_matches(ctx, ce, e) {
+                should_keep = true;
+                break;
+            }
+        }
         if !should_keep {
             native_hs_remove(ctx, &[Value::Object(Some(this)), *e])?;
             modified = true;
@@ -17887,7 +17946,7 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     if tm_is_fast_mode(ctx, this) {
         let values: Vec<Value> = tm_fast_with(ctx, this, |bt| bt.values().copied().collect());
         for v in values {
-            if values_equal(ctx, &v, &target) {
+            if list_element_matches(ctx, &v, &target) {
                 return Ok(Some(Value::Int(1)));
             }
         }
@@ -17900,7 +17959,7 @@ fn native_tm_contains_value(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     for i in 0..(size as usize) {
         let v = ctx.get_array_element(data, i * 2 + 1);
-        if values_equal(ctx, &v, &target) {
+        if list_element_matches(ctx, &v, &target) {
             return Ok(Some(Value::Int(1)));
         }
     }
@@ -22960,7 +23019,7 @@ fn native_collections_frequency(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     let mut count = 0i32;
     for i in 0..size as usize {
         let elem = ctx.get_array_element(data, i);
-        if values_equal(ctx, &elem, &target) {
+        if list_element_matches(ctx, &elem, &target) {
             count += 1;
         }
     }
@@ -23890,7 +23949,7 @@ fn native_lbq_contains(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
     let head = lbq_head(ctx, this);
     for i in 0..size as usize {
         let elem = ctx.get_array_element(arr, head + i);
-        if values_equal(ctx, &elem, &target) {
+        if list_element_matches(ctx, &elem, &target) {
             ctx.monitor_exit(this);
             return Ok(Some(Value::Int(1)));
         }
@@ -23920,7 +23979,7 @@ fn native_lbq_remove(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let head = lbq_head(ctx, this);
     for i in 0..size as usize {
         let elem = ctx.get_array_element(arr, head + i);
-        if values_equal(ctx, &elem, &target) {
+        if list_element_matches(ctx, &elem, &target) {
             // Shift the tail of the window left by one over the removed slot.
             for j in i..(size - 1) as usize {
                 ctx.set_array_element(
