@@ -8568,6 +8568,22 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     registry.register(car, "close", "()V", native_noop_void);
     }
 
+    // CharArrayWriter: the synthetic 2-field carrier (buf=0, count=1) shadowed
+    // only SOME methods (`<init>()V`, `write(I)V`, `write([CII)V`, …) — the
+    // unshadowed ones (`write(String)`, `append`, `writeTo`, …) ran real JDK
+    // bytecode against a REAL `CharArrayWriter` whose field layout is
+    // `Writer.lock` + `buf` + `count` (NOT the synthetic slots 0/1). Result:
+    // the synthetic `<init>` never set the inherited `lock`, so `write(String)`
+    // NPE'd on `synchronized (lock)` (monitorenter on null), and the slot-based
+    // bulk write corrupted/no-op'd. This broke Jasper's `JspReader`
+    // (`CharArrayWriter.write(buf,0,n)` → `toCharArray()` returned empty) →
+    // every JSP compiled to an EMPTY servlet (HTTP 200, 0-byte body) →
+    // `TestPageContext` "contains on null". The real `CharArrayWriter` bytecode
+    // is simple and self-contained (its ctor chains through `Writer()` which
+    // sets `lock = this`), so run it. Keep the synthetic carrier only under
+    // `synthetic-jdk` (mirrors the LineNumberReader migration below).
+    #[cfg(feature = "synthetic-jdk")]
+    {
     // CharArrayWriter = 2-field synthetic (buf=0, count=1)
     let caw = "java/io/CharArrayWriter";
     registry.register(caw, "<init>", "()V", native_caw_init);
@@ -8584,6 +8600,7 @@ fn register_io_extras_natives(registry: &mut NativeMethodRegistry) {
     registry.register(caw, "reset", "()V", native_caw_reset);
     registry.register(caw, "flush", "()V", native_noop_void);
     registry.register(caw, "close", "()V", native_noop_void);
+    } // end #[cfg(feature = "synthetic-jdk")] synthetic CharArrayWriter natives
 
     // RDR-MIGRATION 2026-06-01: LineNumberReader extends BufferedReader; its
     // synthetic readLine/<init> natives (4-field in/lineNumber/pos/content)
