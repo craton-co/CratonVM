@@ -107,6 +107,97 @@ fn registry() -> &'static Mutex<ConnRegistry> {
 }
 
 // ---------------------------------------------------------------------------
+// Real-JDK HttpURLConnection support
+// ---------------------------------------------------------------------------
+//
+// When `URL.openConnection()` runs GENUINE JDK bytecode (a real `http(s)://`
+// URL whose stream handler is wired — e.g. `URI.create(...).toURL()` in
+// `TomcatBaseTest.getUrl`), it returns a real
+// `sun.net.www.protocol.http.HttpURLConnection`, NOT our synthetic carrier.
+// That object's instance layout is the JDK's (field 0 = `URLConnection.url`, a
+// `java/net/URL`) and does NOT match our `HUC_*` slots — so the synthetic
+// `getResponseCode`/`getInputStream` natives below misread it (`HUC_CONNECTED`
+// lands on an unrelated real field that reads 1 → `ensure_connected`
+// early-returns making NO request → `-1`; confirmed by tracing, see
+// docs/tomcat-suite-bugs/10-pagecontext-npe-contains-null-FAIL.md). Detect that
+// case via the URL object at field 0, perform the request from the *real* URL,
+// and cache the result keyed by the connection object's identity hash so a
+// follow-up `getInputStream` returns the same body. The synthetic resource-URL
+// path (`file:`/`jar:`/`classpath:` → `URL.openStream`) is left untouched.
+
+struct RealResult {
+    status: i32,
+    body: Vec<u8>,
+}
+
+fn real_results() -> &'static Mutex<HashMap<i32, RealResult>> {
+    static R: OnceLock<Mutex<HashMap<i32, RealResult>>> = OnceLock::new();
+    R.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// If `this` is a real-JDK URLConnection (field 0 is a `java/net/URL` object,
+/// not our synthetic int conn-id), return its full external-form URL string via
+/// `URL.toExternalForm()` (robust for both synthetic and real URL layouts).
+fn huc_real_object_url(ctx: &mut dyn NativeContext, this: ObjectRef) -> Option<String> {
+    let url_obj = match ctx.get_field(this, HUC_CONN_ID) {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    match ctx.invoke_virtual(url_obj, "toExternalForm", "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s),
+        _ => None,
+    }
+}
+
+/// Perform (idempotently) the request for a real-JDK http(s) connection and
+/// cache `(status, body)` by object identity. Returns the HTTP status (-1 on
+/// parse/IO failure). Wrapped in a GC-safe blocking region so the blocking I/O
+/// does not stall an in-process CratonVM server's worker threads.
+///
+/// Method is assumed GET (the only verb `TomcatBaseTest.getUrl` uses, and the
+/// dominant one for `getResponseCode`/`getInputStream`); the real `method`
+/// field is not at a known synthetic slot.
+fn huc_real_perform(ctx: &mut dyn NativeContext, this: ObjectRef, url_str: &str) -> i32 {
+    let key = ctx.identity_hash_code(this);
+    if let Some(st) = real_results().lock().ok().and_then(|t| t.get(&key).map(|r| r.status)) {
+        return st;
+    }
+    let parsed = match parse_url(url_str) {
+        Ok(p) => p,
+        Err(_) => return -1,
+    };
+    ctx.begin_blocking_region();
+    let resp = perform(
+        &parsed,
+        "GET",
+        &[],
+        &[],
+        Duration::from_secs(30),
+        Duration::from_secs(60),
+    );
+    ctx.end_blocking_region();
+    match resp {
+        Ok((status, _headers, body)) => {
+            if let Ok(mut t) = real_results().lock() {
+                t.insert(key, RealResult { status, body });
+            }
+            status
+        }
+        Err(_) => -1,
+    }
+}
+
+/// Cached response body for a real-JDK connection (empty if not performed).
+fn huc_real_body(ctx: &dyn NativeContext, this: ObjectRef) -> Vec<u8> {
+    let key = ctx.identity_hash_code(this);
+    real_results()
+        .lock()
+        .ok()
+        .and_then(|t| t.get(&key).map(|r| r.body.clone()))
+        .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
 // rustls config — system trust store, no ALPN (legacy HTTP/1.1 only)
 // ---------------------------------------------------------------------------
 
@@ -163,6 +254,18 @@ fn new_byte_array(ctx: &mut dyn NativeContext, bytes: &[u8]) -> ObjectRef {
         ctx.set_array_element(arr, i, Value::Int(*b as i32));
     }
     arr
+}
+
+/// Build a `java/io/ByteArrayInputStream` over `body` (4-field synthetic:
+/// buf=0, pos=1, mark=2, count=3).
+fn make_byte_array_input_stream(ctx: &mut dyn NativeContext, body: &[u8]) -> Value {
+    let body_arr = new_byte_array(ctx, body);
+    let stream = alloc_concurrent_synthetic(ctx, "java/io/ByteArrayInputStream", 4);
+    ctx.set_field(stream, 0, Value::Object(Some(body_arr)));
+    ctx.set_field(stream, 1, Value::Int(0));
+    ctx.set_field(stream, 2, Value::Int(0));
+    ctx.set_field(stream, 3, Value::Int(body.len() as i32));
+    Value::Object(Some(stream))
 }
 
 #[derive(Debug, Clone)]
@@ -585,6 +688,13 @@ fn huc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult 
 
 fn huc_get_response_code(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
+    // Real-JDK sun.net.www HttpURLConnection (field 0 is the real URL object):
+    // perform from the real URL rather than misreading our synthetic HUC_* slots.
+    if let Some(url_str) = huc_real_object_url(ctx, this) {
+        if url_str.starts_with("http://") || url_str.starts_with("https://") {
+            return Ok(Some(Value::Int(huc_real_perform(ctx, this, &url_str))));
+        }
+    }
     ensure_connected(ctx, this)?;
     let code = with_state(ctx, this, |s| s.status).unwrap_or(-1);
     Ok(Some(Value::Int(code)))
@@ -628,6 +738,15 @@ fn huc_get_input_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
     // ByteArrayInputStream — which surfaces as `SAXParseException: Premature
     // end of file` in Logback's Joran parser (Cassandra NodeTool boot).
     if let Value::Object(Some(maybe_url)) = ctx.get_field(this, HUC_CONN_ID) {
+        // Real-JDK http(s) connection (robust external form via toExternalForm):
+        // perform the request from the real URL and return its buffered body.
+        if let Some(full) = huc_real_object_url(ctx, this) {
+            if full.starts_with("http://") || full.starts_with("https://") {
+                huc_real_perform(ctx, this, &full);
+                let body = huc_real_body(ctx, this);
+                return Ok(Some(make_byte_array_input_stream(ctx, &body)));
+            }
+        }
         // Peek at the external form via the URL's full-URL string field
         // (field 5 in our URL synthetic), falling back to field 0.
         let url_str = match ctx.get_field(maybe_url, 5) {
