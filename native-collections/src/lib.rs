@@ -2024,14 +2024,23 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
         .resolve_field_index("java/util/HashMap", "size")
         .filter(|&slot| slot < ctx.object_num_fields(this))
         .map(|slot| ctx.get_field(this, slot));
+    // spring-bug-09: bound the slot-2 fallbacks below. `map_state` is invoked on
+    // any Map-typed receiver, including non-synthetic JDK maps with fewer than 3
+    // slots (e.g. `java/util/Collections$EmptyMap`, which has only AbstractMap's
+    // 2 reference slots). Reading absolute slot 2 (`MAP_FIELD_CAPACITY`) on such a
+    // receiver is out of bounds: the GC guard drops the read in-process, but it
+    // fires on a hot path (SpEL `ReflectiveIndexAccessor` map indexing) and the
+    // batch JVM eventually SIGSEGVs. Probe slot 2 only when the receiver has it.
+    let nf = ctx.object_num_fields(this);
     let size = match size_by_name {
         Some(Value::Int(s)) => s,
         _ => match ctx.get_field(this, MAP_FIELD_SIZE) {
             Value::Int(s) => s,                            // legacy: slot 1 is Int
-            _ => match ctx.get_field(this, 2) {            // ancient fallback
+            _ if nf > 2 => match ctx.get_field(this, 2) {  // ancient fallback
                 Value::Int(s) => s,
                 _ => 0,
             },
+            _ => 0,
         },
     };
     // S111r26: Use bucket array length as the true capacity.  When
@@ -2043,11 +2052,14 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
     let cap = if let Some(b) = buckets {
         let arr_len = ctx.array_length(b) as i32;
         if arr_len > 0 { arr_len } else { MAP_DEFAULT_CAPACITY as i32 }
-    } else {
+    } else if nf > MAP_FIELD_CAPACITY {
         match ctx.get_field(this, MAP_FIELD_CAPACITY) {
             Value::Int(c) if c > 0 => c,
             _ => MAP_DEFAULT_CAPACITY as i32,
         }
+    } else {
+        // spring-bug-09: receiver has no slot-2 capacity field (e.g. EmptyMap).
+        MAP_DEFAULT_CAPACITY as i32
     };
     (buckets, size, cap)
 }
@@ -10199,6 +10211,10 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "count", "()J", native_int_stream_count);
     r.register(c, "min", "()Ljava/util/OptionalInt;", native_int_stream_min);
     r.register(c, "max", "()Ljava/util/OptionalInt;", native_int_stream_max);
+    // spring-bug-03: synthetic IntStreams (range/rangeClosed/filter/mapToInt) lacked
+    // findFirst/findAny returning OptionalInt -> abstract-method (no Code) -> AbstractMethodError.
+    r.register(c, "findFirst", "()Ljava/util/OptionalInt;", native_int_stream_find_first);
+    r.register(c, "findAny", "()Ljava/util/OptionalInt;", native_int_stream_find_first);
     r.register(
         c,
         "forEach",
@@ -10396,6 +10412,33 @@ fn native_int_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         .max()
     {
         set_opt_prim_value(ctx, opt, Value::Int(max));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+/// spring-bug-03: `IntStream.findFirst()` / `findAny()` for CratonVM's *synthetic*
+/// IntStreams. Synthetic IntStreams (produced by the `range`/`rangeClosed`/`filter`/
+/// `mapToInt` intrinsics) are stamped with the abstract interface class
+/// `java/util/stream/IntStream`, which has no Code for `findFirst`, so the call
+/// threw `AbstractMethodError: …IntStream.findFirst()…has no Code attribute`.
+/// (Real `IntPipeline$Head` receivers from `IntStream.of`/`Arrays.stream` run their
+/// own bytecode and never reach this native — it is only consulted on the no-Code
+/// fallback path keyed on the receiver's `IntStream` class.) The synthetic stream
+/// is eager: its elements are already buffered, so return the first one — order is
+/// preserved by `int_stream_elements`, matching `findFirst`; `findAny` may return
+/// any element and the first is a valid choice.
+fn native_int_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = int_stream_elements(ctx, this);
+    let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
+    if let Some(&Value::Int(first)) = elements.first() {
+        set_opt_prim_value(ctx, opt, Value::Int(first));
     }
     Ok(Some(Value::Object(Some(opt))))
 }
@@ -11689,13 +11732,51 @@ pub fn comparator_compare(
     let tag = match tag {
         Some(t) => t,
         None => {
-            // Not a factory comparator — delegate to invoke_virtual (lambda path)
-            return ctx.invoke_virtual(
+            // Not a factory comparator — invoke its `compare` (lambda path).
+            //
+            // Fallback: if `compare` does not resolve, the object is actually a
+            // key-extractor `Function` that was stored RAW as a nested
+            // comparator — a `someComparator.thenComparing(EntityTableMapping::
+            // relativePosition)` whose dispatch landed on the `(Comparator)`
+            // overload (`native_comparator_then_comparing`, inner_tag=None)
+            // instead of `(Function)`. Treat it like `Comparator.comparing(keyFn)`
+            // (apply + natural compare), matching the JDK default method. A real
+            // Comparator lambda implements `compare` (not `apply`), so a genuine
+            // exception from its `compare` still propagates (apply would fail and
+            // we re-raise the original error). Without this, Hibernate's
+            // `ConstraintModelBuilder` (Stream.sorted over the entity-table
+            // comparator) threw `NoSuchMethodError: Function.compare`, which
+            // unwound through the JUnit MethodHandle interceptor chain and tripped
+            // "InvocationInterceptors called invocation multiple times".
+            return match ctx.invoke_virtual(
                 comparator,
                 "compare",
                 "(Ljava/lang/Object;Ljava/lang/Object;)I",
                 &[a, b],
-            );
+            ) {
+                Ok(v) => Ok(v),
+                Err(compare_err) => {
+                    match ctx.invoke_virtual(
+                        comparator,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[a],
+                    ) {
+                        Ok(Some(ka)) => {
+                            let kb = ctx
+                                .invoke_virtual(
+                                    comparator,
+                                    "apply",
+                                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                                    &[b],
+                                )?
+                                .unwrap_or(Value::Object(None));
+                            natural_compare(ctx, &ka, &kb)
+                        }
+                        _ => Err(compare_err),
+                    }
+                }
+            };
         }
     };
 

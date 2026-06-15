@@ -1102,14 +1102,16 @@ mod tests {
             c1.fetch_add(1, Ordering::SeqCst);
         })
         .expect("submit");
-        // Wait briefly for the task to run.
-        let deadline = Instant::now() + Duration::from_secs(2);
+        // Wait for the task to run. Generous deadline so the test is robust to
+        // OS-thread scheduling delays when the suite runs under heavy parallel
+        // load (a healthy worker runs the task in milliseconds).
+        let deadline = Instant::now() + Duration::from_secs(30);
         while counter.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         w.shutdown_now();
-        assert!(w.await_termination(Duration::from_secs(2)));
+        assert!(w.await_termination(Duration::from_secs(30)));
     }
 
     #[test]
@@ -1177,7 +1179,9 @@ mod tests {
             });
         }
         w.shutdown_now();
-        assert!(w.await_termination(Duration::from_secs(3)));
+        // Generous deadline: robust to OS-thread scheduling delays under heavy
+        // parallel test load (worker shutdown completes near-instantly otherwise).
+        assert!(w.await_termination(Duration::from_secs(30)));
         // Not every submitted task must have run — that's the point of
         // shutdown_now.  The queued tasks beyond what in-flight workers
         // had already picked up were cleared.

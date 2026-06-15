@@ -1,10 +1,78 @@
-# Bug 10 — TestPageContext "contains on null": a five-layer onion (HTTP serving → client → resource loading → ecj binder)
+# Bug 10 — TestPageContext "contains on null": a six-layer onion — ✅ FIXED (OK (1 test))
 
-**Status:** four layers root-caused and FIXED; the fifth (an ecj/JDT
-binding-phase miscompile on CratonVM) is the remaining blocker. The original
-`PageContext`/EL hypothesis was WRONG — `res.toString()` is null because the
-JSP never compiled, and that traced through HTTP serving, the HTTP client, JDK
-resource loading, and finally the Eclipse JDT compiler itself.
+**Status: FULLY FIXED — `TestPageContext.testBug49196` passes (`OK (1 test)`).**
+The original `PageContext`/EL hypothesis was WRONG. `res.toString()` was null
+because the JSP produced an empty body, which peeled back through six layers:
+HTTP serving → the in-process HTTP client → JDK resource loading → the Eclipse
+JDT compiler → a **fundamental VM bug in `Unsafe`/`Arrays.equals`** → and finally
+a **synthetic `java.io.CharArrayWriter` shadow** that swallowed every JSP body.
+
+| # | Layer | Root cause | Fix |
+|---|---|---|---|
+| 1 | NIO connector reset | `SocketChannel.setOption` AbstractMethodError (covariant desc) | `socket_channel.rs` (merged) |
+| 2 | in-process HTTP client | native HUC read a real `sun.net.www` obj w/ synthetic layout → code -1 | `48183599` (merged) |
+| 3 | boot-class resource load | `getResourceAsStream("java/lang/String.class")` null (jmod `classes/` prefix in `URL.openStream`) | `net_phase_e.rs` + jrt arm (merged) |
+| 5 | ecj generic compile | `Arrays.equals(char[]/long[])` compared only element 0 → `"Signature".equals("Synthetic")`=true → generic methods tagged `ACC_SYNTHETIC` & dropped | `1cddae8f` (Unsafe/vectorizedMismatch) |
+| 6 | empty JSP body | synthetic `CharArrayWriter` shadow: `write([CII)` no-op + `write(String)` NPE on null `lock` → `JspReader.toCharArray()` empty → empty servlet | `b628d8d7` (run real bytecode) |
+
+**The "group 04 NioEndpoint serving wall" was a MISDIAGNOSIS.** Static files
+served `HTTP 200` end-to-end the whole time (`/test/index.html` → 200/957 bytes
+in-process); JSPs returned `200` with a `0`-byte body. The empty body was the
+CharArrayWriter bug (layer 6), not the connector. There is no serving wall for
+this test.
+
+## Layer 6 root cause (the final blocker — commit `b628d8d7`)
+
+CratonVM had a synthetic 2-field `CharArrayWriter` (slots buf=0/count=1) that
+shadowed only some methods. The unshadowed ones (`write(String)`, `append`,
+`writeTo`) ran real JDK bytecode against a REAL `CharArrayWriter`
+(layout: `Writer.lock` + `buf` + `count`). The synthetic `<init>` never set the
+inherited `lock`, so `write(String)` NPE'd on `synchronized (lock)`, and the
+slot-based bulk write no-op'd. Jasper's `JspReader` does
+`caw.write(buf,0,n); … caw.toCharArray()` — which returned EMPTY → zero JSP
+nodes → empty servlet → `200`/empty. Fix: gate the synthetic natives under
+`synthetic-jdk` and run the real, self-contained JDK bytecode (its ctor chains
+through `Writer()` which sets `lock = this`). Verified byte-identical to HotSpot;
+diagnosed with `scratch/rec0910/CawProbe.java`.
+
+## Layer 5 root cause (THE fundamental bug — commit `1cddae8f`)
+
+ecj reported phantom `Duplicate field` + `method undefined` for generic methods
+when compiling on CratonVM. Narrowing from the JSP all the way down (driving
+ecj's `Compiler`/`Parser`/`ClassFileReader`/`SignatureWrapper` directly, then a
+3-line pure-Java repro) found:
+
+**`java.util.Arrays.equals(char[],char[])` and `Arrays.equals(long[],long[])`
+compared only element 0** — returning `true` for arrays differing at any index
+except the first. (`int[]`/`byte[]` happened to be saved by the JDK's scalar
+fallback; scales 1 and 3 were not.) Two intrinsic bugs:
+- `ArraysSupport.vectorizedMismatch` native (`phases_early.rs`) computed the
+  element index as `offset / scale` without subtracting the array base offset
+  (ABASE=16): `16/2 = 8` for `char[]` → out-of-range guard → reported "equal".
+- `Unsafe.get{Char,Short,Int,Long}[Unaligned]` (`lib.rs`) assembled multi-byte
+  reads only for `byte[]`; for typed arrays it read one element zero-extended,
+  so `getLongUnaligned(char[],…)` returned 1 char instead of 8 bytes.
+
+The cascade up to the symptom: ecj's `CharOperation.equals` **is**
+`Arrays.equals(char[])` → `"Signature".equals("Synthetic")` returned `true` →
+in `MethodInfo.readModifierRelatedAttributes` a method's `Signature` attribute
+was mis-read as the `Synthetic` attribute → the method got `ACC_SYNTHETIC`
+(`0x401`→`0x1401`) → `createMethods` dropped every generic method → "method
+undefined" + the phantom "Duplicate field" cascade → JSP won't compile → empty
+body → `null.contains("OK")`.
+
+Verified vs HotSpot (byte-identical): Arrays.equals/hashCode/sort/mismatch,
+ByteBuffer get/put, String equals/hashCode, HashMap; ecj resolves all generic
+methods and compiles the generated JSP with no errors. This was a serious
+LATENT VM bug affecting any char[]/long[] comparison and any generic-heavy Java
+compilation — not Tomcat-specific.
+
+## Remaining blocker (layer 6 = group 04 serving wall)
+
+With JSP compilation unblocked, `getUrl(...)` still returns a null/empty body:
+the embedded `Http11NioProtocol`/`NioEndpoint` connector accepts but does not
+drive the accepted `SocketChannel` through read→process→write. No new VM bug
+surfaced here yet; tracked under group 04.
 
 ## Layer summary (symptom → cause → fix)
 
@@ -68,6 +136,14 @@ resource loading, and finally the Eclipse JDT compiler itself.
    `jrt` NIO filesystem for ecj batch `Main`, or a module-aware
    `INameEnvironment` harness — then instrument `SourceTypeBinding.buildFields`
    / its `HashtableOfObject` to see why `c` and `d` are seen twice.
+
+   **Re-confirmed on the fresh dev worktree build (srun, 2026-06-15):** identical
+   failure — `Duplicate field _jspx_imports_classes` + `_el_expressionfactory`
+   (the field immediately before and immediately after the `static{}` block in the
+   captured `bug49196_jsp.java`), `_el_expressionfactory cannot be resolved` ×8,
+   under both JIT and `--nojit`. The valid-single-field source was re-captured.
+   No regression and no progress on layer 5 — still blocked on the ecj-binding
+   isolation harness (jrt module-system gap). Deep, NOT a quick fix.
 
 ---
 

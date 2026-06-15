@@ -1370,6 +1370,12 @@ fn s2_bb_remaining_bytes(ctx: &dyn NativeContext, buf: ObjectRef) -> Vec<u8> {
 /// a genuine bounds miss.
 #[inline]
 fn s2_bb_off(idx: i32, off: i32) -> i32 {
+    // A negative starting index is already out of range; keep it negative (the
+    // out-of-range sentinel) instead of letting `idx + off` cross zero into a
+    // valid-looking positive offset. Overflow on a valid index saturates to -1.
+    if idx < 0 {
+        return -1;
+    }
     idx.checked_add(off).unwrap_or(-1)
 }
 

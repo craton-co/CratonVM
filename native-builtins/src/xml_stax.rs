@@ -779,6 +779,92 @@ fn native_create_event_reader_from_reader(
     wrap_in_event_reader(ctx, cursor)
 }
 
+/// `createXMLEventReader(javax.xml.transform.Source)`. Hibernate's
+/// `PersistenceXmlParser` binds JAXB from `new StreamSource(inputStream)`,
+/// whose JAXB unmarshaller calls this overload. Without it the call dispatches
+/// to the abstract `XMLInputFactory.createXMLEventReader(Source)` and raises
+/// `AbstractMethodError: … has no Code attribute` — 6 CV-only suite classes
+/// (`jpa.persistenceunit.*`, `jpa.boot.*`, JAXB persistence.xml parsing).
+///
+/// We support `StreamSource` (the overwhelmingly common case): pull its
+/// `InputStream`, else its `Reader`, else open its `systemId` as a URL — then
+/// build the same cursor reader as the stream/reader overloads.
+fn native_create_event_reader_from_source(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let source = match args.get(1) {
+        Some(Value::Object(Some(s))) => *s,
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException {
+                    message: Some("createXMLEventReader: null Source".to_string()),
+                },
+            )))
+        }
+    };
+    let src_cls = ctx
+        .class_name_of_id(ctx.class_id_of_object(source))
+        .unwrap_or_default();
+    // StreamSource path (and any subclass): InputStream → Reader → systemId.
+    if src_cls == "javax/xml/transform/stream/StreamSource" {
+        if let Ok(Some(Value::Object(Some(stream)))) = ctx.invoke(
+            "javax/xml/transform/stream/StreamSource",
+            "getInputStream",
+            "()Ljava/io/InputStream;",
+            &[Value::Object(Some(source))],
+        ) {
+            let bytes = drain_input_stream(ctx, stream);
+            let cursor = make_cursor_reader(ctx, &bytes)?;
+            return wrap_in_event_reader(ctx, cursor);
+        }
+        if let Ok(Some(Value::Object(Some(reader_in)))) = ctx.invoke(
+            "javax/xml/transform/stream/StreamSource",
+            "getReader",
+            "()Ljava/io/Reader;",
+            &[Value::Object(Some(source))],
+        ) {
+            let text = drain_reader_to_string(ctx, reader_in);
+            let cursor = make_cursor_reader(ctx, text.as_bytes())?;
+            return wrap_in_event_reader(ctx, cursor);
+        }
+        // Fall back to systemId: open it as a URL and drain the stream.
+        if let Ok(Some(Value::Object(Some(sid)))) = ctx.invoke(
+            "javax/xml/transform/stream/StreamSource",
+            "getSystemId",
+            "()Ljava/lang/String;",
+            &[Value::Object(Some(source))],
+        ) {
+            let sid_str = ctx.read_string(sid).unwrap_or_default();
+            if !sid_str.is_empty() {
+                if let Ok(Some(Value::Object(Some(url)))) = ctx.new_object_initialized(
+                    "java/net/URL",
+                    "(Ljava/lang/String;)V",
+                    &[Value::Object(Some(sid))],
+                ) {
+                    if let Ok(Some(Value::Object(Some(stream)))) = ctx.invoke(
+                        "java/net/URL",
+                        "openStream",
+                        "()Ljava/io/InputStream;",
+                        &[Value::Object(Some(url))],
+                    ) {
+                        let bytes = drain_input_stream(ctx, stream);
+                        let cursor = make_cursor_reader(ctx, &bytes)?;
+                        return wrap_in_event_reader(ctx, cursor);
+                    }
+                }
+            }
+        }
+    }
+    Err(MethodCallFailed::InternalError(VmError::Runtime(
+        RuntimeError::NullPointerException {
+            message: Some(format!(
+                "createXMLEventReader(Source): unsupported / empty Source ({src_cls})"
+            )),
+        },
+    )))
+}
+
 /// `XMLStreamReader.getPrefix()` — current element's prefix ("" when
 /// unprefixed). Previously hard-coded to null, which made the event-API
 /// `XMLEventAllocatorImpl.getQName` (`new QName(ns, local, prefix)`) throw
@@ -1126,6 +1212,12 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "createXMLEventReader",
         "(Ljava/io/Reader;)Ljavax/xml/stream/XMLEventReader;",
         native_create_event_reader_from_reader,
+    );
+    registry.register(
+        "javax/xml/stream/XMLInputFactory",
+        "createXMLEventReader",
+        "(Ljavax/xml/transform/Source;)Ljavax/xml/stream/XMLEventReader;",
+        native_create_event_reader_from_source,
     );
 
     // Reader cursor methods (interface-keyed; native dispatch matches on

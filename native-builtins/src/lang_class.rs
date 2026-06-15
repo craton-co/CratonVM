@@ -4492,8 +4492,47 @@ pub(crate) fn native_method_invoke(ctx: &mut dyn NativeContext, args: &[Value]) 
         // type mismatch (per java.lang.reflect.Method.invoke javadoc).
         for (i, pdesc) in param_descs.iter().enumerate() {
             let arg_val = raw_args[i];
-            let coerced = coerce_arg_strict(ctx, arg_val, pdesc, "Method.invoke argument")?;
-            invoke_args.push(coerced);
+            match coerce_arg_strict(ctx, arg_val, pdesc, "Method.invoke argument") {
+                Ok(coerced) => invoke_args.push(coerced),
+                Err(e) => {
+                    // CRATONVM_DBG_INVOKE_COERCE=1 — dump the method, formal
+                    // descriptors, actual arg runtime types, and innermost Java
+                    // caller frames on a coercion mismatch. Env-gated.
+                    if std::env::var("CRATONVM_DBG_INVOKE_COERCE").as_deref() == Ok("1") {
+                        let arg_types: Vec<String> = raw_args
+                            .iter()
+                            .map(|v| match v {
+                                Value::Object(Some(o)) => {
+                                    let cid = ctx.class_id_of_object(*o);
+                                    ctx.class_name_of_id(cid).unwrap_or_default()
+                                }
+                                Value::Object(None) => "null".to_string(),
+                                other => format!("{other:?}"),
+                            })
+                            .collect();
+                        let trace = ctx.capture_stack_trace(0);
+                        let total = trace.len();
+                        let skip = total.saturating_sub(24);
+                        let mut rendered = String::new();
+                        for (j, entry) in trace.iter().enumerate().skip(skip) {
+                            use std::fmt::Write as _;
+                            let _ = write!(
+                                rendered,
+                                "\n  #{j}/{total} {cls}.{m} (bci={bci})",
+                                cls = entry.class_name,
+                                m = entry.method_name,
+                                bci = entry.byte_code_index,
+                            );
+                        }
+                        tracing::warn!(
+                            target: "cratonvm::invoke_coerce",
+                            "[DBG_INVOKE_COERCE] {class_name}.{method_name} param[{i}]={pdesc} \
+                             params={param_descs:?} argTypes={arg_types:?} caller chain:{rendered}"
+                        );
+                    }
+                    return Err(e);
+                }
+            }
         }
     }
 
