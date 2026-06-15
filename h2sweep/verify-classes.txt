@@ -1,0 +1,15 @@
+org.h2.test.unit.TestStringUtils
+org.h2.test.db.TestListener
+org.h2.test.db.TestCompatibilityOracle
+org.h2.test.db.TestCompatibilitySQLServer
+org.h2.test.db.TestLinkedTable
+org.h2.test.db.TestSequence
+org.h2.test.db.TestSelectTableNotFound
+org.h2.test.db.TestAlterTableNotFound
+org.h2.test.jdbc.TestZloty
+org.h2.test.jdbc.TestManyJdbcObjects
+org.h2.test.jdbc.TestDatabaseEventListener
+org.h2.test.server.TestInit
+org.h2.test.db.TestRunscript
+org.h2.test.db.TestCsv
+org.h2.test.unit.TestSort
