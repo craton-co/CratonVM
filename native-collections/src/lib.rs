@@ -16322,9 +16322,20 @@ fn native_pq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             ctx.set_array_element(arr, i, elem);
         }
     }
-    let itr = alloc_synthetic(ctx, "java/util/PriorityQueue$Itr", 2);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(0));
+    // Return an `ArrayList$Itr` over an ArrayList-shaped wrapper holding the
+    // heap-order snapshot, rather than a `PriorityQueue$Itr` with the snapshot
+    // in slot 0. In real-JDK mode `alloc_synthetic("java/util/PriorityQueue$Itr")`
+    // honours the real field layout — slot 0 is the `cursor:int` field — so
+    // `set_field(itr, 0, Object[])` coerced the array away and iteration saw
+    // zero elements (and, before the snapshot-iterator fix, recursed). The
+    // wrapper + name-resolved `al_itr_slots` layout is exactly the EnumSet/COWAL
+    // iteration path; `ArrayList$Itr.hasNext/next` read it correctly in both
+    // real-JDK and synthetic-jdk modes.
+    let wrapper = alloc_arraylist_with(ctx, arr, size);
+    let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
+    let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
+    ctx.set_field(itr, list_slot, Value::Object(Some(wrapper)));
+    ctx.set_field(itr, cursor_slot, Value::Int(0));
     Ok(Some(Value::Object(Some(itr))))
 }
 
