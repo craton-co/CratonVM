@@ -8738,7 +8738,9 @@ pub(crate) fn native_class_get_generic_superclass(
             let _gscope = crate::generics::GenericDeclScope::new(Value::Object(Some(
                 ctx.get_class_mirror(class_id),
             )));
-            let val = crate::generics::type_sig_to_java(ctx, &class_sig.super_class);
+            // SB-02b-#3: real ParameterizedTypeImpl so a generic supertype like
+            // `AbstractList<Map<String, List<X>>>` renders its type name correctly.
+            let val = crate::generics::typesig_to_real_type(ctx, &class_sig.super_class);
             // If signature resolution succeeded, return it
             if !matches!(val, Value::Object(None)) {
                 if dbg_bb {
@@ -8817,7 +8819,8 @@ pub(crate) fn native_class_get_generic_interfaces(
                     // class's type parameters.
                     let _gscope =
                         crate::generics::GenericDeclScope::new(Value::Object(Some(class_mirror)));
-                    let val = crate::generics::type_sig_to_java(ctx, iface);
+                    // SB-02b-#3: real ParameterizedTypeImpl for generic interfaces.
+                    let val = crate::generics::typesig_to_real_type(ctx, iface);
                     ctx.set_array_element(arr, i, val);
                 }
                 return Ok(Some(Value::Object(Some(arr))));
@@ -8861,7 +8864,10 @@ pub(crate) fn native_method_get_generic_param_types(
             let arr = ctx.new_ref_array(ClassId::new(0), method_sig.param_types.len());
             for (i, pt) in method_sig.param_types.iter().enumerate() {
                 let _gscope = crate::generics::GenericDeclScope::new(decl);
-                let val = crate::generics::type_sig_to_java(ctx, pt);
+                // SB-02b-#3: real ParameterizedTypeImpl for parameterized parameter
+                // types (the firing path for synthetic Method objects; real Method
+                // objects already run the JDK reifier bytecode).
+                let val = crate::generics::typesig_to_real_type(ctx, pt);
                 ctx.set_array_element(arr, i, val);
             }
             return Ok(Some(Value::Object(Some(arr))));
@@ -8893,7 +8899,8 @@ pub(crate) fn native_method_get_generic_return_type(
                 Value::Object(Some(this))
             };
             let _gscope = crate::generics::GenericDeclScope::new(decl);
-            let val = crate::generics::type_sig_to_java(ctx, &method_sig.return_type);
+            // SB-02b-#3: real ParameterizedTypeImpl for a parameterized return type.
+            let val = crate::generics::typesig_to_real_type(ctx, &method_sig.return_type);
             return Ok(Some(val));
         }
     }
@@ -8962,7 +8969,11 @@ pub(crate) fn native_field_get_generic_type(
             let _gscope = crate::generics::GenericDeclScope::new(Value::Object(Some(
                 ctx.get_class_mirror(class_id),
             )));
-            let val = crate::generics::type_sig_to_java(ctx, &field_sig);
+            // SB-02b-#3: build a REAL `sun.reflect…ParameterizedTypeImpl` (not the
+            // bare-interface synthetic) so a nested generic field type like
+            // `Map<String, List<String>>` renders its `getTypeName()`/`toString()`
+            // identically to HotSpot instead of `java.lang.reflect.ParameterizedType@…`.
+            let val = crate::generics::typesig_to_real_type(ctx, &field_sig);
             return Ok(Some(val));
         }
     }
@@ -9006,7 +9017,9 @@ pub(crate) fn native_record_component_get_generic_type(
                 let _gscope = crate::generics::GenericDeclScope::new(Value::Object(Some(
                     ctx.get_class_mirror(class_id),
                 )));
-                let val = crate::generics::type_sig_to_java(ctx, &field_sig);
+                // SB-02b-#3: real ParameterizedTypeImpl for nested record-component
+                // generics (e.g. `Map<String, List<X>>`) — see field path above.
+                let val = crate::generics::typesig_to_real_type(ctx, &field_sig);
                 return Ok(Some(val));
             }
         }
