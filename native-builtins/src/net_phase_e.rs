@@ -3104,7 +3104,9 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 // Without this, Hibernate's Jandex indexer
                 // (`SourceModelTestHelper.buildJandexIndex`, which reads JDK
                 // baseline types out of `java.base.jmod`) failed with
-                // "entry java/lang/Object.class … not found in archive".
+                // "entry java/lang/Object.class … not found in archive"; it
+                // also made `ClassLoader.getResourceAsStream("java/lang/...")`
+                // null, blocking ecj/Jasper JSP type resolution (bug 10).
                 let lookup: std::borrow::Cow<str> =
                     if outer_jar.ends_with(".jmod") && !inner_path.starts_with("classes/") {
                         std::borrow::Cow::Owned(format!("classes/{inner_path}"))
@@ -3197,6 +3199,19 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             let name = name.trim_start_matches('/');
             ctx.find_resource(name)
                 .ok_or_else(|| ioex(format!("URL.openStream: resource not found: {name}")))?
+        } else if let Some(rest) = url_str.strip_prefix("jrt:") {
+            // JEP 220 runtime-image URL: `jrt:/<module>/<resource>`. CratonVM
+            // emits these from `find_all_resource_urls` when the boot classpath
+            // is a jimage (`lib/modules`) rather than exploded `.jmod`s (HotSpot
+            // always uses this form). `find_resource` keys on the module-relative
+            // resource name, so strip the leading `/<module>/` before looking up.
+            let path = rest.trim_start_matches('/');
+            let resource = match path.split_once('/') {
+                Some((_module, r)) => r,
+                None => path,
+            };
+            ctx.find_resource(resource)
+                .ok_or_else(|| ioex(format!("URL.openStream: jrt resource not found: {url_str}")))?
         } else if url_str.starts_with("http://") || url_str.starts_with("https://") {
             let resp = http_perform_request("GET", &url_str, &[], &[], 10)
                 .map_err(|e| ioex(format!("URL.openStream failed: {e}")))?;

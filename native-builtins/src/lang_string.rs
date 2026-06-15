@@ -210,6 +210,21 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
         "(C)Ljava/lang/StringBuffer;",
         native_sb_append_char,
     );
+    // JDK 21+ `repeat(int codePoint, int count)` — intercept so it operates on
+    // the synthetic char[] layout instead of running real bytecode that hits
+    // `ensureCapacityNewCoder` → `Arrays.copyOf([B)` over a char[] (ArrayStore).
+    registry.register(
+        class,
+        "repeat",
+        "(II)Ljava/lang/StringBuilder;",
+        native_sb_repeat_codepoint,
+    );
+    registry.register(
+        class,
+        "repeat",
+        "(II)Ljava/lang/StringBuffer;",
+        native_sb_repeat_codepoint,
+    );
     registry.register(
         class,
         "append",
@@ -526,6 +541,48 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
             let mut chars = sb_read_chars(ctx, this);
             for _ in 0..count {
                 chars.extend_from_slice(&s_chars);
+            }
+            sb_write_chars(ctx, this, &chars);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
+    // Java 21: StringBuilder.repeat(int codePoint, int count). MUST be a native:
+    // unregistered, it falls through to the real `AbstractStringBuilder.repeat`
+    // → `ensureCapacityNewCoder` → `Arrays.copyOf(value, …)` bytecode, which
+    // treats `value` as a compact-string `byte[]`. CratonVM's StringBuilder
+    // backing is a `char[]`, so the real bytecode's `System.arraycopy` copies
+    // char[]→byte[] and throws `ArrayStoreException: incompatible array element
+    // types (src=Char, dest=Byte)`. `java.time.format.DateTimeFormatter` uses
+    // `buf.repeat('0', n)` for zero-padding, so this broke every timestamp/
+    // temporal literal (35 Hibernate suite classes).
+    registry.register(
+        class,
+        "repeat",
+        "(II)Ljava/lang/StringBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let code_point = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let count = match args.get(2) {
+                Some(Value::Int(v)) => (*v).max(0) as usize,
+                _ => 0,
+            };
+            // Encode the code point to UTF-16 units (surrogate pair for
+            // supplementary planes); fall back to a single unit for an invalid
+            // code point (e.g. a lone surrogate) rather than dropping it.
+            let mut units: Vec<u16> = Vec::with_capacity(2);
+            match char::from_u32(code_point as u32) {
+                Some(c) => {
+                    let mut buf = [0u16; 2];
+                    units.extend_from_slice(c.encode_utf16(&mut buf));
+                }
+                None => units.push(code_point as u16),
+            }
+            let mut chars = sb_read_chars(ctx, this);
+            for _ in 0..count {
+                chars.extend_from_slice(&units);
             }
             sb_write_chars(ctx, this, &chars);
             Ok(Some(Value::Object(Some(this))))
@@ -1297,6 +1354,65 @@ pub(crate) fn native_sb_append_char(ctx: &mut dyn NativeContext, args: &[Value])
         _ => 0,
     };
     sb_append_chars(ctx, this, &[ch]);
+    Ok(Some(Value::Object(Some(this))))
+}
+
+/// `StringBuilder.repeat(int codePoint, int count)` / `StringBuffer.repeat(...)`
+/// (JDK 21+). Without this native the real `AbstractStringBuilder.repeat`
+/// bytecode runs against our synthetic `char[]` layout: it reaches
+/// `ensureCapacityNewCoder`, which on a capacity grow calls
+/// `Arrays.copyOf([B,I)` over the (actually `char[]`) `value` field →
+/// `ArrayStoreException: arraycopy: incompatible array element types
+/// (src=Char, dest=Byte)`. `java.time.format.DateTimeFormatter` uses
+/// `repeat` for zero-padding, so this surfaced across many date/time paths.
+pub(crate) fn native_sb_repeat_codepoint(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(None),
+    };
+    let code_point = match args.get(1) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    let count = match args.get(2) {
+        Some(Value::Int(v)) => *v,
+        _ => 0,
+    };
+    if count < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: format!("count is negative: {count}"),
+        }
+        .into());
+    }
+    if count == 0 {
+        return Ok(Some(Value::Object(Some(this))));
+    }
+    // Expand the code point to UTF-16 units, matching `AbstractStringBuilder`:
+    //   * 0x0000..=0xFFFF  -> one unit (Java treats it as `repeat((char)cp, n)`,
+    //                        so lone surrogates are appended verbatim, not rejected);
+    //   * 0x10000..=0x10FFFF -> surrogate pair;
+    //   * anything else (incl. negative) -> IllegalArgumentException.
+    let cp = code_point as u32;
+    let unit: Vec<u16> = if cp <= 0xFFFF {
+        vec![cp as u16]
+    } else if cp <= 0x10_FFFF {
+        let v = cp - 0x1_0000;
+        vec![0xD800 + (v >> 10) as u16, 0xDC00 + (v & 0x3FF) as u16]
+    } else {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: format!("Not a valid Unicode code point: 0x{cp:X}"),
+        }
+        .into());
+    };
+    let total = unit.len().saturating_mul(count as usize);
+    let mut chars: Vec<u16> = Vec::with_capacity(total);
+    for _ in 0..count {
+        chars.extend_from_slice(&unit);
+    }
+    sb_append_chars(ctx, this, &chars);
     Ok(Some(Value::Object(Some(this))))
 }
 

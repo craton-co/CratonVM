@@ -978,6 +978,15 @@ impl SharedVm {
                 // Real-JDK mode: register essential natives only. Do NOT use
                 // register_builtins — synthetic overrides assume synthetic field
                 // layouts and corrupt real JDK objects.
+                //
+                // `register_collections_natives` (called below) is shared with
+                // synthetic mode and bundles the synthetic `java/util/StringJoiner`
+                // natives (fake 5-field layout). On a real StringJoiner those
+                // corrupt the object — `add` no-ops, so e.g. Spring
+                // `UriComponentsBuilder.pathSegment` drops the URL path segment.
+                // Tell the registry to drop StringJoiner registrations so the real,
+                // self-contained bytecode runs instead.
+                native_methods.set_drop_real_layout_synthetic(true);
                 register_essential_natives(&mut native_methods);
                 // Register concurrent natives (ReentrantLock, etc.) needed by real JDK classes
                 // like LinkedBlockingQueue which use ReentrantLock for synchronization
@@ -1314,6 +1323,15 @@ impl SharedVm {
         }
         #[cfg(not(feature = "synthetic-jdk"))]
         {
+            // Real-JDK mode (the default `cratonvm-cli` build): drop the synthetic
+            // `java/util/StringJoiner` natives that `register_collections_natives`
+            // (called below) bundles in — their fake 5-field layout corrupts the
+            // real 7-field object (`add` no-ops, so e.g. Spring
+            // `UriComponentsBuilder.pathSegment` drops the URL path segment). The
+            // real, self-contained StringJoiner bytecode runs instead. Must be set
+            // BEFORE any `register_*` pass here. (The synthetic-jdk-feature build
+            // sets the same flag in its real-JDK arm above.)
+            native_methods.set_drop_real_layout_synthetic(true);
             register_essential_natives(&mut native_methods);
             // cratonvm-cli default features omit `synthetic-jdk`; the rich
             // registration block only lives under `cfg(feature = "synthetic-jdk")`

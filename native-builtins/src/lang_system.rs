@@ -169,6 +169,37 @@ pub(crate) fn native_system_arraycopy(ctx: &mut dyn NativeContext, args: &[Value
     let src_elem = ctx.heap_element_type_of(src);
     let dest_elem = ctx.heap_element_type_of(dest);
     if src_elem != dest_elem {
+        // CRATONVM_DBG_ARRAYCOPY=1 — dump the Java caller chain + array
+        // identities for the element-type mismatch. Env-gated; default output
+        // unchanged. Used to localize the Hibernate/H2 "src=Char, dest=Byte"
+        // cluster (an array mislabeled at its allocation site).
+        if std::env::var("CRATONVM_DBG_ARRAYCOPY").as_deref() == Ok("1") {
+            let src_cls = ctx.class_id_of_object(src);
+            let dest_cls = ctx.class_id_of_object(dest);
+            let src_name = ctx.class_name_of_id(src_cls).unwrap_or_default();
+            let dest_name = ctx.class_name_of_id(dest_cls).unwrap_or_default();
+            let trace = ctx.capture_stack_trace(0);
+            let total = trace.len();
+            // Show the INNERMOST ~40 frames (closest to the arraycopy call
+            // site); the trace is outermost-first so the tail is what matters.
+            let skip = total.saturating_sub(40);
+            let mut rendered = String::new();
+            for (i, entry) in trace.iter().enumerate().skip(skip) {
+                use std::fmt::Write as _;
+                let _ = write!(
+                    rendered,
+                    "\n  #{i}/{total} {cls}.{m} (bci={bci})",
+                    cls = entry.class_name,
+                    m = entry.method_name,
+                    bci = entry.byte_code_index,
+                );
+            }
+            tracing::warn!(
+                target: "cratonvm::arraycopy",
+                "[DBG_ARRAYCOPY] mismatch src={src_elem:?}({src_name}) dest={dest_elem:?}({dest_name}) \
+                 srcLen={src_len} destLen={dest_len} len={length} caller chain:{rendered}"
+            );
+        }
         return Err(cratonvm_types::error::RuntimeError::ArrayStoreException {
             message: format!(
                 "arraycopy: incompatible array element types (src={:?}, dest={:?})",
