@@ -10199,6 +10199,10 @@ fn register_int_stream_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "count", "()J", native_int_stream_count);
     r.register(c, "min", "()Ljava/util/OptionalInt;", native_int_stream_min);
     r.register(c, "max", "()Ljava/util/OptionalInt;", native_int_stream_max);
+    // spring-bug-03: synthetic IntStreams (range/rangeClosed/filter/mapToInt) lacked
+    // findFirst/findAny returning OptionalInt -> abstract-method (no Code) -> AbstractMethodError.
+    r.register(c, "findFirst", "()Ljava/util/OptionalInt;", native_int_stream_find_first);
+    r.register(c, "findAny", "()Ljava/util/OptionalInt;", native_int_stream_find_first);
     r.register(
         c,
         "forEach",
@@ -10396,6 +10400,33 @@ fn native_int_stream_max(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         .max()
     {
         set_opt_prim_value(ctx, opt, Value::Int(max));
+    }
+    Ok(Some(Value::Object(Some(opt))))
+}
+
+/// spring-bug-03: `IntStream.findFirst()` / `findAny()` for CratonVM's *synthetic*
+/// IntStreams. Synthetic IntStreams (produced by the `range`/`rangeClosed`/`filter`/
+/// `mapToInt` intrinsics) are stamped with the abstract interface class
+/// `java/util/stream/IntStream`, which has no Code for `findFirst`, so the call
+/// threw `AbstractMethodError: …IntStream.findFirst()…has no Code attribute`.
+/// (Real `IntPipeline$Head` receivers from `IntStream.of`/`Arrays.stream` run their
+/// own bytecode and never reach this native — it is only consulted on the no-Code
+/// fallback path keyed on the receiver's `IntStream` class.) The synthetic stream
+/// is eager: its elements are already buffered, so return the first one — order is
+/// preserved by `int_stream_elements`, matching `findFirst`; `findAny` may return
+/// any element and the first is a valid choice.
+fn native_int_stream_find_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => {
+            let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
+            return Ok(Some(Value::Object(Some(opt))));
+        }
+    };
+    let elements = int_stream_elements(ctx, this);
+    let opt = make_opt_prim(ctx, "java/util/OptionalInt", None);
+    if let Some(&Value::Int(first)) = elements.first() {
+        set_opt_prim_value(ctx, opt, Value::Int(first));
     }
     Ok(Some(Value::Object(Some(opt))))
 }

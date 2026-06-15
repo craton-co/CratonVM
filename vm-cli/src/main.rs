@@ -2068,6 +2068,27 @@ fn run() -> Result<()> {
     vm.shared.set_init_level(3);
     vm.shared.set_init_level(4);
 
+    // spring-bug-05: advance the REAL `jdk.internal.misc.VM.initLevel` static
+    // field. `set_init_level` above only updates CratonVM's internal counter and
+    // the `VM.initLevel()` *method* native — but `VM.isModuleSystemInited()`
+    // (Proxy.java's gate at ProxyBuilder) reads the static *field* directly
+    // (`initLevel >= MODULE_SYSTEM_INITED`). Since we never run the real
+    // `System.initPhase2/3` (which would call `VM.initLevel(int)`), the field
+    // stays 0 and every JDK dynamic Proxy throws `InternalError: Proxy is not
+    // supported until module system is fully initialized`. The setter
+    // `VM.initLevel(I)V` is real bytecode (not natively shadowed): invoking it
+    // sets the field to SYSTEM_BOOTED (4) and wakes `awaitInitLevel` waiters,
+    // exactly as a fully-booted HotSpot would. Real-JDK mode only; errors are
+    // swallowed (synthetic mode has no such class/method).
+    if vm.shared.config.java_home.is_some() {
+        let _ = vm.invoke(
+            "jdk/internal/misc/VM",
+            "initLevel",
+            "(I)V",
+            &[Value::Int(4)],
+        );
+    }
+
     // Now (after `initPhase1` has set up system properties / encodings
     // / standard streams) it's safe to resolve and load the user main
     // class. See the comment on the `initPhase1` block above for why
