@@ -14418,15 +14418,26 @@ fn native_arrays_support_vectorized_mismatch(
     if length <= 0 || log2_scale < 0 || log2_scale > 3 {
         return Ok(Some(Value::Int(-1)));
     }
-    // The offsets are in bytes from the object header. We treat the
-    // caller's offsets as "start of element 0" (the only configuration
-    // OpenJDK's Arrays / String / Objects paths actually use) and
-    // translate through `>> log2Scale` to an element index. Negative
-    // offsets are treated as zero — the JDK contract doesn't forbid
-    // this but HotSpot would wrap silently.
+    // The offsets are *Unsafe* byte offsets from the object header, so for a
+    // real array they START at the array base offset (ABASE = 16), not 0:
+    // OpenJDK's `Arrays.equals(char[],…)` calls
+    // `vectorizedMismatch(a, ARRAY_CHAR_BASE_OFFSET, …)`. `get_array_element`
+    // is 0-based, so we must subtract ABASE before translating to an element
+    // index. The previous code divided the raw offset by `scale`, giving
+    // `16/2 = 8` for `char[]` (and `16/8 = 2` for `long[]`): the
+    // out-of-range guard below then tripped and the native reported "equal"
+    // for ANY two char[]/long[] arrays — breaking `Arrays.equals(char[])`
+    // (e.g. ecj's `CharOperation.equals("Signature","Synthetic")` → every
+    // generic method tagged `ACC_SYNTHETIC` → dropped). Offsets below ABASE
+    // (the synthetic unit tests pass 0) are treated as already
+    // element-byte-relative for backwards compatibility.
+    const ABASE: i64 = 16;
     let scale = 1i64 << log2_scale;
-    let a_idx = (a_offset_bytes.max(0) / scale) as usize;
-    let b_idx = (b_offset_bytes.max(0) / scale) as usize;
+    let rel = |off: i64| -> i64 {
+        if off >= ABASE { off - ABASE } else { off.max(0) }
+    };
+    let a_idx = (rel(a_offset_bytes) / scale) as usize;
+    let b_idx = (rel(b_offset_bytes) / scale) as usize;
 
     let a_len = ctx.array_length(a);
     let b_len = ctx.array_length(b);

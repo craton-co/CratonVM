@@ -14463,38 +14463,67 @@ pub(crate) fn native_unsafe_put_object(ctx: &mut dyn NativeContext, args: &[Valu
 /// uses the platform's native byte order, which on every CratonVM host
 /// (x86-64 / aarch64) is little-endian.
 ///
-/// Returns `Some(bytes)` only when `obj` is a `byte[]` (or boolean[]) and
-/// the offset has byte-offset shape; otherwise `None`, so the caller falls
-/// back to the generic element/field path.
-fn unsafe_read_bytes_from_byte_array(
+/// Returns `Some(bytes)` only when `obj` is a primitive array and the
+/// requested byte range fits; otherwise `None`, so the caller falls back to
+/// the generic element/field path (non-array targets, off-heap, references).
+///
+/// Works for EVERY primitive element type — not just `byte[]`. A multi-byte
+/// `Unsafe` read takes a *byte* offset and assembles `width` consecutive
+/// bytes which may SPAN several elements: `getLongUnaligned(char[], …)`
+/// reads 4 chars, `getLongUnaligned(int[], …)` reads 2 ints, etc. The JDK
+/// lays each element out in the platform's native (little-endian) byte
+/// order. The previous version handled only `byte[]`/`boolean[]` and fell
+/// back to a single-ELEMENT read for `char[]`/`int[]`/`long[]`, which
+/// truncated every cross-element word read to its first element — breaking
+/// `jdk.internal.util.ArraysSupport.vectorizedMismatch` and therefore
+/// `Arrays.equals(char[]/long[])` (e.g. ecj's `CharOperation.equals`
+/// mis-comparing `"Signature"` vs `"Synthetic"`).
+fn unsafe_read_bytes_from_array(
     ctx: &dyn NativeContext,
     obj: cratonvm_types::ObjectRef,
     offset: usize,
     width: usize,
 ) -> Option<Vec<u8>> {
+    use cratonvm_types::ArrayElementType as Aet;
     if ctx.heap_kind_of(obj) != cratonvm_types::ObjectKind::Array {
         return None;
     }
-    match ctx.heap_element_type_of(obj) {
-        cratonvm_types::ArrayElementType::Byte
-        | cratonvm_types::ArrayElementType::Boolean => {}
-        _ => return None,
-    }
+    let elem_type = ctx.heap_element_type_of(obj);
+    let elem_size: usize = match elem_type {
+        Aet::Byte | Aet::Boolean => 1,
+        Aet::Char | Aet::Short => 2,
+        Aet::Int | Aet::Float => 4,
+        Aet::Long | Aet::Double => 8,
+        // Reference arrays have no byte-addressable element storage.
+        Aet::Reference => return None,
+    };
     // Array byte offsets always start at ABASE (16); see
     // `unsafe_array_index_from_offset` / `native_unsafe_array_base_offset`.
     const ABASE: usize = 16;
     if offset < ABASE {
         return None;
     }
-    let start = offset - ABASE;
-    let len = ctx.array_length(obj);
-    if start + width > len {
+    let rel = offset - ABASE; // bytes from element 0
+    let len = ctx.array_length(obj); // element COUNT
+    let total_bytes = len.checked_mul(elem_size)?;
+    if rel.checked_add(width)? > total_bytes {
         return None;
     }
     let mut bytes = Vec::with_capacity(width);
-    for i in 0..width {
-        let b = ctx.get_array_element(obj, start + i).as_int().unwrap_or(0) as u8;
-        bytes.push(b);
+    for k in 0..width {
+        let byte_pos = rel + k;
+        let elem_idx = byte_pos / elem_size;
+        let byte_in_elem = byte_pos % elem_size;
+        // Read the element's raw bit pattern, then extract the requested
+        // byte in little-endian order (native order on x86-64 / aarch64).
+        let elem_bits: u64 = match ctx.get_array_element(obj, elem_idx) {
+            Value::Int(v) => v as u32 as u64, // byte/short/char/int (low bits used per elem_size)
+            Value::Long(v) => v as u64,
+            Value::Float(f) => f.to_bits() as u64,
+            Value::Double(d) => d.to_bits(),
+            _ => return None,
+        };
+        bytes.push(((elem_bits >> (8 * byte_in_elem)) & 0xFF) as u8);
     }
     Some(bytes)
 }
@@ -14519,14 +14548,14 @@ macro_rules! unsafe_multibyte_get {
             let offset = unsafe_offset(args, 2);
             if let Some(obj) = unsafe_obj(args, 1) {
                 if let Some(bytes) =
-                    unsafe_read_bytes_from_byte_array(ctx, obj, offset, $width)
+                    unsafe_read_bytes_from_array(ctx, obj, offset, $width)
                 {
                     let big_endian = unsafe_big_endian_arg(args);
                     let v: i64 = $assemble(&bytes, big_endian);
                     return Ok(Some(Value::Int(v as i32)));
                 }
             }
-            // Not a byte-array target — generic element/field access.
+            // Not a primitive-array target — generic element/field access.
             native_unsafe_get_int(ctx, args)
         }
     };
@@ -14569,7 +14598,7 @@ pub(crate) fn native_unsafe_get_long_mb(
 ) -> MethodCallResult {
     let offset = unsafe_offset(args, 2);
     if let Some(obj) = unsafe_obj(args, 1) {
-        if let Some(b) = unsafe_read_bytes_from_byte_array(ctx, obj, offset, 8) {
+        if let Some(b) = unsafe_read_bytes_from_array(ctx, obj, offset, 8) {
             let big_endian = unsafe_big_endian_arg(args);
             let v = if big_endian {
                 i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
