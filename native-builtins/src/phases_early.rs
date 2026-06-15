@@ -14418,15 +14418,24 @@ fn native_arrays_support_vectorized_mismatch(
     if length <= 0 || log2_scale < 0 || log2_scale > 3 {
         return Ok(Some(Value::Int(-1)));
     }
-    // The offsets are in bytes from the object header. We treat the
-    // caller's offsets as "start of element 0" (the only configuration
-    // OpenJDK's Arrays / String / Objects paths actually use) and
-    // translate through `>> log2Scale` to an element index. Negative
-    // offsets are treated as zero — the JDK contract doesn't forbid
-    // this but HotSpot would wrap silently.
+    // The offsets are Unsafe byte offsets from the object header. The JDK's
+    // ArraysSupport.mismatch/Arrays.equals ALWAYS pass
+    // `Unsafe.ARRAY_<T>_BASE_OFFSET + fromIndex*scale` — i.e. the offset is
+    // BASE-RELATIVE, not 0-based at element 0. CratonVM reports a base offset of
+    // 16 for every array type (see native_unsafe_array_base_offset), so the
+    // element index is `(offset - 16) >> log2Scale`. The previous code divided
+    // the raw offset by scale WITHOUT subtracting the base: for char[] that gave
+    // a_idx = 16/2 = 8 (not 0), so the bounds check `a_idx+length > a_len`
+    // tripped and the method returned -1 ("equal") for ANY same-length char[]
+    // >7 elements whose element 0 matched — Arrays.equals(char[]) was broken,
+    // which in turn made ecj's char[] field-name hashtable report phantom
+    // "Duplicate field" errors and fail JSP compilation (bug 10). Subtracting
+    // the base restores correct mismatch detection. (Regression of the earlier
+    // "subtract ABASE" fix, lost in a merge.)
+    const ARRAY_BASE: i64 = 16;
     let scale = 1i64 << log2_scale;
-    let a_idx = (a_offset_bytes.max(0) / scale) as usize;
-    let b_idx = (b_offset_bytes.max(0) / scale) as usize;
+    let a_idx = ((a_offset_bytes - ARRAY_BASE).max(0) / scale) as usize;
+    let b_idx = ((b_offset_bytes - ARRAY_BASE).max(0) / scale) as usize;
 
     let a_len = ctx.array_length(a);
     let b_len = ctx.array_length(b);
