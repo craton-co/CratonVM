@@ -2261,6 +2261,22 @@ pub struct NativeMethodRegistry {
     /// errors. `Intrinsic` and `Bridge` registrations are never affected.
     /// See docs/synthetic-vs-real-explained.md.
     drop_synthetic_stubs: bool,
+    /// Real-JDK mode: drop synthetic natives whose hardcoded field-slot layout
+    /// corrupts the *real* JDK object. Currently `java/util/StringJoiner`, which
+    /// `native-collections::register_string_joiner_natives` registers with a fake
+    /// 5-field layout (delim/prefix/suffix/elements-ArrayList/emptyValue) but
+    /// bundles into `register_collections_natives` — a function real-JDK mode
+    /// calls for the side-table collection natives. On a real StringJoiner (7
+    /// fields: prefix/delimiter/suffix/elts[]/size/len/emptyValue) the synthetic
+    /// `add` reads slot 3 (real `elts`, null) and no-ops, so `size` never moves
+    /// and `toString` renders just prefix+suffix. The real bytecode is
+    /// self-contained and correct, so we drop the synthetic surface and let it
+    /// run. Same mechanism as the `CRATONVM_REAL_NET_SOCKETS` Socket drop above,
+    /// but set by `vm_init`'s real-JDK arm (not env-gated). Off in synthetic mode
+    /// (there the fake layout *is* the object layout). Surfaced via Spring
+    /// `UriComponentsBuilder.pathSegment`, which dropped the URL path segment
+    /// (`ReleaseScheduleTests`).
+    drop_real_layout_synthetic: bool,
 }
 
 impl NativeMethodRegistry {
@@ -2289,6 +2305,7 @@ impl NativeMethodRegistry {
             // dropped so calls hit real bytecode or a clear error.
             drop_synthetic_stubs: std::env::var_os("CRATONVM_NO_STUBS")
                 .is_some_and(|v| !v.is_empty()),
+            drop_real_layout_synthetic: false,
         }
     }
 
@@ -2303,6 +2320,14 @@ impl NativeMethodRegistry {
     /// being dropped).
     pub fn drops_synthetic_stubs(&self) -> bool {
         self.drop_synthetic_stubs
+    }
+
+    /// Enable real-JDK-mode dropping of synthetic natives whose hardcoded
+    /// field-slot layout corrupts the real JDK object (see
+    /// [`drop_real_layout_synthetic`](Self)). Call before the `register_*`
+    /// population pass in real-JDK mode.
+    pub fn set_drop_real_layout_synthetic(&mut self, drop: bool) {
+        self.drop_real_layout_synthetic = drop;
     }
 
     /// Set the category applied to all subsequent `register()` calls until
@@ -2381,6 +2406,13 @@ impl NativeMethodRegistry {
         if real_net_sockets_enabled()
             && (class_name == "java/net/Socket" || class_name == "java/net/ServerSocket")
         {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic `java/util/StringJoiner` natives
+        // (fake 5-field layout) so the real 7-field-layout bytecode runs — the
+        // synthetic `add` reads the wrong slot on a real object and silently
+        // no-ops, leaving `size`/`len` at 0. See `drop_real_layout_synthetic`.
+        if self.drop_real_layout_synthetic && class_name == "java/util/StringJoiner" {
             return;
         }
         let key = native_method_hash(class_name, method_name, descriptor);
