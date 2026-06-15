@@ -217,6 +217,48 @@ fn ss_set<F: FnOnce(&mut SsSide)>(this: ObjectRef, f: F) {
     f(entry);
 }
 
+// `DatagramSocket` side-table — same rationale as `SockSide`/`SsSide` above.
+// The synthetic natives stored port/closed/timeout/fd in object slots
+// `DS_PORT=0 / DS_CLOSED=1 / DS_TIMEOUT=2 / DS_FD=3`, but in real-JDK mode the
+// loaded `java.net.DatagramSocket` (JDK 17+) has a single instance field
+// (`delegate`), so slots 1/2/3 are out of bounds — the writes were dropped by
+// the GC guard, the `fd` was lost, and every send/receive saw a "closed"
+// socket. Keying the state by `ObjectRef` makes it layout-independent. (The
+// synthetic-JDK `register_p72_datagram` path keeps its 4-field-layout natives;
+// only this real-JDK `register_re7_datagram_socket` set is converted.)
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct DsSide {
+    pub port: i32,    // local port (was DS_PORT)
+    pub closed: i32,  // 0 = open, 1 = closed (was DS_CLOSED)
+    pub timeout: i32, // SO_TIMEOUT ms (was DS_TIMEOUT)
+    pub fd: i32,      // udp fd handle; -1 = closed/unset (was DS_FD)
+}
+
+fn ds_side_table() -> &'static Mutex<HashMap<ObjectRef, DsSide>> {
+    static T: OnceLock<Mutex<HashMap<ObjectRef, DsSide>>> = OnceLock::new();
+    T.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ds_get(this: ObjectRef) -> DsSide {
+    ds_side_table().lock().get(&this).copied().unwrap_or(DsSide {
+        port: 0,
+        closed: 0,
+        timeout: 0,
+        fd: -1,
+    })
+}
+
+fn ds_set<F: FnOnce(&mut DsSide)>(this: ObjectRef, f: F) {
+    let mut t = ds_side_table().lock();
+    let entry = t.entry(this).or_insert(DsSide {
+        port: 0,
+        closed: 0,
+        timeout: 0,
+        fd: -1,
+    });
+    f(entry);
+}
+
 // Map Socket$SocketInputStream / Socket$SocketOutputStream synthetic
 // instance -> owner Socket. The real-JDK inner classes have their own
 // fields (`parent`, `in`/`out`); we cannot use raw slot indices safely.
@@ -4833,10 +4875,9 @@ fn register_re6_ssl_context(r: &mut NativeMethodRegistry) {
 // RE.7 — java.net.DatagramSocket
 // ===========================================================================
 
-const DS_PORT: usize = 0;
-const DS_CLOSED: usize = 1;
-const DS_TIMEOUT: usize = 2;
-const DS_FD: usize = 3;
+// DatagramSocket state now lives in the `ds_side_table()` (see `DsSide`),
+// keyed by ObjectRef — the old DS_PORT/DS_CLOSED/DS_TIMEOUT/DS_FD object-slot
+// layout collided with the real-JDK single-field `DatagramSocket`.
 
 const DP_DATA: usize = 0;
 const DP_LENGTH: usize = 1;
@@ -4858,10 +4899,12 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             .ok()
             .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
             .unwrap_or(0);
-        ctx.set_field(this, DS_PORT, Value::Int(port));
-        ctx.set_field(this, DS_CLOSED, Value::Int(0));
-        ctx.set_field(this, DS_TIMEOUT, Value::Int(0));
-        ctx.set_field(this, DS_FD, Value::Int(fd as i32));
+        ds_set(this, |s| {
+            s.port = port;
+            s.closed = 0;
+            s.timeout = 0;
+            s.fd = fd as i32;
+        });
         Ok(None)
     });
     r.register(ds, "<init>", "(I)V", |ctx, args| {
@@ -4878,10 +4921,12 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             .ok()
             .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
             .unwrap_or(port);
-        ctx.set_field(this, DS_PORT, Value::Int(actual_port));
-        ctx.set_field(this, DS_CLOSED, Value::Int(0));
-        ctx.set_field(this, DS_TIMEOUT, Value::Int(0));
-        ctx.set_field(this, DS_FD, Value::Int(fd as i32));
+        ds_set(this, |s| {
+            s.port = actual_port;
+            s.closed = 0;
+            s.timeout = 0;
+            s.fd = fd as i32;
+        });
         Ok(None)
     });
     r.register(ds, "<init>", "(ILjava/net/InetAddress;)V", |ctx, args| {
@@ -4901,17 +4946,19 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
             .ok()
             .and_then(|s| s.rsplit(':').next().and_then(|p| p.parse::<i32>().ok()))
             .unwrap_or(port);
-        ctx.set_field(this, DS_PORT, Value::Int(actual_port));
-        ctx.set_field(this, DS_CLOSED, Value::Int(0));
-        ctx.set_field(this, DS_TIMEOUT, Value::Int(0));
-        ctx.set_field(this, DS_FD, Value::Int(fd as i32));
+        ds_set(this, |s| {
+            s.port = actual_port;
+            s.closed = 0;
+            s.timeout = 0;
+            s.fd = fd as i32;
+        });
         Ok(None)
     });
 
     r.register(ds, "send", "(Ljava/net/DatagramPacket;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let pkt = obj_arg(args, 1)?;
-        let fd = ctx.get_field(this, DS_FD).as_int().unwrap_or(-1);
+        let fd = ds_get(this).fd;
         if fd < 0 {
             return Err(ioex("DatagramSocket: closed"));
         }
@@ -4939,7 +4986,7 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
     r.register(ds, "receive", "(Ljava/net/DatagramPacket;)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         let pkt = obj_arg(args, 1)?;
-        let fd = ctx.get_field(this, DS_FD).as_int().unwrap_or(-1);
+        let fd = ds_get(this).fd;
         if fd < 0 {
             return Err(ioex("DatagramSocket: closed"));
         }
@@ -4949,7 +4996,7 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
         };
         let cap = ctx.array_length(data_arr);
         let mut buf = vec![0u8; cap];
-        let timeout_ms = ctx.get_field(this, DS_TIMEOUT).as_int().unwrap_or(0);
+        let timeout_ms = ds_get(this).timeout;
         let d = if timeout_ms > 0 {
             Some(Duration::from_millis(timeout_ms as u64))
         } else {
@@ -4975,36 +5022,38 @@ fn register_re7_datagram_socket(r: &mut NativeMethodRegistry) {
 
     r.register(ds, "close", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        let fd = ctx.get_field(this, DS_FD).as_int().unwrap_or(-1);
+        let fd = ds_get(this).fd;
         if fd >= 0 {
             // Ignore close errors — the fd may already be closed by
-            // a racing caller; DS_CLOSED is still set unconditionally.
+            // a racing caller; `closed` is still set unconditionally.
             let _ = ctx.fd_table().close(fd as u32);
         }
-        ctx.set_field(this, DS_CLOSED, Value::Int(1));
-        ctx.set_field(this, DS_FD, Value::Int(-1));
+        ds_set(this, |s| {
+            s.closed = 1;
+            s.fd = -1;
+        });
         Ok(None)
     });
-    r.register(ds, "isClosed", "()Z", |ctx, args| {
+    r.register(ds, "isClosed", "()Z", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, DS_CLOSED)))
+        Ok(Some(Value::Int(ds_get(this).closed)))
     });
-    r.register(ds, "getLocalPort", "()I", |ctx, args| {
+    r.register(ds, "getLocalPort", "()I", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, DS_PORT)))
+        Ok(Some(Value::Int(ds_get(this).port)))
     });
-    r.register(ds, "setSoTimeout", "(I)V", |ctx, args| {
+    r.register(ds, "setSoTimeout", "(I)V", |_ctx, args| {
         let this = obj_arg(args, 0)?;
         let ms = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
         if ms < 0 {
             return Err(iae("negative SO_TIMEOUT"));
         }
-        ctx.set_field(this, DS_TIMEOUT, Value::Int(ms));
+        ds_set(this, |s| s.timeout = ms);
         Ok(None)
     });
-    r.register(ds, "getSoTimeout", "()I", |ctx, args| {
+    r.register(ds, "getSoTimeout", "()I", |_ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, DS_TIMEOUT)))
+        Ok(Some(Value::Int(ds_get(this).timeout)))
     });
 
     // Same rationale as the `ServerSocket` setReuseAddress no-op: the synthetic
