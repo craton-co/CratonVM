@@ -23,7 +23,31 @@ the JUnit Platform engine during discovery/execution, so KRun reports `LOADERR`.
 | 1 | `AbstractMethodError: java/util/function/Predicate.test(...)Z has no Code attribute` |
 | few | `NoClassDefFoundError` (MutinyRegistrar, TestCompiler, ExceptionUtils) |
 
-## ROOT CAUSE — CORRECTED (deep investigation): GC root-undercount race, NOT dispatch/weaving
+## ★ VALIDATED this session — GC race confirmed; real fix = fix the moving/remap SIGSEGV (deferred B-K Stage B/C)
+Reproduced + validated directly (dev `334fe5e7`):
+- **Reproduced** the race: a 14-class `org.springframework.aop.aspectj.*` batch (these classes live in
+  **spring-context**'s test output, not spring-aop — my first repro ClassNotFound'd on the wrong CP)
+  produced **101 "Stale pointer detected … all-zero header → falling back to CP class java/util/List"**
+  warnings under default flags. So the GC stale-pointer race is real and reproducible.
+- **`CRATONVM_SHADOW_STACK=1` → 101 stale warnings drop to 0** (the shadow-stack **marking** keeps the
+  register-invisible oops alive) **BUT the run then SIGSEGVs (rc=139)** — the **moving/remap** half
+  (Cheney-while-in-JIT + `shadow_stack.remap`) that the same flag enables is what crashes.
+- **A "marking-only default" (the proposed quick fix) is NOT safe** — I implemented + then reverted it:
+  the marking root publish (`vm/src/memory/roots.rs:216`) emits shadow oops as **movable** (the B-K
+  design, to avoid OOM), relying on the non-moving sweep's **selective promotion to EVACUATE** them,
+  which needs the **remap**. With remap gated off (marking-only), a *promoted* shadow object's slot
+  goes **stale** → the race returns for promoted objects. Publishing them **pinned** instead avoids
+  that but **re-introduces the bt18 small-heap OOM** the B-K change specifically fixed ("pinning every
+  register-invisible operand-stack oop OOMs at small heap").
+- **Therefore the real, load-bearing fix is to make the FULL shadow mode (movable + remap + moving)
+  not SIGSEGV** — then the existing movable+remap path resolves the race with no OOM. That SIGSEGV is
+  the deferred **B-K Stage B/C** GC work (fix the Cheney-while-in-JIT / `shadow_stack.remap` crash),
+  needing **uncontended-machine bt16/bt18 validation**. Gate split alone does not fix it.
+- **Per-run mitigation:** none clean (full flag crashes; marking-only is unsafe). The conservative
+  scan already pins stack-resident oops; only the register-invisible ones leak — so the bug is
+  bounded to heavy-multithreaded register-oop-across-call shapes.
+
+## (corrected) ROOT CAUSE — GC root-undercount race, NOT dispatch/weaving
 All sub-causes are **one bug**: a **young-gen GC stale-pointer / cross-thread root-undercount race**.
 Under heavy multithreaded JUnit execution, a live platform-engine/listener/enum object is reclaimed
 (header zeroed) or left stale because a root referencing it (operand-stack / register-resident on a
