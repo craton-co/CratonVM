@@ -3085,14 +3085,58 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 let cursor = std::io::Cursor::new(jar_bytes.as_slice());
                 let mut zip = zip::ZipArchive::new(cursor)
                     .map_err(|e| ioex(format!("URL.openStream: open jar {outer_jar}: {e}")))?;
-                let mut entry_file = zip
-                    .by_name(inner_path)
-                    .map_err(|e| zip_entry_err(inner_path, outer_jar, e))?;
-                let mut buf = Vec::with_capacity(entry_file.size().min(1 << 27) as usize);
-                entry_file
-                    .read_to_end(&mut buf)
-                    .map_err(|e| ioex(format!("URL.openStream: read entry {inner_path}: {e}")))?;
-                buf
+                // JMOD archives nest every class/resource under a top-level
+                // `classes/` directory (a `.jmod` is a zip with classes/,
+                // conf/, lib/, … sections). `ClassLoader.getResource` of a
+                // boot class returns `jar:file:/…/java.base.jmod!/<entry>`
+                // WITHOUT that prefix — mirroring HotSpot's `jrt:` form and
+                // CratonVM's own `ClassPath::find_resource`, which prepends
+                // `classes/` internally. A literal `by_name(<entry>)` therefore
+                // misses every boot class, so `getResourceAsStream` of a JRE
+                // type returned a broken/null stream (e.g. ecj/Jasper resolving
+                // `java/lang/String.class` during JSP compilation → "The type
+                // java.lang.String cannot be resolved"). For `.jmod` containers,
+                // try the `classes/`-prefixed entry first, then the raw name.
+                let is_jmod = outer_jar
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(outer_jar)
+                    .to_ascii_lowercase()
+                    .ends_with(".jmod");
+                let candidates: [String; 2] = if is_jmod {
+                    [format!("classes/{inner_path}"), inner_path.to_string()]
+                } else {
+                    [inner_path.to_string(), String::new()]
+                };
+                let mut buf: Option<Vec<u8>> = None;
+                let mut last_err: Option<zip::result::ZipError> = None;
+                for cand in candidates.iter() {
+                    if cand.is_empty() {
+                        continue;
+                    }
+                    match zip.by_name(cand) {
+                        Ok(mut entry_file) => {
+                            let mut b =
+                                Vec::with_capacity(entry_file.size().min(1 << 27) as usize);
+                            entry_file.read_to_end(&mut b).map_err(|e| {
+                                ioex(format!("URL.openStream: read entry {cand}: {e}"))
+                            })?;
+                            buf = Some(b);
+                            break;
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                match buf {
+                    Some(b) => b,
+                    None => {
+                        return Err(zip_entry_err(
+                            inner_path,
+                            outer_jar,
+                            last_err.unwrap_or(zip::result::ZipError::FileNotFound),
+                        ))
+                    }
+                }
             };
             buf
         } else if let Some(rest) = url_str.strip_prefix("file:") {
@@ -3171,6 +3215,19 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
             let name = name.trim_start_matches('/');
             ctx.find_resource(name)
                 .ok_or_else(|| ioex(format!("URL.openStream: resource not found: {name}")))?
+        } else if let Some(rest) = url_str.strip_prefix("jrt:") {
+            // JEP 220 runtime-image URL: `jrt:/<module>/<resource>`. CratonVM
+            // emits these from `find_all_resource_urls` when the boot classpath
+            // is a jimage (`lib/modules`) rather than exploded `.jmod`s (HotSpot
+            // always uses this form). `find_resource` keys on the module-relative
+            // resource name, so strip the leading `/<module>/` before looking up.
+            let path = rest.trim_start_matches('/');
+            let resource = match path.split_once('/') {
+                Some((_module, r)) => r,
+                None => path,
+            };
+            ctx.find_resource(resource)
+                .ok_or_else(|| ioex(format!("URL.openStream: jrt resource not found: {url_str}")))?
         } else if url_str.starts_with("http://") || url_str.starts_with("https://") {
             let resp = http_perform_request("GET", &url_str, &[], &[], 10)
                 .map_err(|e| ioex(format!("URL.openStream failed: {e}")))?;
