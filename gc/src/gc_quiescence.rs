@@ -96,6 +96,63 @@ pub fn depth() -> usize {
     JIT_ACTIVE_DEPTH.load(Ordering::Acquire)
 }
 
+// ---------------------------------------------------------------------------
+// Stage B (precise oop maps, B-K fix) — movable precise-JIT roots
+// ---------------------------------------------------------------------------
+//
+// A conservatively-discovered JIT root MUST be pinned: a stack qword that
+// merely looks like a heap pointer might be an `i64`, so the collector cannot
+// rewrite it after a move — the object it points at must stay put. That pinning
+// is exactly what wedges the young generation under heavy JIT (bt18 @ small
+// heap: over-pinning blocks the drain) AND, when a pinned-but-relocated object
+// slips through, leaves a stale slot (the B-K under-count).
+//
+// When a JIT frame is FULLY precisely covered (`CompiledMethod::fully_oop_
+// covered`), its live oops live in a precise, *rewritable* oop map. The VM's
+// `remap_active_jit_frames` rewrites those frame slots after a move and the
+// JIT's post-safepoint reload refreshes the registers, so such an oop may be
+// marked-but-NOT-pinned: selective promotion can evacuate it (draining young)
+// and the slot is fixed up afterwards. The marking walk publishes each such
+// young address here; `sweep_young_non_moving` consults it to EXCLUDE those
+// addresses from the pin set.
+//
+// Per-thread because the JIT entry chain and the collection both run on the
+// triggering thread. Cleared at the start of each root-gathering pass so it
+// reflects only the CURRENT stack. A missed publication is always SAFE (the
+// address simply stays pinned, the legacy behaviour); only a *stale* extra
+// entry could be unsafe, which the per-pass clear prevents.
+
+thread_local! {
+    static MOVABLE_JIT_ROOTS: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Clear the movable-precise-JIT-root set. Called by the VM's root gatherer at
+/// the start of every collection, before the JIT-frame scan republishes.
+pub fn clear_movable_jit_roots() {
+    MOVABLE_JIT_ROOTS.with(|s| s.borrow_mut().clear());
+}
+
+/// Record `addr` (an object address held in a precisely-covered, rewritable JIT
+/// frame slot) as movable — i.e. it may be evacuated rather than pinned.
+pub fn add_movable_jit_root(addr: usize) {
+    MOVABLE_JIT_ROOTS.with(|s| {
+        s.borrow_mut().insert(addr);
+    });
+}
+
+/// True if `addr` was published as a movable precise JIT root this cycle.
+/// `sweep_young_non_moving` calls this to exclude the address from the pin set.
+#[inline]
+pub fn is_movable_jit_root(addr: usize) -> bool {
+    MOVABLE_JIT_ROOTS.with(|s| s.borrow().contains(&addr))
+}
+
+/// Count of movable roots published this cycle (diagnostics).
+pub fn movable_jit_root_count() -> usize {
+    MOVABLE_JIT_ROOTS.with(|s| s.borrow().len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

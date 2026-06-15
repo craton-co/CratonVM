@@ -23,6 +23,13 @@ use crate::vm::SharedVm;
 pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     let mut roots = Vec::new();
 
+    // Stage B (precise oop maps, B-K fix): reset the movable precise-JIT-root
+    // set so it reflects only THIS collection's stack. `scan_active_jit_frames`
+    // below republishes the covered, rewritable JIT-frame oops; the young
+    // collector then excludes them from the pin set. No-op unless precise
+    // relocation is engaged (the set stays empty on the default path).
+    cratonvm_gc::gc_quiescence::clear_movable_jit_roots();
+
     // 1. Thread frames — scan locals and operand stacks (SoA layout).
     //
     // Spring Boot SEGV fix (2026-05-16): `ValueStack::scan_object_refs`
@@ -210,6 +217,15 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
         thread.shadow_stack.for_each_value(|v| {
             if let Some(obj_ref) = shared.heap.is_object_address(v) {
                 roots.push(obj_ref);
+                // B-K kafka fix: shadow-stack oops are precise AND *rewritable*
+                // (`thread.shadow_stack.remap` rewrites them after a move, then
+                // the JIT's post-safepoint reload refreshes the register). So
+                // they may be EVACUATED rather than pinned — publish them movable
+                // so the non-moving sweep's selective promotion drains them
+                // instead of over-retaining (pinning every register-invisible
+                // operand-stack oop OOMs at small heap). Reuses the movable-root
+                // set; empty/no-op unless shadow stack is engaged.
+                cratonvm_gc::gc_quiescence::add_movable_jit_root(obj_ref.as_ptr() as usize);
             }
         });
     }
