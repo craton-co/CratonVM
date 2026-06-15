@@ -7767,6 +7767,19 @@ fn annotation_array_component_class_id(ctx: &mut dyn NativeContext) -> ClassId {
     if let Some(cid) = ctx.class_id_by_name("[Ljava/lang/annotation/Annotation;") {
         return cid;
     }
+    // SB-02b-#5: resolve the `Annotation[]` array class via its mirror, which
+    // registers the array class correctly. The previous derive-via-sample path
+    // (`class_id_of_object(new_ref_array(Annotation, 0))`) mis-resolved the
+    // array class on COLD use, returning the `Annotation` component id instead
+    // of `[Annotation` — so the FIRST `getParameterAnnotations()` call built a
+    // 1-D `Annotation[]` outer array instead of `Annotation[][]`. kotlin-reflect's
+    // `ReflectClassStructure.loadMethodAnnotations` then `checkcast`s the result
+    // to `[[Annotation` and throws ClassCastException (only on the first method
+    // processed; later calls hit the now-cached class and were already fine).
+    let mirror = descriptor_to_class_mirror(ctx, "[Ljava/lang/annotation/Annotation;");
+    if let Some(cid) = ctx.class_id_from_mirror(mirror) {
+        return cid;
+    }
     let comp = annotation_component_class_id(ctx);
     let sample = ctx.new_ref_array(comp, 0);
     ctx.class_id_of_object(sample)
