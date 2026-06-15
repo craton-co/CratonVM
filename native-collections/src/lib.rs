@@ -10632,6 +10632,17 @@ fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/stream/Stream;",
         native_long_stream_boxed,
     );
+    // mapToObj(LongFunction) -> Stream. Without this real-JDK-active native, an
+    // `invokeinterface LongStream.mapToObj` on our synthetic LongStream resolved
+    // to the bodiless interface method (`AbstractMethodError: … has no Code
+    // attribute`) — the synthetic-jdk-only `register_phase56_stream_extras`
+    // registration is compiled out of the real-JDK CLI.
+    r.register(
+        c,
+        "mapToObj",
+        "(Ljava/util/function/LongFunction;)Ljava/util/stream/Stream;",
+        native_long_stream_map_to_obj,
+    );
     r.register(
         c,
         "asDoubleStream",
@@ -10639,6 +10650,28 @@ fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
         native_long_stream_as_double,
     );
     r.set_category(__prev_cat);
+}
+
+fn native_long_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let mapper = match args.get(1) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mapped: Vec<Value> = elements
+        .iter()
+        .map(|e| {
+            ctx.invoke_virtual(mapper, "apply", "(J)Ljava/lang/Object;", &[*e])
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None))
+        })
+        .collect();
+    make_stream(ctx, &mapped)
 }
 
 fn native_long_stream_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10941,6 +10974,12 @@ fn register_double_stream_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         c,
+        "mapToObj",
+        "(Ljava/util/function/DoubleFunction;)Ljava/util/stream/Stream;",
+        native_double_stream_map_to_obj,
+    );
+    r.register(
+        c,
         "mapToLong",
         "(Ljava/util/function/DoubleToLongFunction;)Ljava/util/stream/LongStream;",
         native_double_stream_map_to_long,
@@ -11134,6 +11173,28 @@ fn native_double_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     let elements = stream_elements(ctx, this);
     make_stream(ctx, &elements)
+}
+
+fn native_double_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let mapper = match args.get(1) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mapped: Vec<Value> = elements
+        .iter()
+        .map(|e| {
+            ctx.invoke_virtual(mapper, "apply", "(D)Ljava/lang/Object;", &[*e])
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None))
+        })
+        .collect();
+    make_stream(ctx, &mapped)
 }
 
 fn native_double_stream_map_to_long(
