@@ -15097,17 +15097,48 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let mut entries = Vec::new();
+    // Collect (key, value) pairs in insertion order.
+    let mut pairs = Vec::new();
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        let entry = alloc_live_entry(ctx, "java/util/AbstractMap$SimpleEntry", key, val, this);
-        entries.push(Value::Object(Some(entry)));
+        pairs.push((key, val));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
     }
-    // Live view: removals delete the matching key from the LinkedHashMap.
-    let set = make_view_set_of(ctx, this, VIEW_KIND_ENTRYSET, &entries)?;
+    // Build the entrySet view backing keyed by the entry objects' IDENTITY hash,
+    // exactly like `native_map_entry_set` (HashMap). The previous
+    // `make_view_set_of` path hashed each entry via its Java `hashCode` (=
+    // key.hashCode ^ value.hashCode), calling the VALUE's `hashCode` at
+    // construction. For a `LinkedHashMap<…, PersistentCollection>` that ran
+    // `PersistentSet.hashCode` -> `read` -> lazy init during
+    // `BatchFetchQueue.collectBatchLoadableCollectionKeys`, recursing into
+    // another batch load -> `StackOverflowError` (HotSpot never hashes entries
+    // while building/iterating `entrySet()`). Live removal/`setValue` still work
+    // via the entrySet view-backing (`VIEW_KIND_ENTRYSET` + 3-field entries).
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let cap = std::cmp::max(pairs.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+    let backing_map = alloc_view_backing(ctx, this, VIEW_KIND_ENTRYSET, cap);
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    for (key, val) in &pairs {
+        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 3);
+        ctx.set_field(entry_obj, 0, *key);
+        ctx.set_field(entry_obj, 1, *val);
+        ctx.set_field(entry_obj, 2, Value::Object(Some(this)));
+        let hash = ctx.identity_hash_code(entry_obj);
+        let (b, size, c) = map_state(ctx, backing_map);
+        let b = b.unwrap();
+        let idx = map_bucket_index(hash, c);
+        let existing = ctx.get_array_element(b, idx);
+        let head = match existing {
+            Value::Object(obj_opt) => obj_opt,
+            _ => None,
+        };
+        let sentinel = Value::Int(1);
+        let node = map_alloc_node(ctx, entry_obj, sentinel, hash, head);
+        ctx.set_array_element(b, idx, Value::Object(Some(node)));
+        set_map_size(ctx, backing_map, size + 1);
+    }
     Ok(Some(Value::Object(Some(set))))
 }
 
