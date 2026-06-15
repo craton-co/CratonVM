@@ -2278,6 +2278,19 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
         "findProvider",
         "()Lorg/jboss/logging/LoggerProvider;",
         |ctx, _args| {
+            // Honor a ServiceLoader-registered custom `LoggerProvider` first —
+            // e.g. Hibernate testing's `TestableLoggerProvider`, declared in
+            // `META-INF/services/org.jboss.logging.LoggerProvider`, which the
+            // log-inspection tests require so `Logger.getLogger` yields a
+            // `DelegatingLogger` (else `AssertionFailure: JBoss Logger didn't
+            // register the custom TestableLoggerProvider`). This runs the real
+            // `ServiceLoader` bytecode (not a stub). Fall back to the built-in
+            // `JDKLoggerProvider` when nothing is registered — preserving the
+            // WildFly boot path whose real `LoggerProviders.<clinit>` (empty
+            // ServiceLoader) was the reason for this interception.
+            if let Some(p) = jboss_logging_serviceloader_provider(ctx) {
+                return Ok(Some(p));
+            }
             let cls = "org/jboss/logging/JDKLoggerProvider";
             let obj = match ctx.new_object(cls) {
                 Ok(Some(Value::Object(Some(o)))) => o,
@@ -2331,6 +2344,39 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
 
     let _ = CTX_NUM_SLOTS; // silence unused constant when debug builds elide.
     r.set_category(__prev_cat);
+}
+
+/// Try to obtain a custom `org.jboss.logging.LoggerProvider` registered via the
+/// standard ServiceLoader mechanism (`META-INF/services/org.jboss.logging.
+/// LoggerProvider`). Returns the first provider found, or `None` so the caller
+/// falls back to the built-in JDK provider. Runs real `ServiceLoader` bytecode,
+/// so a test-supplied provider (Hibernate's `TestableLoggerProvider`) is
+/// honoured. Any failure (no class, empty loader, provider <init> error) yields
+/// `None` and the safe JDK fallback.
+fn jboss_logging_serviceloader_provider(ctx: &mut dyn NativeContext) -> Option<Value> {
+    let cid = ctx.class_id_by_name("org/jboss/logging/LoggerProvider")?;
+    let mirror = ctx.get_class_mirror(cid);
+    let sl = match ctx.invoke(
+        "java/util/ServiceLoader",
+        "load",
+        "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
+        &[Value::Object(Some(mirror))],
+    ) {
+        Ok(Some(Value::Object(Some(s)))) => s,
+        _ => return None,
+    };
+    let it = match ctx.invoke_virtual(sl, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(i)))) => i,
+        _ => return None,
+    };
+    match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+        Ok(Some(Value::Int(1))) => {}
+        _ => return None,
+    }
+    match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
+        Ok(Some(v @ Value::Object(Some(_)))) => Some(v),
+        _ => None,
+    }
 }
 
 /// Construct a `<intf>_$logger` instance natively, bypassing the

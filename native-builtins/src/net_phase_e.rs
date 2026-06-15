@@ -3097,8 +3097,22 @@ fn register_re4_url_http(r: &mut NativeMethodRegistry) {
                 let cursor = std::io::Cursor::new(jar_bytes.as_slice());
                 let mut zip = zip::ZipArchive::new(cursor)
                     .map_err(|e| ioex(format!("URL.openStream: open jar {outer_jar}: {e}")))?;
+                // A `.jmod` archive stores its class/resource entries under a
+                // `classes/` prefix, but a `getResource` URL into a jmod omits
+                // it (e.g. `…/java.base.jmod!/java/lang/Object.class`). Resolve
+                // to the prefixed entry, mirroring `find_resource`'s jmod path.
+                // Without this, Hibernate's Jandex indexer
+                // (`SourceModelTestHelper.buildJandexIndex`, which reads JDK
+                // baseline types out of `java.base.jmod`) failed with
+                // "entry java/lang/Object.class … not found in archive".
+                let lookup: std::borrow::Cow<str> =
+                    if outer_jar.ends_with(".jmod") && !inner_path.starts_with("classes/") {
+                        std::borrow::Cow::Owned(format!("classes/{inner_path}"))
+                    } else {
+                        std::borrow::Cow::Borrowed(inner_path)
+                    };
                 let mut entry_file = zip
-                    .by_name(inner_path)
+                    .by_name(&lookup)
                     .map_err(|e| zip_entry_err(inner_path, outer_jar, e))?;
                 let mut buf = Vec::with_capacity(entry_file.size().min(1 << 27) as usize);
                 entry_file

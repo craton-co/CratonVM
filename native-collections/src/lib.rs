@@ -10632,6 +10632,17 @@ fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
         "()Ljava/util/stream/Stream;",
         native_long_stream_boxed,
     );
+    // mapToObj(LongFunction) -> Stream. Without this real-JDK-active native, an
+    // `invokeinterface LongStream.mapToObj` on our synthetic LongStream resolved
+    // to the bodiless interface method (`AbstractMethodError: … has no Code
+    // attribute`) — the synthetic-jdk-only `register_phase56_stream_extras`
+    // registration is compiled out of the real-JDK CLI.
+    r.register(
+        c,
+        "mapToObj",
+        "(Ljava/util/function/LongFunction;)Ljava/util/stream/Stream;",
+        native_long_stream_map_to_obj,
+    );
     r.register(
         c,
         "asDoubleStream",
@@ -10639,6 +10650,28 @@ fn register_long_stream_natives(r: &mut NativeMethodRegistry) {
         native_long_stream_as_double,
     );
     r.set_category(__prev_cat);
+}
+
+fn native_long_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let mapper = match args.get(1) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mapped: Vec<Value> = elements
+        .iter()
+        .map(|e| {
+            ctx.invoke_virtual(mapper, "apply", "(J)Ljava/lang/Object;", &[*e])
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None))
+        })
+        .collect();
+    make_stream(ctx, &mapped)
 }
 
 fn native_long_stream_of(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -10941,6 +10974,12 @@ fn register_double_stream_natives(r: &mut NativeMethodRegistry) {
     );
     r.register(
         c,
+        "mapToObj",
+        "(Ljava/util/function/DoubleFunction;)Ljava/util/stream/Stream;",
+        native_double_stream_map_to_obj,
+    );
+    r.register(
+        c,
         "mapToLong",
         "(Ljava/util/function/DoubleToLongFunction;)Ljava/util/stream/LongStream;",
         native_double_stream_map_to_long,
@@ -11134,6 +11173,28 @@ fn native_double_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> Me
     };
     let elements = stream_elements(ctx, this);
     make_stream(ctx, &elements)
+}
+
+fn native_double_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(r))) => *r,
+        _ => return make_stream(ctx, &[]),
+    };
+    let mapper = match args.get(1) {
+        Some(Value::Object(Some(f))) => *f,
+        _ => return make_stream(ctx, &[]),
+    };
+    let elements = stream_elements(ctx, this);
+    let mapped: Vec<Value> = elements
+        .iter()
+        .map(|e| {
+            ctx.invoke_virtual(mapper, "apply", "(D)Ljava/lang/Object;", &[*e])
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None))
+        })
+        .collect();
+    make_stream(ctx, &mapped)
 }
 
 fn native_double_stream_map_to_long(
@@ -15036,17 +15097,48 @@ fn native_lhm_entry_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
         Some(Value::Object(Some(r))) => *r,
         _ => return Ok(Some(Value::Object(None))),
     };
-    let mut entries = Vec::new();
+    // Collect (key, value) pairs in insertion order.
+    let mut pairs = Vec::new();
     let mut cur = lhm_get(ctx, this, "head", LHM_FIELD_HEAD);
     while let Value::Object(Some(node)) = cur {
         let key = ctx.get_field(node, LHM_NODE_KEY);
         let val = ctx.get_field(node, LHM_NODE_VALUE);
-        let entry = alloc_live_entry(ctx, "java/util/AbstractMap$SimpleEntry", key, val, this);
-        entries.push(Value::Object(Some(entry)));
+        pairs.push((key, val));
         cur = ctx.get_field(node, LHM_NODE_AFTER);
     }
-    // Live view: removals delete the matching key from the LinkedHashMap.
-    let set = make_view_set_of(ctx, this, VIEW_KIND_ENTRYSET, &entries)?;
+    // Build the entrySet view backing keyed by the entry objects' IDENTITY hash,
+    // exactly like `native_map_entry_set` (HashMap). The previous
+    // `make_view_set_of` path hashed each entry via its Java `hashCode` (=
+    // key.hashCode ^ value.hashCode), calling the VALUE's `hashCode` at
+    // construction. For a `LinkedHashMap<…, PersistentCollection>` that ran
+    // `PersistentSet.hashCode` -> `read` -> lazy init during
+    // `BatchFetchQueue.collectBatchLoadableCollectionKeys`, recursing into
+    // another batch load -> `StackOverflowError` (HotSpot never hashes entries
+    // while building/iterating `entrySet()`). Live removal/`setValue` still work
+    // via the entrySet view-backing (`VIEW_KIND_ENTRYSET` + 3-field entries).
+    let set = alloc_synthetic(ctx, "java/util/HashSet", HS_NUM_FIELDS);
+    let cap = std::cmp::max(pairs.len().next_power_of_two(), MAP_DEFAULT_CAPACITY);
+    let backing_map = alloc_view_backing(ctx, this, VIEW_KIND_ENTRYSET, cap);
+    ctx.set_field(set, HS_FIELD_MAP, Value::Object(Some(backing_map)));
+    for (key, val) in &pairs {
+        let entry_obj = alloc_synthetic(ctx, "java/util/Map$Entry", 3);
+        ctx.set_field(entry_obj, 0, *key);
+        ctx.set_field(entry_obj, 1, *val);
+        ctx.set_field(entry_obj, 2, Value::Object(Some(this)));
+        let hash = ctx.identity_hash_code(entry_obj);
+        let (b, size, c) = map_state(ctx, backing_map);
+        let b = b.unwrap();
+        let idx = map_bucket_index(hash, c);
+        let existing = ctx.get_array_element(b, idx);
+        let head = match existing {
+            Value::Object(obj_opt) => obj_opt,
+            _ => None,
+        };
+        let sentinel = Value::Int(1);
+        let node = map_alloc_node(ctx, entry_obj, sentinel, hash, head);
+        ctx.set_array_element(b, idx, Value::Object(Some(node)));
+        set_map_size(ctx, backing_map, size + 1);
+    }
     Ok(Some(Value::Object(Some(set))))
 }
 

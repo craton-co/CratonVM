@@ -6778,8 +6778,8 @@ fn register_data_stream_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)V",
         native_dos_write_utf,
     );
-    registry.register(dos, "flush", "()V", native_noop_void);
-    registry.register(dos, "close", "()V", native_noop_void);
+    registry.register(dos, "flush", "()V", native_dos_flush);
+    registry.register(dos, "close", "()V", native_dos_close);
     registry.register(dos, "size", "()I", native_dos_size);
 
     // DataInput/DataOutput interface registrations
@@ -7367,6 +7367,37 @@ fn native_dos_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRe
         _ => 0,
     };
     dos_write_one(ctx, this, b)?;
+    Ok(None)
+}
+
+/// `DataOutputStream.flush()` MUST propagate to the underlying stream — it is
+/// `FilterOutputStream.flush()` (`out.flush()`). A no-op here silently strips
+/// the flush, so e.g. `Manifest.write(new BufferedOutputStream(jos))` (the
+/// `JarOutputStream(out, manifest)` constructor) leaves the manifest buffered
+/// in the BufferedOutputStream and never written to the JAR — producing an
+/// empty MANIFEST.MF.
+fn native_dos_flush(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    if let Value::Object(Some(inner)) = ctx.get_field(this, DOS_FIELD_OUT) {
+        ctx.invoke_virtual(inner, "flush", "()V", &[])?;
+    }
+    Ok(None)
+}
+
+/// `DataOutputStream.close()` flushes then closes the underlying stream
+/// (`FilterOutputStream.close`). A no-op loses any buffered output.
+fn native_dos_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(None),
+    };
+    if let Value::Object(Some(inner)) = ctx.get_field(this, DOS_FIELD_OUT) {
+        let _ = ctx.invoke_virtual(inner, "flush", "()V", &[]);
+        ctx.invoke_virtual(inner, "close", "()V", &[])?;
+    }
     Ok(None)
 }
 

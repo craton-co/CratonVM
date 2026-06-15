@@ -15,33 +15,54 @@
   invoked, connection healthy. So group 04's "servers don't serve" framing is
   refuted for the connector — it serves; the prior failures were the `setOption`
   reset.
-- **Remaining blocker — the in-process HTTP CLIENT.** `TomcatBaseTest.getUrl`
-  (every embedded-HTTP test) uses `HttpURLConnection`, which CratonVM bridges to
-  a native Rust HTTP client (`native-builtins/src/http_url_connection.rs::perform`
-  → raw `std::net::TcpStream`). When that client runs **in the same process** as
-  the server, `getResponseCode()` returns `-1`, the server's `doGet` is **never**
-  invoked, and the socket layer logs **no** server-side read (capture empty) — i.e.
-  the server never even processes the request. An external curl against the same
-  server works, and an in-process raw `java.net.Socket` client (separate
-  write/read calls) also gets `doGet` invoked; only the native `perform` (a single
-  long blocking native call that connects+writes+reads with no Java safepoint in
-  between) fails. Leading hypothesis: `perform`'s uninterrupted native blocking
-  I/O on the calling thread starves the server's worker threads (no safepoint /
-  GC progress) until its read times out → `-1`. This — not the server — is why
-  `TestPageContext` (and getUrl-based tests) still FAIL.
+- **Remaining blocker — the native `HttpURLConnection` natives corrupt a REAL
+  `sun.net.www` object (field-layout mismatch). ROOT-CAUSED.** `TomcatBaseTest.getUrl`
+  uses `HttpURLConnection`. For a real `http://` URL, `url.openConnection()` runs
+  the genuine JDK bytecode (NOT the synthetic resource-URL intercept in
+  `net_phase_e`) and returns a real `sun.net.www.protocol.http.HttpURLConnection`.
+  `getResponseCode()` then dispatches to a NATIVE — `http_url_connection.rs::
+  huc_get_response_code` (registered last, at `lib.rs:5423`, so it wins over both
+  the other two native impls AND the real bytecode). That native reads the object
+  with its *own synthetic* field layout (`HUC_CONNECTED`=field 7,
+  `HUC_CONN_ID`=field 0, `HUC_URL_STR`=field 1), but the real object's layout is
+  completely different. Confirmed by tracing the live call:
+  `HUC_CONNECTED(f7)=Int(1)` (a real field that happens to be 1) → `ensure_connected`
+  **early-returns without making any request**; `HUC_CONN_ID(f0)=Object` (the real
+  `URLConnection.url` field, not an int conn-id) → `with_state` returns `None` →
+  `getResponseCode()` yields **`-1`**. That is why there is NO socket I/O, NO
+  `ssc_accept`, NO `doGet` — the request is never even attempted. (The earlier
+  "GC-starvation" hypothesis was DISPROVEN: `begin_blocking_region` had no effect
+  because the client `perform`/`huc_perform` functions it was wrapped around are
+  never reached — `ensure_connected` bails first.)
+**There are THREE competing native `HttpURLConnection` implementations** — in
+`http_url_connection.rs`, `net_phase_e.rs` (`huc_perform`), and `phases_early.rs`
+(`p54_huc_do_request`) — each with a *different* synthetic field layout, all
+registered on `java/net/HttpURLConnection`/`sun/net/www/...`; last-writer-wins
+picks the `http_url_connection.rs` one, which then corrupts real JDK objects.
 **Severity:** Medium-High (blocks every getUrl-based embedded-HTTP test).
 **Repro class:** `jakarta.servlet.jsp.TestPageContext` — `Tests run: 1, Failures: 1`.
 
 ## Next step for the remaining blocker
 
-Make the native `HttpURLConnection.perform` cooperate with the VM's
-safepoint/thread model during blocking I/O (e.g. run it as a safepoint-safe
-"in native" region, or chunk connect/write/read so the calling thread reaches a
-safepoint), OR drop the native `HttpURLConnection` bridge so the real
-`sun.net.www.protocol.http` bytecode runs over the now-working socket layer.
-A minimal repro is `scratch/rec0910/mini/MiniHU.java` (CratonVM
-`HttpURLConnection` client + CratonVM server in one process → code=-1) vs the
-external-`curl` success.
+The clean fix is to stop the synthetic `HttpURLConnection` natives from hijacking
+real `sun.net.www` objects. Options, in rough order of safety:
+1. Consolidate the THREE native impls into one and make the method natives detect
+   a real (JDK-constructed) `HttpURLConnection` — e.g. field 0 is a `java/net/URL`
+   object (the real `URLConnection.url`) rather than an int conn-id — and in that
+   case read the URL from the real layout and perform the request (the real
+   `java.net.Socket` path already works in-process: an in-process raw
+   `java.net.Socket` client gets `doGet` invoked), instead of trusting the
+   synthetic `HUC_*` slots.
+2. OR drop the method natives on `sun/net/www/protocol/http(s).HttpURLConnection`
+   so real bytecode runs for real HTTP, while keeping the synthetic carrier +
+   natives ONLY for the `net_phase_e` resource-URL path (`file:`/`jar:`/
+   `classpath:` via `getInputStream`→`openStream`).
+RISK: the synthetic path is load-bearing for resource loading (Spring
+`spring.factories`, jar URLs, WildFly bootstrap), so any change MUST preserve it
+(verify those don't regress). Minimal repro: `scratch/rec0910/mini/MiniHU.java`
+(CratonVM `HttpURLConnection` client + CratonVM server in one process → code=-1)
+vs the external-`curl` success; `[GRC-A]` trace showed `HUC_CONNECTED(f7)=Int(1)`
+on the real object.
 
 ## Symptom
 

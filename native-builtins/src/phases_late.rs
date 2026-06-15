@@ -1798,6 +1798,12 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
     );
     r.register(
         ls,
+        "mapToObj",
+        "(Ljava/util/function/LongFunction;)Ljava/util/stream/Stream;",
+        p56_long_stream_map_to_obj,
+    );
+    r.register(
+        ls,
         "asDoubleStream",
         "()Ljava/util/stream/DoubleStream;",
         p56_long_stream_as_double,
@@ -1852,6 +1858,12 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
         "boxed",
         "()Ljava/util/stream/Stream;",
         p56_double_stream_boxed,
+    );
+    r.register(
+        ds,
+        "mapToObj",
+        "(Ljava/util/function/DoubleFunction;)Ljava/util/stream/Stream;",
+        p56_double_stream_map_to_obj,
     );
     r.register(
         ds,
@@ -2342,6 +2354,39 @@ fn p56_long_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         boxed.push(Value::Object(Some(wrapper)));
     }
     let s = p56_build_stream(ctx, boxed, "java/util/stream/Stream");
+    Ok(Some(Value::Object(Some(s))))
+}
+
+// --- LongStream.mapToObj(LongFunction) -> Stream ---
+// CratonVM's `LongStream` (and `DoubleStream`) is a synthetic object whose class
+// is the interface itself; `boxed`/`map`/etc. are registered natives, but
+// `mapToObj` was missing, so the call landed on the bodiless interface method
+// (`AbstractMethodError: … has no Code attribute`). `IntStream.mapToObj` works
+// because IntStream is not synthesised. Mirror `boxed`, applying the function.
+fn p56_long_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let func = obj_arg(args, 1)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let mut out = Vec::with_capacity(elems.len());
+    for v in elems {
+        let mapped = ctx.invoke_virtual(func, "apply", "(J)Ljava/lang/Object;", &[v])?;
+        out.push(mapped.unwrap_or(Value::Object(None)));
+    }
+    let s = p56_build_stream(ctx, out, "java/util/stream/Stream");
+    Ok(Some(Value::Object(Some(s))))
+}
+
+// --- DoubleStream.mapToObj(DoubleFunction) -> Stream ---
+fn p56_double_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let func = obj_arg(args, 1)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let mut out = Vec::with_capacity(elems.len());
+    for v in elems {
+        let mapped = ctx.invoke_virtual(func, "apply", "(D)Ljava/lang/Object;", &[v])?;
+        out.push(mapped.unwrap_or(Value::Object(None)));
+    }
+    let s = p56_build_stream(ctx, out, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(s))))
 }
 
@@ -11328,7 +11373,7 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             Ok(None)
         },
     );
-    // Internal accumulator for current entry data
+    // Internal accumulator for current entry data.
     r.register(zo, "write", "([BII)V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         if let Some(Value::Object(Some(src))) = args.get(1) {
@@ -11342,6 +11387,32 @@ pub(crate) fn register_p58_gzip_streams(r: &mut NativeMethodRegistry) {
             }
             // Accumulate in a Rust-side buffer via a temporary byte array
             // Read existing accumulated bytes for this entry, append new ones
+            zo_append_entry_data(ctx, this, &bytes);
+        }
+        Ok(None)
+    });
+    // write(int) and write([B) MUST be overridden on ZipOutputStream too:
+    // DataOutputStream.writeBytes (used by Manifest.write) emits the data one
+    // byte at a time via out.write(int). Without a ZipOutputStream-level
+    // override that path falls through to DeflaterOutputStream.write(int) — a
+    // no-op here — silently dropping every byte (e.g. an empty MANIFEST.MF when
+    // building a JAR via `new JarOutputStream(out, manifest)`).
+    r.register(zo, "write", "(I)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let b = args.get(1).and_then(|v| v.as_int()).unwrap_or(0) as u8;
+        zo_append_entry_data(ctx, this, &[b]);
+        Ok(None)
+    });
+    r.register(zo, "write", "([B)V", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        if let Some(Value::Object(Some(src))) = args.get(1) {
+            let len = ctx.array_length(*src);
+            let mut bytes = Vec::with_capacity(len);
+            for i in 0..len {
+                if let Value::Int(b) = ctx.get_array_element(*src, i) {
+                    bytes.push(b as u8);
+                }
+            }
             zo_append_entry_data(ctx, this, &bytes);
         }
         Ok(None)
@@ -11625,12 +11696,17 @@ fn zo_bufs() -> &'static StdMutex<ZoHashMap<u64, Vec<u8>>> {
     ZO_ENTRY_BUFS.get_or_init(|| StdMutex::new(ZoHashMap::new()))
 }
 
-fn zo_buf_key(obj: ObjectRef) -> u64 {
-    obj.as_ptr() as u64
+fn zo_buf_key(ctx: &dyn NativeContext, obj: ObjectRef) -> u64 {
+    // Identity hash is stable across a moving GC; the raw object pointer is
+    // not, and the entry data accumulates across many write() calls whose
+    // intervening Java allocations (DataOutputStream/StringBuffer in
+    // Manifest.write) can move `this`. A pointer key would then split the
+    // buffer and lose data.
+    ctx.identity_hash_code(obj) as u32 as u64
 }
 
 fn zo_append_entry_data(ctx: &mut dyn NativeContext, this: ObjectRef, bytes: &[u8]) {
-    let key = zo_buf_key(this);
+    let key = zo_buf_key(ctx, this);
     let mut bufs = zo_bufs().lock().unwrap();
     bufs.entry(key).or_default().extend_from_slice(bytes);
 }
@@ -11642,7 +11718,7 @@ fn zo_finalize_current_entry(ctx: &mut dyn NativeContext, this: ObjectRef) {
         return;
     }
 
-    let key = zo_buf_key(this);
+    let key = zo_buf_key(ctx, this);
     let data = {
         let mut bufs = zo_bufs().lock().unwrap();
         bufs.remove(&key).unwrap_or_default()
@@ -13030,11 +13106,18 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
     r.register(mf, "<init>", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
         // Empty main attributes + empty entries map so getMainAttributes /
-        // getEntries always return a non-null container.
+        // getEntries always return a non-null container. Both helpers now run
+        // real <init>s (which allocate and can GC-move objects), so pin `this`
+        // and the attributes across the construction and re-read before storing.
+        let this_pin = ctx.pin_native_root(this);
         let attrs = p59_manifest_new_attributes(ctx);
+        let attrs_pin = ctx.pin_native_root(attrs);
         let entries = p59_manifest_new_entries_map(ctx);
+        let this = ctx.read_native_pin(this_pin, this);
+        let attrs = ctx.read_native_pin(attrs_pin, attrs);
         ctx.set_field(this, 0, Value::Object(Some(attrs)));
         ctx.set_field(this, 1, Value::Object(Some(entries)));
+        ctx.unpin_native_roots(this_pin);
         Ok(None)
     });
     r.register(
@@ -13057,38 +13140,13 @@ pub fn register_p59_jar(r: &mut NativeMethodRegistry) {
         Ok(Some(ctx.get_field(this, 1)))
     });
 
-    // Attributes extends HashMap — layout: buckets=0 (Object[] of alternating
-    // String key / String value), size=1 (Int count of pairs), capacity=2
-    // (Int total slots). `getValue` / `putValue` walk the buckets array so
-    // the Manifest(InputStream) constructor can store parsed attributes
-    // that are readable by subsequent `getValue` calls.
-    let attr = "java/util/jar/Attributes";
-    r.register(
-        attr,
-        "getValue",
-        "(Ljava/lang/String;)Ljava/lang/String;",
-        p59_attributes_get_value,
-    );
-    r.register(
-        attr,
-        "getValue",
-        "(Ljava/util/jar/Attributes$Name;)Ljava/lang/String;",
-        p59_attributes_get_value_name,
-    );
-    r.register(
-        attr,
-        "putValue",
-        "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
-        p59_attributes_put_value,
-    );
-    r.register(attr, "size", "()I", |ctx, args| {
-        let this = obj_arg(args, 0)?;
-        let n = match ctx.get_field(this, 1) {
-            Value::Int(v) => v,
-            _ => 0,
-        };
-        Ok(Some(Value::Int(n)))
-    });
+    // NOTE: java.util.jar.Attributes is backed by a single real `map`
+    // (LinkedHashMap) field — see p59_manifest_new_attributes. getValue /
+    // putValue / size / entrySet therefore run the genuine JDK bytecode over
+    // that map; we deliberately do NOT register synthetic overrides here (the
+    // old slot-walking overrides were wrong for the 1-field real layout and
+    // returned null/0 once the gen_heap OOB guard started dropping their
+    // out-of-bounds slot accesses).
 
     // Attributes.Name constants
     let an = "java/util/jar/Attributes$Name";
@@ -14127,30 +14185,45 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
         }
         Err(_) => return Value::Object(None),
     };
-    // Parse manifest: main attributes are key: value pairs
-    let manifest = alloc_concurrent_synthetic(ctx, "java/util/jar/Manifest", 2);
-    // Create Attributes as a HashMap-like synthetic (3-field: buckets, size, capacity)
-    let attrs = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes", 3);
-    let mut attr_count = 0;
-    let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 64);
+    // Parse the main section (terminated by a blank line) into key/value pairs,
+    // then build a REAL Manifest whose Attributes is backed by a real map —
+    // consistent with getValue/putValue/size/write (see
+    // p59_manifest_new_attributes). The previous synthetic 3-slot Attributes
+    // was wrong for the 1-field real layout and read back null/empty.
+    let mut pairs: Vec<(String, String)> = Vec::new();
     for line in manifest_content.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.trim().is_empty() {
+            break; // end of the main (manifest-wide) section
+        }
         if let Some((key, value)) = line.split_once(": ") {
-            let key_str = ctx.create_string(key.trim());
-            let val_str = ctx.create_string(value.trim());
-            // Store as pair in buckets array (alternating key, value)
-            if attr_count * 2 + 1 < 64 {
-                ctx.set_array_element(buckets, attr_count * 2, Value::Object(Some(key_str)));
-                ctx.set_array_element(buckets, attr_count * 2 + 1, Value::Object(Some(val_str)));
-                attr_count += 1;
-            }
+            pairs.push((key.trim().to_string(), value.trim().to_string()));
         }
     }
-    ctx.set_field(attrs, 0, Value::Object(Some(buckets)));
-    ctx.set_field(attrs, 1, Value::Int(attr_count as i32));
-    ctx.set_field(attrs, 2, Value::Int(64));
-    ctx.set_field(manifest, 0, Value::Object(Some(attrs)));
-    ctx.set_field(manifest, 1, Value::Object(None)); // per-entry attributes
-    Value::Object(Some(manifest))
+    // A real Manifest (its <init> native installs a real empty Attributes at
+    // slot 0 and a real entries map at slot 1); populate the main Attributes
+    // through real putValue. Pin across the allocating calls.
+    let manifest = match ctx.new_object_initialized("java/util/jar/Manifest", "()V", &[]) {
+        Ok(Some(Value::Object(Some(o)))) => o,
+        _ => return Value::Object(None),
+    };
+    let man_pin = ctx.pin_native_root(manifest);
+    let attrs = match ctx.get_field(manifest, 0) {
+        Value::Object(Some(a)) => a,
+        _ => {
+            ctx.unpin_native_roots(man_pin);
+            return Value::Object(None);
+        }
+    };
+    let attrs_pin = ctx.pin_native_root(attrs);
+    let ok = p59_attrs_populate_real(ctx, attrs_pin, attrs, &pairs).is_ok();
+    let manifest = ctx.read_native_pin(man_pin, manifest);
+    ctx.unpin_native_roots(man_pin);
+    if ok {
+        Value::Object(Some(manifest))
+    } else {
+        Value::Object(None)
+    }
 }
 
 // =============================================================================
@@ -14161,20 +14234,26 @@ fn p98_read_jar_manifest(ctx: &mut dyn NativeContext, path: &str) -> Value {
 // the real-JDK bytecode for Manifest isn't loaded.
 // =============================================================================
 
-const P59_ATTR_CAPACITY: usize = 64;
-
 /// Allocate a fresh synthetic `java.util.jar.Attributes` with an empty
 /// buckets array (alternating key/value Strings; fixed cap=64 for simplicity).
 fn p59_manifest_new_attributes(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let attrs = alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes", 3);
-    let buckets = ctx.new_array(
-        cratonvm_types::ArrayElementType::Reference,
-        P59_ATTR_CAPACITY * 2,
-    );
-    ctx.set_field(attrs, 0, Value::Object(Some(buckets)));
-    ctx.set_field(attrs, 1, Value::Int(0));
-    ctx.set_field(attrs, 2, Value::Int(P59_ATTR_CAPACITY as i32));
-    attrs
+    // Build a REAL java.util.jar.Attributes: its single `map` field is a real
+    // LinkedHashMap, so every access path — Map.put/entrySet (real bytecode),
+    // getValue/putValue/size (also real bytecode now) and Manifest.write's
+    // writeMain — operates on one consistent backing. The previous synthetic
+    // 3-slot layout (buckets/size/capacity) was wrong: Attributes has exactly
+    // one field, so slots 1/2 were out-of-bounds and slot 0 (the real `map`)
+    // was misread as a bucket array. (Out-of-bounds slot writes used to land
+    // on adjacent memory and "work" by accident until the gen_heap OOB guard
+    // started dropping them, which made every Manifest attribute read null.)
+    if let Ok(Some(Value::Object(Some(o)))) =
+        ctx.new_object_initialized("java/util/jar/Attributes", "()V", &[])
+    {
+        return o;
+    }
+    // Fallback: a bare allocation (map left at its default) is still better
+    // than the broken synthetic layout.
+    alloc_concurrent_synthetic(ctx, "java/util/jar/Attributes", 1)
 }
 
 /// Allocate a fresh HashMap-shaped synthetic for per-entry Attributes
@@ -14184,113 +14263,17 @@ fn p59_manifest_new_attributes(ctx: &mut dyn NativeContext) -> ObjectRef {
 /// pair-list one, and `getEntries()` callers only walk the entries via
 /// their own iteration so the layout choice is local).
 fn p59_manifest_new_entries_map(ctx: &mut dyn NativeContext) -> ObjectRef {
-    let map = alloc_concurrent_synthetic(ctx, "java/util/HashMap", 3);
-    let buckets = ctx.new_array(
-        cratonvm_types::ArrayElementType::Reference,
-        P59_ATTR_CAPACITY * 2,
-    );
-    ctx.set_field(map, 0, Value::Object(Some(buckets)));
-    ctx.set_field(map, 1, Value::Int(0));
-    ctx.set_field(map, 2, Value::Int(P59_ATTR_CAPACITY as i32));
-    map
-}
-
-/// Write one (key, value) entry into an Attributes-shaped synthetic.
-/// If the key already exists, overwrites its value. No-op if the bucket
-/// array is full (bounded at P59_ATTR_CAPACITY pairs).
-fn p59_attrs_insert(
-    ctx: &mut dyn NativeContext,
-    attrs: ObjectRef,
-    key: &str,
-    value: &str,
-) {
-    let buckets = match ctx.get_field(attrs, 0) {
-        Value::Object(Some(b)) => b,
-        _ => return,
-    };
-    let size = match ctx.get_field(attrs, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    let cap = match ctx.get_field(attrs, 2) {
-        Value::Int(v) => v as usize,
-        _ => P59_ATTR_CAPACITY,
-    };
-    // Look for existing key (case-insensitive, matching MANIFEST.MF spec).
-    for i in 0..size {
-        let k_val = ctx.get_array_element(buckets, i * 2);
-        if let Value::Object(Some(k)) = k_val {
-            if let Some(existing) = ctx.read_string(k) {
-                if existing.eq_ignore_ascii_case(key) {
-                    let new_val = ctx.create_string(value);
-                    ctx.set_array_element(buckets, i * 2 + 1, Value::Object(Some(new_val)));
-                    return;
-                }
-            }
-        }
+    // A REAL LinkedHashMap (name -> Attributes), for the same reason as
+    // p59_manifest_new_attributes: the synthetic 3-slot layout did not match
+    // java.util.HashMap's real field layout, so real Map ops (put/get/entrySet,
+    // used by Manifest.write and getEntries consumers) saw a different/empty
+    // backing than the synthetic insert path.
+    if let Ok(Some(Value::Object(Some(o)))) =
+        ctx.new_object_initialized("java/util/LinkedHashMap", "()V", &[])
+    {
+        return o;
     }
-    if size >= cap {
-        return;
-    }
-    let k = ctx.create_string(key);
-    let v = ctx.create_string(value);
-    ctx.set_array_element(buckets, size * 2, Value::Object(Some(k)));
-    ctx.set_array_element(buckets, size * 2 + 1, Value::Object(Some(v)));
-    ctx.set_field(attrs, 1, Value::Int((size + 1) as i32));
-}
-
-/// Insert an entry into the entries map (key = entry name String, value =
-/// Attributes object). Uses the same alternating-pair layout as Attributes
-/// so getEntries()-style introspection works identically.
-fn p59_entries_insert(
-    ctx: &mut dyn NativeContext,
-    map: ObjectRef,
-    name: &str,
-    attrs: ObjectRef,
-) {
-    let buckets = match ctx.get_field(map, 0) {
-        Value::Object(Some(b)) => b,
-        _ => return,
-    };
-    let size = match ctx.get_field(map, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    let cap = match ctx.get_field(map, 2) {
-        Value::Int(v) => v as usize,
-        _ => P59_ATTR_CAPACITY,
-    };
-    if size >= cap {
-        return;
-    }
-    let k = ctx.create_string(name);
-    ctx.set_array_element(buckets, size * 2, Value::Object(Some(k)));
-    ctx.set_array_element(buckets, size * 2 + 1, Value::Object(Some(attrs)));
-    ctx.set_field(map, 1, Value::Int((size + 1) as i32));
-}
-
-/// Look up a String value in an Attributes-shaped synthetic by key.
-/// Returns `Value::Object(None)` if the key isn't present.
-fn p59_attrs_lookup(ctx: &dyn NativeContext, attrs: ObjectRef, key: &str) -> Value {
-    let buckets = match ctx.get_field(attrs, 0) {
-        Value::Object(Some(b)) => b,
-        _ => return Value::Object(None),
-    };
-    let size = match ctx.get_field(attrs, 1) {
-        Value::Int(v) => v as usize,
-        _ => 0,
-    };
-    for i in 0..size {
-        let k_val = ctx.get_array_element(buckets, i * 2);
-        if let Value::Object(Some(k)) = k_val {
-            if let Some(existing) = ctx.read_string(k) {
-                if existing.eq_ignore_ascii_case(key) {
-                    return ctx.get_array_element(buckets, i * 2 + 1);
-                }
-            }
-        }
-    }
-    Value::Object(None)
+    alloc_concurrent_synthetic(ctx, "java/util/HashMap", 1)
 }
 
 /// Read all bytes from an InputStream. For a synthetic ByteArrayInputStream
@@ -14502,102 +14485,95 @@ pub(crate) fn p59_manifest_init_from_input_stream(
             )));
         }
     };
-    let bytes = p59_read_input_stream_fully(ctx, stream)?;
-    let parsed = match p59_parse_manifest_bytes(&bytes) {
-        Ok(p) => p,
-        Err(msg) => {
-            return Err(MethodCallFailed::InternalError(cratonvm_types::error::VmError::Runtime(
-                RuntimeError::IOException {
-                    message: format!("invalid manifest: {}", msg),
-                },
-            )));
+    // Pin the Manifest across the whole parse: reading the stream may invoke
+    // Java, and building the real Attributes / entries map allocates — any of
+    // which can move objects under the collector. `unpin_native_roots(this_pin)`
+    // at the end frees this pin and every pin taken after it.
+    let this_pin = ctx.pin_native_root(this);
+    let result = (|| -> MethodCallResult {
+        let bytes = p59_read_input_stream_fully(ctx, stream)?;
+        let parsed = match p59_parse_manifest_bytes(&bytes) {
+            Ok(p) => p,
+            Err(msg) => {
+                return Err(MethodCallFailed::InternalError(
+                    cratonvm_types::error::VmError::Runtime(RuntimeError::IOException {
+                        message: format!("invalid manifest: {}", msg),
+                    }),
+                ));
+            }
+        };
+
+        // Main attributes: a real Attributes populated through real putValue.
+        let main_attrs = p59_manifest_new_attributes(ctx);
+        let main_pin = ctx.pin_native_root(main_attrs);
+        p59_attrs_populate_real(ctx, main_pin, main_attrs, &parsed.main)?;
+
+        // Per-entry sections: name -> Attributes in a real LinkedHashMap.
+        let entries_map = p59_manifest_new_entries_map(ctx);
+        let entries_pin = ctx.pin_native_root(entries_map);
+        for (name, pairs) in &parsed.entries {
+            let entry_attrs = p59_manifest_new_attributes(ctx);
+            let entry_pin = ctx.pin_native_root(entry_attrs);
+            p59_attrs_populate_real(ctx, entry_pin, entry_attrs, pairs)?;
+            let ns = ctx.create_string(name);
+            let ns_pin = ctx.pin_native_root(ns);
+            let entries_map = ctx.read_native_pin(entries_pin, entries_map);
+            let entry_attrs = ctx.read_native_pin(entry_pin, entry_attrs);
+            let ns = ctx.read_native_pin(ns_pin, ns);
+            ctx.invoke(
+                "java/util/LinkedHashMap",
+                "put",
+                "(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+                &[
+                    Value::Object(Some(entries_map)),
+                    Value::Object(Some(ns)),
+                    Value::Object(Some(entry_attrs)),
+                ],
+            )?;
         }
-    };
-    let main_attrs = p59_manifest_new_attributes(ctx);
-    for (k, v) in &parsed.main {
-        p59_attrs_insert(ctx, main_attrs, k, v);
-    }
-    let entries_map = p59_manifest_new_entries_map(ctx);
-    for (name, pairs) in &parsed.entries {
-        let entry_attrs = p59_manifest_new_attributes(ctx);
-        for (k, v) in pairs {
-            p59_attrs_insert(ctx, entry_attrs, k, v);
-        }
-        p59_entries_insert(ctx, entries_map, name, entry_attrs);
-    }
-    ctx.set_field(this, 0, Value::Object(Some(main_attrs)));
-    ctx.set_field(this, 1, Value::Object(Some(entries_map)));
-    Ok(None)
+
+        // Install on the Manifest, re-reading every ref after the allocations.
+        let this = ctx.read_native_pin(this_pin, this);
+        let main_attrs = ctx.read_native_pin(main_pin, main_attrs);
+        let entries_map = ctx.read_native_pin(entries_pin, entries_map);
+        ctx.set_field(this, 0, Value::Object(Some(main_attrs)));
+        ctx.set_field(this, 1, Value::Object(Some(entries_map)));
+        Ok(None)
+    })();
+    ctx.unpin_native_roots(this_pin);
+    result
 }
 
-/// Synthetic `java.util.jar.Attributes.getValue(String)`: scan the
-/// alternating-pair buckets array for a case-insensitive key match.
-fn p59_attributes_get_value(
+/// GC-safely populate a real `java.util.jar.Attributes` (pinned at `attrs_pin`)
+/// from `pairs` via its genuine `putValue(String,String)` bytecode. Each
+/// `create_string` / `putValue` can allocate and move objects, so the
+/// Attributes is read back from its pin and the key string is pinned across the
+/// value allocation. The key pins accumulate on the caller's pin batch and are
+/// released when the caller unpins.
+fn p59_attrs_populate_real(
     ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    Ok(Some(p59_attrs_lookup(ctx, this, &key)))
-}
-
-/// Synthetic `java.util.jar.Attributes.getValue(Attributes.Name)`: resolve the
-/// internal Name token to its backing String key and then reuse the same
-/// case-insensitive lookup used by the String overload.
-fn p59_attributes_get_value_name(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let name_obj = match args.get(1) {
-        Some(Value::Object(Some(o))) => *o,
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    // JDK Attributes$Name stores the normalized key in field 0 (`name`).
-    // Some call sites may hand us a synthetic object with only that slot set.
-    let key = match ctx.get_field(name_obj, 0) {
-        Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
-        _ => String::new(),
-    };
-    if key.is_empty() {
-        return Ok(Some(Value::Object(None)));
+    attrs_pin: usize,
+    attrs_fallback: ObjectRef,
+    pairs: &[(String, String)],
+) -> Result<(), MethodCallFailed> {
+    for (k, v) in pairs {
+        let ks = ctx.create_string(k);
+        let ks_pin = ctx.pin_native_root(ks);
+        let vs = ctx.create_string(v);
+        let attrs = ctx.read_native_pin(attrs_pin, attrs_fallback);
+        let ks = ctx.read_native_pin(ks_pin, ks);
+        ctx.invoke(
+            "java/util/jar/Attributes",
+            "putValue",
+            "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            &[
+                Value::Object(Some(attrs)),
+                Value::Object(Some(ks)),
+                Value::Object(Some(vs)),
+            ],
+        )?;
     }
-    Ok(Some(p59_attrs_lookup(ctx, this, &key)))
-}
-
-/// Synthetic `java.util.jar.Attributes.putValue(String, String)`: write
-/// the pair into the buckets array and return the previous value (or null).
-fn p59_attributes_put_value(
-    ctx: &mut dyn NativeContext,
-    args: &[Value],
-) -> MethodCallResult {
-    let this = obj_arg(args, 0)?;
-    let key = match args.get(1) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => return Ok(Some(Value::Object(None))),
-    };
-    let value = match args.get(2) {
-        Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-        _ => String::new(),
-    };
-    // Lazily initialise the buckets array if the Attributes was allocated
-    // without going through the synthetic constructor (e.g. some call sites
-    // use alloc_concurrent_synthetic directly).
-    if !matches!(ctx.get_field(this, 0), Value::Object(Some(_))) {
-        let buckets = ctx.new_array(
-            cratonvm_types::ArrayElementType::Reference,
-            P59_ATTR_CAPACITY * 2,
-        );
-        ctx.set_field(this, 0, Value::Object(Some(buckets)));
-        ctx.set_field(this, 1, Value::Int(0));
-        ctx.set_field(this, 2, Value::Int(P59_ATTR_CAPACITY as i32));
-    }
-    let prev = p59_attrs_lookup(ctx, this, &key);
-    p59_attrs_insert(ctx, this, &key, &value);
-    Ok(Some(prev))
+    Ok(())
 }
 
 // =============================================================================
