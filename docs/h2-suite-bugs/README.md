@@ -47,12 +47,17 @@ correctness (see the perf-hang report).
    Fixed by gating the shims behind `synthetic-jdk` so real-JDK runs real
    bytecode. TestInit, TestRunscript, TestCsv, …
 
+## Crash fixes landed (verified)
+3. **`bug-h2-stack-overflow-filesystem-tests.md`** [FIXED] — `EXCEPTION_STACK_OVERFLOW`
+   in `TestReorderWrites` / `TestDiskFull` / `TestSampleApps` / `TestFileLockProcess`.
+   The snapshot-iterator native shadow-recursed on a real `java/util/PriorityQueue$Itr`
+   (`hasNext`→`hasNext` via `ctx.invoke`). Fixed in `native-collections`.
+4. **`bug-h2-testutils-sigsegv.md`** [FIXED] — JIT-only `EXCEPTION_ACCESS_VIOLATION`
+   in `TestUtils`. `aastore` codegen emits the SATB write barrier but the
+   JIT-eligibility pre-scan never set `needs_heap` for it, so the barrier loaded
+   stack garbage as the VM pointer. Fixed in `jit/src/x64.rs`.
+
 ## Open bugs (reports in this directory)
-- **`bug-h2-stack-overflow-filesystem-tests.md`** — `EXCEPTION_STACK_OVERFLOW`
-  at a fixed RVA in `TestReorderWrites` / `TestDiskFull` / `TestSampleApps` /
-  `TestFileLockProcess` (collection-iteration recursion).
-- **`bug-h2-testutils-sigsegv.md`** — `EXCEPTION_ACCESS_VIOLATION` in `TestUtils`
-  (distinct RVA).
 - **`bug-h2-charset-cp500-unsupported.md`** — `Charset.forName("cp500")` missing
   (jdk.charsets extended charsets) — `TestCharsetCollator`.
 - **`bug-h2-netutils-missing-pbe-algparams.md`** — missing
