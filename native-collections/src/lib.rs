@@ -16974,6 +16974,28 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
         }
     }
+    // TreeSet (and its `keySet`/`descendingSet` views) keep their elements in
+    // the `ts_array_table` side-table, NOT in object fields — in real-JDK mode
+    // the receiver's only field is the backing `m` TreeMap (null on a native
+    // TreeSet), so none of the field heuristics above find anything. Read the
+    // sorted state directly so `new ArrayList<>(treeSet)`, `set.addAll(treeSet)`,
+    // `new TreeSet<>(treeSet)`, etc. see the real elements (otherwise they
+    // silently materialise empty — e.g. the copy constructor produced an empty
+    // set). Elements come back in ascending sorted order, matching iteration.
+    let is_treeset_like = ctx
+        .class_id_by_name("java/util/TreeSet")
+        .map(|ts| cid == ts || ctx.is_subclass(cid, ts))
+        .unwrap_or(false);
+    if is_treeset_like {
+        let (data_opt, size, _) = ts_state(ctx, coll);
+        if let (Some(data), true) = (data_opt, size > 0) {
+            let mut out = Vec::with_capacity(size as usize);
+            for i in 0..(size as usize) {
+                out.push(ctx.get_array_element(data, i));
+            }
+            return out;
+        }
+    }
     // No layout heuristic matched and it's not an EnumSet. Return empty rather
     // than driving `iterator()` here: the `Iterable.iterator()` native
     // (`native_al_iterator`) itself snapshots non-list collections via THIS
@@ -20079,6 +20101,124 @@ fn native_ts_add_all(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(Some(Value::Int(i32::from(changed))))
 }
 
+/// `TreeSet.descendingIterator()` — iterate elements in descending order.
+///
+/// Real `TreeSet.descendingIterator()` is `return m.descendingKeySet().iterator()`,
+/// reading the backing `m` TreeMap. CratonVM's native TreeSet keeps its
+/// elements in the `ts_array_table` side-table and never populates `m`, so the
+/// inherited real method dereferenced a null `m` → NPE (snakeyaml's
+/// `SafeConstructor.processDuplicateKeys` hit this). This native builds a
+/// reversed snapshot and returns the same `TreeSet$Itr` shape used by
+/// `iterator()` (field 0 = snapshot, 1 = cursor, 2 = owning set for
+/// `Iterator.remove`).
+fn native_ts_descending_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = ts_state(ctx, this);
+    let n = size as usize;
+    let snap = alloc_ref_array(ctx, n);
+    if let Some(data) = data_opt {
+        for i in 0..n {
+            // Reverse: snap[i] = data[size-1-i] (the data array is kept sorted
+            // ascending by native_ts_add).
+            let v = ctx.get_array_element(data, n - 1 - i);
+            ctx.set_array_element(snap, i, v);
+        }
+    }
+    let itr = alloc_synthetic(ctx, "java/util/TreeSet$Itr", 3);
+    ctx.set_field(itr, 0, Value::Object(Some(snap)));
+    ctx.set_field(itr, 1, Value::Int(0));
+    ctx.set_field(itr, 2, Value::Object(Some(this)));
+    Ok(Some(Value::Object(Some(itr))))
+}
+
+/// `TreeSet.descendingSet()` — a NavigableSet whose iteration order is the
+/// reverse of this set. Real JDK returns `new TreeSet<>(m.descendingMap())`,
+/// reading the null backing `m` → NPE. This native returns a fresh native
+/// TreeSet holding the same elements ordered by the reversed comparator
+/// (`Collections.reverseOrder`), so `iterator`/`first`/`last`/`contains` on the
+/// result are all consistent with descending order.
+fn native_ts_descending_set(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, comparator) = ts_state(ctx, this);
+    let rev = match comparator {
+        Value::Object(Some(c)) => ctx.invoke(
+            "java/util/Collections",
+            "reverseOrder",
+            "(Ljava/util/Comparator;)Ljava/util/Comparator;",
+            &[Value::Object(Some(c))],
+        )?,
+        _ => ctx.invoke(
+            "java/util/Collections",
+            "reverseOrder",
+            "()Ljava/util/Comparator;",
+            &[],
+        )?,
+    }
+    .unwrap_or(Value::Object(None));
+    let result = alloc_synthetic(ctx, "java/util/TreeSet", TS_NUM_FIELDS);
+    let buf = alloc_ref_array(ctx, TS_DEFAULT_CAPACITY);
+    ts_set_slot(ctx, result, TS_FIELD_DATA, Value::Object(Some(buf)));
+    ts_set_slot(ctx, result, TS_FIELD_SIZE, Value::Int(0));
+    ts_set_slot(ctx, result, TS_FIELD_COMPARATOR, rev);
+    if let Some(data) = data_opt {
+        for i in 0..(size as usize) {
+            let e = ctx.get_array_element(data, i);
+            native_ts_add(ctx, &[Value::Object(Some(result)), e])?;
+        }
+    }
+    Ok(Some(Value::Object(Some(result))))
+}
+
+/// `TreeSet.pollFirst()` — remove and return the lowest element (null if empty).
+/// Real JDK reads the null backing `m` (`m.pollFirstEntry()`) → NPE.
+fn native_ts_poll_first(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = ts_state(ctx, this);
+    let data = match data_opt {
+        Some(d) if size > 0 => d,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let first = ctx.get_array_element(data, 0);
+    ts_remove_at(ctx, data, size, 0);
+    ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
+    // Live TreeMap keySet view: delete the key from the source TreeMap too.
+    if let Some(source) = ts_view_source(ctx, this) {
+        source_map_remove(ctx, source, first)?;
+    }
+    Ok(Some(first))
+}
+
+/// `TreeSet.pollLast()` — remove and return the highest element (null if empty).
+/// Real JDK reads the null backing `m` (`m.pollLastEntry()`) → NPE.
+fn native_ts_poll_last(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (data_opt, size, _) = ts_state(ctx, this);
+    let data = match data_opt {
+        Some(d) if size > 0 => d,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let idx = (size - 1) as usize;
+    let last = ctx.get_array_element(data, idx);
+    ts_remove_at(ctx, data, size, idx);
+    ts_set_slot(ctx, this, TS_FIELD_SIZE, Value::Int(size - 1));
+    if let Some(source) = ts_view_source(ctx, this) {
+        source_map_remove(ctx, source, last)?;
+    }
+    Ok(Some(last))
+}
+
 // ===========================================================================
 // Registration
 // ===========================================================================
@@ -20427,6 +20567,23 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
     );
     registry.register(c, "addAll", "(Ljava/util/Collection;)Z", native_ts_add_all);
     registry.register(c, "stream", "()Ljava/util/stream/Stream;", native_ts_stream);
+    // Descending/poll views — read the backing `m` TreeMap in real JDK, which
+    // CratonVM's native TreeSet never populates (state lives in the side-table),
+    // so the inherited bytecode NPEs on a null `m`. Drive them from `ts_state`.
+    registry.register(
+        c,
+        "descendingIterator",
+        "()Ljava/util/Iterator;",
+        native_ts_descending_iterator,
+    );
+    registry.register(
+        c,
+        "descendingSet",
+        "()Ljava/util/NavigableSet;",
+        native_ts_descending_set,
+    );
+    registry.register(c, "pollFirst", "()Ljava/lang/Object;", native_ts_poll_first);
+    registry.register(c, "pollLast", "()Ljava/lang/Object;", native_ts_poll_last);
 
     // TreeSet iterator
     let ti = "java/util/TreeSet$Itr";
@@ -20489,6 +20646,20 @@ fn register_tree_set_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/Object;)Ljava/lang/Object;",
         native_ts_lower,
     );
+    registry.register(
+        ns,
+        "descendingIterator",
+        "()Ljava/util/Iterator;",
+        native_ts_descending_iterator,
+    );
+    registry.register(
+        ns,
+        "descendingSet",
+        "()Ljava/util/NavigableSet;",
+        native_ts_descending_set,
+    );
+    registry.register(ns, "pollFirst", "()Ljava/lang/Object;", native_ts_poll_first);
+    registry.register(ns, "pollLast", "()Ljava/lang/Object;", native_ts_poll_last);
     registry.set_category(__prev_cat);
 }
 
