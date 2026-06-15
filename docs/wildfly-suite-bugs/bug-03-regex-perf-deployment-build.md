@@ -132,3 +132,41 @@ intrinsified yet. Lower priority than (B) (won't help regex's short loops).
 Until (B) lands, the CratonVM Arquillian client still cannot build the JUnit-5
 deployment archive in reasonable time. (The no-container per-class suite is
 unaffected — it never builds a real deployment, so it never hits this hot path.)
+
+## Update (2026-06-14): (B) implemented behind a default-OFF flag — exposes a latent regex-codegen miscompile (new layer C)
+
+(B) is now implemented, **default-OFF** via `CRATONVM_JIT_VIRTUAL_TIERUP=1`
+(`vm/src/runtime/env_cache.rs` + `execute_invokevirtual_cached` /
+`execute_jit_call_decoded` in `vm/src/runtime/interpreter.rs`):
+- A warmup invocation counter on the invokevirtual/invokeinterface VirtualBytecode
+  path (mirrors `execute_invokestatic_cached`), placed **after** all interception
+  checks and **before** the method-level monitor; skips `invokespecial` and
+  `synchronized` methods. Monomorphic-safe (the receiver class id is already
+  verified `== receiver_class_id`).
+- `execute_jit_call_decoded` dispatches the compiled instance method using the
+  already-decoded `args_slice` (receiver = arg 0); deopt / too-many-args fall
+  through to the interpreted frame push with the operand stack untouched.
+  `execute_jit_call` (static path) is left byte-identical.
+
+**Mechanism validated (flag ON):**
+
+| benchmark | flag OFF | flag ON | HotSpot |
+|-----------|----------|---------|---------|
+| `InstBench` instance charAt loop, 12M | 21 613 ms | **285 ms** (~76×) | 20 ms |
+| `StrInstBench` instance build()/countDots() | (correct) | **correct** | correct |
+
+InstBench/StrInstBench/Props/CSBench results are bit-identical to HotSpot with the
+flag on, and flag-OFF default behavior is unchanged.
+
+**But (B) ON exposes a pre-existing JIT codegen miscompile in the regex match
+engine (new layer C, OPEN).** With the flag on, `String.replaceAll("[.]","/")`
+returns `/o/r/g/.../` (a `/` inserted at every position — empty match everywhere)
+instead of `org/.../`, and is ~2.4× *slower* (deopt-thrash). The miscompile is in
+one of the now-compiled instance methods — `CRATONVM_DBG_JITC=1` lists the
+candidates: `Matcher.find()Z`, `Matcher.getTextLength()I`, `Matcher.hasMatch()Z`,
+`Pattern$Node.match`, `Pattern$BmpCharProperty.match`, `Pattern$CharProperty.study`
+(+ helpers). The (B) *dispatch* is proven correct (InstBench/StrInstBench return
+right values), so this is a latent JIT codegen bug that was simply never triggered
+before — instance methods never invocation-compiled. Root-causing/skip-listing the
+specific miscompiling regex method(s) is the remaining work (layer C) before (B)
+can be default-ON and the regex/ShrinkWrap path is finally fast.

@@ -123,6 +123,16 @@ cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
 // Default-OFF until a `try_emit_inline_body` miscompile (Spring boot enum CCE)
 // is root-caused. See `try_jit_upgrade_with_gate`.
 cached_is_set!(jit_main_inline, "CRATONVM_JIT_MAIN_INLINE");
+// Opt-in: invocation-count tier-up for INSTANCE methods (invokevirtual/
+// invokeinterface). Default-OFF: today only static methods have an invocation
+// counter (`execute_invokestatic_cached`); instance methods reach the JIT only
+// via OSR or as direct-call callees, so short-loop instance hot methods (e.g.
+// java.util.regex `Pattern$*.match`) never compile (bug-03 layer B). Enabling
+// this lets `execute_invokevirtual_cached` compile + dispatch a monomorphic
+// instance call site via the JIT. It is the first instance call-site JIT
+// dispatch path, on the VM's hottest code path, so it stays default-OFF pending
+// a full WildFly/Kafka/Tomcat suite re-test.
+cached_is_set!(jit_virtual_tierup, "CRATONVM_JIT_VIRTUAL_TIERUP");
 cached_is_set!(jit_mic_dbg, "CRATONVM_DBG_JIT_MIC");
 cached_is_set!(jit_entry_dbg, "CRATONVM_DBG_JIT_ENTRY");
 cached_is_set!(jit_putfield_diag, "CRATONVM_DBG_JIT_PUTFIELD");
