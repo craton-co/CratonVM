@@ -2024,14 +2024,23 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
         .resolve_field_index("java/util/HashMap", "size")
         .filter(|&slot| slot < ctx.object_num_fields(this))
         .map(|slot| ctx.get_field(this, slot));
+    // spring-bug-09: bound the slot-2 fallbacks below. `map_state` is invoked on
+    // any Map-typed receiver, including non-synthetic JDK maps with fewer than 3
+    // slots (e.g. `java/util/Collections$EmptyMap`, which has only AbstractMap's
+    // 2 reference slots). Reading absolute slot 2 (`MAP_FIELD_CAPACITY`) on such a
+    // receiver is out of bounds: the GC guard drops the read in-process, but it
+    // fires on a hot path (SpEL `ReflectiveIndexAccessor` map indexing) and the
+    // batch JVM eventually SIGSEGVs. Probe slot 2 only when the receiver has it.
+    let nf = ctx.object_num_fields(this);
     let size = match size_by_name {
         Some(Value::Int(s)) => s,
         _ => match ctx.get_field(this, MAP_FIELD_SIZE) {
             Value::Int(s) => s,                            // legacy: slot 1 is Int
-            _ => match ctx.get_field(this, 2) {            // ancient fallback
+            _ if nf > 2 => match ctx.get_field(this, 2) {  // ancient fallback
                 Value::Int(s) => s,
                 _ => 0,
             },
+            _ => 0,
         },
     };
     // S111r26: Use bucket array length as the true capacity.  When
@@ -2043,11 +2052,14 @@ fn map_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i3
     let cap = if let Some(b) = buckets {
         let arr_len = ctx.array_length(b) as i32;
         if arr_len > 0 { arr_len } else { MAP_DEFAULT_CAPACITY as i32 }
-    } else {
+    } else if nf > MAP_FIELD_CAPACITY {
         match ctx.get_field(this, MAP_FIELD_CAPACITY) {
             Value::Int(c) if c > 0 => c,
             _ => MAP_DEFAULT_CAPACITY as i32,
         }
+    } else {
+        // spring-bug-09: receiver has no slot-2 capacity field (e.g. EmptyMap).
+        MAP_DEFAULT_CAPACITY as i32
     };
     (buckets, size, cap)
 }
