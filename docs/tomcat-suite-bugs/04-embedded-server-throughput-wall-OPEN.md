@@ -1,5 +1,125 @@
 # Group 04 — Embedded-server deployment throughput wall  (OPEN, dominant)
 
+> ## ✅ 2026-06-15 RE-VERIFICATION — both FUNCTIONAL sub-problems are fixed; remainder is pure interpreter throughput
+>
+> Re-measured on `dev` (fresh worktree `CratonVM-tcbug0609`, branch
+> `fix/tomcat-bugs-0609-verify`) with the suite env
+> (`CRATONVM_REAL_NET_SOCKETS=1 CRATONVM_REAL_AQS=1 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1
+> CRATONVM_ROOTSNAP_CACHE=1`, `-Xmx2g`):
+>
+> 1. **Connector serving (sub-problem #1, setOption)** — FIXED (in `dev`). Server
+>    accepts + invokes the servlet.
+> 2. **In-process HTTP client `getUrl` (sub-problem #2)** — FIXED (in `dev`,
+>    commits `48183599`+`b628d8d7`). **Verified:** `TestTomcatClassLoader` =
+>    `OK (2 tests)` — it deploys, fetches via `getUrl` *in-process*, and asserts
+>    on the response. `getUrl`/`methodUrl` build the URL with
+>    `URI.create(path).toURL()` (`TomcatBaseTest.java:689`), and that whole path
+>    (`openConnection` → `getResponseCode` → `getInputStream`) now works
+>    in-process.
+>    - ⚠ *Latent, NOT bug 04:* a URL built with the deprecated `new URL(String)`
+>      ctor instead routes `URL.openStream` to read field **slot 5**, which on a
+>      *real-JDK* `java.net.URL` is the `authority` field (`host:port`, contains
+>      `:`) not the full URL → it skips the `toExternalForm` fallback (guard is
+>      `!url_str.contains(':')`) and throws `URL.openStream: unsupported scheme:
+>      host:port` (`net_phase_e.rs:3025`/`:3220`). Tomcat's tests use
+>      `URI.toURL()`, so they are unaffected; filed here only so it isn't
+>      re-discovered as a "server bug." A minimal fix is to validate the slot-5
+>      string actually starts with a real scheme (`^[A-Za-z][A-Za-z0-9+.-]*:`)
+>      before trusting it, else fall through to `toExternalForm`.
+> 3. **Deploy throughput (sub-problem #3) — the ONLY thing still open. ROOT CAUSE
+>    RE-PINNED: it is `update_root_snapshot`, NOT a diffuse "general interpreter
+>    loop."** Quantified on a pure-deploy test with no HTTP client,
+>    `TestApplicationFilterConfig.testBug54170` (one `tomcat.start()` + MBean
+>    asserts) = **`OK (1 test)` in ~29 s on CratonVM vs ~2 s on HotSpot (~15×)**.
+>    - **cdb sampling** of the hot `main-vm` thread (release-with-debug symbols):
+>      **30/30 leaf samples** are
+>      `GenerationalHeap::is_heap_addr` ← `Frame::scan_local_objects` ←
+>      `update_root_snapshot` ← `invoke_cached_native_callback`, under deeply
+>      **nested class-init driven by `Method.invoke` reflection** (the deploy
+>      instantiates servlets/filters/listeners + runs the Digester reflectively).
+>    - **`CRATONVM_DBG_ROOTSNAP` counter** (clean, uninterrupted run): a single
+>      deploy makes **~1.8 M `update_root_snapshot` calls** totalling
+>      **~19.6 s — i.e. ~68 % of the 29 s wall.** It runs **twice per
+>      object-returning native call** (`safe_native_call` publishes for
+>      `native_pending_return`; `native_return_pushed_to_stack` re-publishes after
+>      the value is on the operand stack) and is O(stack-depth ≈ 33).
+>    - **The `CRATONVM_ROOTSNAP_CACHE` cache only buys ~2.4× here**, not the ~11×
+>      seen on `TestSsl`: cache OFF = **28.6 µs/call**, cache ON = **11.9 µs/call**
+>      (same test, internal counter, ratio is contention-robust). The cache
+>      amortises a *deep frozen* stack (TestSsl mid-serve, depth ~53), but a
+>      class-init/reflection **storm churns the top frames every call AND fires
+>      young GC often** (each collection bumps `collection_count`, invalidating the
+>      whole frame-prefix cache), so reuse is poor and per-call cost stays near a
+>      full scan. → the doc's earlier "rootsnap is only ~4 s of ~33 s / no longer
+>      dominant" conclusion was workload-specific to TestSsl and is **wrong for the
+>      reflection-heavy deploy path** that dominates the catalina/core/startup
+>      population.
+>
+>    **Fix levers (ranked by leverage; all GC-correctness-critical — verify with
+>    the bt18 checksum oracle `68332206` + full pool + suite, NOT just wall time):**
+>    1. *Cut call FREQUENCY (highest leverage, deferred #2).* The snapshot exists
+>       only so a STW/concurrent collector can read THIS thread's roots without
+>       walking its Rust stack. Between safepoints nobody reads it, yet it is
+>       published ~1.8 M times/deploy. Guarding the publish on an actual
+>       "collection requested/pending" flag (publish at the safepoint poll, not
+>       every native return) would eliminate the vast majority. Needs the
+>       collector/mutator handshake to be exactly right (a missed publish = a
+>       reclaimed live `native_pending_return` = SEGV).
+>    2. *Drop the SECOND publish.* ✅ **IMPLEMENTED (gated, default-OFF):**
+>       `CRATONVM_SKIP_REDUNDANT_NATIVE_SNAPSHOT=1` makes
+>       `native_return_pushed_to_stack` skip its `update_root_snapshot`. Safety
+>       argument (verified by code reading): EVERY collector read of a thread's
+>       snapshot is preceded by a FRESH rebuild — STW responders rebuild in
+>       `safepoint_check` (`update_root_snapshot`, before `arrive_and_wait`); the
+>       STW initiator rebuilds in `maybe_gc`; a thread entering a *blocking* native
+>       rebuilds in `deposit_root_snapshot` (`clear()` + full re-scan); and a
+>       *running* native is counted in the barrier's `expected` and waited-for (so
+>       it too rebuilds at its next safepoint before the collector proceeds). The
+>       eager post-return snapshot is therefore never the snapshot a collector
+>       actually reads, so the second rebuild is pure overhead.
+>       **Verified:** bt18 GC-stress checksum = `68332206` (== HotSpot) with the
+>       flag ON *and* OFF; `TestApplicationFilterConfig`/`TestTomcatClassLoader`/
+>       `TestServerInfo`/`TestGenericPrincipal` all still pass with it ON.
+>       **Measured:** rootsnap calls per deploy **2.2 M → 1.2 M (~45 % fewer)**;
+>       deploy rootsnap time ~18.7 s → ~15.8 s. The time win (~10–16 %) is smaller
+>       than the call-count cut because the eliminated #2 calls were the
+>       *cache-cheap* ones (stack unchanged since the #1 publish microseconds
+>       earlier, ~2.9 µs each); the expensive calls are the #1 in `safe_native_call`
+>       (~13 µs each, top-frame cache miss) — those are what lever #3 targets.
+>       Default-OFF pending wider soak (cf. `CRATONVM_ROOTSNAP_CACHE` precedent);
+>       the suite can opt in via env. Residual caveat: only the *non-moving*
+>       default sweep + bt18's allocation pattern were exercised — a dedicated
+>       moving-GC + concurrent-old-gen soak should precede flipping it default-ON.
+>    3. *Make the cache survive collections.* ✅ **IMPLEMENTED (gated, default-OFF):**
+>       `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC=1` (requires `CRATONVM_ROOTSNAP_CACHE`).
+>       Subtlety: even the default "non-moving" young sweep RELOCATES survivors via
+>       selective promotion (young→old), so the cache can't just be kept blindly —
+>       promoted cached roots move. Instead `remap_rs_cache_after_gc` remaps the
+>       cached roots through the collection's `pointer_map` (the same proven op that
+>       relocates frame locals) at every site that already remaps a thread's frames
+>       (`update_all_roots`, `apply_pointer_map_to_thread`), then tags the cache with
+>       the post-collection count. A cached root's object is always LIVE across the
+>       collection (its frame is a GC root → never freed), so it can only move, never
+>       dangle. **FAIL-SAFE:** `rs_cache_gen` is advanced ONLY at those remap sites,
+>       so any GC path that relocates this thread without remapping leaves the gen
+>       stale → the gate rebuilds (a stale address is never trusted).
+>       **Verified:** bt18 GC-stress checksum = `68332206` (== HotSpot) in ALL
+>       configs — default, cache-only, and cache+survive (the config that exercises
+>       the rs_cache remap across promotions) — plus the tomcat regression set still
+>       passes with it (and lever #2) ON. **Measured:** reduces per-call rootsnap
+>       cost (cleanest reading ~11 µs → ~6 µs, roughly halved; bt18 was the FASTEST
+>       of the three configs with it on). Exact deploy magnitude is obscured by
+>       concurrent peer-VM load on the measurement box — a quiet-machine re-measure
+>       should precede flipping it default-ON. Composes with lever #2 (independent:
+>       #2 cuts call COUNT, #3 cuts per-call COST).
+>
+> Net: group 04 is no longer "servers don't serve" or "client returns -1" — those
+> are fixed. The residual wall is **`update_root_snapshot` overhead × per-class
+> method count** (each server test method does a full reflective deploy, each
+> deploy paying ~20 s of root-snapshot publishing), which is why deploy-heavy
+> classes still exceed the harness timeout. This is a concrete, attackable hotspot
+> — not an irreducible "interpreter ceiling."
+
 > ## ⚠ 2026-06-14 CORRECTION — a FUNCTIONAL connector bug was masquerading as throughput
 >
 > The premise below ("the server actually starts/serves/tears-down correctly,

@@ -29,6 +29,12 @@ pub fn update_all_roots(
     if std::env::var_os("CRATONVM_DBG_PRECISE").is_some() {
         eprintln!("[PRECISE] update_all_roots called, pointer_map.len()={}", pointer_map.len());
     }
+    // Lever #3 (bug 04): keep this thread's rootsnap frozen-frame cache valid
+    // across this collection (remap relocated cached roots + re-tag the gen).
+    // Done BEFORE the empty-map early return so a non-relocating sweep also keeps
+    // the cache rather than forcing a full rebuild. Opt-in/default-OFF + no-op
+    // unless the rootsnap cache is enabled. See `remap_rs_cache_after_gc`.
+    crate::runtime::interpreter::remap_rs_cache_after_gc(thread, pointer_map, &shared.heap);
     if pointer_map.is_empty() {
         return;
     }

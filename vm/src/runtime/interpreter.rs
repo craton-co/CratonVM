@@ -1656,6 +1656,51 @@ pub(crate) fn apply_pointer_map_to_thread(
             *obj_ref = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
         }
     }
+    // Lever #3 (bug 04): keep this thread's rootsnap frozen-frame cache valid
+    // across the relocation we just applied, in lockstep with the frames above.
+    remap_rs_cache_after_gc(thread, pointer_map, heap);
+}
+
+/// Keep the `update_root_snapshot` frozen-frame cache (`rs_cache`) valid across
+/// a GC instead of letting the next snapshot discard it on the
+/// `collection_count` bump. The cache stores object ADDRESSES, which a
+/// collection only invalidates by RELOCATING the object (the default non-moving
+/// young sweep still relocates via selective promotion). So remap the cached
+/// roots through the same `pointer_map` that relocated the frames, then tag the
+/// cache with the post-collection count so `update_root_snapshot`'s gen gate
+/// accepts it.
+///
+/// FAIL-SAFE: `rs_cache_gen` is advanced ONLY here. Any GC path that relocates
+/// this thread's objects WITHOUT calling this leaves `rs_cache_gen` stale, so
+/// the gen gate rebuilds the cache from scratch — a stale cached address is
+/// never trusted. Opt-in + default-OFF (`CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC`);
+/// a no-op unless the `rootsnap_cache` itself is enabled (else `rs_cache` is
+/// empty). Must be called at every site that applies a `pointer_map` to a
+/// thread's frames (`apply_pointer_map_to_thread` here, `update_all_roots` in
+/// memory/gc.rs); missing one only costs a rebuild, never correctness.
+pub(crate) fn remap_rs_cache_after_gc(
+    thread: &mut JvmThread,
+    pointer_map: &std::collections::HashMap<usize, usize>,
+    heap: &crate::memory::VmHeap,
+) {
+    if !crate::runtime::env_cache::rootsnap_cache_survive_gc() {
+        return;
+    }
+    // An empty map means nothing moved → cached addresses are already valid;
+    // skip the walk but still re-tag the gen below so the cache is kept.
+    if !pointer_map.is_empty() {
+        for (_seq, roots) in thread.rs_cache.iter_mut() {
+            for r in roots.iter_mut() {
+                if let Some(&new_addr) = pointer_map.get(&(r.as_ptr() as usize)) {
+                    // SAFETY: new_addr came from the GC's pointer_map and points
+                    // at the relocated object's header within the heap arena —
+                    // the same invariant the frame/snapshot remaps above rely on.
+                    *r = unsafe { ObjectRef::from_raw(new_addr as *mut u8) };
+                }
+            }
+        }
+    }
+    thread.rs_cache_gen = heap.collection_count();
 }
 
 /// Check if the old generation needs a concurrent GC cycle.
