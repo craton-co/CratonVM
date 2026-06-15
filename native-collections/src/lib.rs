@@ -16727,6 +16727,37 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             }
             return Vec::new();
         }
+        // PriorityQueue / PriorityBlockingQueue — a binary heap held in
+        // `queue`/`array` (Object[]) with a separate `size`. The generic
+        // "f0 = array, f1 = size" heuristic below doesn't model it (returns
+        // empty), which made `toArray()` / `iterator()` / `forEach()` over a
+        // PriorityQueue see zero elements (and, with the `iterator()` shim
+        // shadowing the real `PriorityQueue$Itr`, recurse). Read it by name;
+        // iteration order is heap-array order (matches PriorityQueue$Itr).
+        if cls_name == "java/util/PriorityQueue"
+            || cls_name == "java/util/concurrent/PriorityBlockingQueue"
+        {
+            let arr = match ctx.get_field_by_name(coll, "queue") {
+                Value::Object(Some(a)) if ctx.heap_kind_of(a) == ObjectKind::Array => Some(a),
+                _ => match ctx.get_field_by_name(coll, "array") {
+                    Value::Object(Some(a)) if ctx.heap_kind_of(a) == ObjectKind::Array => Some(a),
+                    _ => None,
+                },
+            };
+            if let Some(a) = arr {
+                let cap = ctx.array_length(a);
+                let size = match ctx.get_field_by_name(coll, "size") {
+                    Value::Int(v) if v >= 0 && (v as usize) <= cap => v as usize,
+                    _ => cap,
+                };
+                let mut out = Vec::with_capacity(size);
+                for i in 0..size {
+                    out.push(ctx.get_array_element(a, i));
+                }
+                return out;
+            }
+            return Vec::new();
+        }
         if cls_name == "java/util/RegularEnumSet" || cls_name == "java/util/JumboEnumSet" {
             if let Value::Object(Some(universe)) = ctx.get_field_by_name(coll, "universe") {
                 // Membership: walk the inherited `universe` (all constants of the
@@ -17302,7 +17333,29 @@ fn native_snapshot_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> 
             if cn.is_empty() || cn == "java/util/Iterator" || cn == "java/util/ListIterator" {
                 return Ok(Some(Value::Int(0)));
             }
-            return ctx.invoke(&cn, "hasNext", "()Z", &[Value::Object(Some(this))]);
+            // BOTH-MODES: this native is registered on the *synthetic*
+            // snapshot iterators (field 0 = Object[]) AND on the real
+            // `java/util/PriorityQueue$Itr` / `ArrayDeque$Itr` and the
+            // `java/util/Iterator` interface. In real-JDK mode the real inner
+            // iterators don't have our snapshot layout (field 0 is their
+            // `cursor` int), so service them from the backing collection.
+            if let Some((_queue, size, cursor)) = real_inner_itr_state(ctx, this, &cn) {
+                return Ok(Some(Value::Int(if cursor < size { 1 } else { 0 })));
+            }
+            // Any other real iterator: try its concrete `hasNext` bytecode by
+            // name, but guard against the shadow-recursion — if dispatch
+            // re-finds THIS native (no distinct concrete override) `ctx.invoke`
+            // recurses unbounded and blows the native stack (H2 TestSampleApps /
+            // TestReorderWrites / TestDiskFull / TestFileLockProcess). On
+            // re-entry for the same receiver, report exhausted instead.
+            let key = this.as_ptr() as usize;
+            let first_entry = SNAPITR_FALLBACK.with(|s| s.borrow_mut().insert(key));
+            if !first_entry {
+                return Ok(Some(Value::Int(0)));
+            }
+            let r = ctx.invoke(&cn, "hasNext", "()Z", &[Value::Object(Some(this))]);
+            SNAPITR_FALLBACK.with(|s| { s.borrow_mut().remove(&key); });
+            return r;
         }
     };
     let cursor = match ctx.get_field(this, 1) {
@@ -17311,6 +17364,54 @@ fn native_snapshot_itr_has_next(ctx: &mut dyn NativeContext, args: &[Value]) -> 
     };
     let len = ctx.array_length(arr) as i32;
     Ok(Some(Value::Int(if cursor < len { 1 } else { 0 })))
+}
+
+thread_local! {
+    /// Receivers currently inside the snapshot-iterator real-mode fallback,
+    /// used to break unbounded `hasNext`/`next` → same-native re-dispatch.
+    static SNAPITR_FALLBACK: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Service a REAL-JDK array-indexed inner iterator whose `cursor` field is a
+/// 0-based index into the backing collection's element array. Returns
+/// `(backing_array, size, cursor)` so callers can compute `hasNext`/`next`
+/// without re-dispatching `hasNext`/`next` back into this native (which would
+/// recurse unbounded, since the native shadows the iterator's real bytecode).
+///
+/// `java/util/PriorityQueue$Itr` iterates `queue[0..size]` in heap-array order,
+/// so we read the outer `PriorityQueue`'s `queue`/`size` fields by name (the
+/// generic collection-element heuristics don't model `PriorityQueue`).
+fn real_inner_itr_state(
+    ctx: &mut dyn NativeContext,
+    this: ObjectRef,
+    cn: &str,
+) -> Option<(ObjectRef, i32, i32)> {
+    if cn != "java/util/PriorityQueue$Itr" {
+        return None;
+    }
+    // `this$0` is the outer PriorityQueue; `queue`/`size` hold the heap array.
+    // (Best-effort: returns None — and the caller falls back to the
+    // recursion-safe guard — when the receiver's `this$0`/`queue` can't be
+    // resolved, e.g. the synthetic `native_pq_iterator` object whose snapshot
+    // was coerced away.)
+    let outer = match ctx.get_field_by_name(this, "this$0") {
+        Value::Object(Some(o)) => o,
+        _ => return None,
+    };
+    let queue = match ctx.get_field_by_name(outer, "queue") {
+        Value::Object(Some(q)) if ctx.heap_kind_of(q) == ObjectKind::Array => q,
+        _ => return None,
+    };
+    let size = match ctx.get_field_by_name(outer, "size") {
+        Value::Int(v) => v,
+        _ => ctx.array_length(queue) as i32,
+    };
+    let cursor = match ctx.get_field_by_name(this, "cursor") {
+        Value::Int(v) => v,
+        _ => 0,
+    };
+    Some((queue, size, cursor))
 }
 
 fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
@@ -17337,8 +17438,29 @@ fn native_snapshot_itr_next(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     let arr = match ctx.get_field(this, 0) {
         Value::Object(Some(r)) if ctx.heap_kind_of(r) == ObjectKind::Array => r,
         _ => {
+            // Real-mode array-indexed inner iterator (PriorityQueue$Itr): return
+            // backing[cursor] and advance the real `cursor` field — no
+            // re-dispatch into `next` (which shadows the real bytecode → recurse).
+            if let Some((queue, size, cursor)) = real_inner_itr_state(ctx, this, &cn) {
+                if cursor < size {
+                    let elem = ctx.get_array_element(queue, cursor as usize);
+                    ctx.set_field_by_name(this, "cursor", Value::Int(cursor + 1));
+                    return Ok(Some(elem));
+                }
+                return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+                    message: "No more elements".to_string(),
+                }
+                .into());
+            }
             if !cn.is_empty() && cn != "java/util/Iterator" && cn != "java/util/ListIterator" {
-                return ctx.invoke(&cn, "next", "()Ljava/lang/Object;", &[Value::Object(Some(this))]);
+                // Guard the shadow-recursion (same as hasNext).
+                let key = this.as_ptr() as usize;
+                let first_entry = SNAPITR_FALLBACK.with(|s| s.borrow_mut().insert(key));
+                if first_entry {
+                    let r = ctx.invoke(&cn, "next", "()Ljava/lang/Object;", &[Value::Object(Some(this))]);
+                    SNAPITR_FALLBACK.with(|s| { s.borrow_mut().remove(&key); });
+                    return r;
+                }
             }
             return Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
                 message: "No more elements".to_string(),
