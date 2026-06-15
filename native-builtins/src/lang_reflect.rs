@@ -1641,7 +1641,21 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
                 let cls = ctx.class_name_of_id(cid).unwrap_or_default();
                 if cls.starts_with("sun/reflect/generics/tree/") {
                     any_tree = true;
-                    let reified = wti_tree_node_to_mirror(ctx, node, &cls)
+                    // SB-02b: a wildcard bound can itself be parameterized
+                    // (`? super Producer<? extends Number>`, the shape Kotlin
+                    // emits for the synthetic `Continuation` parameter of a
+                    // suspending function). The old `wti_tree_node_to_mirror`
+                    // collapsed any class bound to its RAW Class mirror,
+                    // dropping the `<...>` — which made kotlin-reflect's
+                    // `extractContinuationArgument` recover a raw return type.
+                    // Reify the tree node through the full `TypeSig` →
+                    // `type_sig_to_java` pipeline (handles nested type
+                    // arguments and wildcards). Fall back to the raw mirror,
+                    // then to Object, if the shape isn't modellable.
+                    let reified = jdk_tree_to_typesig(ctx, node)
+                        .map(|ts| crate::generics::type_sig_to_java(ctx, &ts))
+                        .filter(|v| !matches!(v, Value::Object(None)))
+                        .or_else(|| wti_tree_node_to_mirror(ctx, node, &cls))
                         .or_else(|| {
                             // Unresolvable exotic bound: degrade to Object
                             // (the JDK's implicit upper bound) rather than
@@ -1670,6 +1684,163 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         // reified values — mirrors the lazy write-back in the real impl.
         ctx.set_field_by_name(this, field, Value::Object(Some(result)));
         Value::Object(Some(result))
+    }
+    // SB-02b — convert a real-JDK `sun.reflect.generics.tree.*` node into
+    // CratonVM's `TypeSig` AST so `crate::generics::type_sig_to_java` can
+    // reify it WITH its nested type arguments / wildcards (the raw-mirror
+    // shortcut above lost them). Returns `None` for shapes we don't model.
+    fn jdk_tree_to_typesig(
+        ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
+        node: cratonvm_types::ObjectRef,
+    ) -> Option<crate::generics::TypeSig> {
+        use crate::generics::TypeSig;
+        let cid = ctx.class_id_of_object(node);
+        let cls = ctx.class_name_of_id(cid).unwrap_or_default();
+        if cls.ends_with("TypeVariableSignature") {
+            let id = match ctx.get_field_by_name(node, "identifier") {
+                Value::Object(Some(s)) => ctx.read_string(s)?,
+                _ => return None,
+            };
+            return Some(TypeSig::TypeVar(id));
+        }
+        if cls.ends_with("ArrayTypeSignature") {
+            let comp = match ctx.get_field_by_name(node, "componentType") {
+                Value::Object(Some(c)) => c,
+                _ => return None,
+            };
+            return Some(TypeSig::Array(Box::new(jdk_tree_to_typesig(ctx, comp)?)));
+        }
+        // SimpleClassTypeSignature / ClassTypeSignature -> Class{name, args}.
+        if cls.ends_with("SimpleClassTypeSignature") {
+            let name = match ctx.get_field_by_name(node, "name") {
+                Value::Object(Some(s)) => ctx.read_string(s)?,
+                _ => return None,
+            };
+            return Some(TypeSig::Class {
+                name: name.replace('.', "/"),
+                type_args: jdk_collect_type_args(ctx, node),
+            });
+        }
+        if cls.ends_with("ClassTypeSignature") {
+            let list = match ctx.get_field_by_name(node, "path") {
+                Value::Object(Some(l)) => l,
+                _ => return None,
+            };
+            let arr = match ctx
+                .invoke_virtual(list, "toArray", "()[Ljava/lang/Object;", &[])
+                .ok()
+                .flatten()
+            {
+                Some(Value::Object(Some(a))) => a,
+                _ => return None,
+            };
+            let mut name = String::new();
+            let mut type_args: Vec<crate::generics::TypeArg> = Vec::new();
+            for i in 0..ctx.array_length(arr) {
+                if let Value::Object(Some(seg)) = ctx.get_array_element(arr, i) {
+                    if let Value::Object(Some(s)) = ctx.get_field_by_name(seg, "name") {
+                        if let Some(part) = ctx.read_string(s) {
+                            if name.is_empty() {
+                                name = part;
+                            } else {
+                                name.push('$');
+                                name.push_str(&part);
+                            }
+                        }
+                    }
+                    // Type args belong to the innermost (last non-empty)
+                    // simple-class segment; later segments override earlier.
+                    let seg_args = jdk_collect_type_args(ctx, seg);
+                    if !seg_args.is_empty() {
+                        type_args = seg_args;
+                    }
+                }
+            }
+            if name.is_empty() {
+                return None;
+            }
+            return Some(TypeSig::Class {
+                name: name.replace('.', "/"),
+                type_args,
+            });
+        }
+        None
+    }
+    // Read a SimpleClassTypeSignature's `typeArgs` (`TypeArgument[]`) and map
+    // each to a `TypeArg`; empty when the segment is not parameterized.
+    fn jdk_collect_type_args(
+        ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
+        sts: cratonvm_types::ObjectRef,
+    ) -> Vec<crate::generics::TypeArg> {
+        let mut out = Vec::new();
+        if let Value::Object(Some(ta_arr)) = ctx.get_field_by_name(sts, "typeArgs") {
+            if ctx.heap_kind_of(ta_arr) == cratonvm_types::ObjectKind::Array {
+                for j in 0..ctx.array_length(ta_arr) {
+                    if let Value::Object(Some(ta)) = ctx.get_array_element(ta_arr, j) {
+                        if let Some(arg) = jdk_typearg_to_typearg(ctx, ta) {
+                            out.push(arg);
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+    // Map a `sun.reflect.generics.tree.TypeArgument` (a `Wildcard`, or an
+    // exact `FieldTypeSignature`) to CratonVM's `TypeArg`.
+    fn jdk_typearg_to_typearg(
+        ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
+        ta: cratonvm_types::ObjectRef,
+    ) -> Option<crate::generics::TypeArg> {
+        use crate::generics::{TypeArg, TypeSig};
+        let cid = ctx.class_id_of_object(ta);
+        let cls = ctx.class_name_of_id(cid).unwrap_or_default();
+        if cls.ends_with("Wildcard") {
+            // `? super X`  -> lowerBounds=[X] (X not BottomSignature)
+            // `? extends X`-> lowerBounds=[Bottom], upperBounds=[X != Object]
+            // `?`          -> upperBounds=[Object], lowerBounds=[Bottom]
+            if let Some(lo) = jdk_first_non_bottom_bound(ctx, ta, "lowerBounds") {
+                return Some(TypeArg::Super(jdk_tree_to_typesig(ctx, lo)?));
+            }
+            if let Some(up) = jdk_first_non_bottom_bound(ctx, ta, "upperBounds") {
+                let ts = jdk_tree_to_typesig(ctx, up)?;
+                if let TypeSig::Class { name, type_args } = &ts {
+                    if name == "java/lang/Object" && type_args.is_empty() {
+                        return Some(TypeArg::Unbounded);
+                    }
+                }
+                return Some(TypeArg::Extends(ts));
+            }
+            return Some(TypeArg::Unbounded);
+        }
+        Some(TypeArg::Exact(jdk_tree_to_typesig(ctx, ta)?))
+    }
+    // First bound node in `field` that is not a `BottomSignature` placeholder.
+    fn jdk_first_non_bottom_bound(
+        ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
+        wildcard: cratonvm_types::ObjectRef,
+        field: &str,
+    ) -> Option<cratonvm_types::ObjectRef> {
+        let arr = match ctx.get_field_by_name(wildcard, field) {
+            Value::Object(Some(a))
+                if ctx.heap_kind_of(a) == cratonvm_types::ObjectKind::Array =>
+            {
+                a
+            }
+            _ => return None,
+        };
+        for i in 0..ctx.array_length(arr) {
+            if let Value::Object(Some(b)) = ctx.get_array_element(arr, i) {
+                let bcls = ctx
+                    .class_name_of_id(ctx.class_id_of_object(b))
+                    .unwrap_or_default();
+                if bcls.ends_with("BottomSignature") {
+                    continue;
+                }
+                return Some(b);
+            }
+        }
+        None
     }
     let tvi_real = "sun/reflect/generics/reflectiveObjects/TypeVariableImpl";
     registry.register(
