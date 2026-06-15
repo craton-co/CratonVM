@@ -546,6 +546,48 @@ pub(crate) fn register_string_builder_natives(registry: &mut NativeMethodRegistr
             Ok(Some(Value::Object(Some(this))))
         },
     );
+    // Java 21: StringBuilder.repeat(int codePoint, int count). MUST be a native:
+    // unregistered, it falls through to the real `AbstractStringBuilder.repeat`
+    // → `ensureCapacityNewCoder` → `Arrays.copyOf(value, …)` bytecode, which
+    // treats `value` as a compact-string `byte[]`. CratonVM's StringBuilder
+    // backing is a `char[]`, so the real bytecode's `System.arraycopy` copies
+    // char[]→byte[] and throws `ArrayStoreException: incompatible array element
+    // types (src=Char, dest=Byte)`. `java.time.format.DateTimeFormatter` uses
+    // `buf.repeat('0', n)` for zero-padding, so this broke every timestamp/
+    // temporal literal (35 Hibernate suite classes).
+    registry.register(
+        class,
+        "repeat",
+        "(II)Ljava/lang/StringBuilder;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let code_point = match args.get(1) {
+                Some(Value::Int(v)) => *v,
+                _ => 0,
+            };
+            let count = match args.get(2) {
+                Some(Value::Int(v)) => (*v).max(0) as usize,
+                _ => 0,
+            };
+            // Encode the code point to UTF-16 units (surrogate pair for
+            // supplementary planes); fall back to a single unit for an invalid
+            // code point (e.g. a lone surrogate) rather than dropping it.
+            let mut units: Vec<u16> = Vec::with_capacity(2);
+            match char::from_u32(code_point as u32) {
+                Some(c) => {
+                    let mut buf = [0u16; 2];
+                    units.extend_from_slice(c.encode_utf16(&mut buf));
+                }
+                None => units.push(code_point as u16),
+            }
+            let mut chars = sb_read_chars(ctx, this);
+            for _ in 0..count {
+                chars.extend_from_slice(&units);
+            }
+            sb_write_chars(ctx, this, &chars);
+            Ok(Some(Value::Object(Some(this))))
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
