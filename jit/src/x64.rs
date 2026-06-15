@@ -18347,6 +18347,30 @@ impl Compiler {
                                 }
                             }
 
+                            // PRECISE-MAPS FIX (bug-03 layer C / B-K): the inline
+                            // MIC/PIC cascade below calls the resolved compiled
+                            // callee directly (`call r11`) on a class-id hit and
+                            // then `jmp`s to the shared `.done` site, where
+                            // `emit_oop_map_for_safepoint` emits the precise
+                            // post-safepoint RELOAD of oop register-locals from
+                            // their canonical frame slots. But the inline-hit path
+                            // never reaches the slow-path `emit_pre_safepoint_spill`
+                            // below — so under `precise_maps` the reload would load
+                            // an UN-spilled (stale) slot back into a live oop
+                            // register (e.g. the receiver `this`), which then
+                            // faults on the next `getfield` (observed: compiled
+                            // `String.codePointAt` → `this.isLatin1()` inline hit →
+                            // reload corrupts `this` → SIGSEGV). Spill HERE, before
+                            // the cascade, so the spill dominates BOTH the
+                            // inline-hit and the slow/miss paths and pairs with the
+                            // single shared reload. Gated on `precise_maps`, and the
+                            // slow-path spill below is made `!precise_maps`, so the
+                            // gate-OFF default path is byte-identical (exactly one
+                            // conservative spill, on the slow path, as before).
+                            if self.precise_maps {
+                                self.emit_pre_safepoint_spill();
+                            }
+
                             // CRIT-8 — Inline MIC fast-path guard.
                             //
                             // Layout (verified by `test_jit_mic_slot_offsets` in
@@ -18898,8 +18922,17 @@ impl Compiler {
                             self.emit_mov_imm32_sx(ARG_REGS[3], n as i32); // Cast: x86-64 immediate encoding
 
                             // Round-8 wave-3: defensive callee-saved spill
-                            // before any GC-triggering dispatch CALL.
-                            self.emit_pre_safepoint_spill();
+                            // before any GC-triggering dispatch CALL. Under
+                            // `precise_maps` the spill was already emitted before
+                            // the inline cascade (so it dominates the inline-hit
+                            // path too — see the PRECISE-MAPS FIX comment above);
+                            // emitting it again here would be a redundant
+                            // double-spill (and, with the shadow stack, an
+                            // unbalanced double push). Gate-OFF: unchanged — this
+                            // is the single conservative spill on the slow path.
+                            if !self.precise_maps {
+                                self.emit_pre_safepoint_spill();
+                            }
 
                             if let Some(mic) = mic_ptr {
                                 // MIC-optimized dispatch: pass MIC slot as 5th

@@ -966,7 +966,17 @@ fn drive_real_pqc_keypair(ctx: &mut dyn NativeContext, algo: i32) -> MethodCallR
             ));
         }
     };
-    ctx.invoke_virtual(spi, "generateKeyPair", "()Ljava/security/KeyPair;", &[])
+    // A real PQC provider returns a genuine KeyPair here. If the SPI yields
+    // null/None (e.g. the provider is unavailable, as in a unit-test mock), fail
+    // CLOSED — never hand back a null KeyPair, which presents failed keygen as
+    // success (no-synthetic-stubs policy; same contract the RSA/EC paths honour).
+    match ctx.invoke_virtual(spi, "generateKeyPair", "()Ljava/security/KeyPair;", &[])? {
+        Some(Value::Object(Some(kp))) => Ok(Some(Value::Object(Some(kp)))),
+        _ => Err(throw_no_such_algorithm(
+            ctx,
+            &format!("{} KeyPairGenerator produced no key", algo_name(algo)),
+        )),
+    }
 }
 
 /// Drive the real JDK PQC `KeyFactory` SPI's `engineGenerate{Public,Private}`
@@ -999,7 +1009,16 @@ fn drive_real_pqc_keyfactory(
     let desc = format!("(Ljava/security/spec/KeySpec;){ret}");
     let r = ctx.invoke_virtual(spi, method, &desc, &[Value::Object(Some(spec))]);
     ctx.unpin_native_roots(spec_pin);
-    r
+    // Fail CLOSED if the SPI produced no key (null/None) — e.g. the PQC provider
+    // is unavailable (unit-test mock). Returning a null key would silently pass
+    // off a dead key as success.
+    match r? {
+        Some(Value::Object(Some(k))) => Ok(Some(Value::Object(Some(k)))),
+        _ => Err(throw_invalid_key_spec(
+            ctx,
+            &format!("{} KeyFactory produced no key", algo_name(algo)),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,8 +1486,11 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
             ) {
                 if let Some(Value::Object(Some(key))) = r {
                     register_rsa_priv_sign_material(ctx, key);
+                    return Ok(Some(Value::Object(Some(key))));
                 }
-                return Ok(r);
+                // r was None (real SPI unavailable / produced no key) — do NOT
+                // return a null PrivateKey; fall through to the PKCS#1 retry and
+                // ultimately the InvalidKeySpecException below (fail closed).
             }
             // Fallback: the encoded spec may carry a PKCS#1 *traditional*
             // RSAPrivateKey rather than a PKCS#8 PrivateKeyInfo. BouncyCastle's
@@ -1496,8 +1518,9 @@ fn kf_generate_private(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCal
                     ) {
                         if let Some(Value::Object(Some(key))) = r {
                             register_rsa_priv_sign_material(ctx, key);
+                            return Ok(Some(Value::Object(Some(key))));
                         }
-                        return Ok(r);
+                        // None — fall through to InvalidKeySpecException below.
                     }
                 }
             }

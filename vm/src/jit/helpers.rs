@@ -621,6 +621,33 @@ unsafe fn bail_to_interpreter(
             info.descriptor,
             args,
         )
+    } else if matches!(info.invoke_kind, 0 | 2) {
+        // VIRTUAL DISPATCH FIX (bug #2 — regex zero-width corruption under
+        // `CRATONVM_JIT_VIRTUAL_TIERUP`). For virtual/interface kinds,
+        // `info.class_name` is the *static* call-site type, not the receiver's
+        // runtime class. `invoke_or_native` resolves the callee against the
+        // class name it is handed (it does NOT re-dispatch on `args[0]`), so a
+        // static type that declares a *concrete* base method shadows the
+        // receiver's override. The regex engine is the canonical victim: the
+        // `root.match(...)` call site is statically typed `Pattern$Node`, whose
+        // base `match` is an unconditional zero-width "accept" (`matcher.last =
+        // i; return true`). Bailing on the static type ran that accept node at
+        // every position instead of `Pattern$Start.match`, so `find()` reported
+        // a zero-width match before every character and
+        // `"org.x".replaceAll("[.]","/")` produced "/o/r/g/...". The compiled-
+        // entry MIC path already resolves on the receiver class (see
+        // `jit_invoke_virtual_mic`); this register-overflow / exception-reroute
+        // bail must do the same. Mirrors the array→Object and synthetic-id
+        // fallbacks used there.
+        let dispatch_class = virtual_dispatch_class(vm, args, info);
+        crate::vm::invoke_or_native(
+            vm,
+            thread,
+            &dispatch_class,
+            info.method_name,
+            info.descriptor,
+            args,
+        )
     } else {
         crate::vm::invoke_or_native(
             vm,
@@ -641,6 +668,37 @@ unsafe fn bail_to_interpreter(
         Ok(_) => 0,
         Err(e) => handle_jit_dispatch_error(vm, thread, e, info),
     }
+}
+
+/// Resolve the runtime dispatch class for a virtual/interface bail
+/// (`bail_to_interpreter`, kinds 0/2). `invoke_or_native` binds to the class
+/// name it is handed rather than re-dispatching on the receiver, so the bail
+/// must hand it the receiver's *runtime* class — not the static call-site type
+/// in `info.class_name`. Mirrors `jit_invoke_virtual_mic`'s receiver
+/// resolution: array receivers dispatch through `java/lang/Object` (JVMS
+/// §4.4.1); a null/non-object receiver or a class id absent from the store
+/// (synthetic alloc, which would derive an empty name) falls back to the
+/// static call-site class so we never dispatch on `""`.
+///
+/// SAFETY: `vm` must be a live `SharedVm`; `args[0]` (when present) is the
+/// receiver `Value` decoded by `decode_dispatch_values`/`decode_values`.
+unsafe fn virtual_dispatch_class(
+    vm: &SharedVm,
+    args: &[Value],
+    info: &JitInvokeInfo,
+) -> std::sync::Arc<str> {
+    let receiver = match args.first() {
+        Some(Value::Object(Some(obj))) => *obj,
+        _ => return std::sync::Arc::from(info.class_name),
+    };
+    if vm.heap.kind_of(receiver) == cratonvm_types::ObjectKind::Array {
+        return std::sync::Arc::from("java/lang/Object");
+    }
+    let cid = vm.heap.class_id_of(receiver);
+    let cm = vm.class_manager.read();
+    cm.get_class(cid)
+        .map(|c| c.name.clone())
+        .unwrap_or_else(|| std::sync::Arc::from(info.class_name))
 }
 
 /// BUG-H: does the statically-bound callee declare a non-empty exception

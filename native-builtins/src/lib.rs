@@ -923,17 +923,32 @@ std::thread_local! {
 }
 
 fn native_url_set_stream_handler_factory_guard(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
     let d = URL_SET_STREAM_HANDLER_FACTORY_DEPTH.get();
     if d != 0 {
+        // Re-entrant install (Spring Boot's factory recurses through
+        // class-init while the outer call is still unwinding). The JDK would
+        // throw `Error("factory already defined")`; we swallow it to keep the
+        // single, outermost factory — matching "first install wins" for the
+        // nested case.
         return Ok(None);
     }
     URL_SET_STREAM_HANDLER_FACTORY_DEPTH.set(1);
-    let out = Ok(None);
+    // `setURLStreamHandlerFactory` is a *static* method, so `args[0]` is the
+    // factory itself (no receiver). Publish it into the real `java.net.URL`
+    // static `factory` field so the un-intercepted real `getURLStreamHandler`
+    // bytecode consults it. Without this the field stays null and
+    // `new URL("vfszip:...")` (Hibernate JarVisitorTest, Spring Boot loader)
+    // raises `MalformedURLException: unknown protocol`. The real JDK also
+    // clears the `handlers` cache on install; we leave it — a freshly-booted
+    // VM has nothing cached for an app-defined scheme.
+    if let Some(Value::Object(Some(fac))) = args.first() {
+        ctx.set_static_field_by_name("java/net/URL", "factory", Value::Object(Some(*fac)));
+    }
     URL_SET_STREAM_HANDLER_FACTORY_DEPTH.set(0);
-    out
+    Ok(None)
 }
 
 /// App-specific compatibility stubs: "fake main" launcher short-circuits and
@@ -989,6 +1004,34 @@ fn register_app_stubs(registry: &mut NativeMethodRegistry) {
         jdownloader_extras::register_jdownloader_stubs(registry);
         freemind_extras::register_freemind_stubs(registry);
     });
+}
+
+/// `ObjectStreamClass.hasStaticInitializer(Class[, boolean]) -> boolean`:
+/// true iff the class declares a `<clinit>`. Always-compiled mirror of
+/// `serialization::class_has_static_initializer` (+ its `class_id_of_mirror`
+/// synthetic-jdk fallback) so the ESSENTIAL registration below does not depend
+/// on the feature-gated `serialization` module — otherwise
+/// `cargo test -p cratonvm-native-builtins` (built without
+/// `experimental-serialization`) fails to compile. Behaviour matches the gated
+/// path; `serialization.rs` keeps its own copy for the feature-on build.
+fn essential_class_has_static_initializer(ctx: &mut dyn NativeContext, args: &[Value]) -> bool {
+    let mirror = match args.first() {
+        Some(Value::Object(Some(m))) => *m,
+        _ => return false,
+    };
+    let class_id = ctx.class_id_from_mirror(mirror).or_else(|| {
+        // Synthetic-jdk fallback: read the mirror's "name" field, look up by name.
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(mirror, "name") {
+            if let Some(n) = ctx.read_string(s) {
+                return ctx.class_id_by_name(&n.replace('.', "/"));
+            }
+        }
+        None
+    });
+    match class_id {
+        Some(id) => ctx.declared_methods(id).iter().any(|m| &*m.name == "<clinit>"),
+        None => false,
+    }
 }
 
 /// Register ONLY the truly native methods (`ACC_NATIVE` in real JDK class files).
@@ -5548,6 +5591,23 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/net/URL;",
         classloader::cl_get_resource_essential,
     );
+    // SB-15: `java.lang.Module.getResourceAsStream(String)`. kotlin-reflect's
+    // multi-release `BuiltInsResourceLoader.loadResource` (JDK 9+ variant)
+    // resolves the `.kotlin_builtins` protobuf resources via
+    // `kotlin.Unit.class.getModule().getResourceAsStream(path)`. The real-JDK
+    // bytecode walks module/loader internals CratonVM leaves unpopulated and
+    // returns null, so the kotlin built-ins module ends up empty and
+    // `getBuiltInClassByName("Int")` fails ("Built-in class kotlin.Int is not
+    // found"). For classpath classes the unnamed module delegates to the app
+    // loader, so resolve via the same classpath scan as the ClassLoader-side
+    // native. Registered unconditionally (real-JDK + synthetic) like the
+    // getResource overrides above.
+    registry.register(
+        "java/lang/Module",
+        "getResourceAsStream",
+        "(Ljava/lang/String;)Ljava/io/InputStream;",
+        classloader::module_get_resource_as_stream,
+    );
     // URLClassLoader.findResource/findResources — the real bytecode walks
     // URLClassPath, whose essential-mode stubs return null/empty, so a
     // direct findResource() call (or a getResource() override delegating to
@@ -5812,13 +5872,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/io/ObjectStreamClass",
         "hasStaticInitializer",
         "(Ljava/lang/Class;Z)Z",
-        |ctx, args| Ok(Some(Value::Int(serialization::class_has_static_initializer(ctx, args) as i32))),
+        |ctx, args| Ok(Some(Value::Int(essential_class_has_static_initializer(ctx, args) as i32))),
     );
     registry.register(
         "java/io/ObjectStreamClass",
         "hasStaticInitializer",
         "(Ljava/lang/Class;)Z",
-        |ctx, args| Ok(Some(Value::Int(serialization::class_has_static_initializer(ctx, args) as i32))),
+        |ctx, args| Ok(Some(Value::Int(essential_class_has_static_initializer(ctx, args) as i32))),
     );
 
     // Force VM.isJavaLangInvokeInited() to return true. In a normal JVM,
@@ -14446,38 +14506,67 @@ pub(crate) fn native_unsafe_put_object(ctx: &mut dyn NativeContext, args: &[Valu
 /// uses the platform's native byte order, which on every CratonVM host
 /// (x86-64 / aarch64) is little-endian.
 ///
-/// Returns `Some(bytes)` only when `obj` is a `byte[]` (or boolean[]) and
-/// the offset has byte-offset shape; otherwise `None`, so the caller falls
-/// back to the generic element/field path.
-fn unsafe_read_bytes_from_byte_array(
+/// Returns `Some(bytes)` only when `obj` is a primitive array and the
+/// requested byte range fits; otherwise `None`, so the caller falls back to
+/// the generic element/field path (non-array targets, off-heap, references).
+///
+/// Works for EVERY primitive element type — not just `byte[]`. A multi-byte
+/// `Unsafe` read takes a *byte* offset and assembles `width` consecutive
+/// bytes which may SPAN several elements: `getLongUnaligned(char[], …)`
+/// reads 4 chars, `getLongUnaligned(int[], …)` reads 2 ints, etc. The JDK
+/// lays each element out in the platform's native (little-endian) byte
+/// order. The previous version handled only `byte[]`/`boolean[]` and fell
+/// back to a single-ELEMENT read for `char[]`/`int[]`/`long[]`, which
+/// truncated every cross-element word read to its first element — breaking
+/// `jdk.internal.util.ArraysSupport.vectorizedMismatch` and therefore
+/// `Arrays.equals(char[]/long[])` (e.g. ecj's `CharOperation.equals`
+/// mis-comparing `"Signature"` vs `"Synthetic"`).
+fn unsafe_read_bytes_from_array(
     ctx: &dyn NativeContext,
     obj: cratonvm_types::ObjectRef,
     offset: usize,
     width: usize,
 ) -> Option<Vec<u8>> {
+    use cratonvm_types::ArrayElementType as Aet;
     if ctx.heap_kind_of(obj) != cratonvm_types::ObjectKind::Array {
         return None;
     }
-    match ctx.heap_element_type_of(obj) {
-        cratonvm_types::ArrayElementType::Byte
-        | cratonvm_types::ArrayElementType::Boolean => {}
-        _ => return None,
-    }
+    let elem_type = ctx.heap_element_type_of(obj);
+    let elem_size: usize = match elem_type {
+        Aet::Byte | Aet::Boolean => 1,
+        Aet::Char | Aet::Short => 2,
+        Aet::Int | Aet::Float => 4,
+        Aet::Long | Aet::Double => 8,
+        // Reference arrays have no byte-addressable element storage.
+        Aet::Reference => return None,
+    };
     // Array byte offsets always start at ABASE (16); see
     // `unsafe_array_index_from_offset` / `native_unsafe_array_base_offset`.
     const ABASE: usize = 16;
     if offset < ABASE {
         return None;
     }
-    let start = offset - ABASE;
-    let len = ctx.array_length(obj);
-    if start + width > len {
+    let rel = offset - ABASE; // bytes from element 0
+    let len = ctx.array_length(obj); // element COUNT
+    let total_bytes = len.checked_mul(elem_size)?;
+    if rel.checked_add(width)? > total_bytes {
         return None;
     }
     let mut bytes = Vec::with_capacity(width);
-    for i in 0..width {
-        let b = ctx.get_array_element(obj, start + i).as_int().unwrap_or(0) as u8;
-        bytes.push(b);
+    for k in 0..width {
+        let byte_pos = rel + k;
+        let elem_idx = byte_pos / elem_size;
+        let byte_in_elem = byte_pos % elem_size;
+        // Read the element's raw bit pattern, then extract the requested
+        // byte in little-endian order (native order on x86-64 / aarch64).
+        let elem_bits: u64 = match ctx.get_array_element(obj, elem_idx) {
+            Value::Int(v) => v as u32 as u64, // byte/short/char/int (low bits used per elem_size)
+            Value::Long(v) => v as u64,
+            Value::Float(f) => f.to_bits() as u64,
+            Value::Double(d) => d.to_bits(),
+            _ => return None,
+        };
+        bytes.push(((elem_bits >> (8 * byte_in_elem)) & 0xFF) as u8);
     }
     Some(bytes)
 }
@@ -14502,14 +14591,14 @@ macro_rules! unsafe_multibyte_get {
             let offset = unsafe_offset(args, 2);
             if let Some(obj) = unsafe_obj(args, 1) {
                 if let Some(bytes) =
-                    unsafe_read_bytes_from_byte_array(ctx, obj, offset, $width)
+                    unsafe_read_bytes_from_array(ctx, obj, offset, $width)
                 {
                     let big_endian = unsafe_big_endian_arg(args);
                     let v: i64 = $assemble(&bytes, big_endian);
                     return Ok(Some(Value::Int(v as i32)));
                 }
             }
-            // Not a byte-array target — generic element/field access.
+            // Not a primitive-array target — generic element/field access.
             native_unsafe_get_int(ctx, args)
         }
     };
@@ -14552,7 +14641,7 @@ pub(crate) fn native_unsafe_get_long_mb(
 ) -> MethodCallResult {
     let offset = unsafe_offset(args, 2);
     if let Some(obj) = unsafe_obj(args, 1) {
-        if let Some(b) = unsafe_read_bytes_from_byte_array(ctx, obj, offset, 8) {
+        if let Some(b) = unsafe_read_bytes_from_array(ctx, obj, offset, 8) {
             let big_endian = unsafe_big_endian_arg(args);
             let v = if big_endian {
                 i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])

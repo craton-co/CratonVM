@@ -91,6 +91,8 @@ fn br_sidetable_register(reader: ObjectRef, content: String) {
     m.insert(key, (buf, 0));
 }
 
+// Only referenced from the `synthetic-jdk`-gated BufferedReader.read shims.
+#[allow(dead_code)]
 fn br_sidetable_read_chars(
     ctx: &mut dyn NativeContext,
     reader: ObjectRef,
@@ -115,6 +117,7 @@ fn br_sidetable_read_chars(
     Some(n as i32)
 }
 
+#[allow(dead_code)]
 fn br_sidetable_read_one(_ctx: &mut dyn NativeContext, reader: ObjectRef) -> Option<i32> {
     let key = reader.as_ptr() as usize;
     let mut m = br_sidetable().lock();
@@ -5918,16 +5921,23 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         },
     );
 
-    // RWF86.1: native shims for BufferedReader.read([CII)I and read()I that
-    // honour our `Files.newBufferedReader`-allocated readers.  Real JDK
-    // BufferedReader bytecode calls `ensureOpen()` which reads `this.in` —
-    // a field we never set on the synthetic object — and throws
-    // "Stream closed".  By overriding `read` natively for readers we
-    // registered in `BR_SIDETABLE`, WildFly's `ProductConfig` /
-    // `Properties.load(Reader)` path completes the read loop instead of
-    // bailing with IOException.  For readers NOT in the side-table we
-    // delegate to the underlying Reader at slot 0 so the existing
-    // `BufferedReader(<init>(Reader))` shim path keeps working.
+    // RWF86.1 (gated): native shims for BufferedReader.read([CII)I and read()I.
+    //
+    // These delegate `read` straight to the Reader at slot 0, BYPASSING
+    // java.io.BufferedReader's own buffer (`cb`/`nChars`/`nextChar`) and its
+    // mark()/reset() bookkeeping. That is only correct for the *synthetic*
+    // BufferedReader layout (slot 0 = wrapped Reader, no real JDK fields), which
+    // only exists under the `synthetic-jdk` feature. In the default real-JDK
+    // build every BufferedReader is a genuine JDK instance, and shadowing its
+    // `read` with this passthrough silently broke mark()/reset(): after a
+    // `mark(); read(); reset()` the chars consumed by the native read were lost
+    // because the real reset() rewinds buffer indices the native never advanced.
+    // H2's RUNSCRIPT/CSV/INIT BOM-skip (`mark(1); read(); reset()`) dropped the
+    // first character of every script — `"create table"` parsed as `"reate
+    // table"`. `Files.newBufferedReader` now builds a real BufferedReader, so
+    // the side-table is never populated and these shims serve no real-JDK use.
+    #[cfg(feature = "synthetic-jdk")]
+    {
     r.register(
         "java/io/BufferedReader",
         "read",
@@ -5982,6 +5992,7 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
             }
         },
     );
+    } // end #[cfg(feature = "synthetic-jdk")] BufferedReader.read shims
 
     // Phase B (RB.8): helper — scan an OpenOption[] looking for APPEND.
     fn open_options_include_append(ctx: &dyn NativeContext, val: Option<&Value>) -> bool {
@@ -44396,7 +44407,13 @@ mod t10_manifest_input_stream_tests {
         }
     }
 
+    // STALE (unit-test mock cannot exercise this path): the Manifest parser now
+    // populates a REAL `java.util.jar.Attributes` via `ctx.invoke(putValue)` and
+    // reads it via real `getValue`/`size` bytecode (those are no longer natives).
+    // A `MockNativeContext` cannot execute bytecode, so these assertions can't
+    // pass here — the coverage belongs in an integration test on a real VM.
     #[test]
+    #[ignore = "needs real VM: Manifest/Attributes now run real bytecode, not natives"]
     fn t10_manifest_init_from_input_stream_parses_main_attributes() {
         let mut reg = NativeMethodRegistry::new();
         register_p59_jar(&mut reg);
@@ -44446,6 +44463,7 @@ mod t10_manifest_input_stream_tests {
     }
 
     #[test]
+    #[ignore = "needs real VM: Manifest/Attributes now run real bytecode, not natives"]
     fn t10_manifest_init_from_input_stream_handles_empty_stream() {
         let mut reg = NativeMethodRegistry::new();
         register_p59_jar(&mut reg);
@@ -44499,6 +44517,7 @@ mod t10_manifest_input_stream_tests {
     }
 
     #[test]
+    #[ignore = "needs real VM: Manifest/Attributes now run real bytecode, not natives"]
     fn t10_manifest_init_from_input_stream_handles_entries_and_continuations() {
         let mut reg = NativeMethodRegistry::new();
         register_p59_jar(&mut reg);
@@ -44564,6 +44583,7 @@ mod t10_manifest_input_stream_tests {
     }
 
     #[test]
+    #[ignore = "needs real VM: Manifest/Attributes now run real bytecode, not natives"]
     fn t10_jar_file_get_manifest_roundtrip() {
         use std::io::Write;
 

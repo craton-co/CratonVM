@@ -2354,26 +2354,68 @@ pub fn register_jboss_msc_natives(r: &mut NativeMethodRegistry) {
 /// honoured. Any failure (no class, empty loader, provider <init> error) yields
 /// `None` and the safe JDK fallback.
 fn jboss_logging_serviceloader_provider(ctx: &mut dyn NativeContext) -> Option<Value> {
-    let cid = ctx.class_id_by_name("org/jboss/logging/LoggerProvider")?;
-    let mirror = ctx.get_class_mirror(cid);
+    let dbg = std::env::var_os("CRATONVM_DBG_LOGPROV").is_some();
+    if dbg {
+        eprintln!("[LOGPROV] findProvider serviceloader called");
+    }
+    // `findProvider` runs from `LoggerProviders.<clinit>`, which is frequently
+    // triggered during a message-logger interface's own `<clinit>` (via
+    // `getMessageLogger`) — BEFORE the `LoggerProvider` interface class itself
+    // has been loaded. `class_id_by_name` only finds *already-loaded* classes,
+    // so load it on demand (the real `findProvider` bytecode would have loaded
+    // it via its `ServiceLoader.load(LoggerProvider.class, …)` reference).
+    let mirror = if let Some(c) = ctx.class_id_by_name("org/jboss/logging/LoggerProvider") {
+        Value::Object(Some(ctx.get_class_mirror(c)))
+    } else if let Ok(Some(v)) = ctx.load_class("org/jboss/logging/LoggerProvider") {
+        v
+    } else {
+        if dbg {
+            eprintln!("[LOGPROV] LoggerProvider class could not be loaded");
+        }
+        return None;
+    };
     let sl = match ctx.invoke(
         "java/util/ServiceLoader",
         "load",
         "(Ljava/lang/Class;)Ljava/util/ServiceLoader;",
-        &[Value::Object(Some(mirror))],
+        &[mirror],
     ) {
         Ok(Some(Value::Object(Some(s)))) => s,
-        _ => return None,
+        other => {
+            if dbg {
+                eprintln!("[LOGPROV] ServiceLoader.load failed ok={}", other.is_ok());
+            }
+            return None;
+        }
     };
     let it = match ctx.invoke_virtual(sl, "iterator", "()Ljava/util/Iterator;", &[]) {
         Ok(Some(Value::Object(Some(i)))) => i,
-        _ => return None,
+        other => {
+            if dbg {
+                eprintln!("[LOGPROV] iterator() failed ok={}", other.is_ok());
+            }
+            return None;
+        }
     };
-    match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+    let has = ctx.invoke_virtual(it, "hasNext", "()Z", &[]);
+    if dbg {
+        eprintln!("[LOGPROV] hasNext -> {has:?}");
+    }
+    match has {
         Ok(Some(Value::Int(1))) => {}
         _ => return None,
     }
-    match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
+    let nx = ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]);
+    if dbg {
+        match &nx {
+            Ok(Some(Value::Object(Some(o)))) => {
+                let cn = ctx.class_name_of_id(ctx.class_id_of_object(*o));
+                eprintln!("[LOGPROV] next -> provider {cn:?}");
+            }
+            other => eprintln!("[LOGPROV] next failed ok={}", other.is_ok()),
+        }
+    }
+    match nx {
         Ok(Some(v @ Value::Object(Some(_)))) => Some(v),
         _ => None,
     }

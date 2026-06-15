@@ -2545,6 +2545,33 @@ fn cl_get_resource_as_stream(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     }
 }
 
+/// `java.lang.Module.getResourceAsStream(String)` (args: `[Module receiver,
+/// name]`).
+///
+/// kotlin-reflect 2.3.20 ships a multi-release jar; under JDK 9+ the loaded
+/// `BuiltInsResourceLoader.loadResource` is the `META-INF/versions/9` variant
+/// whose body is `kotlin.Unit.class.getModule().getResourceAsStream(path)` —
+/// NOT the base jar's `classLoader.getResource(path)`. For classpath classes
+/// the module is the *unnamed* module, whose `getResourceAsStream` delegates to
+/// the defining class loader's `getResourceAsStream`. The real-JDK bytecode for
+/// `Module.getResourceAsStream` walks module/loader internals (the resource map,
+/// `BootLoader`, `BuiltinClassLoader.findResource`) that CratonVM does not
+/// populate, so it returns null — kotlin-reflect then loads zero `.kotlin_builtins`
+/// fragments and asserts "Built-in class kotlin.Int is not found" (SB-15;
+/// HotSpot passes).
+///
+/// Resolve the resource exactly as the ClassLoader-side native does (a classpath
+/// scan via `find_resource`), which is the correct behaviour for the unnamed
+/// module — `Module` is `final`, so the receiver's own class carries this native
+/// and dispatch hits it directly. The receiver (`args[0]`) is ignored: every
+/// classpath class shares the one unnamed module / app loader.
+pub fn module_get_resource_as_stream(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    cl_get_resource_as_stream(ctx, args)
+}
+
 fn cl_get_defined_package(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
     Ok(Some(Value::Object(None)))
 }
