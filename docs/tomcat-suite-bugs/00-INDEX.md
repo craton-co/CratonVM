@@ -21,13 +21,27 @@ Unified status (verified on the fresh dev worktree build, srun run):
 | [08](08-importhandler-standard-packages-npe-FAIL.md) | ModuleFinder.ofSystem/jimage ModuleReader.list | jakarta.el.TestImportHandlerStandardPackages | FAIL | ✅ **FIXED** (peer) |
 | [09](09-objectstreamclass-recordsupport-missing.md) | ObjectStreamClass$RecordSupport (record serialization) | catalina.realm.TestGenericPrincipal | NOSUMMARY | ✅ **FIXED** (peer) — residual: TestJNDIRealm still NOSUMMARY |
 | [04](04-embedded-server-throughput-wall-OPEN.md) | Embedded-server deployment throughput wall | (most catalina/coyote) | perf | 🔴 **OPEN** (dominant — most HANGs) |
-| [06](06-openssl-ffm-clinit-segv-CRASH.md) | OpenSSL Panama/FFM clinit → libffi SEGV | catalina.util.TestServerInfo | CRASH | 🔴 **OPEN** (deep FFM) |
+| [06](06-openssl-ffm-clinit-segv-CRASH.md) | `Method.invoke` GC stale-ref under load (mis-blamed on OpenSSL FFM) | catalina.util.TestServerInfo | CRASH | ✅ **FIXED** — NOT an FFM bug (see note) |
 | [10](10-pagecontext-npe-contains-null-FAIL.md) | Embedded-server serving wall (null response body; re-diagnosed → group 04, NOT a JSP/EL bug) | jakarta.servlet.jsp.TestPageContext | FAIL | 🔴 **OPEN** (→ 04) |
 | [05](05-suite-rerun-fail-triage.md) | Remaining craton-only FAIL set — to triage | (~30 classes) | FAIL | 🔴 **OPEN** (mostly undiagnosed) |
 
-6 of the diagnosed bug groups are FIXED (01/02/03/07/08/09); the open set is
-dominated by the throughput wall (04) plus the FFM SEGV (06) and the
-not-yet-individually-diagnosed FAILs (05).
+7 of the diagnosed bug groups are FIXED (01/02/03/06/07/08/09); the open set is
+dominated by the throughput wall (04) and the not-yet-individually-diagnosed
+FAILs (05).
+
+> **Bug 06 — re-verified FIXED (2026-06-15).** The "OpenSSL Panama/FFM clinit →
+> libffi SEGV" label was a wrong diagnosis. The crash was a GC stale-reference in
+> the `java.lang.reflect.Method.invoke` wrapper (fix `9ce4c3b4`, in `dev`): the
+> inner invoke could GC and move the `Method` mirror while a pre-call `args`
+> snapshot held a now-dangling pointer, faulting under JUnit's per-method
+> reflection — load-dependent, hence "intermittent, only under contention."
+> Re-verified on `dev`: `TestServerInfo` = `OK (22 tests)`; **0 hard crashes
+> across 30+ concurrent runs, JIT on AND off**; the `openssl_h` FFM `<clinit>`
+> fails *cleanly* (caught `ExceptionInInitializerError`/NPE) with **no SEGV in
+> either JIT mode** — the synthetic `panama.rs` wrong-ABI path is `synthetic-jdk`-
+> only and off in the real-JDK suite build. Group 04's root cause was separately
+> re-pinned to `update_root_snapshot` (~68% of a deploy) with two gated perf
+> levers landed; it remains OPEN (perf, default-OFF gates).
 
 ## Current run status — fresh dev worktree (`srun`, `-Xmx2g`, 180s timeout)
 
