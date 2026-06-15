@@ -158,15 +158,48 @@ unaffected — it never builds a real deployment, so it never hits this hot path
 InstBench/StrInstBench/Props/CSBench results are bit-identical to HotSpot with the
 flag on, and flag-OFF default behavior is unchanged.
 
-**But (B) ON exposes a pre-existing JIT codegen miscompile in the regex match
-engine (new layer C, OPEN).** With the flag on, `String.replaceAll("[.]","/")`
-returns `/o/r/g/.../` (a `/` inserted at every position — empty match everywhere)
-instead of `org/.../`, and is ~2.4× *slower* (deopt-thrash). The miscompile is in
-one of the now-compiled instance methods — `CRATONVM_DBG_JITC=1` lists the
-candidates: `Matcher.find()Z`, `Matcher.getTextLength()I`, `Matcher.hasMatch()Z`,
-`Pattern$Node.match`, `Pattern$BmpCharProperty.match`, `Pattern$CharProperty.study`
-(+ helpers). The (B) *dispatch* is proven correct (InstBench/StrInstBench return
-right values), so this is a latent JIT codegen bug that was simply never triggered
-before — instance methods never invocation-compiled. Root-causing/skip-listing the
-specific miscompiling regex method(s) is the remaining work (layer C) before (B)
-can be default-ON and the regex/ShrinkWrap path is finally fast.
+**(B) ON exposed a pre-existing JIT codegen miscompile in the regex match engine
+(layer C).** With the flag on, `String.replaceAll("[.]","/")` returned `/o/r/g/.../`
+(a `/` inserted at every position — empty match everywhere) instead of `org/.../`.
+
+### Layer C — root-caused to `Matcher.search(I)Z`, MITIGATED (skip-listed)
+Bisected with the runtime hook `CRATONVM_JIT_BISECT_SKIP` (no rebuild per step;
+`skip_list.rs`). Result: **skipping ONLY `java/util/regex/Matcher.search(I)Z`
+makes RegexBench + RegexBench2 fully correct again** (allow-only-search → corrupt;
+allow-only-`find`/`reset` → correct). So `search`'s *compiled body* is the sole
+culprit; every other regex method (incl. `Pattern$Start.match`/`LastNode.match`,
+which newly compile when search is skipped) is correct.
+
+The miscompile is NOT in the layer-B dispatch — `InstBench`/`StrInstBench`
+(instance methods, incl. object-returning) are bit-identical to HotSpot. Disasm
+(`CRATONVM_DBG_JIT_DISASM=java/util/regex/Matcher.search`,
+`wildfly-suite/repro/search_disasm.txt`) shows correct field offsets, correct
+`root.match` args, and correct result handling; `search` calls the (also-compiled)
+`Pattern$Node.match` via the generic JIT→JIT dispatch helper. This matches the
+**same signature as the `ByteBuddyState.make` ban in `skip_list.rs`** — "a value/
+receiver lost across the JIT→JIT call boundary," a general codegen defect already
+tracked there. The exact faulty instruction is a deeper follow-up.
+
+**Mitigation (landed):** `("java/util/regex/Matcher", "search")` added to the
+`skip_list.rs` targeted bans. With it, regex is correct under
+`CRATONVM_JIT_VIRTUAL_TIERUP=1`; `search` (the hot scan loop) stays interpreted,
+but the other regex nodes + the layer-A charAt intrinsics still JIT, so:
+
+| RegexBench2 (warm 20k) | flag OFF | flag ON + search ban | HotSpot |
+|------------------------|----------|----------------------|---------|
+| precompiled replaceAll | 14 958 ms | **9 529 ms** | 26 ms |
+
+Per-`replaceAll` ≈ 0.48 ms — ShrinkWrap calls it once per class, so ~1000 classes
+≈ 0.5 s (was minutes-to-never). The skip-list entry is a **no-op for the default
+config** (search only compiles under the still-default-OFF virtual-tierup flag).
+
+### Remaining
+1. The general JIT→JIT call-boundary codegen defect (shared with
+   `ByteBuddyState.make`) — once fixed, drop the `Matcher.search` ban for full
+   regex speed.
+2. Flipping `CRATONVM_JIT_VIRTUAL_TIERUP` default-ON still needs a full
+   WildFly/Kafka/Tomcat suite re-test (B compiles the whole instance-method
+   surface; other latent miscompiles may surface and need the same treatment).
+Until then, run the WildFly Arquillian client with `CRATONVM_JIT_VIRTUAL_TIERUP=1`
+to get the regex/ShrinkWrap path fast enough to build the JUnit-5 deployment
+archive.
