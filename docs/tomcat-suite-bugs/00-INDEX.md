@@ -10,31 +10,34 @@ This directory groups the issues by root cause rather than per-class. Several
 earlier groups have been FIXED and merged to `dev`; the dominant remaining wall
 is interpreter throughput on embedded-server deployment.
 
-| # | Group | Status |
-|---|-------|--------|
-| [01](01-jsse-tls-chain-FIXED.md) | JSSE/TLS chain (SSLContext→live HTTPS) | **FIXED** (dev) |
-| [02](02-native-young-gen-oom-abort-FIXED.md) | Native alloc young-gen OOM hard-abort | **FIXED** (dev) |
-| [03](03-gc-root-snapshot-contention-FIXED.md) | GC root-snapshot lock contention / per-call cost | **FIXED** (dev, partial) |
-| [04](04-embedded-server-throughput-wall-OPEN.md) | Embedded-server deployment throughput wall | **OPEN** (dominant) |
-| [05](05-suite-rerun-fail-triage.md) | Suite-rerun FAIL set — to triage | OPEN (preliminary) |
-| [06](06-openssl-ffm-clinit-segv-CRASH.md) | OpenSSL Panama/FFM clinit NPE → JIT SEGV | **OPEN** (CRASH) |
-| [07](07-beanelresolver-property-not-found-FAIL.md) | BeanELResolver bean property not discovered | OPEN (FAIL) |
-| [08](08-importhandler-standard-packages-npe-FAIL.md) | ImportHandler standard-package list NPE | OPEN (FAIL) |
-| [09](09-objectstreamclass-recordsupport-missing.md) | ObjectStreamClass$RecordSupport missing (record serialization) | **FIXED** (fix/tomcat-suite-bugs-09-10) |
-| [10](10-pagecontext-npe-contains-null-FAIL.md) | TestPageContext "contains on null" = embedded-server serving wall (re-diagnosed; NOT a JSP/EL bug → group 04) | OPEN (FAIL) |
+Unified status (verified on the fresh dev worktree build, srun run):
 
-Groups 06-08 are individually-diagnosed (real per-class repro + trace) from the
-group-05 worklist; more will be added as triage continues.
+| # | Bug / group | Repro class | Type | Status |
+|---|-------------|-------------|------|--------|
+| [01](01-jsse-tls-chain-FIXED.md) | JSSE/TLS chain (SSLContext→live HTTPS) | TestSsl | cluster | ✅ **FIXED** |
+| [02](02-native-young-gen-oom-abort-FIXED.md) | Native alloc young-gen OOM hard-abort | (all server deploy) | CRASH | ✅ **FIXED** |
+| [03](03-gc-root-snapshot-contention-FIXED.md) | GC root-snapshot lock contention | (all server deploy) | perf | ✅ **FIXED** |
+| [07](07-beanelresolver-property-not-found-FAIL.md) | Introspector interface default-method property | jakarta.el.TestBeanELResolver | FAIL | ✅ **FIXED** |
+| [08](08-importhandler-standard-packages-npe-FAIL.md) | ModuleFinder.ofSystem/jimage ModuleReader.list | jakarta.el.TestImportHandlerStandardPackages | FAIL | ✅ **FIXED** (peer) |
+| [09](09-objectstreamclass-recordsupport-missing.md) | ObjectStreamClass$RecordSupport (record serialization) | catalina.realm.TestGenericPrincipal | NOSUMMARY | ✅ **FIXED** (peer) — residual: TestJNDIRealm still NOSUMMARY |
+| [04](04-embedded-server-throughput-wall-OPEN.md) | Embedded-server deployment throughput wall | (most catalina/coyote) | perf | 🔴 **OPEN** (dominant — most HANGs) |
+| [06](06-openssl-ffm-clinit-segv-CRASH.md) | OpenSSL Panama/FFM clinit → libffi SEGV | catalina.util.TestServerInfo | CRASH | 🔴 **OPEN** (deep FFM) |
+| [10](10-pagecontext-npe-contains-null-FAIL.md) | Embedded-server serving wall (null response body; re-diagnosed → group 04, NOT a JSP/EL bug) | jakarta.servlet.jsp.TestPageContext | FAIL | 🔴 **OPEN** (→ 04) |
+| [05](05-suite-rerun-fail-triage.md) | Remaining craton-only FAIL set — to triage | (~30 classes) | FAIL | 🔴 **OPEN** (mostly undiagnosed) |
 
-## Current rerun status (with TLS/server env + `-Xmx2g`, 180s timeout)
+6 of the diagnosed bug groups are FIXED (01/02/03/07/08/09); the open set is
+dominated by the throughput wall (04) plus the FFM SEGV (06) and the
+not-yet-individually-diagnosed FAILs (05).
 
-The post-fix rerun (`results/rerun/craton`) — partial at time of writing
-(~253/651 classes) — reads **51 PASS / 55 FAIL / 145 HANG / 2 NOSUMMARY**. The
-**145 HANG dominate** and are overwhelmingly embedded-server classes hitting the
-180s per-class timeout: that is the throughput wall (group 04), not 145 distinct
-broken tests. The suite is **NOT green**; the gap is mostly throughput, plus the
-group-05 FAILs still to be diagnosed.
+## Current run status — fresh dev worktree (`srun`, `-Xmx2g`, 180s timeout)
 
-**The suite is not green.** The TLS/JCA/GC crash-class bugs are fixed; the
-remaining work is (a) interpreter throughput for server-test deployment and
-(b) triaging the genuine per-class FAILs in group 05.
+Partial at time of writing (~220/651): **51 PASS / 32 FAIL / 136 HANG /
+1 NOSUMMARY / 0 CRASH-so-far** (TestServerInfo/06 not yet reached). The **HANG
+count dominates** = the throughput wall (group 04), not that many distinct broken
+tests; some HANGs are also contention with concurrent runs. Craton-only
+NOSUMMARY so far: `catalina.realm.TestJNDIRealm` (bug-09 family residual).
+
+**The suite is NOT green.** Crash-class TLS/JCA/GC bugs + several semantic bugs
+(07/08/09) are fixed; the remaining gap is (a) interpreter throughput for
+server-test deployment (group 04, the bulk) and (b) the ~30 craton-only FAILs in
+group 05 still to be individually diagnosed.
