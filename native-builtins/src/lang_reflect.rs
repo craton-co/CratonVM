@@ -1766,6 +1766,26 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         }?;
         Some(Value::Object(Some(ctx.get_class_mirror(cid))))
     }
+    /// Recover the declaring `GenericDeclaration` (Method/Constructor/Class) that
+    /// owns a lazily-reified `sun.reflect.generics.reflectiveObjects.*` object, by
+    /// walking its `LazyReflectiveObjectGenerator.factory` →
+    /// `CoreReflectionFactory.decl`. The JDK reifier threads this declaration
+    /// through every nested Type it builds so a type-variable USE (`? super T`)
+    /// resolves to the declaration's REAL type parameter; CratonVM reuses it as
+    /// the `GenericDeclScope` for `type_sig_to_java`.
+    fn reifier_decl_from_factory(
+        ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
+        this: cratonvm_types::ObjectRef,
+    ) -> Value {
+        let factory = match ctx.get_field_by_name(this, "factory") {
+            Value::Object(Some(f)) => f,
+            _ => return Value::Object(None),
+        };
+        match ctx.get_field_by_name(factory, "decl") {
+            v @ Value::Object(Some(_)) => v,
+            _ => Value::Object(None),
+        }
+    }
     fn wti_bounds_reified(
         ctx: &mut dyn cratonvm_native_api::registry::NativeContext,
         this: cratonvm_types::ObjectRef,
@@ -1776,6 +1796,16 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         if ctx.heap_kind_of(arr) != cratonvm_types::ObjectKind::Array {
             return raw;
         }
+        // A wildcard bound may itself be a type-variable USE (`? super T`, the
+        // shape Kotlin emits for a suspending function's `Continuation`
+        // parameter). Resolve such uses against the declaring method/class so
+        // `T` becomes the declaration's REAL `sun.reflect…TypeVariableImpl`
+        // (with its proper bounds + genericDeclaration) instead of a bound-less
+        // synthetic. Without this scope, kotlin-reflect's
+        // `extractContinuationArgument` recovers a decl-less `TypeVariable@…`
+        // and `MethodParameterKotlinTests."Suspending function return type"`
+        // sees `bounds[0] == Object` instead of `Producer<? extends Number>`.
+        let _gscope = crate::generics::GenericDeclScope::new(reifier_decl_from_factory(ctx, this));
         let len = ctx.array_length(arr);
         let mut out: Vec<Value> = Vec::with_capacity(len);
         let mut any_tree = false;
