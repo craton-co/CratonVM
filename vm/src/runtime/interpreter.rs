@@ -16574,8 +16574,8 @@ fn execute_jit_call(
 /// Dispatch an already-resolved compiled method using **pre-decoded** args
 /// (`args_slice`), instead of popping them off the operand stack like
 /// [`execute_jit_call`]. Used by the instance-method invocation tier-up path
-/// (bug-03 layer B, default-OFF via `CRATONVM_JIT_VIRTUAL_TIERUP`), which reaches
-/// the JIT *after* the interception checks have already popped+decoded the args
+/// (bug-03 layer B, default-ON; off-switch `CRATONVM_JIT_VIRTUAL_TIERUP=0`), which
+/// reaches the JIT *after* the interception checks have already popped+decoded the args
 /// into `args_slice`.
 ///
 /// Returns:
@@ -17400,7 +17400,7 @@ fn execute_invokevirtual_cached(
                         return Ok(CachedCallResult::Handled);
                     }
 
-                    // (bug-03 layer B, default-OFF via CRATONVM_JIT_VIRTUAL_TIERUP)
+                    // (bug-03 layer B, default-ON; off-switch CRATONVM_JIT_VIRTUAL_TIERUP=0)
                     // Instance-method invocation tier-up. Today only static
                     // methods have an invocation counter, so short-loop instance
                     // hot methods (e.g. java.util.regex Pattern$*.match) never
