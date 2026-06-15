@@ -1,10 +1,43 @@
 # Bug 06 — OpenSSL Panama/FFM binding clinit NPE → JIT SEGV  (CRASH)
 
-**Status:** OPEN. Real CratonVM crash (HotSpot PASSes).
+**Status:** ✅ FIXED (commit `9ce4c3b4`, in `dev`). Re-verified 2026-06-15 — see
+"Verification (2026-06-15)" below. The CRASH (SEGV) status in older suite runs is
+stale (predates the fix); `TestServerInfo` no longer crashes under load.
 **Severity:** High — a hard `EXCEPTION_ACCESS_VIOLATION` (process death), and the
 trigger (`AprLifecycleListener` / `openssl_h` static init) is reachable from many
 classes, not just the repro below.
 **Repro class:** `org.apache.catalina.util.TestServerInfo` (rc=-1073741819).
+
+## Verification (2026-06-15) — fix confirmed, residual failures are a test artifact
+
+Re-checked on `dev` (fix `9ce4c3b4` present in `native-builtins/src/lang_reflect.rs`,
+see "Root cause (symbolized) + FIX"). Worktree `CratonVM-tcbug0609`, branch
+`fix/tomcat-bugs-0609-verify`.
+
+- **The SEGV is gone.** `TestServerInfo` run **24× under concurrent CPU contention**
+  (8× concurrent × 3 rounds) produced **0 hard crashes** (no
+  `EXCEPTION_ACCESS_VIOLATION` / `0xC0000005` / `SIGSEGV`). Before the fix the doc's
+  6× repro was a reliable 6/6 SEGV. Isolated run = `OK (22 tests)`.
+- **The residual concurrent "FAILURES" are a test-harness artifact, NOT a VM bug.**
+  Running `TestServerInfo` 6× concurrently now yields `rc=1` JUnit assertion
+  failures (e.g. `Should read Bundle-Version expected:<1.2.3> but was:<null>`), all
+  routed through `withTestJar` → `createTestJar`. `createTestJar`
+  (`TestServerInfo.java:512`) writes the test JAR to `System.getProperty("java.io.tmpdir")`
+  with a **fixed filename** and `withTestJar`'s `finally` deletes it — so N
+  concurrent instances of *the same class* clobber/delete each other's shared temp
+  JAR. **HotSpot reproduces the same failures** under 6× concurrent (seen 1/6), so
+  it is a property of the upstream test, not CratonVM. CratonVM fails more often
+  only because it runs the class slower (~15 s vs HotSpot's few s), widening the
+  collision window.
+- **It does not affect the real suite.** `run-suite.ps1` uses `parallel=5` but each
+  *class* runs exactly once, so `TestServerInfo` runs as a **single instance**
+  alongside 4 *different* classes — it gets the GC/CPU pressure that surfaced the
+  SEGV (now fixed) but never the same-class temp-JAR collision. → expected suite
+  result: **PASS**.
+- We deliberately do **not** patch `createTestJar` to use a unique temp file: that
+  would be modifying an upstream Tomcat test to paper over a HotSpot-shared race,
+  which is out of scope (the VM bug — the SEGV — is the thing that was real, and
+  it is fixed).
 
 ## Symptom
 

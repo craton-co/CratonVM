@@ -1,7 +1,9 @@
 # Bug 09 — ObjectStreamClass$RecordSupport missing → NOSUMMARY (VM death)
 
-**Status:** ✅ FIXED (branch `fix/tomcat-suite-bugs-09-10`).
-`org.apache.catalina.realm.TestGenericPrincipal` now `OK (3 tests)` == HotSpot.
+**Status:** ✅ FIXED — merged into `dev` (fix commit `c66ffc0d`, originally branch
+`fix/tomcat-suite-bugs-09-10`). Re-verified 2026-06-15 on `dev`:
+`org.apache.catalina.realm.TestGenericPrincipal` = `OK (3 tests)` == HotSpot.
+(Any NOSUMMARY status in older suite runs is stale — it predates the merge.)
 **Severity:** Medium-High — a `linkage error` kills the VM (NOSUMMARY); affects
 any test serializing a record (or a class whose serialization walks records).
 **Repro classes:** `org.apache.catalina.realm.TestGenericPrincipal` (was NOSUMMARY,

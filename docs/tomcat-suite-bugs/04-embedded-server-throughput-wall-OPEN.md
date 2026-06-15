@@ -1,5 +1,92 @@
 # Group 04 — Embedded-server deployment throughput wall  (OPEN, dominant)
 
+> ## ✅ 2026-06-15 RE-VERIFICATION — both FUNCTIONAL sub-problems are fixed; remainder is pure interpreter throughput
+>
+> Re-measured on `dev` (fresh worktree `CratonVM-tcbug0609`, branch
+> `fix/tomcat-bugs-0609-verify`) with the suite env
+> (`CRATONVM_REAL_NET_SOCKETS=1 CRATONVM_REAL_AQS=1 CRATONVM_DISABLE_DEFAULT_WATCHDOG=1
+> CRATONVM_ROOTSNAP_CACHE=1`, `-Xmx2g`):
+>
+> 1. **Connector serving (sub-problem #1, setOption)** — FIXED (in `dev`). Server
+>    accepts + invokes the servlet.
+> 2. **In-process HTTP client `getUrl` (sub-problem #2)** — FIXED (in `dev`,
+>    commits `48183599`+`b628d8d7`). **Verified:** `TestTomcatClassLoader` =
+>    `OK (2 tests)` — it deploys, fetches via `getUrl` *in-process*, and asserts
+>    on the response. `getUrl`/`methodUrl` build the URL with
+>    `URI.create(path).toURL()` (`TomcatBaseTest.java:689`), and that whole path
+>    (`openConnection` → `getResponseCode` → `getInputStream`) now works
+>    in-process.
+>    - ⚠ *Latent, NOT bug 04:* a URL built with the deprecated `new URL(String)`
+>      ctor instead routes `URL.openStream` to read field **slot 5**, which on a
+>      *real-JDK* `java.net.URL` is the `authority` field (`host:port`, contains
+>      `:`) not the full URL → it skips the `toExternalForm` fallback (guard is
+>      `!url_str.contains(':')`) and throws `URL.openStream: unsupported scheme:
+>      host:port` (`net_phase_e.rs:3025`/`:3220`). Tomcat's tests use
+>      `URI.toURL()`, so they are unaffected; filed here only so it isn't
+>      re-discovered as a "server bug." A minimal fix is to validate the slot-5
+>      string actually starts with a real scheme (`^[A-Za-z][A-Za-z0-9+.-]*:`)
+>      before trusting it, else fall through to `toExternalForm`.
+> 3. **Deploy throughput (sub-problem #3) — the ONLY thing still open. ROOT CAUSE
+>    RE-PINNED: it is `update_root_snapshot`, NOT a diffuse "general interpreter
+>    loop."** Quantified on a pure-deploy test with no HTTP client,
+>    `TestApplicationFilterConfig.testBug54170` (one `tomcat.start()` + MBean
+>    asserts) = **`OK (1 test)` in ~29 s on CratonVM vs ~2 s on HotSpot (~15×)**.
+>    - **cdb sampling** of the hot `main-vm` thread (release-with-debug symbols):
+>      **30/30 leaf samples** are
+>      `GenerationalHeap::is_heap_addr` ← `Frame::scan_local_objects` ←
+>      `update_root_snapshot` ← `invoke_cached_native_callback`, under deeply
+>      **nested class-init driven by `Method.invoke` reflection** (the deploy
+>      instantiates servlets/filters/listeners + runs the Digester reflectively).
+>    - **`CRATONVM_DBG_ROOTSNAP` counter** (clean, uninterrupted run): a single
+>      deploy makes **~1.8 M `update_root_snapshot` calls** totalling
+>      **~19.6 s — i.e. ~68 % of the 29 s wall.** It runs **twice per
+>      object-returning native call** (`safe_native_call` publishes for
+>      `native_pending_return`; `native_return_pushed_to_stack` re-publishes after
+>      the value is on the operand stack) and is O(stack-depth ≈ 33).
+>    - **The `CRATONVM_ROOTSNAP_CACHE` cache only buys ~2.4× here**, not the ~11×
+>      seen on `TestSsl`: cache OFF = **28.6 µs/call**, cache ON = **11.9 µs/call**
+>      (same test, internal counter, ratio is contention-robust). The cache
+>      amortises a *deep frozen* stack (TestSsl mid-serve, depth ~53), but a
+>      class-init/reflection **storm churns the top frames every call AND fires
+>      young GC often** (each collection bumps `collection_count`, invalidating the
+>      whole frame-prefix cache), so reuse is poor and per-call cost stays near a
+>      full scan. → the doc's earlier "rootsnap is only ~4 s of ~33 s / no longer
+>      dominant" conclusion was workload-specific to TestSsl and is **wrong for the
+>      reflection-heavy deploy path** that dominates the catalina/core/startup
+>      population.
+>
+>    **Fix levers (ranked by leverage; all GC-correctness-critical — verify with
+>    the bt18 checksum oracle `68332206` + full pool + suite, NOT just wall time):**
+>    1. *Cut call FREQUENCY (highest leverage, deferred #2).* The snapshot exists
+>       only so a STW/concurrent collector can read THIS thread's roots without
+>       walking its Rust stack. Between safepoints nobody reads it, yet it is
+>       published ~1.8 M times/deploy. Guarding the publish on an actual
+>       "collection requested/pending" flag (publish at the safepoint poll, not
+>       every native return) would eliminate the vast majority. Needs the
+>       collector/mutator handshake to be exactly right (a missed publish = a
+>       reclaimed live `native_pending_return` = SEGV).
+>    2. *Drop the SECOND publish.* `native_return_pushed_to_stack`'s
+>       `update_root_snapshot` (interpreter `invoke_cached_native_callback`) may be
+>       redundant: after the value is pushed it is already a frame/operand-stack
+>       root, and the snapshot published microseconds earlier in `safe_native_call`
+>       still covers the same object via `native_pending_return` (a stale-but-valid
+>       extra conservative root, refreshed by the next native call). If sound, this
+>       *halves* the call count. Risk: subtle under a *moving* GC; must be proven
+>       against the moving sweep, not just the default non-moving one.
+>    3. *Make the cache survive non-moving collections.* The default young sweep is
+>       non-moving (selective promotion), so object ADDRESSES are stable across it;
+>       invalidating the whole cache on every `collection_count` bump is overly
+>       conservative. Track a separate *moving*-collection epoch and only drop the
+>       cache on a moving GC, re-validating reused roots via `is_object_address`.
+>       Restores cache hit-rate on the churning path without changing the root set.
+>
+> Net: group 04 is no longer "servers don't serve" or "client returns -1" — those
+> are fixed. The residual wall is **`update_root_snapshot` overhead × per-class
+> method count** (each server test method does a full reflective deploy, each
+> deploy paying ~20 s of root-snapshot publishing), which is why deploy-heavy
+> classes still exceed the harness timeout. This is a concrete, attackable hotspot
+> — not an irreducible "interpreter ceiling."
+
 > ## ⚠ 2026-06-14 CORRECTION — a FUNCTIONAL connector bug was masquerading as throughput
 >
 > The premise below ("the server actually starts/serves/tears-down correctly,
