@@ -35005,10 +35005,22 @@ fn define_or_get_proxy_class(
         }
     }
 
-    // Ensure the synthetic super class exists so `define_class_full`
-    // can resolve it. `ensure_class_initialized` is idempotent — fast
-    // on the second+ call.
-    let _ = ctx.ensure_class_initialized("java/lang/reflect/Proxy$Instance");
+    // Ensure the synthetic super class exists so `define_class_full` can
+    // resolve it.
+    //
+    // spring-bug-01: `Proxy$Instance` is a CratonVM-invented class with NO
+    // class file. In real-JDK mode (booting --java-home) `ensure_class_initialized`
+    // routes through `load_class`, which returns ClassNotFound for a `java/*`
+    // name when real boot classes are present — so the stub was never
+    // registered, the generated `$Proxy0`'s superclass failed to resolve, and
+    // the FIRST proxy in the process silently fell back to a bare
+    // `Proxy$Instance` (no generated member bodies) → annotation accessors hit
+    // `AbstractMethodError: <Ann>.value() has no Code` / `NoSuchMethodError
+    // Proxy$Instance.value()`. (Every proxy AFTER the first worked, because the
+    // fallback's allocation registered the stub.) `ensure_synthetic_class`
+    // never fails — it registers the 3-field stub (handler/interfaces/identity)
+    // directly — so `$Proxy0` now generates a real proxy exactly like `$Proxy1+`.
+    let _ = ctx.ensure_synthetic_class("java/lang/reflect/Proxy$Instance", 3);
 
     let dbg = std::env::var("CRATONVM_DBG_PROXY").is_ok();
     let (gen_name, spec) = match build_proxy_spec_for(ctx, &sorted) {
