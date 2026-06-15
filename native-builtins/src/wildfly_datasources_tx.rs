@@ -95,8 +95,6 @@ const CLS_TM: &str = "javax/transaction/TransactionManager";
 const CLS_USER_TX: &str = "javax/transaction/UserTransaction";
 const CLS_TX: &str = "javax/transaction/Transaction";
 const CLS_NARAYANA_TM: &str = "com/arjuna/ats/jta/TransactionManagerImple";
-const CLS_NARAYANA_PM: &str = "com/arjuna/ats/jta/common/jtaPropertyManager";
-const CLS_JTA_ENV_BEAN: &str = "com/arjuna/ats/jta/common/JTAEnvironmentBean";
 const CLS_XID: &str = "javax/transaction/xa/Xid";
 const CLS_XA_RES: &str = "javax/transaction/xa/XAResource";
 const CLS_XA_EXC: &str = "javax/transaction/xa/XAException";
@@ -730,14 +728,22 @@ fn native_narayana_tm_singleton(ctx: &mut dyn NativeContext, _args: &[Value]) ->
     Ok(Some(Value::Object(Some(tm))))
 }
 
-/// Narayana: `jtaPropertyManager.getJTAEnvironmentBean()`.
-fn native_narayana_pm_get_env_bean(ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    let bean = alloc_object_for(ctx, CLS_JTA_ENV_BEAN, 2);
-    // Slot 0: object store directory (string) — default Narayana path.
-    let dir = ctx.create_string("PutObjectStoreDirHere");
-    ctx.set_field(bean, 0, Value::Object(Some(dir)));
-    Ok(Some(Value::Object(Some(bean))))
-}
+// NOTE: `jtaPropertyManager.getJTAEnvironmentBean()` is intentionally NOT
+// overridden. It used to be shadowed by a synthetic stub that returned a
+// fresh 2-slot `JTAEnvironmentBean` with only the object-store directory set
+// and every other field left at its zero/null default. That stub silently
+// broke real Narayana whenever it is on the classpath (e.g. Hibernate's
+// narayana-jta): the real bean carries ~40 configured defaults, and the
+// internal Narayana code reads them. In particular
+// `BaseTransaction.<clinit>` builds `new ThreadPoolExecutor(1,
+// getJTAEnvironmentBean().getAsyncCommitPoolSize(), ...)`; with the stub that
+// pool size read back as 0 → `IllegalArgumentException: maximumPoolSize must
+// be positive` → `ExceptionInInitializerError` → `transactionManager()`
+// yields null → Hibernate's JTA coordinator NPEs ("Cannot invoke begin/
+// suspend on null"). The real `jtaPropertyManager.getJTAEnvironmentBean()`
+// (= `BeanPopulator.getDefaultInstance(JTAEnvironmentBean.class)`) runs
+// correctly under CratonVM and returns a fully-populated, cached bean, so we
+// let the real bytecode run. See HIB-CV-19.
 
 // ---- XAResource / Xid ----
 
@@ -885,18 +891,16 @@ pub fn register_wildfly_datasources_tx_natives(registry: &mut NativeMethodRegist
     registry.register(CLS_USER_TX, "setRollbackOnly", "()V", native_tm_set_rollback_only);
     registry.register(CLS_USER_TX, "setTransactionTimeout", "(I)V", native_tm_set_transaction_timeout);
 
-    // Narayana singletons
+    // Narayana singletons.
+    //
+    // NOTE: `com/arjuna/ats/jta/common/jtaPropertyManager.getJTAEnvironmentBean()`
+    // is deliberately NOT registered — overriding it with a synthetic 2-slot
+    // bean breaks real Narayana (HIB-CV-19). The real bytecode self-configures.
     registry.register(
         CLS_NARAYANA_TM,
         "transactionManager",
         "()Ljavax/transaction/TransactionManager;",
         native_narayana_tm_singleton,
-    );
-    registry.register(
-        CLS_NARAYANA_PM,
-        "getJTAEnvironmentBean",
-        "()Lcom/arjuna/ats/jta/common/JTAEnvironmentBean;",
-        native_narayana_pm_get_env_bean,
     );
 
     // Xid + XAResource
