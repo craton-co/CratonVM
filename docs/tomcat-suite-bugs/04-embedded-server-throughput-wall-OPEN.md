@@ -65,14 +65,31 @@
 >       every native return) would eliminate the vast majority. Needs the
 >       collector/mutator handshake to be exactly right (a missed publish = a
 >       reclaimed live `native_pending_return` = SEGV).
->    2. *Drop the SECOND publish.* `native_return_pushed_to_stack`'s
->       `update_root_snapshot` (interpreter `invoke_cached_native_callback`) may be
->       redundant: after the value is pushed it is already a frame/operand-stack
->       root, and the snapshot published microseconds earlier in `safe_native_call`
->       still covers the same object via `native_pending_return` (a stale-but-valid
->       extra conservative root, refreshed by the next native call). If sound, this
->       *halves* the call count. Risk: subtle under a *moving* GC; must be proven
->       against the moving sweep, not just the default non-moving one.
+>    2. *Drop the SECOND publish.* ✅ **IMPLEMENTED (gated, default-OFF):**
+>       `CRATONVM_SKIP_REDUNDANT_NATIVE_SNAPSHOT=1` makes
+>       `native_return_pushed_to_stack` skip its `update_root_snapshot`. Safety
+>       argument (verified by code reading): EVERY collector read of a thread's
+>       snapshot is preceded by a FRESH rebuild — STW responders rebuild in
+>       `safepoint_check` (`update_root_snapshot`, before `arrive_and_wait`); the
+>       STW initiator rebuilds in `maybe_gc`; a thread entering a *blocking* native
+>       rebuilds in `deposit_root_snapshot` (`clear()` + full re-scan); and a
+>       *running* native is counted in the barrier's `expected` and waited-for (so
+>       it too rebuilds at its next safepoint before the collector proceeds). The
+>       eager post-return snapshot is therefore never the snapshot a collector
+>       actually reads, so the second rebuild is pure overhead.
+>       **Verified:** bt18 GC-stress checksum = `68332206` (== HotSpot) with the
+>       flag ON *and* OFF; `TestApplicationFilterConfig`/`TestTomcatClassLoader`/
+>       `TestServerInfo`/`TestGenericPrincipal` all still pass with it ON.
+>       **Measured:** rootsnap calls per deploy **2.2 M → 1.2 M (~45 % fewer)**;
+>       deploy rootsnap time ~18.7 s → ~15.8 s. The time win (~10–16 %) is smaller
+>       than the call-count cut because the eliminated #2 calls were the
+>       *cache-cheap* ones (stack unchanged since the #1 publish microseconds
+>       earlier, ~2.9 µs each); the expensive calls are the #1 in `safe_native_call`
+>       (~13 µs each, top-frame cache miss) — those are what lever #3 targets.
+>       Default-OFF pending wider soak (cf. `CRATONVM_ROOTSNAP_CACHE` precedent);
+>       the suite can opt in via env. Residual caveat: only the *non-moving*
+>       default sweep + bt18's allocation pattern were exercised — a dedicated
+>       moving-GC + concurrent-old-gen soak should precede flipping it default-ON.
 >    3. *Make the cache survive non-moving collections.* The default young sweep is
 >       non-moving (selective promotion), so object ADDRESSES are stable across it;
 >       invalidating the whole cache on every `collection_count` bump is overly

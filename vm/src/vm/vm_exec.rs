@@ -619,6 +619,18 @@ pub fn safe_native_call(
 #[inline]
 pub fn native_return_pushed_to_stack(shared: &SharedVm, thread: &mut JvmThread) {
     thread.native_pending_return = None;
+    // The matching `safe_native_call` already published a root snapshot
+    // covering the just-returned object (via `native_pending_return`); now that
+    // the value is also an operand-stack root it stays covered by the next
+    // snapshot refresh, and a moving STW collector never reads THIS (post-return,
+    // interruptible) snapshot — it waits for this thread to refresh at the
+    // safepoint barrier. So this second publish is redundant. Skipping it halves
+    // `update_root_snapshot` frequency on the reflective-deploy hot path (bug 04:
+    // ~68% of an embedded-server deploy). Opt-in + default-OFF because it touches
+    // GC root publication; see `env_cache::skip_redundant_native_snapshot`.
+    if crate::runtime::env_cache::skip_redundant_native_snapshot() {
+        return;
+    }
     crate::runtime::interpreter::update_root_snapshot(shared, thread);
 }
 
