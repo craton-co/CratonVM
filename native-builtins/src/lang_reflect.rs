@@ -952,6 +952,106 @@ fn class_name_to_type_name(name: &str) -> String {
     name.replace('/', ".")
 }
 
+/// SB-02b-#1 — build a REAL `sun.reflect.generics.reflectiveObjects.*` Type from
+/// CratonVM's `TypeSig`. Unlike the bare-interface synthetic objects
+/// `type_sig_to_java` allocates (whose inherited `Type.getTypeName()` /
+/// `Object.toString()` default-method dispatch cannot be intercepted by a
+/// native), real `*Impl` objects carry working `toString()` bytecode — so a
+/// wildcard bound like `Producer<? extends Number>` renders its type name
+/// correctly. Used for wildcard-bound reification; non-parameterized / type-var
+/// / array shapes fall back to `type_sig_to_java`.
+fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &crate::generics::TypeSig) -> Value {
+    use crate::generics::TypeSig;
+    match sig {
+        TypeSig::Class { name, type_args } if !type_args.is_empty() => {
+            let slashed = name.replace('.', "/");
+            let raw = match ctx
+                .class_id_by_name(&slashed)
+                .or_else(|| {
+                    let _ = ctx.load_class(&slashed);
+                    ctx.class_id_by_name(&slashed)
+                }) {
+                Some(cid) => Value::Object(Some(ctx.get_class_mirror(cid))),
+                None => return crate::generics::type_sig_to_java(ctx, sig),
+            };
+            let pti_cid = match ctx.ensure_class_initialized(
+                "sun/reflect/generics/reflectiveObjects/ParameterizedTypeImpl",
+            ) {
+                Ok(c) => c,
+                Err(_) => return crate::generics::type_sig_to_java(ctx, sig),
+            };
+            let args = ctx.new_ref_array(cratonvm_types::ClassId::new(0), type_args.len());
+            for (i, a) in type_args.iter().enumerate() {
+                let v = typearg_to_real_type(ctx, a);
+                ctx.set_array_element(args, i, v);
+            }
+            let nfields = ctx.class_num_total_fields(pti_cid).max(3);
+            let pti = ctx.alloc_object(pti_cid, nfields);
+            ctx.set_field_by_name(pti, "rawType", raw);
+            ctx.set_field_by_name(pti, "actualTypeArguments", Value::Object(Some(args)));
+            ctx.set_field_by_name(pti, "ownerType", Value::Object(None));
+            Value::Object(Some(pti))
+        }
+        // Class mirror, type variable, array, primitive: defer to type_sig_to_java
+        // (a raw Class mirror renders fine; a synthetic TypeVariable is handled
+        // separately by SB-02b-#2).
+        _ => crate::generics::type_sig_to_java(ctx, sig),
+    }
+}
+
+/// Build the REAL `Type` for a single `TypeArg` (used by `typesig_to_real_type`).
+fn typearg_to_real_type(ctx: &mut dyn NativeContext, arg: &crate::generics::TypeArg) -> Value {
+    use crate::generics::TypeArg;
+    match arg {
+        TypeArg::Exact(sig) => typesig_to_real_type(ctx, sig),
+        TypeArg::Extends(sig) => {
+            let b = typesig_to_real_type(ctx, sig);
+            real_wildcard_type(ctx, vec![b], vec![])
+        }
+        TypeArg::Super(sig) => {
+            let b = typesig_to_real_type(ctx, sig);
+            let obj = object_class_mirror(ctx);
+            real_wildcard_type(ctx, vec![obj], vec![b])
+        }
+        TypeArg::Unbounded => {
+            let obj = object_class_mirror(ctx);
+            real_wildcard_type(ctx, vec![obj], vec![])
+        }
+    }
+}
+
+fn object_class_mirror(ctx: &mut dyn NativeContext) -> Value {
+    ctx.class_id_by_name("java/lang/Object")
+        .map(|c| Value::Object(Some(ctx.get_class_mirror(c))))
+        .unwrap_or(Value::Object(None))
+}
+
+/// Build a REAL `WildcardTypeImpl` with the given (already-reified) bounds. The
+/// reified bounds are written to the `upperBounds`/`lowerBounds` fields the
+/// `wti_real` natives (and the real `toString` via `getUpperBounds`/
+/// `getLowerBounds`) read.
+fn real_wildcard_type(ctx: &mut dyn NativeContext, upper: Vec<Value>, lower: Vec<Value>) -> Value {
+    let wti_cid = match ctx
+        .ensure_class_initialized("sun/reflect/generics/reflectiveObjects/WildcardTypeImpl")
+    {
+        Ok(c) => c,
+        Err(_) => return Value::Object(None),
+    };
+    let up = ctx.new_ref_array(cratonvm_types::ClassId::new(0), upper.len());
+    for (i, v) in upper.iter().enumerate() {
+        ctx.set_array_element(up, i, *v);
+    }
+    let lo = ctx.new_ref_array(cratonvm_types::ClassId::new(0), lower.len());
+    for (i, v) in lower.iter().enumerate() {
+        ctx.set_array_element(lo, i, *v);
+    }
+    let nfields = ctx.class_num_total_fields(wti_cid).max(2);
+    let wti = ctx.alloc_object(wti_cid, nfields);
+    ctx.set_field_by_name(wti, "upperBounds", Value::Object(Some(up)));
+    ctx.set_field_by_name(wti, "lowerBounds", Value::Object(Some(lo)));
+    Value::Object(Some(wti))
+}
+
 // ---------------------------------------------------------------------------
 // Field.isSynthetic / isEnumConstant
 // ---------------------------------------------------------------------------
@@ -1698,7 +1798,7 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
                     // arguments and wildcards). Fall back to the raw mirror,
                     // then to Object, if the shape isn't modellable.
                     let reified = jdk_tree_to_typesig(ctx, node)
-                        .map(|ts| crate::generics::type_sig_to_java(ctx, &ts))
+                        .map(|ts| typesig_to_real_type(ctx, &ts))
                         .filter(|v| !matches!(v, Value::Object(None)))
                         .or_else(|| wti_tree_node_to_mirror(ctx, node, &cls))
                         .or_else(|| {
