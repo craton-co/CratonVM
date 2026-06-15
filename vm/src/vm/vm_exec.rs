@@ -6318,7 +6318,12 @@ pub(super) fn proxy_invoke_handler(
             args.len(),
         );
         for (i, arg) in args.iter().enumerate() {
-            let boxed = proxy_box_value(ctx.shared, *arg);
+            // Box per the formal parameter descriptor (Z/C/B/S/I distinct
+            // wrappers; all share Value::Int) — see proxy_box_value_for_desc.
+            let boxed = match param_descs.get(i) {
+                Some(pdesc) => proxy_box_value_for_desc(ctx.shared, *arg, pdesc),
+                None => proxy_box_value(ctx.shared, *arg),
+            };
             ctx.shared
                 .heap
                 .set_array_element(args_arr, i, boxed)
@@ -6553,7 +6558,13 @@ pub(crate) fn proxy_invoke_handler_shared(
             args.len(),
         );
         for (i, arg) in args.iter().enumerate() {
-            let boxed = proxy_box_value(shared, *arg);
+            // Box per the formal parameter descriptor so a boolean/char/byte/
+            // short arg (all `Value::Int`) becomes Boolean/Character/Byte/Short
+            // — not Integer — matching the proxied method's signature.
+            let boxed = match param_descs.get(i) {
+                Some(pdesc) => proxy_box_value_for_desc(shared, *arg, pdesc),
+                None => proxy_box_value(shared, *arg),
+            };
             shared.heap.set_array_element(args_arr, i, boxed).ok();
         }
         Value::Object(Some(args_arr))
@@ -7858,6 +7869,37 @@ pub(super) fn proxy_resolve_declaring_class_mirror(
 
 /// Box a JVM value into a Java wrapper object for use in Object[] arrays.
 /// Object references are passed through unchanged.
+/// Box a primitive value into its wrapper, choosing the wrapper class from the
+/// formal parameter descriptor. `boolean`/`char`/`byte`/`short`/`int` all share
+/// the `Value::Int` VM representation, so a descriptor-blind `proxy_box_value`
+/// always boxes them as `Integer` — which is wrong for a `Z`/`C`/`B`/`S`
+/// parameter. A JDK dynamic proxy's `Object[] args` must hold the wrapper that
+/// matches the declared parameter type, or the downstream
+/// `Method.invoke`/reflection unbox throws `IllegalArgumentException: cannot
+/// convert java/lang/Integer to Z` (e.g. `Connection.setAutoCommit(boolean)`
+/// through Hibernate's `JdbcSpies` proxy — 17 CV-only suite classes).
+pub(super) fn proxy_box_value_for_desc(shared: &SharedVm, value: Value, pdesc: &str) -> Value {
+    if let Value::Int(v) = value {
+        let wrapper = match pdesc {
+            "Z" => Some("java/lang/Boolean"),
+            "C" => Some("java/lang/Character"),
+            "B" => Some("java/lang/Byte"),
+            "S" => Some("java/lang/Short"),
+            "I" => Some("java/lang/Integer"),
+            _ => None,
+        };
+        if let Some(wname) = wrapper {
+            let class_id = shared.class_manager.write()
+                .load_class(wname).unwrap_or(ClassId::new(0));
+            let obj = shared.heap.alloc_object(class_id, 1);
+            shared.heap.set_field(obj, 0, Value::Int(v));
+            return Value::Object(Some(obj));
+        }
+    }
+    // Long/Float/Double and reference values: descriptor-independent.
+    proxy_box_value(shared, value)
+}
+
 pub(super) fn proxy_box_value(shared: &SharedVm, value: Value) -> Value {
     match value {
         Value::Int(v) => {
