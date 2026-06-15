@@ -1,23 +1,47 @@
 # Bug 10 — TestPageContext "contains on null" is the embedded-server serving wall (NOT a JSP/EL bug)
 
-**Status:** PARTIAL — re-diagnosed + layer-1 FIXED. **Not** a `PageContext`/EL bug
-(the original hypothesis). Two functional layers, neither is "pure perf":
+**Status:** SERVER FIXED; remaining blocker is the in-process HTTP **client**.
+**Not** a `PageContext`/EL bug (the original hypothesis). Three findings, none
+"pure perf":
 - **Layer 1 — connector reset (FIXED, `fix/tomcat-suite-bugs-09-10`).** The NIO
   connector reset every accepted request before reading it, because
   `NioEndpoint.setSocketOptions` → `SocketChannel.setOption` hit an
   `AbstractMethodError` (the `sc_set_option` native was registered only with the
   `NetworkChannel` covariant-return descriptor, not the `SocketChannel` one). Fix
-  in `native-io/src/socket_channel.rs`. Verified: a minimal programmatic embedded
-  server now serves (servlet `doGet` invoked + response written).
-- **Layer 2 — webapp-directory request processing (OPEN).** With layer 1 fixed,
-  an `addWebapp` context reports `ctxState=STARTED` and accepts the connection,
-  but the request — even to a **static** file (DefaultServlet) — hangs/returns
-  empty (flaky: sometimes an immediate connector `Pausing` +
-  `StandardWrapperValve[Container is null]` + reset). `TestPageContext` still
-  FAILs. This is the remaining embedded-server serving issue, tracked under
-  [group 04](04-embedded-server-throughput-wall-OPEN.md).
-**Severity:** Medium (blocks every embedded-server HTTP test, not just this one).
+  in `native-io/src/socket_channel.rs`.
+- **The embedded SERVER serves HTTP correctly — PROVEN.** With layer 1, running a
+  minimal embedded Tomcat (programmatic servlet) on CratonVM and hitting it with
+  an **external `curl`** returns `HTTP/1.1 200` + the body, servlet `doGet`
+  invoked, connection healthy. So group 04's "servers don't serve" framing is
+  refuted for the connector — it serves; the prior failures were the `setOption`
+  reset.
+- **Remaining blocker — the in-process HTTP CLIENT.** `TomcatBaseTest.getUrl`
+  (every embedded-HTTP test) uses `HttpURLConnection`, which CratonVM bridges to
+  a native Rust HTTP client (`native-builtins/src/http_url_connection.rs::perform`
+  → raw `std::net::TcpStream`). When that client runs **in the same process** as
+  the server, `getResponseCode()` returns `-1`, the server's `doGet` is **never**
+  invoked, and the socket layer logs **no** server-side read (capture empty) — i.e.
+  the server never even processes the request. An external curl against the same
+  server works, and an in-process raw `java.net.Socket` client (separate
+  write/read calls) also gets `doGet` invoked; only the native `perform` (a single
+  long blocking native call that connects+writes+reads with no Java safepoint in
+  between) fails. Leading hypothesis: `perform`'s uninterrupted native blocking
+  I/O on the calling thread starves the server's worker threads (no safepoint /
+  GC progress) until its read times out → `-1`. This — not the server — is why
+  `TestPageContext` (and getUrl-based tests) still FAIL.
+**Severity:** Medium-High (blocks every getUrl-based embedded-HTTP test).
 **Repro class:** `jakarta.servlet.jsp.TestPageContext` — `Tests run: 1, Failures: 1`.
+
+## Next step for the remaining blocker
+
+Make the native `HttpURLConnection.perform` cooperate with the VM's
+safepoint/thread model during blocking I/O (e.g. run it as a safepoint-safe
+"in native" region, or chunk connect/write/read so the calling thread reaches a
+safepoint), OR drop the native `HttpURLConnection` bridge so the real
+`sun.net.www.protocol.http` bytecode runs over the now-working socket layer.
+A minimal repro is `scratch/rec0910/mini/MiniHU.java` (CratonVM
+`HttpURLConnection` client + CratonVM server in one process → code=-1) vs the
+external-`curl` success.
 
 ## Symptom
 
