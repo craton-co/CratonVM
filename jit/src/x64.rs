@@ -15073,20 +15073,6 @@ impl Compiler {
                         // `jit_getfield`'s early `return 0`.
                         self.emit_test_r64_r64(RAX);
                         let null_patch = self.emit_jcc_rel32_patch(0x84); // JE
-                        // spring-bug-11 (Groovy SIGSEGV): bounds-check the inline
-                        // getfield exactly like the runtime helper `jit_getfield`
-                        // (the hardened "B2" path) does, so a JIT operand-stack
-                        // miscompile that feeds a garbage receiver faults to the
-                        // null path (RAX:=0) instead of a wild out-of-bounds deref →
-                        // EXCEPTION_ACCESS_VIOLATION (the Groovy class-gen crash).
-                        // num_slots is the u32 at ObjectHeader offset 16.
-                        //   CMP DWORD [RAX+16], field_index   (81 /7 ib-form: ModRM
-                        //     0x78 = mod01 /7 rm=RAX, disp8=0x10)
-                        //   JBE <null-path>   (num_slots <= field_index, unsigned →
-                        //     out of bounds; mirrors `jit_putfield_slot_in_bounds`).
-                        self.buf.emit(&[0x81, 0x78, 0x10]);
-                        self.buf.emit(&(field_index as u32).to_le_bytes());
-                        let oob_patch = self.emit_jcc_rel32_patch(0x86); // JBE
                         match type_tag {
                             b'J' | b'D' | b'L' | b'[' => {
                                 // 8-byte payload: MOV RAX, [RAX + cell + 8].
@@ -15115,9 +15101,8 @@ impl Compiler {
                             }
                         }
                         let done_patch = self.emit_jmp_rel32_patch();
-                        // Null path (also the out-of-bounds path): RAX := 0.
+                        // Null path: RAX := 0.
                         self.patch_rel32_to_here(null_patch);
-                        self.patch_rel32_to_here(oob_patch);
                         self.emit_xor_reg_self(RAX);
                         // Join: result in RAX.
                         self.patch_rel32_to_here(done_patch);
