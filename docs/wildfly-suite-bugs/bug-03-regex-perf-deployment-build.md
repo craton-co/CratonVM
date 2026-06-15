@@ -193,13 +193,54 @@ Per-`replaceAll` ≈ 0.48 ms — ShrinkWrap calls it once per class, so ~1000 cl
 ≈ 0.5 s (was minutes-to-never). The skip-list entry is a **no-op for the default
 config** (search only compiles under the still-default-OFF virtual-tierup flag).
 
+### Layer C root cause CONFIRMED — missing post-safepoint oop reload (precise-maps gap)
+
+The general JIT→JIT defect (shared with `ByteBuddyState.make`) is localized to the
+JIT safepoint / precise-oop-maps machinery. The corruption is **specifically**
+compiled-`search` → compiled-`Pattern$Start.match` (either side interpreted →
+correct), i.e. a compiled caller calling a compiled instance callee across a
+**GC-capable safepoint** (the match path allocates). It is in the same family as
+the documented register-invisibility / relocation **B-K** bug
+(`[[precise-jit-maps-bk-status]]`) and the `ByteBuddyState.make` ban: a JIT-held
+oop (here the receiver Matcher, live in a callee-saved register across the call)
+goes stale across the safepoint — either relocated-without-remap or
+reclaimed-while-register-invisible — so `Start.match` operates on the wrong/stale
+Matcher and `find()` returns zero-width matches everywhere. The exact
+relocation-vs-reclamation micro-step is the open B-K question; what is certain is
+the *fix domain*: the precise-oop-maps safepoint machinery
+(`emit_oop_map_for_safepoint` + `emit_post_safepoint_reload` + frame remap), which
+is emitted **only under `CRATONVM_PRECISE_JIT_MAPS`**.
+
+**Proven by toggling that gate** (search ban temporarily removed, JDK-25 boot):
+
+| `CRATONVM_JIT_VIRTUAL_TIERUP=1` | result |
+|---|---|
+| precise maps OFF (default) | regex **corrupt** (`/o/r/g/...`) |
+| `CRATONVM_PRECISE_JIT_MAPS=1` | regex **SIGSEGV** (EXCEPTION_ACCESS_VIOLATION, read @0x32 in JIT code) |
+
+So the **real fix is completing + validating the precise-oop-maps project**
+(`[[precise-jit-maps-bk-status]]`): it is the machinery that records the oop map
+and emits the paired post-safepoint reload. But in its current **deferred,
+unvalidated** state it *crashes* when enabled — it is not a usable fix yet. The
+per-method skip-list (`Matcher.search`, `ByteBuddyState.make`, AQS/ExecProbe/…)
+remains the only safe mitigation until precise maps lands.
+
 ### Remaining
-1. The general JIT→JIT call-boundary codegen defect (shared with
-   `ByteBuddyState.make`) — once fixed, drop the `Matcher.search` ban for full
-   regex speed.
-2. Flipping `CRATONVM_JIT_VIRTUAL_TIERUP` default-ON still needs a full
-   WildFly/Kafka/Tomcat suite re-test (B compiles the whole instance-method
-   surface; other latent miscompiles may surface and need the same treatment).
-Until then, run the WildFly Arquillian client with `CRATONVM_JIT_VIRTUAL_TIERUP=1`
-to get the regex/ShrinkWrap path fast enough to build the JUnit-5 deployment
-archive.
+1. **Complete + validate the precise-oop-maps (Stage B/C) work** — the canonical
+   fix for the JIT→JIT GC-staleness defect. Currently crashes when enabled; needs
+   the dedicated effort already tracked in `[[precise-jit-maps-bk-status]]`. Once
+   solid, it fixes the whole instance-method surface and the per-method bans can
+   be dropped.
+2. **Flipping `CRATONVM_JIT_VIRTUAL_TIERUP` default-ON is BLOCKED by (1).** With
+   (B) on, the whole instance-method surface compiles, so the same GC-staleness
+   defect affects *any* hot instance method that holds an oop in a callee-saved
+   register across a GC-capable call — surfacing as corruption OR crashes
+   (like the precise-maps SIGSEGV). precise maps (the fix) currently crashes, and
+   per-method skip-listing does not scale to the whole suite. So (B) must stay
+   **default-OFF** until precise maps is completed.
+
+Until then, the WildFly Arquillian client can run with
+`CRATONVM_JIT_VIRTUAL_TIERUP=1` (precise maps OFF) — the `Matcher.search` ban
+keeps regex correct and fast enough to build the JUnit-5 deployment archive,
+while the rest of the (mostly static-method) hot paths still benefit from layers
+A/B. Broader default-ON awaits the precise-maps fix.
