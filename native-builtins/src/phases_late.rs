@@ -1798,6 +1798,12 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
     );
     r.register(
         ls,
+        "mapToObj",
+        "(Ljava/util/function/LongFunction;)Ljava/util/stream/Stream;",
+        p56_long_stream_map_to_obj,
+    );
+    r.register(
+        ls,
         "asDoubleStream",
         "()Ljava/util/stream/DoubleStream;",
         p56_long_stream_as_double,
@@ -1852,6 +1858,12 @@ pub(crate) fn register_phase56_stream_extras(r: &mut NativeMethodRegistry) {
         "boxed",
         "()Ljava/util/stream/Stream;",
         p56_double_stream_boxed,
+    );
+    r.register(
+        ds,
+        "mapToObj",
+        "(Ljava/util/function/DoubleFunction;)Ljava/util/stream/Stream;",
+        p56_double_stream_map_to_obj,
     );
     r.register(
         ds,
@@ -2342,6 +2354,39 @@ fn p56_long_stream_boxed(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
         boxed.push(Value::Object(Some(wrapper)));
     }
     let s = p56_build_stream(ctx, boxed, "java/util/stream/Stream");
+    Ok(Some(Value::Object(Some(s))))
+}
+
+// --- LongStream.mapToObj(LongFunction) -> Stream ---
+// CratonVM's `LongStream` (and `DoubleStream`) is a synthetic object whose class
+// is the interface itself; `boxed`/`map`/etc. are registered natives, but
+// `mapToObj` was missing, so the call landed on the bodiless interface method
+// (`AbstractMethodError: … has no Code attribute`). `IntStream.mapToObj` works
+// because IntStream is not synthesised. Mirror `boxed`, applying the function.
+fn p56_long_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let func = obj_arg(args, 1)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let mut out = Vec::with_capacity(elems.len());
+    for v in elems {
+        let mapped = ctx.invoke_virtual(func, "apply", "(J)Ljava/lang/Object;", &[v])?;
+        out.push(mapped.unwrap_or(Value::Object(None)));
+    }
+    let s = p56_build_stream(ctx, out, "java/util/stream/Stream");
+    Ok(Some(Value::Object(Some(s))))
+}
+
+// --- DoubleStream.mapToObj(DoubleFunction) -> Stream ---
+fn p56_double_stream_map_to_obj(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let func = obj_arg(args, 1)?;
+    let elems = p56_read_stream_elems(ctx, this);
+    let mut out = Vec::with_capacity(elems.len());
+    for v in elems {
+        let mapped = ctx.invoke_virtual(func, "apply", "(D)Ljava/lang/Object;", &[v])?;
+        out.push(mapped.unwrap_or(Value::Object(None)));
+    }
+    let s = p56_build_stream(ctx, out, "java/util/stream/Stream");
     Ok(Some(Value::Object(Some(s))))
 }
 
