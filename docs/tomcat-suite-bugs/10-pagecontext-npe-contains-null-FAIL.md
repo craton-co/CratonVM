@@ -69,6 +69,14 @@ resource loading, and finally the Eclipse JDT compiler itself.
    `INameEnvironment` harness — then instrument `SourceTypeBinding.buildFields`
    / its `HashtableOfObject` to see why `c` and `d` are seen twice.
 
+   **Re-confirmed on the fresh dev worktree build (srun, 2026-06-15):** identical
+   failure — `Duplicate field _jspx_imports_classes` + `_el_expressionfactory`
+   (the field immediately before and immediately after the `static{}` block in the
+   captured `bug49196_jsp.java`), `_el_expressionfactory cannot be resolved` ×8,
+   under both JIT and `--nojit`. The valid-single-field source was re-captured.
+   No regression and no progress on layer 5 — still blocked on the ecj-binding
+   isolation harness (jrt module-system gap). Deep, NOT a quick fix.
+
 ---
 
 ## Historical diagnosis (layers 1–2, retained for context)
