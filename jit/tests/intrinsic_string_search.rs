@@ -99,12 +99,12 @@ fn helpers() -> JitRuntimeHelpers {
     }
 }
 
-fn string_layout() -> StringFieldLayout {
-    StringFieldLayout::new(0, Some(1), 2)
-}
-
 const STRING_CLASS_ID: u32 = 0x5712_3400;
 const OTHER_CLASS_ID: u32 = 0x0099_0099;
+
+fn string_layout() -> StringFieldLayout {
+    StringFieldLayout::new(0, Some(1), 2, STRING_CLASS_ID)
+}
 
 struct FakeObj {
     storage: Vec<u64>,

@@ -17117,6 +17117,27 @@ impl Compiler {
                                 self.emit_test_r64_r64(RAX);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
 
+                                // Receiver class-id guard. For a
+                                // `java/lang/String` call site (final →
+                                // monomorphic) `guard_class_id == 0` and no
+                                // guard is emitted. For a `java/lang/CharSequence`
+                                // site the receiver may be any CharSequence, so
+                                // this inline String-layout decode is valid only
+                                // when the receiver is actually a String: compare
+                                // the ObjectHeader class id at [recv+0] against
+                                // the String class id and deopt (→ native
+                                // dispatch) on a mismatch (e.g. a StringBuilder /
+                                // StringBuffer receiver). Same guard the CRC32
+                                // family uses; see its STRING_SEARCH-adjacent
+                                // region below.
+                                if guard_class_id != 0 {
+                                    // CMP DWORD [RAX + 0], guard_class_id
+                                    //   81 /7 id, ModRM 0x78 = mod00 /7 rm=RAX.
+                                    self.buf.emit(&[0x81, 0x78, 0x00]);
+                                    self.buf.emit(&guard_class_id.to_le_bytes());
+                                    bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+                                }
+
                                 // RCX = value (byte[]) ref. Null → deopt.
                                 self.emit_mov_r64_mem_disp32(
                                     RCX,
