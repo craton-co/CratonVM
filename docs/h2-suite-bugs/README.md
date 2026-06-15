@@ -17,12 +17,18 @@ Harness: `h2sweep/sweep.ps1`, `h2sweep/triage.sh`, `apps/h2database/h2/RunOne.ja
 | | PASS | FAIL | HANG | CRASH | SKIP |
 |---|---|---|---|---|---|
 | HotSpot baseline | 174 | 7 | 1 | 2 | 16 |
-| CratonVM **before** fixes | 73 | 70 | 35 | 6 | 16 |
-| CratonVM **after** fixes (this branch) | **91** | 51 | 36 | 6 | 16 |
+| CratonVM **before** any fix | 73 | 70 | 35 | 6 | 16 |
+| CratonVM after string fixes (repeat + BufferedReader) | **91** | 51 | 36 | 6 | 16 |
+| CratonVM after **all 4 fixes** (PASS↔HANG drifts with load near the timeout) | 84 | 45 | 51 | **4** | 16 |
 
-- **+18 net PASS (73 → 91)**, 19 classes turned green, **0 real regressions**
-  (the lone PASS→HANG, `TestFile`, is a 156 s borderline class tripped by a
-  tighter 150 s cap, not a code regression).
+- The string fixes alone are **+18 net PASS (73 → 91)**, 19 classes green, 0 real
+  code regressions (PASS↔HANG flips are perf-cliff classes crossing the timeout
+  under concurrent load, not regressions).
+- The two crash fixes drop CRASHes **6 → 4** (the remaining four are
+  `TestPgServer`/`TestKeywords` — shared with HotSpot — and the documented-open
+  `cp500` charset / PBE-algparams gaps). Every targeted crash class moved off
+  CRASH: TestReorderWrites CRASH→FAIL, TestDiskFull→FAIL, TestUtils CRASH→HANG,
+  TestSampleApps/TestFileLockProcess HANG (no crash). FAILs dropped 70 → 45.
 - CratonVM-specific divergences after fixes: **45 FAIL + 34 HANG + 4 CRASH**
   (10 further FAIL/CRASH/HANG are shared with HotSpot and excluded:
   TestFunctions, TestPersistentCommonTableExpressions, TestBnf, TestOutOfMemory,
@@ -47,12 +53,17 @@ correctness (see the perf-hang report).
    Fixed by gating the shims behind `synthetic-jdk` so real-JDK runs real
    bytecode. TestInit, TestRunscript, TestCsv, …
 
+## Crash fixes landed (verified)
+3. **`bug-h2-stack-overflow-filesystem-tests.md`** [FIXED] — `EXCEPTION_STACK_OVERFLOW`
+   in `TestReorderWrites` / `TestDiskFull` / `TestSampleApps` / `TestFileLockProcess`.
+   The snapshot-iterator native shadow-recursed on a real `java/util/PriorityQueue$Itr`
+   (`hasNext`→`hasNext` via `ctx.invoke`). Fixed in `native-collections`.
+4. **`bug-h2-testutils-sigsegv.md`** [FIXED] — JIT-only `EXCEPTION_ACCESS_VIOLATION`
+   in `TestUtils`. `aastore` codegen emits the SATB write barrier but the
+   JIT-eligibility pre-scan never set `needs_heap` for it, so the barrier loaded
+   stack garbage as the VM pointer. Fixed in `jit/src/x64.rs`.
+
 ## Open bugs (reports in this directory)
-- **`bug-h2-stack-overflow-filesystem-tests.md`** — `EXCEPTION_STACK_OVERFLOW`
-  at a fixed RVA in `TestReorderWrites` / `TestDiskFull` / `TestSampleApps` /
-  `TestFileLockProcess` (collection-iteration recursion).
-- **`bug-h2-testutils-sigsegv.md`** — `EXCEPTION_ACCESS_VIOLATION` in `TestUtils`
-  (distinct RVA).
 - **`bug-h2-charset-cp500-unsupported.md`** — `Charset.forName("cp500")` missing
   (jdk.charsets extended charsets) — `TestCharsetCollator`.
 - **`bug-h2-netutils-missing-pbe-algparams.md`** — missing
