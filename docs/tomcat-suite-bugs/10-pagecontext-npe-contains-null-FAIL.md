@@ -1,13 +1,39 @@
-# Bug 10 — TestPageContext "contains on null": a six-layer onion (HTTP serving → client → resource loading → ecj binder → core Unsafe/Arrays.equals → serving)
+# Bug 10 — TestPageContext "contains on null": a six-layer onion — ✅ FIXED (OK (1 test))
 
-**Status:** the JSP-compilation chain is FULLY root-caused and FIXED (layers
-1–5). The original `PageContext`/EL hypothesis was WRONG — `res.toString()` was
-null because the JSP never compiled, which traced through HTTP serving → the
-HTTP client → JDK resource loading → the Eclipse JDT compiler → and finally a
-**fundamental VM bug in `Unsafe`/`Arrays.equals`**. With that fixed, JSP
-compilation succeeds. The test still fails on a SEPARATE, pre-existing wall:
-the embedded **NioEndpoint HTTP serving** (group 04) — the request is never
-served end-to-end (no `ssc_accept`/`_jspService`/response in the log).
+**Status: FULLY FIXED — `TestPageContext.testBug49196` passes (`OK (1 test)`).**
+The original `PageContext`/EL hypothesis was WRONG. `res.toString()` was null
+because the JSP produced an empty body, which peeled back through six layers:
+HTTP serving → the in-process HTTP client → JDK resource loading → the Eclipse
+JDT compiler → a **fundamental VM bug in `Unsafe`/`Arrays.equals`** → and finally
+a **synthetic `java.io.CharArrayWriter` shadow** that swallowed every JSP body.
+
+| # | Layer | Root cause | Fix |
+|---|---|---|---|
+| 1 | NIO connector reset | `SocketChannel.setOption` AbstractMethodError (covariant desc) | `socket_channel.rs` (merged) |
+| 2 | in-process HTTP client | native HUC read a real `sun.net.www` obj w/ synthetic layout → code -1 | `48183599` (merged) |
+| 3 | boot-class resource load | `getResourceAsStream("java/lang/String.class")` null (jmod `classes/` prefix in `URL.openStream`) | `net_phase_e.rs` + jrt arm (merged) |
+| 5 | ecj generic compile | `Arrays.equals(char[]/long[])` compared only element 0 → `"Signature".equals("Synthetic")`=true → generic methods tagged `ACC_SYNTHETIC` & dropped | `1cddae8f` (Unsafe/vectorizedMismatch) |
+| 6 | empty JSP body | synthetic `CharArrayWriter` shadow: `write([CII)` no-op + `write(String)` NPE on null `lock` → `JspReader.toCharArray()` empty → empty servlet | `b628d8d7` (run real bytecode) |
+
+**The "group 04 NioEndpoint serving wall" was a MISDIAGNOSIS.** Static files
+served `HTTP 200` end-to-end the whole time (`/test/index.html` → 200/957 bytes
+in-process); JSPs returned `200` with a `0`-byte body. The empty body was the
+CharArrayWriter bug (layer 6), not the connector. There is no serving wall for
+this test.
+
+## Layer 6 root cause (the final blocker — commit `b628d8d7`)
+
+CratonVM had a synthetic 2-field `CharArrayWriter` (slots buf=0/count=1) that
+shadowed only some methods. The unshadowed ones (`write(String)`, `append`,
+`writeTo`) ran real JDK bytecode against a REAL `CharArrayWriter`
+(layout: `Writer.lock` + `buf` + `count`). The synthetic `<init>` never set the
+inherited `lock`, so `write(String)` NPE'd on `synchronized (lock)`, and the
+slot-based bulk write no-op'd. Jasper's `JspReader` does
+`caw.write(buf,0,n); … caw.toCharArray()` — which returned EMPTY → zero JSP
+nodes → empty servlet → `200`/empty. Fix: gate the synthetic natives under
+`synthetic-jdk` and run the real, self-contained JDK bytecode (its ctor chains
+through `Writer()` which sets `lock = this`). Verified byte-identical to HotSpot;
+diagnosed with `scratch/rec0910/CawProbe.java`.
 
 ## Layer 5 root cause (THE fundamental bug — commit `1cddae8f`)
 
