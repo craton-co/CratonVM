@@ -5548,6 +5548,23 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "(Ljava/lang/String;)Ljava/net/URL;",
         classloader::cl_get_resource_essential,
     );
+    // SB-15: `java.lang.Module.getResourceAsStream(String)`. kotlin-reflect's
+    // multi-release `BuiltInsResourceLoader.loadResource` (JDK 9+ variant)
+    // resolves the `.kotlin_builtins` protobuf resources via
+    // `kotlin.Unit.class.getModule().getResourceAsStream(path)`. The real-JDK
+    // bytecode walks module/loader internals CratonVM leaves unpopulated and
+    // returns null, so the kotlin built-ins module ends up empty and
+    // `getBuiltInClassByName("Int")` fails ("Built-in class kotlin.Int is not
+    // found"). For classpath classes the unnamed module delegates to the app
+    // loader, so resolve via the same classpath scan as the ClassLoader-side
+    // native. Registered unconditionally (real-JDK + synthetic) like the
+    // getResource overrides above.
+    registry.register(
+        "java/lang/Module",
+        "getResourceAsStream",
+        "(Ljava/lang/String;)Ljava/io/InputStream;",
+        classloader::module_get_resource_as_stream,
+    );
     // URLClassLoader.findResource/findResources — the real bytecode walks
     // URLClassPath, whose essential-mode stubs return null/empty, so a
     // direct findResource() call (or a getResource() override delegating to
