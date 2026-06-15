@@ -306,6 +306,45 @@ pub(crate) fn native_parameter_is_synthetic(
     Ok(Some(Value::Int(if synthetic { 1 } else { 0 })))
 }
 
+/// `java.lang.reflect.Parameter.isNamePresent()`.
+///
+/// SB-02b-#4: `build_parameter_array` synthesizes `Parameter` objects directly
+/// and never runs the real-JDK `Executable.privateGetParameters()` that sets
+/// `hasRealParameterData`. The real `isNamePresent()` bytecode reads that flag
+/// (`executable.hasRealParameterData() && name != null`) and so would always
+/// return `false` — which makes Spring's `StandardReflectionParameterNameDiscoverer`
+/// return `null` for the WHOLE executable the moment ANY parameter reports no
+/// name (e.g. the enum constructor's `$enum$name` / `$enum$ordinal`, whose names
+/// ARE present from the `MethodParameters` attribute). A name is "present" iff
+/// it is not the synthetic `arg<index>` placeholder that `build_parameter_array`
+/// falls back to when `MethodParameters` is absent. (`Parameter` is a concrete
+/// class, so this same-class native wins over the JDK bytecode — unlike the
+/// inherited-default-method case in #1.)
+pub(crate) fn native_parameter_is_name_present(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    // Name lives at synthetic slot 0 (matching `is_synthetic`'s slot-1 read);
+    // fall back to the real `name` field if the slot isn't a String.
+    let name = match ctx.get_field(this, 0) {
+        Value::Object(Some(s)) => ctx.read_string(s),
+        _ => match ctx.get_field_by_name(this, "name") {
+            Value::Object(Some(s)) => ctx.read_string(s),
+            _ => None,
+        },
+    }
+    .unwrap_or_default();
+    if name.is_empty() {
+        return Ok(Some(Value::Int(0)));
+    }
+    // `arg<digits>` is the JDK's synthesized placeholder → name NOT present.
+    let synthesized = name
+        .strip_prefix("arg")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
+    Ok(Some(Value::Int(if synthesized { 0 } else { 1 })))
+}
+
 // ---------------------------------------------------------------------------
 // Executable.getParameters() — synthesize Parameter[] from descriptor.
 // ---------------------------------------------------------------------------
@@ -1275,6 +1314,12 @@ pub(crate) fn register_wp2_1_natives(registry: &mut NativeMethodRegistry) {
         "isSynthetic",
         "()Z",
         native_parameter_is_synthetic,
+    );
+    registry.register(
+        "java/lang/reflect/Parameter",
+        "isNamePresent",
+        "()Z",
+        native_parameter_is_name_present,
     );
 
     // --- Executable.getParameters / per-subclass ---
