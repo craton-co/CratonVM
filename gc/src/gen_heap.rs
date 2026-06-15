@@ -2056,8 +2056,17 @@ impl GenerationalHeap {
         // so it still routes to the moving Cheney here — it is the INFERIOR path;
         // the DEFAULT (no gate) is now the correct one. `CRATONVM_DBG_FORCE_MOVING`
         // also forces the (under-counting) moving cycle for diagnostics.
-        let shadow_roots = std::env::var_os("CRATONVM_SHADOW_STACK").is_some();
-        if crate::gc_quiescence::is_active() && !force_moving && !shadow_roots {
+        // B-K kafka fix (PROTOTYPE): the shadow stack publishes the operand-stack
+        // `Reg` oops the conservative stack scan misses (register-invisibility).
+        // Previously `shadow_roots` forced the MOVING Cheney (to remap those oops
+        // precisely), but moving UNDER-COUNTS bt18 (67674804) — the non-moving
+        // sweep + card fix is the correct collector. Decouple: keep the NON-MOVING
+        // sweep AND let the shadow oops be scanned as roots → PINNED (kept alive,
+        // not relocated). The reload is then a no-op (pinned objects never move),
+        // so the "incompatible with non-moving" concern does not apply. This keeps
+        // bt18 = 68332206 while closing the kafka register-invisible reclamation.
+        let _shadow_roots = std::env::var_os("CRATONVM_SHADOW_STACK").is_some();
+        if crate::gc_quiescence::is_active() && !force_moving {
             tracing::debug!(
                 "JIT frames are active (depth={}) — running non-moving \
                  young-gen mark-sweep (compaction deferred until quiescence \
@@ -3372,10 +3381,13 @@ impl GenerationalHeap {
 
             // (1) Pin set: every root / finalizer value that lands in young.
             // (1) Pin set: every root / finalizer value that lands in young.
+            // Stage B (precise oop maps, B-K relocation track): EXCLUDE addresses
+            // published as movable precise-JIT roots — empty unless precise
+            // relocation is engaged, so byte-identical on the default path.
             let mut pinned: FxHashSet<usize> = FxHashSet::default();
             for r in roots.iter() {
                 let a = r.as_ptr() as usize;
-                if is_y(a) {
+                if is_y(a) && !crate::gc_quiescence::is_movable_jit_root(a) {
                     pinned.insert(a);
                 }
             }

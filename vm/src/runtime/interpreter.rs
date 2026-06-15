@@ -13819,6 +13819,35 @@ fn execute_invokestatic_cached(
     }
 }
 
+/// Resolve `java/lang/String`'s instance-field layout (slot indices of
+/// `value`, `coder`, `hash`) for the JIT String call-site intrinsics
+/// (`length`/`charAt`/`isEmpty`/`hashCode`/`equals`/`compareTo`/`indexOf`).
+///
+/// String extends Object, which has no instance fields, so `find_own_field`'s
+/// indices match the slot indices used by `jit_getfield`. `coder` is optional —
+/// the legacy synthetic `char[]`-backed String has none, in which case
+/// `StringFieldLayout::new` records `has_coder = false` and the `coder`-dependent
+/// intrinsics bail to normal native dispatch. Returns `None` (all String
+/// intrinsics bail to dispatch) when String is not yet loaded or lacks the
+/// mandatory `value` / `hash` fields. Cheap enough to call once per compilation.
+fn resolve_string_field_layout(shared: &SharedVm) -> Option<cratonvm_jit::StringFieldLayout> {
+    let cm = shared.class_manager.read();
+    let string_id = cm.find_class_by_name("java/lang/String")?;
+    let class = cm.get_class(string_id)?;
+    let (value_idx, _) = class.find_own_field("value")?;
+    let (hash_idx, _) = class.find_own_field("hash")?;
+    let coder_idx = class.find_own_field("coder").map(|(idx, _)| idx);
+    // `string_id` doubles as the ObjectHeader class id used to guard
+    // `java/lang/CharSequence` accessor call sites (the receiver must be a
+    // real String for the inline String-layout decode to be sound).
+    Some(cratonvm_jit::StringFieldLayout::new(
+        value_idx,
+        coder_idx,
+        hash_idx,
+        string_id.as_u32(),
+    ))
+}
+
 /// Backward branch count threshold before triggering OSR compilation.
 const OSR_THRESHOLD: u32 = 1_000;
 
@@ -15217,6 +15246,7 @@ fn try_jit_upgrade_with_gate(
                 shared.profile_store.get_profile(&profile_key)
             };
             let c_helpers = crate::jit::helpers::build_helpers();
+            let c_string_layout_resolver = || resolve_string_field_layout(shared);
             let compiled = crate::jit::try_compile(
                 &callee_cached,
                 Some(&c_resolver),
@@ -15230,13 +15260,13 @@ fn try_jit_upgrade_with_gate(
                 c_pgo_profile.as_ref(),
                 &c_helpers,
                 None, // no inlining in early-compile path
-                // string_layout_resolver: None until the String call-site
-                // intrinsics land (a later wave). To enable, pass a closure
-                // `|| -> Option<cratonvm_jit::StringFieldLayout>` that resolves
-                // java/lang/String's value/coder/hash field indices via
-                // `shared.class_manager` + `Class::find_own_field`, then calls
-                // `StringFieldLayout::new(value_idx, coder_idx_opt, hash_idx)`.
-                None,
+                // String call-site intrinsics (length/charAt/hashCode/equals/…):
+                // resolve java/lang/String's value/coder/hash field layout so the
+                // JIT inlines these accessors instead of crossing the VM→native
+                // boundary per call (bug-03). `resolve_string_field_layout`
+                // returns None → intrinsics bail to dispatch when String isn't
+                // loaded yet.
+                Some(&c_string_layout_resolver),
                 Some(&c_invoke_class_id_resolver),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
@@ -15307,6 +15337,7 @@ fn try_jit_upgrade_with_gate(
     // be default-ON until that is root-caused. The infrastructure was previously
     // wired only into `try_jit_compile_callee_slow`. See the JIT-inlining notes.
     let main_inline_on = crate::runtime::env_cache::jit_main_inline();
+    let string_layout_resolver = || resolve_string_field_layout(shared);
     let compiled = crate::jit::try_compile(
         cached,
         Some(&resolver),
@@ -15320,9 +15351,11 @@ fn try_jit_upgrade_with_gate(
         pgo_profile.as_ref(),
         &helpers,
         if main_inline_on { Some(&inline_resolver) } else { None },
-        // string_layout_resolver: None until the String call-site intrinsics
-        // land — see the matching comment at the early-compile call site.
-        None,
+        // String call-site intrinsics (length/charAt/hashCode/equals/…): resolve
+        // java/lang/String's value/coder/hash field layout so the JIT inlines
+        // these accessors instead of crossing the VM→native boundary per call
+        // (bug-03). Mirrors the already-wired `try_jit_compile_callee_slow` path.
+        Some(&string_layout_resolver),
         Some(&invoke_class_id_resolver),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
@@ -15775,26 +15808,8 @@ fn try_jit_compile_callee_slow(
     };
 
     // Resolve java/lang/String's field layout for the JIT String call-site
-    // intrinsics. Looks up the loaded `java/lang/String` class and reads the
-    // absolute instance-field indices of `value`, `coder`, `hash` via
-    // `Class::find_own_field` (String extends Object, which has no instance
-    // fields, so `first_field_index == 0` and these indices match the slot
-    // indices used by `get_field` / `jit_getfield`). `coder` is optional —
-    // the legacy synthetic `char[]`-backed String has no `coder` field, in
-    // which case `StringFieldLayout::new` records `has_coder = false`.
-    // Returns `None` (intrinsics bail to dispatch) if String is not loaded
-    // or lacks the mandatory `value` / `hash` fields.
-    let string_layout_resolver = || -> Option<cratonvm_jit::StringFieldLayout> {
-        let cm = shared.class_manager.read();
-        let string_id = cm.find_class_by_name("java/lang/String")?;
-        let class = cm.get_class(string_id)?;
-        let (value_idx, _) = class.find_own_field("value")?;
-        let (hash_idx, _) = class.find_own_field("hash")?;
-        let coder_idx = class.find_own_field("coder").map(|(idx, _)| idx);
-        Some(cratonvm_jit::StringFieldLayout::new(
-            value_idx, coder_idx, hash_idx,
-        ))
-    };
+    // intrinsics (see `resolve_string_field_layout`).
+    let string_layout_resolver = || resolve_string_field_layout(shared);
 
     let compile_start = std::time::Instant::now();
     let compiled = crate::jit::try_compile(
@@ -16556,6 +16571,208 @@ fn execute_jit_call(
     Ok(CachedCallResult::Handled)
 }
 
+/// Dispatch an already-resolved compiled method using **pre-decoded** args
+/// (`args_slice`), instead of popping them off the operand stack like
+/// [`execute_jit_call`]. Used by the instance-method invocation tier-up path
+/// (bug-03 layer B, default-OFF via `CRATONVM_JIT_VIRTUAL_TIERUP`), which reaches
+/// the JIT *after* the interception checks have already popped+decoded the args
+/// into `args_slice`.
+///
+/// Returns:
+///   * `Ok(Some(ccr))` — handled; `ccr` is the call result to return (normally
+///     `Handled` with the return value pushed, or whatever
+///     `route_jit_exception_through_method` decided when the JIT body threw).
+///   * `Ok(None)` — the call could not be JIT-dispatched (too many args for the
+///     JIT register ABI, or the method deoptimized via the `i64::MIN` sentinel).
+///     NOTHING was pushed and the operand stack is untouched, so the caller must
+///     fall through to the interpreted frame push (its `args_slice` is still
+///     valid — it was popped into a local buffer, not consumed here).
+///   * `Err(_)` — a Java exception was raised (NPE / AIOOBE / in-method throw).
+///
+/// `num_params` includes the receiver for a non-static `cached` (so
+/// `args_slice[0]` is the receiver, matching the compiled instance prologue).
+/// `execute_jit_call` stays the single source of truth for the stack-popping
+/// (static) path; this mirrors only its run/exception/return logic so that path
+/// is left byte-identical.
+#[allow(clippy::too_many_arguments)]
+fn execute_jit_call_decoded(
+    shared: &SharedVm,
+    thread: &mut JvmThread,
+    frame_idx: usize,
+    compiled: &crate::jit::CompiledMethod,
+    num_params: u16,
+    return_type: u8,
+    needs_heap: bool,
+    cached: &Arc<CachedBytecodeMethod>,
+    args_slice: &[Value],
+) -> Result<Option<CachedCallResult>, MethodCallFailed> {
+    #[cfg(target_os = "windows")]
+    const JIT_ABI_REG_SLOTS: usize = 4;
+    #[cfg(not(target_os = "windows"))]
+    const JIT_ABI_REG_SLOTS: usize = 6;
+    let np = num_params as usize; // Widening: parameter count conversion
+    let max_java_params = JIT_ABI_REG_SLOTS - if needs_heap { 1 } else { 0 };
+    // Too many args for the register-only JIT ABI, or a mismatch between the
+    // decoded args and the declared count → interpreter fallback (Ok(None)).
+    if np > max_java_params || args_slice.len() != np {
+        return Ok(None);
+    }
+    // Decode each Java arg to its raw JIT-ABI bit pattern (Int → sign-extended
+    // i64, Long → raw i64, Float/Double → zero-/raw-bits, Object → pointer).
+    // `args_slice` is already descriptor-decoded by the caller (receiver = arg 0).
+    let mut jit_args = [0i64; JIT_ABI_REG_SLOTS];
+    for (i, v) in args_slice.iter().enumerate().take(np) {
+        jit_args[i] = match v {
+            Value::Int(x) => *x as i64, // Cast: JIT ABI -- i64 register convention
+            Value::Long(x) => *x,
+            Value::Float(x) => x.to_bits() as i64, // Cast: JIT ABI -- float bits to i64
+            Value::Double(x) => x.to_bits() as i64, // Cast: JIT ABI -- double bits to i64
+            Value::Object(Some(obj)) => obj.as_ptr() as i64, // Cast: JIT ABI -- pointer to i64
+            Value::Object(None) => 0,
+            _ => 0,
+        };
+    }
+    let args_jit = &jit_args[..np];
+    let vm_ptr = shared as *const _ as i64; // Cast: JIT ABI -- pointer to i64 register
+
+    // Run the compiled body. Mirrors execute_jit_call's run+exception logic.
+    let result = if !compiled.has_dispatch {
+        let _jit_root_guard =
+            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+        // SAFETY: compiled is a finalized JIT CompiledMethod with a validated entry; args match its JVM descriptor (receiver-aware).
+        let fast_result: Result<i64, cratonvm_jit::CompileError> = unsafe {
+            if needs_heap {
+                compiled.try_call_with_context(vm_ptr, args_jit)
+            } else {
+                compiled.try_call(args_jit)
+            }
+        };
+        match fast_result {
+            Ok(v) => v,
+            Err(jit_err) => {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!("JIT call failed: {jit_err}"),
+                }));
+            }
+        }
+    } else {
+        let saved_jit_thread = crate::jit::helpers::set_jit_thread(thread);
+        let _jit_root_guard =
+            crate::jit::conservative_roots::JitEntryGuard::enter_with_compiled(&*compiled);
+        let jit_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: see the fast-path SAFETY note above.
+            unsafe {
+                if needs_heap {
+                    compiled.try_call_with_context(vm_ptr, args_jit)
+                } else {
+                    compiled.try_call(args_jit)
+                }
+            }
+        }));
+        crate::jit::helpers::restore_jit_thread(saved_jit_thread);
+        if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+            return route_jit_exception_through_method(
+                shared, thread, frame_idx, cached, usize::MAX, exc,
+            )
+            .map(Some);
+        }
+        match jit_result {
+            Ok(Ok(v)) => v,
+            Ok(Err(jit_err)) => {
+                return Err(MethodCallFailed::InternalError(VmError::Internal {
+                    message: format!("JIT call failed: {jit_err}"),
+                }));
+            }
+            Err(panic_payload) => {
+                return Err(jit_panic_to_exception(shared, thread, panic_payload));
+            }
+        }
+    };
+
+    // Drain pending NPE / AIOOBE set by void-return store helpers (same as
+    // execute_jit_call) — route through the JIT'd method's exception table.
+    if crate::jit::helpers::take_jit_pending_npe() {
+        match crate::runtime::exceptions::throw_runtime_error(
+            shared,
+            thread,
+            RuntimeError::NullPointerException { message: None },
+        ) {
+            MethodCallFailed::ExceptionThrown(exc) => {
+                return route_jit_exception_through_method(
+                    shared, thread, frame_idx, cached, usize::MAX, exc,
+                )
+                .map(Some);
+            }
+            other => return Err(other),
+        }
+    }
+    if let Some((index, length)) = crate::jit::helpers::take_jit_pending_aioobe() {
+        let msg = format!("Index {index} out of bounds for length {length}");
+        match crate::runtime::exceptions::create_exception_object(
+            shared,
+            thread,
+            "java/lang/ArrayIndexOutOfBoundsException",
+            Some(&msg),
+        ) {
+            Ok(exc) => {
+                return route_jit_exception_through_method(
+                    shared, thread, frame_idx, cached, usize::MAX, exc,
+                )
+                .map(Some);
+            }
+            Err(other) => return Err(other),
+        }
+    }
+
+    // Deopt sentinel → interpreter fallback. The operand stack was never
+    // touched here, so the caller's `args_slice` is still valid for the
+    // interpreted frame push. (A legitimate i64::MIN long/double return collides
+    // with the sentinel; falling back just re-runs that one call interpreted —
+    // same result.)
+    if result == i64::MIN {
+        return Ok(None);
+    }
+
+    // Push the return value (mirrors execute_jit_call).
+    match return_type {
+        b'I' | b'B' | b'C' | b'S' | b'Z' => {
+            thread.frames[frame_idx]
+                .stack
+                .push_unchecked(Value::Int(result as i32)); // Cast: JIT ABI -- i64 register convention
+        }
+        b'J' => {
+            thread.frames[frame_idx]
+                .stack
+                .push_unchecked(Value::Long(result));
+        }
+        b'F' => {
+            let f = f32::from_bits(result as u32); // Cast: JIT ABI -- i64 register convention
+            thread.frames[frame_idx].stack.push_unchecked(Value::Float(f));
+        }
+        b'D' => {
+            let d = f64::from_bits(result as u64); // Cast: JIT ABI -- i64 register convention
+            thread.frames[frame_idx].stack.push_unchecked(Value::Double(d));
+        }
+        b'[' | b'L' => {
+            if result == 0 {
+                thread.frames[frame_idx]
+                    .stack
+                    .push_unchecked(Value::Object(None));
+            } else {
+                // SAFETY: non-zero JIT return encodes a heap pointer to a valid object header.
+                thread.frames[frame_idx]
+                    .stack
+                    .push_unchecked(Value::Object(Some(unsafe {
+                        crate::types::ObjectRef::from_raw(result as *mut u8) // Cast: JIT ABI -- i64 register convention
+                    })));
+            }
+        }
+        _ => {} // void — no push
+    }
+
+    Ok(Some(CachedCallResult::Handled))
+}
+
 /// T10.9.A — VtableManager fast-path for invokevirtual / invokeinterface.
 ///
 /// Consulted as **fast path 0** ahead of the per-thread `invoke_cache`
@@ -17065,7 +17282,7 @@ fn execute_invokevirtual_cached(
         CachedInvokeTarget::VirtualBytecode {
             receiver_class_id,
             cached,
-            gate: _,
+            gate: entry_gate,
         } => {
             let num_params = cached.num_params as usize; // Widening: parameter count conversion
             let receiver_val = thread.frames[frame_idx].stack.peek_at(num_params);
@@ -17181,6 +17398,90 @@ fn execute_invokevirtual_cached(
                             cached.method_descriptor.as_ref(),
                         )?;
                         return Ok(CachedCallResult::Handled);
+                    }
+
+                    // (bug-03 layer B, default-OFF via CRATONVM_JIT_VIRTUAL_TIERUP)
+                    // Instance-method invocation tier-up. Today only static
+                    // methods have an invocation counter, so short-loop instance
+                    // hot methods (e.g. java.util.regex Pattern$*.match) never
+                    // JIT-compile. Placed AFTER every interception above (so a
+                    // natively-overridden method is never run as JIT'd bytecode)
+                    // and BEFORE the method-level monitor below (the JIT body does
+                    // not acquire a `synchronized`-method monitor, so those are
+                    // excluded). Monomorphic: the receiver class id was already
+                    // checked `== receiver_class_id`, so `cached` is the exact
+                    // target for this receiver. `args_slice` is already decoded;
+                    // on deopt/too-many-args we fall through to the interpreted
+                    // frame push below (the operand stack is untouched).
+                    if !is_special
+                        && !cached.is_synchronized
+                        && crate::runtime::env_cache::jit_virtual_tierup()
+                    {
+                        // Fast path: already compiled (by this counter or OSR)?
+                        let compiled_opt = {
+                            let jc = shared.jit_cache.read();
+                            jc.get(
+                                &cached.class_name,
+                                &cached.method_name,
+                                &cached.method_descriptor,
+                            )
+                        }
+                        .or_else(|| {
+                            // Warmup counter mirroring execute_invokestatic_cached.
+                            let invoc_key = {
+                                let mut h = 0u32;
+                                for &b in cached.method_name.as_bytes() {
+                                    h = h.wrapping_mul(31).wrapping_add(b as u32);
+                                }
+                                for &b in cached.method_descriptor.as_bytes() {
+                                    h = h.wrapping_mul(31).wrapping_add(b as u32);
+                                }
+                                ((cached.declaring_class_id.as_u32() as u64) << 32)
+                                    | (h as u64)
+                            };
+                            const JIT_RETRY_STRIDE: u32 = 64;
+                            let threshold =
+                                crate::runtime::env_cache::jit_invocation_threshold();
+                            let cnt =
+                                shared.profile_store.increment_invocation(invoc_key);
+                            let should_attempt = cnt >= threshold
+                                && (cnt == threshold
+                                    || (cnt - threshold) % JIT_RETRY_STRIDE == 0);
+                            if should_attempt {
+                                if let Some(CachedInvokeTarget::Jit { compiled, .. }) =
+                                    try_jit_upgrade_with_gate(
+                                        shared,
+                                        &cached,
+                                        entry_gate.clone(),
+                                    )
+                                {
+                                    return Some(compiled);
+                                }
+                            }
+                            None
+                        });
+                        if let Some(compiled) = compiled_opt {
+                            let ret =
+                                crate::jit::return_type(&cached.method_descriptor);
+                            let heap = compiled.needs_heap();
+                            // total_args = receiver + declared params; the decoded
+                            // dispatcher treats arg 0 as the receiver.
+                            if let Some(ccr) = execute_jit_call_decoded(
+                                shared,
+                                thread,
+                                frame_idx,
+                                &compiled,
+                                total_args as u16, // Cast: small param count
+                                ret,
+                                heap,
+                                &cached,
+                                args_slice,
+                            )? {
+                                return Ok(ccr);
+                            }
+                            // None → deopt / too-many-args: fall through to the
+                            // interpreted frame push (operand stack untouched).
+                        }
                     }
 
                     // Acquire monitor for synchronized methods

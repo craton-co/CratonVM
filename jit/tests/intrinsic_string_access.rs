@@ -96,14 +96,15 @@ fn helpers() -> JitRuntimeHelpers {
     }
 }
 
-/// The compact `java/lang/String` field layout used by every test:
-/// `value` at field index 0, `coder` at 1, `hash` at 2.
-fn string_layout() -> StringFieldLayout {
-    StringFieldLayout::new(0, Some(1), 2)
-}
-
 /// An arbitrary non-zero class id stamped into every fake String header.
 const STRING_CLASS_ID: u32 = 0x5712_3400;
+
+/// The compact `java/lang/String` field layout used by every test:
+/// `value` at field index 0, `coder` at 1, `hash` at 2, guard class id
+/// = `STRING_CLASS_ID` (matches the id `make_string` stamps at `[recv+0]`).
+fn string_layout() -> StringFieldLayout {
+    StringFieldLayout::new(0, Some(1), 2, STRING_CLASS_ID)
+}
 
 /// A heap object: a `HEADER_SIZE`-byte `ObjectHeader` followed by tightly
 /// packed element data (for arrays) or 16-byte `Value` field cells (for
@@ -144,12 +145,19 @@ fn make_byte_array(data: &[u8]) -> FakeObj {
 /// `value` byte-array pointer, `coder` and cached `hash`. Returns the String
 /// object; the caller must keep the backing `FakeObj` array alive.
 fn make_string(value_ptr: i64, coder: i32, hash: i32) -> FakeObj {
+    make_string_with_cid(value_ptr, coder, hash, STRING_CLASS_ID)
+}
+
+/// Like [`make_string`] but stamps an arbitrary `class_id` into the
+/// `ObjectHeader` — lets the CharSequence-guard tests forge a non-String
+/// receiver (a String-shaped object with the "wrong" class id).
+fn make_string_with_cid(value_ptr: i64, coder: i32, hash: i32, class_id: u32) -> FakeObj {
     // 3 field cells: value (0), coder (1), hash (2).
     let mut obj = FakeObj::with_bytes(HEADER_SIZE + 3 * SLOT_SIZE);
     let base = obj.base();
     unsafe {
         // ObjectHeader: class id at offset 0, kind = Object.
-        let cid = STRING_CLASS_ID.to_le_bytes();
+        let cid = class_id.to_le_bytes();
         std::ptr::copy_nonoverlapping(cid.as_ptr(), base, 4);
         *base.add(4) = ObjectKind::Object as u8;
         // A `Value` field cell: tag (u32) at offset 0. An 8-byte payload
@@ -343,7 +351,7 @@ fn string_access_registered_only_with_a_layout() {
 fn string_access_bails_without_a_coder_field() {
     // The legacy `char[]` String layout has no `coder` field; every String
     // intrinsic decodes via `coder`, so such a layout must bail.
-    let no_coder = StringFieldLayout::new(0, None, 1);
+    let no_coder = StringFieldLayout::new(0, None, 1, STRING_CLASS_ID);
     assert!(!no_coder.has_coder);
     assert!(
         try_resolve_string_intrinsic("java/lang/String", "length", "()I", Some(no_coder))
@@ -493,5 +501,174 @@ fn string_length_null_receiver_deopts() {
         TRAP_COUNT.load(Ordering::SeqCst),
         before + 1,
         "null-receiver length must fire exactly one uncommon trap",
+    );
+}
+
+// --- CharSequence-typed call sites (receiver class-id guard) ---------------
+
+/// A class id distinct from `STRING_CLASS_ID`, used to forge a non-String
+/// CharSequence receiver (e.g. a StringBuilder).
+const NON_STRING_CLASS_ID: u32 = 0x0099_0099;
+
+/// Compile `char f(CharSequence this, int idx)` for a `java/lang/CharSequence`
+/// `charAt` call site. The site carries the String class-id guard, so the
+/// inline String-layout decode runs only for a real String receiver and
+/// deopts otherwise.
+fn compile_charseq_char_at() -> impl Fn(i64, i32) -> i64 {
+    let (entry, _np, _ret, guard) = try_resolve_string_intrinsic(
+        "java/lang/CharSequence",
+        "charAt",
+        "(I)C",
+        Some(string_layout()),
+    )
+    .expect("CharSequence.charAt must register with a layout");
+    assert_eq!(
+        guard, STRING_CLASS_ID,
+        "a CharSequence site must carry the String class-id guard",
+    );
+    // aload_0 (2a), iload_1 (1b), invokevirtual (b6 00 01), ireturn (ac)
+    let code: Vec<u8> = vec![0x2a, 0x1b, 0xb6, 0x00, 0x01, 0xac, 0, 0];
+    let compiled = compile(
+        &code,
+        code.len(),
+        2,
+        2,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![(
+            2,
+            JitDirectCall {
+                entry,
+                needs_context: false,
+                num_params: 1,
+                return_type: b'C',
+                guard_class_id: guard,
+            },
+        )],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        HashMap::new(),
+        HashMap::new(),
+        &helpers(),
+        HashSet::new(),
+        HashMap::new(),
+        Some(string_layout()),
+    )
+    .expect("CharSequence.charAt wrapper compilation failed");
+    move |this: i64, idx: i32| unsafe {
+        compiled.try_call(&[this, idx as i64]).expect("test JIT call")
+    }
+}
+
+#[test]
+fn charseq_access_registers_only_accessors_with_string_guard() {
+    let l = Some(string_layout());
+    // charAt/length/isEmpty are declared on CharSequence → intrinsified,
+    // carrying the String class-id guard.
+    for &(name, desc) in &[("length", "()I"), ("isEmpty", "()Z"), ("charAt", "(I)C")] {
+        let r = try_resolve_string_intrinsic("java/lang/CharSequence", name, desc, l);
+        let (_entry, _np, _ret, guard) =
+            r.unwrap_or_else(|| panic!("CharSequence.{name}{desc} must register with a layout"));
+        assert_eq!(
+            guard, STRING_CLASS_ID,
+            "CharSequence.{name}{desc} must carry the String class-id guard",
+        );
+    }
+    // String-specific methods are NOT on CharSequence → never intrinsified
+    // for a CharSequence receiver.
+    for &(name, desc) in &[
+        ("hashCode", "()I"),
+        ("equals", "(Ljava/lang/Object;)Z"),
+        ("compareTo", "(Ljava/lang/String;)I"),
+        ("indexOf", "(I)I"),
+        ("indexOf", "(Ljava/lang/String;)I"),
+    ] {
+        assert!(
+            try_resolve_string_intrinsic("java/lang/CharSequence", name, desc, l).is_none(),
+            "CharSequence.{name}{desc} must NOT be intrinsified (String-only)",
+        );
+    }
+}
+
+#[test]
+fn charseq_access_bails_without_a_string_class_id() {
+    // A layout whose string_class_id is 0 (String class id unknown) cannot
+    // guard a CharSequence site, so it must bail to native dispatch — while a
+    // String receiver (needs no guard) still resolves.
+    let no_guard = StringFieldLayout::new(0, Some(1), 2, 0);
+    assert!(
+        try_resolve_string_intrinsic("java/lang/CharSequence", "charAt", "(I)C", Some(no_guard))
+            .is_none(),
+        "CharSequence.charAt must bail when there is no String class id to guard with",
+    );
+    assert!(
+        try_resolve_string_intrinsic("java/lang/String", "charAt", "(I)C", Some(no_guard))
+            .is_some(),
+        "String.charAt needs no guard, so it resolves even with string_class_id == 0",
+    );
+}
+
+#[test]
+fn charseq_char_at_string_receiver_decodes() {
+    let f = compile_charseq_char_at();
+    for s in ["abc", "hello", "caf\u{e9}", "A\u{4e2d}Z"] {
+        let (bytes, coder) = encode(s);
+        let arr = make_byte_array(&bytes);
+        // Receiver IS a real String (header class id == STRING_CLASS_ID) →
+        // the guard passes and the inline decode runs.
+        let strobj = make_string(arr.ptr(), coder, 0);
+        for i in 0..ref_length(s) as usize {
+            assert_eq!(
+                f(strobj.ptr(), i as i32) as i32,
+                ref_char_at(s, i),
+                "CharSequence.charAt({s:?}, {i}) with a String receiver",
+            );
+        }
+    }
+}
+
+#[test]
+fn charseq_char_at_non_string_receiver_deopts() {
+    let _guard = DEOPT_LOCK.lock().unwrap();
+    let f = compile_charseq_char_at();
+    let (bytes, coder) = encode("hello");
+    let arr = make_byte_array(&bytes);
+    // A String-shaped object with the WRONG class id stands in for a non-String
+    // CharSequence (e.g. StringBuilder). The receiver-class-id guard must fail
+    // and deopt rather than decode foreign field memory.
+    let foreign = make_string_with_cid(arr.ptr(), coder, 0, NON_STRING_CLASS_ID);
+    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let r = f(foreign.ptr(), 0);
+    assert_eq!(
+        r,
+        i64::MIN,
+        "a non-String CharSequence receiver must return the deopt sentinel",
+    );
+    assert_eq!(
+        TRAP_COUNT.load(Ordering::SeqCst),
+        before + 1,
+        "the class-id guard must fire exactly one uncommon trap",
+    );
+}
+
+#[test]
+fn charseq_char_at_null_receiver_deopts() {
+    let _guard = DEOPT_LOCK.lock().unwrap();
+    let f = compile_charseq_char_at();
+    let before = TRAP_COUNT.load(Ordering::SeqCst);
+    let r = f(0, 0); // null receiver — null check precedes the class-id guard
+    assert_eq!(r, i64::MIN, "null CharSequence receiver must deopt");
+    assert_eq!(
+        TRAP_COUNT.load(Ordering::SeqCst),
+        before + 1,
+        "null-receiver CharSequence.charAt must fire exactly one uncommon trap",
     );
 }

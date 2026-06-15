@@ -5795,35 +5795,28 @@ impl Compiler {
     /// hold FP data, never references). Returns the homes in push order.
     fn collect_live_oop_homes(&self) -> Vec<ShadowHome> {
         let mut homes: Vec<ShadowHome> = Vec::new();
-        // Operand-stack reference entries that survive the call.
+        // B-K kafka fix: publish ONLY the genuinely register-invisible oops —
+        // operand-stack reference entries that live in a REGISTER across the
+        // call. Everything else is already covered, so re-publishing it only
+        // over-pins (the bt18 @ small-heap OOM):
+        //   * operand-stack Frame slots are on the stack → the conservative scan
+        //     `scan_active_jit_frames` already finds them;
+        //   * oop LOCALS are flushed to their canonical frame slots by
+        //     `emit_pre_safepoint_spill` just above → also on the stack;
+        //   * Xmm entries are FP data, never references.
+        // The operand-stack Reg homes (callee-saved survive the call un-spilled;
+        // caller-saved/Scratch are kept for safety) are the only ones the stack
+        // scan can miss, so they are exactly the set the GC must be told about.
         let n = self.stack.len().min(self.stack_oop_marks.len());
         for i in 0..n {
             if !self.stack_oop_marks[i] {
                 continue;
             }
             match self.stack[i] {
-                StackSlot::Frame(off) => homes.push(ShadowHome::Frame(off)),
                 StackSlot::CalleeSaved(reg) | StackSlot::Scratch(reg) => {
                     homes.push(ShadowHome::Reg(reg))
                 }
-                StackSlot::Xmm(_) => {} // FP value, not a reference
-            }
-        }
-        // Oop locals live at this bytecode PC (forward "must be oop" dataflow).
-        if !self.local_oop_masks.is_empty() {
-            let pc = self.cur_bc_pc;
-            if pc < self.local_oop_masks.len()
-                && self.local_oop_reached.get(pc).copied().unwrap_or(false)
-            {
-                let mut mask = self.local_oop_masks[pc];
-                while mask != 0 {
-                    let k = mask.trailing_zeros() as usize;
-                    mask &= mask - 1;
-                    match self.reg_for_local(k) {
-                        Some(reg) => homes.push(ShadowHome::Reg(reg)),
-                        None => homes.push(ShadowHome::Frame(self.local_offset(k))),
-                    }
-                }
+                StackSlot::Frame(_) | StackSlot::Xmm(_) => {}
             }
         }
         homes
@@ -16952,7 +16945,12 @@ impl Compiler {
                         // metadata on the default path, so it is byte-identical
                         // gate-OFF; gate-ON it records the map AND the paired
                         // post-safepoint register reload (Stage 4 / G5).
-                        if self.precise_maps {
+                        // Also required under `shadow_enabled`: the shadow-stack
+                        // PUSH happened in `emit_pre_safepoint_spill`, so its
+                        // paired RELOAD (inside `emit_oop_map_for_safepoint`) must
+                        // run here too, else the shadow stack grows unbalanced
+                        // through this recursive call → unbounded pinning → OOM.
+                        if self.precise_maps || self.shadow_enabled {
                             self.emit_oop_map_for_safepoint();
                         }
                         self.emit_stack_arg_cleanup(total_sub);
@@ -17116,6 +17114,27 @@ impl Compiler {
                                 self.load_slot_to_reg(RAX, recv_slot);
                                 self.emit_test_r64_r64(RAX);
                                 bail.push(self.emit_jcc_rel32_patch(0x84)); // JZ
+
+                                // Receiver class-id guard. For a
+                                // `java/lang/String` call site (final →
+                                // monomorphic) `guard_class_id == 0` and no
+                                // guard is emitted. For a `java/lang/CharSequence`
+                                // site the receiver may be any CharSequence, so
+                                // this inline String-layout decode is valid only
+                                // when the receiver is actually a String: compare
+                                // the ObjectHeader class id at [recv+0] against
+                                // the String class id and deopt (→ native
+                                // dispatch) on a mismatch (e.g. a StringBuilder /
+                                // StringBuffer receiver). Same guard the CRC32
+                                // family uses; see its STRING_SEARCH-adjacent
+                                // region below.
+                                if guard_class_id != 0 {
+                                    // CMP DWORD [RAX + 0], guard_class_id
+                                    //   81 /7 id, ModRM 0x78 = mod00 /7 rm=RAX.
+                                    self.buf.emit(&[0x81, 0x78, 0x00]);
+                                    self.buf.emit(&guard_class_id.to_le_bytes());
+                                    bail.push(self.emit_jcc_rel32_patch(0x85)); // JNE
+                                }
 
                                 // RCX = value (byte[]) ref. Null → deopt.
                                 self.emit_mov_r64_mem_disp32(
@@ -18231,7 +18250,10 @@ impl Compiler {
                         // could not remap this frame. Gated behind `precise_maps`
                         // → byte-identical gate-OFF; gate-ON records the map and
                         // the paired post-safepoint register reload.
-                        if self.precise_maps {
+                        // Also under `shadow_enabled` (balance the shadow push/
+                        // reload across this direct call — see the self-recursive
+                        // site above).
+                        if self.precise_maps || self.shadow_enabled {
                             self.emit_oop_map_for_safepoint();
                         }
                         self.emit_stack_arg_cleanup(total_sub);
