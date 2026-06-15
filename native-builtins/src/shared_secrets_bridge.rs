@@ -1790,7 +1790,11 @@ mod tests {
         for owner in owner_classes() {
             assert!(seen.insert(owner), "duplicate owner class: {owner}");
         }
-        assert_eq!(seen.len(), 16);
+        // Every factory has a distinct owner class, so the unique-owner count
+        // tracks FACTORIES.len() (15 after `getJavaObjectInputStreamAccess` was
+        // removed — see `all_factories_listed`). Derive it so the two stay in
+        // lock-step instead of drifting on the next factory add/remove.
+        assert_eq!(seen.len(), FACTORIES.len());
     }
 
     #[test]
