@@ -1,40 +1,52 @@
-# H2 — `TestUtils` fatal `EXCEPTION_ACCESS_VIOLATION` (SIGSEGV)
+# H2 — `TestUtils` JIT `EXCEPTION_ACCESS_VIOLATION` (aastore SATB barrier)
 
 ## Status
-**OPEN** — not yet isolated (needs symbolized backtrace).
+**FIXED** (worktree `fix/h2-suite-loop`, `jit/src/x64.rs`).
 
 ## Severity
-**HIGH** — fatal process crash.
+**HIGH** — fatal process crash; JIT-only, deterministic. Affects **any**
+JIT-compiled method whose only heap-touching opcode is `aastore` (ref store
+into an `Object[]`).
 
 ## Affected test class
-`org.h2.test.unit.TestUtils` (CRASH in both the baseline and post-fix sweeps —
-pre-existing, unrelated to the repeat / BufferedReader fixes).
+`org.h2.test.unit.TestUtils` (crashes deterministically under JIT; `--nojit`
+runs without the crash).
 
 ## Symptom
 ```
-# A fatal error has been detected by the CratonVM Runtime Environment:
-#  EXCEPTION_ACCESS_VIOLATION (SIGSEGV) (0xC0000005) at pc=0x00007FF7092E450F
-#  thread: "main-vm"
-#  faulting RVA: 0x1F450F
+# EXCEPTION_ACCESS_VIOLATION (SIGSEGV) (0xC0000005) at pc=... (RVA 0x1F3A5F)
+  cratonvm_gc::vm_heap::VmHeap::satb_barrier        [gc/src/vm_heap.rs:844]
+  cratonvm_vm::jit::helpers::jit_satb_pre_write_barrier [vm/src/jit/helpers.rs]
 ```
-No Java output precedes the crash (faults early). The faulting RVA `0x1F450F`
-is **distinct** from the file-system tests' stack-overflow site (`0x81E34E`),
-so this is a different defect.
+Crash registers showed `rcx = 0x4CA4A810` — a **stack** address
+(`rsp = 0x4CA4A5D0`), not a valid `SharedVm` pointer.
 
-## HotSpot behavior
-PASS.
+## Root cause
+`aastore`'s JIT codegen (`x64.rs`, opcode `0x53`) emits the SATB pre-write
+barrier and the post-store write barrier, both of which load the VM pointer from
+the frame's `heap_local_offset` slot:
+```
+emit_load_local(ARG_REGS[0], self.heap_local_offset)  // expects vm_ptr
+... call jit_satb_pre_write_barrier(vm_ptr, old_ref)  // does vm.heap.satb_barrier(...)
+```
+But the JIT-eligibility pre-scan that computes `needs_heap` did **not** set it
+for the array-store opcodes (`0x4f..=0x56` just did `pc += 1`). When a method
+contains an `aastore` and no *other* heap opcode (putfield/invoke/new/…),
+`needs_heap` stays `false`, so `heap_local_offset = 0` (aliasing local 0) and the
+slot is never initialised with the `SharedVm` pointer. The barrier therefore
+passes a **stack address** as `vm_ptr`; `jit_satb_pre_write_barrier` does
+`vm = &*(vm_ptr as *const SharedVm); vm.heap.satb_barrier(...)`, dereferencing
+garbage → SIGSEGV.
 
-## Context
-`org.h2.test.unit.TestUtils` exercises `org.h2.util.Utils` helpers
-(reflection/`newInstance`, `getProperty`, sorting/`MemoryUnmapper`-style memory
-helpers, `getNonPrimitiveClass`, etc.). A native/unsafe memory path or a
-reflection helper is the likely culprit.
+## Fix
+In the `0x4f..=0x56` array-store arm of the `needs_heap` pre-scan, set
+`needs_heap = true` for `aastore` (`op == 0x53`). The primitive array stores
+(`iastore`…`sastore`) do inline stores with no heap-dependent helper, so they
+stay out of `needs_heap`.
 
-## Next steps
-- Re-run under `target/release-with-debug` and symbolize the `exe+0x` RVAs
-  (incl. `0x1F450F`) via `CRATONVM_SYMBOLIZE` (see
-  `apps/h2database/h2/capture-h2-segv-rwd.ps1`).
-- Bisect `TestUtils` test methods to the one that faults.
+Verified: `TestUtils` runs under JIT without the access violation; `--nojit` was
+already crash-free.
 
 ## Repro
-`java -cp temp;ext org.h2.test.RunOne org.h2.test.unit.TestUtils mem`
+`org.h2.test.RunOne org.h2.test.unit.TestUtils mem` (JIT on) — or any tiny
+JIT-compiled method that does only `arr[i] = ref;`.

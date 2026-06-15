@@ -1098,6 +1098,17 @@ pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitSca
             }
             // iastore, lastore, fastore, dastore, aastore, bastore, castore, sastore
             0x4f..=0x56 => {
+                // `aastore` (0x53) emits the SATB pre-write + post-store write
+                // barriers, both of which load the VM pointer from
+                // `heap_local_offset`. Without `needs_heap` that slot is never
+                // set up (offset 0 aliases local 0), so the barrier calls
+                // `jit_satb_pre_write_barrier` with a stack address as `vm_ptr`
+                // → `vm.heap` dereferences garbage → SIGSEGV (H2 TestUtils,
+                // JIT-only; the primitive array stores do inline stores with no
+                // heap-dependent helper).
+                if op == 0x53 {
+                    needs_heap = true;
+                }
                 pc += 1;
             }
             // pop
