@@ -1006,6 +1006,34 @@ fn register_app_stubs(registry: &mut NativeMethodRegistry) {
     });
 }
 
+/// `ObjectStreamClass.hasStaticInitializer(Class[, boolean]) -> boolean`:
+/// true iff the class declares a `<clinit>`. Always-compiled mirror of
+/// `serialization::class_has_static_initializer` (+ its `class_id_of_mirror`
+/// synthetic-jdk fallback) so the ESSENTIAL registration below does not depend
+/// on the feature-gated `serialization` module — otherwise
+/// `cargo test -p cratonvm-native-builtins` (built without
+/// `experimental-serialization`) fails to compile. Behaviour matches the gated
+/// path; `serialization.rs` keeps its own copy for the feature-on build.
+fn essential_class_has_static_initializer(ctx: &mut dyn NativeContext, args: &[Value]) -> bool {
+    let mirror = match args.first() {
+        Some(Value::Object(Some(m))) => *m,
+        _ => return false,
+    };
+    let class_id = ctx.class_id_from_mirror(mirror).or_else(|| {
+        // Synthetic-jdk fallback: read the mirror's "name" field, look up by name.
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(mirror, "name") {
+            if let Some(n) = ctx.read_string(s) {
+                return ctx.class_id_by_name(&n.replace('.', "/"));
+            }
+        }
+        None
+    });
+    match class_id {
+        Some(id) => ctx.declared_methods(id).iter().any(|m| &*m.name == "<clinit>"),
+        None => false,
+    }
+}
+
 /// Register ONLY the truly native methods (`ACC_NATIVE` in real JDK class files).
 /// These methods have no bytecode — they MUST be provided by the VM as native code.
 /// Used when `use_synthetic_jdk == false` (real JDK mode).
@@ -5844,13 +5872,13 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         "java/io/ObjectStreamClass",
         "hasStaticInitializer",
         "(Ljava/lang/Class;Z)Z",
-        |ctx, args| Ok(Some(Value::Int(serialization::class_has_static_initializer(ctx, args) as i32))),
+        |ctx, args| Ok(Some(Value::Int(essential_class_has_static_initializer(ctx, args) as i32))),
     );
     registry.register(
         "java/io/ObjectStreamClass",
         "hasStaticInitializer",
         "(Ljava/lang/Class;)Z",
-        |ctx, args| Ok(Some(Value::Int(serialization::class_has_static_initializer(ctx, args) as i32))),
+        |ctx, args| Ok(Some(Value::Int(essential_class_has_static_initializer(ctx, args) as i32))),
     );
 
     // Force VM.isJavaLangInvokeInited() to return true. In a normal JVM,
