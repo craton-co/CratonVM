@@ -1,0 +1,10 @@
+# Transient suite outputs / build logs / crash dumps / compiled probes
+results-cv/
+triage/
+*.log
+*.output
+*.class
+hs_err_pid*.log
+.af_*.txt
+.err
+test-output/
