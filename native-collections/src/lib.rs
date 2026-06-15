@@ -11689,13 +11689,51 @@ pub fn comparator_compare(
     let tag = match tag {
         Some(t) => t,
         None => {
-            // Not a factory comparator — delegate to invoke_virtual (lambda path)
-            return ctx.invoke_virtual(
+            // Not a factory comparator — invoke its `compare` (lambda path).
+            //
+            // Fallback: if `compare` does not resolve, the object is actually a
+            // key-extractor `Function` that was stored RAW as a nested
+            // comparator — a `someComparator.thenComparing(EntityTableMapping::
+            // relativePosition)` whose dispatch landed on the `(Comparator)`
+            // overload (`native_comparator_then_comparing`, inner_tag=None)
+            // instead of `(Function)`. Treat it like `Comparator.comparing(keyFn)`
+            // (apply + natural compare), matching the JDK default method. A real
+            // Comparator lambda implements `compare` (not `apply`), so a genuine
+            // exception from its `compare` still propagates (apply would fail and
+            // we re-raise the original error). Without this, Hibernate's
+            // `ConstraintModelBuilder` (Stream.sorted over the entity-table
+            // comparator) threw `NoSuchMethodError: Function.compare`, which
+            // unwound through the JUnit MethodHandle interceptor chain and tripped
+            // "InvocationInterceptors called invocation multiple times".
+            return match ctx.invoke_virtual(
                 comparator,
                 "compare",
                 "(Ljava/lang/Object;Ljava/lang/Object;)I",
                 &[a, b],
-            );
+            ) {
+                Ok(v) => Ok(v),
+                Err(compare_err) => {
+                    match ctx.invoke_virtual(
+                        comparator,
+                        "apply",
+                        "(Ljava/lang/Object;)Ljava/lang/Object;",
+                        &[a],
+                    ) {
+                        Ok(Some(ka)) => {
+                            let kb = ctx
+                                .invoke_virtual(
+                                    comparator,
+                                    "apply",
+                                    "(Ljava/lang/Object;)Ljava/lang/Object;",
+                                    &[b],
+                                )?
+                                .unwrap_or(Value::Object(None));
+                            natural_compare(ctx, &ka, &kb)
+                        }
+                        _ => Err(compare_err),
+                    }
+                }
+            };
         }
     };
 
