@@ -25,20 +25,29 @@
 > interpreter throughput.
 >
 > **Still open after the fix (two distinct remaining problems):**
-> 1. **Webapp-DIRECTORY request processing.** With the connector fixed, an
->    `addWebapp(...)` context now reports `ctxState=STARTED` and accepts the
->    connection, but the request (even to a **static** file via DefaultServlet)
->    **hangs / returns empty** (flaky: sometimes the connector logs an immediate
->    `Pausing` + `StandardWrapperValve[Container is null]` and resets;
->    `TestPageContext` still FAILs "contains on null"). The accepted socket is not
->    driven through read→process→write for webapp contexts. Needs poller/
->    DefaultServlet/request-pipeline investigation (separate from `setOption`).
-> 2. **Interpreter throughput** (the original wall below) — still real for the
+> 1. **The server SERVES — proven.** After `setOption`, a minimal embedded
+>    Tomcat on CratonVM answers an **external `curl`** with `HTTP/1.1 200` + body
+>    (servlet `doGet` invoked). So the connector works; "servers don't serve" is
+>    refuted.
+> 2. **The in-process HTTP CLIENT is the remaining blocker.** Every embedded-HTTP
+>    test fetches via `TomcatBaseTest.getUrl` → `HttpURLConnection`, which CratonVM
+>    bridges to a native Rust HTTP client (`http_url_connection.rs::perform`, raw
+>    `std::net::TcpStream`). Run **in the same process** as the server it hits,
+>    `perform` gets `getResponseCode()==-1`, the server's `doGet` is never invoked,
+>    and the socket layer logs NO server-side read — the in-process server never
+>    processes the request. External curl and an in-process raw `java.net.Socket`
+>    client (separate write/read calls) both work; only the native `perform` (one
+>    long uninterrupted blocking native call) fails. GC-starvation was ruled out
+>    (`begin_blocking_region` around `perform` did not help). Likely fix: **drop
+>    the native `HttpURLConnection` bridge so the real `sun.net.www` bytecode runs
+>    over the now-working socket layer** (the raw-`Socket` path already works
+>    in-process). See [bug 10](10-pagecontext-npe-contains-null-FAIL.md).
+> 3. **Interpreter throughput** (the original wall below) — still real for the
 >    cold deploy (jar/TLD/annotation scanning, classloading).
 >
-> Net: group 04 is "functional connector serving" (layer 1 FIXED) **+** "webapp
-> request processing" (layer 2 open) **+** "interpreter throughput" (below), not a
-> single throughput wall.
+> Net: group 04 is "functional connector serving" (FIXED — server proven to serve)
+> **+** "in-process HTTP client" (open, the getUrl blocker) **+** "interpreter
+> throughput" (below), not a single throughput wall.
 
 **Status:** OPEN. The single biggest blocker to a green suite.
 **Affected:** ~all catalina/coyote embedded-server classes (the 145+ HANG in the
