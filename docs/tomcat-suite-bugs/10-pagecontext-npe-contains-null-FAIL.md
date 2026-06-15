@@ -1,10 +1,52 @@
-# Bug 10 — TestPageContext "contains on null": a five-layer onion (HTTP serving → client → resource loading → ecj binder)
+# Bug 10 — TestPageContext "contains on null": a six-layer onion (HTTP serving → client → resource loading → ecj binder → core Unsafe/Arrays.equals → serving)
 
-**Status:** four layers root-caused and FIXED; the fifth (an ecj/JDT
-binding-phase miscompile on CratonVM) is the remaining blocker. The original
-`PageContext`/EL hypothesis was WRONG — `res.toString()` is null because the
-JSP never compiled, and that traced through HTTP serving, the HTTP client, JDK
-resource loading, and finally the Eclipse JDT compiler itself.
+**Status:** the JSP-compilation chain is FULLY root-caused and FIXED (layers
+1–5). The original `PageContext`/EL hypothesis was WRONG — `res.toString()` was
+null because the JSP never compiled, which traced through HTTP serving → the
+HTTP client → JDK resource loading → the Eclipse JDT compiler → and finally a
+**fundamental VM bug in `Unsafe`/`Arrays.equals`**. With that fixed, JSP
+compilation succeeds. The test still fails on a SEPARATE, pre-existing wall:
+the embedded **NioEndpoint HTTP serving** (group 04) — the request is never
+served end-to-end (no `ssc_accept`/`_jspService`/response in the log).
+
+## Layer 5 root cause (THE fundamental bug — commit `1cddae8f`)
+
+ecj reported phantom `Duplicate field` + `method undefined` for generic methods
+when compiling on CratonVM. Narrowing from the JSP all the way down (driving
+ecj's `Compiler`/`Parser`/`ClassFileReader`/`SignatureWrapper` directly, then a
+3-line pure-Java repro) found:
+
+**`java.util.Arrays.equals(char[],char[])` and `Arrays.equals(long[],long[])`
+compared only element 0** — returning `true` for arrays differing at any index
+except the first. (`int[]`/`byte[]` happened to be saved by the JDK's scalar
+fallback; scales 1 and 3 were not.) Two intrinsic bugs:
+- `ArraysSupport.vectorizedMismatch` native (`phases_early.rs`) computed the
+  element index as `offset / scale` without subtracting the array base offset
+  (ABASE=16): `16/2 = 8` for `char[]` → out-of-range guard → reported "equal".
+- `Unsafe.get{Char,Short,Int,Long}[Unaligned]` (`lib.rs`) assembled multi-byte
+  reads only for `byte[]`; for typed arrays it read one element zero-extended,
+  so `getLongUnaligned(char[],…)` returned 1 char instead of 8 bytes.
+
+The cascade up to the symptom: ecj's `CharOperation.equals` **is**
+`Arrays.equals(char[])` → `"Signature".equals("Synthetic")` returned `true` →
+in `MethodInfo.readModifierRelatedAttributes` a method's `Signature` attribute
+was mis-read as the `Synthetic` attribute → the method got `ACC_SYNTHETIC`
+(`0x401`→`0x1401`) → `createMethods` dropped every generic method → "method
+undefined" + the phantom "Duplicate field" cascade → JSP won't compile → empty
+body → `null.contains("OK")`.
+
+Verified vs HotSpot (byte-identical): Arrays.equals/hashCode/sort/mismatch,
+ByteBuffer get/put, String equals/hashCode, HashMap; ecj resolves all generic
+methods and compiles the generated JSP with no errors. This was a serious
+LATENT VM bug affecting any char[]/long[] comparison and any generic-heavy Java
+compilation — not Tomcat-specific.
+
+## Remaining blocker (layer 6 = group 04 serving wall)
+
+With JSP compilation unblocked, `getUrl(...)` still returns a null/empty body:
+the embedded `Http11NioProtocol`/`NioEndpoint` connector accepts but does not
+drive the accepted `SocketChannel` through read→process→write. No new VM bug
+surfaced here yet; tracked under group 04.
 
 ## Layer summary (symptom → cause → fix)
 
