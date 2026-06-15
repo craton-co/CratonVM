@@ -13819,6 +13819,35 @@ fn execute_invokestatic_cached(
     }
 }
 
+/// Resolve `java/lang/String`'s instance-field layout (slot indices of
+/// `value`, `coder`, `hash`) for the JIT String call-site intrinsics
+/// (`length`/`charAt`/`isEmpty`/`hashCode`/`equals`/`compareTo`/`indexOf`).
+///
+/// String extends Object, which has no instance fields, so `find_own_field`'s
+/// indices match the slot indices used by `jit_getfield`. `coder` is optional —
+/// the legacy synthetic `char[]`-backed String has none, in which case
+/// `StringFieldLayout::new` records `has_coder = false` and the `coder`-dependent
+/// intrinsics bail to normal native dispatch. Returns `None` (all String
+/// intrinsics bail to dispatch) when String is not yet loaded or lacks the
+/// mandatory `value` / `hash` fields. Cheap enough to call once per compilation.
+fn resolve_string_field_layout(shared: &SharedVm) -> Option<cratonvm_jit::StringFieldLayout> {
+    let cm = shared.class_manager.read();
+    let string_id = cm.find_class_by_name("java/lang/String")?;
+    let class = cm.get_class(string_id)?;
+    let (value_idx, _) = class.find_own_field("value")?;
+    let (hash_idx, _) = class.find_own_field("hash")?;
+    let coder_idx = class.find_own_field("coder").map(|(idx, _)| idx);
+    // `string_id` doubles as the ObjectHeader class id used to guard
+    // `java/lang/CharSequence` accessor call sites (the receiver must be a
+    // real String for the inline String-layout decode to be sound).
+    Some(cratonvm_jit::StringFieldLayout::new(
+        value_idx,
+        coder_idx,
+        hash_idx,
+        string_id.as_u32(),
+    ))
+}
+
 /// Backward branch count threshold before triggering OSR compilation.
 const OSR_THRESHOLD: u32 = 1_000;
 
@@ -15217,6 +15246,7 @@ fn try_jit_upgrade_with_gate(
                 shared.profile_store.get_profile(&profile_key)
             };
             let c_helpers = crate::jit::helpers::build_helpers();
+            let c_string_layout_resolver = || resolve_string_field_layout(shared);
             let compiled = crate::jit::try_compile(
                 &callee_cached,
                 Some(&c_resolver),
@@ -15230,13 +15260,13 @@ fn try_jit_upgrade_with_gate(
                 c_pgo_profile.as_ref(),
                 &c_helpers,
                 None, // no inlining in early-compile path
-                // string_layout_resolver: None until the String call-site
-                // intrinsics land (a later wave). To enable, pass a closure
-                // `|| -> Option<cratonvm_jit::StringFieldLayout>` that resolves
-                // java/lang/String's value/coder/hash field indices via
-                // `shared.class_manager` + `Class::find_own_field`, then calls
-                // `StringFieldLayout::new(value_idx, coder_idx_opt, hash_idx)`.
-                None,
+                // String call-site intrinsics (length/charAt/hashCode/equals/…):
+                // resolve java/lang/String's value/coder/hash field layout so the
+                // JIT inlines these accessors instead of crossing the VM→native
+                // boundary per call (bug-03). `resolve_string_field_layout`
+                // returns None → intrinsics bail to dispatch when String isn't
+                // loaded yet.
+                Some(&c_string_layout_resolver),
                 Some(&c_invoke_class_id_resolver),
             )?;
             let entry = compiled.entry_ptr() as usize; // Cast: JIT entry point to address
@@ -15307,6 +15337,7 @@ fn try_jit_upgrade_with_gate(
     // be default-ON until that is root-caused. The infrastructure was previously
     // wired only into `try_jit_compile_callee_slow`. See the JIT-inlining notes.
     let main_inline_on = crate::runtime::env_cache::jit_main_inline();
+    let string_layout_resolver = || resolve_string_field_layout(shared);
     let compiled = crate::jit::try_compile(
         cached,
         Some(&resolver),
@@ -15320,9 +15351,11 @@ fn try_jit_upgrade_with_gate(
         pgo_profile.as_ref(),
         &helpers,
         if main_inline_on { Some(&inline_resolver) } else { None },
-        // string_layout_resolver: None until the String call-site intrinsics
-        // land — see the matching comment at the early-compile call site.
-        None,
+        // String call-site intrinsics (length/charAt/hashCode/equals/…): resolve
+        // java/lang/String's value/coder/hash field layout so the JIT inlines
+        // these accessors instead of crossing the VM→native boundary per call
+        // (bug-03). Mirrors the already-wired `try_jit_compile_callee_slow` path.
+        Some(&string_layout_resolver),
         Some(&invoke_class_id_resolver),
     )?;
     let ret = crate::jit::return_type(&cached.method_descriptor);
@@ -15775,26 +15808,8 @@ fn try_jit_compile_callee_slow(
     };
 
     // Resolve java/lang/String's field layout for the JIT String call-site
-    // intrinsics. Looks up the loaded `java/lang/String` class and reads the
-    // absolute instance-field indices of `value`, `coder`, `hash` via
-    // `Class::find_own_field` (String extends Object, which has no instance
-    // fields, so `first_field_index == 0` and these indices match the slot
-    // indices used by `get_field` / `jit_getfield`). `coder` is optional —
-    // the legacy synthetic `char[]`-backed String has no `coder` field, in
-    // which case `StringFieldLayout::new` records `has_coder = false`.
-    // Returns `None` (intrinsics bail to dispatch) if String is not loaded
-    // or lacks the mandatory `value` / `hash` fields.
-    let string_layout_resolver = || -> Option<cratonvm_jit::StringFieldLayout> {
-        let cm = shared.class_manager.read();
-        let string_id = cm.find_class_by_name("java/lang/String")?;
-        let class = cm.get_class(string_id)?;
-        let (value_idx, _) = class.find_own_field("value")?;
-        let (hash_idx, _) = class.find_own_field("hash")?;
-        let coder_idx = class.find_own_field("coder").map(|(idx, _)| idx);
-        Some(cratonvm_jit::StringFieldLayout::new(
-            value_idx, coder_idx, hash_idx,
-        ))
-    };
+    // intrinsics (see `resolve_string_field_layout`).
+    let string_layout_resolver = || resolve_string_field_layout(shared);
 
     let compile_start = std::time::Instant::now();
     let compiled = crate::jit::try_compile(

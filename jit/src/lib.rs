@@ -1854,16 +1854,26 @@ pub struct StringFieldLayout {
     /// Byte offset of `coder`'s `Value` cell from the object base.
     /// Meaningful only when [`has_coder`](Self::has_coder) is `true`.
     pub coder_cell_offset: i32,
+    /// `ObjectHeader` class id of `java/lang/String` (the value stored at
+    /// object offset 0). Used as the receiver class-id guard for the
+    /// `java/lang/CharSequence` accessor intrinsics (`charAt`/`length`/
+    /// `isEmpty`): a CharSequence call site inlines the String-layout decode
+    /// only behind a `[recv+0] == string_class_id` guard, deopting to native
+    /// dispatch for any other CharSequence (`StringBuilder`, …). For a
+    /// `java/lang/String` site (final, monomorphic) no guard is emitted.
+    pub string_class_id: u32,
 }
 
 impl StringFieldLayout {
     /// Build a layout from raw field indices, precomputing the cell offsets.
     /// `coder_field_index` is ignored (and the offset zeroed) when
-    /// `has_coder` is `false`.
+    /// `has_coder` is `false`. `string_class_id` is the `java/lang/String`
+    /// `ObjectHeader` class id used as the CharSequence receiver guard.
     pub fn new(
         value_field_index: usize,
         coder_field_index: Option<usize>,
         hash_field_index: usize,
+        string_class_id: u32,
     ) -> Self {
         let cell = |idx: usize| -> i32 {
             (cratonvm_types::HEADER_SIZE + idx * cratonvm_types::SLOT_SIZE) as i32
@@ -1876,6 +1886,7 @@ impl StringFieldLayout {
             has_coder: coder_field_index.is_some(),
             coder_field_index: coder_field_index.unwrap_or(0),
             coder_cell_offset: coder_field_index.map_or(0, cell),
+            string_class_id,
         }
     }
 }
@@ -2478,15 +2489,24 @@ pub fn try_resolve_intrinsic(
 /// calls THIS function for instance-method invokes, passing the
 /// `StringFieldLayout` it resolved once for the compilation.
 ///
-/// Returns `Some((entry, num_params, return_type))` exactly like
-/// [`try_resolve_intrinsic`]. Returns `None` — so the call falls back to
-/// normal native dispatch — when:
-///   * `class` is not `java/lang/String`;
+/// Returns `Some((entry, num_params, return_type, guard_class_id))`. The
+/// `guard_class_id` is `0` for a statically-monomorphic `java/lang/String`
+/// receiver (no runtime guard needed — String is `final`) and the
+/// `java/lang/String` `ObjectHeader` class id for a `java/lang/CharSequence`
+/// receiver (the codegen then emits a `[recv+0] == guard` check, deopting to
+/// native dispatch for any non-String CharSequence). Returns `None` — so the
+/// call falls back to normal native dispatch — when:
+///   * `class` is neither `java/lang/String` nor `java/lang/CharSequence`;
 ///   * `string_layout` is `None` (String not loaded / resolver unavailable);
 ///   * the resolved layout has no `coder` field (`has_coder == false`, the
 ///     legacy `char[]` String layout) — every inlined String intrinsic
 ///     decodes via `coder`, so a layout without it cannot be inlined;
+///   * a CharSequence site has no resolved String class id to guard against;
 ///   * `(name, descriptor)` is not one of the inlined signatures.
+///
+/// CharSequence eligibility is limited to the accessors CharSequence actually
+/// declares — `charAt`/`length`/`isEmpty`; the String-specific
+/// `hashCode`/`equals`/`compareTo`/`indexOf` are `java/lang/String` only.
 ///
 /// The codegen ladder in `x64.rs` (the 0xb6/b7/b9 STRING_ACCESS /
 /// STRING_SEARCH regions) consumes `compiler.string_layout`, which is
@@ -2499,8 +2519,15 @@ pub fn try_resolve_string_intrinsic(
     name: &str,
     descriptor: &str,
     string_layout: Option<StringFieldLayout>,
-) -> Option<(usize, usize, u8)> {
-    if class != "java/lang/String" {
+) -> Option<(usize, usize, u8, u32)> {
+    // Receiver-guard mode by the *declared* class of the call site:
+    //   * java/lang/String      — final, monomorphic → no guard (0).
+    //   * java/lang/CharSequence — the receiver may be any CharSequence, so
+    //     the String-layout decode is only valid behind a runtime class-id
+    //     guard against the real String class id.
+    let is_string = class == "java/lang/String";
+    let is_charseq = class == "java/lang/CharSequence";
+    if !is_string && !is_charseq {
         return None;
     }
     // Every inlined String intrinsic reads the `coder` byte to pick the
@@ -2510,17 +2537,25 @@ pub fn try_resolve_string_intrinsic(
     if !layout.has_coder {
         return None;
     }
+    let guard: u32 = if is_string { 0 } else { layout.string_class_id };
+    // A CharSequence site needs a real String class id; without one the
+    // inline decode would be unguarded — bail to native dispatch.
+    if is_charseq && guard == 0 {
+        return None;
+    }
 
     // ===== INTRINSIC REGION BEGIN: STRING_ACCESS =====
+    // `charAt`/`length`/`isEmpty` are declared on CharSequence and so are
+    // eligible for both receiver kinds; `hashCode` is String-only.
     let hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
         ("length", "()I") => Some((JitIntrinsic::StringLength, 0, b'I')),
         ("isEmpty", "()Z") => Some((JitIntrinsic::StringIsEmpty, 0, b'Z')),
         ("charAt", "(I)C") => Some((JitIntrinsic::StringCharAt, 1, b'C')),
-        ("hashCode", "()I") => Some((JitIntrinsic::StringHashCode, 0, b'I')),
+        ("hashCode", "()I") if is_string => Some((JitIntrinsic::StringHashCode, 0, b'I')),
         _ => None,
     };
     if let Some((intrinsic, num_params, ret)) = hit {
-        return Some((intrinsic.as_entry(), num_params, ret));
+        return Some((intrinsic.as_entry(), num_params, ret, guard));
     }
     // ===== INTRINSIC REGION END: STRING_ACCESS =====
 
@@ -2529,7 +2564,9 @@ pub fn try_resolve_string_intrinsic(
     // codegen ladder decodes every character through the receiver's /
     // argument's own `coder` byte, so all LATIN1/UTF16 combinations are
     // handled inline; only null receiver / null argument / null backing
-    // array route to the deopt stub.
+    // array route to the deopt stub. These signatures are declared on
+    // `java/lang/String` (not CharSequence), so they never reach a guarded
+    // (CharSequence) call site.
     //
     //   * compareTo(String)   — lexicographic decoded-char compare; the
     //     unsigned-char difference at the first mismatch, else len1-len2.
@@ -2539,19 +2576,21 @@ pub fn try_resolve_string_intrinsic(
     //     their masked low half, no surrogate special-casing).
     //   * indexOf(String)     — naive O(n*m) substring search from 0; an
     //     empty needle returns 0.
-    let search_hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
-        ("equals", "(Ljava/lang/Object;)Z") => Some((JitIntrinsic::StringEquals, 1, b'Z')),
-        ("compareTo", "(Ljava/lang/String;)I") => {
-            Some((JitIntrinsic::StringCompareTo, 1, b'I'))
+    if is_string {
+        let search_hit: Option<(JitIntrinsic, usize, u8)> = match (name, descriptor) {
+            ("equals", "(Ljava/lang/Object;)Z") => Some((JitIntrinsic::StringEquals, 1, b'Z')),
+            ("compareTo", "(Ljava/lang/String;)I") => {
+                Some((JitIntrinsic::StringCompareTo, 1, b'I'))
+            }
+            ("indexOf", "(I)I") => Some((JitIntrinsic::StringIndexOfChar, 1, b'I')),
+            ("indexOf", "(Ljava/lang/String;)I") => {
+                Some((JitIntrinsic::StringIndexOfStr, 1, b'I'))
+            }
+            _ => None,
+        };
+        if let Some((intrinsic, num_params, ret)) = search_hit {
+            return Some((intrinsic.as_entry(), num_params, ret, 0));
         }
-        ("indexOf", "(I)I") => Some((JitIntrinsic::StringIndexOfChar, 1, b'I')),
-        ("indexOf", "(Ljava/lang/String;)I") => {
-            Some((JitIntrinsic::StringIndexOfStr, 1, b'I'))
-        }
-        _ => None,
-    };
-    if let Some((intrinsic, num_params, ret)) = search_hit {
-        return Some((intrinsic.as_entry(), num_params, ret));
     }
     // ===== INTRINSIC REGION END: STRING_SEARCH =====
 
@@ -4367,12 +4406,14 @@ fn try_compile_inner(
                 // decision and the codegen's "can emit inline" decision
                 // never disagree — a String sentinel is never registered
                 // for a site whose codegen would then bail to a raw `CALL`.
-                if let Some((entry, num_params, ret)) = try_resolve_string_intrinsic(
-                    &class_name,
-                    &method_name,
-                    &descriptor,
-                    resolved_string_layout,
-                ) {
+                if let Some((entry, num_params, ret, guard_class_id)) =
+                    try_resolve_string_intrinsic(
+                        &class_name,
+                        &method_name,
+                        &descriptor,
+                        resolved_string_layout,
+                    )
+                {
                     needs_heap = true;
                     direct_calls.push((
                         pc,
@@ -4381,10 +4422,12 @@ fn try_compile_inner(
                             needs_context: false,
                             num_params,
                             return_type: ret,
-                            // String is `final` — a virtual site keyed on the
-                            // declared class is monomorphic, so no receiver
-                            // class-id guard is needed.
-                            guard_class_id: 0,
+                            // `java/lang/String` is `final` → monomorphic →
+                            // `guard_class_id == 0` (no guard). A
+                            // `java/lang/CharSequence` site carries the String
+                            // class id so the codegen guards the receiver and
+                            // deopts for any non-String CharSequence.
+                            guard_class_id,
                         },
                     ));
                     continue;

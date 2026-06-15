@@ -56,19 +56,79 @@ intrinsified direct char-array read (~1.5 ns). The `java.util.regex.Pattern$Node
 loop calls `charAt` per character per position, so it inherits the same ~400–1000×
 penalty; ShrinkWrap calls it per class.
 
-## Status / fix direction
-Open — a **JIT/intrinsics performance project**, not a one-line fix:
-- **Primary:** add JIT intrinsics for the hot String/char accessors
-  (`String.charAt`, `length`, `coder`/`value` access, `charSequence` reads) so
-  compiled code touches the String's backing array directly instead of calling the
-  native each iteration. This is what makes char-by-char loops (regex, path
-  manipulation, `replace`) fast on HotSpot.
-- Secondary: ensure the `Pattern$*.match` methods are JIT-compiled (not skip-listed)
-  once charAt is intrinsified, so the match loop runs as native code.
+## Update (2026-06-14): two independent root causes — (A) FIXED, (B) is the real regex blocker
 
-This is a sensitive area (the JIT carries a curated skip-list and threshold tuning),
-so it needs a focused change with full suite re-test — deferred, not rushed here.
+Investigation split the slowdown into **two separate causes**. The original
+write-up assumed the `Pattern$*.match` loop was JIT-compiled but slow because of
+native `charAt`; in fact it is **not compiled at all** (cause B). Both must be
+fixed for regex to be fast.
 
-Until then the CratonVM Arquillian client cannot build the JUnit-5 deployment archive
-in reasonable time. (The no-container per-class suite is unaffected — it never builds
-a real deployment, so it never hits this hot path.)
+### (A) native-bridged char accessors in *compiled* code — **FIXED**
+The JIT already had complete, unit-tested call-site intrinsic codegen for
+`String.length/charAt/isEmpty/hashCode/equals/compareTo/indexOf` (the
+`STRING_ACCESS`/`STRING_SEARCH` regions in `jit/src/x64.rs`), but it was
+**dormant**: the interpreter passed `string_layout_resolver: None` at the tier-up
+`try_compile` sites ("later wave"). Fix:
+- `vm/src/runtime/interpreter.rs` — added `resolve_string_field_layout()` and
+  wired it into both `try_jit_upgrade_with_gate` `try_compile` sites (main
+  invocation-threshold tier-up + recursive inline-callee). (`try_jit_compile_callee_slow`
+  was already wired.)
+- Extended it to **`CharSequence.charAt/length/isEmpty`** behind a receiver
+  class-id guard: `jit/src/lib.rs` (`StringFieldLayout.string_class_id`,
+  `try_resolve_string_intrinsic` now returns a `guard_class_id` and matches
+  `java/lang/CharSequence`) + a `[recv+0] == string_class_id` guard in the
+  `STRING_ACCESS` codegen (`jit/src/x64.rs`) that deopts to native dispatch for
+  any non-String CharSequence (e.g. `StringBuilder`) — the same pattern the CRC32
+  intrinsics use. Regex calls `charAt`/`length` through `CharSequence`
+  (`Matcher.text`), so this is required for the regex receiver type.
+
+Measured (JDK 25 boot, 58-char input; `wildfly-suite/repro`):
+
+| benchmark | before | after | HotSpot |
+|-----------|--------|-------|---------|
+| `CharAtBench` static charAt loop, 12M calls | ~18 000 ms | **195 ms** | 10 ms |
+| `CSBench` **CharSequence**-typed charAt, 12M | 10 827 ms | **395 ms** | — |
+
+~90× / ~27×. Correct (sum/acc bit-identical to HotSpot). 31 codegen unit tests
+pass (`intrinsic_string_access` incl. new CharSequence-guard tests,
+`intrinsic_string_search`).
+
+### (B) instance methods never invocation-tier-up — **the real regex blocker, OPEN**
+After (A), `RegexBench2` was **unchanged (~15 000 ms)**. `CRATONVM_DBG_JITC=1`
+shows **zero** regex methods compile — `Pattern$*.match` / `Matcher.find/replaceAll`
+run in the **interpreter**, where `charAt` is always native-bridged, so the
+call-site intrinsic never applies (it only fires in *compiled* callers).
+
+Root cause, confirmed with a zero-code-change A/B (`CharAtBench` vs `InstBench`,
+identical charAt loop body):
+
+| same loop, called 200k× | CratonVM | HotSpot |
+|-------------------------|----------|---------|
+| in a **static** method  | **195 ms** | 10 ms |
+| in an **instance** method | **24 729 ms** | 20 ms |
+
+The 126× gap is purely static-vs-instance. Reason: `increment_invocation` (the
+warmup counter that triggers `try_jit_upgrade_with_gate`) is called in **exactly
+one** place — `execute_invokestatic_cached`. Instance methods (invokevirtual /
+invokeinterface, in `execute_invokevirtual_cached`) have **no invocation counter**;
+their only paths to the JIT are OSR (needs ≥1000 back-edges in a *single*
+invocation) and direct-call-callee compilation. Regex spreads its work across many
+**short-loop instance methods**, so none ever cross OSR and none compile.
+
+**Fix direction for (B):** give the invokevirtual/invokeinterface dispatch path an
+invocation counter mirroring `execute_invokestatic_cached` (increment →
+`try_jit_upgrade_with_gate` → update invoke cache to `Jit`). This is a
+**large-blast-radius** change (it makes the whole instance-method surface
+JIT-eligible, interacting with the curated skip-list and `execute_jit_call`
+receiver handling), so it needs full WildFly/Kafka/Tomcat suite re-test on an
+uncontended machine — deferred. Once it lands, regex gets fast *for free* because
+the (A) intrinsics are already in place.
+
+Secondary follow-up: the OSR (`try_osr`) and early-compile `x64::compile` paths
+still pass `string_layout: None` and don't run `try_resolve_string_intrinsic`, so a
+*single* hot-loop instance method that DOES OSR-compile won't get charAt
+intrinsified yet. Lower priority than (B) (won't help regex's short loops).
+
+Until (B) lands, the CratonVM Arquillian client still cannot build the JUnit-5
+deployment archive in reasonable time. (The no-container per-class suite is
+unaffected — it never builds a real deployment, so it never hits this hot path.)
