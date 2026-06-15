@@ -923,17 +923,32 @@ std::thread_local! {
 }
 
 fn native_url_set_stream_handler_factory_guard(
-    _ctx: &mut dyn NativeContext,
-    _args: &[Value],
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
 ) -> MethodCallResult {
     let d = URL_SET_STREAM_HANDLER_FACTORY_DEPTH.get();
     if d != 0 {
+        // Re-entrant install (Spring Boot's factory recurses through
+        // class-init while the outer call is still unwinding). The JDK would
+        // throw `Error("factory already defined")`; we swallow it to keep the
+        // single, outermost factory — matching "first install wins" for the
+        // nested case.
         return Ok(None);
     }
     URL_SET_STREAM_HANDLER_FACTORY_DEPTH.set(1);
-    let out = Ok(None);
+    // `setURLStreamHandlerFactory` is a *static* method, so `args[0]` is the
+    // factory itself (no receiver). Publish it into the real `java.net.URL`
+    // static `factory` field so the un-intercepted real `getURLStreamHandler`
+    // bytecode consults it. Without this the field stays null and
+    // `new URL("vfszip:...")` (Hibernate JarVisitorTest, Spring Boot loader)
+    // raises `MalformedURLException: unknown protocol`. The real JDK also
+    // clears the `handlers` cache on install; we leave it — a freshly-booted
+    // VM has nothing cached for an app-defined scheme.
+    if let Some(Value::Object(Some(fac))) = args.first() {
+        ctx.set_static_field_by_name("java/net/URL", "factory", Value::Object(Some(*fac)));
+    }
     URL_SET_STREAM_HANDLER_FACTORY_DEPTH.set(0);
-    out
+    Ok(None)
 }
 
 /// App-specific compatibility stubs: "fake main" launcher short-circuits and
