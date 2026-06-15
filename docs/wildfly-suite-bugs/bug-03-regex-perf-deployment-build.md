@@ -193,13 +193,101 @@ Per-`replaceAll` ≈ 0.48 ms — ShrinkWrap calls it once per class, so ~1000 cl
 ≈ 0.5 s (was minutes-to-never). The skip-list entry is a **no-op for the default
 config** (search only compiles under the still-default-OFF virtual-tierup flag).
 
+### Layer C root cause — CORRECTED (2026-06-15): TWO distinct bugs, earlier conflated
+
+An earlier write-up here attributed layer C to "the precise-oop-maps
+post-safepoint-reload gap" based on a gate-toggle test (precise-OFF → corrupt;
+`CRATONVM_PRECISE_JIT_MAPS=1` → SIGSEGV). **That conflated two different bugs in
+two different methods.** Careful A/B (with `Matcher.search` temporarily un-banned)
+separates them:
+
+1. **`String.codePointAt` precise-ON crash — a real precise-maps Stage-A bug,
+   FIXED.** The invokevirtual/interface inline MIC/PIC cascade called the compiled
+   callee on a class-id hit then `jmp`ed to the *shared* post-safepoint reload, but
+   the pre-safepoint spill was only on the slow path → the inline-hit path reloaded
+   an un-spilled stale slot into the receiver register → SIGSEGV. Minimal repro
+   `wildfly-suite/repro/CPBench.java` (`s.codePointAt(i)`). FIXED in `jit/src/x64.rs`
+   (spill before the cascade under `precise_maps`; gate-OFF byte-identical — bt16/
+   bt18 golden, full jit suite passes). This was the **SIGSEGV** half of the toggle
+   test. ✔ verified fixed under precise-ON.
+
+2. **Compiled `Matcher.search` zero-width corruption — the actual reason for the
+   ban — is PRECISE-INDEPENDENT and GC-INDEPENDENT, and is STILL OPEN.** With
+   `search` un-banned it corrupts (`/o/r/g/...`) under **all** of: precise-OFF,
+   precise-ON (even after fix #1), and `--Xmx 8g` (no GC). So it is NOT the
+   precise-maps reload and NOT GC relocation — it is a plain compiled-`search`
+   JIT codegen miscompile (manifests only with `search` AND its callee both
+   compiled; either interpreted → correct). Root cause within compiled `search`
+   not yet pinpointed; the `Matcher.search` skip-list ban remains the mitigation.
+   This was the **corrupt** half of the toggle test — a separate bug from #1.
+
+**Consequence:** precise maps does NOT fix layer C (bug #2). The fix #1 above is a
+genuine, separate precise-maps improvement, but the `Matcher.search` (and
+`ByteBuddyState.make`, AQS/ExecProbe) bans remain necessary regardless of precise
+maps. The mitigation table above still holds.
+
+**Mitigation perf (search ban on):**
+
+| RegexBench2 (warm 20k) | flag OFF | flag ON + search ban | HotSpot |
+|------------------------|----------|----------------------|---------|
+| precompiled replaceAll | 14 958 ms | **9 529 ms** | 26 ms |
+
+### Layer C bug #2 — ROOT-CAUSED + FIXED (2026-06-15): JIT virtual-dispatch bail resolved on the static call-site class
+
+Bug #2 was **not** a miscompile of `search`'s body, nor a JIT→JIT register/ABI
+fault. It was a **dispatch-resolution** bug in the JIT virtual-call runtime
+helper. Bisection (`CRATONVM_JIT_BISECT_SKIP`) pinned it to the
+`Matcher.search` ↔ `Pattern$Start.match` pair (skipping *either* fixes it;
+skipping any other regex node does not). Disasm of compiled `search` showed the
+`root.match(this, from, text)` call site goes through `jit_invoke_virtual_mic`
+with a 4-element arg slice `[receiver, matcher, from, text]`.
+
+Chain:
+1. `root.match` is statically typed `Pattern$Node`; the receiver is a
+   `Pattern$Start`. Its compiled entry needs the hidden ctx register, so the
+   call is "4 args **with ctx**".
+2. `try_call_compiled_entry`'s register tables only cover ≤3 with-ctx args, so it
+   returns `None` → the helper falls to `bail_to_interpreter`.
+3. **The bug:** `bail_to_interpreter` called `invoke_or_native(info.class_name,
+   …)` — and for a *virtual* call `info.class_name` is the **static** call-site
+   type `Pattern$Node`, not the receiver's runtime class `Pattern$Start`.
+   `invoke_or_native` binds to the class name it is handed (it does NOT
+   re-dispatch on the receiver), so it ran the **concrete base**
+   `Pattern$Node.match` — an unconditional zero-width "accept" (`matcher.last =
+   i; return true`). That accepts at every position, so `find()` reports a
+   zero-width match before every character and `replaceAll("[.]","/")` yields
+   `/o/r/g/...`.
+
+Why "both compiled" was required: only when `search` is compiled does the call
+route through `jit_invoke_virtual_mic` (→ overflow bail). When `search` is
+interpreted it uses the interpreter's own receiver-resolving invoke; when
+`Start.match` is interpreted there is no compiled entry to overflow on, so the
+helper takes its receiver-resolved cold path. Both correct — only the
+compiled→compiled register-overflow bail hit the static-class path.
+
+**Fix** (`vm/src/jit/helpers.rs`): `bail_to_interpreter` now resolves the
+dispatch class from the **receiver's runtime class** for virtual/interface kinds
+(`invoke_kind` 0/2) via the new `virtual_dispatch_class` helper — mirroring the
+receiver resolution `jit_invoke_virtual_mic`'s cold/miss paths already use
+(array→`Object`, synthetic-id→static fallback). Statically-bound kinds
+(invokespecial=1 → `invoke_special_shared`; invokestatic=3 → static class) are
+unchanged. This also covers the exception-reroute bail in the MIC hit path.
+
+Result: `Matcher.search` now **compiles correctly** under
+`CRATONVM_JIT_VIRTUAL_TIERUP`; the skip-list ban is **removed**. `RegexBench`
+returns `org/junit/jupiter/...` and runs at interpreter speed or better
+(replaceAll x2000: 1593 ms compiled-correct vs 5742 ms corrupt vs 1582 ms
+interp). bt16/bt18 golden hold gate-OFF and B-ON.
+
 ### Remaining
-1. The general JIT→JIT call-boundary codegen defect (shared with
-   `ByteBuddyState.make`) — once fixed, drop the `Matcher.search` ban for full
-   regex speed.
-2. Flipping `CRATONVM_JIT_VIRTUAL_TIERUP` default-ON still needs a full
-   WildFly/Kafka/Tomcat suite re-test (B compiles the whole instance-method
-   surface; other latent miscompiles may surface and need the same treatment).
-Until then, run the WildFly Arquillian client with `CRATONVM_JIT_VIRTUAL_TIERUP=1`
-to get the regex/ShrinkWrap path fast enough to build the JUnit-5 deployment
-archive.
+1. **Flip `CRATONVM_JIT_VIRTUAL_TIERUP` default-ON + full-suite re-test** — bug #2
+   (this dispatch bug) and the codePointAt precise-ON crash (fix #1) are both
+   fixed. Remaining gate is a full WildFly-suite re-test on an uncontended
+   machine to confirm no other per-method compiled-instance miscompiles surface
+   once the whole instance-method surface compiles.
+
+Run the WildFly Arquillian client with `CRATONVM_JIT_VIRTUAL_TIERUP=1` — regex is
+now correct and fast with `search` compiled, and static + instance hot paths
+benefit from layers A/B. (The codePointAt precise-ON fix #1 is independent — it
+makes the precise-maps path safe for compiled instance methods that hit the
+inline cascade, a prerequisite for any future B+precise default-on.)

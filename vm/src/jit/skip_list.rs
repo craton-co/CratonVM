@@ -1414,23 +1414,20 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         // build entry so Hibernate proxies generate correctly; the underlying
         // codegen defect is tracked for a general fix.
         | ("org/hibernate/bytecode/internal/bytebuddy/ByteBuddyState", "make")
-        // REGEX-SEARCH (bug-03 layer C, 2026-06-14) — `java.util.regex.Matcher.
-        // search(I)Z` miscompiles, surfaced once instance methods became
-        // invocation-JIT-eligible (`CRATONVM_JIT_VIRTUAL_TIERUP`). With it
-        // compiled, `String.replaceAll("[.]","/")` returns "/o/r/g/.../" — find()
-        // gets zero-width matches at every position instead of matching the dots.
-        // Bisected with `CRATONVM_JIT_BISECT_SKIP`: skipping ONLY `Matcher.search`
-        // makes RegexBench/RegexBench2 correct again (and partially fast, since
-        // the other regex nodes + the layer-A charAt intrinsics still JIT). The
-        // (B) dispatch itself is proven correct (InstBench/StrInstBench match
-        // HotSpot); search's compiled body is wrong. Same JIT->JIT call-boundary
-        // signature as `ByteBuddyState.make` above (compiled `search` calls
-        // compiled `Pattern$Node.match`) — a value/receiver lost across the
-        // boundary. Skip-list until the general codegen defect is root-caused;
-        // search only compiles under the (still default-OFF) virtual-tierup flag,
-        // so this is a no-op for the default config. Disasm artifact + analysis
-        // in docs/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md.
-        | ("java/util/regex/Matcher", "search")
+        // NOTE (bug-03 layer C, root-caused 2026-06-15): the former
+        // `("java/util/regex/Matcher", "search")` ban is GONE. The defect was
+        // not in `search`'s compiled body but in the JIT virtual-dispatch *bail*
+        // path: when `jit_invoke_virtual_mic`'s register-arg table overflowed
+        // (the 4-arg-with-ctx `Pattern$Node.match` call), `bail_to_interpreter`
+        // resolved the callee against the *static* call-site class
+        // (`Pattern$Node`) instead of the receiver's runtime class
+        // (`Pattern$Start`). `Pattern$Node.match` is a concrete zero-width
+        // "accept" node, so `find()` matched empty at every position and
+        // `replaceAll("[.]","/")` produced "/o/r/g/...". Fixed in
+        // `vm/src/jit/helpers.rs::bail_to_interpreter` (receiver-class
+        // resolution for invoke_kind 0/2); `Matcher.search` now compiles
+        // correctly under `CRATONVM_JIT_VIRTUAL_TIERUP`. Analysis in
+        // docs/wildfly-suite-bugs/bug-03-regex-perf-deployment-build.md.
         // SPB.3 (Session 111 r14) — `apps/SportMe-master`'s Spring Boot
         // bootstrap segfaults (rc=139) deep in Spring's
         // `ConfigurationPropertySources` cache-key build path. Per r13
