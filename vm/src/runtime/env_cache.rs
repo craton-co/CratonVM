@@ -137,6 +137,25 @@ cached_is_set!(
     "CRATONVM_SKIP_REDUNDANT_NATIVE_SNAPSHOT"
 );
 
+// Opt-in: keep the `rootsnap_cache` frozen-frame cache valid ACROSS a GC by
+// remapping its cached roots through the collection's `pointer_map`, instead of
+// discarding the whole cache on every `collection_count` bump. The cache holds
+// object ADDRESSES; a collection only invalidates them if it RELOCATED the
+// object — and even the default non-moving young sweep relocates via selective
+// promotion (young→old), so the plain gen gate rebuilds the cache on nearly
+// every collection during an allocation-heavy deploy. Remapping (the same proven
+// operation that relocates frame locals) lets the cache survive. Fail-safe:
+// `rs_cache_gen` is advanced to the post-collection count ONLY at the remap
+// sites, so any GC path that relocates this thread WITHOUT remapping leaves the
+// gen stale → the gate rebuilds (a stale cached address is never trusted).
+// Requires `rootsnap_cache` (else `rs_cache` is always empty → no-op).
+// Default-OFF: verify with the bt18 checksum oracle (68332206) before enabling.
+// See `update_root_snapshot` and `remap_rs_cache_after_gc`.
+cached_is_set!(
+    rootsnap_cache_survive_gc,
+    "CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC"
+);
+
 cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
 // Opt-in: enable small-method inlining in the main JIT tier-up compile path.
 // Default-OFF until a `try_emit_inline_body` miscompile (Spring boot enum CCE)

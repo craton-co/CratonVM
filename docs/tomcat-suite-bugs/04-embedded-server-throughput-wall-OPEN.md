@@ -90,12 +90,28 @@
 >       the suite can opt in via env. Residual caveat: only the *non-moving*
 >       default sweep + bt18's allocation pattern were exercised — a dedicated
 >       moving-GC + concurrent-old-gen soak should precede flipping it default-ON.
->    3. *Make the cache survive non-moving collections.* The default young sweep is
->       non-moving (selective promotion), so object ADDRESSES are stable across it;
->       invalidating the whole cache on every `collection_count` bump is overly
->       conservative. Track a separate *moving*-collection epoch and only drop the
->       cache on a moving GC, re-validating reused roots via `is_object_address`.
->       Restores cache hit-rate on the churning path without changing the root set.
+>    3. *Make the cache survive collections.* ✅ **IMPLEMENTED (gated, default-OFF):**
+>       `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC=1` (requires `CRATONVM_ROOTSNAP_CACHE`).
+>       Subtlety: even the default "non-moving" young sweep RELOCATES survivors via
+>       selective promotion (young→old), so the cache can't just be kept blindly —
+>       promoted cached roots move. Instead `remap_rs_cache_after_gc` remaps the
+>       cached roots through the collection's `pointer_map` (the same proven op that
+>       relocates frame locals) at every site that already remaps a thread's frames
+>       (`update_all_roots`, `apply_pointer_map_to_thread`), then tags the cache with
+>       the post-collection count. A cached root's object is always LIVE across the
+>       collection (its frame is a GC root → never freed), so it can only move, never
+>       dangle. **FAIL-SAFE:** `rs_cache_gen` is advanced ONLY at those remap sites,
+>       so any GC path that relocates this thread without remapping leaves the gen
+>       stale → the gate rebuilds (a stale address is never trusted).
+>       **Verified:** bt18 GC-stress checksum = `68332206` (== HotSpot) in ALL
+>       configs — default, cache-only, and cache+survive (the config that exercises
+>       the rs_cache remap across promotions) — plus the tomcat regression set still
+>       passes with it (and lever #2) ON. **Measured:** reduces per-call rootsnap
+>       cost (cleanest reading ~11 µs → ~6 µs, roughly halved; bt18 was the FASTEST
+>       of the three configs with it on). Exact deploy magnitude is obscured by
+>       concurrent peer-VM load on the measurement box — a quiet-machine re-measure
+>       should precede flipping it default-ON. Composes with lever #2 (independent:
+>       #2 cuts call COUNT, #3 cuts per-call COST).
 >
 > Net: group 04 is no longer "servers don't serve" or "client returns -1" — those
 > are fixed. The residual wall is **`update_root_snapshot` overhead × per-class
