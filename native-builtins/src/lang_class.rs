@@ -7603,7 +7603,25 @@ pub(crate) fn annotation_element_to_java_typed(
                 // Primitive arrays in annotations (`int[]`, `boolean[]`, etc.)
                 // are still allocated as boxed wrapper arrays here per
                 // pre-existing behaviour — pick the wrapper class.
-                Some(AEV::Int(_)) => "java/lang/Integer".to_string(),
+                //
+                // spring-bug-01: AEV::Int is overloaded for Z/B/C/S/I (the
+                // `.class` AnnotationDefault encodes them all as int constants).
+                // The element values below are already boxed into the correct
+                // wrapper via `elem_desc`, but the ARRAY's component class was
+                // hardcoded to Integer here — so a `char[]` default became an
+                // `Integer[]`-typed array holding Character values, and Spring's
+                // `AnnotationTypeMapping.adapt` rejected it ("should be compatible
+                // with char[] but a java.lang.Integer[] value was returned").
+                // Derive the component wrapper from the array's component
+                // descriptor so `[C`→Character[], `[Z`→Boolean[], etc. (which
+                // Spring then coerces to the primitive array).
+                Some(AEV::Int(_)) => match return_type_desc.and_then(|rd| rd.strip_prefix('[')) {
+                    Some("Z") => "java/lang/Boolean".to_string(),
+                    Some("B") => "java/lang/Byte".to_string(),
+                    Some("C") => "java/lang/Character".to_string(),
+                    Some("S") => "java/lang/Short".to_string(),
+                    _ => "java/lang/Integer".to_string(),
+                },
                 Some(AEV::Long(_)) => "java/lang/Long".to_string(),
                 Some(AEV::Float(_)) => "java/lang/Float".to_string(),
                 Some(AEV::Double(_)) => "java/lang/Double".to_string(),
