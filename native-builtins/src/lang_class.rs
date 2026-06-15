@@ -7580,6 +7580,63 @@ pub(crate) fn annotation_element_to_java_typed(
             // `F4.class`, which `isAnnotation()` returns `true` for, and the
             // synthesize loop then runs as expected.
             use cratonvm_native_api::AnnotationElementValue as AEV;
+            // SB-02b — primitive annotation arrays (`int[] mv()`, `boolean[]`,
+            // `long[]`, …) must materialise as REAL primitive arrays, not boxed
+            // wrapper arrays. The canonical tripwire is `@kotlin.Metadata.mv()`
+            // (the metadata version, declared `int[]`): kotlin-reflect reads it
+            // as a primitive `int[]` (`iaload`), so a boxed `Integer[]` reads
+            // back as all-zeros → version parses as `(0,0,0)` → kotlin-reflect
+            // treats the class metadata as invalid/legacy and falls back to
+            // Java-reflection platform types. That silently corrupts every
+            // Kotlin reflective query (return-type nullability, `isSuspend`,
+            // value-parameter default-value flags, continuation-parameter
+            // hiding), breaking all Spring Kotlin metadata tests while HotSpot
+            // passes. When the method return type is a single-dimension
+            // primitive array, allocate the matching primitive array and store
+            // unboxed values; the boxed-wrapper path below is for reference
+            // (`String[]`, `Class[]`, `Annotation[]`, enum) arrays only.
+            if let Some(comp) = return_type_desc.and_then(|rd| rd.strip_prefix('[')) {
+                use cratonvm_types::ArrayElementType as AET;
+                let prim = match comp {
+                    "Z" => Some(AET::Boolean),
+                    "B" => Some(AET::Byte),
+                    "C" => Some(AET::Char),
+                    "S" => Some(AET::Short),
+                    "I" => Some(AET::Int),
+                    "J" => Some(AET::Long),
+                    "F" => Some(AET::Float),
+                    "D" => Some(AET::Double),
+                    _ => None,
+                };
+                if let Some(et) = prim {
+                    let arr = ctx.new_array(et, elems.len());
+                    for (i, elem) in elems.iter().enumerate() {
+                        // `AnnotationElementValue::Int` is overloaded for
+                        // Z/B/C/S/I (the CP encodes them all as int constants),
+                        // so narrow per the descriptor; J/F/D carry their own
+                        // variants. A kind mismatch yields a typed zero so the
+                        // array stays machine-well-formed.
+                        let pv = match (comp, elem) {
+                            ("Z", AEV::Int(v)) => Value::Int(if *v != 0 { 1 } else { 0 }),
+                            ("B", AEV::Int(v)) => Value::Int(*v as i8 as i32),
+                            ("C", AEV::Int(v)) => Value::Int(*v & 0xFFFF),
+                            ("S", AEV::Int(v)) => Value::Int(*v as i16 as i32),
+                            ("I", AEV::Int(v)) => Value::Int(*v),
+                            ("J", AEV::Long(v)) => Value::Long(*v),
+                            ("F", AEV::Float(v)) => Value::Float(*v),
+                            ("D", AEV::Double(v)) => Value::Double(*v),
+                            (_, _) => match et {
+                                AET::Long => Value::Long(0),
+                                AET::Float => Value::Float(0.0),
+                                AET::Double => Value::Double(0.0),
+                                _ => Value::Int(0),
+                            },
+                        };
+                        ctx.set_array_element(arr, i, pv);
+                    }
+                    return Value::Object(Some(arr));
+                }
+            }
             // S111r19 — when the array is **empty** (no first element to
             // probe), fall back to the caller-provided method return-type
             // descriptor.  This recovers the right component class for
