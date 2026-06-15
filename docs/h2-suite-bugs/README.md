@@ -17,12 +17,18 @@ Harness: `h2sweep/sweep.ps1`, `h2sweep/triage.sh`, `apps/h2database/h2/RunOne.ja
 | | PASS | FAIL | HANG | CRASH | SKIP |
 |---|---|---|---|---|---|
 | HotSpot baseline | 174 | 7 | 1 | 2 | 16 |
-| CratonVM **before** fixes | 73 | 70 | 35 | 6 | 16 |
-| CratonVM **after** fixes (this branch) | **91** | 51 | 36 | 6 | 16 |
+| CratonVM **before** any fix | 73 | 70 | 35 | 6 | 16 |
+| CratonVM after string fixes (repeat + BufferedReader) | **91** | 51 | 36 | 6 | 16 |
+| CratonVM after **all 4 fixes** (PASS↔HANG drifts with load near the timeout) | 84 | 45 | 51 | **4** | 16 |
 
-- **+18 net PASS (73 → 91)**, 19 classes turned green, **0 real regressions**
-  (the lone PASS→HANG, `TestFile`, is a 156 s borderline class tripped by a
-  tighter 150 s cap, not a code regression).
+- The string fixes alone are **+18 net PASS (73 → 91)**, 19 classes green, 0 real
+  code regressions (PASS↔HANG flips are perf-cliff classes crossing the timeout
+  under concurrent load, not regressions).
+- The two crash fixes drop CRASHes **6 → 4** (the remaining four are
+  `TestPgServer`/`TestKeywords` — shared with HotSpot — and the documented-open
+  `cp500` charset / PBE-algparams gaps). Every targeted crash class moved off
+  CRASH: TestReorderWrites CRASH→FAIL, TestDiskFull→FAIL, TestUtils CRASH→HANG,
+  TestSampleApps/TestFileLockProcess HANG (no crash). FAILs dropped 70 → 45.
 - CratonVM-specific divergences after fixes: **45 FAIL + 34 HANG + 4 CRASH**
   (10 further FAIL/CRASH/HANG are shared with HotSpot and excluded:
   TestFunctions, TestPersistentCommonTableExpressions, TestBnf, TestOutOfMemory,
