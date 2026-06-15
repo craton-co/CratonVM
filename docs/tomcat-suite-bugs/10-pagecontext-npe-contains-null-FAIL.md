@@ -1,6 +1,78 @@
-# Bug 10 — TestPageContext "contains on null" is the embedded-server serving wall (NOT a JSP/EL bug)
+# Bug 10 — TestPageContext "contains on null": a five-layer onion (HTTP serving → client → resource loading → ecj binder)
 
-**Status:** SERVER FIXED; remaining blocker is the in-process HTTP **client**.
+**Status:** four layers root-caused and FIXED; the fifth (an ecj/JDT
+binding-phase miscompile on CratonVM) is the remaining blocker. The original
+`PageContext`/EL hypothesis was WRONG — `res.toString()` is null because the
+JSP never compiled, and that traced through HTTP serving, the HTTP client, JDK
+resource loading, and finally the Eclipse JDT compiler itself.
+
+## Layer summary (symptom → cause → fix)
+
+1. **Connector reset (FIXED, `socket_channel.rs`).** NIO connector RST'd every
+   request: `SocketChannel.setOption` AbstractMethodError (covariant-return
+   descriptor missing). Now serves HTTP 200 to external `curl`.
+2. **In-process HTTP client (FIXED, commit `48183599`).** `getUrl` →
+   `HttpURLConnection`: the native `http_url_connection.rs` read a real
+   `sun.net.www` object with its *synthetic* field layout → `getResponseCode()`
+   = -1, no request. Fixed by detecting real JDK-constructed HUCs (field 0 is a
+   `java/net/URL`) and performing the request from the real URL.
+3. **Boot-class resource loading (FIXED, this branch, `net_phase_e.rs`).**
+   `ClassLoader.getResourceAsStream("java/lang/String.class")` returned **null**
+   on CratonVM (HotSpot returns the 50116-byte class). `getResource` already
+   returned a correct URL — `jar:file:/…/java.base.jmod!/java/lang/String.class`
+   — but `URL.openStream()` threw `FileNotFoundException`: a `.jmod` archive
+   stores classes under a top-level `classes/` prefix (which `find_resource`
+   applies internally but the jar-URL stream handler did not). Fix: in the
+   single-level `jar:file:` branch of `URL.openStream`, resolve the
+   `classes/`-prefixed entry for `.jmod` containers (dev had independently
+   landed this same jmod fix for Hibernate's Jandex indexer — kept dev's
+   version on merge); plus a genuinely-new `jrt:` scheme arm (for jimage-based
+   boot classpaths). Verified vs HotSpot:
+   `sysCL.getResourceAsStream` now serves Object/String/IOException, delegation
+   through child/grandchild loaders works, and app classes + `file:`/`classpath:`
+   URLs are unaffected. This unblocked ecj's type resolution — the
+   `"The type java.lang.String cannot be resolved"` JSP error is gone.
+4. *(layer 1 above is the server; layers 2–3 are the client + its dependencies.)*
+5. **ecj binder duplicate-field miscompile (OPEN — remaining blocker).** With
+   layers 1–3 fixed, the JSP now reaches actual compilation and ecj
+   (`ecj-4.39`, driven by Jasper's `JDTCompiler` via the `Compiler` API) reports
+   **phantom** `Duplicate field bug49196_jsp._jspx_imports_classes` and
+   `Duplicate field bug49196_jsp._el_expressionfactory`, then a cascade of
+   `_el_expressionfactory cannot be resolved to a variable` → JSP fails to
+   compile → empty body → `null.contains("OK")`. Findings:
+   - The generated `bug49196_jsp.java` is **valid** — each field is declared
+     exactly once, no duplicate class (captured copy:
+     `scratch/rec0910/bug49196_jsp.captured.java`).
+   - The source is **read correctly** — `FileInputStream → InputStreamReader →
+     BufferedReader` returns byte-identical content on CratonVM and HotSpot
+     (`scratch/rec0910/mini/RdProbe.java`).
+   - **Not a JIT bug** — identical failure with `--nojit` (deterministic,
+     interpreter-level).
+   - ecj's **parser is correct** — driving `org.eclipse.jdt…parser.Parser`
+     directly yields an identical, duplicate-free `TypeDeclaration.fields[]`
+     (`[a, b, c, <initializer>, d, e]`) on both VMs
+     (`scratch/rec0910/ecjrepro/ParseRepro.java`).
+   - So the defect is in ecj's **binding phase**
+     (`SourceTypeBinding.buildFields` duplicate detection). The flagged fields
+     are exactly the two **adjacent to the `static{}` initializer block** (the
+     last field before it and the first after it) — strongly suggesting
+     mis-iteration around the initializer slot during field-binding.
+   - Reproducing the binder in isolation is itself blocked by CratonVM's
+     incomplete JDK **module system**: ecj's batch `Main` rejects `java.home`
+     ("invalid location for system libraries" — needs the `jrt` NIO
+     filesystem), and the `Compiler`-API path needs a module-aware name
+     environment. These module-system gaps are a related sub-area.
+
+   **Next step:** get ecj's binding phase running on a minimal class (fields
+   before + after a `static{}` block) — either by implementing enough of the
+   `jrt` NIO filesystem for ecj batch `Main`, or a module-aware
+   `INameEnvironment` harness — then instrument `SourceTypeBinding.buildFields`
+   / its `HashtableOfObject` to see why `c` and `d` are seen twice.
+
+---
+
+## Historical diagnosis (layers 1–2, retained for context)
+
 **Not** a `PageContext`/EL bug (the original hypothesis). Three findings, none
 "pure perf":
 - **Layer 1 — connector reset (FIXED, `fix/tomcat-suite-bugs-09-10`).** The NIO
