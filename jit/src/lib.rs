@@ -716,6 +716,42 @@ pub fn lookup_jit_code_range(addr: usize) -> Option<usize> {
         .map(|&(_, _, cm)| cm)
 }
 
+/// DBG (spring-bug-11): code-range → method-name table for naming a JIT frame in
+/// a crash report. Populated by `JitCache::put` ONLY when `CRATONVM_DBG_JIT_NAMES`
+/// is set (so the default path keeps zero overhead and no unbounded growth).
+static JIT_NAME_RANGES: std::sync::OnceLock<std::sync::Mutex<Vec<(usize, usize, String)>>> =
+    std::sync::OnceLock::new();
+
+fn jit_name_ranges() -> &'static std::sync::Mutex<Vec<(usize, usize, String)>> {
+    JIT_NAME_RANGES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Whether to record JIT method-name ranges (`CRATONVM_DBG_JIT_NAMES`). Cached.
+pub fn jit_names_enabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_DBG_JIT_NAMES").is_some())
+}
+
+/// Record `[entry, entry+len)` → `name` for crash-time symbolization. No-op
+/// unless `CRATONVM_DBG_JIT_NAMES` is set.
+pub fn register_jit_method_name(entry: usize, len: usize, name: String) {
+    if entry == 0 || len == 0 {
+        return;
+    }
+    if let Ok(mut v) = jit_name_ranges().lock() {
+        v.push((entry, entry + len, name));
+    }
+}
+
+/// Resolve the method name whose code range contains `addr`. Uses `try_lock` so
+/// it is safe to call from a crash handler (never blocks on a held lock).
+pub fn lookup_jit_method_name(addr: usize) -> Option<String> {
+    let v = jit_name_ranges().try_lock().ok()?;
+    v.iter()
+        .find(|(e, end, _)| addr >= *e && addr < *end)
+        .map(|(_, _, name)| name.clone())
+}
+
 /// A compiled native-code method.
 pub struct CompiledMethod {
     /// The executable buffer holding the machine code.
@@ -3390,6 +3426,15 @@ impl JitCache {
                 Arc::as_ptr(&arc) as usize,
             );
         }
+        // DBG (spring-bug-11): record entry→name so a crash report can name the
+        // faulting JIT method. Gated; no overhead unless CRATONVM_DBG_JIT_NAMES.
+        if jit_names_enabled() {
+            register_jit_method_name(
+                arc.entry_ptr() as usize,
+                arc.code_len(),
+                format!("{}.{}{}", key.class_name, key.method_name, key.descriptor),
+            );
+        }
         self.methods.insert(h, (key, arc));
     }
 
@@ -3894,6 +3939,36 @@ pub fn try_compile(
                 if !line.is_empty() {
                     eprintln!("[JIT_DUMP] {}", line);
                 }
+            }
+        }
+    }
+    // DBG (spring-bug-11): list every successfully-compiled method that contains
+    // a dup_x1 (0x5A), with the PCs and a small following-byte window, so the
+    // crashing dup_x1 method (NO_DUP_X1 removes the Groovy SIGSEGV) can be pinned
+    // and dumped. Proper opcode walk via scev::bytecode_len so operand bytes that
+    // happen to equal 0x5A are not mistaken for the opcode.
+    if result.is_some() && std::env::var_os("CRATONVM_DBG_DUPX_METHODS").is_some() {
+        let code: &[u8] = &cached.code;
+        let n = code.len();
+        let mut pc = 0usize;
+        let mut hits: Vec<usize> = Vec::new();
+        while pc < n {
+            if code[pc] == 0x5a {
+                hits.push(pc);
+            }
+            let l = crate::scev::bytecode_len(code, pc, n);
+            pc += if l == 0 { 1 } else { l };
+        }
+        if !hits.is_empty() {
+            eprintln!(
+                "[DUPX1] {}.{}{} dup_x1@{:?} code_len={}",
+                cached.class_name, cached.method_name, cached.method_descriptor, hits, n
+            );
+            for &h in &hits {
+                let end = (h + 10).min(n);
+                let window: Vec<String> =
+                    code[h..end].iter().map(|b| format!("{:02x}", b)).collect();
+                eprintln!("[DUPX1]   @{} bytes: {}", h, window.join(" "));
             }
         }
     }

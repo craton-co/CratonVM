@@ -9,6 +9,67 @@
 | **Status** | OPEN (inventory; needs per-cluster trace) |
 | **Suggested owner** | handoff (Groovy runtime is deep) / me (scheduler) |
 
+## ★★ PINNED (this session, worktree `fix/spring-bug-10-11`) — culprit is `HashMap$KeySpliterator.tryAdvance`, OSR + dup_x1, DETERMINISTIC (not GC, not canonicalize, not dup2)
+Direct root-cause on a fresh build, every prior hypothesis tested and most **falsified**:
+
+- **Crashing method NAMED:** added a JIT code-range→name registry (`CRATONVM_DBG_JIT_NAMES=1`,
+  populated in `JitCache::put`, consumed by `crash_handler.rs`). The crash frame resolves to
+  **`java/util/HashMap$KeySpliterator.tryAdvance(Ljava/util/function/Consumer;)Z`** — a **JDK
+  method, NOT Groovy code**. Groovy/Spring just exercise it heavily (HashMap key iteration in
+  metaclass/classload paths). The faulting deref is a `getfield` (`mov rax,[rax+0x40]`) on a
+  garbage receiver, reached via the `current = tab[index++]` idiom (bytecode pc 64–78, **dup_x1
+  at pc 71**).
+- **It is `dup_x1` specifically, NOT `dup2`/`dup_x2`.** Added split gates: `CRATONVM_JIT_NO_DUP_X1`
+  **removes** the SIGSEGV; `CRATONVM_JIT_NO_DUP_X2` does **not**. The whole "dup2 root" framing
+  below is **wrong** — the load-bearing opcode is `dup_x1` (0x5A).
+- **NOT the canonicalize / non-canonical-offset leak (H1 FALSIFIED).** Added
+  `CRATONVM_JIT_DUPX_EAGER_CANON` (canonicalize_stack immediately after the dup_x1 rotate, killing
+  the non-canonical offsets in place). It does **NOT** fix the crash. So the prior leading theory
+  ("rotated offsets reach an un-canonicalized merge") is dead.
+- **NOT GC-related.** `--Xmx 6g` (little/no GC) → identical crash, identical faulting value.
+- **NOT loop unrolling.** `CRATONVM_DISABLE_UNROLL=1` → identical crash, identical value.
+- **DETERMINISTIC garbage:** every run (any heap, unroll on/off) faults with
+  `rax=rcx=0x3B9ACA00_2A869E70`, **byte-identical**, while the heap base varies run-to-run
+  (`rbx=0x0204…/0x011D…/0x024A…`). So the bad receiver is **not** a corrupted/stale heap pointer
+  (those would track the heap base) — it is a **constant**: the **high 32 bits of a reference get
+  overwritten** (`0x3B9ACA00` = 1e9; not present anywhere in VM source), i.e. an **uninitialized /
+  wrong frame-slot read** produced by `dup_x1`'s slot management in this method's specific branch
+  structure. The low half (`0x2A869E70`) is a plausible reference low-word; the high half is junk.
+- **The COMMON-path codegen is CORRECT.** Dumped the annotated OSR disasm
+  (`CRATONVM_DBG_JIT_DISASM="tryAdvance"`; locals `L0(this)=r15 L1(consumer)=r14 L2(hi)=r13
+  L3(tab)=r12 L4(key)=r12`). At pc 64–78 `r15=this` is used correctly for both putfields, `tab=r12`,
+  the index flows through `[rbp-40]`/`[rbp-38]` correctly. tryAdvance never writes `r15`. So the
+  steady-state code is fine — the defect is a slot-read on a specific iteration/branch path (or the
+  OSR-entry / loop-peeling variant), not on the common path the disasm shows.
+- **The dup_x1 IDIOM ALONE is fine.** `probe/OsrDupX1.java` reproduces the exact
+  `this.current = this.table[this.index++]` bytecode (dup_x1 field-post-inc array index in an
+  OSR'd loop) and **matches HotSpot** (rc=0). So it is the *interaction* of dup_x1 with
+  tryAdvance's register pressure (5 locals, `tab`/`key` sharing r12) + branch structure, not the
+  opcode in isolation — which is why the earlier minimal repros "matched HotSpot".
+
+**Why this method only OSR-compiles:** it is an instance method whose only hot path is the inner
+loop (pc 42–81), so it tiers up via the loop back-edge (OSR), never via invocation counting
+(cf. memory `jit-instance-methods-no-invocation-tierup`). The earlier repros compiled via the
+normal path and so never exercised the buggy OSR/loop variant.
+
+**Remaining to land a fix:** instrument the JIT to log the frame-slot read that yields the
+uninitialized value on the crashing path (needs a build), or single-step the OSR'd loop variant.
+The fix is in `dup_x1`'s slot allocation/oop-map for the register-resident-`this` + frame-`index`
+shape under OSR. Per-run mitigation: `CRATONVM_JIT_NO_DUP_X1=1` (cleaner than `NO_DUPX`; only
+disables the load-bearing arm).
+
+**SEPARATE bug found (not bug-11):** CratonVM's **interpreter** mis-handles
+`HashMap$KeySpliterator.tryAdvance` — `probe/KSplProbe.java` throws
+`internal error: expected object reference, got int(16)` at `arraylength` (pc 25) **even under
+`--nojit`** (0 methods JIT-compiled). `int(16)` = the HashMap capacity, so a `getfield table:[Node`
+returns the array *length* instead of the array — a distinct interpreter/native-HashMap field
+defect worth its own ticket.
+
+Probes/tooling added on `fix/spring-bug-10-11`: `probe/OsrDupX1.java`, `probe/OsrDupX2.java`,
+`probe/KSplProbe.java`, `probe/dupx-matrix.sh`, `probe/pin-dupx.sh`; JIT flags
+`CRATONVM_JIT_NO_DUP_X1`/`NO_DUP_X2`/`DUPX_EAGER_CANON`, `CRATONVM_DBG_JIT_NAMES`,
+`CRATONVM_DBG_DUPX_METHODS`.
+
 ## Crash inventory (5 CRASH classes found so far, baseline @ ~1100/2930)
 **Groovy cluster (3 — likely one root cause in the Groovy runtime under CratonVM):**
 ```

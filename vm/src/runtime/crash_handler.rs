@@ -52,6 +52,17 @@ use std::time::SystemTime;
 // Guard against recursive crashes inside the handler itself.
 static CRASH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
+// spring-bug-10 watchpoint: set true once the VEH catches the -2 write to a
+// shadow savebase slot, so the JIT arm-helper stops re-arming the HW breakpoint.
+pub static SAVEBASE_WATCH_CAUGHT: AtomicBool = AtomicBool::new(false);
+// Count of -2 writes the watchpoint VEH has observed (caps log spam).
+pub static SAVEBASE_WATCH_HITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// True once the savebase-watchpoint VEH has reported the -2 writer.
+pub fn savebase_watch_caught() -> bool {
+    SAVEBASE_WATCH_CAUGHT.load(Ordering::Relaxed)
+}
+
 // ── CrashInfo ──────────────────────────────────────────────────────────────
 
 /// Captures the essential facts about a crash / fatal signal.
@@ -533,6 +544,64 @@ mod windows_fault {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let code = (*rec).exception_code;
+        // spring-bug-10 watchpoint: a HW data breakpoint fires STATUS_SINGLE_STEP.
+        // If DR6 shows one of DR0-3 tripped, this is OUR savebase watchpoint —
+        // inspect the value just written; if it is the corrupt 0xFFFF…FFFE, report
+        // the writing instruction's RIP (the long-hunted -2 writer) and disarm.
+        // Non-(-2) writes (the legitimate push, or other frames reusing the stack
+        // qword) are acknowledged silently and the watchpoint stays armed.
+        const EXCEPTION_SINGLE_STEP: u32 = 0x8000_0004;
+        const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+        if code == EXCEPTION_SINGLE_STEP {
+            let ctx = (*info).context_record as *mut u8;
+            if ctx.is_null() {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+            let dr6 = core::ptr::read_unaligned(ctx.add(0x68) as *const u64);
+            if dr6 & 0xF == 0 {
+                return EXCEPTION_CONTINUE_SEARCH; // not our HW breakpoint
+            }
+            let dr0 = core::ptr::read_unaligned(ctx.add(0x48) as *const u64);
+            let rip = core::ptr::read_unaligned(ctx.add(0xF8) as *const u64);
+            if dr0 != 0 {
+                let val = core::ptr::read_unaligned(dr0 as *const u64);
+                if val == 0xFFFF_FFFF_FFFF_FFFE {
+                    let mb = GetModuleHandleW(core::ptr::null()) as u64;
+                    let wrsp = core::ptr::read_unaligned(ctx.add(0x98) as *const u64);
+                    let wrbp = core::ptr::read_unaligned(ctx.add(0xA0) as *const u64);
+                    let jit = cratonvm_jit::lookup_jit_method_name(rip as usize)
+                        .unwrap_or_else(|| "<none>".to_string());
+                    let rva = if rip >= mb { rip - mb } else { 0 };
+                    // cross-frame: the written addr is ABOVE the writer's whole
+                    // frame ⇒ it reaches into a live CALLER (the real corruptor).
+                    // Within the writer's frame ⇒ a frame-local write to reused
+                    // stack (coincidental, after reset returned).
+                    let cross = dr0 > wrsp.wrapping_add(0x800);
+                    // Log the first several -2 writes (cap to avoid spam).
+                    let n = crate::runtime::crash_handler::SAVEBASE_WATCH_HITS
+                        .fetch_add(1, Ordering::Relaxed);
+                    if n < 24 {
+                        eprintln!(
+                            "[WATCH] -2 write @0x{:016X} RIP=0x{:016X} (exe+0x{:X}) jit={} wrsp=0x{:016X} wrbp=0x{:016X} cross_frame={}",
+                            dr0, rip, rva, jit, wrsp, wrbp, cross
+                        );
+                    }
+                    // One-shot DISARM only on the live (cross-frame) corruptor.
+                    if cross
+                        && !crate::runtime::crash_handler::SAVEBASE_WATCH_CAUGHT
+                            .swap(true, Ordering::SeqCst)
+                    {
+                        core::ptr::write_unaligned(ctx.add(0x70) as *mut u64, 0); // disarm DR7
+                        eprintln!(
+                            "[WATCH] *** LIVE CORRUPTOR: -2 -> savebase 0x{:016X} by exe+0x{:X} (jit={}) ***",
+                            dr0, rva, jit
+                        );
+                    }
+                }
+            }
+            core::ptr::write_unaligned(ctx.add(0x68) as *mut u64, 0); // clear DR6 (ack)
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
         // Ignore everything that is not a genuine fatal hardware fault — in
         // particular Rust's own SEH unwind exceptions and debugger
         // breakpoints must pass through untouched.
@@ -637,6 +706,10 @@ mod windows_fault {
             let a = a as usize;
             if module_base != 0 && a >= module_base && a < module_base + 0x8000_0000 {
                 let _ = writeln!(report, "  {:2}: 0x{:016X}  (exe+0x{:X})", i, a, a - module_base);
+            } else if let Some(name) = cratonvm_jit::lookup_jit_method_name(a) {
+                // spring-bug-11: name the JIT method whose code range contains
+                // this return address (requires CRATONVM_DBG_JIT_NAMES=1).
+                let _ = writeln!(report, "  {:2}: 0x{:016X}  (jit: {})", i, a, name);
             } else {
                 let _ = writeln!(report, "  {:2}: 0x{:016X}  (external/jit)", i, a);
             }
@@ -725,6 +798,36 @@ mod windows_fault {
                 }
             } else {
                 let _ = writeln!(report, "Memory around R10 (0x{:016X}): <unreadable>", r10);
+            }
+        }
+
+        // spring-bug-10: dump the live ShadowStack fields (top@+0x1B8,
+        // end@+0x1C0, base@+0x1C8) via R10 (= the cached thread ptr the faulting
+        // reload reloaded), so a corrupt `top` vs a corrupt savebase slot can be
+        // told apart.
+        if !ctx.is_null() {
+            let r10 = unsafe { core::ptr::read_unaligned(ctx.add(0xC8) as *const u64) } as usize;
+            let ss = r10.wrapping_add(0x1B8);
+            if r10 != 0 && unsafe { is_readable(ss, 0x18) } {
+                let qs = unsafe { core::slice::from_raw_parts(ss as *const u64, 3) };
+                let _ = writeln!(report, "ShadowStack @ R10+0x1B8: top=0x{:016X} end=0x{:016X} base=0x{:016X}", qs[0], qs[1], qs[2]);
+            }
+        }
+
+        // spring-bug-10: dump the current JIT frame's slots [rbp-0x40 .. rbp]
+        // so the shadow-stack slots (thread @ rbp-thread_off, savetop, savebase)
+        // and the locals are visible at the fault — to see whether savebase was
+        // ever written or got corrupted by the safepoint call/GC.
+        if !ctx.is_null() {
+            let rbp = unsafe { core::ptr::read_unaligned(ctx.add(0xA0) as *const u64) } as usize;
+            let win_start = rbp.wrapping_sub(0x40);
+            if rbp != 0 && unsafe { is_readable(win_start, 0x48) } {
+                let qs = unsafe { core::slice::from_raw_parts(win_start as *const u64, 9) };
+                let _ = writeln!(report, "Frame slots around RBP (0x{:016X}):", rbp);
+                for (j, q) in qs.iter().enumerate() {
+                    let off = -0x40i64 + (j as i64) * 8;
+                    let _ = writeln!(report, "    [RBP{:+#06x}] = 0x{:016X}", off, q);
+                }
             }
         }
 

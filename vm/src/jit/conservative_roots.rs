@@ -203,6 +203,16 @@ pub fn shadow_stack_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some())
 }
 
+/// spring-bug-10 experiment (`CRATONVM_SHADOW_PIN`): when set, the shadow-stack
+/// marking publish (`memory/roots.rs`) treats shadow oops as PINNED rather than
+/// MOVABLE — keeping them alive without the evacuate→remap→reload path. Cached.
+#[inline]
+pub fn shadow_pin_roots() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_PIN").is_some())
+}
+
 /// Capture the current native stack pointer.
 ///
 /// Implemented as the address of a probe variable that **must** live in the

@@ -4532,6 +4532,162 @@ pub unsafe extern "C" fn jit_get_current_thread() -> *mut JvmThread {
     JIT_THREAD.with(|t| t.get())
 }
 
+/// spring-bug-10 watchpoint: arm a hardware data WRITE breakpoint (DR0) on the
+/// savebase frame slot at `addr` for the CURRENT thread, so the vectored
+/// exception handler can report the RIP that writes the corrupt `0xFFFF…FFFE`.
+///
+/// Called from the JIT prologue (under `CRATONVM_SHADOW_WATCH`) with
+/// `addr = rbp - savebase_off`. Re-arms only when `addr` changes (reset is
+/// invoked repeatedly at the same stack depth ⇒ usually a no-op) and stops once
+/// the VEH has caught the write. Setting debug registers on the running current
+/// thread via `SetThreadContext(GetCurrentThread())` is applied by the kernel on
+/// the next ring transition.
+/// True if `ra` (a JIT return address) resolves to the no-arg `Matcher.reset()`.
+/// Requires `CRATONVM_DBG_JIT_NAMES=1` (populates the name registry).
+#[cfg(windows)]
+fn ra_is_reset(ra: usize) -> bool {
+    match cratonvm_jit::lookup_jit_method_name(ra) {
+        Some(n) => n.contains("Matcher.reset()"),
+        None => false,
+    }
+}
+
+/// spring-bug-10 watchpoint via a dedicated WATCHER THREAD. Setting debug
+/// registers on the *running current* thread is unreliable (the DRs only reload
+/// on a context-switch-IN, which races the write we want to trap). The fix: a
+/// background thread that SUSPENDS the worker, `SetThreadContext`s its DR0/DR7,
+/// and RESUMES — applied deterministically on resume. The worker's reset prologue
+/// just publishes its current savebase address; the watcher keeps DR0 pinned to
+/// it (reset is called at a stable stack depth, so this is steady-state idle).
+#[cfg(windows)]
+mod savebase_watcher {
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+
+    pub static ARM_ADDR: AtomicUsize = AtomicUsize::new(0);
+    static WORKER_HANDLE: AtomicIsize = AtomicIsize::new(0);
+    static STARTED: AtomicBool = AtomicBool::new(false);
+
+    extern "system" {
+        fn GetCurrentProcess() -> isize;
+        fn GetCurrentThread() -> isize;
+        fn DuplicateHandle(
+            sp: isize,
+            sh: isize,
+            tp: isize,
+            th: *mut isize,
+            access: u32,
+            inherit: i32,
+            opts: u32,
+        ) -> i32;
+        fn SuspendThread(t: isize) -> u32;
+        fn ResumeThread(t: isize) -> u32;
+        fn SetThreadContext(t: isize, ctx: *const u8) -> i32;
+    }
+    const DUPLICATE_SAME_ACCESS: u32 = 0x2;
+
+    unsafe fn set_dr_on(h: isize, addr: u64, dr7: u64) -> i32 {
+        #[repr(C, align(16))]
+        struct Ctx([u8; 1232]);
+        let mut c = Ctx([0u8; 1232]);
+        let p = c.0.as_mut_ptr();
+        core::ptr::write_unaligned(p.add(0x30) as *mut u32, 0x0010_0010); // DEBUG_REGISTERS
+        core::ptr::write_unaligned(p.add(0x48) as *mut u64, addr); // Dr0
+        core::ptr::write_unaligned(p.add(0x70) as *mut u64, dr7); // Dr7
+        SetThreadContext(h, p)
+    }
+
+    /// Worker-side: publish the current reset savebase address; start the watcher
+    /// thread on first call (duplicating the worker's thread handle for it).
+    pub unsafe fn publish(addr: usize) {
+        ARM_ADDR.store(addr, Ordering::Relaxed);
+        if STARTED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let mut h: isize = 0;
+        let proc = GetCurrentProcess();
+        DuplicateHandle(
+            proc,
+            GetCurrentThread(),
+            proc,
+            &mut h,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        );
+        WORKER_HANDLE.store(h, Ordering::SeqCst);
+        eprintln!("[WATCH] watcher thread started; worker savebase @0x{:016X}", addr);
+        std::thread::spawn(|| unsafe { watcher_loop() });
+    }
+
+    unsafe fn watcher_loop() {
+        let mut set_addr = 0usize;
+        loop {
+            let h = WORKER_HANDLE.load(Ordering::SeqCst);
+            if crate::runtime::crash_handler::savebase_watch_caught() {
+                if h != 0 {
+                    SuspendThread(h);
+                    set_dr_on(h, 0, 0);
+                    ResumeThread(h);
+                }
+                return;
+            }
+            let want = ARM_ADDR.load(Ordering::Relaxed);
+            if h != 0 && want != 0 && want != set_addr {
+                let susp = SuspendThread(h);
+                // DR7: L0 + R/W0=01 (write) + LEN0=10 (8-byte).
+                let stc = set_dr_on(h, want as u64, 0x0009_0001);
+                let res = ResumeThread(h);
+                if set_addr == 0 {
+                    eprintln!(
+                        "[WATCH] watcher armed DR0=0x{:016X} on worker h=0x{:X}: SuspendThread={} SetThreadContext={} ResumeThread={}",
+                        want, h, susp as i32, stc, res as i32
+                    );
+                }
+                set_addr = want;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+// Naked trampoline: read `[rsp]` (the true return address into reset's prologue)
+// at entry, tail-jump to the inner handler with it in RDX (ARG1).
+#[cfg(windows)]
+#[unsafe(naked)]
+pub unsafe extern "C" fn jit_arm_savebase_watch(addr: i64) {
+    core::arch::naked_asm!(
+        "mov rdx, [rsp]",
+        "jmp {inner}",
+        inner = sym arm_savebase_watch_inner,
+    );
+}
+
+#[cfg(windows)]
+unsafe extern "C" fn arm_savebase_watch_inner(addr: i64, ra: usize) {
+    if crate::runtime::crash_handler::savebase_watch_caught() {
+        return;
+    }
+    if !ra_is_reset(ra) {
+        return;
+    }
+    let a = addr as usize;
+    if a == 0 || a & 0x7 != 0 {
+        return;
+    }
+    savebase_watcher::publish(a);
+}
+
+// Disarm is watcher-managed (it disarms on catch), so the epilogue helper is a
+// no-op; the cross-frame filter in the VEH separates the live corruptor from a
+// coincidental -2 write to the reused stack slot after reset returns.
+#[cfg(windows)]
+pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
+
+#[cfg(not(windows))]
+pub unsafe extern "C" fn jit_arm_savebase_watch(_addr: i64) {}
+#[cfg(not(windows))]
+pub unsafe extern "C" fn jit_disarm_savebase_watch() {}
+
 /// Build the JIT runtime helpers table with real function pointer addresses.
 pub fn build_helpers() -> JitRuntimeHelpers {
     // Compute the inline-TLAB offset triple once at startup so the JIT
@@ -4541,6 +4697,11 @@ pub fn build_helpers() -> JitRuntimeHelpers {
     let tlab_off = JvmThread::tlab_offset();
     let cursor_in_thread = tlab_off + cratonvm_gc::Tlab::CURSOR_OFFSET;
     let end_in_thread = tlab_off + cratonvm_gc::Tlab::END_OFFSET;
+
+    // spring-bug-10 watchpoint: register the savebase-watch arm-helper so the JIT
+    // prologue (under CRATONVM_SHADOW_WATCH) can bake an absolute call to it.
+    cratonvm_jit::x64::set_arm_savebase_watch_fn(jit_arm_savebase_watch as *const () as usize);
+    cratonvm_jit::x64::set_disarm_savebase_watch_fn(jit_disarm_savebase_watch as *const () as usize);
 
     JitRuntimeHelpers {
         newarray: jit_newarray as *const () as usize,

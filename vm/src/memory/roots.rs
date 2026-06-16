@@ -214,18 +214,39 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //      `top`), but a slot holding null / a not-yet-stored value reads as a
     //      non-object and is harmlessly skipped.
     if crate::jit::conservative_roots::shadow_stack_enabled() {
+        // spring-bug-10 experiment: `CRATONVM_SHADOW_PIN` publishes the
+        // shadow-stack oops as PINNED marking roots instead of MOVABLE ones.
+        // Rationale: the shadow stack is a LIFO scanned only between a
+        // push-before-call and its reload-after-call, so an oop is pinned only
+        // *transiently* (during one GC-capable call) — once popped it promotes
+        // normally on a later GC. Pinned avoids the movable path's
+        // evacuate→remap→reload (the null-reload SIGSEGV) entirely. The doc's
+        // "pinning OOMs bt18" was reasoned for pinning the WHOLE operand stack,
+        // never measured for this transient minimal set; this gate lets us
+        // measure it directly.
+        let pin = crate::jit::conservative_roots::shadow_pin_roots();
+        // spring-bug-10 diagnostic: log this thread's shadow-stack depth at each
+        // GC. A monotonically growing depth across collections means the JIT
+        // `top` is DRIFTING (a push without a paired reload) — which makes the
+        // pop-only reload read above the real data and corrupt a home register.
+        if std::env::var_os("CRATONVM_DBG_SHADOW_DEPTH").is_some() {
+            let d = thread.shadow_stack.depth();
+            if d > 0 {
+                eprintln!("[SHADOW_DEPTH] tid={:?} depth={} pin={}", thread.thread_id, d, pin);
+            }
+        }
         thread.shadow_stack.for_each_value(|v| {
             if let Some(obj_ref) = shared.heap.is_object_address(v) {
                 roots.push(obj_ref);
-                // B-K kafka fix: shadow-stack oops are precise AND *rewritable*
-                // (`thread.shadow_stack.remap` rewrites them after a move, then
-                // the JIT's post-safepoint reload refreshes the register). So
-                // they may be EVACUATED rather than pinned — publish them movable
-                // so the non-moving sweep's selective promotion drains them
-                // instead of over-retaining (pinning every register-invisible
-                // operand-stack oop OOMs at small heap). Reuses the movable-root
-                // set; empty/no-op unless shadow stack is engaged.
-                cratonvm_gc::gc_quiescence::add_movable_jit_root(obj_ref.as_ptr() as usize);
+                if !pin {
+                    // B-K kafka fix: shadow-stack oops are precise AND
+                    // *rewritable* (`thread.shadow_stack.remap` rewrites them
+                    // after a move, then the JIT's post-safepoint reload
+                    // refreshes the register). So they may be EVACUATED rather
+                    // than pinned — publish movable so the non-moving sweep's
+                    // selective promotion drains them.
+                    cratonvm_gc::gc_quiescence::add_movable_jit_root(obj_ref.as_ptr() as usize);
+                }
             }
         });
     }

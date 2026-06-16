@@ -992,6 +992,30 @@ fn dupx_codegen_disabled() -> bool {
     *CACHE.get_or_init(|| std::env::var_os("CRATONVM_JIT_NO_DUPX").is_some())
 }
 
+/// DBG bisection (spring-bug-11): disable ONLY the dup_x1 (0x5A) codegen arm,
+/// to tell whether the Groovy SIGSEGV is in dup_x1 vs dup_x2 vs a co-located op.
+fn dup_x1_codegen_disabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_JIT_NO_DUP_X1").is_some())
+}
+
+/// DBG bisection (spring-bug-11): disable ONLY the dup_x2 (0x5B) codegen arm.
+fn dup_x2_codegen_disabled() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_JIT_NO_DUP_X2").is_some())
+}
+
+/// DBG bisection (spring-bug-11): immediately `canonicalize_stack()` after a
+/// dup_x1/dup_x2 rotate, eliminating the non-canonical rotated frame offsets in
+/// place. If this clears the crash, the defect is a downstream consumer of the
+/// non-canonical offsets (canonicalize parallel-move / a merge that assumes
+/// canonical layout); if it does NOT, the rotate model itself or a co-located
+/// op is to blame.
+fn dupx_eager_canon() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_JIT_DUPX_EAGER_CANON").is_some())
+}
+
 pub fn jit_scan(code: &[u8], code_len: usize, descriptor: &str) -> Option<JitScanResult> {
     let mut needs_heap = false;
     let mut multianewarray_ops = Vec::new();
@@ -1794,6 +1818,78 @@ fn shadow_noreload() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
     *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_NORELOAD").is_some())
+}
+
+/// spring-bug-10 (`CRATONVM_SHADOW_PIN`) — pinned shadow marking. The shadow
+/// oops are published as PINNED roots (memory/roots.rs), so a GC never moves
+/// them; the operand-stack homes are callee-saved registers, preserved across
+/// the call, so the post-call reload's value-restore is REDUNDANT. The reload
+/// must therefore only POP the shadow `top` (balance the LIFO; skipping it
+/// entirely overflows the buffer) and skip the per-home value write — which is
+/// exactly the buggy path that read a stale/null slot and crashed. Correct
+/// because the live value is already in its preserved register/frame slot.
+fn shadow_pin_codegen() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_PIN").is_some())
+}
+
+/// spring-bug-10 diagnostic (`CRATONVM_SHADOW_SENTINEL`) — pre-stamp the savebase
+/// slot with a non-canonical sentinel at each push so a faulting reload reveals
+/// whether the slot was skipped, externally overwritten, or fine.
+fn shadow_sentinel() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_SENTINEL").is_some())
+}
+
+/// spring-bug-10 watchpoint (`CRATONVM_SHADOW_WATCH`) — emit a prologue call to
+/// the registered arm-helper that sets a HW data breakpoint on this frame's
+/// savebase slot, so the VEH can report the PC that writes the corrupt -2.
+fn shadow_watch() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_WATCH").is_some())
+}
+
+/// Process-global pointer to the VM-side `jit_arm_savebase_watch(addr)` helper,
+/// registered at VM init. Baked as an absolute call target by the prologue when
+/// `CRATONVM_SHADOW_WATCH` is set. Avoids a `JitRuntimeHelpers` ABI change.
+pub static ARM_SAVEBASE_WATCH_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the savebase watchpoint arm-helper (called once from the VM).
+pub fn set_arm_savebase_watch_fn(addr: usize) {
+    ARM_SAVEBASE_WATCH_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Process-global pointer to the VM-side `jit_disarm_savebase_watch()` helper.
+pub static DISARM_SAVEBASE_WATCH_FN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Register the savebase watchpoint disarm-helper (called once from the VM).
+pub fn set_disarm_savebase_watch_fn(addr: usize) {
+    DISARM_SAVEBASE_WATCH_FN.store(addr, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// spring-bug-10 diagnostic (`CRATONVM_SHADOW_RAW_RELOAD`) — bypass the reload's
+/// savebase bounds-guard (movable path) so a corrupt savebase faults on deref
+/// (surfacing the bad value in the crash dump) instead of healing to pop-only.
+fn shadow_reload_raw() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_RAW_RELOAD").is_some())
+}
+
+/// spring-bug-10 bisect toggle (`CRATONVM_SHADOW_NO_SAVEBASE`) — disable the
+/// per-push saved-base frame slot and fall back to pure POP-ONLY reload (top -=
+/// n*8 off the live `top`). Lets us measure whether the savebase mechanism
+/// itself is the fault source (its frame slot was observed reading 0xFFFF…FFFE)
+/// vs. a genuine top-drift that only savebase can correct.
+fn shadow_no_savebase() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_NO_SAVEBASE").is_some())
 }
 
 fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
@@ -5072,6 +5168,14 @@ struct Compiler {
     /// unbalanced safepoint push is unwound on return (correct under nesting).
     /// 0 when `shadow_enabled` is off.
     shadow_savetop_slot_off: i32,
+    /// Frame offset of the reserved slot holding the shadow `top` captured by
+    /// the MOST RECENT push (its base), so the matching reload restores from and
+    /// resets `top` to exactly that base — independent of any intervening
+    /// unbalanced push (e.g. a constructor call, or a call that threw and was
+    /// caught in-method) that would otherwise leave `top` drifted high and make
+    /// the reload read uninitialised slots above the real data. 0 when shadow
+    /// is off. (spring-bug-10 — the drift was the shadow-reload SIGSEGV.)
+    shadow_savebase_slot_off: i32,
     /// Byte offset of the `ShadowStack` from `&JvmThread` (from the helper
     /// table). The shadow `top` is at `[thread + shadow_off_in_thread + 0]`.
     shadow_off_in_thread: i32,
@@ -5205,7 +5309,7 @@ impl Compiler {
         // unbalanced safepoint push — e.g. the `invokespecial <init>` push that
         // has no paired reload). OSR entries zero both slots (clobber-free) so
         // the null-guards make those frames skip shadow tracking safely.
-        let shadow_slots = if shadow_enabled { 2 } else { 0 };
+        let shadow_slots = if shadow_enabled { 3 } else { 0 };
         let extra_slots = (if needs_heap { 1 } else { 0 })
             + num_hoists
             + num_arith_hoists
@@ -5224,6 +5328,12 @@ impl Compiler {
         // Shadow-stack saved-`top` watermark slot: second-to-last reserved slot.
         let shadow_savetop_slot_off: i32 = if shadow_enabled {
             (total_locals as i32 - 1).saturating_mul(8)
+        } else {
+            0
+        };
+        // Shadow-stack per-push saved-base slot: third-to-last reserved slot.
+        let shadow_savebase_slot_off: i32 = if shadow_enabled {
+            (total_locals as i32 - 2).saturating_mul(8)
         } else {
             0
         };
@@ -5397,6 +5507,7 @@ impl Compiler {
             shadow_enabled,
             shadow_thread_slot_off,
             shadow_savetop_slot_off,
+            shadow_savebase_slot_off,
             shadow_off_in_thread,
             pending_shadow: Vec::new(),
             induction_vars: Vec::new(),
@@ -5874,6 +5985,16 @@ impl Compiler {
             return;
         }
         let ss_top = self.shadow_off_in_thread; // + ShadowStack::TOP_OFFSET (0)
+        // spring-bug-10 DIAGNOSTIC (CRATONVM_SHADOW_SENTINEL): write a recognizable
+        // NON-CANONICAL sentinel into the savebase slot UNCONDITIONALLY (before the
+        // null-thread guard), so the matching reload's value distinguishes the three
+        // hypotheses if it faults: 0x5151_5151_5151_5151 ⇒ the push BODY was skipped
+        // (null thread) and the slot kept the sentinel; 0xFFFF…FFFE ⇒ an EXTERNAL
+        // write overwrote the real top with -2; a valid buffer ptr ⇒ no corruption.
+        if shadow_sentinel() && self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() {
+            self.emit_mov_imm64_full(R11, 0x5151_5151_5151_5151u64 as i64);
+            self.emit_store_local(self.shadow_savebase_slot_off, R11);
+        }
         // R10 = thread (cached in the prologue-set frame slot); R11 = shadow top.
         self.emit_load_local(R10, self.shadow_thread_slot_off);
         // Guard: if the cached thread pointer is null (get_current_thread
@@ -5881,6 +6002,12 @@ impl Compiler {
         self.emit_test_r64_r64(R10);
         let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
         self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
+        // Save this push's base `top` so the matching reload restores from /
+        // resets `top` to exactly here, immune to any intervening unbalanced
+        // push that drifts `top` (spring-bug-10).
+        if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() {
+            self.emit_store_local(self.shadow_savebase_slot_off, R11);
+        }
         for &home in &homes {
             match home {
                 ShadowHome::Reg(r) => {
@@ -5927,21 +6054,91 @@ impl Compiler {
         // untracked (the push was skipped too).
         self.emit_test_r64_r64(R10);
         let skip = self.emit_jcc_rel32_patch(0x84); // JE skip (R10 == 0)
-        self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
-        for &home in homes.iter().rev() {
-            // Pre-decrement to the slot holding this oop's (possibly moved) value.
-            self.emit_lea_r64_mem_disp32(R11, R11, -8);
+
+        // spring-bug-10: PINNED reload. With `CRATONVM_SHADOW_PIN` the shadow
+        // oops are published as PINNED roots, so the collector NEVER moves them.
+        // The home values are therefore already correct after the call — callee-
+        // saved registers survive it un-clobbered, and any caller-saved operand
+        // oop was spilled to a frame slot by the normal pre-call codegen (and is
+        // reloaded from there by the normal post-call codegen). The shadow
+        // value-restore is thus redundant, and — when the saved base is stale /
+        // corrupt — it is the *cause* of the corruption (it writes a wrong buffer
+        // slot into a live home register; the bisection showed NORELOAD is clean
+        // but reload-with-restore hangs). So under pin we SKIP the value-restore
+        // entirely and only pop `top`, and only to a *validated* base: an
+        // over-high `top` merely over-scans (harmless for marking), whereas a
+        // too-low `top` could drop a live root, so we never pop below a
+        // validated savebase (if savebase is out of range we leave `top` for the
+        // JIT-exit boundary heal `restore_jit_thread` to reset).
+        if shadow_pin_codegen() {
+            if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() {
+                self.emit_load_local(R11, self.shadow_savebase_slot_off);
+                self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16); // vs base
+                let leave_lo = self.emit_jcc_rel32_patch(0x82); // JB  → leave top
+                self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8); // vs end
+                let leave_hi = self.emit_jcc_rel32_patch(0x83); // JAE → leave top
+                self.emit_mov_mem_disp32_r64(R10, R11, ss_top); // top = savebase
+                self.patch_rel32_to_here(leave_lo);
+                self.patch_rel32_to_here(leave_hi);
+            }
+            self.patch_rel32_to_here(skip); // null-thread guard target
+            return;
+        }
+
+        // Restore from the SAVED BASE this push recorded (NOT the current
+        // `top`, which an intervening unbalanced push may have drifted high —
+        // reading from a drifted `top` is what faulted on an uninitialised slot,
+        // the spring-bug-10 SIGSEGV). `R11 = base`; each home `i` was stored at
+        // `[base + i*8]`. Resetting `top` to `base` afterwards also self-corrects
+        // any drift. Works for both movable (slot holds the GC-rewritten value)
+        // and pinned (slot holds the unchanged value; the restore is a harmless
+        // no-op since the callee-saved home was preserved).
+        let n_bytes = -(homes.len() as i32) * 8; // Cast: x86-64 disp32
+        if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() && shadow_reload_raw() {
+            // DIAGNOSTIC raw deref: load savebase and use it unvalidated, so a
+            // corrupt value faults on the home-restore below (crash dump shows it).
+            self.emit_load_local(R11, self.shadow_savebase_slot_off);
+        } else if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() {
+            // R11 = savebase (the saved pre-push `top` for this safepoint).
+            self.emit_load_local(R11, self.shadow_savebase_slot_off);
+            // spring-bug-10 hardening: validate savebase ∈ [base, end) BEFORE
+            // dereferencing it for the home-restore below. The observed SIGSEGV
+            // read 0xFFFF_FFFF_FFFF_FFFE from this slot — a corrupt / stale /
+            // uninitialised value that the unconditional deref then faulted on.
+            // ShadowStack layout (relative to `ss_top`): top@+0, end@+8, base@+16.
+            //   cmp R11, base ; jb  heal   (below base)
+            //   cmp R11, end  ; jae heal   (at/above end)
+            // On heal, fall back to popping `homes.len()` slots off the live
+            // `top` — never out of the backing buffer, so it cannot fault.
+            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16);
+            let heal_lo = self.emit_jcc_rel32_patch(0x82); // JB  (R11 < base)
+            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8);
+            let heal_hi = self.emit_jcc_rel32_patch(0x83); // JAE (R11 >= end)
+            let ok = self.emit_jmp_rel32_patch();
+            self.patch_rel32_to_here(heal_lo);
+            self.patch_rel32_to_here(heal_hi);
+            // heal: R11 = live top - homes.len()*8.
+            self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
+            self.emit_lea_r64_mem_disp32(R11, R11, n_bytes);
+            self.patch_rel32_to_here(ok);
+        } else {
+            // Fallback (savebase unavailable): old current-top behaviour.
+            self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
+            self.emit_lea_r64_mem_disp32(R11, R11, n_bytes);
+        }
+        for (i, &home) in homes.iter().enumerate() {
+            let disp = (i as i32) * 8; // Cast: x86-64 disp32
             match home {
                 ShadowHome::Reg(r) => {
-                    self.emit_mov_r64_mem_disp32(r, R11, 0);
+                    self.emit_mov_r64_mem_disp32(r, R11, disp);
                 }
                 ShadowHome::Frame(off) => {
-                    self.emit_mov_r64_mem_disp32(R8, R11, 0);
+                    self.emit_mov_r64_mem_disp32(R8, R11, disp);
                     self.emit_store_local(off, R8);
                 }
             }
         }
-        // Commit popped top.
+        // Commit popped top = base (drift-corrected).
         self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
         self.patch_rel32_to_here(skip); // null-thread guard target
     }
@@ -8864,10 +9061,34 @@ impl Compiler {
             self.emit_store_local(self.shadow_savetop_slot_off, R11);
             self.patch_rel32_to_here(skip);
         }
+        // spring-bug-10 watchpoint: arm a HW data breakpoint on this frame's
+        // savebase slot (rbp - savebase_off) by calling the registered helper.
+        // Prologue position = no ABI args staged yet, so clobbering ARG_REGS[0]
+        // / caller-saved here is safe (locals live in callee-saved regs). The
+        // arm-helper one-shots / dedups internally.
+        if shadow_watch() && self.shadow_savebase_slot_off != 0 {
+            let h = ARM_SAVEBASE_WATCH_FN.load(std::sync::atomic::Ordering::Relaxed);
+            if h != 0 {
+                self.emit_lea_r64_mem_disp32(ARG_REGS[0], RBP, -self.shadow_savebase_slot_off);
+                self.emit_call_absolute(h);
+            }
+        }
     }
 
     /// Emit function epilogue: restore callee-saved regs; add rsp; pop rbp; ret
     fn emit_epilogue(&mut self) {
+        // spring-bug-10 watchpoint: disarm the savebase HW breakpoint, closing
+        // this frame's live window so a -2 written to the (now-reused) stack slot
+        // after we return is not mistaken for the corruptor. RAX holds the return
+        // value here; stash it in the (now-dead) savebase slot across the call.
+        if shadow_watch() && self.shadow_savebase_slot_off != 0 {
+            let h = DISARM_SAVEBASE_WATCH_FN.load(std::sync::atomic::Ordering::Relaxed);
+            if h != 0 {
+                self.emit_store_local(self.shadow_savebase_slot_off, RAX);
+                self.emit_call_absolute(h);
+                self.emit_load_local(RAX, self.shadow_savebase_slot_off);
+            }
+        }
         // Shadow-stack: restore the `top` watermark saved in the prologue,
         // unwinding any push this method did not pop (e.g. the unbalanced
         // `invokespecial <init>` push). Correct under nesting: each method
@@ -13316,7 +13537,7 @@ impl Compiler {
                 // `canonicalize_stack` resolves arbitrary offset permutations as
                 // a parallel-move problem at the next branch/call boundary.
                 0x5a => {
-                    if dupx_codegen_disabled() || self.stack.len() < 2 {
+                    if dupx_codegen_disabled() || dup_x1_codegen_disabled() || self.stack.len() < 2 {
                         self.failed = true;
                         let _ = self.push_stack();
                     } else {
@@ -13331,6 +13552,9 @@ impl Compiler {
                         let n = self.stack.len();
                         self.stack[n - 3..].rotate_right(1); // […, aC, b, a]
                         self.stack_oop_marks[n - 3..].rotate_right(1);
+                        if dupx_eager_canon() {
+                            self.canonicalize_stack();
+                        }
                     }
                     pc += 1;
                 }
@@ -13353,7 +13577,7 @@ impl Compiler {
                             code[pc + 1],
                             0x4f | 0x51 | 0x53 | 0x54 | 0x55 | 0x56
                         );
-                    if dupx_codegen_disabled() || !next_is_cat1_astore || self.stack.len() < 3 {
+                    if dupx_codegen_disabled() || dup_x2_codegen_disabled() || !next_is_cat1_astore || self.stack.len() < 3 {
                         // Unprovable form (or malformed height) — stay
                         // interpreted; placeholder keeps the model height
                         // plausible until the post-loop `failed` check.
@@ -13371,6 +13595,9 @@ impl Compiler {
                         let n = self.stack.len();
                         self.stack[n - 4..].rotate_right(1); // […, aC, c, b, a]
                         self.stack_oop_marks[n - 4..].rotate_right(1);
+                        if dupx_eager_canon() {
+                            self.canonicalize_stack();
+                        }
                     }
                     pc += 1;
                 }
