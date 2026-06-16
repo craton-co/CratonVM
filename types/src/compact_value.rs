@@ -426,12 +426,34 @@ impl CompactValue {
             ptr != 0,
             "CompactValue::object called with null pointer; use null() instead"
         );
-        assert!(
-            ptr & !PAYLOAD_MASK == 0,
-            "CompactValue::object: pointer {:#x} exceeds 47-bit address space",
-            ptr
-        );
+        if ptr & !PAYLOAD_MASK != 0 {
+            Self::object_out_of_range(ptr);
+        }
         Self(make_tagged(SUB_OBJECT, ptr & PAYLOAD_MASK))
+    }
+
+    /// Cold out-of-line handler for an out-of-47-bit object pointer reaching
+    /// [`object`](Self::object). Default behaviour is unchanged (panic, caught
+    /// upstream and surfaced as `InternalError: JIT dispatch ... failed`).
+    ///
+    /// HUNT diagnostic (gated `CRATONVM_DBG_COMPACTVALUE`): such a value is
+    /// almost always a NaN-double bit pattern (e.g. `0xfffc...`) or other
+    /// primitive landing in a reference slot via a JIT dispatch arg-marshalling
+    /// miscompile. Before panicking, dump the raw value + the Rust call path so
+    /// the offending decode/getfield/dispatch site is identifiable. The panic
+    /// (and its upstream catch) is preserved, so the run continues and every
+    /// occurrence is logged. Built with debug symbols (`--config
+    /// profile.release.debug=true`) for a readable backtrace.
+    #[cold]
+    #[inline(never)]
+    fn object_out_of_range(ptr: u64) -> ! {
+        if std::env::var_os("CRATONVM_DBG_COMPACTVALUE").is_some() {
+            eprintln!(
+                "[CRATONVM_DBG_COMPACTVALUE] CompactValue::object out-of-range ptr={ptr:#x}\n{}",
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        panic!("CompactValue::object: pointer {ptr:#x} exceeds 47-bit address space");
     }
 
     /// Checked constructor: returns `Some(CompactValue)` if `ptr` fits in the
