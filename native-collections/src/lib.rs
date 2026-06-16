@@ -1099,12 +1099,35 @@ fn native_al_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    const AL_MAX_INIT_CAPACITY: usize = 1 << 30;
-    let cap = match args.get(1) {
-        Some(Value::Int(c)) => std::cmp::min(std::cmp::max(*c, 0) as usize, AL_MAX_INIT_CAPACITY),
-        _ => AL_DEFAULT_CAPACITY,
+    // JDK `ArrayList(int initialCapacity)`: a negative capacity throws
+    // IllegalArgumentException; otherwise the backing `Object[initialCapacity]`
+    // is allocated eagerly.
+    let cap_i = match args.get(1) {
+        Some(Value::Int(c)) => *c,
+        _ => AL_DEFAULT_CAPACITY as i32,
     };
-    let buf = alloc_ref_array(ctx, cap);
+    if cap_i < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: format!("Illegal Capacity: {cap_i}"),
+        }
+        .into());
+    }
+    let cap = cap_i as usize;
+    // Match HotSpot: when `Object[cap]` is too large for the heap, throw a
+    // *catchable* OutOfMemoryError ("Requested array size exceeds VM limit")
+    // rather than aborting the whole VM. The previous code clamped `cap` to
+    // 1<<30 and then hard-aborted in the panicking allocator on the resulting
+    // ~8 GiB request (e.g. `new ArrayList(Integer.MAX_VALUE)` in SpEL's
+    // ArrayConstructorTests — see the spring crash report).
+    let buf = match ctx.try_new_ref_array(ClassId::new(0), cap) {
+        Some(b) => b,
+        None => {
+            return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
+                message: "Requested array size exceeds VM limit".to_string(),
+            }
+            .into());
+        }
+    };
     al_set_data(ctx, this, buf);
     al_set_size(ctx, this, 0);
     Ok(None)

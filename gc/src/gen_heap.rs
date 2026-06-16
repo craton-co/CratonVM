@@ -818,6 +818,65 @@ impl GenerationalHeap {
         }
     }
 
+    /// Fallible twin of [`alloc_array`]: walks the identical
+    /// young → humongous(old-gen) spill path, but returns `None` instead of
+    /// aborting the process when the request cannot be satisfied (size/length
+    /// overflow, or both generations exhausted). This lets a *native* caller
+    /// surface a catchable `java.lang.OutOfMemoryError` (matching HotSpot's
+    /// "Requested array size exceeds VM limit" / "Java heap space") rather than
+    /// the VM hard-aborting in [`alloc_young`]. Like `alloc_array` it performs
+    /// no GC, so it is safe to call from a native method holding unrooted local
+    /// `ObjectRef`s.
+    pub fn try_alloc_array_full(
+        &self,
+        class_id: ClassId,
+        element_type: ArrayElementType,
+        length: usize,
+    ) -> Option<ObjectRef> {
+        let data_size = array_data_size(length, element_type).ok()?;
+        let total_size = HEADER_SIZE.checked_add(data_size)?;
+        let length_u32 = u32::try_from(length).ok()?;
+
+        // Humongous path: skip young, allocate straight into old gen.
+        if self.is_humongous(total_size) {
+            if let Some(obj) = self.try_alloc_array_humongous(class_id, element_type, length_u32) {
+                return Some(obj);
+            }
+            // Old gen full — fall through to the young path (mirrors `alloc_array`).
+        }
+
+        let ptr = match self.try_alloc_young(total_size) {
+            Some(p) => p,
+            None => {
+                if let Some(obj) =
+                    self.try_alloc_array_humongous(class_id, element_type, length_u32)
+                {
+                    return Some(obj);
+                }
+                // Both generations exhausted: report OOM to the caller instead
+                // of aborting (the divergence from `alloc_array`).
+                return None;
+            }
+        };
+
+        let header = ObjectHeader::new(
+            class_id,
+            ObjectKind::Array,
+            element_type,
+            self.next_hash(),
+            length_u32,
+            length_u32,
+        );
+        // SAFETY: identical invariants to `alloc_array` — `ptr` is a freshly
+        // bump-allocated, exclusively-owned, zeroed region of `total_size`
+        // bytes with 8-byte alignment, so writing the header and wrapping it in
+        // an `ObjectRef` are sound.
+        unsafe {
+            std::ptr::write(ptr as *mut ObjectHeader, header);
+            Some(ObjectRef::from_raw(ptr))
+        }
+    }
+
     /// Try to allocate a Java object. Returns `None` if young gen is exhausted.
     pub fn try_alloc_object(&self, class_id: ClassId, num_fields: usize) -> Option<ObjectRef> {
         // M6 (round-12 gc): make the `+ HEADER_SIZE` add checked too, so a
