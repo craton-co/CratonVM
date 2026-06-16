@@ -10742,6 +10742,40 @@ fn execute_invoke_kind(
                             std::ptr::read(obj_ref.as_ptr() as *const [u8; 16])
                         };
                         if header_bytes == [0u8; 16] {
+                            // "Zeroed-a-live-object" detector consumer
+                            // (CRATONVM_DBG_SWEEP_ZERO): this receiver lost its
+                            // header to the non-moving young sweep. Recover its
+                            // ORIGINAL class from the sweep ring so the
+                            // root-coverage gap is NAMED (e.g. a reclaimed
+                            // java/util/concurrent/ForkJoinTask whose only live
+                            // ref was a register/native-stack root the sweep
+                            // couldn't see — `CRATONVM_DBG_SWEEP_EDGES` silent).
+                            if let Some((cid, kind, cycle)) =
+                                cratonvm_gc::gen_heap::sweep_zero_lookup(
+                                    obj_ref.as_ptr() as usize,
+                                )
+                            {
+                                // try_read (not read): this is a debug-only leaf
+                                // path; never risk a re-entrant class_manager
+                                // deadlock — fall back to the raw class_id.
+                                let orig = shared
+                                    .class_manager
+                                    .try_read()
+                                    .and_then(|cm| {
+                                        cm.class_store
+                                            .get(cratonvm_types::ClassId::new(cid))
+                                            .map(|c| c.name.to_string())
+                                    })
+                                    .unwrap_or_else(|| format!("class_id={cid}"));
+                                eprintln!(
+                                    "[sweep-zero] RECLAIMED-LIVE receiver ptr={:p}: original \
+                                     class={} (class_id={} kind=0x{:02x}), zeroed by non-moving \
+                                     sweep cycle {}; invoked as {}.{} — the live ref was a \
+                                     register/native-stack root the marker missed",
+                                    obj_ref.as_ptr(), orig, cid, kind, cycle,
+                                    &*method_class_name, &*method_name,
+                                );
+                            }
                             // WildFly / JBoss Modules often hits this path on
                             // `ClassLoader`-typed invokevirtual sites when a
                             // receiver lost its header but CP resolution is
