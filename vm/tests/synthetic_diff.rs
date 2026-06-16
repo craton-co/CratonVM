@@ -244,6 +244,105 @@ fn first_observation_diff(
     None
 }
 
+// ---------------------------------------------------------------------------
+// Generic env-var runner for per-subsystem real-path smoke tests
+// ---------------------------------------------------------------------------
+
+/// Run `cratonvm -c <classpath> cratonvm.<class_simple_name>` with an
+/// explicit set of env-var overrides.  All CRATONVM_REAL* vars inherited
+/// from the test harness are cleared first so each test has a clean baseline.
+///
+/// Returns `Some(Run)` on a successful spawn, or `None` when a prerequisite
+/// is missing (binary not built / class not compiled) so callers can skip.
+fn run_class_env(class_simple_name: &str, env_vars: &[(&str, &str)]) -> Option<Run> {
+    if !class_file_present(class_simple_name) {
+        eprintln!(
+            "[synthetic_diff] {class_simple_name}.class not found — \
+             javac unavailable at build time? skipping."
+        );
+        return None;
+    }
+    let bin = match cratonvm_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!(
+                "[synthetic_diff] cratonvm binary not found; \
+                 build with `cargo build -p cratonvm-cli`. skipping."
+            );
+            return None;
+        }
+    };
+
+    let mut cmd = Command::new(&bin);
+    cmd.arg("-c")
+        .arg(classpath_dir())
+        .arg(format!("cratonvm.{class_simple_name}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Clear every CRATONVM_REAL* var that the test runner may have inherited
+    // so the child starts from a known baseline.
+    for var in &[
+        "CRATONVM_REAL",
+        "CRATONVM_REAL_ANNOTATIONS",
+        "CRATONVM_REAL_AQS",
+        "CRATONVM_REAL_RAF",
+        "CRATONVM_REAL_NET_SOCKETS",
+        "CRATONVM_REAL_FORKJOINPOOL",
+    ] {
+        cmd.env_remove(var);
+    }
+    // Apply the caller's per-subsystem overrides.
+    for (k, v) in env_vars {
+        cmd.env(k, v);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[synthetic_diff] failed to spawn cratonvm: {e}");
+            return None;
+        }
+    };
+
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() > RUN_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "[synthetic_diff] {class_simple_name} timed out after \
+                         {RUN_TIMEOUT:?}."
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => {
+                eprintln!("[synthetic_diff] try_wait failed: {e}");
+                return None;
+            }
+        }
+    }
+
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[synthetic_diff] wait_with_output failed: {e}");
+            return None;
+        }
+    };
+
+    Some(Run {
+        stdout: normalize(&String::from_utf8_lossy(&output.stdout)),
+        stderr: normalize(&String::from_utf8_lossy(&output.stderr)),
+        exit_code: output.status.code(),
+    })
+}
+
 // ===========================================================================
 // Test — synthetic_vs_real
 // ===========================================================================
@@ -336,5 +435,180 @@ fn synthetic_vs_real() {
          the synthetic overlay and real JDK bytecode; exit codes match ({:?}).",
         syn_obs.len(),
         syn.exit_code,
+    );
+}
+
+// ===========================================================================
+// Per-subsystem real-path smoke tests (Phase 1 CI coverage)
+//
+// Each test sets the relevant CRATONVM_REAL_* flag and asserts the program
+// runs to completion (OK marker present, exit code 0, key r: lines correct).
+// All tests skip gracefully when the binary or class file is absent.
+// ===========================================================================
+
+/// Smoke test: annotation dispatch routes to real JDK bytecode under
+/// CRATONVM_REAL_ANNOTATIONS=1.  Exercises getAnnotation / annotationType /
+/// attribute reads on a @Retention(RUNTIME) annotation.
+#[test]
+fn real_annotations_path() {
+    let run = match run_class_env("RealAnnotations", &[("CRATONVM_REAL_ANNOTATIONS", "1")]) {
+        Some(r) => r,
+        None => return,
+    };
+    assert!(
+        run.stdout.contains("REAL_ANNOTATIONS_OK"),
+        "RealAnnotations did not reach the OK marker (exit={:?}).\n\
+         stdout:\n{}\nstderr:\n{}",
+        run.exit_code,
+        run.stdout,
+        run.stderr,
+    );
+    assert_eq!(
+        run.exit_code,
+        Some(0),
+        "RealAnnotations exited nonzero.\nstderr:\n{}",
+        run.stderr,
+    );
+    assert!(
+        run.stdout.contains("r:present=true"),
+        "annotation not found on class"
+    );
+    assert!(
+        run.stdout.contains("r:value=world"),
+        "annotation value() attribute wrong"
+    );
+    assert!(
+        run.stdout.contains("r:retention=RUNTIME"),
+        "@Retention not readable on the annotation type"
+    );
+}
+
+/// Smoke test: AQS / ReentrantLock routes to real JDK bytecode under
+/// CRATONVM_REAL_AQS=1.  Acquires a lock on the main thread, observes it
+/// from a second thread, releases it, and confirms both states.
+#[test]
+fn real_aqs_path() {
+    let run = match run_class_env("RealAqs", &[("CRATONVM_REAL_AQS", "1")]) {
+        Some(r) => r,
+        None => return,
+    };
+    assert!(
+        run.stdout.contains("REAL_AQS_OK"),
+        "RealAqs did not reach the OK marker (exit={:?}).\n\
+         stdout:\n{}\nstderr:\n{}",
+        run.exit_code,
+        run.stdout,
+        run.stderr,
+    );
+    assert_eq!(
+        run.exit_code,
+        Some(0),
+        "RealAqs exited nonzero.\nstderr:\n{}",
+        run.stderr,
+    );
+    assert!(
+        run.stdout.contains("r:lock_seen_held=true"),
+        "background thread did not observe the lock as held"
+    );
+    assert!(
+        run.stdout.contains("r:now_unlocked=true"),
+        "lock still appears locked after unlock"
+    );
+}
+
+/// Smoke test: RandomAccessFile routes to real JDK bytecode under
+/// CRATONVM_REAL_RAF=1.  Writes an int + long, seeks back, reads them, and
+/// verifies the values.
+#[test]
+fn real_raf_path() {
+    let run = match run_class_env("RealRaf", &[("CRATONVM_REAL_RAF", "1")]) {
+        Some(r) => r,
+        None => return,
+    };
+    assert!(
+        run.stdout.contains("REAL_RAF_OK"),
+        "RealRaf did not reach the OK marker (exit={:?}).\n\
+         stdout:\n{}\nstderr:\n{}",
+        run.exit_code,
+        run.stdout,
+        run.stderr,
+    );
+    assert_eq!(
+        run.exit_code,
+        Some(0),
+        "RealRaf exited nonzero.\nstderr:\n{}",
+        run.stderr,
+    );
+    assert!(
+        run.stdout.contains("r:magic=deadbeef"),
+        "int value read back wrong (expected deadbeef)"
+    );
+    assert!(
+        run.stdout.contains("r:value=123456789"),
+        "long value read back wrong"
+    );
+}
+
+/// Smoke test: ForkJoinPool routes to real JDK bytecode under
+/// CRATONVM_REAL_FORKJOINPOOL=1.  Submits two trivial callables to the
+/// common pool and verifies the results.
+#[test]
+fn real_fjp_path() {
+    let run =
+        match run_class_env("RealFjp", &[("CRATONVM_REAL_FORKJOINPOOL", "1")]) {
+            Some(r) => r,
+            None => return,
+        };
+    assert!(
+        run.stdout.contains("REAL_FJP_OK"),
+        "RealFjp did not reach the OK marker (exit={:?}).\n\
+         stdout:\n{}\nstderr:\n{}",
+        run.exit_code,
+        run.stdout,
+        run.stderr,
+    );
+    assert_eq!(
+        run.exit_code,
+        Some(0),
+        "RealFjp exited nonzero.\nstderr:\n{}",
+        run.stderr,
+    );
+    assert!(
+        run.stdout.contains("r:result=42"),
+        "ForkJoinPool task returned wrong value (expected 42)"
+    );
+    assert!(
+        run.stdout.contains("r:sum=123"),
+        "second FJP task returned wrong value (expected 123)"
+    );
+}
+
+/// Smoke test: socket layer routes to real JDK bytecode under
+/// CRATONVM_REAL_NET_SOCKETS=1.  Opens a loopback ServerSocket, connects a
+/// client from the same JVM, sends a byte, and verifies the exchange.
+#[test]
+fn real_net_sockets_path() {
+    let run =
+        match run_class_env("RealNetSockets", &[("CRATONVM_REAL_NET_SOCKETS", "1")]) {
+            Some(r) => r,
+            None => return,
+        };
+    assert!(
+        run.stdout.contains("REAL_NET_SOCKETS_OK"),
+        "RealNetSockets did not reach the OK marker (exit={:?}).\n\
+         stdout:\n{}\nstderr:\n{}",
+        run.exit_code,
+        run.stdout,
+        run.stderr,
+    );
+    assert_eq!(
+        run.exit_code,
+        Some(0),
+        "RealNetSockets exited nonzero.\nstderr:\n{}",
+        run.stderr,
+    );
+    assert!(
+        run.stdout.contains("r:received=42"),
+        "loopback byte not received correctly (expected 0x42)"
     );
 }

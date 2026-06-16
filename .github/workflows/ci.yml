@@ -71,6 +71,40 @@ jobs:
           python3 test-infra/native-census/check_no_stub_growth.py \
             "$CENSUS" test-infra/native-census/default-build-baseline.json
 
+  # Smoke-test every per-subsystem CRATONVM_REAL_* real-path gate.
+  # Requires a JDK (for javac to compile the Java test classes in build.rs)
+  # and the cratonvm binary. The tests skip gracefully when prerequisites are
+  # absent, so this job is non-blocking if the JDK setup fails.
+  real-path-coverage:
+    name: Real-path smoke tests (per-subsystem REAL_* gates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set up JDK 21 (needed for build.rs javac and as cratonvm boot JDK)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Build (debug — produces cratonvm binary for subprocess tests)
+        run: cargo build --workspace
+
+      - name: Run real-path smoke tests
+        run: >
+          cargo test -p cratonvm-vm --test synthetic_diff
+          real_annotations_path
+          real_aqs_path
+          real_raf_path
+          real_fjp_path
+          real_net_sockets_path
+          -- --nocapture
+
   # Future CI hardening — not yet enabled. Uncomment once the
   # corresponding gates are ready to be enforced.
   #
