@@ -1892,6 +1892,32 @@ fn shadow_no_savebase() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_NO_SAVEBASE").is_some())
 }
 
+/// SB-CRASH-04 (register-invisibility) — whether GC-capable safepoints blind-
+/// spill every used callee-saved GPR into a reserved frame slot so the
+/// conservative root scan marks register-only oops. Enabled when
+/// `CRATONVM_JIT_SAFEPOINT_REG_SPILL` is set to any value. Off → byte-identical
+/// default path (no slots reserved, no stores). See the field doc on
+/// `safepoint_reg_spill`.
+fn safepoint_reg_spill_enabled() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_JIT_SAFEPOINT_REG_SPILL").is_some())
+}
+
+/// SB-CRASH-04 diagnostic — `CRATONVM_JIT_SAFEPOINT_REG_SPILL=nostore` reserves
+/// the per-safepoint register-spill slots (matching the spilling build's frame
+/// layout) but emits NO stores, so an A/B vs the full spill separates the effect
+/// of the stores from the effect of the frame-size change.
+fn safepoint_reg_spill_nostore() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| {
+        std::env::var_os("CRATONVM_JIT_SAFEPOINT_REG_SPILL")
+            .map(|v| v.eq_ignore_ascii_case("nostore"))
+            .unwrap_or(false)
+    })
+}
+
 fn compute_branch_targets(code: &[u8], code_len: usize) -> Vec<bool> {
     let mut targets = vec![false; code_len];
     let mut pc = 0usize;
@@ -5285,6 +5311,28 @@ struct Compiler {
     /// Stage 3 — frame offset (positive; slot at `[rbp - sp_id_slot_off]`) of
     /// the reserved safepoint-id slot. 0 when `precise_maps` is off.
     sp_id_slot_off: i32,
+    /// SB-CRASH-04 (register-invisibility) — whether every GC-capable safepoint
+    /// blind-spills the CURRENT value of each used callee-saved GPR
+    /// (`alloc_used_regs`) into a reserved frame slot so the conservative
+    /// `scan_active_jit_frames` walk can mark any oop that lives ONLY in a
+    /// callee-saved register at the safepoint: operand-stack reference entries
+    /// that survive the call un-spilled, PLUS any oop the JIT's per-slot oop
+    /// tracking fails to classify. Fully conservative — the scanner re-validates
+    /// each qword via `heap.is_object_address`, so non-oop register values are
+    /// ignored. No post-call reload is needed under the default non-moving young
+    /// sweep (the object is never relocated, so the register stays valid).
+    /// Gated `CRATONVM_JIT_SAFEPOINT_REG_SPILL`; off → byte-identical default
+    /// path (no slots reserved, no stores).
+    safepoint_reg_spill: bool,
+    /// Diagnostic control (`CRATONVM_JIT_SAFEPOINT_REG_SPILL=nostore`): reserve
+    /// the spill slots (so the frame layout matches the spilling build) but emit
+    /// NO stores — isolates the effect of the stores from the effect of the
+    /// frame-size perturbation (the SB-CRASH-04 "FIX == NOSTORE" methodology).
+    safepoint_reg_spill_nostore: bool,
+    /// Frame offset (positive; first slot at `[rbp - reg_spill_base]`) of the
+    /// reserved callee-saved-register spill area: one 8-byte slot per entry in
+    /// `alloc_used_regs`, same order. 0 when `safepoint_reg_spill` is off.
+    reg_spill_base: i32,
     /// Stage A.2 (precise oop maps, B-K fix) — bytecode PCs at which a
     /// GC-capable safepoint flushed register-locals via
     /// `emit_pre_safepoint_spill`. Populated only under `precise_maps`. Used at
@@ -5457,6 +5505,12 @@ impl Compiler {
         // default → no slot reserved → frame layout byte-identical.
         let precise_maps = precise_jit_maps_enabled();
         let shadow_enabled = shadow_stack_maps_enabled();
+        // SB-CRASH-04 (register-invisibility): blind-spill used callee-saved
+        // GPRs into reserved frame slots at every GC-capable safepoint so the
+        // conservative root scan can see register-only oops. The slot count =
+        // `alloc_used_regs.len()`, reserved in `total` below.
+        let safepoint_reg_spill = safepoint_reg_spill_enabled();
+        let safepoint_reg_spill_nostore = safepoint_reg_spill_nostore();
         // Shadow stack reserves TWO frame slots: the cached thread pointer and
         // a saved `top` watermark (restored in the epilogue to unwind any
         // unbalanced safepoint push — e.g. the `invokespecial <init>` push that
@@ -5540,10 +5594,26 @@ impl Compiler {
         // XMM save slots follow GPR save slots
         let xmm_saved_base = callee_saved_base + callee_saved_size;
 
+        // SB-CRASH-04 — per-safepoint callee-saved-register spill area, one slot
+        // per used callee-saved GPR. Placed AFTER the prologue's XMM-save region
+        // (distinct slots: the prologue's `callee_saved_base` slots hold the
+        // CALLER's values for epilogue restore, whereas these hold each
+        // safepoint's CURRENT live values for the GC root scan). Sits above the
+        // shadow space / stack-arg region (those are nearest RSP), so it never
+        // overlaps the helper-call shadow space or the 6th stack-arg slot.
+        let reg_spill_size = if safepoint_reg_spill { callee_saved_size } else { 0 };
+        let reg_spill_base = xmm_saved_base + xmm_saved_size;
+
         // Total frame = locals + spill + callee-saved GPRs + callee-saved XMMs
+        //             + per-safepoint reg-spill (SB-CRASH-04)
         //             + shadow space + room for in-frame stack args.
-        let total =
-            locals_size + spill_size + callee_saved_size + xmm_saved_size + shadow_space + stack_arg_reserve;
+        let total = locals_size
+            + spill_size
+            + callee_saved_size
+            + xmm_saved_size
+            + reg_spill_size
+            + shadow_space
+            + stack_arg_reserve;
 
         // After CALL entry: RSP ≡ 8 mod 16 (return addr).
         // After PUSH RBP: RSP ≡ 0 mod 16.
@@ -5655,6 +5725,9 @@ impl Compiler {
             cur_bc_pc: 0,
             precise_maps,
             sp_id_slot_off,
+            safepoint_reg_spill,
+            safepoint_reg_spill_nostore,
+            reg_spill_base,
             safepoint_pcs: FxHashSet::default(),
             mapped_safepoint_pcs: FxHashSet::default(),
             shadow_enabled,
@@ -6044,6 +6117,28 @@ impl Compiler {
         for idx in 0..self.local_assignments.len() {
             if let Some(reg) = self.local_assignments[idx] {
                 let off = self.local_offset(idx);
+                self.emit_store_local(off, reg);
+            }
+        }
+        // SB-CRASH-04 (register-invisibility) — blind-spill the CURRENT value of
+        // every used callee-saved GPR into its reserved frame slot. The local
+        // flush above only covers register-resident *locals*; an oop can also
+        // live in a callee-saved register as an operand-stack temporary that
+        // survives the call, or via a value the per-slot oop tracker fails to
+        // tag. Spilling ALL of `alloc_used_regs` is fully conservative: the
+        // scanner re-validates each slot via `heap.is_object_address`, so non-
+        // oop register values are simply ignored. Under the default non-moving
+        // young sweep no post-call reload is needed (the object never moves, so
+        // the register keeps a valid address). The slots are scanned by the
+        // conservative `[scanner_sp, entry_sp)` frame walk. `=nostore` reserves
+        // the slots but skips the stores (frame-perturbation A/B control).
+        if self.safepoint_reg_spill
+            && !self.safepoint_reg_spill_nostore
+            && self.reg_spill_base != 0
+        {
+            for i in 0..self.alloc_used_regs.len() {
+                let reg = self.alloc_used_regs[i];
+                let off = self.reg_spill_base + (i as i32) * 8; // Cast: x86-64 immediate encoding
                 self.emit_store_local(off, reg);
             }
         }
@@ -18853,7 +18948,15 @@ impl Compiler {
                             // slow-path spill below is made `!precise_maps`, so the
                             // gate-OFF default path is byte-identical (exactly one
                             // conservative spill, on the slow path, as before).
-                            if self.precise_maps {
+                            //
+                            // SB-CRASH-04: `safepoint_reg_spill` joins this hoist for
+                            // the SAME reason — the inline-hit virtual dispatch is a
+                            // GC-capable safepoint (the callee allocates), so the
+                            // caller's register-only oops must be spilled BEFORE the
+                            // cascade to be visible to the conservative scan. Hoisting
+                            // here (vs the .miss slow path) also keeps the inline-hit
+                            // `jmp .done` rel8 span from being widened by the spill.
+                            if self.precise_maps || self.safepoint_reg_spill {
                                 self.emit_pre_safepoint_spill();
                             }
 
@@ -19409,14 +19512,15 @@ impl Compiler {
 
                             // Round-8 wave-3: defensive callee-saved spill
                             // before any GC-triggering dispatch CALL. Under
-                            // `precise_maps` the spill was already emitted before
-                            // the inline cascade (so it dominates the inline-hit
-                            // path too — see the PRECISE-MAPS FIX comment above);
-                            // emitting it again here would be a redundant
-                            // double-spill (and, with the shadow stack, an
-                            // unbalanced double push). Gate-OFF: unchanged — this
-                            // is the single conservative spill on the slow path.
-                            if !self.precise_maps {
+                            // `precise_maps` (or SB-CRASH-04 `safepoint_reg_spill`)
+                            // the spill was already emitted before the inline
+                            // cascade (so it dominates the inline-hit path too — see
+                            // the PRECISE-MAPS FIX comment above); emitting it again
+                            // here would be a redundant double-spill (and, with the
+                            // shadow stack, an unbalanced double push). Gate-OFF:
+                            // unchanged — this is the single conservative spill on
+                            // the slow path.
+                            if !self.precise_maps && !self.safepoint_reg_spill {
                                 self.emit_pre_safepoint_spill();
                             }
 
