@@ -677,6 +677,7 @@ mod tests {
             tlab_post_init: 0,
             frame_record: 0,
             shadow_stack_offset_in_thread: 0,
+            throw_exception: 0,
         };
         assert_eq!(h.newarray, 0);
         assert_eq!(h.write_barrier, 0);
@@ -888,6 +889,7 @@ mod tests {
             (37, "tlab_post_init",               std::mem::offset_of!(JitRuntimeHelpers, tlab_post_init)),
             (38, "frame_record",                 std::mem::offset_of!(JitRuntimeHelpers, frame_record)),
             (39, "shadow_stack_offset_in_thread", std::mem::offset_of!(JitRuntimeHelpers, shadow_stack_offset_in_thread)),
+            (40, "throw_exception",              std::mem::offset_of!(JitRuntimeHelpers, throw_exception)),
         ];
 
         // (a) Each field is at its documented sequential byte offset.

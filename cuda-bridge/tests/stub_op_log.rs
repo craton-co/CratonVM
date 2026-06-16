@@ -27,7 +27,7 @@
 
 #![cfg(not(feature = "cuda"))]
 
-use cuda_bridge::{
+use cratonvm_cuda_bridge::{
     DeviceBuffer, DeviceContext, DeviceModule, Event, KernelArgs, LaunchConfig, Stream, StreamOp,
 };
 

@@ -3886,24 +3886,51 @@ mod tests {
     }
 
     #[test]
+    fn classpath_class_and_program_args_pipeline() {
+        // Regression guard for cli_main_args integration test.
+        // `cratonvm --classpath <dir> PrintArgs alpha beta gamma` must produce
+        // class_name=PrintArgs and args=["alpha","beta","gamma"].
+        let argv0: Vec<String> =
+            argv(&["cratonvm", "--classpath", "/tmp/dir", "PrintArgs", "alpha", "beta", "gamma"]);
+        let stage1 = insert_program_args_separator(argv0);
+        let stage2 = normalize_java_launcher_argv(stage1);
+        let (stage3, _props) = extract_system_properties(stage2);
+        let (stage4, _hot) = extract_hotspot_flags(stage3);
+        let parsed = Args::try_parse_from(stage4).expect("clap must parse classpath+args argv");
+        assert_eq!(parsed.class_name.as_deref(), Some("PrintArgs"));
+        assert_eq!(parsed.args, argv(&["alpha", "beta", "gamma"]));
+    }
+
+    #[test]
     fn launcher_trailing_double_dash_artifact_is_popped() {
-        // B2: the only launcher `--` that leaks into `parsed.args` is the
-        // JBoss `-mp` double-separator trailing artifact. `run()` removes it
-        // by popping a single *trailing* `--`; verify both that the leak occurs
-        // and that the pop rule (mirrored here) removes exactly one token and
-        // leaves interior `--` alone.
+        // B2 regression guard: `-mp` is listed in VALUE_TAKING_OPTS, so
+        // `insert_program_args_separator` treats `/modules` as `-mp`'s value
+        // and does NOT inject a spurious `"--"` between them.
+        //
+        // The pipeline result for `java -mp /modules`:
+        //   normalize inserts `"--"` before `-mp` → clap sees ["java", "--", "-mp", "/modules"]
+        //   class_name = Some("-mp")  (first positional after "--")
+        //   args = ["/modules"]       (trailing_var_arg gets the rest)
+        //
+        // The old trailing `"--"` artifact (from when `/modules` was wrongly
+        // treated as the main-class name) no longer occurs. The guard pop in
+        // `run()` is a no-op.
         let argv0: Vec<String> = argv(&["java", "-mp", "/modules"]);
         let stage1 = insert_program_args_separator(argv0);
         let stage2 = normalize_java_launcher_argv(stage1);
         let (stage3, _props) = extract_system_properties(stage2);
         let (stage4, _hot) = extract_hotspot_flags(stage3);
         let parsed = Args::try_parse_from(stage4).expect("clap must parse `-mp` argv");
+        // `-mp` is consumed as the class_name (first positional after `--`).
+        assert_eq!(parsed.class_name.as_deref(), Some("-mp"));
         let mut prog = parsed.args;
-        // The leaked launcher separator is the final token.
-        assert_eq!(prog.last().map(String::as_str), Some("--"));
+        // No trailing "--" artifact — VALUE_TAKING_OPTS prevents the spurious injection.
+        assert_ne!(prog.last().map(String::as_str), Some("--"));
+        // The guard pop in `run()` is a no-op; args are already clean.
         if prog.last().map(String::as_str) == Some("--") {
             prog.pop();
         }
-        assert_eq!(prog, argv(&["-mp", "/modules"]));
+        // Only `/modules` remains in args; `-mp` went to class_name.
+        assert_eq!(prog, argv(&["/modules"]));
     }
 }

@@ -1182,6 +1182,7 @@ mod tests {
                 is_static: true,
                 is_volatile: false,
                 is_reference: false,
+                desc_byte: 0,
             },
         );
 
@@ -1233,6 +1234,7 @@ mod tests {
                 is_static: false,
                 is_volatile: false,
                 is_reference: false,
+                desc_byte: 0,
             },
         );
         cache.put_field(
@@ -1244,6 +1246,7 @@ mod tests {
                 is_static: true,
                 is_volatile: false,
                 is_reference: false,
+                desc_byte: 0,
             },
         );
 
@@ -1272,6 +1275,7 @@ mod tests {
                 is_static: false,
                 is_volatile: false,
                 is_reference: false,
+                desc_byte: 0,
             },
         );
         cache.put_field(
@@ -1283,6 +1287,7 @@ mod tests {
                 is_static: true,
                 is_volatile: false,
                 is_reference: false,
+                desc_byte: 0,
             },
         );
 
