@@ -5651,6 +5651,30 @@ pub fn invoke_or_native(
         class_name
     };
 
+    // Fast-path: a virtual call whose dispatch class is the synthetic
+    // `java/lang/annotation/AnnotationProxy`. The proxy has no bytecode methods,
+    // so without this every call (`annotationType`/`value`/`equals`/element
+    // accessors — heavily exercised by JUnit/Arquillian/Spring annotation
+    // scanning) would traverse the entire class-load + resolution-miss cascade
+    // below before reaching the identical "last resort" annotation rescue near
+    // the end of this function. `annotation_proxy_dispatch_impl` handles every
+    // method (annotation members + Object equals/hashCode/toString/getClass), so
+    // routing all of them here is correct.
+    //
+    // Keyed on the DISPATCH class (`effective_class`), which is `AnnotationProxy`
+    // only for a virtual call resolved on a proxy receiver — so a *static* call
+    // that merely passes an annotation as its first argument (e.g.
+    // `Objects.requireNonNull(annotation)`, whose `class_name` is the declaring
+    // class) is unaffected.
+    if effective_class == "java/lang/annotation/AnnotationProxy" {
+        if let Some(Value::Object(Some(recv))) = args.first().copied() {
+            note_annotation_proxy_cid(shared.heap.class_id_of(recv).as_u32());
+            return annotation_proxy_invoke_shared(
+                shared, thread, recv, method_name, &args[1..],
+            );
+        }
+    }
+
     // Forked Surefire calls `ClassLoader.setDefaultAssertionStatus` very early on
     // the context loader (`AppClassLoader` / `BuiltinClassLoader`). Inline-cache
     // promotion can still land on JDK bytecode for `java/lang/ClassLoader` when
@@ -6645,6 +6669,29 @@ pub(crate) fn proxy_invoke_handler_shared(
 }
 
 /// Shared-interpreter version of `annotation_proxy_invoke`.
+/// Cached ClassId (as `u32`) of the synthetic `java/lang/annotation/AnnotationProxy`
+/// class. Every annotation proxy shares this single id. `u32::MAX` = not yet
+/// observed. Warmed the first time an AnnotationProxy virtual call is routed
+/// through [`invoke_or_native`]'s fast-path; read lock-free on the hot JIT MIC
+/// path (`jit_invoke_virtual_mic`) for an identity check. Relaxed ordering: a
+/// stale read at worst misses the fast-path once and falls through to the
+/// (correct) slow path, which re-warms it.
+static ANNOTATION_PROXY_CID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// Lock-free hint for "is this the AnnotationProxy class id?" — returns the
+/// cached id, or `u32::MAX` (never a real class id) before it is warmed.
+#[inline]
+pub(crate) fn annotation_proxy_cid_hint() -> u32 {
+    ANNOTATION_PROXY_CID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Warm [`ANNOTATION_PROXY_CID`] once the AnnotationProxy class id is known.
+#[inline]
+fn note_annotation_proxy_cid(cid: u32) {
+    ANNOTATION_PROXY_CID.store(cid, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn annotation_proxy_invoke_shared(
     shared: &SharedVm,
     thread: &mut JvmThread,

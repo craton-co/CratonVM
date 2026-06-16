@@ -3241,6 +3241,37 @@ pub unsafe extern "C" fn jit_invoke_virtual_mic(
     let receiver_class_id = vm.heap.class_id_of(receiver_ref);
     let receiver_cid = receiver_class_id.as_u32();
 
+    // AnnotationProxy receiver: synthetic class with no bytecode methods, so the
+    // cache-miss path below would resolve on it, fail the compile-probe, and
+    // call `invoke_or_native` only to hit its annotation rescue — every call.
+    // Route straight to the shared annotation dispatch here. Uses the lock-free
+    // cached cid (warmed by `invoke_or_native`'s fast-path); before it is warmed
+    // the hint is `u32::MAX` (never a real cid) so this simply falls through.
+    if receiver_cid == crate::vm::annotation_proxy_cid_hint() {
+        mic_prof::bump(&mic_prof::MIC_LAMBDA);
+        let values = decode_values();
+        match crate::vm::annotation_proxy_invoke_shared(
+            vm,
+            thread,
+            receiver_ref,
+            info.method_name,
+            &values[1..],
+        ) {
+            Ok(result) => {
+                return match result {
+                    Some(Value::Int(v)) => v as i64,
+                    Some(Value::Long(v)) => v,
+                    Some(Value::Float(f)) => f.to_bits() as i64,
+                    Some(Value::Double(d)) => d.to_bits() as i64,
+                    Some(Value::Object(Some(obj))) => obj.as_ptr() as i64,
+                    Some(Value::Object(None)) | None => 0,
+                    _ => 0,
+                };
+            }
+            Err(e) => return handle_jit_dispatch_error(vm, thread, e, info),
+        }
+    }
+
     // Lambda-proxy receiver: its class id is a synthetic id absent from the
     // class store, so the resolution below derives an EMPTY class name and
     // `invoke_or_native("")` surfaces as a message-less
