@@ -6551,6 +6551,7 @@ fn route_jit_exception_through_method(
     cached: &Arc<CachedBytecodeMethod>,
     throw_pc: usize,
     exc: ObjectRef,
+    incoming_args: &[Value],
 ) -> Result<CachedCallResult, MethodCallFailed> {
     // Fast path: no exception table at all — propagate.
     if cached.exception_table.is_empty() {
@@ -6628,16 +6629,29 @@ fn route_jit_exception_through_method(
     // (execute_invokestatic_cached / execute_invokevirtual_cached) popped
     // them before calling execute_jit_call — so nothing to undo here.
 
-    // Pass an empty args slice — these locals are unreachable once PC jumps
-    // to the catch block (Java verifier guarantees catch-block locals are
-    // re-initialized before use). `Frame::new_pooled` already fills `locals`
-    // with `CompactValue::uninitialized()` slots; the historical
-    // `Vec<Value::Uninitialized>` of length `num_params` was a per-throw
-    // heap allocation that got immediately re-set by `init_locals_pooled`'s
-    // `resize(n, uninitialized())`. The `cached.max_locals` parameter still
-    // sizes the local slot vec correctly via `effective_max_locals`.
-    // (round-7 vm #6 perf fix.)
-    const NO_ARGS: &[Value] = &[];
+    // Restore the JIT'd method's incoming locals (`this` + declared params)
+    // into the handler frame. The earlier "pass NO_ARGS — catch-block locals
+    // are re-initialized before use" assumption was WRONG: the Java verifier
+    // does NOT require a handler to reassign locals it reads. `this` (local 0
+    // of every instance method) and unmodified parameters are live throughout
+    // the method, including its catch blocks — e.g. JUnit's
+    // `ThrowableCollector.execute` catches and runs `aload_0; … add(t)`, and
+    // `add` then does `aload_0; getfield throwable`. With NO_ARGS those slots
+    // were `uninitialized()` (→ null), so the handler saw `this == null`
+    // ("Cannot read field 'throwable' because the object is null"). This was
+    // latent until layer B (instance-method JIT tier-up) routed instance
+    // methods — whose handlers overwhelmingly read `this` — through here.
+    //
+    // The incoming args are a verifier-consistent state for ANY handler in the
+    // method: an exception can be thrown at the protected region's first
+    // instruction, where locals still equal the method-entry values, so the
+    // handler's local-type merge always includes that state. Locals first
+    // assigned *inside* the try block (slot >= incoming_args.len()) remain
+    // uninitialized — recovering those would need a deopt map the JIT does not
+    // record — but `this`/params (the dominant and previously-broken case) are
+    // now correct. `Frame::new_pooled` → `copy_args_to_locals` performs the
+    // category-2 (long/double) two-slot expansion, matching a normal call.
+    // `effective_max_locals` still sizes the slot vec from `cached.max_locals`.
 
     // T10.7 — if the per-thread pool has run dry, replenish it from the
     // shared VM-wide VecPool before building the frame.
@@ -6658,7 +6672,7 @@ fn route_jit_exception_through_method(
         cached.exception_table.clone(),
         cached.max_stack,
         cached.max_locals,
-        NO_ARGS,
+        incoming_args,
         &mut thread.locals_pool,
         &mut thread.stacks_pool,
     );
@@ -16294,6 +16308,34 @@ pub fn parse_aioobe_index(msg: &str) -> i32 {
     -1
 }
 
+/// Reconstruct a JIT'd method's incoming locals (`this` + declared params) as
+/// `Value`s from the bit-exact `(CompactValue, is_long)` arg slots that
+/// `execute_jit_call` saved before dispatch. Used only on the cold
+/// exception-routing path to repopulate the handler frame's locals (see
+/// `route_jit_exception_through_method`). Mirrors the descriptor-aware decode
+/// of the dispatch pop loop: receiver slot is `L`, the rest decode by the
+/// method descriptor's parameter tags.
+fn jit_saved_args_to_values(
+    cached: &CachedBytecodeMethod,
+    saved_args: &[(CompactValue, bool)],
+    np: usize,
+) -> Vec<Value> {
+    let is_static = cached.is_static;
+    let mut out = Vec::with_capacity(np);
+    for i in 0..np {
+        let (cv, is_long) = saved_args[i];
+        let desc_byte = if is_static {
+            nth_param_tag_byte(&cached.method_descriptor, i)
+        } else if i == 0 {
+            b'L' // receiver
+        } else {
+            nth_param_tag_byte(&cached.method_descriptor, i - 1)
+        };
+        out.push(decode_arg_kind_aware(cv, is_long, desc_byte));
+    }
+    out
+}
+
 /// Execute a JIT-compiled method call: pop args, call native code, push result.
 ///
 /// When `needs_heap` is true, passes a heap pointer as hidden first C argument,
@@ -16453,8 +16495,9 @@ fn execute_jit_call(
         // protected region, while still allowing typed handlers to match
         // by exception class.
         if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
+            let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
             return route_jit_exception_through_method(
-                shared, thread, frame_idx, cached, usize::MAX, exc,
+                shared, thread, frame_idx, cached, usize::MAX, exc, &exc_locals,
             );
         }
         match jit_result {
@@ -16500,8 +16543,9 @@ fn execute_jit_call(
             RuntimeError::NullPointerException { message: None },
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
+                let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
                 return route_jit_exception_through_method(
-                    shared, thread, frame_idx, cached, usize::MAX, exc,
+                    shared, thread, frame_idx, cached, usize::MAX, exc, &exc_locals,
                 );
             }
             other => return Err(other),
@@ -16531,8 +16575,9 @@ fn execute_jit_call(
             Some(&msg),
         ) {
             Ok(exc) => {
+                let exc_locals = jit_saved_args_to_values(cached, &saved_args, np);
                 return route_jit_exception_through_method(
-                    shared, thread, frame_idx, cached, usize::MAX, exc,
+                    shared, thread, frame_idx, cached, usize::MAX, exc, &exc_locals,
                 );
             }
             Err(other) => return Err(other),
@@ -16751,7 +16796,7 @@ fn execute_jit_call_decoded(
         crate::jit::helpers::restore_jit_thread(saved_jit_thread);
         if let Some(exc) = crate::jit::helpers::take_jit_pending_exception() {
             return route_jit_exception_through_method(
-                shared, thread, frame_idx, cached, usize::MAX, exc,
+                shared, thread, frame_idx, cached, usize::MAX, exc, args_slice,
             )
             .map(Some);
         }
@@ -16778,7 +16823,7 @@ fn execute_jit_call_decoded(
         ) {
             MethodCallFailed::ExceptionThrown(exc) => {
                 return route_jit_exception_through_method(
-                    shared, thread, frame_idx, cached, usize::MAX, exc,
+                    shared, thread, frame_idx, cached, usize::MAX, exc, args_slice,
                 )
                 .map(Some);
             }
@@ -16795,7 +16840,7 @@ fn execute_jit_call_decoded(
         ) {
             Ok(exc) => {
                 return route_jit_exception_through_method(
-                    shared, thread, frame_idx, cached, usize::MAX, exc,
+                    shared, thread, frame_idx, cached, usize::MAX, exc, args_slice,
                 )
                 .map(Some);
             }
