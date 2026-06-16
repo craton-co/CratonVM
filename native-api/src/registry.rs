@@ -21,18 +21,29 @@ fn real_net_sockets_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some())
 }
 
-/// REAL-FORKJOINPOOL (opt-in): cached check of `CRATONVM_REAL_FORKJOINPOOL`.
-/// When set, the registry drops ALL synthetic `java/util/concurrent/ForkJoinPool`
-/// natives so the real JDK pool bytecode runs (proper init, parallelism =
-/// cpus-1, work-stealing degrading to caller-runs). The synthetic pool's
-/// `commonPool()` returns an uninitialised real-class instance (no queues), so
-/// the real `invokeAll`/`submit` bytecode throws `RejectedExecutionException`;
-/// dropping the natives fixes that and enables Weld's real concurrent CDI
-/// bootstrap (`ConcurrentBeanDeployer`). **Default-off**: it is NOT a safe
-/// global default — CratonVM's real ForkJoinPool does not support the
-/// async-`execute` path `CompletableFuture.*Async` relies on (CF hangs under
-/// the real pool), whereas the synthetic pool's eager-inline `execute` keeps CF
-/// working. So this is an opt-in for concurrent-CDI workloads. HIB-CV-20.
+/// REAL-FORKJOINPOOL (opt-in `CRATONVM_REAL_FORKJOINPOOL`): when set, the
+/// registry drops the synthetic `java/util/concurrent/ForkJoinPool` natives
+/// **except `execute`** so the real JDK pool bytecode runs (proper init,
+/// parallelism = cpus-1, real `ForkJoinWorkerThread`s; work-stealing degrades to
+/// caller-runs). The synthetic pool's `commonPool()` returns an uninitialised
+/// real-class instance (no queues), so real `invokeAll`/`submit` throws
+/// `RejectedExecutionException` — dropping the natives fixes that and enables
+/// Weld's real concurrent CDI bootstrap (`ConcurrentBeanDeployer`).
+///
+/// `execute` is KEPT synthetic (eager-inline, run on the caller) so that
+/// `CompletableFuture.*Async` (which schedules every stage via `execute`) keeps
+/// working under the real pool — see below.
+///
+/// **Opt-in, NOT a safe global default.** CratonVM's cross-worker memory
+/// ordering doesn't reliably publish an object-reference field written by one
+/// worker to a task on another worker. The eager-inline `execute` masks this for
+/// `CompletableFuture` (everything runs caller-side), but `parallel-stream` /
+/// fork-join work uses `ForkJoinTask.fork`/`invoke` (not `execute`), runs on
+/// real workers, and can read stale-null cross-worker state — observed as a
+/// regression in `PersistenceXmlParserTest` (4/4 → 2/4) when this was forced on
+/// globally. So the synthetic pool stays the default; this gate is for
+/// concurrent-CDI workloads that don't lean on parallel-stream result passing.
+/// HIB-CV-20.
 fn real_forkjoinpool_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
@@ -2427,10 +2438,23 @@ impl NativeMethodRegistry {
             return;
         }
         // REAL-FORKJOINPOOL (opt-in): drop synthetic ForkJoinPool natives so the
-        // real JDK pool bytecode runs (real init + workers). See
-        // `real_forkjoinpool_enabled`. `ForkJoinWorkerThread` natives are kept.
+        // real JDK pool bytecode runs (real init + workers, real
+        // invokeAll/submit). See `real_forkjoinpool_enabled`.
+        //
+        // EXCEPTION — keep the synthetic eager-inline `execute`: under the real
+        // pool, work submitted via `execute()` runs on a worker thread, and
+        // CratonVM's cross-worker memory ordering doesn't reliably publish an
+        // object-reference field (e.g. `CompletableFuture.result`) written by
+        // one worker to a dependent task on another worker — so
+        // `CompletableFuture.*Async` (which schedules every stage via
+        // `execute`) reads a stale-null upstream result. Keeping `execute`
+        // eager-inline (run on the caller) makes those stages run caller-side,
+        // avoiding the cross-worker read, so CF keeps working WHILE the real
+        // pool services Weld's `invokeAll`. `ForkJoinWorkerThread` natives are
+        // also kept (the real pool needs them).
         if real_forkjoinpool_enabled()
             && class_name == "java/util/concurrent/ForkJoinPool"
+            && method_name != "execute"
         {
             return;
         }

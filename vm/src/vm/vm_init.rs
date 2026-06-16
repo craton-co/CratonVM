@@ -1953,10 +1953,12 @@ impl SharedVm {
         // over these defaults). HIB-CV-20.
         //
         // EXCEPTION: when `CRATONVM_REAL_FORKJOINPOOL` is set, the registry runs
-        // the *real* ForkJoinPool bytecode, so Weld's concurrent deployer works
-        // (and is needed — it clears the WELD-001301 the single-threaded path
-        // hits). Skip the NONE default then so Weld uses its own COMMON default
-        // and this becomes a clean one-flag opt-in for real concurrent CDI.
+        // the real ForkJoinPool, so Weld's concurrent `COMMON` deployer works
+        // (and clears the WELD-001301 the single-threaded path hits). Skip the
+        // NONE default then so Weld uses its own `COMMON` default — a clean
+        // one-flag opt-in for real concurrent CDI. Otherwise (synthetic pool,
+        // the default) seed NONE so Weld deploys single-threaded instead of
+        // hanging on `ForkJoinPool.commonPool().invokeAll`.
         if std::env::var_os("CRATONVM_REAL_FORKJOINPOOL").is_none() {
             sys_props.insert(
                 "org.jboss.weld.executor.threadPoolType".to_string(),
