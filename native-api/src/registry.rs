@@ -2458,6 +2458,32 @@ impl NativeMethodRegistry {
         {
             return;
         }
+        // REAL-FORKJOINPOOL (opt-in) — also drop the synthetic FJP *task-family*
+        // natives (`ForkJoinTask` / `RecursiveTask` / `RecursiveAction` /
+        // `CountedCompleter`). These track each task's done-flag and result in a
+        // process-global `fjp_state` SIDE-TABLE (phases_early), but under the real
+        // pool the task is completed by REAL `exec()` bytecode which writes the
+        // real `result` field (and CASes the real `status`). The side-table is
+        // never populated on that path, so `getRawResult()`/`get()`/`join()` —
+        // still served by the synthetic native — return the side-table's stale
+        // default (a bare `Object`/null) while the real field (and reflection)
+        // hold the true result. That mismatch is the actual "cross-worker"
+        // failure (NOT a memory-ordering / publication bug): the value is written
+        // and read on the SAME object but through two different stores. Dropping
+        // the task-family natives lets the real bytecode run end-to-end, so the
+        // completing worker and the reading thread agree. `ForkJoinWorkerThread`
+        // natives are still kept above (the real pool needs them).
+        if real_forkjoinpool_enabled()
+            && matches!(
+                class_name,
+                "java/util/concurrent/ForkJoinTask"
+                    | "java/util/concurrent/RecursiveTask"
+                    | "java/util/concurrent/RecursiveAction"
+                    | "java/util/concurrent/CountedCompleter"
+            )
+        {
+            return;
+        }
         // Real-JDK mode: drop the synthetic `java/util/StringJoiner` natives
         // (fake 5-field layout) so the real 7-field-layout bytecode runs — the
         // synthetic `add` reads the wrong slot on a real object and silently
