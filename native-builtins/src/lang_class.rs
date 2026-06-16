@@ -8827,8 +8827,20 @@ pub(crate) fn native_class_get_generic_interfaces(
             }
         }
     }
-    // Fallback: return empty array
-    let arr = ctx.new_ref_array(ClassId::new(0), 0);
+    // Fallback (no generic Signature, or it had no interfaces): per the JDK
+    // contract, `getGenericInterfaces()` returns the RAW direct superinterfaces
+    // (the same `Class[]` as `getInterfaces()`), NOT an empty array. Returning
+    // empty broke any type-closure / hierarchy walk that uses
+    // `getGenericInterfaces()` on a non-generic interface — e.g. Weld's
+    // `HierarchyDiscovery` for `BeanManager extends BeanContainer`, which then
+    // omitted `BeanContainer` from the closure and rejected every container
+    // lifecycle observer with `WELD-000409` (HIB-CV-20).
+    let iface_ids = ctx.class_interfaces(class_id);
+    let arr = ctx.new_ref_array(ClassId::new(0), iface_ids.len());
+    for (i, iface_id) in iface_ids.iter().enumerate() {
+        let mirror = ctx.get_class_mirror(*iface_id);
+        ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
+    }
     Ok(Some(Value::Object(Some(arr))))
 }
 
