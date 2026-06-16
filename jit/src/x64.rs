@@ -5183,6 +5183,19 @@ struct Compiler {
     /// matching post-call reload. Cleared at each push start so an unbalanced
     /// (no-reload) safepoint cannot feed stale homes to a later reload.
     pending_shadow: Vec<ShadowHome>,
+    /// Lazy-prologue perf lever: byte range `[start, end)` of the prologue's
+    /// (NOP-able) `get_current_thread` fetch sequence. After codegen, if
+    /// `shadow_pushed_any` is still false (the method never published a
+    /// register-resident oop), this range is overwritten with NOPs so the
+    /// per-invocation thread-fetch CALL never runs — eliminating the ~2.8x
+    /// fib44 / ~7x call-heavy shadow regression for the (vast majority of)
+    /// methods that never push. Both 0 when shadow is off or the fetch was
+    /// not emitted.
+    shadow_fetch_start: usize,
+    shadow_fetch_end: usize,
+    /// Set true the first time `emit_shadow_push` emits a real push (non-empty
+    /// homes). Gates whether the prologue fetch above is kept or NOP'd.
+    shadow_pushed_any: bool,
     /// T5.2.1 — induction variables detected in each loop.
     ///
     /// One entry per detected counted loop. Consumed by downstream
@@ -5510,6 +5523,9 @@ impl Compiler {
             shadow_savebase_slot_off,
             shadow_off_in_thread,
             pending_shadow: Vec::new(),
+            shadow_fetch_start: 0,
+            shadow_fetch_end: 0,
+            shadow_pushed_any: false,
             induction_vars: Vec::new(),
             null_check_info: crate::null_check_elim::NullCheckInfo::default(),
             simd_element_wise_loops: Vec::new(),
@@ -5984,6 +6000,9 @@ impl Compiler {
         if homes.is_empty() {
             return;
         }
+        // Lazy-prologue lever: this method genuinely publishes a register-
+        // resident oop, so the prologue thread-fetch must be KEPT (not NOP'd).
+        self.shadow_pushed_any = true;
         let ss_top = self.shadow_off_in_thread; // + ShadowStack::TOP_OFFSET (0)
         // spring-bug-10 DIAGNOSTIC (CRATONVM_SHADOW_SENTINEL): write a recognizable
         // NON-CANONICAL sentinel into the savebase slot UNCONDITIONALLY (before the
@@ -9050,6 +9069,22 @@ impl Compiler {
             && self.helpers.get_current_thread != 0
             && self.shadow_thread_slot_off != 0
         {
+            // Lazy-prologue perf lever (SB-CRASH-04 shadow default-on work):
+            // FIRST zero the thread slot unconditionally (one XOR+store) so it
+            // reads null if the fetch below is later NOP'd out. Then emit the
+            // `get_current_thread` fetch INTO a recorded byte range. After
+            // codegen, `maybe_nop_out_shadow_fetch` overwrites that range with a
+            // JMP-over when the method never published a register-resident oop
+            // (`!shadow_pushed_any`) — so the per-invocation thread-fetch CALL
+            // disappears for the vast majority of methods, killing the ~2.8x
+            // fib44 / ~7x call-heavy shadow regression. A NOP'd fetch leaves the
+            // slot null ⇒ every (absent) push and the epilogue savetop-restore
+            // skip safely. `get_current_thread` is a caller-saved clobber but
+            // we are still in the prologue (params already homed), so this is a
+            // register-safe place to keep the actual fetch.
+            self.emit_xor_reg_self(RAX); // RAX = 0
+            self.emit_store_local(self.shadow_thread_slot_off, RAX);
+            self.shadow_fetch_start = self.buf.pos();
             self.emit_call_absolute(self.helpers.get_current_thread);
             self.emit_store_local(self.shadow_thread_slot_off, RAX);
             // Save the shadow `top` watermark (RAX = thread). The epilogue
@@ -9060,6 +9095,7 @@ impl Compiler {
             self.emit_mov_r64_mem_disp32(R11, RAX, self.shadow_off_in_thread);
             self.emit_store_local(self.shadow_savetop_slot_off, R11);
             self.patch_rel32_to_here(skip);
+            self.shadow_fetch_end = self.buf.pos();
         }
         // spring-bug-10 watchpoint: arm a HW data breakpoint on this frame's
         // savebase slot (rbp - savebase_off) by calling the registered helper.
@@ -9071,6 +9107,39 @@ impl Compiler {
             if h != 0 {
                 self.emit_lea_r64_mem_disp32(ARG_REGS[0], RBP, -self.shadow_savebase_slot_off);
                 self.emit_call_absolute(h);
+            }
+        }
+    }
+
+    /// Lazy-prologue perf lever — call AFTER the whole body is compiled. If the
+    /// method never published a register-resident oop (`!shadow_pushed_any`),
+    /// the prologue's `get_current_thread` fetch sequence is dead weight on
+    /// every invocation; overwrite its recorded byte range with a `JMP`-over so
+    /// the CALL never runs. The thread slot was zeroed before the fetch, so a
+    /// NOP'd fetch leaves it null and every (absent) push + the epilogue
+    /// savetop-restore skip via their null guards. Patching writes within the
+    /// already-emitted range only — no offsets move, no branch target lands
+    /// inside the prologue fetch.
+    fn maybe_nop_out_shadow_fetch(&mut self) {
+        if !self.shadow_enabled
+            || self.shadow_pushed_any
+            || self.shadow_fetch_end <= self.shadow_fetch_start
+        {
+            return;
+        }
+        let start = self.shadow_fetch_start;
+        let end = self.shadow_fetch_end;
+        let len = end - start;
+        if len >= 2 && (len - 2) <= 127 {
+            // JMP rel8 from (start+2) to end; pad the skipped body with NOPs.
+            let _ = self.buf.try_patch_byte(start, 0xEB);
+            let _ = self.buf.try_patch_byte(start + 1, (len - 2) as u8); // Cast: rel8, len-2 <= 127
+            for i in (start + 2)..end {
+                let _ = self.buf.try_patch_byte(i, 0x90);
+            }
+        } else {
+            for i in start..end {
+                let _ = self.buf.try_patch_byte(i, 0x90);
             }
         }
     }
@@ -20432,6 +20501,11 @@ pub fn compile_with_param_slots(
 
     // Patch self-recursive calls to point to entry
     compiler.patch_self_calls(entry_offset);
+
+    // Lazy-prologue perf lever: now that the body is fully compiled,
+    // `shadow_pushed_any` is final — NOP out the prologue thread-fetch if no
+    // register-resident oop was ever published (no-op when shadow is off).
+    compiler.maybe_nop_out_shadow_fetch();
 
     // `estimated_size` is a heuristic; a pathological method can emit past it.
     // The emit hot path records the overflow instead of panicking — bail to
