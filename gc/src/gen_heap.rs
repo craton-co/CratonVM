@@ -133,6 +133,113 @@ fn gc_stress_threshold() -> Option<usize> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// "Zeroed-a-live-object" detector (CRATONVM_DBG_SWEEP_ZERO)
+//
+// The non-moving sweep zeroes every UNMARKED young object. When a live object
+// is reclaimed because its only reference is invisible to the marker (a
+// register/native-stack root — `CRATONVM_DBG_SWEEP_EDGES` stays silent, ruling
+// out heap/root/card edges), the bug surfaces LATER as an all-zero-header
+// receiver / ClassCastException on some other thread. By then the header is
+// zeroed, so the object's class is lost.
+//
+// This records the (address, class_id, kind) of every object the sweep zeroes
+// into a bounded ring BEFORE the zeroing write. A consumer (e.g. the
+// interpreter's all-zero-header detection) calls `sweep_zero_lookup(addr)` to
+// recover the ORIGINAL class of a reclaimed object — i.e. "this swept slot was
+// a java/util/concurrent/ForkJoinTask", which names the root-coverage gap.
+// Gated + cheap (one masked ring write per dead object only when enabled).
+// ---------------------------------------------------------------------------
+
+/// One swept-object record: heap address, original class_id, original kind byte.
+#[derive(Clone, Copy)]
+struct SweptRec {
+    addr: u64,
+    class_id: u32,
+    kind: u8,
+    cycle: u32,
+}
+
+const SWEPT_RING_BITS: usize = 18; // 256K entries
+const SWEPT_RING_LEN: usize = 1 << SWEPT_RING_BITS;
+const SWEPT_RING_MASK: usize = SWEPT_RING_LEN - 1;
+
+struct SweptRing {
+    buf: Vec<SweptRec>,
+    next: usize,
+}
+
+static SWEPT_RING: std::sync::OnceLock<parking_lot::Mutex<SweptRing>> =
+    std::sync::OnceLock::new();
+static SWEEP_ZERO_CYCLE: AtomicU64 = AtomicU64::new(0);
+
+fn sweep_zero_enabled() -> bool {
+    use std::sync::OnceLock;
+    static S: OnceLock<bool> = OnceLock::new();
+    *S.get_or_init(|| std::env::var_os("CRATONVM_DBG_SWEEP_ZERO").is_some())
+}
+
+fn swept_ring() -> &'static parking_lot::Mutex<SweptRing> {
+    SWEPT_RING.get_or_init(|| {
+        parking_lot::Mutex::new(SweptRing {
+            buf: vec![
+                SweptRec { addr: 0, class_id: 0, kind: 0, cycle: 0 };
+                SWEPT_RING_LEN
+            ],
+            next: 0,
+        })
+    })
+}
+
+/// Record that the sweep is about to zero `addr` (a young object with the given
+/// header), so a later all-zero-header consumer can recover its original class.
+/// No-op unless `CRATONVM_DBG_SWEEP_ZERO` is set.
+#[inline]
+fn record_swept(addr: usize, class_id: u32, kind: u8, cycle: u32) {
+    if !sweep_zero_enabled() {
+        return;
+    }
+    // Skip synthetic filler sentinels (TLAB/GAP fillers are *supposed* to be
+    // reclaimed) — they only mask the real reclaimed object's record when a
+    // freed slot is later reused as a filler at the same address.
+    if class_id == crate::tlab::TLAB_FILLER_CLASS_ID.as_u32()
+        || class_id == crate::tlab::GAP_FILLER_CLASS_ID.as_u32()
+    {
+        return;
+    }
+    let mut r = swept_ring().lock();
+    let i = r.next & SWEPT_RING_MASK;
+    r.buf[i] = SweptRec {
+        addr: addr as u64,
+        class_id,
+        kind,
+        cycle,
+    };
+    r.next = r.next.wrapping_add(1);
+}
+
+/// Look up whether `addr` was recently zeroed by the non-moving sweep. Returns
+/// `(original_class_id, original_kind, gc_cycle)` of the most recent matching
+/// record, or `None`. Used by the all-zero-header detection to name a reclaimed
+/// (register/native-root-invisible) live object. No-op unless the gate is set.
+pub fn sweep_zero_lookup(addr: usize) -> Option<(u32, u8, u32)> {
+    if !sweep_zero_enabled() {
+        return None;
+    }
+    let a = addr as u64;
+    let r = swept_ring().lock();
+    let mut best: Option<SweptRec> = None;
+    for rec in r.buf.iter() {
+        if rec.addr == a {
+            match best {
+                Some(b) if b.cycle >= rec.cycle => {}
+                _ => best = Some(*rec),
+            }
+        }
+    }
+    best.map(|b| (b.class_id, b.kind, b.cycle))
+}
+
 #[derive(Default, Debug)]
 pub struct HeapStats {
     /// Number of minor GC cycles completed.
@@ -3157,6 +3264,10 @@ impl GenerationalHeap {
         let mut young_from = self.young_from.lock();
         let mut old_gen = self.old_gen.lock();
 
+        // "Zeroed-a-live-object" detector cycle stamp (CRATONVM_DBG_SWEEP_ZERO).
+        let sweep_zero_cycle =
+            SWEEP_ZERO_CYCLE.fetch_add(1, Ordering::Relaxed) as u32;
+
         // Fold every mutator's thread-local card buffer into the bitmap
         // before scanning dirty cards (same protocol as the moving path).
         self.card_table.flush_all();
@@ -4083,6 +4194,12 @@ impl GenerationalHeap {
                 // tested to rule out a register-only dangling read — it did NOT
                 // fix bintrees18's wrong checksum, so the residual corruption is
                 // a structural wrong-address fixup, not a dangling read.)
+                record_swept(
+                    obj_ptr as usize,
+                    header.class_id.as_u32(),
+                    header.kind as u8,
+                    sweep_zero_cycle,
+                );
                 // SAFETY: span within from-space (checked above).
                 unsafe { std::ptr::write_bytes(obj_ptr, 0, total_size) };
                 dead_regions.push((cursor, total_size));
@@ -4100,6 +4217,12 @@ impl GenerationalHeap {
                 // Dead: zero the whole object span so a later conservative
                 // root scan cannot resurrect a stale header inside the
                 // reclaimed hole, then record it for the free list.
+                record_swept(
+                    obj_ptr as usize,
+                    header.class_id.as_u32(),
+                    header.kind as u8,
+                    sweep_zero_cycle,
+                );
                 // SAFETY: `[obj_ptr, obj_ptr+total_size)` lies within the
                 // live from-space region (checked above).
                 unsafe { std::ptr::write_bytes(obj_ptr, 0, total_size) };
