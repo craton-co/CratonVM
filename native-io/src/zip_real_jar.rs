@@ -309,11 +309,47 @@ fn native_jarfile_init_file_verify(
     native_jarfile_init_file(ctx, args)
 }
 
+/// Normalize a JAR/ZIP path the way `java.io.File` does for the one pattern
+/// where the `(String)` and `(File)` `JarFile`/`ZipFile` constructors diverge
+/// on Windows.
+///
+/// `java.util.zip.ZipFile(String name)` is specified as `this(new File(name))`,
+/// so a leading-separator drive path like `/C:/foo` — exactly what
+/// `URL{file:/C:/foo}.toURI().getSchemeSpecificPart()` yields on Windows —
+/// normalizes to `C:\foo`. The `(File)` ctor already opens the normalized form
+/// (it reads `file.getAbsolutePath()`), but the `(String)` ctor fed the raw
+/// `/C:/foo` straight to the host `File::open`, which on Windows opens an
+/// empty/wrong target, so `getEntry`/`getJarEntry`/`entries` saw zero entries.
+/// Hibernate's archive scanner does precisely
+/// `new JarFile(url.toURI().getSchemeSpecificPart())`, which is why locating
+/// `META-INF/persistence.xml` inside a packaged `.par` failed (HIB-CV-17).
+/// Strip the spurious leading separator before a `<letter>:` drive so both
+/// constructors resolve the same file. Windows-only: on POSIX `/C:/foo` is a
+/// legitimate path and must be left untouched.
+fn normalize_drive_rooted_path(path: &str) -> &str {
+    #[cfg(windows)]
+    {
+        let b = path.as_bytes();
+        if b.len() >= 3
+            && (b[0] == b'/' || b[0] == b'\\')
+            && b[1].is_ascii_alphabetic()
+            && b[2] == b':'
+        {
+            return &path[1..];
+        }
+    }
+    path
+}
+
 fn open_and_register(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
     path_str: &str,
 ) -> MethodCallResult {
+    // HIB-CV-17: `ZipFile(String)`/`JarFile(String)` must resolve the same file
+    // as the `(File)` ctor. Normalize a leading-separator Windows drive path
+    // (`/C:/foo` → `C:/foo`) before opening, matching `new File(name)`.
+    let path_str = normalize_drive_rooted_path(path_str);
     // SECURITY (HIGH): mirror the validation done by every other
     // guest-controlled file entry point in this crate. Under
     // `set_path_confine_to_cwd(true)` a guest must not be able to open

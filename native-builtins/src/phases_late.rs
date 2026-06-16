@@ -14138,13 +14138,31 @@ fn p59_jar_file_entries(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCa
 fn p59_jar_file_init(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = obj_arg(args, 0)?;
     let name_val = args.get(1).copied().unwrap_or(Value::Object(None));
-    ctx.set_field(this, 0, name_val);
-    // Try to read the real MANIFEST.MF
-    let path = if let Value::Object(Some(s)) = name_val {
-        ctx.read_string(s).unwrap_or_default()
-    } else {
-        String::new()
+    // HIB-CV-17: normalize a leading-slash Windows drive path (`/C:/foo` →
+    // `C:/foo`) BEFORE storing it in slot 0. Every reader — `getEntry`,
+    // `getInputStream`, `entries`, `getManifest` — `File::open`s the slot-0
+    // path, and on Windows `File::open("/C:/foo")` opens an empty/wrong target
+    // (zero entries). `new JarFile(url.toURI().getSchemeSpecificPart())` yields
+    // exactly the `/C:/...` form on Windows, so Hibernate's packaged-`.par`
+    // scan found no `META-INF/persistence.xml`. The `JarFile(File)` ctor was
+    // unaffected because `java.io.File` already normalizes the drive path.
+    // Storing the normalized form also makes `getName()` match HotSpot's
+    // `file.getPath()`. `p57_to_os_path` is a no-op for already-normal paths.
+    let (slot0_val, path) = match name_val {
+        Value::Object(Some(s)) => {
+            let raw = ctx.read_string(s).unwrap_or_default();
+            let norm = p57_to_os_path(&raw);
+            if norm != raw {
+                let ns = ctx.create_string(&norm);
+                (Value::Object(Some(ns)), norm)
+            } else {
+                (name_val, raw)
+            }
+        }
+        _ => (name_val, String::new()),
     };
+    ctx.set_field(this, 0, slot0_val);
+    // Try to read the real MANIFEST.MF
     let manifest = p98_read_jar_manifest(ctx, &path);
     ctx.set_field(this, 1, manifest);
     Ok(None)

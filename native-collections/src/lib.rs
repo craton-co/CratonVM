@@ -5007,6 +5007,8 @@ fn native_hs_to_array_typed(
     if let Some(arr) = target {
         let len = ctx.array_length(arr);
         if len >= keys.len() {
+            // Storing into the caller-supplied array: no allocation between the
+            // collect and the stores, so the gathered refs stay valid.
             for (i, k) in keys.iter().enumerate() {
                 ctx.set_array_element(arr, i, *k);
             }
@@ -5021,14 +5023,21 @@ fn native_hs_to_array_typed(
     // header stores its component class id, so `class_id_of_object(t)` is the
     // component id `new_ref_array` wants — keeps `Set<String>.toArray(new
     // String[0])` typed `String[]` instead of `Object[]`.
+    //
+    // GC-safe (HIB-CV-18): the allocation may move the element objects, so the
+    // `keys` gathered above are stale once `new_ref_array`/`alloc_ref_array`
+    // returns. Use only their count for sizing, then RE-collect from the live
+    // backing after the alloc and store immediately (no alloc in between).
+    let len = keys.len();
     let arr = match target {
         Some(t) => {
             let comp = ctx.class_id_of_object(t);
-            ctx.new_ref_array(comp, keys.len())
+            ctx.new_ref_array(comp, len)
         }
-        None => alloc_ref_array(ctx, keys.len()),
+        None => alloc_ref_array(ctx, len),
     };
-    for (i, k) in keys.iter().enumerate() {
+    let keys = collect_view_snapshot_ordered(ctx, backing);
+    for (i, k) in keys.iter().enumerate().take(len) {
         ctx.set_array_element(arr, i, *k);
     }
     Ok(Some(Value::Object(Some(arr))))
@@ -5428,9 +5437,21 @@ fn native_hs_to_array(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
         Some(m) => m,
         None => return Ok(Some(Value::Object(None))),
     };
+    // GC-safe (HIB-CV-18): `alloc_ref_array` may trigger a young GC that MOVES
+    // the element objects. The collected `Value`s are raw object pointers held
+    // only in a Rust `Vec` — not a GC root — so any pointer gathered BEFORE the
+    // allocation is stale afterwards, and storing it yields whatever now lives
+    // at the old address (observed as VM-singleton heap garbage on the first
+    // `toArray()` after a collection load, while the second call and the
+    // GC-aware iterator returned the right values). Mirror the documented
+    // count → allocate → re-read pattern (cf. `tm_materialize_deser_array`):
+    // collect once only to learn the length, allocate, then RE-collect from the
+    // live (and now post-GC) backing and store each ref immediately, with no
+    // allocation between the read and the store.
+    let len = collect_view_snapshot_ordered(ctx, backing).len();
+    let arr = alloc_ref_array(ctx, len);
     let keys = collect_view_snapshot_ordered(ctx, backing);
-    let arr = alloc_ref_array(ctx, keys.len());
-    for (i, k) in keys.iter().enumerate() {
+    for (i, k) in keys.iter().enumerate().take(len) {
         ctx.set_array_element(arr, i, *k);
     }
     Ok(Some(Value::Object(Some(arr))))
@@ -11643,10 +11664,18 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     } else {
         al_state(ctx, source)
     };
-    if let (Some(arr), size) = (src_data, src_size) {
+    if let (Some(_arr0), size) = (src_data, src_size) {
         if size > 0 {
             let cap = std::cmp::max(size as usize, AL_DEFAULT_CAPACITY);
+            // GC-safe (HIB-CV-18): `alloc_ref_array` may move the SOURCE's
+            // backing array, so the `_arr0` captured before the allocation is a
+            // stale pointer afterwards. Re-read the source's array AFTER the
+            // alloc, then copy element-by-element (no allocation in the loop).
             let buf = alloc_ref_array(ctx, cap);
+            let arr = match al_state(ctx, source).0 {
+                Some(a) => a,
+                None => return Ok(None),
+            };
             for i in 0..size as usize {
                 let val = ctx.get_array_element(arr, i);
                 ctx.set_array_element(buf, i, val);
@@ -11669,14 +11698,22 @@ fn native_al_init_from_collection(ctx: &mut dyn NativeContext, args: &[Value]) -
     // producing an empty list — the JUnit-Vintage `new ArrayList<>(
     // Description.fChildren)` bug, where `fChildren` is a real-bytecode
     // ConcurrentLinkedQueue, hid every `@org.junit.Test` method from discovery.
-    let elems = collect_collection_elements_or_real(ctx, source);
-    let cap = std::cmp::max(elems.len(), AL_DEFAULT_CAPACITY);
+    // GC-safe (HIB-CV-18): the gathered element pointers are raw, non-rooted
+    // refs; `alloc_ref_array` may trigger a young GC that moves the elements,
+    // leaving every pre-alloc pointer stale (observed as VM-singleton heap
+    // garbage from `new ArrayList<>(persistentSet)` on the first read after a
+    // collection load). Collect once only for the length, allocate, then
+    // RE-collect from the live source and store immediately — no allocation
+    // between the read and the store.
+    let len = collect_collection_elements_or_real(ctx, source).len();
+    let cap = std::cmp::max(len, AL_DEFAULT_CAPACITY);
     let buf = alloc_ref_array(ctx, cap);
-    for (i, val) in elems.iter().enumerate() {
+    let elems = collect_collection_elements_or_real(ctx, source);
+    for (i, val) in elems.iter().enumerate().take(len) {
         ctx.set_array_element(buf, i, *val);
     }
     al_set_data(ctx, this, buf);
-    al_set_size(ctx, this, elems.len() as i32);
+    al_set_size(ctx, this, len as i32);
 
     Ok(None)
 }
@@ -16414,9 +16451,20 @@ fn native_pq_iterator(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCall
             ctx.set_array_element(arr, i, elem);
         }
     }
-    let itr = alloc_synthetic(ctx, "java/util/PriorityQueue$Itr", 2);
-    ctx.set_field(itr, 0, Value::Object(Some(arr)));
-    ctx.set_field(itr, 1, Value::Int(0));
+    // Return an `ArrayList$Itr` over an ArrayList-shaped wrapper holding the
+    // heap-order snapshot, rather than a `PriorityQueue$Itr` with the snapshot
+    // in slot 0. In real-JDK mode `alloc_synthetic("java/util/PriorityQueue$Itr")`
+    // honours the real field layout — slot 0 is the `cursor:int` field — so
+    // `set_field(itr, 0, Object[])` coerced the array away and iteration saw
+    // zero elements (and, before the snapshot-iterator fix, recursed). The
+    // wrapper + name-resolved `al_itr_slots` layout is exactly the EnumSet/COWAL
+    // iteration path; `ArrayList$Itr.hasNext/next` read it correctly in both
+    // real-JDK and synthetic-jdk modes.
+    let wrapper = alloc_arraylist_with(ctx, arr, size);
+    let (cursor_slot, list_slot, n_fields) = al_itr_slots(ctx);
+    let itr = alloc_synthetic(ctx, "java/util/ArrayList$Itr", n_fields);
+    ctx.set_field(itr, list_slot, Value::Object(Some(wrapper)));
+    ctx.set_field(itr, cursor_slot, Value::Int(0));
     Ok(Some(Value::Object(Some(itr))))
 }
 
@@ -16957,6 +17005,40 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
                 }
                 return out;
             }
+        }
+        // Hibernate persistent collections (org.hibernate.collection.spi.*:
+        // PersistentSet / PersistentList / PersistentBag / PersistentSortedSet
+        // / …) are REAL bytecode classes, not natively-modelled. The generic
+        // ArrayList/array slot probes further down read slots by index on any
+        // object, and on a PersistentSet those indices land on unrelated fields
+        // — one of which happens to be a ref-array whose head elements are VM
+        // singletons, so `new ArrayList<>(persistentSet)` surfaced heap garbage
+        // (HIB-CV-18: a reloaded `@ElementCollection Set` came back as
+        // [SessionFactoryImpl, <uuid>, BootstrapServiceRegistryImpl]). Read via
+        // the collection's own (correct) `toArray()` instead. Returns refs that
+        // a GC may later move, so callers that allocate afterwards must re-read
+        // (cf. `native_al_init_from_collection`).
+        if cls_name.starts_with("org/hibernate/collection/") {
+            let size = match ctx.invoke_virtual(coll, "size", "()I", &[]) {
+                Ok(Some(Value::Int(n))) => n,
+                _ => 0,
+            };
+            if size <= 0 {
+                return Vec::new();
+            }
+            if let Ok(Some(Value::Object(Some(arr)))) =
+                ctx.invoke_virtual(coll, "toArray", "()[Ljava/lang/Object;", &[])
+            {
+                if ctx.heap_kind_of(arr) == ObjectKind::Array {
+                    let len = ctx.array_length(arr);
+                    let mut out = Vec::with_capacity(len);
+                    for i in 0..len {
+                        out.push(ctx.get_array_element(arr, i));
+                    }
+                    return out;
+                }
+            }
+            return Vec::new();
         }
     }
     // org.apache.kafka.common.utils.ImplicitLinkedHashCollection (and its
