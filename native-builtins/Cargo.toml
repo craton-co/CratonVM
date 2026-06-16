@@ -14,22 +14,12 @@ categories.workspace = true
 
 [features]
 # Default build is synthetic-stub-free: real bytecode runs, or a clear
-# unimplemented error is thrown. `legacy-synthetic-crypto` and `app-stubs`
-# are opt-in only. See docs/synthetic-vs-real-explained.md.
+# unimplemented error is thrown. See docs/synthetic-vs-real-explained.md.
 default = []
 synthetic-jdk = []
-# App-specific compatibility stubs: "fake main" launcher short-circuits and
-# framework unblockers (register_app_stubs in lib.rs). SYNTHETIC STUBS that
-# shadow real bytecode — off by default; enable only for emergency fallback.
-app-stubs = []
 # NEW-13: `experimental-tls` is now a no-op alias. The native-tls backed
 # javax.net.ssl implementation is always compiled and registered.
 experimental-tls = []
-# T2.6.18: renamed from `experimental-crypto`. The RustCrypto-backed
-# implementations (SHA-3, AES-GCM/CBC/CTR, ChaCha20-Poly1305, Ed25519,
-# RSA, ECDSA) are the default path. This feature retains the legacy
-# synthetic stubs for tests requiring byte-identical outputs.
-legacy-synthetic-crypto = []
 experimental-jmx = []
 experimental-serialization = []
 experimental-aot = []
