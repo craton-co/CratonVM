@@ -3013,6 +3013,56 @@ fn field_extra_base(ctx: &dyn NativeContext, class_id: ClassId) -> usize {
 /// accessible flag) in extra slots appended *after* the JDK layout. All
 /// native readers go via `set_field_by_name` / `get_field_by_name` for
 /// JDK fields and via the extra-slot helpers for our metadata.
+/// GC-safe construction of a reference array whose `len` elements are produced
+/// by an allocating factory (`create_field_object` / `create_method_object` /
+/// `descriptor_to_class_mirror` / …).
+///
+/// The freshly-allocated array is held only in a Rust local, so it is invisible
+/// to the GC root scan. Every per-element factory call allocates and can trigger
+/// a moving young GC that relocates the array, leaving the raw `ObjectRef` stale
+/// — it then resolves to a reused, usually `java/lang/Object`, slot. That is the
+/// WildFly bug-06 family: a reflective `Field[]`/`Method[]`/`Class[]` corrupted
+/// mid-build, surfacing later as `NoSuchMethodError Object.getName()`,
+/// `PreconditionViolationException: annotationType/Member must not be null`, or
+/// `ClassCastException: java/lang/Object cannot be cast to [L…;`.
+///
+/// Fix: pin the array as a GC root across the fill loop and re-read the
+/// forwarded reference before each store. Each element, once stored into the
+/// pinned array, stays reachable and is remapped by subsequent collections.
+/// There is no allocation between `make` returning an element and the store, so
+/// the just-built element cannot be collected before it is rooted by the array.
+fn build_mirror_array<F>(ctx: &mut dyn NativeContext, len: usize, make: F) -> cratonvm_types::ObjectRef
+where
+    F: FnMut(&mut dyn NativeContext, usize) -> cratonvm_types::ObjectRef,
+{
+    build_mirror_array_comp(ctx, cratonvm_types::ClassId::new(0), len, make)
+}
+
+/// As [`build_mirror_array`], but with an explicit array component class id
+/// (e.g. the `Annotation`/`Class` component for `getDeclaredAnnotations`).
+fn build_mirror_array_comp<F>(
+    ctx: &mut dyn NativeContext,
+    comp: cratonvm_types::ClassId,
+    len: usize,
+    mut make: F,
+) -> cratonvm_types::ObjectRef
+where
+    F: FnMut(&mut dyn NativeContext, usize) -> cratonvm_types::ObjectRef,
+{
+    let mut arr = ctx.new_ref_array(comp, len);
+    let pin = ctx.pin_native_root(arr);
+    for i in 0..len {
+        let elem = make(ctx, i);
+        // `make` may have moved `arr` (and the already-stored elements, which
+        // are remapped through it); re-read the forwarded array reference.
+        arr = ctx.read_native_pin(pin, arr);
+        ctx.set_array_element(arr, i, Value::Object(Some(elem)));
+    }
+    arr = ctx.read_native_pin(pin, arr);
+    ctx.unpin_native_roots(pin);
+    arr
+}
+
 pub(crate) fn create_field_object(
     ctx: &mut dyn NativeContext,
     meta: &FieldMetadata,
@@ -3765,11 +3815,11 @@ pub(crate) fn native_class_get_declared_fields(
         .iter()
         .filter(|m| !public_only || (m.access_flags & (ACC_PUBLIC as u16)) != 0)
         .collect();
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), selected.len());
-    for (i, meta) in selected.iter().enumerate() {
-        let field_obj = create_field_object(ctx, meta);
-        ctx.set_array_element(arr, i, Value::Object(Some(field_obj)));
-    }
+    // GC-safe: `create_field_object` allocates, so the array must be pinned
+    // across the fill loop (see `build_mirror_array` — WildFly bug-06).
+    let arr = build_mirror_array(ctx, selected.len(), |ctx, i| {
+        create_field_object(ctx, selected[i])
+    });
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -3936,12 +3986,12 @@ pub(crate) fn create_method_object(
     let (param_descs, ret_desc) = parse_descriptor_param_and_return(&meta.descriptor);
     let ret_mirror = descriptor_to_class_mirror(ctx, &ret_desc);
 
-    // Parameter type mirrors array.
-    let param_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), param_descs.len());
-    for (i, pdesc) in param_descs.iter().enumerate() {
-        let pmirror = descriptor_to_class_mirror(ctx, pdesc);
-        ctx.set_array_element(param_arr, i, Value::Object(Some(pmirror)));
-    }
+    // Parameter type mirrors array. GC-safe: `descriptor_to_class_mirror`
+    // allocates/loads classes, so the array is pinned across the fill loop
+    // (see `build_mirror_array` — WildFly bug-06).
+    let param_arr = build_mirror_array(ctx, param_descs.len(), |ctx, i| {
+        descriptor_to_class_mirror(ctx, &param_descs[i])
+    });
 
     // G2: Always allocate non-null array fields. JDK 25 `Method` and its
     // parent `Executable` declare `exceptionTypes` (Class[]) and several
@@ -3962,19 +4012,14 @@ pub(crate) fn create_method_object(
         &meta.name,
         &meta.descriptor,
     );
-    let exception_arr = ctx.new_ref_array(
-        cratonvm_types::ClassId::new(0),
-        exception_names.len(),
-    );
-    for (i, name) in exception_names.iter().enumerate() {
-        // Build a Class<T> mirror for each thrown checked exception.
-        // We use `descriptor_to_class_mirror` with an L-form so that
-        // the same code path that turns `Ljava/io/IOException;` into a
-        // mirror handles class loading + caching consistently.
-        let desc = format!("L{name};");
-        let mirror = descriptor_to_class_mirror(ctx, &desc);
-        ctx.set_array_element(exception_arr, i, Value::Object(Some(mirror)));
-    }
+    // GC-safe (see `build_mirror_array`): each `descriptor_to_class_mirror`
+    // allocates/loads classes, so the array is pinned across the fill loop.
+    // Build a Class<T> mirror for each thrown checked exception via the L-form
+    // so class loading + caching go through the same path as elsewhere.
+    let exception_arr = build_mirror_array(ctx, exception_names.len(), |ctx, i| {
+        let desc = format!("L{};", exception_names[i]);
+        descriptor_to_class_mirror(ctx, &desc)
+    });
     let empty_byte_arr = ctx.new_array(cratonvm_types::ArrayElementType::Byte, 0);
 
     let desc_str = ctx.create_string(&meta.descriptor);
@@ -5283,11 +5328,10 @@ pub(crate) fn native_class_get_declared_methods(
         .filter(|m| m.name != "<init>" && m.name != "<clinit>")
         .collect();
 
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), visible.len());
-    for (i, meta) in visible.iter().enumerate() {
-        let method_obj = create_method_object(ctx, meta);
-        ctx.set_array_element(arr, i, Value::Object(Some(method_obj)));
-    }
+    // GC-safe: `create_method_object` allocates (see `build_mirror_array`).
+    let arr = build_mirror_array(ctx, visible.len(), |ctx, i| {
+        create_method_object(ctx, visible[i])
+    });
     Ok(Some(Value::Object(Some(arr))))
     })();
     // Restore depth on every exit path (success or error).
@@ -5692,11 +5736,10 @@ pub(crate) fn create_constructor_object(
 
     // Parse descriptor for param types
     let (param_descs, _) = parse_descriptor_param_and_return(&meta.descriptor);
-    let param_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), param_descs.len());
-    for (i, pdesc) in param_descs.iter().enumerate() {
-        let pmirror = descriptor_to_class_mirror(ctx, pdesc);
-        ctx.set_array_element(param_arr, i, Value::Object(Some(pmirror)));
-    }
+    // GC-safe: `descriptor_to_class_mirror` allocates (see `build_mirror_array`).
+    let param_arr = build_mirror_array(ctx, param_descs.len(), |ctx, i| {
+        descriptor_to_class_mirror(ctx, &param_descs[i])
+    });
     let desc_str = ctx.create_string(&meta.descriptor);
 
     // WP2.1 — populate `exceptionTypes` from the JVMS §4.7.5 `Exceptions`
@@ -5710,15 +5753,12 @@ pub(crate) fn create_constructor_object(
         &meta.name,
         &meta.descriptor,
     );
-    let exception_arr = ctx.new_ref_array(
-        cratonvm_types::ClassId::new(0),
-        exception_names.len(),
-    );
-    for (i, name) in exception_names.iter().enumerate() {
-        let desc = format!("L{name};");
-        let mirror = descriptor_to_class_mirror(ctx, &desc);
-        ctx.set_array_element(exception_arr, i, Value::Object(Some(mirror)));
-    }
+    // GC-safe (see `build_mirror_array`): each `descriptor_to_class_mirror`
+    // allocates/loads classes, so the array is pinned across the fill loop.
+    let exception_arr = build_mirror_array(ctx, exception_names.len(), |ctx, i| {
+        let desc = format!("L{};", exception_names[i]);
+        descriptor_to_class_mirror(ctx, &desc)
+    });
 
     // --- Real JDK Constructor layout ---
     ctx.set_field_by_name(obj, "clazz", Value::Object(Some(class_mirror)));
@@ -6219,11 +6259,10 @@ pub(crate) fn native_class_get_declared_constructors(
         })
         .collect();
 
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), constructors.len());
-    for (i, meta) in constructors.iter().enumerate() {
-        let ctor_obj = create_constructor_object(ctx, meta);
-        ctx.set_array_element(arr, i, Value::Object(Some(ctor_obj)));
-    }
+    // GC-safe: `create_constructor_object` allocates (see `build_mirror_array`).
+    let arr = build_mirror_array(ctx, constructors.len(), |ctx, i| {
+        create_constructor_object(ctx, constructors[i])
+    });
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -6960,11 +6999,10 @@ pub(crate) fn native_class_get_interfaces(ctx: &mut dyn NativeContext, args: &[V
             .collect();
         eprintln!("[bb-dbg] getInterfaces({}) -> {:?}", this_name, names);
     }
-    let arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), iface_ids.len());
-    for (i, iface_id) in iface_ids.iter().enumerate() {
-        let mirror = ctx.get_class_mirror(*iface_id);
-        ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
-    }
+    // GC-safe: `get_class_mirror` may allocate a mirror (see `build_mirror_array`).
+    let arr = build_mirror_array(ctx, iface_ids.len(), |ctx, i| {
+        ctx.get_class_mirror(iface_ids[i])
+    });
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -7819,12 +7857,10 @@ fn build_annotation_array(
         .iter()
         .filter(|a| annotation_type_loadable(ctx, a))
         .collect();
-    let arr = ctx.new_ref_array(comp, resolvable.len());
-    for (i, ann) in resolvable.iter().enumerate() {
-        let proxy = create_annotation_proxy(ctx, ann);
-        ctx.set_array_element(arr, i, Value::Object(Some(proxy)));
-    }
-    arr
+    // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
+    build_mirror_array_comp(ctx, comp, resolvable.len(), |ctx, i| {
+        create_annotation_proxy(ctx, resolvable[i])
+    })
 }
 
 /// Like [`build_annotation_array`] but routes each proxy through the per-class
@@ -7842,12 +7878,10 @@ fn build_class_annotation_array(
         .iter()
         .filter(|a| annotation_type_loadable(ctx, a))
         .collect();
-    let arr = ctx.new_ref_array(ClassId::new(0), resolvable.len());
-    for (i, ann) in resolvable.iter().enumerate() {
-        let proxy = cached_annotation_proxy(ctx, queried_class_id, ann);
-        ctx.set_array_element(arr, i, Value::Object(Some(proxy)));
-    }
-    arr
+    // GC-safe: `cached_annotation_proxy` allocates (see `build_mirror_array`).
+    build_mirror_array_comp(ctx, ClassId::new(0), resolvable.len(), |ctx, i| {
+        cached_annotation_proxy(ctx, queried_class_id, resolvable[i])
+    })
 }
 
 /// Class.getDeclaredAnnotations() — only this class's own annotations.
@@ -8177,11 +8211,10 @@ pub(crate) fn native_class_get_annotations_by_type(
         }
     }
 
-    let arr = ctx.new_ref_array(ClassId::new(0), matching.len());
-    for (i, ann) in matching.iter().enumerate() {
-        let proxy = create_annotation_proxy(ctx, ann);
-        ctx.set_array_element(arr, i, Value::Object(Some(proxy)));
-    }
+    // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
+    let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
+        create_annotation_proxy(ctx, &matching[i])
+    });
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -8263,11 +8296,10 @@ pub(crate) fn native_method_get_annotations_by_type(
         }
     }
 
-    let arr = ctx.new_ref_array(ClassId::new(0), matching.len());
-    for (i, ann) in matching.iter().enumerate() {
-        let proxy = create_annotation_proxy(ctx, ann);
-        ctx.set_array_element(arr, i, Value::Object(Some(proxy)));
-    }
+    // GC-safe: `create_annotation_proxy` allocates (see `build_mirror_array`).
+    let arr = build_mirror_array(ctx, matching.len(), |ctx, i| {
+        create_annotation_proxy(ctx, &matching[i])
+    });
     Ok(Some(Value::Object(Some(arr))))
 }
 
@@ -8836,11 +8868,10 @@ pub(crate) fn native_class_get_generic_interfaces(
     // omitted `BeanContainer` from the closure and rejected every container
     // lifecycle observer with `WELD-000409` (HIB-CV-20).
     let iface_ids = ctx.class_interfaces(class_id);
-    let arr = ctx.new_ref_array(ClassId::new(0), iface_ids.len());
-    for (i, iface_id) in iface_ids.iter().enumerate() {
-        let mirror = ctx.get_class_mirror(*iface_id);
-        ctx.set_array_element(arr, i, Value::Object(Some(mirror)));
-    }
+    // GC-safe: `get_class_mirror` may allocate a mirror (see `build_mirror_array`).
+    let arr = build_mirror_array(ctx, iface_ids.len(), |ctx, i| {
+        ctx.get_class_mirror(iface_ids[i])
+    });
     Ok(Some(Value::Object(Some(arr))))
 }
 
