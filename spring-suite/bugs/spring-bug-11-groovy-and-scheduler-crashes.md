@@ -209,3 +209,29 @@ gated on [[spring-bug-01]]. `--nojit` avoids the crash but not the failure.
   post-fix rerun.
 
 Each crash is its own investigation + ~17 min rebuild. Prioritize by cluster size: Groovy (3) first.
+
+---
+
+## RESOLUTION (2026-06-16) — the dup_x1/SIGSEGV crash is FIXED; "dup_x1 OSR miscompile" was a misdiagnosis
+
+After merging dev + the **spring-bug-12** HashMap-view layout fix, the Groovy `EXCEPTION_ACCESS_VIOLATION`
+**no longer reproduces**: `dupx-matrix.sh` (GroovyScriptEvaluatorTests) is `no-crash` under EVERY
+variant — baseline, NO_DUPX, NO_DUP_X1, NO_DUP_X2, EAGER_CANON — and 3/3 fresh baseline runs are
+crash-free (the crash was previously called "non-deterministic"; it is now simply gone).
+
+**Root cause was bug-12, not dup_x1.** The crashing method is `HashMap$KeySpliterator.tryAdvance`,
+whose hot idiom is `current = tab[i++]` (the dup_x1 site). bug-12 was that `getfield table` returned
+the array **length** (synthetic-map layout put capacity at the real table slot) instead of the
+`Node[]` reference — so `tab` was an `int`, and `tab[i++]` (`aaload`) ran on a garbage "array",
+producing the wild deref / SIGSEGV. The dup_x1 *codegen is correct*: the focused
+`spring-suite/probe/OsrDupX1.java` (the exact `this.current = this.table[this.index++]` idiom, driven
+hot to OSR-compile) matches HotSpot bit-for-bit (`FINAL sum=4560000000`, rc=0). bug-12's real-HashMap
+layout fixes `map.table` for BOTH interpreter and JIT, so the dup_x1 path no longer reads garbage.
+The `CRATONVM_JIT_NO_DUP_X1` / `_NO_DUP_X2` / `_NO_DUPX` / `_DUPX_EAGER_CANON` gates remain as
+bisection tooling but are not load-bearing.
+
+**Residual (re-classified, NOT a crash):** the Groovy test now **hangs at `BEGIN`** (no test output
+in 150 s) under **both JIT and `--nojit`** — i.e. a general Groovy compile/execute hang in
+CratonVM's runtime (indy/MethodHandle/reflection/class-generation), independent of the JIT and of the
+resolved SIGSEGV. This is the deep "Groovy compiler internals × CratonVM" issue the original analysis
+flagged for handoff; it is a separate investigation from the bug-11 dup_x1 crash, which is closed.
