@@ -65,14 +65,30 @@ pub struct Graph {
 impl Graph {
     /// Create an empty graph with a Start and a Return node.
     pub fn new() -> Self {
-        let start = Node { op: Op::Start, inputs: vec![], uses: vec![] };
-        let ret = Node { op: Op::Return, inputs: vec![], uses: vec![] };
-        Graph { nodes: vec![start, ret], entry: 0, exit: 1 }
+        let start = Node {
+            op: Op::Start,
+            inputs: vec![],
+            uses: vec![],
+        };
+        let ret = Node {
+            op: Op::Return,
+            inputs: vec![],
+            uses: vec![],
+        };
+        Graph {
+            nodes: vec![start, ret],
+            entry: 0,
+            exit: 1,
+        }
     }
 
     pub fn add_node(&mut self, op: Op, inputs: Vec<NodeId>) -> NodeId {
         let id = self.nodes.len();
-        self.nodes.push(Node { op, inputs: inputs.clone(), uses: vec![] });
+        self.nodes.push(Node {
+            op,
+            inputs: inputs.clone(),
+            uses: vec![],
+        });
         for &inp in &inputs {
             if inp < self.nodes.len() {
                 self.nodes[inp].uses.push(id);
@@ -128,12 +144,18 @@ impl ConnectionGraph {
     }
 
     fn set_escape(&mut self, node: NodeId, state: EscapeState) {
-        let entry = self.escape_states.entry(node).or_insert(EscapeState::NoEscape);
+        let entry = self
+            .escape_states
+            .entry(node)
+            .or_insert(EscapeState::NoEscape);
         *entry = (*entry).join(state);
     }
 
     fn get_escape(&self, node: NodeId) -> EscapeState {
-        self.escape_states.get(&node).copied().unwrap_or(EscapeState::NoEscape)
+        self.escape_states
+            .get(&node)
+            .copied()
+            .unwrap_or(EscapeState::NoEscape)
     }
 
     fn add_points_to(&mut self, from: NodeId, to: NodeId) {
@@ -145,7 +167,10 @@ impl ConnectionGraph {
     }
 
     fn add_field_edge(&mut self, obj: NodeId, field: usize, value: NodeId) {
-        self.field_edges.entry((obj, field)).or_default().insert(value);
+        self.field_edges
+            .entry((obj, field))
+            .or_default()
+            .insert(value);
     }
 
     /// Resolve all deferred edges to compute the full points-to set for a node.
@@ -309,12 +334,7 @@ fn is_ref_producer(graph: &Graph, node: NodeId) -> bool {
     }
     matches!(
         graph.nodes[node].op,
-        Op::New { .. }
-            | Op::NewArray { .. }
-            | Op::Phi
-            | Op::Load(_)
-            | Op::Param(_)
-            | Op::Call
+        Op::New { .. } | Op::NewArray { .. } | Op::Phi | Op::Load(_) | Op::Param(_) | Op::Call
     )
 }
 
@@ -416,7 +436,11 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
     let mut results = Vec::new();
 
     for (id, node) in graph.nodes.iter().enumerate() {
-        if let Op::New { class_id, num_fields } = &node.op {
+        if let Op::New {
+            class_id,
+            num_fields,
+        } = &node.op
+        {
             if cg.get_escape(id) != EscapeState::NoEscape {
                 continue;
             }
@@ -492,7 +516,8 @@ fn find_lock_elisions(cg: &ConnectionGraph, graph: &Graph) -> Vec<NodeId> {
                 let all_no_escape = if pts.is_empty() {
                     cg.get_escape(obj) == EscapeState::NoEscape
                 } else {
-                    pts.iter().all(|&a| cg.get_escape(a) == EscapeState::NoEscape)
+                    pts.iter()
+                        .all(|&a| cg.get_escape(a) == EscapeState::NoEscape)
                 };
                 if all_no_escape {
                     elide.push(id);
@@ -527,9 +552,7 @@ pub fn is_partial_escape(cg: &ConnectionGraph, graph: &Graph, alloc: NodeId) -> 
         }
         match &graph.nodes[use_id].op {
             Op::Return | Op::Call => has_escaping_use = true,
-            Op::Store(_) | Op::Load(_) | Op::MonitorEnter | Op::MonitorExit => {
-                has_local_use = true
-            }
+            Op::Store(_) | Op::Load(_) | Op::MonitorEnter | Op::MonitorExit => has_local_use = true,
             Op::Phi => {
                 // Phi merges paths -- check if any successor escapes.
                 if cg.get_escape(use_id) >= EscapeState::ArgEscape {
@@ -567,10 +590,7 @@ pub fn find_materialization_points(
         if use_id >= graph.nodes.len() {
             continue;
         }
-        let is_escape_point = matches!(
-            graph.nodes[use_id].op,
-            Op::Return | Op::Call
-        );
+        let is_escape_point = matches!(graph.nodes[use_id].op, Op::Return | Op::Call);
         if !is_escape_point {
             if let Op::Phi = &graph.nodes[use_id].op {
                 if cg.get_escape(use_id) >= EscapeState::ArgEscape {
@@ -724,7 +744,13 @@ mod tests {
     fn graph_local_alloc() -> Graph {
         let mut g = Graph::new();
         // node 2: New { class_id: 1, num_fields: 2 }
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 2 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 2,
+            },
+            vec![],
+        );
         // node 3: Const(42)
         let c42 = g.add_node(Op::Const(42), vec![]);
         // node 4: Store field 0 <- 42
@@ -746,38 +772,74 @@ mod tests {
     #[test]
     fn test_returned_alloc_global_escape() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 1 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
         // Wire alloc as input to Return.
         g.nodes[1].inputs.push(alloc); // Return node
         g.nodes[alloc].uses.push(1);
         let result = analyze_escapes(&g);
-        assert_eq!(result.escape_states.get(&alloc), Some(&EscapeState::GlobalEscape));
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::GlobalEscape)
+        );
     }
 
     #[test]
     fn test_call_arg_escape() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 1 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
         let _call = g.add_node(Op::Call, vec![alloc]);
         let result = analyze_escapes(&g);
-        assert_eq!(result.escape_states.get(&alloc), Some(&EscapeState::ArgEscape));
+        assert_eq!(
+            result.escape_states.get(&alloc),
+            Some(&EscapeState::ArgEscape)
+        );
     }
 
     #[test]
     fn test_stored_to_escaping_object_global_escape() {
         let mut g = Graph::new();
         // Outer object escapes via return.
-        let outer = g.add_node(Op::New { class_id: 1, num_fields: 1 }, vec![]);
+        let outer = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
         g.nodes[1].inputs.push(outer);
         g.nodes[outer].uses.push(1);
         // Inner object is stored into outer's field.
-        let inner = g.add_node(Op::New { class_id: 2, num_fields: 0 }, vec![]);
+        let inner = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
         let _store = g.add_node(Op::Store(0), vec![outer, inner]);
         let result = analyze_escapes(&g);
-        assert_eq!(result.escape_states.get(&outer), Some(&EscapeState::GlobalEscape));
+        assert_eq!(
+            result.escape_states.get(&outer),
+            Some(&EscapeState::GlobalEscape)
+        );
         // Inner should also be GlobalEscape because it's stored into a
         // globally-escaping object.
-        assert_eq!(result.escape_states.get(&inner), Some(&EscapeState::GlobalEscape));
+        assert_eq!(
+            result.escape_states.get(&inner),
+            Some(&EscapeState::GlobalEscape)
+        );
     }
 
     // ---- Scalar replacement ----
@@ -785,7 +847,13 @@ mod tests {
     #[test]
     fn test_scalar_replacement_single_field() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 5, num_fields: 1 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 5,
+                num_fields: 1,
+            },
+            vec![],
+        );
         let c10 = g.add_node(Op::Const(10), vec![]);
         let _store = g.add_node(Op::Store(0), vec![alloc, c10]);
         let _load = g.add_node(Op::Load(0), vec![alloc]);
@@ -798,7 +866,13 @@ mod tests {
     #[test]
     fn test_scalar_replacement_multi_field() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 3, num_fields: 3 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 3,
+                num_fields: 3,
+            },
+            vec![],
+        );
         let c1 = g.add_node(Op::Const(1), vec![]);
         let c2 = g.add_node(Op::Const(2), vec![]);
         let c3 = g.add_node(Op::Const(3), vec![]);
@@ -818,7 +892,13 @@ mod tests {
     #[test]
     fn test_load_after_store_returns_stored_value() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 1 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
         let c99 = g.add_node(Op::Const(99), vec![]);
         let _store = g.add_node(Op::Store(0), vec![alloc, c99]);
         let _load = g.add_node(Op::Load(0), vec![alloc]);
@@ -830,7 +910,13 @@ mod tests {
     #[test]
     fn test_uninitialized_field_returns_none() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 2 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 2,
+            },
+            vec![],
+        );
         let c1 = g.add_node(Op::Const(1), vec![]);
         let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
         // Field 1 is never stored to.
@@ -845,7 +931,13 @@ mod tests {
     #[test]
     fn test_lock_on_non_escaping_elided() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 0 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
         let _enter = g.add_node(Op::MonitorEnter, vec![alloc]);
         let _exit = g.add_node(Op::MonitorExit, vec![alloc]);
         let result = analyze_escapes(&g);
@@ -856,7 +948,13 @@ mod tests {
     #[test]
     fn test_lock_on_escaping_object_kept() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 0 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
         g.nodes[1].inputs.push(alloc); // Return
         g.nodes[alloc].uses.push(1);
         let _enter = g.add_node(Op::MonitorEnter, vec![alloc]);
@@ -869,7 +967,13 @@ mod tests {
     #[test]
     fn test_partial_escape_detection() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 1 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
         let c1 = g.add_node(Op::Const(1), vec![]);
         let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
         // Also passed to a call (ArgEscape).
@@ -881,7 +985,13 @@ mod tests {
     #[test]
     fn test_materialization_point_found() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 1 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
         let c7 = g.add_node(Op::Const(7), vec![]);
         let _store = g.add_node(Op::Store(0), vec![alloc, c7]);
         let _call = g.add_node(Op::Call, vec![alloc]);
@@ -898,8 +1008,20 @@ mod tests {
     #[test]
     fn test_phi_deferred_edges() {
         let mut g = Graph::new();
-        let a1 = g.add_node(Op::New { class_id: 1, num_fields: 0 }, vec![]);
-        let a2 = g.add_node(Op::New { class_id: 2, num_fields: 0 }, vec![]);
+        let a1 = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let a2 = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
         let phi = g.add_node(Op::Phi, vec![a1, a2]);
         let _ = phi; // just used for CG building
         let cg = build_connection_graph(&g);
@@ -911,7 +1033,13 @@ mod tests {
     #[test]
     fn test_points_to_propagation_through_copies() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 0 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
         // Phi acts as a "copy".
         let phi1 = g.add_node(Op::Phi, vec![alloc]);
         let phi2 = g.add_node(Op::Phi, vec![phi1]);
@@ -923,7 +1051,13 @@ mod tests {
     #[test]
     fn test_field_edge_tracking() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 2 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 2,
+            },
+            vec![],
+        );
         let c1 = g.add_node(Op::Const(1), vec![]);
         let c2 = g.add_node(Op::Const(2), vec![]);
         let _s0 = g.add_node(Op::Store(0), vec![alloc, c1]);
@@ -937,14 +1071,23 @@ mod tests {
     fn test_fixed_point_convergence() {
         // Build a graph where propagation needs multiple iterations.
         let mut g = Graph::new();
-        let a1 = g.add_node(Op::New { class_id: 1, num_fields: 0 }, vec![]);
+        let a1 = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
         let phi1 = g.add_node(Op::Phi, vec![a1]);
         let phi2 = g.add_node(Op::Phi, vec![phi1]);
         // Return phi2 -> should propagate GlobalEscape back to a1.
         g.nodes[1].inputs.push(phi2);
         g.nodes[phi2].uses.push(1);
         let result = analyze_escapes(&g);
-        assert_eq!(result.escape_states.get(&a1), Some(&EscapeState::GlobalEscape));
+        assert_eq!(
+            result.escape_states.get(&a1),
+            Some(&EscapeState::GlobalEscape)
+        );
     }
 
     // ---- Empty / edge cases ----
@@ -966,7 +1109,10 @@ mod tests {
         g.nodes[1].inputs.push(arr);
         g.nodes[arr].uses.push(1);
         let result = analyze_escapes(&g);
-        assert_eq!(result.escape_states.get(&arr), Some(&EscapeState::GlobalEscape));
+        assert_eq!(
+            result.escape_states.get(&arr),
+            Some(&EscapeState::GlobalEscape)
+        );
     }
 
     #[test]
@@ -981,9 +1127,27 @@ mod tests {
     #[test]
     fn test_multiple_allocations() {
         let mut g = Graph::new();
-        let a1 = g.add_node(Op::New { class_id: 1, num_fields: 0 }, vec![]);
-        let a2 = g.add_node(Op::New { class_id: 2, num_fields: 0 }, vec![]);
-        let a3 = g.add_node(Op::New { class_id: 3, num_fields: 0 }, vec![]);
+        let a1 = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let a2 = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let a3 = g.add_node(
+            Op::New {
+                class_id: 3,
+                num_fields: 0,
+            },
+            vec![],
+        );
         // a1 returned.
         g.nodes[1].inputs.push(a1);
         g.nodes[a1].uses.push(1);
@@ -991,7 +1155,10 @@ mod tests {
         let _call = g.add_node(Op::Call, vec![a2]);
         // a3 purely local.
         let result = analyze_escapes(&g);
-        assert_eq!(result.escape_states.get(&a1), Some(&EscapeState::GlobalEscape));
+        assert_eq!(
+            result.escape_states.get(&a1),
+            Some(&EscapeState::GlobalEscape)
+        );
         assert_eq!(result.escape_states.get(&a2), Some(&EscapeState::ArgEscape));
         assert_eq!(result.escape_states.get(&a3), Some(&EscapeState::NoEscape));
         assert_eq!(result.stats.total_allocations, 3);
@@ -1000,8 +1167,20 @@ mod tests {
     #[test]
     fn test_stats_counting() {
         let mut g = Graph::new();
-        let _a1 = g.add_node(Op::New { class_id: 1, num_fields: 1 }, vec![]);
-        let a2 = g.add_node(Op::New { class_id: 2, num_fields: 0 }, vec![]);
+        let _a1 = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let a2 = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
         let _call = g.add_node(Op::Call, vec![a2]);
         // a1 is local -> scalar replaceable, a2 is ArgEscape -> stack alloc.
         let result = analyze_escapes(&g);
@@ -1017,7 +1196,13 @@ mod tests {
     #[test]
     fn test_apply_scalar_replacement_marks_dead() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 1 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
         let c10 = g.add_node(Op::Const(10), vec![]);
         let store = g.add_node(Op::Store(0), vec![alloc, c10]);
         let load = g.add_node(Op::Load(0), vec![alloc]);
@@ -1040,7 +1225,13 @@ mod tests {
     #[test]
     fn test_apply_lock_elision_marks_dead() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 0 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
         let enter = g.add_node(Op::MonitorEnter, vec![alloc]);
         let exit = g.add_node(Op::MonitorExit, vec![alloc]);
 
@@ -1053,8 +1244,8 @@ mod tests {
     fn test_deferred_edge_propagation() {
         let mut cg = ConnectionGraph::new();
         cg.add_points_to(10, 10); // alloc 10 points to itself
-        cg.add_deferred(20, 10);  // node 20 copies from 10
-        cg.add_deferred(30, 20);  // node 30 copies from 20
+        cg.add_deferred(20, 10); // node 20 copies from 10
+        cg.add_deferred(30, 20); // node 30 copies from 20
 
         let pts = cg.resolve_points_to(30);
         assert!(pts.contains(&10));
@@ -1063,8 +1254,20 @@ mod tests {
     #[test]
     fn test_nested_object_stored_to_escaping() {
         let mut g = Graph::new();
-        let outer = g.add_node(Op::New { class_id: 1, num_fields: 1 }, vec![]);
-        let inner = g.add_node(Op::New { class_id: 2, num_fields: 0 }, vec![]);
+        let outer = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let inner = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
         let _store = g.add_node(Op::Store(0), vec![outer, inner]);
         // Outer escapes via call.
         let _call = g.add_node(Op::Call, vec![outer]);
@@ -1094,8 +1297,20 @@ mod tests {
         // Two allocations, one NoEscape and one GlobalEscape, merged
         // through a phi. The phi should be GlobalEscape.
         let mut g = Graph::new();
-        let a1 = g.add_node(Op::New { class_id: 1, num_fields: 0 }, vec![]);
-        let a2 = g.add_node(Op::New { class_id: 2, num_fields: 0 }, vec![]);
+        let a1 = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
+        let a2 = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 0,
+            },
+            vec![],
+        );
         // a2 escapes globally.
         g.nodes[1].inputs.push(a2);
         g.nodes[a2].uses.push(1);
@@ -1112,8 +1327,14 @@ mod tests {
 
     #[test]
     fn test_escape_state_join_lattice() {
-        assert_eq!(EscapeState::NoEscape.join(EscapeState::NoEscape), EscapeState::NoEscape);
-        assert_eq!(EscapeState::NoEscape.join(EscapeState::ArgEscape), EscapeState::ArgEscape);
+        assert_eq!(
+            EscapeState::NoEscape.join(EscapeState::NoEscape),
+            EscapeState::NoEscape
+        );
+        assert_eq!(
+            EscapeState::NoEscape.join(EscapeState::ArgEscape),
+            EscapeState::ArgEscape
+        );
         assert_eq!(
             EscapeState::ArgEscape.join(EscapeState::GlobalEscape),
             EscapeState::GlobalEscape
@@ -1127,7 +1348,13 @@ mod tests {
     #[test]
     fn test_scalar_replacement_not_applied_to_escaping() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 1 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
         let c1 = g.add_node(Op::Const(1), vec![]);
         let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
         // Return the allocation -> GlobalEscape.
@@ -1140,7 +1367,13 @@ mod tests {
     #[test]
     fn test_apply_scalar_replacement_redirects_uses() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 1 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
         let c42 = g.add_node(Op::Const(42), vec![]);
         let store = g.add_node(Op::Store(0), vec![alloc, c42]);
         let load = g.add_node(Op::Load(0), vec![alloc]);
@@ -1173,7 +1406,13 @@ mod tests {
     fn test_param_ref_in_phi_does_not_crash() {
         let mut g = Graph::new();
         let param = g.add_node(Op::Param(0), vec![]);
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 0 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 0,
+            },
+            vec![],
+        );
         let _phi = g.add_node(Op::Phi, vec![param, alloc]);
         // Should not panic.
         let _ = analyze_escapes(&g);
@@ -1182,7 +1421,13 @@ mod tests {
     #[test]
     fn test_multiple_stores_to_same_field_last_wins() {
         let mut g = Graph::new();
-        let alloc = g.add_node(Op::New { class_id: 1, num_fields: 1 }, vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
         let c1 = g.add_node(Op::Const(1), vec![]);
         let c2 = g.add_node(Op::Const(2), vec![]);
         let _s1 = g.add_node(Op::Store(0), vec![alloc, c1]);

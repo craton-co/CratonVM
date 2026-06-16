@@ -124,11 +124,12 @@ fn opcode_dereferences_receiver(op: u8) -> bool {
     // from the immediately-preceding instruction, so we forgo the fact
     // rather than assert a wrong one. `getfield` is retained: its receiver
     // IS the top-of-stack operand the preceding `aload` pushed.
-    matches!(op,
+    matches!(
+        op,
         0xB4 | // getfield
         0xBE | // arraylength
         0xC2 | // monitorenter
-        0xC3   // monitorexit
+        0xC3 // monitorexit
     )
 }
 
@@ -174,14 +175,15 @@ fn astore_at(code: &[u8], pc: usize) -> Option<usize> {
 /// implicitly via the IN mask, so this only returns true for the
 /// allocation opcodes.)
 fn produces_nonnull(op: u8) -> bool {
-    matches!(op,
+    matches!(
+        op,
         0xBB | // new
         0xBC | // newarray
         0xBD | // anewarray
         0xC5 | // multianewarray
         0x12 | // ldc — string/class literals are non-null (numeric ldc is also OK; never null)
         0x13 | // ldc_w
-        0x14   // ldc2_w
+        0x14 // ldc2_w
     )
 }
 
@@ -544,12 +546,12 @@ mod tests {
         // aload_0; getfield #1; ... ; aload_0; getfield #2
         // After the first getfield, local 0 is proven non-null.
         let code = vec![
-            0x2A,             // 0: aload_0
+            0x2A, // 0: aload_0
             0xB4, 0x00, 0x01, // 1: getfield #1
-            0x57,             // 4: pop (discard field value)
-            0x2A,             // 5: aload_0
+            0x57, // 4: pop (discard field value)
+            0x2A, // 5: aload_0
             0xB4, 0x00, 0x02, // 6: getfield #2
-            0xB1,             // 9: return
+            0xB1, // 9: return
         ];
         let info = analyze(&code, code.len());
         // At PC 0, local 0 is NOT proven non-null (no prior evidence).
@@ -566,11 +568,11 @@ mod tests {
         // aload_1; ifnull +5; aload_1; ...
         // The fall-through after `ifnull` proves local 1 non-null.
         let code = vec![
-            0x2B,             // 0: aload_1
+            0x2B, // 0: aload_1
             0xC6, 0x00, 0x05, // 1: ifnull → PC 6
-            0x2B,             // 4: aload_1 (fall-through: local 1 non-null)
-            0xB1,             // 5: return
-            0xB1,             // 6: return (taken path)
+            0x2B, // 4: aload_1 (fall-through: local 1 non-null)
+            0xB1, // 5: return
+            0xB1, // 6: return (taken path)
         ];
         let info = analyze(&code, code.len());
         assert!(info.is_nonnull(4, 1));
@@ -583,9 +585,9 @@ mod tests {
         // new #X; astore_1 → local 1 is non-null
         let code = vec![
             0xBB, 0x00, 0x01, // 0: new #1
-            0x4C,             // 3: astore_1
-            0x2B,             // 4: aload_1
-            0xB1,             // 5: return
+            0x4C, // 3: astore_1
+            0x2B, // 4: aload_1
+            0xB1, // 5: return
         ];
         let info = analyze(&code, code.len());
         assert!(info.is_nonnull(4, 1));
@@ -595,8 +597,8 @@ mod tests {
     fn total_facts_counts_correctly() {
         let code = vec![
             0xBB, 0x00, 0x01, // 0: new
-            0x4C,             // 3: astore_1
-            0xB1,             // 4: return
+            0x4C, // 3: astore_1
+            0xB1, // 4: return
         ];
         let info = analyze(&code, code.len());
         assert!(info.total_facts() >= 1);
@@ -622,11 +624,11 @@ mod tests {
         // get dropped by the CFG walk, and leave PC 8 with only the
         // getfield predecessor.
         let code = vec![
-            0x03,              // 0: iconst_0
-            0x99, 0x00, 0x07,  // 1: ifeq → PC 8
-            0x2B,              // 4: aload_1
-            0xB4, 0x00, 0x01,  // 5: getfield (proves L1 nonnull on this path)
-            0xB1,              // 8: return (merge)
+            0x03, // 0: iconst_0
+            0x99, 0x00, 0x07, // 1: ifeq → PC 8
+            0x2B, // 4: aload_1
+            0xB4, 0x00, 0x01, // 5: getfield (proves L1 nonnull on this path)
+            0xB1, // 8: return (merge)
         ];
         // The "merge" PC here is 8 (the return). Local 1 should NOT
         // be proven non-null at PC 8 because the ifeq-taken path
@@ -642,9 +644,9 @@ mod tests {
         //   4: pop
         //   5: goto -5 → PC 0 (loop back)
         let code = vec![
-            0x2A,             // 0: aload_0
+            0x2A, // 0: aload_0
             0xB4, 0x00, 0x01, // 1: getfield
-            0x57,             // 4: pop
+            0x57, // 4: pop
             0xA7, 0xFF, 0xFB, // 5: goto -5 → PC 0
         ];
         let info = analyze(&code, code.len());

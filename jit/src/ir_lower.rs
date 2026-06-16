@@ -402,7 +402,7 @@ impl<'a> Lowerer<'a> {
                 self.buf.emit(&[0x39, 0xC8]);
                 // SETcc AL
                 self.buf.emit(&[0x0F, cc.x64_cc() - 0x10]); // SETcc = 0x0F 0x9x
-                // MOVZX EAX, AL
+                                                            // MOVZX EAX, AL
                 self.buf.emit(&[0x0F, 0xB6, 0xC0]);
                 self.store_rax(slot);
             }
@@ -426,8 +426,7 @@ impl<'a> Lowerer<'a> {
                 self.alloc_slot(id);
             }
             // Control and meta nodes — skip
-            Op::Start | Op::Return | Op::If | Op::Merge | Op::Region
-            | Op::Proj(_) | Op::Dead => {}
+            Op::Start | Op::Return | Op::If | Op::Merge | Op::Region | Op::Proj(_) | Op::Dead => {}
             // Unhandled — skip (bail in ir_compatible prevents reaching here)
             _ => {}
         }
@@ -479,7 +478,9 @@ impl<'a> Lowerer<'a> {
         for &(patch_pos, target_block) in &self.branch_patches {
             let target_offset = self.block_offsets[target_block];
             let rel32 = target_offset as i32 - (patch_pos as i32 + 4);
-            self.buf.try_patch_i32(patch_pos, rel32).expect("codegen patch in-bounds");
+            self.buf
+                .try_patch_i32(patch_pos, rel32)
+                .expect("codegen patch in-bounds");
         }
     }
 }
@@ -529,7 +530,14 @@ pub fn lower(
     let estimated_size = graph.nodes.len() * 32 + 256;
     let buf = ExecutableBuffer::new(estimated_size.max(4096))?;
 
-    let mut lowerer = Lowerer::new(graph, schedule, buf, num_params, num_locals, graph.nodes.len());
+    let mut lowerer = Lowerer::new(
+        graph,
+        schedule,
+        buf,
+        num_params,
+        num_locals,
+        graph.nodes.len(),
+    );
 
     lowerer.emit_prologue();
 

@@ -2423,33 +2423,23 @@ impl MarshalWriteback {
     ) -> Result<(), String> {
         use crate::runtime::gpu_marshal;
         match self {
-            Self::I32 { obj, buf, len } => {
-                let mut dst = vec![0i32; *len];
-                gpu_marshal::download_into(buf.as_ref(), &mut dst)
-                    .map_err(|e| format!("download_into i32: {e}"))?;
-                gpu_marshal::write_back_i32(*obj, &shared.heap, &dst, token);
-                Ok(())
+            // Download the kernel-written buffer straight into the JVM heap
+            // arena (no staging Vec + write-back) when the array is contiguous.
+            Self::I32 { obj, buf, .. } => {
+                gpu_marshal::download_obj_i32(buf.as_ref(), *obj, &shared.heap, token)
+                    .map_err(|e| format!("download i32: {e}"))
             }
-            Self::I64 { obj, buf, len } => {
-                let mut dst = vec![0i64; *len];
-                gpu_marshal::download_into(buf.as_ref(), &mut dst)
-                    .map_err(|e| format!("download_into i64: {e}"))?;
-                gpu_marshal::write_back_i64(*obj, &shared.heap, &dst, token);
-                Ok(())
+            Self::I64 { obj, buf, .. } => {
+                gpu_marshal::download_obj_i64(buf.as_ref(), *obj, &shared.heap, token)
+                    .map_err(|e| format!("download i64: {e}"))
             }
-            Self::F32 { obj, buf, len } => {
-                let mut dst = vec![0f32; *len];
-                gpu_marshal::download_into(buf.as_ref(), &mut dst)
-                    .map_err(|e| format!("download_into f32: {e}"))?;
-                gpu_marshal::write_back_f32(*obj, &shared.heap, &dst, token);
-                Ok(())
+            Self::F32 { obj, buf, .. } => {
+                gpu_marshal::download_obj_f32(buf.as_ref(), *obj, &shared.heap, token)
+                    .map_err(|e| format!("download f32: {e}"))
             }
-            Self::F64 { obj, buf, len } => {
-                let mut dst = vec![0f64; *len];
-                gpu_marshal::download_into(buf.as_ref(), &mut dst)
-                    .map_err(|e| format!("download_into f64: {e}"))?;
-                gpu_marshal::write_back_f64(*obj, &shared.heap, &dst, token);
-                Ok(())
+            Self::F64 { obj, buf, .. } => {
+                gpu_marshal::download_obj_f64(buf.as_ref(), *obj, &shared.heap, token)
+                    .map_err(|e| format!("download f64: {e}"))
             }
             // Phase 9 #1 — Resident-arg writebacks no longer
             // download to host bytes eagerly. They mark the cache
@@ -2788,7 +2778,7 @@ fn marshal_array_arg(
         (
             $ty:ty,
             $variant:ident,
-            $host_view:path,
+            $upload_obj:path,
             $cache_get:path,
             $cache_put:path,
             $tag:literal,
@@ -2799,10 +2789,10 @@ fn marshal_array_arg(
                 if let Some(arc) = $cache_get(obj_ref, len) {
                     (arc, false)
                 } else {
-                    // (b) Miss — host_view + upload, then install.
-                    let host = $host_view(obj_ref, &shared.heap, token);
-                    debug_assert_eq!(host.len(), len, concat!("host_view ", $tag, " length mismatch"));
-                    let buf = gpu_marshal::upload(ctx, &host)
+                    // (b) Miss — upload, reading the JVM heap arena directly
+                    //     (no staging Vec) when the array is contiguous, then
+                    //     install into the input cache.
+                    let buf = $upload_obj(ctx, obj_ref, &shared.heap, token)
                         .map_err(|e| format!("upload {} (len={len}): {e}", $tag))?;
                     let arc = Arc::new(buf);
                     $cache_put(obj_ref, len, arc.clone());
@@ -2842,19 +2832,19 @@ fn marshal_array_arg(
 
     let (push, wb, bytes_uploaded) = match element_type {
         ArrayElementType::Int => arm!(
-            i32, I32, gpu_marshal::host_view_i32,
+            i32, I32, gpu_marshal::upload_obj_i32,
             input_cache::get_i32, input_cache::put_i32, "i32", 4
         ),
         ArrayElementType::Long => arm!(
-            i64, I64, gpu_marshal::host_view_i64,
+            i64, I64, gpu_marshal::upload_obj_i64,
             input_cache::get_i64, input_cache::put_i64, "i64", 8
         ),
         ArrayElementType::Float => arm!(
-            f32, F32, gpu_marshal::host_view_f32,
+            f32, F32, gpu_marshal::upload_obj_f32,
             input_cache::get_f32, input_cache::put_f32, "f32", 4
         ),
         ArrayElementType::Double => arm!(
-            f64, F64, gpu_marshal::host_view_f64,
+            f64, F64, gpu_marshal::upload_obj_f64,
             input_cache::get_f64, input_cache::put_f64, "f64", 8
         ),
         other => return Err(format!("submitMethod: unsupported array element type: {other:?}")),

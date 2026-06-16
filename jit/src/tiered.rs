@@ -96,7 +96,11 @@ pub struct MethodKey {
 }
 
 impl MethodKey {
-    pub fn new(class_name: impl Into<String>, method_name: impl Into<String>, descriptor: impl Into<String>) -> Self {
+    pub fn new(
+        class_name: impl Into<String>,
+        method_name: impl Into<String>,
+        descriptor: impl Into<String>,
+    ) -> Self {
         Self {
             class_name: class_name.into(),
             method_name: method_name.into(),
@@ -698,7 +702,11 @@ mod tests {
     }
 
     fn test_key2() -> MethodKey {
-        MethodKey::new("java/util/HashMap", "get", "(Ljava/lang/Object;)Ljava/lang/Object;")
+        MethodKey::new(
+            "java/util/HashMap",
+            "get",
+            "(Ljava/lang/Object;)Ljava/lang/Object;",
+        )
     }
 
     // ── Policy defaults ──────────────────────────────────────────────────
@@ -1077,7 +1085,10 @@ mod tests {
         mgr.on_method_invocation(&key);
         mgr.compilation_complete(&key, CompilationTier::C1, 15);
         mgr.compilation_complete(&key, CompilationTier::C2, 85);
-        assert_eq!(mgr.stats().total_compile_time_ms.load(Ordering::Relaxed), 100);
+        assert_eq!(
+            mgr.stats().total_compile_time_ms.load(Ordering::Relaxed),
+            100
+        );
     }
 
     // ── Method states listing ────────────────────────────────────────────

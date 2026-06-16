@@ -94,9 +94,7 @@ pub fn detect_loops(code: &[u8], code_len: usize) -> Vec<LoopInfo> {
                     // Use `from_be_bytes` to avoid the debug overflow
                     // panic that `(byte_hi as i16) << 8` triggers when
                     // the high bit is set.
-                    let offset = i16::from_be_bytes(
-                        [code[pc + 1], code[pc + 2]],
-                    ) as i32;
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
                     let target_opt = pc.checked_add_signed(offset as isize);
                     if let Some(target) = target_opt {
                         if target < code_len && target <= pc {
@@ -135,10 +133,7 @@ pub fn detect_loops(code: &[u8], code_len: usize) -> Vec<LoopInfo> {
 /// itself requires safepoint and oop-map adjustments not implemented
 /// here. This function exists so that future hoisting passes can be
 /// developed and tested without re-implementing detection.
-pub fn find_invariant_loads(
-    loop_info: &LoopInfo,
-    code: &[u8],
-) -> Vec<InvariantLoad> {
+pub fn find_invariant_loads(loop_info: &LoopInfo, code: &[u8]) -> Vec<InvariantLoad> {
     let (start, end) = loop_info.body_blocks;
     if end > code.len() || start >= end {
         return Vec::new();
@@ -184,11 +179,10 @@ pub fn find_invariant_loads(
             0xb4 if pc + 2 < end => {
                 if let (Some(load_op), Some(local)) = (prev_op, prev_local) {
                     let is_aload = matches!(load_op, 0x19 | 0x2a..=0x2d);
-                    let local_is_invariant = (local as usize) < 64
-                        && (modified & (1u64 << local)) == 0;
+                    let local_is_invariant =
+                        (local as usize) < 64 && (modified & (1u64 << local)) == 0;
                     if is_aload && local_is_invariant {
-                        let cp_index =
-                            ((code[pc + 1] as u16) << 8) | code[pc + 2] as u16;
+                        let cp_index = ((code[pc + 1] as u16) << 8) | code[pc + 2] as u16;
                         out.push(InvariantLoad {
                             loop_header: loop_info.header_pc,
                             load_pc: pc,
@@ -273,8 +267,19 @@ fn inst_len_at(code: &[u8], pc: usize) -> usize {
         // 3-byte: sipush, ldc_w/ldc2_w, branches, getfield/static,
         // putfield/static, invokestatic/special/virtual, new,
         // anewarray, checkcast, instanceof, iinc.
-        0x11 | 0x13 | 0x14 | 0x84 | 0x99..=0xa6 | 0xa7 | 0xb2..=0xb8
-        | 0xbb | 0xbd | 0xc0 | 0xc1 | 0xc6 | 0xc7 => 3,
+        0x11
+        | 0x13
+        | 0x14
+        | 0x84
+        | 0x99..=0xa6
+        | 0xa7
+        | 0xb2..=0xb8
+        | 0xbb
+        | 0xbd
+        | 0xc0
+        | 0xc1
+        | 0xc6
+        | 0xc7 => 3,
         // 5-byte: invokedynamic / invokeinterface / multianewarray
         0xb9 | 0xba => 5,
         0xc5 => 4,
@@ -326,8 +331,8 @@ mod tests {
         // PC 11: goto -9                ; 3 bytes → target PC 2
         // PC 14: return
         let code: Vec<u8> = vec![
-            0x03, 0x3c, 0x1b, 0x10, 0x0a, 0xa2, 0x00, 0x08, 0x84, 0x01, 0x01,
-            0xa7, 0xff, 0xf7, 0xb1,
+            0x03, 0x3c, 0x1b, 0x10, 0x0a, 0xa2, 0x00, 0x08, 0x84, 0x01, 0x01, 0xa7, 0xff, 0xf7,
+            0xb1,
         ];
         let loops = detect_loops(&code, code.len());
         assert_eq!(loops.len(), 1);
@@ -351,9 +356,7 @@ mod tests {
         // PC 4: pop
         // PC 5: getstatic #0x0002
         // PC 8: pop
-        let code: Vec<u8> = vec![
-            0x2a, 0xb4, 0x00, 0x01, 0x57, 0xb2, 0x00, 0x02, 0x57,
-        ];
+        let code: Vec<u8> = vec![0x2a, 0xb4, 0x00, 0x01, 0x57, 0xb2, 0x00, 0x02, 0x57];
         let li = LoopInfo {
             header_pc: 0,
             back_edges: vec![],

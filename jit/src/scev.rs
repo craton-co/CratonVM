@@ -130,8 +130,7 @@ pub fn analyze_induction_variables(
         //   iload <iv>; iload <bound>; if_icmpge <exit>
         // or:
         //   iload <iv>; sipush <N>; if_icmpge <exit>
-        let (init, bound_local, bound_const) =
-            analyze_loop_exit(code, code_len, header_pc, local);
+        let (init, bound_local, bound_const) = analyze_loop_exit(code, code_len, header_pc, local);
 
         result.push(InductionVar {
             header_pc,
@@ -252,14 +251,20 @@ pub fn bytecode_len(code: &[u8], pc: usize, code_len: usize) -> usize {
         0xAA => {
             let pad = (4 - ((pc + 1) % 4)) % 4;
             let table = pc + 1 + pad;
-            if table + 12 > code_len { return 1; }
+            if table + 12 > code_len {
+                return 1;
+            }
             let low = i32::from_be_bytes([
-                code[table + 4], code[table + 5],
-                code[table + 6], code[table + 7],
+                code[table + 4],
+                code[table + 5],
+                code[table + 6],
+                code[table + 7],
             ]);
             let high = i32::from_be_bytes([
-                code[table + 8], code[table + 9],
-                code[table + 10], code[table + 11],
+                code[table + 8],
+                code[table + 9],
+                code[table + 10],
+                code[table + 11],
             ]);
             let n = match crate::x64::checked_tableswitch_count(low, high) {
                 Some(c) => c,
@@ -273,19 +278,26 @@ pub fn bytecode_len(code: &[u8], pc: usize, code_len: usize) -> usize {
         0xAB => {
             let pad = (4 - ((pc + 1) % 4)) % 4;
             let table = pc + 1 + pad;
-            if table + 8 > code_len { return 1; }
+            if table + 8 > code_len {
+                return 1;
+            }
             // Read as i32 first to detect negative values explicitly; the
             // historical `u32` cast silently accepted huge "negative"
             // npairs and let them propagate into address arithmetic.
             let npairs_raw = i32::from_be_bytes([
-                code[table + 4], code[table + 5],
-                code[table + 6], code[table + 7],
+                code[table + 4],
+                code[table + 5],
+                code[table + 6],
+                code[table + 7],
             ]);
             let npairs = match crate::x64::checked_lookupswitch_npairs(npairs_raw) {
                 Some(n) => n,
                 None => return 1,
             };
-            match npairs.checked_mul(8).and_then(|x| x.checked_add(1 + pad + 8)) {
+            match npairs
+                .checked_mul(8)
+                .and_then(|x| x.checked_add(1 + pad + 8))
+            {
                 Some(len) => len,
                 None => 1,
             }
@@ -301,8 +313,14 @@ pub fn bytecode_len(code: &[u8], pc: usize, code_len: usize) -> usize {
         0xC0..=0xC1 => 3,
         0xC2..=0xC3 => 1,
         0xC4 => {
-            if pc + 1 >= code_len { return 1; }
-            if code[pc + 1] == 0x84 { 6 } else { 4 }
+            if pc + 1 >= code_len {
+                return 1;
+            }
+            if code[pc + 1] == 0x84 {
+                6
+            } else {
+                4
+            }
         }
         0xC5 => 4,
         0xC6 | 0xC7 => 3,
@@ -321,20 +339,20 @@ mod tests {
         // iconst_0; istore_1; [header:] iload_1; bipush 10; if_icmpge exit;
         // ... body ...; iinc 1, 1; goto header; [exit:]
         let code = vec![
-            0x03,             // 0: iconst_0
-            0x3C,             // 1: istore_1
+            0x03, // 0: iconst_0
+            0x3C, // 1: istore_1
             // header at PC=2:
-            0x1B,             // 2: iload_1
-            0x10, 0x0A,       // 3: bipush 10
+            0x1B, // 2: iload_1
+            0x10, 0x0A, // 3: bipush 10
             0xA2, 0x00, 0x08, // 5: if_icmpge +8 → exit at 13
             // body (nop):
-            0x00,             // 8: nop
+            0x00, // 8: nop
             // increment:
             0x84, 0x01, 0x01, // 9: iinc 1, 1
             // back-edge:
             0xA7, 0xFF, 0xF5, // 12: goto -11 → PC=2
             // exit:
-            0xB1,             // 15: return
+            0xB1, // 15: return
         ];
         let loops = vec![(2usize, 12usize)];
         let ivs = analyze_induction_variables(&code, code.len(), &loops);
@@ -356,13 +374,13 @@ mod tests {
     fn detect_decrementing_loop() {
         // iinc 2, -1 → stride = -1, trip_count = None (negative stride)
         let code = vec![
-            0x1C,             // 0: iload_2
-            0x10, 0x00,       // 1: bipush 0
+            0x1C, // 0: iload_2
+            0x10, 0x00, // 1: bipush 0
             0xA4, 0x00, 0x07, // 3: if_icmple +7 → exit
-            0x00,             // 6: nop
+            0x00, // 6: nop
             0x84, 0x02, 0xFF, // 7: iinc 2, -1
             0xA7, 0xFF, 0xF5, // 10: goto -11 → PC=0
-            0xB1,             // 13: return
+            0xB1, // 13: return
         ];
         let loops = vec![(0, 10)];
         let ivs = analyze_induction_variables(&code, code.len(), &loops);
@@ -375,7 +393,7 @@ mod tests {
     fn no_iinc_means_no_iv() {
         // Loop body with no iinc → not a counted loop.
         let code = vec![
-            0x00,             // 0: nop
+            0x00, // 0: nop
             0xA7, 0xFF, 0xFD, // 1: goto -3 → PC=0
         ];
         let loops = vec![(0, 1)];

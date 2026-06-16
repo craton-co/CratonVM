@@ -136,9 +136,7 @@ fn platform_make_executable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
     }
 
     let mut old_protect: u32 = 0;
-    let ret = unsafe {
-        VirtualProtect(ptr, size, PAGE_EXECUTE_READ, &mut old_protect)
-    };
+    let ret = unsafe { VirtualProtect(ptr, size, PAGE_EXECUTE_READ, &mut old_protect) };
     if ret == 0 {
         // VirtualProtect returns 0 on failure; surface GetLastError() so the
         // diagnostic carries the actual OS error code rather than the useless
@@ -166,9 +164,7 @@ fn platform_make_writable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
     }
 
     let mut old_protect: u32 = 0;
-    let ret = unsafe {
-        VirtualProtect(ptr, size, PAGE_READWRITE, &mut old_protect)
-    };
+    let ret = unsafe { VirtualProtect(ptr, size, PAGE_READWRITE, &mut old_protect) };
     if ret == 0 {
         // VirtualProtect returns 0 on failure; surface GetLastError() so the
         // diagnostic carries the actual OS error code rather than the useless
@@ -196,14 +192,7 @@ fn platform_alloc(size: usize) -> Option<*mut u8> {
     const MAP_FAILED: *mut u8 = !0 as *mut u8;
 
     extern "C" {
-        fn mmap(
-            addr: *mut u8,
-            len: usize,
-            prot: i32,
-            flags: i32,
-            fd: i32,
-            offset: i64,
-        ) -> *mut u8;
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     }
 
     // Allocate as RW with MAP_JIT. Apple Silicon requires MAP_JIT for pages
@@ -283,7 +272,10 @@ extern "C" {
 // Unix (non-macOS-ARM64) — Linux, FreeBSD, macOS x86-64
 // ---------------------------------------------------------------------------
 
-#[cfg(all(not(target_os = "windows"), not(all(target_os = "macos", target_arch = "aarch64"))))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "macos", target_arch = "aarch64"))
+))]
 fn platform_alloc(size: usize) -> Option<*mut u8> {
     use std::ptr;
 
@@ -294,14 +286,7 @@ fn platform_alloc(size: usize) -> Option<*mut u8> {
     const MAP_FAILED: *mut u8 = !0 as *mut u8;
 
     extern "C" {
-        fn mmap(
-            addr: *mut u8,
-            len: usize,
-            prot: i32,
-            flags: i32,
-            fd: i32,
-            offset: i64,
-        ) -> *mut u8;
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
     }
 
     // Allocate as RW only — W^X enforcement.
@@ -322,7 +307,10 @@ fn platform_alloc(size: usize) -> Option<*mut u8> {
     }
 }
 
-#[cfg(all(not(target_os = "windows"), not(all(target_os = "macos", target_arch = "aarch64"))))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "macos", target_arch = "aarch64"))
+))]
 fn platform_free(ptr: *mut u8, size: usize) {
     extern "C" {
         fn munmap(addr: *mut u8, len: usize) -> i32;
@@ -332,7 +320,10 @@ fn platform_free(ptr: *mut u8, size: usize) {
     }
 }
 
-#[cfg(all(not(target_os = "windows"), not(all(target_os = "macos", target_arch = "aarch64"))))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "macos", target_arch = "aarch64"))
+))]
 fn platform_make_executable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
     const PROT_READ: i32 = 1;
     const PROT_EXEC: i32 = 4;
@@ -399,7 +390,10 @@ unsafe fn flush_icache_range_aarch64(ptr: *mut u8, size: usize) {
     __clear_cache(begin, end);
 }
 
-#[cfg(all(not(target_os = "windows"), not(all(target_os = "macos", target_arch = "aarch64"))))]
+#[cfg(all(
+    not(target_os = "windows"),
+    not(all(target_os = "macos", target_arch = "aarch64"))
+))]
 fn platform_make_writable(ptr: *mut u8, size: usize) -> Result<(), JitError> {
     const PROT_READ: i32 = 1;
     const PROT_WRITE: i32 = 2;
@@ -464,23 +458,31 @@ mod tests {
         let ptr = alloc_executable(size).expect("alloc_executable failed");
 
         // Write initial data
-        unsafe { *ptr = 0xAA; }
+        unsafe {
+            *ptr = 0xAA;
+        }
 
         // Transition RW -> RX
         make_executable(ptr, size).expect("make_executable failed");
 
         // Read should still work
-        unsafe { assert_eq!(*ptr, 0xAA); }
+        unsafe {
+            assert_eq!(*ptr, 0xAA);
+        }
 
         // Transition RX -> RW for patching
         make_writable(ptr, size).expect("make_writable failed");
 
         // Write new data
-        unsafe { *ptr = 0xBB; }
+        unsafe {
+            *ptr = 0xBB;
+        }
 
         // Transition back to RX
         make_executable(ptr, size).expect("make_executable failed");
-        unsafe { assert_eq!(*ptr, 0xBB); }
+        unsafe {
+            assert_eq!(*ptr, 0xBB);
+        }
 
         free_executable(ptr, size);
     }

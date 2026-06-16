@@ -600,6 +600,81 @@ where
     buf.to_host(dst)
 }
 
+// ── Direct heap↔device transfer (skips the intermediate host Vec) ─────────
+//
+// `host_view_<T>` + `upload` stage through a packed host `Vec` (one memcpy on
+// the way in, another on the way out via `download_into` + `write_back_<T>`).
+// For an *ordinary* (contiguous) primitive array we can skip that staging
+// buffer and let CUDA's H2D/D2H DMA read/write the JVM heap arena in place:
+// the `SafepointToken` proves the GC is paused, so the arena pointer is stable
+// and no Java thread touches the array for the duration of the copy. This
+// removes a full array-sized host memcpy per direction (≈1 GiB at 2^28),
+// which is the residual warm-path gap vs TornadoVM's native off-heap arrays.
+// G1-humongous arrays (no flat base pointer) fall back to the staged path.
+
+/// `false` only when `CRATONVM_GPU_NO_ZEROCOPY` is set — an opt-out for A/B
+/// measurement / safety. Cached.
+fn zerocopy_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_GPU_NO_ZEROCOPY").is_none())
+}
+
+macro_rules! direct_xfer {
+    ($up:ident, $down:ident, $ty:ty, $host_view:path, $write_back:path, $what:literal) => {
+        #[doc = concat!("Upload a Java `", $what, "` to a fresh device buffer, reading the heap")]
+        #[doc = "arena directly when the array is contiguous (else staged via a host `Vec`)."]
+        pub fn $up(
+            ctx: &DeviceContext,
+            obj: ObjectRef,
+            heap: &VmHeap,
+            token: &SafepointToken<'_>,
+        ) -> DeviceResult<DeviceBuffer<$ty>> {
+            let len = heap.get_header(obj).array_length as usize;
+            if zerocopy_enabled() && len != 0 {
+                if let Some(src) = heap.array_data_ptr(obj) {
+                    // SAFETY: `obj` is a live contiguous array of `len` elements
+                    // at `src` (native-aligned primitive storage); the held
+                    // `token` pins the GC, so the arena cannot move and no Java
+                    // thread observes it during this read-only upload.
+                    let slice = unsafe { std::slice::from_raw_parts(src as *const $ty, len) };
+                    return DeviceBuffer::from_host(ctx, slice);
+                }
+            }
+            DeviceBuffer::from_host(ctx, &$host_view(obj, heap, token))
+        }
+
+        #[doc = concat!("Download a device buffer back into a Java `", $what, "`, writing the heap")]
+        #[doc = "arena directly when the array is contiguous (else staged + write-back)."]
+        pub fn $down(
+            buf: &DeviceBuffer<$ty>,
+            obj: ObjectRef,
+            heap: &VmHeap,
+            token: &SafepointToken<'_>,
+        ) -> DeviceResult<()> {
+            let len = heap.get_header(obj).array_length as usize;
+            if zerocopy_enabled() && len != 0 {
+                if let Some(dst) = heap.array_data_ptr(obj) {
+                    // SAFETY: live contiguous array of `len` elements at `dst`;
+                    // GC paused (token) so this dispatch thread has exclusive
+                    // access to the arena for the device→host copy.
+                    let slice = unsafe { std::slice::from_raw_parts_mut(dst as *mut $ty, len) };
+                    return buf.to_host(slice);
+                }
+            }
+            let mut staged = vec![<$ty>::default(); len];
+            buf.to_host(&mut staged)?;
+            $write_back(obj, heap, &staged, token);
+            Ok(())
+        }
+    };
+}
+
+direct_xfer!(upload_obj_i32, download_obj_i32, i32, host_view_i32, write_back_i32, "int[]");
+direct_xfer!(upload_obj_i64, download_obj_i64, i64, host_view_i64, write_back_i64, "long[]");
+direct_xfer!(upload_obj_f32, download_obj_f32, f32, host_view_f32, write_back_f32, "float[]");
+direct_xfer!(upload_obj_f64, download_obj_f64, f64, host_view_f64, write_back_f64, "double[]");
+
 // ── Tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

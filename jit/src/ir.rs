@@ -113,7 +113,6 @@ pub enum MemKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
     // ── Control ──────────────────────────────────────────────────────
-
     /// Method entry.  Produces (ctrl, mem) via `Proj(0)`, `Proj(1)`.
     Start,
 
@@ -133,13 +132,11 @@ pub enum Op {
     Region,
 
     // ── Projection ───────────────────────────────────────────────────
-
     /// Extract the Nth output from a multi-output node.
     /// Input: `[multi_node]`.
     Proj(u8),
 
     // ── Constants ────────────────────────────────────────────────────
-
     /// Integer / long constant (no inputs).
     Const(i64),
 
@@ -147,18 +144,15 @@ pub enum Op {
     ConstF(u64),
 
     // ── Parameters ───────────────────────────────────────────────────
-
     /// Method parameter at index `i` (no inputs — defined at Start).
     Param(u16),
 
     // ── SSA ──────────────────────────────────────────────────────────
-
     /// φ function at a Merge / Region.
     /// Inputs: `[merge_node, val_0, val_1, …]` (one val per predecessor).
     Phi,
 
     // ── Integer arithmetic ───────────────────────────────────────────
-
     Add,
     Sub,
     Mul,
@@ -167,7 +161,6 @@ pub enum Op {
     Neg,
 
     // ── Bitwise / shift ──────────────────────────────────────────────
-
     And,
     Or,
     Xor,
@@ -176,12 +169,10 @@ pub enum Op {
     UShr,
 
     // ── Comparison ───────────────────────────────────────────────────
-
     /// Integer compare.  Inputs: `[left, right]`.  Result: `Int` (0/1).
     Cmp(CmpOp),
 
     // ── Type conversion ──────────────────────────────────────────────
-
     I2L,
     L2I,
     I2F,
@@ -199,7 +190,6 @@ pub enum Op {
     I2S,
 
     // ── Memory ───────────────────────────────────────────────────────
-
     /// Array / field load.  Inputs: `[ctrl, mem, base, index/offset]`.
     Load(MemKind),
 
@@ -210,7 +200,6 @@ pub enum Op {
     ArrayLength,
 
     // ── Allocation ───────────────────────────────────────────────────
-
     /// Object allocation.  Inputs: `[ctrl, mem]`.
     New {
         class_id: u32,
@@ -223,13 +212,11 @@ pub enum Op {
     },
 
     // ── Method calls ─────────────────────────────────────────────────
-
     /// Method call.  Inputs: `[ctrl, mem, args…]`.
     /// Produces (ctrl, mem, retval) via Proj nodes.
     Call,
 
     // ── Dead / removed ───────────────────────────────────────────────
-
     /// Placeholder for a removed node (inputs cleared, not referenced).
     Dead,
 }
@@ -470,7 +457,9 @@ impl IrBuilder {
     /// Register a branch target that may need a merge node.
     fn ensure_merge(&mut self, target_pc: usize) {
         if !self.merges.contains_key(&target_pc) {
-            let merge_id = self.graph.add(Op::Merge, IrType::Control, vec![], Some(target_pc));
+            let merge_id = self
+                .graph
+                .add(Op::Merge, IrType::Control, vec![], Some(target_pc));
             self.merges.insert(
                 target_pc,
                 MergeState {
@@ -515,7 +504,9 @@ impl IrBuilder {
         if state.mem_inputs.len() > 1 {
             let mut phi_inputs = vec![merge_id];
             phi_inputs.extend_from_slice(&state.mem_inputs);
-            self.mem = self.graph.add(Op::Phi, IrType::Memory, phi_inputs, Some(target_pc));
+            self.mem = self
+                .graph
+                .add(Op::Phi, IrType::Memory, phi_inputs, Some(target_pc));
         } else if let Some(&m) = state.mem_inputs.first() {
             self.mem = m;
         }
@@ -537,7 +528,9 @@ impl IrBuilder {
                     for snap in &state.local_snapshots {
                         phi_inputs.push(snap.get(local_idx).copied().unwrap_or(NO_NODE));
                     }
-                    let phi = self.graph.add(Op::Phi, IrType::Int, phi_inputs, Some(target_pc));
+                    let phi = self
+                        .graph
+                        .add(Op::Phi, IrType::Int, phi_inputs, Some(target_pc));
                     self.locals[local_idx] = phi;
                 }
             }
@@ -558,8 +551,9 @@ impl IrBuilder {
                         for snap in &state.stack_snapshots {
                             phi_inputs.push(snap.get(slot_idx).copied().unwrap_or(NO_NODE));
                         }
-                        let phi =
-                            self.graph.add(Op::Phi, IrType::Int, phi_inputs, Some(target_pc));
+                        let phi = self
+                            .graph
+                            .add(Op::Phi, IrType::Int, phi_inputs, Some(target_pc));
                         self.stack[slot_idx] = phi;
                     }
                 }
@@ -834,9 +828,15 @@ impl IrBuilder {
                         _ => unreachable!(),
                     };
                     let cmp = self.add_data(Op::Cmp(cc), IrType::Int, vec![val, zero], pc);
-                    let if_node = self.graph.add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
-                    let true_ctrl = self.graph.add(Op::Proj(0), IrType::Control, vec![if_node], Some(pc));
-                    let false_ctrl = self.graph.add(Op::Proj(1), IrType::Control, vec![if_node], Some(pc));
+                    let if_node =
+                        self.graph
+                            .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
+                    let true_ctrl =
+                        self.graph
+                            .add(Op::Proj(0), IrType::Control, vec![if_node], Some(pc));
+                    let false_ctrl =
+                        self.graph
+                            .add(Op::Proj(1), IrType::Control, vec![if_node], Some(pc));
 
                     // True edge → target
                     let _saved_ctrl = self.ctrl;
@@ -872,9 +872,15 @@ impl IrBuilder {
                         _ => unreachable!(),
                     };
                     let cmp = self.add_data(Op::Cmp(cc), IrType::Int, vec![a, b], pc);
-                    let if_node = self.graph.add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
-                    let true_ctrl = self.graph.add(Op::Proj(0), IrType::Control, vec![if_node], Some(pc));
-                    let false_ctrl = self.graph.add(Op::Proj(1), IrType::Control, vec![if_node], Some(pc));
+                    let if_node =
+                        self.graph
+                            .add(Op::If, IrType::Control, vec![self.ctrl, cmp], Some(pc));
+                    let true_ctrl =
+                        self.graph
+                            .add(Op::Proj(0), IrType::Control, vec![if_node], Some(pc));
+                    let false_ctrl =
+                        self.graph
+                            .add(Op::Proj(1), IrType::Control, vec![if_node], Some(pc));
 
                     let saved_locals = self.locals.clone();
                     let saved_stack = self.stack.clone();
@@ -903,7 +909,9 @@ impl IrBuilder {
                 // ireturn
                 0xac => {
                     let val = self.pop();
-                    let ret = self.graph.add(Op::Return, IrType::Void, vec![self.ctrl, val], Some(pc));
+                    let ret =
+                        self.graph
+                            .add(Op::Return, IrType::Void, vec![self.ctrl, val], Some(pc));
                     self.graph.exit = ret;
                     self.ctrl = NO_NODE;
                     pc += 1;
@@ -912,7 +920,9 @@ impl IrBuilder {
                 // lreturn
                 0xad => {
                     let val = self.pop();
-                    let ret = self.graph.add(Op::Return, IrType::Void, vec![self.ctrl, val], Some(pc));
+                    let ret =
+                        self.graph
+                            .add(Op::Return, IrType::Void, vec![self.ctrl, val], Some(pc));
                     self.graph.exit = ret;
                     self.ctrl = NO_NODE;
                     pc += 1;
@@ -920,7 +930,9 @@ impl IrBuilder {
 
                 // return (void)
                 0xb1 => {
-                    let ret = self.graph.add(Op::Return, IrType::Void, vec![self.ctrl], Some(pc));
+                    let ret = self
+                        .graph
+                        .add(Op::Return, IrType::Void, vec![self.ctrl], Some(pc));
                     self.graph.exit = ret;
                     self.ctrl = NO_NODE;
                     pc += 1;
@@ -984,10 +996,32 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
                 pc += 3;
             }
             // 1-byte opcodes
-            0x02..=0x0a | 0x1a..=0x21 | 0x3b..=0x42 | 0x57 | 0x59
-            | 0x60 | 0x61 | 0x64 | 0x65 | 0x68 | 0x69 | 0x6c | 0x70
-            | 0x74 | 0x75 | 0x78 | 0x7a | 0x7c | 0x7e | 0x80 | 0x82
-            | 0x85 | 0x88 | 0xac | 0xad | 0xb1 => {
+            0x02..=0x0a
+            | 0x1a..=0x21
+            | 0x3b..=0x42
+            | 0x57
+            | 0x59
+            | 0x60
+            | 0x61
+            | 0x64
+            | 0x65
+            | 0x68
+            | 0x69
+            | 0x6c
+            | 0x70
+            | 0x74
+            | 0x75
+            | 0x78
+            | 0x7a
+            | 0x7c
+            | 0x7e
+            | 0x80
+            | 0x82
+            | 0x85
+            | 0x88
+            | 0xac
+            | 0xad
+            | 0xb1 => {
                 pc += 1;
             }
             // 2-byte opcodes
@@ -1141,8 +1175,14 @@ mod tests {
         let add_id = ret.inputs[1];
         let add = &graph.nodes[add_id as usize];
         // Both inputs should be Const nodes
-        assert!(matches!(graph.nodes[add.inputs[0] as usize].op, Op::Const(3)));
-        assert!(matches!(graph.nodes[add.inputs[1] as usize].op, Op::Const(4)));
+        assert!(matches!(
+            graph.nodes[add.inputs[0] as usize].op,
+            Op::Const(3)
+        ));
+        assert!(matches!(
+            graph.nodes[add.inputs[1] as usize].op,
+            Op::Const(4)
+        ));
     }
 
     #[test]
@@ -1151,13 +1191,13 @@ mod tests {
         // iload_0; ifeq +5; iconst_0; ireturn; iconst_1; ireturn
         //   0       1        4         5        6         7
         let code = [
-            0x1a,             // 0: iload_0
+            0x1a, // 0: iload_0
             0x99, 0x00, 0x05, // 1: ifeq → 6
-            0x03,             // 4: iconst_0
-            0xac,             // 5: ireturn
-            0x04,             // 6: iconst_1
-            0xac,             // 7: ireturn
-            0, 0,             // padding
+            0x03, // 4: iconst_0
+            0xac, // 5: ireturn
+            0x04, // 6: iconst_1
+            0xac, // 7: ireturn
+            0, 0, // padding
         ];
         let graph = build_ir(&code, 8, 1, 1);
         // Should have Merge, If, Cmp nodes
@@ -1172,12 +1212,12 @@ mod tests {
         // void f(int x) { x++; return x; }  [simplified]
         // iload_0; istore_1; iinc 1,1; iload_1; ireturn
         let code = [
-            0x1a,       // 0: iload_0
-            0x3c,       // 1: istore_1
-            0x84, 1, 1, // 2: iinc 1, 1
-            0x1b,       // 5: iload_1
-            0xac,       // 6: ireturn
-            0, 0,       // padding
+            0x1a, // 0: iload_0
+            0x3c, // 1: istore_1
+            0x84, 1, 1,    // 2: iinc 1, 1
+            0x1b, // 5: iload_1
+            0xac, // 6: ireturn
+            0, 0, // padding
         ];
         let graph = build_ir(&code, 7, 1, 2);
         // The iinc should create an Add node

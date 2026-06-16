@@ -75,10 +75,10 @@ pub struct RegAllocResult {
 /// A basic block in the bytecode CFG.
 struct BasicBlock {
     start_pc: usize,
-    end_pc: usize, // exclusive
+    end_pc: usize,          // exclusive
     successors: Vec<usize>, // indices into blocks vec
-    gen: u64,      // locals used before defined in this block
-    kill: u64,     // locals defined in this block
+    gen: u64,               // locals used before defined in this block
+    kill: u64,              // locals defined in this block
     live_in: u64,
     live_out: u64,
 }
@@ -100,8 +100,25 @@ struct BasicBlock {
 pub(crate) fn bc_len(code: &[u8], pc: usize) -> usize {
     match code[pc] {
         0x10 | 0x12 | 0x15..=0x19 | 0x36..=0x3a | 0xa9 | 0xbc => 2,
-        0x11 | 0x13 | 0x14 | 0x84 | 0x99..=0xa6 | 0xa7 | 0xa8 | 0xb2 | 0xb3 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8
-        | 0xbd | 0xc0 | 0xc1 | 0xc6 | 0xc7 => 3,
+        0x11
+        | 0x13
+        | 0x14
+        | 0x84
+        | 0x99..=0xa6
+        | 0xa7
+        | 0xa8
+        | 0xb2
+        | 0xb3
+        | 0xb4
+        | 0xb5
+        | 0xb6
+        | 0xb7
+        | 0xb8
+        | 0xbd
+        | 0xc0
+        | 0xc1
+        | 0xc6
+        | 0xc7 => 3,
         0xbb => 3,
         0xc5 => 4,
         0xb9 => 5,
@@ -134,18 +151,29 @@ pub(crate) fn bc_len(code: &[u8], pc: usize) -> usize {
         // and bails the method out of JIT compilation.
         0xaa => {
             let mut p = pc + 1;
-            while p % 4 != 0 { p += 1; }
-            if p + 12 > code.len() { return 1; }
+            while p % 4 != 0 {
+                p += 1;
+            }
+            if p + 12 > code.len() {
+                return 1;
+            }
             let low = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
             let high = i32::from_be_bytes([code[p + 8], code[p + 9], code[p + 10], code[p + 11]]);
-            let count = match (high as i64).checked_sub(low as i64).and_then(|d| d.checked_add(1)) {
+            let count = match (high as i64)
+                .checked_sub(low as i64)
+                .and_then(|d| d.checked_add(1))
+            {
                 Some(n) if n >= 0 && (n as u64) <= MAX_TABLESWITCH_ENTRIES as u64 => n as usize,
                 _ => return 1, // overflow or cap exceeded — bail (caller will reject method)
             };
             // Saturate the address arithmetic too: a pathological but in-cap
             // count multiplied by 4 still fits in u64, but using checked_*
             // documents intent and protects future cap raises.
-            match count.checked_mul(4).and_then(|x| x.checked_add(p + 12)).and_then(|x| x.checked_sub(pc)) {
+            match count
+                .checked_mul(4)
+                .and_then(|x| x.checked_add(p + 12))
+                .and_then(|x| x.checked_sub(pc))
+            {
                 Some(len) => len,
                 None => 1,
             }
@@ -159,13 +187,26 @@ pub(crate) fn bc_len(code: &[u8], pc: usize) -> usize {
         // `MAX_LOOKUPSWITCH_NPAIRS`; fall back to length 1 on violation.
         0xab => {
             let mut p = pc + 1;
-            while p % 4 != 0 { p += 1; }
-            if p + 8 > code.len() { return 1; }
-            let npairs_raw = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
-            if npairs_raw < 0 { return 1; }
+            while p % 4 != 0 {
+                p += 1;
+            }
+            if p + 8 > code.len() {
+                return 1;
+            }
+            let npairs_raw =
+                i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
+            if npairs_raw < 0 {
+                return 1;
+            }
             let npairs = npairs_raw as usize;
-            if npairs > MAX_LOOKUPSWITCH_NPAIRS { return 1; }
-            match npairs.checked_mul(8).and_then(|x| x.checked_add(p + 8)).and_then(|x| x.checked_sub(pc)) {
+            if npairs > MAX_LOOKUPSWITCH_NPAIRS {
+                return 1;
+            }
+            match npairs
+                .checked_mul(8)
+                .and_then(|x| x.checked_add(p + 8))
+                .and_then(|x| x.checked_sub(pc))
+            {
                 Some(len) => len,
                 None => 1,
             }
@@ -208,7 +249,7 @@ fn is_unconditional(op: u8) -> bool {
         | 0xaf  // dreturn
         | 0xb0  // areturn
         | 0xb1  // return (void)
-        | 0xbf  // athrow
+        | 0xbf // athrow
     )
 }
 
@@ -218,7 +259,9 @@ fn switch_targets(code: &[u8], pc: usize, code_len: usize) -> Vec<usize> {
     let op = code[pc];
     let base_pc = pc;
     let mut p = pc + 1;
-    while p % 4 != 0 { p += 1; }
+    while p % 4 != 0 {
+        p += 1;
+    }
 
     match op {
         // HIGH security fix: same overflow audit as `bc_len` above. The
@@ -227,46 +270,70 @@ fn switch_targets(code: &[u8], pc: usize, code_len: usize) -> Vec<usize> {
         // we still spin billions of iterations, which is a DoS in itself.
         0xaa => {
             // tableswitch
-            if p + 12 > code_len { return targets; }
-            let default_off = i32::from_be_bytes([code[p], code[p+1], code[p+2], code[p+3]]);
+            if p + 12 > code_len {
+                return targets;
+            }
+            let default_off = i32::from_be_bytes([code[p], code[p + 1], code[p + 2], code[p + 3]]);
             // Use checked arithmetic: a malformed/negative offset must not
             // wrap to a huge usize. Skip targets that fall outside the code.
             if let Some(t) = base_pc.checked_add_signed(default_off as isize) {
-                if t < code_len { targets.push(t); }
+                if t < code_len {
+                    targets.push(t);
+                }
             }
-            let low = i32::from_be_bytes([code[p+4], code[p+5], code[p+6], code[p+7]]);
-            let high = i32::from_be_bytes([code[p+8], code[p+9], code[p+10], code[p+11]]);
-            let count = match (high as i64).checked_sub(low as i64).and_then(|d| d.checked_add(1)) {
+            let low = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
+            let high = i32::from_be_bytes([code[p + 8], code[p + 9], code[p + 10], code[p + 11]]);
+            let count = match (high as i64)
+                .checked_sub(low as i64)
+                .and_then(|d| d.checked_add(1))
+            {
                 Some(n) if n >= 0 && (n as u64) <= MAX_TABLESWITCH_ENTRIES as u64 => n as usize,
                 _ => return targets, // overflow / cap exceeded → no targets harvested
             };
             p += 12;
             for _ in 0..count {
-                if p + 4 > code_len { break; }
-                let off = i32::from_be_bytes([code[p], code[p+1], code[p+2], code[p+3]]);
+                if p + 4 > code_len {
+                    break;
+                }
+                let off = i32::from_be_bytes([code[p], code[p + 1], code[p + 2], code[p + 3]]);
                 if let Some(t) = base_pc.checked_add_signed(off as isize) {
-                    if t < code_len { targets.push(t); }
+                    if t < code_len {
+                        targets.push(t);
+                    }
                 }
                 p += 4;
             }
         }
         0xab => {
             // lookupswitch
-            if p + 8 > code_len { return targets; }
-            let default_off = i32::from_be_bytes([code[p], code[p+1], code[p+2], code[p+3]]);
-            if let Some(t) = base_pc.checked_add_signed(default_off as isize) {
-                if t < code_len { targets.push(t); }
+            if p + 8 > code_len {
+                return targets;
             }
-            let npairs_raw = i32::from_be_bytes([code[p+4], code[p+5], code[p+6], code[p+7]]);
-            if npairs_raw < 0 { return targets; }
+            let default_off = i32::from_be_bytes([code[p], code[p + 1], code[p + 2], code[p + 3]]);
+            if let Some(t) = base_pc.checked_add_signed(default_off as isize) {
+                if t < code_len {
+                    targets.push(t);
+                }
+            }
+            let npairs_raw =
+                i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
+            if npairs_raw < 0 {
+                return targets;
+            }
             let npairs = npairs_raw as usize;
-            if npairs > MAX_LOOKUPSWITCH_NPAIRS { return targets; }
+            if npairs > MAX_LOOKUPSWITCH_NPAIRS {
+                return targets;
+            }
             p += 8;
             for _ in 0..npairs {
-                if p + 8 > code_len { break; }
-                let off = i32::from_be_bytes([code[p+4], code[p+5], code[p+6], code[p+7]]);
+                if p + 8 > code_len {
+                    break;
+                }
+                let off = i32::from_be_bytes([code[p + 4], code[p + 5], code[p + 6], code[p + 7]]);
                 if let Some(t) = base_pc.checked_add_signed(off as isize) {
-                    if t < code_len { targets.push(t); }
+                    if t < code_len {
+                        targets.push(t);
+                    }
                 }
                 p += 8;
             }
@@ -742,32 +809,44 @@ fn find_float_locals(code: &[u8], code_len: usize, num_locals: usize) -> u64 {
             // fload_0..fload_3
             0x22..=0x25 => {
                 let idx = (code[pc] - 0x22) as usize;
-                if idx < 64 { float_mask |= 1u64 << idx; }
+                if idx < 64 {
+                    float_mask |= 1u64 << idx;
+                }
             }
             // dload_0..dload_3
             0x26..=0x29 => {
                 let idx = (code[pc] - 0x26) as usize;
-                if idx < 64 { float_mask |= 1u64 << idx; }
+                if idx < 64 {
+                    float_mask |= 1u64 << idx;
+                }
             }
             // fstore_0..fstore_3
             0x43..=0x46 => {
                 let idx = (code[pc] - 0x43) as usize;
-                if idx < 64 { float_mask |= 1u64 << idx; }
+                if idx < 64 {
+                    float_mask |= 1u64 << idx;
+                }
             }
             // dstore_0..dstore_3
             0x47..=0x4a => {
                 let idx = (code[pc] - 0x47) as usize;
-                if idx < 64 { float_mask |= 1u64 << idx; }
+                if idx < 64 {
+                    float_mask |= 1u64 << idx;
+                }
             }
             // fload, dload (wide)
             0x17 | 0x18 => {
                 let idx = code[pc + 1] as usize;
-                if idx < 64 { float_mask |= 1u64 << idx; }
+                if idx < 64 {
+                    float_mask |= 1u64 << idx;
+                }
             }
             // fstore, dstore (wide)
             0x38 | 0x39 => {
                 let idx = code[pc + 1] as usize;
-                if idx < 64 { float_mask |= 1u64 << idx; }
+                if idx < 64 {
+                    float_mask |= 1u64 << idx;
+                }
             }
             _ => {}
         }
@@ -785,7 +864,15 @@ pub fn allocate_registers(
     num_params: usize,
     loops: &[(usize, usize)],
 ) -> RegAllocResult {
-    allocate_registers_with(code, code_len, num_locals, num_params, loops, &LOCAL_REGS, &LOCAL_XMMS)
+    allocate_registers_with(
+        code,
+        code_len,
+        num_locals,
+        num_params,
+        loops,
+        &LOCAL_REGS,
+        &LOCAL_XMMS,
+    )
 }
 
 /// Run register allocation for a method (ARM64).
@@ -796,7 +883,15 @@ pub fn allocate_registers_arm64(
     num_params: usize,
     loops: &[(usize, usize)],
 ) -> RegAllocResult {
-    allocate_registers_with(code, code_len, num_locals, num_params, loops, &ARM64_LOCAL_GPRS, &ARM64_LOCAL_FPS)
+    allocate_registers_with(
+        code,
+        code_len,
+        num_locals,
+        num_params,
+        loops,
+        &ARM64_LOCAL_GPRS,
+        &ARM64_LOCAL_FPS,
+    )
 }
 
 /// Platform-generic register allocation entry point.
@@ -973,8 +1068,7 @@ fn allocate_registers_with(
         };
     }
 
-    let block_live_in: Vec<(usize, u64)> =
-        blocks.iter().map(|b| (b.start_pc, b.live_in)).collect();
+    let block_live_in: Vec<(usize, u64)> = blocks.iter().map(|b| (b.start_pc, b.live_in)).collect();
     RegAllocResult {
         assignments,
         xmm_assignments,
@@ -1067,7 +1161,13 @@ mod tests {
         let xmm = vec![None, None, Some(8)];
         let interference = vec![0u64, 0, 0];
         let float_mask = 0b100; // local 2 is float
-        assert!(regalloc_invariants_hold(&gpr, &xmm, &interference, float_mask, 3));
+        assert!(regalloc_invariants_hold(
+            &gpr,
+            &xmm,
+            &interference,
+            float_mask,
+            3
+        ));
     }
 
     #[test]
@@ -1084,7 +1184,13 @@ mod tests {
         let xmm = vec![None];
         let interference = vec![0u64];
         let float_mask = 0b1; // local 0 is float but assigned a GPR
-        assert!(!regalloc_invariants_hold(&gpr, &xmm, &interference, float_mask, 1));
+        assert!(!regalloc_invariants_hold(
+            &gpr,
+            &xmm,
+            &interference,
+            float_mask,
+            1
+        ));
     }
 
     #[test]
@@ -1093,7 +1199,13 @@ mod tests {
         let xmm = vec![Some(8)];
         let interference = vec![0u64];
         let float_mask = 0; // local 0 is int but assigned an XMM
-        assert!(!regalloc_invariants_hold(&gpr, &xmm, &interference, float_mask, 1));
+        assert!(!regalloc_invariants_hold(
+            &gpr,
+            &xmm,
+            &interference,
+            float_mask,
+            1
+        ));
     }
 
     // CM-FASTMATH — `ldc`/`ldc_w`/`ldc2_w` were missing from `bc_len` (the
@@ -1195,7 +1307,13 @@ mod tests {
         let xmm = vec![Some(8), Some(8)];
         let interference = vec![0b10, 0b01];
         let float_mask = 0b11;
-        assert!(!regalloc_invariants_hold(&gpr, &xmm, &interference, float_mask, 2));
+        assert!(!regalloc_invariants_hold(
+            &gpr,
+            &xmm,
+            &interference,
+            float_mask,
+            2
+        ));
     }
 
     #[test]
@@ -1213,7 +1331,10 @@ mod tests {
         let code = [0x1a, 0xac, 0, 0];
         let result = allocate_registers(&code, 2, 1, 1, &[]);
         assert_eq!(result.assignments.len(), 1);
-        assert!(result.assignments[0].is_some(), "param 0 should get a register");
+        assert!(
+            result.assignments[0].is_some(),
+            "param 0 should get a register"
+        );
     }
 
     #[test]
@@ -1252,8 +1373,7 @@ mod tests {
         assert!(result.assignments[0].is_some());
         assert!(result.assignments[1].is_some());
         assert_ne!(
-            result.assignments[0],
-            result.assignments[1],
+            result.assignments[0], result.assignments[1],
             "interfering locals must get different registers"
         );
     }
@@ -1278,7 +1398,11 @@ mod tests {
         // local 0: 1 use outside loop
         assert_eq!(counts[0], 1);
         // local 2: used in loop (iload_2 @ 2, istore_2 @ 5) = 2 * 10 = 20, plus outside (iload_0→istore_2 @1, iload_2 @9) = 2
-        assert!(counts[2] >= 20, "loop uses should be weighted higher: got {}", counts[2]);
+        assert!(
+            counts[2] >= 20,
+            "loop uses should be weighted higher: got {}",
+            counts[2]
+        );
     }
 
     #[test]
@@ -1374,7 +1498,11 @@ mod tests {
             0, 0,
         ];
         let blocks = build_cfg(&code, 8);
-        assert!(blocks.len() >= 3, "should have at least 3 blocks, got {}", blocks.len());
+        assert!(
+            blocks.len() >= 3,
+            "should have at least 3 blocks, got {}",
+            blocks.len()
+        );
     }
 
     // ===================================================================
@@ -1387,7 +1515,10 @@ mod tests {
         let code = [0x1a, 0xac, 0, 0];
         let result = allocate_registers_arm64(&code, 2, 1, 1, &[]);
         assert_eq!(result.assignments.len(), 1);
-        assert!(result.assignments[0].is_some(), "param 0 should get ARM64 register");
+        assert!(
+            result.assignments[0].is_some(),
+            "param 0 should get ARM64 register"
+        );
         // Should be one of X19-X28
         let reg = result.assignments[0].unwrap();
         assert!((19..=28).contains(&reg), "should be callee-saved X{reg}");
@@ -1414,7 +1545,10 @@ mod tests {
         assert_eq!(regs.len(), 10, "all registers should be distinct");
         // All should be in 19..=28
         for r in &regs {
-            assert!((19..=28).contains(r), "register X{r} not in callee-saved range");
+            assert!(
+                (19..=28).contains(r),
+                "register X{r} not in callee-saved range"
+            );
         }
     }
 
@@ -1430,9 +1564,15 @@ mod tests {
         let code_len = code.len();
         let result = allocate_registers_arm64(&code, code_len, 12, 12, &[]);
         let assigned_count = result.assignments.iter().filter(|a| a.is_some()).count();
-        assert!(assigned_count <= 10, "at most 10 ARM64 callee-saved GPRs, got {assigned_count}");
+        assert!(
+            assigned_count <= 10,
+            "at most 10 ARM64 callee-saved GPRs, got {assigned_count}"
+        );
         let spill_count = result.assignments.iter().filter(|a| a.is_none()).count();
-        assert!(spill_count >= 2, "should have at least 2 spills, got {spill_count}");
+        assert!(
+            spill_count >= 2,
+            "should have at least 2 spills, got {spill_count}"
+        );
     }
 
     #[test]
@@ -1448,17 +1588,32 @@ mod tests {
         ];
         let result = allocate_registers_arm64(&code, 4, 2, 2, &[]);
         // Both locals should be recognized as float and get FP assignments
-        assert!(result.xmm_assignments[0].is_some(), "float local 0 should get FP register");
-        assert!(result.xmm_assignments[1].is_some(), "float local 1 should get FP register");
+        assert!(
+            result.xmm_assignments[0].is_some(),
+            "float local 0 should get FP register"
+        );
+        assert!(
+            result.xmm_assignments[1].is_some(),
+            "float local 1 should get FP register"
+        );
         // FP regs should be in 8..=15 (D8-D15)
         let fp0 = result.xmm_assignments[0].unwrap();
         let fp1 = result.xmm_assignments[1].unwrap();
         assert!((8..=15).contains(&fp0), "FP reg {fp0} not in D8-D15 range");
         assert!((8..=15).contains(&fp1), "FP reg {fp1} not in D8-D15 range");
-        assert_ne!(fp0, fp1, "interfering float locals must get different FP regs");
+        assert_ne!(
+            fp0, fp1,
+            "interfering float locals must get different FP regs"
+        );
         // GPR assignments should be None for float locals
-        assert!(result.assignments[0].is_none(), "float local 0 should NOT get GPR");
-        assert!(result.assignments[1].is_none(), "float local 1 should NOT get GPR");
+        assert!(
+            result.assignments[0].is_none(),
+            "float local 0 should NOT get GPR"
+        );
+        assert!(
+            result.assignments[1].is_none(),
+            "float local 1 should NOT get GPR"
+        );
     }
 
     #[test]
@@ -1475,10 +1630,16 @@ mod tests {
         ];
         let result = allocate_registers_arm64(&code, 5, 2, 1, &[]);
         // local 0 = int → GPR
-        assert!(result.assignments[0].is_some(), "int local 0 should get GPR");
+        assert!(
+            result.assignments[0].is_some(),
+            "int local 0 should get GPR"
+        );
         assert!((19..=28).contains(&result.assignments[0].unwrap()));
         // local 1 = float → FP reg
-        assert!(result.xmm_assignments[1].is_some(), "float local 1 should get FP register");
+        assert!(
+            result.xmm_assignments[1].is_some(),
+            "float local 1 should get FP register"
+        );
         assert!((8..=15).contains(&result.xmm_assignments[1].unwrap()));
     }
 
@@ -1496,7 +1657,8 @@ mod tests {
         ];
         let result = allocate_registers_arm64(&code, 6, 3, 3, &[]);
         assert_eq!(
-            result.used_callee_saved.len(), 3,
+            result.used_callee_saved.len(),
+            3,
             "should use exactly 3 callee-saved GPRs"
         );
         for &r in &result.used_callee_saved {

@@ -28,7 +28,11 @@ pub struct BranchProfile {
 
 impl BranchProfile {
     pub fn new(bytecode_index: u32) -> Self {
-        Self { bytecode_index, taken_count: 0, not_taken_count: 0 }
+        Self {
+            bytecode_index,
+            taken_count: 0,
+            not_taken_count: 0,
+        }
     }
 
     /// Total observations.
@@ -39,7 +43,11 @@ impl BranchProfile {
     /// Fraction of observations where the branch was taken (0.0 – 1.0).
     pub fn taken_ratio(&self) -> f64 {
         let t = self.total();
-        if t == 0 { 0.5 } else { self.taken_count as f64 / t as f64 }
+        if t == 0 {
+            0.5
+        } else {
+            self.taken_count as f64 / t as f64
+        }
     }
 
     /// Returns `true` when one direction accounts for more than `threshold` of
@@ -61,7 +69,11 @@ impl BranchProfile {
 
     /// Record one observation.
     pub fn update(&mut self, taken: bool) {
-        if taken { self.taken_count += 1; } else { self.not_taken_count += 1; }
+        if taken {
+            self.taken_count += 1;
+        } else {
+            self.not_taken_count += 1;
+        }
     }
 }
 
@@ -92,7 +104,11 @@ impl ReceiverTypeProfile {
     const MAX_ENTRIES: usize = 8;
 
     pub fn new(call_site_bci: u32) -> Self {
-        Self { call_site_bci, entries: Vec::new(), total_calls: 0 }
+        Self {
+            call_site_bci,
+            entries: Vec::new(),
+            total_calls: 0,
+        }
     }
 
     /// Record one call with the given concrete receiver class/method ids.
@@ -103,7 +119,12 @@ impl ReceiverTypeProfile {
         if let Some(e) = self.entries.iter_mut().find(|e| e.class_id == class_id) {
             e.count += 1;
         } else if self.entries.len() < Self::MAX_ENTRIES {
-            self.entries.push(TypeProfileEntry { class_id, method_id, count: 1, ratio: 0.0 });
+            self.entries.push(TypeProfileEntry {
+                class_id,
+                method_id,
+                count: 1,
+                ratio: 0.0,
+            });
         }
         // If the table is full and the type is new, we just bump `total_calls`
         // (the entry is not recorded, reflecting megamorphic overflow).
@@ -118,8 +139,13 @@ impl ReceiverTypeProfile {
     /// Returns the `class_id` that accounts for >90 % of all observed calls,
     /// if any.
     pub fn dominant_type(&self) -> Option<u32> {
-        if self.total_calls == 0 { return None; }
-        self.entries.iter().find(|e| e.ratio > 0.9).map(|e| e.class_id)
+        if self.total_calls == 0 {
+            return None;
+        }
+        self.entries
+            .iter()
+            .find(|e| e.ratio > 0.9)
+            .map(|e| e.class_id)
     }
 
     /// True iff exactly one concrete type has been observed.
@@ -159,7 +185,11 @@ pub struct CallSiteProfile {
 
 impl CallSiteProfile {
     pub fn new(bci: u32) -> Self {
-        Self { bci, call_count: 0, callee_distribution: FxHashMap::default() }
+        Self {
+            bci,
+            call_count: 0,
+            callee_distribution: FxHashMap::default(),
+        }
     }
 
     /// Record one invocation of `callee_id`.
@@ -170,12 +200,17 @@ impl CallSiteProfile {
 
     /// The `method_id` invoked most frequently, if any.
     pub fn most_common_callee(&self) -> Option<u64> {
-        self.callee_distribution.iter().max_by_key(|(_, &c)| c).map(|(&id, _)| id)
+        self.callee_distribution
+            .iter()
+            .max_by_key(|(_, &c)| c)
+            .map(|(&id, _)| id)
     }
 
     /// Inline benefit score: (call_count × dominance_ratio) / (callee_size + 1).
     pub fn inline_benefit_score(&self, callee_size: usize) -> f64 {
-        if self.call_count == 0 { return 0.0; }
+        if self.call_count == 0 {
+            return 0.0;
+        }
         let dominance_ratio = match self.most_common_callee() {
             Some(id) => {
                 let top = *self.callee_distribution.get(&id).unwrap_or(&0);
@@ -221,7 +256,10 @@ impl DeoptProfile {
 
     /// The most frequently occurring deopt reason, if any have been recorded.
     pub fn dominant_reason(&self) -> Option<&str> {
-        self.reasons.iter().max_by_key(|(_, &c)| c).map(|(r, _)| r.as_str())
+        self.reasons
+            .iter()
+            .max_by_key(|(_, &c)| c)
+            .map(|(r, _)| r.as_str())
     }
 
     /// Record a deoptimisation at `bci` with the given `reason`.
@@ -247,12 +285,18 @@ pub struct LoopProfile {
 
 impl LoopProfile {
     pub fn new(header_bci: u32) -> Self {
-        Self { header_bci, iteration_counts: Vec::new(), backedge_count: 0 }
+        Self {
+            header_bci,
+            iteration_counts: Vec::new(),
+            backedge_count: 0,
+        }
     }
 
     /// Average trip count over all sampled invocations.
     pub fn avg_iterations(&self) -> f64 {
-        if self.iteration_counts.is_empty() { return 0.0; }
+        if self.iteration_counts.is_empty() {
+            return 0.0;
+        }
         let sum: u64 = self.iteration_counts.iter().sum();
         sum as f64 / self.iteration_counts.len() as f64
     }
@@ -280,13 +324,27 @@ impl LoopProfile {
     /// estimated trip count is small enough to make unrolling worthwhile.
     /// Returns `None` when unrolling is not advised.
     pub fn suggests_unrolling(&self, max_unroll: usize) -> Option<usize> {
-        if !self.is_hot(100) { return None; }
+        if !self.is_hot(100) {
+            return None;
+        }
         let trip = self.estimated_trip_count();
         // Only unroll when the trip count is known and small.
-        if trip == 0 || trip > 128 { return None; }
-        let factor = if trip <= 4 { 8 } else if trip <= 16 { 4 } else { 2 };
+        if trip == 0 || trip > 128 {
+            return None;
+        }
+        let factor = if trip <= 4 {
+            8
+        } else if trip <= 16 {
+            4
+        } else {
+            2
+        };
         let capped = factor.min(max_unroll);
-        if capped >= 2 { Some(capped) } else { None }
+        if capped >= 2 {
+            Some(capped)
+        } else {
+            None
+        }
     }
 }
 
@@ -339,7 +397,10 @@ impl MethodProfile {
 
     /// Record a branch observation at `bci`.
     pub fn record_branch(&mut self, bci: u32, taken: bool) {
-        self.branches.entry(bci).or_insert_with(|| BranchProfile::new(bci)).update(taken);
+        self.branches
+            .entry(bci)
+            .or_insert_with(|| BranchProfile::new(bci))
+            .update(taken);
     }
 
     /// Record a receiver type observation at a virtual call site.
@@ -390,7 +451,11 @@ impl MethodProfile {
                 })
             })
             .collect();
-        candidates.sort_by(|a, b| b.estimated_benefit.partial_cmp(&a.estimated_benefit).unwrap_or(std::cmp::Ordering::Equal));
+        candidates.sort_by(|a, b| {
+            b.estimated_benefit
+                .partial_cmp(&a.estimated_benefit)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         candidates.truncate(budget);
         candidates
     }
@@ -490,7 +555,10 @@ impl InliningPolicy {
         };
 
         if candidate.callee_size > effective_max {
-            return InlineDecision::TooLarge { size: candidate.callee_size, max: effective_max };
+            return InlineDecision::TooLarge {
+                size: candidate.callee_size,
+                max: effective_max,
+            };
         }
 
         // Check call frequency.
@@ -500,7 +568,10 @@ impl InliningPolicy {
             .map(|cs| cs.call_count)
             .unwrap_or(0);
         if call_count < self.min_call_count {
-            return InlineDecision::TooRare { count: call_count, min: self.min_call_count };
+            return InlineDecision::TooRare {
+                count: call_count,
+                min: self.min_call_count,
+            };
         }
 
         InlineDecision::Inline
@@ -586,14 +657,30 @@ impl PgoRepository {
             total_branches += p.branches.len();
             biased_branches += p.branches.values().filter(|b| b.is_biased(0.9)).count();
             total_call_sites += p.type_profiles.len();
-            monomorphic_sites += p.type_profiles.values().filter(|t| t.is_monomorphic()).count();
-            bimorphic_sites += p.type_profiles.values().filter(|t| t.is_bimorphic()).count();
-            megamorphic_sites += p.type_profiles.values().filter(|t| t.is_megamorphic()).count();
+            monomorphic_sites += p
+                .type_profiles
+                .values()
+                .filter(|t| t.is_monomorphic())
+                .count();
+            bimorphic_sites += p
+                .type_profiles
+                .values()
+                .filter(|t| t.is_bimorphic())
+                .count();
+            megamorphic_sites += p
+                .type_profiles
+                .values()
+                .filter(|t| t.is_megamorphic())
+                .count();
             total_loops += p.loops.len();
             hot_loops += p.loops.values().filter(|l| l.is_hot(1000)).count();
         }
 
-        let hot_methods = self.profiles.values().filter(|p| p.invocation_count > hot_threshold).count();
+        let hot_methods = self
+            .profiles
+            .values()
+            .filter(|p| p.invocation_count > hot_threshold)
+            .count();
 
         PgoSummary {
             total_methods: self.total_methods,
@@ -617,7 +704,10 @@ impl PgoRepository {
                 mine.backedge_count += other_profile.backedge_count;
                 // Merge branches.
                 for (bci, ob) in other_profile.branches {
-                    let b = mine.branches.entry(bci).or_insert_with(|| BranchProfile::new(bci));
+                    let b = mine
+                        .branches
+                        .entry(bci)
+                        .or_insert_with(|| BranchProfile::new(bci));
                     b.taken_count += ob.taken_count;
                     b.not_taken_count += ob.not_taken_count;
                 }
@@ -636,11 +726,16 @@ impl PgoRepository {
                         }
                     }
                     let total = tp.total_calls as f64;
-                    for e in &mut tp.entries { e.ratio = e.count as f64 / total; }
+                    for e in &mut tp.entries {
+                        e.ratio = e.count as f64 / total;
+                    }
                 }
                 // Merge call sites.
                 for (bci, ocs) in other_profile.call_sites {
-                    let cs = mine.call_sites.entry(bci).or_insert_with(|| CallSiteProfile::new(bci));
+                    let cs = mine
+                        .call_sites
+                        .entry(bci)
+                        .or_insert_with(|| CallSiteProfile::new(bci));
                     cs.call_count += ocs.call_count;
                     for (callee, cnt) in ocs.callee_distribution {
                         *cs.callee_distribution.entry(callee).or_insert(0) += cnt;
@@ -648,7 +743,10 @@ impl PgoRepository {
                 }
                 // Merge loops.
                 for (bci, ol) in other_profile.loops {
-                    let lp = mine.loops.entry(bci).or_insert_with(|| LoopProfile::new(bci));
+                    let lp = mine
+                        .loops
+                        .entry(bci)
+                        .or_insert_with(|| LoopProfile::new(bci));
                     lp.backedge_count += ol.backedge_count;
                     lp.iteration_counts.extend_from_slice(&ol.iteration_counts);
                 }
@@ -717,15 +815,13 @@ pub struct DevirtualizationAnalyzer;
 
 impl DevirtualizationAnalyzer {
     /// Analyse all virtual call sites in `profile` and return decisions.
-    pub fn analyze(
-        &self,
-        profile: &MethodProfile,
-        policy: &InliningPolicy,
-    ) -> Vec<DevirtDecision> {
+    pub fn analyze(&self, profile: &MethodProfile, policy: &InliningPolicy) -> Vec<DevirtDecision> {
         let mut decisions = Vec::new();
 
         for (bci, tp) in &profile.type_profiles {
-            if tp.total_calls == 0 { continue; }
+            if tp.total_calls == 0 {
+                continue;
+            }
 
             let strategy = if tp.is_megamorphic() {
                 DevirtDecision {
@@ -737,13 +833,21 @@ impl DevirtualizationAnalyzer {
                 let entry = &tp.entries[0];
                 let confidence = entry.ratio;
                 // Prefer inlining if the callee is small enough and call count high enough.
-                let cs_count = profile.call_sites.get(bci).map(|cs| cs.call_count).unwrap_or(0);
+                let cs_count = profile
+                    .call_sites
+                    .get(bci)
+                    .map(|cs| cs.call_count)
+                    .unwrap_or(0);
                 let strategy = if cs_count >= policy.min_call_count {
                     DevirtStrategy::Inline(entry.method_id)
                 } else {
                     DevirtStrategy::DirectCall(entry.method_id)
                 };
-                DevirtDecision { call_site_bci: *bci, strategy, confidence }
+                DevirtDecision {
+                    call_site_bci: *bci,
+                    strategy,
+                    confidence,
+                }
             } else if tp.is_bimorphic() {
                 let a = &tp.entries[0];
                 let b = &tp.entries[1];
@@ -756,7 +860,11 @@ impl DevirtualizationAnalyzer {
             } else {
                 // Polymorphic (3 or 4 types): use direct call to dominant if possible.
                 if let Some(dominant_class) = tp.dominant_type() {
-                    let entry = tp.entries.iter().find(|e| e.class_id == dominant_class).unwrap();
+                    let entry = tp
+                        .entries
+                        .iter()
+                        .find(|e| e.class_id == dominant_class)
+                        .unwrap();
                     DevirtDecision {
                         call_site_bci: *bci,
                         strategy: DevirtStrategy::DirectCall(entry.method_id),
@@ -896,32 +1004,45 @@ impl ProfileSerializer {
 
         macro_rules! read_u16 {
             () => {{
-                if pos + 2 > data.len() { return Err("unexpected EOF (u16)".into()); }
-                let v = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap());
-                pos += 2; v
+                if pos + 2 > data.len() {
+                    return Err("unexpected EOF (u16)".into());
+                }
+                let v = u16::from_le_bytes(data[pos..pos + 2].try_into().unwrap());
+                pos += 2;
+                v
             }};
         }
         macro_rules! read_u32 {
             () => {{
-                if pos + 4 > data.len() { return Err("unexpected EOF (u32)".into()); }
-                let v = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap());
-                pos += 4; v
+                if pos + 4 > data.len() {
+                    return Err("unexpected EOF (u32)".into());
+                }
+                let v = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                v
             }};
         }
         macro_rules! read_u64 {
             () => {{
-                if pos + 8 > data.len() { return Err("unexpected EOF (u64)".into()); }
-                let v = u64::from_le_bytes(data[pos..pos+8].try_into().unwrap());
-                pos += 8; v
+                if pos + 8 > data.len() {
+                    return Err("unexpected EOF (u64)".into());
+                }
+                let v = u64::from_le_bytes(data[pos..pos + 8].try_into().unwrap());
+                pos += 8;
+                v
             }};
         }
         macro_rules! read_str {
             () => {{
                 let len = read_u32!() as usize;
-                if pos + len > data.len() { return Err("unexpected EOF (string)".into()); }
-                let s = std::str::from_utf8(&data[pos..pos+len])
-                    .map_err(|e| format!("utf8 error: {e}"))?.to_owned();
-                pos += len; s
+                if pos + len > data.len() {
+                    return Err("unexpected EOF (string)".into());
+                }
+                let s = std::str::from_utf8(&data[pos..pos + len])
+                    .map_err(|e| format!("utf8 error: {e}"))?
+                    .to_owned();
+                pos += len;
+                s
             }};
         }
 
@@ -938,9 +1059,9 @@ impl ProfileSerializer {
         let mut repo = PgoRepository::new();
 
         for _ in 0..method_count {
-            let method_id   = read_u64!();
-            let inv_count   = read_u64!();
-            let back_count  = read_u64!();
+            let method_id = read_u64!();
+            let inv_count = read_u64!();
+            let back_count = read_u64!();
 
             // Branches.
             let n_branches = read_u32!() as usize;
@@ -949,7 +1070,14 @@ impl ProfileSerializer {
                 let bci = read_u32!();
                 let taken = read_u64!();
                 let not_taken = read_u64!();
-                branches.insert(bci, BranchProfile { bytecode_index: bci, taken_count: taken, not_taken_count: not_taken });
+                branches.insert(
+                    bci,
+                    BranchProfile {
+                        bytecode_index: bci,
+                        taken_count: taken,
+                        not_taken_count: not_taken,
+                    },
+                );
             }
 
             // Type profiles.
@@ -961,13 +1089,29 @@ impl ProfileSerializer {
                 let n_entries = read_u32!() as usize;
                 let mut entries = Vec::with_capacity(n_entries);
                 for _ in 0..n_entries {
-                    let class_id  = read_u32!();
-                    let m_id      = read_u64!();
-                    let count     = read_u64!();
-                    let ratio     = if total_calls > 0 { count as f64 / total_calls as f64 } else { 0.0 };
-                    entries.push(TypeProfileEntry { class_id, method_id: m_id, count, ratio });
+                    let class_id = read_u32!();
+                    let m_id = read_u64!();
+                    let count = read_u64!();
+                    let ratio = if total_calls > 0 {
+                        count as f64 / total_calls as f64
+                    } else {
+                        0.0
+                    };
+                    entries.push(TypeProfileEntry {
+                        class_id,
+                        method_id: m_id,
+                        count,
+                        ratio,
+                    });
                 }
-                type_profiles.insert(bci, ReceiverTypeProfile { call_site_bci: bci, entries, total_calls });
+                type_profiles.insert(
+                    bci,
+                    ReceiverTypeProfile {
+                        call_site_bci: bci,
+                        entries,
+                        total_calls,
+                    },
+                );
             }
 
             // Call sites.
@@ -976,14 +1120,21 @@ impl ProfileSerializer {
             for _ in 0..n_cs {
                 let bci = read_u32!();
                 let call_count = read_u64!();
-                let n_callees  = read_u32!() as usize;
+                let n_callees = read_u32!() as usize;
                 let mut dist = FxHashMap::default();
                 for _ in 0..n_callees {
                     let callee_id = read_u64!();
-                    let cnt       = read_u64!();
+                    let cnt = read_u64!();
                     dist.insert(callee_id, cnt);
                 }
-                call_sites.insert(bci, CallSiteProfile { bci, call_count, callee_distribution: dist });
+                call_sites.insert(
+                    bci,
+                    CallSiteProfile {
+                        bci,
+                        call_count,
+                        callee_distribution: dist,
+                    },
+                );
             }
 
             // Loops.
@@ -991,25 +1142,32 @@ impl ProfileSerializer {
             let mut loops = FxHashMap::default();
             for _ in 0..n_loops {
                 let hbci = read_u32!();
-                let be   = read_u64!();
-                loops.insert(hbci, LoopProfile { header_bci: hbci, iteration_counts: Vec::new(), backedge_count: be });
+                let be = read_u64!();
+                loops.insert(
+                    hbci,
+                    LoopProfile {
+                        header_bci: hbci,
+                        iteration_counts: Vec::new(),
+                        backedge_count: be,
+                    },
+                );
             }
 
             // Deopt.
-            let deopt_count   = read_u32!();
-            let recomp_count  = read_u32!();
-            let last_bci      = read_u32!();
-            let n_reasons     = read_u32!() as usize;
-            let mut reasons   = FxHashMap::default();
+            let deopt_count = read_u32!();
+            let recomp_count = read_u32!();
+            let last_bci = read_u32!();
+            let n_reasons = read_u32!() as usize;
+            let mut reasons = FxHashMap::default();
             for _ in 0..n_reasons {
                 let reason = read_str!();
-                let cnt    = read_u32!();
+                let cnt = read_u32!();
                 reasons.insert(reason, cnt);
             }
 
-            let class_name  = read_str!();
+            let class_name = read_str!();
             let method_name = read_str!();
-            let descriptor  = read_str!();
+            let descriptor = read_str!();
 
             let profile = MethodProfile {
                 method_id,
@@ -1076,7 +1234,9 @@ mod tests {
     #[test]
     fn branch_taken_ratio() {
         let mut bp = BranchProfile::new(0);
-        for _ in 0..9 { bp.update(true); }
+        for _ in 0..9 {
+            bp.update(true);
+        }
         bp.update(false);
         assert!((bp.taken_ratio() - 0.9).abs() < 1e-9);
     }
@@ -1084,24 +1244,36 @@ mod tests {
     #[test]
     fn branch_is_biased_true() {
         let mut bp = BranchProfile::new(0);
-        for _ in 0..95 { bp.update(true); }
-        for _ in 0..5  { bp.update(false); }
+        for _ in 0..95 {
+            bp.update(true);
+        }
+        for _ in 0..5 {
+            bp.update(false);
+        }
         assert!(bp.is_biased(0.9));
     }
 
     #[test]
     fn branch_is_biased_false() {
         let mut bp = BranchProfile::new(0);
-        for _ in 0..55 { bp.update(true); }
-        for _ in 0..45 { bp.update(false); }
+        for _ in 0..55 {
+            bp.update(true);
+        }
+        for _ in 0..45 {
+            bp.update(false);
+        }
         assert!(!bp.is_biased(0.9));
     }
 
     #[test]
     fn branch_not_taken_biased() {
         let mut bp = BranchProfile::new(0);
-        for _ in 0..5  { bp.update(true); }
-        for _ in 0..95 { bp.update(false); }
+        for _ in 0..5 {
+            bp.update(true);
+        }
+        for _ in 0..95 {
+            bp.update(false);
+        }
         assert!(bp.is_biased(0.9));
         assert!(!bp.likely_taken());
     }
@@ -1109,15 +1281,21 @@ mod tests {
     #[test]
     fn branch_likely_taken() {
         let mut bp = BranchProfile::new(0);
-        for _ in 0..6 { bp.update(true); }
-        for _ in 0..4 { bp.update(false); }
+        for _ in 0..6 {
+            bp.update(true);
+        }
+        for _ in 0..4 {
+            bp.update(false);
+        }
         assert!(bp.likely_taken());
     }
 
     #[test]
     fn branch_is_hot() {
         let mut bp = BranchProfile::new(0);
-        for _ in 0..101 { bp.update(true); }
+        for _ in 0..101 {
+            bp.update(true);
+        }
         assert!(bp.is_hot(100));
         assert!(!bp.is_hot(200));
     }
@@ -1135,7 +1313,9 @@ mod tests {
     #[test]
     fn type_profile_monomorphic() {
         let mut tp = ReceiverTypeProfile::new(0);
-        for _ in 0..10 { tp.add_receiver(42, 1001); }
+        for _ in 0..10 {
+            tp.add_receiver(42, 1001);
+        }
         assert!(tp.is_monomorphic());
         assert!(!tp.is_bimorphic());
         assert!(!tp.is_megamorphic());
@@ -1145,8 +1325,12 @@ mod tests {
     #[test]
     fn type_profile_bimorphic() {
         let mut tp = ReceiverTypeProfile::new(0);
-        for _ in 0..5 { tp.add_receiver(1, 100); }
-        for _ in 0..5 { tp.add_receiver(2, 200); }
+        for _ in 0..5 {
+            tp.add_receiver(1, 100);
+        }
+        for _ in 0..5 {
+            tp.add_receiver(2, 200);
+        }
         assert!(tp.is_bimorphic());
         assert!(!tp.is_monomorphic());
         assert!(!tp.is_megamorphic());
@@ -1155,30 +1339,42 @@ mod tests {
     #[test]
     fn type_profile_megamorphic() {
         let mut tp = ReceiverTypeProfile::new(0);
-        for i in 0..5 { tp.add_receiver(i, i as u64 * 100); }
+        for i in 0..5 {
+            tp.add_receiver(i, i as u64 * 100);
+        }
         assert!(tp.is_megamorphic());
     }
 
     #[test]
     fn type_profile_dominant_90_percent() {
         let mut tp = ReceiverTypeProfile::new(0);
-        for _ in 0..91 { tp.add_receiver(1, 100); }
-        for _ in 0..9  { tp.add_receiver(2, 200); }
+        for _ in 0..91 {
+            tp.add_receiver(1, 100);
+        }
+        for _ in 0..9 {
+            tp.add_receiver(2, 200);
+        }
         assert_eq!(tp.dominant_type(), Some(1));
     }
 
     #[test]
     fn type_profile_no_dominant_under_90() {
         let mut tp = ReceiverTypeProfile::new(0);
-        for _ in 0..85 { tp.add_receiver(1, 100); }
-        for _ in 0..15 { tp.add_receiver(2, 200); }
+        for _ in 0..85 {
+            tp.add_receiver(1, 100);
+        }
+        for _ in 0..15 {
+            tp.add_receiver(2, 200);
+        }
         assert_eq!(tp.dominant_type(), None);
     }
 
     #[test]
     fn type_profile_max_entries_capped_at_8() {
         let mut tp = ReceiverTypeProfile::new(0);
-        for i in 0..12u32 { tp.add_receiver(i, i as u64); }
+        for i in 0..12u32 {
+            tp.add_receiver(i, i as u64);
+        }
         assert!(tp.entries.len() <= 8);
         assert!(tp.total_calls >= 12);
     }
@@ -1186,7 +1382,11 @@ mod tests {
     #[test]
     fn type_profile_ratios_sum_to_at_most_one() {
         let mut tp = ReceiverTypeProfile::new(0);
-        for i in 0..4u32 { for _ in 0..25 { tp.add_receiver(i, i as u64); } }
+        for i in 0..4u32 {
+            for _ in 0..25 {
+                tp.add_receiver(i, i as u64);
+            }
+        }
         let sum: f64 = tp.entries.iter().map(|e| e.ratio).sum();
         assert!((sum - 1.0).abs() < 1e-9);
     }
@@ -1211,7 +1411,9 @@ mod tests {
     #[test]
     fn call_site_benefit_score_single_callee() {
         let mut cs = CallSiteProfile::new(0);
-        for _ in 0..100 { cs.record_call(42); }
+        for _ in 0..100 {
+            cs.record_call(42);
+        }
         // dominance_ratio = 1.0, callee_size = 9 => score = 100 / 10
         let score = cs.inline_benefit_score(9);
         assert!((score - 10.0).abs() < 1e-9);
@@ -1220,8 +1422,12 @@ mod tests {
     #[test]
     fn call_site_benefit_score_split_callee() {
         let mut cs = CallSiteProfile::new(0);
-        for _ in 0..50 { cs.record_call(1); }
-        for _ in 0..50 { cs.record_call(2); }
+        for _ in 0..50 {
+            cs.record_call(1);
+        }
+        for _ in 0..50 {
+            cs.record_call(2);
+        }
         // dominance_ratio = 0.5, callee_size = 9 => score = 100 * 0.5 / 10 = 5.0
         let score = cs.inline_benefit_score(9);
         assert!((score - 5.0).abs() < 1e-9);
@@ -1347,7 +1553,9 @@ mod tests {
     #[test]
     fn method_profile_record_call() {
         let mut mp = MethodProfile::new(1, "Foo", "bar", "()V");
-        for _ in 0..200 { mp.record_call(30, 55); }
+        for _ in 0..200 {
+            mp.record_call(30, 55);
+        }
         let cs = mp.call_sites.get(&30).unwrap();
         assert_eq!(cs.call_count, 200);
     }
@@ -1364,7 +1572,9 @@ mod tests {
     #[test]
     fn method_profile_get_hot_loops() {
         let mut mp = MethodProfile::new(1, "Foo", "bar", "()V");
-        for _ in 0..5000 { mp.record_backedge(10); }
+        for _ in 0..5000 {
+            mp.record_backedge(10);
+        }
         mp.record_backedge(20); // cold
         let hot = mp.get_hot_loops(100);
         assert!(hot.contains(&10));
@@ -1374,7 +1584,9 @@ mod tests {
     #[test]
     fn method_profile_get_inline_candidates() {
         let mut mp = MethodProfile::new(1, "Foo", "bar", "()V");
-        for _ in 0..500 { mp.record_call(5, 99); }
+        for _ in 0..500 {
+            mp.record_call(5, 99);
+        }
         let cands = mp.get_inline_candidates(10);
         assert!(!cands.is_empty());
         assert_eq!(cands[0].call_site_bci, 5);
@@ -1394,7 +1606,9 @@ mod tests {
     fn inlining_policy_too_rare() {
         let policy = InliningPolicy::default();
         let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..50 { mp.record_call(0, 1); } // only 50, need 100
+        for _ in 0..50 {
+            mp.record_call(0, 1);
+        } // only 50, need 100
         let cand = InlineCandidate {
             call_site_bci: 0,
             callee_method_id: 1,
@@ -1403,14 +1617,22 @@ mod tests {
             estimated_benefit: 1.0,
             callee_size: 10,
         };
-        assert_eq!(policy.should_inline(&cand, &mp), InlineDecision::TooRare { count: 50, min: 100 });
+        assert_eq!(
+            policy.should_inline(&cand, &mp),
+            InlineDecision::TooRare {
+                count: 50,
+                min: 100
+            }
+        );
     }
 
     #[test]
     fn inlining_policy_too_large() {
         let policy = InliningPolicy::default();
         let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..200 { mp.record_call(0, 1); }
+        for _ in 0..200 {
+            mp.record_call(0, 1);
+        }
         let cand = InlineCandidate {
             call_site_bci: 0,
             callee_method_id: 1,
@@ -1432,7 +1654,9 @@ mod tests {
     fn inlining_policy_monomorphic_boost_allows_larger() {
         let policy = InliningPolicy::default(); // boost = 2.0, max = 35 => effective 70
         let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..200 { mp.record_call(0, 1); }
+        for _ in 0..200 {
+            mp.record_call(0, 1);
+        }
         mp.record_receiver(0, 7, 1); // monomorphic
         let cand = InlineCandidate {
             call_site_bci: 0,
@@ -1449,8 +1673,12 @@ mod tests {
     fn inlining_policy_megamorphic_rejected() {
         let policy = InliningPolicy::default();
         let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..500 { mp.record_call(0, 1); }
-        for i in 0..5u32 { mp.record_receiver(0, i, i as u64); }
+        for _ in 0..500 {
+            mp.record_call(0, 1);
+        }
+        for i in 0..5u32 {
+            mp.record_receiver(0, i, i as u64);
+        }
         let cand = InlineCandidate {
             call_site_bci: 0,
             callee_method_id: 1,
@@ -1459,19 +1687,40 @@ mod tests {
             estimated_benefit: 100.0,
             callee_size: 10,
         };
-        assert_eq!(policy.should_inline(&cand, &mp), InlineDecision::Megamorphic);
+        assert_eq!(
+            policy.should_inline(&cand, &mp),
+            InlineDecision::Megamorphic
+        );
     }
 
     #[test]
     fn inlining_policy_rank_candidates() {
         let policy = InliningPolicy::default();
         let mut cands = vec![
-            InlineCandidate { call_site_bci: 0, callee_method_id: 1, callee_class: "".into(),
-                              callee_name: "".into(), estimated_benefit: 3.0, callee_size: 10 },
-            InlineCandidate { call_site_bci: 1, callee_method_id: 2, callee_class: "".into(),
-                              callee_name: "".into(), estimated_benefit: 7.0, callee_size: 10 },
-            InlineCandidate { call_site_bci: 2, callee_method_id: 3, callee_class: "".into(),
-                              callee_name: "".into(), estimated_benefit: 1.0, callee_size: 10 },
+            InlineCandidate {
+                call_site_bci: 0,
+                callee_method_id: 1,
+                callee_class: "".into(),
+                callee_name: "".into(),
+                estimated_benefit: 3.0,
+                callee_size: 10,
+            },
+            InlineCandidate {
+                call_site_bci: 1,
+                callee_method_id: 2,
+                callee_class: "".into(),
+                callee_name: "".into(),
+                estimated_benefit: 7.0,
+                callee_size: 10,
+            },
+            InlineCandidate {
+                call_site_bci: 2,
+                callee_method_id: 3,
+                callee_class: "".into(),
+                callee_name: "".into(),
+                estimated_benefit: 1.0,
+                callee_size: 10,
+            },
         ];
         policy.rank_candidates(&mut cands);
         assert_eq!(cands[0].estimated_benefit, 7.0);
@@ -1529,10 +1778,16 @@ mod tests {
             p.record_branch(0, true);
             p.record_branch(0, false);
             // Make biased branch at BCI 5.
-            for _ in 0..95 { p.record_branch(5, true); }
+            for _ in 0..95 {
+                p.record_branch(5, true);
+            }
             p.record_branch(5, false);
-            for i in 0..3u32 { p.record_receiver(10, i, i as u64); }
-            for _ in 0..10000 { p.record_backedge(20); }
+            for i in 0..3u32 {
+                p.record_receiver(10, i, i as u64);
+            }
+            for _ in 0..10000 {
+                p.record_backedge(20);
+            }
         }
         let summary = repo.serialize_summary();
         assert_eq!(summary.total_methods, 1);
@@ -1545,9 +1800,17 @@ mod tests {
     #[test]
     fn repo_merge_accumulates_counts() {
         let mut r1 = PgoRepository::new();
-        { let p = r1.get_or_create(1, "A", "m", "()V"); p.invocation_count = 100; p.record_branch(0, true); }
+        {
+            let p = r1.get_or_create(1, "A", "m", "()V");
+            p.invocation_count = 100;
+            p.record_branch(0, true);
+        }
         let mut r2 = PgoRepository::new();
-        { let p = r2.get_or_create(1, "A", "m", "()V"); p.invocation_count = 200; p.record_branch(0, false); }
+        {
+            let p = r2.get_or_create(1, "A", "m", "()V");
+            p.invocation_count = 200;
+            p.record_branch(0, false);
+        }
         r1.merge(r2);
         let p = r1.get(1).unwrap();
         assert_eq!(p.invocation_count, 300);
@@ -1570,7 +1833,9 @@ mod tests {
     #[test]
     fn devirt_monomorphic_inline() {
         let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..200 { mp.record_call(10, 99); }
+        for _ in 0..200 {
+            mp.record_call(10, 99);
+        }
         mp.record_receiver(10, 5, 99);
         let analyzer = DevirtualizationAnalyzer;
         let policy = InliningPolicy::default();
@@ -1583,8 +1848,12 @@ mod tests {
     #[test]
     fn devirt_bimorphic_if_then_else() {
         let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..5 { mp.record_receiver(20, 1, 101); }
-        for _ in 0..5 { mp.record_receiver(20, 2, 202); }
+        for _ in 0..5 {
+            mp.record_receiver(20, 1, 101);
+        }
+        for _ in 0..5 {
+            mp.record_receiver(20, 2, 202);
+        }
         let analyzer = DevirtualizationAnalyzer;
         let policy = InliningPolicy::default();
         let decisions = analyzer.analyze(&mp, &policy);
@@ -1602,7 +1871,9 @@ mod tests {
     #[test]
     fn devirt_megamorphic() {
         let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for i in 0..5u32 { mp.record_receiver(30, i, i as u64 + 100); }
+        for i in 0..5u32 {
+            mp.record_receiver(30, i, i as u64 + 100);
+        }
         let analyzer = DevirtualizationAnalyzer;
         let policy = InliningPolicy::default();
         let decisions = analyzer.analyze(&mp, &policy);
@@ -1614,7 +1885,9 @@ mod tests {
     fn devirt_direct_call_rare() {
         // Monomorphic but below min_call_count => DirectCall, not Inline.
         let mut mp = MethodProfile::new(1, "A", "m", "()V");
-        for _ in 0..10 { mp.record_call(40, 77); }
+        for _ in 0..10 {
+            mp.record_call(40, 77);
+        }
         mp.record_receiver(40, 9, 77);
         let analyzer = DevirtualizationAnalyzer;
         let policy = InliningPolicy::default(); // min_call_count = 100
@@ -1643,7 +1916,9 @@ mod tests {
             p.record_branch(0, false);
             p.record_receiver(10, 7, 77);
             p.record_call(20, 55);
-            for _ in 0..100 { p.record_backedge(30); }
+            for _ in 0..100 {
+                p.record_backedge(30);
+            }
             p.deopt.record_deopt("type_mismatch", 5);
         }
         let bytes = ProfileSerializer::serialize(&repo);

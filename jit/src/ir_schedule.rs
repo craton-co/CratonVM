@@ -200,12 +200,7 @@ fn is_if(graph: &Graph, id: NodeId) -> bool {
 /// Find the best block for a data node.
 /// Uses a simple heuristic: place in the entry block (block 0) unless
 /// one of its inputs is in a later block (then use that block).
-fn find_best_block(
-    graph: &Graph,
-    id: NodeId,
-    node_to_block: &[usize],
-    blocks: &[Block],
-) -> usize {
+fn find_best_block(graph: &Graph, id: NodeId, node_to_block: &[usize], blocks: &[Block]) -> usize {
     let node = &graph.nodes[id as usize];
     let mut best = 0; // default: entry block
     for &inp in &node.inputs {
@@ -292,12 +287,12 @@ mod tests {
     fn test_schedule_branching_method() {
         // if (x == 0) return 1; return 0;
         let code = [
-            0x1a,             // 0: iload_0
+            0x1a, // 0: iload_0
             0x99, 0x00, 0x05, // 1: ifeq → 6
-            0x03,             // 4: iconst_0
-            0xac,             // 5: ireturn
-            0x04,             // 6: iconst_1
-            0xac,             // 7: ireturn
+            0x03, // 4: iconst_0
+            0xac, // 5: ireturn
+            0x04, // 6: iconst_1
+            0xac, // 7: ireturn
             0, 0,
         ];
         let sched = build_schedule(&code, 8, 1, 1);
@@ -379,20 +374,17 @@ mod tests {
     fn test_schedule_branching_successor_count() {
         // if (x == 0) return 1; return 0;
         let code = [
-            0x1a,             // iload_0
+            0x1a, // iload_0
             0x99, 0x00, 0x05, // ifeq → 6
-            0x03,             // iconst_0
-            0xac,             // ireturn
-            0x04,             // iconst_1
-            0xac,             // ireturn
+            0x03, // iconst_0
+            0xac, // ireturn
+            0x04, // iconst_1
+            0xac, // ireturn
             0, 0,
         ];
         let sched = build_schedule(&code, 8, 1, 1);
         // At least one block should have 2 successors (the If block)
-        let _has_branch = sched
-            .blocks
-            .iter()
-            .any(|b| b.successors.len() == 2);
+        let _has_branch = sched.blocks.iter().any(|b| b.successors.len() == 2);
         // It's possible the optimizer simplifies the branch, so just check
         // that the schedule produced valid blocks
         assert!(

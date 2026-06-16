@@ -13,8 +13,8 @@
 /// - Receiver type counts pre-populate Monomorphic Inline Cache (MIC) slots so the
 ///   common-case virtual dispatch is a direct call from the very first JIT execution.
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 
@@ -114,10 +114,7 @@ pub type ReceiverCounts = FxHashMap<u32, u32>;
 
 /// Returns the dominant receiver class (most frequent) and its count if it
 /// exceeds `min_fraction_pct` percent of total observations.
-pub fn dominant_receiver(
-    counts: &ReceiverCounts,
-    min_fraction_pct: u32,
-) -> Option<u32> {
+pub fn dominant_receiver(counts: &ReceiverCounts, min_fraction_pct: u32) -> Option<u32> {
     let total: u32 = counts.values().copied().sum();
     if total == 0 {
         return None;
@@ -239,7 +236,10 @@ impl MethodProfile {
     /// Record a completed trip count for a loop at the given back-edge PC.
     #[inline]
     pub fn record_trip_complete(&mut self, backedge_pc: usize, trip: u32) {
-        self.loops.entry(backedge_pc).or_default().record_trip_complete(trip);
+        self.loops
+            .entry(backedge_pc)
+            .or_default()
+            .record_trip_complete(trip);
     }
 }
 
@@ -273,9 +273,8 @@ const PROFILE_SHARDS: usize = 16;
 /// can hold an array of these and dispatch by hash.
 struct ProfileShard {
     methods: parking_lot::RwLock<FxHashMap<MethodKey, Arc<parking_lot::Mutex<MethodProfile>>>>,
-    name_index: parking_lot::RwLock<
-        FxHashMap<u64, (MethodKey, Arc<parking_lot::Mutex<MethodProfile>>)>,
-    >,
+    name_index:
+        parking_lot::RwLock<FxHashMap<u64, (MethodKey, Arc<parking_lot::Mutex<MethodProfile>>)>>,
 }
 
 impl ProfileShard {
@@ -406,7 +405,8 @@ impl ProfileStore {
     /// SipHash collision (probability ~2.7e-10 per pair at 100k
     /// methods) or a logic bug.
     pub fn name_index_collisions(&self) -> u64 {
-        self.name_index_collisions.load(std::sync::atomic::Ordering::Relaxed)
+        self.name_index_collisions
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Increment the invocation counter for a method identified by the packed key
@@ -824,22 +824,34 @@ mod tests {
     #[test]
     fn test_branch_counts_thresholds() {
         // Not enough samples — neither flag set.
-        let sparse = BranchCounts { taken: 5, not_taken: 5 };
+        let sparse = BranchCounts {
+            taken: 5,
+            not_taken: 5,
+        };
         assert!(!sparse.is_usually_taken());
         assert!(!sparse.is_usually_not_taken());
 
         // Usually taken (>90 %).
-        let hot = BranchCounts { taken: 95, not_taken: 5 };
+        let hot = BranchCounts {
+            taken: 95,
+            not_taken: 5,
+        };
         assert!(hot.is_usually_taken());
         assert!(!hot.is_usually_not_taken());
 
         // Usually not taken (<10 %).
-        let cold = BranchCounts { taken: 1, not_taken: 99 };
+        let cold = BranchCounts {
+            taken: 1,
+            not_taken: 99,
+        };
         assert!(!cold.is_usually_taken());
         assert!(cold.is_usually_not_taken());
 
         // Borderline — exactly 90 % (not strictly > 90 %).
-        let borderline = BranchCounts { taken: 18, not_taken: 2 };
+        let borderline = BranchCounts {
+            taken: 18,
+            not_taken: 2,
+        };
         assert!(!borderline.is_usually_taken(), "90% is not >90%");
     }
 
@@ -927,8 +939,10 @@ mod tests {
                 store.record_receiver(&key, 1, 0);
                 store.record_trip_complete(&key, 1, 4);
             }
-            assert!(store.get_profile(&key).is_none(),
-                "no profile entry should be created while profiling is disabled");
+            assert!(
+                store.get_profile(&key).is_none(),
+                "no profile entry should be created while profiling is disabled"
+            );
         });
     }
 
@@ -975,8 +989,12 @@ mod tests {
         with_profiling_enabled(|| {
             let store = ProfileStore::new();
             let key = make_key(99);
-            for _ in 0..10 { store.record_branch(&key, 42, true); }
-            for _ in 0..5 { store.record_branch(&key, 42, false); }
+            for _ in 0..10 {
+                store.record_branch(&key, 42, true);
+            }
+            for _ in 0..5 {
+                store.record_branch(&key, 42, false);
+            }
             let all = store.snapshot_all();
             assert_eq!(all.len(), 1);
             let (_, profile) = &all[0];

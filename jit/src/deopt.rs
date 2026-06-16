@@ -344,7 +344,8 @@ impl InvalidationManager {
             assumptions.push(assumption);
             return;
         }
-        self.assumptions.insert(method.to_string(), vec![assumption]);
+        self.assumptions
+            .insert(method.to_string(), vec![assumption]);
     }
 
     /// Called when a new class is loaded. Returns the set of compiled methods

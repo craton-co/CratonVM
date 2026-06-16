@@ -297,9 +297,9 @@ pub const CC: Cond = Cond::LO;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum VectorArrangement {
-    S4, // 4xS (i32x4 / f32x4)
-    D2, // 2xD (i64x2 / f64x2)
-    H8, // 8xH (i16x8)
+    S4,  // 4xS (i32x4 / f32x4)
+    D2,  // 2xD (i64x2 / f64x2)
+    H8,  // 8xH (i16x8)
     B16, // 16xB (i8x16)
 }
 
@@ -317,7 +317,9 @@ pub struct Aarch64Emitter {
 impl Aarch64Emitter {
     /// Create a new emitter with an empty code buffer.
     pub fn new() -> Self {
-        Self { code: Vec::with_capacity(1024) }
+        Self {
+            code: Vec::with_capacity(1024),
+        }
     }
 
     /// Return a reference to the generated machine code.
@@ -1293,8 +1295,15 @@ enum ShiftType {
 /// Data-processing (shifted register).
 /// sf(1) opc(2) fixed(5) shift(2) N(1) Rm(5) imm6(6) Rn(5) Rd(5)
 fn dp_shifted_reg(
-    sf: bool, opc: u32, fixed: u32, shift: ShiftType, n: u32,
-    rm: Reg, imm6: u8, rn: Reg, rd: Reg,
+    sf: bool,
+    opc: u32,
+    fixed: u32,
+    shift: ShiftType,
+    n: u32,
+    rm: Reg,
+    imm6: u8,
+    rn: Reg,
+    rd: Reg,
 ) -> u32 {
     ((sf as u32) << 31)
         | (opc << 29)
@@ -1334,8 +1343,14 @@ fn dp_3src(sf: bool, op31: u32, rm: Reg, o0: u32, ra: Reg, rn: Reg, rd: Reg) -> 
 /// Logic (shifted register).
 /// sf(1) opc(2) 01010 shift(2) N(1) Rm(5) imm6(6) Rn(5) Rd(5)
 fn logic_shifted(
-    sf: bool, opc: u32, shift: ShiftType, n: u32,
-    rm: Reg, imm6: u8, rn: Reg, rd: Reg,
+    sf: bool,
+    opc: u32,
+    shift: ShiftType,
+    n: u32,
+    rm: Reg,
+    imm6: u8,
+    rn: Reg,
+    rd: Reg,
 ) -> u32 {
     ((sf as u32) << 31)
         | ((opc & 0x3) << 29)
@@ -1350,7 +1365,15 @@ fn logic_shifted(
 
 /// Add/subtract immediate.
 /// sf(1) op(1) S(1) 100010 sh(1) imm12(12) Rn(5) Rd(5)
-fn addsub_imm(sf: bool, sub: bool, set_flags: bool, imm12: u16, shift12: bool, rn: Reg, rd: Reg) -> u32 {
+fn addsub_imm(
+    sf: bool,
+    sub: bool,
+    set_flags: bool,
+    imm12: u16,
+    shift12: bool,
+    rn: Reg,
+    rd: Reg,
+) -> u32 {
     ((sf as u32) << 31)
         | ((sub as u32) << 30)
         | ((set_flags as u32) << 29)
@@ -1388,7 +1411,16 @@ fn ldst_unsigned_imm(size: u32, v: u32, opc: u32, imm12: u16, rn: Reg, rt: u32) 
 
 /// Load/store register (register offset).
 /// size(2) 1 1 1 V(1) 00 opc(2) 1 Rm(5) option(3) S(1) 10 Rn(5) Rt(5)
-fn ldst_reg_offset(size: u32, v: u32, opc: u32, rm: Reg, option: u32, s: u32, rn: Reg, rt: u32) -> u32 {
+fn ldst_reg_offset(
+    size: u32,
+    v: u32,
+    opc: u32,
+    rm: Reg,
+    option: u32,
+    s: u32,
+    rn: Reg,
+    rt: u32,
+) -> u32 {
     ((size & 0x3) << 30)
         | (0b111u32 << 27)
         | ((v & 1) << 26)
@@ -1426,7 +1458,16 @@ fn ldst_pre_post(size: u32, v: u32, opc: u32, simm9: i16, pre: bool, rn: Reg, rt
 ///
 /// encoding: 00=non-temporal, 01=post-index, 10=signed-offset, 11=pre-index
 /// For 64-bit (opc=10), imm7 is signed and scaled by 8.
-fn ldst_pair(opc: u32, v: u32, l: u32, encoding: u32, imm: i16, rt2: Reg, rn: Reg, rt1: Reg) -> u32 {
+fn ldst_pair(
+    opc: u32,
+    v: u32,
+    l: u32,
+    encoding: u32,
+    imm: i16,
+    rt2: Reg,
+    rn: Reg,
+    rt1: Reg,
+) -> u32 {
     // Scale: for opc=10 (64-bit), divide by 8
     let imm7 = ((imm / 8) as u32) & 0x7F;
     ((opc & 0x3) << 30)
@@ -1476,7 +1517,10 @@ mod tests {
     #[test]
     fn fpreg_from_u8_rejects_out_of_range() {
         for n in [32u8, 40, 64, 100, 200, 255] {
-            assert!(FpReg::from_u8(n).is_none(), "FpReg::from_u8({n}) must be None");
+            assert!(
+                FpReg::from_u8(n).is_none(),
+                "FpReg::from_u8({n}) must be None"
+            );
         }
     }
 
@@ -1710,7 +1754,7 @@ mod tests {
         e.tbz(Reg::X0, 5, 8);
         let inst = last_inst(&e);
         assert_eq!(inst & 0x1F, 0); // Rt = X0
-        // bit 5 in b40 field
+                                    // bit 5 in b40 field
         assert_eq!((inst >> 19) & 0x1F, 5);
         // imm14 = 8/4 = 2
         assert_eq!((inst >> 5) & 0x3FFF, 2);
@@ -1793,7 +1837,7 @@ mod tests {
 
         let inst = inst_at(&e, bpos);
         assert_eq!(inst & 0xF, Cond::NE.enc()); // condition preserved
-        // delta = 16 bytes → imm19 = 4
+                                                // delta = 16 bytes → imm19 = 4
         assert_eq!((inst >> 5) & 0x7FFFF, 4);
     }
 
