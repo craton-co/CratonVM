@@ -13,6 +13,31 @@ use crate::threading::jvm_thread::JvmThread;
 use crate::types::{ObjectRef, Value};
 use crate::vm::SharedVm;
 
+/// True when interpreter-frame locals should be scanned CONSERVATIVELY (every
+/// pointer-shaped slot, validated by the strict `is_object_address` header
+/// probe) in addition to the tag-filtered scan. Enabled exactly when the
+/// non-moving + selective-promotion sweep is the collector that will run — i.e.
+/// any thread is in JIT (`gc_quiescence::is_active()`), the only mode in which a
+/// false-positive root is harmless (nothing is relocated). Off on the moving
+/// (no-JIT) path, where a pointer-shaped `long` rooted here would be relocated
+/// and corrupted. Opt out entirely with `CRATONVM_NO_CONSERVATIVE_LOCALS`.
+#[inline]
+pub(crate) fn conservative_locals_enabled() -> bool {
+    use std::sync::OnceLock;
+    // Blast-radius bound: only under the opt-in real-ForkJoinPool gate (the gate
+    // the multi-thread reclamation bug lives under — see the FJP-worker test
+    // case). With it OFF — the default for the entire app gauntlet and the
+    // bintrees benchmarks — this returns false and the root scan is byte-
+    // identical to baseline (no extra `is_object_address` probes, no over-pin
+    // risk). Opt out even under the gate with `CRATONVM_NO_CONSERVATIVE_LOCALS`.
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    let base = *ENABLED.get_or_init(|| {
+        std::env::var_os("CRATONVM_REAL_FORKJOINPOOL").is_some()
+            && std::env::var_os("CRATONVM_NO_CONSERVATIVE_LOCALS").is_none()
+    });
+    base && cratonvm_gc::gc_quiescence::is_active()
+}
+
 /// Collect all GC root ObjectRefs from the shared VM state and the current thread.
 ///
 /// Returns a vector of all live non-null ObjectRefs reachable from:
@@ -40,8 +65,24 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     // `heap.is_object_address` so a primitive `long` (file size, hash,
     // jboss-modules token) can no longer poison the root set and cause a
     // `0xC0000005` SEGV when the GC later dereferences the bogus pointer.
+    // Multi-thread non-moving-sweep root hardening (Fork6 FJP reclamation):
+    // when the non-moving + selective-promotion sweep is the collector that will
+    // run (any thread in JIT → `gc_quiescence::is_active()`), conservatively
+    // probe every local for a lost-tag object reference. A JIT callee's object
+    // return value can reach an interpreter local under a non-object tag (e.g.
+    // `main`'s `f = POOL.submit(t)`); the tag-filtered `scan_local_objects` then
+    // omits it, so selective promotion neither pins nor remaps it and the young
+    // slot is evacuated+zeroed → stale all-zero receiver. The conservative probe
+    // roots (and thereby PINS, since the pin set is keyed by root value) such
+    // slots. Sound here ONLY because this collector never relocates — a
+    // false-positive can only over-retain. Opt out with
+    // `CRATONVM_NO_CONSERVATIVE_LOCALS`.
+    let conservative_locals = conservative_locals_enabled();
     for frame in thread.frames.iter() {
         frame.scan_local_objects(&mut roots, &shared.heap);
+        if conservative_locals {
+            frame.scan_locals_conservative(&mut roots, &shared.heap);
+        }
         let before = roots.len();
         frame.stack.scan_object_refs(&mut roots, &shared.heap);
         if roots.len() > before {

@@ -158,6 +158,13 @@ struct SweptRec {
     class_id: u32,
     kind: u8,
     cycle: u32,
+    /// GC context at the time of reclamation (CRATONVM_DBG_MTROOTS), so the
+    /// sweep-zero detector can name WHICH GC reclaimed a live object: the
+    /// reason (1=System.gc / 2=alloc-young / 3=forced-alloc), the initiating
+    /// thread id, and how many threads were parked (blocked) at that STW.
+    reason: u8,
+    initiator: u32,
+    blocked: u32,
 }
 
 const SWEPT_RING_BITS: usize = 18; // 256K entries
@@ -173,6 +180,26 @@ static SWEPT_RING: std::sync::OnceLock<parking_lot::Mutex<SweptRing>> =
     std::sync::OnceLock::new();
 static SWEEP_ZERO_CYCLE: AtomicU64 = AtomicU64::new(0);
 
+/// GC context for the IN-PROGRESS collection, published by the VM root-gathering
+/// path just before `collect_garbage` (CRATONVM_DBG_MTROOTS). Read by
+/// `record_swept` so a reclaimed-live record names the responsible GC.
+/// reason: 1=System.gc, 2=alloc-young (maybe_gc), 3=forced-alloc (maybe_gc_forced).
+pub static GC_CTX_REASON: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub static GC_CTX_INITIATOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+pub static GC_CTX_BLOCKED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Publish the current collection's context (VM-side, before `collect_garbage`).
+pub fn set_gc_context(reason: u8, initiator: u32, blocked: u32) {
+    GC_CTX_REASON.store(reason as u32, Ordering::Relaxed);
+    GC_CTX_INITIATOR.store(initiator, Ordering::Relaxed);
+    GC_CTX_BLOCKED.store(blocked, Ordering::Relaxed);
+}
+
+/// Current young-sweep cycle stamp (the value the next sweep will record).
+pub fn current_sweep_cycle() -> u32 {
+    SWEEP_ZERO_CYCLE.load(Ordering::Relaxed) as u32
+}
+
 fn sweep_zero_enabled() -> bool {
     use std::sync::OnceLock;
     static S: OnceLock<bool> = OnceLock::new();
@@ -183,7 +210,8 @@ fn swept_ring() -> &'static parking_lot::Mutex<SweptRing> {
     SWEPT_RING.get_or_init(|| {
         parking_lot::Mutex::new(SweptRing {
             buf: vec![
-                SweptRec { addr: 0, class_id: 0, kind: 0, cycle: 0 };
+                SweptRec { addr: 0, class_id: 0, kind: 0, cycle: 0,
+                           reason: 0, initiator: 0, blocked: 0 };
                 SWEPT_RING_LEN
             ],
             next: 0,
@@ -214,15 +242,19 @@ fn record_swept(addr: usize, class_id: u32, kind: u8, cycle: u32) {
         class_id,
         kind,
         cycle,
+        reason: GC_CTX_REASON.load(Ordering::Relaxed) as u8,
+        initiator: GC_CTX_INITIATOR.load(Ordering::Relaxed),
+        blocked: GC_CTX_BLOCKED.load(Ordering::Relaxed),
     };
     r.next = r.next.wrapping_add(1);
 }
 
 /// Look up whether `addr` was recently zeroed by the non-moving sweep. Returns
-/// `(original_class_id, original_kind, gc_cycle)` of the most recent matching
-/// record, or `None`. Used by the all-zero-header detection to name a reclaimed
-/// (register/native-root-invisible) live object. No-op unless the gate is set.
-pub fn sweep_zero_lookup(addr: usize) -> Option<(u32, u8, u32)> {
+/// `(original_class_id, original_kind, gc_cycle, reason, initiator_tid, blocked)`
+/// of the most recent matching record, or `None`. Used by the all-zero-header
+/// detection to name a reclaimed (register/native-root-invisible) live object
+/// AND the GC that reclaimed it. No-op unless the gate is set.
+pub fn sweep_zero_lookup(addr: usize) -> Option<(u32, u8, u32, u8, u32, u32)> {
     if !sweep_zero_enabled() {
         return None;
     }
@@ -237,7 +269,7 @@ pub fn sweep_zero_lookup(addr: usize) -> Option<(u32, u8, u32)> {
             }
         }
     }
-    best.map(|b| (b.class_id, b.kind, b.cycle))
+    best.map(|b| (b.class_id, b.kind, b.cycle, b.reason, b.initiator, b.blocked))
 }
 
 #[derive(Default, Debug)]

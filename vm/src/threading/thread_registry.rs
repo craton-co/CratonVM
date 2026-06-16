@@ -495,6 +495,27 @@ impl ThreadRegistry {
         }
     }
 
+    /// DBG (CRATONVM_DBG_MTROOTS): per-thread (tid, in_blocked_region,
+    /// snapshot_len) for every alive thread. Used at an STW to see whether a
+    /// thread that holds a reclaimed live oop was counted BLOCKED (excluded from
+    /// the barrier `expected`) while actually running — the multi-thread
+    /// root-coverage gap.
+    pub fn dump_blocked_states(&self) -> Vec<(u64, bool, usize)> {
+        let threads = self.threads.lock();
+        let mut v = Vec::new();
+        for (tid, entry) in threads.iter() {
+            if entry.alive.load(Ordering::Acquire) {
+                let blk = entry
+                    .gc_block_state
+                    .in_blocked_region
+                    .load(Ordering::Acquire);
+                let len = entry.root_snapshot.lock().len();
+                v.push((tid.0, blk, len));
+            }
+        }
+        v
+    }
+
     /// Collect root snapshots from all alive threads.
     /// Returns a combined vector of all ObjectRefs from all threads' snapshots.
     ///
