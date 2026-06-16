@@ -3896,6 +3896,146 @@ fn arith_expr_max_depth(steps: &[ArithStep]) -> usize {
     max
 }
 
+// ── Affine self-recurrence strength reduction (CRATONVM_JIT_REASSOC) ──
+//
+// Collapse an unrolled affine recurrence on a single int local —
+//   `x = x*c1 + c2; x = x*c1' + c2'; …`  (≥2 consecutive steps)
+// — into one `x = x*K + C`. This is C2's Mul/Add reassociation, the
+// optimization that dominated the CratonVM-vs-HotSpot CPU gap on compute
+// kernels (e.g. `GpuCompute.heavy`: 96 multiply-adds → 1). Exact under Java
+// two's-complement (wrapping) `int` arithmetic. The IR optimizer carries the
+// same transform for methods it can compile, but the IR backend declines
+// loops/arrays, so the in-loop kernels that matter are folded here in the
+// single-pass x64 backend instead.
+
+/// Decode `iload` / `iload_0..3` → (local index, next pc).
+fn decode_int_load(code: &[u8], pc: usize, code_len: usize) -> Option<(usize, usize)> {
+    match *code.get(pc)? {
+        0x1a..=0x1d => Some(((code[pc] - 0x1a) as usize, pc + 1)),
+        0x15 if pc + 1 < code_len => Some((code[pc + 1] as usize, pc + 2)),
+        _ => None,
+    }
+}
+
+/// Decode `istore` / `istore_0..3` → (local index, next pc).
+fn decode_int_store(code: &[u8], pc: usize, code_len: usize) -> Option<(usize, usize)> {
+    match *code.get(pc)? {
+        0x3b..=0x3e => Some(((code[pc] - 0x3b) as usize, pc + 1)),
+        0x36 if pc + 1 < code_len => Some((code[pc + 1] as usize, pc + 2)),
+        _ => None,
+    }
+}
+
+/// Decode a small int constant push (`iconst_m1..5` / `bipush` / `sipush`) →
+/// (value, next pc).
+fn decode_int_const_push(code: &[u8], pc: usize, code_len: usize) -> Option<(i32, usize)> {
+    match *code.get(pc)? {
+        0x02..=0x08 => Some((code[pc] as i32 - 3, pc + 1)),
+        0x10 if pc + 1 < code_len => Some((code[pc + 1] as i8 as i32, pc + 2)),
+        0x11 if pc + 2 < code_len => {
+            Some((i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32, pc + 3))
+        }
+        _ => None,
+    }
+}
+
+/// One affine self-update of local `k`: `x' = m*x + b`, ending at `end`.
+struct AffineStep {
+    m: i32,
+    b: i32,
+    end: usize,
+}
+
+/// Match a single `iload_k ; [push c1 ; imul] ; [push c2 ; (iadd|isub)] ;
+/// istore_k` step on local `k` at `pc`. At least one of the multiply/add must
+/// be present (so a bare `iload_k; istore_k` copy is not "folded").
+fn match_affine_step(code: &[u8], pc: usize, code_len: usize, k: usize) -> Option<AffineStep> {
+    let (lk, mut p) = decode_int_load(code, pc, code_len)?;
+    if lk != k {
+        return None;
+    }
+    let (mut m, mut b) = (1i32, 0i32);
+    let mut saw_op = false;
+    if let Some((c1, p2)) = decode_int_const_push(code, p, code_len) {
+        if code.get(p2) == Some(&0x68) {
+            // imul
+            m = c1;
+            p = p2 + 1;
+            saw_op = true;
+        }
+    }
+    if let Some((c2, p2)) = decode_int_const_push(code, p, code_len) {
+        match code.get(p2) {
+            Some(&0x60) => {
+                b = c2;
+                p = p2 + 1;
+                saw_op = true;
+            }
+            Some(&0x64) => {
+                b = c2.wrapping_neg();
+                p = p2 + 1;
+                saw_op = true;
+            }
+            _ => {}
+        }
+    }
+    if !saw_op {
+        return None;
+    }
+    let (sk, end) = decode_int_store(code, p, code_len)?;
+    if sk != k {
+        return None;
+    }
+    Some(AffineStep { m, b, end })
+}
+
+/// Match a maximal run of ≥2 affine self-updates on the same int local from
+/// `start_pc`, with no branch target landing strictly inside the folded
+/// region. Returns `(local, K, C, end_pc)` equivalent to `local = local*K + C`.
+fn match_affine_chain(
+    code: &[u8],
+    start_pc: usize,
+    code_len: usize,
+    branch_targets: &[bool],
+) -> Option<(usize, i32, i32, usize)> {
+    let (k, _) = decode_int_load(code, start_pc, code_len)?;
+    let mut p = start_pc;
+    let mut steps = 0usize;
+    let (mut big_k, mut big_c) = (1i32, 0i32);
+    let mut end = start_pc;
+    loop {
+        // A second-or-later step must not begin at a branch target, and no
+        // target may land inside a step's bytes — otherwise a branch could
+        // jump into code we are about to fold away.
+        if steps > 0 && branch_targets.get(p).copied().unwrap_or(true) {
+            break;
+        }
+        let step = match match_affine_step(code, p, code_len, k) {
+            Some(s) => s,
+            None => break,
+        };
+        let mut inner = p + 1;
+        let mut inner_target = false;
+        while inner < step.end {
+            if branch_targets.get(inner).copied().unwrap_or(true) {
+                inner_target = true;
+                break;
+            }
+            inner += 1;
+        }
+        if inner_target {
+            break;
+        }
+        // x' = m*x + b  ⇒  K *= m ; C = C*m + b   (Java int wrapping).
+        big_c = big_c.wrapping_mul(step.m).wrapping_add(step.b);
+        big_k = big_k.wrapping_mul(step.m);
+        end = step.end;
+        steps += 1;
+        p = step.end;
+    }
+    (steps >= 2).then_some((k, big_k, big_c, end))
+}
+
 /// Find loop-invariant integer-arithmetic runs that can be hoisted to a loop
 /// pre-header. For nested loops, a run is attributed to the OUTERMOST loop in
 /// which all its operands are invariant (largest span first), so it is
@@ -7841,6 +7981,39 @@ impl Compiler {
         if val != 0 {
             self.rex_w();
             self.buf.emit(&[0x63, 0xC0]); // MOVSXD RAX, EAX
+        }
+    }
+
+    /// Emit a folded affine self-update `local = local*k + c` for an int local
+    /// (the result of [`match_affine_chain`]). Reads the local into RAX,
+    /// multiplies + adds the (sign-extended) constants, writes it back — a
+    /// net-zero effect on the simulated operand stack (the matched bytecodes
+    /// were a balanced load…store run), using RAX as the only scratch.
+    fn emit_affine_fold(&mut self, local: usize, k: i32, c: i32) {
+        // RAX = local
+        if let Some(reg) = self.reg_for_local(local) {
+            self.emit_mov_reg_reg(RAX, reg);
+        } else {
+            self.emit_load_local(RAX, self.local_offset(local));
+        }
+        // RAX *= k  (emit_imul_const sign-extends the result for k != 0)
+        self.emit_imul_const(k);
+        // RAX += c  (matches the const-arith peephole's add encoding)
+        if c != 0 {
+            if (-128..=127).contains(&c) {
+                self.buf.emit(&[0x83, 0xC0, c as u8]); // ADD EAX, imm8
+            } else {
+                self.buf.emit(&[0x81, 0xC0]); // ADD EAX, imm32
+                self.buf.emit(&c.to_le_bytes());
+            }
+            self.rex_w();
+            self.buf.emit(&[0x63, 0xC0]); // MOVSXD RAX, EAX
+        }
+        // local = RAX
+        if let Some(reg) = self.reg_for_local(local) {
+            self.emit_mov_reg_reg(reg, RAX);
+        } else {
+            self.emit_store_local(self.local_offset(local), RAX);
         }
     }
 
@@ -12946,6 +13119,16 @@ impl Compiler {
                 // iload / lload / fload / dload / aload
                 // iload/lload/fload/dload/aload (wide index: opcode 0x15-0x19, then idx byte)
                 0x15..=0x19 => {
+                    // Affine self-recurrence strength reduction (CRATONVM_JIT_REASSOC).
+                    if op == 0x15 && crate::ir_optimize::reassoc_enabled() {
+                        if let Some((local, k, c, end)) =
+                            match_affine_chain(code, pc, code_len, &branch_targets)
+                        {
+                            self.emit_affine_fold(local, k, c);
+                            pc = end;
+                            continue;
+                        }
+                    }
                     let idx = code[pc + 1] as usize; // Widening: always safe
                     // fload (0x17) and dload (0x18) may have XMM-allocated locals
                     if matches!(op, 0x17 | 0x18) {
@@ -12974,6 +13157,17 @@ impl Compiler {
 
                 // iload_0..iload_3
                 0x1a..=0x1d => {
+                    // Affine self-recurrence strength reduction (CRATONVM_JIT_REASSOC):
+                    // fold a run of `x = x*c1 + c2` steps into one `x = x*K + C`.
+                    if crate::ir_optimize::reassoc_enabled() {
+                        if let Some((local, k, c, end)) =
+                            match_affine_chain(code, pc, code_len, &branch_targets)
+                        {
+                            self.emit_affine_fold(local, k, c);
+                            pc = end;
+                            continue;
+                        }
+                    }
                     let idx = (op - 0x1a) as usize; // Widening: always safe
                     if let Some(local_reg) = self.reg_for_local(idx) {
                         // Zero-cost: just record register reference on simulated

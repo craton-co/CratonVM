@@ -16,6 +16,15 @@ use super::ir::{CmpOp, Graph, IrType, Node, NodeId, Op, NO_NODE};
 
 /// Run all optimization passes on the graph.
 pub fn optimize(graph: &mut Graph) {
+    // Affine strength-reduction (reassociation). Collapses an unrolled affine
+    // recurrence such as `x = x*c1 + c2` (×N) into a single `k*root + c` — the
+    // optimization C2 performs via Mul/Add reassociation, which dominated the
+    // CratonVM-vs-HotSpot CPU gap on compute kernels. Gated default-OFF behind
+    // `CRATONVM_JIT_REASSOC` while it soaks (the IR path it feeds is also
+    // gate-relaxed for branchy integer loops in `lib.rs`).
+    if reassoc_enabled() {
+        reassociate_affine(graph);
+    }
     // Run passes in a fixed-point loop until no more changes.
     for _ in 0..8 {
         let before = graph.live_count();
@@ -25,6 +34,231 @@ pub fn optimize(graph: &mut Graph) {
         eliminate_dead_nodes(graph);
         if graph.live_count() == before {
             break;
+        }
+    }
+}
+
+/// `true` when `CRATONVM_JIT_REASSOC` is set (cached). Enables the affine
+/// strength-reduction pass and the matching IR-path gate relaxation.
+pub fn reassoc_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_REASSOC").is_some())
+}
+
+// ── Affine strength reduction (reassociation) ────────────────────────
+//
+// An integer value is "affine in `root`" when it equals `k*root + c` for
+// compile-time constants `k`, `c` (with `root == NO_NODE` meaning a pure
+// constant `c`). The pass computes this form for every integer Add/Sub/Mul/Neg
+// node in one forward pass (SSA data inputs precede their users in id order;
+// loop-carried φ back-edges read as opaque, which is conservative), then
+// rewrites each chain node into the canonical `k*root + c`. Dead chain nodes
+// are removed by the following DCE pass; duplicate const/Mul/Add nodes are
+// merged by GVN.
+//
+// Correctness: Java `int`/`long` arithmetic is two's-complement and wraps mod
+// 2^n, where +, -, * are associative, commutative, and distributive, so the
+// reassociation is exact. Floating point (non-associative) is never touched.
+
+#[derive(Clone, Copy)]
+struct Affine {
+    /// Root value this expression is affine in; `NO_NODE` => pure constant.
+    root: NodeId,
+    k: i64,
+    c: i64,
+}
+
+#[inline]
+fn w_mul(is_int: bool, a: i64, b: i64) -> i64 {
+    if is_int {
+        ((a as i32).wrapping_mul(b as i32)) as i64
+    } else {
+        a.wrapping_mul(b)
+    }
+}
+#[inline]
+fn w_add(is_int: bool, a: i64, b: i64) -> i64 {
+    if is_int {
+        ((a as i32).wrapping_add(b as i32)) as i64
+    } else {
+        a.wrapping_add(b)
+    }
+}
+#[inline]
+fn w_sub(is_int: bool, a: i64, b: i64) -> i64 {
+    if is_int {
+        ((a as i32).wrapping_sub(b as i32)) as i64
+    } else {
+        a.wrapping_sub(b)
+    }
+}
+#[inline]
+fn w_neg(is_int: bool, a: i64) -> i64 {
+    if is_int {
+        ((a as i32).wrapping_neg()) as i64
+    } else {
+        a.wrapping_neg()
+    }
+}
+
+/// `Some(true)` for `int`, `Some(false)` for `long`, `None` otherwise.
+fn int_width(ty: IrType) -> Option<bool> {
+    match ty {
+        IrType::Int => Some(true),
+        IrType::Long => Some(false),
+        _ => None,
+    }
+}
+
+fn is_int_arith(op: &Op) -> bool {
+    matches!(op, Op::Add | Op::Sub | Op::Mul | Op::Neg)
+}
+
+/// Combine the affine forms of a binary op's two operands.
+fn combine_affine(op: &Op, is_int: bool, a: Affine, b: Affine, opaque: Affine) -> Affine {
+    match op {
+        Op::Add => {
+            if a.root == NO_NODE {
+                Affine { root: b.root, k: b.k, c: w_add(is_int, b.c, a.c) }
+            } else if b.root == NO_NODE {
+                Affine { root: a.root, k: a.k, c: w_add(is_int, a.c, b.c) }
+            } else if a.root == b.root {
+                Affine { root: a.root, k: w_add(is_int, a.k, b.k), c: w_add(is_int, a.c, b.c) }
+            } else {
+                opaque
+            }
+        }
+        Op::Sub => {
+            if b.root == NO_NODE {
+                Affine { root: a.root, k: a.k, c: w_sub(is_int, a.c, b.c) }
+            } else if a.root == NO_NODE {
+                Affine { root: b.root, k: w_neg(is_int, b.k), c: w_sub(is_int, a.c, b.c) }
+            } else if a.root == b.root {
+                Affine { root: a.root, k: w_sub(is_int, a.k, b.k), c: w_sub(is_int, a.c, b.c) }
+            } else {
+                opaque
+            }
+        }
+        Op::Mul => {
+            if a.root == NO_NODE {
+                if b.root == NO_NODE {
+                    Affine { root: NO_NODE, k: 0, c: w_mul(is_int, a.c, b.c) }
+                } else {
+                    Affine { root: b.root, k: w_mul(is_int, b.k, a.c), c: w_mul(is_int, b.c, a.c) }
+                }
+            } else if b.root == NO_NODE {
+                Affine { root: a.root, k: w_mul(is_int, a.k, b.c), c: w_mul(is_int, a.c, b.c) }
+            } else {
+                opaque
+            }
+        }
+        _ => opaque,
+    }
+}
+
+/// Get an existing `Const(val)` node of type `ty`, or create one.
+fn get_or_add_const(graph: &mut Graph, val: i64, ty: IrType) -> NodeId {
+    if let Some(i) = graph
+        .nodes
+        .iter()
+        .position(|n| n.op == Op::Const(val) && n.ty == ty)
+    {
+        return i as NodeId;
+    }
+    graph.add(Op::Const(val), ty, vec![], None)
+}
+
+/// Materialize `k*root + c` as IR nodes, reusing `root` directly when possible.
+fn build_affine(graph: &mut Graph, root: NodeId, k: i64, c: i64, ty: IrType) -> NodeId {
+    if k == 0 {
+        return get_or_add_const(graph, c, ty);
+    }
+    let base = if k == 1 {
+        root
+    } else {
+        let kc = get_or_add_const(graph, k, ty);
+        graph.add(Op::Mul, ty, vec![root, kc], None)
+    };
+    if c == 0 {
+        base
+    } else {
+        let cc = get_or_add_const(graph, c, ty);
+        graph.add(Op::Add, ty, vec![base, cc], None)
+    }
+}
+
+fn reassociate_affine(graph: &mut Graph) {
+    let len = graph.nodes.len();
+    let mut aff: Vec<Option<Affine>> = vec![None; len];
+    // `true` for nodes we will rewrite: an integer arith node that is affine in
+    // a single real root AND has an operand that is itself an affine arith node
+    // over the same root (i.e. a genuine chain to collapse). Decided in the
+    // forward pass from *original* inputs so later input-rewrites cannot
+    // perturb the decision.
+    let mut materialize: Vec<bool> = vec![false; len];
+
+    for id in 0..len {
+        let node = &graph.nodes[id];
+        if node.op == Op::Dead {
+            continue;
+        }
+        let opaque = Affine { root: id as NodeId, k: 1, c: 0 };
+        let is_int = match int_width(node.ty) {
+            Some(w) => w,
+            None => {
+                aff[id] = Some(opaque);
+                continue;
+            }
+        };
+        // Read an operand's already-computed affine form; only inputs with a
+        // strictly-lower id are available (φ back-edges read as None → opaque).
+        let geta = |slot: usize| -> Option<Affine> {
+            node.inputs
+                .get(slot)
+                .and_then(|&i| if (i as usize) < id { aff[i as usize] } else { None })
+        };
+        let res = match &node.op {
+            Op::Const(v) => Affine {
+                root: NO_NODE,
+                k: 0,
+                c: if is_int { (*v as i32) as i64 } else { *v },
+            },
+            Op::Neg => match geta(0) {
+                Some(a) => Affine { root: a.root, k: w_neg(is_int, a.k), c: w_neg(is_int, a.c) },
+                None => opaque,
+            },
+            Op::Add | Op::Sub | Op::Mul => match (geta(0), geta(1)) {
+                (Some(a), Some(b)) => combine_affine(&node.op, is_int, a, b, opaque),
+                _ => opaque,
+            },
+            _ => opaque,
+        };
+        // Decide materialization while original inputs are intact.
+        if is_int_arith(&node.op) && res.root != NO_NODE && res.root != id as NodeId {
+            let has_arith_operand = node.inputs.iter().any(|&j| {
+                (j as usize) < id
+                    && aff[j as usize].is_some_and(|fj| fj.root == res.root && fj.root != NO_NODE)
+                    && is_int_arith(&graph.nodes[j as usize].op)
+            });
+            materialize[id] = has_arith_operand;
+        }
+        aff[id] = Some(res);
+    }
+
+    for id in 0..len {
+        if !materialize[id] {
+            continue;
+        }
+        let ty = graph.nodes[id].ty;
+        let a = match aff[id] {
+            Some(a) => a,
+            None => continue,
+        };
+        let mat = build_affine(graph, a.root, a.k, a.c, ty);
+        if mat != id as NodeId {
+            graph.replace_all_uses(id as NodeId, mat);
+            graph.kill(id as NodeId);
         }
     }
 }
@@ -524,6 +758,91 @@ mod tests {
         let ret = &graph.nodes[graph.exit as usize];
         let val_id = ret.inputs[1];
         assert_eq!(graph.nodes[val_id as usize].op, Op::Const(20));
+    }
+
+    // ── Affine strength reduction (reassociation) ───────────────────
+
+    fn build_and_reassociate(code: &[u8], code_len: usize, num_params: usize, num_locals: usize) -> Graph {
+        let builder = IrBuilder::new(num_params, num_locals);
+        let mut graph = builder.build(code, code_len).expect("build failed");
+        reassociate_affine(&mut graph);
+        // Clean-up passes that normally follow in `optimize`.
+        for _ in 0..8 {
+            let before = graph.live_count();
+            fold_constants(&mut graph);
+            algebraic_simplify(&mut graph);
+            gvn(&mut graph);
+            eliminate_dead_nodes(&mut graph);
+            if graph.live_count() == before {
+                break;
+            }
+        }
+        graph
+    }
+
+    #[test]
+    fn test_reassoc_affine_chain_folds() {
+        // int f(int x){ x = x*3+5; x = x*2+1; return x; }  →  x*6 + 11
+        // iload_0; iconst_3; imul; iconst_5; iadd; iconst_2; imul; iconst_1; iadd; ireturn
+        let code = [
+            0x1a, 0x06, 0x68, 0x08, 0x60, 0x05, 0x68, 0x04, 0x60, 0xac, 0, 0,
+        ];
+        let graph = build_and_reassociate(&code, 10, 1, 1);
+        let ret = &graph.nodes[graph.exit as usize];
+        let val = &graph.nodes[ret.inputs[1] as usize];
+        assert_eq!(val.op, Op::Add, "top of folded chain should be Add(k*x, c)");
+        // One input is the constant c=11, the other is Mul(x, 6).
+        let (mul_id, c_id) = if graph.nodes[val.inputs[0] as usize].op == Op::Mul {
+            (val.inputs[0], val.inputs[1])
+        } else {
+            (val.inputs[1], val.inputs[0])
+        };
+        assert_eq!(graph.nodes[c_id as usize].op, Op::Const(11), "additive constant");
+        let mul = &graph.nodes[mul_id as usize];
+        assert_eq!(mul.op, Op::Mul);
+        let (px, k_id) = if graph.nodes[mul.inputs[0] as usize].op == Op::Param(0) {
+            (mul.inputs[0], mul.inputs[1])
+        } else {
+            (mul.inputs[1], mul.inputs[0])
+        };
+        assert_eq!(graph.nodes[px as usize].op, Op::Param(0));
+        assert_eq!(graph.nodes[k_id as usize].op, Op::Const(6), "multiplicative constant");
+        // The whole intermediate chain collapsed: exactly one Mul + one Add remain.
+        assert_eq!(graph.nodes.iter().filter(|n| n.op == Op::Mul).count(), 1);
+        assert_eq!(graph.nodes.iter().filter(|n| n.op == Op::Add).count(), 1);
+    }
+
+    #[test]
+    fn test_reassoc_combines_muls() {
+        // x = x*181; x = x*181;  →  x*32761  (181*181, a single Mul)
+        // iload_0; sipush 181; imul; sipush 181; imul; ireturn
+        let code = [
+            0x1a, 0x11, 0x00, 0xb5, 0x68, 0x11, 0x00, 0xb5, 0x68, 0xac, 0, 0,
+        ];
+        let graph = build_and_reassociate(&code, 10, 1, 1);
+        let ret = &graph.nodes[graph.exit as usize];
+        let val = &graph.nodes[ret.inputs[1] as usize];
+        assert_eq!(val.op, Op::Mul);
+        let k_id = if graph.nodes[val.inputs[0] as usize].op == Op::Param(0) {
+            val.inputs[1]
+        } else {
+            val.inputs[0]
+        };
+        assert_eq!(graph.nodes[k_id as usize].op, Op::Const(32761), "181*181 folds to 32761");
+        assert_eq!(graph.nodes.iter().filter(|n| n.op == Op::Mul).count(), 1);
+    }
+
+    #[test]
+    fn test_reassoc_leaves_nonlinear_alone() {
+        // x*x is not affine (variable * variable) — must not be folded.
+        // iload_0; iload_0; imul; ireturn
+        let code = [0x1a, 0x1a, 0x68, 0xac, 0, 0];
+        let graph = build_and_reassociate(&code, 4, 1, 1);
+        let ret = &graph.nodes[graph.exit as usize];
+        let val = &graph.nodes[ret.inputs[1] as usize];
+        assert_eq!(val.op, Op::Mul);
+        assert_eq!(graph.nodes[val.inputs[0] as usize].op, Op::Param(0));
+        assert_eq!(graph.nodes[val.inputs[1] as usize].op, Op::Param(0));
     }
 
     // ── Unit tests for try_fold i32-truncation correctness ──────────

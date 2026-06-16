@@ -4136,7 +4136,14 @@ fn try_compile_inner(
             // and a standalone `Modifier.isStatic` hot-loop repro.
             let has_conditional_branch =
                 graph.nodes.iter().any(|n| matches!(n.op, ir::Op::If));
-            if has_conditional_branch && scan.invoke_ops.is_empty() {
+            // `CRATONVM_JIT_REASSOC` opts branchy call-free integer methods
+            // into the IR pipeline so the affine strength-reduction pass can
+            // fire. Default-OFF: the φ/branch lowering caveat above still
+            // applies until this soaks.
+            if has_conditional_branch
+                && scan.invoke_ops.is_empty()
+                && !ir_optimize::reassoc_enabled()
+            {
                 // Fall through to the single-pass backend below.
             } else {
             ir_optimize::optimize(&mut graph);
