@@ -4092,8 +4092,75 @@ fn alloc_view_backing(
     kind: i32,
     cap: usize,
 ) -> ObjectRef {
-    let backing = alloc_synthetic(ctx, "cratonvm/util/MapViewBacking", VIEW_BACKING_FIELDS);
     let buckets = alloc_ref_array(ctx, cap);
+
+    // Build the view backing with the REAL `java/util/HashMap` field layout
+    // (buckets at the resolved `table` slot), NOT the legacy synthetic
+    // `(buckets@0, size@1, capacity@2)` placement. JDK bytecode for
+    // `keySet()/entrySet().spliterator()` constructs a
+    // `HashMap.KeySpliterator(map, ...)` and reads `getfield map.table` /
+    // `map.modCount` / `map.size` directly; on the synthetic layout `table`
+    // (real slot 2) resolved to the `Int(capacity=16)` slot, so `arraylength`
+    // panicked with `expected object reference, got int(16)`. This mirrors the
+    // already-fixed plain-HashSet path (`make_hashset_with_elements`, S111r13).
+    //
+    // The source-map + view-kind markers stay in the high slots (14/15), which
+    // sit above every real `java/util/HashMap` instance field (loadFactor is the
+    // last, ≤ slot 7), so write-through removal keeps working and
+    // `view_backing_source` still distinguishes a view backing (≥ 16 slots) from
+    // an ordinary HashSet backing (real layout, fewer slots). `map_state` /
+    // `set_map_size` are already layout-aware (table-slot fallback + name-
+    // resolved `size`), so the view's own population/iterator/remove natives are
+    // unaffected. Falls back to the legacy synthetic `MapViewBacking` layout if
+    // the real HashMap class is not yet resolvable (early bootstrap).
+    let _ = ctx.ensure_class_initialized("java/util/HashMap");
+    let f_table = ctx.resolve_field_index("java/util/HashMap", "table");
+    let f_size = ctx.resolve_field_index("java/util/HashMap", "size");
+    if let (Some(f_table), Some(f_size)) = (f_table, f_size) {
+        let hashmap_cid = ctx
+            .class_id_by_name("java/util/HashMap")
+            .unwrap_or_else(|| cratonvm_types::ClassId::new(0));
+        let f_modcount = ctx.resolve_field_index("java/util/HashMap", "modCount");
+        let f_threshold = ctx.resolve_field_index("java/util/HashMap", "threshold");
+        let f_loadfactor = ctx.resolve_field_index("java/util/HashMap", "loadFactor");
+        let f_entryset = ctx.resolve_field_index("java/util/HashMap", "entrySet");
+        // Enough slots for every real field AND the high marker slots.
+        let real_max = [Some(f_table), Some(f_size), f_modcount, f_threshold, f_loadfactor, f_entryset]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(0);
+        let n_fields = std::cmp::max(real_max + 1, VIEW_BACKING_FIELDS);
+        let backing = ctx.alloc_object(hashmap_cid, n_fields);
+        ctx.set_field(backing, f_table, Value::Object(Some(buckets)));
+        // Dual-storage: also keep the bucket array at the synthetic slot 0 so the
+        // legacy slot-0 readers (`map_state`'s fast path, the `collect_view_
+        // snapshot` HashMap-like guard) see it without the table-slot fallback,
+        // and stay consistent with what `map_resize`/`resync_view_set` maintain.
+        if f_table != MAP_FIELD_BUCKETS {
+            ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
+        }
+        ctx.set_field(backing, f_size, Value::Int(0));
+        if let Some(f) = f_modcount {
+            ctx.set_field(backing, f, Value::Int(0));
+        }
+        if let Some(f) = f_threshold {
+            ctx.set_field(backing, f, Value::Int((cap as i32 * 3) / 4));
+        }
+        if let Some(f) = f_loadfactor {
+            ctx.set_field(backing, f, Value::Float(0.75));
+        }
+        if let Some(f) = f_entryset {
+            ctx.set_field(backing, f, Value::Object(None));
+        }
+        ctx.set_field(backing, VIEW_BACKING_KIND_SLOT, Value::Int(kind));
+        ctx.set_field(backing, VIEW_BACKING_SRC_SLOT, Value::Object(Some(source)));
+        return backing;
+    }
+
+    // Fallback: legacy synthetic `(buckets, size, capacity)` MapViewBacking
+    // layout, used before the real `java/util/HashMap` class is resolvable.
+    let backing = alloc_synthetic(ctx, "cratonvm/util/MapViewBacking", VIEW_BACKING_FIELDS);
     ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     set_map_size(ctx, backing, 0);
     ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap as i32));
@@ -4359,15 +4426,40 @@ fn resync_view_set(ctx: &mut dyn NativeContext, set: ObjectRef) {
         None => return,
     };
     let kind = view_backing_kind(ctx, backing);
-    // Rebuild the backing map's contents from the live source.
-    let cap = ctx
-        .get_field(backing, MAP_FIELD_CAPACITY)
-        .as_int()
-        .unwrap_or(MAP_DEFAULT_CAPACITY as i32)
+    // Rebuild the backing map's contents from the live source. Derive the
+    // capacity from the current bucket-array length via `map_state` (NOT a raw
+    // `get_field(MAP_FIELD_CAPACITY)`): a real-layout view backing keeps its
+    // bucket array at the JDK `table` slot, which may be the same absolute slot
+    // (2) as the synthetic `capacity`, so reading slot 2 as an Int would yield
+    // `None`.
+    let cap = map_state(ctx, backing)
+        .2
         .max(MAP_DEFAULT_CAPACITY as i32);
     let buckets = alloc_ref_array(ctx, cap as usize);
+    // Synthetic slot-0 bucket store (what map_state / iterator / remove read).
     ctx.set_field(backing, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
-    ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap));
+    // Mirror the bucket array into the real `java/util/HashMap` `table` slot so
+    // JDK `keySet()/entrySet().spliterator()` bytecode (which reads `getfield
+    // map.table` directly) sees the live array instead of a stale value — and
+    // only write the synthetic `Int(capacity)` when `table` is NOT that same
+    // slot, otherwise it clobbers the bucket array and `arraylength` panics with
+    // `expected object reference, got int(16)`. This mirrors the dual-storage
+    // `map_resize` already maintains (see its `table_slot` mirror).
+    let table_slot = ctx.resolve_field_index("java/util/HashMap", "table");
+    if let Some(t) = table_slot {
+        if t != MAP_FIELD_BUCKETS && t < ctx.object_num_fields(backing) {
+            ctx.set_field(backing, t, Value::Object(Some(buckets)));
+        }
+    }
+    if table_slot != Some(MAP_FIELD_CAPACITY) {
+        ctx.set_field(backing, MAP_FIELD_CAPACITY, Value::Int(cap));
+    }
+    // Reset modCount so the JDK spliterator's CME check stays consistent.
+    if let Some(mc) = ctx.resolve_field_index("java/util/HashMap", "modCount") {
+        if mc < ctx.object_num_fields(backing) {
+            ctx.set_field(backing, mc, Value::Int(0));
+        }
+    }
     set_map_size(ctx, backing, 0);
     let sentinel = Value::Int(1);
     if kind == VIEW_KIND_ENTRYSET {
