@@ -1947,17 +1947,22 @@ impl SharedVm {
         // Weld runs its real `SimpleBeanDeployer` bytecode instead of the
         // concurrent `ConcurrentBeanDeployer`, which submits bean-discovery
         // tasks to `ForkJoinPool.commonPool().invokeAll(...)`. CratonVM's
-        // ForkJoinPool is a synthetic, non-functional pool (no real
-        // worker/queue machinery), so the real `invokeAll` bytecode throws
-        // `RejectedExecutionException` (and the concurrent path otherwise hangs
-        // during Weld startup). Single-threaded deployment is functionally
-        // identical (same beans, just no parallelism) and is the documented
-        // Weld config for constrained environments. App `-D` overrides this
-        // (the config loop applies over these defaults). HIB-CV-20.
-        sys_props.insert(
-            "org.jboss.weld.executor.threadPoolType".to_string(),
-            "NONE".to_string(),
-        );
+        // synthetic ForkJoinPool can't service that (RejectedExecutionException
+        // / hang). Single-threaded deployment is functionally identical (same
+        // beans, no parallelism). App `-D` overrides this (config loop applies
+        // over these defaults). HIB-CV-20.
+        //
+        // EXCEPTION: when `CRATONVM_REAL_FORKJOINPOOL` is set, the registry runs
+        // the *real* ForkJoinPool bytecode, so Weld's concurrent deployer works
+        // (and is needed — it clears the WELD-001301 the single-threaded path
+        // hits). Skip the NONE default then so Weld uses its own COMMON default
+        // and this becomes a clean one-flag opt-in for real concurrent CDI.
+        if std::env::var_os("CRATONVM_REAL_FORKJOINPOOL").is_none() {
+            sys_props.insert(
+                "org.jboss.weld.executor.threadPoolType".to_string(),
+                "NONE".to_string(),
+            );
+        }
 
         // ---- Tier 2: platform-derived keys ----
         sys_props.insert("os.name".to_string(), canonical_os_name());

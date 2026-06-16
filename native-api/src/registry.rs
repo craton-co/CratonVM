@@ -21,6 +21,24 @@ fn real_net_sockets_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("CRATONVM_REAL_NET_SOCKETS").is_some())
 }
 
+/// REAL-FORKJOINPOOL (opt-in): cached check of `CRATONVM_REAL_FORKJOINPOOL`.
+/// When set, the registry drops ALL synthetic `java/util/concurrent/ForkJoinPool`
+/// natives so the real JDK pool bytecode runs (proper init, parallelism =
+/// cpus-1, work-stealing degrading to caller-runs). The synthetic pool's
+/// `commonPool()` returns an uninitialised real-class instance (no queues), so
+/// the real `invokeAll`/`submit` bytecode throws `RejectedExecutionException`;
+/// dropping the natives fixes that and enables Weld's real concurrent CDI
+/// bootstrap (`ConcurrentBeanDeployer`). **Default-off**: it is NOT a safe
+/// global default — CratonVM's real ForkJoinPool does not support the
+/// async-`execute` path `CompletableFuture.*Async` relies on (CF hangs under
+/// the real pool), whereas the synthetic pool's eager-inline `execute` keeps CF
+/// working. So this is an opt-in for concurrent-CDI workloads. HIB-CV-20.
+fn real_forkjoinpool_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_REAL_FORKJOINPOOL").is_some())
+}
+
 use rustc_hash::FxHashMap;
 
 use cratonvm_types::ClassId;
@@ -2405,6 +2423,14 @@ impl NativeMethodRegistry {
         // here catches them all in one place. See `reference_server_socket_gap`.
         if real_net_sockets_enabled()
             && (class_name == "java/net/Socket" || class_name == "java/net/ServerSocket")
+        {
+            return;
+        }
+        // REAL-FORKJOINPOOL (opt-in): drop synthetic ForkJoinPool natives so the
+        // real JDK pool bytecode runs (real init + workers). See
+        // `real_forkjoinpool_enabled`. `ForkJoinWorkerThread` natives are kept.
+        if real_forkjoinpool_enabled()
+            && class_name == "java/util/concurrent/ForkJoinPool"
         {
             return;
         }
