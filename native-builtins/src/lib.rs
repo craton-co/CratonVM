@@ -421,44 +421,6 @@ pub mod jmx;
 // natives (always compiled, since real-JDK mode also reaches the
 // MXBean introspection path during KC16 boot).
 pub mod jmx_openmbean;
-pub mod jboss_extras;
-pub mod jetty_extras;
-pub mod liberty_extras;
-pub mod sonar_extras;
-pub mod elasticsearch_extras;
-pub mod log4j_extras;
-pub mod keycloak16_extras;
-pub mod bytebuddy_extras;
-pub mod demo_extras;
-pub mod jenkins_extras;
-pub mod wildfly_extras;
-pub mod bluej_extras;
-pub mod jedit_extras;
-pub mod arduino_extras;
-pub mod cassandra_extras;
-pub mod neo4j_extras;
-pub mod solr_extras;
-pub mod cglib_extras;
-pub mod wildfly_method_synth;
-pub mod activemq_extras;
-pub mod felix_extras;
-pub mod glassfish_extras;
-pub mod gradle_extras;
-pub mod hbase_extras;
-pub mod ignite_extras;
-pub mod hazelcast_extras;
-pub mod spark_extras;
-pub mod flink_extras;
-pub mod eclipse_extras;
-pub mod netbeans_extras;
-pub mod hadoop_extras;
-pub mod mindustry_extras;
-pub mod nexus_extras;
-pub mod cas_extras;
-pub mod grpc_extras;
-pub mod rabbitmq_extras;
-pub mod jdownloader_extras;
-pub mod freemind_extras;
 pub mod tls;
 pub mod http2;
 pub mod t27_tls;
@@ -473,8 +435,6 @@ pub(crate) mod bigint;
 // `--no-default-features` build; it now lives at the top level. `crypto.rs`
 // re-exports it as `crate::crypto::crypto_impl` for feature-on back-compat.
 pub mod crypto_impl;
-#[cfg(feature = "legacy-synthetic-crypto")]
-pub mod crypto;
 #[allow(dead_code)]
 pub mod classloader;
 pub mod classloader_real;
@@ -779,9 +739,6 @@ use servlet::*;
 use jmx::*;
 use tls::*;
 use http2::*;
-#[cfg(feature = "legacy-synthetic-crypto")]
-use crypto::*;
-
 // ---------------------------------------------------------------------------
 // Context ClassLoader storage (Thread.get/setContextClassLoader)
 // ---------------------------------------------------------------------------
@@ -949,61 +906,6 @@ fn native_url_set_stream_handler_factory_guard(
     }
     URL_SET_STREAM_HANDLER_FACTORY_DEPTH.set(0);
     Ok(None)
-}
-
-/// App-specific compatibility stubs: "fake main" launcher short-circuits and
-/// framework unblockers. These are [`NativeKind::SyntheticStub`]s — they shadow
-/// real bytecode with fakes (several exit an app's `main()` rc=0 without running
-/// it). Compiled and called only under the default-OFF `app-stubs` feature so
-/// the normal build never short-circuits a real launcher. When the feature is
-/// off, the corresponding calls fall through to real bytecode or the clear
-/// unimplemented error. See docs/synthetic-vs-real-explained.md.
-#[cfg(feature = "app-stubs")]
-fn register_app_stubs(registry: &mut NativeMethodRegistry) {
-    registry.with_category(cratonvm_native_api::NativeKind::SyntheticStub, |registry| {
-        // Wildfly hang fix: short-circuit intercepts for
-        // Module.getBootModuleLoader / ModuleLoader.getDefaultLoader.
-        jboss_extras::register_jboss_wildfly_stubs(registry);
-        // Boot-test shims for Jetty 11, Open Liberty (WLP), SonarQube 9.9.7 —
-        // each short-circuits the launcher's `main` so the JVM exits rc=0
-        // without actually running the server.
-        jetty_extras::register_jetty_stubs(registry);
-        liberty_extras::register_liberty_stubs(registry);
-        sonar_extras::register_sonar_stubs(registry);
-        elasticsearch_extras::register_es_stubs(registry);
-        log4j_extras::register_log4j_stubs(registry);
-        keycloak16_extras::register_keycloak16_stubs(registry);
-        bytebuddy_extras::register_bytebuddy_stubs(registry);
-        demo_extras::register_demo_stubs(registry);
-        jenkins_extras::register_jenkins_stubs(registry);
-        wildfly_extras::register_wildfly_stubs(registry);
-        bluej_extras::register_bluej_stubs(registry);
-        jedit_extras::register_jedit_stubs(registry);
-        arduino_extras::register_arduino_stubs(registry);
-        cassandra_extras::register_cassandra_stubs(registry);
-        neo4j_extras::register_neo4j_stubs(registry);
-        solr_extras::register_solr_stubs(registry);
-        wildfly_method_synth::register_wildfly_method_synth_stubs(registry);
-        activemq_extras::register_activemq_stubs(registry);
-        felix_extras::register_felix_stubs(registry);
-        glassfish_extras::register_glassfish_stubs(registry);
-        gradle_extras::register_gradle_stubs(registry);
-        hbase_extras::register_hbase_stubs(registry);
-        ignite_extras::register_ignite_stubs(registry);
-        hazelcast_extras::register_hazelcast_stubs(registry);
-        spark_extras::register_spark_stubs(registry);
-        flink_extras::register_flink_stubs(registry);
-        eclipse_extras::register_eclipse_stubs(registry);
-        netbeans_extras::register_netbeans_stubs(registry);
-        hadoop_extras::register_hadoop_stubs(registry);
-        mindustry_extras::register_mindustry_stubs(registry);
-        nexus_extras::register_nexus_stubs(registry);
-        cas_extras::register_cas_stubs(registry);
-        grpc_extras::register_grpc_stubs(registry);
-        rabbitmq_extras::register_rabbitmq_stubs(registry);
-        jdownloader_extras::register_jdownloader_stubs(registry);
-        freemind_extras::register_freemind_stubs(registry);
-    });
 }
 
 /// `ObjectStreamClass.hasStaticInitializer(Class[, boolean]) -> boolean`:
@@ -1849,24 +1751,6 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     // Main.loadModule("org.jboss.as.standalone") resolve against
     // -mp <path>/module.xml on disk.
     jboss_module_loader::register_jboss_module_loader(registry);
-    // App-specific compatibility stubs — fake-main launcher short-circuits
-    // (Jetty/Liberty/SonarQube/… that exit rc=0 without running the server)
-    // plus framework unblockers. These are SYNTHETIC STUBS, not bridges: they
-    // shadow real bytecode with fakes. Gated behind the default-OFF `app-stubs`
-    // feature so the normal build runs real bytecode — or surfaces a clear
-    // unimplemented error — instead of a fake. See
-    // docs/synthetic-vs-real-explained.md.
-    #[cfg(feature = "app-stubs")]
-    register_app_stubs(registry);
-    // bc_probe / EJBCA: wire KeyGenerator shims into real-JDK mode. The full
-    // crypto module is gated to synthetic-jdk, but bc_probe needs init/
-    // getInstance/generateKey to bypass JDK bytecode that derefs `this.spi`.
-    // The synthetic KeyGenerator shim lives in the feature-gated `crypto`
-    // module; when the feature is off there is no synthetic path to register.
-    #[cfg(feature = "legacy-synthetic-crypto")]
-    if !crate::real_jca_mode() {
-        crypto::register_key_generator_for_real_jdk(registry);
-    }
     // T19.H2: SharedSecrets JavaLangAccess shim — returns a non-null
     // System$1-shaped object whose currentCarrierThread() forwards to
     // the current thread. Fixes "Cannot invoke currentCarrierThread on null"
@@ -9956,8 +9840,6 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
     // therefore provides the fallback coverage for SSLEngine/SSLParameters/
     // TrustManagerFactory methods that phase68 doesn't override.
     register_tls_natives(registry);
-    #[cfg(feature = "legacy-synthetic-crypto")]
-    tls::tls_impl::register_tls_impl_natives(registry);
 
     // --- Phase 68: javax.crypto.Mac, SSL, security.cert, JDBC, XML, invoke extras ---
     register_phase68_natives(registry);
@@ -10034,12 +9916,6 @@ pub fn register_synthetic_overrides(registry: &mut NativeMethodRegistry) {
 
     // --- Phase J: Jackson ObjectMapper + Gson (M16) ---
     register_jackson_gson_natives(registry);
-
-    // --- Phase 9.3: JDK 25 Cryptography (KDF, ML-KEM, ML-DSA, PEM) ---
-    #[cfg(feature = "legacy-synthetic-crypto")]
-    if !crate::real_jca_mode() {
-        register_crypto_natives(registry);
-    }
 
     // --- Phase 10: ClassLoader hierarchy ---
     classloader::register_classloader_natives(registry);
@@ -38998,93 +38874,6 @@ mod t2_6_crypto_acceptance_tests {
         }
     }
 
-    /// T2.6.20 — RSA 2048 key pair round-trip through Signature (sign
-    /// then verify, SHA-256) using the in-tree `crypto::crypto_impl`
-    /// RSA backend that also powers `java/security/Signature#sign` /
-    /// `#verify` via the RSA key store.
-    ///
-    /// The pure-Rust primality-testing loop is minutes-long in debug
-    /// mode, which blows through the default test harness timeout. The
-    /// test is marked `#[ignore]` so `cargo test` stays fast by
-    /// default; the full acceptance run is:
-    ///
-    ///     cargo test --release -p cratonvm-native-builtins \
-    ///         t2_6_20_rsa_2048_sign_verify_round_trip -- --ignored
-    #[test]
-    #[ignore = "RSA 2048 keygen slow in debug; run with --release --ignored"]
-    #[cfg(feature = "legacy-synthetic-crypto")]
-    fn t2_6_20_rsa_2048_sign_verify_round_trip() {
-        use crate::crypto::crypto_impl::{
-            rsa_key_next_id, rsa_key_store, rsa_sign, rsa_verify, Rsa,
-            RsaKeyPairData,
-        };
-
-        // Generate a fresh 2048-bit RSA key pair. The in-tree
-        // `Rsa::generate_keypair` is infallible at the type level; its
-        // only failure mode is the internal primality sampling loop
-        // which panics on exhaustion, so we do not need a Result here.
-        let (pubk, privk) = Rsa::generate_keypair(2048);
-        let id = rsa_key_next_id();
-        rsa_key_store(
-            id,
-            RsaKeyPairData { public_key: pubk, private_key: privk },
-        );
-
-        let message = b"T2.6.20 - cratonvm RSA 2048 acceptance vector";
-        let sig = rsa_sign(id, message).expect("rsa_sign must produce a signature");
-        assert!(
-            sig.len() >= 256,
-            "2048-bit PKCS#1 v1.5 signature must be 256 bytes, got {}",
-            sig.len()
-        );
-
-        let ok = rsa_verify(id, message, &sig)
-            .expect("rsa_verify must return a decision");
-        assert!(ok, "RSA 2048 self-signature must verify");
-
-        // Tampered message must fail verification.
-        let mut bad = message.to_vec();
-        bad[0] ^= 0x01;
-        let ok2 = rsa_verify(id, &bad, &sig)
-            .expect("rsa_verify must return a decision on tampered input");
-        assert!(!ok2, "RSA 2048 must reject tampered message");
-    }
-
-    /// T2.6.8/T2.6.9 — Ed25519 key generation + sign/verify round-trip.
-    /// Ed25519 keygen is fast (~microseconds), so this test runs in
-    /// debug mode without needing `--release`.
-    #[test]
-    #[cfg(feature = "legacy-synthetic-crypto")]
-    fn t2_6_8_ed25519_sign_verify_round_trip() {
-        use crate::crypto::crypto_impl::{
-            ed25519_generate_keypair, ed25519_sign, ed25519_verify,
-        };
-
-        let (_pk_bytes, key_id) = ed25519_generate_keypair();
-        let message = b"T2.6.8 - cratonvm Ed25519 acceptance vector";
-
-        let sig = ed25519_sign(key_id, message)
-            .expect("ed25519_sign must produce a signature");
-        assert_eq!(sig.len(), 64, "Ed25519 signature must be 64 bytes");
-
-        let ok = ed25519_verify(key_id, message, &sig)
-            .expect("ed25519_verify must return a decision");
-        assert!(ok, "Ed25519 self-signature must verify");
-
-        // Tampered message must fail verification.
-        let mut bad = message.to_vec();
-        bad[0] ^= 0x01;
-        let ok2 = ed25519_verify(key_id, &bad, &sig)
-            .expect("ed25519_verify must return a decision on tampered input");
-        assert!(!ok2, "Ed25519 must reject tampered message");
-
-        // Tampered signature must also fail.
-        let mut bad_sig = sig.clone();
-        bad_sig[0] ^= 0xff;
-        let ok3 = ed25519_verify(key_id, message, &bad_sig)
-            .expect("ed25519_verify must return a decision on tampered sig");
-        assert!(!ok3, "Ed25519 must reject tampered signature");
-    }
 }
 
 // ===========================================================================

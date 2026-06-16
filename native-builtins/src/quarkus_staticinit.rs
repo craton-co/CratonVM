@@ -318,93 +318,11 @@ pub fn register_quarkus_staticinit_natives(registry: &mut NativeMethodRegistry) 
 /// value on the second read; see the comment above this fn). The correct fix
 /// is in the VM's NIO pipeline, NOT a hardcoded app-specific main class.
 ///
-/// Per the no-stubs policy this whole bootstrap-runner replacement is
-/// therefore gated behind the default-OFF `app-stubs` feature. When the
-/// feature is OFF none of these natives are installed, so the REAL
-/// `SerializedApplication.read` / `RunnerClassLoader` bytecode runs and the
-/// underlying NIO bug surfaces honestly instead of being papered over by a
-/// hardcoded Keycloak main class. The accessor / `loadClass` natives are
-/// gated alongside `read` because they only make sense against the synthetic
-/// `SerializedApplication` that `read` would have produced; with `read` gone
-/// they would otherwise shadow the real bytecode's own accessors.
+/// The bootstrap-runner synthetic stubs have been removed (app-stubs feature
+/// deleted). The real Quarkus `.dat` bootstrap bytecode runs; the underlying
+/// NIO `DataInputStream.readInt` bug surfaces honestly instead of being
+/// papered over by a hardcoded Keycloak main class.
 fn register_bootstrap_runner(registry: &mut NativeMethodRegistry) {
-    #[cfg(feature = "app-stubs")]
-    {
-        let __prev_cat = registry.current_category();
-        registry.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
-        registry.register(
-            CLS_SERIALIZED_APP,
-            "read",
-            "(Ljava/io/InputStream;Ljava/nio/file/Path;)Lio/quarkus/bootstrap/runner/SerializedApplication;",
-            native_serialized_application_read,
-        );
-        registry.register(
-            CLS_SERIALIZED_APP,
-            "getRunnerClassLoader",
-            "()Lio/quarkus/bootstrap/runner/RunnerClassLoader;",
-            native_serialized_application_get_runner_cl,
-        );
-        registry.register(
-            CLS_SERIALIZED_APP,
-            "getMainClass",
-            "()Ljava/lang/String;",
-            native_serialized_application_get_main_class,
-        );
-        // QuarkusEntryPoint.currentVersionExpectation — some tool chains
-        // synthesize this accessor; register as a graceful-return for
-        // belt-and-suspenders defense if a build emits it.
-        registry.register(
-            CLS_QUARKUS_ENTRY_POINT,
-            "currentVersionExpectation",
-            "()I",
-            |_ctx, _args| Ok(Some(Value::Int(QUARKUS_BOOTSTRAP_VERSION))),
-        );
-        // RunnerClassLoader: register the version accessor name seen in
-        // some 3.x minor revisions. Harmless if absent in this build.
-        registry.register(
-            CLS_RUNNER_CLASSLOADER,
-            "getVersion",
-            "()I",
-            |_ctx, _args| Ok(Some(Value::Int(QUARKUS_BOOTSTRAP_VERSION))),
-        );
-        // T19.H5: RunnerClassLoader.loadClass — the real bytecode walks an
-        // internal JAR index (populated from `quarkus-application.dat`) to
-        // resolve a class name. Our synthetic SerializedApplication doesn't
-        // populate that index; instead we delegate to the VM's
-        // `ensure_class_initialized`, which already walks the `lib/app/*`,
-        // `lib/quarkus/*`, `lib/main/*` jars the vm-cli CLI expanded into
-        // the application classpath.  Returns the Class mirror (real JDK
-        // API), throwing ClassNotFoundException on miss.
-        registry.register(
-            CLS_RUNNER_CLASSLOADER,
-            "loadClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            native_runner_class_loader_load_class,
-        );
-        // Some Quarkus minor versions expose an additional `loadClass(String,
-        // boolean)` overload; its `resolve` flag is ignored by the real
-        // implementation on cached classes — we delegate to the same code.
-        registry.register(
-            CLS_RUNNER_CLASSLOADER,
-            "loadClass",
-            "(Ljava/lang/String;Z)Ljava/lang/Class;",
-            native_runner_class_loader_load_class_with_resolve,
-        );
-        // findClass returns the Class directly (same semantics as loadClass
-        // for our synthetic delegation model).
-        registry.register(
-            CLS_RUNNER_CLASSLOADER,
-            "findClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            native_runner_class_loader_load_class,
-        );
-        registry.set_category(__prev_cat);
-    }
-    // Without `app-stubs` the bootstrap-runner replacement is not installed;
-    // the real Quarkus `.dat` bootstrap bytecode runs (and the underlying NIO
-    // `DataInputStream.readInt` bug, if present, surfaces honestly). The
-    // `registry` argument is unused in that configuration.
-    #[cfg(not(feature = "app-stubs"))]
     let _ = registry;
 }
 
@@ -1790,39 +1708,6 @@ mod tests {
     // T19.H3: bootstrap-runner replacement natives
     // -----------------------------------------------------------------
 
-    // B3: the bootstrap-runner replacement is only installed under the
-    // default-OFF `app-stubs` feature, so the registration-surface assertions
-    // are gated on that feature too. Under the default build there is nothing
-    // to register (real Quarkus `.dat` bytecode runs instead).
-    #[cfg(feature = "app-stubs")]
-    #[test]
-    fn t19_h3_register_bootstrap_runner_natives_lists_all_entries() {
-        let mut r = NativeMethodRegistry::new();
-        register_bootstrap_runner(&mut r);
-
-        assert!(r.find(
-            CLS_SERIALIZED_APP,
-            "read",
-            "(Ljava/io/InputStream;Ljava/nio/file/Path;)Lio/quarkus/bootstrap/runner/SerializedApplication;",
-        ).is_some());
-        assert!(r.find(
-            CLS_SERIALIZED_APP,
-            "getRunnerClassLoader",
-            "()Lio/quarkus/bootstrap/runner/RunnerClassLoader;",
-        ).is_some());
-        assert!(r.find(
-            CLS_SERIALIZED_APP,
-            "getMainClass",
-            "()Ljava/lang/String;",
-        ).is_some());
-        assert!(r
-            .find(CLS_QUARKUS_ENTRY_POINT, "currentVersionExpectation", "()I")
-            .is_some());
-        assert!(r
-            .find(CLS_RUNNER_CLASSLOADER, "getVersion", "()I")
-            .is_some());
-    }
-
     #[test]
     fn t19_h3_serialized_application_read_returns_populated_sa() {
         let mut ctx = mock_ctx();
@@ -1937,52 +1822,9 @@ mod tests {
         assert_eq!(QUARKUS_BOOTSTRAP_VERSION, 2);
     }
 
-    #[cfg(feature = "app-stubs")]
-    #[test]
-    fn t19_h3_current_version_expectation_native_returns_compile_time_constant() {
-        // The `currentVersionExpectation` override must be a pure
-        // Rust-constant return — verify no ctx field reads sneak in.
-        let mut ctx = mock_ctx();
-        let mut r = NativeMethodRegistry::new();
-        register_bootstrap_runner(&mut r);
-        let method = r
-            .find(CLS_QUARKUS_ENTRY_POINT, "currentVersionExpectation", "()I")
-            .expect("native registered");
-        let out = method(&mut ctx, &[]).unwrap().unwrap();
-        assert_eq!(out, Value::Int(QUARKUS_BOOTSTRAP_VERSION));
-    }
-
     // -----------------------------------------------------------------
-    // T19.H5: RunnerClassLoader.loadClass natives
+    // T19.H5: RunnerClassLoader.loadClass sanitizer tests
     // -----------------------------------------------------------------
-
-    #[cfg(feature = "app-stubs")]
-    #[test]
-    fn t19_h5_register_bootstrap_runner_includes_load_class() {
-        let mut r = NativeMethodRegistry::new();
-        register_bootstrap_runner(&mut r);
-        assert!(r
-            .find(
-                CLS_RUNNER_CLASSLOADER,
-                "loadClass",
-                "(Ljava/lang/String;)Ljava/lang/Class;"
-            )
-            .is_some());
-        assert!(r
-            .find(
-                CLS_RUNNER_CLASSLOADER,
-                "loadClass",
-                "(Ljava/lang/String;Z)Ljava/lang/Class;"
-            )
-            .is_some());
-        assert!(r
-            .find(
-                CLS_RUNNER_CLASSLOADER,
-                "findClass",
-                "(Ljava/lang/String;)Ljava/lang/Class;"
-            )
-            .is_some());
-    }
 
     #[test]
     fn t19_h5_sanitize_load_class_name_accepts_binary_names() {
