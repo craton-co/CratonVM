@@ -1283,6 +1283,52 @@ impl Frame {
         }
     }
 
+    /// Conservative local scan for the NON-MOVING sweep (gc_quiescence active).
+    ///
+    /// `scan_local_objects` is *tag-filtered*: it skips `LKIND_LONG`/`_DOUBLE`
+    /// slots and only roots `is_object()` CompactValues. That is correct for the
+    /// MOVING collector (a false-positive root would be relocated, corrupting a
+    /// primitive `long` that merely looks like a pointer). But it MISSES a
+    /// genuine object reference whose slot tag was lost — e.g. a JIT-compiled
+    /// callee's object return value mis-tagged on the transition back to the
+    /// interpreter, leaving `main`'s `f = POOL.submit(t)` local holding the
+    /// ForkJoinTask under a non-object tag. The tag-filtered scan then omits it,
+    /// so selective promotion (which pins by root VALUE) does not pin it,
+    /// evacuates it, zeroes the young slot, and the stale local reads an
+    /// all-zero header (the Fork6 multi-thread reclamation).
+    ///
+    /// This conservative variant additionally probes EVERY local's pointer-shaped
+    /// candidates (the object-ptr decode, the `long` payload, and the raw bits)
+    /// with the STRICT `is_object_address` header probe — only a slot that
+    /// actually lands on a live object header is rooted. It is sound ONLY under
+    /// the non-moving sweep: nothing is relocated, so a false-positive root can
+    /// only over-retain (and over-pin against evacuation) — never corrupt a
+    /// primitive. Callers MUST gate this on `gc_quiescence::is_active()`.
+    pub fn scan_locals_conservative(
+        &self,
+        roots: &mut Vec<ObjectRef>,
+        heap: &crate::memory::VmHeap,
+    ) {
+        for cv in self.locals.iter() {
+            // Three pointer candidates covering the encodings a lost-tag object
+            // ref can take: a properly object-tagged ptr, a `long`-tagged
+            // payload, and the raw NaN-box bits (an untagged raw store).
+            let cands = [
+                cv.as_object_ptr().unwrap_or(0),
+                cv.as_long().map(|l| l as u64).unwrap_or(0),
+                cv.raw_bits(),
+            ];
+            for c in cands {
+                if c != 0 {
+                    if let Some(obj) = heap.is_object_address(c as usize) {
+                        roots.push(obj);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     /// Update Object references in locals after GC using the pointer map.
     ///
     /// Symmetric with [`Self::scan_local_objects`]: only verified heap-resident

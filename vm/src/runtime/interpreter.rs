@@ -239,6 +239,100 @@ fn ec_is_watched_class(shared: &SharedVm, cid: cratonvm_types::ClassId) -> bool 
     v
 }
 
+/// DBG (CRATONVM_DBG_MTROOTS): publish the in-progress collection's context
+/// (reason / initiator thread / blocked-thread count) so the sweep-zero detector
+/// can name WHICH GC reclaimed a live object — pinning the initiator-vs-blocked
+/// root-coverage gap. Reason: 1=System.gc, 2=alloc-young, 3=forced-alloc.
+#[inline]
+fn mtroots_on() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CRATONVM_DBG_MTROOTS").is_some())
+}
+
+#[inline]
+fn mtroots_set_gc_ctx(shared: &SharedVm, thread: &JvmThread, reason: u8) {
+    if mtroots_on() {
+        cratonvm_gc::gen_heap::set_gc_context(
+            reason,
+            thread.thread_id.0 as u32,
+            shared.gc_barrier.blocked_count() as u32,
+        );
+    }
+}
+
+/// DBG (CRATONVM_DBG_MTROOTS): dump the GC initiator's frames + their
+/// object-local heap addresses, so a later `[sweep-zero] RECLAIMED-LIVE ptr=X`
+/// can be cross-referenced — was X actually present as a scanned root here?
+/// (Cross-reference within ONE run: addresses are run-specific.)
+fn mtroots_dump_initiator(shared: &SharedVm, thread: &JvmThread, reason: u8) {
+    if !mtroots_on() {
+        return;
+    }
+    let mut buf = String::new();
+    use std::fmt::Write as _;
+    let _ = write!(
+        buf,
+        "[mtroots] GC reason={} initiator_tid={} alive={} blocked={} frames={}",
+        reason, thread.thread_id.0,
+        shared.thread_registry.alive_count(),
+        shared.gc_barrier.blocked_count(),
+        thread.frames.len(),
+    );
+    // Top frames only (the relevant Java call site).
+    for frame in thread.frames.iter().rev().take(8) {
+        let mut objs: Vec<ObjectRef> = Vec::new();
+        frame.scan_local_objects(&mut objs, &shared.heap);
+        let _ = write!(buf, "\n[mtroots]   {}.{} locals=[", frame.class_name(), frame.method_name());
+        for (i, o) in objs.iter().enumerate() {
+            if i > 0 { let _ = write!(buf, " "); }
+            let _ = write!(buf, "{:p}", o.as_ptr());
+        }
+        let _ = write!(buf, "]");
+    }
+    // Per-thread blocked-state census: a thread holding a live oop while counted
+    // BLOCKED here is excluded from `expected` and its (possibly stale) deposit
+    // snapshot is used instead of its current frames — the suspected gap.
+    let states = shared.thread_registry.dump_blocked_states();
+    let nblk = states.iter().filter(|(_, b, _)| *b).count();
+    let _ = write!(buf, "\n[mtroots]   thread-census ({} alive, {} in_blocked):", states.len(), nblk);
+    for (tid, blk, snap) in states {
+        let _ = write!(buf, " t{}{}({})", tid, if blk { "B" } else { "R" }, snap);
+    }
+    eprintln!("{buf}");
+}
+
+/// DBG (CRATONVM_DBG_MTROOTS): after a thread resumes from an STW, scan its OWN
+/// frames for object refs whose header is all-zero — i.e. an object the sweep
+/// RECLAIMED while this thread still references it (a missed-root reclamation),
+/// naming the holder thread + its blocked state + the method, for ANY failure
+/// mode (checkcast CCE / SIGSEGV / invokevirtual), not just the invokevirtual
+/// all-zero-receiver detector.
+fn mtroots_selfcheck(thread: &JvmThread, heap: &crate::memory::VmHeap, location: &str) {
+    if !mtroots_on() {
+        return;
+    }
+    let blocked = thread
+        .gc_block_state
+        .in_blocked_region
+        .load(std::sync::atomic::Ordering::Acquire);
+    for frame in thread.frames.iter().rev() {
+        let mut objs: Vec<ObjectRef> = Vec::new();
+        frame.scan_local_objects(&mut objs, heap);
+        for o in objs {
+            let hdr: [u8; 16] = unsafe { std::ptr::read(o.as_ptr() as *const [u8; 16]) };
+            if hdr == [0u8; 16] {
+                eprintln!(
+                    "[mtroots] SELFCHECK@{} tid={} in_blocked={} kind={:?} method={}.{} \
+                     holds RECLAIMED(all-zero) obj @{:p}",
+                    location, thread.thread_id.0, blocked, thread.kind,
+                    frame.class_name(), frame.method_name(), o.as_ptr(),
+                );
+            }
+        }
+    }
+}
+
 fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
     // First, check if another thread requested STW — if so, participate
     safepoint_check(shared, thread);
@@ -255,6 +349,8 @@ fn maybe_gc(shared: &SharedVm, thread: &mut JvmThread) {
         shared.heap.flush_thread_satb();
         // Update our root snapshot before requesting STW
         update_root_snapshot(shared, thread);
+        mtroots_set_gc_ctx(shared, thread, 2); // 2 = alloc-young (maybe_gc)
+        mtroots_dump_initiator(shared, thread, 2);
 
         // DBG (bc math-ec, CRATONVM_DBG_ECWATCH): detect watched-cell corruption
         // at GC ENTRY (addresses still valid, pre-relocation). Fires even if the
@@ -490,6 +586,8 @@ fn maybe_gc_forced(shared: &SharedVm, thread: &mut JvmThread) {
     // before scanning roots.
     shared.heap.flush_thread_satb();
     update_root_snapshot(shared, thread);
+    mtroots_set_gc_ctx(shared, thread, 3); // 3 = forced-alloc (maybe_gc_forced)
+    mtroots_dump_initiator(shared, thread, 3);
 
     let alive_count = shared.thread_registry.alive_count() as u32; // Widening: thread count to u32
     if alive_count <= 1 {
@@ -537,6 +635,8 @@ pub fn force_gc_from_native(shared: &SharedVm, thread: &mut JvmThread) {
     // buffer before initiating GC; see `maybe_gc` for the full rationale.
     shared.heap.flush_thread_satb();
     update_root_snapshot(shared, thread);
+    mtroots_set_gc_ctx(shared, thread, 1); // 1 = System.gc
+    mtroots_dump_initiator(shared, thread, 1);
 
     // Snapshot finalizable object addresses so the GC can resurrect dead ones
     let fin_addrs: Vec<usize> = {
@@ -1403,8 +1503,16 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         thread.rs_cache_gen = gen;
     } else {
         // ── Default path (unchanged) ────────────────────────────────────────
+        // Multi-thread non-moving-sweep root hardening (Fork6): see
+        // `roots::conservative_locals_enabled`. Capture lost-tag object refs in
+        // THIS thread's frame locals so a parked/running worker (or main)
+        // publishes them, pinning them against selective-promotion evacuation.
+        let conservative_locals = crate::memory::roots::conservative_locals_enabled();
         for frame in &thread.frames {
             frame.scan_local_objects(&mut snapshot, &shared.heap);
+            if conservative_locals {
+                frame.scan_locals_conservative(&mut snapshot, &shared.heap);
+            }
             let before = snapshot.len();
             frame.stack.scan_object_refs(&mut snapshot, &shared.heap);
             // Validate every operand-stack-sourced root against the heap.
@@ -1591,6 +1699,7 @@ fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         if !pointer_map.is_empty() {
             apply_pointer_map_to_thread(thread, &pointer_map, &shared.heap);
         }
+        mtroots_selfcheck(thread, &shared.heap, "safepoint-resume");
     }
     // T1.5.1 — pick up any async exception posted by another thread
     // (e.g. `Thread.stop0`). The cross-thread poster writes into the
@@ -10750,7 +10859,7 @@ fn execute_invoke_kind(
                             // java/util/concurrent/ForkJoinTask whose only live
                             // ref was a register/native-stack root the sweep
                             // couldn't see — `CRATONVM_DBG_SWEEP_EDGES` silent).
-                            if let Some((cid, kind, cycle)) =
+                            if let Some((cid, kind, cycle, reason, initiator, blocked)) =
                                 cratonvm_gc::gen_heap::sweep_zero_lookup(
                                     obj_ref.as_ptr() as usize,
                                 )
@@ -10767,13 +10876,44 @@ fn execute_invoke_kind(
                                             .map(|c| c.name.to_string())
                                     })
                                     .unwrap_or_else(|| format!("class_id={cid}"));
+                                // GC context (CRATONVM_DBG_MTROOTS): names the GC
+                                // that reclaimed the live object so the
+                                // initiator-vs-blocked-mutator root-coverage gap is
+                                // pinned (reason 0 = unknown / gate off).
+                                let reason_s = match reason {
+                                    1 => "System.gc",
+                                    2 => "alloc-young(maybe_gc)",
+                                    3 => "forced-alloc(maybe_gc_forced)",
+                                    _ => "unknown",
+                                };
+                                // Holder thread state (CRATONVM_DBG_MTROOTS): the
+                                // detector fires ON the thread that holds the
+                                // reclaimed ref. Log its id / blocked-flag / kind
+                                // + call stack so we can see whether the holder
+                                // was EXCLUDED from the STW (counted blocked while
+                                // actually running) — the multi-thread root gap.
+                                let holder_blocked = thread
+                                    .gc_block_state
+                                    .in_blocked_region
+                                    .load(std::sync::atomic::Ordering::Acquire);
+                                let mut stk = String::new();
+                                {
+                                    use std::fmt::Write as _;
+                                    for f in thread.frames.iter().rev().take(8) {
+                                        let _ = write!(stk, "\n[sweep-zero]     at {}.{}", f.class_name(), f.method_name());
+                                    }
+                                }
                                 eprintln!(
                                     "[sweep-zero] RECLAIMED-LIVE receiver ptr={:p}: original \
                                      class={} (class_id={} kind=0x{:02x}), zeroed by non-moving \
                                      sweep cycle {}; invoked as {}.{} — the live ref was a \
-                                     register/native-stack root the marker missed",
+                                     register/native-stack root the marker missed \
+                                     [gc reason={} initiator_tid={} blocked_threads={}] \
+                                     [holder tid={} in_blocked={} kind={:?}]{}",
                                     obj_ref.as_ptr(), orig, cid, kind, cycle,
                                     &*method_class_name, &*method_name,
+                                    reason_s, initiator, blocked,
+                                    thread.thread_id.0, holder_blocked, thread.kind, stk,
                                 );
                             }
                             // WildFly / JBoss Modules often hits this path on

@@ -990,8 +990,17 @@ impl<'a> NativeContextImpl<'a> {
     pub(crate) fn deposit_root_snapshot(&self) {
         let mut snapshot = self.thread.root_snapshot.lock();
         snapshot.clear();
+        // Multi-thread non-moving-sweep root hardening (Fork6): see
+        // `roots::conservative_locals_enabled`. A thread blocking in a native
+        // (e.g. a parked FJP worker, or `main` in `f.get()`) must publish any
+        // lost-tag object ref in its frame locals so selective promotion pins it
+        // instead of evacuating it and zeroing the young slot under it.
+        let conservative_locals = crate::memory::roots::conservative_locals_enabled();
         for frame in &self.thread.frames {
             frame.scan_local_objects(&mut snapshot, &self.shared.heap);
+            if conservative_locals {
+                frame.scan_locals_conservative(&mut snapshot, &self.shared.heap);
+            }
             let before = snapshot.len();
             frame.stack.scan_object_refs(&mut snapshot, &self.shared.heap);
             if snapshot.len() > before {
@@ -1017,6 +1026,7 @@ impl<'a> NativeContextImpl<'a> {
         if let Some(r) = self.thread.native_pending_return {
             snapshot.push(r);
         }
+
         drop(snapshot);
         // Mark the blocked region AFTER the snapshot is complete: from this
         // point on, every GC initiator maintains this thread's roots via
