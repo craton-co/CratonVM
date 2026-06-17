@@ -1,120 +1,80 @@
-# Bug 06b — JIT-frame conservative root-scan cache is unsound (the ReflRepro residual)
+# Bug 06b — ReflRepro GC corruption is a register-resident missed root (precise-maps gap) — **OPEN**
 
-**Severity:** High — **CratonVM-only**, JIT-on only. Heap corruption: the
-non-moving young sweep reclaims a *live* young object whose only reference is a
-JIT-frame conservative root that the per-thread scan **cache** dropped. The
-freed slot is reused; a later sweep walks the resulting garbage header and aborts
-with `non-moving sweep: stopping walk … implausible object size …` (`rc=132`
-SIGILL).
+**Severity:** High — **CratonVM-only**, JIT-on only. The non-moving young sweep
+reclaims a *live* reflection-result object whose only reference, at sweep time,
+lives in a JIT **register** (never spilled to the stack). The slot is reused as a
+bare `java/lang/Object`; the result is either a crash (sweep-walk desync,
+`implausible object size`, rc=132/139) or — once the slot is over-scanned by a
+wider conservative pass — a silent wrong result (`MISMATCH: java.lang.Object@…`,
+~1 in 8000 reflective calls under GC stress).
 
-**Status: FIXED** (worktree `C:\craton\CratonVM-gcsweep`, branch
-`fix/gc-young-sweep-array-header`). The JIT-scan cache is **default-OFF**;
-re-enable for benchmarking with `CRATONVM_JIT_SCAN_CACHE=1`.
-
-This is the residual tracked after [bug-06](bug-06-jit-junit-discovery-reflection-corruption.md)
-(reflection mirror arrays not GC-rooted) was fixed. Bug-06's `pin_native_root`
-sweep fixed the mirror-array builders; this is a **separate** root cause in the
-GC-root machinery itself, surfaced by the same reflection-heavy workload.
+**Status: OPEN.** This is the residual tracked after
+[bug-06](bug-06-jit-junit-discovery-reflection-corruption.md) (reflection mirror
+arrays not pinned). It is **NOT** the JIT-scan cache and is **NOT** fixable by a
+conservative-scan tweak — see "What does NOT fix it" below. The real fix is
+precise oop maps for JIT frames / a complete shadow stack (the deferred Stage
+B/C work).
 
 ## Reproduce
 
 ```
-cd <repo>
-target/release/cratonvm.exe --java-home "<jdk25>" \
-  -cp wildfly-suite/repro  ReflRepro 8000
-# clean. Now force a young GC every 64 KB:
-CRATONVM_DBG_GC_STRESS=65536 target/release/cratonvm.exe --java-home "<jdk25>" \
-  -cp wildfly-suite/repro  ReflRepro 8000        # rc=132 (before fix)
+CRATONVM_DBG_GC_STRESS=65536 cratonvm.exe --java-home "<jdk25>" \
+  -cp wildfly-suite/repro  ReflRepro 8000        # rc=132/139
 ```
 
-`ReflRepro.scan` iterates `Class.getDeclaredFields()/getDeclaredMethods()` and
-builds strings with `StringBuilder` — i.e. many object-returning native calls
-under an active JIT frame, exactly the cache's hot path.
+`ReflRepro.scan` (JIT-compiled) calls `Class.getDeclaredFields/getDeclaredMethods`
+(natives that allocate) and concatenates with `StringBuilder` — i.e. a JIT method
+making native calls whose object results land in JIT registers.
 
-## Diagnosis chain (bisection)
+## Root cause (corrected)
 
-| Experiment | Result | Conclusion |
-|---|---|---|
-| `CRATONVM_DISABLE_JIT=1` + stress | clean | JIT-on only |
-| `CRATONVM_JIT_BISECT_ONLY=ReflRepro` | crash | corruptor is a ReflRepro method |
-| `…BISECT_SKIP=ReflRepro.scan` | clean | **`scan` is the corruptor** |
-| `…DISABLE_INLINE_NEW` / `…NO_BCE` / `…NO_SPEC_BCE` | crash | not alloc, not bounds-check elimination |
-| **`CRATONVM_NO_JIT_SCAN_CACHE=1`** | **clean** | **the JIT-scan cache** |
-| `CRATONVM_DBG_FULLSTACK_SCAN=1` | (slow) | a fresh full scan finds the dropped root |
-| `CRATONVM_DBG_GCPATH` (added) | single-threaded; `collect_roots` finds 40–57 fresh JIT roots | the *authoritative* scan is complete |
-| `CRATONVM_DBG_SWEEP_EDGES` | `root=0 young-survivor=0 old-gen=0` | reclaimed node has **no** heap/root/card edge — its only ref was a register/native-stack root the marker couldn't see |
+`SWEEP_EDGES` reports, on every corrupting sweep, `root=0 young-survivor=0
+old-gen=0` — the reclaimed node has **no** heap edge, no passed root, no
+old→young card. Per the in-tree detector comment, that means *"the only live
+reference is a register/native-stack root the sweep cannot see."* The decisive
+toggle matrix on current dev (`df304353`):
 
-A bespoke cache-miss probe in `scan_active_jit_frames` confirmed the cache
-returns **fewer** roots than a fresh scan at the same generation (`cached=26`
-vs `fresh=40`; the 14 dropped were mostly `cid=0 kind=Array` char[]/byte[] and
-reflection objects).
+| Config | Result |
+|---|---|
+| default | crash |
+| `NO_JIT_SCAN_CACHE` (cache off) | crash |
+| `JIT_SCAN_CACHE` (cache on) | crash |
+| `DBG_FULLSTACK_SCAN` (whole native stack as roots) | **no crash, but `bad=1`** (`java.lang.Object` mismatch persists) |
+| `DBG_FORCE_MOVING` (moving collector) | no crash |
+| `DISABLE_JIT` | clean |
 
-## Root cause
+`getDeclaredFields()` etc. are dispatched from a **JIT** frame; their object
+result returns in a register (`rax`). Between the native return and the JIT
+spilling/storing it, the object's only reference is that register. The non-moving
+young sweep (forced because a JIT frame is live — `gc_quiescence`) marks from the
+conservative root set, which scans the *stack* only; a register-resident oop is
+invisible. The sweep reclaims the object → the slot is reused as a bare
+`java/lang/Object` (the bug-06 signature). `FULLSTACK_SCAN` scanning the whole
+stack catches the cases where the value *has* spilled, dropping the crash rate to
+the rare still-in-register window — hence `bad=1`, not 0.
 
-The conservative scanner ([`conservative_roots::scan_active_jit_frames`])
-reports every 8-byte word in `[scanner_sp, entry_sp]` that
-`is_object_address`-validates as a root. To avoid re-walking that band on every
-object-returning native call, results are cached per thread and reused while the
-**`JIT_BOUNDARY_GEN`** (bumped at every JIT runtime-helper entry / chain
-mutation) is unchanged. The premise: *"JIT spill slots can only change while
-compiled code executes."*
+## What does NOT fix it (ruled out)
 
-That premise is **incomplete**. The scanned band `[scanner_sp, entry_sp]` also
-covers the **interpreter / native / Rust stack BELOW the JIT frame** — every
-callee a JIT method invoked. That region mutates continuously while interpreted
-or native code runs, **without any boundary bump**, and it can hold the only
-live reference to a freshly-allocated object (a `Field[]`, a `StringBuilder`
-char[] in a native's Rust local, …) before it is stored into a tracked slot.
-`update_root_snapshot` runs on every object-returning native call and fills the
-cache at that generation, so a later root scan at the same generation reuses a
-snapshot that **predates** those references and silently drops them. Because an
-active JIT frame forces the **non-moving** young sweep (`gc_quiescence`), a
-dropped live root is reclaimed in place and its slot reused → the corrupt
-header / `implausible object size` walk abort.
+- **The JIT-scan cache** (`JIT_SCAN_CACHE`). An earlier pass mis-attributed the
+  crash to the cache being unsound and disabled it by default. On the original
+  base (`0e3f0398`) disabling it *appeared* to fix the crash — but that was only
+  a GC-timing perturbation: on current dev the crash is identical cache-on and
+  cache-off. The cache default-off was reverted (it was a perf regression for no
+  benefit). The cache *does* have a real, separate weakness — reusing a snapshot
+  across a GC could republish a freed address — which is now closed by keying it
+  on `heap.collection_count()` (`JitScanCache::collection_count`); that hardening
+  was kept.
+- **A full native-stack conservative scan** (`DBG_FULLSTACK_SCAN`). Reduces but
+  does NOT eliminate the corruption (`bad=1`), because the missed root is in a
+  register, not on the stack.
 
-A secondary, related flaw: a garbage collection **does not bump
-`JIT_BOUNDARY_GEN`**, and several young sweeps can run at one generation during a
-single interpreted callee — so the cache could also republish **freed
-addresses** across a GC.
+## Real fix (required, not yet implemented)
 
-## Fix
-
-`vm/src/jit/conservative_roots.rs`, `vm/src/memory/roots.rs`,
-`vm/src/runtime/interpreter.rs`:
-
-1. **Cache default-OFF** (`jit_scan_cache_enabled`): the cache is unsound for the
-   conservative scanner; the proven-correct behaviour (`NO_JIT_SCAN_CACHE`) is
-   now the default. Opt-in via `CRATONVM_JIT_SCAN_CACHE=1` for benchmarking.
-2. **`collection_count` cache key** (hardens the opt-in path): the cache is also
-   invalidated whenever a GC has occurred, so it can never republish a freed /
-   relocated address. Only sampled when the cache is on (keeps the default path
-   free of the stats-snapshot cost).
-3. **Fresh GC-authoritative scans:** `collect_roots` (current thread) and
-   `safepoint_check`'s pre-STW publish (parked thread) call
-   `invalidate_scan_cache_for_gc()` before scanning, so the root set a collector
-   actually marks from is always a full, current walk even if the cache is
-   re-enabled.
-
-## Verification
-
-- `ReflRepro 8000` under `CRATONVM_DBG_GC_STRESS=65536`: **6/6 clean**
-  (`ok=8000 bad=0`), incl. the minimal `BISECT_ONLY=ReflRepro` /
-  `SKIP=describeField,main` config.
-- `ReflRepro 40000` (no stress): clean, output byte-identical to the JIT-off
-  golden reference.
-- `MinRepro` / `ArrRepro` / `ForEachOrderedRepro` / `PBRepro`: no regression
-  (with and without GC stress).
-
-## Performance note & follow-up
-
-Disabling the cache re-introduces the per-native-call conservative scan the
-cache was added to avoid (a deep JIT-over-interpreter frame can make that scan
-O(stack depth)). The impact is bounded: `collect_roots` already does its own
-fresh scan, so the cache only ever optimised `update_root_snapshot`'s publish —
-which is **redundant for the GC-initiating thread** and only consumed for a
-*parked* thread during a cross-thread STW. The right long-term fix is a **sound**
-cache that records the JIT frame's spill bounds (precise oop maps) and caches
-only that genuinely-frozen region, re-scanning the mutating native stack below
-it each time. Until then, OFF is correct; a cheaper interim win is to skip the
-JIT-frame scan in `update_root_snapshot` entirely when `alive_count <= 1` (no
-cross-thread consumer can ever read it).
+Precise oop maps for JIT frames (so a register-resident oop at a safepoint is
+exactly described and either spilled or relocated), or a **complete** shadow
+stack (`CRATONVM_SHADOW_STACK` spills register oops before GC-capable calls —
+it does not crash here, consistent with the diagnosis, but is incomplete/slow).
+Both are the tracked Stage B/C "precise JIT maps" work. A narrower interim is to
+have JIT codegen spill the live oop set (or at least native-call return values)
+to stack spill slots before every GC-capable call from a JIT frame, so the
+existing conservative stack scan can see them.
