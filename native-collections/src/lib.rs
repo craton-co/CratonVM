@@ -16200,15 +16200,22 @@ fn pq_compare(
             _ => 0,
         });
     }
-    // Natural ordering: compare by string value, int, long, float, double
+    // Natural ordering. PriorityQueue elements are virtually always *boxed*
+    // (`pq.add(5)` stores an `Integer`, not a primitive), so dispatch the
+    // element's real `Comparable.compareTo` — exactly what HotSpot's
+    // `PriorityQueue.siftUpComparable` does. This handles `Integer`/`Long`/
+    // `Double`/`String`/... and any user `Comparable` uniformly. (The earlier
+    // code only knew `read_string` + raw primitives, so two boxed `Integer`s
+    // compared "equal" (0) and the heap never ordered — `5 2 9 3 1`.)
+    if let Value::Object(Some(oa)) = a {
+        let result = ctx.invoke_virtual(*oa, "compareTo", "(Ljava/lang/Object;)I", &[*b])?;
+        return Ok(match result {
+            Some(Value::Int(v)) => v,
+            _ => 0,
+        });
+    }
+    // Primitive fallback (rare — PQ normally holds boxed objects).
     Ok(match (a, b) {
-        (Value::Object(Some(oa)), Value::Object(Some(ob))) => {
-            if let (Some(sa), Some(sb)) = (ctx.read_string(*oa), ctx.read_string(*ob)) {
-                sa.cmp(&sb) as i32
-            } else {
-                0
-            }
-        }
         (Value::Int(a), Value::Int(b)) => a.cmp(b) as i32,
         (Value::Long(a), Value::Long(b)) => a.cmp(b) as i32,
         (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).map_or(0, |o| o as i32),
