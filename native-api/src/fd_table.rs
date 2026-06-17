@@ -61,6 +61,11 @@ enum FileEntry {
     /// WP1.12 — subprocess stdin pipe (write side). Bytes written go to
     /// the child process's standard input.
     ChildStdinPipe(Mutex<std::process::ChildStdin>),
+    /// `ProcessBuilder.redirectErrorStream(true)` (`2>&1`): a single OS pipe
+    /// whose write-end is handed to BOTH the child's stdout and stderr, so the
+    /// merged output is read through one fd. getInputStream() reads this;
+    /// getErrorStream() is then the empty stream.
+    ChildMergedPipe(Mutex<std::io::PipeReader>),
 }
 
 /// Non-destructive socket readiness probe.
@@ -346,6 +351,11 @@ impl FileDescriptorTable {
                 let n = p.lock().read(&mut buf)?;
                 Ok(if n == 0 { -1 } else { buf[0] as i32 })
             }
+            FileEntry::ChildMergedPipe(p) => {
+                let mut buf = [0u8; 1];
+                let n = p.lock().read(&mut buf)?;
+                Ok(if n == 0 { -1 } else { buf[0] as i32 })
+            }
             FileEntry::FileReadWrite(file) => {
                 let mut buf = [0u8; 1];
                 let n = file.lock().read(&mut buf)?;
@@ -364,6 +374,7 @@ impl FileDescriptorTable {
             // WP1.12 — subprocess stdout/stderr bulk read.
             FileEntry::ChildStdoutPipe(p) => p.lock().read(buf),
             FileEntry::ChildStderrPipe(p) => p.lock().read(buf),
+            FileEntry::ChildMergedPipe(p) => p.lock().read(buf),
             // Read+write file (FileChannel via newFileChannel /
             // RandomAccessFile) — the real `FileDispatcherImpl.read0` path
             // reaches here. Read at the current cursor, matching `rw_read`.
@@ -965,6 +976,17 @@ impl FileDescriptorTable {
         self.entries
             .write()
             .insert(fd, Arc::new(FileEntry::ChildStderrPipe(Mutex::new(stream))));
+        fd
+    }
+
+    /// `redirectErrorStream(true)`: wrap the read-end of the single pipe that
+    /// the child's stdout AND stderr both write to. Read through the same
+    /// `read_bytes`/`read_byte` API as the separate pipes.
+    pub fn insert_child_merged(&self, reader: std::io::PipeReader) -> FdId {
+        let fd = self.alloc_fd_or_abort();
+        self.entries
+            .write()
+            .insert(fd, Arc::new(FileEntry::ChildMergedPipe(Mutex::new(reader))));
         fd
     }
 

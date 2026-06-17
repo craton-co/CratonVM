@@ -7631,7 +7631,16 @@ pub(crate) fn register_phase57_process(r: &mut NativeMethodRegistry) {
         pb,
         "redirectErrorStream",
         "(Z)Ljava/lang/ProcessBuilder;",
-        |_ctx, args| Ok(Some(args[0])),
+        |ctx, args| {
+            // Was a no-op that dropped the flag, so the real ProcessBuilder.start()
+            // bytecode (which reads `this.redirectErrorStream` and forwards it to
+            // ProcessImpl.create's `redirectErrorStream` arg) always saw false and
+            // the child's stderr never merged into stdout. Store it on the field.
+            let this = obj_arg(args, 0)?;
+            let flag = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
+            ctx.set_field_by_name(this, "redirectErrorStream", Value::Int(flag));
+            Ok(Some(args[0]))
+        },
     );
 
     // environment() — return a Map of environment variables

@@ -229,6 +229,7 @@ pub fn spawn_and_wrap(
     work_dir: Option<&str>,
     env_vars: Option<&[(String, String)]>,
     clear_env: bool,
+    redirect_error_stream: bool,
 ) -> MethodCallResult {
     if program.is_empty() {
         return Err(RuntimeError::IllegalArgumentException {
@@ -268,8 +269,36 @@ pub fn spawn_and_wrap(
     let mut command = Command::new(program);
     command.args(args);
     command.stdin(Stdio::piped());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
+    // redirectErrorStream(true) == `2>&1`: hand the write-end of a single OS pipe
+    // to BOTH the child's stdout and stderr so the merged output reads through one
+    // fd (getInputStream); getErrorStream is then empty. Spring Boot buildpack
+    // CredentialHelper reads docker-credential errors (written to stderr) via the
+    // merged getInputStream(). Falls back to separate pipes if pipe creation fails.
+    let merged_reader: Option<std::io::PipeReader> = if redirect_error_stream {
+        match std::io::pipe() {
+            Ok((reader, writer)) => match writer.try_clone() {
+                Ok(writer2) => {
+                    command.stdout(Stdio::from(writer));
+                    command.stderr(Stdio::from(writer2));
+                    Some(reader)
+                }
+                Err(_) => {
+                    command.stdout(Stdio::piped());
+                    command.stderr(Stdio::piped());
+                    None
+                }
+            },
+            Err(_) => {
+                command.stdout(Stdio::piped());
+                command.stderr(Stdio::piped());
+                None
+            }
+        }
+    } else {
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        None
+    };
 
     if clear_env {
         command.env_clear();
@@ -330,18 +359,26 @@ pub fn spawn_and_wrap(
         .map(|s| ctx.fd_table().insert_child_stdin(s))
         .map(|fd| fd as i32)
         .unwrap_or(-1);
-    let stdout_fd = child
-        .stdout
-        .take()
-        .map(|s| ctx.fd_table().insert_child_stdout(s))
-        .map(|fd| fd as i32)
-        .unwrap_or(-1);
-    let stderr_fd = child
-        .stderr
-        .take()
-        .map(|s| ctx.fd_table().insert_child_stderr(s))
-        .map(|fd| fd as i32)
-        .unwrap_or(-1);
+    // When redirectErrorStream merged the pipes, child.stdout/stderr are None
+    // (we gave the child a custom pipe); expose the merged reader as the stdout
+    // fd and leave stderr empty (-1).
+    let (stdout_fd, stderr_fd) = if let Some(reader) = merged_reader {
+        (ctx.fd_table().insert_child_merged(reader) as i32, -1)
+    } else {
+        let so = child
+            .stdout
+            .take()
+            .map(|s| ctx.fd_table().insert_child_stdout(s))
+            .map(|fd| fd as i32)
+            .unwrap_or(-1);
+        let se = child
+            .stderr
+            .take()
+            .map(|s| ctx.fd_table().insert_child_stderr(s))
+            .map(|fd| fd as i32)
+            .unwrap_or(-1);
+        (so, se)
+    };
 
     let pid = child.id() as i64;
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
@@ -603,6 +640,8 @@ fn native_process_impl_create(
         _ => None,
     };
 
+    // args[4] = redirectErrorStream (boolean, passed as Int by the JDK ProcessImpl).
+    let redirect_err = matches!(args.get(4), Some(Value::Int(v)) if *v != 0);
     let result = spawn_and_wrap(
         ctx,
         program,
@@ -610,6 +649,7 @@ fn native_process_impl_create(
         work_dir.as_deref(),
         env_vars.as_deref(),
         env_vars.is_some(),
+        redirect_err,
     )?;
     // The native returns the native handle (our internal handle id) so
     // the JDK can later dispatch into native_wait_for0 etc.
@@ -689,6 +729,8 @@ fn native_unix_fork_and_exec(
         _ => None,
     };
 
+    // forkAndExec's last arg is redirectErrorStream (boolean).
+    let redirect_err = matches!(args.get(9), Some(Value::Int(v)) if *v != 0);
     let result = spawn_and_wrap(
         ctx,
         &program,
@@ -696,6 +738,7 @@ fn native_unix_fork_and_exec(
         work_dir.as_deref(),
         env_vars.as_deref(),
         env_vars.is_some(),
+        redirect_err,
     )?;
     match result {
         Some(Value::Object(Some(proc_ref))) => {
@@ -1245,7 +1288,12 @@ fn native_process_builder_start(
     // --- Spawn ---
     let program = cmd_strings[0].clone();
     let rest: Vec<String> = cmd_strings.into_iter().skip(1).collect();
-    spawn_and_wrap(ctx, &program, &rest, work_dir.as_deref(), None, false)
+    // Honor ProcessBuilder.redirectErrorStream(true) (`2>&1`).
+    let redirect_err = matches!(
+        ctx.get_field_by_name(this, "redirectErrorStream"),
+        Value::Int(v) if v != 0
+    );
+    spawn_and_wrap(ctx, &program, &rest, work_dir.as_deref(), None, false, redirect_err)
 }
 
 // ---------------------------------------------------------------------------
