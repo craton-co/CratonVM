@@ -1,5 +1,146 @@
 # SB-SUITE-CRASH-04 — ~~JIT inline-`new` heap corruption~~ → **GC register-invisibility** (PluginXmlParser hang + AntoraAsciidoc wrong result)
 
+> This is **manifestation A3** of the GC-root-coverage-under-JIT family — see
+> [README.md](README.md) for the family map. Multi-thread sibling = [Fork6](fork6-fjp-multithread-jit-root-reclamation.md) (A4).
+
+---
+## SESSION UPDATE 2026-06-17 (#3) — re-verified on current `dev` (`fca424a4`, binary 2026-06-17); every mitigation still broken
+
+Re-ran the deterministic repro on the current `dev` binary
+(`MinRegexProbe code 20000`, `CRATONVM_DBG_GC_STRESS=524288`), correct-output metric:
+
+| config | rc | `inconsistent header` | correct (`DONE` + right string)? | signature |
+|---|---|---|---|---|
+| `--nojit` | 0 | 0 | **YES (only one)** | — |
+| default (JIT) | 1 | ~20 | NO | `Stale pointer … all-zero header` on `Pattern`/`Matcher` receiver |
+| `CRATONVM_NO_JIT_SCAN_CACHE=1` | 1 | 79 | NO | all-zero `Matcher` |
+| `CRATONVM_JIT_SAFEPOINT_REG_SPILL=1` | 1 | 152 | NO | (frame perturbation) |
+| `…REG_SPILL=1 …NO_JIT_SCAN_CACHE=1` | 1 | 15 | NO | `Cannot invoke iterator on null` |
+| `CRATONVM_DBG_FULLSTACK_SCAN=1` | 1 | 108 | NO | all-zero `Matcher` |
+| `CRATONVM_SHADOW_STACK=1` (movable) | **139 SIGSEGV** | 0 | NO | Rust helper @ exe RVA `0x933305` reads `[rax+0x11]`, **rax=0** |
+| `CRATONVM_SHADOW_STACK=1 …SHADOW_PIN=1` | **124 HANG** | 0 | NO | — |
+| `CRATONVM_SHADOW_STACK=1 …NORELOAD=1` | **124 HANG** | 0 | NO | — |
+| `…SHADOW_STACK=1 …NORELOAD=1 …NO_SELECTIVE_PROMOTE=1` | **124 HANG** | 0 | NO | — |
+| `…SHADOW_STACK=1 …NO_SELECTIVE_PROMOTE=1` | **139 SIGSEGV** | 0 | NO | — |
+| `--nojit …NO_SELECTIVE_PROMOTE=1` (control) | 0 | 0 | YES | — |
+
+**Two hard conclusions:**
+
+1. **No conservative scan can fix A3.** `NO_JIT_SCAN_CACHE` (the bug-06b/A2 fix —
+   now default on dev), full-stack scan, blind callee-saved reg-spill, and every
+   combination still crash. The live root is genuinely **register-resident** at the
+   GC safepoint and unreachable by any read of stack memory. (This is the clean
+   separation from A2: `NO_JIT_SCAN_CACHE` *does* fix ReflRepro, *does not* fix
+   `MinRegexProbe`.)
+
+2. **The `CRATONVM_SHADOW_STACK` precise-roots mechanism is itself broken right
+   now** — in *both* directions:
+   - **movable** (reload restores the GC-rewritten value into the home register)
+     → **SIGSEGV**. The fault is in a Rust JIT helper at exe RVA `0x933305`,
+     dereferencing a **null** pointer (`rax=0`) at offset `0x11`. Read: the shadow
+     reload wrote a stale/zero value into a live oop home register (almost
+     certainly an `invokevirtual` receiver — matches the default path's
+     `Stale pointer … invokevirtual receiver` message), and the JIT then passed
+     that null to a dispatch helper that dereferenced the object header.
+   - **noreload / pin** (skip the restore) → **HANG**, even with
+     `NO_SELECTIVE_PROMOTE` (no evacuation, so marking-only *should* suffice). A
+     hang with 0 corruption strongly suggests the shadow `top` **drifts**
+     (unbalanced push with no paired reload — e.g. an exception unwinding past a
+     shadow-push'd CALL) so the buffer fills / the per-GC scan blows up. Probe with
+     `CRATONVM_DBG_SHADOW_DEPTH=1`.
+
+So the fix is *not* another conservative knob; it is to make precise JIT roots
+**actually correct** (fix the reload-corrupts-register bug) and then
+default-viable (the lazy-prologue perf lever). See the synthesis directly below.
+
+### Pinned mechanism of the `SHADOW_STACK` movable SIGSEGV (4-agent diagnosis, 2026-06-17)
+
+- **The faulting helper is `jit_getfield`** (`vm/src/jit/helpers.rs:1695`, via the
+  inlined bounds-check `jit_putfield_slot_in_bounds` at `:1752/:1758`), **NOT** an
+  invoke-dispatch helper. RVA `0x933305` = function entry `0x933270` + `0x95`; the
+  faulting instruction is `mov eax, dword ptr [rdi+0x10]` — the `num_slots` (u32)
+  read at object header offset 16. (Confirmed by cdb disasm against `cratonvm.pdb`:
+  the surrounding code is `cmp rbx,rax; jae` index-bound check, `shl rbx,4`
+  [SLOT_SIZE=16], `lea rax,[rdi+rbx]; add rax,0x28` [HEADER_SIZE=40],
+  `movups xmm0,[rax]` = a 16-byte `Value` *load* → getfield, not store.)
+- **The receiver is the integer `1`, not null.** `rdi=0x1`, so `[rdi+0x10] = [0x11]`
+  faults. `rdi=1` is why the helper's `if obj_ptr==0` null guard (`test rdi,rdi; je`
+  at the prologue) does **not** catch it. (`rax=0` is just the cleared load dest,
+  `rbx=rdx=3` is `field_index`/slot 3 — earlier "rax=0 ⇒ reload wrote null" was a
+  misread.)
+- **The two safepoints are named and disassembled (`CRATONVM_DBG_SHADOW2` +
+  `CRATONVM_DBG_DUMP_JIT` + capstone):** exactly **two** pushes in the whole run,
+  both `this` (local 0) below a call —
+  `Matcher.reset()` pc=110 (`aload_0; aload_0; invokevirtual getTextLength`),
+  `this`→**R13**; and `Pattern.append(II)V` pc=29 (`...; invokestatic Arrays.copyOf`),
+  `this`→**R15**. **The oop mark is CORRECT** — `this` is genuinely an object, and the
+  disasm confirms R13/R15 hold a valid `this` at the push (no write to R13 between
+  the prologue `mov r13,rdx` and the push). So the earlier "oop-mistag" theory is
+  **DISPROVEN**: the push stores a valid pointer.
+- **The bug is the RELOAD reading a shadow slot that was corrupted to `1` during the
+  nested call.** In `reset`'s disasm: push at `09dc mov [r11],r13` (shadow[top]=this,
+  savebase=[rbp-0x20]); after the `getTextLength` dispatch (`0a13 call`), the reload
+  `0a53 mov r13,[r11]` loads R13 back from the (savebase-validated) slot — and the
+  very next getfield (`0a90 call jit_getfield`, = the crash frame `reset+0xA92`,
+  bytecode pc=118 `getfield modCount`) uses R13 as receiver → `rdi=1`. Both `reset`
+  (R13) and `append` (R15) corrupt `this`→`1` the same way (hence `r13=1` **and**
+  `r15=1` at the crash). So between the push (stores valid `this`) and the reload,
+  **`[savebase]` becomes `1`** — the shadow buffer slot holding the caller's live
+  `this` is overwritten across the nested call.
+- **Leading mechanism (to confirm):** the boundary heal `restore_jit_thread`
+  (`helpers.rs:356-364`) resets `shadow_stack.top` to the watermark
+  **snapshotted at the *callee's* `set_jit_thread`** — but a JIT→interpreter→JIT
+  re-entry can snapshot a `top` at or below the caller's still-live pushed slot, so a
+  nested push then **overwrites** `[savebase]`. The `savebase ∈ [base,end)` validation
+  in the reload (`0a26-0a3a`) can't catch this — `savebase` is still in range; it just
+  reads the overwritten slot. (Exact origin of the value `1` not yet pinned — needs a
+  runtime log of `[savebase]` at reload, or of `set_top`/`remap` during the nested
+  call. GC remap is sound — `gc.rs update_all_roots` passes the full `evac_map` — so
+  this is buffer-slot reuse, not a bad remap.)
+- **Per the no-stub/no-mask rule, do NOT add a non-canonical receiver guard to
+  `jit_getfield`** (same class as the avrora real-RAF `jit_putfield obj_ptr=0x1`).
+  The fix is in the shadow-stack bookkeeping: a caller's pushed slots must not be
+  reusable by a nested JIT re-entry — e.g. `set_jit_thread` should snapshot/raise the
+  watermark to the *current* `top` (so nested pushes start *above* the caller's live
+  slots), not reset below them.
+- **Top-drift is NOT the default-path bug** (it is real only under the
+  `CRATONVM_SHADOW_NORELOAD` toggle / OSR-track loops): the throwing-unwind path is
+  triple-balanced — per-safepoint reload is emitted *before* the post-invoke
+  exception check (`x64.rs:17347` then `:17360`); every abnormal-exit stub
+  (`:12206/:12289/:12067/:12139/:15476`) runs the full `emit_epilogue` which
+  restores the prologue-saved entry `top` (`:9358-9366`/`:9435-9442`); and
+  `restore_jit_thread` re-clamps `top` even after a Rust panic
+  (`helpers.rs:302/356-365`, `interpreter.rs:14692-14709`). The `noreload`/`pin`
+  HANG is a *separate* latent gap: inline `emit_shadow_push` (`x64.rs:6265-6278`)
+  has **no `top>=end` overflow guard** (the `push()` helper at `shadow_stack.rs:168`
+  does), so skipping the pop grows `top` unbounded → buffer overflow + O(n) scan.
+- **GC remap is sound** (`gc.rs` `update_all_roots` passes the full `evac_map` as the
+  pointer_map; `gen_heap.rs:4411`), so the movable shadow slot *is* correctly
+  rewritten after evacuation — reinforcing that the SIGSEGV is a JIT home-register
+  miscompile, not a missing remap.
+- **A3 == A2 (same class).** Update 2026-06-17: the bug-06b "scan-cache unsound"
+  framing was **reverted** (`b41c0484`) — on current dev `NO_JIT_SCAN_CACHE` fixes
+  *neither* ReflRepro nor `MinRegexProbe`; both are register-resident missed roots.
+  See [reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md).
+  **Asymmetry that matters for the fix:** `CRATONVM_SHADOW_STACK` *fixes* ReflRepro
+  (no crash) but *crashes* `MinRegexProbe` via the reload bug pinned below — so the
+  A2 handoff's "complete the shadow stack" plan must also fix this reload codegen.
+
+**Concrete next step (pinning the corrupting site):** there are only **two**
+candidate safepoints (`pc=29` and `pc=110`, each one `CalleeSaved` home). Identify
+the two compiled methods (`CRATONVM_DBG_SHADOW2` prints the pc; add the method name
+to that trace, or `CRATONVM_DBG_JIT_DISASM` the small compiled set — only ~2
+methods have a register-resident oop at a safepoint) and disassemble around those
+PCs. Find the operand entry that `stack_oop_marks` tags `true` while the
+callee-saved register actually carries an `iconst_1`/boolean/`arraylength`-style
+`1`. Then fix the provenance: the bytecode/codegen path that pushed a primitive
+into a slot the marks still believe is an oop (dup/swap/merge-reconstruct, a
+`getfield`-of-int result reusing an oop's `CalleeSaved` register, or a phi/merge
+that didn't clear the mark). Acceptance: `SHADOW_STACK=1 MinRegexProbe code 20000`
+under `GC_STRESS=524288` → `DONE` with the correct string, **and** the default
+(non-shadow) all-zero-`Pattern` reclaim is also gone once the same marks drive a
+complete root set.
+
 ---
 ## SESSION UPDATE 2026-06-16 (#2) — metric correction + conservative-spill experiment (branch `fix/sb-crash-04-register-invisibility`, worktree `C:\craton\CratonVM-sbreg`, built off dev `6088b9be`)
 

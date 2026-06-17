@@ -1,0 +1,292 @@
+---
+name: springrepos-extension-hang-jit-throughput-and-deep-recursion
+description: Handoff for the Spring Boot buildSrc SpringRepositoriesExtensionTests hang. 3 fixes landed on dev (pdcache NPE, AssertionError-preload JIT bail, hashCode/equals-override JIT compile). dev passes the test via the peer's root-snapshot fix. Residual = cold-path interpreted ATN simulation; enabling it to JIT-compile exposes a NATIVE STACK OVERFLOW in deep closure() recursion (not a value miscompile). Deep-recursion stack guard designed + prototyped (explicit prologue check works but taxes hot path; correct fix = stack banging + fault recovery).
+metadata:
+  type: known-issue
+  area: jit, classloader, groovy, throughput
+---
+
+# SpringRepositoriesExtensionTests — full handoff
+
+Scope: the one genuine CratonVM-only item from the Spring Boot buildSrc suite
+(`org.springframework.boot.build.groovyscripts.SpringRepositoriesExtensionTests`).
+HotSpot passes it 11/11 in ~5s. This doc captures everything learned across the
+investigation, what landed, and what remains.
+
+**Current status:** `dev` **passes** this test (via the peer's GC-root-snapshot
+fix, commit `1d523351`). Three additional general JIT/classloader fixes landed on
+`dev`. The remaining cold-path throughput work is **not a blocker**, and the one
+crash it surfaces is precisely diagnosed (a native stack overflow, design for the
+fix below).
+
+---
+
+## 1. The test decomposes into THREE independent defects (earlier reports conflated them)
+
+| # | Defect | Status |
+|---|--------|--------|
+| 1 | `SecureClassLoader.pdcache` left null → deterministic `computeIfAbsent on null` NPE in Groovy class-gen | ✅ FIXED on dev (`43f5fe03`) |
+| 2 | CRASH-04 JIT register-invisibility heap corruption on the Groovy path (only under `GC_STRESS`) | 🔴 separate, open (shadow-stack workstream) |
+| 3 | ANTLR adaptive-prediction interpreter-throughput blow-up parsing the closure-heavy script → the HANG | 🟡 mitigated on dev by root-snapshot; deeper JIT throughput work open |
+
+Plus, the **hang itself** on `dev` was already fixed by the peer via a *fourth*,
+orthogonal root cause: the **per-native-call GC root snapshot rescan**
+(`update_root_snapshot` rescanned every interpreter frame on every object-returning
+native call; at the Groovy-compile-under-JUnit stack depth ~46 this is
+O(stack-depth) per call → >300s hang). Commit `1d523351` made `rootsnap_cache` /
+`skip_redundant_native_snapshot` / `rootsnap_cache_survive_gc` default-ON. bt18
+stays `68332206`. **Do not re-solve the hang — dev already passes.**
+
+### Corrected diagnoses (prior reports were wrong)
+- **No thread leak.** The watchdog "1015 / 3807 thread(s) dumped" is its **ack
+  counter** (poll iterations during the 3s grace window), NOT a thread count. The
+  actual registry has **2 threads** (`main` + the JDK `Cleaner`). It re-dumps the
+  single `main` thread thousands of times.
+- The hang is **single-threaded, CPU-bound**, pinned in ANTLR
+  `ParserATNSimulator.adaptivePredict → execATN → computeReachSet → computeTargetState`
+  — **NOT** `ATNDeserializer.deserialize` (one earlier theory) and **NOT**
+  `MetaClassRegistryImpl.registerMethods` (an older theory).
+- The DFA cache **works** (refutes the "memoization broken" theory): a scaling
+  probe shows `N=1` parse = 62s but `N=8` = 6.5s — the 8-statement parse reuses the
+  first decision's DFA. The cost is the *first-time* simulation of each **distinct**
+  grammar decision; the diverse 163-line script has many, so the interpreted cold
+  path dominates.
+
+---
+
+## 2. Fix 1 — `SecureClassLoader.pdcache` (LANDED, dev `43f5fe03`)
+
+**Symptom:** `NullPointerException: Cannot invoke computeIfAbsent on null` thrown
+in Groovy's `class generation` phase (re-wrapped as `GroovyBugError`).
+
+**Real root cause** (via `CRATONVM_DBG_NPE_STACK=1` interpreter frames — the
+reconstructed Java trace is unreliable here): the null receiver is
+`java/security/SecureClassLoader.pdcache`, read by real-JDK bytecode
+`SecureClassLoader.getProtectionDomain(CodeSource)` ← `defineClass(name, byte[], …,
+CodeSource)` ← Groovy's `GroovyClassLoader$ClassCollector.createClass`.
+`pdcache = new ConcurrentHashMap<>(11)` is set by `SecureClassLoader.<init>`'s
+inline field initialiser, which CratonVM's simplified URLClassLoader/ClassLoader
+`<init>` natives bypass — `init_classloader_common_fields`
+(`native-builtins/src/classloader_real.rs`) populated every inherited field
+**except** `pdcache`.
+
+**Fix:** init `pdcache` to a real, *segment-initialised* `ConcurrentHashMap` (built
+via its native `<init>()V`; a bare `alloc_concurrent_synthetic` leaves the segments
+array null so `computeIfAbsent` would silently no-op), null-guarded.
+
+**This was DETERMINISTIC, not flaky/CRASH-04.** Pre-fix: 3/3 runs throw the NPE
+with **0** `inconsistent header` warnings (corruption produces warnings; their
+absence + perfect reproducibility rule it out). A peer report had misfiled it as a
+flaky CRASH-04 symptom; that report's own `GC_STRESS` matrix shows 0 warnings in
+the no-stress row, consistent with this gap. CRASH-04 *is* real but separate (3432
+warnings only under `GC_STRESS`, on both pre- and post-fix binaries).
+
+---
+
+## 3. Fix 2 — preload `java/lang/AssertionError` (LANDED, dev `05b9622a`)
+
+**General JIT bug:** a method's JIT compilation is vetoed wholesale when a `new`-site
+references a class the JIT's new-resolver can't resolve — `resolve_jit_new_site`
+(`vm/src/runtime/interpreter.rs`) does `find_class_by_name(name)?` → `None` when the
+class is unloaded → `try_compile_inner` bails the **entire** method
+(`backend_attempted=false`, a pre-backend resolver miss).
+
+`assert` compiles to `getstatic $assertionsDisabled; ifne L; … new
+java/lang/AssertionError; …; athrow; L:`. With assertions **disabled** (the default)
+that path is dead and `AssertionError` is **never loaded** → every assert-bearing
+method fails to JIT-compile and runs interpreted forever. `assert` is pervasive;
+ANTLR's `ParserATNSimulator` (`closure`, `getEpsilonTarget`, `ATNConfigSet.add`,
+`PredictionContext.join`, `SingletonPredictionContext.getReturnState`, …) is
+assert-saturated → none compiled → Groovy parse ~2500× slower than HotSpot.
+
+**Fix:** load `java/lang/AssertionError` once at VM bootstrap (next to
+`java/lang/Object` in `vm/src/vm/vm_init.rs`). Verified: `closure` + cluster now in
+`[JIT_COMPILED]` with no NEW-miss bail; ~2× faster parse; LibraryTests 4/4.
+
+**Pinning tool added:** `CRATONVM_DBG_JITBAIL=<method-substring>` in
+`jit/src/lib.rs::try_compile_inner` prints which pre-backend resolver returns `None`
+(`closure` → `NEW miss cp=123` = AssertionError). Also: `CRATONVM_DBG_DUMP_JIT=LIST`
+(list compiled methods), `CRATONVM_DBG_JITC=1` (compile-bails).
+
+---
+
+## 4. Fix 3 — `hashCode`/`equals` override JIT compilation (LANDED, dev `2fbabc0b`)
+
+Two coupled JIT throughput bugs (`vm/src/runtime/interpreter.rs`):
+
+**3a — over-broad native-shadow refusal.** `try_jit_compile_callee_slow` refused to
+compile a method if **any ancestor** had a Rust native of the same signature.
+`Object.{hashCode,equals,toString,clone}` are native → **every** bytecode override
+of them was refused JIT compilation, even though the override shadows the ancestor
+native and is what actually runs. `PredictionContext.hashCode` (3 bytecodes,
+`getfield cachedHashCode; ireturn`) was ~32% of the parse profile, interpreted.
+**Fix:** check the native shadow at the **resolved declaring class** (+ the
+receiver's own class), not the whole ancestor chain — preserving the
+`ForkJoinTask.fork()` inherited-native case.
+
+**3b — recompile storm.** `try_jit_compile_callee` looks up the JIT cache by
+**receiver** class, but `callee_slow` stored under the **declaring** class. For an
+inherited method (`SingletonPredictionContext.hashCode → final
+PredictionContext.hashCode`) the keys differ → cache never hits → the dispatch
+helper recompiled it on **every** polymorphic call (**42,676** recompiles in one
+parse). **Fix:** store under the receiver class to match the lookup.
+
+Verified (no miscompile): bt18 = `68332206`; Mockito/ByteBuddy
+`InteractiveUpgradeResolverTests` 1/1; `DependencyVersionUpgradeTests` 63/63;
+`ArtifactVersionDependencyVersionTests` 20/20; `LibraryTests` 4/4.
+
+**⚠️ ByteBuddy caveat (for anyone extending this).** The interpreter's *own* compile
+path (`try_jit_upgrade_with_gate`) and the first-call path (~`interpreter.rs:2801`)
+**still carry the over-broad parent-walk** — left intact deliberately. It guards a
+real ByteBuddy miscompile: a compiled method whose body contains an inner
+`invokevirtual Object.equals` mis-dispatches it to constant `false`
+(`LazyProjection.equals` → "Failed to resolve super class … Object"). The **correct**
+generalisation (if you remove those walks to compile `hashCode`/`equals` overrides
+on the interpreter path too) is a `jit_method_calls_native_shadowed(declaring_id,
+code)` guard: compile an override **unless its bytecode internally invokes a method
+that resolves to a native** (that is the actual mis-dispatch trigger). A leaf like
+`PredictionContext.hashCode` (no inner invoke) compiles; `ATNConfig.hashCode` (calls
+the *override* `PredictionContext.hashCode`, not native) compiles; `LazyProjection.
+equals` (calls `Object.equals`) is still refused. **This was prototyped — see §6.**
+
+---
+
+## 5. The cold path (residual throughput) — what it really is
+
+After fixes 2+3, the hot `hashCode` methods compile, yet a fresh interpreter
+leaf-frame profile still shows them interpreted. The watchdog samples **only
+interpreter frames**, and the reason they show is: the **first-time recursive
+simulation of each new grammar decision runs interpreted**. The interpreter *does*
+dispatch interpreted call-sites to already-compiled callees (the
+`CachedInvokeTarget::Bytecode` fast-path checks the JIT cache every call); the gap is
+that the interpreter's *own* compile path (`try_jit_upgrade_with_gate`) still has the
+over-broad native-shadow walk (§4 caveat), so the leaf methods don't compile *there*
+during the interpreted simulation (only via the rarer MIC path from already-JIT'd
+callers).
+
+dev already passes the test (root-snapshot), so this is a **pure throughput
+follow-up**, not a blocker. The remaining lever is to let the ATN-sim leaf methods
+compile via the interpreter path (the §6 guard) — **but that uncovers the crash in
+§6.**
+
+---
+
+## 6. Cold-path fix ATTEMPT → uncovered a NATIVE STACK OVERFLOW (the real next bug)
+
+Applying the precise §4 inner-invoke guard to `try_jit_upgrade_with_gate` +
+`try_jit_compile_callee_slow` let the ATN-sim cluster compile via the interpreted
+simulation path. It **passed** bt18 (`68332206`) and ByteBuddy/Mockito 1/1 — **but
+the real parse SIGSEGV'd ~5.5 min in**, deep in `ParserATNSimulator.closure`
+recursion. **Reverted; NOT on dev.**
+
+**The crash is a NATIVE STACK OVERFLOW, not a value-miscompile** (so NOT a codegen
+bisect). VEH dump signature:
+- `EXCEPTION_ACCESS_VIOLATION` reading a **page-aligned guard address** (`read at
+  0x409C0000`, `R10 = 0x184F0000`);
+- `ShadowStack` `top` (`0x3C9DB468`) grown **past** its `end` limit (`0x3CA41C58`);
+- faulting frame spill slots literally spell **`"operand stack overflow"`**;
+- stack = `closure → closure → …` 110+ frames.
+
+**Mechanism:** the cold-path fix makes the ATN-sim **leaf** methods compile, so each
+`closure()` level stays in JIT'd native code (native stack) instead of bailing to
+the interpreter (VM frame stack). The deep ANTLR `closure()` recursion then overruns
+the **native** stack, and the VM's overflow path (GC / shadow-stack scan or
+`StackOverflowError` construction) faults instead of throwing cleanly.
+
+**Confirmed cold-path-specific:** the clean dev binary parses the same
+deeply-nested-closure script (`runner/GroovyNestProbe.java`) **without crashing**,
+only *slowly* — its `closure()` leaf calls bail to the interpreter and never
+deep-recurse in native code.
+
+### Why the existing guard doesn't catch it
+`enter_jit_dispatch` (`vm/src/jit/helpers.rs`) maintains a thread-local depth counter
+and throws a *catchable* `StackOverflowError` (via `raise_jit_stack_overflow` →
+`i64::MIN` sentinel) — **but only inside the two dispatch helpers**
+(`jit_invoke_dispatch`, `jit_invoke_virtual_mic` = the inline-cache MISS path). Every
+**direct** JIT→JIT call bypasses it:
+- **invokestatic self-recursion** — `jit/src/x64.rs` ~17469 (`self_call_patches`);
+- **PIC inline-cache HIT** — `jit/src/x64.rs` ~18968–19477 (`MOV R11,[R10+8]; CALL
+  R11` — what warm monomorphic `closure()` recursion uses);
+- regular **direct_calls** — ~15804.
+
+Also the depth counter uses a **fixed per-level budget**
+(`NATIVE_STACK_BYTES_PER_JIT_DISPATCH_LEVEL`) that under-counts when frames grow
+(exactly what compiling the leaf calls does), so even the guarded path can overrun.
+
+---
+
+## 7. Deep-recursion stack guard — design + what was tried
+
+### Attempt 1 (prototyped, reverted): explicit prologue check → deopt stub
+Inline `gs:[0x30]` → `[+0x1478]` (`TEB.DeallocationStack` = reserved stack bottom)
+RSP check in the prologue (after params homed, using free scratch R10/R11; gated on
+`needs_heap` so the deopt stub can load `vm_ptr` from `heap_local_offset`). On
+underflow, jump to the **existing deopt-stub machinery** (`emit_deopt_stubs` →
+`jit_uncommon_trap`, reason 6, bci 0): the method re-executes in the interpreter
+(recursion continues on the VM frame stack; the `DeoptimizationController` escalates a
+repeatedly-tripping method to **not-entrant** → interpreter-only — exactly the
+desired terminal state). Exact bytes:
+```
+65 4C 8B 14 25 30 00 00 00   ; MOV R10, qword gs:[0x30]            (TEB)
+4D 8B 9A 78 14 00 00         ; MOV R11, qword [R10 + 0x1478]       (DeallocationStack)
+49 81 C3 <imm32>             ; ADD R11, HEADROOM (256 KiB)
+4C 39 DC                     ; CMP RSP, R11
+0F 82 <rel32>                ; JB  -> deopt stub
+```
+**Result:** codegen **correct** (bt16 `14985902`, bt18 `68332206` golden, inert for
+normal code). bt18 *appeared* ~2× slower, **but that magnitude was contaminated by
+concurrent machine load** (a clean no-guard binary measured the same ~53s while the
+peer session was rebuilding/running `dev`). True per-call cost **unconfirmed**.
+Reverted anyway: an explicit per-prologue check (two TEB loads, one to the cold
+`DeallocationStack` field) is inherently non-free on hot recursive methods, and the
+guard is **inert on dev** (the deep-recursion scenario only arises with the reverted
+cold-path fix).
+
+### Attempt 2 (recommended): stack banging + a stack-overflow-aware fault handler
+HotSpot-style, near-zero cost. Emit a single prologue **bang** — `mov eax, [rsp -
+BANG_OFFSET]` — which merely *touches* committed stack on the normal path (hot cache
+hit, ~free) and only faults near the guard page. Move the work to the VEH handler:
+recognise `EXCEPTION_STACK_OVERFLOW` (`0xC00000FD`) / a fault at the bang address as a
+recoverable deep-JIT-recursion overflow and **deopt the current JIT frame to the
+interpreter** (or throw a catchable `StackOverflowError`). Hard part: the handler runs
+with almost no stack left (use a reserved guard region / alternate stack) and must
+unwind/deopt the JIT'd frame. This removes the per-call cost entirely.
+
+---
+
+## 8. Repros & tooling (all under `apps/spring-boot/buildSrc/runner/`)
+- `GroovyParseProbe.java` / `GroovyNpeProbe.java` — trivial-class parse (pdcache NPE).
+- `GroovyThreadProbe.java` — prints live thread count (= 1; debunks the "explosion").
+- `GroovyScriptProbe.java` — parses the real `SpringRepositorySupport.groovy` after a
+  warmup parse (isolates bootstrap from the script parse).
+- `GroovyScaleProbe.java` — parse time vs N closure statements (proves the DFA cache
+  works: cost is first-time per-decision simulation).
+- `GroovyNestProbe.java` — deeply-nested closures; reproduces deep `closure()`
+  recursion (clean dev: slow, no crash; cold-path binary: native stack overflow).
+- Run harness: `buildSrc/runner/run-sbcrash.sh` (one class per process). JDK home
+  `C:/Program Files/Java/jdk-25`. Classpath `runner;$(cat test-classpath.txt)`.
+- Always set `CRATONVM_DISABLE_DEFAULT_WATCHDOG=1` for long parses (the default 120s
+  watchdog aborts otherwise). The Groovy bootstrap (one-time ATN deserialize +
+  metaclass) is ~55s.
+
+## 9. Gotchas
+- **Concurrent-session contamination is real and severe here.** A peer session works
+  the same suite/branch: it `taskkill`s `cratonvm*` processes (silent rc=1/127 early
+  deaths — use a binary copy whose name does NOT start with `cratonvm`), commits/moves
+  branches under you, runs the dev binary (file-locking cargo's link step), and edits
+  the same bug-report docs. Verify timing on a quiet machine; cross-check bt18 vs
+  HotSpot (`68332206`).
+- bt18 golden = `68332206` (HotSpot-confirmed); bt16 = `14985902`. Always cross-check
+  JIT changes against these. Run via `bench/BenchSuite bintrees18`, `-Xmx8g`.
+- Build: `build-cpu.bat` (PowerShell); ~4–12 min depending on contention. Transient
+  "failed to remove cratonvm.exe" link error = a process (often a peer) holds the exe;
+  retry when free.
+
+## 10. Bottom line
+- 3 general fixes landed on `dev` (pdcache, AssertionError preload,
+  hashCode/equals-override compile + cache-key) — all regression-validated.
+- `dev` **passes** `SpringRepositoriesExtensionTests` via the root-snapshot fix.
+- Remaining: (a) the cold-path throughput follow-up (let ATN-sim leaf methods compile
+  via the interpreter path using the §4 inner-invoke guard), which (b) requires the
+  **§7 deep-recursion stack guard (stack banging + fault recovery)** first, because
+  enabling it surfaces the native stack overflow. Neither is a blocker.
