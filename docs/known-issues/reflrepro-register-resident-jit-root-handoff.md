@@ -49,8 +49,38 @@ current binary — the missed root is genuinely register-only (rax, a native-cal
    MIC/PIC direct-call `call r11` fast path in jit/src/x64.rs). precise maps don't cover this
    because the oop is a register/native-return value, not a JIT frame slot.
 
-**Status: OPEN — fully diagnosed, fix is multi-session GC/JIT core work** (distinct from the
-now-fixed A3 register-invisibility, which precise maps default-on closed).
+### Fix attempt #1 (reclaimed-region filler) — TRIED, did NOT fix A2, REVERTED
+
+Hypothesis: the non-moving sweep ZEROES dead objects (`gen_heap.rs` `sweep_young_non_moving`,
+`write_bytes(obj_ptr, 0, total_size)`), and a zeroed `>= HEADER_SIZE` hole decodes as a run of
+phantom 40-byte `Object`s (class_id=0, num_slots=0 → size 40), so a re-walk whose cursor missed
+the exact free-block start strides them and drifts off-grid. Fix tried: stamp a walkable `int[]`
+filler over each reclaimed span instead of zeroing (same as `Tlab::install_tail_filler`), so any
+hole is self-describing and the linear walk re-syncs from any on-grid position.
+
+**Result: did NOT fix A2** — the crash just MOVED (off=3064 → off=2904) and the corrupt header
+changed from a zeroed gap to *random payload* (`kind=0x3a`, huge garbage), i.e. the walk still
+drifts, from a DIFFERENT source. **So the drift is NOT the reclaimed-zeroing** (refuted). The
+original off=3064 byte-dump confirms this: the 8 bytes at 3064–3071 are a zero **inter-object
+gap** (the walk stops at 3064; the real next object re-syncs at **3072**, 8 bytes later) — i.e.
+an **8-byte stride mismatch between the allocator's cursor advance and the walker's computed
+size for the *preceding* object**, NOT a zeroed reclaimed dead object (which is `>= 40` bytes).
+The filler also **regressed sweep perf** badly (`MinRegexProbe` @`GC_STRESS=4MB`: ~2 s → 71 s) —
+the fillers accumulate (re-stamped / re-added every sweep on long-lived workloads). Reverted;
+not on dev.
+
+**Refined next step:** instrument the sweep walk to log the FIRST object whose
+`gen_object_total_size` stride diverges from the real allocation grid (the object BEFORE the
+first desync), and cross-check its size against what the allocator advanced the cursor by for
+that exact object — the 8-byte mismatch is an allocator↔walker size disagreement for some
+specific object/array kind (candidate: a JIT inline array alloc that 16-aligns or over-rounds
+the cursor by 8 vs the walker's 8-rounded `array_data_size`; or a `char[]`/odd-element-size
+array). `bt16/bt18` are unaffected (checksums stay golden) so it's a kind the bintrees workload
+never allocates — reflection/`char[]`/String-specific.
+
+**Status: OPEN — fully diagnosed mechanism, root of the 8-byte stride mismatch still unpinned;
+fix is multi-session GC/JIT core work** (distinct from the now-fixed A3 register-invisibility,
+which precise maps default-on closed).
 
 ---
 
