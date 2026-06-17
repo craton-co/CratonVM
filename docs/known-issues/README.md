@@ -35,24 +35,43 @@ current (incomplete/buggy) implementation of that.
 | # | Manifestation | Repro | Status | Doc |
 |---|---|---|---|---|
 | **A1** | Reflection mirror-array builders held an `ObjectRef` array in a Rust local across allocating calls (`Field[]`/`Method[]`/annotation arrays) | `wildfly-suite/repro/MinRepro` | ✅ **FIXED on dev** (`pin_native_root` sweep) | [jit-junit-discovery-reflection-corruption.md](jit-junit-discovery-reflection-corruption.md) |
-| **A2** | **Register-resident / above-band missed root** — a reflection-result oop returns in a register (or spills *above* the per-JIT-entry scan band) and is reclaimed by the non-moving sweep | `wildfly-suite/repro/ReflRepro` | 🟢 **FIXED on dev** (precise maps default-on) — *verify ReflRepro* | [reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md) |
+| **A2** | **`implausible object size` young-sweep-walker crash** (reflection/String-array allocation churn) — a *distinct* bug, NOT the register root | `wildfly-suite/repro/ReflRepro` | 🔴 **OPEN** — precise maps do **not** fix it (still crashes; verified 2026-06-17) | [reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md) |
 | **A3** | **Register-invisibility** — a live oop sits only in a CPU register at a young-GC safepoint, invisible to the stack-only scan (single thread) | `apps/spring-boot/buildSrc/runner/MinRegexProbe` | ✅ **FIXED on dev** (`32649b56`, precise maps default-on) | [SB-SUITE-CRASH-04-jit-inline-new-heap-corruption.md](SB-SUITE-CRASH-04-jit-inline-new-heap-corruption.md) |
-| **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local; amplified by selective-promotion evacuation | `scratch/xworker/Fork6` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟢 **likely FIXED** (precise maps walk per-thread frames) — *verify Fork6* | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
+| **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local | `scratch/xworker/Fork6` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟡 **OPEN / inconclusive** — a separate real-FJP CAS failure now masks the reclaim test (same with/without precise) | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
 
-> ## ✅ FAMILY FIX (2026-06-17, dev `32649b56`): **precise JIT oop maps, default-on**
+> ## ✅ FIX (2026-06-17, dev `32649b56`): **precise JIT oop maps, default-on** — closes the register-invisibility root-scan gap (A3)
 > `CRATONVM_PRECISE_JIT_MAPS` is now **default-on** (opt out: `CRATONVM_NO_PRECISE_JIT_MAPS`).
 > It makes the non-moving sweep's root scan **precise across every active JIT frame**
 > (RBP-chain `frame_record` + per-safepoint oop maps + a conservative per-frame
 > fallback), so a live oop in a callee-saved register of a **caller** frame — the
 > register-invisible root the conservative deepest-band-only scan missed — is found.
-> This is the single fix for the whole family. **Verified:** A3 (`MinRegexProbe`) green
-> at `GC_STRESS` 524288 **and** 4 MB; `bintrees16/18` == golden `14985902`/`68332206`
-> (no under-count); `matrix`/`sieve`/`fib` correct; opt-out reverts to the legacy
-> (broken) path. **A2/A4 share the exact root cause + mechanism** and are expected
-> fixed — re-run `ReflRepro` and `Fork6` to confirm and close. **Perf:** ~6% bt18, ~0%
-> compute, ~2.5× pure call-heavy (the per-invocation `frame_record` CALL — follow-up:
-> inline that store; details in SB-CRASH-04 #5). Predecessor: the `SHADOW_STACK` reload
-> SIGSEGV fix (`19fd6707`) — `SHADOW_STACK` is now superseded by precise maps.
+> This fixes the **register-invisibility class** (A3 and the kafka bug-21/22 /
+> tomcat-style register-invisibility reclaims). **Verified:** A3 (`MinRegexProbe`)
+> green at `GC_STRESS` 524288 **and** 4 MB; `bintrees16/18` == golden
+> `14985902`/`68332206` (no under-count); `matrix`/`sieve`/`fib` correct; opt-out
+> reverts to the broken path.
+>
+> **Scope correction (verified 2026-06-17): A2 and A4 are NOT closed by this** — they
+> have *separate* bugs. **A2** (`ReflRepro`) still crashes with `implausible object
+> size` / `inconsistent header` on the young-sweep WALK (a core array/String
+> allocation↔sweep bug, distinct from the register root — precise maps fix root
+> *scanning*, not the sweep walker; it actually surfaces *more* of A2's corruption by
+> retaining more). **A4** (`Fork6`, under the experimental `CRATONVM_REAL_FORKJOINPOOL`
+> gate) now fails with a real-FJP `ForkJoinPool` CAS conflict on *both* precise-on and
+> -off, masking the original reclaim — so unverified, not regressed.
+>
+> **Perf:** the per-invocation `frame_record` CALL was made ~40% cheaper by caching
+> the top-frame RBP in a thread-local (`82cf85e9`): **fib44 2.5× → 1.68×**; alloc/
+> compute/array are neutral or slightly faster. Residual = the CALL itself (follow-up:
+> inline the RBP store in codegen; the NOP-skip lever is unsafe — it anchors the frame
+> walk; details in SB-CRASH-04 #5).
+>
+> **Regression sweep (2026-06-17, default-on vs `CRATONVM_NO_PRECISE_JIT_MAPS`):**
+> **zero correctness regressions** — `bintrees10/12/14/16/18`, `matrix600/800`,
+> `sieve250k`, `fib44` all checksum-identical; 10 standalone app probes
+> (`AR`/`Antora`/`CHMEq`/`CollCopy`/`DOMWalk`/`Builtins`/`CPUtil`/`Asm`/`ArrInst`/`AnonM`)
+> byte-identical output to legacy. The full 50+ app gauntlet remains the CI bar.
+> Predecessor: the `SHADOW_STACK` reload SIGSEGV fix (`19fd6707`).
 
 The history below predates the fix.
 

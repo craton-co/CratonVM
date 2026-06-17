@@ -455,6 +455,39 @@ fn native_string_init_bytes(
     string_from_bytes_utf8(ctx, this, &bytes)
 }
 
+/// `<init>(Ljava/lang/StringBuilder;)V` — `new String(StringBuilder)`.
+///
+/// Reads the builder's chars (CratonVM's synthetic SB layout: field 0 = char[]
+/// buffer, field 1 = count — same accessor `StringBuilder.toString()` uses) and
+/// initialises `this` from them. This bypasses the real JDK
+/// `String(AbstractStringBuilder, Void)` ctor, which assumes `getValue()` returns
+/// the compact-string `byte[]` and `Arrays.copyOfRange`s it — a char[]->byte[]
+/// type mismatch against CratonVM's char[]-backed builder (Tomcat DF05).
+fn native_string_init_from_string_builder(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let this = obj_arg(args, 0)?;
+    let sb = obj_arg(args, 1)?; // null builder -> NPE, matching the JDK ctor
+    let (buf, count) = crate::lang_string::sb_state(ctx, sb);
+    let bytes = match buf {
+        Some(b) => {
+            let n = count.max(0) as usize;
+            let mut chars = Vec::with_capacity(n);
+            for i in 0..n {
+                let ch = match ctx.get_array_element(b, i) {
+                    Value::Int(v) => v as u16,
+                    _ => 0,
+                };
+                chars.push(ch);
+            }
+            String::from_utf16_lossy(&chars).into_bytes()
+        }
+        None => Vec::new(),
+    };
+    string_from_bytes_utf8(ctx, this, &bytes)
+}
+
 /// `<init>([BII)V` — `new String(byte[], int offset, int length)`.
 fn native_string_init_bytes_off_len(
     ctx: &mut dyn NativeContext,
@@ -1167,6 +1200,20 @@ pub(crate) fn register_deprecated_util_natives(r: &mut NativeMethodRegistry) {
     // matches the JDK 25 compact-string contract.
     r.register("java/lang/String", "<init>", "([B)V", native_string_init_bytes);
     r.register("java/lang/String", "<init>", "([BII)V", native_string_init_bytes_off_len);
+    // DF05: `new String(StringBuilder)`. The real JDK `String(AbstractStringBuilder,
+    // Void)` ctor reads `byte[] val = asb.getValue()` and `Arrays.copyOfRange(val,...)`,
+    // assuming the compact-string byte[] layout. CratonVM's synthetic StringBuilder
+    // backs its content with a char[], so that copy hits a char[]->byte[] mismatch
+    // (ArrayStoreException directly, or "Object cannot be cast to [B" via Xerces'
+    // StringToken char-merge in XSD xs:pattern validation = Tomcat DF05). Build the
+    // String from the builder's chars instead. (StringBuffer's ctor already works and
+    // is intentionally not intercepted.)
+    r.register(
+        "java/lang/String",
+        "<init>",
+        "(Ljava/lang/StringBuilder;)V",
+        native_string_init_from_string_builder,
+    );
     r.register(
         "java/lang/String",
         "<init>",
