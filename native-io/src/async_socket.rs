@@ -904,38 +904,23 @@ fn aio_asc_close(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResul
 }
 
 /// Decode SocketAddress into "host:port".
+///
+/// DF07: the previous implementation read `port` / `hostname` / `addr`
+/// DIRECTLY off the `InetSocketAddress` object. Under CRATONVM_REAL_NET_SOCKETS
+/// the real JDK `java.net.InetSocketAddress` keeps that state in an inner
+/// `InetSocketAddressHolder holder` (and `InetAddress` keeps its host in its
+/// own holder), so the direct reads all missed: `port` resolved to absent →
+/// `Err("connect: bad port")`, or (when a literal-IP host partially decoded) a
+/// wildcard `0.0.0.0` that `std::net` connect rejects with WSAEADDRNOTAVAIL
+/// (os error 10049). The websocket client's `connectToServer` hits exactly this
+/// (handler-form `AsynchronousSocketChannel.connect`).
+///
+/// Delegate to the blocking path's `decode_socket_address`, the single robust
+/// decoder: it tries the public `getPort()` / `getHostString()` accessors
+/// first, then the real-JDK `holder` fields, then the synthetic 2-field layout.
 fn decode_addr(ctx: &mut dyn NativeContext, sa: ObjectRef) -> Result<String, MethodCallFailed> {
-    let port = match ctx.get_field_by_name(sa, "port") {
-        Value::Int(v) if (0..=u16::MAX as i32).contains(&v) => v,
-        _ => return Err(ioex("connect: bad port")),
-    };
-    if let Value::Object(Some(s)) = ctx.get_field_by_name(sa, "hostname") {
-        if let Some(host) = ctx.read_string(s) {
-            if !host.is_empty() {
-                return Ok(format!("{host}:{port}"));
-            }
-        }
-    }
-    if let Value::Object(Some(ia)) = ctx.get_field_by_name(sa, "addr") {
-        if let Value::Object(Some(s)) = ctx.get_field_by_name(ia, "hostName") {
-            if let Some(host) = ctx.read_string(s) {
-                if !host.is_empty() {
-                    return Ok(format!("{host}:{port}"));
-                }
-            }
-        }
-    }
-    // Fall back to synthetic 2-field layout.
-    if ctx.object_num_fields(sa) >= 2 {
-        if let Value::Object(Some(s)) = ctx.get_field(sa, 0) {
-            if let Some(host) = ctx.read_string(s) {
-                if !host.is_empty() {
-                    return Ok(format!("{host}:{port}"));
-                }
-            }
-        }
-    }
-    Err(ioex("connect: cannot decode SocketAddress"))
+    let (host, port) = crate::socket_channel::decode_socket_address(ctx, sa)?;
+    Ok(format!("{host}:{port}"))
 }
 
 fn aio_asc_connect(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {

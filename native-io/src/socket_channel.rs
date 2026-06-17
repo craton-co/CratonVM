@@ -448,7 +448,7 @@ fn read_blocking_flag(ctx: &dyn NativeContext, this: ObjectRef) -> bool {
 /// object. The synthetic layout is `(host:String, port:int)`. Real-JDK
 /// `InetSocketAddress` is more elaborate (has a holder), but we reach
 /// for `getHostString()` / `getPort()` via `get_field_by_name` first.
-fn decode_socket_address(
+pub(crate) fn decode_socket_address(
     ctx: &mut dyn NativeContext,
     sa: ObjectRef,
 ) -> Result<(String, u16), MethodCallFailed> {
@@ -1308,6 +1308,204 @@ fn sc_write(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
 }
 
 // ---------------------------------------------------------------------------
+// SocketChannel — vectored (gathering / scattering) I/O  [DF03]
+// ---------------------------------------------------------------------------
+//
+// `java.nio.channels.SocketChannel` declares the gathering `write(ByteBuffer[],
+// int, int)` and scattering `read(ByteBuffer[], int, int)` as ABSTRACT (it
+// inherits them from GatheringByteChannel / ScatteringByteChannel); the
+// concrete bodies live in `sun.nio.ch.SocketChannelImpl`. CratonVM's channel
+// objects are synthetic `java/nio/channels/SocketChannel` instances, so a
+// direct call to the three-arg form resolves to the abstract declaration (no
+// Code attribute) → AbstractMethodError. Tomcat's NIO write path uses the
+// gathering form for header+body flushes, so the websocket connector hit this
+// (DF03). We implement both by looping over the buffer slice and reusing the
+// same `TcpStream` + ByteBuffer plumbing as the scalar read/write natives.
+//
+// The single-arg final overloads `read(ByteBuffer[])` / `write(ByteBuffer[])`
+// delegate to these in the real JDK; we register the same handlers for them too
+// (detecting the 2-arg arity → offset 0, length = array length) so dispatch is
+// robust regardless of whether the final bytecode body is taken.
+
+/// Resolve the `(offset, length)` window for a vectored op, tolerating both the
+/// 3-arg `(srcs, offset, length)` and the convenience `(srcs)` arities, and
+/// clamping the result to a valid sub-range of an `arr_len`-element array.
+fn vec_window(args: &[Value], arr_len: i32) -> (i32, i32) {
+    let (offset, length) = if args.len() >= 4 {
+        (int_arg(args, 2), int_arg(args, 3))
+    } else {
+        (0, arr_len)
+    };
+    let start = offset.clamp(0, arr_len);
+    let end = offset.saturating_add(length).clamp(start, arr_len);
+    (start, end)
+}
+
+/// Gathering write: `write(ByteBuffer[] srcs, int offset, int length)` → long
+/// (and the `write(ByteBuffer[])` convenience form). Concatenates the readable
+/// region of each buffer in the slice, performs one non-blocking write, then
+/// advances each buffer's position by the number of its own bytes that were
+/// actually sent. Returns the total bytes written (0 on EAGAIN).
+fn sc_write_gathering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Err(ioex("write(gathering): null channel")),
+    };
+    let srcs = match obj_or_none(args, 1) {
+        Some(o) => o,
+        None => return Err(ioex("write(gathering): null buffer array")),
+    };
+    let id = read_reg_id(ctx, this)
+        .ok_or_else(|| ioex("write(gathering): channel not connected"))?;
+
+    // Collect each buffer's readable region (in order), keeping the buffer ref
+    // so we can advance its position by the bytes actually consumed.
+    let arr_len = ctx.array_length(srcs) as i32;
+    let (start, end) = vec_window(args, arr_len);
+    let mut chunks: Vec<(ObjectRef, Vec<u8>)> = Vec::new();
+    let mut total: usize = 0;
+    for i in start..end {
+        if let Value::Object(Some(bb)) = ctx.get_array_element(srcs, i as usize) {
+            let bytes = buffer_read_bytes(ctx, bb).unwrap_or_default();
+            total += bytes.len();
+            chunks.push((bb, bytes));
+        }
+    }
+    if total == 0 {
+        return Ok(Some(Value::Long(0)));
+    }
+    let mut data = Vec::with_capacity(total);
+    for (_, bytes) in &chunks {
+        data.extend_from_slice(bytes);
+    }
+
+    let n_opt = {
+        let map = tcp_registry().read();
+        match map.get(&id) {
+            Some(TcpHandle::Stream(s)) => {
+                try_write_nb(s, &data).map_err(|e| map_err("write(gathering)", e))?
+            }
+            Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Long(0))),
+            _ => return Err(ioex("write(gathering): channel not a stream")),
+        }
+    };
+    let n = match n_opt {
+        Some(v) => v,
+        None => return Ok(Some(Value::Long(0))), // EAGAIN — JDK convention
+    };
+    if n > 0 {
+        crate::net::socket_capture('w', id, &data[..n as usize]);
+        // Distribute the written count across the source buffers, advancing
+        // each position by the portion of its bytes that made it out.
+        let mut remaining = n;
+        for (bb, bytes) in &chunks {
+            if remaining <= 0 {
+                break;
+            }
+            let consume = (bytes.len() as i32).min(remaining);
+            buffer_advance(ctx, *bb, consume);
+            remaining -= consume;
+        }
+    }
+    Ok(Some(Value::Long(n as i64)))
+}
+
+/// Scattering read: `read(ByteBuffer[] dsts, int offset, int length)` → long
+/// (and the `read(ByteBuffer[])` convenience form). Reads up to the combined
+/// writable capacity of the slice in one non-blocking call, then scatters the
+/// bytes into the destination buffers in order. Returns the total bytes read,
+/// 0 on EAGAIN, or -1 on EOF.
+fn sc_read_scattering(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let this = match obj_or_none(args, 0) {
+        Some(o) => o,
+        None => return Err(ioex("read(scattering): null channel")),
+    };
+    let dsts = match obj_or_none(args, 1) {
+        Some(o) => o,
+        None => return Err(ioex("read(scattering): null buffer array")),
+    };
+    let id = read_reg_id(ctx, this)
+        .ok_or_else(|| ioex("read(scattering): channel not connected"))?;
+
+    // Sum the writable capacity across the buffer slice; remember each target
+    // so we can scatter the bytes back afterward (in array order).
+    let arr_len = ctx.array_length(dsts) as i32;
+    let (start, end) = vec_window(args, arr_len);
+    let mut targets: Vec<ObjectRef> = Vec::new();
+    let mut total: i64 = 0;
+    for i in start..end {
+        if let Value::Object(Some(bb)) = ctx.get_array_element(dsts, i as usize) {
+            let room = match buffer_access(ctx, bb) {
+                Some(BufferAccess::Direct { length, .. }) => length,
+                Some(BufferAccess::Heap { length, .. }) => length,
+                None => 0,
+            };
+            if room > 0 {
+                total += room as i64;
+                targets.push(bb);
+            }
+        }
+    }
+    if total <= 0 {
+        return Ok(Some(Value::Long(0)));
+    }
+    let cap = total.min(i32::MAX as i64) as usize;
+    let mut buf = vec![0u8; cap];
+
+    let n_opt = {
+        let map = tcp_registry().read();
+        match map.get(&id) {
+            Some(TcpHandle::Stream(s)) => {
+                try_read_nb(s, &mut buf).map_err(|e| map_err("read(scattering)", e))?
+            }
+            Some(TcpHandle::Connecting(_)) => return Ok(Some(Value::Long(0))),
+            _ => return Err(ioex("read(scattering): channel not a stream")),
+        }
+    };
+    let n = match n_opt {
+        Some(v) => v,
+        None => return Ok(Some(Value::Long(0))), // EAGAIN
+    };
+    if n < 0 {
+        return Ok(Some(Value::Long(-1))); // EOF
+    }
+    if n > 0 {
+        crate::net::socket_capture('r', id, &buf[..n as usize]);
+        // Scatter the bytes into the destination buffers in order; each call
+        // fills one buffer up to its remaining room, then we move to the next.
+        let mut consumed = 0usize;
+        for bb in &targets {
+            if consumed >= n as usize {
+                break;
+            }
+            let written = buffer_write_bytes(ctx, *bb, &buf[consumed..n as usize]);
+            if written <= 0 {
+                break;
+            }
+            buffer_advance(ctx, *bb, written);
+            consumed += written as usize;
+        }
+    }
+    Ok(Some(Value::Long(n as i64)))
+}
+
+// ---------------------------------------------------------------------------
+// SocketChannel — read-availability (FIONREAD), shared with sun/nio/ch/Net
+// ---------------------------------------------------------------------------
+
+/// Number of bytes readable without blocking on the channel backed by registry
+/// `id`, or `None` when the id is not a live stream. Lets `sun/nio/ch/Net`'s
+/// `available` native (net.rs) cover a SocketChannel-backed fd should one ever
+/// reach it; the primary path is the `net_sockets` registry.
+pub(crate) fn tcp_stream_available(id: i32) -> Option<i32> {
+    let map = tcp_registry().read();
+    match map.get(&id) {
+        Some(TcpHandle::Stream(s)) => crate::net::socket_available_stream(s),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SocketChannel — TCP options
 // ---------------------------------------------------------------------------
 
@@ -1588,6 +1786,15 @@ pub fn register_socket_channel_real(r: &mut NativeMethodRegistry) {
         r.register(c, "isOutputOpen", "()Z", sc_io_open);
         r.register(c, "read", "(Ljava/nio/ByteBuffer;)I", sc_read);
         r.register(c, "write", "(Ljava/nio/ByteBuffer;)I", sc_write);
+        // Vectored (scattering read / gathering write). Abstract on
+        // SocketChannel (inherited from Scattering/GatheringByteChannel); the
+        // synthetic channel object has no concrete body, so register both the
+        // 3-arg slice form and the 1-arg convenience form. Tomcat's websocket
+        // write path flushes header+body via the gathering form (DF03).
+        r.register(c, "read", "([Ljava/nio/ByteBuffer;II)J", sc_read_scattering);
+        r.register(c, "read", "([Ljava/nio/ByteBuffer;)J", sc_read_scattering);
+        r.register(c, "write", "([Ljava/nio/ByteBuffer;II)J", sc_write_gathering);
+        r.register(c, "write", "([Ljava/nio/ByteBuffer;)J", sc_write_gathering);
         r.register(
             c,
             "setOption",
