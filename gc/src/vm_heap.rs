@@ -241,6 +241,22 @@ impl VmHeap {
         }
     }
 
+    /// Fallible twin of [`alloc_array`](Self::alloc_array): same (no-GC)
+    /// allocation path, but returns `None` on true heap exhaustion instead of
+    /// aborting the VM. Lets native callers (e.g. `ArrayList(int)`) raise a
+    /// catchable `OutOfMemoryError` for an over-large backing array.
+    pub fn try_alloc_array_full(
+        &self,
+        class_id: ClassId,
+        element_type: ArrayElementType,
+        length: usize,
+    ) -> Option<ObjectRef> {
+        match self {
+            VmHeap::Generational(h) => h.try_alloc_array_full(class_id, element_type, length),
+            VmHeap::G1(h) => h.try_alloc_array(class_id, element_type, length),
+        }
+    }
+
     /// DBG (bc math-ec `0x4`): scan young from-space for the first `0x4` seed
     /// slot. See [`GenerationalHeap::dbg_first_young_small_ref`]. G1 unsupported.
     pub fn dbg_first_young_small_ref(&self) -> Option<(usize, u32, usize, usize, u64)> {

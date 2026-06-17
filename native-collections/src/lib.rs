@@ -347,6 +347,28 @@ fn alloc_ref_array(ctx: &mut dyn NativeContext, length: usize) -> ObjectRef {
     ctx.new_ref_array(ClassId::new(0), length)
 }
 
+/// Allocate a hash-map bucket table of `cap` entries, **capping the eager
+/// allocation to what the heap can hold**, and return `(table, actual_cap)`.
+///
+/// HotSpot allocates the `HashMap`/`LinkedHashMap` table lazily on the first
+/// insert, so `new HashMap(Integer.MAX_VALUE)` never allocates and never
+/// throws. CratonVM's synthetic map allocates the bucket array eagerly in the
+/// constructor, so an over-large `cap` (`tableSizeFor` caps at `1<<30` ⇒ ~8 GiB
+/// of `Object[]`) would hit the panicking allocator and abort the VM. When the
+/// requested table doesn't fit we start from the default and let the map grow
+/// on demand — matching HotSpot's "constructor succeeds, no throw". The caller
+/// must use the returned `actual_cap` for `__capacity`/`threshold` so they stay
+/// consistent with the real table length.
+fn alloc_bucket_table(ctx: &mut dyn NativeContext, cap: usize) -> (ObjectRef, usize) {
+    match ctx.try_new_ref_array(ClassId::new(0), cap) {
+        Some(table) => (table, cap),
+        None => {
+            let small = MAP_DEFAULT_CAPACITY;
+            (alloc_ref_array(ctx, small), small)
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-segment resize lock (Bug 1+2 CRIT correctness fix, round-10)
 // ---------------------------------------------------------------------------
@@ -1099,12 +1121,35 @@ fn native_al_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
-    const AL_MAX_INIT_CAPACITY: usize = 1 << 30;
-    let cap = match args.get(1) {
-        Some(Value::Int(c)) => std::cmp::min(std::cmp::max(*c, 0) as usize, AL_MAX_INIT_CAPACITY),
-        _ => AL_DEFAULT_CAPACITY,
+    // JDK `ArrayList(int initialCapacity)`: a negative capacity throws
+    // IllegalArgumentException; otherwise the backing `Object[initialCapacity]`
+    // is allocated eagerly.
+    let cap_i = match args.get(1) {
+        Some(Value::Int(c)) => *c,
+        _ => AL_DEFAULT_CAPACITY as i32,
     };
-    let buf = alloc_ref_array(ctx, cap);
+    if cap_i < 0 {
+        return Err(cratonvm_types::error::RuntimeError::IllegalArgumentException {
+            message: format!("Illegal Capacity: {cap_i}"),
+        }
+        .into());
+    }
+    let cap = cap_i as usize;
+    // Match HotSpot: when `Object[cap]` is too large for the heap, throw a
+    // *catchable* OutOfMemoryError ("Requested array size exceeds VM limit")
+    // rather than aborting the whole VM. The previous code clamped `cap` to
+    // 1<<30 and then hard-aborted in the panicking allocator on the resulting
+    // ~8 GiB request (e.g. `new ArrayList(Integer.MAX_VALUE)` in SpEL's
+    // ArrayConstructorTests — see the spring crash report).
+    let buf = match ctx.try_new_ref_array(ClassId::new(0), cap) {
+        Some(b) => b,
+        None => {
+            return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
+                message: "Requested array size exceeds VM limit".to_string(),
+            }
+            .into());
+        }
+    };
     al_set_data(ctx, this, buf);
     al_set_size(ctx, this, 0);
     Ok(None)
@@ -3029,7 +3074,11 @@ fn native_map_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Meth
     };
     // S111r28: same legacy synthetic layout as `native_map_init`. See the
     // longer comment there for the rationale.
-    let buckets = alloc_ref_array(ctx, cap);
+    // Cap the eager bucket-table allocation to what the heap can hold (HotSpot
+    // sizes the table lazily, so `new HashMap(Integer.MAX_VALUE)` must not
+    // abort); `cap` is rebound to the actually-allocated size so the JDK
+    // `threshold`/`__capacity` fields below stay consistent with the table.
+    let (buckets, cap) = alloc_bucket_table(ctx, cap);
     ctx.set_field(this, MAP_FIELD_BUCKETS, Value::Object(Some(buckets)));
     set_map_size(ctx, this, 0);
     // S111r29: see `native_map_init` for rationale. Mirror the bucket array
@@ -14876,7 +14925,10 @@ fn lhm_init_with_cap(ctx: &mut dyn NativeContext, this: ObjectRef, cap: usize) {
     // so that the GC-stable key is established at init time — see
     // `identity_hash::seed`.
     ih_seed(ctx, this);
-    let buckets = alloc_ref_array(ctx, cap);
+    // Cap the eager bucket-table allocation to what the heap can hold (see
+    // `alloc_bucket_table`); `cap` is rebound to the actual table length so
+    // `__capacity`/`threshold` stay consistent and the map grows on demand.
+    let (buckets, cap) = alloc_bucket_table(ctx, cap);
     lhm_set(ctx, this, "table", LHM_FIELD_BUCKETS, Value::Object(Some(buckets)));
     lhm_set(ctx, this, "size", LHM_FIELD_SIZE, Value::Int(0));
     lhm_set(ctx, this, "__capacity", LHM_FIELD_CAPACITY, Value::Int(cap as i32));
@@ -15609,7 +15661,17 @@ fn native_ad_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(c)) => std::cmp::max(*c, 1) as usize,
         _ => AD_DEFAULT_CAPACITY,
     };
-    let buf = alloc_ref_array(ctx, cap);
+    // HotSpot throws a catchable OutOfMemoryError for an over-large element
+    // array rather than aborting; mirror that instead of the panicking alloc.
+    let buf = match ctx.try_new_ref_array(ClassId::new(0), cap) {
+        Some(b) => b,
+        None => {
+            return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
+                message: "Requested array size exceeds VM limit".to_string(),
+            }
+            .into());
+        }
+    };
     ctx.set_field(this, AD_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, AD_FIELD_HEAD, Value::Int(0));
     ctx.set_field(this, AD_FIELD_TAIL, Value::Int(0));
@@ -16138,15 +16200,22 @@ fn pq_compare(
             _ => 0,
         });
     }
-    // Natural ordering: compare by string value, int, long, float, double
+    // Natural ordering. PriorityQueue elements are virtually always *boxed*
+    // (`pq.add(5)` stores an `Integer`, not a primitive), so dispatch the
+    // element's real `Comparable.compareTo` — exactly what HotSpot's
+    // `PriorityQueue.siftUpComparable` does. This handles `Integer`/`Long`/
+    // `Double`/`String`/... and any user `Comparable` uniformly. (The earlier
+    // code only knew `read_string` + raw primitives, so two boxed `Integer`s
+    // compared "equal" (0) and the heap never ordered — `5 2 9 3 1`.)
+    if let Value::Object(Some(oa)) = a {
+        let result = ctx.invoke_virtual(*oa, "compareTo", "(Ljava/lang/Object;)I", &[*b])?;
+        return Ok(match result {
+            Some(Value::Int(v)) => v,
+            _ => 0,
+        });
+    }
+    // Primitive fallback (rare — PQ normally holds boxed objects).
     Ok(match (a, b) {
-        (Value::Object(Some(oa)), Value::Object(Some(ob))) => {
-            if let (Some(sa), Some(sb)) = (ctx.read_string(*oa), ctx.read_string(*ob)) {
-                sa.cmp(&sb) as i32
-            } else {
-                0
-            }
-        }
         (Value::Int(a), Value::Int(b)) => a.cmp(b) as i32,
         (Value::Long(a), Value::Long(b)) => a.cmp(b) as i32,
         (Value::Float(a), Value::Float(b)) => a.partial_cmp(b).map_or(0, |o| o as i32),
@@ -16259,7 +16328,17 @@ fn native_pq_init_capacity(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
         Some(Value::Int(c)) => std::cmp::max(*c, 1) as usize,
         _ => PQ_DEFAULT_CAPACITY,
     };
-    let buf = alloc_ref_array(ctx, cap);
+    // HotSpot throws a catchable OutOfMemoryError for an over-large element
+    // array rather than aborting; mirror that instead of the panicking alloc.
+    let buf = match ctx.try_new_ref_array(ClassId::new(0), cap) {
+        Some(b) => b,
+        None => {
+            return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
+                message: "Requested array size exceeds VM limit".to_string(),
+            }
+            .into());
+        }
+    };
     ctx.set_field(this, PQ_FIELD_DATA, Value::Object(Some(buf)));
     ctx.set_field(this, PQ_FIELD_SIZE, Value::Int(0));
     ctx.set_field(this, PQ_FIELD_COMPARATOR, Value::Object(None));
