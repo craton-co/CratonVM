@@ -227,15 +227,30 @@ fn native_fd_size0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallRes
 }
 
 /// `seek0(FileDescriptor, long pos) -> long` — returns new position.
+///
+/// JDK `FileDispatcherImpl.seek0` sentinel: a **negative** offset means "return
+/// the current position without seeking" (used by `FileChannelImpl.position()`,
+/// which calls `nd.seek(fd, -1)`). CratonVM previously did
+/// `SeekFrom::Start(pos as u64)` unconditionally, so `seek0(fd, -1)` became
+/// `Start(u64::MAX)` → on Windows a FILE_BEGIN offset > i64::MAX is a negative
+/// seek → `IOException: seek0: …before beginning of file (os error 131)`. That
+/// broke every `FileChannelImpl.position()`/relative `read(ByteBuffer)` — e.g.
+/// commons-compress's `ZipFile.positionAtEndOfCentralDirectoryRecord` (Spring
+/// Boot buildpack `ZipFileTarArchive`).
 fn native_fd_seek0(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let fd_obj = fd_arg(args, 0)?;
     let pos = long_arg(args, 1);
     let Some(fd) = fd_from_descriptor(ctx, fd_obj) else {
         return Err(io_error("seek0: FileDescriptor has no open handle"));
     };
+    let seek = if pos < 0 {
+        std::io::SeekFrom::Current(0) // query current position, no seek
+    } else {
+        std::io::SeekFrom::Start(pos as u64)
+    };
     let new_pos = ctx
         .fd_table()
-        .rw_seek(fd, std::io::SeekFrom::Start(pos as u64))
+        .rw_seek(fd, seek)
         .map_err(|e| io_error(format!("seek0: {e}")))?;
     Ok(Some(Value::Long(new_pos as i64)))
 }

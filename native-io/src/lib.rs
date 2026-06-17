@@ -8489,14 +8489,25 @@ fn native_files_is_writable(_ctx: &mut dyn NativeContext, args: &[Value]) -> Met
 // Phase 36: I/O extras — RandomAccessFile, CharArrayReader/Writer
 // ===========================================================================
 
-/// Diagnostic gate: when `CRATONVM_REAL_RAF=1`, the synthetic
-/// `java.io.RandomAccessFile` natives are NOT registered, so RAF runs its real
-/// JDK bytecode. Read once and cached. See `register_io_extras_natives`.
+/// Gate: when real-RAF is enabled the synthetic `java.io.RandomAccessFile`
+/// natives are NOT registered, so RAF runs its real JDK bytecode (real ctor →
+/// `new FileDescriptor(); open0(...)` + the open0/read0/seek0/length0 platform
+/// primitives). Read once and cached. See `register_io_extras_natives`.
+///
+/// Real-RAF is now the DEFAULT. The synthetic RAF path is broken: two synthetic
+/// implementations (this crate's `register_io_extras_natives` and
+/// native-builtins `register_phase57_random_access_file`) both register RAF
+/// methods and their handle models conflict, leaving `this.fd` null →
+/// `length()`=0, `read()`=-1, and commons-compress's seek-from-EOF computes a
+/// negative offset ("seek before beginning of file"). The SEGV/Cleaner crashes
+/// that originally justified gating real-RAF behind opt-in are FIXED (see
+/// docs/internal/app-jvm-bugs/real-raf-segv-root-cause.md, 2026-06-02). Opt back
+/// into the (broken) synthetic path with `CRATONVM_SYNTHETIC_RAF=1`.
 pub(crate) fn real_raf_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
     *FLAG.get_or_init(|| {
-        std::env::var("CRATONVM_REAL_RAF").as_deref() == Ok("1")
+        std::env::var("CRATONVM_SYNTHETIC_RAF").as_deref() != Ok("1")
     })
 }
 

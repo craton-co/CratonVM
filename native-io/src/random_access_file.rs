@@ -223,13 +223,29 @@ fn read_handle(ctx: &dyn NativeContext, this: ObjectRef) -> Option<i64> {
 }
 
 fn write_handle(ctx: &mut dyn NativeContext, this: ObjectRef, handle: i64) {
-    if let Some(fd_obj) = raf_fd_object(ctx, this) {
-        // Store the same id in both slots so code looking at either
-        // gets a consistent value.  JDK's RandomAccessFile close path
-        // checks `fd.fd != -1`.
-        ctx.set_field_by_name(fd_obj, "fd", Value::Int(handle as i32));
-        ctx.set_field_by_name(fd_obj, "handle", Value::Long(handle));
-    }
+    // Real `RandomAccessFile.<init>` sets `this.fd = new FileDescriptor()` before
+    // calling open0, but on CratonVM that constructor field-initializer does not
+    // always land — `this.fd` reads back null (same class of issue as
+    // java.net.Socket's null `socketLock`). With no FileDescriptor there is
+    // nowhere to record the open handle, so `read_handle` returns None and every
+    // length/read/seek behaves as a closed/empty file: `length()`=0, `read()`=-1,
+    // and commons-compress's seek-from-EOF computes a negative offset
+    // ("seek before beginning of file"). Create the FileDescriptor on demand.
+    let fd_obj = match raf_fd_object(ctx, this) {
+        Some(o) => o,
+        None => match ctx.new_object("java/io/FileDescriptor") {
+            Ok(Some(Value::Object(Some(fd)))) => {
+                ctx.set_field_by_name(this, "fd", Value::Object(Some(fd)));
+                fd
+            }
+            _ => return,
+        },
+    };
+    // Store the same id in both slots so code looking at either
+    // gets a consistent value.  JDK's RandomAccessFile close path
+    // checks `fd.fd != -1`.
+    ctx.set_field_by_name(fd_obj, "fd", Value::Int(handle as i32));
+    ctx.set_field_by_name(fd_obj, "handle", Value::Long(handle));
 }
 
 fn clear_handle(ctx: &mut dyn NativeContext, this: ObjectRef) {

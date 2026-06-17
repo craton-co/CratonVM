@@ -3724,11 +3724,15 @@ pub(crate) fn register_phase57_natives(registry: &mut NativeMethodRegistry) {
     register_phase57_nio_file(registry);
     register_phase57_process(registry);
     register_phase57_text(registry);
-    // DIAGNOSTIC GATE (CRATONVM_REAL_RAF=1): skip the high-level RAF natives so
-    // RandomAccessFile runs real JDK bytecode (mirrors the native-io gate in
-    // `register_io_extras_natives`). Both must be skipped together — either one
-    // shadows the real ctor via native-override priority.
-    if std::env::var("CRATONVM_REAL_RAF").as_deref() != Ok("1") {
+    // Real-RAF is now the DEFAULT (mirrors the native-io gate in
+    // `register_io_extras_natives`). The high-level synthetic RAF natives are
+    // skipped so RandomAccessFile runs real JDK bytecode + the open0/read0/seek0/
+    // length0 primitives; the two synthetic impls otherwise conflict and leave
+    // `this.fd` null (length()=0/read()=-1). Both crates must skip together — each
+    // shadows the real ctor via native-override priority. Opt back into synthetic
+    // with CRATONVM_SYNTHETIC_RAF=1. (SEGV/Cleaner crashes that once gated this are
+    // fixed: docs/internal/app-jvm-bugs/real-raf-segv-root-cause.md.)
+    if std::env::var("CRATONVM_SYNTHETIC_RAF").as_deref() == Ok("1") {
         register_phase57_random_access_file(registry);
     }
     register_phase57_file(registry);
@@ -15902,10 +15906,22 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(ft, "toString", "()Ljava/lang/String;", |ctx, args| {
+        // Real FileTime.toString is the ISO-8601 instant (was "{millis}ms").
         let this = obj_arg(args, 0)?;
         let millis = filetime_read_millis(ctx, this);
-        let s = ctx.create_string(&format!("{millis}ms"));
-        Ok(Some(Value::Object(Some(s))))
+        let inst = match ctx.invoke(
+            "java/time/Instant",
+            "ofEpochMilli",
+            "(J)Ljava/time/Instant;",
+            &[Value::Long(millis)],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                let s = ctx.create_string("");
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        };
+        ctx.invoke_virtual(inst, "toString", "()Ljava/lang/String;", &[])
     });
 
     // Files.readAttributes
@@ -15946,6 +15962,21 @@ pub(crate) fn register_p59_file_attributes(r: &mut NativeMethodRegistry) {
 fn filetime_alloc(ctx: &mut dyn NativeContext, millis: i64) -> ObjectRef {
     let ft = alloc_concurrent_synthetic(ctx, "java/nio/file/attribute/FileTime", 1);
     ctx.set_field_by_name(ft, "value", Value::Long(millis));
+    // Set the real `unit` field to TimeUnit.MILLISECONDS. The raw-alloc path
+    // skips FileTime's constructor, so `unit` and the cached `instant` are both
+    // null. Real FileTime bytecode that has no native override — notably
+    // `to(TimeUnit)` (commons-compress's `FileTimes.toUnixTime` → tar entry
+    // mtime) — branches on `unit`: when null it dereferences the (null)
+    // `instant`, NPEing on `instant.getEpochSecond()`. With `unit` set, all the
+    // real value+unit math works (to/toMillis/toInstant/compareTo).
+    if let Ok(tu_cid) = ctx.ensure_class_initialized("java/util/concurrent/TimeUnit") {
+        if let Some(idx) = ctx.static_field_index_by_name(tu_cid, "MILLISECONDS") {
+            let ms = ctx.get_static_field(tu_cid, idx);
+            if matches!(ms, Value::Object(Some(_))) {
+                ctx.set_field_by_name(ft, "unit", ms);
+            }
+        }
+    }
     // Only fall back to slot 0 when the real `value` field is absent
     // (synthetic-jdk stub) — touching slot 0 of a real FileTime would clobber
     // a reference cache field.
@@ -34786,7 +34817,18 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
                 Some(Value::Long(v)) => *v,
                 _ => 0,
             };
-            let obj = filetime_alloc(ctx, val);
+            // Honor the TimeUnit (was ignored → SECONDS/etc. stored as raw
+            // millis → wrong dates). Convert to millis via unit.toMillis(val).
+            let millis = match args.get(1) {
+                Some(Value::Object(Some(unit))) => {
+                    match ctx.invoke_virtual(*unit, "toMillis", "(J)J", &[Value::Long(val)])? {
+                        Some(Value::Long(m)) => m,
+                        _ => val,
+                    }
+                }
+                _ => val,
+            };
+            let obj = filetime_alloc(ctx, millis);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -34794,8 +34836,25 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
         ft,
         "from",
         "(Ljava/time/Instant;)Ljava/nio/file/attribute/FileTime;",
-        |ctx, _args| {
-            let obj = filetime_alloc(ctx, 0);
+        |ctx, args| {
+            // Preserve the Instant's value (was dropped → stored 0, so every
+            // FileTime.from(Instant) round-tripped to epoch 0). Read the real
+            // java.time.Instant's named fields (seconds/nanos).
+            let millis = match args.first() {
+                Some(Value::Object(Some(inst))) => {
+                    let secs = match ctx.get_field_by_name(*inst, "seconds") {
+                        Value::Long(v) => v,
+                        _ => 0,
+                    };
+                    let nanos = match ctx.get_field_by_name(*inst, "nanos") {
+                        Value::Int(v) => v,
+                        _ => 0,
+                    };
+                    secs.saturating_mul(1000) + (nanos as i64) / 1_000_000
+                }
+                _ => 0,
+            };
+            let obj = filetime_alloc(ctx, millis);
             Ok(Some(Value::Object(Some(obj))))
         },
     );
@@ -34803,8 +34862,18 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
         let this = obj_arg(args, 0)?;
         Ok(Some(Value::Long(filetime_read_millis(ctx, this))))
     });
-    r.register(ft, "toInstant", "()Ljava/time/Instant;", |_ctx, _args| {
-        Ok(Some(Value::Object(None)))
+    r.register(ft, "toInstant", "()Ljava/time/Instant;", |ctx, args| {
+        // Was hardcoded to null → every `FileTime.toInstant().getEpochSecond()`
+        // NPE'd (Spring Boot buildpack tar-layer timestamps). Build a real
+        // java.time.Instant from the stored millis via its real factory.
+        let this = obj_arg(args, 0)?;
+        let millis = filetime_read_millis(ctx, this);
+        ctx.invoke(
+            "java/time/Instant",
+            "ofEpochMilli",
+            "(J)Ljava/time/Instant;",
+            &[Value::Long(millis)],
+        )
     });
     r.register(
         ft,
@@ -34822,10 +34891,22 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
         },
     );
     r.register(ft, "toString", "()Ljava/lang/String;", |ctx, args| {
+        // Was "{millis}ms"; real FileTime.toString is the ISO-8601 instant.
         let this = obj_arg(args, 0)?;
         let millis = filetime_read_millis(ctx, this);
-        let s = ctx.create_string(&format!("{}ms", millis));
-        Ok(Some(Value::Object(Some(s))))
+        let inst = match ctx.invoke(
+            "java/time/Instant",
+            "ofEpochMilli",
+            "(J)Ljava/time/Instant;",
+            &[Value::Long(millis)],
+        )? {
+            Some(Value::Object(Some(o))) => o,
+            _ => {
+                let s = ctx.create_string("");
+                return Ok(Some(Value::Object(Some(s))));
+            }
+        };
+        ctx.invoke_virtual(inst, "toString", "()Ljava/lang/String;", &[])
     });
 
     // PosixFilePermission enum
