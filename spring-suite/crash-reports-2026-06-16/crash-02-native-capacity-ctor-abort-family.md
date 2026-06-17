@@ -8,8 +8,8 @@
 | **CratonVM** | ABEND — `FATAL: OutOfMemoryError: young gen exhausted — tried to allocate … bytes`, then `abort()` |
 | **HotSpot JDK 25** | maps: **no throw** (working empty map, lazy table); deque/PQ/StringBuilder: catchable `OutOfMemoryError` |
 | **CratonVM HEAD** | `0e3f0398` (current dev) |
-| **Status** | **OPEN** — sibling of crash-01; plumbing to fix is already in place |
-| **Suggested owner** | me (quick subset) + 1 slightly larger map fix (me or handoff) |
+| **Status** | **FIXED** on `fix/oom-array-alloc-abend` (`da58ff4e`) — verified vs HotSpot |
+| **Suggested owner** | **me (fixed)** |
 
 ## Symptom — measured (CratonVM `fix/oom-array-alloc-abend` build, each ctor with `Integer.MAX_VALUE`)
 | Constructor | CratonVM | bytes it tried to allocate | HotSpot JDK 25 |
@@ -59,6 +59,27 @@ The fallible `NativeContext::try_new_ref_array` added for crash-01 already suppl
    sane bound (or defer allocation to first insert) and grow on demand. This is a behavioral change to
    the map-init path (slightly larger than 1–2; do NOT simply throw OOME here — that would diverge
    from HotSpot, which succeeds).
+
+## Verified (FamFix.java — CratonVM vs HotSpot JDK 25)
+```
+== huge capacity (Integer.MAX_VALUE) — CratonVM now == HotSpot ==
+HashMap(M)/HashSet(M)/LinkedHashMap(M): NO THROW (working empty map)   [HotSpot: NO THROW]
+ArrayDeque(M)/PriorityQueue(M)/StringBuilder(M): OutOfMemoryError      [HotSpot: OutOfMemoryError]
+== normal usage — no regression ==
+HashMap(16)+100puts: size=100 get(50)=2500 get(99)=9801
+HashMap(M)+1000puts: size=1000 ...           (capped table grew on demand; HotSpot OOMs on 1st put)
+LinkedHashMap insertion order: [c, a, b]
+HashSet(32): size=50 contains(25)=true
+ArrayDeque(4)+10: size=10 ...   PriorityQueue/StringBuilder: ok
+```
+All six aborts eliminated. Maps match HotSpot's "ctor succeeds, no throw" (CratonVM is in fact more
+lenient on a later `put` to a huge-capacity map, where HotSpot OOMs on the deferred table alloc —
+acceptable; it never aborts).
+
+> Side-finding (separate, **pre-existing**, NOT a crash): CratonVM's native `PriorityQueue.poll()`
+> does **not** return min-heap order (`add 5,1,3,9,2` → polls `5 2 9 3 1`; HotSpot `1 2 3 5 9`).
+> Identical on baseline `8e8e47d9`, so unrelated to this fix. Tracked separately (correctness, not
+> in this crash/hang run's scope).
 
 ## Notes
 - **Severity in practice:** low likelihood of organic occurrence in the Spring suite — real framework

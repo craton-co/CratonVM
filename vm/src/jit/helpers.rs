@@ -1998,6 +1998,48 @@ pub unsafe extern "C" fn jit_getstatic(vm_ptr: i64, class_id_raw: i64, field_ind
     // SAFETY: vm_ptr originates from JIT code that received it from the interpreter's SharedVm reference.
     let vm = &*(vm_ptr as *const SharedVm);
     let class_id = ClassId::new(class_id_raw as u32);
+
+    // Bootstrap intercept: mirror the interpreter's System.out/err/in intercept.
+    // The real JDK System.<clinit> isn't fully bootable; the interpreter returns
+    // pre-built synthetic streams for these three fields. The JIT must do the same,
+    // or jit_getstatic falls through to get_static_shared → Object(None) → null
+    // receiver → println silently no-ops (arg0=0x0 in jit_invoke_dispatch).
+    let field_name = vm.class_manager.read().get_class(class_id).and_then(|c| {
+        if &*c.name == "java/lang/System" {
+            c.fields.get(field_index as usize).map(|f| f.name.to_string())
+        } else {
+            None
+        }
+    });
+    if let Some(ref fname) = field_name {
+        if fname == "out" || fname == "err" {
+            // Honor System.setOut/setErr: if the static field was explicitly set
+            // (via setOut0/setErr0), use that value; otherwise fall back to the
+            // canonical synthetic stream (same logic as the interpreter intercept).
+            let overridden = match crate::vm::get_static_shared(vm, class_id, field_index as usize) {
+                Value::Object(Some(s)) => Some(s),
+                _ => None,
+            };
+            let stream = match overridden {
+                Some(s) => s,
+                None => {
+                    let (out, err) = vm.ensure_system_streams();
+                    if fname == "out" { out } else { err }
+                }
+            };
+            return stream.as_ptr() as i64;
+        } else if fname == "in" {
+            // System.in: same pattern — use the pre-built InputStream object.
+            // `ensure_system_stdin_object` requires a mutable JvmThread which we
+            // don't have here; fall back to the static field (set during init).
+            let val = crate::vm::get_static_shared(vm, class_id, field_index as usize);
+            return match val {
+                Value::Object(Some(r)) => r.as_ptr() as i64,
+                _ => 0,
+            };
+        }
+    }
+
     let val = crate::vm::get_static_shared(vm, class_id, field_index as usize);
     match val {
         Value::Int(i) => i as i64,
