@@ -111,12 +111,33 @@ pub fn intrinsics_disabled() -> bool {
     })
 }
 
-// Opt-in: cache the per-native-call GC root snapshot's *frozen* lower frames
-// and re-scan only the churning top, keyed by per-frame `seq` + GC generation.
-// Default-OFF — it touches the GC root-publication path; correctness rests on
-// the LIFO stack discipline (a frame still present at index k with unchanged
-// seq proves [0..k) stayed continuously frozen). See `update_root_snapshot`.
-cached_is_set!(rootsnap_cache, "CRATONVM_ROOTSNAP_CACHE");
+// Cache the per-native-call GC root snapshot's *frozen* lower frames and
+// re-scan only the churning top, keyed by per-frame `seq` + GC generation.
+// Correctness rests on the LIFO stack discipline (a frame still present at
+// index k with unchanged seq proves [0..k) stayed continuously frozen). See
+// `update_root_snapshot`.
+//
+// DEFAULT-ON as of 2026-06-16 (SpringRepositoriesExtension hang). Previously
+// default-OFF: `update_root_snapshot` rescans EVERY interpreter frame on every
+// object-returning native call, so a native-call-heavy hot loop running at a
+// deep stack (Groovy compile under JUnit at depth ~46) pays O(stack-depth) per
+// call and hangs (>300s). Measured: parse#0 depth-40 95s→42s with the cache;
+// the real test goes from a 300s-timeout hang to completing. The cached path is
+// byte-identical to the default path in the default config (`conservative_locals`
+// off); `update_root_snapshot` falls back to the default path when the Fork6
+// `conservative_locals` hardening is engaged. Validated: bt16=14985902,
+// bt18=68332206 (== golden, with vs without). Off-switch for diagnosis/bisection:
+// `CRATONVM_ROOTSNAP_CACHE=0`.
+#[inline]
+pub fn rootsnap_cache() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_ROOTSNAP_CACHE") {
+        // Explicit opt-out only: `0` / `false` disable; unset or any other
+        // value (incl. `1`, empty) enables.
+        Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+        Err(_) => true,
+    })
+}
 
 // Opt-in: skip the SECOND, redundant `update_root_snapshot` that
 // `native_return_pushed_to_stack` runs after pushing a native's return value
@@ -130,12 +151,23 @@ cached_is_set!(rootsnap_cache, "CRATONVM_ROOTSNAP_CACHE");
 // waits for the thread to refresh at the barrier. Dropping the rebuild halves
 // `update_root_snapshot` frequency on the hot reflective-deploy path (bug 04:
 // `update_root_snapshot` is ~68% of an embedded-server deploy). Default-OFF: it
-// touches GC root publication; verify with the bt18 checksum oracle (68332206)
-// before enabling. See `native_return_pushed_to_stack`.
-cached_is_set!(
-    skip_redundant_native_snapshot,
-    "CRATONVM_SKIP_REDUNDANT_NATIVE_SNAPSHOT"
-);
+// touches GC root publication; verified with the bt18 checksum oracle (68332206).
+// See `native_return_pushed_to_stack`.
+//
+// DEFAULT-ON as of 2026-06-16 (SpringRepositoriesExtension hang) — halves
+// `update_root_snapshot` frequency on every object-returning native call.
+// Validated: bt16=14985902, bt18=68332206 (== golden, with vs without).
+// Off-switch: `CRATONVM_SKIP_REDUNDANT_NATIVE_SNAPSHOT=0`.
+#[inline]
+pub fn skip_redundant_native_snapshot() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(
+        || match std::env::var("CRATONVM_SKIP_REDUNDANT_NATIVE_SNAPSHOT") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
+}
 
 // Opt-in: keep the `rootsnap_cache` frozen-frame cache valid ACROSS a GC by
 // remapping its cached roots through the collection's `pointer_map`, instead of
@@ -149,12 +181,25 @@ cached_is_set!(
 // sites, so any GC path that relocates this thread WITHOUT remapping leaves the
 // gen stale → the gate rebuilds (a stale cached address is never trusted).
 // Requires `rootsnap_cache` (else `rs_cache` is always empty → no-op).
-// Default-OFF: verify with the bt18 checksum oracle (68332206) before enabling.
 // See `update_root_snapshot` and `remap_rs_cache_after_gc`.
-cached_is_set!(
-    rootsnap_cache_survive_gc,
-    "CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC"
-);
+//
+// DEFAULT-ON as of 2026-06-16 (SpringRepositoriesExtension hang). Essential for
+// the hang fix: under allocation-heavy compile the plain gen gate rebuilds the
+// cache on nearly every collection (selective-promote relocates young→old), so
+// without survive-GC the cache only gets past `<clinit>` and the test still
+// times out. Fail-safe by construction (a missed remap site only costs a rebuild,
+// never correctness). Validated: bt16=14985902, bt18=68332206 (== golden, with vs
+// without). Off-switch: `CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC=0`.
+#[inline]
+pub fn rootsnap_cache_survive_gc() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(
+        || match std::env::var("CRATONVM_ROOTSNAP_CACHE_SURVIVE_GC") {
+            Ok(v) => v != "0" && !v.eq_ignore_ascii_case("false"),
+            Err(_) => true,
+        },
+    )
+}
 
 cached_is_set!(jit_dispatch_dbg, "CRATONVM_DBG_JIT_DISPATCH");
 // Opt-in: enable small-method inlining in the main JIT tier-up compile path.

@@ -1449,8 +1449,16 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
     let mut snapshot = snap_arc.lock();
     snapshot.clear();
 
-    if crate::runtime::env_cache::rootsnap_cache() {
-        // ── Opt-in cached path ──────────────────────────────────────────────
+    // The frozen-frame cache yields to the default path when the Fork6
+    // multi-thread `conservative_locals` hardening is engaged: the cached
+    // `scan_frame_roots` omits `scan_locals_conservative`, so caching under it
+    // could drop a parked worker's lost-tag local from the snapshot. This flag
+    // is off in the default config (only the opt-in CRATONVM_REAL_FORKJOINPOOL
+    // gate turns it on), so the cache still engages for the deep-stack
+    // native-heavy workloads it fixes.
+    let conservative_locals = crate::memory::roots::conservative_locals_enabled();
+    if crate::runtime::env_cache::rootsnap_cache() && !conservative_locals {
+        // ── Frozen-frame cached path ────────────────────────────────────────
         // Reuse the cached roots of the deep, continuously-frozen frames and
         // re-scan only the churning top. Correctness rests on the LIFO stack
         // discipline: if `frames[k]` is still the SAME instance (`seq`
@@ -1507,7 +1515,8 @@ pub(crate) fn update_root_snapshot(shared: &SharedVm, thread: &mut JvmThread) {
         // `roots::conservative_locals_enabled`. Capture lost-tag object refs in
         // THIS thread's frame locals so a parked/running worker (or main)
         // publishes them, pinning them against selective-promotion evacuation.
-        let conservative_locals = crate::memory::roots::conservative_locals_enabled();
+        // (`conservative_locals` was computed above, where it also gates the
+        // cached path off so this hardening is never skipped.)
         for frame in &thread.frames {
             frame.scan_local_objects(&mut snapshot, &shared.heap);
             if conservative_locals {
