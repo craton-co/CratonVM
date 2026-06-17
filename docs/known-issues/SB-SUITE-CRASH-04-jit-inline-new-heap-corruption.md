@@ -53,6 +53,28 @@ the [ReflRepro/A2 handoff](reflrepro-register-resident-jit-root-handoff.md) call
 for; the reload fix above is a prerequisite (without it the mechanism SIGSEGVs
 before coverage can matter).
 
+**Residual nailed down further (post-fix `sdbg.exe`, no-build probes):**
+- `CRATONVM_DBG_SWEEP_EDGES` on the residual reclaim: `root=0 young-survivor=0
+  old-gen=0 ⇒ case (a) register/native root gap` — confirmed register/native, not a
+  heap/card edge.
+- It is a **true register root**, not an above-`entry_sp` stack root:
+  `shadow + CRATONVM_DBG_FULLSTACK_SCAN` and `+ CRATONVM_NO_JIT_SCAN_CACHE` (and
+  both together) **still reclaim**. So no stack scan can see it — only a shadow
+  push can. (This is *stronger* than the ReflRepro/A2 case, where a full-stack
+  scan removed the crash; here the root is purely register-resident.)
+- `CRATONVM_JIT_DISABLE_INLINE_NEW` does **not** fix it → not specific to the
+  inline-TLAB alloc safepoint.
+- **`CRATONVM_DBG_SHADOW_DEPTH` reports depth 0 at *every* GC** → the shadow stack
+  is **empty when the GC actually fires**. The reclaim-triggering GCs land *outside*
+  the brief push→call→reload window, so the caller's `this` is not in the scanned
+  `[base, top)` range at that moment. (Consistent with the correctness gradient:
+  `GC_STRESS=524288` mostly lands a GC *inside* a push window → correct; the rarer
+  `4 MB` GC lands outside → reclaim.) So "complete coverage" specifically means the
+  live oop must remain shadow-marked across the *whole* interval it is
+  register-resident, not just at the call itself — i.e. push at the producing site
+  and keep it on the shadow stack until consumed, OR a precise per-safepoint oop
+  map. This is the core remaining design work.
+
 ---
 ## SESSION UPDATE 2026-06-17 (#3) — re-verified on current `dev` (`fca424a4`, binary 2026-06-17); every mitigation still broken
 
