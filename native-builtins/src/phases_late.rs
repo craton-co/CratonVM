@@ -4532,6 +4532,32 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(s))))
     });
 
+    // FileSystemProvider.isSameFile(Path, Path) — abstract on the base, so the
+    // synthetic provider lacking it made `Files.isSameFile` dispatch to the
+    // abstract method ("no Code attribute" AbstractMethodError). The default
+    // provider's same-file check is path equality (real-path resolution for
+    // symlinks omitted); approximate with `Path.equals`.
+    r.register(
+        fsp,
+        "isSameFile",
+        "(Ljava/nio/file/Path;Ljava/nio/file/Path;)Z",
+        |ctx, args| {
+            let p1 = match obj_arg(args, 1) {
+                Ok(p) => p,
+                Err(_) => return Ok(Some(Value::Int(0))),
+            };
+            let p2 = match args.get(2) {
+                Some(Value::Object(Some(p))) => *p,
+                _ => return Ok(Some(Value::Int(0))),
+            };
+            let eq = matches!(
+                ctx.invoke_virtual(p1, "equals", "(Ljava/lang/Object;)Z", &[Value::Object(Some(p2))]),
+                Ok(Some(Value::Int(n))) if n != 0
+            );
+            Ok(Some(Value::Int(i32::from(eq))))
+        },
+    );
+
     // FileSystemProvider.installedProviders() — real JDK uses ServiceLoader to
     // discover providers including jdk.nio.zipfs.ZipFileSystemProvider for the
     // "jar" scheme.  Under CratonVM the ServiceLoader path doesn't surface it,
