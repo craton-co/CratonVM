@@ -4318,10 +4318,18 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
         |ctx, args| {
             let this = obj_arg(args, 0)?;
             let p = p57_read_path(ctx, this);
-            // jar-FS Path.toString() shows the in-jar entry (matches zipfs).
-            let display = jarfs_decode(&p)
-                .map(|(_, e)| if e.starts_with('/') { e } else { format!("/{e}") })
-                .unwrap_or(p);
+            let display = match jarfs_decode(&p) {
+                // jar-FS Path.toString() shows the in-jar entry with '/'
+                // (matches the JDK zipfs separator), regardless of host OS.
+                Some((_, e)) => {
+                    if e.starts_with('/') { e } else { format!("/{e}") }
+                }
+                // Host-FS path: render the OS-native separator. CratonVM stores
+                // paths with '/' internally, but HotSpot's WindowsPath.toString()
+                // renders '\'; convert at this display boundary on Windows
+                // (no-op on Unix). Matches `File.getPath()` below.
+                None => file_normalise_path(&p),
+            };
             let s = ctx.create_string(&display);
             Ok(Some(Value::Object(Some(s))))
         },
@@ -6894,7 +6902,24 @@ fn p57_alloc_path(ctx: &mut dyn NativeContext, path: &str) -> ObjectRef {
     // 2 fields: [0] = path String, [1] = owning FileSystem (P57_PATH_FS_FIELD,
     // null unless set by `FileSystem.getPath`).
     let obj = alloc_concurrent_synthetic(ctx, "java/nio/file/Path", 2);
-    let s = ctx.create_string(path);
+    // Canonicalise separators to '/' internally so Path operations
+    // (normalize/equals/resolve/hashCode) and the file-IO natives all see one
+    // form. Windows accepts '\' as a separator and HotSpot's WindowsPath stores
+    // '\', but rendering '\' lives at the `toString()`/`getPath()` display
+    // boundary (see `Path.toString`); internally we keep '/'. A real Windows
+    // filename can never contain '\', so folding it to '/' is loss-free there.
+    // On Unix '\' is a legal filename character — leave it untouched. jar-FS
+    // encoded strings carry a sentinel + their own '/'-separated entry, so
+    // never rewrite those.
+    #[cfg(windows)]
+    let stored = if jarfs_decode(path).is_some() {
+        path.to_string()
+    } else {
+        path.replace('\\', "/")
+    };
+    #[cfg(not(windows))]
+    let stored = path.to_string();
+    let s = ctx.create_string(&stored);
     ctx.set_field(obj, P57_PATH_FIELD, Value::Object(Some(s)));
     obj
 }
@@ -8912,13 +8937,28 @@ pub fn register_phase57_file(r: &mut NativeMethodRegistry) {
     });
 
     // --- Path accessors ---
+    // `getPath()`/`toString()` render the OS-native separator. `File.<init>`
+    // already normalises field 0 (so a normally-constructed File holds '\' on
+    // Windows), but a File minted from `Path.toFile()` keeps the Path's '/'
+    // internal form — normalise on read so both paths agree with HotSpot
+    // (no-op on Unix; field 0 holds no jar-FS sentinel).
     r.register(file, "getPath", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        let raw = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            other => return Ok(Some(other)),
+        };
+        let s = ctx.create_string(&file_normalise_path(&raw));
+        Ok(Some(Value::Object(Some(s))))
     });
     r.register(file, "toString", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 0)))
+        let raw = match ctx.get_field(this, 0) {
+            Value::Object(Some(s)) => ctx.read_string(s).unwrap_or_default(),
+            other => return Ok(Some(other)),
+        };
+        let s = ctx.create_string(&file_normalise_path(&raw));
+        Ok(Some(Value::Object(Some(s))))
     });
     r.register(file, "getName", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;

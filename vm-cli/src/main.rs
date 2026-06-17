@@ -1530,6 +1530,19 @@ fn run() -> Result<()> {
         let size = parse_size(max_heap_str)
             .with_context(|| format!("Invalid heap size: {max_heap_str}"))?;
         config = config.with_max_heap_size(size);
+    } else if let Some(ergo) = ergonomic_default_max_heap() {
+        // No explicit -Xmx: size the heap like a stock JDK (1/4 physical RAM)
+        // instead of the fixed 256 MB library default, so Spring/Mockito/JUnit
+        // workloads don't thrash GC into a pseudo-hang. See
+        // `ergonomic_default_max_heap`.
+        if args.verbose_gc {
+            eprintln!(
+                "[cratonvm] ergonomic default max heap: {} MB (1/4 physical RAM; \
+                 set -Xmx or CRATONVM_DEFAULT_HEAP_ERGONOMICS=0 to override)",
+                ergo / (1024 * 1024)
+            );
+        }
+        config = config.with_max_heap_size(ergo);
     }
 
     // CDS configuration
@@ -3117,6 +3130,107 @@ fn parse_size(s: &str) -> Option<usize> {
         return None;
     }
     Some(bytes)
+}
+
+/// Total physical RAM in bytes, or `None` if it can't be determined.
+///
+/// Used for HotSpot-style ergonomic default-heap sizing when the user did not
+/// pass an explicit `-Xmx`. Mirrors the platform probes in
+/// `vm::runtime::crash_handler` but returns the raw byte count.
+fn physical_ram_bytes() -> Option<u64> {
+    #[cfg(target_os = "windows")]
+    {
+        #[repr(C)]
+        struct MemoryStatusEx {
+            dw_length: u32,
+            dw_memory_load: u32,
+            ull_total_phys: u64,
+            ull_avail_phys: u64,
+            ull_total_page_file: u64,
+            ull_avail_page_file: u64,
+            ull_total_virtual: u64,
+            ull_avail_virtual: u64,
+            ull_avail_extended_virtual: u64,
+        }
+        extern "system" {
+            fn GlobalMemoryStatusEx(lp_buffer: *mut MemoryStatusEx) -> i32;
+        }
+        let mut status = MemoryStatusEx {
+            dw_length: std::mem::size_of::<MemoryStatusEx>() as u32,
+            dw_memory_load: 0,
+            ull_total_phys: 0,
+            ull_avail_phys: 0,
+            ull_total_page_file: 0,
+            ull_avail_page_file: 0,
+            ull_total_virtual: 0,
+            ull_avail_virtual: 0,
+            ull_avail_extended_virtual: 0,
+        };
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        if ok != 0 && status.ull_total_phys > 0 {
+            return Some(status.ull_total_phys);
+        }
+        None
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let content = std::fs::read_to_string("/proc/meminfo").ok()?;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("MemTotal:") {
+                let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let out = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()?;
+        String::from_utf8(out.stdout).ok()?.trim().parse::<u64>().ok()
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+/// HotSpot-style ergonomic default max heap, applied only when the user did
+/// not pass an explicit `-Xmx`.
+///
+/// Approximates a stock JDK's `-XX:MaxRAMPercentage=25` ergonomics: max heap =
+/// 1/4 of physical RAM, **floored** at the historical 256 MB default (so this
+/// only ever *raises* the heap above the prior baseline) and **capped** at
+/// `MAX_ERGONOMIC_HEAP`. Without it, real-world apps (Spring / Mockito /
+/// ByteBuddy / JUnit) thrash GC at 256 MB and look like a hang where HotSpot —
+/// which auto-sizes — finishes fine (e.g. buildpack `LifecycleTests`).
+///
+/// The cap exists because CratonVM's generational heap **eagerly commits** its
+/// arenas (`Arena::new` → `vec![0u8; cap]`): an uncapped 1/4-of-RAM heap (e.g.
+/// 16 GB on a 64 GB host) would charge ~16 GB of commit per process. The cap
+/// keeps the default's commit bounded while still giving GC-heavy workloads
+/// enough room. (If the heap is ever made lazily-committed, the cap can grow
+/// or be removed to fully match HotSpot.)
+///
+/// Opt out with `CRATONVM_DEFAULT_HEAP_ERGONOMICS=0` (fixed 256 MB default), or
+/// override the cap with `CRATONVM_DEFAULT_HEAP_MAX_MB=<N>`. An explicit `-Xmx`
+/// always wins over all of this.
+fn ergonomic_default_max_heap() -> Option<usize> {
+    if std::env::var("CRATONVM_DEFAULT_HEAP_ERGONOMICS").as_deref() == Ok("0") {
+        return None;
+    }
+    const FLOOR: u64 = 256 * 1024 * 1024;
+    const MAX_ERGONOMIC_HEAP: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+    let cap = std::env::var("CRATONVM_DEFAULT_HEAP_MAX_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|mb| mb * 1024 * 1024)
+        .unwrap_or(MAX_ERGONOMIC_HEAP);
+    let phys = physical_ram_bytes()?;
+    let chosen = (phys / 4).clamp(FLOOR, cap.max(FLOOR));
+    usize::try_from(chosen).ok()
 }
 
 #[cfg(test)]
