@@ -1678,6 +1678,25 @@ fn re1_socket_write_stream(
     Ok(None)
 }
 
+/// The real `java.net.Socket` constructor initializes `socketLock = new Object()`
+/// via a field initializer; the synthetic `<init>` natives skip it, so
+/// `socketLock` reads back null. Real `Socket.getImpl()` bytecode — reached by
+/// the option *getters* we do not override (`getReceiveBufferSize`,
+/// `getKeepAlive`, …) and by `jdk.net.Sockets.<clinit>` (option-set probing) —
+/// does `synchronized (socketLock)` → `NullPointerException: monitorenter in
+/// java/net/Socket.getImpl pc=16`. Initialize the lock object(s) so that path
+/// works. `set_field_by_name` is a no-op if the field is absent (synthetic-stub
+/// mode), so this is safe on either layout.
+fn re1_init_socket_locks(ctx: &mut dyn NativeContext, this: ObjectRef) {
+    for f in ["socketLock", "closeLock"] {
+        if !matches!(ctx.get_field_by_name(this, f), Value::Object(Some(_))) {
+            if let Ok(Some(Value::Object(Some(lock)))) = ctx.new_object("java/lang/Object") {
+                ctx.set_field_by_name(this, f, Value::Object(Some(lock)));
+            }
+        }
+    }
+}
+
 fn re1_connect_socket(
     ctx: &mut dyn NativeContext,
     this: ObjectRef,
@@ -1706,6 +1725,7 @@ fn re1_connect_socket(
         s.closed = 0;
         s.stream_id = stream_id;
     });
+    re1_init_socket_locks(ctx, this);
     Ok(None)
 }
 
@@ -1726,6 +1746,7 @@ fn register_re1_socket(r: &mut NativeMethodRegistry) {
             s.closed = 0;
             s.stream_id = -1;
         });
+        re1_init_socket_locks(ctx, this);
         Ok(None)
     });
 
@@ -2175,6 +2196,7 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             x.closed = 0;
             x.stream_id = -1;
         });
+        re1_init_socket_locks(ctx, sock);
         re2_accept_into(ctx, lid, sock, timeout_ms)
     });
 
