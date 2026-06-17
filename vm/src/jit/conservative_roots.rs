@@ -175,6 +175,19 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// Perf mirror of the CURRENT top chain entry's `exact_rbp`. The hot
+    /// per-invocation `set_top_frame_base` (called once per JIT method entry —
+    /// ~1.8B times for fib44) writes ONLY this `Cell` (a single TLS store, no
+    /// `RefCell` borrow / `Vec::last_mut` / Option matching), cutting the
+    /// per-call cost. It is synced with the chain at the rare push/pop/retain
+    /// boundaries and flushed into the top entry by `remap_active_jit_frames`
+    /// before the relocation walk — the ONLY reader of `exact_rbp`. Invariant:
+    /// `TOP_RBP` == the live `exact_rbp` of `JIT_ENTRY_CHAIN.last()` (or 0 when
+    /// the chain is empty / the top is not yet precise).
+    static TOP_RBP: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Process-wide counter of active JIT entries across all threads. Lets the GC
 /// quickly answer "is anyone in JIT?" without crossing thread boundaries.
 static GLOBAL_JIT_DEPTH: AtomicUsize = AtomicUsize::new(0);
@@ -277,8 +290,18 @@ pub(crate) fn push_entry_full(entry: JitFrameChainEntry) -> usize {
     note_jit_boundary();
     let depth = JIT_ENTRY_CHAIN.with(|c| {
         let mut v = c.borrow_mut();
+        // Finalize the outgoing top entry's `exact_rbp` from the cache before it
+        // becomes non-top (each entry's `exact_rbp` is read by the relocation
+        // walk). The incoming entry starts unrecorded → reset the cache to 0.
+        if let Some(old_top) = v.last_mut() {
+            if let Some(info) = old_top.precise.as_mut() {
+                info.exact_rbp = TOP_RBP.with(|cc| cc.get());
+            }
+        }
         v.push(entry);
-        v.len()
+        let n = v.len();
+        TOP_RBP.with(|cc| cc.set(0));
+        n
     });
     GLOBAL_JIT_DEPTH.fetch_add(1, Ordering::Release);
     // Mirror into the GC-side quiescence flag so the GC can defer
@@ -312,7 +335,13 @@ pub fn push_jit_entry() -> usize {
 pub fn pop_jit_entry() -> Option<usize> {
     // Chain mutation = JIT boundary: invalidate the per-thread scan cache.
     note_jit_boundary();
-    let popped = JIT_ENTRY_CHAIN.with(|c| c.borrow_mut().pop());
+    let popped = JIT_ENTRY_CHAIN.with(|c| {
+        let mut v = c.borrow_mut();
+        let p = v.pop();
+        // Mirror now tracks the entry that became top again.
+        reload_top_rbp_cache(&v);
+        p
+    });
     if let Some(entry) = popped {
         GLOBAL_JIT_DEPTH.fetch_sub(1, Ordering::Release);
         cratonvm_gc::gc_quiescence::leave();
@@ -356,6 +385,8 @@ pub fn prune_returned_jit_entries(scanner_sp: usize) -> usize {
         // Keep only entries that could still be live (spill region at or
         // above the scanner SP). Entries below it have provably returned.
         v.retain(|e| e.entry_sp >= scanner_sp);
+        // Mirror tracks whatever entry is top after pruning.
+        reload_top_rbp_cache(&v);
         before - v.len()
     });
     if pruned > 0 {
@@ -795,18 +826,23 @@ pub fn scan_active_jit_frames_with_sp(
 /// No-op if the top entry is conservative (`precise == None`): such methods
 /// have no oop maps and are never relocated through this path.
 pub fn set_top_frame_base(rbp: usize) {
-    JIT_ENTRY_CHAIN.with(|c| {
-        if let Some(entry) = c.borrow_mut().last_mut() {
-            if let Some(info) = entry.precise.as_mut() {
-                // Record the EXACT innermost RBP for the relocation walk.
-                // Do NOT touch `frame_base` — the marking path
-                // `scan_one_frame_precise` uses it as the upper bound of its
-                // conservative sweep; shrinking it to this (low) RBP would
-                // drop every ancestor frame's spilled oops.
-                info.exact_rbp = rbp;
-            }
-        }
-    });
+    // HOT path (once per JIT invocation): write only the cached mirror. The
+    // value is synced into the top chain entry's `exact_rbp` at push/pop/retain
+    // and flushed by `remap_active_jit_frames` before the (only) reader runs.
+    // `frame_base` is deliberately NOT touched — the marking path uses it as the
+    // upper bound of its conservative sweep.
+    TOP_RBP.with(|c| c.set(rbp));
+}
+
+/// Sync `TOP_RBP` to the current top entry's saved `exact_rbp` (or 0 when the
+/// chain is empty). Called after pop/retain so the mirror tracks the new top.
+#[inline]
+fn reload_top_rbp_cache(v: &[JitFrameChainEntry]) {
+    let val = v
+        .last()
+        .and_then(|e| e.precise.as_ref())
+        .map_or(0, |info| info.exact_rbp);
+    TOP_RBP.with(|c| c.set(val));
 }
 
 /// Stage 3 — precisely relocate the oop slots of every active JIT frame on
@@ -845,6 +881,16 @@ pub fn remap_active_jit_frames(pointer_map: &std::collections::HashMap<usize, us
     let dbg_maps_found = std::cell::Cell::new(0usize);
     let dbg_examined = std::cell::Cell::new(0usize);
     JIT_ENTRY_CHAIN.with(|c| {
+        // Flush the cached top `exact_rbp` into the top chain entry so the walk
+        // below (the only reader) sees the live innermost RBP.
+        {
+            let mut v = c.borrow_mut();
+            if let Some(top) = v.last_mut() {
+                if let Some(info) = top.precise.as_mut() {
+                    info.exact_rbp = TOP_RBP.with(|cc| cc.get());
+                }
+            }
+        }
         let chain = c.borrow();
         for entry in chain.iter() {
             dbg_entries += 1;
