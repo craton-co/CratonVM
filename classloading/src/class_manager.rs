@@ -1460,6 +1460,23 @@ impl ClassManager {
                 }
             }
         }
+        // Every synthetic stub object IS-A `java.lang.Object`, so its
+        // superclass must be `java/lang/Object` (not `None`). Without this
+        // link, method dispatch on a synthetic-stub receiver — e.g. a
+        // `cratonvm/synthetic/AnonymousObject$N` allocated by a native that
+        // passed `ClassId(0)` with N fields — walks an empty superclass chain
+        // and never reaches the natives registered on `java/lang/Object`
+        // (`clone`, `equals`, `hashCode`, `toString`, `getClass`, `wait`,
+        // `notify`, …). The result is a spurious `NoSuchMethodError:
+        // cratonvm/synthetic/AnonymousObject$4.clone()`. Resolving Object's id
+        // here (it is always loaded before any synthetic object is allocated)
+        // makes those inherited Object methods reachable. Arrays and Object
+        // itself keep `superclass = None`.
+        let synthetic_superclass = if name == "java/lang/Object" || name.starts_with('[') {
+            None
+        } else {
+            self.get_loaded_class_id("java/lang/Object")
+        };
         let id = self.class_store.next_id();
         let class = Class {
             id,
@@ -1473,7 +1490,7 @@ impl ClassManager {
                 cratonvm_reader::constant_pool::ConstantPoolEntry::Tombstone,
             ]),
             access_flags: cratonvm_reader::class_access_flags::ClassAccessFlags::from_bits_truncate(0x0021),
-            superclass: None,
+            superclass: synthetic_superclass,
             interfaces: vec![],
             fields: vec![],
             methods: synthetic_stub_ctor_methods(name),
@@ -7302,6 +7319,47 @@ mod tests {
             descriptor: cratonvm_types::intern_arc("I"),
             attributes: vec![],
         }
+    }
+
+    // --- bug-06 family 4: synthetic stubs inherit java/lang/Object ---
+
+    #[test]
+    fn synthetic_anonymous_object_extends_java_lang_object() {
+        // Repro of bug-06 family 4: a `cratonvm/synthetic/AnonymousObject$N`
+        // stub (minted when a native allocates `ClassId(0)` with N fields)
+        // must link `java/lang/Object` as its superclass, otherwise
+        // dispatching `clone()` / `equals()` / `hashCode()` on it walks an
+        // empty superclass chain and raises a spurious NoSuchMethodError.
+        let mut cm = ClassManager::new(&[], &[], &[]);
+
+        // Object must be loaded before any synthetic object is allocated;
+        // mirror that ordering here.
+        let object_id = cm.ensure_synthetic_class("java/lang/Object", 0);
+        assert_eq!(
+            cm.get_class(object_id).and_then(|c| c.superclass),
+            None,
+            "java/lang/Object must not have a superclass"
+        );
+
+        let anon_id = cm.ensure_synthetic_class("cratonvm/synthetic/AnonymousObject$4", 4);
+        assert_ne!(anon_id, object_id, "AnonymousObject is a distinct class");
+        assert_eq!(
+            cm.get_class(anon_id).and_then(|c| c.superclass),
+            Some(object_id),
+            "synthetic AnonymousObject must inherit java/lang/Object so Object \
+             methods (clone/equals/hashCode/…) resolve"
+        );
+        // Field layout is preserved: the stub still declares its N slots.
+        assert_eq!(cm.get_class(anon_id).map(|c| c.num_total_fields), Some(4));
+    }
+
+    #[test]
+    fn synthetic_array_stub_has_no_superclass() {
+        // Array synthetic stubs are special-cased and keep `superclass = None`.
+        let mut cm = ClassManager::new(&[], &[], &[]);
+        cm.ensure_synthetic_class("java/lang/Object", 0);
+        let arr_id = cm.ensure_synthetic_class("[Lcratonvm/synthetic/Foo;", 0);
+        assert_eq!(cm.get_class(arr_id).and_then(|c| c.superclass), None);
     }
 
     // --- H5: prohibited package-name guard ---
