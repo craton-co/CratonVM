@@ -3548,6 +3548,15 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             // Set the interrupted flag via the registry (cross-thread safe)
             self.shared.thread_registry.set_interrupted(tid, true);
         }
+        // Match HotSpot `Thread.interrupt0`: wake the target if it is parked in
+        // `LockSupport.park` (e.g. AQS `ConditionObject.await`). Without this the
+        // target only notices at the next 5 ms interrupt poll; an explicit unpark
+        // makes the wakeup prompt and matches the JVM contract. (`park_interruptible`
+        // re-checks the registry flag, so a not-yet-parked target just sees a
+        // spurious permit, which `park` is specified to allow.)
+        if let Some(park_state) = self.shared.find_park_state_for_thread_obj(thread_obj) {
+            park_state.unpark();
+        }
     }
 
     /// T1.5.1 вЂ” post an async exception to the target thread's
@@ -3584,6 +3593,27 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         val
+    }
+
+    fn thread_is_interrupted(&self, thread_obj: ObjectRef) -> bool {
+        // Fast path: the receiver IS the current thread (the common case for
+        // `Thread.currentThread().isInterrupted()` and AQS self-checks).
+        if self.thread.java_thread_obj == Some(thread_obj) {
+            return self
+                .thread
+                .interrupted
+                .load(std::sync::atomic::Ordering::Acquire);
+        }
+        // Cross-thread query (e.g. `ThreadPoolExecutor` checking a worker):
+        // resolve the target's registry id and read its shared interrupt flag.
+        // Unknown / not-yet-registered threads default to false, matching the
+        // registry's "missing means absent" convention.
+        self.shared
+            .thread_registry
+            .find_thread_id_by_thread_obj(thread_obj)
+            .and_then(|tid| self.shared.thread_registry.get_interrupted_flag(tid))
+            .map(|flag| flag.load(std::sync::atomic::Ordering::Acquire))
+            .unwrap_or(false)
     }
 
     // -- Virtual thread / Loom hooks (NEW-15) --

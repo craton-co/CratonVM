@@ -1090,6 +1090,16 @@ pub trait NativeContext {
     /// Check and optionally clear the current thread's interrupted status.
     fn is_interrupted(&self, clear: bool) -> bool;
 
+    /// Check the interrupted status of the thread identified by `thread_obj`
+    /// — which may be a thread *other* than the current one (e.g.
+    /// `ThreadPoolExecutor.interruptIdleWorkers` calls `worker.isInterrupted()`
+    /// from the pool-management thread). Never clears the flag. The default
+    /// impl falls back to the current thread's status for mock contexts that
+    /// don't track per-thread state.
+    fn thread_is_interrupted(&self, _thread_obj: ObjectRef) -> bool {
+        self.is_interrupted(false)
+    }
+
     // -- Virtual-thread / Loom (JEP 444/491) --
     //
     // Default implementations make these no-ops so platform native code (and
@@ -2530,6 +2540,24 @@ impl NativeMethodRegistry {
         // synthetic `add` reads the wrong slot on a real object and silently
         // no-ops, leaving `size`/`len` at 0. See `drop_real_layout_synthetic`.
         if self.drop_real_layout_synthetic && class_name == "java/util/StringJoiner" {
+            return;
+        }
+        // Real-JDK mode: drop the synthetic `ThreadPoolExecutor` lifecycle/stat
+        // natives (`shutdownNow`, `shutdown`, `isShutdown`, `isTerminated`,
+        // `awaitTermination`, `getPoolSize`, `getActiveCount`, …). They assume a
+        // fake 2-field layout (`poolSize=0`, `isShutdown=1`) and, on a *real*
+        // `ThreadPoolExecutor`, corrupt slot 0/1 and lie. Critically, the
+        // synthetic `shutdownNow` returns an empty list WITHOUT interrupting the
+        // pool's worker threads — so a real worker blocked in
+        // `getTask()`/`BlockingQueue.take()` never terminates and a non-daemon
+        // executor (e.g. JUnit's `@Timeout(SEPARATE_THREAD)` preemptive-timeout
+        // executor) keeps the VM alive past `main()` (false "hang"). The real
+        // `ThreadPoolExecutor` bytecode runs end-to-end on CratonVM
+        // (submit/execute/addWorker/runWorker/getTask), so dropping these lets
+        // `shutdownNow` interrupt workers correctly. See `drop_real_layout_synthetic`.
+        if self.drop_real_layout_synthetic
+            && class_name == "java/util/concurrent/ThreadPoolExecutor"
+        {
             return;
         }
         let key = native_method_hash(class_name, method_name, descriptor);
