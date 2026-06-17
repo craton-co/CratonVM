@@ -281,6 +281,27 @@ pub trait NativeContext {
         None
     }
 
+    /// GPU device enumeration escape hatch.
+    ///
+    /// Returns one entry per attached CUDA device, in ordinal order:
+    /// `(name, compute_major, compute_minor, total_global_mem_bytes)`.
+    ///
+    /// The default impl returns an empty `Vec` — the truthful answer on
+    /// a build without the `gpu-offload` feature, or on a host with no
+    /// CUDA driver. The VM's `NativeContextImpl` overrides this under
+    /// `#[cfg(feature = "gpu-offload")]` to call [`cuda_bridge::probe`].
+    /// Because `probe()` itself returns `Err(NoDriver)` on a driverless
+    /// host (or when `cuda-bridge` was built in stub mode), the override
+    /// likewise yields an empty `Vec` there — `deviceCount()` honestly
+    /// reports `0` rather than pretending a device exists.
+    ///
+    /// `cuda_bridge::probe` currently reports only the primary device
+    /// (ordinal 0); the contract here is general (a `Vec`) so a future
+    /// multi-device probe needs no signature change.
+    fn gpu_device_info(&self) -> Vec<(String, u32, u32, u64)> {
+        Vec::new()
+    }
+
     /// Phase 6 #5 — resolve a `GpuCallable` / `GpuRunnable` /
     /// `GpuFunction` lambda's target method.
     ///

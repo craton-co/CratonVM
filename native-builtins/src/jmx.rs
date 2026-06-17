@@ -1827,14 +1827,183 @@ fn register_gc_mxbean(r: &mut NativeMethodRegistry) {
 }
 
 // ---------------------------------------------------------------------------
-// 10. MBeanServer — 2-field synthetic
+// 10. MBeanServer — in-process synthetic MBean registry
+//
+// `experimental-jmx` ships a working (if minimal) in-process JMX agent. The
+// synthetic `javax/management/MBeanServer` instance carries its registry on
+// the heap so the moving GC traces it like any other object — no Rust-side
+// static handle table (which a moving GC would silently relocate out from
+// under us). Field layout:
+//
+//   slot 0  defaultDomain  : String           ("DefaultDomain")
+//   slot 1  mbeanCount      : Integer          (cached count, kept in sync)
+//   slot 2  names           : Object[]         (registry keys — ObjectName
+//                                               canonical-name strings)
+//   slot 3  beans           : Object[]         (registered MBean ObjectRefs,
+//                                               index-parallel to `names`)
+//
+// On `registerMBean` we grow both parallel arrays by one. `getAttribute` /
+// `setAttribute` / `invoke` look the bean up by ObjectName key and dispatch
+// the JavaBean accessor (`getXxx` / `setXxx`) or the named operation against
+// the stored MBean object via `invoke_virtual`. This is the same dispatch
+// the JDK's `StandardMBean` performs reflectively, minus the OpenType
+// translation layer.
+//
+// The registry capacity is fixed-grown (a fresh, one-larger array each
+// register); MBean registration is rare and one-shot at boot, so the O(n)
+// copy is irrelevant and avoids needing a resizable backing structure in a
+// synthetic field.
 // ---------------------------------------------------------------------------
+
+/// Slot indices on the synthetic MBeanServer.
+const MBS_DOMAIN: usize = 0;
+const MBS_COUNT: usize = 1;
+const MBS_NAMES: usize = 2;
+const MBS_BEANS: usize = 3;
+
+/// Number of fields on the synthetic MBeanServer (must cover all slots above).
+const MBS_NUM_FIELDS: usize = 4;
+
+/// Allocate the in-process platform MBeanServer with an empty registry.
+fn alloc_mbean_server(ctx: &mut dyn NativeContext) -> ObjectRef {
+    let obj = alloc_concurrent_synthetic(ctx, "javax/management/MBeanServer", MBS_NUM_FIELDS);
+    let domain = ctx.create_string("DefaultDomain");
+    ctx.set_field(obj, MBS_DOMAIN, Value::Object(Some(domain)));
+    ctx.set_field(obj, MBS_COUNT, Value::Int(0));
+    let names = ctx.new_ref_array(ClassId::new(0), 0);
+    let beans = ctx.new_ref_array(ClassId::new(0), 0);
+    ctx.set_field(obj, MBS_NAMES, Value::Object(Some(names)));
+    ctx.set_field(obj, MBS_BEANS, Value::Object(Some(beans)));
+    obj
+}
+
+/// Resolve a stable registry key for an `ObjectName` argument. Tries the
+/// real-JDK `getCanonicalName()` first, then `toString()`, then a direct
+/// `read_string` (synthetic ObjectName stubs sometimes ARE the string).
+/// Returns the empty string when the argument is null/unreadable so a
+/// caller can still register/look up under a deterministic key rather than
+/// panicking.
+fn object_name_key(ctx: &mut dyn NativeContext, name: Option<ObjectRef>) -> String {
+    let name = match name {
+        Some(n) => n,
+        None => return String::new(),
+    };
+    for (m, d) in [
+        ("getCanonicalName", "()Ljava/lang/String;"),
+        ("toString", "()Ljava/lang/String;"),
+    ] {
+        if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke_virtual(name, m, d, &[]) {
+            if let Some(text) = ctx.read_string(s) {
+                if !text.is_empty() {
+                    return text;
+                }
+            }
+        }
+    }
+    // Last resort: the object might itself be a String (synthetic stub).
+    ctx.read_string(name).unwrap_or_default()
+}
+
+/// Read the current registry (names, beans) arrays off a server object.
+fn mbs_registry(ctx: &dyn NativeContext, server: ObjectRef) -> (Option<ObjectRef>, Option<ObjectRef>) {
+    let names = match ctx.get_field(server, MBS_NAMES) {
+        Value::Object(opt) => opt,
+        _ => None,
+    };
+    let beans = match ctx.get_field(server, MBS_BEANS) {
+        Value::Object(opt) => opt,
+        _ => None,
+    };
+    (names, beans)
+}
+
+/// Find the registry index for `key`, or None.
+fn mbs_find(ctx: &dyn NativeContext, server: ObjectRef, key: &str) -> Option<usize> {
+    let (names, _) = mbs_registry(ctx, server);
+    let names = names?;
+    let len = ctx.array_length(names);
+    for i in 0..len {
+        if let Value::Object(Some(s)) = ctx.get_array_element(names, i) {
+            if ctx.read_string(s).as_deref() == Some(key) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// Capitalise the first ASCII letter of `s` (JavaBean accessor naming).
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Look up the registered MBean ObjectRef for `key`, or None.
+fn mbs_lookup_bean(ctx: &dyn NativeContext, server: ObjectRef, key: &str) -> Option<ObjectRef> {
+    let idx = mbs_find(ctx, server, key)?;
+    let (_, beans) = mbs_registry(ctx, server);
+    match ctx.get_array_element(beans?, idx) {
+        Value::Object(Some(o)) => Some(o),
+        _ => None,
+    }
+}
+
+/// `javax.management.InstanceNotFoundException` — modelled as an
+/// IllegalArgumentException carrying the key (CratonVM has no dedicated
+/// JMX-exception variant; callers catch the broader type at boot).
+fn jmx_instance_not_found(key: &str) -> MethodCallFailed {
+    RuntimeError::IllegalArgumentException {
+        message: format!("InstanceNotFoundException: {key}"),
+    }
+    .into()
+}
+
+/// `javax.management.AttributeNotFoundException` — modelled as an
+/// IllegalArgumentException carrying the attribute name.
+fn jmx_attribute_not_found(attr: &str) -> MethodCallFailed {
+    RuntimeError::IllegalArgumentException {
+        message: format!("AttributeNotFoundException: {attr}"),
+    }
+    .into()
+}
+
+/// Build a synthetic `java.util.HashSet` whose backing array holds the
+/// supplied references in order, with the `size` slot set. Mirrors the
+/// 2-slot synthetic-set layout the existing `queryMBeans` body used so
+/// callers that iterate / call `size()` see the right element count.
+fn build_hash_set(ctx: &mut dyn NativeContext, elems: &[ObjectRef]) -> ObjectRef {
+    let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
+    let backing = ctx.new_ref_array(ClassId::new(0), elems.len());
+    for (i, e) in elems.iter().enumerate() {
+        ctx.set_array_element(backing, i, Value::Object(Some(*e)));
+    }
+    ctx.set_field(set, 0, Value::Object(Some(backing)));
+    ctx.set_field(set, 1, Value::Int(elems.len() as i32));
+    ctx.set_field_by_name(set, "size", Value::Int(elems.len() as i32));
+    set
+}
 
 fn register_mbean_server(r: &mut NativeMethodRegistry) {
     let __prev_cat = r.current_category();
     r.set_category(cratonvm_native_api::NativeKind::SyntheticStub);
     let cls = "javax/management/MBeanServer";
-    r.register(cls, "<init>", "()V", native_noop_with_this);
+    r.register(cls, "<init>", "()V", |ctx, args| {
+        // Initialise the registry on a freshly-constructed synthetic server
+        // so a directly-`new`'d instance (not via getPlatformMBeanServer)
+        // also has a usable empty registry.
+        let this = obj_arg(args, 0)?;
+        let domain = ctx.create_string("DefaultDomain");
+        ctx.set_field(this, MBS_DOMAIN, Value::Object(Some(domain)));
+        ctx.set_field(this, MBS_COUNT, Value::Int(0));
+        let names = ctx.new_ref_array(ClassId::new(0), 0);
+        let beans = ctx.new_ref_array(ClassId::new(0), 0);
+        ctx.set_field(this, MBS_NAMES, Value::Object(Some(names)));
+        ctx.set_field(this, MBS_BEANS, Value::Object(Some(beans)));
+        Ok(None)
+    });
 
     r.register(
         cls,
@@ -1842,7 +2011,13 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/String;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 0)))
+            match ctx.get_field(this, MBS_DOMAIN) {
+                v @ Value::Object(Some(_)) => Ok(Some(v)),
+                _ => {
+                    let d = ctx.create_string("DefaultDomain");
+                    Ok(Some(Value::Object(Some(d))))
+                }
+            }
         },
     );
     r.register(
@@ -1851,45 +2026,422 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
         "()Ljava/lang/Integer;",
         |ctx, args| {
             let this = obj_arg(args, 0)?;
-            Ok(Some(ctx.get_field(this, 1)))
+            // Compute the live count from the registry array so the answer
+            // can never drift from the actual number of registered beans.
+            let (names, _) = mbs_registry(ctx, this);
+            let count = names.map(|n| ctx.array_length(n)).unwrap_or(0);
+            // Box as java.lang.Integer (getMBeanCount returns Integer).
+            let boxed = ctx.invoke(
+                "java/lang/Integer",
+                "valueOf",
+                "(I)Ljava/lang/Integer;",
+                &[Value::Int(count as i32)],
+            );
+            match boxed {
+                Ok(Some(v @ Value::Object(Some(_)))) => Ok(Some(v)),
+                // Fall back to the cached primitive slot if Integer.valueOf
+                // isn't available in this context (e.g. unit-test mock).
+                _ => Ok(Some(Value::Int(count as i32))),
+            }
         },
     );
+
+    // registerMBean(Object, ObjectName) -> ObjectInstance. We store the
+    // bean under its ObjectName key and return the ObjectName-bearing
+    // ObjectInstance (callers mostly ignore the return or read getObjectName).
+    r.register(
+        cls,
+        "registerMBean",
+        "(Ljava/lang/Object;Ljavax/management/ObjectName;)Ljavax/management/ObjectInstance;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let bean = match args.get(1) {
+                Some(Value::Object(Some(b))) => *b,
+                _ => return Err(RuntimeError::IllegalArgumentException {
+                    message: "registerMBean: null MBean instance".to_string(),
+                }.into()),
+            };
+            let name_ref = match args.get(2) {
+                Some(Value::Object(opt)) => *opt,
+                _ => None,
+            };
+            let key = object_name_key(ctx, name_ref);
+
+            // Grow the parallel registry arrays by one (or overwrite an
+            // existing entry with the same key — last registration wins,
+            // matching a re-register after unregister).
+            let (names_opt, beans_opt) = mbs_registry(ctx, this);
+            let old_len = names_opt.map(|n| ctx.array_length(n)).unwrap_or(0);
+            if let Some(idx) = mbs_find(ctx, this, &key) {
+                // Overwrite in place.
+                if let Some(beans) = beans_opt {
+                    ctx.set_array_element(beans, idx, Value::Object(Some(bean)));
+                }
+            } else {
+                let new_names = ctx.new_ref_array(ClassId::new(0), old_len + 1);
+                let new_beans = ctx.new_ref_array(ClassId::new(0), old_len + 1);
+                for i in 0..old_len {
+                    if let Some(names) = names_opt {
+                        ctx.set_array_element(new_names, i, ctx.get_array_element(names, i));
+                    }
+                    if let Some(beans) = beans_opt {
+                        ctx.set_array_element(new_beans, i, ctx.get_array_element(beans, i));
+                    }
+                }
+                let key_str = ctx.create_string(&key);
+                ctx.set_array_element(new_names, old_len, Value::Object(Some(key_str)));
+                ctx.set_array_element(new_beans, old_len, Value::Object(Some(bean)));
+                ctx.set_field(this, MBS_NAMES, Value::Object(Some(new_names)));
+                ctx.set_field(this, MBS_BEANS, Value::Object(Some(new_beans)));
+                ctx.set_field(this, MBS_COUNT, Value::Int((old_len + 1) as i32));
+            }
+
+            // Build an ObjectInstance(name, className) for the return value.
+            let oi = alloc_concurrent_synthetic(ctx, "javax/management/ObjectInstance", 2);
+            ctx.set_field_by_name(oi, "name", Value::Object(name_ref));
+            let cls_name = ctx
+                .class_name_of_id(ctx.class_id_of_object(bean))
+                .unwrap_or_default()
+                .replace('/', ".");
+            let cls_name_str = ctx.create_string(&cls_name);
+            ctx.set_field_by_name(oi, "className", Value::Object(Some(cls_name_str)));
+            Ok(Some(Value::Object(Some(oi))))
+        },
+    );
+
+    // unregisterMBean(ObjectName) — remove the entry if present.
+    r.register(
+        cls,
+        "unregisterMBean",
+        "(Ljavax/management/ObjectName;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name_ref = match args.get(1) {
+                Some(Value::Object(opt)) => *opt,
+                _ => None,
+            };
+            let key = object_name_key(ctx, name_ref);
+            if let Some(idx) = mbs_find(ctx, this, &key) {
+                let (names_opt, beans_opt) = mbs_registry(ctx, this);
+                let old_len = names_opt.map(|n| ctx.array_length(n)).unwrap_or(0);
+                if old_len > 0 {
+                    let new_names = ctx.new_ref_array(ClassId::new(0), old_len - 1);
+                    let new_beans = ctx.new_ref_array(ClassId::new(0), old_len - 1);
+                    let mut w = 0usize;
+                    for rd in 0..old_len {
+                        if rd == idx {
+                            continue;
+                        }
+                        if let Some(names) = names_opt {
+                            ctx.set_array_element(new_names, w, ctx.get_array_element(names, rd));
+                        }
+                        if let Some(beans) = beans_opt {
+                            ctx.set_array_element(new_beans, w, ctx.get_array_element(beans, rd));
+                        }
+                        w += 1;
+                    }
+                    ctx.set_field(this, MBS_NAMES, Value::Object(Some(new_names)));
+                    ctx.set_field(this, MBS_BEANS, Value::Object(Some(new_beans)));
+                    ctx.set_field(this, MBS_COUNT, Value::Int((old_len - 1) as i32));
+                }
+            }
+            Ok(None)
+        },
+    );
+
     r.register(
         cls,
         "isRegistered",
         "(Ljavax/management/ObjectName;)Z",
-        |_ctx, _args| Ok(Some(Value::Int(0))),
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name_ref = match args.get(1) {
+                Some(Value::Object(opt)) => *opt,
+                _ => None,
+            };
+            let key = object_name_key(ctx, name_ref);
+            Ok(Some(Value::Int(mbs_find(ctx, this, &key).is_some() as i32)))
+        },
     );
+
+    // getObjectInstance(ObjectName) -> ObjectInstance for a registered bean.
+    r.register(
+        cls,
+        "getObjectInstance",
+        "(Ljavax/management/ObjectName;)Ljavax/management/ObjectInstance;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name_ref = match args.get(1) {
+                Some(Value::Object(opt)) => *opt,
+                _ => None,
+            };
+            let key = object_name_key(ctx, name_ref);
+            let idx = match mbs_find(ctx, this, &key) {
+                Some(i) => i,
+                None => return Err(jmx_instance_not_found(&key)),
+            };
+            let (_, beans_opt) = mbs_registry(ctx, this);
+            let bean = beans_opt
+                .and_then(|b| match ctx.get_array_element(b, idx) {
+                    Value::Object(Some(o)) => Some(o),
+                    _ => None,
+                });
+            let oi = alloc_concurrent_synthetic(ctx, "javax/management/ObjectInstance", 2);
+            ctx.set_field_by_name(oi, "name", Value::Object(name_ref));
+            let cls_name = bean
+                .map(|b| ctx.class_name_of_id(ctx.class_id_of_object(b)).unwrap_or_default())
+                .unwrap_or_default()
+                .replace('/', ".");
+            let cls_name_str = ctx.create_string(&cls_name);
+            ctx.set_field_by_name(oi, "className", Value::Object(Some(cls_name_str)));
+            Ok(Some(Value::Object(Some(oi))))
+        },
+    );
+
+    // queryNames(ObjectName, QueryExp) -> Set<ObjectName>. We don't parse
+    // wildcard ObjectName patterns or evaluate QueryExp; a null/empty
+    // pattern means "all", which is the common boot-time usage. We return
+    // the canonical-name strings wrapped back into ObjectName via
+    // ObjectName.getInstance, so callers iterating the Set get usable
+    // names. Where ObjectName construction isn't available we fall back to
+    // returning the raw key strings (still a valid Set<?> for size/iterate).
+    r.register(
+        cls,
+        "queryNames",
+        "(Ljavax/management/ObjectName;Ljavax/management/QueryExp;)Ljava/util/Set;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let (names_opt, _) = mbs_registry(ctx, this);
+            let len = names_opt.map(|n| ctx.array_length(n)).unwrap_or(0);
+            let mut elems: Vec<ObjectRef> = Vec::with_capacity(len);
+            if let Some(names) = names_opt {
+                for i in 0..len {
+                    if let Value::Object(Some(s)) = ctx.get_array_element(names, i) {
+                        let key = ctx.read_string(s).unwrap_or_default();
+                        // Reconstruct an ObjectName for the key. If that
+                        // fails, fall back to the raw String key.
+                        let on = ctx
+                            .invoke(
+                                "javax/management/ObjectName",
+                                "getInstance",
+                                "(Ljava/lang/String;)Ljavax/management/ObjectName;",
+                                &[Value::Object(Some(s))],
+                            )
+                            .ok()
+                            .flatten()
+                            .and_then(|v| match v {
+                                Value::Object(Some(o)) => Some(o),
+                                _ => None,
+                            });
+                        elems.push(on.unwrap_or(s));
+                        let _ = key;
+                    }
+                }
+            }
+            Ok(Some(Value::Object(Some(build_hash_set(ctx, &elems)))))
+        },
+    );
+
+    // queryMBeans(ObjectName, QueryExp) -> Set<ObjectInstance>.
     r.register(
         cls,
         "queryMBeans",
         "(Ljavax/management/ObjectName;Ljavax/management/QueryExp;)Ljava/util/Set;",
-        |ctx, _args| {
-            // Return empty HashSet (synthetic ArrayList acting as set)
-            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 2);
-            let backing = ctx.new_ref_array(ClassId::new(0), 0);
-            ctx.set_field(set, 0, Value::Object(Some(backing)));
-            ctx.set_field(set, 1, Value::Int(0));
-            Ok(Some(Value::Object(Some(set))))
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let (names_opt, beans_opt) = mbs_registry(ctx, this);
+            let len = names_opt.map(|n| ctx.array_length(n)).unwrap_or(0);
+            let mut elems: Vec<ObjectRef> = Vec::with_capacity(len);
+            for i in 0..len {
+                let name_ref = names_opt.and_then(|n| match ctx.get_array_element(n, i) {
+                    Value::Object(Some(s)) => Some(s),
+                    _ => None,
+                });
+                let bean = beans_opt.and_then(|b| match ctx.get_array_element(b, i) {
+                    Value::Object(Some(o)) => Some(o),
+                    _ => None,
+                });
+                let oi = alloc_concurrent_synthetic(ctx, "javax/management/ObjectInstance", 2);
+                ctx.set_field_by_name(oi, "name", Value::Object(name_ref));
+                let cls_name = bean
+                    .map(|b| ctx.class_name_of_id(ctx.class_id_of_object(b)).unwrap_or_default())
+                    .unwrap_or_default()
+                    .replace('/', ".");
+                let cls_name_str = ctx.create_string(&cls_name);
+                ctx.set_field_by_name(oi, "className", Value::Object(Some(cls_name_str)));
+                elems.push(oi);
+            }
+            Ok(Some(Value::Object(Some(build_hash_set(ctx, &elems)))))
         },
     );
+
+    // setAttribute(ObjectName, Attribute) — dispatch setXxx on the bean.
+    r.register(
+        cls,
+        "setAttribute",
+        "(Ljavax/management/ObjectName;Ljavax/management/Attribute;)V",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name_ref = match args.get(1) {
+                Some(Value::Object(opt)) => *opt,
+                _ => None,
+            };
+            let attr = match args.get(2) {
+                Some(Value::Object(Some(a))) => *a,
+                _ => return Err(RuntimeError::IllegalArgumentException {
+                    message: "setAttribute: null Attribute".to_string(),
+                }.into()),
+            };
+            let key = object_name_key(ctx, name_ref);
+            let bean = match mbs_lookup_bean(ctx, this, &key) {
+                Some(b) => b,
+                None => return Err(jmx_instance_not_found(&key)),
+            };
+            // Attribute.getName() / getValue().
+            let attr_name = ctx
+                .invoke_virtual(attr, "getName", "()Ljava/lang/String;", &[])
+                .ok()
+                .flatten()
+                .and_then(|v| match v {
+                    Value::Object(Some(s)) => ctx.read_string(s),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let attr_val = ctx
+                .invoke_virtual(attr, "getValue", "()Ljava/lang/Object;", &[])
+                .ok()
+                .flatten()
+                .unwrap_or(Value::Object(None));
+            let setter = format!("set{}", capitalize(&attr_name));
+            // Try the common Object-typed setter signature first.
+            let _ = ctx.invoke_virtual(
+                bean,
+                &setter,
+                "(Ljava/lang/Object;)V",
+                &[attr_val],
+            );
+            Ok(None)
+        },
+    );
+
+    // invoke(ObjectName, String op, Object[] params, String[] sig) -> Object.
+    r.register(
+        cls,
+        "invoke",
+        "(Ljavax/management/ObjectName;Ljava/lang/String;[Ljava/lang/Object;[Ljava/lang/String;)Ljava/lang/Object;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name_ref = match args.get(1) {
+                Some(Value::Object(opt)) => *opt,
+                _ => None,
+            };
+            let op_name = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let params = match args.get(3) {
+                Some(Value::Object(Some(a))) => Some(*a),
+                _ => None,
+            };
+            let key = object_name_key(ctx, name_ref);
+            let bean = match mbs_lookup_bean(ctx, this, &key) {
+                Some(b) => b,
+                None => return Err(jmx_instance_not_found(&key)),
+            };
+            // Build the argument list from the params Object[]. Construct a
+            // descriptor of (Ljava/lang/Object;)* matching the arity, which
+            // dispatches to a no-arg or N-Object-arg method. This covers the
+            // common JMX operation shapes (no-arg lifecycle ops, Object-typed
+            // operation params); typed primitive operations are out of scope.
+            let mut call_args: Vec<Value> = Vec::new();
+            let mut desc = String::from("(");
+            if let Some(arr) = params {
+                let n = ctx.array_length(arr);
+                for i in 0..n {
+                    call_args.push(ctx.get_array_element(arr, i));
+                    desc.push_str("Ljava/lang/Object;");
+                }
+            }
+            desc.push_str(")Ljava/lang/Object;");
+            match ctx.invoke_virtual(bean, &op_name, &desc, &call_args)? {
+                Some(v) => Ok(Some(v)),
+                None => Ok(Some(Value::Object(None))),
+            }
+        },
+    );
+
+    // getMBeanInfo(ObjectName) -> MBeanInfo. We don't synthesise a full
+    // descriptor model; return null when the bean is registered (callers
+    // that need the structured info take the JDK StandardMBean path) and
+    // raise InstanceNotFound when it isn't, which is the JMX-correct error.
+    r.register(
+        cls,
+        "getMBeanInfo",
+        "(Ljavax/management/ObjectName;)Ljavax/management/MBeanInfo;",
+        |ctx, args| {
+            let this = obj_arg(args, 0)?;
+            let name_ref = match args.get(1) {
+                Some(Value::Object(opt)) => *opt,
+                _ => None,
+            };
+            let key = object_name_key(ctx, name_ref);
+            if mbs_find(ctx, this, &key).is_none() {
+                return Err(jmx_instance_not_found(&key));
+            }
+            Ok(Some(Value::Object(None)))
+        },
+    );
+
     r.register(
         cls,
         "getAttribute",
         "(Ljavax/management/ObjectName;Ljava/lang/String;)Ljava/lang/Object;",
         |ctx, args| {
-            // WildFly `BootstrapImpl.internalBootstrap` calls e.g.
+            // First try the in-process registry: if the ObjectName resolves
+            // to a bean we registered, dispatch the JavaBean accessor
+            // (`getXxx` / `isXxx`) against it. This makes a full
+            // register -> getAttribute round-trip work for user MBeans.
+            let this = obj_arg(args, 0)?;
+            let name_ref = match args.get(1) {
+                Some(Value::Object(opt)) => *opt,
+                _ => None,
+            };
+            let attr_name = match args.get(2) {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let key = object_name_key(ctx, name_ref);
+            if let Some(bean) = mbs_lookup_bean(ctx, this, &key) {
+                let cap = capitalize(&attr_name);
+                // Try getXxx()Object, then getXxx()-with-real-return via the
+                // generic Object return, then isXxx()Z for boolean attrs.
+                for (m, d) in [
+                    (format!("get{cap}"), "()Ljava/lang/Object;".to_string()),
+                    (format!("is{cap}"), "()Z".to_string()),
+                    (format!("is{cap}"), "()Ljava/lang/Boolean;".to_string()),
+                ] {
+                    if let Ok(Some(v)) = ctx.invoke_virtual(bean, &m, &d, &[]) {
+                        return Ok(Some(v));
+                    }
+                }
+                // Registered bean but no accessor matched — JMX says
+                // AttributeNotFound.
+                return Err(jmx_attribute_not_found(&attr_name));
+            }
+
+            // Fall through: the platform `java.lang:type=*` MXBean
+            // attributes that WildFly / boot code queries directly without
+            // registering anything in our in-process registry (e.g.
             //   server.getAttribute(ObjectName("java.lang:type=OperatingSystem"),
             //                       "MaxFileDescriptorCount")
-            // then `.toString()` + `Long.parseLong`.
+            // then `.toString()` + `Long.parseLong`).
             //
             // We answer each attribute with REAL VM state where a source
             // exists, and with the OpenJDK "unavailable" sentinel (-1 / -1.0)
-            // — NOT a fabricated plausible number — where it does not. The
-            // previous body returned a fake "8192" for every memory/fd size,
-            // which is exactly the kind of invented-but-plausible value the
-            // no-synthetic-stubs policy forbids: a consumer could not tell it
-            // apart from a real reading.
+            // — NOT a fabricated plausible number — where it does not. A
+            // fabricated plausible value is exactly the invented-but-plausible
+            // value the no-synthetic-stubs policy forbids: a consumer could
+            // not tell it apart from a real reading.
             //
             // Sources used:
             //   AvailableProcessors -> available_parallelism (real)
@@ -1903,10 +2455,6 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
             // For any unrecognised attribute we return null (the JMX-correct
             // "no such attribute" answer) rather than a fabricated string;
             // callers' existing AttributeNotFound / Throwable handlers cope.
-            let attr_name = match args.get(2) {
-                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
-                _ => String::new(),
-            };
             let response: Option<String> = match attr_name.as_str() {
                 "AvailableProcessors" => {
                     let n = std::thread::available_parallelism()
@@ -1943,6 +2491,29 @@ fn register_mbean_server(r: &mut NativeMethodRegistry) {
             }
         },
     );
+
+    // -- MBeanServerFactory: produce our in-process synthetic server --
+    //
+    // `ManagementFactory.getPlatformMBeanServer()` bytecode calls
+    // `MBeanServerFactory.createMBeanServer()` (real JDK). We intentionally
+    // do NOT register `getPlatformMBeanServer` itself (the KAFKA-MBEAN note
+    // in `register_management_factory` explains why the real-JDK path must
+    // build the concrete `JmxMBeanServer`), but under `experimental-jmx`
+    // there is no real `java.management` module, so the factory call needs a
+    // server. Returning our synthetic `alloc_mbean_server` gives the full
+    // register/get/set/invoke/query flow a concrete receiver.
+    let make_server = |ctx: &mut dyn NativeContext, _args: &[Value]| {
+        Ok(Some(Value::Object(Some(alloc_mbean_server(ctx)))))
+    };
+    let make_server_fn: fn(&mut dyn NativeContext, &[Value]) -> MethodCallResult = make_server;
+    for (name, desc) in [
+        ("createMBeanServer", "()Ljavax/management/MBeanServer;"),
+        ("createMBeanServer", "(Ljava/lang/String;)Ljavax/management/MBeanServer;"),
+        ("newMBeanServer", "()Ljavax/management/MBeanServer;"),
+        ("newMBeanServer", "(Ljava/lang/String;)Ljavax/management/MBeanServer;"),
+    ] {
+        r.register("javax/management/MBeanServerFactory", name, desc, make_server_fn);
+    }
     r.set_category(__prev_cat);
 }
 
@@ -2167,6 +2738,106 @@ mod jmx_tests {
             "getAttribute",
             "(Ljavax/management/ObjectName;Ljava/lang/String;)Ljava/lang/Object;"
         ).is_some());
+    }
+
+    #[test]
+    fn test_mbean_server_flow_methods_registered() {
+        // The full in-process JMX flow must expose register / unregister /
+        // get / set / invoke / query so a basic round-trip works.
+        let mut r = NativeMethodRegistry::new();
+        register_jmx_natives(&mut r);
+        let cls = "javax/management/MBeanServer";
+        let methods = [
+            ("registerMBean", "(Ljava/lang/Object;Ljavax/management/ObjectName;)Ljavax/management/ObjectInstance;"),
+            ("unregisterMBean", "(Ljavax/management/ObjectName;)V"),
+            ("getObjectInstance", "(Ljavax/management/ObjectName;)Ljavax/management/ObjectInstance;"),
+            ("setAttribute", "(Ljavax/management/ObjectName;Ljavax/management/Attribute;)V"),
+            ("invoke", "(Ljavax/management/ObjectName;Ljava/lang/String;[Ljava/lang/Object;[Ljava/lang/String;)Ljava/lang/Object;"),
+            ("queryNames", "(Ljavax/management/ObjectName;Ljavax/management/QueryExp;)Ljava/util/Set;"),
+            ("getMBeanInfo", "(Ljavax/management/ObjectName;)Ljavax/management/MBeanInfo;"),
+        ];
+        for (name, desc) in &methods {
+            assert!(
+                r.find(cls, name, desc).is_some(),
+                "Missing MBeanServer.{}{}",
+                name,
+                desc
+            );
+        }
+        // MBeanServerFactory must produce a server for getPlatformMBeanServer.
+        assert!(
+            r.find(
+                "javax/management/MBeanServerFactory",
+                "createMBeanServer",
+                "()Ljavax/management/MBeanServer;"
+            )
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn test_capitalize() {
+        assert_eq!(capitalize("name"), "Name");
+        assert_eq!(capitalize("X"), "X");
+        assert_eq!(capitalize(""), "");
+        assert_eq!(capitalize("alreadyCap"), "AlreadyCap");
+    }
+
+    #[test]
+    fn test_mbean_server_register_query_roundtrip() {
+        // Build a server, register a bean under an ObjectName whose key
+        // resolves via read_string (the mock returns None from
+        // invoke_virtual, so object_name_key falls back to reading the
+        // name object as a String). Verify isRegistered + count + lookup.
+        let mut ctx = crate::test_utils::mock_ctx();
+        let server = alloc_mbean_server(&mut ctx);
+
+        // Name object: a mock String holding the canonical-name text.
+        let name = ctx.create_string("com.acme:type=Widget");
+        // Bean object: any allocated object.
+        let bean = alloc_concurrent_synthetic(&mut ctx, "com/acme/Widget", 2);
+
+        // Not registered yet.
+        assert!(mbs_find(&ctx, server, "com.acme:type=Widget").is_none());
+
+        // Simulate registerMBean's registry-growth logic directly.
+        let key = object_name_key(&mut ctx, Some(name));
+        assert_eq!(key, "com.acme:type=Widget");
+
+        // Grow registry by one (mirrors the native body).
+        let (names_opt, beans_opt) = mbs_registry(&ctx, server);
+        let old_len = names_opt.map(|n| ctx.array_length(n)).unwrap_or(0);
+        let new_names = ctx.new_ref_array(ClassId::new(0), old_len + 1);
+        let new_beans = ctx.new_ref_array(ClassId::new(0), old_len + 1);
+        let key_str = ctx.create_string(&key);
+        ctx.set_array_element(new_names, old_len, Value::Object(Some(key_str)));
+        ctx.set_array_element(new_beans, old_len, Value::Object(Some(bean)));
+        ctx.set_field(server, MBS_NAMES, Value::Object(Some(new_names)));
+        ctx.set_field(server, MBS_BEANS, Value::Object(Some(new_beans)));
+        let _ = beans_opt;
+
+        // Now it's found, and the bean lookup returns our bean.
+        assert_eq!(mbs_find(&ctx, server, "com.acme:type=Widget"), Some(0));
+        assert_eq!(
+            mbs_lookup_bean(&ctx, server, "com.acme:type=Widget"),
+            Some(bean)
+        );
+        // An unregistered key is not found.
+        assert!(mbs_lookup_bean(&ctx, server, "com.acme:type=Other").is_none());
+    }
+
+    #[test]
+    fn test_object_name_key_falls_back_to_string() {
+        let mut ctx = crate::test_utils::mock_ctx();
+        let name = ctx.create_string("java.lang:type=Memory");
+        // invoke_virtual on the mock returns None, so object_name_key
+        // falls through to read_string of the name object.
+        assert_eq!(
+            object_name_key(&mut ctx, Some(name)),
+            "java.lang:type=Memory"
+        );
+        // Null name -> empty key, no panic.
+        assert_eq!(object_name_key(&mut ctx, None), "");
     }
 
     #[test]

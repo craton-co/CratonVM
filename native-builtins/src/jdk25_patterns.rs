@@ -371,7 +371,28 @@ fn native_stable_value_of_supplier(
     Ok(Some(Value::Object(Some(obj))))
 }
 
-/// `computeIfUnset(Ljava/util/function/Supplier;)Ljava/lang/Object;`
+/// Invoke a `Supplier.get()` and return its result, or `Value::Object(None)`
+/// if the supplier reference is null/invalid. Propagates any exception thrown
+/// by the supplier to the caller.
+fn invoke_supplier(
+    ctx: &mut dyn NativeContext,
+    supplier: Value,
+) -> Result<Value, cratonvm_types::error::MethodCallFailed> {
+    if let Value::Object(Some(s)) = supplier {
+        let r = ctx.invoke_virtual(s, "get", "()Ljava/lang/Object;", &[])?;
+        Ok(r.unwrap_or(Value::Object(None)))
+    } else {
+        Ok(Value::Object(None))
+    }
+}
+
+/// `computeIfUnset(Ljava/util/function/Supplier;)Ljava/lang/Object;` (JDK 25
+/// `orElseSet`): if the value is already set, return it; otherwise invoke the
+/// supplied `Supplier.get()`, store the result write-once, and return it.
+///
+/// Per the JEP 502 contract this is idempotent: once set, the supplier is
+/// never invoked again. Any exception thrown by the supplier propagates and
+/// the StableValue remains unset.
 fn native_stable_value_compute_if_unset(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -379,19 +400,32 @@ fn native_stable_value_compute_if_unset(
     let this = obj_arg(args, 0)?;
     let is_set = ctx.get_field(this, SV_FIELD_IS_SET);
     if let Value::Int(1) = is_set {
-        // Already set — return current value.
+        // Already set — return current value, do NOT invoke the supplier.
         let val = ctx.get_field(this, SV_FIELD_VALUE);
         return Ok(Some(val));
     }
-    // Not set — we would invoke the supplier here. For now, store Object(None)
-    // and mark as set. A real implementation would call supplier.get().
+    // Not set — invoke the supplier passed as the argument (arg1), falling
+    // back to a supplier stored at construction time (of(Supplier)).
+    let supplier = match args.get(1) {
+        Some(Value::Object(Some(_))) => args[1],
+        _ => ctx.get_field(this, SV_FIELD_SUPPLIER),
+    };
+    let computed = invoke_supplier(ctx, supplier)?;
+    // Re-check is_set: the supplier could have set this StableValue reentrantly.
+    if let Value::Int(1) = ctx.get_field(this, SV_FIELD_IS_SET) {
+        return Ok(Some(ctx.get_field(this, SV_FIELD_VALUE)));
+    }
+    ctx.set_field(this, SV_FIELD_VALUE, computed);
     ctx.set_field(this, SV_FIELD_IS_SET, Value::Int(1));
-    ctx.set_field(this, SV_FIELD_VALUE, Value::Object(None));
-    let val = ctx.get_field(this, SV_FIELD_VALUE);
-    Ok(Some(val))
+    Ok(Some(computed))
 }
 
 /// `orElseThrow()Ljava/lang/Object;`
+///
+/// Returns the value if set. If unset but a supplier was stored at
+/// construction (`of(Supplier)`), invokes it lazily, stores the result
+/// write-once, and returns it. If unset and there is no supplier, throws
+/// `NoSuchElementException` per the JEP 502 contract.
 fn native_stable_value_or_else_throw(
     ctx: &mut dyn NativeContext,
     args: &[Value],
@@ -402,8 +436,22 @@ fn native_stable_value_or_else_throw(
         let val = ctx.get_field(this, SV_FIELD_VALUE);
         return Ok(Some(val));
     }
-    // Not set — return Object(None) (caller could throw).
-    Ok(Some(Value::Object(None)))
+    // Not set — try a construction-time supplier before giving up.
+    let supplier = ctx.get_field(this, SV_FIELD_SUPPLIER);
+    if let Value::Object(Some(_)) = supplier {
+        let computed = invoke_supplier(ctx, supplier)?;
+        if let Value::Int(1) = ctx.get_field(this, SV_FIELD_IS_SET) {
+            return Ok(Some(ctx.get_field(this, SV_FIELD_VALUE)));
+        }
+        ctx.set_field(this, SV_FIELD_VALUE, computed);
+        ctx.set_field(this, SV_FIELD_IS_SET, Value::Int(1));
+        return Ok(Some(computed));
+    }
+    // No value and no supplier — throw, matching StableValue.orElseThrow().
+    Err(cratonvm_types::error::RuntimeError::NoSuchElementException {
+        message: "StableValue has no contents".to_string(),
+    }
+    .into())
 }
 
 /// `orElse(Ljava/lang/Object;)Ljava/lang/Object;`
@@ -1066,6 +1114,135 @@ mod jdk25_patterns_tests {
             reg.find("jdk/internal/misc/PatternSupport", "isExactDouble", "(D)Z")
                 .is_some()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // StableValue behavioral tests (supplier invocation — JEP 502)
+    // -----------------------------------------------------------------------
+
+    use crate::test_utils::{mock_ctx, MockNativeContext};
+
+    /// Arm the single-shot `invoke_virtual` result on the local test mock.
+    /// The mock's `invoke_virtual` consumes this value the next time it is
+    /// called (used here to script `Supplier.get()`).
+    fn arm_invoke(ctx: &MockNativeContext, result: MethodCallResult) {
+        // SAFETY: single-threaded test code; matches the mock's own usage.
+        unsafe { *ctx.invoke_virtual_result.get() = Some(result) };
+    }
+
+    /// `computeIfUnset` must invoke the supplied Supplier, store its result
+    /// write-once, and return it.
+    #[test]
+    fn test_compute_if_unset_invokes_supplier_and_stores() {
+        let mut ctx = mock_ctx();
+        // Create an empty StableValue.
+        let sv = match native_stable_value_of_empty(&mut ctx, &[]).unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected StableValue object, got {other:?}"),
+        };
+        // A dummy supplier object (its identity is irrelevant — the mock's
+        // invoke_virtual returns the scripted result).
+        let supplier = ctx.fresh_object_ref();
+        arm_invoke(&ctx, Ok(Some(Value::Int(99))));
+        let r = native_stable_value_compute_if_unset(
+            &mut ctx,
+            &[Value::Object(Some(sv)), Value::Object(Some(supplier))],
+        )
+        .unwrap();
+        assert_eq!(r, Some(Value::Int(99)), "supplier result must be returned");
+        // It must now be set.
+        assert_eq!(ctx.get_field(sv, SV_FIELD_IS_SET), Value::Int(1));
+        assert_eq!(ctx.get_field(sv, SV_FIELD_VALUE), Value::Int(99));
+    }
+
+    /// Once set, `computeIfUnset` must NOT invoke the supplier again and must
+    /// return the originally stored value (idempotence).
+    #[test]
+    fn test_compute_if_unset_idempotent_after_set() {
+        let mut ctx = mock_ctx();
+        let sv = match native_stable_value_of_empty(&mut ctx, &[]).unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected StableValue object, got {other:?}"),
+        };
+        // First set via trySet.
+        assert_eq!(
+            native_stable_value_try_set(
+                &mut ctx,
+                &[Value::Object(Some(sv)), Value::Int(7)]
+            )
+            .unwrap(),
+            Some(Value::Int(1))
+        );
+        // Arm a DIFFERENT supplier result; it must not be observed.
+        let supplier = ctx.fresh_object_ref();
+        arm_invoke(&ctx, Ok(Some(Value::Int(123))));
+        let r = native_stable_value_compute_if_unset(
+            &mut ctx,
+            &[Value::Object(Some(sv)), Value::Object(Some(supplier))],
+        )
+        .unwrap();
+        assert_eq!(r, Some(Value::Int(7)), "must return the already-set value");
+        // The armed scripted result must still be pending (never consumed).
+        let pending = unsafe { &*ctx.invoke_virtual_result.get() }.is_some();
+        assert!(pending, "supplier must not have been invoked when already set");
+    }
+
+    /// A supplier-backed StableValue (`of(Supplier)`) resolves lazily via
+    /// `orElseThrow()`.
+    #[test]
+    fn test_or_else_throw_resolves_construction_supplier() {
+        let mut ctx = mock_ctx();
+        let supplier = ctx.fresh_object_ref();
+        let sv = match native_stable_value_of_supplier(
+            &mut ctx,
+            &[Value::Object(Some(supplier))],
+        )
+        .unwrap()
+        {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected StableValue object, got {other:?}"),
+        };
+        arm_invoke(&ctx, Ok(Some(Value::Int(55))));
+        let r = native_stable_value_or_else_throw(&mut ctx, &[Value::Object(Some(sv))]).unwrap();
+        assert_eq!(r, Some(Value::Int(55)));
+        // And it is now cached.
+        assert_eq!(ctx.get_field(sv, SV_FIELD_IS_SET), Value::Int(1));
+        assert_eq!(ctx.get_field(sv, SV_FIELD_VALUE), Value::Int(55));
+    }
+
+    /// `orElseThrow()` on an unset, supplier-less StableValue throws.
+    #[test]
+    fn test_or_else_throw_unset_no_supplier_throws() {
+        let mut ctx = mock_ctx();
+        let sv = match native_stable_value_of_empty(&mut ctx, &[]).unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected StableValue object, got {other:?}"),
+        };
+        let r = native_stable_value_or_else_throw(&mut ctx, &[Value::Object(Some(sv))]);
+        assert!(r.is_err(), "expected an exception for unset value with no supplier");
+    }
+
+    /// A supplier that throws propagates the failure and leaves the value
+    /// unset (no partial write).
+    #[test]
+    fn test_compute_if_unset_supplier_exception_propagates() {
+        let mut ctx = mock_ctx();
+        let sv = match native_stable_value_of_empty(&mut ctx, &[]).unwrap() {
+            Some(Value::Object(Some(o))) => o,
+            other => panic!("expected StableValue object, got {other:?}"),
+        };
+        let supplier = ctx.fresh_object_ref();
+        let exc = ctx.fresh_object_ref();
+        ctx.set_invoke_virtual_result(Err(
+            cratonvm_types::error::MethodCallFailed::ExceptionThrown(exc),
+        ));
+        let r = native_stable_value_compute_if_unset(
+            &mut ctx,
+            &[Value::Object(Some(sv)), Value::Object(Some(supplier))],
+        );
+        assert!(r.is_err(), "supplier exception must propagate");
+        // Value remains unset.
+        assert_eq!(ctx.get_field(sv, SV_FIELD_IS_SET), Value::Int(0));
     }
 
     // -----------------------------------------------------------------------
