@@ -826,6 +826,22 @@ impl SharedVm {
         let object_id = class_manager
             .load_class("java/lang/Object")
             .expect("java/lang/Object must be loadable");
+        // Preload `java/lang/AssertionError` so the JIT's `new`-site resolver
+        // (`resolve_jit_new_site` → `find_class_by_name`) can resolve it. The
+        // `assert` statement compiles to `... new AssertionError ...; athrow`,
+        // which is DEAD code when assertions are disabled (the default), so the
+        // class is otherwise never loaded. With it unloaded, the resolver returns
+        // None and the JIT bails compilation of the ENTIRE method — and `assert`
+        // is pervasive in libraries. The canonical victim is ANTLR's
+        // `ParserATNSimulator.closure` (and the whole ATN-simulation cluster:
+        // `getEpsilonTarget`, `ATNConfigSet.add`, `PredictionContext.join`,
+        // `SingletonPredictionContext.getReturnState`, …), every one of which has
+        // asserts → none JIT-compile → Groovy script parsing runs the interpreter
+        // ~2500× slower than HotSpot and times out (Spring Boot buildSrc
+        // `SpringRepositoriesExtensionTests` hang). Loading it once here (a tiny
+        // standard class) lets all assert-bearing methods compile; the dead
+        // assert path still deopts harmlessly if ever reached.
+        let _ = class_manager.load_class("java/lang/AssertionError");
         let enumeration_id = class_manager
             .load_class("java/util/Enumeration")
             .expect("java/util/Enumeration must be loadable");
