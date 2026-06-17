@@ -1990,6 +1990,14 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
             .try_alloc_array_full(class_id, ArrayElementType::Reference, length)
     }
 
+    fn try_new_array(&mut self, element_type: ArrayElementType, length: usize) -> Option<ObjectRef> {
+        // Fallible sibling of `new_array` (primitive arrays) — see
+        // `try_new_ref_array`.
+        self.shared
+            .heap
+            .try_alloc_array_full(ClassId::new(0), element_type, length)
+    }
+
     fn array_component_class_id(&self, class_id: ClassId) -> Option<ClassId> {
         // `array_info` is `Some` only for array classes; its `component_class_id`
         // is the immediate element type (e.g. `String[]` for `String[][]`).

@@ -1309,7 +1309,19 @@ pub(crate) fn native_sb_init_capacity(ctx: &mut dyn NativeContext, args: &[Value
         _ => 16,
     };
     let this_pin = ctx.pin_native_root(this);
-    let buf = ctx.new_array(ArrayElementType::Char, cap);
+    // HotSpot throws a catchable OutOfMemoryError for an over-large value array
+    // (e.g. `new StringBuilder(Integer.MAX_VALUE)`); mirror that instead of the
+    // panicking allocator, which would abort the whole VM.
+    let buf = match ctx.try_new_array(ArrayElementType::Char, cap) {
+        Some(b) => b,
+        None => {
+            ctx.unpin_native_roots(this_pin);
+            return Err(cratonvm_types::error::RuntimeError::OutOfMemoryError {
+                message: "Requested array size exceeds VM limit".to_string(),
+            }
+            .into());
+        }
+    };
     let this = ctx.read_native_pin(this_pin, this);
     ctx.unpin_native_roots(this_pin);
     ctx.set_field(this, 0, Value::Object(Some(buf)));

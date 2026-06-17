@@ -527,6 +527,15 @@ pub trait NativeContext {
         Some(self.new_ref_array(class_id, length))
     }
 
+    /// Fallible primitive-array allocator — the `new_array` counterpart of
+    /// [`try_new_ref_array`](Self::try_new_ref_array). Returns `None` when the
+    /// request is too large for the heap so a native (e.g. `StringBuilder(int)`)
+    /// can raise a catchable `OutOfMemoryError` instead of aborting. Default
+    /// delegates to the infallible `new_array`.
+    fn try_new_array(&mut self, element_type: ArrayElementType, length: usize) -> Option<ObjectRef> {
+        Some(self.new_array(element_type, length))
+    }
+
     /// Component (element) class id of an array class `class_id`, or `None` if
     /// it is not an array class. Lets natives allocate a typed array matching a
     /// given array `Class` — e.g. `Arrays.copyOf(T[], n, a.getClass())` /
