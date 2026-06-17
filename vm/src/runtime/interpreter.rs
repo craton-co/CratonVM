@@ -1698,7 +1698,14 @@ fn safepoint_check(shared: &SharedVm, thread: &mut JvmThread) {
         // on `is_active() == false` when concurrent marking is idle.
         shared.heap.flush_thread_satb();
 
-        // Update root snapshot before pausing
+        // Update root snapshot before pausing. This snapshot is the ONLY view a
+        // cross-thread STW collector has of this (parked) thread's roots, so the
+        // JIT-frame portion must be a fresh scan, not the possibly-stale cached
+        // one (see `invalidate_scan_cache_for_gc`): the conservative scan covers
+        // the native stack below this thread's JIT frames, which mutated since
+        // the last boundary bump, and a dropped live root would be reclaimed by
+        // the collector this thread is about to park for.
+        crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
         update_root_snapshot(shared, thread);
 
         // Arrive at barrier and wait for GC to complete

@@ -488,6 +488,17 @@ impl Drop for JitEntryGuard {
 // covered that band (its scanner_sp was at or below the helper frame). Words
 // outside the band are interpreter/Rust junk — including or omitting them
 // only perturbs conservative over-retention, never drops a real JIT root.
+//
+// ⚠ CAVEAT (the words "outside the band" are NOT always junk): the scanned band
+// also covers the interpreter / native / Rust stack of any callee a JIT method
+// invoked, which mutates while that callee runs WITHOUT a boundary bump and can
+// hold the only live reference to a freshly-allocated object (a reflection
+// `Field[]`, a `StringBuilder` char[] in a native's Rust local, ...). Reusing
+// the snapshot across such mutation therefore CAN drop a real root. That is
+// tolerable for the cache's hot, best-effort purpose, but every
+// GC-AUTHORITATIVE root scan must first discard the snapshot via
+// [`invalidate_scan_cache_for_gc`] so it re-scans fresh. See that function's
+// doc for the corruption this prevents.
 // Address stability: while any JIT frame is live, `gc_quiescence` forces the
 // NON-MOVING young sweep, so cached `ObjectRef` addresses cannot be
 // relocated. The two diagnostic modes that lift that guarantee
@@ -505,6 +516,17 @@ struct JitScanCache {
     /// Generation the cached roots were scanned at (`u64::MAX` = never).
     filled_gen: u64,
     chain_len: usize,
+    /// Heap collection count the roots were scanned at. The boundary
+    /// generation tracks JIT *spill* mutation, but the cached `roots` are raw
+    /// object ADDRESSES — a garbage collection (which does NOT bump the
+    /// boundary generation) can free or relocate them, leaving the cache
+    /// pointing at reclaimed slots. Several young sweeps run at the SAME
+    /// generation during one interpreted callee (the boundary only bumps when
+    /// compiled code re-executes), so without this key the cache republishes
+    /// freed addresses into the root snapshot; feeding those back as roots
+    /// makes the next mark phase traverse garbage headers → the "implausible
+    /// object size" sweep abort. Invalidate whenever a collection has occurred.
+    collection_count: u64,
     roots: Vec<ObjectRef>,
 }
 
@@ -513,6 +535,7 @@ impl JitScanCache {
         Self {
             filled_gen: u64::MAX,
             chain_len: usize::MAX,
+            collection_count: u64::MAX,
             roots: Vec::new(),
         }
     }
@@ -526,10 +549,66 @@ pub fn note_jit_boundary() {
     JIT_BOUNDARY_GEN.with(|g| g.set(g.get().wrapping_add(1)));
 }
 
+/// Force the next [`scan_active_jit_frames`] on this thread to re-scan rather
+/// than reuse the cached root set. **Must be called before every GC-authoritative
+/// root collection** (the current thread's `collect_roots`, and a parked thread's
+/// pre-STW `update_root_snapshot` publish).
+///
+/// ## Why this is required (the JIT-scan-cache soundness gap)
+///
+/// The cache (see the `JIT_SCAN_CACHE` module comment) reuses the previous
+/// conservative scan's roots whenever the boundary generation is unchanged,
+/// on the premise that "JIT spill slots can only change while compiled code
+/// executes" — i.e. only at a [`note_jit_boundary`] crossing.
+///
+/// That premise is incomplete. The conservative scanner walks the WHOLE band
+/// `[scanner_sp, entry_sp]`, which also covers the **interpreter / native /
+/// Rust stack BELOW the JIT frame** (an interpreted callee a JIT method invoked,
+/// and the native helpers it in turn calls). That region mutates continuously
+/// while interpreted/native code runs — *without* any boundary bump — and it can
+/// hold the only live reference to a freshly-allocated object (e.g. a reflection
+/// `Field[]` or a `StringBuilder` char[] held in a callee's frame / a native's
+/// Rust local before it is stored into a tracked slot). `update_root_snapshot`
+/// runs on every object-returning native call and fills the cache at that same
+/// generation, so a subsequent GC root scan at the same generation reuses a
+/// snapshot that PREDATES those new references and silently drops them. With the
+/// non-moving young sweep (forced while any JIT frame is live), a dropped live
+/// root is reclaimed and its slot reused — heap corruption (observed as the
+/// "inconsistent header / implausible object size" sweep abort on reflection-
+/// heavy JIT workloads under GC stress).
+///
+/// The cache stays correct for its hot purpose (cheap repeated snapshots between
+/// native calls); we only need the *authoritative* GC root scans to be fresh.
+/// Bumping the generation here discards the stale snapshot so the immediately
+/// following `scan_active_jit_frames` performs a full, current scan.
+#[inline]
+pub fn invalidate_scan_cache_for_gc() {
+    note_jit_boundary();
+}
+
 fn jit_scan_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("CRATONVM_NO_JIT_SCAN_CACHE").is_none()
+        // DEFAULT-OFF (2026-06-17): the JIT-scan cache is unsound for the
+        // conservative scanner and corrupts the heap. The scanner walks the
+        // whole `[scanner_sp, entry_sp]` band, which covers the interpreter /
+        // native / Rust stack BELOW the JIT frame — a region that mutates while
+        // an interpreted callee runs WITHOUT a `note_jit_boundary` bump and can
+        // hold the only live reference to a freshly-allocated object. Reusing a
+        // snapshot across that mutation drops the live root; the non-moving
+        // young sweep (forced while any JIT frame is live) then reclaims it and
+        // a later walk aborts with "implausible object size". Reproduced
+        // deterministically by `wildfly-suite/repro/ReflRepro` under
+        // `CRATONVM_DBG_GC_STRESS=65536` (rc=132); `CRATONVM_NO_JIT_SCAN_CACHE`
+        // — i.e. this default — fixes it. `collect_roots` does its OWN fresh JIT
+        // scan, so the cache only ever optimised `update_root_snapshot`'s
+        // publish, which is redundant for the GC-initiating thread, so the cost
+        // of disabling is small. A SOUND reimplementation (precise oop maps that
+        // bound the cache to the genuinely-frozen JIT spill region, excluding
+        // the mutating native stack) is the tracked follow-up; until then the
+        // cache is OPT-IN via `CRATONVM_JIT_SCAN_CACHE=1` for benchmarking only.
+        std::env::var_os("CRATONVM_JIT_SCAN_CACHE").is_some()
+            && std::env::var_os("CRATONVM_NO_JIT_SCAN_CACHE").is_none()
             && std::env::var_os("CRATONVM_DBG_FORCE_MOVING").is_none()
             && std::env::var_os("CRATONVM_SHADOW_STACK").is_none()
     })
@@ -641,11 +720,23 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     // reuse the previous scan's roots verbatim unless a Rust↔JIT boundary
     // was crossed since (generation bump), which is the only way a spill
     // slot can have changed.
+    let cache_on = jit_scan_cache_enabled();
     let gen = JIT_BOUNDARY_GEN.with(|g| g.get());
-    if jit_scan_cache_enabled() {
+    // Heap collection count: a GC frees/relocates objects WITHOUT bumping the
+    // boundary generation (and several young sweeps can run at one generation
+    // during a single interpreted callee), so the cached object addresses are
+    // only valid while this is unchanged. See `JitScanCache::collection_count`.
+    // Only sampled when the (opt-in) cache is on — `collection_count()` builds a
+    // full stats snapshot, and `scan_active_jit_frames` is a per-native-call hot
+    // path, so we must not pay for it on the default cache-off path.
+    let collection_count = if cache_on { heap.collection_count() } else { 0 };
+    if cache_on {
         let hit = JIT_SCAN_CACHE.with(|c| {
             let c = c.borrow();
-            if c.filled_gen == gen && c.chain_len == chain_len {
+            if c.filled_gen == gen
+                && c.chain_len == chain_len
+                && c.collection_count == collection_count
+            {
                 out.extend_from_slice(&c.roots);
                 true
             } else {
@@ -658,11 +749,12 @@ pub fn scan_active_jit_frames(heap: &VmHeap, out: &mut Vec<ObjectRef>) {
     }
     let scan_start = out.len();
     scan_active_jit_frames_with_sp(scanner_sp, heap, out);
-    if jit_scan_cache_enabled() {
+    if cache_on {
         JIT_SCAN_CACHE.with(|c| {
             let mut c = c.borrow_mut();
             c.filled_gen = gen;
             c.chain_len = chain_len;
+            c.collection_count = collection_count;
             c.roots.clear();
             c.roots.extend_from_slice(&out[scan_start..]);
         });
