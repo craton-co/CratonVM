@@ -35057,26 +35057,89 @@ pub(crate) fn register_p70_file_attributes(r: &mut NativeMethodRegistry) {
 
     // PosixFilePermissions utility
     let pfps = "java/nio/file/attribute/PosixFilePermissions";
+    // The 9 PosixFilePermission constants in canonical "rwxrwxrwx" order, with
+    // the rwx char expected at each position. The constants are stable singletons
+    // (PosixFilePermission stub_clinit / real enum), so a HashSet of them works
+    // with Set.contains(OWNER_READ) downstream.
+    const PFP_NAMES: [&str; 9] = [
+        "OWNER_READ", "OWNER_WRITE", "OWNER_EXECUTE",
+        "GROUP_READ", "GROUP_WRITE", "GROUP_EXECUTE",
+        "OTHERS_READ", "OTHERS_WRITE", "OTHERS_EXECUTE",
+    ];
+    const PFP_PAT: [char; 9] = ['r', 'w', 'x', 'r', 'w', 'x', 'r', 'w', 'x'];
     r.register(
         pfps,
         "toString",
         "(Ljava/util/Set;)Ljava/lang/String;",
-        |ctx, _args| {
-            let s = ctx.create_string("rwxr-xr-x");
-            Ok(Some(Value::Object(Some(s))))
+        |ctx, args| {
+            // Was a stub that always returned "rwxr-xr-x". Build the real
+            // "rwxrwxrwx" string from the actual set membership.
+            let set = match args.first() {
+                Some(Value::Object(Some(o))) => *o,
+                _ => return Ok(Some(Value::Object(Some(ctx.create_string("---------"))))),
+            };
+            let pfp = "java/nio/file/attribute/PosixFilePermission";
+            let _ = ctx.ensure_class_initialized(pfp);
+            let cid = ctx.class_id_by_name(pfp);
+            let mut out = String::with_capacity(9);
+            for i in 0..9 {
+                let present = if let Some(c) = cid {
+                    match ctx.static_field_index_by_name(c, PFP_NAMES[i]) {
+                        Some(slot) => {
+                            let constant = ctx.get_static_field(c, slot);
+                            matches!(
+                                ctx.invoke_virtual(set, "contains", "(Ljava/lang/Object;)Z", &[constant]),
+                                Ok(Some(Value::Int(1)))
+                            )
+                        }
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                out.push(if present { PFP_PAT[i] } else { '-' });
+            }
+            Ok(Some(Value::Object(Some(ctx.create_string(&out)))))
         },
     );
     r.register(
         pfps,
         "fromString",
         "(Ljava/lang/String;)Ljava/util/Set;",
-        |ctx, _args| {
-            // Return empty HashSet
-            let set = alloc_concurrent_synthetic(ctx, "java/util/HashSet", 3);
-            let buckets = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 16);
-            ctx.set_field(set, 0, Value::Object(Some(buckets)));
-            ctx.set_field(set, 1, Value::Int(0));
-            ctx.set_field(set, 2, Value::Int(16));
+        |ctx, args| {
+            // Was a stub returning an EMPTY set (ignored the input). Parse the
+            // real "rwxrwxrwx" permission string into a HashSet of the singleton
+            // PosixFilePermission constants.
+            let perms = match args.first() {
+                Some(Value::Object(Some(s))) => ctx.read_string(*s).unwrap_or_default(),
+                _ => String::new(),
+            };
+            let set = match ctx.new_object("java/util/HashSet") {
+                Ok(Some(Value::Object(Some(o)))) => o,
+                _ => return Ok(Some(Value::Object(None))),
+            };
+            let _ = ctx.invoke("java/util/HashSet", "<init>", "()V", &[Value::Object(Some(set))]);
+            let chars: Vec<char> = perms.chars().collect();
+            let pfp = "java/nio/file/attribute/PosixFilePermission";
+            let _ = ctx.ensure_class_initialized(pfp);
+            let cid = ctx.class_id_by_name(pfp);
+            for i in 0..9 {
+                if chars.get(i).copied() == Some(PFP_PAT[i]) {
+                    if let Some(c) = cid {
+                        if let Some(slot) = ctx.static_field_index_by_name(c, PFP_NAMES[i]) {
+                            let constant = ctx.get_static_field(c, slot);
+                            if matches!(constant, Value::Object(Some(_))) {
+                                let _ = ctx.invoke_virtual(
+                                    set,
+                                    "add",
+                                    "(Ljava/lang/Object;)Z",
+                                    &[constant],
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             Ok(Some(Value::Object(Some(set))))
         },
     );
