@@ -929,6 +929,16 @@ fn seed_sunjsse_services() {
     // implementation in any provider" and aborted SSLContext setup.
     put_service(S, "CertificateFactory", "X.509", "sun.security.provider.X509Factory");
     put_alias(S, "CertificateFactory", "X509", "X.509");
+    // CertPathValidator / CertPathBuilder PKIX (SUN provider) — needed by the
+    // real PKIX TLS trust path and OCSP revocation tests. Without these,
+    // `CertPathValidator.getInstance("PKIX")` fell through to "no
+    // CertPathValidator PKIX implementation in any provider" and ABORTED the VM
+    // (DF06: TestOcspEnabled / TestOcspSoftFail* / TestSecurity2017Ocsp ended as
+    // NOSUMMARY). Both Sun SPI classes have the public no-arg ctor JCA requires,
+    // so `build_jca_instance`'s `new_object_initialized(cls,"()V")` runs real
+    // provider bytecode (verified against JDK 25).
+    put_service(S, "CertPathValidator", "PKIX", "sun.security.provider.certpath.PKIXCertPathValidator");
+    put_service(S, "CertPathBuilder", "PKIX", "sun.security.provider.certpath.SunCertPathBuilder");
 }
 
 /// Internal API: register an alias (Alg.Alias.<type>.<alias> → canonical).
