@@ -69,6 +69,15 @@ pub(crate) fn register(registry: &mut NativeMethodRegistry) {
     registry.set_category(cratonvm_native_api::NativeKind::Bridge);
     const KLASS: &str = "craton/gpu/internal/Native";
 
+    // Device enumeration — delegates to `cuda_bridge::probe()` via the
+    // `NativeContext::gpu_device_info` escape hatch. Truthful on a
+    // driverless host: `deviceCount` returns 0 and the per-device
+    // queries return null / 0 for every ordinal.
+    registry.register(KLASS, "deviceCount",              "()I", builtin_device_count);
+    registry.register(KLASS, "deviceName",               "(I)Ljava/lang/String;", builtin_device_name);
+    registry.register(KLASS, "deviceTotalMemory",        "(I)J", builtin_device_total_memory);
+    registry.register(KLASS, "deviceComputeCapability",  "(I)I", builtin_device_compute_capability);
+
     registry.register(KLASS, "openExecutor", "(I)Lcraton/gpu/GpuExecutor;", builtin_open_executor);
     registry.register(KLASS, "submit",       "(JLcraton/gpu/GpuCallable;)Lcraton/gpu/GpuFuture;", builtin_submit);
     registry.register(KLASS, "launch",       "(JLcraton/gpu/GpuRunnable;)Lcraton/gpu/GpuFuture;", builtin_launch);
@@ -360,6 +369,107 @@ fn snapshot_java_array(
         }
     }
     (element_type, length, bytes)
+}
+
+// ---------------------------------------------------------------------------
+// Device enumeration
+// ---------------------------------------------------------------------------
+//
+// These are the only `Native.*` handlers that touch real hardware
+// information. They delegate to `NativeContext::gpu_device_info`, whose
+// VM override calls `cuda_bridge::probe()`. On a driverless host (or a
+// stub-mode `cuda-bridge`, or the trait default) the escape hatch yields
+// an empty list, so `deviceCount` returns 0 and the per-ordinal queries
+// return null / 0. No handler ever fabricates a device.
+
+/// One entry of the device list as produced by
+/// `NativeContext::gpu_device_info`: `(name, compute_major,
+/// compute_minor, total_global_mem_bytes)`.
+#[cfg(feature = "gpu-offload")]
+type DeviceInfo = (String, u32, u32, u64);
+
+/// Bounds-safe ordinal lookup shared by the per-device queries.
+///
+/// A negative `ordinal` (Java `int` can be negative) or one past the
+/// last device yields `None`. Factored out so the bounds logic is
+/// covered by a driver-free unit test against synthetic device lists.
+#[cfg(feature = "gpu-offload")]
+fn device_at(devices: &[DeviceInfo], ordinal: i32) -> Option<&DeviceInfo> {
+    usize::try_from(ordinal).ok().and_then(|i| devices.get(i))
+}
+
+/// Pack a `(major, minor)` compute capability into the `major*10 + minor`
+/// integer the Java side expects (sm_75 → `75`). Kept separate so the
+/// packing is unit-tested directly.
+#[cfg(feature = "gpu-offload")]
+fn pack_compute_capability(major: u32, minor: u32) -> i32 {
+    (major * 10 + minor) as i32
+}
+
+/// `Native.deviceCount() -> int`
+///
+/// Number of attached CUDA devices. `0` when there is no driver.
+#[cfg(feature = "gpu-offload")]
+fn builtin_device_count(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    _args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let count = ctx.gpu_device_info().len();
+    Ok(Some(Value::Int(count as i32)))
+}
+
+/// `Native.deviceName(int ordinal) -> String`
+///
+/// Device product name (e.g. `"NVIDIA GeForce RTX 2060"`), or `null`
+/// when `ordinal` is out of range / no device is present.
+#[cfg(feature = "gpu-offload")]
+fn builtin_device_name(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let ordinal = arg_int(args, 0);
+    let devices = ctx.gpu_device_info();
+    let name = device_at(&devices, ordinal).map(|(name, _, _, _)| name.clone());
+    let value = match name {
+        Some(text) => Value::Object(Some(ctx.create_string(&text))),
+        None => Value::Object(None),
+    };
+    Ok(Some(value))
+}
+
+/// `Native.deviceTotalMemory(int ordinal) -> long`
+///
+/// Total global device memory in bytes, or `0` when `ordinal` is out of
+/// range / no device is present.
+#[cfg(feature = "gpu-offload")]
+fn builtin_device_total_memory(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let ordinal = arg_int(args, 0);
+    let devices = ctx.gpu_device_info();
+    let bytes = device_at(&devices, ordinal)
+        .map(|(_, _, _, mem)| *mem)
+        .unwrap_or(0);
+    Ok(Some(Value::Long(bytes as i64)))
+}
+
+/// `Native.deviceComputeCapability(int ordinal) -> int`
+///
+/// Compute capability packed as `major * 10 + minor` (e.g. sm_75 →
+/// `75`), or `0` when `ordinal` is out of range / no device is present.
+/// `0` is an impossible real capability, so it doubles as a sentinel.
+#[cfg(feature = "gpu-offload")]
+fn builtin_device_compute_capability(
+    ctx: &mut dyn cratonvm_native_api::NativeContext,
+    args: &[Value],
+) -> cratonvm_types::error::MethodCallResult {
+    let ordinal = arg_int(args, 0);
+    let devices = ctx.gpu_device_info();
+    let packed = device_at(&devices, ordinal)
+        .map(|(_, major, minor, _)| pack_compute_capability(*major, *minor))
+        .unwrap_or(0);
+    Ok(Some(Value::Int(packed)))
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,4 +1154,149 @@ fn builtin_release_array(
     });
     ctx.gpu_release_array_cache(handle);
     Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Tests (gpu-offload only)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "gpu-offload"))]
+mod tests {
+    use super::*;
+    use crate::test_utils::MockNativeContext;
+
+    fn synthetic_devices() -> Vec<DeviceInfo> {
+        vec![
+            ("NVIDIA GeForce RTX 2060".to_string(), 7, 5, 6 * 1024 * 1024 * 1024),
+            ("NVIDIA A100".to_string(), 8, 0, 40 * 1024 * 1024 * 1024),
+        ]
+    }
+
+    // ── Pure ordinal-lookup + capability-packing logic ──────────────────
+
+    #[test]
+    fn device_at_in_range() {
+        let d = synthetic_devices();
+        assert_eq!(device_at(&d, 0).unwrap().0, "NVIDIA GeForce RTX 2060");
+        assert_eq!(device_at(&d, 1).unwrap().0, "NVIDIA A100");
+    }
+
+    #[test]
+    fn device_at_out_of_range_is_none() {
+        let d = synthetic_devices();
+        // One past the end.
+        assert!(device_at(&d, 2).is_none());
+        // Java ints can be negative; must not panic or wrap into a valid
+        // index.
+        assert!(device_at(&d, -1).is_none());
+        assert!(device_at(&d, i32::MIN).is_none());
+    }
+
+    #[test]
+    fn device_at_empty_list_is_none() {
+        let empty: Vec<DeviceInfo> = Vec::new();
+        assert!(device_at(&empty, 0).is_none());
+        assert!(device_at(&empty, -5).is_none());
+    }
+
+    #[test]
+    fn compute_capability_packing() {
+        // sm_75 → 75, sm_80 → 80, sm_90 → 90.
+        assert_eq!(pack_compute_capability(7, 5), 75);
+        assert_eq!(pack_compute_capability(8, 0), 80);
+        assert_eq!(pack_compute_capability(9, 0), 90);
+        // Two-digit minor (hypothetical) still packs deterministically.
+        assert_eq!(pack_compute_capability(7, 2), 72);
+    }
+
+    #[test]
+    fn synthetic_device_fields_round_trip() {
+        let d = synthetic_devices();
+        let (name, major, minor, mem) = device_at(&d, 1).unwrap();
+        assert_eq!(name, "NVIDIA A100");
+        assert_eq!(pack_compute_capability(*major, *minor), 80);
+        assert_eq!(*mem, 40 * 1024 * 1024 * 1024);
+    }
+
+    // ── Handler glue on the no-device fallback path ─────────────────────
+    //
+    // `MockNativeContext` uses the trait's default `gpu_device_info`,
+    // which returns an empty Vec — exactly the driverless-host /
+    // stub-`cuda-bridge` case this build degrades to. The handlers must
+    // report a truthful "no device" rather than fabricating one.
+
+    #[test]
+    fn device_count_no_device_is_zero() {
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_device_count(&mut ctx, &[]).unwrap();
+        assert_eq!(r, Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn device_name_no_device_is_null() {
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_device_name(&mut ctx, &[Value::Int(0)]).unwrap();
+        assert_eq!(r, Some(Value::Object(None)));
+    }
+
+    #[test]
+    fn device_total_memory_no_device_is_zero() {
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_device_total_memory(&mut ctx, &[Value::Int(0)]).unwrap();
+        assert_eq!(r, Some(Value::Long(0)));
+    }
+
+    #[test]
+    fn device_compute_capability_no_device_is_zero() {
+        let mut ctx = MockNativeContext::new();
+        let r = builtin_device_compute_capability(&mut ctx, &[Value::Int(0)]).unwrap();
+        assert_eq!(r, Some(Value::Int(0)));
+    }
+
+    #[test]
+    fn device_queries_negative_ordinal_no_device() {
+        // Negative ordinal on the no-device path must still be a clean
+        // null / 0, never a panic.
+        let mut ctx = MockNativeContext::new();
+        assert_eq!(
+            builtin_device_name(&mut ctx, &[Value::Int(-1)]).unwrap(),
+            Some(Value::Object(None))
+        );
+        assert_eq!(
+            builtin_device_compute_capability(&mut ctx, &[Value::Int(-1)]).unwrap(),
+            Some(Value::Int(0))
+        );
+    }
+
+    // ── Future round-trip via the synthetic state store ─────────────────
+    //
+    // The failed-future path is fully handle-based and works end-to-end
+    // without a device, so it can be exercised directly.
+
+    #[test]
+    fn failed_future_reports_status_and_message() {
+        let h = record_failed_future_with_message("test failure");
+        // Status code 2 == FAILED in the spec's enum-ordinal layout.
+        let mut ctx = MockNativeContext::new();
+        let status = builtin_future_status(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        assert_eq!(status, Some(Value::Int(2)));
+        // Error message round-trips back as a (mock) String object.
+        let msg = builtin_future_get_error_message(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        assert!(matches!(msg, Some(Value::Object(Some(_)))));
+        // Result of a failed future is null.
+        let res = builtin_future_get_result(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        assert_eq!(res, Some(Value::Object(None)));
+        // Releasing it removes it: status becomes UNKNOWN (3).
+        builtin_release_future(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        let after = builtin_future_status(&mut ctx, &[Value::Long(h as i64)]).unwrap();
+        assert_eq!(after, Some(Value::Int(3)));
+    }
+
+    #[test]
+    fn unknown_future_handle_is_status_unknown() {
+        let mut ctx = MockNativeContext::new();
+        // A handle that was never recorded.
+        let status = builtin_future_status(&mut ctx, &[Value::Long(999_999)]).unwrap();
+        assert_eq!(status, Some(Value::Int(3)));
+    }
 }

@@ -140,6 +140,7 @@ enum HeapEntry {
     },
     Array {
         elements: Vec<Value>,
+        element_type: ArrayElementType,
     },
 }
 
@@ -542,6 +543,25 @@ impl MockNativeContext {
         *self.ptr_map_ref().get(&ptr_val).expect("invalid ObjectRef in mock heap")
     }
 
+    /// Allocate a bare heap object and return its `ObjectRef`. Used by tests
+    /// that only need a distinct object identity (e.g. a dummy `Supplier`)
+    /// without caring about its class or fields. Class id 0 + four zeroed
+    /// slots mirrors `new_object`'s default layout.
+    pub(crate) fn fresh_object_ref(&mut self) -> ObjectRef {
+        self.alloc_entry(HeapEntry::Object {
+            class_id: ClassId::new(0),
+            fields: vec![Value::Int(0); 4],
+        })
+    }
+
+    /// Script the next `invoke_virtual` upcall's result (consumed once by the
+    /// mock's `invoke_virtual`). Mirrors directly writing
+    /// `invoke_virtual_result`; provided as a method so tests read cleanly.
+    pub(crate) fn set_invoke_virtual_result(&self, result: MethodCallResult) {
+        // SAFETY: single-threaded test context; no aliasing of the cell.
+        unsafe { *self.invoke_virtual_result.get() = Some(result) };
+    }
+
     /// FIX(test-isolation): map a `thread_id` handed out by
     /// `register_native_thread` back to its 0-based slot in
     /// `registered_native_threads`. The k-th registration returns
@@ -659,22 +679,24 @@ impl NativeContext for MockNativeContext {
         false
     }
 
-    fn new_array(&mut self, _element_type: ArrayElementType, length: usize) -> ObjectRef {
+    fn new_array(&mut self, element_type: ArrayElementType, length: usize) -> ObjectRef {
         self.alloc_entry(HeapEntry::Array {
             elements: vec![Value::Int(0); length],
+            element_type,
         })
     }
 
     fn new_ref_array(&mut self, _class_id: ClassId, length: usize) -> ObjectRef {
         self.alloc_entry(HeapEntry::Array {
             elements: vec![Value::Object(None); length],
+            element_type: ArrayElementType::Reference,
         })
     }
 
     fn array_length(&self, obj: ObjectRef) -> usize {
         let idx = self.entry_index(obj);
         match &self.heap_ref()[idx] {
-            HeapEntry::Array { elements } => elements.len(),
+            HeapEntry::Array { elements, .. } => elements.len(),
             _ => 0,
         }
     }
@@ -682,7 +704,7 @@ impl NativeContext for MockNativeContext {
     fn get_array_element(&self, obj: ObjectRef, index: usize) -> Value {
         let idx = self.entry_index(obj);
         match &self.heap_ref()[idx] {
-            HeapEntry::Array { elements } => {
+            HeapEntry::Array { elements, .. } => {
                 elements.get(index).copied().unwrap_or(Value::Int(0))
             }
             _ => Value::Int(0),
@@ -692,7 +714,7 @@ impl NativeContext for MockNativeContext {
     fn set_array_element(&self, obj: ObjectRef, index: usize, value: Value) {
         let idx = self.entry_index(obj);
         match &mut self.heap_mut()[idx] {
-            HeapEntry::Array { elements } => {
+            HeapEntry::Array { elements, .. } => {
                 if index < elements.len() {
                     elements[index] = value;
                 }
@@ -709,8 +731,12 @@ impl NativeContext for MockNativeContext {
         }
     }
 
-    fn heap_element_type_of(&self, _obj: ObjectRef) -> ArrayElementType {
-        ArrayElementType::Reference
+    fn heap_element_type_of(&self, obj: ObjectRef) -> ArrayElementType {
+        let idx = self.entry_index(obj);
+        match &self.heap_ref()[idx] {
+            HeapEntry::Array { element_type, .. } => *element_type,
+            _ => ArrayElementType::Reference,
+        }
     }
 
     fn create_string(&mut self, text: &str) -> ObjectRef {
@@ -718,10 +744,18 @@ impl NativeContext for MockNativeContext {
         let chars: Vec<u16> = text.encode_utf16().collect();
         let arr = self.alloc_entry(HeapEntry::Array {
             elements: chars.iter().map(|&c| Value::Int(c as i32)).collect(),
+            element_type: ArrayElementType::Char,
         });
+        // Resolve the canonical String class id so callers that inspect the
+        // object's class (e.g. ObjectOutputStream's String fast-path) see
+        // `java/lang/String` rather than the class-0 ("Object") default.
+        let sid = self
+            .ensure_class_initialized("java/lang/String")
+            .map(|c| c.as_u32())
+            .unwrap_or(0);
         // Create string object: field 0 = char[], field 1 = hash (0)
         self.alloc_entry(HeapEntry::Object {
-            class_id: ClassId::new(0),
+            class_id: ClassId::new(sid),
             fields: vec![Value::Object(Some(arr)), Value::Int(0)],
         })
     }

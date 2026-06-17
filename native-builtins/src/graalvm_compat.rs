@@ -11,8 +11,9 @@
 use parking_lot::RwLock;
 use cratonvm_native_api::{NativeContext, NativeMethodRegistry};
 use cratonvm_types::error::MethodCallResult;
-use cratonvm_types::Value;
+use cratonvm_types::{ObjectRef, Value};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Escape a string for safe JSON embedding. Handles `"`, `\`, and control chars.
 fn json_escape(s: &str) -> String {
@@ -795,6 +796,33 @@ static GRAALVM_SUBSTITUTIONS: RwLock<Option<SubstitutionRegistry>> = RwLock::new
 /// Feature callbacks registered by the application.
 static GRAALVM_FEATURES: RwLock<Option<Vec<FeatureRegistration>>> = RwLock::new(None);
 
+/// Global `ImageSingletons` registry (org.graalvm.nativeimage.ImageSingletons).
+///
+/// Maps a singleton *key class* (internal slash-form name) to the live
+/// singleton object. We never store the bare `ObjectRef` pointer across a GC
+/// move — instead we keep the VM's pin handle (from
+/// [`NativeContext::pin_native_root`]) plus the raw pointer as a fallback, and
+/// read the forwarded reference back with `read_native_pin` on lookup.
+static GRAALVM_SINGLETONS: RwLock<Option<HashMap<String, SingletonSlot>>> = RwLock::new(None);
+
+/// One entry in the ImageSingletons registry.
+#[derive(Debug, Clone, Copy)]
+struct SingletonSlot {
+    /// GC pin handle keeping the object alive (0 for non-relocating contexts).
+    pin_handle: usize,
+    /// Raw pointer fallback, used to rebuild an `ObjectRef` when the VM does
+    /// not relocate (mock contexts return the fallback unchanged).
+    raw_ptr: *mut u8,
+}
+
+// SAFETY: `SingletonSlot::raw_ptr` is only ever dereferenced by the VM through
+// `read_native_pin` (which validates the handle); we store it purely as the
+// fallback `ObjectRef` and never read through it directly. The object it names
+// is kept alive by `pin_handle`. The pointer is therefore a plain integer
+// token from this module's perspective, so the slot is safe to share.
+unsafe impl Send for SingletonSlot {}
+unsafe impl Sync for SingletonSlot {}
+
 /// A registered GraalVM Feature (org.graalvm.nativeimage.hosted.Feature).
 #[derive(Debug, Clone)]
 pub struct FeatureRegistration {
@@ -811,6 +839,7 @@ pub fn init_graalvm_metadata() {
     *GRAALVM_CONFIG.write() = Some(NativeImageConfig::new());
     *GRAALVM_SUBSTITUTIONS.write() = Some(SubstitutionRegistry::new());
     *GRAALVM_FEATURES.write() = Some(Vec::new());
+    *GRAALVM_SINGLETONS.write() = Some(HashMap::new());
 }
 
 /// Register a class for runtime reflection access.
@@ -984,6 +1013,114 @@ fn reset_graalvm_globals() {
     *GRAALVM_CONFIG.write() = None;
     *GRAALVM_SUBSTITUTIONS.write() = None;
     *GRAALVM_FEATURES.write() = None;
+    *GRAALVM_SINGLETONS.write() = None;
+    set_image_code_mode(ImageCodeMode::Off);
+}
+
+/// True when an `ImageSingletons` entry exists for `key_class`.
+///
+/// Mirrors `ImageSingletons.contains(Class)`. Returns `false` when the
+/// registry is not initialized.
+pub fn graalvm_singleton_contains(key_class: &str) -> bool {
+    let guard = GRAALVM_SINGLETONS.read();
+    match guard.as_ref() {
+        Some(map) => map.contains_key(key_class),
+        None => false,
+    }
+}
+
+/// Number of registered `ImageSingletons` entries (for diagnostics/tests).
+pub fn graalvm_singleton_count() -> usize {
+    let guard = GRAALVM_SINGLETONS.read();
+    guard.as_ref().map(|m| m.len()).unwrap_or(0)
+}
+
+// ===========================================================================
+// ImageInfo runtime mode (org.graalvm.nativeimage.ImageInfo)
+// ===========================================================================
+//
+// Real GraalVM derives ImageInfo's booleans from the system property
+// `org.graalvm.nativeimage.imagecode`, whose value is one of:
+//   - unset      → not running inside a native image (HotSpot / CratonVM)
+//   - "buildtime"→ executing in the image *generator* (build time)
+//   - "runtime"  → executing inside the generated image at run time
+//
+// CratonVM is a regular JVM, so the honest default is *not in image*
+// (`inImageCode() == false`), which matches real GraalVM running on HotSpot.
+// We still model the three states explicitly so (a) test harnesses and
+// build-tooling probing the surface get internally-consistent answers, and
+// (b) a host embedding CratonVM as an image-generation sandbox can flip the
+// mode via [`set_image_code_mode`].
+
+/// The three ImageInfo execution states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageCodeMode {
+    /// Not running inside a native image (default — CratonVM as a normal JVM).
+    Off,
+    /// Executing inside the native-image *generator* (build time).
+    Buildtime,
+    /// Executing inside a generated native image at run time.
+    Runtime,
+}
+
+impl ImageCodeMode {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => ImageCodeMode::Buildtime,
+            2 => ImageCodeMode::Runtime,
+            _ => ImageCodeMode::Off,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            ImageCodeMode::Off => 0,
+            ImageCodeMode::Buildtime => 1,
+            ImageCodeMode::Runtime => 2,
+        }
+    }
+
+    /// The GraalVM `org.graalvm.nativeimage.imagecode` property value, if any.
+    pub fn property_value(self) -> Option<&'static str> {
+        match self {
+            ImageCodeMode::Off => None,
+            ImageCodeMode::Buildtime => Some("buildtime"),
+            ImageCodeMode::Runtime => Some("runtime"),
+        }
+    }
+
+    fn from_property(value: &str) -> Self {
+        match value {
+            "buildtime" => ImageCodeMode::Buildtime,
+            "runtime" => ImageCodeMode::Runtime,
+            _ => ImageCodeMode::Off,
+        }
+    }
+}
+
+/// Global ImageInfo mode. Defaults to `Off` (CratonVM is not a native image).
+static IMAGE_CODE_MODE: AtomicU8 = AtomicU8::new(0);
+
+/// Override the ImageInfo execution mode. Hosts embedding CratonVM as an
+/// image-generation sandbox call this; otherwise the default (`Off`) is the
+/// correct answer for a normal JVM.
+pub fn set_image_code_mode(mode: ImageCodeMode) {
+    IMAGE_CODE_MODE.store(mode.as_u8(), Ordering::Release);
+}
+
+/// Current ImageInfo execution mode.
+pub fn image_code_mode() -> ImageCodeMode {
+    ImageCodeMode::from_u8(IMAGE_CODE_MODE.load(Ordering::Acquire))
+}
+
+/// Resolve the effective mode for a native call: the system property
+/// (if the running program set one) takes precedence over the global flag,
+/// mirroring GraalVM's property-driven contract.
+fn effective_image_mode(ctx: &dyn NativeContext) -> ImageCodeMode {
+    if let Some(v) = ctx.get_system_property("org.graalvm.nativeimage.imagecode") {
+        return ImageCodeMode::from_property(&v);
+    }
+    image_code_mode()
 }
 
 // ===========================================================================
@@ -991,37 +1128,44 @@ fn reset_graalvm_globals() {
 // ===========================================================================
 
 fn graalvm_in_image_code(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
+    // True in either buildtime or runtime image modes.
+    let in_image = effective_image_mode(ctx) != ImageCodeMode::Off;
+    Ok(Some(Value::Int(if in_image { 1 } else { 0 })))
 }
 
 fn graalvm_in_image_buildtime_code(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
+    let v = effective_image_mode(ctx) == ImageCodeMode::Buildtime;
+    Ok(Some(Value::Int(if v { 1 } else { 0 })))
 }
 
 fn graalvm_in_image_runtime_code(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
+    let v = effective_image_mode(ctx) == ImageCodeMode::Runtime;
+    Ok(Some(Value::Int(if v { 1 } else { 0 })))
 }
 
 fn graalvm_is_executable(
-    _ctx: &mut dyn NativeContext,
+    ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
-    Ok(Some(Value::Int(0)))
+    // A generated image is an executable only while it is running (runtime).
+    let v = effective_image_mode(ctx) == ImageCodeMode::Runtime;
+    Ok(Some(Value::Int(if v { 1 } else { 0 })))
 }
 
 fn graalvm_is_shared_library(
     _ctx: &mut dyn NativeContext,
     _args: &[Value],
 ) -> MethodCallResult {
+    // CratonVM never produces a shared-library image form.
     Ok(Some(Value::Int(0)))
 }
 
@@ -1112,6 +1256,91 @@ fn graalvm_feature_register(
         if let Some(name) = ctx.class_name_of_id(class_id) {
             graalvm_register_feature(&name);
         }
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// org.graalvm.nativeimage.ImageSingletons
+// ---------------------------------------------------------------------------
+//
+// GraalVM's ImageSingletons is a build-time/run-time keyed registry of
+// per-image singleton objects, keyed by Class. On a normal JVM there is no
+// image, so frameworks that probe ImageSingletons (Micronaut, Quarkus, the
+// GraalVM SDK itself) need a working in-heap map: `add(key, obj)` stores,
+// `contains(key)` queries, `lookup(key)` returns the stored object (throwing
+// in real GraalVM if absent — we return null, which the bytecode wrapper turns
+// into the same outcome for the common `contains`-guarded call pattern).
+
+/// Resolve the internal name of the Class object passed as `args[idx]`.
+fn class_name_arg(ctx: &dyn NativeContext, args: &[Value], idx: usize) -> Option<String> {
+    if let Some(Value::Object(Some(class_obj))) = args.get(idx) {
+        let class_id = ctx.class_id_of_object(*class_obj);
+        ctx.class_name_of_id(class_id)
+    } else {
+        None
+    }
+}
+
+fn graalvm_singletons_contains(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // static contains(Class) — args[0] = key Class
+    let present = class_name_arg(ctx, args, 0)
+        .map(|name| graalvm_singleton_contains(&name))
+        .unwrap_or(false);
+    Ok(Some(Value::Int(if present { 1 } else { 0 })))
+}
+
+fn graalvm_singletons_lookup(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // static <T> lookup(Class<T>) — args[0] = key Class; returns the singleton.
+    let Some(name) = class_name_arg(ctx, args, 0) else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let slot = {
+        let guard = GRAALVM_SINGLETONS.read();
+        guard.as_ref().and_then(|m| m.get(&name).copied())
+    };
+    match slot {
+        Some(slot) => {
+            // Rebuild the fallback ObjectRef from the stored pointer, then ask
+            // the VM for the current (possibly forwarded) reference.
+            // SAFETY: raw_ptr was a live, non-null, 8-byte-aligned heap object
+            // when stored via `add`; it is kept alive by the pin handle. In a
+            // relocating VM `read_native_pin` returns the forwarded reference
+            // and ignores the stale fallback.
+            if slot.raw_ptr.is_null() {
+                return Ok(Some(Value::Object(None)));
+            }
+            let fallback = unsafe { ObjectRef::from_raw(slot.raw_ptr) };
+            let live = ctx.read_native_pin(slot.pin_handle, fallback);
+            Ok(Some(Value::Object(Some(live))))
+        }
+        None => Ok(Some(Value::Object(None))),
+    }
+}
+
+fn graalvm_singletons_add(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    // static <T> add(Class<T> key, T value) — args[0] = key Class, args[1] = value.
+    let Some(name) = class_name_arg(ctx, args, 0) else {
+        return Ok(None);
+    };
+    let Some(Value::Object(Some(value))) = args.get(1).copied() else {
+        return Ok(None);
+    };
+    // Pin the object so a moving GC keeps it alive and so we can read the
+    // forwarded reference back on lookup.
+    let pin_handle = ctx.pin_native_root(value);
+    let raw_ptr = ctx.read_native_pin(pin_handle, value).as_ptr();
+    if let Some(ref mut map) = *GRAALVM_SINGLETONS.write() {
+        map.insert(name, SingletonSlot { pin_handle, raw_ptr });
     }
     Ok(None)
 }
@@ -1218,6 +1447,26 @@ pub(crate) fn register_graalvm_compat_natives(r: &mut NativeMethodRegistry) {
         "register",
         "(Ljava/lang/Class;)V",
         graalvm_feature_register,
+    );
+
+    // --- org/graalvm/nativeimage/ImageSingletons ---
+    r.register(
+        "org/graalvm/nativeimage/ImageSingletons",
+        "contains",
+        "(Ljava/lang/Class;)Z",
+        graalvm_singletons_contains,
+    );
+    r.register(
+        "org/graalvm/nativeimage/ImageSingletons",
+        "lookup",
+        "(Ljava/lang/Class;)Ljava/lang/Object;",
+        graalvm_singletons_lookup,
+    );
+    r.register(
+        "org/graalvm/nativeimage/ImageSingletons",
+        "add",
+        "(Ljava/lang/Class;Ljava/lang/Object;)V",
+        graalvm_singletons_add,
     );
 
     // --- CratonVM extension: metadata dump ---
@@ -2193,5 +2442,198 @@ mod tests {
         assert!(glob_match("src/**/*.rs", "src/lib.rs"));
         assert!(glob_match("src/**/*.rs", "src/deep/nested/file.rs"));
         assert!(!glob_match("src/**/*.rs", "test/file.rs"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ImageInfo execution-mode tests
+    // -----------------------------------------------------------------------
+    //
+    // These drive the real native bodies through the in-crate MockNativeContext
+    // (which resolves class names + system properties), so they exercise the
+    // mode logic end-to-end rather than just registration presence.
+
+    use crate::test_utils::MockNativeContext;
+
+    /// Allocate an object whose runtime class resolves to `class_name`. Our
+    /// `ImageSingletons` natives only need `class_id_of_object` →
+    /// `class_name_of_id` to round-trip, which this satisfies.
+    fn class_object(ctx: &mut MockNativeContext, class_name: &str) -> Value {
+        let cid = ctx.ensure_class_initialized(class_name).expect("class init");
+        Value::Object(Some(ctx.alloc_object(cid, 0)))
+    }
+
+    #[test]
+    fn test_image_info_default_off_is_not_in_image() {
+        let _guard = graalvm_test_lock();
+        reset_graalvm_globals();
+        let mut ctx = MockNativeContext::new();
+        // Default mode: not a native image (CratonVM is a normal JVM).
+        assert_eq!(
+            graalvm_in_image_code(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            graalvm_in_image_buildtime_code(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            graalvm_in_image_runtime_code(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            graalvm_is_executable(&mut ctx, &[]).unwrap(),
+            Some(Value::Int(0))
+        );
+        reset_graalvm_globals();
+    }
+
+    #[test]
+    fn test_image_info_runtime_mode_flag() {
+        let _guard = graalvm_test_lock();
+        reset_graalvm_globals();
+        set_image_code_mode(ImageCodeMode::Runtime);
+        let mut ctx = MockNativeContext::new();
+        assert_eq!(graalvm_in_image_code(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
+        assert_eq!(graalvm_in_image_runtime_code(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
+        assert_eq!(graalvm_in_image_buildtime_code(&mut ctx, &[]).unwrap(), Some(Value::Int(0)));
+        // A running generated image is the executable form.
+        assert_eq!(graalvm_is_executable(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
+        assert_eq!(graalvm_is_shared_library(&mut ctx, &[]).unwrap(), Some(Value::Int(0)));
+        reset_graalvm_globals();
+    }
+
+    #[test]
+    fn test_image_info_buildtime_mode_flag() {
+        let _guard = graalvm_test_lock();
+        reset_graalvm_globals();
+        set_image_code_mode(ImageCodeMode::Buildtime);
+        let mut ctx = MockNativeContext::new();
+        assert_eq!(graalvm_in_image_code(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
+        assert_eq!(graalvm_in_image_buildtime_code(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
+        assert_eq!(graalvm_in_image_runtime_code(&mut ctx, &[]).unwrap(), Some(Value::Int(0)));
+        // Build-time image generation is not the executable.
+        assert_eq!(graalvm_is_executable(&mut ctx, &[]).unwrap(), Some(Value::Int(0)));
+        reset_graalvm_globals();
+    }
+
+    #[test]
+    fn test_image_info_system_property_overrides_flag() {
+        let _guard = graalvm_test_lock();
+        reset_graalvm_globals();
+        // Flag says Off, but the running program set the GraalVM property to
+        // "runtime" — the property must win (matches GraalVM's contract).
+        set_image_code_mode(ImageCodeMode::Off);
+        let mut ctx = MockNativeContext::new();
+        ctx.set_system_property("org.graalvm.nativeimage.imagecode", "runtime");
+        assert_eq!(graalvm_in_image_code(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
+        assert_eq!(graalvm_in_image_runtime_code(&mut ctx, &[]).unwrap(), Some(Value::Int(1)));
+        reset_graalvm_globals();
+    }
+
+    #[test]
+    fn test_image_code_mode_property_value() {
+        assert_eq!(ImageCodeMode::Off.property_value(), None);
+        assert_eq!(ImageCodeMode::Buildtime.property_value(), Some("buildtime"));
+        assert_eq!(ImageCodeMode::Runtime.property_value(), Some("runtime"));
+    }
+
+    // -----------------------------------------------------------------------
+    // ImageSingletons tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_image_singletons_add_contains_lookup_roundtrip() {
+        let _guard = graalvm_test_lock();
+        reset_graalvm_globals();
+        init_graalvm_metadata();
+        let mut ctx = MockNativeContext::new();
+
+        let key = class_object(&mut ctx, "com/example/MyServiceKey");
+        // Value: any heap object standing in for the singleton instance.
+        let value_cid = ctx.ensure_class_initialized("com/example/MyServiceImpl").unwrap();
+        let value = Value::Object(Some(ctx.alloc_object(value_cid, 2)));
+
+        // Not present before add.
+        assert_eq!(
+            graalvm_singletons_contains(&mut ctx, std::slice::from_ref(&key)).unwrap(),
+            Some(Value::Int(0))
+        );
+        assert_eq!(
+            graalvm_singletons_lookup(&mut ctx, std::slice::from_ref(&key)).unwrap(),
+            Some(Value::Object(None))
+        );
+
+        // add(key, value)
+        graalvm_singletons_add(&mut ctx, &[key, value]).unwrap();
+        assert_eq!(graalvm_singleton_count(), 1);
+        assert!(graalvm_singleton_contains("com/example/MyServiceKey"));
+
+        // contains(key) → true
+        assert_eq!(
+            graalvm_singletons_contains(&mut ctx, std::slice::from_ref(&key)).unwrap(),
+            Some(Value::Int(1))
+        );
+
+        // lookup(key) → the same object we stored.
+        let looked_up = graalvm_singletons_lookup(&mut ctx, std::slice::from_ref(&key)).unwrap();
+        assert_eq!(looked_up, Some(value));
+        reset_graalvm_globals();
+    }
+
+    #[test]
+    fn test_image_singletons_lookup_absent_returns_null() {
+        let _guard = graalvm_test_lock();
+        reset_graalvm_globals();
+        init_graalvm_metadata();
+        let mut ctx = MockNativeContext::new();
+        let key = class_object(&mut ctx, "com/example/Absent");
+        assert_eq!(
+            graalvm_singletons_lookup(&mut ctx, std::slice::from_ref(&key)).unwrap(),
+            Some(Value::Object(None))
+        );
+        reset_graalvm_globals();
+    }
+
+    #[test]
+    fn test_image_singletons_distinct_keys() {
+        let _guard = graalvm_test_lock();
+        reset_graalvm_globals();
+        init_graalvm_metadata();
+        let mut ctx = MockNativeContext::new();
+
+        let key_a = class_object(&mut ctx, "com/example/KeyA");
+        let key_b = class_object(&mut ctx, "com/example/KeyB");
+        let val_cid = ctx.ensure_class_initialized("com/example/ValA").unwrap();
+        let val_a = Value::Object(Some(ctx.alloc_object(val_cid, 1)));
+
+        graalvm_singletons_add(&mut ctx, &[key_a, val_a]).unwrap();
+        assert!(graalvm_singleton_contains("com/example/KeyA"));
+        assert!(!graalvm_singleton_contains("com/example/KeyB"));
+        assert_eq!(
+            graalvm_singletons_contains(&mut ctx, std::slice::from_ref(&key_b)).unwrap(),
+            Some(Value::Int(0))
+        );
+        reset_graalvm_globals();
+    }
+
+    #[test]
+    fn test_image_singletons_helpers_uninitialized() {
+        let _guard = graalvm_test_lock();
+        reset_graalvm_globals();
+        // No init_graalvm_metadata(): registry is None → permissive defaults.
+        assert!(!graalvm_singleton_contains("anything"));
+        assert_eq!(graalvm_singleton_count(), 0);
+        reset_graalvm_globals();
+    }
+
+    #[test]
+    fn test_register_image_singletons_natives() {
+        let r = make_registry();
+        const SINGLETONS: &str = "org/graalvm/nativeimage/ImageSingletons";
+        assert!(r.find(SINGLETONS, "contains", "(Ljava/lang/Class;)Z").is_some());
+        assert!(r.find(SINGLETONS, "lookup", "(Ljava/lang/Class;)Ljava/lang/Object;").is_some());
+        assert!(r
+            .find(SINGLETONS, "add", "(Ljava/lang/Class;Ljava/lang/Object;)V")
+            .is_some());
     }
 }

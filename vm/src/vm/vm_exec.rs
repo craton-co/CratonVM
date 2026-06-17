@@ -1728,6 +1728,33 @@ impl<'a> NativeContext for NativeContextImpl<'a> {
         }
     }
 
+    /// GPU device enumeration: delegate to the real CUDA bridge probe.
+    ///
+    /// `cuda_bridge::probe()` reports the primary device (ordinal 0) or
+    /// `Err(DeviceError::NoDriver)` when no driver is present or the
+    /// bridge was built in stub mode. We translate `Ok(caps)` into a
+    /// single-entry list and any `Err` into an empty list — so the
+    /// `Native.deviceCount` shim returns a truthful `0` on a driverless
+    /// host rather than fabricating a device.
+    fn gpu_device_info(&self) -> Vec<(String, u32, u32, u64)> {
+        #[cfg(feature = "gpu-offload")]
+        {
+            match cuda_bridge::probe() {
+                Ok(caps) => vec![(
+                    caps.name,
+                    caps.compute_major,
+                    caps.compute_minor,
+                    caps.total_global_mem,
+                )],
+                Err(_) => Vec::new(),
+            }
+        }
+        #[cfg(not(feature = "gpu-offload"))]
+        {
+            Vec::new()
+        }
+    }
+
     fn is_class_synthetic_stub(&self, class_name: &str) -> bool {
         match self.shared.load_class_concurrent(class_name) {
             Ok(class_id) => self
