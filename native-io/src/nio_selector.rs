@@ -1799,6 +1799,45 @@ fn channel_register_native(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     Ok(Some(Value::Object(Some(key_obj))))
 }
 
+/// `SelectableChannel.keyFor(Selector)` — return the `SelectionKey` this channel
+/// is currently registered with on `sel`, or `null`.
+///
+/// The real `AbstractSelectableChannel.keyFor` bytecode is
+/// `synchronized (keyLock) { ...walk keys[]... }`. CratonVM's channel objects keep
+/// their state in the `socket_channel` identity-hash side-table and never
+/// initialise the reference-typed `keyLock` slot, so that bytecode does
+/// `monitorenter` on a null `keyLock` → `NullPointerException`. Tomcat's
+/// `NioEndpoint` reports this as "Error in selector loop" and the poller thread
+/// dies, so every embedded-server test hangs (DF01). Answer from the native key
+/// registry `channel_register_native` populated instead of running the bytecode.
+fn channel_key_for_native(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
+    let Some(Value::Object(Some(channel))) = args.first().copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let Some(Value::Object(Some(selector_obj))) = args.get(1).copied() else {
+        return Ok(Some(Value::Object(None)));
+    };
+    let sel_id = selector_id_from_obj(ctx, selector_obj);
+    if sel_id == 0 {
+        return Ok(Some(Value::Object(None)));
+    }
+    // The channel's net fd (tcp_registry id) is the per-selector key into the
+    // registration map — exactly what `channel_register_native` stored under.
+    let Some(net_fd) = crate::socket_channel::channel_net_fd(ctx, channel) else {
+        // Not bound / connected → no live registration to find.
+        return Ok(Some(Value::Object(None)));
+    };
+    let key_obj = selectors().read().get(&sel_id).and_then(|s| {
+        let guard = s.lock();
+        guard
+            .keys
+            .get(&net_fd)
+            .filter(|k| !k.cancelled)
+            .and_then(|k| k.key_obj)
+    });
+    Ok(Some(Value::Object(key_obj)))
+}
+
 // ---------------------------------------------------------------------------
 // Native method impls — SelectionKeyImpl
 // ---------------------------------------------------------------------------
@@ -2365,7 +2404,14 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
     // Tomcat's Poller calls the 3-arg `register(sel, OP_READ, wrapper)` on the
     // accepted `SocketChannel`, so override both arities on every concrete
     // channel class our synthetic factories return.
+    // `keyFor(Selector)` is `final` on AbstractSelectableChannel; its real
+    // bytecode locks the (null-on-CratonVM) `keyLock` field → NPE that kills the
+    // NioEndpoint poller (DF01). Override it on every concrete channel class
+    // (native dispatch keys on the concrete receiver class) plus the abstract
+    // bases for completeness.
     for c in [
+        "java/nio/channels/spi/AbstractSelectableChannel",
+        "java/nio/channels/SelectableChannel",
         "java/nio/channels/SocketChannel",
         "sun/nio/ch/SocketChannelImpl",
         "java/nio/channels/ServerSocketChannel",
@@ -2382,6 +2428,12 @@ pub fn register_nio_selector_real(r: &mut NativeMethodRegistry) {
             "register",
             "(Ljava/nio/channels/Selector;ILjava/lang/Object;)Ljava/nio/channels/SelectionKey;",
             channel_register_native,
+        );
+        r.register(
+            c,
+            "keyFor",
+            "(Ljava/nio/channels/Selector;)Ljava/nio/channels/SelectionKey;",
+            channel_key_for_native,
         );
     }
 
