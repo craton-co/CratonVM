@@ -14723,9 +14723,23 @@ pub(crate) fn native_unsafe_put_byte_mb(ctx: &mut dyn NativeContext, args: &[Val
 
 pub(crate) fn native_unsafe_get_long(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let offset = unsafe_offset(args, 2);
-    // C32: Buffer.address sentinel — answer non-zero so Netty's
-    // PD0$4.run() returns the Field rather than null.
+    // C32: Buffer.address sentinel. `objectFieldOffset(Buffer.address)` returns
+    // this sentinel; `getLong(buffer, sentinel)` must return that buffer's REAL
+    // native address — Netty's `PlatformDependent0.directBufferAddress()` uses
+    // exactly this path to compute `memoryAddress()` for *every* direct buffer,
+    // not just the `<clinit>` availability probe. Returning a constant `1` made
+    // every direct buffer's address `0x1`, so the first write SIGSEGV'd
+    // (crash-03: rsocket/Netty PooledByteBuf). Read the receiver's `address`
+    // field; fall back to `1` (non-zero, so the init probe still passes) only
+    // when there is no readable native address.
     if offset == BUFFER_ADDRESS_SENTINEL {
+        if let Some(obj) = unsafe_obj(args, 1) {
+            if let Value::Long(addr) = ctx.get_field_by_name(obj, "address") {
+                if addr != 0 {
+                    return Ok(Some(Value::Long(addr)));
+                }
+            }
+        }
         return Ok(Some(Value::Long(1)));
     }
     let obj = match unsafe_obj(args, 1) {

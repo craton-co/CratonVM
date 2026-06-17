@@ -241,6 +241,14 @@ pub fn collect_roots(shared: &SharedVm, thread: &JvmThread) -> Vec<ObjectRef> {
     //     collector consults `any_thread_in_jit()` to skip compaction while
     //     this is in flight, so a value coincidentally equal to an object
     //     address never causes a wrong relocation.
+    //
+    //     This is the AUTHORITATIVE root set for the current thread's collection,
+    //     so it must NOT be served from the per-thread JIT-scan cache: that cache
+    //     can drop a live root that appeared on the conservatively-scanned native
+    //     stack since the last boundary bump (see
+    //     `invalidate_scan_cache_for_gc`). Discard the cached snapshot first so
+    //     this scan is a full, current walk.
+    crate::jit::conservative_roots::invalidate_scan_cache_for_gc();
     crate::jit::conservative_roots::scan_active_jit_frames(&shared.heap, &mut roots);
 
     // 14b. Shadow-stack precise roots (CRATONVM_SHADOW_STACK). JIT code pushes

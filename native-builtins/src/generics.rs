@@ -192,7 +192,7 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             if !matches!(raw_val, Value::Object(None)) {
                 ctx.set_field(pt, 0, raw_val);
             }
-            let args_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), type_args.len());
+            let args_arr = new_type_array(ctx,type_args.len());
             for (i, arg) in type_args.iter().enumerate() {
                 let val = type_arg_to_java(ctx, arg);
                 ctx.set_array_element(args_arr, i, val);
@@ -224,7 +224,7 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
             let name_str = ctx.create_string(name);
             ctx.set_field(tv, 0, Value::Object(Some(name_str)));
             // Bounds: default to Object if no bounds known
-            let bounds_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+            let bounds_arr = new_type_array(ctx,1);
             if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
                 let obj_mirror = ctx.get_class_mirror(obj_cid);
                 ctx.set_array_element(bounds_arr, 0, Value::Object(Some(obj_mirror)));
@@ -261,6 +261,27 @@ pub fn type_sig_to_java(ctx: &mut dyn NativeContext, sig: &TypeSig) -> Value {
     }
 }
 
+/// Allocate a `java.lang.reflect.Type[]` (component type `Type`, **not**
+/// `Object`). HotSpot's generic-reflection methods (`getActualTypeArguments`,
+/// `getBounds`, `getUpperBounds`/`getLowerBounds`) all return `Type[]`; code
+/// that reflectively invokes them then does `(Type[]) result` — e.g. Spring's
+/// `SerializableTypeWrapper$TypeProxyInvocationHandler.invoke`. Allocating the
+/// backing array as `Object[]` made that cast throw
+/// `ClassCastException: …Object[] / FieldTypeSignature cannot be cast to
+/// [Ljava/lang/reflect/Type;` across spring-beans/AOP/binding (bug-05).
+fn new_type_array(ctx: &mut dyn NativeContext, len: usize) -> cratonvm_types::ObjectRef {
+    // `ensure_class_initialized` force-loads + returns the ClassId directly.
+    // `class_id_by_name` alone returns `None` when `java/lang/reflect/Type`
+    // has not been loaded yet — which is the common case during the very first
+    // `getGenericType()` call — silently degrading the array to `Object[]`.
+    let cid = ctx
+        .ensure_class_initialized("java/lang/reflect/Type")
+        .ok()
+        .or_else(|| ctx.class_id_by_name("java/lang/reflect/Type"))
+        .unwrap_or(cratonvm_types::ClassId::new(0));
+    ctx.new_ref_array(cid, len)
+}
+
 /// Convert a TypeArg into a Type object.
 fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
     match arg {
@@ -268,23 +289,23 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
         TypeArg::Extends(sig) => {
             // WildcardType: field 0 = upperBounds, field 1 = lowerBounds
             let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
-            let upper = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+            let upper = new_type_array(ctx,1);
             let bound_val = type_sig_to_java(ctx, sig);
             ctx.set_array_element(upper, 0, bound_val);
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
-            let lower = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+            let lower = new_type_array(ctx,0);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
             Value::Object(Some(wt))
         }
         TypeArg::Super(sig) => {
             let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
-            let upper = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+            let upper = new_type_array(ctx,1);
             if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
                 let obj_mirror = ctx.get_class_mirror(obj_cid);
                 ctx.set_array_element(upper, 0, Value::Object(Some(obj_mirror)));
             }
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
-            let lower = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+            let lower = new_type_array(ctx,1);
             let bound_val = type_sig_to_java(ctx, sig);
             ctx.set_array_element(lower, 0, bound_val);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
@@ -293,13 +314,13 @@ fn type_arg_to_java(ctx: &mut dyn NativeContext, arg: &TypeArg) -> Value {
         TypeArg::Unbounded => {
             // ? => WildcardType with upper=Object, lower=empty
             let wt = alloc_concurrent_synthetic(ctx, "java/lang/reflect/WildcardType", 2);
-            let upper = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+            let upper = new_type_array(ctx,1);
             if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
                 let obj_mirror = ctx.get_class_mirror(obj_cid);
                 ctx.set_array_element(upper, 0, Value::Object(Some(obj_mirror)));
             }
             ctx.set_field(wt, 0, Value::Object(Some(upper)));
-            let lower = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 0);
+            let lower = new_type_array(ctx,0);
             ctx.set_field(wt, 1, Value::Object(Some(lower)));
             Value::Object(Some(wt))
         }
@@ -337,7 +358,7 @@ pub fn type_param_to_java(
     }
     if bound_sigs.is_empty() {
         // Default bound is Object
-        let bounds_arr = ctx.new_ref_array(cratonvm_types::ClassId::new(0), 1);
+        let bounds_arr = new_type_array(ctx,1);
         if let Some(obj_cid) = ctx.class_id_by_name("java/lang/Object") {
             let obj_mirror = ctx.get_class_mirror(obj_cid);
             ctx.set_array_element(bounds_arr, 0, Value::Object(Some(obj_mirror)));
@@ -345,7 +366,7 @@ pub fn type_param_to_java(
         ctx.set_field(tv, 1, Value::Object(Some(bounds_arr)));
     } else {
         let bounds_arr =
-            ctx.new_ref_array(cratonvm_types::ClassId::new(0), bound_sigs.len());
+            new_type_array(ctx,bound_sigs.len());
         for (i, bs) in bound_sigs.iter().enumerate() {
             let val = type_sig_to_java(ctx, bs);
             ctx.set_array_element(bounds_arr, i, val);
@@ -385,7 +406,7 @@ pub(crate) fn typesig_to_real_type(ctx: &mut dyn NativeContext, sig: &TypeSig) -
                 Ok(c) => c,
                 Err(_) => return type_sig_to_java(ctx, sig),
             };
-            let args = ctx.new_ref_array(cratonvm_types::ClassId::new(0), type_args.len());
+            let args = new_type_array(ctx,type_args.len());
             for (i, a) in type_args.iter().enumerate() {
                 let v = typearg_to_real_type(ctx, a);
                 ctx.set_array_element(args, i, v);
@@ -435,11 +456,11 @@ fn real_wildcard_type(ctx: &mut dyn NativeContext, upper: Vec<Value>, lower: Vec
         Ok(c) => c,
         Err(_) => return Value::Object(None),
     };
-    let up = ctx.new_ref_array(cratonvm_types::ClassId::new(0), upper.len());
+    let up = new_type_array(ctx,upper.len());
     for (i, v) in upper.iter().enumerate() {
         ctx.set_array_element(up, i, *v);
     }
-    let lo = ctx.new_ref_array(cratonvm_types::ClassId::new(0), lower.len());
+    let lo = new_type_array(ctx,lower.len());
     for (i, v) in lower.iter().enumerate() {
         ctx.set_array_element(lo, i, *v);
     }
