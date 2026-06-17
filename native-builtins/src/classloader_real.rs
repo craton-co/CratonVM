@@ -168,6 +168,36 @@ fn init_classloader_common_fields(ctx: &mut dyn NativeContext, this: ObjectRef) 
     // `assertionLock` — `setDefaultAssertionStatus` synchronizes on it.
     let lock = alloc_concurrent_synthetic(ctx, "java/lang/Object", 0);
     ctx.set_field_by_name(this, "assertionLock", Value::Object(Some(lock)));
+
+    // `pdcache` — `SecureClassLoader`'s `Map<CodeSource, ProtectionDomain>`,
+    // declared `private final pdcache = new ConcurrentHashMap<>(11)` and set
+    // by `SecureClassLoader.<init>`'s inline field initialiser. Because the
+    // simplified URLClassLoader/ClassLoader `<init>` natives bypass the real
+    // `SecureClassLoader` constructor, this field stays null. The real-JDK
+    // bytecode for `SecureClassLoader.getProtectionDomain(CodeSource)` (reached
+    // from `SecureClassLoader.defineClass(name, byte[], …, CodeSource)`) does
+    // `pdcache.computeIfAbsent(cs, …)`, so a null `pdcache` throws
+    // `NullPointerException: Cannot invoke computeIfAbsent on null`. Concrete
+    // breakage: Groovy's `GroovyClassLoader$ClassCollector.createClass` →
+    // `defineClass` → `getProtectionDomain` NPE during the Groovy compiler's
+    // `class generation` phase (Spring Boot buildSrc `SpringRepositoriesExtension`
+    // Groovy script compile). Build a real, segment-initialised CHM via its
+    // native `<init>()V` (a bare `alloc_concurrent_synthetic` leaves the segments
+    // array null, so `computeIfAbsent` would silently no-op) and only when null
+    // so a real ctor that already ran is not clobbered.
+    if !matches!(ctx.get_field_by_name(this, "pdcache"), Value::Object(Some(_))) {
+        if let Ok(Some(Value::Object(Some(chm)))) =
+            ctx.new_object("java/util/concurrent/ConcurrentHashMap")
+        {
+            let _ = ctx.invoke(
+                "java/util/concurrent/ConcurrentHashMap",
+                "<init>",
+                "()V",
+                &[Value::Object(Some(chm))],
+            );
+            ctx.set_field_by_name(this, "pdcache", Value::Object(Some(chm)));
+        }
+    }
 }
 
 /// Populate the `URLClassLoader`-specific instance fields that the real
