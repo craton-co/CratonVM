@@ -4,6 +4,63 @@
 > [README.md](README.md) for the family map. Multi-thread sibling = [Fork6](fork6-fjp-multithread-jit-root-reclamation.md) (A4).
 
 ---
+## SESSION UPDATE 2026-06-17 (#5) — ✅ `CRATONVM_PRECISE_JIT_MAPS` is the verified fix for A3 (correct; perf lever is the only thing gating default-on)
+
+After fixing the `SHADOW_STACK` reload SIGSEGV (#4), I tested the *other* precise-roots
+mechanism already in the tree — `CRATONVM_PRECISE_JIT_MAPS` — and it **fixes A3
+outright**. It keeps the non-moving + selective-promotion young sweep but makes its
+root scan **precise across every active JIT frame** (walks the RBP chain via the
+prologue frame-record + per-safepoint oop maps keyed on the `sp_id`/return-PC, and
+remaps evacuated slots in Stage 3). Because `emit_pre_safepoint_spill` already spills
+register-resident locals to their frame slots, the per-safepoint map records them, so
+a young GC firing deep in a callee finds the **caller frame's** `this`/oop — the exact
+register-resident root the conservative (deepest-band-only) scan missed.
+
+**Verified (worktree `CratonVM-shadowdbg`, `sdbg.exe` = dev + the #4 reload fix):**
+| workload | metric | result |
+|---|---|---|
+| `MinRegexProbe code 2000`, `GC_STRESS=524288` **and** `4 MB` | correct? | ✅ DONE, correct (the A3 repro — fixed at both stress levels) |
+| `bintrees16` | checksum | ✅ **14985902** (golden) |
+| `bintrees18` | checksum | ✅ **68332206** (golden) — **no under-count**, even for the operand-in-callee-saved-register-across-recursion case |
+| `matrix600`, `sieve250k`, `fib44` | checksum | ✅ all correct |
+
+So precise maps are **complete and sound** — not the fragile/incomplete state the older
+notes assumed. (Do NOT combine with `SHADOW_STACK`: the two mechanisms interfere —
+`precise + shadow` reclaims. Precise alone is the path.)
+
+**Perf:** negligible on alloc/compute (`bt18` ~6%: 43.7 s vs 41.4 s; `matrix`/`sieve`
+~0%); **2.5× on pure call-heavy recursion** (`fib44` 21.5 s vs 8.5 s). The cost is the
+**per-invocation `jit_frame_record` CALL** the prologue emits under precise maps
+(`x64.rs` ~9394: `mov arg0,rbp; call helpers.frame_record` → `set_top_frame_base`).
+
+**Perf-lever attempt — the NOP lever does NOT work for precise maps (tested, reverted).**
+I mirrored the shadow `maybe_nop_out_shadow_fetch` lever: gate the `frame_record` CALL on
+a `has_oop_safepoint` flag and `JMP`-over it for methods with no live oop at any safepoint.
+It dropped `fib44` 21.5 s → 9.7 s (~16%) and kept `bt18`=68332206 — **but it broke
+`MinRegexProbe` (2 s → timeout)**. Root cause: `jit_frame_record` anchors the GC's
+**RBP-chain frame walk** (JIT keeps RBP, but the walk needs each active JIT frame's exact
+RBP to address its oop-map slots and to reach caller frames). NOP-ing it for an *oop-free
+intermediate* frame breaks traversal to oop-bearing **caller** frames → those oops are
+missed → reclaim → GC churn. Unlike the shadow stack (an independent side structure), the
+frame-record is load-bearing for the walk and **cannot be skipped per-method**.
+
+**The viable perf fix is to make the record cheap, not to skip it:** replace the
+per-invocation `call frame_record` with an **inlined** RBP store into the thread's
+JIT-frame-chain top (cache the chain-top address in a frame slot in the prologue, like the
+shadow path caches the thread pointer; then each entry is one `mov`, no CALL). That keeps
+the walk intact while removing the call overhead. This is the concrete follow-up for
+default-on; it's a focused codegen change, not the NOP lever.
+
+**Bottom line:** A3 (and the A2/A4 register-invisibility family) is *correctly* fixed by
+`CRATONVM_PRECISE_JIT_MAPS` — **not** a new GC algorithm. Two ways to ship it:
+(a) flip it **default-on now**, accepting the ~2.5× pure-call-heavy cost (alloc/compute/
+real-app code is ~6% or less; correctness-first for the gauntlet), then add the inline
+frame-record optimization; or (b) do the **inline frame-record** optimization first, then
+default-on. Either needs a full app/bench regression sweep. The `SHADOW_STACK` mechanism
+is superseded for this purpose (precise maps are correct where shadow needed both the #4
+fix *and* still-incomplete push coverage).
+
+---
 ## SESSION UPDATE 2026-06-17 (#4) — `SHADOW_STACK` SIGSEGV ROOT-CAUSED + FIXED (partial); residual = incomplete push coverage
 
 Worked in an isolated worktree (`C:\craton\CratonVM-shadowdbg`, branch
