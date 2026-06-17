@@ -60,8 +60,17 @@ current (incomplete/buggy) implementation of that.
 > gate) now fails with a real-FJP `ForkJoinPool` CAS conflict on *both* precise-on and
 > -off, masking the original reclaim — so unverified, not regressed.
 >
-> **Perf:** ~6% bt18, ~0% compute, ~2.5× pure call-heavy (the per-invocation
-> `frame_record` CALL — follow-up: inline that store; details in SB-CRASH-04 #5).
+> **Perf:** the per-invocation `frame_record` CALL was made ~40% cheaper by caching
+> the top-frame RBP in a thread-local (`82cf85e9`): **fib44 2.5× → 1.68×**; alloc/
+> compute/array are neutral or slightly faster. Residual = the CALL itself (follow-up:
+> inline the RBP store in codegen; the NOP-skip lever is unsafe — it anchors the frame
+> walk; details in SB-CRASH-04 #5).
+>
+> **Regression sweep (2026-06-17, default-on vs `CRATONVM_NO_PRECISE_JIT_MAPS`):**
+> **zero correctness regressions** — `bintrees10/12/14/16/18`, `matrix600/800`,
+> `sieve250k`, `fib44` all checksum-identical; 10 standalone app probes
+> (`AR`/`Antora`/`CHMEq`/`CollCopy`/`DOMWalk`/`Builtins`/`CPUtil`/`Asm`/`ArrInst`/`AnonM`)
+> byte-identical output to legacy. The full 50+ app gauntlet remains the CI bar.
 > Predecessor: the `SHADOW_STACK` reload SIGSEGV fix (`19fd6707`).
 
 The history below predates the fix.
