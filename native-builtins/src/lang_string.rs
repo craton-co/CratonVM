@@ -3581,12 +3581,35 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
         if ctx.heap_kind_of(obj) == cratonvm_types::ObjectKind::Array {
             return Value::Object(Some(obj));
         }
-        let nf = ctx.object_num_fields(obj);
-        if nf >= 1 {
-            let f = ctx.get_field(obj, 0);
-            match f {
-                Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_) => return f,
-                _ => {}
+        // ONLY unbox genuine primitive-wrapper classes. Other objects have an
+        // int/long at slot 0 too — notably java.math.BigInteger (slot 0 =
+        // `signum`), so blindly reading slot 0 made String.format("%x"/"%d"/"%s",
+        // bigInteger) format the signum (1) instead of the magnitude. Gate on the
+        // wrapper class name so non-wrappers fall through to toString()/radix.
+        let cname = ctx
+            .class_name_of_id(ctx.class_id_of_object(obj))
+            .unwrap_or_default();
+        let is_wrapper = matches!(
+            cname.as_str(),
+            "java/lang/Integer"
+                | "java/lang/Long"
+                | "java/lang/Short"
+                | "java/lang/Byte"
+                | "java/lang/Character"
+                | "java/lang/Boolean"
+                | "java/lang/Float"
+                | "java/lang/Double"
+        );
+        if is_wrapper {
+            let nf = ctx.object_num_fields(obj);
+            if nf >= 1 {
+                let f = ctx.get_field(obj, 0);
+                match f {
+                    Value::Int(_) | Value::Long(_) | Value::Float(_) | Value::Double(_) => {
+                        return f
+                    }
+                    _ => {}
+                }
             }
         }
         Value::Object(Some(obj))
@@ -3631,6 +3654,32 @@ pub(crate) fn format_arg(ctx: &mut dyn NativeContext, val: &Value, spec: char) -
             // %h / %H: hashcode hex (left as-is — String fast path or "null").
             if spec == 'h' || spec == 'H' {
                 return ctx.read_string(*obj).unwrap_or_else(|| "null".to_string());
+            }
+            // BigInteger numeric conversions: its slot-0 field is `signum`, not the
+            // value, so it must NOT be unboxed. Java's Formatter formats a
+            // BigInteger via its real radix toString (e.g. %x => toString(16));
+            // BigInteger.toString(radix) works correctly on CratonVM.
+            // (new BigInteger(1, sha256).%064x -> Spring Boot buildpack LayerId.)
+            if matches!(spec, 'd' | 'x' | 'X' | 'o') {
+                let cname = ctx
+                    .class_name_of_id(ctx.class_id_of_object(*obj))
+                    .unwrap_or_default();
+                if cname == "java/math/BigInteger" {
+                    let radix = match spec {
+                        'o' => 8,
+                        'd' => 10,
+                        _ => 16,
+                    };
+                    if let Ok(Some(Value::Object(Some(s)))) = ctx.invoke_virtual(
+                        *obj,
+                        "toString",
+                        "(I)Ljava/lang/String;",
+                        &[Value::Int(radix)],
+                    ) {
+                        let str = ctx.read_string(s).unwrap_or_default();
+                        return if spec == 'X' { str.to_uppercase() } else { str };
+                    }
+                }
             }
             // Try to unbox wrapper to primitive and recurse
             let inner = unbox_obj(ctx, *obj);

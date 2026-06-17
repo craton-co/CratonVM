@@ -3975,6 +3975,20 @@ pub fn register_phase57_nio_file(r: &mut NativeMethodRegistry) {
                     }
                 }
             }
+            // Real Path constructors drop trailing name separators (e.g.
+            // Path.of("spring/") -> "spring"); the synthetic Path kept them, so
+            // `toAbsolutePath()` ("…/spring/") != `normalize()` ("…/spring")
+            // (Spring Boot buildpack ZipFileTarArchive/ImageBuildpack
+            // "Malformed zip entry name"). Strip them here, preserving roots
+            // ("/", "C:/") and jar: filesystem paths.
+            if !acc.starts_with("jar:") && !acc.contains("!/") {
+                while acc.len() > 1
+                    && acc.ends_with('/')
+                    && !acc[..acc.len() - 1].ends_with(':')
+                {
+                    acc.truncate(acc.len() - 1);
+                }
+            }
             let result = p57_alloc_path(ctx, &acc);
             Ok(Some(Value::Object(Some(result))))
         },
