@@ -3614,6 +3614,29 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
     registry.register("java/lang/Thread", "interrupt0", "()V", native_thread_interrupt);
     // Also register public interrupt() so it works on synthetic Thread stubs
     registry.register("java/lang/Thread", "interrupt", "()V", native_thread_interrupt);
+    // `Thread.isInterrupted()` / `Thread.interrupted()` (JDK 25): these are pure
+    // bytecode reading the Java `interrupted` field. But CratonVM's interrupt path
+    // (`native_thread_interrupt`) records the interrupt only in the VM's
+    // ThreadRegistry flag, never the Java field — so in real-JDK mode the field
+    // read always returns `false` and AQS interrupt checks (`ConditionObject.await`
+    // polling `Thread.interrupted()`, etc.) never observe an interrupt, hanging
+    // executor workers on `shutdownNow()`. Shadow both with natives that read the
+    // registry flag — the single source of truth every native blocking op
+    // (sleep0/wait/join/park) already uses. (`register_synthetic_overrides`
+    // registers equivalent closures for synthetic-JDK mode after this.)
+    registry.register("java/lang/Thread", "isInterrupted", "()Z", |ctx, args| {
+        // Instance method: read the RECEIVER's interrupt status (which may be a
+        // thread *other* than the caller — e.g. `ThreadPoolExecutor`).
+        let interrupted = match args.first() {
+            Some(Value::Object(Some(this))) => ctx.thread_is_interrupted(*this),
+            _ => ctx.is_interrupted(false),
+        };
+        Ok(Some(Value::Int(if interrupted { 1 } else { 0 })))
+    });
+    registry.register("java/lang/Thread", "interrupted", "()Z", |ctx, _args| {
+        // Static method: read+clear the CURRENT thread's interrupt status.
+        Ok(Some(Value::Int(if ctx.is_interrupted(true) { 1 } else { 0 })))
+    });
     // getPriority / isDaemon / setDaemon: in real-JDK mode these live on
     // `Thread.holder` (a `Thread$FieldHolder`).  These natives shadow the
     // real Java methods, so they must read/write through `holder` when it
@@ -22031,9 +22054,17 @@ fn native_cond_await(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     let this = ctx.read_native_pin(this_pin, this);
     let lock_ref = ctx.read_native_pin(lock_pin, lock_ref);
     ctx.unpin_native_roots(this_pin);
-    wr?;
     ctx.monitor_exit(this);
+    // Condition contract (java.util.concurrent.locks.Condition#await): "In all
+    // cases, before this method can return the current thread must re-acquire
+    // the lock associated with this condition." That includes the interrupted
+    // case — so re-acquire the lock BEFORE propagating the interrupt. Otherwise
+    // the caller's `lock.unlock()` (e.g. `LinkedBlockingQueue.take`'s `finally`)
+    // runs without holding the lock and throws IllegalMonitorStateException,
+    // which corrupts a ThreadPoolExecutor worker's shutdown under takeLock
+    // contention (multiple idle workers) → workers never terminate.
     reacquire_lock_after_await(ctx, lock_ref, lock_key, tid, saved_hold)?;
+    wr?;
     Ok(None)
 }
 
@@ -22083,10 +22114,12 @@ fn native_cond_await_timeout(ctx: &mut dyn NativeContext, args: &[Value]) -> Met
     let this = ctx.read_native_pin(this_pin, this);
     let lock_ref = ctx.read_native_pin(lock_pin, lock_ref);
     ctx.unpin_native_roots(this_pin);
-    wr?;
     ctx.monitor_exit(this);
     let timed_out = start.elapsed().as_millis() as u64 >= timeout_ms;
+    // Condition contract: re-acquire the lock before returning, even on
+    // interrupt (see `native_cond_await`).
     reacquire_lock_after_await(ctx, lock_ref, lock_key, tid, saved_hold)?;
+    wr?;
     Ok(Some(Value::Int(if timed_out { 0 } else { 1 })))
 }
 
@@ -22123,7 +22156,14 @@ fn reacquire_lock_after_await(
         lock_ref = ctx.read_native_pin(pin, lock_ref);
         ctx.monitor_exit(lock_ref);
         ctx.unpin_native_roots(pin);
-        wr?;
+        // UNINTERRUPTIBLE re-acquire (Condition contract): a pending interrupt
+        // must NOT abandon the lock re-acquire — the caller observes the
+        // interrupt via the registry flag after `await` returns. On interrupt
+        // the monitor wait returns immediately, so throttle the retry to avoid
+        // a hot spin while another thread still holds the lock.
+        if wr.is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
 }
 
@@ -22169,11 +22209,13 @@ fn native_cond_await_nanos(ctx: &mut dyn NativeContext, args: &[Value]) -> Metho
     let this = ctx.read_native_pin(this_pin, this);
     let lock_ref = ctx.read_native_pin(lock_pin, lock_ref);
     ctx.unpin_native_roots(this_pin);
-    wr?;
     ctx.monitor_exit(this);
     let elapsed_nanos = start.elapsed().as_nanos() as i64;
     let remaining = nanos.saturating_sub(elapsed_nanos).max(0);
+    // Condition contract: re-acquire the lock before returning, even on
+    // interrupt (see `native_cond_await`).
     reacquire_lock_after_await(ctx, lock_ref, lock_key, tid, saved_hold)?;
+    wr?;
     Ok(Some(Value::Long(remaining)))
 }
 
