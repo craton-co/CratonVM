@@ -589,26 +589,18 @@ pub fn invalidate_scan_cache_for_gc() {
 fn jit_scan_cache_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        // DEFAULT-OFF (2026-06-17): the JIT-scan cache is unsound for the
-        // conservative scanner and corrupts the heap. The scanner walks the
-        // whole `[scanner_sp, entry_sp]` band, which covers the interpreter /
-        // native / Rust stack BELOW the JIT frame — a region that mutates while
-        // an interpreted callee runs WITHOUT a `note_jit_boundary` bump and can
-        // hold the only live reference to a freshly-allocated object. Reusing a
-        // snapshot across that mutation drops the live root; the non-moving
-        // young sweep (forced while any JIT frame is live) then reclaims it and
-        // a later walk aborts with "implausible object size". Reproduced
-        // deterministically by `wildfly-suite/repro/ReflRepro` under
-        // `CRATONVM_DBG_GC_STRESS=65536` (rc=132); `CRATONVM_NO_JIT_SCAN_CACHE`
-        // — i.e. this default — fixes it. `collect_roots` does its OWN fresh JIT
-        // scan, so the cache only ever optimised `update_root_snapshot`'s
-        // publish, which is redundant for the GC-initiating thread, so the cost
-        // of disabling is small. A SOUND reimplementation (precise oop maps that
-        // bound the cache to the genuinely-frozen JIT spill region, excluding
-        // the mutating native stack) is the tracked follow-up; until then the
-        // cache is OPT-IN via `CRATONVM_JIT_SCAN_CACHE=1` for benchmarking only.
-        std::env::var_os("CRATONVM_JIT_SCAN_CACHE").is_some()
-            && std::env::var_os("CRATONVM_NO_JIT_SCAN_CACHE").is_none()
+        // Cache ON by default. (An earlier change here disabled it as a
+        // supposed fix for the `ReflRepro` GC corruption — that was a
+        // MISDIAGNOSIS: disabling the cache only perturbed GC timing enough to
+        // mask the crash on one base, and does not fix it on current dev. The
+        // real bug is a register-resident JIT root that conservative scanning —
+        // cached, fresh, or even whole-stack (`CRATONVM_DBG_FULLSTACK_SCAN`) —
+        // cannot see; it needs precise oop maps / the shadow stack. See
+        // `docs/wildfly-suite-bugs/bug-06b-jit-scan-cache-unsound.md`.) So the
+        // cache stays enabled for its perf benefit; `collection_count` keying
+        // (see `JitScanCache`) keeps it from republishing freed addresses across
+        // a GC. `CRATONVM_NO_JIT_SCAN_CACHE` force-disables it for bisection.
+        std::env::var_os("CRATONVM_NO_JIT_SCAN_CACHE").is_none()
             && std::env::var_os("CRATONVM_DBG_FORCE_MOVING").is_none()
             && std::env::var_os("CRATONVM_SHADOW_STACK").is_none()
     })
