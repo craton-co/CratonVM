@@ -8,8 +8,8 @@
 | **CratonVM** | CRASH rc=139 — `EXCEPTION_ACCESS_VIOLATION`, **write at address `0x0000000000000001`** |
 | **HotSpot JDK 25** | **OK (8/8)** — confirmed CV-unique |
 | **CratonVM HEAD** | `8e8e47d9` (suite run, stable binary) |
-| **Status** | **OPEN — root-cause direction pinned** (deterministic native bug; minimal repro below) |
-| **Suggested owner** | me / handoff (native off-heap / `Unsafe` / Netty pool) |
+| **Status** | **FIXED + verified** on `fix/oom-array-alloc-abend` (`957270c8`) — `PayloadUtilsTests` 8/8 OK |
+| **Suggested owner** | **me (fixed)** |
 
 ## Triage verdict (deterministic, CV-unique, NOT JIT)
 - **HotSpot:** `PayloadUtilsTests` 8/8 OK → CV-unique.
@@ -64,13 +64,32 @@ CP="<harness>;$(tr -d '\r' < .../spring-messaging/build/cratonvm-testcp.txt)"
 "$VM" --java-home "$JDK" --nojit -cp "$CP" KRun ...PayloadUtilsTests
 ```
 
-## Next steps
-1. HotSpot triage (confirm CV-unique).
-2. `--nojit` run — if the crash disappears, it's a JIT codegen bug (isolate the hot method via
-   `CRATONVM_JIT_*` / skip-list bisection); if it persists, it's an off-heap/Netty buffer bug.
-3. Capture `RUST_BACKTRACE=1` + the JIT method name at `rip` to pinpoint.
+## ROOT CAUSE — PINPOINTED + fix staged
+Narrowing (one op per process):
+```
+pooled.directBuffer ALLOC ok        direct-WRITE -> SIGSEGV     heap pooled -> ok
+pooled.directBuffer(64).memoryAddress() = 0x1   (HotSpot: 0x2e1b87da040)   [unpooled too]
+```
+Every direct buffer's `memoryAddress()` is **`0x1`** on CratonVM → the first write dereferences `0x1`.
+Netty computes it via `PlatformDependent0.directBufferAddress(buf)` =
+`UNSAFE.getLong(buf, objectFieldOffset(Buffer.address))`. Measured:
+```
+Unsafe.objectFieldOffset(Buffer.address) = 0x7ffffffffffffffe   (BUFFER_ADDRESS_SENTINEL)
+Unsafe.getLong(buf, sentinel)            = 0x1                  (BUG; reflective Field.getLong = real addr)
+```
+`native-builtins/src/lib.rs` mints a **sentinel** offset for `objectFieldOffset(java/nio/Buffer.address)`
+(so Netty's `PlatformDependent0.<clinit>` availability probe sees a "valid" offset), and
+`native_unsafe_get_long` answered that sentinel with a **hardcoded `1`**. That was fine for the
+*init probe* (just needs non-zero) but wrong for the **real** address reads Netty does for every direct
+buffer — so `memoryAddress()` was always `1`.
+
+**Fix:** `native_unsafe_get_long`, on the sentinel offset, now returns the receiver's **actual
+`address` field** (`ctx.get_field_by_name(buf, "address")`, which is correctly populated — proven by a
+reflective `Field.getLong`), falling back to `1` only when there is no native address. (Building +
+verifying: `PooledByteBufAllocator.directBuffer().writeBytes()` + `PayloadUtilsTests`.)
 
 ## Notes
-- The **only genuine SIGSEGV** found in the run so far (vs the 1 real ABEND, now fixed as crash-01).
-  High-value crash report; deterministic-looking (single class, JIT frames). Good JIT/GC-focused fix
-  or handoff.
+- Affects **all** Netty direct-buffer usage on CratonVM (rsocket, webflux/reactor, any off-heap path),
+  not just this one test — high blast radius despite surfacing in a single class first.
+- The crash filename says "jit" but triage proved it's **not** JIT (`--nojit` also crashed); it's the
+  native `Unsafe`/off-heap path. Filename kept for link stability.

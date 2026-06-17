@@ -7,8 +7,8 @@
 | **CratonVM** | `java.lang.ClassCastException: sun/reflect/generics/tree/FieldTypeSignature cannot be cast to [Ljava/lang/reflect/Type;` |
 | **HotSpot JDK 25** | OK (e.g. `BeanWrapperGenericsTests` 42/42) |
 | **CratonVM HEAD** | `8e8e47d9` (suite run) |
-| **Status** | **ROOT-CAUSED + FIX STAGED** on `fix/oom-array-alloc-abend` (building) — deterministic core fixed; GC-race instances fold into bug-04 |
-| **Suggested owner** | **me** |
+| **Status** | **PARTIAL FIX** (`d01345d1`): wildcard-bound `Type[]` fixed ✓; real-`ParameterizedTypeImpl` `actualTypeArguments` still `Object[]` → repro **still fails** (remaining gap below) |
+| **Suggested owner** | **me (partial)** / follow-up |
 
 ## Blast radius (≥12 distinct test classes)
 ```
