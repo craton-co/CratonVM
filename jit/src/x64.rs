@@ -1801,6 +1801,25 @@ pub fn shadow_stack_maps_enabled() -> bool {
     *G.get_or_init(|| std::env::var_os("CRATONVM_SHADOW_STACK").is_some())
 }
 
+/// DBG (CRATONVM_DBG_SHADOW_RELOAD): emit a bad-path-only logging call in
+/// `emit_shadow_reload` that reports (thread, orig-savebase, reloaded value,
+/// actual-read-address) whenever a reload loads a non-pointer (`< 0x10000`).
+/// Default-off; the common (pointer) path emits only a `cmp`+`jae`.
+fn shadow_reload_dbg() -> bool {
+    use std::sync::OnceLock;
+    static G: OnceLock<bool> = OnceLock::new();
+    *G.get_or_init(|| std::env::var_os("CRATONVM_DBG_SHADOW_RELOAD").is_some())
+}
+
+/// DBG helper called from JIT-emitted reload code (see `shadow_reload_dbg`).
+/// Logs the values that explain a reload that produced a non-pointer home value.
+extern "C" fn jit_dbg_shadow_reload_log(thread: usize, orig_savebase: usize, slotval: usize, read_addr: usize) {
+    eprintln!(
+        "[RELOAD] thread={:#x} orig_savebase={:#x} slotval={:#x} read_addr={:#x}",
+        thread, orig_savebase, slotval, read_addr
+    );
+}
+
 /// Bisect toggle (`CRATONVM_SHADOW_NOPUSH`) — when set, the shadow push/reload
 /// codegen is suppressed while the prologue thread-fetch + the GC gate flip stay
 /// on. Used to localize a fault to the push/reload sequences vs the rest.
@@ -6348,6 +6367,10 @@ impl Compiler {
         // and pinned (slot holds the unchanged value; the restore is a harmless
         // no-op since the callee-saved home was preserved).
         let n_bytes = -(homes.len() as i32) * 8; // Cast: x86-64 disp32
+        // SB-CRASH-04 fix: branches to here (resolved after the commit) when the
+        // savebase is invalid — the reload then leaves the home registers + `top`
+        // untouched instead of reading an out-of-bounds healed slot.
+        let mut sr_patches: Vec<usize> = Vec::new();
         if self.shadow_savebase_slot_off != 0 && !shadow_no_savebase() && shadow_reload_raw() {
             // DIAGNOSTIC raw deref: load savebase and use it unvalidated, so a
             // corrupt value faults on the home-restore below (crash dump shows it).
@@ -6364,17 +6387,20 @@ impl Compiler {
             //   cmp R11, end  ; jae heal   (at/above end)
             // On heal, fall back to popping `homes.len()` slots off the live
             // `top` — never out of the backing buffer, so it cannot fault.
-            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16);
-            let heal_lo = self.emit_jcc_rel32_patch(0x82); // JB  (R11 < base)
-            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8);
-            let heal_hi = self.emit_jcc_rel32_patch(0x83); // JAE (R11 >= end)
-            let ok = self.emit_jmp_rel32_patch();
-            self.patch_rel32_to_here(heal_lo);
-            self.patch_rel32_to_here(heal_hi);
-            // heal: R11 = live top - homes.len()*8.
-            self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
-            self.emit_lea_r64_mem_disp32(R11, R11, n_bytes);
-            self.patch_rel32_to_here(ok);
+            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16); // vs base
+            // SB-CRASH-04 fix: on an invalid savebase (corrupt/uninitialised —
+            // the observed 0xFFFF_FFFF_FFFF_FFFE), SKIP the value-restore rather
+            // than healing to `top - n*8`. The old heal read `[top - n*8]`, which
+            // is OUT OF BOUNDS below `base` when the stack is shallow/empty
+            // (top≈base) → it loaded an adjacent non-pointer word (the observed
+            // `0x1`) and wrote it into the `this` register → SIGSEGV at the next
+            // field access. Under the non-moving sweep the home registers already
+            // hold the correct, un-moved object, so leaving them (and `top`)
+            // untouched is correct; an over-high `top` is reset by the JIT-exit
+            // boundary heal (`restore_jit_thread`).
+            sr_patches.push(self.emit_jcc_rel32_patch(0x82)); // JB  (savebase < base) → skip restore
+            self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 8); // vs end
+            sr_patches.push(self.emit_jcc_rel32_patch(0x83)); // JAE (savebase >= end) → skip restore
         } else {
             // Fallback (savebase unavailable): old current-top behaviour.
             self.emit_mov_r64_mem_disp32(R11, R10, ss_top);
@@ -6392,8 +6418,51 @@ impl Compiler {
                 }
             }
         }
-        // Commit popped top = base (drift-corrected).
+        // Commit popped top = savebase (drift-corrected).
         self.emit_mov_mem_disp32_r64(R10, R11, ss_top);
+        // SB-CRASH-04: on the valid path, jump past the invalid-savebase recovery.
+        let after_pop = self.emit_jmp_rel32_patch();
+        // Invalid-savebase recovery (the corrupt 0xFFFF…FFFE case): DON'T restore
+        // the home registers (they already hold the correct, un-moved object under
+        // the non-moving sweep — reading a healed `top - n*8` went OOB below `base`
+        // and corrupted `this` with `0x1`). But still POP `top` by the pushed count,
+        // clamped to `base`, so the LIFO stays balanced and cannot drift/overflow.
+        for p in sr_patches.drain(..) {
+            self.patch_rel32_to_here(p);
+        }
+        self.emit_mov_r64_mem_disp32(R11, R10, ss_top); // R11 = current top
+        self.emit_lea_r64_mem_disp32(R11, R11, n_bytes); // R11 = top - n*8
+        self.emit_cmp_r64_mem_disp32(R11, R10, ss_top + 16); // vs base
+        let no_clamp = self.emit_jcc_rel32_patch(0x83); // JAE → R11 >= base
+        self.emit_mov_r64_mem_disp32(R11, R10, ss_top + 16); // clamp R11 = base
+        self.patch_rel32_to_here(no_clamp);
+        self.emit_mov_mem_disp32_r64(R10, R11, ss_top); // commit top = R11
+        self.patch_rel32_to_here(after_pop);
+        // DBG (CRATONVM_DBG_SHADOW_RELOAD): for a single Reg home, if the reloaded
+        // value is a non-pointer (< 0x10000) — the `1`-as-`this` bug — call the log
+        // helper with (thread=R10, orig-savebase=[rbp-savebase_slot], slotval=home,
+        // read_addr=R11). Bad-path only: the pointer path emits just cmp+jae.
+        if shadow_reload_dbg()
+            && homes.len() == 1
+            && self.shadow_savebase_slot_off != 0
+        {
+            if let ShadowHome::Reg(r) = homes[0] {
+                // cmp r, 0x10000   (REX.W+B, 0x81 /7 id) — r is r8..r15 here.
+                self.buf.emit(&[0x49, 0x81, 0xC0 | (7 << 3) | (r & 7)]);
+                self.buf.emit(&0x10000i32.to_le_bytes());
+                let skip2 = self.emit_jcc_rel32_patch(0x83); // JAE → skip (pointer)
+                self.buf.emit_byte(0x50); // push rax (preserve call return value)
+                self.emit_mov_reg_reg(RCX, R10); // arg0 = thread
+                self.emit_mov_r64_mem_disp32(RDX, RBP, -self.shadow_savebase_slot_off); // arg1 = orig savebase slot
+                self.emit_mov_reg_reg(R8, r); // arg2 = reloaded value
+                self.emit_mov_reg_reg(R9, R11); // arg3 = actual read address
+                self.emit_sub_rsp_imm(0x28); // shadow space + 16B align (after push rax)
+                self.emit_call_absolute(jit_dbg_shadow_reload_log as usize);
+                self.buf.emit(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
+                self.buf.emit_byte(0x58); // pop rax
+                self.patch_rel32_to_here(skip2);
+            }
+        }
         self.patch_rel32_to_here(skip); // null-thread guard target
     }
 
