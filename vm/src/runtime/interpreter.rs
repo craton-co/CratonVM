@@ -15810,56 +15810,28 @@ fn try_jit_compile_callee_slow(
     if is_fjp_subclass_blocklisted(shared, class_name) {
         return None;
     }
-    // FJP fix: refuse to compile a method that has a Rust native override
-    // anywhere in its class hierarchy. Compiling the JDK bytecode for a
-    // shadowed method produces machine code that bypasses our native
-    // (e.g., `ForkJoinTask.fork()`'s Unsafe-CAS body, which has no
-    // observable effect in our environment), so the JIT-MIC fast path
-    // would silently no-op the call. Returning `None` here forces the
-    // dispatcher to fall back to `invoke_or_native`, which honors the
-    // parent-chain native lookup.
-    {
-        let cm_native_check = shared.class_manager.read();
-        if shared.native_methods.find(class_name, method_name, descriptor).is_some() {
-            if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
-                && class_name.contains("LazyProjection")
-                && method_name == "equals"
-            {
-                eprintln!("[BBLP-callee] direct-native skip {}.{}{}", class_name, method_name, descriptor);
-            }
-            return None;
-        }
-        if let Some(start_cid) = cm_native_check.find_class_by_name(class_name) {
-            let mut cid = start_cid;
-            while let Some(parent_id) =
-                cm_native_check.get_class(cid).and_then(|c| c.superclass)
-            {
-                if let Some(parent) = cm_native_check.get_class(parent_id) {
-                    if shared
-                        .native_methods
-                        .find(&parent.name, method_name, descriptor)
-                        .is_some()
-                    {
-                        if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
-                            && class_name.contains("LazyProjection")
-                            && method_name == "equals"
-                        {
-                            eprintln!("[BBLP-callee] parent-native skip {}.{}{} via parent={}",
-                                class_name, method_name, descriptor, parent.name);
-                        }
-                        return None;
-                    }
-                }
-                cid = parent_id;
-            }
-        }
-        if std::env::var_os("CRATONVM_DBG_BBLP").is_some()
-            && class_name.contains("LazyProjection")
-            && method_name == "equals"
-        {
-            eprintln!("[BBLP-callee] no native shadow, will COMPILE {}.{}{}",
-                class_name, method_name, descriptor);
-        }
+    // FJP fix (CORRECTED): refuse to compile a method only when the method that
+    // would ACTUALLY RUN for this receiver is natively shadowed — compiling its
+    // bytecode would bypass the native (e.g. `ForkJoinTask.fork()`'s Unsafe-CAS
+    // body). Two such cases:
+    //   (1) the receiver's OWN class has a native for (method, desc) — checked
+    //       here, before resolution;
+    //   (2) the method is INHERITED from a class that has the native (e.g. a
+    //       `ForkJoinTask` subclass that does not override `fork()`) — checked at
+    //       the resolved DECLARING class just after `find_method_recursive` below.
+    //
+    // The previous implementation walked the ENTIRE ancestor chain and refused
+    // whenever ANY ancestor had a native of the same signature. That wrongly
+    // refused every bytecode OVERRIDE of a method that is native on `Object`
+    // (`hashCode`/`equals`/`toString`/`clone`): a real override shadows the
+    // ancestor native, so `find_method_recursive` stops at the override and it
+    // IS compilable. The bug made hashCode/equals-heavy code run interpreted —
+    // e.g. ANTLR's `ParserATNSimulator` ATN simulation (PredictionContext/
+    // ATNConfig/DFAState `hashCode` are ~58% of the Groovy-parse profile) never
+    // compiled, ~100x slower than HotSpot (Spring Boot buildSrc
+    // `SpringRepositoriesExtensionTests` hang).
+    if shared.native_methods.find(class_name, method_name, descriptor).is_some() {
+        return None;
     }
     // Look up the method bytecode
     let cm = shared.class_manager.read();
@@ -15881,6 +15853,22 @@ fn try_jit_compile_callee_slow(
     )?;
     let code_attr = method.code()?;
     let declaring_class_name = store.get(declaring_id).map(|c| &*c.name)?;
+    // FJP fix (CORRECTED) case (2): the resolved method is INHERITED from a
+    // class that has a Rust native override (e.g. `ForkJoinTask.fork()` reached
+    // through a subclass that does not override it). Compiling its bytecode
+    // would bypass the native, so refuse. Checking the DECLARING class (the
+    // resolution point) — rather than every ancestor — is precisely what lets
+    // bytecode OVERRIDES on the receiver/intermediate classes still compile.
+    // (When `declaring_class_name == class_name` the own-class check above
+    // already returned None, so this only fires for genuinely inherited natives.)
+    if declaring_class_name != class_name
+        && shared
+            .native_methods
+            .find(declaring_class_name, method_name, descriptor)
+            .is_some()
+    {
+        return None;
+    }
     let source_file = store
         .get(declaring_id)
         .and_then(|c| c.source_file.as_deref())
@@ -16117,11 +16105,25 @@ fn try_jit_compile_callee_slow(
         );
     }
 
-    // Store in JIT cache
+    // Store in JIT cache.
+    //
+    // Recompile-storm fix: key by the RECEIVER `class_name` (the value the
+    // lookup in `try_jit_compile_callee` uses), NOT `cached.class_name` (the
+    // DECLARING class). For an INHERITED method the two differ — e.g.
+    // `SingletonPredictionContext.hashCode` resolves to the final
+    // `PredictionContext.hashCode`, whose declaring class is
+    // `PredictionContext`. Storing under the declaring class while the lookup
+    // probes the receiver class made the cache miss on every polymorphic call,
+    // so the dispatch helper recompiled the same method endlessly (42k+
+    // recompiles of `PredictionContext.hashCode` observed during a Groovy
+    // parse). Keying by the receiver makes the next call on the same receiver
+    // class hit; distinct subclasses recompile at most once each. The compiled
+    // code is identical regardless of receiver (it is the resolved method's
+    // body), so dispatching it for any receiver of that class is correct.
     {
         let mut jit_cache = shared.jit_cache.write();
         jit_cache.put(
-            cached.class_name.clone(),
+            std::sync::Arc::from(class_name),
             cached.method_name.clone(),
             cached.method_descriptor.clone(),
             compiled,
