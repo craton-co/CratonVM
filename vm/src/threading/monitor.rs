@@ -592,12 +592,23 @@ impl Monitor {
                         break;
                     }
                     let wait_time = remaining.min(poll_interval);
-                    self.wait_condvar.wait_for(&mut state, wait_time);
+                    let result = self.wait_condvar.wait_for(&mut state, wait_time);
                     if let Some(flag) = interrupted {
                         if flag.load(std::sync::atomic::Ordering::Acquire) {
                             was_interrupted = true;
                             break;
                         }
+                    }
+                    // Woken by notify()/notifyAll() (or a spurious wakeup) before
+                    // the poll slice elapsed — return so the caller can re-check
+                    // its condition, exactly like the untimed branch below.
+                    // Without this, timed Object.wait(timeout) ignored notify and
+                    // always slept the FULL timeout: Thread.join(millis) waited
+                    // the entire timeout after the joined thread already died, and
+                    // ExecutorService.awaitTermination / timed Condition.await
+                    // slept the whole duration after being signalled.
+                    if !result.timed_out() {
+                        break;
                     }
                     if !frames_dumped
                         && stack_dump_wait_flag().load(std::sync::atomic::Ordering::Acquire)
