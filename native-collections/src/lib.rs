@@ -28276,15 +28276,84 @@ fn native_tp_is_shutdown(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodC
     }
 }
 
+/// Interrupt every worker thread of a REAL `ThreadPoolExecutor` (or a delegate
+/// wrapper around one, via field `e`) so `shutdownNow()` actually stops idle
+/// workers blocked in `getTask()` -> `workQueue.take()`. Returns `true` if a
+/// real `workers` set was found, `false` for the synthetic 2-field executor.
+///
+/// The inner ThreadPoolExecutor's `shutdownNow()` is dispatched here (the
+/// delegate wrapper from `Executors.newSingleThreadExecutor(ThreadFactory)`
+/// delegates `e.shutdownNow()` to it). Without interrupting the worker, a leaked
+/// real executor's non-daemon worker kept the VM alive past `main()` (JUnit
+/// `assertTimeoutPreemptively` → ImageReference false-hang). Mirrors the
+/// native-builtins helper of the same shape (kept separate to avoid a crate
+/// dependency cycle).
+fn interrupt_tpe_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
+    let dbg = std::env::var_os("CRATONVM_DBG_EXEC").is_some();
+    let tpe = match ctx.get_field_by_name(exec, "e") {
+        Value::Object(Some(inner)) => inner,
+        _ => exec,
+    };
+    let workers = match ctx.get_field_by_name(tpe, "workers") {
+        Value::Object(Some(w)) => w,
+        other => {
+            if dbg { eprintln!("[EXEC2] no workers field ({:?}) -> synthetic", other); }
+            return false;
+        }
+    };
+    // Advance the real ThreadPoolExecutor.ctl runState to STOP first, so a worker
+    // woken by the interrupt below sees STOP in getTask() and returns null (exits)
+    // instead of re-blocking in workQueue.take(). ctl = runState(top 3 bits) |
+    // workerCount(low 29 bits); STOP = 1<<29.
+    if let Value::Object(Some(ctl)) = ctx.get_field_by_name(tpe, "ctl") {
+        if let Ok(Some(Value::Int(c))) = ctx.invoke_virtual(ctl, "get", "()I", &[]) {
+            const STOP: i32 = 1 << 29;
+            const CAPACITY: i32 = (1 << 29) - 1;
+            let new_ctl = STOP | (c & CAPACITY);
+            let _ = ctx.invoke_virtual(ctl, "set", "(I)V", &[Value::Int(new_ctl)]);
+            if dbg { eprintln!("[EXEC2] advanced ctl {} -> {} (STOP)", c, new_ctl); }
+        }
+    }
+    let it = match ctx.invoke_virtual(workers, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(it)))) => it,
+        other => {
+            if dbg { eprintln!("[EXEC2] workers.iterator failed: {:?}", other); }
+            return true;
+        }
+    };
+    let mut n = 0;
+    for _ in 0..4096 {
+        match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => {}
+            _ => break,
+        }
+        let worker = match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(w)))) => w,
+            _ => break,
+        };
+        if let Value::Object(Some(t)) = ctx.get_field_by_name(worker, "thread") {
+            ctx.thread_interrupt(t);
+            ctx.set_field_by_name(t, "interrupted", Value::Int(1));
+            n += 1;
+        }
+    }
+    if dbg { eprintln!("[EXEC2] interrupted {} worker(s)", n); }
+    true
+}
+
 fn native_tp_shutdown_now(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    ctx.set_field(this, TP_FIELD_SHUTDOWN, Value::Int(1));
+    // Real ThreadPoolExecutor: interrupt its workers so they terminate; don't
+    // write the synthetic slot (would corrupt a real field).
+    if !interrupt_tpe_workers(ctx, this) {
+        ctx.set_field(this, TP_FIELD_SHUTDOWN, Value::Int(1));
+    }
     // Return empty list
     let list = alloc_synthetic(ctx, "java/util/ArrayList", 2);
-    let arr = alloc_ref_array(ctx, 10);
+    let arr = alloc_ref_array(ctx, 0);
     ctx.set_field(list, 0, Value::Object(Some(arr)));
     ctx.set_field(list, 1, Value::Int(0));
     Ok(Some(Value::Object(Some(list))))

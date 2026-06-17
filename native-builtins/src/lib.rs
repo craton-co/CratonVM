@@ -27187,7 +27187,12 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
+        // Real ThreadPoolExecutor: don't write the synthetic shutdown slot
+        // (would corrupt a real field); its idle workers are stopped by
+        // shutdownNow() (which ExecutorService.close()/cleanup also calls).
+        if !executor_has_real_workers(ctx, this) {
+            ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
+        }
         Ok(None)
     });
     registry.register(
@@ -27224,7 +27229,12 @@ fn register_executor_natives(registry: &mut NativeMethodRegistry) {
             Some(Value::Object(Some(o))) => *o,
             _ => return Ok(None),
         };
-        ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
+        // Real ThreadPoolExecutor: don't write the synthetic shutdown slot
+        // (would corrupt a real field); its idle workers are stopped by
+        // shutdownNow() (which ExecutorService.close()/cleanup also calls).
+        if !executor_has_real_workers(ctx, this) {
+            ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
+        }
         Ok(None)
     });
 
@@ -27431,12 +27441,92 @@ fn native_es_execute(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallR
     Ok(None)
 }
 
+/// Interrupt every worker thread of a (possibly delegate-wrapped) REAL
+/// `ThreadPoolExecutor` so `shutdownNow()` actually stops idle workers blocked
+/// in `getTask()` -> `workQueue.take()`. Returns `true` if a real executor's
+/// workers were found (and interrupted), `false` for CratonVM's synthetic
+/// 2-field executor model (which has no `workers` field).
+///
+/// This is what lets a leaked real executor terminate its non-daemon worker so
+/// the VM can exit — e.g. JUnit `assertTimeoutPreemptively`, whose
+/// `newSingleThreadExecutor(ThreadFactory)` (the non-intercepted overload)
+/// builds a real `ThreadPoolExecutor` and calls `shutdownNow()` in `finally`.
+/// Without this the synthetic stub only set a flag, the worker was never
+/// interrupted, and the non-daemon worker kept the VM alive past `main()`.
+/// True if `exec` is a real `ThreadPoolExecutor` (or a delegate wrapper around
+/// one) — i.e. it has a real `workers` field — rather than CratonVM's synthetic
+/// 2-field executor. Used to keep synthetic lifecycle stubs from writing slot
+/// fields of a real executor (which would corrupt real fields).
+pub(crate) fn executor_has_real_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
+    let tpe = match ctx.get_field_by_name(exec, "e") {
+        Value::Object(Some(inner)) => inner,
+        _ => exec,
+    };
+    matches!(ctx.get_field_by_name(tpe, "workers"), Value::Object(Some(_)))
+}
+
+pub(crate) fn interrupt_executor_workers(ctx: &mut dyn NativeContext, exec: ObjectRef) -> bool {
+    // Unwrap Executors$DelegatedExecutorService / AutoShutdownDelegated...
+    // (field `e` -> the inner executor) if present.
+    let dbg = std::env::var_os("CRATONVM_DBG_EXEC").is_some();
+    if dbg {
+        let has_e = matches!(ctx.get_field_by_name(exec, "e"), Value::Object(Some(_)));
+        eprintln!("[EXEC] interrupt_executor_workers called (has 'e' field={})", has_e);
+    }
+    let tpe = match ctx.get_field_by_name(exec, "e") {
+        Value::Object(Some(inner)) => inner,
+        _ => exec,
+    };
+    let workers = match ctx.get_field_by_name(tpe, "workers") {
+        Value::Object(Some(w)) => w,
+        other => {
+            if dbg { eprintln!("[EXEC] no workers field (got {:?}) -> synthetic", other); }
+            return false; // synthetic executor (no real worker set)
+        }
+    };
+    let it = match ctx.invoke_virtual(workers, "iterator", "()Ljava/util/Iterator;", &[]) {
+        Ok(Some(Value::Object(Some(it)))) => it,
+        other => {
+            if dbg { eprintln!("[EXEC] workers.iterator failed: {:?}", other); }
+            return true; // it's a real TPE; we just couldn't iterate
+        }
+    };
+    let mut interrupted = 0;
+    // Bound defensively; the worker set is tiny in practice.
+    for _ in 0..4096 {
+        match ctx.invoke_virtual(it, "hasNext", "()Z", &[]) {
+            Ok(Some(Value::Int(1))) => {}
+            _ => break,
+        }
+        let worker = match ctx.invoke_virtual(it, "next", "()Ljava/lang/Object;", &[]) {
+            Ok(Some(Value::Object(Some(w)))) => w,
+            _ => break,
+        };
+        if let Value::Object(Some(t)) = ctx.get_field_by_name(worker, "thread") {
+            // Mirror the foundation interrupt: set the VM atomic AND the Java
+            // Thread.interrupted field so getTask()'s Condition.await wakes and
+            // the AQS/await loop observes the interrupt.
+            ctx.thread_interrupt(t);
+            ctx.set_field_by_name(t, "interrupted", Value::Int(1));
+            interrupted += 1;
+        }
+    }
+    if dbg { eprintln!("[EXEC] interrupt_executor_workers: interrupted {} worker(s)", interrupted); }
+    true
+}
+
 fn native_es_shutdown_now(ctx: &mut dyn NativeContext, args: &[Value]) -> MethodCallResult {
     let this = match args.first() {
         Some(Value::Object(Some(o))) => *o,
         _ => return Ok(Some(Value::Object(None))),
     };
-    ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
+    // Real executor: interrupt its workers so they terminate. Only fall back to
+    // the synthetic shutdown flag for the synthetic model — writing field index
+    // 1 of a real ThreadPoolExecutor / delegate wrapper would corrupt a real
+    // field.
+    if !interrupt_executor_workers(ctx, this) {
+        ctx.set_field(this, EXEC_FIELD_SHUTDOWN, Value::Int(1));
+    }
     // Return empty list
     let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
     cratonvm_native_collections::native_al_init(ctx, &[Value::Object(Some(list))])?;

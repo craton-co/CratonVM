@@ -880,6 +880,13 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
     let es = "java/util/concurrent/ExecutorService";
     r.register(es, "shutdown", "()V", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Real ThreadPoolExecutor: leave its lifecycle to real bytecode (the
+        // synthetic slot writes below would corrupt real fields, and reading
+        // field 3 as a task count yields garbage). shutdownNow() (called by
+        // ExecutorResource.close after this) interrupts the idle workers.
+        if crate::executor_has_real_workers(ctx, this) {
+            return Ok(Some(Value::Object(None)));
+        }
         ctx.set_field(this, 0, Value::Int(1));
         // Execute all pending tasks before shutdown
         let task_count = ctx.get_field(this, 3).as_int().unwrap_or(0);
@@ -901,6 +908,17 @@ pub(crate) fn register_phase55_executors(r: &mut NativeMethodRegistry) {
     });
     r.register(es, "shutdownNow", "()Ljava/util/List;", |ctx, args| {
         let this = obj_arg(args, 0)?;
+        // Real ThreadPoolExecutor: interrupt its workers so idle ones blocked in
+        // getTask()->take() terminate (so a leaked non-daemon worker can't keep
+        // the VM alive). Don't touch the synthetic slot fields — would corrupt a
+        // real executor. Return an empty pending-tasks list.
+        if crate::interrupt_executor_workers(ctx, this) {
+            let empty = ctx.new_array(cratonvm_types::ArrayElementType::Reference, 0);
+            let list = alloc_concurrent_synthetic(ctx, "java/util/ArrayList", 2);
+            ctx.set_field(list, 0, Value::Object(Some(empty)));
+            ctx.set_field(list, 1, Value::Int(0));
+            return Ok(Some(Value::Object(Some(list))));
+        }
         ctx.set_field(this, 0, Value::Int(1));
         // Return list of pending (unexecuted) tasks
         let task_count = ctx.get_field(this, 3).as_int().unwrap_or(0) as usize;
