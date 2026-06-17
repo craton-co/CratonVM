@@ -154,3 +154,44 @@ Docs: `CratonVM-wildfly/docs/wildfly-suite-bugs/bug-06-\*.md`.
 
 `pin\_native\_root` it (the codebase's HIB-CV-18 "GC-safe array fill" pattern).
 
+---
+
+## Spring-suite full-run field evidence — the residual race is live at suite scale (2026-06-16)
+
+Running the **complete** Spring Framework suite (`apps/spring-framework`, ~2930 classes, JUnit
+Platform 6.1, 4-way batched, boot JDK 25) on dev `8e8e47d9` reproduced this race **pervasively** in
+production — independent confirmation that the residual young-sweep / GC-register-invisibility gap
+(this doc + [[SB-SUITE-CRASH-04-jit-inline-new-heap-corruption]] + the `precise-jit-stack-maps-*`
+testcases) is still active without `GC_STRESS`. Full per-finding reports + repros:
+`spring-suite/crash-reports-2026-06-16/` (`bug-04`, `bug-05`, `crash-03`, `INDEX.md`, `FAIL-ANALYSIS.md`).
+
+**Diagnostic signature (use this to classify any suite failure):** a class that **fails or crashes in
+the batched run but passes 1-per-JVM in isolation** is *this race*, NOT a deterministic bug. In the
+2026-06-16 run, **every deterministic crash was a separate, fixable bug** (`crash-01` ArrayList(int)
+OOM-abort, `crash-03` Netty `PooledByteBuf` `Unsafe.Buffer.address` SIGSEGV — both reproduced 1/JVM and
+are now fixed); **everything below is load-dependent and is this one race.**
+
+**Manifestations observed (one race, different victims):**
+1. **Batch-only SIGSEGV at a *varying* victim class.** spring-webflux batches SIGSEGV'd (rc=139) at a
+   *different* class on each run (`DefaultWebClientTests`, `DefaultRenderingResponseTests`,
+   `DispatcherHandlerIntegrationTests`, `DefaultClientRequestBuilderTests`); none reproduces in
+   isolation. The **varying victim is the hallmark** — the collector reclaims whatever live object is
+   transiently unrooted at the GC point under multithreaded JUnit execution.
+2. **Live String constant → bare `java.lang.Object`** (`bug-04`). KRun's interned `"OK"`/`"FAIL"`
+   status literals read back as `java.lang.Object@<hash>` in batch (only **two** distinct hashes per
+   JVM = the two constants), but correct in isolation. Same reclaim-and-reuse, hitting interned
+   constants instead of mirror arrays.
+3. **`ClassCastException: java/lang/Object cannot be cast to Class / CharSequence /
+   TestExecutionSummary$Failure`** — FAIL-cluster instances of a live ref reclaimed→reused as `Object`
+   (same `Object→...$Status` family this doc opened with, now seen across spring-beans/web/JUnit-harness).
+4. **Part of the generics-reflection CCE cluster** (`bug-05`): `DirectFieldAccessorTests` passes 93/93
+   alone but FAILs the `FieldTypeSignature`→`Type[]` CCE in batch — a *load-dependent* second cause,
+   distinct from the deterministic `Object[]`-vs-`Type[]` half of bug-05 (that half is fixed).
+
+**Leverage:** this single race is the dominant source of the run's *non-deterministic* FAIL/CRASH/
+LOADERR/TIMEOUT noise under 4-way load (it inflates those counts well above the true per-class bug
+count). It is the **highest-leverage remaining bug** in the Spring suite — one GC fix would clear a
+large slice of the apparent failures at once. The fix is architectural (the young-heap array/String
+header-walker mis-parse + the unrooted-live-ref-under-multithreaded-GC gap already analysed above);
+this entry is the suite-scale field evidence that it has NOT regressed away on current dev.
+
