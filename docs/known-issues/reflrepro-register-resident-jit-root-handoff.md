@@ -1,5 +1,59 @@
 # Handoff — ReflRepro GC corruption = register-resident missed JIT root (OPEN)
 
+---
+## DEFINITIVE DIAGNOSIS 2026-06-17 (4-agent workflow + verification on dev `82cf85e9`, binary with the SHADOW reload fix + precise-maps default-on)
+
+A2 is a **two-part bug** and is **NOT closed by any root-coverage mechanism** currently:
+
+**Part 1 — the reclaim (root cause).** `ReflRepro.scan` is JIT-compiled; it dispatches
+`Class.getDeclaredFields()/getDeclaredMethods()` (allocating natives) whose object result
+(`Method[]` / `getName` String / StringBuilder `char[]`) is live only via a JIT **register
+(rax)** or a native-return slot **above** the per-JIT-entry `[scanner_sp, entry_sp]`
+conservative band at the GC. Under `GC_STRESS=65536` the JIT-active non-moving sweep marks
+from a root set that misses it → it is reclaimed while live. `CRATONVM_DBG_SWEEP_EDGES`:
+`root=0 young-survivor=0 old-gen=0` (no inbound edge).
+
+**Part 2 — the CRASH (the SIGSEGV) is a SEPARATE non-moving-sweep robustness bug.** After the
+reclaim, the non-moving sweep's *linear* walk cannot safely re-walk the resulting hole: the
+freed/zeroed span drifts the cursor off the object grid (a zeroed 40-byte chunk decodes as a
+phantom empty Object; an accumulated free list overlaps live objects — `Arena::add_free_block`
+does no overlap check, and the walk skips free blocks only on exact `cursor==off` match), so
+the walk lands mid-object and reads leftover field bytes as a giant `num_slots`
+(`class_id=0, kind=Object, num_slots=16423 → size 40+16423*16 = 262808` — the reported
+"implausible object size 262808" at off=3064). The walker itself is SOUND — off=3064 is a real
+boundary it correctly reached; the bad size is how it *detects* the pre-existing corruption.
+
+**Decisive verification (current binary):**
+| config | result | reading |
+|---|---|---|
+| default (precise maps on) | rc=139, stop @3064 | A2 reproduces |
+| `--nojit` | **ok=8000 bad=0** | JIT-on only |
+| `CRATONVM_DBG_FORCE_MOVING=1` | **ok=7584 bad=416, NO crash** | the reclaim still happens (bad=416 wrong results), but the MOVING collector never linear-walks → no crash. **Proves the crash is the non-moving linear walk, the reclaim is a separate wrong-result bug.** |
+| `CRATONVM_SHADOW_STACK=1` (+ the reload fix) | rc=139 (stop @2944) | does NOT fix A2 (the old "shadow fixes ReflRepro" claim is STALE) |
+| `CRATONVM_PRECISE_JIT_MAPS` (default) | rc=139 | precise maps fix A3 but NOT A2's register-only/native-return root |
+| `CRATONVM_DBG_FULLSTACK_SCAN=1` | rc=139 (stop @67536) | full native-stack scan does NOT fix it either (truly register-only residual) |
+
+So **no stack/register-coverage approach (precise, shadow, fullstack) prevents A2** on the
+current binary — the missed root is genuinely register-only (rax, a native-call return value).
+
+**Two fixes are needed for `bad=0` + no crash (both are deep GC/JIT work):**
+1. **Eliminate the crash (more contained, GC-side):** make the non-moving sweep robust to a
+   reclaimed hole — rebuild the from-space free list from THIS cycle's dead regions instead of
+   carrying a stale accumulated list; harden `Arena::add_free_block` (gc/src/arena.rs:149) against
+   overlaps; and/or stamp every reclaimed dead span with a walkable filler (like the TLAB
+   `install_tail_filler` GAP_FILLER) so the linear walk strides it cleanly regardless of cursor
+   position. This stops the SIGSEGV even when a reclaim happens (degrades crash → wrong-result).
+2. **Eliminate the reclaim (root coverage):** cover the register-only / native-call-return oop —
+   the narrow interim is to have JIT codegen spill every invoke/native-call **object return
+   value** to a conservatively-scanned stack slot before the next GC-capable call (investigate the
+   MIC/PIC direct-call `call r11` fast path in jit/src/x64.rs). precise maps don't cover this
+   because the oop is a register/native-return value, not a JIT frame slot.
+
+**Status: OPEN — fully diagnosed, fix is multi-session GC/JIT core work** (distinct from the
+now-fixed A3 register-invisibility, which precise maps default-on closed).
+
+---
+
 **Status: OPEN.** JIT-on-only heap corruption under GC stress. A live
 reflection-result object is reclaimed by the non-moving young sweep because its
 only reference, at sweep time, is invisible to the conservative root scan — it
