@@ -4061,9 +4061,16 @@ pub fn register_essential_natives(registry: &mut NativeMethodRegistry) {
         }
         Ok(Some(Value::Object(Some(arr))))
     });
-    registry.register("java/lang/Thread", "clearInterruptEvent", "()V", |_ctx, _args| {
-        // The interrupt flag is managed by the VM (see native_thread_interrupt / Thread.interrupted).
-        // This JDK-internal method is called on Windows to reset the event object; we don't use one.
+    registry.register("java/lang/Thread", "clearInterruptEvent", "()V", |ctx, _args| {
+        // Real static `Thread.interrupted()` clears the Java `interrupted` FIELD
+        // and then calls this JDK-internal method. We use it as the clear-side
+        // hook to also reset the VM-side interrupt atomic (set by
+        // native_thread_interrupt), keeping the field and the atomic — which
+        // LockSupport.park / Object.wait / Condition.await poll — in sync. Without
+        // this, the atomic would stay set after `interrupted()` cleared the field,
+        // making the next park() return spuriously. `is_interrupted(true)` reads
+        // and clears the current thread's atomic (the clear is what we want here).
+        let _ = ctx.is_interrupted(true);
         Ok(None)
     });
 

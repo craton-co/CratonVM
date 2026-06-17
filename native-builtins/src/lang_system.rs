@@ -630,7 +630,22 @@ pub(crate) fn native_thread_interrupt(ctx: &mut dyn NativeContext, args: &[Value
         Some(Value::Object(Some(obj))) => *obj,
         _ => return Ok(None),
     };
+    // Set the VM-side interrupt atomic (what LockSupport.park / Object.wait /
+    // Condition.await poll to wake).
     ctx.thread_interrupt(this);
+    // Mirror onto the real `java.lang.Thread.interrupted` boolean FIELD. In
+    // real-JDK mode `Thread.isInterrupted()` and the static `Thread.interrupted()`
+    // run real bytecode that reads this field (not the VM atomic) — and AQS's
+    // ConditionObject.checkInterruptWhileWaiting calls the static
+    // `Thread.interrupted()`. Without mirroring, a thread woken from
+    // LockSupport.park by an interrupt sees `interrupted == false`, so the AQS
+    // await loop never detects the interrupt and re-parks forever
+    // (LinkedBlockingQueue.take inside ThreadPoolExecutor.getTask → shutdownNow
+    // can't stop the worker → leaked non-daemon thread hangs the VM). The
+    // clear side is handled by `clearInterruptEvent` (which static
+    // `Thread.interrupted()` calls right after clearing the field). A synthetic
+    // Thread without this field resolves to a no-op set.
+    ctx.set_field_by_name(this, "interrupted", Value::Int(1));
     Ok(None)
 }
 
