@@ -1776,17 +1776,24 @@ fn bytecode_len_at(code: &[u8], pc: usize) -> usize {
 /// Returns a bit-set (`Vec<bool>` indexed by PC) of size `code_len`.
 /// Stage 3 (precise oop maps) — process-wide gate for the *moving*-safe
 /// precise-stack-map machinery (exact RBP frame registration, safepoint-id
-/// slot, precise relocation). Read once from `CRATONVM_PRECISE_JIT_MAPS`.
+/// slot, precise relocation).
 ///
-/// Default OFF: when off, none of the Stage 3 codegen (prologue frame-record
-/// call, per-safepoint id store, extra frame slot) is emitted, so the default
-/// path is byte-identical. The precise *maps* themselves (Stages 1–2) are
-/// still produced — they are consumed only as additive roots by the
-/// conservative walker until this gate turns the relocation path on (Stage 5).
+/// **DEFAULT ON** (opt out with `CRATONVM_NO_PRECISE_JIT_MAPS`). This is the fix
+/// for the GC-root-coverage-under-JIT family (SB-CRASH-04 / A2 / A4): the GC
+/// walks every active JIT frame via the RBP-chain `frame_record` and scans each
+/// precisely (with a conservative per-frame fallback), so a live oop held only in
+/// a callee-saved register of a *caller* frame is found — the register-invisible
+/// root the conservative deepest-band-only scan missed. Verified: bintrees16/18
+/// == golden (14985902 / 68332206), MinRegexProbe A3 repro green, matrix/sieve/fib
+/// correct. Perf: ~6% alloc-heavy (bt18), ~0% compute, ~2.5× pure call-heavy (the
+/// per-invocation `frame_record` CALL — follow-up: inline that store; the
+/// NOP-skip lever is unsafe as it anchors the frame walk). See
+/// docs/known-issues/SB-SUITE-CRASH-04. When off, no Stage 3 codegen is emitted
+/// (byte-identical legacy path) for A/B + bisection.
 pub fn precise_jit_maps_enabled() -> bool {
     use std::sync::OnceLock;
     static G: OnceLock<bool> = OnceLock::new();
-    *G.get_or_init(|| std::env::var_os("CRATONVM_PRECISE_JIT_MAPS").is_some())
+    *G.get_or_init(|| std::env::var_os("CRATONVM_NO_PRECISE_JIT_MAPS").is_none())
 }
 
 /// Whether the JIT **shadow-stack** precise-roots codegen is enabled
