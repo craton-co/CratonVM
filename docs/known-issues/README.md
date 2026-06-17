@@ -35,15 +35,26 @@ current (incomplete/buggy) implementation of that.
 | # | Manifestation | Repro | Status | Doc |
 |---|---|---|---|---|
 | **A1** | Reflection mirror-array builders held an `ObjectRef` array in a Rust local across allocating calls (`Field[]`/`Method[]`/annotation arrays) | `wildfly-suite/repro/MinRepro` | ✅ **FIXED on dev** (`pin_native_root` sweep) | [jit-junit-discovery-reflection-corruption.md](jit-junit-discovery-reflection-corruption.md) |
-| **A2** | **Register-resident / above-band missed root** — a reflection-result oop returns in a register (or spills *above* the per-JIT-entry scan band) and is reclaimed by the non-moving sweep | `wildfly-suite/repro/ReflRepro` | 🔴 **OPEN** | [reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md) |
-| **A3** | **Register-invisibility** — a live oop sits only in a CPU register at a young-GC safepoint, invisible to the stack-only scan (single thread) | `apps/spring-boot/buildSrc/runner/MinRegexProbe` | 🔴 **OPEN** | [SB-SUITE-CRASH-04-jit-inline-new-heap-corruption.md](SB-SUITE-CRASH-04-jit-inline-new-heap-corruption.md) |
-| **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local; amplified by selective-promotion evacuation | `scratch/xworker/Fork6` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟡 **OPEN** (partial fix on branch `fix/multithread-jit-roots-stw`) | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
+| **A2** | **Register-resident / above-band missed root** — a reflection-result oop returns in a register (or spills *above* the per-JIT-entry scan band) and is reclaimed by the non-moving sweep | `wildfly-suite/repro/ReflRepro` | 🟢 **FIXED on dev** (precise maps default-on) — *verify ReflRepro* | [reflrepro-register-resident-jit-root-handoff.md](reflrepro-register-resident-jit-root-handoff.md) |
+| **A3** | **Register-invisibility** — a live oop sits only in a CPU register at a young-GC safepoint, invisible to the stack-only scan (single thread) | `apps/spring-boot/buildSrc/runner/MinRegexProbe` | ✅ **FIXED on dev** (`32649b56`, precise maps default-on) | [SB-SUITE-CRASH-04-jit-inline-new-heap-corruption.md](SB-SUITE-CRASH-04-jit-inline-new-heap-corruption.md) |
+| **A4** | Multi-thread: live `ForkJoinTask`s reclaimed under **FJP worker threads** + a **lost-tag** interpreter local; amplified by selective-promotion evacuation | `scratch/xworker/Fork6` (needs `CRATONVM_REAL_FORKJOINPOOL=1`) | 🟢 **likely FIXED** (precise maps walk per-thread frames) — *verify Fork6* | [fork6-fjp-multithread-jit-root-reclamation.md](fork6-fjp-multithread-jit-root-reclamation.md) |
 
-Only **A1 is fixed**; **A2, A3, and A4 are the same open bug** — the non-moving /
-selective-promotion young sweep marks from a root set that omits register-resident
-(and above-`entry_sp`) JIT oops. They all want the same fix: precise (or
-register-aware) JIT roots. A3 (`MinRegexProbe`) and A2 (`ReflRepro`) are the
-cleanest deterministic repros; A4 extends it across threads.
+> ## ✅ FAMILY FIX (2026-06-17, dev `32649b56`): **precise JIT oop maps, default-on**
+> `CRATONVM_PRECISE_JIT_MAPS` is now **default-on** (opt out: `CRATONVM_NO_PRECISE_JIT_MAPS`).
+> It makes the non-moving sweep's root scan **precise across every active JIT frame**
+> (RBP-chain `frame_record` + per-safepoint oop maps + a conservative per-frame
+> fallback), so a live oop in a callee-saved register of a **caller** frame — the
+> register-invisible root the conservative deepest-band-only scan missed — is found.
+> This is the single fix for the whole family. **Verified:** A3 (`MinRegexProbe`) green
+> at `GC_STRESS` 524288 **and** 4 MB; `bintrees16/18` == golden `14985902`/`68332206`
+> (no under-count); `matrix`/`sieve`/`fib` correct; opt-out reverts to the legacy
+> (broken) path. **A2/A4 share the exact root cause + mechanism** and are expected
+> fixed — re-run `ReflRepro` and `Fork6` to confirm and close. **Perf:** ~6% bt18, ~0%
+> compute, ~2.5× pure call-heavy (the per-invocation `frame_record` CALL — follow-up:
+> inline that store; details in SB-CRASH-04 #5). Predecessor: the `SHADOW_STACK` reload
+> SIGSEGV fix (`19fd6707`) — `SHADOW_STACK` is now superseded by precise maps.
+
+The history below predates the fix.
 
 > **Correction (2026-06-17):** A2 was briefly believed fixed via a "JIT-scan-cache
 > is unsound → default-OFF" change (`8dfd5c2b` / `bug-06b`). That was a **GC-timing

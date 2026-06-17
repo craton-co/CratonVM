@@ -1,4 +1,13 @@
-# SB-SUITE-CRASH-04 — ~~JIT inline-`new` heap corruption~~ → **GC register-invisibility** (PluginXmlParser hang + AntoraAsciidoc wrong result)
+# SB-SUITE-CRASH-04 — ~~JIT inline-`new` heap corruption~~ → **GC register-invisibility** → ✅ **FIXED** (precise JIT oop maps, default-on)
+
+> **✅ RESOLVED on dev `32649b56` (2026-06-17):** `CRATONVM_PRECISE_JIT_MAPS` is now
+> **default-on** (opt out `CRATONVM_NO_PRECISE_JIT_MAPS`). It makes the non-moving
+> young sweep's root scan precise across every active JIT frame, finding the
+> register-invisible caller-frame oop. Verified: `MinRegexProbe` A3 repro green at
+> `GC_STRESS` 524288 **and** 4 MB; `bintrees16/18` == golden; opt-out reverts to the
+> broken legacy path. Predecessor fix: the `SHADOW_STACK` reload SIGSEGV (`19fd6707`).
+> Perf follow-up (inline the `frame_record` CALL) in update #5 below. The history
+> below is retained for the root-cause trail.
 
 > This is **manifestation A3** of the GC-root-coverage-under-JIT family — see
 > [README.md](README.md) for the family map. Multi-thread sibling = [Fork6](fork6-fjp-multithread-jit-root-reclamation.md) (A4).
