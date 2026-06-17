@@ -4,6 +4,56 @@
 > [README.md](README.md) for the family map. Multi-thread sibling = [Fork6](fork6-fjp-multithread-jit-root-reclamation.md) (A4).
 
 ---
+## SESSION UPDATE 2026-06-17 (#4) — `SHADOW_STACK` SIGSEGV ROOT-CAUSED + FIXED (partial); residual = incomplete push coverage
+
+Worked in an isolated worktree (`C:\craton\CratonVM-shadowdbg`, branch
+`dbg/shadow-reload-probe`, unique binary `sdbg.exe`) with a gated reload-logging
+probe (`CRATONVM_DBG_SHADOW_RELOAD`).
+
+**The `SHADOW_STACK` movable SIGSEGV is fully root-caused.** A single `[RELOAD]`
+event right before the crash:
+```
+thread=0x4c97c4c0  orig_savebase=0xfffffffffffffffe  slotval=0x1  read_addr=0x19b2fff8
+```
+- `orig_savebase = 0xFFFF_FFFF_FFFF_FFFE` (-2) — the exact corrupt/uninitialised
+  savebase the spring-bug-10 note predicted. It is **not in `[base,end)`** → the
+  reload takes the **heal** path.
+- The heal computed `read_addr = top - 8 = 0x19b2fff8`, but the stack is
+  effectively empty (`top ≈ base`), so this read **out of bounds below `base`** →
+  the adjacent word `0x1`.
+- That `0x1` was written into the `this` register (`r13`/`r15`) → the next field
+  access (`Matcher.reset` pc=113 `putfield to`, `Pattern.append` pc=36/41) faults
+  reading `[0x1+0x10]`. (`reset+0xA92` in the backtrace = that `putfield`.)
+
+**FIX (verified to remove the SIGSEGV):** in `emit_shadow_reload`
+(`jit/src/x64.rs`), when `savebase` is invalid, **skip the home value-restore**
+(the home register already holds the correct, un-moved object under the non-moving
+sweep) and **safely pop `top` by the pushed count, clamped to `base`** (keeps the
+LIFO balanced, never reads OOB). Replaces the old heal that computed `top - n*8`
+and read it unconditionally.
+
+**Verified (`sdbg.exe`, `MinRegexProbe code N`):**
+| config | before fix | after fix |
+|---|---|---|
+| N=2000, no stress | SIGSEGV | **DONE, correct output** |
+| N=500, `GC_STRESS=524288` | SIGSEGV | **DONE, correct** |
+| N=5000, `GC_STRESS=524288` | SIGSEGV | **DONE, correct (36 s)** |
+| N=20000, `GC_STRESS=524288` | SIGSEGV | DONE but >120 s (the documented ~7× slowness; not a hang — `restore_jit_thread` keeps `top` bounded) |
+| N=2000, `GC_STRESS=4 MB` | SIGSEGV | **still fails** — `Stale pointer … all-zero … Pattern` (the original A3 reclaim) |
+
+**Residual (the real remaining A3 bug): incomplete push coverage.** The savebase
+being `-2` means the matching **push body didn't run / didn't mark `this`** at that
+safepoint, and `CRATONVM_DBG_SHADOW2` shows only *some* safepoints push `this`
+(`reset` pc=110 and `append` pc=29, but NOT `reset` pc=89 `IntHashSet.clear`). So a
+young GC that fires while `this` is register-resident but **un-pushed** still
+reclaims it (the all-zero `Pattern` at 4 MB stress). Completing the shadow stack =
+push every live oop at **every** GC-capable safepoint (and fix whatever makes the
+push skip / write a `-2` savebase). That is the "complete the shadow stack" work
+the [ReflRepro/A2 handoff](reflrepro-register-resident-jit-root-handoff.md) calls
+for; the reload fix above is a prerequisite (without it the mechanism SIGSEGVs
+before coverage can matter).
+
+---
 ## SESSION UPDATE 2026-06-17 (#3) — re-verified on current `dev` (`fca424a4`, binary 2026-06-17); every mitigation still broken
 
 Re-ran the deterministic repro on the current `dev` binary
