@@ -48,7 +48,38 @@ The residual-1 connect fix improved this from a hard fail to ~70–90 % passing 
 `testManyAsyncRequests` is still borderline against the 10 s latch at N≈1000 (full single-host suite
 ~9.6–12 s; occasional 17 s+ timeout). The robust fix is HTTP keep-alive in the synthetic server.
 
-### Keep-alive WAS implemented and works server-side — but UNMASKS a separate VM bug (reverted)
+### UPDATE: pool bug ROOT-CAUSED & FIXED; keep-alive determined to be the WRONG lever
+
+Follow-up pass resolved the blocker below and re-evaluated keep-alive end-to-end:
+
+- **The null-`PoolEntry` NPE is FIXED** (commit `dc52895b` on `dev`): the LinkedList native overlay registered
+  `remove(int)` but **not** `remove(Object)` / `removeFirstOccurrence` / `removeLastOccurrence`, so
+  remove-by-value fell through to real-JDK `LinkedList` bytecode walking the never-populated `first`/`last`
+  fields — a silent no-op. `AbstractNIOConnPool`'s `available.remove(entry)` therefore never shrank the pool's
+  `available` LinkedList, which grew unbounded and yielded a stale/null element → the shutdown NPE. Added
+  `native_ll_remove_object` (+ last-occurrence) on the overlay. Verified vs HotSpot with a pool-churn repro
+  (`scratch/eshang/PoolCollTest.java`): CratonVM now matches exactly (`available=4`, 0 null holes; was
+  `available=1594` + a null hole). This is a real, general VM bug fix, valuable independent of keep-alive.
+
+- **But keep-alive still does NOT finish residual 2, and was kept REVERTED:**
+  1. With the pool NPE gone, keep-alive unmasks **yet another** CratonVM bug: an Apache reactor worker thread
+     (`elasticsearch-rest-client-N-thread-M`) ends up stuck in `state=NEW` (created, never started/reaped) →
+     `ThreadLeakError` at suite teardown (+ downstream `RandomizedContext.randomnesses` / `Thread.threadStatus`
+     NPEs while the framework inspects the leaked thread). A separate CratonVM Thread-lifecycle bug.
+  2. **Keep-alive does not actually improve throughput.** Isolated `testManyAsyncRequests` runs ~14–15 s wall
+     with OR without keep-alive (latch satisfied either way); the full-suite pass rate did not improve. This
+     matches this doc's own earlier measurement that "the server is not the bottleneck" — the wall is
+     **client-side interpreted per-request cost** (RestClient processing + per-request real-`Headers`
+     build/read), not connect/accept/close churn. Eliminating churn (keep-alive's only effect) therefore
+     doesn't move the needle.
+
+  **Conclusion: residual 2 is gated by interpreted-mode per-request throughput, not connection churn.** The
+  real levers are interpreter/JIT throughput (the suite also fails under `--jit` for these classes) or
+  cutting per-request interpreted work (lever #2: leaner `re10_read_headers`/`re10_build_headers`). Keep-alive
+  is NOT the path. The 2-edit keep-alive patch is preserved in git history / below for reference but should
+  not be re-applied without first fixing the NEW-state reactor-thread leak AND demonstrating a throughput win.
+
+### (historical) Keep-alive WAS implemented and works server-side — but UNMASKS a separate VM bug (reverted)
 
 A **minimal, low-risk keep-alive** was prototyped and is the recommended approach (much simpler than the
 oneshot-channel rework originally sketched): the stream already flows
