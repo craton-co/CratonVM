@@ -18442,13 +18442,28 @@ const TM_DEFAULT_CAPACITY: usize = 16; // initial entry slots (array len = 32)
 
 /// Natural-order key supported by the fast-mode TreeMap. Variants are
 /// ordered so the derived `Ord` matches Java's natural ordering for
-/// homogeneous-typed maps (String, Integer, Long). Mixed-type maps
-/// disable fast mode (the array path handles them via `natural_compare`).
+/// homogeneous-typed maps (String, Integer, Long, Character, Byte, Short,
+/// Boolean). Mixed-type maps disable fast mode (the array path handles them
+/// via `natural_compare`).
+///
+/// Each numeric wrapper has its OWN variant — they must NOT collapse to a
+/// single integer representation. The variant records the original Java
+/// wrapper type so `tree_key_to_value` reboxes a `Character` key back to a
+/// `Character` (not an `Integer`); collapsing `Character`/`Byte`/`Short` to
+/// `I32` made `firstKey()`/`entrySet()` hand back `Integer`s, failing the
+/// `checkcast Character` in e.g. `sun.util.locale.LocaleExtensions.toID`
+/// (ClassCastException Integer→Character on `Locale.forLanguageTag`). The
+/// per-variant in-memory representation matches each wrapper's natural
+/// `compareTo`: `Char` is unsigned (u16), `Byte`/`Short` are signed.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum TreeKey {
     Str(String),
     I32(i32),
     I64(i64),
+    Char(u16),
+    Byte(i8),
+    Short(i16),
+    Bool(bool),
 }
 
 /// Try to extract a fast-mode key from a Java value. Returns None for
@@ -18464,10 +18479,26 @@ fn tree_key_from_value(ctx: &dyn NativeContext, v: &Value) -> Option<TreeKey> {
             if let Some(s) = ctx.read_string(*o) {
                 return Some(TreeKey::Str(s));
             }
-            // Integer / Long boxes: field 0 is the wrapped primitive.
+            // Boxed primitive wrappers: field 0 holds the value. The wrapper
+            // CLASS selects the variant so the key reboxes to its original
+            // type on read-back — Character/Byte/Short/Boolean must NOT
+            // collapse to Integer (see TreeKey doc). An unrecognized
+            // single-field class (a custom Comparable) returns None so the
+            // caller falls back to the array path, which keeps the real
+            // ObjectRef and honors its own compareTo/identity.
+            let name = ctx
+                .class_name_of_id(ctx.class_id_of_object(*o))
+                .unwrap_or_default();
             match ctx.get_field(*o, 0) {
-                Value::Int(i) => Some(TreeKey::I32(i)),
-                Value::Long(l) => Some(TreeKey::I64(l)),
+                Value::Int(i) => match name.as_str() {
+                    "java/lang/Integer" => Some(TreeKey::I32(i)),
+                    "java/lang/Character" => Some(TreeKey::Char(i as u16)),
+                    "java/lang/Byte" => Some(TreeKey::Byte(i as i8)),
+                    "java/lang/Short" => Some(TreeKey::Short(i as i16)),
+                    "java/lang/Boolean" => Some(TreeKey::Bool(i != 0)),
+                    _ => None,
+                },
+                Value::Long(l) if name == "java/lang/Long" => Some(TreeKey::I64(l)),
                 _ => None,
             }
         }
@@ -18931,35 +18962,47 @@ fn tm_migrate_fast_to_array(ctx: &mut dyn NativeContext, this: ObjectRef) {
 /// the corresponding wrapper class; reuses the standard `Integer.valueOf`
 /// / `Long.valueOf` / `String` paths via the NativeContext.
 fn tree_key_to_value(ctx: &mut dyn NativeContext, k: &TreeKey) -> Value {
+    // Box a primitive back to its wrapper via `<Wrapper>.valueOf`, preserving
+    // the original Java type recorded in the TreeKey variant.
+    let box_via = |ctx: &mut dyn NativeContext, cls: &str, desc: &str, arg: Value| -> Value {
+        ctx.invoke(cls, "valueOf", desc, &[arg])
+            .ok()
+            .flatten()
+            .unwrap_or(Value::Object(None))
+    };
     match k {
         TreeKey::Str(s) => Value::Object(Some(ctx.create_string(s))),
-        TreeKey::I32(i) => {
-            // Box via Integer.valueOf
-            let boxed = ctx
-                .invoke(
-                    "java/lang/Integer",
-                    "valueOf",
-                    "(I)Ljava/lang/Integer;",
-                    &[Value::Int(*i)],
-                )
-                .ok()
-                .flatten()
-                .unwrap_or(Value::Object(None));
-            boxed
-        }
-        TreeKey::I64(l) => {
-            let boxed = ctx
-                .invoke(
-                    "java/lang/Long",
-                    "valueOf",
-                    "(J)Ljava/lang/Long;",
-                    &[Value::Long(*l)],
-                )
-                .ok()
-                .flatten()
-                .unwrap_or(Value::Object(None));
-            boxed
-        }
+        TreeKey::I32(i) => box_via(
+            ctx,
+            "java/lang/Integer",
+            "(I)Ljava/lang/Integer;",
+            Value::Int(*i),
+        ),
+        TreeKey::I64(l) => box_via(ctx, "java/lang/Long", "(J)Ljava/lang/Long;", Value::Long(*l)),
+        TreeKey::Char(c) => box_via(
+            ctx,
+            "java/lang/Character",
+            "(C)Ljava/lang/Character;",
+            Value::Int(*c as i32),
+        ),
+        TreeKey::Byte(b) => box_via(
+            ctx,
+            "java/lang/Byte",
+            "(B)Ljava/lang/Byte;",
+            Value::Int(*b as i32),
+        ),
+        TreeKey::Short(s) => box_via(
+            ctx,
+            "java/lang/Short",
+            "(S)Ljava/lang/Short;",
+            Value::Int(*s as i32),
+        ),
+        TreeKey::Bool(b) => box_via(
+            ctx,
+            "java/lang/Boolean",
+            "(Z)Ljava/lang/Boolean;",
+            Value::Int(if *b { 1 } else { 0 }),
+        ),
     }
 }
 

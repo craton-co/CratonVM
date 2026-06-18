@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{boxed_int, build_registry, call, new_treemap, MockCtx};
+use common::{boxed_char, boxed_int, build_registry, call, class_name_of, new_treemap, MockCtx};
 use cratonvm_types::Value;
 
 const TM: &str = "java/util/TreeMap";
@@ -103,6 +103,51 @@ fn round_trip_get_after_insert() {
                        &[Value::Object(Some(tm)), *k]).unwrap();
         assert_eq!(got, Some(*v), "round-trip mismatch on key {:?}", k);
     }
+}
+
+#[test]
+fn character_key_preserves_wrapper_type_on_readback() {
+    // Regression for the `Locale.forLanguageTag` CCE (Integer→Character):
+    // the fast-mode `TreeKey` used to collapse every int-field wrapper to
+    // `I32`, so a `TreeMap<Character,?>` handed back `Integer` keys from
+    // `firstKey()` / `keySet()` / `entrySet()`. `LocaleExtensions.toID`
+    // `checkcast Character`s those keys → ClassCastException.
+    let reg = build_registry();
+    let mut ctx = MockCtx::new();
+    let tm = new_treemap(&reg, &mut ctx);
+
+    let k = boxed_char(&mut ctx, 'v');
+    let v = boxed_int(&mut ctx, 42);
+    call(&reg, &mut ctx, TM, "put", PUT, &[Value::Object(Some(tm)), k, v]).unwrap();
+
+    // firstKey() must come back as a Character, not an Integer.
+    let first = call(&reg, &mut ctx, TM, "firstKey", "()Ljava/lang/Object;",
+                     &[Value::Object(Some(tm))]).unwrap();
+    match first {
+        Some(Value::Object(Some(o))) => {
+            assert_eq!(
+                class_name_of(&ctx, o).as_deref(),
+                Some("java/lang/Character"),
+                "firstKey() of a TreeMap<Character,?> must rebox as Character"
+            );
+        }
+        other => panic!("firstKey returned {other:?}"),
+    }
+
+    // get with the SAME Character key must still find the value.
+    let k_char = boxed_char(&mut ctx, 'v');
+    let got_char = call(&reg, &mut ctx, TM, "get", GET,
+                        &[Value::Object(Some(tm)), k_char]).unwrap();
+    assert_eq!(got_char, Some(v), "get(Character('v')) must return the stored value");
+
+    // get with a numerically-equal Integer(118) must NOT match (HotSpot
+    // parity: TreeMap.compare casts to Comparable and Character.compareTo
+    // rejects an Integer — keys are NOT compared as bare numbers).
+    let k_int = boxed_int(&mut ctx, 118);
+    let got_int = call(&reg, &mut ctx, TM, "get", GET,
+                       &[Value::Object(Some(tm)), k_int]).unwrap();
+    assert_eq!(got_int, Some(Value::Object(None)),
+               "get(Integer(118)) must NOT match a stored Character('v')");
 }
 
 /// Read the inner `Int` value from a boxed `java.lang.Integer` heap
