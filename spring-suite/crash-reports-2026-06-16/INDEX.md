@@ -4,11 +4,28 @@ One `.md` per **CratonVM crash (CRASH/ABEND), hang, or distinct correctness bug*
 **complete** Spring suite (`apps/spring-framework`, ~2930 test classes) under CratonVM.
 
 - **CratonVM build under test:** dev `8e8e47d9` (suite run, pinned `CratonVM-springrun`).
-- **Fixes built/verified on:** current dev `0e3f0398` (worktree `CratonVM-oomfix`, branch `fix/oom-array-alloc-abend`).
+- **Fixes built/verified on:** current dev `0e3f0398`; **merged to dev `44a8ae56`** (worktree `CratonVM-oomfix`, branch `fix/oom-array-alloc-abend`).
 - **HotSpot baseline:** Temurin JDK 25.0.2.
 - **Harness:** `spring-suite/run-all-shards.sh` (4-way, never stops on failure) + `triage-spring.sh`.
 
-> **Run status: IN PROGRESS** (~1970/2930 at last update). Crash monitor live.
+> **Run status: COMPLETE — all 2,930 classes executed.**
+
+## Final whole-suite totals (CratonVM)
+| Status | Classes | | Status | Classes |
+|--------|--------:|---|--------|--------:|
+| OK | **1,212** | | LOADERR | 60 |
+| FAIL (assertions) | 1,172 | | EMPTY (abstract/no @Test) | 117 |
+| TIMEOUT (hang/slow) | 367 | | **ABEND** | **1** (fixed) |
+| | | | **CRASH (SIGSEGV)** | **1** (fixed) |
+| **Total** | **2,930** | | | |
+
+Test-method level: **19,803 found · 13,133 passed · 6,340 failed.** (10 classes had GC-race
+`Object@hash`-corrupted status — reclassified by their real pass/fail counts.)
+
+**Only 2 classes crash deterministically in the whole suite — both now fixed.** The TIMEOUT/LOADERR
+tail is dominated by the interpreted-perf pathology + the one GC-root-undercount race (load-dependent),
+not distinct crash bugs. (HotSpot triage of the 427 crash/hang/loaderr classes in progress —
+CV-unique counts appended on completion.)
 
 ## Crashes found
 | # | Report | Class / API | CratonVM | Status |
