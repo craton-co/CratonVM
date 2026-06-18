@@ -618,20 +618,69 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
             let mut eliminated_stores = Vec::new();
             let mut can_replace = true;
 
-            // Walk all uses of this allocation to find loads and stores.
-            for &use_id in &node.uses {
-                if use_id >= graph.nodes.len() {
+            // WIDENED ACCEPTED SHAPE (increment 1):
+            //
+            // The narrow pre-widening shape accepted scalar replacement only
+            // when *every* direct use of the allocation was a field
+            // load/store/monitor/length on the allocation itself.  Two
+            // provably-sound relaxations broaden the set of objects that
+            // scalar-replace without weakening the escape guarantees:
+            //
+            //   1. `Op::Dead` uses are *skipped*, not rejected.  A use list
+            //      may still reference a node that an earlier pass marked
+            //      dead; a dead node observes nothing, so it can never make a
+            //      NoEscape object escape.  Previously such a stale edge hit
+            //      the catch-all and spuriously blocked SR.
+            //
+            //   2. A `NoEscape` `Op::Phi` use is treated as a *transparent
+            //      copy*: the allocation may flow through a phi that merges it
+            //      with another reference (e.g. `o = cond ? new A() : a2`)
+            //      yet never escapes.  We accept the allocation as long as the
+            //      phi itself is NoEscape (so propagation already proved no
+            //      use beyond the phi escapes) AND the phi's own uses are only
+            //      field loads/stores addressing valid fields of THIS
+            //      allocation — i.e. the phi forwards the reference to more
+            //      in-method field accesses that we also fold in.  A phi whose
+            //      uses include anything else, or that is not NoEscape, still
+            //      bails.  Loads/stores reached through such a phi are
+            //      collected for replacement just like direct ones.
+            //
+            // Soundness anchor: we only ever fold loads/stores whose holder
+            // resolves (directly, or via a NoEscape transparent phi) to THIS
+            // allocation, and the object's NoEscape state — computed by the
+            // sound propagation in `propagate_escape_states`, which escapes
+            // any value reaching a call arg / field store / return / throw —
+            // is the precondition for entering this loop at all.
+
+            // Work list of nodes (uses) to validate. We seed it with the
+            // allocation's direct uses and may push a transparent phi's uses
+            // when we accept it.  `transparent` is the set of nodes that are
+            // provably aliases of THIS allocation and nothing else (the
+            // allocation itself plus any accepted singleton-phi); a field
+            // op's holder is accepted iff it is in this set.
+            let mut worklist: Vec<NodeId> = node.uses.clone();
+            let mut visited: HashSet<NodeId> = HashSet::new();
+            let mut transparent: HashSet<NodeId> = HashSet::new();
+            transparent.insert(id);
+
+            while let Some(use_id) = worklist.pop() {
+                if use_id >= graph.nodes.len() || !visited.insert(use_id) {
                     continue;
                 }
                 let use_node = &graph.nodes[use_id];
                 match &use_node.op {
+                    // Stale dead edge — observes nothing, skip it.
+                    Op::Dead => {}
                     Op::Store(field_idx) => {
                         // This allocation may appear in a Store either as the
                         // HOLDER (storing into our field — recordable) or as
                         // the VALUE (we are being published into another
                         // object — that escapes us, so bail).  Distinguish by
-                        // role rather than assuming holder.
-                        let is_holder = store_holder(use_node) == Some(id);
+                        // role rather than assuming holder.  A holder that is
+                        // a transparent phi alias of this allocation counts as
+                        // a holder edge too.
+                        let holder = store_holder(use_node);
+                        let is_holder = holder.is_some_and(|h| transparent.contains(&h));
                         let is_value = store_value(use_node) == Some(id);
                         if is_holder && *field_idx < *num_fields {
                             // Record the value written into our field.  If the
@@ -653,9 +702,62 @@ fn find_scalar_replacements(cg: &ConnectionGraph, graph: &Graph) -> Vec<ScalarRe
                         }
                     }
                     Op::Load(field_idx) => {
-                        // Only a load OF this object's field is replaceable.
-                        if load_holder(use_node) == Some(id) && *field_idx < *num_fields {
+                        // Only a load OF this object's field (directly or via
+                        // a transparent phi alias) is replaceable.
+                        let holder = load_holder(use_node);
+                        let is_holder = holder.is_some_and(|h| transparent.contains(&h));
+                        if is_holder && *field_idx < *num_fields {
                             replaced_loads.push(use_id);
+                        } else {
+                            can_replace = false;
+                            break;
+                        }
+                    }
+                    // A NoEscape phi is a transparent copy of the reference,
+                    // but ONLY when it provably resolves to *exactly* this
+                    // allocation and nothing else.  If the phi merged this
+                    // allocation with a different reference `a2`, a load
+                    // reached through it could be reading `a2`'s field on the
+                    // `a2` control path; folding that load to THIS object's
+                    // field value would be a miscompile (the kafka bug-25
+                    // class of missed-alias error).  We therefore require the
+                    // phi's resolved points-to set to be the singleton {id}.
+                    // We also require it to be NoEscape (a redundant but cheap
+                    // guard, since a phi that escapes would already have
+                    // forced `id` to escape and we would not be in this loop).
+                    Op::Phi => {
+                        let phi_no_escape = cg.get_escape(use_id) == EscapeState::NoEscape;
+                        let pts = cg.resolve_points_to(use_id);
+                        let only_this_alloc = pts.len() == 1 && pts.contains(&id);
+                        // CRITICAL soundness guard: a points-to set of exactly
+                        // {id} is necessary but NOT sufficient.  A reference
+                        // input with *unknown* provenance — a `Param`, `Call`
+                        // result, or field `Load` — contributes no entry to
+                        // the points-to set, so a phi merging `id` with such an
+                        // input would still resolve to the singleton {id} while
+                        // genuinely also carrying that other object.  Folding a
+                        // load through it would miscompile the path on which
+                        // the phi takes the unknown reference.  Require every
+                        // *reference-producing* input to be a concrete alias of
+                        // this allocation (an allocation that is `id`, or
+                        // another transparent phi we have already accepted).
+                        let all_inputs_alias_id = use_node.inputs.iter().all(|&inp| {
+                            if !is_ref_producer(graph, inp) {
+                                // Non-reference (e.g. the Merge control input,
+                                // a primitive) cannot carry a foreign object.
+                                return true;
+                            }
+                            // Reference input: must resolve to exactly {id}.
+                            let ip = cg.resolve_points_to(inp);
+                            ip.len() == 1 && ip.contains(&id)
+                        });
+                        if phi_no_escape && only_this_alloc && all_inputs_alias_id {
+                            // The phi is a sound alias of this allocation:
+                            // record it as transparent and follow its uses.
+                            transparent.insert(use_id);
+                            for &u in &use_node.uses {
+                                worklist.push(u);
+                            }
                         } else {
                             can_replace = false;
                             break;
@@ -1897,6 +1999,147 @@ mod tests {
             result.escape_states.get(&inner),
             Some(&EscapeState::NoEscape)
         );
+    }
+
+    // ---- Widened scalar-replacement shapes (increment 1) ----
+
+    /// WIDENING: an allocation whose field load is reached *through* a
+    /// NoEscape phi that resolves solely to this allocation must now be
+    /// scalar-replaced.  The pre-widening shape rejected ANY phi use via the
+    /// catch-all, so this object stayed heap-allocated.
+    #[test]
+    fn test_scalar_replacement_through_transparent_phi() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 7,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c5 = g.add_node(Op::Const(5), vec![]);
+        // Store 5 into field 0 of the allocation.
+        let _store = g.add_node(Op::Store(0), vec![alloc, c5]);
+        // A phi that carries ONLY this allocation (e.g. `o = o` across a
+        // merge): points-to set is the singleton {alloc}.
+        let phi = g.add_node(Op::Phi, vec![alloc]);
+        // Load field 0 THROUGH the phi (holder = phi, not alloc directly).
+        let _load = g.add_node(Op::Load(0), vec![phi]);
+
+        let result = analyze_escapes(&g);
+        // The allocation does not escape ...
+        assert_eq!(result.escape_states.get(&alloc), Some(&EscapeState::NoEscape));
+        // ... and is now scalar-replaceable despite the intervening phi.
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("allocation reached only through a transparent phi must scalar-replace");
+        assert_eq!(sr.field_values[0], Some(c5));
+        // The load through the phi is recorded for replacement.
+        assert!(sr.replaced_loads.contains(&_load));
+    }
+
+    /// SOUNDNESS GUARD on the widening: a phi that merges this allocation
+    /// with a DIFFERENT allocation must NOT be treated as transparent — a
+    /// load through it could be reading the other object's field. Scalar
+    /// replacement must bail for both allocations.
+    #[test]
+    fn test_phi_merging_two_allocs_blocks_scalar_replacement() {
+        let mut g = Graph::new();
+        let a1 = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let a2 = g.add_node(
+            Op::New {
+                class_id: 2,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let c2 = g.add_node(Op::Const(2), vec![]);
+        let _s1 = g.add_node(Op::Store(0), vec![a1, c1]);
+        let _s2 = g.add_node(Op::Store(0), vec![a2, c2]);
+        // phi merges two DISTINCT allocations.
+        let phi = g.add_node(Op::Phi, vec![a1, a2]);
+        // Load field 0 through the ambiguous phi.
+        let _load = g.add_node(Op::Load(0), vec![phi]);
+
+        let result = analyze_escapes(&g);
+        // Neither allocation may be scalar-replaced: folding the load to one
+        // object's field value would miscompile the other control path.
+        assert!(
+            result.scalar_replaceable.iter().all(|s| s.alloc_node != a1),
+            "a1 must not scalar-replace through an ambiguous phi"
+        );
+        assert!(
+            result.scalar_replaceable.iter().all(|s| s.alloc_node != a2),
+            "a2 must not scalar-replace through an ambiguous phi"
+        );
+    }
+
+    /// SOUNDNESS GUARD: a phi merging this allocation with a `Param` (unknown
+    /// provenance) resolves to the singleton {alloc} in the points-to set —
+    /// because the Param contributes no points-to entry — yet it genuinely
+    /// carries a foreign object on the Param path.  The widening must NOT
+    /// treat it as transparent; scalar replacement must bail.
+    #[test]
+    fn test_phi_merging_alloc_and_param_blocks_scalar_replacement() {
+        let mut g = Graph::new();
+        let param = g.add_node(Op::Param(0), vec![]);
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c1 = g.add_node(Op::Const(1), vec![]);
+        let _store = g.add_node(Op::Store(0), vec![alloc, c1]);
+        // phi merges the allocation with an opaque parameter reference.
+        let phi = g.add_node(Op::Phi, vec![alloc, param]);
+        let _load = g.add_node(Op::Load(0), vec![phi]);
+
+        let result = analyze_escapes(&g);
+        assert!(
+            result.scalar_replaceable.iter().all(|s| s.alloc_node != alloc),
+            "a phi merging the allocation with a Param must block scalar replacement"
+        );
+    }
+
+    /// WIDENING: a stale `Op::Dead` node left in the allocation's use list
+    /// must be skipped, not treated as an unknown use that blocks SR.
+    #[test]
+    fn test_scalar_replacement_skips_dead_use() {
+        let mut g = Graph::new();
+        let alloc = g.add_node(
+            Op::New {
+                class_id: 1,
+                num_fields: 1,
+            },
+            vec![],
+        );
+        let c9 = g.add_node(Op::Const(9), vec![]);
+        let store = g.add_node(Op::Store(0), vec![alloc, c9]);
+        let _load = g.add_node(Op::Load(0), vec![alloc]);
+        // Simulate an earlier pass having killed a former user of `alloc`
+        // while leaving the use-edge dangling.
+        let dead = g.add_node(Op::Other, vec![alloc]);
+        g.nodes[dead].op = Op::Dead;
+
+        let result = analyze_escapes(&g);
+        let sr = result
+            .scalar_replaceable
+            .iter()
+            .find(|s| s.alloc_node == alloc)
+            .expect("a stale Dead use must not block scalar replacement");
+        assert_eq!(sr.field_values[0], Some(c9));
+        assert!(sr.eliminated_stores.contains(&store));
     }
 
     /// An allocation used as a stored VALUE (published into another object's

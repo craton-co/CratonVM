@@ -10,7 +10,7 @@ use std::hash::{Hash, Hasher};
 
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
-use super::ir::{CmpOp, Graph, IrType, Node, NodeId, Op, NO_NODE};
+use super::ir::{CmpOp, Graph, IrType, MemKind, Node, NodeId, Op, NO_NODE};
 
 // ── Public API ───────────────────────────────────────────────────────
 
@@ -31,6 +31,7 @@ pub fn optimize(graph: &mut Graph) {
         fold_constants(graph);
         algebraic_simplify(graph);
         gvn(graph);
+        eliminate_dead_stores(graph);
         eliminate_dead_nodes(graph);
         if graph.live_count() == before {
             break;
@@ -631,6 +632,185 @@ fn gvn_hash(op: &Op, ty: IrType, inputs: &[NodeId]) -> u64 {
     hasher.finish()
 }
 
+// ── Dead Store Elimination (DSE) ─────────────────────────────────────
+//
+// `eliminate_dead_nodes` (below) is a *value* DCE: it removes nodes whose
+// result no node reads.  It cannot remove a store, because a store produces
+// no value its consumers depend on — its effect is on memory, and DCE keeps
+// any node transitively reachable from the exit through the memory-token /
+// input chain.  DSE is the complementary pass that targets the *side
+// effect*: a `Store` whose written location is provably overwritten by a
+// later store before any read, or that is never read at all, performs no
+// observable work and can be deleted.
+//
+// SOUNDNESS MODEL (deliberately conservative — removing a store that *was*
+// observed is silent data loss):
+//
+//   * We only ever remove a store to a **provably-local, non-escaping
+//     allocation** (`New`/`NewArray` base).  A store through a Param, a
+//     loaded reference, a phi, a call result, or any base we cannot resolve
+//     to a fresh allocation in this method is left untouched — another
+//     thread, the caller, or a callee might observe it.
+//
+//   * "Overwritten before any read" is decided by an ordered scan in
+//     node-id order.  A store `S` to location `L = (base, idx_key, kind)` is
+//     dead iff a *later* store `S'` writes the same `L` with **no** node
+//     between them that could read or alias memory.  The instant we see *any*
+//     non-pure, non-store node — `Load`, `Call`, `Return`, `New`/`NewArray`
+//     (constructor effects), `Guard`, `ArrayLength`, a monitor op, OR any
+//     control / merge / phi / projection node — we flush every pending store
+//     (give up — conservative).
+//
+//     WHY THIS IS SOUND DESPITE NODE-ID ORDER NOT BEING GLOBAL PROGRAM ORDER:
+//     in this Sea-of-Nodes IR, node id is creation order, which is a faithful
+//     linearisation only *within a single straight-line region*.  Across a
+//     branch or join the order is meaningless.  But every control node
+//     (`If`, `Merge`, `Region`, `Proj`, `Start`, `Return`) and every `Phi`
+//     is non-pure, so it is a barrier that flushes the pending set.  Two
+//     stores therefore only ever match when no control node lies between
+//     them — i.e. they are in the same straight-line region where node-id
+//     order *is* a valid before/after relationship.  This is intentionally
+//     coarse: it fires on the common straight-line "init then overwrite" and
+//     "write-only scratch field" shapes without needing a real alias oracle.
+//
+//   * The location key uses the *base node id*, the *index/offset node id*
+//     (or a sentinel for plain field stores with no index operand), and the
+//     `MemKind`.  Two stores match only when all three are structurally
+//     identical.  Because the base is a single SSA allocation node, equal
+//     base ids are the same object; differing `MemKind`/idx are different
+//     slots and never matched.
+//
+// This pass is monotone (only ever marks nodes `Dead`) and idempotent, so it
+// composes safely inside the `optimize()` fixed-point loop.
+
+/// A memory location written by a store, used to match an overwriting store.
+/// Equality is structural over (base, index, kind).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StoreLoc {
+    /// The base reference node (a non-escaping allocation).
+    base: NodeId,
+    /// The index/offset operand node, or `NO_NODE` for a plain field store.
+    idx: NodeId,
+    /// The access width / kind.
+    kind: MemKind,
+}
+
+/// Read `(base, idx, value)` from a `Store` node, tolerating both the compact
+/// `[base, value]` layout used by the EA bridge / hand-built test graphs and
+/// the full `[ctrl, mem, base, index/offset, value]` layout documented on
+/// `Op::Store`.  Returns `None` when the layout is too short to interpret,
+/// so the caller treats the store conservatively (never removed).
+///
+/// Disambiguation: the documented full form always carries a `Memory`-typed
+/// token at input slot 1, whereas the compact form puts the base reference
+/// there.  We key off the type of slot 1's producer.
+fn store_operands(graph: &Graph, store_id: NodeId) -> Option<(NodeId, NodeId, NodeId)> {
+    let n = &graph.nodes[store_id as usize];
+    debug_assert!(matches!(n.op, Op::Store(_)));
+    let inputs = &n.inputs;
+    match inputs.len() {
+        // Compact: [base, value]
+        2 => Some((inputs[0], NO_NODE, inputs[1])),
+        // Full store with no explicit index: [ctrl, mem, base, value]
+        4 => Some((inputs[2], NO_NODE, inputs[3])),
+        // Full store with index/offset: [ctrl, mem, base, index, value]
+        n if n >= 5 => Some((inputs[2], inputs[3], inputs[4])),
+        _ => None,
+    }
+}
+
+/// True if `id` is a fresh allocation node in this method (provably local
+/// provenance — the only base we are willing to delete a store to).
+fn is_local_alloc(graph: &Graph, id: NodeId) -> bool {
+    if id == NO_NODE || (id as usize) >= graph.nodes.len() {
+        return false;
+    }
+    matches!(
+        graph.nodes[id as usize].op,
+        Op::New { .. } | Op::NewArray { .. }
+    )
+}
+
+/// True if a node could read memory or otherwise observe a pending store, so
+/// encountering it forces DSE to discard all pending (not-yet-overwritten)
+/// stores.  This is the conservative "alias barrier": anything that is not a
+/// pure data computation is treated as a potential reader.
+fn is_memory_barrier(op: &Op) -> bool {
+    if op.is_pure() {
+        return false;
+    }
+    // A store is handled explicitly by the scan; everything else that is
+    // impure (loads, calls, returns, allocations, guards, monitors, control
+    // joins, projections, memory phis, …) is a barrier.
+    !matches!(op, Op::Store(_))
+}
+
+/// Dead-store elimination: remove stores whose effect is never observed.
+///
+/// See the module-level soundness model above.  Walks nodes in id order,
+/// tracking the most recent still-live store to each location written to a
+/// local allocation; an overwriting store to the same location kills the
+/// earlier one, and any memory barrier flushes the pending set.
+fn eliminate_dead_stores(graph: &mut Graph) {
+    // The location each currently-pending store writes, in node order. A
+    // pending store is one we have seen but not yet proven observed; a later
+    // store to the same location proves it dead.
+    let mut pending: Vec<(NodeId, StoreLoc)> = Vec::new();
+    let mut to_kill: Vec<NodeId> = Vec::new();
+
+    let len = graph.nodes.len();
+    for id in 0..len {
+        let op = graph.nodes[id].op.clone();
+        match op {
+            Op::Dead => continue,
+            Op::Store(kind) => {
+                let store_id = id as NodeId;
+                let (base, idx, _val) = match store_operands(graph, store_id) {
+                    Some(t) => t,
+                    None => {
+                        // Unreadable layout — treat as a barrier so we never
+                        // delete around a store we cannot understand.
+                        pending.clear();
+                        continue;
+                    }
+                };
+
+                // Only stores to a fresh local allocation are eligible: any
+                // other base may be observed outside this method.
+                if !is_local_alloc(graph, base) {
+                    // Non-local store: it both may be observed AND may alias
+                    // pending locals (we cannot prove otherwise), so flush.
+                    pending.clear();
+                    continue;
+                }
+
+                let loc = StoreLoc { base, idx, kind };
+
+                // If an earlier pending store wrote the exact same location,
+                // it is overwritten here with no intervening reader → dead.
+                if let Some(pos) = pending.iter().position(|(_, l)| *l == loc) {
+                    let (dead_store, _) = pending.remove(pos);
+                    to_kill.push(dead_store);
+                }
+                // This store is now the live writer of `loc`.
+                pending.push((store_id, loc));
+            }
+            other => {
+                // Any non-pure, non-store node may observe memory: give up on
+                // every pending store (we cannot prove they are unread past
+                // this point).
+                if is_memory_barrier(&other) {
+                    pending.clear();
+                }
+            }
+        }
+    }
+
+    for id in to_kill {
+        graph.kill(id);
+    }
+}
+
 // ── Dead Node Elimination ────────────────────────────────────────────
 
 /// Remove nodes not reachable from the exit (Return).
@@ -682,7 +862,7 @@ fn eliminate_dead_nodes(graph: &mut Graph) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::IrBuilder;
+    use crate::ir::{IrBuilder, MemKind};
 
     fn build_and_optimize(code: &[u8], code_len: usize, num_params: usize, num_locals: usize) -> Graph {
         let builder = IrBuilder::new(num_params, num_locals);
@@ -1014,5 +1194,121 @@ mod tests {
     fn test_fold_i64_neg_longmin() {
         let r = fold_unop(IrType::Long, Op::Neg, i64::MIN).unwrap();
         assert_eq!(r, i64::MIN);
+    }
+
+    // ── Dead Store Elimination (DSE) ────────────────────────────────
+
+    /// Hand-build a minimal `ir::Graph` (the `optimize()` passes run on the
+    /// real `ir::Graph`, distinct from the EA graph). Returns a graph with a
+    /// Start node already in place.
+    fn probe_graph() -> Graph {
+        let mut g = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: 0,
+            safepoints: Vec::new(),
+        };
+        let start = g.add(Op::Start, IrType::Void, vec![], None);
+        g.entry = start;
+        g
+    }
+
+    #[test]
+    fn test_dse_removes_overwritten_store() {
+        // A local object whose field 0 is written twice with no read in
+        // between: the first store is dead and must be removed; the second
+        // (live) store and the allocation survive.
+        let mut g = probe_graph();
+        let alloc = g.add(Op::New { class_id: 1, num_fields: 1 }, IrType::Ref, vec![g.entry], None);
+        let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
+        // Compact [base, value] layout (as used by the EA bridge/tests).
+        let dead_store = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
+        let live_store = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c2], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![g.entry, live_store], None);
+        g.exit = ret;
+
+        eliminate_dead_stores(&mut g);
+
+        assert_eq!(
+            g.nodes[dead_store as usize].op,
+            Op::Dead,
+            "the overwritten store must be eliminated"
+        );
+        assert_eq!(
+            g.nodes[live_store as usize].op,
+            Op::Store(MemKind::Int),
+            "the surviving (overwriting) store must be kept"
+        );
+        assert!(
+            !matches!(g.nodes[alloc as usize].op, Op::Dead),
+            "DSE must not touch the allocation"
+        );
+    }
+
+    #[test]
+    fn test_dse_keeps_store_with_intervening_load() {
+        // store; load(same obj); store  — the first store IS observed by the
+        // load, so it must NOT be removed.
+        let mut g = probe_graph();
+        let alloc = g.add(Op::New { class_id: 1, num_fields: 1 }, IrType::Ref, vec![g.entry], None);
+        let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let s1 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
+        // A load is a memory barrier — flushes the pending store.
+        let _load = g.add(Op::Load(MemKind::Int), IrType::Int, vec![alloc], None);
+        let s2 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c2], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![g.entry, s2], None);
+        g.exit = ret;
+
+        eliminate_dead_stores(&mut g);
+
+        assert_eq!(
+            g.nodes[s1 as usize].op,
+            Op::Store(MemKind::Int),
+            "a store observed by an intervening load must be kept"
+        );
+    }
+
+    #[test]
+    fn test_dse_keeps_store_to_non_local_base() {
+        // Store through a Param (could be observed by the caller / other
+        // threads): even an immediate overwrite must NOT remove the first.
+        let mut g = probe_graph();
+        let p0 = g.add(Op::Param(0), IrType::Ref, vec![], None);
+        let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
+        let s1 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![p0, c1], None);
+        let s2 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![p0, c2], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![g.entry, s2], None);
+        g.exit = ret;
+
+        eliminate_dead_stores(&mut g);
+
+        assert_eq!(
+            g.nodes[s1 as usize].op,
+            Op::Store(MemKind::Int),
+            "a store to a non-local (Param) base may be observed externally and must be kept"
+        );
+    }
+
+    #[test]
+    fn test_dse_distinct_fields_not_matched() {
+        // Two stores to *different* fields of the same object: neither
+        // overwrites the other, so both survive.
+        let mut g = probe_graph();
+        let alloc = g.add(Op::New { class_id: 1, num_fields: 2 }, IrType::Ref, vec![g.entry], None);
+        let c1 = g.add(Op::Const(1), IrType::Int, vec![], None);
+        let c2 = g.add(Op::Const(2), IrType::Int, vec![], None);
+        // Different MemKind → different location key (Int vs Long slot).
+        let s1 = g.add(Op::Store(MemKind::Int), IrType::Void, vec![alloc, c1], None);
+        let s2 = g.add(Op::Store(MemKind::Long), IrType::Void, vec![alloc, c2], None);
+        let ret = g.add(Op::Return, IrType::Void, vec![g.entry, s2], None);
+        g.exit = ret;
+
+        eliminate_dead_stores(&mut g);
+
+        assert_eq!(g.nodes[s1 as usize].op, Op::Store(MemKind::Int));
+        assert_eq!(g.nodes[s2 as usize].op, Op::Store(MemKind::Long));
     }
 }
