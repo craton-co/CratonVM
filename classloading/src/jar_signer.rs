@@ -2791,11 +2791,27 @@ pub fn verify_chain<'a>(
     trust_store: &TrustStore,
 ) -> Result<(), TrustError> {
     let mut current: &'a X509Cert<'a> = leaf;
-    // Track visited Subject DNs by owned bytes — we re-walk through
-    // both leaf-borrowed slices and trust-store-borrowed slices and
-    // mixing those lifetimes inside a `Vec<&[u8]>` is awkward.
-    let mut visited: Vec<Vec<u8>> = Vec::new();
-    visited.push(current.subject_dn.to_vec());
+    // PERF(cl-jarsigner-perf): track visited Subject DNs in a `HashSet` of
+    // borrowed `&'a [u8]` slices for O(1) cycle-detection membership instead
+    // of the former `Vec<Vec<u8>>` + linear `iter().any(...)` scan per step.
+    // The leaf and every intermediate `subject_dn` are `&'a [u8]`, so no
+    // owned copies (`.to_vec()`) are needed — this also drops the per-step
+    // DN allocation. Behavior is unchanged: the set holds exactly the same
+    // Subject DNs that were pushed before, and `insert`-returns-false ⇔ the
+    // old `any(...)` would have matched.
+    let mut visited: std::collections::HashSet<&'a [u8]> = std::collections::HashSet::new();
+    visited.insert(current.subject_dn);
+
+    // PERF(cl-jarsigner-perf): index intermediates by Subject DN for O(1)
+    // parent lookup instead of `intermediates.iter().find(...)` per step.
+    // `entry(...).or_insert(...)` keeps the FIRST occurrence of any duplicate
+    // Subject DN, exactly matching the old `find()` (which returned the first
+    // matching cert in slice order). Lookups below preserve identical result.
+    let mut inter_by_subject: std::collections::HashMap<&'a [u8], &'a X509Cert<'a>> =
+        std::collections::HashMap::with_capacity(intermediates.len());
+    for c in intermediates {
+        inter_by_subject.entry(c.subject_dn).or_insert(c);
+    }
 
     // Leaf validity window must include "now" (skip for the synthetic
     // stub-sig fixtures, whose dummy validity dates aren't real times).
@@ -2833,12 +2849,14 @@ pub fn verify_chain<'a>(
             return Ok(());
         }
         // Look up an intermediate whose subject == current.issuer.
-        let next = intermediates
-            .iter()
-            .find(|c| c.subject_dn == current.issuer_dn);
+        // PERF(cl-jarsigner-perf): O(1) indexed lookup (was a linear
+        // `iter().find(...)`); `.copied()` yields the same first-match cert.
+        let next = inter_by_subject.get(current.issuer_dn).copied();
         match next {
             Some(parent) => {
-                if visited.iter().any(|v| v.as_slice() == parent.subject_dn) {
+                // PERF(cl-jarsigner-perf): O(1) set membership (was a linear
+                // `visited.iter().any(...)`); same Cyclic result.
+                if visited.contains(parent.subject_dn) {
                     return Err(TrustError::Cyclic);
                 }
                 if !is_stub_sig_fixture(parent) && !cert_dates_ok(parent) {
@@ -2852,7 +2870,8 @@ pub fn verify_chain<'a>(
                     check_ca_ext_facts(&facts, ca_certs_below)?;
                 }
                 current.link_signature_ok(parent)?;
-                visited.push(parent.subject_dn.to_vec());
+                // PERF(cl-jarsigner-perf): insert borrowed DN slice (no alloc).
+                visited.insert(parent.subject_dn);
                 // A non-self-issued intermediate adds to the CA count that
                 // the *next* (higher) CA's pathLenConstraint must cover.
                 if !parent.is_self_signed() {

@@ -218,7 +218,15 @@ impl ClassUnloader {
         }
 
         // Phase 1 -- find unreachable loaders.
-        let unreachable: Vec<usize> = inner
+        //
+        // Perf (gc-classunload): collect the unreachable loader addresses into a
+        // `HashSet` once so that every later membership test
+        // (`unreachable.contains(&addr)`) in Phases 2/4, the name collections and
+        // the final `retain` is O(1) instead of an O(loaders) linear scan over a
+        // `Vec`. The previous code re-scanned a `Vec<usize>` multiple times,
+        // giving O(loaders * unreachable) total work per phase. The membership
+        // set unloaded is exactly the same as before.
+        let unreachable: std::collections::HashSet<usize> = inner
             .loaders
             .iter()
             .filter(|l| !l.is_system_loader && !l.alive && !is_loader_reachable(l.loader_addr))

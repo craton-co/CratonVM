@@ -8,6 +8,7 @@
 //! heuristic calculations. Platform backends override these with exact
 //! values from the OS font engine.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::OnceLock;
 
@@ -21,12 +22,13 @@ use cratonvm_types::intern_arc;
 
 /// Hard cap on entries in the per-engine font metrics cache.
 ///
-/// Used as a crude safety bound to prevent unbounded growth from a
-/// pathological app that cycles through many distinct (family, style, size)
-/// triples. When the cache reaches this size, the next insertion clears it
-/// entirely — coarse, but it bounds memory at a constant ceiling and
-/// avoids per-lookup eviction bookkeeping. A proper LRU is a follow-up
-/// (would require adding the `lru` crate to workspace deps).
+/// Bounds memory from a pathological app that cycles through many distinct
+/// (family, style, size) triples. Once the cache reaches this size, the next
+/// insertion evicts one entry via a Second-Chance (CLOCK) approximation of
+/// LRU — see [`FontEngine::get_metrics`]. The metrics values are a pure
+/// function of the key ([`FontEngine::compute_metrics`]), so the choice of
+/// eviction victim is a performance property only and never affects the
+/// returned metrics.
 const METRICS_CACHE_CAP: usize = 1024;
 
 // ── Style flags (match java.awt.Font) ────────────────────────────────────
@@ -101,19 +103,26 @@ pub struct FontMetrics {
 /// native font rasterizer. For real rendering, the platform backend
 /// replaces these values with OS-provided measurements.
 pub struct FontEngine {
-    /// Cache: (interned family, style, size) -> metrics.
+    /// Cache: (interned family, style, size) -> (metrics, referenced-bit).
     ///
     /// The family name is interned to an `Arc<str>` so the key carries a
     /// cheap (refcount-bump) clone instead of a fresh `String` allocation
-    /// on every lookup. The cache is bounded by `METRICS_CACHE_CAP` and
-    /// evicts the least-recently-used entry once that cap is reached.
+    /// on every lookup. The cache is bounded by `METRICS_CACHE_CAP`.
     ///
-    /// Each value carries the value of `tick` at its last access; on a hit
-    /// the stored tick is refreshed, and on an at-cap insert the entry with
-    /// the smallest tick (oldest use) is dropped.
-    metrics_cache: FxHashMap<(Arc<str>, i32, i32), (FontMetrics, u64)>,
-    /// Monotonic logical clock used to order cache accesses for LRU eviction.
-    tick: u64,
+    /// PERF (awt-perf #1): eviction was a full `min_by_key` linear scan over
+    /// every entry on every at-cap insert — O(CAP) on a path (`string_width`)
+    /// that runs once per glyph-run in Swing layout. It is now a Second-Chance
+    /// (CLOCK) approximation of LRU: each value carries a `referenced` bit,
+    /// set on insert and refreshed to `true` on every hit. Eviction walks the
+    /// `clock` FIFO below, giving a referenced entry a "second chance" (clear
+    /// its bit and re-queue) and evicting the first entry whose bit is already
+    /// clear. This is amortized O(1) per insert (each second-chance re-queue is
+    /// paid for by a prior access that set the bit) with no per-lookup scan.
+    metrics_cache: FxHashMap<(Arc<str>, i32, i32), (FontMetrics, bool)>,
+    /// CLOCK hand: live cache keys in FIFO order. Holds exactly one entry per
+    /// `metrics_cache` key (so its length is bounded by `METRICS_CACHE_CAP`),
+    /// and is consulted only on at-cap inserts to pick an eviction victim.
+    clock: VecDeque<(Arc<str>, i32, i32)>,
 }
 
 /// Logical font family categories.
@@ -209,7 +218,7 @@ impl FontEngine {
     pub fn new() -> Self {
         FontEngine {
             metrics_cache: FxHashMap::default(),
-            tick: 0,
+            clock: VecDeque::new(),
         }
     }
 
@@ -218,37 +227,54 @@ impl FontEngine {
     /// The family name is interned to a process-global `Arc<str>` so the
     /// cache key avoids a fresh `String` allocation on every lookup. The
     /// cache is bounded by [`METRICS_CACHE_CAP`]; when the bound is reached
-    /// the least-recently-used entry is evicted before insertion.
+    /// one entry is evicted via the Second-Chance (CLOCK) policy described on
+    /// the `metrics_cache` field. (PERF awt-perf #1 — replaced a per-insert
+    /// `min_by_key` linear scan over the whole cache.)
     pub fn get_metrics(&mut self, spec: &FontSpec) -> FontMetrics {
         let family: Arc<str> = intern_arc(&spec.family);
         let key = (Arc::clone(&family), spec.style, spec.size);
 
-        // Bump the logical clock on every access so hits and inserts share a
-        // single monotonic ordering for LRU.
-        self.tick = self.tick.wrapping_add(1);
-        let now = self.tick;
-
         if let Some(entry) = self.metrics_cache.get_mut(&key) {
-            // Hit: refresh last-use so this entry counts as recently used.
-            entry.1 = now;
+            // Hit: set the referenced bit so the CLOCK sweep gives this entry
+            // a second chance before evicting it.
+            entry.1 = true;
             return entry.0;
         }
 
         let m = Self::compute_metrics(spec);
         if self.metrics_cache.len() >= METRICS_CACHE_CAP {
-            // LRU eviction: drop the single entry with the smallest last-use
-            // tick (least recently used). Linear scan, but only on inserts at
-            // cap and avoids the re-warm thrash of clearing wholesale.
-            if let Some(oldest) = self
-                .metrics_cache
-                .iter()
-                .min_by_key(|(_, v)| v.1)
-                .map(|(k, _)| k.clone())
-            {
-                self.metrics_cache.remove(&oldest);
+            // CLOCK eviction: sweep the FIFO. A referenced entry gets a
+            // second chance (clear its bit, re-queue at the back); the first
+            // entry found with a clear bit is evicted. Amortized O(1): a
+            // re-queue only happens for an entry an access marked referenced,
+            // so the total re-queue work is bounded by accesses. The loop
+            // always terminates — once every bit has been cleared by a sweep,
+            // the next candidate has a clear bit and is evicted.
+            while let Some(candidate) = self.clock.pop_front() {
+                match self.metrics_cache.get_mut(&candidate) {
+                    Some(slot) if slot.1 => {
+                        // Referenced: clear and give a second chance.
+                        slot.1 = false;
+                        self.clock.push_back(candidate);
+                    }
+                    Some(_) => {
+                        // Unreferenced: evict.
+                        self.metrics_cache.remove(&candidate);
+                        break;
+                    }
+                    None => {
+                        // Defensive: key already gone (should not happen — the
+                        // clock holds exactly the live keys). Drop the stale
+                        // hand entry and keep sweeping.
+                    }
+                }
             }
         }
-        self.metrics_cache.insert(key, (m, now));
+        // New entries start referenced=false: they take their place in the
+        // FIFO and earn a second chance only once actually re-accessed, which
+        // keeps a one-shot scan from pinning churned-through entries.
+        self.metrics_cache.insert(key.clone(), (m, false));
+        self.clock.push_back(key);
         m
     }
 
@@ -472,33 +498,40 @@ pub struct GlyphBitmap {
 
 /// Process-wide cache of rasterized glyphs.
 ///
-/// Eviction strategy: when the map reaches `cap`, evict the single
-/// least-recently-used entry before inserting the new one. Each map value
-/// carries the value of a monotonic logical clock (`tick`) at its last use;
-/// a hit refreshes that stamp and an at-cap insert drops the entry with the
-/// smallest stamp. The clock lives under the same mutex as the map, so the
-/// bookkeeping is a single integer write on the hot path — far cheaper than
-/// the re-warm thrash of the previous "drop half the map" approach, which
-/// could evict hot glyphs and force redundant re-rasterization.
+/// Eviction strategy: when the map reaches `cap`, evict one entry via a
+/// Second-Chance (CLOCK) approximation of LRU before inserting the new one.
+/// Each map value carries a `referenced` bit, set on insert-access and on
+/// every hit; eviction sweeps the `clock` FIFO, giving a referenced entry a
+/// second chance (clear its bit, re-queue) and evicting the first entry whose
+/// bit is already clear.
+///
+/// PERF (awt-perf #1): the previous policy refreshed a per-entry `tick` and,
+/// on an at-cap insert, picked the victim via a `min_by_key` linear scan over
+/// the WHOLE atlas — O(cap) per insert on the glyph-rasterization hot path
+/// (each keystroke re-measures the visible glyph run). The CLOCK sweep is
+/// amortized O(1) and keeps the same "evict a stale, not a hot, glyph"
+/// behavior without the full scan. The cache lives under the same mutex, so
+/// the hot-path bookkeeping is still a single boolean write.
 pub struct GlyphAtlas {
     cache: Mutex<GlyphCache>,
     cap: usize,
 }
 
-/// Mutex-guarded interior of [`GlyphAtlas`]: the glyph map plus the logical
-/// clock that orders entries for LRU eviction. Each map value pairs the
-/// shared bitmap with the `tick` value at its last access.
+/// Mutex-guarded interior of [`GlyphAtlas`]: the glyph map plus the CLOCK
+/// hand used to order entries for eviction. Each map value pairs the shared
+/// bitmap with a `referenced` bit (set on access, cleared by a CLOCK sweep).
 struct GlyphCache {
-    map: rustc_hash::FxHashMap<GlyphKey, (Arc<GlyphBitmap>, u64)>,
-    /// Monotonic logical clock; bumped on every access (hit or insert).
-    tick: u64,
+    map: rustc_hash::FxHashMap<GlyphKey, (Arc<GlyphBitmap>, bool)>,
+    /// CLOCK hand: live cache keys in FIFO order, exactly one per `map` key
+    /// (so bounded by the atlas `cap`). Consulted only on at-cap inserts.
+    clock: VecDeque<GlyphKey>,
 }
 
 impl GlyphCache {
     fn new() -> Self {
         GlyphCache {
             map: rustc_hash::FxHashMap::default(),
-            tick: 0,
+            clock: VecDeque::new(),
         }
     }
 
@@ -512,6 +545,7 @@ impl GlyphCache {
 
     fn clear(&mut self) {
         self.map.clear();
+        self.clock.clear();
     }
 }
 
@@ -569,15 +603,13 @@ impl GlyphAtlas {
         key: GlyphKey,
         fontdue_font: &fontdue::Font,
     ) -> Arc<GlyphBitmap> {
-        // Hot path: scoped lock, drops before any work. On a hit we also
-        // refresh the entry's last-use tick so it counts as recently used
-        // for LRU ordering.
+        // Hot path: scoped lock, drops before any work. On a hit we set the
+        // referenced bit so the CLOCK sweep gives this glyph a second chance
+        // before eviction.
         {
             let mut cache = self.cache.lock();
-            cache.tick = cache.tick.wrapping_add(1);
-            let now = cache.tick;
             if let Some(entry) = cache.map.get_mut(&key) {
-                entry.1 = now;
+                entry.1 = true;
                 return Arc::clone(&entry.0);
             }
         }
@@ -587,21 +619,36 @@ impl GlyphAtlas {
         // first inserter wins, the rest get the cached entry. This
         // preserves `Arc::ptr_eq` for downstream identity caches.
         let mut cache = self.cache.lock();
-        cache.tick = cache.tick.wrapping_add(1);
-        let now = cache.tick;
 
-        // LRU-evict BEFORE the `entry` lookup. If we are about to insert a new
-        // key and we're already at cap, drop the single least-recently-used
-        // entry (smallest last-use tick) to make room. Linear scan, but only
-        // on at-cap inserts; avoids the re-warm thrash of bulk eviction.
-        if cache.map.len() >= self.cap && !cache.map.contains_key(&key) {
-            if let Some(oldest) = cache
-                .map
-                .iter()
-                .min_by_key(|(_, v)| v.1)
-                .map(|(k, _)| *k)
-            {
-                cache.map.remove(&oldest);
+        // Another thread may have inserted this key while we released the lock
+        // above. Only run the (cap-bounded) eviction sweep and the clock push
+        // when we are genuinely about to add a new key, so the clock stays in
+        // one-to-one correspondence with the map.
+        let is_new = !cache.map.contains_key(&key);
+
+        // CLOCK-evict BEFORE the `entry` insert when we are about to add a new
+        // key at cap. Sweep the FIFO: a referenced entry gets a second chance
+        // (clear its bit, re-queue); the first unreferenced entry is evicted.
+        // Amortized O(1) — replaces the old O(cap) `min_by_key` scan — and
+        // always terminates (one full sweep clears every bit, so the next
+        // candidate is unreferenced).
+        if is_new && cache.map.len() >= self.cap {
+            while let Some(candidate) = cache.clock.pop_front() {
+                match cache.map.get_mut(&candidate) {
+                    Some(slot) if slot.1 => {
+                        slot.1 = false;
+                        cache.clock.push_back(candidate);
+                    }
+                    Some(_) => {
+                        cache.map.remove(&candidate);
+                        break;
+                    }
+                    None => {
+                        // Defensive: key already gone (should not happen — the
+                        // clock mirrors the live keys). Drop the stale hand
+                        // entry and keep sweeping.
+                    }
+                }
             }
         }
 
@@ -619,9 +666,18 @@ impl GlyphAtlas {
                 bearing_y: metrics.ymin,
                 advance: metrics.advance_width,
             });
-            (bitmap, now)
+            // New entries start unreferenced; they earn a second chance only
+            // once actually re-accessed, so a one-shot scan doesn't pin them.
+            (bitmap, false)
         });
-        Arc::clone(&entry.0)
+        let bitmap = Arc::clone(&entry.0);
+        // Record the new key in the clock exactly once (the entry was newly
+        // inserted iff `is_new` held). A racing concurrent insert would have
+        // already pushed it, so we must not push a duplicate.
+        if is_new {
+            cache.clock.push_back(key);
+        }
+        bitmap
     }
 }
 
@@ -699,6 +755,41 @@ mod tests {
         assert_eq!(m.leading, 1);
         assert_eq!(m.height, 21);
         assert_eq!(m.max_advance, 12);
+    }
+
+    // PERF (awt-perf #1): the CLOCK eviction must keep the metrics cache
+    // bounded at `METRICS_CACHE_CAP`, must keep the `clock` hand in 1:1
+    // correspondence with the map, and must give a recently-used (referenced)
+    // entry a second chance over a cold one.
+    #[test]
+    fn metrics_cache_clock_eviction_bounds_and_protects_hot_entry() {
+        let mut engine = FontEngine::new();
+
+        // A "hot" entry we will keep touching so its referenced bit stays set.
+        let hot = FontSpec::new("SansSerif", PLAIN, 7);
+        let _ = engine.get_metrics(&hot);
+
+        // Overflow the cache well past capacity with distinct (size) keys,
+        // re-touching the hot entry along the way so it earns a second chance.
+        for size in 100..(100 + METRICS_CACHE_CAP as i32 + 50) {
+            let _ = engine.get_metrics(&FontSpec::new("SansSerif", PLAIN, size));
+            let _ = engine.get_metrics(&hot); // refresh referenced bit
+        }
+
+        // Never exceeds the hard cap, and the clock mirrors the map exactly.
+        assert!(engine.metrics_cache.len() <= METRICS_CACHE_CAP);
+        assert_eq!(engine.metrics_cache.len(), engine.clock.len());
+
+        // The continually-touched hot entry survived the churn.
+        let hot_key = (intern_arc(&hot.family), hot.style, hot.size);
+        assert!(
+            engine.metrics_cache.contains_key(&hot_key),
+            "CLOCK must not evict a repeatedly-referenced entry"
+        );
+
+        // Metrics are a pure function of the key, so any value the cache
+        // returns equals a fresh computation — eviction can never change it.
+        assert_eq!(engine.get_metrics(&hot), FontEngine::compute_metrics(&hot));
     }
 
     #[test]
@@ -962,10 +1053,13 @@ mod tests {
     fn glyph_atlas_clear() {
         let atlas = GlyphAtlas::new(8);
         // Directly poke a bitmap in so we don't need a real fontdue font.
+        // Keep the map<->clock invariant (one clock entry per map key) so the
+        // poke mirrors what `get_or_rasterize` would produce.
         {
             let mut cache = atlas.cache.lock();
+            let key = GlyphKey::new("Dialog", 12, false, false, 'A');
             cache.map.insert(
-                GlyphKey::new("Dialog", 12, false, false, 'A'),
+                key,
                 (
                     Arc::new(GlyphBitmap {
                         alpha: Vec::<u8>::new().into(),
@@ -975,9 +1069,11 @@ mod tests {
                         bearing_y: 0,
                         advance: 0.0,
                     }),
-                    0,
+                    // Referenced bit (CLOCK); value is irrelevant to this test.
+                    false,
                 ),
             );
+            cache.clock.push_back(key);
         }
         assert_eq!(atlas.len(), 1);
         atlas.clear();

@@ -1131,6 +1131,25 @@ impl G1Collector {
         let header = unsafe { &*(old_ptr as *const ObjectHeader) };
         let obj_size = object_total_size(header);
 
+        // gc-abort-cleanup (mirrors gc.rs::try_forward_object): a corrupt /
+        // implausible header makes `object_total_size` return the `0` sentinel
+        // (or otherwise an implausible size). Refuse to evacuate it rather than
+        // memcpy `0`/garbage bytes and install a bad forwarding entry; bail out
+        // as an evacuation failure (`None`) with a diagnostic instead of
+        // aborting the VM.
+        if obj_size < HEADER_SIZE {
+            tracing::warn!(
+                "g1::evacuate_object: refusing to evacuate object at {:p} — implausible \
+                 size {} (kind=0x{:02x}, num_slots={}, array_len={}); corrupt header",
+                old_ptr,
+                obj_size,
+                header.kind as u8,
+                header.num_slots,
+                header.array_length,
+            );
+            return None;
+        }
+
         // Decide destination based on age
         let promote = header.gc_age >= self.config.promotion_age;
         let dest_type = if promote {
@@ -3465,10 +3484,36 @@ fn find_contiguous_free(regions: &[G1Region], count: usize) -> Option<usize> {
 }
 
 /// Compute total object size from header.
+///
+/// Defensive corruption handling (gc-abort-cleanup, mirrors `gc.rs`): a corrupt /
+/// implausible array header (e.g. a stale `array_length` so large that
+/// `header + length * element_size` overflows `usize`) must NOT abort the whole
+/// VM. This previously `.expect()`-panicked here, killing the process on a bad
+/// header, whereas the non-moving sweep (`gen_heap.rs::gen_object_total_size`)
+/// returns a `0` sentinel and lets its walker re-sync. Mirror that behavior: on
+/// overflow, log a diagnostic and return `0`. `0 < HEADER_SIZE`, so every
+/// caller's existing corruption guard treats it as a bad header and stops /
+/// re-syncs the linear walk rather than advancing the cursor by 0 and spinning.
+///
+/// This does not mask genuine bugs silently — the corruption is logged — but it
+/// converts a hard process abort into a recoverable / fail-safe path.
 fn object_total_size(header: &ObjectHeader) -> usize {
     if header.kind == ObjectKind::Array {
-        HEADER_SIZE + array_data_size(header.array_length as usize, header.element_type)
-            .expect("array_data_size overflow in g1 object_total_size")
+        match array_data_size(header.array_length as usize, header.element_type) {
+            Ok(data) => HEADER_SIZE + data,
+            Err(_) => {
+                // Implausible array header — treat as corrupt. Return 0 so the
+                // caller's `total_size < HEADER_SIZE` guard fires (matching the
+                // non-moving sweep's re-sync contract) instead of panicking.
+                tracing::warn!(
+                    "g1: implausible array_length {} (element_type={:?}) in object header — \
+                     treating as corrupt; caller will skip/stop the walk",
+                    header.array_length,
+                    header.element_type,
+                );
+                0
+            }
+        }
     } else {
         HEADER_SIZE + header.num_slots as usize * SLOT_SIZE
     }

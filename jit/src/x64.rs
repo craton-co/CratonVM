@@ -3325,10 +3325,18 @@ fn plan_scalar_replacement(
     let mut total_slots = 0usize;
     let mut sorted_pcs: Vec<usize> = non_escaping_new.iter().copied().collect();
     sorted_pcs.sort();
+    // PERF: index new_info by PC once (O(new_info_len)) instead of doing a
+    // linear `new_info.iter().find(|(p,..)| *p == new_pc)` inside the loop
+    // below — that was O(sorted_pcs.len() * new_info.len()). To preserve the
+    // exact prior behavior, where `find` returns the FIRST matching entry, we
+    // keep the first occurrence on duplicate PCs (`entry(..).or_insert(..)`).
+    let mut new_info_by_pc: FxHashMap<usize, usize> = FxHashMap::default();
+    new_info_by_pc.reserve(new_info.len());
+    for &(p, _, num_fields, _, _) in new_info {
+        new_info_by_pc.entry(p).or_insert(num_fields);
+    }
     for &new_pc in &sorted_pcs {
-        if let Some(&(_, _, num_fields, _, _)) =
-            new_info.iter().find(|(p, _, _, _, _)| *p == new_pc)
-        {
+        if let Some(&num_fields) = new_info_by_pc.get(&new_pc) {
             if num_fields > 0 && num_fields <= 16 {
                 let field_base_offset = ((scalar_base + total_slots) as i32 + 1) * 8; // Cast: x86-64 immediate encoding
                 objects.insert(new_pc, ScalarReplacedObject { num_fields, field_base_offset });

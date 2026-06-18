@@ -1031,22 +1031,42 @@ impl Arm64Backend {
         });
 
         // Save callee-saved registers used for locals (in pairs).
-        let saved = &frame.saved_regs.clone();
+        //
+        // PERF: the previous code cloned the entire `saved_regs` Vec
+        // (`&frame.saved_regs.clone()`) once per compiled method purely to
+        // satisfy the borrow checker — the loop body needs `&mut self` for
+        // `self.buffer.emit(...)`, which cannot coexist with a live borrow of
+        // `self.frame` held across the call. `Arm64Register` is `Copy`, so
+        // instead of cloning the whole Vec we hoist the two scalars we need
+        // (the callee-save base offset and the element count) out of the borrow,
+        // then copy out each register by briefly re-borrowing `self.frame` per
+        // access. No per-method heap allocation; the emission sequence is
+        // byte-for-byte identical to before.
+        let callee_save_offset = frame.callee_save_offset;
+        let saved_len = frame.saved_regs.len();
+        // `frame` is unused past this point — its borrow ends here, freeing the
+        // `self.buffer.emit` calls below to take `&mut self`.
+
         let mut i = 0;
-        while i + 1 < saved.len() {
-            let offset = frame.callee_save_offset + (i as i32) * 8;
+        while i + 1 < saved_len {
+            let offset = callee_save_offset + (i as i32) * 8;
+            // Re-borrow `self.frame` only to copy out the two `Copy` registers;
+            // the borrow ends before `self.buffer.emit` is invoked.
+            let frame = self.frame.as_ref().expect("frame present");
+            let (rt1, rt2) = (frame.saved_regs[i], frame.saved_regs[i + 1]);
             self.buffer.emit(Arm64Instruction::Stp {
-                rt1: saved[i],
-                rt2: saved[i + 1],
+                rt1,
+                rt2,
                 rn: Arm64Register::FP,
                 offset,
             });
             i += 2;
         }
-        if i < saved.len() {
-            let offset = frame.callee_save_offset + (i as i32) * 8;
+        if i < saved_len {
+            let offset = callee_save_offset + (i as i32) * 8;
+            let rt = self.frame.as_ref().expect("frame present").saved_regs[i];
             self.buffer.emit(Arm64Instruction::Str {
-                rt: saved[i],
+                rt,
                 rn: Arm64Register::FP,
                 offset,
             });
