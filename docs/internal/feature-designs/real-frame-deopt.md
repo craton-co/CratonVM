@@ -75,6 +75,84 @@ machine-state → frame plumbing and the actual mid-method resume.
 So today: data types exist, codegen emits none of them, resume is "re-run from
 bci 0".
 
+> **Next:** the production backport is scoped in
+> [`real-frame-deopt-x64-backport.md`](real-frame-deopt-x64-backport.md) — bring
+> this mechanism to the single-pass `x64.rs` backend (which has regalloc, real VM
+> dispatch, and the precise-oop-map safepoint infra) so it deopts real workloads.
+
+## Progress — Phase A foundation landed on the IR path (2026-06-18)
+
+Branch `feat/real-frame-deopt-phaseA`. Steps 1–3 of the plan below are
+implemented **on the IR pipeline** (`jit/src/ir*.rs`), per the recommendation
+in §1. Caveat that reframes the rest of the work: the IR path is **dormant /
+default-off** (its own ternary/phi lowering tests are `#[ignore]`d, and
+production methods compile through the single-pass `x64.rs`). So this is a
+*correct, tested mechanism on a non-production backend* — it does not yet
+deopt any real workload. Wiring it to production means either reviving the IR
+path (`activate-ir-optimizer.md`) or backporting the safepoint emission to
+`x64.rs`.
+
+What landed (all unit-tested in the `cratonvm-jit` crate; full suite 745 green):
+
+- **Step 1 — safepoint snapshots** (`ir.rs`). New `SafepointSnapshot { bci,
+  locals: Vec<NodeId>, stack: Vec<NodeId> }` and `Graph.safepoints`. The
+  `IrBuilder` records one per reachable bytecode boundary (after merge
+  activation, so phi-resolved state is captured). `replace_all_uses` rewrites
+  safepoint NodeIds so they survive GVN/const-fold.
+- **Step 2 — resolve + lookup** (`ir_lower.rs`, `lib.rs`). The lowerer maps
+  each snapshot NodeId → `FrameValue` (constant → `Int`/`Float`; everything
+  else → `StackSlot`, because this naive lowerer spills *every* value to a
+  frame slot — no register-residency analysis needed yet). Emits a
+  `DeoptimizationPoint` per safepoint, keyed by native offset (`bci_native`
+  map). `CompiledMethod::find_deopt_point` does the PC→point binary search.
+- **Step 3 — one real guard, end-to-end** (`ir.rs`, `ir_lower.rs`,
+  `deopt.rs`, `lib.rs`). New `Op::Guard { bci }` lowers to `TEST/JNZ` past a
+  per-guard deopt path that loads the boxed `DeoptimizationPoint` pointer and
+  `JMP`s to one shared deopt stub. The stub passes `(point, rbp)` to
+  `deopt::ir_deopt_entry`, which calls `reconstruct_frame_from_machine_state`
+  to resolve `StackSlot`/`Register` against the **live** native frame and
+  stashes the result (`take_last_deopt`). The end-to-end test compiles a
+  guarded method, fails the guard at runtime, and asserts the locals were read
+  back out of the live frame (the real argument values) with resume at the
+  guard's bci. Returns the existing `i64::MIN` sentinel.
+
+Known first-cut limitations / follow-ups (in rough priority order):
+
+1. **Not wired to interpreter resume.** `ir_deopt_entry` stashes the frame
+   instead of pushing real interpreter `Frame`s and resuming at `bci` — that
+   needs the IR path in VM dispatch (today's `CompiledMethod`s from `lower()`
+   are `try_call`'d directly). This is the gap between "frame reconstructed"
+   and step 3's "resumes in the interpreter". STRUCTURAL — needs the IR path
+   in production dispatch (it can't yet compile a ternary; see
+   `activate-ir-optimizer.md`) or an `x64.rs` backport. Deferred.
+2. **`StackSlot`-only provenance.** Every value spills, so `Register`/XMM
+   provenance is unexercised (the resolver handles `Register`, but nothing
+   emits it). Real register provenance arrives with regalloc. STRUCTURAL —
+   the naive lowerer has no regalloc. Deferred.
+3. **No type tags.** Resolved `StackSlot`/`Register` values become `Int`; an
+   object-ref slot can't be distinguished from a primitive yet. PREMATURE
+   today: the IR lowerer emits no ref/float/double-producing ops (Load/New/…
+   hit the `_ => {}` arm), so every value it produces is int/long and `Int` is
+   already correct. Becomes load-bearing the moment ref ops are lowered — then
+   resolve from each node's `IrType` (`Ref → Object`, `Float/Double → Float`).
+4. **VirtualObject = Phase B.** `reconstruct_frame_from_machine_state` passes
+   `VirtualObject` through unresolved; GC-backed materialization
+   (`materialize_virtual_objects`, still the `deopt.rs` panic stub) is Phase B,
+   needs VM heap/allocator threading. Deferred.
+5. **DCE vs. safepoint liveness.** `replace_all_uses` is safepoint-aware but
+   DCE is intentionally NOT seeded from safepoints — attempted and reverted:
+   because the builder records a snapshot at *every* bci, pinning all
+   safepoint refs as DCE roots keeps every transient operand alive and breaks
+   DCE/reassociation/folding (regressed `ir_optimize` reassoc tests). The real
+   fix is a **model change**: record/pin safepoints only at actual deopt sites
+   (guard bcis, call returns) instead of every bci, or recompute safepoint
+   liveness *after* optimization. Until then deopt is exercised on the
+   un-optimized graph; a value DCE'd out resolves to `Undefined`.
+6. ~~**Win64 shadow-space overlap.**~~ DONE. `alloc_slot` now caps spill
+   offsets at `frame_size - DEOPT_SHADOW_SPACE` (32) so no spill slot overlaps
+   the caller shadow space the deopt stub's `call` needs; `frame_size` already
+   budgeted it, so no valid method is rejected.
+
 ## Design
 
 Four pieces, in dependency order.

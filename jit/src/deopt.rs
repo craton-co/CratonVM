@@ -536,6 +536,7 @@ impl InvalidationManager {
 
 /// A fully reconstructed interpreter frame ready for the interpreter to
 /// resume execution.
+#[derive(Debug)]
 pub struct ReconstructedFrame {
     pub method_key: String,
     pub bci: u32,
@@ -745,6 +746,154 @@ pub fn materialize_virtual_objects(frame: &FrameState) -> Vec<(usize, u64)> {
         "materialize_virtual_objects called on a live path without GC-backed \
          materialization — refusing to mint fake heap addresses (see deopt.rs)"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Machine-state frame reconstruction (real-frame-deopt step 3)
+// ---------------------------------------------------------------------------
+
+/// The integer register file spilled by the deopt trampoline, indexed by
+/// x86-64 GPR number (0 = RAX, 1 = RCX, … 15 = R15).
+///
+/// `FrameValue::Register(r)` resolves against `gpr[r]`. The naive IR lowerer
+/// spills every value to a frame slot, so on that path this is unused (all
+/// `FrameValue`s are `StackSlot`/constant); it exists so the resolver is
+/// complete for backends that keep live values in registers at a safepoint.
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub struct SavedRegisters {
+    pub gpr: [u64; 16],
+}
+
+impl Default for SavedRegisters {
+    fn default() -> Self {
+        Self { gpr: [0; 16] }
+    }
+}
+
+/// Resolve one `FrameValue` against live machine state.
+///
+/// Constants (`Int`/`Float`/`Object`/`Undefined`) and not-yet-materialized
+/// `VirtualObject`s pass through unchanged. A `Register(r)` reads
+/// `regs.gpr[r]`; a `StackSlot(off)` reads `*(rbp + off)` from the live
+/// native frame. Both resolved cases become a concrete `Int` — the IR path
+/// carries no per-slot ref/int tag yet, so callers that need to distinguish
+/// object references from primitives must consult the method's verification
+/// type state (a later refinement; see `real-frame-deopt.md`).
+///
+/// # Safety
+/// `rbp` must be the still-live frame base for which `off` was computed, and
+/// `off` must address a word inside that frame. The deopt trampoline calls
+/// this *before* tearing the frame down, satisfying that invariant.
+fn resolve_value(v: &FrameValue, regs: &SavedRegisters, rbp: u64) -> FrameValue {
+    match v {
+        FrameValue::Register(r) => FrameValue::Int(regs.gpr[*r as usize] as i64),
+        FrameValue::StackSlot(off) => {
+            let addr = (rbp as i64 + *off as i64) as u64 as *const i64;
+            // SAFETY: see function-level contract — frame is live, slot in-frame.
+            FrameValue::Int(unsafe { addr.read_unaligned() })
+        }
+        other => other.clone(),
+    }
+}
+
+fn resolve_frame_state_machine(
+    state: &FrameState,
+    regs: &SavedRegisters,
+    rbp: u64,
+) -> ReconstructedFrame {
+    let monitors = state
+        .monitors
+        .iter()
+        .map(|m| MonitorInfo {
+            object: resolve_value(&m.object, regs, rbp),
+            lock_depth: m.lock_depth,
+        })
+        .collect();
+    ReconstructedFrame {
+        method_key: state.method_key.clone(),
+        bci: state.bci,
+        locals: state
+            .locals
+            .iter()
+            .map(|v| resolve_value(v, regs, rbp))
+            .collect(),
+        stack: state
+            .stack
+            .iter()
+            .map(|v| resolve_value(v, regs, rbp))
+            .collect(),
+        monitors,
+        caller_frames: Vec::new(),
+    }
+}
+
+/// Reconstruct a precise interpreter frame from a `DeoptimizationPoint` and
+/// the live machine state captured at the trapping site.
+///
+/// This is the machine-state-aware sibling of [`reconstruct_frame`]: where
+/// that one assumes every `FrameValue` is already a resolved constant, this
+/// one reads `Register`/`StackSlot` values out of the spilled register file
+/// and the native stack. The inlined caller chain (`FrameState.caller`) is
+/// flattened into `caller_frames`, each resolved against the same machine
+/// state (inlined frames share the physical frame).
+///
+/// Virtual (scalar-replaced) objects are NOT materialized here — that needs
+/// GC-backed allocation and is Phase B (`materialize_virtual_objects`); they
+/// pass through as `VirtualObject` for a later pass to realize.
+pub fn reconstruct_frame_from_machine_state(
+    deopt: &DeoptimizationPoint,
+    regs: &SavedRegisters,
+    rbp: u64,
+) -> ReconstructedFrame {
+    let mut frame = resolve_frame_state_machine(&deopt.frame_state, regs, rbp);
+    let mut callers = Vec::new();
+    let mut next = deopt.frame_state.caller.as_deref();
+    while let Some(c) = next {
+        callers.push(resolve_frame_state_machine(c, regs, rbp));
+        next = c.caller.as_deref();
+    }
+    frame.caller_frames = callers;
+    frame
+}
+
+thread_local! {
+    /// The most recent frame reconstructed by [`ir_deopt_entry`]. The IR-path
+    /// deopt trampoline is not yet wired into VM interpreter dispatch, so the
+    /// reconstructed frame is stashed here for the test harness / caller to
+    /// consume via [`take_last_deopt`] rather than being resumed directly.
+    static LAST_DEOPT: std::cell::RefCell<Option<ReconstructedFrame>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take (and clear) the frame most recently reconstructed by a deopt.
+pub fn take_last_deopt() -> Option<ReconstructedFrame> {
+    LAST_DEOPT.with(|c| c.borrow_mut().take())
+}
+
+/// Deopt trampoline entry — called from JIT code when a guard fails.
+///
+/// The trampoline loads a pointer to the guard's `DeoptimizationPoint` into
+/// the first argument register and the live `rbp` into the second, then calls
+/// here. We reconstruct the interpreter frame from the live native frame and
+/// stash it (see [`LAST_DEOPT`]). Returns the `i64::MIN` deopt sentinel so the
+/// trampoline can return it as the method result, matching the existing JIT
+/// deopt-signal convention.
+///
+/// # Safety
+/// `point` must point at a live `DeoptimizationPoint` (owned by the running
+/// `CompiledMethod`), and `rbp` must be the live frame base of the trapping
+/// method. Both are guaranteed by the trampoline that calls this.
+pub extern "C" fn ir_deopt_entry(point: *const DeoptimizationPoint, rbp: u64) -> i64 {
+    // SAFETY: contract documented above.
+    let point = unsafe { &*point };
+    // The IR lowerer keeps every live value in a frame slot, so no register
+    // file is needed; a register-allocating backend would spill GPRs/XMMs in
+    // the trampoline and pass them here instead.
+    let regs = SavedRegisters::default();
+    let frame = reconstruct_frame_from_machine_state(point, &regs, rbp);
+    LAST_DEOPT.with(|c| *c.borrow_mut() = Some(frame));
+    i64::MIN
 }
 
 /// Count how many virtual objects need materialization across locals and

@@ -216,6 +216,18 @@ pub enum Op {
     /// Produces (ctrl, mem, retval) via Proj nodes.
     Call,
 
+    // ── Speculation guard (real-frame-deopt) ─────────────────────────
+    /// Speculative guard. Inputs: `[ctrl, cond]`. If `cond` is zero at
+    /// runtime the guard fails and control transfers to the deopt
+    /// trampoline, reconstructing the interpreter frame for `bci`. A
+    /// non-zero `cond` falls through with no effect. Produces no value and
+    /// is impure (must not be DCE'd or reordered past side effects), so it
+    /// is neither `is_pure` nor `is_control`.
+    Guard {
+        /// Bytecode index whose frame state to reconstruct on failure.
+        bci: usize,
+    },
+
     // ── Dead / removed ───────────────────────────────────────────────
     /// Placeholder for a removed node (inputs cleared, not referenced).
     Dead,
@@ -282,6 +294,33 @@ pub struct Node {
     pub bytecode_pc: Option<usize>,
 }
 
+// ── Safepoint snapshots (deopt frame provenance) ─────────────────────
+
+/// A snapshot of the abstract interpreter state at a bytecode boundary,
+/// used to build a deopt `FrameState`.
+///
+/// Records, for the given `bci`, the `NodeId` currently providing each
+/// local variable and each operand-stack slot (`NO_NODE` = undefined /
+/// uninitialised). The lowerer (`ir_lower.rs`) resolves each `NodeId` to a
+/// concrete `FrameValue` (frame spill slot or constant) once physical
+/// locations are known, producing a `DeoptimizationPoint` keyed by the
+/// native code offset of the safepoint.
+///
+/// This is the IR-path realisation of step 1 of `real-frame-deopt.md`:
+/// carry the interpreter locals[]/stack[] shadow alongside the SSA graph
+/// so a precise interpreter frame can be rebuilt at the trapping bci. The
+/// snapshots are emit-and-discard until the lowerer consumes them — they
+/// never change codegen on their own.
+#[derive(Clone, Debug)]
+pub struct SafepointSnapshot {
+    /// Bytecode index this frame state resumes at.
+    pub bci: usize,
+    /// `NodeId` for each local variable slot (index = local index).
+    pub locals: Vec<NodeId>,
+    /// `NodeId` for each operand-stack slot (index 0 = bottom of stack).
+    pub stack: Vec<NodeId>,
+}
+
 // ── Graph ────────────────────────────────────────────────────────────
 
 /// The IR graph — a flat arena of nodes with an entry and exit.
@@ -292,6 +331,10 @@ pub struct Graph {
     pub entry: NodeId,
     /// The `Return` node (may be a Merge if multiple returns).
     pub exit: NodeId,
+    /// Deopt safepoint snapshots, recorded by the builder at bytecode
+    /// boundaries and resolved into `DeoptimizationPoint`s by the lowerer.
+    /// Empty when the builder did not record any (e.g. hand-built graphs).
+    pub safepoints: Vec<SafepointSnapshot>,
 }
 
 impl Graph {
@@ -308,11 +351,23 @@ impl Graph {
     }
 
     /// Replace all uses of `old` with `new_id` in the entire graph.
+    ///
+    /// Also rewrites any `old` references held by safepoint snapshots so a
+    /// deopt frame state survives optimization rewrites (GVN, const-fold,
+    /// materialization) intact — a safepoint slot pointing at `old` must
+    /// follow the value to `new_id`, exactly like a real input edge.
     pub fn replace_all_uses(&mut self, old: NodeId, new_id: NodeId) {
         for node in &mut self.nodes {
             for inp in &mut node.inputs {
                 if *inp == old {
                     *inp = new_id;
+                }
+            }
+        }
+        for sp in &mut self.safepoints {
+            for v in sp.locals.iter_mut().chain(sp.stack.iter_mut()) {
+                if *v == old {
+                    *v = new_id;
                 }
             }
         }
@@ -391,6 +446,7 @@ impl IrBuilder {
             nodes: Vec::with_capacity(256),
             entry: 0,
             exit: NO_NODE,
+            safepoints: Vec::new(),
         };
 
         // Node 0: Start
@@ -586,6 +642,23 @@ impl IrBuilder {
                     self.add_merge_predecessor(pc);
                 }
                 self.activate_merge(pc);
+            }
+
+            // Step 1 of real-frame-deopt: record the abstract interpreter
+            // state at this bytecode boundary so a precise deopt frame can be
+            // rebuilt if execution must resume here. We snapshot AFTER any
+            // merge activation above, so the recorded locals/stack reflect the
+            // merged (phi-resolved) state the interpreter would see on entry to
+            // this bci. Dead code after an unconditional transfer (ctrl ==
+            // NO_NODE, not itself a merge target) has no reachable frame state,
+            // so it is skipped. These snapshots are emit-and-discard until the
+            // lowerer resolves them — they do not affect codegen on their own.
+            if self.ctrl != NO_NODE {
+                self.graph.safepoints.push(SafepointSnapshot {
+                    bci: pc,
+                    locals: self.locals.clone(),
+                    stack: self.stack.clone(),
+                });
             }
 
             let op = code[pc];
@@ -1223,6 +1296,78 @@ mod tests {
         // The iinc should create an Add node
         let has_add = graph.nodes.iter().any(|n| n.op == Op::Add);
         assert!(has_add, "iinc should produce an Add node");
+    }
+
+    // ── real-frame-deopt step 1: safepoint snapshots ────────────────────
+
+    #[test]
+    fn test_safepoints_recorded_per_instruction() {
+        // int f(int a, int b) { return a + b; }
+        // iload_0; iload_1; iadd; ireturn   (pc 0,1,2,3)
+        let code = [0x1a, 0x1b, 0x60, 0xac, 0, 0];
+        let graph = build_ir(&code, 4, 2, 2);
+
+        // One snapshot per reachable bytecode boundary (pc 0..=3); the
+        // post-ireturn pc is past code_len and never recorded.
+        let bcis: Vec<usize> = graph.safepoints.iter().map(|s| s.bci).collect();
+        assert_eq!(bcis, vec![0, 1, 2, 3], "a snapshot at every reachable bci");
+
+        let at = |bci: usize| graph.safepoints.iter().find(|s| s.bci == bci).unwrap();
+
+        // Entry to the method: two params in locals, empty operand stack.
+        assert_eq!(at(0).locals.len(), 2);
+        assert!(at(0).stack.is_empty());
+        // Param nodes are live in locals throughout.
+        assert_ne!(at(0).locals[0], NO_NODE);
+        assert_ne!(at(0).locals[1], NO_NODE);
+
+        // Before iload_1: one operand pushed (a).
+        assert_eq!(at(1).stack.len(), 1);
+        // Before iadd: both operands on the stack.
+        assert_eq!(at(2).stack.len(), 2);
+        // Before ireturn: the Add result is the sole stack slot.
+        assert_eq!(at(3).stack.len(), 1);
+        let add_id = at(3).stack[0];
+        assert_eq!(graph.nodes[add_id as usize].op, Op::Add);
+    }
+
+    #[test]
+    fn test_safepoint_local_tracks_store() {
+        // void-ish: iload_0; istore_1; iinc 1,1; iload_1; ireturn
+        // Mirrors test_ir_iinc; check the snapshot for local 1 changes after
+        // the store + increment rather than staying NO_NODE.
+        let code = [0x1a, 0x3c, 0x84, 1, 1, 0x1b, 0xac, 0, 0];
+        let graph = build_ir(&code, 7, 1, 2);
+
+        let at = |bci: usize| graph.safepoints.iter().find(|s| s.bci == bci).unwrap();
+        // Before istore_1 (pc 1): local 1 is still uninitialised.
+        assert_eq!(at(1).locals[1], NO_NODE);
+        // Before iload_1 (pc 5), after the store + iinc: local 1 is an Add.
+        let l1 = at(5).locals[1];
+        assert_ne!(l1, NO_NODE);
+        assert_eq!(graph.nodes[l1 as usize].op, Op::Add);
+    }
+
+    #[test]
+    fn test_replace_all_uses_rewrites_safepoints() {
+        let mut graph = Graph {
+            nodes: Vec::new(),
+            entry: 0,
+            exit: NO_NODE,
+            safepoints: Vec::new(),
+        };
+        let a = graph.add(Op::Const(1), IrType::Int, vec![], None);
+        let b = graph.add(Op::Const(2), IrType::Int, vec![], None);
+        graph.safepoints.push(SafepointSnapshot {
+            bci: 0,
+            locals: vec![a],
+            stack: vec![a, b],
+        });
+        graph.replace_all_uses(a, b);
+        // Every `a` reference in the snapshot must now point at `b`.
+        assert_eq!(graph.safepoints[0].locals[0], b);
+        assert_eq!(graph.safepoints[0].stack[0], b);
+        assert_eq!(graph.safepoints[0].stack[1], b);
     }
 
     #[test]
