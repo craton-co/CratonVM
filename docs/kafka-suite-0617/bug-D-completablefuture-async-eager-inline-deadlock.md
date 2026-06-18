@@ -6,8 +6,8 @@
 | **Kind** | Hang / deadlock (TIMEOUT @ 600s) |
 | **Surfaced by** | The heavy `consumer.internals.*` / `producer.internals.*` tests (FetcherTest, SenderTest, TransactionManagerTest, CommitRequestManagerTest, …), `KafkaAdminClientTest`, and the trivial `common.header.internals.RecordHeadersTest` |
 | **CratonVM** | TIMEOUT · **HotSpot** OK |
-| **Status** | OPEN — root-caused with a 1-line-pattern minimal repro |
-| **Recommendation** | Fix is infrastructure-level (≈Bug B tier), not a quick skip-list entry. See "Fix direction". |
+| **Status** | **FIXED** (CratonVM-subfix) — bounded real-thread pool; validated on RecordHeadersTest (TIMEOUT→OK) |
+| **Recommendation** | Fixed (see "Fix attempt #2 — VALIDATED"). |
 
 ## Symptom
 
@@ -108,3 +108,65 @@ Blast radius / why this is not a quick fix:
 
 Regression witnesses: `MinGate` (must DONE), `MinAsync`/`MinGate2` (must stay OK), `FjpProbe`
 (recursive compute must stay OK), and the Kafka `consumer.internals` TIMEOUT cluster.
+
+## Fix attempt #2 — bounded real-thread pool (VALIDATED ✅)
+
+`ForkJoinPool.execute(Runnable)` now routes to a **process-wide singleton bounded pool**
+(`native-builtins/src/lib.rs::spawn_runnable_on_real_thread` + `async_worker_pool`), instead
+of inline-on-caller (attempt #0) or thread-per-task (attempt #1):
+
+```
+new ThreadPoolExecutor(0, 256, 10L, TimeUnit.SECONDS, new SynchronousQueue())
+```
+
+- **Cached-style** (core=0, max=256, SynchronousQueue): grows on demand to a 256 cap, **reuses
+  idle workers** (no per-task thread churn → no explosion), and **retires workers after 10 s
+  idle** so the VM still exits cleanly past `main()` without daemon threads (verified: idle
+  TPE workers time out → rc=0).
+- Submission uses **`pool.submit(Runnable)`**, NOT `execute`: on a *real* `ThreadPoolExecutor`,
+  `submit` runs real JDK bytecode on a real worker thread, whereas `execute` is intercepted by
+  the inline `native_es_execute` override. (Only `ForkJoinPool.execute` is force-gated to the
+  native; `TimeUnit.SECONDS` is read via `get_static_field`.)
+- Singleton stored as a raw `ObjectRef` in `static ASYNC_POOL: Mutex<Option<ObjectRef>>` and
+  kept alive across calls + GC moves via `register_var_handle_root` — the same long-lived
+  native-singleton pattern as `SYSTEM_CL`/`SECURITY_MANAGER`. (First attempt used a
+  `pin_native_root` handle — **wrong**: that is a transient per-thread pin stack cleared after
+  each native call, so the 2nd+ call read a stale slot and tried `AsyncRun.submit(...)` →
+  `linkage error`. Fixed by switching to the `Mutex<Option<ObjectRef>>` singleton.)
+- Recursive `ForkJoinTask.fork/invoke/submit(ForkJoinTask)` compute path stays eager-inline
+  (untouched).
+
+**Validation (clean):**
+- `MinGate` 1 / 8 / 100 → `DONE all N completed`, rc=0.
+- `MinPool` (K=4, M=20 over-subscribed blocking gate) → DONE; `MinAsync` / `MinGate2` → OK.
+- `FjForkJoin` (recursive fork/join, 1e6 sum) → correct (compute path not regressed).
+- **`RecordHeadersTest`: TIMEOUT(600 s) → `status=OK found=212 succ=212 fail=0` rc=0.** ← the
+  real-workload witness (~30 calls × 16 readers; previously the largest of the TIMEOUT cluster).
+
+**Rejected alternatives:** inline (deadlock); platform-thread-per-task (477-thread explosion);
+virtual-thread-per-task (`Executors.newVirtualThreadPerTaskExecutor` / `startVirtualThread`
+hang at N=100 — carrier starvation in CratonVM's vthread scheduler).
+
+## Fix attempt #1 — thread-per-task (REJECTED)
+
+Tried: `ForkJoinPool.execute(Runnable)` spawns a fresh real daemon `java.lang.Thread`
+per task (`spawn_runnable_on_real_thread`, native-builtins/src/lib.rs + concurrent_extras.rs),
+leaving the recursive `fork/invoke/submit(ForkJoinTask)` compute path eager-inline.
+
+Result — **partial, not viable as-is**:
+- ✅ `MinGate` 1/8/100 → DONE (deadlock gone for bounded batches).
+- ✅ `FjForkJoin` recursive compute → correct sum (compute path not regressed).
+- ✅ `MinAsync`/`MinGate2` → still OK.
+- ❌ Real `RecordHeadersTest` / `FetchCollectorTest` → **still TIMEOUT**. Stack dump shows
+  **~477 live threads**, 69 in `CompletableFuture$AsyncRun.run` + 53 in the reader lambda,
+  all parked in `latch.await()`. `assertRecordHeaderReadThreadSafe` (16 readers) is called
+  ~30× across the class, so thread-per-task spawns hundreds of OS threads → the suite is
+  starved/too slow to finish in 600 s (and likely a multi-waiter AQS `releaseShared`
+  propagation weakness leaves some parked). Trades deadlock for thread explosion.
+
+Conclusion: the correct fix is a **bounded pool of real Java worker threads** backing the
+common/async executor (the HotSpot model: ~`procs-1` workers + blocking compensation), so
+N≫K blocking tasks cycle through K workers without spawning N threads. That is a real
+subsystem (worker threads running a dequeue loop, a GC-rooted work queue, shutdown/lifecycle)
+and is the recommended Bug D fix; the thread-per-task change is shelved (lives only in the
+`cratonvm-bugD.exe` verification binary, not in the sweep binary).
