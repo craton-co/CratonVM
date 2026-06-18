@@ -17,7 +17,7 @@
 //! are compiled through this pipeline; others fall back to the
 //! single-pass `x64::compile`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ── Node identity ────────────────────────────────────────────────────
 
@@ -402,6 +402,20 @@ impl Graph {
 
 // ── IR Builder ───────────────────────────────────────────────────────
 
+/// Loop-carried phis created eagerly at a loop header, so a backward branch
+/// can back-patch each phi's back-edge input. Indexed parallel to the
+/// builder's `locals`/`stack`; `NO_NODE` means no phi was created for that
+/// slot (uninitialised on entry → not loop-carried).
+#[derive(Clone)]
+struct LoopPhis {
+    /// Phi for each local variable slot (`NO_NODE` = none).
+    local_phis: Vec<NodeId>,
+    /// Phi for each operand-stack slot at the header (usually empty).
+    stack_phis: Vec<NodeId>,
+    /// Phi for the memory token (`NO_NODE` = none).
+    mem_phi: NodeId,
+}
+
 /// State at a bytecode merge point (branch target / loop header).
 #[derive(Clone)]
 struct MergeState {
@@ -436,6 +450,13 @@ pub struct IrBuilder {
     _num_locals: usize,
     /// Merge-point state, keyed by bytecode PC.
     merges: HashMap<usize, MergeState>,
+    /// Bytecode PCs that are loop headers (targets of a backward branch).
+    /// A loop header is activated with eager loop-carried phis whose back-edge
+    /// input is back-patched when the backward branch is processed.
+    loop_headers: HashSet<usize>,
+    /// Loop-carried phis per loop-header PC, recorded at activation so the
+    /// backward branch can fill each phi's back-edge input.
+    loop_phis: HashMap<usize, LoopPhis>,
 }
 
 impl IrBuilder {
@@ -471,6 +492,8 @@ impl IrBuilder {
             mem,
             _num_locals: num_locals,
             merges: HashMap::new(),
+            loop_headers: HashSet::new(),
+            loop_phis: HashMap::new(),
         }
     }
 
@@ -531,13 +554,141 @@ impl IrBuilder {
     }
 
     /// Record the current state as a predecessor of the merge at `target_pc`.
+    ///
+    /// If the merge has already been activated (`visited`), this predecessor is
+    /// a **loop back-edge** (in reducible bytecode a forward merge is activated
+    /// only after all its forward predecessors are in, so a later predecessor
+    /// can only come from a backward branch). Back-patch the loop-header phis
+    /// instead of recording a snapshot that activation already consumed.
     fn add_merge_predecessor(&mut self, target_pc: usize) {
         self.ensure_merge(target_pc);
+        if self.merges.get(&target_pc).map_or(false, |s| s.visited) {
+            self.patch_loop_backedge(target_pc);
+            return;
+        }
         let state = self.merges.get_mut(&target_pc).unwrap();
         state.ctrl_inputs.push(self.ctrl);
         state.local_snapshots.push(self.locals.clone());
         state.stack_snapshots.push(self.stack.clone());
         state.mem_inputs.push(self.mem);
+    }
+
+    /// Activate a loop header: create a loop-carried phi for every live local
+    /// (and operand-stack slot) up front, seeded with the forward-entry
+    /// value(s), leaving the back-edge input to be appended by
+    /// [`Self::patch_loop_backedge`] when the backward branch is processed.
+    ///
+    /// Unlike [`Self::activate_merge`] (a forward join, where every predecessor
+    /// is known before activation), a loop header is reached forward with only
+    /// its entry predecessor(s); the back-edge value does not exist yet. We
+    /// therefore cannot decide "phi only where predecessors differ" — any local
+    /// the loop body writes needs a phi to carry the updated value around the
+    /// back-edge. We conservatively create a phi for every entry-initialised
+    /// local; `phi(region, x, x)` for loop-invariant locals collapses under
+    /// GVN / is a self-copy in the lowerer.
+    fn activate_loop_header(&mut self, target_pc: usize) {
+        let state = match self.merges.get(&target_pc) {
+            Some(s) if !s.ctrl_inputs.is_empty() => s.clone(),
+            _ => return,
+        };
+        let region = state.merge_id;
+        // The region's control inputs are the forward-entry ctrls so far; the
+        // back-edge ctrl is appended in patch_loop_backedge.
+        self.graph.nodes[region as usize].inputs = state.ctrl_inputs.clone();
+        self.ctrl = region;
+
+        // Memory phi: [region, entry_mem_0, …]; back-edge mem appended later.
+        let mem_phi = {
+            let mut inputs = vec![region];
+            inputs.extend_from_slice(&state.mem_inputs);
+            self.graph.add(Op::Phi, IrType::Memory, inputs, Some(target_pc))
+        };
+        self.mem = mem_phi;
+
+        // Local phis: one per entry-initialised local.
+        let num_locals = state.local_snapshots.first().map_or(0, |s| s.len());
+        let mut local_phis = vec![NO_NODE; num_locals];
+        for i in 0..num_locals {
+            // Skip locals uninitialised on every entry edge (not loop-carried).
+            if state
+                .local_snapshots
+                .iter()
+                .all(|s| s.get(i).copied().unwrap_or(NO_NODE) == NO_NODE)
+            {
+                continue;
+            }
+            let mut inputs = vec![region];
+            for snap in &state.local_snapshots {
+                inputs.push(snap.get(i).copied().unwrap_or(NO_NODE));
+            }
+            let phi = self.graph.add(Op::Phi, IrType::Int, inputs, Some(target_pc));
+            local_phis[i] = phi;
+            self.locals[i] = phi;
+        }
+
+        // Operand-stack phis: one per stack slot at the header (usually none).
+        let stack_depth = state.stack_snapshots.first().map_or(0, |s| s.len());
+        let mut stack_phis = vec![NO_NODE; stack_depth];
+        self.stack = state
+            .stack_snapshots
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        for i in 0..stack_depth {
+            let mut inputs = vec![region];
+            for snap in &state.stack_snapshots {
+                inputs.push(snap.get(i).copied().unwrap_or(NO_NODE));
+            }
+            let phi = self.graph.add(Op::Phi, IrType::Int, inputs, Some(target_pc));
+            stack_phis[i] = phi;
+            self.stack[i] = phi;
+        }
+
+        self.loop_phis.insert(
+            target_pc,
+            LoopPhis {
+                local_phis,
+                stack_phis,
+                mem_phi,
+            },
+        );
+        if let Some(s) = self.merges.get_mut(&target_pc) {
+            s.visited = true;
+        }
+    }
+
+    /// Back-patch a loop header's phis with the back-edge values: append the
+    /// current control to the region and the current local/stack/mem values to
+    /// each phi (matching the appended region input by position).
+    fn patch_loop_backedge(&mut self, target_pc: usize) {
+        let lp = match self.loop_phis.get(&target_pc) {
+            Some(lp) => lp.clone(),
+            None => return,
+        };
+        let region = self.merges[&target_pc].merge_id;
+        let back_ctrl = self.ctrl;
+        self.graph.nodes[region as usize].inputs.push(back_ctrl);
+
+        for (i, &phi) in lp.local_phis.iter().enumerate() {
+            if phi != NO_NODE {
+                let v = self.locals.get(i).copied().unwrap_or(NO_NODE);
+                self.graph.nodes[phi as usize].inputs.push(v);
+            }
+        }
+        for (i, &phi) in lp.stack_phis.iter().enumerate() {
+            if phi != NO_NODE {
+                let v = self.stack.get(i).copied().unwrap_or(NO_NODE);
+                self.graph.nodes[phi as usize].inputs.push(v);
+            }
+        }
+        if lp.mem_phi != NO_NODE {
+            self.graph.nodes[lp.mem_phi as usize].inputs.push(self.mem);
+        }
+        // Record this back-edge as a predecessor for completeness (so any later
+        // consumer that scans MergeState sees the right pred count).
+        if let Some(s) = self.merges.get_mut(&target_pc) {
+            s.ctrl_inputs.push(back_ctrl);
+        }
     }
 
     /// Activate the merge at `target_pc`: set builder state from merged predecessors.
@@ -627,21 +778,31 @@ impl IrBuilder {
     /// Convert bytecode to IR graph.  Returns `None` if an unsupported
     /// opcode is encountered.
     pub fn build(mut self, code: &[u8], code_len: usize) -> Option<Graph> {
-        // First pass: identify branch targets so we know where merges go
+        // First pass: identify branch targets so we know where merges go, and
+        // which of them are loop headers (targets of a backward branch).
         let targets = find_branch_targets(code, code_len);
         for &target in &targets {
             self.ensure_merge(target);
         }
+        self.loop_headers = find_loop_headers(code, code_len);
 
         let mut pc = 0;
         while pc < code_len {
             // If this PC is a merge target, activate the merge
             if self.merges.contains_key(&pc) {
-                // Add current state as predecessor (fall-through)
+                // Add current state as predecessor (fall-through). On a loop
+                // header this is the forward-entry predecessor; the back-edge
+                // arrives later and is back-patched (see add_merge_predecessor).
                 if self.ctrl != NO_NODE {
                     self.add_merge_predecessor(pc);
                 }
-                self.activate_merge(pc);
+                // Loop headers get eager loop-carried phis; forward joins use
+                // the difference-based merge (all predecessors already known).
+                if self.loop_headers.contains(&pc) {
+                    self.activate_loop_header(pc);
+                } else {
+                    self.activate_merge(pc);
+                }
             }
 
             // Step 1 of real-frame-deopt: record the abstract interpreter
@@ -1114,6 +1275,64 @@ fn find_branch_targets(code: &[u8], code_len: usize) -> Vec<usize> {
     targets.sort_unstable();
     targets.dedup();
     targets
+}
+
+/// Identify loop headers: bytecode PCs reached by a *backward* branch
+/// (`target <= source`). These must be activated with eager loop-carried phis
+/// (see `activate_loop_header`) so the back-edge value can be back-patched.
+/// Mirrors `find_branch_targets`' opcode-length walk exactly.
+fn find_loop_headers(code: &[u8], code_len: usize) -> HashSet<usize> {
+    let mut headers = HashSet::new();
+    let mut pc = 0;
+    while pc < code_len {
+        let op = code[pc];
+        match op {
+            // ifeq..ifle, if_icmpeq..if_icmple, goto — all 2-byte signed offset.
+            0x99..=0xa4 | 0xa7 => {
+                if pc + 2 < code_len {
+                    let offset = i16::from_be_bytes([code[pc + 1], code[pc + 2]]) as i32;
+                    let target = pc as i32 + offset;
+                    if target >= 0 && (target as usize) <= pc && (target as usize) < code_len {
+                        headers.insert(target as usize);
+                    }
+                }
+                pc += 3;
+            }
+            // 1-byte opcodes
+            0x02..=0x0a
+            | 0x1a..=0x21
+            | 0x3b..=0x42
+            | 0x57
+            | 0x59
+            | 0x60
+            | 0x61
+            | 0x64
+            | 0x65
+            | 0x68
+            | 0x69
+            | 0x6c
+            | 0x70
+            | 0x74
+            | 0x75
+            | 0x78
+            | 0x7a
+            | 0x7c
+            | 0x7e
+            | 0x80
+            | 0x82
+            | 0x85
+            | 0x88
+            | 0xac
+            | 0xad
+            | 0xb1 => pc += 1,
+            // 2-byte opcodes
+            0x10 | 0x15 | 0x36 => pc += 2,
+            // 3-byte opcodes
+            0x11 | 0x84 => pc += 3,
+            _ => pc += 1,
+        }
+    }
+    headers
 }
 
 /// Check if a method (from its JitScanResult) is suitable for IR compilation.

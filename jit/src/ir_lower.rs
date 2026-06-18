@@ -1369,13 +1369,6 @@ mod tests {
     // be routed to the IR path — i.e. the lib.rs gate cannot be flipped on the
     // SETcc fix alone.
     #[test]
-    #[ignore = "GATE-FLIP BLOCKER: the IR builder is a single forward pass and \
-                does not fold loop back-edge values into the loop-header phi, so \
-                a counted loop's loop-carried accumulator is lost (sum returns \
-                the initial 0). The SETcc fix (#3) unblocks if/else branches, \
-                but branchy call-free methods include LOOPS, so jit/src/lib.rs \
-                must keep declining them from the IR path until loop-phi support \
-                lands. This test is the readiness guard for that work."]
     fn test_lower_counted_loop_sum() {
         // int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; }
         //  0: iconst_0  1: istore_1  2: iconst_0  3: istore_2
@@ -1391,5 +1384,75 @@ mod tests {
         assert_eq!(sum(5), 10, "0+1+2+3+4 = 10");
         assert_eq!(sum(0), 0, "empty loop = 0");
         assert_eq!(sum(10), 45, "sum 0..9 = 45");
+    }
+
+    // do-while: the back-edge is an `if_icmplt` (not a goto), and the loop
+    // header self-loops (the condition is at the bottom). Exercises the
+    // if-as-back-edge path + a block whose true edge targets its own head.
+    #[test]
+    fn test_lower_do_while_sum() {
+        // int f(int n){ int s=0,i=0; do { s+=i; i++; } while(i<n); return s; }
+        //  0:iconst_0 1:istore_1 2:iconst_0 3:istore_2
+        //  4:iload_1 5:iload_2 6:iadd 7:istore_1 8:iinc 2,1
+        // 11:iload_2 12:iload_0 13:if_icmplt 4  16:iload_1 17:ireturn
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1b, 0x1c, 0x60, 0x3c, 0x84, 0x02, 0x01, 0x1c, 0x1a, 0xa1,
+            0xff, 0xf7, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 18, 1, 3).expect("do-while compiles via IR");
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
+        assert_eq!(f(5), 10, "runs i=0..4 → 0+1+2+3+4 = 10");
+        assert_eq!(f(1), 0, "runs once (i=0) → 0");
+        assert_eq!(f(0), 0, "do-while runs once even at n=0 → s=0");
+    }
+
+    // Nested counted loops: two loop headers, the inner nested in the outer.
+    #[test]
+    fn test_lower_nested_loops() {
+        // int f(int n){ int c=0; for(i=0;i<n;i++) for(j=0;j<n;j++) c++; return c; }
+        //  0:iconst_0 1:istore_1            // c=0
+        //  2:iconst_0 3:istore_2            // i=0
+        //  4:iload_2 5:iload_0 6:if_icmpge 28   // outer header
+        //  9:iconst_0 10:istore_3           // j=0
+        // 11:iload_3 12:iload_0 13:if_icmpge 22 // inner header
+        // 16:iinc 1,1  19:iinc 3,1  22? ...
+        // Layout carefully below.
+        //  0:03 1:3c 2:03 3:3d
+        //  4:1c 5:1a 6:a2 00 16(=22? we need offset) ...
+        // Compute: outer if_icmpge at 6 must exit past the outer iinc/goto.
+        //  4: iload_2        1c            outer header
+        //  5: iload_0        1a
+        //  6: if_icmpge 31   a2 00 19       (6+25=31)
+        //  9: iconst_0       03            j=0
+        // 10: istore_3       3e
+        // 11: iload_3        1d            inner header
+        // 12: iload_0        1a
+        // 13: if_icmpge 25   a2 00 0c       (13+12=25)
+        // 16: iinc 1,1       84 01 01       c++
+        // 19: iinc 3,1       84 03 01       j++
+        // 22: goto 11        a7 ff f5       (22-11=11)
+        // 25: iinc 2,1       84 02 01       i++
+        // 28: goto 4         a7 ff e8       (28-24=4)
+        // 31: iload_1        1b
+        // 32: ireturn        ac
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, // 0..3
+            0x1c, 0x1a, 0xa2, 0x00, 0x19, // 4: outer header, if_icmpge 31
+            0x03, 0x3e, // 9: j=0
+            0x1d, 0x1a, 0xa2, 0x00, 0x0c, // 11: inner header, if_icmpge 25
+            0x84, 0x01, 0x01, // 16: iinc c
+            0x84, 0x03, 0x01, // 19: iinc j
+            0xa7, 0xff, 0xf5, // 22: goto 11
+            0x84, 0x02, 0x01, // 25: iinc i
+            0xa7, 0xff, 0xe8, // 28: goto 4
+            0x1b, 0xac, // 31: iload_1; ireturn
+            0, 0,
+        ];
+        let cm = compile_via_ir(&code, 33, 1, 4).expect("nested loops compile via IR");
+        let f = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
+        assert_eq!(f(3), 9, "3*3 = 9");
+        assert_eq!(f(5), 25, "5*5 = 25");
+        assert_eq!(f(0), 0, "no iterations");
+        assert_eq!(f(1), 1, "1*1 = 1");
     }
 }
