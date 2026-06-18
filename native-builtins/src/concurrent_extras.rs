@@ -240,11 +240,11 @@ fn register_forkjoin_extras(r: &mut NativeMethodRegistry) {
         // Stat-bookkeeping only: bump the queue/dequeue counter so that
         // `hasQueuedSubmissions` callers see a non-zero churn.
         let _ = common_pool();
-        // Run the Runnable inline. Errors are surfaced because real CF
-        // stages translate them into completeExceptionally → wrapped
-        // CompletionException on `.get()`.
-        ctx.invoke_virtual(runnable, "run", "()V", &[])?;
-        Ok(None)
+        // Bug D (kafka-suite-0617): run on a real daemon thread, not inline.
+        // The former eager-inline policy deadlocked any task that blocks on a
+        // signal the submitter sends later (start-gate CountDownLatch,
+        // CompletableFuture.get). See `crate::spawn_runnable_on_real_thread`.
+        crate::spawn_runnable_on_real_thread(ctx, runnable)
     });
 
     // WP4.2: ForkJoinPool.execute(ForkJoinTask) — same eager-inline policy
