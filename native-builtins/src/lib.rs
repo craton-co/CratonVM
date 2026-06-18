@@ -13223,6 +13223,18 @@ pub(crate) fn unsafe_offset(args: &[Value], pos: usize) -> usize {
     let clamp = |u: usize| {
         if u == BUFFER_ADDRESS_SENTINEL || u <= MAX_REASONABLE_OFFSET {
             u
+        } else if unsafe_arena_contains(u as i64) {
+            // DF07: the `base == null` form of `Unsafe.get*/put*(Object,long,..)`
+            // (used by `ScopedMemoryAccess` → `DirectByteBuffer.put(byte)`/`get(byte)`
+            // for transfers of <=6 elements) passes a FULL off-heap ADDRESS here,
+            // not a field-slot index. An Unsafe-arena handle (ARENA_TAG bit 62 set,
+            // so always > MAX_REASONABLE_OFFSET) is a legitimate such address —
+            // clamping it to 0 made the JDK-25 NioSocketImpl temp DirectByteBuffer
+            // (FFM/`newDirectByteBuffer`-wrapped arena handle) put its bytes at
+            // address 0 (lost) while `Net.write0` read the arena handle (zeros),
+            // so every small real-`Socket` write silently delivered zeros. A live
+            // arena handle is never a field offset, so passing it through is safe.
+            u
         } else {
             0
         }

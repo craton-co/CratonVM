@@ -120,6 +120,38 @@ items are **its "defect #2" (= family A3 above)** and **bug C** (the cold-path
 deep-recursion overflow). It is kept for that context and the deep-recursion
 stack-guard design.
 
+## Standalone — Hibernate JTA cluster (Narayana XA + socket loopback)
+
+[hibernate-jta-narayana-xa-completion-and-socket-loopback.md](hibernate-jta-narayana-xa-completion-and-socket-loopback.md)
+— found in the full Hibernate ORM 8.0 suite census (dev, 2026-06-17). **Not** a
+GC/JIT issue. Three layers: (0) `ServerSocket.getInetAddress()` → null →
+`TxControl.<clinit>` NPE — **fixed** (`net_phase_e.rs` `getInetAddress` native);
+(1) Narayana **XA transaction completion** doesn't commit/release the enlisted H2
+connection → `@AfterEach truncate` blocks on H2 lock timeout → hang (🔴 open);
+(2) default-mode synthetic `ServerSocket` accept/connect **loopback** doesn't pair
+→ `TransactionStatusManager` bring-up hangs (🔴 open). Layers 1–2 are a deep
+JTA/XA + socket-subsystem handoff.
+
+## Standalone — Hibernate JAXB/ByteBuddy bootstrap slow (XML mapping hangs)
+
+[hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md](hibernate-jaxb-classloading-bytebuddy-bootstrap-slow.md)
+— full-suite census (dev, 2026-06-17). XML/JAXB mapping classes + complex-entity
+bootstrap time out (`rc=124` @ 600s). **Re-diagnosed**: NOT a `retainAll`/collection
+loop (standalone `LinkedHashMap.keySet().retainAll` is correct). Live `cdb` shows the
+time is in **class loading** (`alloc_object → ensure_synthetic_class → ZipArchive::by_name
+→ indexmap/hashbrown`) during JAXB reflection model-building, and ByteBuddy `MethodGraph`
+proxy generation — i.e. interpreter throughput / class-loading, possibly an intermittent
+zip-index hot spot. 🔴 open (handoff).
+
+## Standalone — Hibernate deserialized SessionFactory is null
+
+[hibernate-deserialization-sessionfactory-reconnect-null.md](hibernate-deserialization-sessionfactory-reconnect-null.md)
+— full-suite census (dev, 2026-06-17). 5 serialization round-trip tests NPE
+(`getMappingMetamodel`/`getClassLoaderService` on null) because a deserialized
+`EntityManager`/`SessionFactory` doesn't reconnect to the live factory. Generic
+`readObject`/`readResolve` work on CV (verified); the gap is Hibernate's
+`SessionFactoryRegistry.findSessionFactory(uuid,name)` returning null after deser. 🔴 open.
+
 ## Consolidation log
 
 - **2026-06-17:** Merged `precise-jit-stack-maps-multithread-fjp-worker-testcase.md`

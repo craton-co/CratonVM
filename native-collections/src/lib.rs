@@ -853,6 +853,31 @@ fn alloc_arraylist_with(
     list
 }
 
+/// `true` iff `obj` actually has the `java.util.ArrayList` field layout, so
+/// reading `elementData`/`size` at the resolved slots is sound. Real
+/// `ArrayList`s (and subclasses, which inherit the layout) qualify; a known
+/// non-ArrayList class (`String`, `LinkedList`, a JDK bean, …) does not.
+/// Synthetic / unknown objects with no resolvable class name stay lenient —
+/// CratonVM's internal placeholder lists allocate against
+/// `java/util/ArrayList` (so they resolve by name and qualify), but bare
+/// class-id-0 allocations must keep working as before.
+fn al_is_arraylist_layout(ctx: &dyn NativeContext, obj: ObjectRef) -> bool {
+    let cid = ctx.class_id_of_object(obj);
+    match ctx.class_id_by_name("java/util/ArrayList") {
+        Some(al_id) => {
+            if cid == al_id || ctx.is_subclass(cid, al_id) {
+                return true;
+            }
+            // Not an ArrayList: reject only when the class is known and named.
+            match ctx.class_name_of_id(cid) {
+                None => true, // synthetic / unknown — lenient
+                Some(n) => n.is_empty() || n == "java/lang/Object",
+            }
+        }
+        None => true, // ArrayList not loaded (synthetic-jdk) — preserve old behavior
+    }
+}
+
 /// Extract ArrayList state: (elementData, size).
 fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32) {
     // See through CratonVM's unmodifiable wrapper views. A generic
@@ -884,6 +909,20 @@ fn al_state(ctx: &dyn NativeContext, this: ObjectRef) -> (Option<ObjectRef>, i32
     // virtual-dispatch path.
     let n_fields = ctx.object_num_fields(this);
     if n_fields <= data_slot || n_fields <= size_slot {
+        return (None, 0);
+    }
+    // Layout-class guard (defense-in-depth over the field-count check above).
+    // A foreign object with >= size_slot fields (e.g. a `String`, a JDK bean)
+    // passes the count check, but slots data_slot/size_slot are NOT its
+    // `elementData`/`size`. Decoding such a slot as a `Value` can yield a
+    // garbage discriminant, and `coerce_field_value_by_descriptor`'s match then
+    // jumps through an out-of-range jump-table entry — a wild read /
+    // EXCEPTION_ACCESS_VIOLATION (observed on `ArrayList.equals(nonList)` during
+    // Hibernate JSON dirty-checking: HIB JSON-function SIGSEGV). Only read the
+    // ArrayList slots when the receiver actually has ArrayList layout; otherwise
+    // return the empty sentinel so the caller falls back to the receiver's own
+    // `iterator()` (equals) / virtual dispatch.
+    if !al_is_arraylist_layout(ctx, this) {
         return (None, 0);
     }
     let data = match ctx.get_field(this, data_slot) {

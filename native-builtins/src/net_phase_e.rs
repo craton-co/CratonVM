@@ -2277,6 +2277,38 @@ fn register_re2_server_socket(r: &mut NativeMethodRegistry) {
             }
         },
     );
+
+    // `getInetAddress()` — the bound local address. This was previously
+    // unregistered, so it fell through to the real `ServerSocket.getInetAddress`
+    // bytecode (`if (!isBound()) return null; …`) which returns **null** for the
+    // synthetic socket. Narayana's `TxControl.<clinit>` does
+    // `serverSocket.getInetAddress().getHostAddress()`, so that null NPEs and
+    // aborts every JTA-platform test (HIB-DEV-02). Resolve the bound IP from the
+    // shared listener registry — checking both the re2 side-table and the
+    // object-field listener id used by the phase-53 ServerSocket ctors (the two
+    // synthetic surfaces coexist; see `reference_server_socket_gap`) — and fall
+    // back to the wildcard address so the caller gets a usable, non-null
+    // InetAddress (matching `new ServerSocket(port).getInetAddress()` == 0.0.0.0
+    // on HotSpot) instead of an NPE.
+    r.register(ss, "getInetAddress", "()Ljava/net/InetAddress;", |ctx, args| {
+        let this = obj_arg(args, 0)?;
+        let mut lid = ss_get(this).listener_id;
+        if lid < 0 {
+            lid = ctx.get_field(this, SS_LISTENER_ID).as_int().unwrap_or(-1);
+        }
+        let ip = if lid >= 0 {
+            let reg = s2_registry().lock();
+            reg.listeners
+                .get(&lid)
+                .and_then(|l| l.local_addr().ok())
+                .map(|a| a.ip().to_string())
+        } else {
+            None
+        };
+        let ip = ip.unwrap_or_else(|| "0.0.0.0".to_string());
+        let ia = alloc_inet_address(ctx, &ip, &ip);
+        Ok(Some(Value::Object(Some(ia))))
+    });
 }
 
 fn re2_accept_timeouts() -> &'static Mutex<HashMap<i32, i32>> {

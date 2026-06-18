@@ -423,7 +423,14 @@ pub(crate) fn native_init_stack_trace_elements(
             .unwrap_or_default();
 
     let cap = ctx.array_length(elements);
-    for (i, (cls_slashed, meth, file, line)) in trace_data.iter().take(cap).enumerate() {
+    // `Throwable.getStackTrace()` requires index 0 = the most-recent (innermost)
+    // frame — the throw site. The stored trace is **outermost-first** (`main`
+    // first): that is the order `capture_stack_trace` documents and the order
+    // the StackWalker / `Reflection.getCallerClass` consumers rely on, so we do
+    // NOT change the capture. Reverse only here, when materialising the
+    // user-facing `StackTraceElement[]`, so it matches the JDK (throw site at
+    // [0], `main` last) instead of being upside-down.
+    for (i, (cls_slashed, meth, file, line)) in trace_data.iter().rev().take(cap).enumerate() {
         let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         let cls_dotted = match ctx.class_id_by_name(cls_slashed) {
             Some(cid) => crate::lang_class::dotted_class_name(cid, cls_slashed),
@@ -484,10 +491,16 @@ pub(crate) fn native_throwable_get_stack_trace_element(
 
     // Clone the trace entry data to release the immutable borrow on ctx
     // before we need mutable access for object allocation.
-    let entry_data = ctx
-        .get_stack_trace(hash)
-        .and_then(|t| t.get(index as usize))
-        .cloned();
+    // Stored trace is outermost-first; `getStackTraceElement(index)` is
+    // innermost-first (index 0 = throw site), so map to the reversed index.
+    let entry_data = ctx.get_stack_trace(hash).and_then(|t| {
+        let len = t.len();
+        if index >= 0 && (index as usize) < len {
+            t.get(len - 1 - index as usize).cloned()
+        } else {
+            None
+        }
+    });
 
     // Helper: build a StackTraceElement with 4 fields.
     //
@@ -758,7 +771,10 @@ fn throwable_frame_lines(ctx: &mut dyn NativeContext, t: ObjectRef) -> Vec<Strin
     let frames: Vec<(String, String, Option<String>, i32)> = ctx
         .get_stack_trace(hash)
         .map(|tr| {
+            // stored trace is outermost-first; printStackTrace prints the
+            // throw site first, so reverse to innermost-first.
             tr.iter()
+                .rev()
                 .map(|e| {
                     (
                         e.class_name.replace('/', "."),
@@ -954,7 +970,9 @@ pub(crate) fn native_throwable_get_stack_trace_array(
 
     let len = trace_data.len();
     let arr = ctx.new_ref_array(ClassId::new(0), len);
-    for (i, (cls_slashed, meth, file, line)) in trace_data.iter().enumerate() {
+    // stored trace is outermost-first; getStackTrace() wants index 0 = the
+    // throw site (innermost), so fill the array reversed.
+    for (i, (cls_slashed, meth, file, line)) in trace_data.iter().rev().enumerate() {
         let ste = crate::alloc_concurrent_synthetic(ctx, "java/lang/StackTraceElement", 4);
         // Reuse the dotted-name cache shared with `Class.getName()` so
         // repeat frames in the same trace (recursion) hit the cached
