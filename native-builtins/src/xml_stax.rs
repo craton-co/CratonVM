@@ -856,13 +856,52 @@ fn native_create_event_reader_from_source(
             }
         }
     }
+    // Non-StreamSource (e.g. DOMSource/SAXSource): the real JDK
+    // XMLInputFactoryImpl throws UnsupportedOperationException for this
+    // optional overload. Callers (e.g. keycloak StaxParserUtil.getXMLEventReader)
+    // catch UnsupportedOperationException to fall back to a stream source;
+    // throwing NullPointerException here breaks that contract (kcfull #07 —
+    // surfaced as a misleading "Error in base64 decoding saml message" log).
     Err(MethodCallFailed::InternalError(VmError::Runtime(
-        RuntimeError::NullPointerException {
-            message: Some(format!(
-                "createXMLEventReader(Source): unsupported / empty Source ({src_cls})"
-            )),
+        RuntimeError::UnsupportedOperationException {
+            message: format!(
+                "Cannot create XMLStreamReader or XMLEventReader from a {}",
+                src_cls.replace('/', ".")
+            ),
         },
     )))
+}
+
+/// `XMLInputFactory.createFilteredReader(XMLEventReader, EventFilter)` — the
+/// abstract factory method has no Code attribute on our synthetic factory, so
+/// without this native it raised `AbstractMethodError: ... createFilteredReader
+/// ... has no Code attribute` (kcfull #02; also blocks #07 once the DOMSource
+/// path falls back to a stream/event reader). Mirror the real JDK
+/// `XMLInputFactoryImpl`, which simply returns
+/// `new EventFilterSupport(reader, filter)` — a real JDK
+/// `javax.xml.stream.util.EventReaderDelegate` subclass that applies the filter
+/// over the delegate reader. The delegate is our real `XMLEventReaderImpl`, so
+/// the filtered reader runs entirely on real JDK bytecode.
+fn native_create_filtered_event_reader(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let reader = match args.get(1) {
+        Some(v @ Value::Object(Some(_))) => v.clone(),
+        _ => {
+            return Err(MethodCallFailed::InternalError(VmError::Runtime(
+                RuntimeError::NullPointerException {
+                    message: Some("createFilteredReader: null XMLEventReader".to_string()),
+                },
+            )))
+        }
+    };
+    let filter = args.get(2).cloned().unwrap_or(Value::Object(None));
+    ctx.new_object_initialized(
+        "com/sun/xml/internal/stream/EventFilterSupport",
+        "(Ljavax/xml/stream/XMLEventReader;Ljavax/xml/stream/EventFilter;)V",
+        &[reader, filter],
+    )
 }
 
 /// `XMLStreamReader.getPrefix()` — current element's prefix ("" when
@@ -1218,6 +1257,12 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "createXMLEventReader",
         "(Ljavax/xml/transform/Source;)Ljavax/xml/stream/XMLEventReader;",
         native_create_event_reader_from_source,
+    );
+    registry.register(
+        "javax/xml/stream/XMLInputFactory",
+        "createFilteredReader",
+        "(Ljavax/xml/stream/XMLEventReader;Ljavax/xml/stream/EventFilter;)Ljavax/xml/stream/XMLEventReader;",
+        native_create_filtered_event_reader,
     );
 
     // Reader cursor methods (interface-keyed; native dispatch matches on

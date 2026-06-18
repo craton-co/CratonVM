@@ -1132,6 +1132,45 @@ fn uri_split(s: &str) -> (Option<String>, Option<String>, String, Option<String>
     (scheme, authority, path, query, fragment)
 }
 
+/// Decompose a server-based authority `[userinfo@]host[:port]` into its
+/// `(host, port)` parts, mirroring `java.net.URI`'s server-authority parse.
+/// `port = -1` when there is no `:port` (the JDK "no port" sentinel);
+/// `port = 0` for malformed digits. IPv6 literals keep their `[...]` brackets.
+fn uri_split_authority(authority: &str) -> (Option<String>, i32) {
+    let host_port = match authority.rfind('@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    if host_port.is_empty() {
+        return (None, -1);
+    }
+    if host_port.starts_with('[') {
+        if let Some(close) = host_port.find(']') {
+            let host = host_port[..=close].to_string();
+            let rest = &host_port[close + 1..];
+            let port = match rest.strip_prefix(':') {
+                Some(p) if !p.is_empty() => p.parse::<i32>().unwrap_or(0),
+                _ => -1,
+            };
+            return (Some(host), port);
+        }
+        return (Some(host_port.to_string()), -1);
+    }
+    match host_port.rfind(':') {
+        Some(i) => {
+            let host = host_port[..i].to_string();
+            let port_str = &host_port[i + 1..];
+            let port = if port_str.is_empty() {
+                -1
+            } else {
+                port_str.parse::<i32>().unwrap_or(0)
+            };
+            (if host.is_empty() { None } else { Some(host) }, port)
+        }
+        None => (Some(host_port.to_string()), -1),
+    }
+}
+
 /// RFC 3986 §5.2 — resolve a reference against a base URI string.
 fn uri_resolve_ref(base: &str, reference: &str) -> String {
     if reference.is_empty() {
@@ -1362,23 +1401,52 @@ fn register_uri_natives(r: &mut NativeMethodRegistry) {
         Ok(Some(Value::Object(Some(ctx.create_string(&raw_path)))))
     });
 
-    // getHost() → host field (1) or parsed from raw
+    // getHost() → `host` field by name (slot-order safe), else parse the
+    // server-authority of the raw string. Reading raw slot 1 was WRONG: real
+    // java.net.URI declares fields scheme(0),fragment(1),authority(2),
+    // userInfo(3),host(4),port(5),... so slot1=fragment, slot2=authority. The
+    // synthetic make_uri (URI.create) never sets host/port either — so both
+    // `new URI(...)` and `URI.create(...)` yielded null host / port 0 (kcfull
+    // #14: keycloak ProxyMappingsTest's `new HttpHost(uri.getHost(), ...)` →
+    // "Host name may not be null"). getAuthority already works, so derive
+    // host/port from it.
     r.register(uri, "getHost", "()Ljava/lang/String;", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        if let Value::Object(Some(s)) = ctx.get_field(this, 1) {
+        if let Value::Object(Some(s)) = ctx.get_field_by_name(this, "host") {
             if let Some(v) = ctx.read_string(s) {
-                if !v.is_empty() {
+                if !v.is_empty() && !v.contains('/') && !v.contains(':') {
                     return Ok(Some(Value::Object(Some(ctx.create_string(&v)))));
                 }
             }
         }
-        Ok(Some(Value::Object(None)))
+        let raw = uri_raw_string(ctx, this);
+        let (_, authority, _, _, _) = uri_split(&raw);
+        match authority {
+            Some(a) => match uri_split_authority(&a).0 {
+                Some(h) => Ok(Some(Value::Object(Some(ctx.create_string(&h))))),
+                None => Ok(Some(Value::Object(None))),
+            },
+            None => Ok(Some(Value::Object(None))),
+        }
     });
 
-    // getPort() → port field (2)
+    // getPort() → `port` field by name (slot-order safe), else parse the
+    // server-authority. Reading raw slot 2 (== the authority object) was wrong.
+    // Returns -1 when there is no `:port` (the JDK sentinel).
     r.register(uri, "getPort", "()I", |ctx, args| {
         let this = obj_arg(args, 0)?;
-        Ok(Some(ctx.get_field(this, 2)))
+        if let Value::Int(p) = ctx.get_field_by_name(this, "port") {
+            if p > 0 {
+                return Ok(Some(Value::Int(p)));
+            }
+        }
+        let raw = uri_raw_string(ctx, this);
+        let (_, authority, _, _, _) = uri_split(&raw);
+        let port = match authority {
+            Some(a) => uri_split_authority(&a).1,
+            None => -1,
+        };
+        Ok(Some(Value::Int(port)))
     });
 
     // getQuery() → `query` field by name (slot-order safe), else parse the

@@ -214,6 +214,46 @@ pub fn load_keystore(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, Ke
 // PKCS#12 — backed by the `p12` crate
 // ---------------------------------------------------------------------------
 
+/// Crate-private `p12::bmp_string`, re-implemented: UTF-16BE + trailing 0x0000.
+/// The PKCS#12 PBE/MAC password mixing operates on this BMPString form.
+fn pkcs12_bmp_string(s: &str) -> Vec<u8> {
+    let utf16: Vec<u16> = s.encode_utf16().collect();
+    let mut bytes = Vec::with_capacity(utf16.len() * 2 + 2);
+    for c in utf16 {
+        bytes.push((c >> 8) as u8);
+        bytes.push((c & 0xff) as u8);
+    }
+    bytes.push(0x00);
+    bytes.push(0x00);
+    bytes
+}
+
+/// BER-mode equivalent of `p12::PFX::bags`. Identical structure to the crate's
+/// own `bags()` (auth_safe -> SEQUENCE OF ContentInfo -> per-content data ->
+/// SEQUENCE OF SafeBag) but parsed with `yasna::parse_ber`, which does not
+/// enforce DER canonical SET-OF ordering. The JDK emits trusted-cert bag
+/// attribute sets out of DER order (friendlyName before the Oracle
+/// trustedKeyUsage attribute); SunJSSE accepts them and so must we. BER is a
+/// strict superset of DER — every field is still fully decoded and type-checked;
+/// only the DER-only canonical-ordering constraint is relaxed (kcfull #12).
+fn bags_ber(pfx: &p12::PFX, password_str: &str) -> Result<Vec<p12::SafeBag>, yasna::ASN1Error> {
+    let password = pkcs12_bmp_string(password_str);
+    let data = pfx
+        .auth_safe
+        .data(&password)
+        .ok_or_else(|| yasna::ASN1Error::new(yasna::ASN1ErrorKind::Invalid))?;
+    let contents = yasna::parse_ber(&data, |r| r.collect_sequence_of(p12::ContentInfo::parse))?;
+    let mut result = Vec::new();
+    for content in contents.iter() {
+        let inner = content
+            .data(&password)
+            .ok_or_else(|| yasna::ASN1Error::new(yasna::ASN1ErrorKind::Invalid))?;
+        let safe_bags = yasna::parse_ber(&inner, |r| r.collect_sequence_of(p12::SafeBag::parse))?;
+        result.extend(safe_bags);
+    }
+    Ok(result)
+}
+
 pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyStoreError> {
     let pfx = p12::PFX::parse(bytes).map_err(|e| KeyStoreError::Pkcs12Parse(format!("{e:?}")))?;
 
@@ -232,8 +272,14 @@ pub fn load_pkcs12(bytes: &[u8], password: &[u8]) -> Result<LoadedKeyStore, KeyS
         return Err(KeyStoreError::Pkcs12MacFailed);
     }
 
-    let bags = pfx
-        .bags(password_str)
+    // The `p12` crate parses every layer with yasna::parse_der (strict DER),
+    // which rejects the JDK's per-bag attribute SET because the JDK does not
+    // DER-sort it (friendlyName is written before the Oracle trustedKeyUsage
+    // attribute, but encodes as a larger element so it sorts last). SunJSSE
+    // reads it leniently, so we re-implement PFX::bags in BER mode, which
+    // relaxes the SET-OF ordering check without skipping any structural
+    // validation (kcfull #12).
+    let bags = bags_ber(&pfx, password_str)
         .map_err(|e| KeyStoreError::Pkcs12Parse(format!("bags(): {e:?}")))?;
 
     // Index bags by `localKeyId` so we can pair a private-key bag with the
