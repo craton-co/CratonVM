@@ -2101,6 +2101,15 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "set", "(ILjava/lang/Object;)Ljava/lang/Object;", native_asl_set);
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_asl_iterator);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_asl_to_array);
+    // ES-FAIL-04 — `ArrayList.subList(a,b).toArray(new T[n])` is the dominant
+    // Elasticsearch unit-test blocker: only the 0-arg `toArray()` was registered
+    // on the sublist view, so the typed `toArray(T[])` overload resolved to a
+    // missing native (NoSuchMethodError) for ~every ESTestCase. Delegate to a
+    // fresh snapshot ArrayList (same pattern as contains/indexOf/stream below),
+    // whose `native_al_to_array_typed` fills/allocates the typed array.
+    r.register(c, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
+    });
     r.register(c, "toString", "()Ljava/lang/String;", native_asl_to_string);
     // Remaining read methods delegate to a fresh snapshot ArrayList. Without
     // these, an interface-level `Collection`/`List` native would be reached
