@@ -4182,31 +4182,31 @@ fn try_compile_inner(
         let num_params = prologue_param_slots;
         let builder = ir::IrBuilder::new(num_params, cached.max_locals as usize);
         if let Some(mut graph) = builder.build(code, code_len) {
-            // Correctness gate: the IR backend miscompiles a *pure* (call-free)
-            // method that contains a conditional branch / φ merge. The canonical
-            // failure is a tiny leaf predicate like
-            // `static boolean f(int m){ return (m & K) != 0; }`
-            // (e.g. `java.lang.reflect.Modifier.isStatic`): once hot-called in a
-            // loop its IR-compiled body SIGSEGVs with a write through a near-null
-            // base (faulting address == the masked constant / 0). Methods that
-            // contain an `invoke*` lower correctly through the same pipeline, and
-            // branch-free leaf methods are fine — only call-free *branchy* methods
-            // are affected. Until the IR φ/branch lowering bug is root-fixed,
-            // decline IR for this exact shape and let the single-pass bytecode-x64
-            // backend (which compiles arbitrary control flow correctly) handle it.
-            // Bisected from keycloak JsonParserTest / SkeletonKeyTokenTest SIGSEGVs
-            // and a standalone `Modifier.isStatic` hot-loop repro.
+            // History: the IR backend used to miscompile a *pure* (call-free)
+            // method containing a conditional branch / φ merge — a tiny leaf
+            // predicate like `static boolean f(int m){ return (m & K) != 0; }`
+            // (e.g. `java.lang.reflect.Modifier.isStatic`) SIGSEGV'd with a write
+            // through a near-null base. ROOT CAUSE (fixed): the Op::Cmp SETcc was
+            // emitted as `0F 9x` without its ModRM byte, desyncing the stream
+            // into a stray `SETL [rdi]` (near-null write) and leaving the boolean
+            // unset. A second blocker — loop-carried phis dropped on the
+            // back-edge — was also fixed (loop-header eager phis + back-patch).
+            // The IR path now compiles if/else and loops (while/do-while/nested)
+            // correctly, so branchy call-free integer methods take the IR
+            // pipeline by default. `CRATONVM_NO_IR_BRANCHY` is the emergency
+            // opt-out (restores single-pass-only routing for this shape); methods
+            // the IR builder can't fully build still return None → single-pass.
+            // (Bisected originally from keycloak JsonParserTest /
+            // SkeletonKeyTokenTest SIGSEGVs + a standalone `Modifier.isStatic`.)
             let has_conditional_branch =
                 graph.nodes.iter().any(|n| matches!(n.op, ir::Op::If));
-            // `CRATONVM_JIT_REASSOC` opts branchy call-free integer methods
-            // into the IR pipeline so the affine strength-reduction pass can
-            // fire. Default-OFF: the φ/branch lowering caveat above still
-            // applies until this soaks.
             if has_conditional_branch
                 && scan.invoke_ops.is_empty()
+                && !ir_optimize::ir_branchy_enabled()
                 && !ir_optimize::reassoc_enabled()
             {
-                // Fall through to the single-pass backend below.
+                // Branchy-IR explicitly disabled (CRATONVM_NO_IR_BRANCHY) and
+                // reassoc off → fall through to the single-pass backend below.
             } else {
             ir_optimize::optimize(&mut graph);
 

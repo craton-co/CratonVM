@@ -46,6 +46,18 @@ pub fn reassoc_enabled() -> bool {
     *FLAG.get_or_init(|| std::env::var_os("CRATONVM_JIT_REASSOC").is_some())
 }
 
+/// `true` (default) when pure, call-free *branchy* integer methods may take the
+/// IR pipeline. The φ/branch SIGSEGV (missing SETcc ModRM byte) and the
+/// loop-carried-phi miscompile that originally gated these methods are fixed,
+/// so the IR path now compiles if/else and loops correctly. `CRATONVM_NO_IR_BRANCHY`
+/// is the emergency opt-out that restores the single-pass-only routing for the
+/// branchy shape (e.g. to bisect a suspected IR-path regression).
+pub fn ir_branchy_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var_os("CRATONVM_NO_IR_BRANCHY").is_none())
+}
+
 // ── Affine strength reduction (reassociation) ────────────────────────
 //
 // An integer value is "affine in `root`" when it equals `k*root + c` for
