@@ -486,9 +486,12 @@ impl<'a> Lowerer<'a> {
             }
             Op::Div => {
                 let slot = self.alloc_slot(id);
+                let ty = node.ty;
+                let bpc = node.bytecode_pc;
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 self.load_to_rcx(self.slot_of(node.inputs[1]));
-                if node.ty == IrType::Int {
+                self.emit_div_zero_guard(ty, bpc);
+                if ty == IrType::Int {
                     // CDQ (sign-extend EAX → EDX:EAX)
                     self.buf.emit_byte(0x99);
                     // IDIV ECX
@@ -503,9 +506,12 @@ impl<'a> Lowerer<'a> {
             }
             Op::Rem => {
                 let slot = self.alloc_slot(id);
+                let ty = node.ty;
+                let bpc = node.bytecode_pc;
                 self.load_to_rax(self.slot_of(node.inputs[0]));
                 self.load_to_rcx(self.slot_of(node.inputs[1]));
-                if node.ty == IrType::Int {
+                self.emit_div_zero_guard(ty, bpc);
+                if ty == IrType::Int {
                     self.buf.emit_byte(0x99); // CDQ
                     self.buf.emit(&[0xF7, 0xF9]); // IDIV ECX
                 } else {
@@ -844,6 +850,68 @@ impl<'a> Lowerer<'a> {
                 caller: None,
             },
         }
+    }
+
+    /// Emit a div-by-zero deopt guard for an `Op::Div`/`Op::Rem` whose divisor
+    /// was just loaded into RCX. If the divisor is zero, deopt to the
+    /// interpreter at this bci, which re-executes the `idiv`/`irem` and throws
+    /// `ArithmeticException` — instead of the raw `IDIV` faulting (#DE/SIGFPE),
+    /// the latent crash this fixes. Only emitted when the bci has a safepoint
+    /// snapshot (so the reconstructed frame carries the operand stack the
+    /// interpreter needs to re-execute the division); a hand-built graph with
+    /// no snapshot keeps the bare `IDIV`.
+    fn emit_div_zero_guard(&mut self, ty: IrType, bytecode_pc: Option<usize>) {
+        let bci = match bytecode_pc {
+            Some(b) if self.graph.safepoints.iter().any(|s| s.bci == b) => b,
+            _ => return,
+        };
+        // TEST ECX,ECX (int) / TEST RCX,RCX (long): ZF=1 when divisor == 0.
+        if ty == IrType::Int {
+            self.buf.emit(&[0x85, 0xC9]);
+        } else {
+            self.buf.emit(&[0x48, 0x85, 0xC9]);
+        }
+        self.emit_deopt_if_zero(bci, DeoptReason::DivByZero);
+    }
+
+    /// Emit a deopt-on-zero branch, given the caller has already emitted a
+    /// `TEST` that sets `ZF=1` exactly when the deopt condition holds (the
+    /// tested value was zero). Builds + boxes a `DeoptimizationPoint` for `bci`
+    /// (frame state from its safepoint snapshot), then emits
+    /// `JNZ continue; <mov DEOPT_ARG0, point; JMP deopt_stub>; continue:`.
+    /// Shares the Phase-A deopt stub via `deopt_stub_patches`.
+    ///
+    /// NOTE: on Windows `DEOPT_ARG0` is RCX, which a div/rem site uses for the
+    /// divisor — but the `mov` only executes on the deopt branch (after the
+    /// `JNZ`), so the fall-through path keeps RCX intact for the `IDIV`.
+    fn emit_deopt_if_zero(&mut self, bci: usize, reason: DeoptReason) {
+        let frame_state = self.resolve_frame_state_for_bci(bci);
+        let point = Box::new(DeoptimizationPoint {
+            native_offset: self.buf.pos() as u32,
+            bci: bci as u32,
+            reason,
+            action: DeoptAction::Reinterpret,
+            speculation_id: 0,
+            frame_state,
+        });
+        let point_ptr = point.as_ref() as *const DeoptimizationPoint as u64;
+        self.deopt_boxes.push(point);
+        // JNZ continue (value != 0 → skip deopt).
+        self.buf.emit(&[0x0F, 0x85]);
+        let jnz_patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        // Deopt path: load the point pointer into arg0, JMP to the shared stub.
+        self.emit_mov_reg_imm64(DEOPT_ARG0, point_ptr);
+        self.buf.emit_byte(0xE9);
+        let jmp_patch = self.buf.pos();
+        self.buf.emit(&[0x00, 0x00, 0x00, 0x00]);
+        self.deopt_stub_patches.push(jmp_patch);
+        // continue:
+        let cont = self.buf.pos();
+        let rel = cont as i32 - (jnz_patch as i32 + 4);
+        self.buf
+            .try_patch_i32(jnz_patch, rel)
+            .expect("deopt-if-zero JNZ patch in-bounds");
     }
 
     /// Emit the single shared deopt stub (if any guard jumps to it) and patch
@@ -1454,5 +1522,37 @@ mod tests {
         assert_eq!(f(5), 25, "5*5 = 25");
         assert_eq!(f(0), 0, "no iterations");
         assert_eq!(f(1), 1, "1*1 = 1");
+    }
+
+    // ── real-frame-deopt fires end-to-end: div-by-zero guard ─────────────
+    // Proves the trigger half: an IR-compiled `a/b` deopts (instead of the raw
+    // IDIV faulting) when b==0, with the reconstructed frame carrying the live
+    // operands at the idiv bci so the interpreter can re-execute and throw
+    // ArithmeticException. (The VM-side resume is wired separately, gated.)
+    #[test]
+    fn test_lower_div_by_zero_deopts() {
+        use crate::deopt::{take_last_deopt, FrameValue};
+        // int f(int a, int b){ return a / b; }  — iload_0; iload_1; idiv; ireturn
+        let code = [0x1a, 0x1b, 0x6c, 0xac, 0, 0];
+        let cm = compile_via_ir(&code, 4, 2, 2).expect("div compiles via IR");
+
+        let _ = take_last_deopt(); // clear any stale state
+        // divisor != 0 → normal result, no deopt.
+        let ok = unsafe { cm.try_call(&[20, 4]).expect("call (b != 0)") };
+        assert_eq!(ok, 5, "20 / 4 = 5");
+        assert!(take_last_deopt().is_none(), "no deopt when divisor != 0");
+
+        // divisor == 0 → deopt (sentinel + reconstructed frame), NOT a #DE fault.
+        let sentinel = unsafe { cm.try_call(&[20, 0]).expect("call (b == 0)") };
+        assert_eq!(sentinel, i64::MIN, "div by zero → deopt sentinel");
+        let frame = take_last_deopt().expect("deopt reconstructed a frame");
+        // idiv is at bci 2; resume there with [a, b] live on the operand stack
+        // so the interpreter re-executes the division and throws.
+        assert_eq!(frame.bci, 2, "resume at the idiv bci");
+        assert_eq!(
+            frame.stack,
+            vec![FrameValue::Int(20), FrameValue::Int(0)],
+            "operands restored for re-execution",
+        );
     }
 }
