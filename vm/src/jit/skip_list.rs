@@ -1154,6 +1154,41 @@ fn is_known_miscompile(class_name: &str, method_name: &str) -> bool {
         | ("java/util/LinkedHashMap", "afterNodeInsertion")
         | ("java/util/LinkedHashMap", "afterNodeAccess")
         | ("java/util/LinkedHashMap", "afterNodeRemoval")
+        // ES-HANG-01 (2026-06-18) — Elasticsearch 9.5 unit-test suite: every
+        // `ESTestCase`/`LuceneTestCase` suite livelocks during RandomizedRunner
+        // setup under the JIT; `--nojit` runs fine and the process is still hung
+        // at 650s (permanent, CPU-bound — cdb shows an interpreter/JIT execution
+        // loop, not a deadlock). Bisected with `CRATONVM_JIT_BISECT_ONLY/SKIP`:
+        //   - `BISECT_ONLY=java/util/WeakHashMap`            -> still hangs
+        //   - `BISECT_ONLY=java/util/WeakHashMap` + SKIP
+        //     `WeakHashMap$ValueSpliterator.tryAdvance`      -> runs
+        // i.e. compiling ONLY WeakHashMap reproduces it and skipping exactly
+        // `ValueSpliterator.tryAdvance` eliminates it — so the defect is in that
+        // method's JIT code, not a compilation-shift artifact (cf. CM-FASTMATH).
+        //
+        // `WeakHashMap$*Spliterator.tryAdvance` is the table-walk loop
+        // `while (current != null || index < fence) { if (current==null)
+        // current = tab[index++]; else { ... current = current.next; ... } }`.
+        // The post-increment `current = tab[index++]` is emitted as the awkward
+        // `dup_x1` stack dance (bci 60..74: getfield index; dup_x1; iconst_1;
+        // iadd; putfield index; aaload; putfield current) interleaving the
+        // `index` putfield with the array load. The JIT'd loop never terminates
+        // — same family as NETTY.1 (`Arrays.fill` counted-loop) and the HashMap
+        // hot-loop miscompiles above: either the `index`/`current` putfield is
+        // dropped (IV never advances) or the `if_icmpge`/`ifnonnull` exit is
+        // miscompiled. The Key/Value/Entry spliterators and their
+        // `forEachRemaining` share byte-for-byte the same walk, so all six are
+        // skip-listed together (cf. the pre-emptive `Arrays.fill` variants).
+        // Skipping these runs them in the interpreter (correct) and unblocks the
+        // entire ES suite. Repro: `apps/elasticsearch/cratonvm-suite/probe/
+        // LuceneOnlyTest` under JIT. Root-cause fix in the loop/putfield codegen
+        // would let these be lifted (like NETTY.1 was after the regalloc fix).
+        | ("java/util/WeakHashMap$KeySpliterator", "tryAdvance")
+        | ("java/util/WeakHashMap$KeySpliterator", "forEachRemaining")
+        | ("java/util/WeakHashMap$ValueSpliterator", "tryAdvance")
+        | ("java/util/WeakHashMap$ValueSpliterator", "forEachRemaining")
+        | ("java/util/WeakHashMap$EntrySpliterator", "tryAdvance")
+        | ("java/util/WeakHashMap$EntrySpliterator", "forEachRemaining")
         // NETTY.1 (current session) — JIT'd `java/util/Arrays.fill(byte[], byte)`
         // never returns. Reproducer: `apps/netty/NettyEchoTest` (rc=124 after
         // 30s) hangs during the netty bootstrap cascade. `CRATONVM_FRAME_TRACE=1`
@@ -2076,6 +2111,40 @@ mod tests {
         // Aggressive still lifts it.
         assert_eq!(
             check("java/util/HashMap", "put", false, true, SkipPolicy::Aggressive),
+            None
+        );
+    }
+
+    #[test]
+    fn weakhashmap_spliterator_walk_skipped_under_conservative() {
+        // ES-HANG-01 — WeakHashMap$*Spliterator.{tryAdvance,forEachRemaining}
+        // JIT-miscompile (infinite loop) is on the targeted list. The confirmed
+        // culprit is ValueSpliterator.tryAdvance; the Key/Entry siblings and
+        // forEachRemaining share identical table-walk bytecode and are banned
+        // together.
+        for (cls, m) in [
+            ("java/util/WeakHashMap$KeySpliterator", "tryAdvance"),
+            ("java/util/WeakHashMap$KeySpliterator", "forEachRemaining"),
+            ("java/util/WeakHashMap$ValueSpliterator", "tryAdvance"),
+            ("java/util/WeakHashMap$ValueSpliterator", "forEachRemaining"),
+            ("java/util/WeakHashMap$EntrySpliterator", "tryAdvance"),
+            ("java/util/WeakHashMap$EntrySpliterator", "forEachRemaining"),
+        ] {
+            assert_eq!(
+                check(cls, m, false, true, SkipPolicy::Conservative),
+                Some(SkipReason::JavaUtilCollection),
+                "{cls}.{m} must be JIT-skipped under Conservative (ES-HANG-01)"
+            );
+            // Aggressive lifts the targeted ban (developers surfacing new miscompiles).
+            assert_eq!(
+                check(cls, m, false, true, SkipPolicy::Aggressive),
+                None,
+                "{cls}.{m} must be JIT-eligible under Aggressive"
+            );
+        }
+        // A non-walk WeakHashMap method stays JIT-eligible.
+        assert_eq!(
+            check("java/util/WeakHashMap", "size", false, true, SkipPolicy::Conservative),
             None
         );
     }
