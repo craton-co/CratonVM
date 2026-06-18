@@ -17229,13 +17229,18 @@ fn execute_jit_call(
     // never leak to the next JIT call): precise-resume at the trapping bci when
     // enabled + mappable, else re-run the method from entry (`CacheMiss`),
     // restoring the popped args first exactly like the `i64::MIN` arm below.
-    // Gated by the cached flag first, so the default-OFF path adds no
-    // thread-local access to the hot JIT-return path (no production IR method
-    // emits a deopt guard yet, so `LAST_DEOPT` is always empty regardless).
-    if ir_deopt_resume_enabled() {
+    // The detection MUST run whenever a deopt could have stashed a frame (the
+    // IR div-by-zero guard, and any future guard); the resume *gate* only
+    // chooses precise mid-bci resume vs re-run. `ir_deopt_entry` always returns
+    // `i64::MIN` when it stashes, so gating on `result == i64::MIN` keeps the
+    // common JIT-return path free of the thread-local access while never missing
+    // a deopt (an undetected i64::MIN would be pushed as a real return == 0).
+    if result == i64::MIN {
         if let Some(rframe) = cratonvm_jit::deopt::take_last_deopt() {
-            if let Some(r) = resume_from_ir_deopt(shared, thread, cached, &rframe) {
-                return Ok(r);
+            if ir_deopt_resume_enabled() {
+                if let Some(r) = resume_from_ir_deopt(shared, thread, cached, &rframe) {
+                    return Ok(r);
+                }
             }
             for i in 0..np {
                 let (cv, is_long) = saved_args[i];
@@ -17532,9 +17537,10 @@ fn execute_jit_call_decoded(
     // without setting `JIT_DEOPT_PENDING`, so consume the stashed frame here too
     // (clearing it) and re-run the method from entry. Precise mid-bci resume is
     // wired at the fast sink; this slow path falls back to re-run, which is
-    // correct for the side-effect-free methods that deopt today. Gated first so
-    // the default-OFF path adds nothing to the hot JIT-return path.
-    if ir_deopt_resume_enabled() && cratonvm_jit::deopt::take_last_deopt().is_some() {
+    // correct for the side-effect-free methods that deopt today. Detection runs
+    // unconditionally (an undetected IR deopt would push i64::MIN as a real
+    // return); the resume gate only matters at the fast sink.
+    if cratonvm_jit::deopt::take_last_deopt().is_some() {
         return Ok(None);
     }
 
