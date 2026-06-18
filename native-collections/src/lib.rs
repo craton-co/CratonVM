@@ -2101,6 +2101,17 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "set", "(ILjava/lang/Object;)Ljava/lang/Object;", native_asl_set);
     r.register(c, "iterator", "()Ljava/util/Iterator;", native_asl_iterator);
     r.register(c, "toArray", "()[Ljava/lang/Object;", native_asl_to_array);
+    // Typed `toArray(T[])` — delegate to a snapshot ArrayList's typed
+    // `toArray`, which honours the JDK semantics (reuse the passed array when
+    // large enough, else allocate one of the same component type). Without
+    // this overload, `subList(..).toArray(new T[0])` — which Mockito's
+    // internals (and plenty of app code) call — hits NoSuchMethodError.
+    r.register(
+        c,
+        "toArray",
+        "([Ljava/lang/Object;)[Ljava/lang/Object;",
+        |ctx, args| asl_delegate_snapshot(ctx, args, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;"),
+    );
     r.register(c, "toString", "()Ljava/lang/String;", native_asl_to_string);
     // Remaining read methods delegate to a fresh snapshot ArrayList. Without
     // these, an interface-level `Collection`/`List` native would be reached
