@@ -1362,4 +1362,34 @@ mod tests {
         assert_eq!(max(5, 5), 5, "max(5,5)=5");
         assert_eq!(max(-2, -9), -2, "max(-2,-9)=-2");
     }
+
+    // ── Gate-flip readiness probe: a COUNTED LOOP (loop-carried phi over a
+    // back-edge). If this fails, the IR builder/lowerer does not yet handle
+    // loop phis, and branchy call-free methods (which include loops) must NOT
+    // be routed to the IR path — i.e. the lib.rs gate cannot be flipped on the
+    // SETcc fix alone.
+    #[test]
+    #[ignore = "GATE-FLIP BLOCKER: the IR builder is a single forward pass and \
+                does not fold loop back-edge values into the loop-header phi, so \
+                a counted loop's loop-carried accumulator is lost (sum returns \
+                the initial 0). The SETcc fix (#3) unblocks if/else branches, \
+                but branchy call-free methods include LOOPS, so jit/src/lib.rs \
+                must keep declining them from the IR path until loop-phi support \
+                lands. This test is the readiness guard for that work."]
+    fn test_lower_counted_loop_sum() {
+        // int sum(int n){ int s=0; for(int i=0;i<n;i++) s+=i; return s; }
+        //  0: iconst_0  1: istore_1  2: iconst_0  3: istore_2
+        //  4: iload_2   5: iload_0   6: if_icmpge 19
+        //  9: iload_1  10: iload_2  11: iadd  12: istore_1
+        // 13: iinc 2,1 16: goto 4   19: iload_1 20: ireturn
+        let code = [
+            0x03, 0x3c, 0x03, 0x3d, 0x1c, 0x1a, 0xa2, 0x00, 0x0d, 0x1b, 0x1c, 0x60, 0x3c, 0x84,
+            0x02, 0x01, 0xa7, 0xff, 0xf4, 0x1b, 0xac, 0, 0,
+        ];
+        let cm = compile_via_ir(&code, 21, 1, 3).expect("loop compiles via IR");
+        let sum = |n: i64| unsafe { cm.try_call(&[n]).expect("call") };
+        assert_eq!(sum(5), 10, "0+1+2+3+4 = 10");
+        assert_eq!(sum(0), 0, "empty loop = 0");
+        assert_eq!(sum(10), 45, "sum 0..9 = 45");
+    }
 }
