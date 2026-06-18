@@ -167,6 +167,82 @@ pub mod helpful_npe {
         format!("Cannot invoke \"{owner}.{name}({params})\"")
     }
 
+    // -- Increment 2: action halves for the remaining null-deref opcodes -----
+    //
+    // Each mirrors the exact HotSpot (`BytecodeUtils`) wording so compliance
+    // suites that assert the JEP 358 strings match. The `getfield` /
+    // `putfield` field name is the *simple* field name (HotSpot prints
+    // `Cannot read field "x"`, not the owner-qualified name).
+
+    /// `getfield` on a null receiver: `Cannot read field "name"`.
+    pub fn action_read_field(name: &str) -> String {
+        format!("Cannot read field \"{name}\"")
+    }
+
+    /// `putfield` on a null receiver: `Cannot assign field "name"`.
+    pub fn action_assign_field(name: &str) -> String {
+        format!("Cannot assign field \"{name}\"")
+    }
+
+    /// `arraylength` on a null array.
+    pub fn action_array_length() -> String {
+        "Cannot read the array length".to_string()
+    }
+
+    /// `*aload` on a null array. `elem` is the JEP 358 element-type spelling
+    /// (`int`, `object`, `byte`, …) — HotSpot prints e.g.
+    /// `Cannot load from int array`, `Cannot load from object array`.
+    pub fn action_array_load(elem: ArrayElemKind) -> String {
+        format!("Cannot load from {} array", elem.as_str())
+    }
+
+    /// `*astore` into a null array: `Cannot store to <elem> array`.
+    pub fn action_array_store(elem: ArrayElemKind) -> String {
+        format!("Cannot store to {} array", elem.as_str())
+    }
+
+    /// `monitorenter` / `monitorexit` on null.
+    pub fn action_monitor() -> String {
+        "Cannot enter synchronized block".to_string()
+    }
+
+    /// `athrow` of a null reference.
+    pub fn action_throw() -> String {
+        "Cannot throw exception".to_string()
+    }
+
+    /// The JEP 358 element-type spelling used in the `*aload`/`*astore`
+    /// action strings. HotSpot spells reference-array element type as
+    /// `object` and primitive arrays by their Java keyword.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ArrayElemKind {
+        Int,
+        Long,
+        Float,
+        Double,
+        Byte,
+        Char,
+        Short,
+        Boolean,
+        Object,
+    }
+
+    impl ArrayElemKind {
+        pub fn as_str(self) -> &'static str {
+            match self {
+                ArrayElemKind::Int => "int",
+                ArrayElemKind::Long => "long",
+                ArrayElemKind::Float => "float",
+                ArrayElemKind::Double => "double",
+                ArrayElemKind::Byte => "byte",
+                ArrayElemKind::Char => "char",
+                ArrayElemKind::Short => "short",
+                ArrayElemKind::Boolean => "boolean",
+                ArrayElemKind::Object => "object",
+            }
+        }
+    }
+
     /// Combine an action half with an optional null-expression half into the
     /// final JEP 358 message. When the expression is unknown we emit the
     /// action-only form (`"<action> because the return value ... is null"` is
@@ -175,6 +251,18 @@ pub mod helpful_npe {
         match expr {
             Some(e) => format!("{action} because \"{e}\" is null"),
             None => format!("{action} because the receiver is null"),
+        }
+    }
+
+    /// Like [`combine`] but emits the *action-only* string when the
+    /// expression can't be classified (HotSpot omits the `because` clause
+    /// rather than fabricating "the receiver"). Used by the increment-2
+    /// opcode sites (getfield / array / monitor / athrow), whose null operand
+    /// isn't always a "receiver".
+    pub fn combine_opt(action: &str, expr: Option<&str>) -> String {
+        match expr {
+            Some(e) => format!("{action} because \"{e}\" is null"),
+            None => action.to_string(),
         }
     }
 
@@ -378,10 +466,31 @@ pub mod helpful_npe {
         num_params: usize,
         resolver: &dyn CpResolver,
     ) -> Option<String> {
-        let stack = simulate_to(code, invoke_bci)?;
-        // Receiver sits `num_params` slots below the top of stack.
-        let recv_idx = stack.len().checked_sub(num_params + 1)?;
-        let producer = stack.get(recv_idx)?.producer_bci?;
+        // The receiver sits `num_params` slots below the top of the operand
+        // stack as it stood just before the invoke.
+        null_expr_at_depth(code, invoke_bci, num_params, resolver)
+    }
+
+    /// Generalized null-operand reconstruction shared by every null-deref
+    /// opcode (increment 2). `depth_below_top` is how many operand-stack
+    /// slots sit *above* the null operand at the moment the trapping opcode
+    /// at `trap_bci` begins executing — `0` for the top-of-stack operand
+    /// (`getfield` receiver, `arraylength` / `monitor` / `athrow` operand),
+    /// `1` for the slot one below (the `putfield` receiver, which has the
+    /// stored value above it; the `*aload` array, which has the index above
+    /// it), and `2` for the `*astore` array (value + index above it).
+    ///
+    /// Returns `None` (→ action-only message) when the producer can't be
+    /// unambiguously classified, exactly like the invoke path.
+    pub fn null_expr_at_depth(
+        code: &[u8],
+        trap_bci: usize,
+        depth_below_top: usize,
+        resolver: &dyn CpResolver,
+    ) -> Option<String> {
+        let stack = simulate_to(code, trap_bci)?;
+        let idx = stack.len().checked_sub(depth_below_top + 1)?;
+        let producer = stack.get(idx)?.producer_bci?;
         describe_producer(code, producer, resolver, 0)
     }
 }
@@ -1343,9 +1452,25 @@ mod helpful_npe_tests {
 
     /// Map-backed resolver: cp-index -> CpRef, mirroring what the live
     /// constant pool would hand back. No VM / rt.jar required.
+    ///
+    /// `locals` mimics a resolved `LocalVariableTable`: slot -> source name.
+    /// When a slot is present the resolver returns that real name (as the
+    /// live `CpPoolResolver` does from the `LocalVariableTable` attribute);
+    /// when absent the analysis falls back to the synthetic `<localN>` form.
     struct MockResolver {
         fields: HashMap<u16, CpRef>,
         methods: HashMap<u16, CpRef>,
+        locals: HashMap<u16, String>,
+    }
+
+    impl MockResolver {
+        fn new(fields: HashMap<u16, CpRef>, methods: HashMap<u16, CpRef>) -> Self {
+            MockResolver {
+                fields,
+                methods,
+                locals: HashMap::new(),
+            }
+        }
     }
 
     impl CpResolver for MockResolver {
@@ -1354,6 +1479,9 @@ mod helpful_npe_tests {
         }
         fn method_ref(&self, i: u16) -> Option<CpRef> {
             self.methods.get(&i).cloned()
+        }
+        fn local_name(&self, slot: u16, _bci: usize) -> Option<String> {
+            self.locals.get(&slot).cloned()
         }
     }
 
@@ -1422,7 +1550,7 @@ mod helpful_npe_tests {
                 descriptor: "()I".to_string(),
             },
         );
-        let resolver = MockResolver { fields, methods };
+        let resolver = MockResolver::new(fields, methods);
 
         let action = helpful_npe::action_invoke("Node", "value", "()I");
         let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
@@ -1462,7 +1590,7 @@ mod helpful_npe_tests {
                 descriptor: "()I".to_string(),
             },
         );
-        let resolver = MockResolver { fields, methods };
+        let resolver = MockResolver::new(fields, methods);
 
         let action = helpful_npe::action_invoke("java/lang/String", "length", "()I");
         let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
@@ -1488,10 +1616,7 @@ mod helpful_npe_tests {
                 descriptor: "()Ljava/lang/String;".to_string(),
             },
         );
-        let resolver = MockResolver {
-            fields: HashMap::new(),
-            methods,
-        };
+        let resolver = MockResolver::new(HashMap::new(), methods);
         let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
         assert_eq!(expr.as_deref(), Some("<local1>"));
     }
@@ -1522,8 +1647,177 @@ mod helpful_npe_tests {
                 descriptor: "()V".to_string(),
             },
         );
-        let resolver = MockResolver { fields, methods };
+        let resolver = MockResolver::new(fields, methods);
         let expr = helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, 0, &resolver);
         assert_eq!(expr.as_deref(), Some("java.lang.System.out"));
+    }
+
+    // -- Increment 2: action halves + new-opcode expression shapes ----------
+
+    // Additional opcode bytes (JVMS §6) for the increment-2 tests.
+    const ALOAD: u8 = 0x19; // aload <index> (wide-index local load)
+    const IASTORE: u8 = 0x4f;
+    const ARRAYLENGTH: u8 = 0xbe;
+    const MONITORENTER: u8 = 0xc2;
+    const ICONST_0: u8 = 0x03;
+    const ICONST_1: u8 = 0x04;
+
+    /// The increment-2 action halves match the exact HotSpot wording.
+    #[test]
+    fn increment2_action_shapes() {
+        use helpful_npe::ArrayElemKind;
+        assert_eq!(helpful_npe::action_read_field("x"), "Cannot read field \"x\"");
+        assert_eq!(
+            helpful_npe::action_assign_field("count"),
+            "Cannot assign field \"count\""
+        );
+        assert_eq!(helpful_npe::action_array_length(), "Cannot read the array length");
+        assert_eq!(
+            helpful_npe::action_array_load(ArrayElemKind::Int),
+            "Cannot load from int array"
+        );
+        assert_eq!(
+            helpful_npe::action_array_store(ArrayElemKind::Object),
+            "Cannot store to object array"
+        );
+        assert_eq!(
+            helpful_npe::action_array_store(ArrayElemKind::Byte),
+            "Cannot store to byte array"
+        );
+        assert_eq!(
+            helpful_npe::action_monitor(),
+            "Cannot enter synchronized block"
+        );
+        assert_eq!(helpful_npe::action_throw(), "Cannot throw exception");
+    }
+
+    /// `combine_opt` emits the action-only string (no fabricated `because`)
+    /// when the expression can't be classified.
+    #[test]
+    fn combine_opt_action_only_when_unknown() {
+        let action = helpful_npe::action_array_length();
+        assert_eq!(
+            helpful_npe::combine_opt(&action, None),
+            "Cannot read the array length"
+        );
+        assert_eq!(
+            helpful_npe::combine_opt(&action, Some("a")),
+            "Cannot read the array length because \"a\" is null"
+        );
+    }
+
+    /// getfield-read on a null `this.next`: `aload_0; getfield #1 (Node.next);
+    /// getfield #2 (Node.value)`. The *second* getfield (at `trap_bci`) reads
+    /// a field of the null `this.next`, so the null operand is the receiver at
+    /// depth 0.
+    #[test]
+    fn getfield_read_receiver_is_field_of_this() {
+        // aload_0; getfield #1; getfield #2
+        let mut code = vec![ALOAD_0, GETFIELD];
+        code.extend_from_slice(&u16_be(1));
+        let trap_bci = code.len();
+        code.push(GETFIELD);
+        code.extend_from_slice(&u16_be(2));
+
+        let mut fields = HashMap::new();
+        fields.insert(
+            1u16,
+            CpRef::Field {
+                owner_internal: "Node".to_string(),
+                name: "next".to_string(),
+            },
+        );
+        fields.insert(
+            2u16,
+            CpRef::Field {
+                owner_internal: "Node".to_string(),
+                name: "value".to_string(),
+            },
+        );
+        let resolver = MockResolver::new(fields, HashMap::new());
+
+        // The trapping getfield reads field "value"; its receiver (depth 0)
+        // is `this.next`.
+        let action = helpful_npe::action_read_field("value");
+        let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &resolver);
+        assert_eq!(expr.as_deref(), Some("this.next"));
+        let msg = helpful_npe::combine_opt(&action, expr.as_deref());
+        assert_eq!(
+            msg,
+            "Cannot read field \"value\" because \"this.next\" is null"
+        );
+    }
+
+    /// arraylength of a null local array: `aload_1; arraylength`. The array is
+    /// the top-of-stack operand (depth 0).
+    #[test]
+    fn arraylength_of_local() {
+        let code = vec![ALOAD_1, ARRAYLENGTH];
+        let trap_bci = 1;
+        let resolver = MockResolver::new(HashMap::new(), HashMap::new());
+        let action = helpful_npe::action_array_length();
+        let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &resolver);
+        assert_eq!(expr.as_deref(), Some("<local1>"));
+        assert_eq!(
+            helpful_npe::combine_opt(&action, expr.as_deref()),
+            "Cannot read the array length because \"<local1>\" is null"
+        );
+    }
+
+    /// array-store into a null local int[]: `aload_1; iconst_0; iconst_1;
+    /// iastore`. Source stack at the iastore is `[arrayref, index, value]`, so
+    /// the null array is at depth 2.
+    #[test]
+    fn array_store_to_local() {
+        let mut code = vec![ALOAD_1, ICONST_0, ICONST_1];
+        let trap_bci = code.len();
+        code.push(IASTORE);
+        let resolver = MockResolver::new(HashMap::new(), HashMap::new());
+        let action = helpful_npe::action_array_store(helpful_npe::ArrayElemKind::Int);
+        let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 2, &resolver);
+        assert_eq!(expr.as_deref(), Some("<local1>"));
+        assert_eq!(
+            helpful_npe::combine_opt(&action, expr.as_deref()),
+            "Cannot store to int array because \"<local1>\" is null"
+        );
+    }
+
+    /// monitorenter on a null local: `aload_1; monitorenter`. The monitor
+    /// object is the top-of-stack operand (depth 0).
+    #[test]
+    fn monitorenter_of_local() {
+        let code = vec![ALOAD_1, MONITORENTER];
+        let trap_bci = 1;
+        let resolver = MockResolver::new(HashMap::new(), HashMap::new());
+        let action = helpful_npe::action_monitor();
+        let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &resolver);
+        assert_eq!(expr.as_deref(), Some("<local1>"));
+        assert_eq!(
+            helpful_npe::combine_opt(&action, expr.as_deref()),
+            "Cannot enter synchronized block because \"<local1>\" is null"
+        );
+    }
+
+    /// When a `LocalVariableTable` resolves slot 3 to its real source name
+    /// `items`, the analysis renders that name in place of `<local3>`.
+    /// `aload 3; arraylength`.
+    #[test]
+    fn lvt_name_resolves_when_present() {
+        let code = vec![ALOAD, 3u8, ARRAYLENGTH];
+        let trap_bci = 2;
+        let mut resolver = MockResolver::new(HashMap::new(), HashMap::new());
+        resolver.locals.insert(3u16, "items".to_string());
+        let action = helpful_npe::action_array_length();
+        let expr = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &resolver);
+        assert_eq!(expr.as_deref(), Some("items"));
+        assert_eq!(
+            helpful_npe::combine_opt(&action, expr.as_deref()),
+            "Cannot read the array length because \"items\" is null"
+        );
+
+        // Without the LVT entry the same bytecode falls back to <local3>.
+        let bare = MockResolver::new(HashMap::new(), HashMap::new());
+        let expr_bare = helpful_npe::null_expr_at_depth(&code, trap_bci, 0, &bare);
+        assert_eq!(expr_bare.as_deref(), Some("<local3>"));
     }
 }
