@@ -9675,6 +9675,15 @@ pub(crate) fn aastore_element_assignable(
         if cm.get_class(value_class_id).is_none() {
             return true;
         }
+        // Component is an INTERFACE → fail open. Proving a value implements an
+        // interface is unreliable in this VM (dynamic proxies, annotation
+        // proxies, and synthetic classes implement interfaces at runtime / by
+        // name, invisibly to the static hierarchy). A genuine ArrayStoreException
+        // essentially always involves a concrete-class component (Number[],
+        // String[], …); for an interface[] we don't risk a spurious throw.
+        if cm.get_class(comp_id).map_or(false, |c| c.is_interface()) {
+            return true;
+        }
         // Provably assignable iff value's class is a subclass/subtype of the
         // component class (interfaces handled by `is_subclass_of`).
         if cm.is_subclass_of(value_class_id, comp_id) {
@@ -9682,11 +9691,37 @@ pub(crate) fn aastore_element_assignable(
         }
     }
     // Both types resolved and the element is NOT a subtype of the component:
-    // a genuine ArrayStoreException. Two narrow escape hatches keep us from
-    // regressing on the VM's own imprecise synthetic types:
+    // potentially an ArrayStoreException. Several escape hatches keep us from
+    // throwing a SPURIOUS one on the VM's imprecise synthetic / dynamic-proxy
+    // types, whose true interface set is not recorded in the static hierarchy:
     //   - synthetic lambda/proxy class ids (>= 0x8000_0000) never appear in the
     //     loaded hierarchy, so `is_subclass_of` cannot vouch for them.
     if value_class_id.as_u32() >= 0x8000_0000 {
+        return true;
+    }
+    //   - dynamic proxies (java.lang.reflect.Proxy instances) and annotation
+    //     proxies (java/lang/annotation/AnnotationProxy) implement their target
+    //     interfaces at RUNTIME, invisibly to `is_subclass_of`. Storing one into
+    //     an interface[] is legal on a real JVM (regression: hibernate-smoke
+    //     stored an AnnotationProxy into an annotation-type array). Fail open.
+    {
+        let cm = shared.class_manager.read();
+        if let Some(cls) = cm.get_class(value_class_id) {
+            let vn: &str = &*cls.name;
+            if vn == "java/lang/annotation/AnnotationProxy"
+                || vn.ends_with("AnnotationProxy")
+                || vn.contains("$Proxy")
+            {
+                return true;
+            }
+        }
+    }
+    if class_chain_reaches_proxy_instance(shared, value_class_id) {
+        return true;
+    }
+    //   - synthetic classes whose interface relationships are name-based only
+    //     (HashMap$Entry, etc.) honour the existing name-based fallback.
+    if synthetic_implements(shared, value_class_id, comp_name) {
         return true;
     }
     false

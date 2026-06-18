@@ -6,17 +6,40 @@ angles**; this index is the consolidated map. Read it first.
 
 ## How many distinct bugs are here?
 
-Four of the docs are all manifestations of **one root-cause family** — the
-*GC-root-coverage-under-JIT* family — plus **two standalone bugs**. Net: **2 open
-GC-root manifestations, 1 open standalone bug, 1 latent standalone bug** (the
-other GC-root manifestations are already fixed on `dev`).
+After consolidation (full re-count 2026-06-18), the ~30 docs map to **one root-cause family
++ ~15 distinct standalone bugs**, of which **6 are already FIXED on `dev`**. Headline:
 
-That headline covers the original GC-root cluster. The folder also holds the
-**Hibernate** standalone cluster, the **bug-06** Spring reflection/annotation
-families (F5/F6), and — added 2026-06-18 — **7 more open, distinct suite bugs**
-consolidated from the per-suite trackers (see *Consolidated suite bug docs* below).
-Two of those (`springsuite-bug-04`, `spring-bug-10`) are themselves Family A
-manifestations seen from the Spring suite.
+**~12 distinct OPEN defects + 1 latent**, grouped as:
+
+1. **Family A — GC root coverage under JIT** (one root cause, several manifestations). Open members:
+   **A2** (register-only/native-return reclaim + non-moving-sweep walk) and **A4** (Fork6 FJP
+   multi-thread, gated). **A1/A3 are FIXED.** `springsuite-bug-04` and `spring-bug-10` are Family-A
+   manifestations seen from the Spring suite (same root cause, different entry points), and the
+   suite-scale field evidence in `jit-junit-discovery-reflection-corruption.md` is the same race.
+2. **Standalone B** — JUnit `@Timeout` interceptor double-`proceed()` (open).
+3. **Standalone C** — deep JIT→JIT recursion native-stack overflow (latent; only with an unmerged experiment).
+4. **bug-06 F5** — reflection native returns null vs a `Class`/`Method` (open, unattributed).
+5. **bug-06 F6 / `spring-bug-06` / `spring-bug-01`** — annotation **synthesis** mismatches +
+   `MergedAnnotations` hang + a ~2 GB OOM (all the annotation-proxy/synthesis cluster; open).
+6. **`spring-bug-08`** — serializable JDK-proxy round-trip (open).
+7. **`spring-bug-11` residual** — Groovy hang at `BEGIN` (the SIGSEGV half is FIXED via bug-12; open).
+8. **`kafka-bug-B`** — Mockito `mockStatic` + `mock`/`mockConstruction` dispatch (open, deep).
+9. **`kafka-bug-C`** — `WeakHashMap.values().stream()` infinite hang (open; pure-JDK 3-line repro).
+10. **Hibernate JTA** (Narayana XA completion + synthetic-socket loopback) — **two docs consolidated into one** (open layers).
+11. **Hibernate JAXB/ByteBuddy bootstrap slow** (class-loading/`MethodGraph` throughput; open).
+12. **Hibernate deserialized-`SessionFactory`-null** (`SessionFactoryRegistry` reconnect; open).
+13. **ES-HANG-01** (Lucene/`ESTestCase` JIT livelock), **ES-FAIL-03** (`catch (LinkageError)` not honored),
+    **ES-HANG-02** (RestClient embedded-HTTP-server hang) — three distinct ES-suite defects (open).
+
+FIXED docs kept for the trail: A1 (`jit-junit-discovery-…`), A3 (`SB-SUITE-CRASH-04`), the Hibernate
+JAXB class-load rescan storm (HIB-DEV-03), the JSON-function `al_state` SIGSEGV, the reversed
+stack-trace order, and the springrepos hang (3 fixes landed; `dev` passes the test).
+
+### Consolidations applied (2026-06-18)
+- The two Hibernate-JTA docs (`hibernate-jta-narayana-…` + `hibernate-jta-txcontrol-getinetaddress-per-class-report`)
+  described the **same** Narayana cluster → merged into `hibernate-jta-narayana-xa-completion-and-socket-loopback.md`;
+  the per-class file is now a redirect stub.
+- (2026-06-17) The two Fork6 precise-maps files were already merged into `fork6-fjp-multithread-jit-root-reclamation.md`.
 
 There is also a **second umbrella family** distinct from the GC-root one:
 [**JIT regalloc callee-saved-register clobber**](jit-regalloc-callee-saved-clobber-family.md)
@@ -223,7 +246,7 @@ zip-index hot spot. 🔴 open (handoff).
 Per-run bug reports relocated here from the (gitignored) `apps/hibernate-orm/cratonvm-bug-reports/dev-run-20260617/`:
 - [hibernate-json-function-sigsegv-al_state-foreign-receiver.md](hibernate-json-function-sigsegv-al_state-foreign-receiver.md) — ✅ **FIXED** (`al_state` ArrayList-layout guard; 4 `function.json.*` SIGSEGV classes).
 - [hibernate-throwable-stacktrace-order-reversed-FIXED.md](hibernate-throwable-stacktrace-order-reversed-FIXED.md) — ✅ **FIXED** (`getStackTrace()`/`printStackTrace()` were reversed).
-- [hibernate-jta-txcontrol-getinetaddress-per-class-report.md](hibernate-jta-txcontrol-getinetaddress-per-class-report.md) — per-class companion to the JTA Narayana known-issue (entry crash ✅ fixed; XA/socket layers 🔴 open).
+- ~~hibernate-jta-txcontrol-getinetaddress-per-class-report.md~~ — **consolidated 2026-06-18** into [hibernate-jta-narayana-xa-completion-and-socket-loopback.md](hibernate-jta-narayana-xa-completion-and-socket-loopback.md) (now a redirect stub).
 - [hibernate-hang-clusters-summary.md](hibernate-hang-clusters-summary.md) — overview of the 22 census hangs grouped by root cause (JAXB/class-load, ByteBuddy MethodGraph, JTA/socket).
 
 Also fixed on dev this run (no standalone doc — see commit): `Locale.toLanguageTag()` dropped all subtags for real Locales (`13e8c761`).

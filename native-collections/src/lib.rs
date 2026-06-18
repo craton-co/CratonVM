@@ -2140,6 +2140,30 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "equals", "(Ljava/lang/Object;)Z", |ctx, args| {
         asl_delegate_snapshot(ctx, args, "equals", "(Ljava/lang/Object;)Z")
     });
+    // REGRESSION FIX (hibernate-smoke): the synthetic view only had the
+    // no-arg `toArray()`; real code (e.g. Hibernate's metadata collector) calls
+    // the `toArray(T[])` overload and other List read methods, which 404'd as a
+    // NoSuchMethodError on this synthetic class. Delegate the remaining common
+    // read methods to a fresh snapshot ArrayList (which carries the real JDK
+    // implementations), matching the snapshot pattern above.
+    r.register(c, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
+    });
+    r.register(c, "containsAll", "(Ljava/util/Collection;)Z", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "containsAll", "(Ljava/util/Collection;)Z")
+    });
+    r.register(c, "listIterator", "()Ljava/util/ListIterator;", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "listIterator", "()Ljava/util/ListIterator;")
+    });
+    r.register(c, "listIterator", "(I)Ljava/util/ListIterator;", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "listIterator", "(I)Ljava/util/ListIterator;")
+    });
+    r.register(c, "subList", "(II)Ljava/util/List;", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "subList", "(II)Ljava/util/List;")
+    });
+    r.register(c, "spliterator", "()Ljava/util/Spliterator;", |ctx, args| {
+        asl_delegate_snapshot(ctx, args, "spliterator", "()Ljava/util/Spliterator;")
+    });
     // Structural mutators: fail loud rather than silently diverge from the
     // parent (the full JDK ripple-to-parent behavior is out of scope here).
     r.register(c, "add", "(Ljava/lang/Object;)Z", native_asl_unsupported);
