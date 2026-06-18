@@ -2190,20 +2190,32 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "spliterator", "()Ljava/util/Spliterator;", |ctx, args| {
         asl_delegate_snapshot(ctx, args, "spliterator", "()Ljava/util/Spliterator;")
     });
-    // Structural mutators: fail loud rather than silently diverge from the
-    // parent (the full JDK ripple-to-parent behavior is out of scope here).
-    r.register(c, "add", "(Ljava/lang/Object;)Z", native_asl_unsupported);
-    r.register(c, "add", "(ILjava/lang/Object;)V", native_asl_unsupported);
-    r.register(c, "remove", "(I)Ljava/lang/Object;", native_asl_unsupported);
-    r.register(c, "remove", "(Ljava/lang/Object;)Z", native_asl_unsupported);
-    r.register(c, "clear", "()V", native_asl_unsupported);
-    r.register(c, "addAll", "(Ljava/util/Collection;)Z", native_asl_unsupported);
-    r.register(
-        c,
-        "removeIf",
-        "(Ljava/util/function/Predicate;)Z",
-        native_asl_unsupported,
-    );
+    // Structural mutators: delegate through a snapshot ArrayList and write the
+    // result back into the parent slice (live-view contract — see
+    // `asl_delegate_mutating`). `subList(a,b).clear()` and friends now mutate the
+    // parent (Kafka `Acknowledgements.getAcknowledgementBatches` range-delete),
+    // instead of the former fail-loud `UnsupportedOperationException`.
+    r.register(c, "add", "(Ljava/lang/Object;)Z", |ctx, args| {
+        asl_delegate_mutating(ctx, args, "add", "(Ljava/lang/Object;)Z")
+    });
+    r.register(c, "add", "(ILjava/lang/Object;)V", |ctx, args| {
+        asl_delegate_mutating(ctx, args, "add", "(ILjava/lang/Object;)V")
+    });
+    r.register(c, "remove", "(I)Ljava/lang/Object;", |ctx, args| {
+        asl_delegate_mutating(ctx, args, "remove", "(I)Ljava/lang/Object;")
+    });
+    r.register(c, "remove", "(Ljava/lang/Object;)Z", |ctx, args| {
+        asl_delegate_mutating(ctx, args, "remove", "(Ljava/lang/Object;)Z")
+    });
+    r.register(c, "clear", "()V", |ctx, args| {
+        asl_delegate_mutating(ctx, args, "clear", "()V")
+    });
+    r.register(c, "addAll", "(Ljava/util/Collection;)Z", |ctx, args| {
+        asl_delegate_mutating(ctx, args, "addAll", "(Ljava/util/Collection;)Z")
+    });
+    r.register(c, "removeIf", "(Ljava/util/function/Predicate;)Z", |ctx, args| {
+        asl_delegate_mutating(ctx, args, "removeIf", "(Ljava/util/function/Predicate;)Z")
+    });
     r.set_category(__prev_cat);
 }
 
@@ -2380,10 +2392,98 @@ fn asl_delegate_snapshot(
     ctx.invoke_virtual(snap, method, descriptor, &args[1..])
 }
 
+/// Delegate a STRUCTURAL mutator (`add`/`remove`/`clear`/`addAll`/`removeIf`)
+/// through a snapshot `ArrayList` of the view's slice, then write the mutated
+/// slice back into the parent — honouring the `List.subList` live-view contract
+/// (mutations through the sublist write through to the parent). Reuses the real
+/// ArrayList mutator semantics + return value on the snapshot, then replaces the
+/// parent's `[offset, offset+size)` slice with the snapshot's new contents and
+/// resyncs the view's `size`/`expected`. Mirrors `asl_delegate_snapshot` (the
+/// read-side pattern); supersedes the former fail-loud `native_asl_unsupported`.
+///
+/// GC-safety: the snapshot is pinned across the (possibly allocating) mutator
+/// invoke; `this` is a rooted native-call arg so the parent is re-read through
+/// it after each allocation; the new backing array is allocated once and filled
+/// with no intervening allocation.
+fn asl_delegate_mutating(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+    method: &str,
+    descriptor: &str,
+) -> MethodCallResult {
+    let this = match args.first() {
+        Some(Value::Object(Some(o))) => *o,
+        _ => return Ok(Some(Value::Object(None))),
+    };
+    let (parent, _offset, _size, expected) = match asl_state(ctx, this) {
+        Some(s) => s,
+        None => return Ok(Some(Value::Object(None))),
+    };
+    asl_check_comod(ctx, parent, expected)?;
+
+    // Materialize the current slice as a real ArrayList and run the mutator on
+    // it (reuses the real-JDK semantics + return value). Pin the snapshot across
+    // the invoke, which may allocate/GC.
+    let buf = asl_snapshot(ctx, this)?;
+    let size0 = ctx.array_length(buf) as i32;
+    let snap = alloc_arraylist_with(ctx, buf, size0);
+    let pin = ctx.pin_native_root(snap);
+    let ret = ctx.invoke_virtual(snap, method, descriptor, &args[1..])?;
+
+    // Allocate the replacement parent backing once, then re-read every object
+    // ref (the allocations above may have moved them) before the alloc-free copy.
+    let (parent, offset, size, _) = match asl_state(ctx, this) {
+        Some(s) => s,
+        None => {
+            ctx.unpin_native_roots(pin);
+            return Ok(ret);
+        }
+    };
+    let snap_r = ctx.read_native_pin(pin, snap);
+    let (_, new_size) = al_state(ctx, snap_r);
+    let (_, psize) = al_state(ctx, parent);
+    let new_psize = (psize - size + new_size).max(0);
+    let new_buf = alloc_ref_array(ctx, std::cmp::max(new_psize as usize, AL_DEFAULT_CAPACITY));
+
+    let snap_r = ctx.read_native_pin(pin, snap);
+    let (parent, offset, size, _) = asl_state(ctx, this).unwrap_or((parent, offset, size, 0));
+    let (sdata, new_size) = al_state(ctx, snap_r);
+    let (pdata, psize) = al_state(ctx, parent);
+
+    let mut w = 0usize;
+    if let Some(pd) = pdata {
+        for i in 0..(offset as usize) {
+            let v = ctx.get_array_element(pd, i);
+            ctx.set_array_element(new_buf, w, v);
+            w += 1;
+        }
+    }
+    if let Some(sd) = sdata {
+        for k in 0..(new_size as usize) {
+            let v = ctx.get_array_element(sd, k);
+            ctx.set_array_element(new_buf, w, v);
+            w += 1;
+        }
+    }
+    if let Some(pd) = pdata {
+        for i in ((offset + size) as usize)..(psize as usize) {
+            let v = ctx.get_array_element(pd, i);
+            ctx.set_array_element(new_buf, w, v);
+            w += 1;
+        }
+    }
+    al_set_data(ctx, parent, new_buf);
+    al_set_size(ctx, parent, w as i32);
+    ctx.set_field(this, ASL_FIELD_SIZE, Value::Int(new_size));
+    ctx.set_field(this, ASL_FIELD_EXPECTED, Value::Int(w as i32));
+    ctx.unpin_native_roots(pin);
+    Ok(ret)
+}
+
+#[allow(dead_code)]
 fn native_asl_unsupported(_ctx: &mut dyn NativeContext, _args: &[Value]) -> MethodCallResult {
-    // Fail loud (fix item 6): structural mutation of the backed sublist view is
-    // not supported here; the alternative — mutating only the view's own state —
-    // would silently diverge from the parent, exactly the bug this fix removes.
+    // Retained for reference: the former fail-loud stopgap. Structural mutation
+    // is now delegated through `asl_delegate_mutating` (live-view contract).
     Err(cratonvm_types::error::RuntimeError::UnsupportedOperationException {
         message: "structural modification of ArrayList.subList view is not supported".to_string(),
     }
