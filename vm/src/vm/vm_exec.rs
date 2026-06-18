@@ -9350,7 +9350,13 @@ fn invoke_on_class_shared_inner(
                         // the real JDK bytecode reads `this.applicationStartup` which may be
                         // null when ApplicationStartup.DEFAULT fails to initialize (nested-JAR
                         // classloading). Force the native that returns a no-op synthetic object.
-                        || (matches!(
+                        //
+                        // real-cdi-bean-container increment 2 (Step 2, gated): under
+                        // `CRATONVM_REAL_SPRING_STARTUP` the no-op natives are not
+                        // registered and the real `ApplicationStartup.DEFAULT`
+                        // `<clinit>` runs, so do NOT force-shadow the real getter.
+                        || (!crate::runtime::env_cache::real_spring_startup()
+                            && matches!(
                                 class_name,
                                 "org/springframework/context/support/AbstractApplicationContext"
                                 | "org/springframework/context/support/GenericApplicationContext"
@@ -9386,7 +9392,14 @@ fn invoke_on_class_shared_inner(
                         // Spring Framework StartupStep methods — ApplicationStartup.start(String)
                         // and StartupStep.tag/end. The real bytecode requires DefaultApplicationStartup
                         // which may not be loadable from nested JARs.
-                        || (matches!(
+                        //
+                        // real-cdi-bean-container increment 2 (Step 2, gated): under
+                        // `CRATONVM_REAL_SPRING_STARTUP` the no-op startup-metrics
+                        // natives are not registered and the real
+                        // `DefaultApplicationStartup` / `DefaultStartupStep` bytecode
+                        // runs, so do NOT force-shadow those methods.
+                        || (!crate::runtime::env_cache::real_spring_startup()
+                            && matches!(
                                 class_name,
                                 "org/springframework/core/metrics/ApplicationStartup"
                                 | "org/springframework/core/metrics/DefaultApplicationStartup"

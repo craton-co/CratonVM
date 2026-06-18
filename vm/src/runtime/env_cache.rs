@@ -385,6 +385,37 @@ pub fn strict_swallows() -> bool {
     })
 }
 
+// ── `CRATONVM_REAL_SPRING_STARTUP` — Spring startup-metrics real-path gate ──
+
+/// `CRATONVM_REAL_SPRING_STARTUP` — opt-in gate (default OFF) that routes
+/// Spring's `org.springframework.core.metrics` startup-metrics subsystem to its
+/// **real** bytecode instead of the `spring_startup_bootstrap.rs` no-op shim.
+///
+/// real-cdi-bean-container increment 2 (Step 2). When this is set:
+///   * the no-op `getApplicationStartup` / `start` / `tag` / `end` / `getName` /
+///     `getTags` / `getId` / `getParentId` natives are NOT registered (see
+///     `native-builtins/src/lib.rs`), so the real `DefaultApplicationStartup` /
+///     `DefaultStartupStep` methods run;
+///   * the `check_override` force arms that shadowed those methods with the
+///     no-op natives are suppressed (see `vm_exec.rs`);
+///   * `org/springframework/core/metrics/ApplicationStartup` is **removed** from
+///     the lenient `<clinit>`-swallow allowlist and its `post_clinit_fixup` arm
+///     is skipped (see `vm_util.rs`), so the real `ApplicationStartup.<clinit>`
+///     → `new DefaultApplicationStartup` → `DefaultApplicationStartup.<clinit>`
+///     → `new DefaultStartupStep` → `new DefaultTags` chain runs and any failure
+///     surfaces per JVMS §5.5 instead of being backfilled with a synthetic
+///     `DEFAULT`.
+///
+/// **Default OFF**: when unset the existing swallow + `post_clinit_fixup`
+/// ApplicationStartup arm and the functional no-op natives remain the default
+/// behavior byte-for-byte, so the working Spring Boot path cannot regress.
+/// Cached once for the process lifetime.
+#[inline]
+pub fn real_spring_startup() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("CRATONVM_REAL_SPRING_STARTUP").is_some())
+}
+
 // ── `CRATONVM_REAL` — synthetic-stub differential switch ─────────────────
 
 /// Parsed, process-lifetime view of the `CRATONVM_REAL` (and legacy
