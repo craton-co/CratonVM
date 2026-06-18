@@ -856,6 +856,25 @@ fn native_create_event_reader_from_source(
             }
         }
     }
+    // DOMSource path: serialize the wrapped DOM node back to XML text via the
+    // public DOM API, then build the same cursor reader. keycloak's
+    // `SamlProtocolUtils` re-reads an already-parsed DOM element as a StAX event
+    // stream (`createXMLEventReader(new DOMSource(element))`); without this the
+    // call fell through to the unsupported-Source error.
+    if src_cls == "javax/xml/transform/dom/DOMSource" {
+        if let Ok(Some(Value::Object(Some(node)))) = ctx.invoke(
+            "javax/xml/transform/dom/DOMSource",
+            "getNode",
+            "()Lorg/w3c/dom/Node;",
+            &[Value::Object(Some(source))],
+        ) {
+            let xml = serialize_dom_node(ctx, node, 0);
+            if !xml.trim().is_empty() {
+                let cursor = make_cursor_reader(ctx, xml.as_bytes())?;
+                return wrap_in_event_reader(ctx, cursor);
+            }
+        }
+    }
     Err(MethodCallFailed::InternalError(VmError::Runtime(
         RuntimeError::NullPointerException {
             message: Some(format!(
@@ -863,6 +882,163 @@ fn native_create_event_reader_from_source(
             )),
         },
     )))
+}
+
+/// XML-escape text node content.
+fn xml_escape_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// XML-escape an attribute value (also quotes).
+fn xml_escape_attr(s: &str) -> String {
+    xml_escape_text(s).replace('"', "&quot;")
+}
+
+/// Read a `()Ljava/lang/String;` DOM accessor, returning "" on null/failure.
+fn dom_str(ctx: &mut dyn NativeContext, node: ObjectRef, method: &str) -> String {
+    match ctx.invoke_virtual(node, method, "()Ljava/lang/String;", &[]) {
+        Ok(Some(Value::Object(Some(s)))) => ctx.read_string(s).unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Read a `()I` DOM accessor, returning 0 on failure.
+fn dom_int(ctx: &mut dyn NativeContext, node: ObjectRef, method: &str) -> i32 {
+    match ctx.invoke_virtual(node, method, "()I", &[]) {
+        Ok(Some(v)) => v.as_int().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Serialize a synthetic DOM node back to XML text using only the public DOM
+/// API (so it does not depend on the internal node layout). Used by the
+/// `createXMLEventReader(DOMSource)` path. `depth` guards pathological recursion.
+fn serialize_dom_node(ctx: &mut dyn NativeContext, node: ObjectRef, depth: u32) -> String {
+    if depth > 256 {
+        return String::new();
+    }
+    let ntype = match ctx.invoke_virtual(node, "getNodeType", "()S", &[]) {
+        Ok(Some(v)) => v.as_int().unwrap_or(0),
+        _ => 0,
+    };
+    match ntype {
+        1 => {
+            // ELEMENT
+            let mut tag = dom_str(ctx, node, "getTagName");
+            if tag.is_empty() {
+                tag = dom_str(ctx, node, "getNodeName");
+            }
+            if tag.is_empty() {
+                return String::new();
+            }
+            let mut out = String::new();
+            out.push('<');
+            out.push_str(&tag);
+            // attributes (xmlns declarations are ordinary attrs here)
+            if let Ok(Some(Value::Object(Some(attrs)))) =
+                ctx.invoke_virtual(node, "getAttributes", "()Lorg/w3c/dom/NamedNodeMap;", &[])
+            {
+                let n = dom_int(ctx, attrs, "getLength");
+                for i in 0..n {
+                    if let Ok(Some(Value::Object(Some(attr)))) = ctx.invoke_virtual(
+                        attrs,
+                        "item",
+                        "(I)Lorg/w3c/dom/Node;",
+                        &[Value::Int(i)],
+                    ) {
+                        let an = dom_str(ctx, attr, "getNodeName");
+                        let av = dom_str(ctx, attr, "getNodeValue");
+                        if !an.is_empty() {
+                            out.push(' ');
+                            out.push_str(&an);
+                            out.push_str("=\"");
+                            out.push_str(&xml_escape_attr(&av));
+                            out.push('"');
+                        }
+                    }
+                }
+            }
+            // children
+            let mut inner = String::new();
+            if let Ok(Some(Value::Object(Some(nl)))) =
+                ctx.invoke_virtual(node, "getChildNodes", "()Lorg/w3c/dom/NodeList;", &[])
+            {
+                let cn = dom_int(ctx, nl, "getLength");
+                for i in 0..cn {
+                    if let Ok(Some(Value::Object(Some(child)))) = ctx.invoke_virtual(
+                        nl,
+                        "item",
+                        "(I)Lorg/w3c/dom/Node;",
+                        &[Value::Int(i)],
+                    ) {
+                        inner.push_str(&serialize_dom_node(ctx, child, depth + 1));
+                    }
+                }
+            }
+            if inner.is_empty() {
+                out.push_str("></");
+                out.push_str(&tag);
+                out.push('>');
+            } else {
+                out.push('>');
+                out.push_str(&inner);
+                out.push_str("</");
+                out.push_str(&tag);
+                out.push('>');
+            }
+            out
+        }
+        // TEXT / CDATA
+        3 | 4 => xml_escape_text(&dom_str(ctx, node, "getNodeValue")),
+        // DOCUMENT: serialize element children
+        9 => {
+            let mut out = String::new();
+            if let Ok(Some(Value::Object(Some(nl)))) =
+                ctx.invoke_virtual(node, "getChildNodes", "()Lorg/w3c/dom/NodeList;", &[])
+            {
+                let cn = dom_int(ctx, nl, "getLength");
+                for i in 0..cn {
+                    if let Ok(Some(Value::Object(Some(child)))) = ctx.invoke_virtual(
+                        nl,
+                        "item",
+                        "(I)Lorg/w3c/dom/Node;",
+                        &[Value::Int(i)],
+                    ) {
+                        out.push_str(&serialize_dom_node(ctx, child, depth + 1));
+                    }
+                }
+            }
+            out
+        }
+        // COMMENT and others: skip
+        _ => String::new(),
+    }
+}
+
+/// `XMLInputFactory.createFilteredReader(XMLEventReader, EventFilter)` — mirror the
+/// real `XMLInputFactoryImpl`, which returns `new EventFilterSupport(reader, filter)`.
+/// Our reader is already a real JDK `XMLEventReaderImpl` (see `wrap_in_event_reader`),
+/// and `EventFilterSupport` is plain JDK bytecode that delegates to it and drops the
+/// events the filter rejects — so this runs entirely on real classes. Without the
+/// native the abstract base method raised `AbstractMethodError` (keycloak SAML parsing
+/// via `StaxParserUtil`, 4 CV-only suite classes).
+fn native_create_filtered_event_reader(
+    ctx: &mut dyn NativeContext,
+    args: &[Value],
+) -> MethodCallResult {
+    let reader = args.get(1).copied().unwrap_or(Value::Object(None));
+    let filter = args.get(2).copied().unwrap_or(Value::Object(None));
+    match ctx.new_object_initialized(
+        "com/sun/xml/internal/stream/EventFilterSupport",
+        "(Ljavax/xml/stream/XMLEventReader;Ljavax/xml/stream/EventFilter;)V",
+        &[reader, filter],
+    ) {
+        Ok(Some(v)) => Ok(Some(v)),
+        // Fall back to the unfiltered reader rather than AbstractMethodError.
+        _ => Ok(Some(reader)),
+    }
 }
 
 /// `XMLStreamReader.getPrefix()` — current element's prefix ("" when
@@ -1218,6 +1394,15 @@ pub fn register(registry: &mut NativeMethodRegistry) {
         "createXMLEventReader",
         "(Ljavax/xml/transform/Source;)Ljavax/xml/stream/XMLEventReader;",
         native_create_event_reader_from_source,
+    );
+    // createFilteredReader(XMLEventReader, EventFilter) — abstract on the base
+    // XMLInputFactory; without this native our synthetic factory raised
+    // AbstractMethodError. Mirrors the real impl (`new EventFilterSupport(...)`).
+    registry.register(
+        "javax/xml/stream/XMLInputFactory",
+        "createFilteredReader",
+        "(Ljavax/xml/stream/XMLEventReader;Ljavax/xml/stream/EventFilter;)Ljavax/xml/stream/XMLEventReader;",
+        native_create_filtered_event_reader,
     );
 
     // Reader cursor methods (interface-keyed; native dispatch matches on
