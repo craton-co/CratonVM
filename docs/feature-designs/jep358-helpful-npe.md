@@ -1,5 +1,60 @@
 # JEP 358 — Helpful NullPointerException Messages
 
+> **Increment 2 landed (2026-06-18).** Extends the JEP-358 message shape from
+> the increment-1 invoke site to the remaining interpreter null-deref opcodes,
+> and replaces the synthetic `<localN>` spelling with real source names when a
+> `LocalVariableTable` is present. What shipped in increment 2:
+> - **Action halves for every non-invoke null-deref opcode** in a set of small
+>   `helpful_npe::action_*` builders (`exceptions.rs`): `action_read_field`
+>   (`Cannot read field "x"`), `action_assign_field` (`Cannot assign field
+>   "x"`), `action_array_length` (`Cannot read the array length`),
+>   `action_array_load` / `action_array_store` (`Cannot load from <T> array` /
+>   `Cannot store to <T> array`, with `<T>` ∈ {int,long,float,double,byte,
+>   char,short,boolean,object} via the new `ArrayElemKind` enum), `action_monitor`
+>   (`Cannot enter synchronized block`), `action_throw` (`Cannot throw
+>   exception`). All match the HotSpot `BytecodeUtils` wording.
+> - **Generalized expression analysis.** `null_expr_for_invoke_receiver` now
+>   delegates to a new `null_expr_at_depth(code, trap_bci, depth_below_top,
+>   resolver)` that reconstructs the null operand at an arbitrary operand-stack
+>   depth (0 = top-of-stack for getfield/arraylength/monitor/athrow, 1 = the
+>   putfield receiver and the `*aload` array, 2 = the `*astore` array). Reuses
+>   the same increment-1 backward `simulate_to` walk + `describe_producer`.
+> - **`combine_opt`** emits the action-only string (no fabricated `because`
+>   clause) when the operand can't be classified — matching HotSpot, which
+>   omits the clause rather than printing "the receiver". (The invoke site keeps
+>   the increment-1 `combine`, whose `None` arm reads "because the receiver is
+>   null", for backward compatibility with its shipped tests.)
+> - **Interpreter routing** (`vm/src/runtime/interpreter.rs`): `getfield`
+>   (~8003), `putfield` (~8250), the `*aload` family (~7040), `aastore`
+>   (~7110), the `iastore`/`fastore`/`bastore`/`castore`/`sastore` family
+>   (~7165), `lastore` (~7205), `dastore` (~7235), `arraylength` (~8690),
+>   `athrow`-null (~9010), `monitorenter` (~9235) and `monitorexit` (~9320) now
+>   build the JEP-358 message via the shared `helpful_npe_opcode_message` /
+>   `helpful_npe_opcode_message_parts` glue (the `_parts` form is `thread`-free
+>   so it can run inside a `pop_object_ref_ctx_with` closure).
+> - **Real `LocalVariableTable` names.** `CpPoolResolver` now carries the
+>   trapping method's name+descriptor and implements `local_name(slot, bci)` by
+>   scanning the method's `Code.LocalVariableTable` attribute (already parsed by
+>   `cratonvm_reader`) for an entry whose `[start_pc, start_pc+length)` live
+>   range covers `bci` — rendering the real source name (e.g. `items`) in place
+>   of `<localN>`. Falls back to `<localN>` / `this` when no LVT is present.
+> - **Default-off flag.** All increment-2 opcode routing is gated behind
+>   `CRATONVM_HELPFUL_NPE_OPCODES` (`env_cache::helpful_npe_opcodes()`, default
+>   OFF). With the flag unset the default path keeps the exact prior ad-hoc
+>   null-NPE strings, so no message string regresses; setting it to anything
+>   non-empty / non-`0` switches the covered opcodes to the JEP-358 shape. The
+>   increment-1 invoke-site message is unconditionally on and unaffected.
+> - **Tests:** `exceptions.rs` `mod helpful_npe_tests` gained
+>   `increment2_action_shapes`, `combine_opt_action_only_when_unknown`,
+>   `getfield_read_receiver_is_field_of_this`, `arraylength_of_local`,
+>   `array_store_to_local`, `monitorenter_of_local`, and
+>   `lvt_name_resolves_when_present` (asserts the LVT name renders when present
+>   and falls back to `<local3>` when absent).
+>
+> **Still not done:** step 6 JIT-NPE parity (deopt-gated) and the
+> `-XX:±ShowCodeDetailsInExceptionMessages` HotSpot opt-out spelling (the
+> increment-2 `CRATONVM_HELPFUL_NPE_OPCODES` env flag is the interim knob).
+
 > **Increment 1 landed (2026-06-18).** Steps 1–5 of this doc are implemented;
 > step 6 (JIT-NPE parity) is intentionally skipped (deopt-gated). What shipped:
 > - **Action half + null-expression half at the interpreter null-receiver

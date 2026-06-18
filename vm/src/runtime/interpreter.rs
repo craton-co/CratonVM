@@ -7023,10 +7023,44 @@ fn execute_instruction(
         | Instruction::Laload
         | Instruction::Daload => {
             let index = thread.frames[frame_idx].stack.pop_int()?;
-            let array_ref = pop_object_ref_ctx(
-                &mut thread.frames[frame_idx].stack,
-                Some("Cannot load from null array"),
-            )?;
+            // JEP 358 increment 2: `Cannot load from <T> array because
+            // "<expr>" is null`. Source bytecode stack is `[..., arrayref,
+            // index]` so the array is one slot below the top (depth 1). The
+            // element kind comes from the opcode itself.
+            let array_ref = if crate::runtime::env_cache::helpful_npe_opcodes() {
+                use crate::runtime::exceptions::helpful_npe::ArrayElemKind;
+                let elem = match instruction {
+                    Instruction::Iaload => ArrayElemKind::Int,
+                    Instruction::Laload => ArrayElemKind::Long,
+                    Instruction::Faload => ArrayElemKind::Float,
+                    Instruction::Daload => ArrayElemKind::Double,
+                    Instruction::Aaload => ArrayElemKind::Object,
+                    Instruction::Baload => ArrayElemKind::Byte,
+                    Instruction::Caload => ArrayElemKind::Char,
+                    _ => ArrayElemKind::Short, // Saload
+                };
+                let action = crate::runtime::exceptions::helpful_npe::action_array_load(elem);
+                let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+                let npe_cid = thread.frames[frame_idx].class_id;
+                let npe_mname = thread.frames[frame_idx].method_name_arc();
+                let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+                let npe_bci = thread.frames[frame_idx].last_instr_pc;
+                pop_object_ref_ctx_with(
+                    &mut thread.frames[frame_idx].stack,
+                    &shared.heap,
+                    || {
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci,
+                            &action, 1,
+                        )
+                    },
+                )?
+            } else {
+                pop_object_ref_ctx(
+                    &mut thread.frames[frame_idx].stack,
+                    Some("Cannot load from null array"),
+                )?
+            };
             let value = shared
                 .heap
                 .get_array_element(array_ref, index as usize) // Widening: index conversion
@@ -7086,7 +7120,27 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("aastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // JEP 358 increment 2: `Cannot store to object array because
+            // "<expr>" is null`. Source stack `[..., arrayref, index, value]`
+            // → array at depth 2.
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                if jep358 {
+                    let action = crate::runtime::exceptions::helpful_npe::action_array_store(
+                        crate::runtime::exceptions::helpful_npe::ArrayElemKind::Object,
+                    );
+                    helpful_npe_opcode_message_parts(
+                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
+                    )
+                } else {
+                    format!("aastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)
+                }
+            })?;
             // JVMS §aastore covariance check: a reference store into an
             // Object[]-family array whose element's runtime type is NOT
             // assignment-compatible with the array's component type throws
@@ -7136,7 +7190,32 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // JEP 358 increment 2: array at depth 2 (`[..., arrayref, index,
+            // value]`); element kind from the opcode.
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                if jep358 {
+                    use crate::runtime::exceptions::helpful_npe::ArrayElemKind;
+                    let elem = match instruction {
+                        Instruction::Iastore => ArrayElemKind::Int,
+                        Instruction::Fastore => ArrayElemKind::Float,
+                        Instruction::Bastore => ArrayElemKind::Byte,
+                        Instruction::Castore => ArrayElemKind::Char,
+                        _ => ArrayElemKind::Short, // Sastore
+                    };
+                    let action = crate::runtime::exceptions::helpful_npe::action_array_store(elem);
+                    helpful_npe_opcode_message_parts(
+                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
+                    )
+                } else {
+                    format!("Xastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)
+                }
+            })?;
             // bc math-ec 0x4 smear hunt — see the Lastore twin below.
             if arrstore_enabled() {
                 arrstore_check(shared, thread, array_ref, index, "iastore");
@@ -7163,7 +7242,25 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // JEP 358 increment 2: long array store, array at depth 2.
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                if jep358 {
+                    let action = crate::runtime::exceptions::helpful_npe::action_array_store(
+                        crate::runtime::exceptions::helpful_npe::ArrayElemKind::Long,
+                    );
+                    helpful_npe_opcode_message_parts(
+                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
+                    )
+                } else {
+                    format!("lastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)
+                }
+            })?;
             // bc math-ec 0x4 smear hunt (CRATONVM_DBG_ARRSTORE): validate the
             // receiver's header AT THE WRITE. A stale (GC-moved) long[] ref
             // points at reused memory whose "header" is garbage math data —
@@ -7186,7 +7283,25 @@ fn execute_instruction(
             let _diag_pc = thread.frames[frame_idx].pc;
             let _diag_method = thread.frames[frame_idx].method_name().to_string();
             let _diag_class = thread.frames[frame_idx].class_name().to_string();
-            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || format!("dastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc))?;
+            // JEP 358 increment 2: double array store, array at depth 2.
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
+            let array_ref = pop_object_ref_ctx_with(&mut thread.frames[frame_idx].stack, &shared.heap, || {
+                if jep358 {
+                    let action = crate::runtime::exceptions::helpful_npe::action_array_store(
+                        crate::runtime::exceptions::helpful_npe::ArrayElemKind::Double,
+                    );
+                    helpful_npe_opcode_message_parts(
+                        shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci, &action, 2,
+                    )
+                } else {
+                    format!("dastore in {}.{} pc={}", _diag_class, _diag_method, _diag_pc)
+                }
+            })?;
             shared
                 .heap
                 .set_array_element(array_ref, index as usize, Value::Double(d))
@@ -7983,15 +8098,45 @@ fn execute_instruction(
             // (rare) null-receiver NPE message and the (cached-off) debug
             // blocks below. Resolve it LAZILY in those paths instead of on
             // every getfield (the single most common opcode in OO bytecode).
+            // JEP 358 increment 2 (opt-in via CRATONVM_HELPFUL_NPE_OPCODES):
+            // emit the HotSpot shape `Cannot read field "x" because "<expr>"
+            // is null`. The getfield receiver is at the top of the operand
+            // stack (depth 0). Pre-extract the `thread`-independent frame
+            // parts so the closure (which holds a &mut borrow of the operand
+            // stack) can build the message without re-borrowing `thread`.
+            // Only clone the frame parts (Arc bumps) when the opt-in flag is
+            // set — keep the default getfield path (the hottest OO opcode)
+            // allocation-free.
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_parts = if jep358 {
+                Some((
+                    Arc::clone(&thread.frames[frame_idx].code),
+                    thread.frames[frame_idx].method_name_arc(),
+                    thread.frames[frame_idx].method_descriptor_arc(),
+                    thread.frames[frame_idx].last_instr_pc,
+                ))
+            } else {
+                None
+            };
             let obj_ref = pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
                 &shared.heap,
-                || format!(
-                    "Cannot read field '{}' because the object is null",
-                    resolve_field_name(shared, current_class_id, *index)
-                        .as_deref()
-                        .unwrap_or("?")
-                ),
+                || {
+                    let field_name = resolve_field_name(shared, current_class_id, *index);
+                    if let Some((code, mname, mdesc, bci)) = &npe_parts {
+                        let action = crate::runtime::exceptions::helpful_npe::action_read_field(
+                            field_name.as_deref().unwrap_or("?"),
+                        );
+                        helpful_npe_opcode_message_parts(
+                            shared, current_class_id, code, mname, mdesc, *bci, &action, 0,
+                        )
+                    } else {
+                        format!(
+                            "Cannot read field '{}' because the object is null",
+                            field_name.as_deref().unwrap_or("?")
+                        )
+                    }
+                },
             )?;
             let field = resolve_field_ref(shared, current_class_id, *index)?;
             // Perf: ALL of the per-getfield diagnostic blocks below are gated
@@ -8283,15 +8428,42 @@ fn execute_instruction(
             // Perf: resolve the field name LAZILY (it locks + allocates) — see
             // the matching Getfield comment. Only the rare null-NPE message and
             // cached-off debug blocks need it; putfield is a hot opcode.
+            // JEP 358 increment 2: `Cannot assign field "x" because "<expr>"
+            // is null`. In the source bytecode the putfield stack is
+            // `[..., objectref, value]`, so the receiver sits one slot below
+            // the top (the stored value) — depth 1. Clone the frame parts
+            // only when the opt-in flag is set (putfield is a hot opcode).
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_parts = if jep358 {
+                Some((
+                    Arc::clone(&thread.frames[frame_idx].code),
+                    thread.frames[frame_idx].method_name_arc(),
+                    thread.frames[frame_idx].method_descriptor_arc(),
+                    thread.frames[frame_idx].last_instr_pc,
+                ))
+            } else {
+                None
+            };
             let obj_ref = pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
                 &shared.heap,
-                || format!(
-                    "Cannot write field '{}' because the object is null",
-                    resolve_field_name(shared, current_class_id, *index)
-                        .as_deref()
-                        .unwrap_or("?")
-                ),
+                || {
+                    let field_name = resolve_field_name(shared, current_class_id, *index);
+                    if let Some((code, mname, mdesc, bci)) = &npe_parts {
+                        let action =
+                            crate::runtime::exceptions::helpful_npe::action_assign_field(
+                                field_name.as_deref().unwrap_or("?"),
+                            );
+                        helpful_npe_opcode_message_parts(
+                            shared, current_class_id, code, mname, mdesc, *bci, &action, 1,
+                        )
+                    } else {
+                        format!(
+                            "Cannot write field '{}' because the object is null",
+                            field_name.as_deref().unwrap_or("?")
+                        )
+                    }
+                },
             );
             // CRATONVM_DBG_NULLTHIS — dump the Java frame stack + current-frame
             // locals when a putfield pops a null receiver. Diagnoses the
@@ -8653,11 +8825,31 @@ fn execute_instruction(
             let current_class_name = thread.frames[frame_idx].class_name().to_string();
             let mname = thread.frames[frame_idx].method_name().to_string();
             let mdesc = thread.frames[frame_idx].method_descriptor().to_string();
+            // JEP 358 increment 2: `Cannot read the array length because
+            // "<expr>" is null`. The array ref is at the top of the operand
+            // stack (depth 0).
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
             // S111r14 diag: print full Java stack trace on arraylength failure
             let arr_ref = match pop_object_ref_ctx_with(
                 &mut thread.frames[frame_idx].stack,
                 &shared.heap,
-                || format!("arraylength null (in {current_class_name}.{mname}{mdesc} pc={pc})"),
+                || {
+                    if jep358 {
+                        let action =
+                            crate::runtime::exceptions::helpful_npe::action_array_length();
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci,
+                            &action, 0,
+                        )
+                    } else {
+                        format!("arraylength null (in {current_class_name}.{mname}{mdesc} pc={pc})")
+                    }
+                },
             ) {
                 Ok(r) => r,
                 Err(e) => {
@@ -8946,10 +9138,20 @@ fn execute_instruction(
                     return Err(MethodCallFailed::ExceptionThrown(obj_ref));
                 }
                 Value::Object(None) => {
-                    return Err(RuntimeError::NullPointerException {
-                        message: Some("cannot throw null".to_string()),
-                    }
-                    .into());
+                    // JEP 358 increment 2: `Cannot throw exception because
+                    // "<expr>" is null`. The thrown ref was at the top of the
+                    // operand stack (depth 0). Falls back to the legacy
+                    // `cannot throw null` text when the flag is off.
+                    let message = if crate::runtime::env_cache::helpful_npe_opcodes() {
+                        let action =
+                            crate::runtime::exceptions::helpful_npe::action_throw();
+                        Some(helpful_npe_opcode_message(
+                            shared, thread, frame_idx, &action, 0,
+                        ))
+                    } else {
+                        Some("cannot throw null".to_string())
+                    };
+                    return Err(RuntimeError::NullPointerException { message }.into());
                 }
                 _ => {
                     return Err(VmError::Internal {
@@ -9178,6 +9380,15 @@ fn execute_instruction(
         // `thread.frames[..]`-borrow-while-also-mut-borrowing-stack issue.
         Instruction::Monitorenter => {
             let pc_snap = thread.frames[frame_idx].pc;
+            // JEP 358 increment 2: `Cannot enter synchronized block because
+            // "<expr>" is null`. The monitor object is at the top of the
+            // operand stack (depth 0).
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
             let obj_ref = {
                 // Capture &str borrows of class/method into the closure
                 // without allocating Strings on the hot path. The frame
@@ -9193,12 +9404,21 @@ fn execute_instruction(
                 let mth_ptr = mth as *const str;
                 let stack = &mut thread.frames[frame_idx].stack;
                 pop_object_ref_ctx_with(stack, &shared.heap, || {
-                    // SAFETY: cls/mth originate from `frame_ref.inner`,
-                    // which is not mutated by stack ops; the pointers are
-                    // valid for the duration of the closure call.
-                    let cls = unsafe { &*cls_ptr };
-                    let mth = unsafe { &*mth_ptr };
-                    format!("monitorenter in {cls}.{mth} pc={pc_snap}")
+                    if jep358 {
+                        let action =
+                            crate::runtime::exceptions::helpful_npe::action_monitor();
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci,
+                            &action, 0,
+                        )
+                    } else {
+                        // SAFETY: cls/mth originate from `frame_ref.inner`,
+                        // which is not mutated by stack ops; the pointers are
+                        // valid for the duration of the closure call.
+                        let cls = unsafe { &*cls_ptr };
+                        let mth = unsafe { &*mth_ptr };
+                        format!("monitorenter in {cls}.{mth} pc={pc_snap}")
+                    }
                 })?
             };
             // Snapshot the JFR-enabled flag *before* the acquire so the
@@ -9259,17 +9479,33 @@ fn execute_instruction(
         }
         Instruction::Monitorexit => {
             let pc_snap = thread.frames[frame_idx].pc;
+            // JEP 358 increment 2: monitor object at top of stack (depth 0).
+            let jep358 = crate::runtime::env_cache::helpful_npe_opcodes();
+            let npe_code = Arc::clone(&thread.frames[frame_idx].code);
+            let npe_cid = thread.frames[frame_idx].class_id;
+            let npe_mname = thread.frames[frame_idx].method_name_arc();
+            let npe_mdesc = thread.frames[frame_idx].method_descriptor_arc();
+            let npe_bci = thread.frames[frame_idx].last_instr_pc;
             let obj_ref = {
                 let frame_ref = &thread.frames[frame_idx];
                 let cls_ptr = frame_ref.class_name() as *const str;
                 let mth_ptr = frame_ref.method_name() as *const str;
                 let stack = &mut thread.frames[frame_idx].stack;
                 pop_object_ref_ctx_with(stack, &shared.heap, || {
-                    // SAFETY: see Monitorenter — frame metadata is stable
-                    // across the stack pop performed by `pop_object_ref_ctx_with`.
-                    let cls = unsafe { &*cls_ptr };
-                    let mth = unsafe { &*mth_ptr };
-                    format!("monitorexit in {cls}.{mth} pc={pc_snap}")
+                    if jep358 {
+                        let action =
+                            crate::runtime::exceptions::helpful_npe::action_monitor();
+                        helpful_npe_opcode_message_parts(
+                            shared, npe_cid, &npe_code, &npe_mname, &npe_mdesc, npe_bci,
+                            &action, 0,
+                        )
+                    } else {
+                        // SAFETY: see Monitorenter — frame metadata is stable
+                        // across the stack pop performed by `pop_object_ref_ctx_with`.
+                        let cls = unsafe { &*cls_ptr };
+                        let mth = unsafe { &*mth_ptr };
+                        format!("monitorexit in {cls}.{mth} pc={pc_snap}")
+                    }
                 })?
             };
             // Round-9 JFR MED-6 fix (audit `round9-jfr.md`): the previous
@@ -10993,6 +11229,11 @@ fn execute_invoke(
 struct CpPoolResolver<'a> {
     shared: &'a SharedVm,
     class_id: ClassId,
+    /// Method identity needed to locate the `LocalVariableTable` for real
+    /// local-name resolution (increment 2). When these are empty the
+    /// resolver still works — `local_name` just falls back to `<localN>`.
+    method_name: &'a str,
+    method_descriptor: &'a str,
 }
 
 impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> {
@@ -11045,6 +11286,39 @@ impl crate::runtime::exceptions::helpful_npe::CpResolver for CpPoolResolver<'_> 
             descriptor: desc.to_string(),
         })
     }
+
+    /// JEP 358 step 4 — real `LocalVariableTable` name resolution. Look up
+    /// the source name of local slot `slot` live at byte-offset `bci` by
+    /// scanning the trapping method's `Code.LocalVariableTable` attribute
+    /// (`[start_pc, start_pc+length)` is the live range, JVMS §4.7.13). The
+    /// name is a Utf8 CP entry referenced by `name_index`. Returns `None`
+    /// when the method has no LVT (the common stripped-debug-info case),
+    /// which makes the analysis fall back to the synthetic `<localN>` /
+    /// `this` spelling.
+    fn local_name(&self, slot: u16, bci: usize) -> Option<String> {
+        use cratonvm_reader::attribute::Attribute;
+        let cm = self.shared.class_manager.read_recursive();
+        let class = cm.get_class(self.class_id)?;
+        let method = class.find_method(self.method_name, self.method_descriptor)?;
+        let code = method.code()?;
+        let bci_u16 = bci.min(u16::MAX as usize) as u16;
+        for attr in &code.attributes {
+            if let Attribute::LocalVariableTable(entries) = attr {
+                for e in entries {
+                    // Live range is `[start_pc, start_pc + length)`. A slot is
+                    // matched only when the trapping bci falls inside it, so a
+                    // re-used slot resolves to the correct variable name.
+                    let end = e.start_pc.saturating_add(e.length);
+                    if e.index == slot && bci_u16 >= e.start_pc && bci_u16 < end {
+                        if let Some(name) = class.constant_pool.get_utf8(e.name_index) {
+                            return Some(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 /// JEP 358 — synthesize the HotSpot-style extended message for a null-receiver
@@ -11069,13 +11343,77 @@ fn helpful_npe_invoke_message(
     // relies on for the interpreter path.
     let invoke_bci = frame.last_instr_pc;
     let code = Arc::clone(&frame.code);
+    let m_name = frame.method_name_arc();
+    let m_desc = frame.method_descriptor_arc();
     let resolver = CpPoolResolver {
         shared,
         class_id: frame.class_id,
+        method_name: &m_name,
+        method_descriptor: &m_desc,
     };
     let expr =
         helpful_npe::null_expr_for_invoke_receiver(&code, invoke_bci, num_params, &resolver);
     helpful_npe::combine(&action, expr.as_deref())
+}
+
+/// JEP 358 increment 2 — synthesize the HotSpot-style extended message for a
+/// non-invoke null-deref opcode (`getfield`/`putfield`, `arraylength`, the
+/// array load/store family, `monitorenter`/`monitorexit`, `athrow`). The
+/// caller supplies the already-built action half (e.g.
+/// `Cannot read field "x"`) and the operand's depth below the top of the
+/// operand stack as it stood just before the trapping opcode. Appends
+/// `because "<expr>" is null` when the bounded backward analysis can name the
+/// null operand; otherwise emits the action half alone (HotSpot omits the
+/// `because` clause rather than fabricating one).
+///
+/// Gated by `env_cache::helpful_npe_opcodes()` at the call sites; the trapping
+/// bci is `last_instr_pc`, always known in the interpreter (deopt-independent).
+fn helpful_npe_opcode_message(
+    shared: &SharedVm,
+    thread: &JvmThread,
+    frame_idx: usize,
+    action: &str,
+    depth_below_top: usize,
+) -> String {
+    let frame = &thread.frames[frame_idx];
+    helpful_npe_opcode_message_parts(
+        shared,
+        frame.class_id,
+        &frame.code,
+        frame.method_name_arc_ref(),
+        frame.method_descriptor_arc_ref(),
+        frame.last_instr_pc,
+        action,
+        depth_below_top,
+    )
+}
+
+/// `thread`-free core of [`helpful_npe_opcode_message`]: builds the message
+/// from the trapping frame's already-extracted parts. Kept separate so the
+/// opcode call sites can invoke it from inside a `pop_object_ref_ctx_with`
+/// closure (which holds a `&mut` borrow of the frame's operand stack and so
+/// cannot also borrow `thread`). The bytecode analysis only reads `shared`
+/// (for CP / LVT lookups) and the supplied `code` slice, never `thread`.
+#[allow(clippy::too_many_arguments)]
+fn helpful_npe_opcode_message_parts(
+    shared: &SharedVm,
+    class_id: ClassId,
+    code: &[u8],
+    method_name: &str,
+    method_descriptor: &str,
+    trap_bci: usize,
+    action: &str,
+    depth_below_top: usize,
+) -> String {
+    use crate::runtime::exceptions::helpful_npe;
+    let resolver = CpPoolResolver {
+        shared,
+        class_id,
+        method_name,
+        method_descriptor,
+    };
+    let expr = helpful_npe::null_expr_at_depth(code, trap_bci, depth_below_top, &resolver);
+    helpful_npe::combine_opt(action, expr.as_deref())
 }
 
 /// Variant of `execute_invoke` that knows whether the source bytecode was

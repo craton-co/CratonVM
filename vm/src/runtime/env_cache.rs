@@ -111,6 +111,29 @@ pub fn intrinsics_disabled() -> bool {
     })
 }
 
+/// `CRATONVM_HELPFUL_NPE_OPCODES` — JEP 358 increment 2 opt-in. When set,
+/// the non-invoke null-deref opcodes (`getfield`/`putfield`, `arraylength`,
+/// the array load/store family, `monitorenter`/`monitorexit`, `athrow`) emit
+/// the HotSpot-style `Cannot <action> because "<expr>" is null` message
+/// instead of their older ad-hoc null-NPE text.
+///
+/// DEFAULT-OFF: routing these opcodes through the JEP 358 helper changes the
+/// user-visible NPE message string for every one of them (the single most
+/// common is `getfield`), and some test suites assert the current ad-hoc
+/// wording. Keeping it behind an explicit opt-in means the default path is
+/// byte-for-byte unchanged and can't regress while the new shape is rolled
+/// out. The increment-1 invoke-site message is unconditionally on (it shipped
+/// already) and is unaffected by this flag. Semantics match `disable_jit()`:
+/// empty or `"0"` is off, anything else is on.
+#[inline]
+pub fn helpful_npe_opcodes() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("CRATONVM_HELPFUL_NPE_OPCODES") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    })
+}
+
 // Cache the per-native-call GC root snapshot's *frozen* lower frames and
 // re-scan only the churning top, keyed by per-frame `seq` + GC generation.
 // Correctness rests on the LIFO stack discipline (a frame still present at
