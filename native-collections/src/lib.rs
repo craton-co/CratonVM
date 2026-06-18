@@ -2138,6 +2138,23 @@ fn register_al_sublist_natives(r: &mut NativeMethodRegistry) {
     r.register(c, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;", |ctx, args| {
         asl_delegate_snapshot(ctx, args, "toArray", "([Ljava/lang/Object;)[Ljava/lang/Object;")
     });
+    // `toArray(IntFunction)` sibling of the `toArray(T[])` overload above: the
+    // JUnit Platform launcher calls `subList(..).toArray(X[]::new)`, which 404'd
+    // as a NoSuchMethodError on the synthetic ASL class. A fresh snapshot
+    // ArrayList carries both overloads via `native_collection_to_array_generator`.
+    r.register(
+        c,
+        "toArray",
+        "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+        |ctx, args| {
+            asl_delegate_snapshot(
+                ctx,
+                args,
+                "toArray",
+                "(Ljava/util/function/IntFunction;)[Ljava/lang/Object;",
+            )
+        },
+    );
     r.register(c, "containsAll", "(Ljava/util/Collection;)Z", |ctx, args| {
         asl_delegate_snapshot(ctx, args, "containsAll", "(Ljava/util/Collection;)Z")
     });
@@ -17506,6 +17523,28 @@ fn collect_collection_elements(ctx: &mut dyn NativeContext, coll: ObjectRef) -> 
             if let Value::Object(Some(inner)) = ctx.get_field(coll, UNMOD_FIELD_BACKING) {
                 return collect_collection_elements(ctx, inner);
             }
+        }
+        // `cratonvm/internal/ArrayListSubList` (the backed view returned by
+        // ArrayList.subList) has layout (parent, offset, size, expected) — NOT
+        // (elementData, size). The generic field probes below misread it as a
+        // 2-element array → `[null, <garbage>]`, dropping every element of
+        // `new ArrayList<>(list.subList(..))` / `addAll(subList)` and crashing
+        // downstream when the garbage ref is dispatched (e.g. wild call through
+        // StringBuilder.append(Object) → EXCEPTION_ACCESS_VIOLATION). Read the
+        // real slice straight out of the parent's backing array instead.
+        if cls_name == ASL_CLASS {
+            if let Some((parent, offset, size, _expected)) = asl_state(ctx, coll) {
+                if size > 0 {
+                    if let (Some(data), _) = al_state(ctx, parent) {
+                        let mut out = Vec::with_capacity(size as usize);
+                        for i in 0..(size as usize) {
+                            out.push(ctx.get_array_element(data, offset as usize + i));
+                        }
+                        return out;
+                    }
+                }
+            }
+            return Vec::new();
         }
         if cls_name.starts_with("java/util/Collections$Unmodifiable")
             || cls_name.starts_with("java/util/Collections$Synchronized")
